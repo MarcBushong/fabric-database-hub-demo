@@ -195,7 +195,7 @@ function Invoke-DemoHostCompact {
         finally {
             Dismount-VHD -Path $path -ErrorAction Stop
         }
-        $disks += [pscustomobject]@{ file = [System.IO.Path]::GetFileName($path); bytesBefore = $sizeBefore; bytesAfter = [long](Get-Item -LiteralPath $path).Length }
+        $disks += [pscustomobject]@{ file = ($path -split '[\\/]')[-1]; bytesBefore = $sizeBefore; bytesAfter = [long](Get-Item -LiteralPath $path).Length }
     }
     $before = Get-DemoWipeFreeSpace -Path 'C:\'
     $zero = Write-DemoZeroFill -Folder 'C:\DbHubDemo\wipe' -MarginBytes $MarginBytes -MaxSeconds $MaxSeconds
