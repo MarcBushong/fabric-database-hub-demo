@@ -183,6 +183,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Fixed
 
+- The golden recapture's host compaction (`Invoke-DemoHostCompact`) reported a guest disk's file name with `[System.IO.Path]::GetFileName`, which doesn't split a Windows path on Linux, so its unit test failed on the Linux CI runner. It now splits on both separators.
 - Phase 6: the bootstrap loader extracted `bundle-<sha12>.zip.partial` with `Expand-Archive`, which Windows PowerShell 5.1 rejects for any extension but `.zip`, so no VM would have bootstrapped. It now extracts a renamed `.zip` with `ZipFile.ExtractToDirectory`, and a test runs it in Windows PowerShell 5.1.
 - Phase 6: generated VM passwords no longer use `%`, `!`, or `^`, which broke or could break `az.cmd` command lines on Windows.
 - Phase 7: Phase 5's private `Get-DemoArmResource` silently replaced Phase 7's function of the same name; Phase 7's is now `Get-DemoArcArmResource`, and a test fails on duplicate function names.
