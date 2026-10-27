@@ -1,0 +1,28 @@
+name: schedule-stop
+
+# Scheduled stop (plan section 9.4, C3): removes Bastion and any public IP an interrupted delete left, rotates
+# the host password, sets every activity profile to off (so a later boot doesn't keep T3 awake, R183), stops
+# the T2 guest, and deallocates the VMs; T3 persists and auto-pauses. A second line of defense next to the
+# DevTest Labs auto-shutdown. Off unless DBHUB_SCHEDULES_ENABLED is 'true'. Edit the cron (UTC).
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+# Least privilege (ADR 0022): only the job that signs in to Azure may request an OpenID Connect token.
+permissions:
+  contents: read
+
+jobs:
+  stop:
+    permissions:
+      contents: read
+      id-token: write
+    if: vars.DBHUB_SCHEDULES_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/reusable-demo-run.yml
+    with:
+      # The schedule environment (no reviewers) only for scheduled runs; a run by hand uses the reviewed one (ADR 0022).
+      environment: ${{ github.event_name == 'schedule' && vars.DBHUB_SCHEDULE_ENVIRONMENT || 'demo' }}
+      script: stop-demo
+      timeout-minutes: 45
+    secrets: inherit

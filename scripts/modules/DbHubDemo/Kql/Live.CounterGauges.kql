@@ -1,0 +1,19 @@
+// Blocking and transaction gauges per bin: Processes blocked, Active Transactions, and User Connections.
+// Based on query 8 ('Which resources show blocking or memory pressure?') in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-21). Rules applied: 1 (filter on SampleTimeUTC first), 3 (CounterType 65792 is a gauge,
+// read directly), 4 (group by SqlServerInstanceName per target), 10 (row limit).
+// Contract: runs after Live.Prelude.kql, which defines _start, _end, _bin, _rg, _db, and _target(). The body is
+// identical to GAUGES_KQL in fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, and the Real-Time Dashboard
+// (fabric/realtime) is generated from this file; tests/unit/Fabric.Dashboard.Tests.ps1 fails if they drift.
+SqlServerPerformanceCountersCommon
+| where SampleTimeUTC between (_start .. _end)
+| where ResourceGroup =~ _rg
+| where CounterType == 65792
+| where CounterName in ('Processes blocked', 'Active Transactions', 'User Connections')
+| extend Target = _target(ResourceType, ResourceName)
+| where isnotempty(Target)
+| summarize MaxValue = max(CounterValue), AvgValue = avg(CounterValue)
+        by Target, ResourceName, SqlServerInstanceName, CounterName, Bucket = bin(SampleTimeUTC, _bin)
+| order by Bucket asc
+| take 50000

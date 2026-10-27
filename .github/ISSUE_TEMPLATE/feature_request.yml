@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest an improvement to the demo.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or opportunity
+      description: What would this change make easier for a presenter, operator, or customer?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: If it depends on a preview feature or a new permission, say which.
+    validations:
+      required: true
+  - type: textarea
+    id: docs
+    attributes:
+      label: Official documentation
+      description: Links to the Microsoft Learn pages that support the change.

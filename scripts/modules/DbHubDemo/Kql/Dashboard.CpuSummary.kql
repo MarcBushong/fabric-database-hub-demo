@@ -1,0 +1,7 @@
+// Resources page status row, after Live.CpuSummary.kql and Dashboard.SelectTargets.kql: CPU over the time range
+// per target. 80% is the threshold that query 3 in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry uses
+// (checked 2026-10-21) and that the live-activity notebook flags; the tile's colors are presenter heuristics, not
+// product behavior.
+| summarize P95CpuPercent = max(P95CPU), MaxCpuPercent = max(MaxCPU), PctTimeAbove80 = max(PctTimeAbove80) by Target
+| order by Target asc

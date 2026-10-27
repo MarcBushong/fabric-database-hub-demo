@@ -1,0 +1,443 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/config/environment.schema.json",
+  "title": "Fabric Database Hub hybrid SQL demo configuration",
+  "description": "Inputs that can't be discovered. Copy config/demo.config.example.json to config/demo.config.json (ignored by Git) and set your values. Defaults here are the single source of truth for scripts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["subscriptionId", "tenantId", "t3AdminGroupObjectId", "ownerEmail"],
+  "allOf": [
+    {
+      "description": "Premium SSD v2 needs a zonal VM, so dataDiskSku PremiumV2 requires a zone.",
+      "if": {
+        "properties": { "dataDiskSku": { "const": "PremiumV2" } },
+        "required": ["dataDiskSku"]
+      },
+      "then": {
+        "properties": { "zone": { "type": "string" } },
+        "required": ["zone"]
+      }
+    },
+    {
+      "description": "Access to the opt-in Key Vault is a role assignment, so keyVault.enabled requires assignRoles (ADR 0008).",
+      "if": {
+        "properties": {
+          "keyVault": {
+            "properties": { "enabled": { "const": true } },
+            "required": ["enabled"]
+          }
+        },
+        "required": ["keyVault"]
+      },
+      "then": {
+        "properties": { "assignRoles": { "const": true } },
+        "required": ["assignRoles"]
+      }
+    }
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "subscriptionId": {
+      "description": "Target subscription. Every Azure CLI call passes it with --subscription, so the scripts never use or change the Azure CLI's default subscription; the subscription guard checks that this subscription's Azure CLI account reaches it in tenantId.",
+      "$ref": "#/$defs/uuid"
+    },
+    "tenantId": {
+      "description": "Microsoft Entra tenant of the target subscription. The subscription guard refuses to run unless the Azure CLI's entry for subscriptionId is in this tenant and every token the scripts use (Azure Resource Manager, Fabric, Kusto, Microsoft Graph) is issued for it without interaction.",
+      "$ref": "#/$defs/uuid"
+    },
+    "azureAccount": {
+      "description": "Optional. The account the subscription guard expects the Azure CLI to use for subscriptionId: a user principal name, or the client ID of a service principal or managed identity. The GitHub workflows set it to AZURE_CLIENT_ID. When set, any other account fails the guard; when it isn't set, the guard reports the signed-in account with a Warning.",
+      "type": "string",
+      "pattern": "^([^@\\s]+@[^@\\s]+\\.[^@\\s]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+    },
+    "location": {
+      "description": "Azure region. Must be in Database Hub's performance-monitoring list and the SQL VM unified-inventory list.",
+      "type": "string",
+      "pattern": "^[a-z0-9]+$",
+      "default": "westus3"
+    },
+    "prefix": {
+      "description": "Short lowercase prefix for resource names.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]{2,7}$",
+      "default": "dbhub"
+    },
+    "environment": {
+      "description": "Environment name, for example demo or dev.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]{1,7}$",
+      "default": "demo"
+    },
+    "profile": {
+      "description": "Cost and performance profile (ADR 0016).",
+      "enum": ["lowest-cost", "demo-day", "enhanced-performance"],
+      "default": "lowest-cost"
+    },
+    "networkMode": {
+      "description": "auto (default): preflight reads Azure Policy and picks private when a policy turns off or denies public network access on SQL servers, otherwise public. public: T3 reachable only through a VNet rule. private: T3 private endpoint and private DNS zone (ADR 0007).",
+      "enum": ["auto", "public", "private"],
+      "default": "auto"
+    },
+    "outboundMode": {
+      "description": "Outbound internet path for the VM subnets (ADR 0017). NatGateway adds a NAT gateway and a public IP at extra cost.",
+      "enum": ["DefaultOutboundAccess", "NatGateway"],
+      "default": "DefaultOutboundAccess"
+    },
+    "zone": {
+      "description": "Availability zone for T1 and the T2 host ('1', '2', or '3'). Null keeps both VMs regional. With a zone and dataDiskSku Auto, the demo-day and enhanced-performance data disks use Premium SSD v2, which needs zonal VMs (ADR 0016, C10); preflight checks that the sizes and Premium SSD v2 are offered in that zone.",
+      "type": ["string", "null"],
+      "enum": ["1", "2", "3", null],
+      "default": null
+    },
+    "dataDiskSku": {
+      "description": "Data disk tier for T1 and the T2 host (ADR 0016). Auto: the profile decides - lowest-cost has no separate data disks (None), demo-day and enhanced-performance use Premium SSD v2 with a zone and otherwise their regional tier (Standard SSD E10 for demo-day). None: no data disks; SQL Server data on T1 and the T2 guest's VHDX and media on the host use the OS disks. E10, P10, or PremiumV2 force that tier; P10 is an explicit opt-in that can exceed the monthly ceiling, and PremiumV2 needs a zone. Preflight and estimate-cost report when an estimate exceeds a ceiling.",
+      "enum": ["Auto", "None", "E10", "P10", "PremiumV2"],
+      "default": "Auto"
+    },
+    "t2Mode": {
+      "description": "Nested: T2 is a nested Hyper-V guest (default). EvaluationOnlyAzureVm: opt-in fallback when the nested preflight fails; labeled evaluation only everywhere (ADR 0006).",
+      "enum": ["Nested", "EvaluationOnlyAzureVm"],
+      "default": "Nested"
+    },
+    "t2SqlInstallMode": {
+      "description": "PaygWizard: one documented setup-wizard step per guest build. ProductKey: unattended, needs prerequisite P10. Developer: unattended, Estate only (ADR 0006).",
+      "enum": ["PaygWizard", "ProductKey", "Developer"],
+      "default": "PaygWizard"
+    },
+    "t2ArcBillableCores": {
+      "description": "Billable cores used by estimate-cost.ps1 for Arc SQL PAYG. Defaults to the larger of the guest vCPU count and the documented minimum of four cores per OSE when omitted; configure-arc.ps1 records the instance's actual cores as evidence.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64
+    },
+    "t2Source": {
+      "description": "Where a new archost01 comes from (ADR 0018). auto: the newest boot-verified golden snapshot in rg-<prefix>-golden, otherwise a build from the image. golden: a snapshot is required. build: always builds the guest. An existing host keeps its disk.",
+      "enum": ["auto", "golden", "build"],
+      "default": "auto"
+    },
+    "t3AdminGroupObjectId": {
+      "description": "Object ID of the Entra security group (prerequisite P6) used as the Azure SQL Entra admin.",
+      "$ref": "#/$defs/uuid"
+    },
+    "t3AutoPauseMinutes": {
+      "description": "Serverless auto-pause delay in minutes. Minimum 15. Use -1 to disable auto-pause.",
+      "type": "integer",
+      "anyOf": [{ "minimum": 15, "maximum": 10080 }, { "const": -1 }],
+      "default": 15
+    },
+    "t3FreeOffer": {
+      "description": "auto (default): T3 uses the Azure SQL Database free offer with 'continue using database for additional charges', so it never pauses for the limit, when preflight finds the offer available; otherwise regular General Purpose serverless with a Warning. off: always regular serverless (ADR 0016, C7).",
+      "enum": ["auto", "off"],
+      "default": "auto"
+    },
+    "t4Enabled": {
+      "description": "Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId> (Burstable B1ms, PostgreSQL 18, Microsoft Entra only, virtual network integration; Phase 24, ADR 0019). Its fixed monthly cost (storage, and the Defender plans a tenant policy enables) is billed even while it is stopped, and a stopped server starts on its own after seven days.",
+      "type": "boolean",
+      "default": true
+    },
+    "t4SkuName": {
+      "description": "T4's compute size: Standard_B1ms, the smallest Burstable size (default); Standard_B2s (2 vCores, 4 GiB), the documented fallback when Azure refuses B1ms in the region with SkuNotAvailable; or Standard_D2ds_v5 (General Purpose, 2 vCores, 8 GiB), the documented option the owner chose on 2026-10-26 after West US 3 refused both Burstable sizes. The tier follows the size. It's never the default and never set automatically: deploy.ps1 and preflight report a Fail that names the next option, and nothing changes the size on its own. B2s lists at about four times B1ms's hourly price and D2ds_v5 at about ten times; estimate-cost.ps1 prices the size you set, including the 7-day automatic restart's worst case (Phase 24, ADR 0019).",
+      "type": "string",
+      "enum": ["Standard_B1ms", "Standard_B2s", "Standard_D2ds_v5"],
+      "default": "Standard_B1ms"
+    },
+    "t4AvailabilityZone": {
+      "description": "Availability zone T4 is created in: empty for no preference (default), or 1, 2, or 3 (a zone the region's PostgreSQL capabilities list). It applies only when T4 is created; a server keeps its zone (Phase 24, ADR 0019).",
+      "type": "string",
+      "enum": ["", "1", "2", "3"],
+      "default": ""
+    },
+    "activityProfile": {
+      "description": "Activity profile that deploy.ps1 and start-demo.ps1 set on the targets, until the next auto-shutdown: off, baseline (default; the steady Contoso Care mix), business-day (the baseline plus scheduled, bounded incidents), or incident:<scenario> (ADR 0010). demo-control.yml, start-demo.ps1 -ActivityProfile, and the live-activity notebook change it while the VMs run, and stop-demo.ps1 sets it to off. While T3 has an active profile, the runner keeps its serverless database from auto-pausing, which bills compute (ADR 0016).",
+      "type": "string",
+      "pattern": "^(off|baseline|business-day|incident:[a-z0-9][a-z0-9-]{0,47})$",
+      "default": "baseline"
+    },
+    "activityProfileOnBoot": {
+      "description": "Whether the VMs also set activityProfile at every boot (a manual start, a scheduled start, a restart). False (default): a VM that starts serves only the profile someone set, so T3 can auto-pause unless a demo needs it (ADR 0016, R183).",
+      "type": "boolean",
+      "default": false
+    },
+    "owner": {
+      "description": "Value of the owner tag.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "default": "demo-owner"
+    },
+    "ownerEmail": {
+      "description": "Recipient of budget alerts.",
+      "type": "string",
+      "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    },
+    "costCenter": {
+      "description": "Value of the costCenter tag.",
+      "type": "string",
+      "maxLength": 64,
+      "default": "demo"
+    },
+    "monthlyCeilingUsd": {
+      "description": "Hard monthly ceiling for idle plus light use: preflight and estimate-cost.ps1 fail when the estimate is above it. Also the Azure budget amount (ADR 0016).",
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 250
+    },
+    "sessionCeilingUsd": {
+      "description": "Ceiling for one demo-day session.",
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 15
+    },
+    "autoShutdownTime": {
+      "description": "Daily auto-shutdown time (HHmm, 24-hour) for T1 and the T2 host.",
+      "type": "string",
+      "pattern": "^([01][0-9]|2[0-3])[0-5][0-9]$",
+      "default": "1900"
+    },
+    "autoShutdownTimeZone": {
+      "description": "Windows time zone ID for the auto-shutdown schedule.",
+      "type": "string",
+      "minLength": 3,
+      "default": "Pacific Standard Time"
+    },
+    "expiresOn": {
+      "description": "Optional expiry date (yyyy-MM-dd). The expiry workflow parks T2 or destroys the environment after it.",
+      "type": ["string", "null"],
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "default": null
+    },
+    "assignRoles": {
+      "description": "Create the optional role assignments (presenter Reader, Arc onboarding identity). Needs Microsoft.Authorization/roleAssignments/write (ADR 0008).",
+      "type": "boolean",
+      "default": false
+    },
+    "presenterObjectIds": {
+      "description": "User object IDs of presenters who aren't Contributors (prerequisite P8). Used only when assignRoles is true; the role assignments are created with --assignee-principal-type User.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/uuid" },
+      "uniqueItems": true,
+      "default": []
+    },
+    "bastionMaxHours": {
+      "description": "On-demand Bastion is removed automatically after this many hours (ADR 0016, C8).",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 24,
+      "default": 4
+    },
+    "keyVault": {
+      "description": "Opt-in Azure Key Vault for the one-time T2 host password, so a Bastion session needs no clipboard on the machine that runs start-demo.ps1 (ADR 0009). Off by default: the default path creates no vault and no role assignment. enabled requires assignRoles, because access to the vault is a role assignment on the vault only (ADR 0008).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Deploy the vault (RBAC authorization, soft delete) and write the one-time host password to it instead of the clipboard.",
+          "type": "boolean",
+          "default": false
+        },
+        "purgeProtection": {
+          "description": "Turn on purge protection, for tenants whose policy requires it. Irreversible: after destroy.ps1 the vault then stays soft-deleted for the whole retention period, and deploy.ps1 recovers it.",
+          "type": "boolean",
+          "default": false
+        },
+        "softDeleteRetentionDays": {
+          "description": "Days a deleted vault stays recoverable. Key Vault fixes it when the vault is created.",
+          "type": "integer",
+          "minimum": 7,
+          "maximum": 90,
+          "default": 7
+        },
+        "allowedIpRanges": {
+          "description": "Public IPv4 addresses or CIDR ranges allowed through the vault firewall (your machine's, for the CLI and the portal). Empty allows every network; the data plane still needs a role.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$"
+          },
+          "uniqueItems": true,
+          "default": []
+        },
+        "operatorObjectIds": {
+          "description": "More principals who get Key Vault Secrets Officer on the vault, for example the GitHub workflow identity that runs the scheduled stop. The signed-in caller always gets it.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/uuid" },
+          "uniqueItems": true,
+          "default": []
+        },
+        "readerObjectIds": {
+          "description": "Principals who get Key Vault Secrets User on the vault, to read the one-time password in the portal without running the scripts.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/uuid" },
+          "uniqueItems": true,
+          "default": []
+        }
+      },
+      "default": {}
+    },
+    "control": {
+      "description": "Optional on-demand activity control (ADR 0020): a Fabric notebook calls an Azure Automation webhook in rg-<prefix>-control that starts the targets and runs bounded scenarios, with an auto-stop for every run. Off by default; scripts/setup-activity-control.ps1 sets it up, and an Owner grants its one custom role once (-GrantRole). Contributor-only deployers use scripts/demo-control.ps1.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Use the on-demand activity control: setup-activity-control.ps1 creates it, validate.ps1 and status.ps1 check it, and deploy.ps1 grants A1 again after a redeploy when assignRoles is true.",
+          "type": "boolean",
+          "default": false
+        },
+        "vaultNetworkMode": {
+          "description": "The control vault's network access. auto reads the tenant's policy assignments: public (and the notebook in a folder of the existing workspace) where new vaults can stay public, private (and the notebook in a separate DBHub Control workspace with a managed private endpoint) where a policy makes them private. public and private force a path; public is refused where a policy would make the vault private.",
+          "enum": ["auto", "public", "private"],
+          "default": "auto"
+        },
+        "webhookExpiryDays": {
+          "description": "Days until a new webhook expires; setup-activity-control.ps1 -RotateWebhook replaces it, and status.ps1 warns 14 days before.",
+          "type": "integer",
+          "minimum": 15,
+          "maximum": 365,
+          "default": 90
+        },
+        "t4SafetyStopTime": {
+          "description": "HH:mm for the daily T4 safety stop in autoShutdownTimeZone. Empty: 15 minutes after autoShutdownTime.",
+          "type": "string",
+          "pattern": "^(([01][0-9]|2[0-3]):[0-5][0-9])?$",
+          "default": ""
+        },
+        "notebookUserObjectIds": {
+          "description": "More users who get Key Vault Secrets User on the webhook secret only (A3), besides the Owner who runs -GrantRole. Only -GrantRole assigns them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/uuid"
+          },
+          "uniqueItems": true,
+          "default": []
+        },
+        "fabricFolderName": {
+          "description": "The folder of the existing workspace for the control notebook (public vault).",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "default": "DBHub Control"
+        },
+        "fabricWorkspaceName": {
+          "description": "The workspace for the control notebook when the vault is private (on the existing workspace's capacity).",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "default": "DBHub Control"
+        }
+      },
+      "default": {}
+    },
+    "hostPriority": {
+      "description": "Regular or Spot for the T2 host (ADR 0016, C5).",
+      "enum": ["Regular", "Spot"],
+      "default": "Regular"
+    },
+    "t1Priority": {
+      "description": "Regular or Spot for T1 (ADR 0016, C5).",
+      "enum": ["Regular", "Spot"],
+      "default": "Regular"
+    },
+    "securityType": {
+      "description": "VM security types (ADR 0003).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "t1": {
+          "description": "Auto uses TrustedLaunch only when the image advertises support.",
+          "enum": ["Auto", "TrustedLaunch", "Standard"],
+          "default": "Auto"
+        },
+        "t2Host": {
+          "description": "Standard by default because Trusted Launch is reported as incompatible with nested virtualization.",
+          "enum": ["Standard", "TrustedLaunch"],
+          "default": "Standard"
+        }
+      },
+      "default": {}
+    },
+    "hybridBenefit": {
+      "description": "Opt-in Azure Hybrid Benefit (ADR 0006, C6). Requires entitlementAttested = true.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "windows": { "type": "boolean", "default": false },
+        "sql": { "type": "boolean", "default": false },
+        "entitlementAttested": { "type": "boolean", "default": false }
+      },
+      "default": {}
+    },
+    "fabric": {
+      "description": "The Fabric workspace and lakehouse that hold the demo's Fabric items (prerequisite P5), by name: the scripts resolve their IDs at run time and create them when they're missing (ADR 0021). The repository stores no Fabric ID.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspaceName": {
+          "description": "The workspace's display name. The scripts find the one workspace with this name among those you can access, and create it on capacityName when it's missing and createIfMissing is true.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "default": "Database Hub Demo"
+        },
+        "lakehouseName": {
+          "description": "The lakehouse the notebooks write to and the history model reads, in that workspace. Created with lakehouse schemas when it's missing and createIfMissing is true.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "default": "LH_DatabaseHub"
+        },
+        "capacityName": {
+          "description": "The Fabric capacity's display name, used only to create the workspace or to assign one that has no capacity. It must be an F or Trial capacity you're a contributor or administrator of, and Active. The scripts never create, resume, pause, or scale a capacity. Empty: an existing workspace keeps its capacity, and a missing one is Manual action required.",
+          "type": "string",
+          "maxLength": 256,
+          "default": ""
+        },
+        "createIfMissing": {
+          "description": "Create the workspace (on capacityName) and the lakehouse when they're missing. Scripts that only read (preflight.ps1, status.ps1, validate.ps1) never create anything.",
+          "type": "boolean",
+          "default": true
+        },
+        "workspaceId": {
+          "description": "Optional override, not needed: use this workspace ID instead of finding fabric.workspaceName. Kept for configurations written before ADR 0021. The all-zero ID counts as not set.",
+          "$ref": "#/$defs/uuid"
+        },
+        "lakehouseId": {
+          "description": "Optional override, not needed: use this lakehouse ID instead of finding fabric.lakehouseName. Kept for configurations written before ADR 0021. The all-zero ID counts as not set.",
+          "$ref": "#/$defs/uuid"
+        },
+        "importNotebooks": {
+          "description": "Whether deploy.ps1 also updates the demo's notebooks when they're already in the workspace. False: deploy.ps1 imports only the notebooks that are missing, so a new workspace or lakehouse gets them without asking, and edits made in Fabric are kept. True: it creates or updates both on every deploy. Running configure-fabric.ps1 yourself always creates or updates them.",
+          "type": "boolean",
+          "default": false
+        },
+        "manageCapacity": {
+          "description": "Opt-in, only for a capacity that's yours alone (Phase 26b, ADR 0023). True: start-demo.ps1 resumes the capacity in capacityName when it's Paused, and records that in the demo resource group's DbHubFabricCapacityResumed tag; stop-demo.ps1 and destroy.ps1 pause only the capacity that tag records, then clear it. It must be an F capacity in the configured subscription (Microsoft.Fabric/capacities; Contributor on it is enough); a Trial capacity or one in another subscription is Not supported. False (default): the scripts never resume, pause, or scale a capacity. Keep it false for a shared capacity.",
+          "type": "boolean",
+          "default": false
+        },
+        "saveHistoryOnStop": {
+          "description": "True: stop-demo.ps1 runs NB_DatabaseHub_LiveActivity on demand to save the session's history to the lakehouse before it pauses anything, as stop-demo.ps1 -SaveHistory does (at most 15 minutes; Phase 26b). False (default): run the notebook yourself, or use -SaveHistory.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "default": {}
+    },
+    "github": {
+      "description": "Optional GitHub path (prerequisites P7 and P9).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$" },
+        "environment": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+      },
+      "default": {}
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    }
+  }
+}

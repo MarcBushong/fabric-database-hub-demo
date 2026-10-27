@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/scripts/modules/DbHubDemo/schemas/validation-result.schema.json",
+  "title": "Validation result record (ADR 0012)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["checkId", "area", "target", "status", "message", "evidence", "remediation", "docUrl", "evaluationOnly", "timestamp"],
+  "properties": {
+    "checkId": { "type": "string", "pattern": "^[A-Z0-9]+(\\.[A-Z0-9_]+)+$" },
+    "area": { "enum": ["static", "preflight", "infra", "t1", "t2", "t3", "t4", "hub", "workload", "teardown", "fabric", "cost", "security"] },
+    "target": { "enum": ["T1", "T2", "T3", "T4", "subscription", "tenant", "fabric", "github", "repo"] },
+    "status": { "enum": ["Pass", "Fail", "Warning", "Manual action required", "Not supported", "Not selected"] },
+    "message": { "type": "string", "minLength": 1 },
+    "evidence": { "type": "object" },
+    "remediation": { "type": "string" },
+    "docUrl": { "type": "string" },
+    "evaluationOnly": { "type": "boolean" },
+    "timestamp": { "type": "string", "minLength": 20 }
+  }
+}

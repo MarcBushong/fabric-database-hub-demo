@@ -1,0 +1,492 @@
+/// One value per notebook run, analysis, target, resource, instance, database, metric, and bin, from dbo.telemetry_snapshots. Overlapping notebook runs store the same bin more than once; every measure keeps only the most recent capture of each bin (Snapshot Value).
+table 'Telemetry Snapshots'
+
+    /// Base measure. Per target, analysis, metric, and bin, keeps only the most recent capture, then sums across instances and files inside that capture. Every telemetry measure builds on it.
+    measure 'Snapshot Value' =
+            SUMX (
+                SUMMARIZE (
+                    'Telemetry Snapshots',
+                    'Telemetry Snapshots'[Target Key],
+                    'Telemetry Snapshots'[Analysis Key],
+                    'Telemetry Snapshots'[Metric],
+                    'Telemetry Snapshots'[Bucket UTC]
+                ),
+                VAR LatestCapture = CALCULATE ( MAX ( 'Telemetry Snapshots'[Captured At UTC] ) )
+                RETURN
+                    CALCULATE ( SUM ( 'Telemetry Snapshots'[Value] ), 'Telemetry Snapshots'[Captured At UTC] = LatestCapture )
+            )
+        formatString: #,0.##
+        isHidden
+        displayFolder: Base
+
+    /// Average CPU per bin across the selected targets and period. On T3 the value is a percentage of the service tier's limit.
+    measure 'CPU (%)' =
+            CALCULATE (
+                AVERAGEX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cpu" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "AvgCPU" )
+            )
+        formatString: #,0.0" %"
+        displayFolder: CPU
+
+    /// Highest per-bin CPU peak (MaxCPU) in the selection. On T3 the value is a percentage of the service tier's limit.
+    measure 'CPU Peak (%)' =
+            CALCULATE (
+                MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cpu" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "MaxCPU" )
+            )
+        formatString: #,0.0" %"
+        displayFolder: CPU
+
+    /// CPU (%) only for bins inside an incident window of the targets in context; blank elsewhere, so the line draws the window in indigo.
+    measure 'CPU In Incident Window' = IF ( [In Incident Window], [CPU (%)] )
+        formatString: #,0.0" %"
+        displayFolder: CPU
+
+    /// Highest number of blocked processes in any bin (gauge, maximum per bin).
+    measure 'Blocked Processes (peak)' =
+            CALCULATE (
+                MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "gauges" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Processes blocked" )
+            )
+        formatString: #,0
+        displayFolder: Locks and blocking
+
+    /// Highest number of open transactions in any bin (gauge, maximum per bin).
+    measure 'Active Transactions (peak)' =
+            CALCULATE (
+                MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "gauges" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Active Transactions" )
+            )
+        formatString: #,0
+        displayFolder: Locks and blocking
+
+    /// Highest number of sessions in the ContosoCare database in any bin.
+    measure 'Active Sessions (peak)' =
+            CALCULATE (
+                MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "sessions" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "MaxSessions" )
+            )
+        formatString: #,0
+        displayFolder: Locks and blocking
+
+    /// Seconds spent in the Lock wait category, summed over the selected bins (wait deltas are stored in milliseconds per bin).
+    measure 'Lock Wait (s)' =
+            DIVIDE (
+                CALCULATE (
+                    [Snapshot Value],
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "wait_deltas" ),
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Lock" )
+                ),
+                1000
+            )
+        formatString: #,0.0
+        displayFolder: Locks and blocking
+
+    /// Deadlocks in the selected bins: per-bin deltas of the cumulative Number of Deadlocks/sec counter.
+    measure Deadlocks =
+            CALCULATE (
+                [Snapshot Value],
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "counter_deltas" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Number of Deadlocks/sec" )
+            )
+        formatString: #,0
+        displayFolder: Locks and blocking
+
+    /// Seconds of Buffer IO page-latch waits (PAGEIOLATCH): data pages read from storage. The IO-pressure and missing-index signal.
+    measure 'Buffer IO Wait (s)' =
+            DIVIDE (
+                CALCULATE (
+                    [Snapshot Value],
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "wait_deltas" ),
+                    KEEPFILTERS ( FILTER ( ALL ( 'Telemetry Snapshots'[Metric] ), CONTAINSSTRING ( 'Telemetry Snapshots'[Metric], "(PAGEIOLATCH)" ) ) )
+                ),
+                1000
+            )
+        formatString: #,0.0
+        displayFolder: Waits and IO
+
+    /// Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance, the T3 log-rate scenario's signature.
+    measure 'Log Rate Governor Wait (s)' =
+            DIVIDE (
+                CALCULATE (
+                    [Snapshot Value],
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "wait_deltas" ),
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Log Rate Governor" )
+                ),
+                1000
+            )
+        formatString: #,0.0
+        displayFolder: Waits and IO
+
+    /// Seconds of non-idle wait time in the selection, for every wait category in context.
+    measure 'Wait Time (s)' =
+            DIVIDE ( CALCULATE ( [Snapshot Value], KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "wait_deltas" ) ), 1000 )
+        formatString: #,0.0
+        displayFolder: Waits and IO
+
+    /// Bar fill for the wait ranking: Warning amber when a signature category (Lock, PAGEIOLATCH, Log Rate Governor) holds 10 % or more of the wait time, neutral otherwise.
+    measure 'Wait Bar Color' =
+            VAR Category = SELECTEDVALUE ( 'Telemetry Snapshots'[Metric] )
+            VAR Share = DIVIDE ( [Wait Time (s)], CALCULATE ( [Wait Time (s)], REMOVEFILTERS ( 'Telemetry Snapshots'[Metric] ) ) )
+            VAR IsSignature = Category IN { "Lock", "Log Rate Governor" } || CONTAINSSTRING ( Category, "(PAGEIOLATCH)" )
+            RETURN IF ( IsSignature && Share >= 0.1, "#FFB020", "#B4B4C2" )
+        isHidden
+        displayFolder: Waits and IO
+
+    /// Megabytes read and written on data and log files in the selected bins.
+    measure 'Data and Log IO (MB)' =
+            CALCULATE (
+                [Snapshot Value],
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "storage_io" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] IN { "ReadMB", "WriteMB" } )
+            )
+        formatString: #,0.0
+        displayFolder: Waits and IO
+
+    /// Batch requests in the selected bins: per-bin deltas of the cumulative Batch Requests/sec counter. The load axis of the explorer's scatter.
+    measure 'Batch Requests' =
+            CALCULATE (
+                [Snapshot Value],
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "counter_deltas" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "Batch Requests/sec" )
+            )
+        formatString: #,0
+        displayFolder: Waits and IO
+
+    /// The signal picked in the explorer's Signal slicer (CPU, average per bin, when none is picked), in the signal's own unit and format.
+    measure 'Signal Value' =
+            SWITCH (
+                SELECTEDVALUE ( 'Signal'[Signal Key], "cpu" ),
+                "cpu", [CPU (%)],
+                "cpu_peak", [CPU Peak (%)],
+                "blocked", [Blocked Processes (peak)],
+                "lock_wait", [Lock Wait (s)],
+                "deadlocks", [Deadlocks],
+                "transactions", [Active Transactions (peak)],
+                "buffer_io_wait", [Buffer IO Wait (s)],
+                "io_mb", [Data and Log IO (MB)],
+                "log_rate_wait", [Log Rate Governor Wait (s)],
+                "batch_requests", [Batch Requests],
+                "sessions", [Active Sessions (peak)]
+            )
+        displayFolder: Explorer
+        formatStringDefinition = SELECTEDVALUE ( 'Signal'[Format String], "#,0.0" )
+
+    /// Signal Value only for bins inside an incident window of the targets in context.
+    measure 'Signal Value In Incident Window' = IF ( [In Incident Window], [Signal Value] )
+        displayFolder: Explorer
+        formatStringDefinition = SELECTEDVALUE ( 'Signal'[Format String], "#,0.0" )
+
+    /// The selected signal's attention threshold for the explorer's reference line; blank when the signal has none.
+    measure 'Signal Threshold' =
+            VAR T = SELECTEDVALUE ( 'Signal'[Attention Threshold] )
+            RETURN IF ( T > 0, T )
+        formatString: #,0.#
+        displayFolder: Explorer
+
+    /// Highest per-bin value of the selected signal in context.
+    measure 'Signal Peak' =
+            MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Signal Value] )
+        formatString: #,0.#
+        isHidden
+        displayFolder: Explorer
+
+    /// Explorer page title: the selected signal and the SQL target with its highest bin, or an empty-state sentence.
+    measure 'Explorer Headline' =
+            VAR SignalName = SELECTEDVALUE ( 'Signal'[Signal], "CPU, average per bin" )
+            VAR Unit = SELECTEDVALUE ( 'Signal'[Unit], "%" )
+            VAR Candidates =
+                FILTER (
+                    CALCULATETABLE ( VALUES ( 'Target'[Target Short] ), 'Target'[Target Kind] = "SQL target" ),
+                    NOT ISBLANK ( [Signal Peak] )
+                )
+            VAR Best = TOPN ( 1, Candidates, [Signal Peak], DESC )
+            VAR BestTarget = MAXX ( Best, 'Target'[Target Short] )
+            VAR BestPeak = MAXX ( Best, [Signal Peak] )
+            RETURN
+                IF (
+                    ISBLANK ( BestTarget ),
+                    SignalName & ": no telemetry bins in this selection",
+                    SignalName & " by target: the highest bin was " & FORMAT ( BestPeak, "#,0.#" ) & " " & Unit & " on " & BestTarget
+                )
+        displayFolder: Explorer
+
+    /// The explorer's active signal, SQL targets, and data range, for the breadcrumb next to the title.
+    measure 'Active Filters Summary' =
+            VAR Targets =
+                CONCATENATEX (
+                    CALCULATETABLE ( VALUES ( 'Target'[Target Short] ), 'Target'[Target Kind] = "SQL target" ),
+                    'Target'[Target Short], ", ", 'Target'[Target Short], ASC
+                )
+            VAR FirstDay = CALCULATE ( MIN ( 'Telemetry Snapshots'[Report Date UTC] ) )
+            VAR LastDay = CALCULATE ( MAX ( 'Telemetry Snapshots'[Report Date UTC] ) )
+            RETURN
+                "Signal: " & SELECTEDVALUE ( 'Signal'[Signal], "CPU, average per bin" )
+                    & "  ·  Targets: " & Targets
+                    & IF ( NOT ISBLANK ( FirstDay ), "  ·  Data from " & FORMAT ( FirstDay, "d mmm yyyy" ) & " to " & FORMAT ( LastDay, "d mmm yyyy" ) & " UTC" )
+        displayFolder: Explorer
+
+    /// How many of the three SQL targets sent CPU telemetry in the selected period.
+    measure 'Targets Reporting' =
+            COUNTROWS (
+                FILTER (
+                    CALCULATETABLE ( VALUES ( 'Target'[Target Key] ), 'Target'[Target Kind] = "SQL target" ),
+                    NOT ISBLANK ( [CPU (%)] )
+                )
+            )
+        formatString: #,0
+        displayFolder: Estate
+
+    /// Age of the target's newest telemetry sample when the notebook captured the window (estate pulse), the larger across targets.
+    measure 'Telemetry Lag at Capture (min)' =
+            CALCULATE (
+                MAXX ( VALUES ( 'Telemetry Snapshots'[Target Key] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "estate_pulse" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "LastSampleAgeMinutes" )
+            )
+        formatString: #,0.0
+        displayFolder: Estate
+
+    /// Reference line for each target tile: peak CPU, blocking incidents, and telemetry lag, or an empty-state sentence.
+    measure 'Target Tile Context' =
+            IF (
+                ISBLANK ( [CPU (%)] ),
+                "No telemetry bins in this period",
+                "Peak CPU " & FORMAT ( [CPU Peak (%)], "0" ) & " %  ·  "
+                    & FORMAT ( [Blocking Incidents] + 0, "0" ) & " blocking incident(s)  ·  telemetry lag "
+                    & FORMAT ( [Telemetry Lag at Capture (min)], "0" ) & " min"
+            )
+        displayFolder: Estate
+
+    /// Health matrix font color for CPU Peak (%): Warning amber at 80 % or more.
+    measure 'CPU Peak Font Color' = IF ( [CPU Peak (%)] >= 80, "#FFB020", "#F2F2F5" )
+        isHidden
+        displayFolder: Estate
+
+    /// Health matrix font color for Blocked Processes (peak): Warning amber above 0.
+    measure 'Blocked Font Color' = IF ( [Blocked Processes (peak)] > 0, "#FFB020", "#F2F2F5" )
+        isHidden
+        displayFolder: Estate
+
+    /// Health matrix font color for Buffer IO Wait (s): Warning amber at 1 s or more.
+    measure 'Buffer IO Font Color' = IF ( [Buffer IO Wait (s)] >= 1, "#FFB020", "#F2F2F5" )
+        isHidden
+        displayFolder: Estate
+
+    /// Health matrix font color for Log Rate Governor Wait (s): Warning amber above 0.
+    measure 'Log Rate Font Color' = IF ( [Log Rate Governor Wait (s)] > 0, "#FFB020", "#F2F2F5" )
+        isHidden
+        displayFolder: Estate
+
+    /// The text twin of the health matrix colors, so color is never the only signal: every threshold the target crossed, or None.
+    measure 'Target Attention Signals' =
+            VAR Parts =
+                {
+                    IF ( [CPU Peak (%)] >= 80, "▲ CPU" ),
+                    IF ( [Blocked Processes (peak)] > 0, "▲ Blocking" ),
+                    IF ( [Buffer IO Wait (s)] >= 1, "▲ Buffer IO" ),
+                    IF ( [Log Rate Governor Wait (s)] > 0, "▲ Log rate" )
+                }
+            VAR Result = CONCATENATEX ( FILTER ( Parts, NOT ISBLANK ( [Value] ) ), [Value], "  " )
+            RETURN IF ( Result = "", "None", Result )
+        displayFolder: Estate
+
+    /// Newest capture time in the lakehouse across snapshots, findings, and checks. Ignores the period slicer.
+    measure 'Latest Capture UTC' =
+            CALCULATE (
+                MAX (
+                    MAX ( 'Telemetry Snapshots'[Captured At UTC] ),
+                    MAX ( MAX ( 'Analysis Findings'[Captured At UTC] ), MAX ( 'Validation Results'[Checked At UTC] ) )
+                ),
+                REMOVEFILTERS ( 'Date' )
+            )
+        formatString: yyyy-mm-dd hh:nn
+        displayFolder: Freshness
+
+    /// Hours between the newest capture and now (UTC).
+    measure 'Hours Since Latest Capture' =
+            VAR Latest = [Latest Capture UTC]
+            RETURN IF ( NOT ISBLANK ( Latest ), DIVIDE ( DATEDIFF ( Latest, UTCNOW (), MINUTE ), 60 ) )
+        formatString: #,0.0
+        displayFolder: Freshness
+
+    /// Pass while the history is fresh, Warning after 24 hours, Manual action required with no snapshot at all.
+    measure 'History Freshness Status' =
+            VAR Hours = [Hours Since Latest Capture]
+            RETURN SWITCH ( TRUE (), ISBLANK ( Hours ), "Manual action required", Hours > 24, "Warning", "Pass" )
+        displayFolder: Freshness
+
+    /// Rail color of the history tile: cyan with no snapshot, amber after 24 hours, unlit otherwise.
+    measure 'History Freshness Rail Color' =
+            SWITCH ( [History Freshness Status], "Manual action required", "#8CEEEE", "Warning", "#FFB020", "#2A2A3A" )
+        isHidden
+        displayFolder: Freshness
+
+    /// The history tile's reference line: the newest capture and its age, or what to run when there's none.
+    measure 'History Freshness Label' =
+            IF (
+                ISBLANK ( [Latest Capture UTC] ),
+                "No snapshot yet: run NB_DatabaseHub_LiveActivity",
+                "Latest snapshot " & FORMAT ( [Latest Capture UTC], "yyyy-mm-dd hh:nn" ) & " UTC  ·  "
+                    & FORMAT ( [Hours Since Latest Capture], "0.0" ) & " h ago"
+            )
+        displayFolder: Freshness
+
+    /// Notebook runs that saved telemetry snapshots, over all history.
+    measure 'Notebook Runs Captured' = CALCULATE ( DISTINCTCOUNT ( 'Telemetry Snapshots'[Run ID] ), REMOVEFILTERS ( 'Date' ) )
+        formatString: #,0
+        displayFolder: Freshness
+
+    /// 1 when the lakehouse holds any per-bin telemetry, whatever the filters; drives every empty state.
+    measure 'Has Telemetry Bins' =
+            IF (
+                CALCULATE (
+                    COUNTROWS ( 'Telemetry Snapshots' ),
+                    REMOVEFILTERS (),
+                    'Telemetry Snapshots'[Analysis Key] IN { "cpu", "gauges", "wait_deltas", "counter_deltas", "sessions", "storage_io" }
+                ) > 0,
+                1,
+                0
+            )
+        formatString: 0
+        isHidden
+        displayFolder: Freshness
+
+    /// Telemetry tables that each target sent, from the deployment notebook's coverage check in the validation run the readiness page selects.
+    measure 'Coverage Tables (selected run)' =
+            VAR RunId = [Selected Validation Run]
+            RETURN
+                CALCULATE (
+                    DISTINCTCOUNT ( 'Telemetry Snapshots'[Metric] ),
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "telemetry_coverage" ),
+                    KEEPFILTERS ( RIGHT ( 'Telemetry Snapshots'[Metric], 5 ) = ".rows" ),
+                    TREATAS ( { RunId }, 'Telemetry Snapshots'[Run ID] ),
+                    REMOVEFILTERS ( 'Date' )
+                )
+        formatString: #,0
+        displayFolder: Coverage
+
+    /// Minutes between the target's newest telemetry sample and the end of the coverage window, in the selected validation run.
+    measure 'Coverage Last Sample Age (min)' =
+            VAR RunId = [Selected Validation Run]
+            VAR CoverageRows =
+                CALCULATETABLE (
+                    'Telemetry Snapshots',
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "telemetry_coverage" ),
+                    TREATAS ( { RunId }, 'Telemetry Snapshots'[Run ID] ),
+                    REMOVEFILTERS ( 'Date' )
+                )
+            VAR LastSample = MAXX ( CoverageRows, 'Telemetry Snapshots'[Bucket UTC] )
+            VAR WindowEnd = MAXX ( CoverageRows, 'Telemetry Snapshots'[Window End UTC] )
+            RETURN IF ( NOT ISBLANK ( LastSample ), DATEDIFF ( LastSample, WindowEnd, SECOND ) / 60 )
+        formatString: #,0.0
+        displayFolder: Coverage
+
+    /// Fresh, stale (older than 15 minutes, the deployment notebook's freshness rule), or not captured, with a glyph.
+    measure 'Coverage Attention' =
+            VAR Age = [Coverage Last Sample Age (min)]
+            RETURN SWITCH ( TRUE (), ISBLANK ( Age ), "○ Not captured", Age > 15, "▲ Stale", "✓ Fresh" )
+        displayFolder: Coverage
+
+    /// Font color for the coverage spotlight: Warning amber when the newest sample is older than 15 minutes.
+    measure 'Coverage Font Color' = IF ( [Coverage Last Sample Age (min)] > 15, "#FFB020", "#8C8C9C" )
+        isHidden
+        displayFolder: Coverage
+
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    column 'Source Notebook'
+        dataType: string
+        isHidden
+        sourceColumn: source_notebook
+
+    column 'Captured At UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: captured_at_utc
+
+    column 'Analysis Key'
+        dataType: string
+        isHidden
+        sourceColumn: analysis
+
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// Azure resource type of the target: virtualMachines (T1), machines (T2), or servers/databases (T3).
+    column 'Resource Type'
+        dataType: string
+        sourceColumn: resource_type
+
+    /// Azure resource name of the target.
+    column 'Resource Name'
+        dataType: string
+        sourceColumn: resource_name
+
+    /// SQL Server instance name.
+    column 'Instance Name'
+        dataType: string
+        sourceColumn: instance_name
+
+    /// Database name, where the analysis is per database.
+    column 'Database Name'
+        dataType: string
+        sourceColumn: database_name
+
+    /// The metric or wait category, for example AvgCPU, Processes blocked, Lock, or Buffer IO (PAGEIOLATCH).
+    column Metric
+        dataType: string
+        sourceColumn: metric
+
+    /// Start of the telemetry bin (UTC). Empty for analyses with one row per window; the latest sample time for memory, growth, and coverage.
+    column 'Bucket UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: bucket_utc
+
+    column Value
+        dataType: double
+        isHidden
+        summarizeBy: none
+        sourceColumn: value
+
+    /// Unit of Value, for example percent, rows, or MB.
+    column Unit
+        dataType: string
+        sourceColumn: unit
+
+    column 'Window Start UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: window_start_utc
+
+    column 'Window End UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: window_end_utc
+
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'Telemetry Snapshots' = entity
+        mode: directLake
+        source
+            entityName: telemetry_snapshots
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

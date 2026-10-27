@@ -1,0 +1,177 @@
+/// One finding per notebook run and finding ID, from dbo.analysis_findings: estate pulse, blocking incidents, consumption, scenario correlation, and readiness findings, each with an ADR 0012 status.
+table 'Analysis Findings'
+
+    /// Finding rows in context.
+    measure Findings = COUNTROWS ( 'Analysis Findings' )
+        formatString: #,0
+        displayFolder: Findings
+
+    /// Finding IDs whose most recent capture has a status that needs attention (Fail, Manual action required, or Warning).
+    measure 'Findings Needing Attention' =
+            SUMX (
+                VALUES ( 'Analysis Findings'[Finding ID] ),
+                VAR LatestCapture = CALCULATE ( MAX ( 'Analysis Findings'[Captured At UTC] ) )
+                RETURN
+                    MAXX (
+                        CALCULATETABLE ( 'Analysis Findings', 'Analysis Findings'[Captured At UTC] = LatestCapture ),
+                        RELATED ( 'Status'[Needs Attention Flag] )
+                    )
+            )
+        formatString: #,0
+        displayFolder: Findings
+
+    /// Worst status among the latest capture of each finding in context: 1 Fail, 2 Manual action required, 3 Warning; 4 to 6 need no attention.
+    measure 'Worst Finding Status Sort' =
+            MINX (
+                VALUES ( 'Analysis Findings'[Finding ID] ),
+                VAR LatestCapture = CALCULATE ( MAX ( 'Analysis Findings'[Captured At UTC] ) )
+                RETURN
+                    MINX (
+                        CALCULATETABLE ( 'Analysis Findings', 'Analysis Findings'[Captured At UTC] = LatestCapture ),
+                        RELATED ( 'Status'[Status Sort] )
+                    )
+            )
+        formatString: 0
+        isHidden
+        displayFolder: Findings
+
+    /// Rail color of a target tile: red, cyan, or amber for its worst attention status; unlit otherwise.
+    measure 'Target Rail Color' =
+            SWITCH ( [Worst Finding Status Sort], 1, "#FF4D5A", 2, "#8CEEEE", 3, "#FFB020", "#2A2A3A" )
+        isHidden
+        displayFolder: Findings
+
+    /// Visual filter for the open-findings queue: 1 when the row is its finding's latest capture.
+    measure 'Is Latest Finding Capture' =
+            VAR ThisCapture = MAX ( 'Analysis Findings'[Captured At UTC] )
+            VAR LatestForIds =
+                MAXX (
+                    VALUES ( 'Analysis Findings'[Finding ID] ),
+                    CALCULATE (
+                        MAX ( 'Analysis Findings'[Captured At UTC] ),
+                        ALLEXCEPT ( 'Analysis Findings', 'Analysis Findings'[Finding ID], 'Date'[Date] )
+                    )
+                )
+            RETURN IF ( ThisCapture = LatestForIds, 1, 0 )
+        formatString: 0
+        isHidden
+        displayFolder: Findings
+
+    /// Visual filter for the incident page's evidence table: 1 when the finding is on the focus incident's target and overlaps its padded window.
+    measure 'Finding In Focus Window' =
+            VAR TargetKey = [Focus Target Key]
+            VAR RangeStart = [Focus Range Start UTC]
+            VAR RangeEnd = [Focus Range End UTC]
+            RETURN
+                IF (
+                    CALCULATE (
+                        COUNTROWS ( 'Analysis Findings' ),
+                        KEEPFILTERS ( 'Analysis Findings'[Target Key] = TargetKey ),
+                        KEEPFILTERS ( 'Analysis Findings'[Window Start UTC] <= RangeEnd ),
+                        KEEPFILTERS ( 'Analysis Findings'[Window End UTC] >= RangeStart )
+                    ) > 0,
+                    1,
+                    0
+                )
+        formatString: 0
+        isHidden
+        displayFolder: Findings
+
+    /// Blocking incidents that the notebook detected: consecutive bins with a blocked process (deadlock summaries excluded).
+    measure 'Blocking Incidents' =
+            CALCULATE (
+                DISTINCTCOUNT ( 'Analysis Findings'[Finding ID] ),
+                KEEPFILTERS ( 'Analysis Findings'[Analysis Key] = "blocking" ),
+                KEEPFILTERS ( NOT CONTAINSSTRING ( 'Analysis Findings'[Finding ID], ".deadlocks" ) )
+            )
+        formatString: #,0
+        displayFolder: Findings
+
+    /// Estate page title: SQL targets reporting and findings that need attention, or an empty-state sentence.
+    measure 'Estate Headline' =
+            VAR Reporting = [Targets Reporting]
+            VAR Attention = [Findings Needing Attention] + 0
+            RETURN
+                IF (
+                    [Has Telemetry Bins] = 0,
+                    "No telemetry history yet: run NB_DatabaseHub_LiveActivity to start the estate's history",
+                    FORMAT ( Reporting, "0" ) & " of 3 SQL targets sent telemetry in this period; "
+                        & FORMAT ( Attention, "0" ) & IF ( Attention = 1, " finding needs", " findings need" ) & " attention"
+                )
+        displayFolder: Findings
+
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// Stable finding key: analysis, target, and a per-analysis key, for example blocking.T1.20261021T1405.
+    column 'Finding ID'
+        dataType: string
+        sourceColumn: finding_id
+
+    column 'Source Notebook'
+        dataType: string
+        isHidden
+        sourceColumn: source_notebook
+
+    /// When the notebook recorded the finding (UTC).
+    column 'Captured At UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: captured_at_utc
+
+    column 'Analysis Key'
+        dataType: string
+        isHidden
+        sourceColumn: analysis
+
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    column 'Status Key'
+        dataType: string
+        isHidden
+        sourceColumn: status
+
+    /// The finding in one sentence.
+    column Finding
+        dataType: string
+        sourceColumn: finding
+
+    /// The finding's evidence as redacted JSON.
+    column Evidence
+        dataType: string
+        sourceColumn: evidence
+
+    column 'Request ID'
+        dataType: string
+        isHidden
+        sourceColumn: request_id
+
+    /// Start of the window the finding covers (UTC).
+    column 'Window Start UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: window_start_utc
+
+    /// End of the window the finding covers (UTC).
+    column 'Window End UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: window_end_utc
+
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'Analysis Findings' = entity
+        mode: directLake
+        source
+            entityName: analysis_findings
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

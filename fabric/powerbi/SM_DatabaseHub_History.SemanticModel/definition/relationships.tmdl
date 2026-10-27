@@ -1,0 +1,63 @@
+relationship 'Validation Results to Target'
+    fromColumn: 'Validation Results'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'Validation Results to Status'
+    fromColumn: 'Validation Results'.'Status Key'
+    toColumn: Status.Status
+
+relationship 'Validation Results to Date'
+    fromColumn: 'Validation Results'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'Scenario Runs to Target'
+    fromColumn: 'Scenario Runs'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'Scenario Runs to Status'
+    fromColumn: 'Scenario Runs'.'Status Key'
+    toColumn: Status.Status
+
+relationship 'Scenario Runs to Date'
+    fromColumn: 'Scenario Runs'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'Telemetry Snapshots to Target'
+    fromColumn: 'Telemetry Snapshots'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'Telemetry Snapshots to Analysis'
+    fromColumn: 'Telemetry Snapshots'.'Analysis Key'
+    toColumn: Analysis.'Analysis Key'
+
+relationship 'Telemetry Snapshots to Date'
+    fromColumn: 'Telemetry Snapshots'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'Analysis Findings to Target'
+    fromColumn: 'Analysis Findings'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'Analysis Findings to Status'
+    fromColumn: 'Analysis Findings'.'Status Key'
+    toColumn: Status.Status
+
+relationship 'Analysis Findings to Analysis'
+    fromColumn: 'Analysis Findings'.'Analysis Key'
+    toColumn: Analysis.'Analysis Key'
+
+relationship 'Analysis Findings to Date'
+    fromColumn: 'Analysis Findings'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'Incident Windows to Target'
+    fromColumn: 'Incident Windows'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'Incident Windows to Status'
+    fromColumn: 'Incident Windows'.'Correlation Status Key'
+    toColumn: Status.Status
+
+relationship 'Incident Windows to Date'
+    fromColumn: 'Incident Windows'.'Report Date UTC'
+    toColumn: Date.Date

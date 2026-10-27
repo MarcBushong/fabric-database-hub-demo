@@ -1,0 +1,98 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/page/2.1.0/schema.json",
+  "name": "bad5e0f930ba51e21ed8",
+  "displayName": "3 · Signal explorer",
+  "displayOption": "FitToPage",
+  "height": 1080,
+  "width": 1920,
+  "objects": {
+    "background": [
+      {
+        "properties": {
+          "color": {
+            "solid": {
+              "color": {
+                "expr": {
+                  "Literal": {
+                    "Value": "'#0E0E10'"
+                  }
+                }
+              }
+            }
+          },
+          "transparency": {
+            "expr": {
+              "Literal": {
+                "Value": "0D"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "outspace": [
+      {
+        "properties": {
+          "color": {
+            "solid": {
+              "color": {
+                "expr": {
+                  "Literal": {
+                    "Value": "'#0E0E10'"
+                  }
+                }
+              }
+            }
+          },
+          "transparency": {
+            "expr": {
+              "Literal": {
+                "Value": "0D"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "personalizeVisual": [
+      {
+        "properties": {
+          "show": {
+            "expr": {
+              "Literal": {
+                "Value": "true"
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "visualInteractions": [
+    {
+      "source": "b0a55e5c1dc1f71a21a7",
+      "target": "b1756eeb28ea7163b93f",
+      "type": "NoFilter"
+    },
+    {
+      "source": "b0a55e5c1dc1f71a21a7",
+      "target": "ec1df1ab136019ae994e",
+      "type": "NoFilter"
+    },
+    {
+      "source": "b0a55e5c1dc1f71a21a7",
+      "target": "d03e2d456e77517559ad",
+      "type": "NoFilter"
+    },
+    {
+      "source": "b0a55e5c1dc1f71a21a7",
+      "target": "33aedeae41c9f88b9553",
+      "type": "NoFilter"
+    },
+    {
+      "source": "b0a55e5c1dc1f71a21a7",
+      "target": "e3896b953c0e4f368e04",
+      "type": "NoFilter"
+    }
+  ]
+}

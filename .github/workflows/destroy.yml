@@ -1,0 +1,33 @@
+name: destroy
+
+# Deletes a demo environment: its Arc resources first, then the resource group (plan section 9.6). Type the
+# environment's name in "confirm". The GitHub identity's resource group (rg-<prefix>-control) stays.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment to destroy
+        type: string
+        required: true
+      confirm:
+        description: Type the environment's name again
+        type: string
+        required: true
+
+# Least privilege (ADR 0022): only the job that signs in to Azure may request an OpenID Connect token.
+permissions:
+  contents: read
+
+jobs:
+  destroy:
+    permissions:
+      contents: read
+      id-token: write
+    if: inputs.confirm == inputs.environment
+    uses: ./.github/workflows/reusable-demo-run.yml
+    with:
+      environment: ${{ inputs.environment }}
+      script: destroy
+      parameters: '{"Force": true}'
+      timeout-minutes: 90
+    secrets: inherit

@@ -1,0 +1,19 @@
+# markdownlint-cli2 configuration. The version is pinned in config/versions.json.
+config:
+  default: true
+  # Prose isn't hard-wrapped.
+  MD013: false
+  # Repeated headings are fine in different sections (for example "Validation" in each ADR).
+  MD024:
+    siblings_only: true
+  # Table delimiter rows use the compact "|---|" form; GitHub renders both forms the same.
+  MD060: false
+
+globs:
+  - "**/*.md"
+
+ignores:
+  - "**/node_modules/**"
+  - "**/bin/**"
+  - "**/obj/**"
+  - "out/**"

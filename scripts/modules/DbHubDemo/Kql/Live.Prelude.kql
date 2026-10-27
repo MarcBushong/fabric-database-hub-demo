@@ -1,0 +1,25 @@
+// The prelude that every Live.*.kql query runs after: the analysis window, the bin, the demo's names, and
+// _target(), which maps a telemetry row to T1, T2, or T3 by ResourceType and ResourceName, as the "Resource
+// types" table in https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// documents them (checked 2026-10-21): VM name for virtualMachines, machine name for machines, and
+// <server>/<database> for servers/databases. Names, never resource IDs, so no query holds a subscription ID.
+// Mirrors kql_prelude() in fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, which fills it from the notebook's
+// parameters cell; the Real-Time Dashboard fills it from its time range parameter, and its resource group at
+// import time. tests/unit/Fabric.Dashboard.Tests.ps1 fails if the notebook and this file drift.
+// Parameters, rendered by Format-DemoKqlTemplate: Start and End (datetime expressions), Bin (a timespan
+// expression), and ResourceGroup, Database, VmName, ArcMachineName, ServerPrefix, DatabaseSuffix (string literals).
+let _start = {{Start}};
+let _end = {{End}};
+let _bin = {{Bin}};
+let _rg = {{ResourceGroup}};
+let _db = {{Database}};
+let _t1 = {{VmName}};
+let _t2 = {{ArcMachineName}};
+let _t3prefix = {{ServerPrefix}};
+let _t3suffix = {{DatabaseSuffix}};
+let _target = (resourceType: string, resourceName: string) {
+    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',
+         resourceType == 'machines' and resourceName =~ _t2, 'T2',
+         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',
+         '')
+};

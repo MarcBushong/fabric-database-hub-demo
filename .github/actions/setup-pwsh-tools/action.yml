@@ -1,0 +1,17 @@
+name: Set up PowerShell validation tools
+description: Installs the Pester and PSScriptAnalyzer versions pinned in config/versions.json, and optionally PSRule.
+
+inputs:
+  include-psrule:
+    description: Also install PSRule and PSRule.Rules.Azure.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned PowerShell modules
+      shell: pwsh
+      env:
+        INCLUDE_PSRULE: ${{ inputs.include-psrule }}
+      run: ./tests/Install-TestTools.ps1 -IncludePSRule:($env:INCLUDE_PSRULE -eq 'true')

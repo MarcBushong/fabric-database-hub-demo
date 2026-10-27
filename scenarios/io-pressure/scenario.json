@@ -1,0 +1,41 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "io-pressure",
+  "title": "IO pressure",
+  "summary": "Bounded reads and writes over a scratch data set. The first session grows demo.io_scratch to scratchMb (one 7,000-byte row per page) after a free-space check; then every session alternates range scans of up to 256 MB with 16 MB range updates that checkpoints write back. Growth stops at scratchMb, below the file caps, and the scratch set is reused by later runs.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_io_pressure",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 2, "min": 1, "max": 8, "description": "Sessions scanning and updating the scratch set." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pause between scans and updates: about 2 seconds at 1, about 50 ms at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3", "T4"],
+    "default": ["T2"],
+    "notes": {
+      "T2": "The runner checks the guest volume (the VHDX) for scratchMb plus 2 GB free; the T-SQL check keeps a 512 MB margin under the 8 GB data cap.",
+      "T3": "Uses a smaller default scratch set; storage IO on Azure SQL Database is governed by the service objective.",
+      "T4": "demo.io_scratch grows to scratchMb (never past 8 GiB of database size) on the 32 GiB P4 disk (120 IOPS baseline, B1ms caps the server at 640 IOPS); reads wait on IO (DataFileRead) once the set exceeds memory."
+    }
+  },
+  "parameters": {
+    "scratchMb": { "type": "integer", "default": 1024, "minimum": 64, "maximum": 6144, "defaultByTarget": { "T3": 256, "T4": 1024 }, "description": "Size of the scratch data set in MB. Reads become physical (PAGEIOLATCH) once it no longer fits in the buffer pool.", "sqlParameter": "@scratch_mb" }
+  },
+  "freeSpace": { "dataMbFromParameter": "scratchMb", "marginMb": 2048 },
+  "expectedHubSignals": [
+    { "signal": "SqlServerStorageIO: read and write bytes and IO stalls rising on the ContosoCare data file", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: Page reads/sec, Readahead pages/sec, Page writes/sec, Checkpoint pages/sec", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: Buffer IO (PAGEIOLATCH_SH) once the scratch set exceeds memory, Tran Log IO (WRITELOG) while it grows", "surface": "Performance" },
+    { "signal": "SqlServerDatabaseStorageUtilization: data size grows once, up to scratchMb", "surface": "Performance" },
+    { "signal": "T4: IOPS (iops) at the disk's limit and Storage (storage_percent) up by scratchMb; Disk IOPS Consumed Percentage near 100%", "surface": "Performance", "note": "Hub's PostgreSQL dashboard shows IOPS and storage; the consumed percentage is an Azure Monitor metric." }
+  ],
+  "expectedSymptoms": [
+    "Write IO while the scratch set grows, then steady read and write IO",
+    "PAGEIOLATCH waits only when scratchMb exceeds the memory SQL Server can use; on small VMs with the default size most reads come from memory",
+    "No uncontrolled growth: the data file stays below its cap, with a 512 MB margin"
+  ],
+  "queryLevelEvidence": [
+    "Query Store: the scratch range scan with high logical and physical reads",
+    "sys.dm_io_virtual_file_stats for the ContosoCare data file (needs VIEW SERVER STATE)"
+  ],
+  "reset": "Auto-cleanup and reset truncate demo.io_scratch; the space stays allocated in the data file for the next run, and business data is never touched."
+}

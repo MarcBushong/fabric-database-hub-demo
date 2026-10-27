@@ -1,0 +1,43 @@
+{
+  "description": "Cost and performance profiles (ADR 0016). Single source for estimate-cost.ps1, preflight.ps1, and the Bicep VM modules. Every value can be overridden by parameters.",
+  "nestedVirtualizationFamilies": ["standardDSv5Family", "standardDASv5Family", "standardDSv6Family", "standardESv5Family", "standardESv6Family"],
+  "diskTiers": {
+    "None": { "sku": "None", "sizeGiB": 0, "caching": "None", "zonalOnly": false },
+    "E10": { "sku": "StandardSSD_LRS", "sizeGiB": 128, "caching": "None", "zonalOnly": false },
+    "P10": { "sku": "Premium_LRS", "sizeGiB": 128, "caching": "ReadOnly", "zonalOnly": false },
+    "PremiumV2": { "sku": "PremiumV2_LRS", "sizeGiB": 128, "iops": 3000, "mbps": 125, "caching": "None", "zonalOnly": true }
+  },
+  "profiles": {
+    "lowest-cost": {
+      "t1": { "size": "Standard_D2s_v5", "vcpus": 2, "family": "standardDSv5Family", "osDisk": "E10", "dataDisk": "None" },
+      "t2Host": { "size": "Standard_E2s_v5", "vcpus": 2, "family": "standardESv5Family", "osDisk": "E10", "dataDisk": "None" },
+      "t2Guest": { "vcpus": 2, "memoryGiB": 8, "vhdxGB": 64 },
+      "t3": { "minVcores": 0.5, "maxVcores": 1, "maxSizeGB": 32, "autoPauseMinutes": 15 },
+      "t4": { "skuName": "Standard_B1ms", "tier": "Burstable", "vcores": 1, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
+      "database": { "seedScale": 1 }
+    },
+    "demo-day": {
+      "t1": { "size": "Standard_D4as_v5", "vcpus": 4, "family": "standardDASv5Family", "osDisk": "E10", "dataDisk": "E10", "zonalDataDisk": "PremiumV2" },
+      "t2Host": { "size": "Standard_D4as_v5", "vcpus": 4, "family": "standardDASv5Family", "osDisk": "E10", "dataDisk": "E10", "zonalDataDisk": "PremiumV2" },
+      "t2Guest": { "vcpus": 2, "memoryGiB": 8, "vhdxGB": 64 },
+      "t3": { "minVcores": 0.5, "maxVcores": 2, "maxSizeGB": 32, "autoPauseMinutes": 60 },
+      "t4": { "skuName": "Standard_B1ms", "tier": "Burstable", "vcores": 1, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
+      "database": { "seedScale": 2 }
+    },
+    "enhanced-performance": {
+      "t1": { "size": "Standard_D8as_v5", "vcpus": 8, "family": "standardDASv5Family", "osDisk": "P10", "dataDisk": "P10", "zonalDataDisk": "PremiumV2" },
+      "t2Host": { "size": "Standard_D8as_v5", "vcpus": 8, "family": "standardDASv5Family", "osDisk": "P10", "dataDisk": "P10", "zonalDataDisk": "PremiumV2" },
+      "t2Guest": { "vcpus": 4, "memoryGiB": 16, "vhdxGB": 64 },
+      "t3": { "minVcores": 0.5, "maxVcores": 4, "maxSizeGB": 32, "autoPauseMinutes": 60 },
+      "t4": { "skuName": "Standard_B1ms", "tier": "Burstable", "vcores": 1, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
+      "database": { "seedScale": 4 }
+    }
+  },
+  "assumptions": {
+    "demoHoursPerSession": 5,
+    "lightUseHoursPerMonth": 10,
+    "bastionHoursPerSession": 1,
+    "t3ActiveShareOfMaxVcores": 1.0,
+    "hoursPerMonth": 730
+  }
+}

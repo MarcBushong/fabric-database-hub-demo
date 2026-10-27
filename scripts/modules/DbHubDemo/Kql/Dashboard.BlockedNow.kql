@@ -1,0 +1,8 @@
+// Incident page status row, after Live.CounterGauges.kql and Dashboard.SelectTargets.kql: processes blocked in
+// the latest bin of each SQL Server instance, per target. Processes blocked is a gauge (CounterType 65792, read
+// directly: rule 3 in https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry,
+// checked 2026-10-21). A target without telemetry has no row, never a zero.
+| where CounterName == 'Processes blocked'
+| summarize arg_max(Bucket, MaxValue) by Target, SqlServerInstanceName
+| summarize BlockedProcesses = toint(max(MaxValue)), AsOfUTC = max(Bucket) by Target
+| order by Target asc

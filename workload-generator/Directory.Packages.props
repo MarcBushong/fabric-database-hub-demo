@@ -1,0 +1,30 @@
+<Project>
+  <!-- Central package versions. Dependabot updates them; lock files keep restores reproducible. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Azure.Identity was already in the graph through Microsoft.Data.SqlClient.Extensions.Azure; T4 (Phase 24) uses its managed identity credential directly for PostgreSQL tokens. -->
+    <PackageVersion Include="Azure.Identity" Version="1.18.0" />
+    <PackageVersion Include="Microsoft.Data.SqlClient" Version="7.1.1" />
+    <PackageVersion Include="Microsoft.Data.SqlClient.Extensions.Azure" Version="7.1.1" />
+    <!-- T4, Azure Database for PostgreSQL flexible server (Phase 24, ADR 0019). -->
+    <PackageVersion Include="Npgsql" Version="10.0.3" />
+    <PackageVersion Include="System.CommandLine" Version="2.0.13" />
+  </ItemGroup>
+
+  <ItemGroup Label="Transitive pins">
+    <!-- Microsoft.Data.SqlClient 7.1.1 resolves 9.0.18 for net10.0, which has known advisories (GHSA-2fmv-rv2c-59x7, GHSA-846f-f764-76mx). -->
+    <PackageVersion Include="System.Security.Cryptography.Pkcs" Version="10.0.13" />
+  </ItemGroup>
+
+  <ItemGroup Label="Tests">
+    <PackageVersion Include="JsonSchema.Net" Version="9.4.1" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageVersion Include="Microsoft.SqlServer.TransactSql.ScriptDom" Version="180.140.0" />
+    <PackageVersion Include="xunit.v3" Version="4.0.2" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.1" />
+  </ItemGroup>
+</Project>

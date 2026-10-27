@@ -1,0 +1,126 @@
+/// One activity request that NB_DatabaseHub_LiveActivity dispatched or recorded, from dbo.scenario_runs. Runs started from PowerShell, GitHub Actions, or the business-day profile are recorded in SQL, which Fabric can't reach; Incident Windows covers them through detected signals.
+table 'Scenario Runs'
+
+    /// Activity requests that the notebook recorded, over all history.
+    measure 'Scenario Requests' = CALCULATE ( COUNTROWS ( 'Scenario Runs' ), REMOVEFILTERS ( 'Date' ) )
+        formatString: #,0
+        displayFolder: Scenarios
+
+    /// The request's ID.
+    column 'Request ID'
+        dataType: string
+        sourceColumn: request_id
+
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    column 'Source Notebook'
+        dataType: string
+        isHidden
+        sourceColumn: source_notebook
+
+    /// When the notebook sent or recorded the request (UTC).
+    column 'Requested At UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: requested_at_utc
+
+    column Environment
+        dataType: string
+        isHidden
+        sourceColumn: environment
+
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// The activity profile: baseline, business-day, off, or incident:<scenario>.
+    column Profile
+        dataType: string
+        sourceColumn: profile
+
+    /// Requested maximum duration in minutes.
+    column 'Duration (min)'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: duration_minutes
+
+    /// Requested sessions; empty means the scenario's default.
+    column Concurrency
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: concurrency
+
+    /// Requested load level; empty means the scenario's default.
+    column Intensity
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: intensity
+
+    /// Whether ContosoCare was reset to its seed state first.
+    column 'Reset Before'
+        dataType: boolean
+        sourceColumn: reset_before
+
+    /// Whether the run stops and cleans up at its end.
+    column 'Auto Cleanup'
+        dataType: boolean
+        sourceColumn: auto_cleanup
+
+    /// How the request was sent: workflow_dispatch, or manual when P9 isn't configured.
+    column 'Dispatch Mode'
+        dataType: string
+        sourceColumn: dispatch_mode
+
+    column 'Status Key'
+        dataType: string
+        isHidden
+        sourceColumn: status
+
+    /// What happened to the request.
+    column Message
+        dataType: string
+        sourceColumn: message
+
+    column 'GitHub Run ID'
+        dataType: int64
+        isHidden
+        summarizeBy: none
+        sourceColumn: github_run_id
+
+    /// The GitHub Actions run the request started, when it was dispatched.
+    column 'GitHub Run'
+        dataType: string
+        dataCategory: WebUrl
+        sourceColumn: github_run_url
+
+    /// Start of the requested activity window (UTC).
+    column 'Window Start UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: window_start_utc
+
+    /// End of the requested activity window (UTC).
+    column 'Window End UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: window_end_utc
+
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'Scenario Runs' = entity
+        mode: directLake
+        source
+            entityName: scenario_runs
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

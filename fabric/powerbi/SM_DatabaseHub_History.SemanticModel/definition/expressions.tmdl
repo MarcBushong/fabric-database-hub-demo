@@ -1,0 +1,6 @@
+/// Direct Lake on OneLake source: lakehouse LH_DatabaseHub in the demo workspace. Git holds an all-zero placeholder; scripts/configure-powerbi.ps1 puts the configured workspace and lakehouse IDs in at deploy time.
+expression 'DirectLake - LH_DatabaseHub' =
+        let
+            Source = AzureStorage.DataLake("https://onelake.dfs.fabric.microsoft.com/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000", [HierarchicalNavigation=true])
+        in
+            Source

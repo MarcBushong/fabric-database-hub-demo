@@ -1,0 +1,234 @@
+/// One check per validation run and check ID, from dbo.validation_results: the Fabric-side checks of NB_DatabaseHub_Deployment, with ADR 0012 statuses. The Azure-side catalog stays in ./scripts/validate.ps1.
+table 'Validation Results'
+
+    /// The validation run the readiness page shows: the newest run in context (run IDs start with the run's UTC start, so the maximum is the latest).
+    measure 'Selected Validation Run' =
+            CALCULATE ( MAX ( 'Validation Results'[Run ID] ), REMOVEFILTERS ( 'Status' ), REMOVEFILTERS ( 'Target' ) )
+        isHidden
+        displayFolder: Readiness
+
+    /// Visual filter for the check queue: 1 when the row belongs to the selected validation run.
+    measure 'Is Selected Validation Run' =
+            VAR SelectedRun = CALCULATE ( [Selected Validation Run], ALLSELECTED ( 'Validation Results' ) )
+            RETURN
+                IF ( CALCULATE ( COUNTROWS ( 'Validation Results' ), KEEPFILTERS ( 'Validation Results'[Run ID] = SelectedRun ) ) > 0, 1, 0 )
+        formatString: 0
+        isHidden
+        displayFolder: Readiness
+
+    /// Checks in the selected validation run.
+    measure 'Checks (selected run)' =
+            VAR SelectedRun = [Selected Validation Run]
+            RETURN CALCULATE ( COUNTROWS ( 'Validation Results' ), 'Validation Results'[Run ID] = SelectedRun )
+        formatString: #,0
+        displayFolder: Readiness
+
+    /// Checks with status Fail in the selected validation run: 0 when there are none, so the strip tiles read 0; blank when no check of the run is in context.
+    measure 'Checks Failed (selected run)' =
+            VAR RunChecks = [Checks (selected run)]
+            RETURN IF ( NOT ISBLANK ( RunChecks ), CALCULATE ( [Checks (selected run)], KEEPFILTERS ( 'Status'[Status] = "Fail" ) ) + 0 )
+        formatString: #,0
+        displayFolder: Readiness
+
+    /// Checks with status Manual action required in the selected validation run: 0 when there are none, so the strip tiles read 0; blank when no check of the run is in context.
+    measure 'Checks Needing a Manual Step (selected run)' =
+            VAR RunChecks = [Checks (selected run)]
+            RETURN IF ( NOT ISBLANK ( RunChecks ), CALCULATE ( [Checks (selected run)], KEEPFILTERS ( 'Status'[Status] = "Manual action required" ) ) + 0 )
+        formatString: #,0
+        displayFolder: Readiness
+
+    /// Checks with status Warning in the selected validation run: 0 when there are none, so the strip tiles read 0; blank when no check of the run is in context.
+    measure 'Checks With Warnings (selected run)' =
+            VAR RunChecks = [Checks (selected run)]
+            RETURN IF ( NOT ISBLANK ( RunChecks ), CALCULATE ( [Checks (selected run)], KEEPFILTERS ( 'Status'[Status] = "Warning" ) ) + 0 )
+        formatString: #,0
+        displayFolder: Readiness
+
+    /// Checks with status Pass in the selected validation run: 0 when there are none, so the strip tiles read 0; blank when no check of the run is in context.
+    measure 'Checks Passed (selected run)' =
+            VAR RunChecks = [Checks (selected run)]
+            RETURN IF ( NOT ISBLANK ( RunChecks ), CALCULATE ( [Checks (selected run)], KEEPFILTERS ( 'Status'[Status] = "Pass" ) ) + 0 )
+        formatString: #,0
+        displayFolder: Readiness
+
+    /// Checks with status Not supported in the selected validation run: 0 when there are none, so the strip tiles read 0; blank when no check of the run is in context.
+    measure 'Checks Not Supported (selected run)' =
+            VAR RunChecks = [Checks (selected run)]
+            RETURN IF ( NOT ISBLANK ( RunChecks ), CALCULATE ( [Checks (selected run)], KEEPFILTERS ( 'Status'[Status] = "Not supported" ) ) + 0 )
+        formatString: #,0
+        displayFolder: Readiness
+
+    /// Checks with status Not selected in the selected validation run: 0 when there are none, so the strip tiles read 0; blank when no check of the run is in context.
+    measure 'Checks Not Selected (selected run)' =
+            VAR RunChecks = [Checks (selected run)]
+            RETURN IF ( NOT ISBLANK ( RunChecks ), CALCULATE ( [Checks (selected run)], KEEPFILTERS ( 'Status'[Status] = "Not selected" ) ) + 0 )
+        formatString: #,0
+        displayFolder: Readiness
+
+    /// Checks that need attention (Fail, Manual action required, or Warning) in the selected validation run: 0 when there are none, so the strip tiles read 0; blank when no check of the run is in context.
+    measure 'Checks Needing Attention (selected run)' =
+            VAR RunChecks = [Checks (selected run)]
+            RETURN IF ( NOT ISBLANK ( RunChecks ), CALCULATE ( [Checks (selected run)], KEEPFILTERS ( 'Status'[Needs Attention] = "Yes" ) ) + 0 )
+        formatString: #,0
+        displayFolder: Readiness
+
+    /// Reference line for the readiness strip: the run's check count.
+    measure 'Checks Context' = "of " & FORMAT ( [Checks (selected run)] + 0, "0" ) & " checks in the selected run"
+        displayFolder: Readiness
+
+    /// Pass share of the checks that apply and were selected (Not supported and Not selected excluded). Never turns green in the report.
+    measure 'Readiness (%)' =
+            DIVIDE (
+                [Checks Passed (selected run)],
+                [Checks (selected run)] - [Checks Not Supported (selected run)] - [Checks Not Selected (selected run)]
+            )
+        formatString: 0%
+        displayFolder: Readiness
+
+    /// Rail color of the Failed strip tile: red when any check failed.
+    measure 'Fail Rail Color' = IF ( [Checks Failed (selected run)] > 0, "#FF4D5A", "#2A2A3A" )
+        isHidden
+        displayFolder: Readiness
+
+    /// Rail color of the Manual action required strip tile: cyan when any check needs a manual step.
+    measure 'Manual Rail Color' = IF ( [Checks Needing a Manual Step (selected run)] > 0, "#8CEEEE", "#2A2A3A" )
+        isHidden
+        displayFolder: Readiness
+
+    /// Rail color of the Warnings strip tile: amber when any check has a warning.
+    measure 'Warning Rail Color' = IF ( [Checks With Warnings (selected run)] > 0, "#FFB020", "#2A2A3A" )
+        isHidden
+        displayFolder: Readiness
+
+    /// Rail color of the readiness tiles: the worst attention status of the selected run, unlit when none.
+    measure 'Readiness Rail Color' =
+            SWITCH (
+                TRUE (),
+                [Checks Failed (selected run)] > 0, "#FF4D5A",
+                [Checks Needing a Manual Step (selected run)] > 0, "#8CEEEE",
+                [Checks With Warnings (selected run)] > 0, "#FFB020",
+                "#2A2A3A"
+            )
+        isHidden
+        displayFolder: Readiness
+
+    /// Readiness page title: failed, manual, and warning counts of the selected run, or an empty-state sentence.
+    measure 'Readiness Headline' =
+            IF (
+                [Checks (selected run)] + 0 = 0,
+                "No validation run in the lakehouse yet: run NB_DatabaseHub_Deployment",
+                FORMAT ( [Checks (selected run)], "0" ) & " checks: "
+                    & FORMAT ( [Checks Failed (selected run)] + 0, "0" ) & " failed, "
+                    & FORMAT ( [Checks Needing a Manual Step (selected run)] + 0, "0" ) & " manual steps, "
+                    & FORMAT ( [Checks With Warnings (selected run)] + 0, "0" ) & " warnings"
+            )
+        displayFolder: Readiness
+
+    /// When the selected validation run started (UTC).
+    measure 'Validation Run Label' =
+            VAR SelectedRun = [Selected Validation Run]
+            VAR Started = CALCULATE ( MIN ( 'Validation Results'[Checked At UTC] ), 'Validation Results'[Run ID] = SelectedRun )
+            RETURN IF ( NOT ISBLANK ( Started ), "Run started " & FORMAT ( Started, "yyyy-mm-dd hh:nn" ) & " UTC" )
+        displayFolder: Readiness
+
+    /// Worst status of the checks in context: 1 Fail through 6 Not selected.
+    measure 'Worst Check Status Sort' = MINX ( 'Validation Results', RELATED ( 'Status'[Status Sort] ) )
+        formatString: 0
+        isHidden
+        displayFolder: Readiness
+
+    /// Glyph and short status of the worst check in context, for the readiness heat strip.
+    measure 'Worst Check Status Glyph' =
+            VAR S = [Worst Check Status Sort]
+            RETURN
+                IF (
+                    NOT ISBLANK ( S ),
+                    LOOKUPVALUE ( 'Status'[Status Glyph], 'Status'[Status Sort], S ) & " "
+                        & LOOKUPVALUE ( 'Status'[Status Short], 'Status'[Status Sort], S )
+                )
+        displayFolder: Readiness
+
+    /// Font color for the heat strip: red, cyan, or amber for attention statuses, graphite otherwise.
+    measure 'Worst Check Status Color' = SWITCH ( [Worst Check Status Sort], 1, "#FF4D5A", 2, "#8CEEEE", 3, "#FFB020", "#8C8C9C" )
+        isHidden
+        displayFolder: Readiness
+
+    /// First check time of the run in context (UTC); ranks the heat strip's latest six runs.
+    measure 'Run Start UTC' = MIN ( 'Validation Results'[Checked At UTC] )
+        formatString: yyyy-mm-dd hh:nn
+        displayFolder: Readiness
+
+    /// Validation run ID: the run's UTC start (yyyymmddThhmmssZ) and a random suffix, so sorting by it sorts by time.
+    column 'Run ID'
+        dataType: string
+        sourceColumn: run_id
+
+    column 'Source Notebook'
+        dataType: string
+        isHidden
+        sourceColumn: source_notebook
+
+    /// The check's ID, for example FABRIC.P5.CAPACITY or HUB.TELEMETRY.T1.
+    column 'Check ID'
+        dataType: string
+        sourceColumn: check_id
+
+    /// The check's area, for example fabric, hub, or telemetry.
+    column Area
+        dataType: string
+        sourceColumn: area
+
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    column 'Status Key'
+        dataType: string
+        isHidden
+        sourceColumn: status
+
+    /// What the check found. Evaluation-only results keep their EVALUATION ONLY prefix (ADR 0012).
+    column Message
+        dataType: string
+        sourceColumn: message
+
+    /// The check's evidence as redacted JSON.
+    column Evidence
+        dataType: string
+        sourceColumn: evidence
+
+    /// The exact step that fixes the check, when it needs one.
+    column Remediation
+        dataType: string
+        sourceColumn: remediation
+
+    /// Microsoft Learn or repository page for the check.
+    column Documentation
+        dataType: string
+        dataCategory: WebUrl
+        sourceColumn: doc_url
+
+    /// True when the result comes from an evaluation-only path (ADR 0012).
+    column 'Evaluation Only'
+        dataType: boolean
+        sourceColumn: evaluation_only
+
+    /// When the check ran (UTC).
+    column 'Checked At UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: timestamp_utc
+
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'Validation Results' = entity
+        mode: directLake
+        source
+            entityName: validation_results
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

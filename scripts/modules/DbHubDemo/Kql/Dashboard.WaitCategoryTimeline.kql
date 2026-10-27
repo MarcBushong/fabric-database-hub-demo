@@ -1,0 +1,7 @@
+// Wait seconds per wait category and bin over the selected targets, after Live.WaitDeltas.kql and
+// Dashboard.SelectTargets.kql. WaitMs is already a per-series delta (rule 2 in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry, checked
+// 2026-10-21), so summing it is correct. Lock waits mean blocking; CPU, Buffer IO, and Log Rate Governor rise in
+// the other incidents, as that page's wait-category guidance describes.
+| summarize WaitSeconds = round(sum(WaitMs) / 1000.0, 1) by WaitCategory, Bucket
+| order by Bucket asc

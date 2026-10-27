@@ -1,0 +1,49 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "locking-blocking",
+  "title": "Locking and blocking",
+  "summary": "A batch session updates the first Billing work items and then sits idle with its transaction open, like an application that forgot to commit. Billing clerks (the contender sessions) block on those rows, a normal workload keeps running beside them, and an optional bounded deadlock adds a deadlock victim. The holder always rolls back after holdSeconds (the watchdog rollback), then repeats after pauseSeconds until the run ends.",
+  "orchestration": "locking",
+  "procedure": "demo.usp_scenario_locking_contend",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 3, "min": 1, "max": 16, "description": "Blocked sessions (billing clerks contending for the hot rows)." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace of the normal workload that runs next to the blocking." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3", "T4"],
+    "default": ["T1"],
+    "notes": {
+      "T3": "Azure SQL Database uses read committed snapshot isolation, so plain readers don't block; the clerks' UPDATEs and READCOMMITTEDLOCK reads still do.",
+      "T4": "PostgreSQL readers never block (MVCC); the clerks' UPDATEs queue on the holder's row locks (wait event Lock:transactionid, pg_blocking_pids), and the deadlock detector cancels one side with SQLSTATE 40P01."
+    }
+  },
+  "parameters": {
+    "holdSeconds": { "type": "integer", "default": 120, "minimum": 10, "maximum": 900, "description": "How long the head blocker keeps its transaction open each cycle (never past the run's deadline)." },
+    "pauseSeconds": { "type": "integer", "default": 30, "minimum": 0, "maximum": 300, "description": "Quiet time between blocking episodes." },
+    "hotRows": { "type": "integer", "default": 10, "minimum": 1, "maximum": 50, "description": "How many Billing work items the holder locks (row locks; never enough to escalate).", "sqlParameter": "@hot_rows" },
+    "holder": { "type": "string", "default": "idle-transaction", "enum": ["idle-transaction", "active-wait"], "description": "idle-transaction: the holder session sits idle with an open transaction (realistic head blocker). active-wait: demo.usp_scenario_locking_hold holds and rolls back inside one T-SQL call." },
+    "normalWorkers": { "type": "integer", "default": 1, "minimum": 0, "maximum": 8, "description": "Sessions running the healthy baseline next to the incident (the optional third, normal workload)." },
+    "deadlock": { "type": "boolean", "default": false, "description": "Add the optional, bounded deadlock: two sessions lock two inventory rows in opposite order; one is the victim and both roll back." },
+    "deadlockRounds": { "type": "integer", "default": 1, "minimum": 1, "maximum": 3, "description": "Deadlock rounds when deadlock is true." }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerPerformanceCountersCommon: Processes blocked above 0 while the holder holds", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: Lock wait category rising (LCK_M_U, LCK_M_S)", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: Active Transactions held open", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/locking-blocking sessions waiting, one head blocker", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: Number of Deadlocks/sec above 0 (only with deadlock=true)", "surface": "Performance" },
+    { "signal": "A blocking or long-transaction finding with a recommended action that needs approval", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." },
+    { "signal": "T4: Sessions By WaitEventType (sessions_by_wait_event_type) Lock rising, Sessions By State idle in transaction (the holder), Oldest Transaction (longest_transaction_time_sec) climbing, Deadlocks above 0 with deadlock=true", "surface": "Azure Monitor", "note": "PostgreSQL enhanced metrics (metrics.collector_database_activity on); Hub's PostgreSQL dashboard has no wait view." }
+  ],
+  "expectedSymptoms": [
+    "Billing work-queue updates stall behind one idle session that holds row locks in an open transaction",
+    "A blocking chain: one head blocker (sleeping, open_transaction_count 1), several sessions waiting on LCK_M_U",
+    "Lock waits end when the holder rolls back, then return each cycle",
+    "With deadlock=true, one session per round is chosen as the deadlock victim (error 1205)"
+  ],
+  "queryLevelEvidence": [
+    "sys.dm_exec_requests.blocking_session_id points at the holder; its last statement is the UPDATE of care.work_queues",
+    "demo.scenario_run_events records holder-acquired and holder-rolled-back with session IDs and timestamps",
+    "The microsoft-sql plugin's diagnose-blocking-and-deadlocks skill, or SSMS Activity Monitor"
+  ],
+  "reset": "Every transaction rolls back, so the work items stay as seeded. Reset stops the run, kills leftover ContosoCare.Demo/ sessions, and verifies no demo transaction is still open."
+}

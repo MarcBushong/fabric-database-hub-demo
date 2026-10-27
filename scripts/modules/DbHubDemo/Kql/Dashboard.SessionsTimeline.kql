@@ -1,0 +1,5 @@
+// Active sessions in the demo database per target and bin (the most in one sample), after
+// Live.ActiveSessions.kql and Dashboard.SelectTargets.kql. SqlServerActiveSessions is a 30-second gauge table
+// (https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry, checked 2026-10-21).
+| summarize ActiveSessions = sum(MaxSessions) by Target, Bucket
+| order by Bucket asc

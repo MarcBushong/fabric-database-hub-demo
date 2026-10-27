@@ -1,0 +1,10 @@
+// Storage IO over the time range per target, after Live.StorageIoDeltas.kql and Dashboard.SelectTargets.kql.
+// Average latency is stall time divided by IOs. Per-file IO latency from SqlServerStorageIO isn't supported for
+// Azure SQL Database (https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry,
+// checked 2026-10-21), so it stays empty for T3, as in the live-activity notebook.
+| summarize ReadMB = round(sum(ReadMB), 1), WriteMB = round(sum(WriteMB), 1), Reads = sum(Reads), Writes = sum(Writes),
+            ReadStallMs = sum(ReadStallMs), WriteStallMs = sum(WriteStallMs) by Target
+| extend ReadLatencyMs = iff(Target == 'T3' or Reads == 0, real(null), round(1.0 * ReadStallMs / Reads, 2)),
+         WriteLatencyMs = iff(Target == 'T3' or Writes == 0, real(null), round(1.0 * WriteStallMs / Writes, 2))
+| project Target, ReadMB, WriteMB, Reads, Writes, ReadLatencyMs, WriteLatencyMs
+| order by Target asc

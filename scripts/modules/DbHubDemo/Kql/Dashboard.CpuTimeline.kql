@@ -1,0 +1,7 @@
+// CPU per target and bin, after Live.CpuTimeline.kql and Dashboard.SelectTargets.kql: for T1 and T2 the SQL Server
+// process's share of all logical CPUs on the machine (SQLProcessCPUPercent), for T3 a percentage of the service tier's
+// limit (AvgCPUPercent); Live.CpuTimeline.kql says why
+// (https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry, checked
+// 2026-10-26). The highest instance average in each bin.
+| summarize CpuPercent = round(max(AvgCPU), 1) by Target, Bucket
+| order by Bucket asc

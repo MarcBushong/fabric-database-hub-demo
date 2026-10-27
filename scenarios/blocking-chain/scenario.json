@@ -1,0 +1,47 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "blocking-chain",
+  "title": "Deep blocking chain and lock escalation",
+  "summary": "A head blocker sits idle with its transaction open on one Scheduling work item. Under it, chains of sessions each lock their own work item and then wait for their parent's, so the sessions below wait for them in turn: head <- level 2 <- level 3 and deeper (depth 3 to 6). Beside the chain, an escalator updates thousands of appointments in one statement until SQL Server escalates to a table lock that blocks everyone else on care.appointments. Every change rolls back.",
+  "orchestration": "chain",
+  "procedure": "demo.usp_scenario_chain_link",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 2, "min": 1, "max": 4, "description": "Branches: parallel chains under the one head blocker. Sessions: 1 + (depth - 1) x branches, plus the escalator and the normal workers (26 at most)." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace of the normal workload that runs next to the chain." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T1"],
+    "notes": {
+      "T3": "Azure SQL Database always uses optimized locking: the chain's links wait on transaction-ID locks (LCK_M_*_XACT waits), and the escalator's update holds one transaction-ID lock instead of row locks, so it doesn't escalate there (its event says 'table lock: no')."
+    }
+  },
+  "parameters": {
+    "depth": { "type": "integer", "default": 4, "minimum": 3, "maximum": 6, "description": "Sessions in each chain, the head blocker included: 4 means head blocker <- level 2 <- level 3 <- level 4." },
+    "holdSeconds": { "type": "integer", "default": 90, "minimum": 20, "maximum": 600, "description": "How long the head blocker keeps its transaction open each cycle (never past the run's deadline). Each link waits at most 60 seconds at a time." },
+    "pauseSeconds": { "type": "integer", "default": 20, "minimum": 0, "maximum": 300, "description": "Quiet time between chains." },
+    "escalation": { "type": "boolean", "default": true, "description": "Add the lock escalator: one session updates escalationRows appointments in one statement, holds the table lock for escalationHoldSeconds, and rolls back." },
+    "escalationRows": { "type": "integer", "default": 10000, "minimum": 7000, "maximum": 20000, "description": "Appointments the escalator updates in one statement with row locks. SQL Server documents escalation past 5,000 locks; it was measured from about 6,200 rows on SQL Server 2025, so the minimum is 7,000." },
+    "escalationHoldSeconds": { "type": "integer", "default": 15, "minimum": 5, "maximum": 60, "description": "How long the escalator holds its locks before it rolls back." },
+    "escalationEverySeconds": { "type": "integer", "default": 120, "minimum": 30, "maximum": 600, "description": "Time between escalations; the first one starts 20 seconds into the run." },
+    "normalWorkers": { "type": "integer", "default": 1, "minimum": 0, "maximum": 4, "description": "Sessions running the healthy baseline next to the incident; they also queue behind the table lock." }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerPerformanceCountersCommon: Processes blocked at the number of waiting sessions while the head blocker holds (depth - 1) x branches, more during an escalation", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: Lock wait category with long single waits: LCK_M_U for the links, LCK_M_IS and LCK_M_IX behind an escalation, and on Azure SQL Database LCK_M_S_XACT_MODIFY", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: Active Transactions held open by the head blocker and every link", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersDetailed: Lock escalation counters (Table Lock Escalations/sec) when the target's Detailed table lists them", "surface": "Telemetry", "note": "List the counters with the query in the telemetry page's Schema section." },
+    { "signal": "A blocking finding that names the head blocker with a recommended action that needs approval", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
+  ],
+  "expectedSymptoms": [
+    "A blocking chain several levels deep: sys.dm_exec_requests shows level 2 waiting on the head blocker, level 3 on level 2, and so on",
+    "The head blocker is sleeping with one open transaction; every link is running, waiting on LCK_M_U",
+    "Every escalationEverySeconds, a table lock on care.appointments blocks the normal workload for escalationHoldSeconds",
+    "The chain clears when the head blocker rolls back, then forms again each cycle"
+  ],
+  "queryLevelEvidence": [
+    "sys.dm_exec_requests.blocking_session_id: follow each chain from the deepest link up to the head blocker",
+    "demo.scenario_run_events: holder-acquired, holder-rolled-back, and lock-escalation (rows locked, whether the table lock was taken, how long it was held)",
+    "sys.dm_tran_locks: an OBJECT X lock on care.appointments during an escalation (needs VIEW SERVER STATE or VIEW DATABASE STATE)"
+  ],
+  "reset": "Every transaction rolls back, so the work items and appointments stay as seeded. Reset stops the run, kills leftover ContosoCare.Demo/ sessions, and verifies no demo transaction is still open; auto-cleanup removes the normal workers' audit rows."
+}

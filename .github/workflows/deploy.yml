@@ -1,0 +1,65 @@
+name: deploy
+
+# One-click deployment (plan section 9.2, ADR 0011): the same stages as scripts/deploy.ps1, with -Resume
+# by default, so running it again continues where it stopped. Needs the one-time setup (prerequisite P7):
+# scripts/setup-github-oidc.ps1, the Contributor assignment it prints, and the GitHub environment's
+# variables. Manual action required items (for example the T2 setup-wizard step) are listed in the job
+# summary with their exact steps.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment (one per demo instance)
+        type: string
+        required: true
+        default: demo
+      resume:
+        description: Continue after the last stage that finished
+        type: boolean
+        default: true
+      from-stage:
+        description: Start at this stage instead (auto follows resume)
+        type: choice
+        default: auto
+        options:
+          - auto
+          - Preflight
+          - Infrastructure
+          - Artifacts
+          - Bootstraps
+          - T3
+          - T4
+          - Activity
+          - Monitoring
+          - T2
+          - Fabric
+          - Validation
+      skip-fabric:
+        description: Skip the Fabric stage (it needs Fabric access for the identity)
+        type: boolean
+        default: true
+      t2-wait-minutes:
+        description: Minutes to wait for the T2 host (the guest build takes 60-90)
+        type: string
+        default: "120"
+
+# Least privilege (ADR 0022): only the job that signs in to Azure may request an OpenID Connect token.
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/reusable-demo-run.yml
+    with:
+      environment: ${{ inputs.environment }}
+      script: deploy
+      parameters: >-
+        {"Resume": ${{ inputs.resume }}, "FromStage": ${{ toJSON(inputs.from-stage != 'auto' && inputs.from-stage || '') }},
+        "SkipFabric": ${{ inputs.skip-fabric }}, "T2WaitMinutes": ${{ toJSON(inputs.t2-wait-minutes) }}}
+      bicep: true
+      dotnet: true
+      timeout-minutes: 360
+    secrets: inherit

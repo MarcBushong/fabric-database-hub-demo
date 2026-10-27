@@ -1,0 +1,29 @@
+name: bastion-cleanup
+
+# Removes on-demand Bastion after its expiry tag (bastionMaxHours, plan section 9.4, C8), then its public IP,
+# and at once a public IP that an interrupted Bastion delete left behind; then rotates the T2 host's one-time
+# password (Manual action required while the host is deallocated). A forgotten Bastion stops billing within
+# the hour. Off unless DBHUB_SCHEDULES_ENABLED is 'true'.
+on:
+  schedule:
+    - cron: "10 * * * *"
+  workflow_dispatch:
+
+# Least privilege (ADR 0022): only the job that signs in to Azure may request an OpenID Connect token.
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    permissions:
+      contents: read
+      id-token: write
+    if: vars.DBHUB_SCHEDULES_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/reusable-demo-run.yml
+    with:
+      # The schedule environment (no reviewers) only for scheduled runs; a run by hand uses the reviewed one (ADR 0022).
+      environment: ${{ github.event_name == 'schedule' && vars.DBHUB_SCHEDULE_ENVIRONMENT || 'demo' }}
+      script: stop-demo
+      parameters: '{"RemoveBastionOnly": true, "IfExpired": true}'
+      timeout-minutes: 30
+    secrets: inherit

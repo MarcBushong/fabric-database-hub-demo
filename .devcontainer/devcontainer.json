@@ -1,0 +1,40 @@
+{
+  "name": "fabric-database-hub-demo",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb",
+    "storage": "32gb"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/azure-cli:1": {
+      "installBicep": true,
+      "bicepVersion": "v0.47.16"
+    },
+    "ghcr.io/devcontainers/features/powershell:2": {
+      "version": "7.4"
+    },
+    "ghcr.io/devcontainers/features/dotnet:2": {
+      "version": "10.0.402"
+    },
+    "ghcr.io/devcontainers/features/node:2": {
+      "version": "24"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/python:1": {}
+  },
+  "postCreateCommand": "pwsh -NoProfile -File tests/Install-TestTools.ps1 -IncludePSRule && pip install --user pre-commit && pre-commit install",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-azuretools.vscode-bicep",
+        "ms-vscode.powershell",
+        "ms-dotnettools.csdevkit",
+        "github.vscode-github-actions",
+        "davidanson.vscode-markdownlint",
+        "ms-toolsai.jupyter",
+        "editorconfig.editorconfig"
+      ]
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "parallel-scans",
+  "title": "Parallelism waits",
+  "summary": "A large reporting aggregate over appointments and their encounters, at MAXDOP maxdop (capped by the target's schedulers). No hint forces parallelism: its estimated cost is well above the default cost threshold for parallelism, so the optimizer picks a parallel plan where it can. The coordinating thread waits for its workers (CXCONSUMER), workers wait at the exchanges (CXPACKET), grouping by status (a skewed key) leaves them uneven work, and more sessions than schedulers add CPU waits. Reads only.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_parallel_scans",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 4, "min": 1, "max": 8, "description": "Sessions running parallel reports at once." },
+  "intensity": { "default": 6, "min": 1, "max": 10, "description": "Rows per report (encounters times 40 plus 20 per level) and a shorter pause: about 2 seconds at 1, none at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T2"],
+    "notes": {
+      "T1": "2 vCPUs: plans run at DOP 2.",
+      "T2": "The guest has 2 vCPUs: plans run at DOP 2.",
+      "T3": "At 1 vCore or less the database has no second scheduler, so the plans run serially: expect CPU waits, not Parallelism waits."
+    }
+  },
+  "parameters": {
+    "maxdop": { "type": "integer", "default": 4, "minimum": 2, "maximum": 8, "description": "The MAXDOP query hint; SQL Server never uses more threads than it has schedulers.", "sqlParameter": "@maxdop" }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerWaitStats: Parallelism wait category (CXPACKET, CXCONSUMER, CXSYNC_PORT)", "surface": "Performance" },
+    { "signal": "SqlServerCPUUtilization: CPU high while the reports run", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: CPU wait category (SOS_SCHEDULER_YIELD) when sessions outnumber schedulers", "surface": "Performance" }
+  ],
+  "expectedSymptoms": [
+    "Parallel plans (Parallelism operators) for the reporting aggregate on SQL Server, chosen by cost",
+    "CXCONSUMER waits from each query's coordinating thread and CXPACKET waits at the exchanges",
+    "On Azure SQL Database at 1 vCore, serial plans and CPU waits instead"
+  ],
+  "queryLevelEvidence": [
+    "sys.dm_os_tasks and sys.dm_exec_requests: several tasks per request with CXPACKET or CXCONSUMER waits (needs VIEW SERVER STATE)",
+    "Query Store: the report's plan with Parallelism operators and its degree of parallelism"
+  ],
+  "reset": "Read-only: nothing to undo. Reset kills leftover ContosoCare.Demo/ sessions."
+}

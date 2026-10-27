@@ -1,0 +1,27 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <Deterministic>true</Deterministic>
+    <!-- The published runner, and its SHA-256, change only when its source does (live, 2026-10-22: two checkouts of the
+         same source built two runners, so a deploy from the other checkout reinstalled it on both VMs). Keep the commit out
+         of the informational version (GetVersion() drops the suffix anyway), and map the checkout's path, which file-local
+         type names (the regex generator's) and the debug directory derive from, to a fixed one. Publish-DemoWorkloadRunner
+         also builds no program database, whose Source Link data holds the path and the commit. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <PathMap>$(MSBuildThisFileDirectory)=/_/</PathMap>
+    <!-- Microsoft.Data.SqlClient needs culture data (collations); it refuses to open connections in invariant mode. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+</Project>

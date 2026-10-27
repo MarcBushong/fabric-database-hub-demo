@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.1.0/schema.json",
+  "metadata": {
+    "type": "Report",
+    "displayName": "RPT_DatabaseHub_History"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "7430ee12-b3d6-7e2a-b301-66ec86b90f5d"
+  }
+}

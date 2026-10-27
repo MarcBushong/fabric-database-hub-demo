@@ -1,0 +1,32 @@
+// Data and log file IO per target and bin: MB read and written, reads, writes, and IO stall time, from deltas
+// of the cumulative SqlServerStorageIO columns in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-21). Rules applied: 1 (filter on SampleTimeUTC first), 2 (per-file deltas that skip
+// resets), 4 (series by ResourceID, SqlServerInstanceName, database, and file), 10 (row limit). Per-file IO
+// latency from this table isn't supported for Azure SQL Database, so consumers don't compute it for T3.
+// Contract: runs after Live.Prelude.kql, which defines _start, _end, _bin, _rg, _db, and _target(). The body is
+// identical to STORAGE_IO_KQL in fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, and the Real-Time Dashboard
+// (fabric/realtime) is generated from this file; tests/unit/Fabric.Dashboard.Tests.ps1 fails if they drift.
+SqlServerStorageIO
+| where SampleTimeUTC between (_start .. _end)
+| where ResourceGroup =~ _rg
+| where FileType in ('Data', 'Log')
+| extend Target = _target(ResourceType, ResourceName)
+| where isnotempty(Target)
+| summarize (FirstT, R1, W1, RS1, WS1, NR1, NW1) = arg_min(SampleTimeUTC, NumOfBytesRead, NumOfBytesWritten, IOStallReadMs, IOStallWriteMs, NumOfReads, NumOfWrites),
+            (LastT, R2, W2, RS2, WS2, NR2, NW2) = arg_max(SampleTimeUTC, NumOfBytesRead, NumOfBytesWritten, IOStallReadMs, IOStallWriteMs, NumOfReads, NumOfWrites)
+        by Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, Bucket = bin(SampleTimeUTC, _bin)
+| extend T = pack_array(FirstT, LastT), R = pack_array(R1, R2), W = pack_array(W1, W2), RS = pack_array(RS1, RS2),
+         WS = pack_array(WS1, WS2), NR = pack_array(NR1, NR2), NW = pack_array(NW1, NW2)
+| mv-expand T to typeof(datetime), R to typeof(long), W to typeof(long), RS to typeof(long), WS to typeof(long), NR to typeof(long), NW to typeof(long)
+| distinct Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, Bucket, T, R, W, RS, WS, NR, NW
+| sort by ResourceID asc, SqlServerInstanceName asc, DatabaseID asc, FileID asc, T asc
+| extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)
+                and DatabaseID == prev(DatabaseID) and FileID == prev(FileID)
+                and R >= prev(R) and W >= prev(W) and RS >= prev(RS) and WS >= prev(WS) and NR >= prev(NR) and NW >= prev(NW)
+| extend dR = iff(Keep, R - prev(R), long(0)), dW = iff(Keep, W - prev(W), long(0)), dRS = iff(Keep, RS - prev(RS), long(0)),
+         dWS = iff(Keep, WS - prev(WS), long(0)), dNR = iff(Keep, NR - prev(NR), long(0)), dNW = iff(Keep, NW - prev(NW), long(0))
+| summarize ReadMB = round(sum(dR) / 1048576.0, 2), WriteMB = round(sum(dW) / 1048576.0, 2), ReadStallMs = sum(dRS),
+            WriteStallMs = sum(dWS), Reads = sum(dNR), Writes = sum(dNW) by Target, FileType, Bucket
+| order by Bucket asc
+| take 50000

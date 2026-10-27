@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/scenarios/activity-profiles.schema.json",
+  "title": "Contoso Care activity profiles (ADR 0010, plan section 9.3)",
+  "description": "What the runner's profile host does for baseline, business-day, and incident:<scenario>; off runs nothing. Every run is still clamped to its scenario's maximum, the profile's expiry, and --not-after.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["pollSeconds", "minimumRunSeconds", "baseline", "profiles"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "pollSeconds": { "type": "integer", "minimum": 5, "maximum": 120, "description": "How often the host reads each target's profile." },
+    "minimumRunSeconds": { "type": "integer", "minimum": 30, "maximum": 600, "description": "Windows with less time left than this aren't started." },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scenario", "chunkMinutes", "concurrency", "intensity"],
+      "properties": {
+        "scenario": { "const": "healthy-baseline" },
+        "chunkMinutes": { "type": "integer", "minimum": 5, "maximum": 240 },
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "intensity": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "byTarget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "T1": { "$ref": "#/$defs/load" },
+            "T2": { "$ref": "#/$defs/load" },
+            "T3": { "$ref": "#/$defs/load" },
+            "T4": { "$ref": "#/$defs/load" }
+          }
+        }
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline", "business-day", "incident"],
+      "properties": {
+        "baseline": { "$ref": "#/$defs/profile" },
+        "business-day": { "$ref": "#/$defs/profile" },
+        "incident": { "$ref": "#/$defs/profile" }
+      }
+    }
+  },
+  "$defs": {
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["concurrency", "intensity"],
+      "properties": {
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "intensity": { "type": "integer", "minimum": 1, "maximum": 10 }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "defaultDurationMinutes", "maxDurationMinutes", "baseline"],
+      "properties": {
+        "description": { "type": "string", "minLength": 10 },
+        "defaultDurationMinutes": { "type": "integer", "minimum": 1, "maximum": 1440 },
+        "maxDurationMinutes": { "type": "integer", "minimum": 1, "maximum": 1440 },
+        "baseline": { "type": "boolean" },
+        "cycleMinutes": { "type": "integer", "minimum": 10, "maximum": 1440 },
+        "incidents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["target", "scenario", "startMinute", "durationMinutes"],
+            "properties": {
+              "target": { "enum": ["T1", "T2", "T3", "T4"] },
+              "scenario": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$" },
+              "startMinute": { "type": "integer", "minimum": 0, "maximum": 1439 },
+              "durationMinutes": { "type": "integer", "minimum": 1, "maximum": 240 },
+              "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+              "intensity": { "type": "integer", "minimum": 1, "maximum": 10 },
+              "parameters": {
+                "type": "object",
+                "propertyNames": { "pattern": "^[a-z][A-Za-z0-9]*$" },
+                "additionalProperties": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+// Everything a demo environment could leave behind, for the read-only teardown check (validate.ps1 -Area
+// Teardown, ADR 0002): resources in the demo resource group, resources tagged for the environment
+// (solution fabric-database-hub-demo with its environment, or its deploymentId) anywhere in the subscription,
+// and those resource groups themselves. Arc machines carry the tags from azcmagent connect --tags.
+// Sent to the documented Resources API
+// (https://learn.microsoft.com/rest/api/azureresourcegraph/resourcegraph/resources/resources, checked
+// 2026-10-20); resource groups are in the resourcecontainers table, and a union of resources and
+// resourcecontainers is supported
+// (https://learn.microsoft.com/azure/governance/resource-graph/concepts/query-language, checked 2026-10-20).
+// Parameters, rendered by Invoke-DemoValidationTeardown: SubscriptionId, ResourceGroup, ControlGroup,
+// Environment, and DeploymentId (strings; DeploymentId may be empty, which matches nothing).
+resources
+| where subscriptionId =~ {{SubscriptionId}}
+| where resourceGroup =~ {{ResourceGroup}}
+    or (tostring(tags['solution']) =~ 'fabric-database-hub-demo' and tostring(tags['environment']) =~ {{Environment}})
+    or (isnotempty({{DeploymentId}}) and tostring(tags['deploymentId']) =~ {{DeploymentId}})
+| project id, name, type, resourceGroup, location
+| union (
+    resourcecontainers
+    | where subscriptionId =~ {{SubscriptionId}}
+    | where type =~ 'microsoft.resources/subscriptions/resourcegroups'
+    | where name in~ ({{ResourceGroup}}, {{ControlGroup}})
+        or (tostring(tags['solution']) =~ 'fabric-database-hub-demo' and tostring(tags['environment']) =~ {{Environment}})
+    | project id, name, type, resourceGroup = name, location
+)
+| order by type asc, name asc
+| take 1000

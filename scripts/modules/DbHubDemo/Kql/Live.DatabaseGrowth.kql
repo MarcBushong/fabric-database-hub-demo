@@ -1,0 +1,20 @@
+// Growth of the demo database over the window: data used at the start and end, allocated, log, and version
+// store. Based on query 10 ('Which databases are growing fastest?') in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-21). Rules applied: 1 (filter on SampleTimeUTC first), 4 (group by SqlServerInstanceName
+// per target). Gauges only, so the first and last samples are read directly.
+// Contract: runs after Live.Prelude.kql, which defines _start, _end, _bin, _rg, _db, and _target(). The body is
+// identical to GROWTH_KQL in fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, and the Real-Time Dashboard
+// (fabric/realtime) is generated from this file; tests/unit/Fabric.Dashboard.Tests.ps1 fails if they drift.
+SqlServerDatabaseStorageUtilization
+| where SampleTimeUTC between (_start .. _end)
+| where ResourceGroup =~ _rg
+| where DatabaseName =~ _db
+| extend Target = _target(ResourceType, ResourceName)
+| where isnotempty(Target)
+| summarize (FirstUTC, StartUsedMB) = arg_min(SampleTimeUTC, DataSizeUsedMB),
+            (LastUTC, EndUsedMB, AllocatedMB, LogUsedMB, VersionStoreMB) =
+                arg_max(SampleTimeUTC, DataSizeUsedMB, DataSizeAllocatedMB, LogSizeUsedMB, PersistentVersionStoreSizeMB)
+        by Target, ResourceName, SqlServerInstanceName, DatabaseName
+| extend GrowthMB = round(EndUsedMB - StartUsedMB, 1)
+| order by Target asc

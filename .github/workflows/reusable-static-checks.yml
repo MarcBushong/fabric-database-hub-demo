@@ -1,0 +1,164 @@
+name: reusable-static-checks
+
+# Shared static checks (plan section 9.5). Called by validate.yml; later phases reuse it before deploys.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  ACTIONLINT_VERSION: "1.7.12"
+  BICEP_VERSION: "0.47.16"
+
+jobs:
+  powershell:
+    name: PowerShell (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-pwsh-tools
+      - name: PSScriptAnalyzer and Pester
+        shell: pwsh
+        run: ./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester -CI
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: static-results-${{ matrix.os }}
+          path: out/
+          if-no-files-found: ignore
+
+  dotnet:
+    name: Workload generator (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: workload-generator
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: workload-generator/global.json
+      - run: dotnet restore --locked-mode
+      - run: dotnet build --no-restore --configuration Release
+      - run: dotnet test --no-build --configuration Release
+
+  fabric-app:
+    # Phase 19b: the Fabric App (preview) in fabric/app. No Fabric access: install from the lock file, then
+    # typecheck, lint, unit and page tests, the production license check, and the build (npm run verify).
+    name: Fabric App
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fabric/app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: fabric/app/package-lock.json
+      - name: Install from the lock file
+        run: npm ci --no-audit --no-fund
+        env:
+          RAYFIN_TELEMETRY_OPTOUT: "1"
+      - name: Typecheck, lint, test, license check, and build
+        run: npm run verify
+        env:
+          RAYFIN_TELEMETRY_OPTOUT: "1"
+
+  bicep:
+    name: Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Detect Bicep sources
+        id: detect
+        shell: bash
+        run: |
+          if [ -f infra/main.bicep ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Install the pinned Bicep version
+        if: steps.detect.outputs.present == 'true'
+        run: az bicep install --version "v${BICEP_VERSION}"
+      - name: Install pinned PowerShell modules, including PSRule
+        if: steps.detect.outputs.present == 'true'
+        uses: ./.github/actions/setup-pwsh-tools
+        with:
+          include-psrule: "true"
+      - name: Build, lint, azuredeploy.json sync, and PSRule for Azure
+        if: steps.detect.outputs.present == 'true'
+        shell: pwsh
+        run: ./tests/Invoke-StaticValidation.ps1 -Check Bicep, PSRule
+      - name: Not selected yet
+        if: steps.detect.outputs.present != 'true'
+        run: echo "No infra/main.bicep yet; Bicep checks start in Phase 5."
+
+  markdown:
+    name: Markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: markdownlint-cli2 (pinned)
+        shell: pwsh
+        run: ./tests/Invoke-StaticValidation.ps1 -Check Markdown
+
+  actionlint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint (pinned, checksum verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          file="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "${base}/${file}"
+          curl -fsSLO "${base}/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          grep " ${file}\$" "actionlint_${ACTIONLINT_VERSION}_checksums.txt" | sha256sum --check -
+          tar -xzf "${file}" actionlint
+      - name: Run actionlint
+        run: ./actionlint -color
+
+  gitleaks:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (pinned, checksum verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          file="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "${base}/${file}"
+          curl -fsSLO "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${file}\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum --check -
+          tar -xzf "${file}" gitleaks
+      - name: Scan the full history
+        run: ./gitleaks git --redact --no-banner --verbose .

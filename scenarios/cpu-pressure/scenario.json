@@ -1,0 +1,38 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "cpu-pressure",
+  "title": "CPU pressure",
+  "summary": "A double-booking audit report with a bounded plan problem: the overlap test wraps both date columns in DATEDIFF, so each execution compares every pair of a provider's appointments instead of seeking ix_appointments_provider. Concurrent sessions run it back to back. The healthy variant asks the same question with a range on scheduled_start and seeks the index, for a before-and-after comparison.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_cpu_pressure",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 2, "min": 1, "max": 16, "description": "Sessions running the report; one per vCPU saturates the target." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Providers covered per execution: 4 per level, so 20 at the default." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3", "T4"],
+    "default": ["T2", "T4"],
+    "notes": {
+      "T4": "The PostgreSQL report hashes every pair of ten providers' appointments; two sessions hold the Burstable server's one vCore at its ceiling, and its CPU credits (cpu_credits_remaining) drain toward the 20% baseline."
+    }
+  },
+  "parameters": {
+    "variant": { "type": "string", "default": "problem", "enum": ["problem", "healthy"], "description": "problem: the non-SARGable DATEDIFF version. healthy: the indexed range version (the 'after').", "sqlParameter": "@variant" }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerCPUUtilization rising toward 100% (problem variant)", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: CPU wait category (SOS_SCHEDULER_YIELD)", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/cpu-pressure sessions running", "surface": "Performance" },
+    { "signal": "An expensive-query or CPU finding for the target", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." },
+    { "signal": "T4: CPU (cpu_percent) at 100%, CPU Credits Remaining (cpu_credits_remaining) falling", "surface": "Performance", "note": "Hub's PostgreSQL dashboard shows CPU; the credits are an Azure Monitor metric (Burstable tier)." }
+  ],
+  "expectedSymptoms": [
+    "Sustained high CPU from a few sessions running the same report",
+    "The report's plan scans and hash-joins care.appointments to itself; each execution takes about a second",
+    "Switching to variant=healthy cuts CPU per execution by well over an order of magnitude"
+  ],
+  "queryLevelEvidence": [
+    "Query Store: the problem query at the top of total CPU; the healthy query beside it for comparison",
+    "The execution plan shows a hash join on provider_id with a residual DATEDIFF predicate"
+  ],
+  "reset": "Read-only; nothing to undo. Stopping the run returns CPU to the baseline."
+}

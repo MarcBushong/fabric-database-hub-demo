@@ -1,0 +1,15 @@
+// Which telemetry tables have recent rows for each demo target.
+// Based on "List the tables that have recent data" in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-20). Rules applied: 1 (filter on SampleTimeUTC first), 5 (compare ResourceID
+// case-insensitively), 10 (row limit). Developer, Express, and Evaluation editions on Azure VMs report only
+// SqlServerClientConnections, so the table list tells a connection-only target apart from a full one.
+// Parameters, rendered by Get-DemoHubTelemetryKql: Lookback (timespan), Targets (dynamic array of ResourceIDs).
+let lookback = {{Lookback}};
+let targetIds = {{Targets}};
+union withsource=TableName SqlServer*
+| where SampleTimeUTC > ago(lookback)
+| where ResourceID in~ (targetIds)
+| summarize Rows = count(), LastSampleUTC = max(SampleTimeUTC) by ResourceID, TableName
+| order by ResourceID asc, TableName asc
+| take 500

@@ -1,0 +1,339 @@
+{
+  "description": "Single source of pinned versions (plan section 9.5). Workflows, scripts, and tests read this file; Pester tests check that workflow action pins, Azure Verified Modules, resource API versions, media, and the .NET runtime pin match it. Agent plugins and the runner build are added in the phases that introduce them.",
+  "updated": "2026-10-21",
+  "tools": {
+    "pwsh": "7.4",
+    "pester": "5.9.1",
+    "psscriptanalyzer": "1.25.0",
+    "psrule": "2.9.0",
+    "psruleRulesAzure": "1.47.0",
+    "bicep": "0.47.16",
+    "dotnetSdk": "10.0.402",
+    "markdownlintCli2": "0.23.3",
+    "gitleaks": "8.30.1",
+    "actionlint": "1.7.12",
+    "nbstripout": "0.9.1",
+    "preCommitHooks": "6.0.0",
+    "node": "26",
+    "powerbiReportAuthoringCli": "0.5.0",
+    "powerbiDesktopBridgeCli": "1.0.0"
+  },
+  "powerbi": {
+    "note": "Phase 19: the npm CLIs that author and preview the PBIR report (npm install --global @microsoft/powerbi-report-authoring-cli@<tools.powerbiReportAuthoringCli> @microsoft/powerbi-desktop-bridge-cli@<tools.powerbiDesktopBridgeCli>). The report generator in fabric/powerbi/generator pins its own npm dependency in package-lock.json. The report's base theme is the one this CLI version scaffolds.",
+    "reportAuthoringCliPackage": "@microsoft/powerbi-report-authoring-cli",
+    "desktopBridgeCliPackage": "@microsoft/powerbi-desktop-bridge-cli",
+    "baseTheme": "Fluent2-CY26SU10"
+  },
+  "fabricApp": {
+    "note": "Phase 19b: the read-only Fabric App (preview) APP_DatabaseHub_Insights in fabric/app, deployed by scripts/configure-fabric-app.ps1 with the Rayfin CLI (npx rayfin up). The CLI and SDK packages are pinned in fabric/app/package.json and package-lock.json; this block records the same versions for the script and the tests. The CLI supports Node 20, 22, and 24 (its engines field); CI uses 24. Sources: https://learn.microsoft.com/fabric/apps/overview, https://learn.microsoft.com/fabric/apps/cli-reference, https://learn.microsoft.com/fabric/apps/connectors, https://learn.microsoft.com/fabric/apps/hosting, https://learn.microsoft.com/fabric/apps/fabric-authentication.",
+    "cliPackage": "@microsoft/rayfin-cli",
+    "cliVersion": "1.36.2",
+    "sdkVersion": "1.36.2",
+    "supportedNodeMajors": [20, 22, 24],
+    "ciNodeVersion": "24",
+    "template": {
+      "repository": "microsoft/fabric-apps-analytic-templates",
+      "path": "dataapp",
+      "commit": "239b2c75f633639689025b7d819b0fa2e8539a98",
+      "license": "MIT"
+    },
+    "itemName": "APP_DatabaseHub_Insights",
+    "itemType": "AppBackend",
+    "connectorName": "history",
+    "assetAccess": "protected",
+    "semanticModelName": "SM_DatabaseHub_History",
+    "dashboardName": "RTD_DatabaseHub_LiveView",
+    "reportName": "RPT_DatabaseHub_History",
+    "portalUrl": "https://app.fabric.microsoft.com",
+    "tenantSettings": [
+      { "checkId": "FABRIC.APP.TENANTSETTING", "title": "Fabric Apps (preview)", "alternateTitles": [], "settingName": "", "verifiedBy": "FABRIC.APP.DEPLOY", "docUrl": "https://learn.microsoft.com/fabric/apps/overview" },
+      { "checkId": "FABRIC.APP.EXECUTEQUERIES", "title": "Dataset Execute Queries REST API", "alternateTitles": ["Semantic Model Execute Queries REST API"], "settingName": "", "verifiedBy": "FABRIC.APP.CONNECTOR", "docUrl": "https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group" }
+    ],
+    "docsVerifiedOn": "2026-10-22"
+  },
+  "actions": {
+    "actions/checkout": { "version": "v7.0.1", "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1" },
+    "actions/setup-dotnet": { "version": "v6.0.0", "sha": "a98b56852c35b8e3190ac28c8c2271da59106c68" },
+    "actions/upload-artifact": { "version": "v7.0.2", "sha": "cf430e030ddbb5b0abf93d22962f4752f3646cd9" },
+    "actions/setup-node": { "version": "v7.1.0", "sha": "949feb2413d6458794dcd2491c4babbbce0c15c1" },
+    "azure/login": { "version": "v3.1.0", "sha": "a641126d1b8aa4d1fa005f4f92df94a3a4c4c906" },
+    "github/codeql-action/init": { "version": "v4.39.0", "sha": "6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee" },
+    "github/codeql-action/analyze": { "version": "v4.39.0", "sha": "6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee" }
+  },
+  "nuget": {
+    "note": "NuGet versions are pinned centrally in workload-generator/Directory.Packages.props, with lock files."
+  },
+  "avm": {
+    "note": "Azure Verified Modules referenced by infra/. Dependabot has no Bicep registry ecosystem; review monthly (CONTRIBUTING.md).",
+    "avm/res/network/virtual-network": "0.10.2",
+    "avm/res/network/network-security-group": "0.5.4"
+  },
+  "apiVersions": {
+    "note": "Resource API versions declared directly in infra/ (ADR 0001), plus the ones scripts call through az rest (Phase 7: HybridCompute and AzureArcData, from the REST references on Microsoft Learn, checked 2026-10-20; Phase 13: Microsoft.CostManagement/query for the month-to-date cost, Microsoft.Network/bastionHosts for on-demand Bastion in infra/modules/bastion.bicep, and Microsoft.KeyVault/vaults for the opt-in vault in infra/modules/keyvault.bicep, the newest version Bicep 0.47.16 has types for; 2026-10-21: Microsoft.Resources/subscriptions for the subscription guard's az rest canary, from the Subscriptions - Get reference; Phase 16: Microsoft.Authorization/denyAssignments, which the deployment-stack trial in tests/teardown lists after its cleanup, from the Deny Assignments REST reference, checked 2026-10-21; Phase 24: Microsoft.DBforPostgreSQL/flexibleServers and its administrators, databases, and configurations for T4 in infra/modules/pgflex01.bicep, the newest version Bicep 0.47.16 has types for, checked 2026-10-23; and Microsoft.Insights/metrics, which status.ps1 and validate.ps1 read T4's Azure Monitor metrics through, from the Metrics - List REST reference, checked 2026-10-23; Phase 25c: Microsoft.Automation/automationAccounts, its webhooks, and Microsoft.KeyVault/vaults/secrets for the on-demand activity control in infra/control, the newest versions Bicep 0.47.16 has types for, from the REST references on Microsoft Learn, checked 2026-10-26; its runbooks start and stop T4 with the Microsoft.DBforPostgreSQL/flexibleServers version above; Phase 26b: Microsoft.Fabric/capacities, which start-demo.ps1, stop-demo.ps1, destroy.ps1, and status.ps1 read, resume, and suspend through az rest when fabric.manageCapacity is true, from the Fabric Capacities REST reference, checked 2026-10-27). A Pester test keeps the Bicep files in sync with this list; the Bicep linter's use-recent-api-versions rule keeps them current.",
+    "Microsoft.Authorization/denyAssignments": "2022-04-01",
+    "Microsoft.Authorization/locks": "2020-05-01",
+    "Microsoft.Authorization/roleAssignments": "2022-04-01",
+    "Microsoft.AzureArcData/sqlServerInstances": "2026-01-01",
+    "Microsoft.Compute/disks": "2025-01-02",
+    "Microsoft.Compute/virtualMachines": "2025-11-01",
+    "Microsoft.Compute/virtualMachines/runCommands": "2025-11-01",
+    "Microsoft.Consumption/budgets": "2026-06-01",
+    "Microsoft.CostManagement/query": "2026-06-01",
+    "Microsoft.DevTestLab/schedules": "2018-09-15",
+    "Microsoft.HybridCompute/machines": "2026-07-15",
+    "Microsoft.HybridCompute/machines/extensions": "2026-07-15",
+    "Microsoft.KeyVault/vaults": "2026-02-01",
+    "Microsoft.ManagedIdentity/userAssignedIdentities": "2024-11-30",
+    "Microsoft.Network/bastionHosts": "2025-09-01",
+    "Microsoft.Network/natGateways": "2025-09-01",
+    "Microsoft.Network/networkInterfaces": "2025-09-01",
+    "Microsoft.Network/publicIPAddresses": "2025-09-01",
+    "Microsoft.Resources/resourceGroups": "2025-04-01",
+    "Microsoft.Resources/subscriptions": "2022-12-01",
+    "Microsoft.SqlVirtualMachine/sqlVirtualMachines": "2023-10-01",
+    "Microsoft.Sql/servers": "2025-01-01",
+    "Microsoft.Sql/servers/databases": "2025-01-01",
+    "Microsoft.Sql/servers/virtualNetworkRules": "2025-01-01",
+    "Microsoft.Network/privateEndpoints": "2025-09-01",
+    "Microsoft.Network/privateEndpoints/privateDnsZoneGroups": "2025-09-01",
+    "Microsoft.Network/privateDnsZones": "2024-06-01",
+    "Microsoft.Network/privateDnsZones/virtualNetworkLinks": "2024-06-01",
+    "Microsoft.DBforPostgreSQL/flexibleServers": "2025-08-01",
+    "Microsoft.DBforPostgreSQL/flexibleServers/administrators": "2025-08-01",
+    "Microsoft.DBforPostgreSQL/flexibleServers/databases": "2025-08-01",
+    "Microsoft.DBforPostgreSQL/flexibleServers/configurations": "2025-08-01",
+    "Microsoft.Insights/metrics": "2023-10-01",
+    "Microsoft.Automation/automationAccounts": "2024-10-23",
+    "Microsoft.Automation/automationAccounts/webhooks": "2024-10-23",
+    "Microsoft.KeyVault/vaults/secrets": "2026-02-01",
+    "Microsoft.Fabric/capacities": "2023-11-01"
+  },
+  "arc": {
+    "note": "Azure Arc onboarding of the T2 guest and SQL Server enabled by Azure Arc (Phase 7, ADR 0005, ADR 0006). Checked on Microsoft Learn on 2026-10-20; the source of each value is in docUrls.",
+    "machineName": "arcsql01",
+    "cloud": "AzureCloud",
+    "agent": {
+      "description": "Azure Connected Machine agent for Windows. The documented link always serves the latest release (it resolved to resolvedUrl on 2026-10-20, 117,747,712 bytes), so no SHA-256 can be pinned: sha256 stays null and the host verifies the Windows Installer package's Authenticode signature instead (status Valid, signer subject matching signerSubjectPattern) and fails closed otherwise. Pin a versioned URL and its sha256 here to switch to hash verification.",
+      "url": "https://aka.ms/AzureConnectedMachineAgent",
+      "resolvedUrl": "https://gbl.his.arc.azure.com/azcmagent/latest/AzureConnectedMachineAgent.msi",
+      "fileName": "AzureConnectedMachineAgent.msi",
+      "sha256": null,
+      "signerSubjectPattern": "O=Microsoft Corporation",
+      "maxCacheDays": 7,
+      "verifiedOn": "2026-10-20"
+    },
+    "sqlExtension": {
+      "description": "Azure extension for SQL Server on the Arc machine. Monitoring needs version 1.1.2504.99 or later; the license type comes from the resource-group tag ArcSQLServerExtensionDeployment=PAYG at automatic deployment and is enforced by configure-arc.ps1.",
+      "name": "WindowsAgent.SqlServer",
+      "publisher": "Microsoft.AzureData",
+      "type": "WindowsAgent.SqlServer",
+      "minimumVersion": "1.1.2504.99",
+      "licenseType": "PAYG"
+    },
+    "monitoringApiVersion": "2023-09-01-preview",
+    "billing": {
+      "description": "Pay-as-you-go SQL Server on a virtual machine is metered on the virtual cores available to the operating system environment, with a minimum of four cores per OSE (manage-license-billing, Metering section, checked 2026-10-20). configure-arc.ps1 records the instance's vCore and cores properties as evidence.",
+      "minimumCoresPerOse": 4
+    },
+    "docUrls": {
+      "connect": "https://learn.microsoft.com/azure/azure-arc/servers/azcmagent-connect",
+      "show": "https://learn.microsoft.com/azure/azure-arc/servers/azcmagent-show",
+      "disconnect": "https://learn.microsoft.com/azure/azure-arc/servers/azcmagent-disconnect",
+      "installWindows": "https://learn.microsoft.com/azure/azure-arc/servers/onboard-portal",
+      "machinesRest": "https://learn.microsoft.com/rest/api/hybridcompute/machines/get",
+      "extensionsRest": "https://learn.microsoft.com/rest/api/hybridcompute/machine-extensions/create-or-update",
+      "sqlInstancesRest": "https://learn.microsoft.com/rest/api/arcdata/sql-server-instances/get",
+      "autoDeploy": "https://learn.microsoft.com/sql/sql-server/azure-arc/manage-autodeploy",
+      "configuration": "https://learn.microsoft.com/sql/sql-server/azure-arc/manage-configuration",
+      "licenseBilling": "https://learn.microsoft.com/sql/sql-server/azure-arc/manage-license-billing",
+      "monitoring": "https://learn.microsoft.com/sql/sql-server/azure-arc/sql-monitoring",
+      "deleteFromArc": "https://learn.microsoft.com/sql/sql-server/azure-arc/delete-from-azure-arc",
+      "evaluateOnAzureVm": "https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine"
+    }
+  },
+  "sqlVm": {
+    "note": "Performance monitoring for SQL Server on Azure VMs (preview): the DatabaseWatcheronAzureVM feature flag merged into the SQL IaaS Agent extension's public settings with the documented Azure CLI procedure (https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm, checked 2026-10-20).",
+    "extensionInstanceName": "SqlIaasExtension",
+    "extensionName": "SqlIaaSAgent",
+    "publisher": "Microsoft.SqlServer.Management",
+    "minimumVersion": "2.0.229.0",
+    "featureFlag": "DatabaseWatcheronAzureVM",
+    "statusPlugin": "DatabaseMonitorArcPlugin"
+  },
+  "postgresql": {
+    "note": "T4 (Phase 24, ADR 0019): Azure Database for PostgreSQL flexible server, Burstable Standard_B1ms (config/profiles.json t4). majorVersion is a generally available major version (version policy and supported versions on Learn, checked 2026-10-23: 11 to 18, with 18 GA; West US 3's capabilities list 11 to 18). The server and its child resources use the apiVersions entries above: 2025-08-01 is the newest version Bicep 0.47.16 has types for (2026-10-01 is published but has no Bicep types yet). The runner's PostgreSQL provider, Npgsql, is pinned in workload-generator/Directory.Packages.props, and the optional local test server in workloadRunner.localTestPostgresImage.",
+    "majorVersion": "18",
+    "serverNamePrefix": "pgflex01",
+    "databaseName": "contosocare",
+    "runnerRole": "contosocare_runner",
+    "tokenResource": "https://ossrdbms-aad.database.windows.net",
+    "enhancedMetricsParameter": "metrics.collector_database_activity",
+    "autoStartAfterStoppedDays": 7,
+    "capabilitiesApiVersion": "2025-08-01",
+    "metrics": {
+      "note": "Azure Monitor metrics T4 shows (Database Hub's PostgreSQL dashboard uses the first six; the enhanced metrics need metricsParameter on). Read by status.ps1 and validate.ps1 with az monitor metrics list.",
+      "hub": [ "cpu_percent", "memory_percent", "storage_percent", "iops", "active_connections", "connections_failed" ],
+      "burstable": [ "cpu_credits_remaining", "cpu_credits_consumed", "disk_iops_consumed_percentage" ],
+      "enhanced": [ "sessions_by_state", "sessions_by_wait_event_type", "longest_transaction_time_sec", "longest_query_time_sec", "oldest_backend_xmin_age", "deadlocks", "max_connections" ]
+    },
+    "docUrls": {
+      "hubMonitor": "https://learn.microsoft.com/fabric/database/hub/monitor-postgresql",
+      "networkingPrivate": "https://learn.microsoft.com/azure/postgresql/network/concepts-networking-private",
+      "entraRoles": "https://learn.microsoft.com/azure/postgresql/security/security-manage-entra-users",
+      "managedIdentity": "https://learn.microsoft.com/azure/postgresql/security/security-connect-with-managed-identity",
+      "monitoring": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-monitoring",
+      "stopServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server",
+      "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
+      "versionPolicy": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-version-policy"
+    },
+    "verifiedOn": "2026-10-23"
+  },
+  "vmImages": {
+    "note": "Marketplace images; 'latest' is resolved by Azure at creation. Preflight reads t1 to resolve securityType.t1 = Auto (ADR 0003).",
+    "t1": { "publisher": "MicrosoftSQLServer", "offer": "sql2022-ws2022", "sku": "standard-gen2", "version": "latest" },
+    "t2Host": { "publisher": "MicrosoftWindowsServer", "offer": "WindowsServer", "sku": "2022-datacenter-g2", "version": "latest" }
+  },
+  "media": {
+    "note": "Installation media for the T2 guest (ADR 0003, ADR 0006). 'url' is the final download URL; for the Evaluation Center fwlinks it was resolved with HEAD requests on 2026-10-19. 'sha256' was computed on 2026-10-19 by streaming each public download through SHA-256. The host bootstrap verifies the hash and fails closed on a mismatch; a null sha256 means trust on first use (the host records the first hash and reports a Warning).",
+    "windowsServer2022Eval": {
+      "description": "Windows Server 2022 Evaluation ISO, en-US. The host applies the Datacenter Evaluation (Desktop Experience) image with DISM.",
+      "sourceUrl": "https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US",
+      "url": "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso",
+      "fileName": "SERVER_EVAL_x64FRE_en-us.iso",
+      "sizeBytes": 5044094976,
+      "sha256": "3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325",
+      "verifiedOn": "2026-10-19"
+    },
+    "sqlServer2022": {
+      "description": "SQL Server 2022 Evaluation ISO, en-US. ProductKey mode installs the licensed edition with /PID; PaygWizard mode offers pay-as-you-go Standard on the setup wizard's Edition page. The Evaluation Center link (sourceUrl) serves only the web installer, so the ISO's download-center URL is pinned instead.",
+      "sourceUrl": "https://go.microsoft.com/fwlink/?linkid=2215202&clcid=0x409&culture=en-us&country=us",
+      "url": "https://download.microsoft.com/download/3/8/d/38de7036-2433-4207-8eae-06e247e17b25/SQLServer2022-x64-ENU.iso",
+      "fileName": "SQLServer2022-x64-ENU.iso",
+      "sizeBytes": 1163051008,
+      "sha256": "342fc9f4b89eaa50a0d1ef0d30470ea7b6af91b425c26023461198cb4e925b4f",
+      "verifiedOn": "2026-10-19"
+    },
+    "sqlServer2022Developer": {
+      "description": "SQL Server 2022 Developer ISO, en-US, used by the Developer install mode. Its product key is predefined on this media, so setup gets no /PID.",
+      "sourceUrl": "https://go.microsoft.com/fwlink/p/?linkid=2215158&clcid=0x409&culture=en-us&country=us",
+      "url": "https://download.microsoft.com/download/3/8/d/38de7036-2433-4207-8eae-06e247e17b25/SQLServer2022-x64-ENU-Dev.iso",
+      "fileName": "SQLServer2022-x64-ENU-Dev.iso",
+      "sizeBytes": 1163053056,
+      "sha256": "80d2cd75dd2b28098c0182f50ad86bd44f9b3a9f357c30ff617480a1497daffd",
+      "verifiedOn": "2026-10-19"
+    }
+  },
+  "dotnetRuntime": {
+    "note": "The .NET runtime that runs the framework-dependent workload runner on the VMs (ADR 0010, Phase 6 decision): the win-x64 zip, not the installer. It matches tools.dotnetSdk (a Pester test checks sdkVersion). 'sha512' is the hash Microsoft publishes in the release metadata (releaseMetadata), checked on 2026-10-20 by downloading the zip and hashing it. The VM verifies it before it extracts it to C:\\ProgramData\\DbHubDemo\\dotnet (Phase 11). Update it with the SDK: pick the release whose sdks list contains tools.dotnetSdk, then its runtime file dotnet-runtime-win-x64.zip.",
+    "version": "10.0.13",
+    "sdkVersion": "10.0.402",
+    "rid": "win-x64",
+    "url": "https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.13/dotnet-runtime-10.0.13-win-x64.zip",
+    "fileName": "dotnet-runtime-10.0.13-win-x64.zip",
+    "sizeBytes": 36970749,
+    "sha512": "2b98792ce86adc50899764ad2e4d21bd25cfda5432eeb0b4dfe7944f3ea049f9e0570a8f4aee92314d97cdb5f8b7be1363d501fc5012e680371e607af648ef40",
+    "releaseMetadata": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
+    "verifiedOn": "2026-10-20"
+  },
+  "databaseHub": {
+    "note": "Database Hub (preview) validation settings (Phase 9). Hub has no public API or ARM resource, so the validators use only these documented interfaces; the repo never calls private Hub routes. The telemetry endpoint and schema can change during the preview: re-read docUrl before you change a value. KQL templates live in scripts/modules/DbHubDemo/Kql.",
+    "telemetry": {
+      "queryUrl": "https://adx.centralus.arcdataservices.com/kusto/v1/rest/query",
+      "connectionUri": "https://adx.centralus.arcdataservices.com/kusto/",
+      "connectionUriNote": "The SQL ADX proxy connection URI that Learn documents for the Azure Data Explorer web UI, the same in every region (monitor-sql, checked 2026-10-21). The Real-Time Dashboard (Phase 18) uses it as its Azure Data Explorer data source.",
+      "database": "ArcSqlTelemetry",
+      "tokenAudience": "https://kusto.kusto.windows.net",
+      "retentionDays": 7,
+      "docUrl": "https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry",
+      "verifiedOn": "2026-10-20"
+    },
+    "resourceGraph": {
+      "url": "https://management.azure.com/providers/Microsoft.ResourceGraph/resources",
+      "apiVersion": "2024-04-01",
+      "docUrl": "https://learn.microsoft.com/rest/api/azureresourcegraph/resourcegraph/resources/resources",
+      "verifiedOn": "2026-10-20"
+    },
+    "authorizationPermissionsApiVersion": "2022-04-01",
+    "arcTelemetryRole": {
+      "roleName": "Azure Hybrid Database Administrator - Read Only Service Role",
+      "note": "Resolved by name at run time; its ID is never pinned. Learn's add-sql page names it as the built-in role that includes Microsoft.AzureArcData/sqlServerInstances/getTelemetry/action; the RBAC built-in role catalog pages don't list it (risk R22).",
+      "docUrl": "https://learn.microsoft.com/fabric/database/hub/add-sql"
+    },
+    "fabric": {
+      "apiBaseUrl": "https://api.fabric.microsoft.com/v1",
+      "note": "The Hub checks (P4, P5) call the Fabric REST API only through the Phase 12 helpers Get-DemoFabricToken and Invoke-DemoFabricRequest, which own the token audience and refuse other hosts.",
+      "hubTenantSetting": {
+        "title": "Users can access the Database hub (preview)",
+        "settingName": null,
+        "note": "Learn documents the title (monitor-sql) but not the internal settingName. TODO(verify): record settingName here after the first read with a Fabric administrator's token; until then the setting is matched by title.",
+        "docUrl": "https://learn.microsoft.com/fabric/database/hub/monitor-sql"
+      },
+      "notebookCapacitySkuPattern": "^F[0-9]+$",
+      "capacityNote": "Fabric (F) SKUs run notebooks. TODO(verify): Learn doesn't document the SKU string that List Capacities returns for a Trial capacity, so any other SKU is reported as Manual action required until a live read confirms it.",
+      "viewerLicense": {
+        "minimumFreeViewerFSku": 64,
+        "note": "Phase 18, PREFLIGHT.FABRIC.VIEWERLICENSE: on F SKUs smaller than F64, each user viewing Power BI content must have Pro, PPU, or an individual trial; on F64 or larger, and on P SKUs, users with only a Free license and a viewer role can view. A Trial capacity acts like F64 for viewing, but its SKU string isn't documented, so it's reported as a Warning until a live read records it.",
+        "docUrl": "https://learn.microsoft.com/fabric/enterprise/licenses",
+        "verifiedOn": "2026-10-21"
+      },
+      "verifiedOn": "2026-10-20"
+    },
+    "realTimeDashboard": {
+      "displayName": "RTD_DatabaseHub_LiveView",
+      "itemType": "KQLDashboard",
+      "definitionPart": "RealTimeDashboard.json",
+      "schemaVersion": "52",
+      "schemaUrl": "https://dataexplorer.azure.com/static/d/schema/52/dashboard.json",
+      "note": "Phase 18. The Real-Time Dashboard definition follows the KQL dashboard item definition on Learn: one part, RealTimeDashboard.json, InlineBase64, and the payload example's schema_version 52, whose published JSON Schema is at schemaUrl. Newer schema versions exist (89 on 2026-10-21); move the pin only after an import and read-back in the workspace. Built by Export-DemoRealTimeDashboard from fabric/realtime/dashboard.spec.psd1 and the Live.* and Dashboard.* KQL; imported by configure-fabric.ps1 -ImportDashboard.",
+      "docUrl": "https://learn.microsoft.com/rest/api/fabric/articles/item-management/definitions/kql-dashboard-definition",
+      "verifiedOn": "2026-10-21"
+    }
+  },
+  "docsVerifiedOn": {
+    "databaseHub": "2026-10-19",
+    "sqlVmPerformanceMonitoring": "2026-10-19",
+    "arcSqlMonitoring": "2026-10-19",
+    "telemetryEndpoint": "2026-10-19",
+    "arcOnboardingAndSqlMonitoring": "2026-10-20"
+  },
+  "workloadRunner": {
+    "note": "The ContosoCare.Workload runner (Phase 11, ADR 0010), published framework-dependent for win-x64; the delivery phase pins the .NET runtime it downloads. NuGet packages are pinned in workload-generator/Directory.Packages.props. A .NET test keeps version and the compose image in sync.",
+    "version": "0.1.0",
+    "targetFramework": "net10.0",
+    "publishRuntimeIdentifier": "win-x64",
+    "localTestSqlServerImage": "mcr.microsoft.com/mssql/server:2022-CU27-ubuntu-22.04",
+    "localTestPostgresImage": "postgres:18.6-bookworm"
+  },
+  "agentPlugins": {
+    "note": "Agent plugins for the skills fallback (ADR 0013, fabric/agent/README.md). Copilot CLI ('copilot plugin marketplace add owner/repo#ref') and VS Code ('chat.plugins.marketplaces' with 'owner/repo#<commit>') install from the marketplace repository at 'marketplace.commit', so both hosts get the versions below. Move the pin only after re-running the prompt pack; a Pester test keeps the install guide on this commit. The Learn MCP server is a remote endpoint and has no version; 'learnMcp.plugin*' records the optional microsoft-docs plugin.",
+    "verifiedOn": "2026-10-20",
+    "marketplace": {
+      "name": "microsoft-sql",
+      "repository": "microsoft/microsoft-sql",
+      "url": "https://github.com/microsoft/microsoft-sql",
+      "commit": "eeb1c6867c2d128763516a1aad41671c593cc189",
+      "version": "1.0.0"
+    },
+    "plugins": {
+      "microsoft-sql-fdh": {
+        "version": "1.0.0",
+        "skillsUsed": [ "databasehub-cli" ]
+      },
+      "microsoft-sql": {
+        "version": "1.0.0",
+        "skillsUsed": [ "diagnose-blocking-and-deadlocks", "diagnose-resource-pressure", "diagnose-slow-query", "read-execution-plan" ]
+      },
+      "microsoft-sql-vscode": {
+        "version": "1.0.0",
+        "note": "Instead of microsoft-sql in VS Code with the MSSQL extension; install one of the two, never both."
+      }
+    },
+    "learnMcp": {
+      "endpoint": "https://learn.microsoft.com/api/mcp",
+      "plugin": "microsoft-docs",
+      "pluginRepository": "MicrosoftDocs/mcp",
+      "pluginVersion": "0.3.1",
+      "pluginCommit": "f8ffde185dfd232dbf5d187c22ce299eadc3d583"
+    }
+  }
+}

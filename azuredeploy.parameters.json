@@ -1,0 +1,78 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "prefix": {
+      "value": "dbhub"
+    },
+    "environment": {
+      "value": "demo"
+    },
+    "networkMode": {
+      "value": "public"
+    },
+    "outboundMode": {
+      "value": "DefaultOutboundAccess"
+    },
+    "owner": {
+      "value": "demo-owner"
+    },
+    "ownerEmail": {
+      "value": "owner@example.com"
+    },
+    "costCenter": {
+      "value": "demo"
+    },
+    "monthlyCeilingUsd": {
+      "value": 250
+    },
+    "enableLocks": {
+      "value": false
+    },
+    "profile": {
+      "value": "lowest-cost"
+    },
+    "zone": {
+      "value": ""
+    },
+    "dataDiskSku": {
+      "value": "Auto"
+    },
+    "t1Priority": {
+      "value": "Regular"
+    },
+    "hostPriority": {
+      "value": "Regular"
+    },
+    "t1SecurityType": {
+      "value": "Standard"
+    },
+    "hostSecurityType": {
+      "value": "Standard"
+    },
+    "windowsHybridBenefit": {
+      "value": false
+    },
+    "sqlHybridBenefit": {
+      "value": false
+    },
+    "hybridBenefitAttested": {
+      "value": false
+    },
+    "t2SqlInstallMode": {
+      "value": "PaygWizard"
+    },
+    "t3AdminGroupObjectId": {
+      "value": "00000000-0000-0000-0000-000000000000"
+    },
+    "t3UseFreeLimit": {
+      "value": true
+    },
+    "t2Mode": {
+      "value": "Nested"
+    },
+    "assignArcOnboardingRole": {
+      "value": false
+    }
+  }
+}

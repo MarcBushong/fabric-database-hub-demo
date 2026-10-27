@@ -1,0 +1,24 @@
+// CPU over the window per target: average, 95th percentile, maximum, and the share of samples above 80%.
+// Based on query 3 ('Which resources use the most CPU?') in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-21).
+// CPU per platform (Phase 25b): T3 (servers/databases) reads AvgCPUPercent, a percentage of the service tier's limit.
+// T1 and T2 (virtualMachines, machines) read SQLProcessCPUPercent, the SQL Server process's share of the machine,
+// because AvgCPUPercent, which the article calls the primary signal, was 0 in every T1 and T2 sample on 2026-10-23
+// while SQLProcessCPUPercent showed 92 to 99 (Phase 25a). Both columns are in the table's schema in the article
+// (getschema, checked 2026-10-26); SQL Server falls back to AvgCPUPercent where SQLProcessCPUPercent is empty.
+// Rules applied: 1 (filter on SampleTimeUTC first), 4 (group by SqlServerInstanceName per target), 7 (report
+// a percentage of samples, not a count).
+// Contract: runs after Live.Prelude.kql, which defines _start, _end, _bin, _rg, _db, and _target(). The body is
+// identical to CPU_SUMMARY_KQL in fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, and the Real-Time Dashboard
+// (fabric/realtime) is generated from this file; tests/unit/Fabric.Dashboard.Tests.ps1 fails if they drift.
+SqlServerCPUUtilization
+| where SampleTimeUTC between (_start .. _end)
+| where ResourceGroup =~ _rg
+| extend Target = _target(ResourceType, ResourceName)
+| where isnotempty(Target)
+| extend CpuPercent = iff(ResourceType =~ 'servers/databases', AvgCPUPercent, coalesce(todouble(SQLProcessCPUPercent), AvgCPUPercent))
+| summarize AvgCPU = round(avg(CpuPercent), 1), P95CPU = round(percentile(CpuPercent, 95), 1),
+            MaxCPU = round(max(CpuPercent), 1), PctTimeAbove80 = round(100.0 * countif(CpuPercent > 80.0) / count(), 1)
+        by Target, ResourceType, ResourceName, SqlServerInstanceName
+| order by Target asc

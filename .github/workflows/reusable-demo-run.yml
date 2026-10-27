@@ -1,0 +1,109 @@
+name: reusable-demo-run
+
+# Runs one demo script against one GitHub environment with OpenID Connect (plan section 9.5, ADR 0011).
+# Called by deploy.yml, demo-control.yml, destroy.yml, validate.yml, warm-up.yml, and the scheduled
+# workflows. Every run for the same environment shares one concurrency group, so a deploy, a control change,
+# and a destroy never overlap.
+# The script's parameters arrive as a JSON object and are splatted, never pasted into a command line.
+# Public repository (ADR 0022): the identifiers come from the environment's secrets, which callers pass with
+# "secrets: inherit", so GitHub masks them; demo-setup masks every ID derived from them before anything prints, and a
+# run in the schedule environment (no reviewers) is refused unless a schedule started it.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: The GitHub environment, whose secrets are AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and DBHUB_CONFIG_JSON.
+        type: string
+        required: true
+      script:
+        description: "One of: deploy, start-demo, stop-demo, status, reset-demo, destroy, demo-control, validate."
+        type: string
+        required: true
+      parameters:
+        description: The script's parameters as a JSON object, for example {"Resume":true}.
+        type: string
+        required: false
+        default: "{}"
+      bicep:
+        description: Install the pinned Bicep.
+        type: boolean
+        required: false
+        default: false
+      dotnet:
+        description: Install the pinned .NET SDK.
+        type: boolean
+        required: false
+        default: false
+      timeout-minutes:
+        description: The job's time limit.
+        type: number
+        required: false
+        default: 60
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  run:
+    name: ${{ inputs.script }} (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: dbhub-demo-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Refuse the schedule environment outside a schedule
+        if: github.event_name != 'schedule' && vars.DBHUB_SCHEDULE_ENVIRONMENT != '' && inputs.environment == vars.DBHUB_SCHEDULE_ENVIRONMENT
+        shell: bash
+        run: |
+          echo "::error::The schedule environment has no required reviewers, so only scheduled runs may use it. Run this workflow in your reviewed environment (ADR 0022)."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/demo-setup
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          config-json: ${{ secrets.DBHUB_CONFIG_JSON }}
+          bicep: ${{ inputs.bicep }}
+          dotnet: ${{ inputs.dotnet }}
+
+      - name: Run scripts/${{ inputs.script }}.ps1
+        shell: pwsh
+        env:
+          DEMO_SCRIPT: ${{ inputs.script }}
+          DEMO_PARAMETERS: ${{ inputs.parameters }}
+          # Only ProductKey mode (prerequisite P10) uses it; deploy.ps1 removes it from the environment after reading it.
+          DBHUB_SQL_PRODUCT_KEY: ${{ secrets.DBHUB_SQL_PRODUCT_KEY }}
+        run: |
+          $allowed = @('deploy', 'start-demo', 'stop-demo', 'status', 'reset-demo', 'destroy', 'demo-control', 'validate')
+          if ($env:DEMO_SCRIPT -notin $allowed) {
+            throw "Unknown script '$env:DEMO_SCRIPT'."
+          }
+          $parameters = @{}
+          if (-not [string]::IsNullOrWhiteSpace($env:DEMO_PARAMETERS)) {
+            $parameters = $env:DEMO_PARAMETERS | ConvertFrom-Json -AsHashtable
+          }
+          # An empty optional input (for example from-stage) means the script's default.
+          foreach ($key in @($parameters.Keys)) {
+            if ($parameters[$key] -is [string] -and $parameters[$key] -eq '') {
+              $parameters.Remove($key)
+            }
+          }
+          & "./scripts/$($env:DEMO_SCRIPT).ps1" @parameters
+          exit $LASTEXITCODE
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.script }}-${{ inputs.environment }}-${{ github.run_id }}
+          path: out/*.jsonl
+          if-no-files-found: ignore
+          retention-days: 30

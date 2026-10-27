@@ -1,0 +1,61 @@
+/// The demo's targets and platform scopes. T1, T2, and T3 are the SQL targets; the other rows are the scopes that validation checks report on. Sorted in a fixed T1-to-T3 order; never colored by hue in the report.
+table Target
+
+    /// Join key, the target value the notebooks write (T1, T2, T3, all, fabric, subscription, tenant, github, repo).
+    column 'Target Key'
+        dataType: string
+        isHidden
+        isNameInferred
+        sourceColumn: [Target Key]
+
+    /// Display name with the platform, for example "T1 · SQL Server on Azure VM".
+    column Target
+        dataType: string
+        isNameInferred
+        sourceColumn: [Target]
+        sortByColumn: 'Target Sort'
+
+    /// Short label for tiles, slicers, and table rows: T1, T2, T3, or the scope's name.
+    column 'Target Short'
+        dataType: string
+        isNameInferred
+        sourceColumn: [Target Short]
+        sortByColumn: 'Target Sort'
+
+    /// SQL target, All targets, or Platform scope.
+    column 'Target Kind'
+        dataType: string
+        isNameInferred
+        sourceColumn: [Target Kind]
+
+    /// What the target runs on.
+    column Platform
+        dataType: string
+        isNameInferred
+        sourceColumn: [Platform]
+
+    column 'Target Sort'
+        dataType: int64
+        isHidden
+        isNameInferred
+        summarizeBy: none
+        sourceColumn: [Target Sort]
+
+    partition Target = calculated
+        mode: import
+        source =
+                DATATABLE (
+                    "Target Key", STRING, "Target", STRING, "Target Short", STRING,
+                    "Target Kind", STRING, "Platform", STRING, "Target Sort", INTEGER,
+                    {
+                        { "T1", "T1 · SQL Server on Azure VM", "T1", "SQL target", "SQL Server 2022 on an Azure VM", 1 },
+                        { "T2", "T2 · Arc-enabled SQL Server", "T2", "SQL target", "Arc-enabled SQL Server in a nested Hyper-V guest", 2 },
+                        { "T3", "T3 · Azure SQL Database", "T3", "SQL target", "Azure SQL Database", 3 },
+                        { "all", "All targets", "All", "All targets", "Every SQL target", 4 },
+                        { "fabric", "Fabric workspace", "Fabric", "Platform scope", "Fabric workspace and lakehouse", 5 },
+                        { "subscription", "Azure subscription", "Subscription", "Platform scope", "Azure subscription and resource group", 6 },
+                        { "tenant", "Fabric tenant", "Tenant", "Platform scope", "Tenant settings", 7 },
+                        { "github", "GitHub", "GitHub", "Platform scope", "GitHub repository and Actions", 8 },
+                        { "repo", "Repository", "Repo", "Platform scope", "Static checks", 9 }
+                    }
+                )

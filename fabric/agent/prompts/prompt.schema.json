@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/fabric/agent/prompts/prompt.schema.json",
+  "title": "Database agent prompt front matter",
+  "description": "The YAML front matter of every prompt file in fabric/agent/prompts (ADR 0013). tests/unit/Agent.PromptPack.Tests.ps1 parses the front matter and validates it against this schema, then checks the rules a schema can't express: the id matches the file name, the scenario folder exists, the prompt text is read-only and uses known placeholders, and nothing hard-codes an answer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "scenario",
+    "incident",
+    "targets",
+    "surface",
+    "hosts",
+    "dataSources",
+    "capability",
+    "permission",
+    "responseShape",
+    "previewLimitation",
+    "fallback",
+    "actionPolicy",
+    "adrPrompts",
+    "sources",
+    "reviewed"
+  ],
+  "properties": {
+    "id": {
+      "description": "Equal to the file name without .md: <name>.<in-hub|skills>.",
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.(in-hub|skills)$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 100
+    },
+    "scenario": {
+      "description": "A folder under scenarios/ (resource-governance and log-rate-pressure since Phase 11, and the eight wait-family scenarios since Phase 25b; the cpu-pressure and inefficient-query scenarios also produce resource-governance pressure on T3), any (cross-incident wrap-up), or setup (session setup).",
+      "enum": [
+        "setup",
+        "healthy-baseline",
+        "locking-blocking",
+        "cpu-pressure",
+        "io-pressure",
+        "missing-index",
+        "inefficient-query",
+        "resource-governance",
+        "log-rate-pressure",
+        "blocking-chain",
+        "deadlock-storm",
+        "tempdb-contention",
+        "memory-grant-pressure",
+        "parallel-scans",
+        "log-flush-waits",
+        "slow-consumer",
+        "capacity-max",
+        "any"
+      ]
+    },
+    "incident": {
+      "description": "True for prompts used during an incident. Incident prompts must work on T1, T2, and T3, because the Database Agent's target coverage isn't documented.",
+      "type": "boolean"
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "T1",
+          "T2",
+          "T3"
+        ]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "defaultTarget": {
+      "description": "The target the scenario runs on by default (architecture, ADR 0010).",
+      "enum": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "producedBy": {
+      "description": "For scenario resource-governance only: the scenario folders whose workload produces it.",
+      "type": "array",
+      "items": {
+        "enum": [
+          "cpu-pressure",
+          "inefficient-query",
+          "resource-governance"
+        ]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "surface": {
+      "description": "in-hub-agent: the Database Agent and Copilot in Database Hub (presenter-driven UI). skills: GitHub Copilot CLI or VS Code with the documented plugins, the telemetry agent instructions, and the Learn MCP server.",
+      "enum": [
+        "in-hub-agent",
+        "skills"
+      ]
+    },
+    "hosts": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "database-hub",
+          "copilot-cli",
+          "vscode"
+        ]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "dataSources": {
+      "description": "hub-estate and hub-performance: what Database Hub shows. databasehub-skill: the microsoft-sql-fdh plugin. telemetry-endpoint: the documented telemetry REST endpoint through the Learn agent instructions block. sql-diagnostics-skills: the microsoft-sql plugin over a SQL connection. scenario-record: demo.scenario_runs, read only. learn-mcp: the Microsoft Learn MCP server.",
+      "type": "array",
+      "items": {
+        "enum": [
+          "hub-estate",
+          "hub-performance",
+          "databasehub-skill",
+          "telemetry-endpoint",
+          "sql-diagnostics-skills",
+          "scenario-record",
+          "learn-mcp"
+        ]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "capability": {
+      "description": "What the surface is expected to be able to do with this prompt. Never the answer itself.",
+      "type": "string",
+      "minLength": 40
+    },
+    "permission": {
+      "type": "string",
+      "minLength": 40
+    },
+    "responseShape": {
+      "description": "The structure the prompt asks for, not its content.",
+      "type": "string",
+      "minLength": 40
+    },
+    "previewLimitation": {
+      "type": "string",
+      "minLength": 40
+    },
+    "fallback": {
+      "description": "The fallback demo when this surface or prompt doesn't work.",
+      "type": "string",
+      "minLength": 40
+    },
+    "actionPolicy": {
+      "description": "read-only: investigation only. propose-only: the agent may propose an action but never applies it.",
+      "enum": [
+        "read-only",
+        "propose-only"
+      ]
+    },
+    "adrPrompts": {
+      "description": "The ADR 0013 prompt kinds this file covers. The index test checks that both surfaces cover all twelve.",
+      "type": "array",
+      "items": {
+        "enum": [
+          "estate-health-summary",
+          "target-most-pressure",
+          "investigate-locking",
+          "correlate-signals",
+          "customer-root-cause",
+          "supporting-evidence",
+          "safest-next-action",
+          "baseline-vs-incident",
+          "inefficient-queries",
+          "actions-needing-approval",
+          "what-to-verify",
+          "incident-summary"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "sources": {
+      "description": "Microsoft Learn, GitHub, or VS Code documentation pages the prompt relies on.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^https://(learn\\.microsoft\\.com|docs\\.github\\.com|github\\.com|code\\.visualstudio\\.com)/"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "reviewed": {
+      "description": "UTC date the prompt and its sources were last checked.",
+      "type": "string",
+      "pattern": "^20[0-9]{2}-[01][0-9]-[0-3][0-9]$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "incident": {
+            "const": true
+          }
+        },
+        "required": [
+          "incident"
+        ]
+      },
+      "then": {
+        "properties": {
+          "targets": {
+            "allOf": [
+              {
+                "contains": {
+                  "const": "T1"
+                }
+              },
+              {
+                "contains": {
+                  "const": "T2"
+                }
+              },
+              {
+                "contains": {
+                  "const": "T3"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "surface": {
+            "const": "in-hub-agent"
+          }
+        },
+        "required": [
+          "surface"
+        ]
+      },
+      "then": {
+        "properties": {
+          "id": {
+            "pattern": "\\.in-hub$"
+          },
+          "hosts": {
+            "const": [
+              "database-hub"
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "id": {
+            "pattern": "\\.skills$"
+          },
+          "hosts": {
+            "items": {
+              "enum": [
+                "copilot-cli",
+                "vscode"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "scenario": {
+            "const": "resource-governance"
+          }
+        },
+        "required": [
+          "scenario"
+        ]
+      },
+      "then": {
+        "required": [
+          "producedBy"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "producedBy"
+          ]
+        }
+      }
+    }
+  ]
+}

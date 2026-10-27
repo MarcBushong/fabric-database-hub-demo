@@ -1,0 +1,36 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "resource-governance",
+  "title": "Resource governance (CPU cap)",
+  "summary": "Sustained, well-planned reporting at more concurrency than the target has vCores: a full utilization rollup with a per-row scoring hash, parallelism allowed. On Azure SQL Database it drives CPU to the service objective's limit, so the database is throttled rather than slowed by a bad plan; on SQL Server it's plain CPU saturation. The fix is capacity or scheduling, not a rewrite, which contrasts with cpu-pressure.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_resource_governance",
+  "duration": { "defaultSeconds": 300, "maxSeconds": 1200 },
+  "concurrency": { "default": 4, "min": 1, "max": 32, "description": "Reporting sessions; more than the vCore limit to reach the cap." },
+  "intensity": { "default": 6, "min": 1, "max": 10, "description": "Hashing work per row (1 to 4 passes) and a shorter pause between reports." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T3"],
+    "notes": {
+      "T3": "Consumes serverless vCore seconds (and the free offer's monthly allowance) while it runs; the default is 5 minutes.",
+      "T1": "Shows as CPU saturation of the VM, not a service-objective cap."
+    }
+  },
+  "parameters": {},
+  "expectedHubSignals": [
+    { "signal": "SqlServerCPUUtilization at the tier limit on T3 (or near 100% of the VM on T1 and T2)", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: CPU wait category (SOS_SCHEDULER_YIELD) with healthy plans", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/resource-governance sessions running in parallel", "surface": "Performance" },
+    { "signal": "A capacity or CPU-limit finding for the database", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
+  ],
+  "expectedSymptoms": [
+    "CPU pinned at the limit while every plan is sound",
+    "Report duration grows with concurrency because the sessions share a capped CPU",
+    "On T3, sys.dm_db_resource_stats shows avg_cpu_percent near 100"
+  ],
+  "queryLevelEvidence": [
+    "sys.dm_db_resource_stats (Azure SQL Database) or sys.dm_os_ring_buffers scheduler monitor (SQL Server)",
+    "Query Store: one report query with high total CPU and a stable, reasonable plan"
+  ],
+  "reset": "Read-only; nothing to undo. Stopping the run returns CPU to the baseline; T3 auto-pauses after its delay once no session is open."
+}

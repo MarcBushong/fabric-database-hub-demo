@@ -1,0 +1,74 @@
+{
+  "$schema": "./environment.schema.json",
+  "subscriptionId": "00000000-0000-0000-0000-000000000000",
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "azureAccount": "you@example.com",
+  "location": "westus3",
+  "prefix": "dbhub",
+  "environment": "demo",
+  "profile": "lowest-cost",
+  "networkMode": "auto",
+  "outboundMode": "DefaultOutboundAccess",
+  "zone": null,
+  "dataDiskSku": "Auto",
+  "t2Mode": "Nested",
+  "t2SqlInstallMode": "PaygWizard",
+  "t2Source": "auto",
+  "t3AdminGroupObjectId": "00000000-0000-0000-0000-000000000000",
+  "t3AutoPauseMinutes": 15,
+  "t3FreeOffer": "auto",
+  "activityProfile": "baseline",
+  "activityProfileOnBoot": false,
+  "owner": "your-alias",
+  "ownerEmail": "you@example.com",
+  "costCenter": "demo",
+  "monthlyCeilingUsd": 250,
+  "sessionCeilingUsd": 15,
+  "autoShutdownTime": "1900",
+  "autoShutdownTimeZone": "Pacific Standard Time",
+  "expiresOn": null,
+  "assignRoles": false,
+  "presenterObjectIds": [],
+  "bastionMaxHours": 4,
+  "keyVault": {
+    "enabled": false,
+    "purgeProtection": false,
+    "softDeleteRetentionDays": 7,
+    "allowedIpRanges": [],
+    "operatorObjectIds": [],
+    "readerObjectIds": []
+  },
+  "control": {
+    "enabled": false,
+    "vaultNetworkMode": "auto",
+    "webhookExpiryDays": 90,
+    "t4SafetyStopTime": "",
+    "notebookUserObjectIds": [],
+    "fabricFolderName": "DBHub Control",
+    "fabricWorkspaceName": "DBHub Control"
+  },
+  "hostPriority": "Regular",
+  "t1Priority": "Regular",
+  "securityType": {
+    "t1": "Auto",
+    "t2Host": "Standard"
+  },
+  "hybridBenefit": {
+    "windows": false,
+    "sql": false,
+    "entitlementAttested": false
+  },
+  "fabric": {
+    "workspaceName": "Database Hub Demo",
+    "lakehouseName": "LH_DatabaseHub",
+    "capacityName": "your-fabric-capacity",
+    "createIfMissing": true,
+    "importNotebooks": false,
+    "manageCapacity": false,
+    "saveHistoryOnStop": false
+  },
+  "github": {
+    "repository": "your-org/fabric-database-hub-demo",
+    "environment": "demo"
+  }
+}

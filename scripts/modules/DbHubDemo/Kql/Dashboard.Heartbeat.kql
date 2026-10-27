@@ -1,0 +1,13 @@
+// Telemetry heartbeat for the Real-Time Dashboard: CPU samples per target and bin. CPU samples arrive every
+// 10 seconds (15 for Azure SQL Database), so a steady line means a target is reporting and a gap means it isn't
+// (the "Tables" table in https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry,
+// checked 2026-10-21). Runs after Live.Prelude.kql. Rules applied: 1 (filter on SampleTimeUTC first), 7 (samples
+// per bin, which read as time), and an aggregation as the row limit (rule 10). Sample counts aren't counters, so
+// summing them per target doesn't mix counter values from different instances (rule 4).
+SqlServerCPUUtilization
+| where SampleTimeUTC between (_start .. _end)
+| where ResourceGroup =~ _rg
+| extend Target = _target(ResourceType, ResourceName)
+| where isnotempty(Target)
+| summarize Samples = count() by Target, Bucket = bin(SampleTimeUTC, _bin)
+| order by Bucket asc

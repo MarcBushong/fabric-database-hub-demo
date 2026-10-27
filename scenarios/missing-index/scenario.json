@@ -1,0 +1,34 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "missing-index",
+  "title": "Missing index",
+  "summary": "Repeatable lookups that no index covers: claims aging by payer and submission date, and visits by reason code. Each call scans its table, and the optimizer records a missing-index suggestion. The story is before, recommendation, action, after: the remediation (scenarios/missing-index/remediation.sql) is reviewed and applied by a person, never automatically.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_missing_index",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 2, "min": 1, "max": 16, "description": "Sessions running the lookups." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace: a lookup about once a second per session at 1, about 50 per second at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T2"],
+    "notes": {
+      "T3": "Azure SQL Database may also raise its own CREATE INDEX tuning recommendation after enough executions."
+    }
+  },
+  "parameters": {},
+  "expectedHubSignals": [
+    { "signal": "SqlServerCPUUtilization and logical reads higher than the baseline", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/missing-index sessions", "surface": "Performance" },
+    { "signal": "A missing-index or query-tuning finding with the index as the recommended action", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
+  ],
+  "expectedSymptoms": [
+    "Every claims-aging lookup scans care.claims; every reason-code lookup scans care.appointments",
+    "sys.dm_db_missing_index_details suggests (payer_code, submitted_on) INCLUDE (billed_amount, claim_status) on care.claims and (reason_code, scheduled_start) on care.appointments",
+    "After a person applies remediation.sql, the same lookups seek and their reads drop sharply"
+  ],
+  "queryLevelEvidence": [
+    "Query Store: the lookups' plans before and after the index (forced plans aren't used)",
+    "The plan's MissingIndex element and sys.dm_db_missing_index_group_stats (needs VIEW SERVER STATE or VIEW DATABASE STATE)"
+  ],
+  "reset": "The lookups only read. Reset with --undo-remediation (or EXEC demo.usp_undo_missing_index_remediation) drops the two remediation indexes, so the scenario starts again from 'before'."
+}

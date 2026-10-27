@@ -1,0 +1,43 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "idle-in-transaction",
+  "title": "Idle in transaction",
+  "summary": "Application sessions open a transaction, lock a few Submitted claims, and then go quiet without committing: they sit idle in transaction, block the billing writers that queue behind them, and hold back vacuum's cleanup horizon while the baseline keeps writing. Each idle session rolls back after holdSeconds (never past the deadline), pauses, and repeats. PostgreSQL (T4) only.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_idle_in_transaction",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 3, "min": 1, "max": 8, "description": "Sessions left idle in an open transaction." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace of the normal workload that runs beside them." },
+  "targets": {
+    "applicable": ["T4"],
+    "default": ["T4"],
+    "notes": {
+      "T4": "Each idle session sets idle_in_transaction_session_timeout to end before the run's hard deadline, and the server's 15-minute setting is the backstop, so a stuck runner can't leave one behind."
+    }
+  },
+  "parameters": {
+    "holdSeconds": { "type": "integer", "default": 180, "minimum": 10, "maximum": 900, "description": "How long each session sits idle in its open transaction each cycle (never past the run's deadline)." },
+    "pauseSeconds": { "type": "integer", "default": 30, "minimum": 0, "maximum": 300, "description": "Quiet time between cycles." },
+    "rowsPerSession": { "type": "integer", "default": 5, "minimum": 1, "maximum": 50, "description": "Submitted claims each idle session locks." },
+    "blockedWriters": { "type": "integer", "default": 2, "minimum": 0, "maximum": 8, "description": "Sessions that keep updating those claims and queue behind the idle sessions' row locks." },
+    "normalWorkers": { "type": "integer", "default": 1, "minimum": 0, "maximum": 8, "description": "Sessions running the healthy baseline beside the incident, which keeps writing while the horizon is held." }
+  },
+  "expectedHubSignals": [
+    { "signal": "T4: Connections (active_connections) steady while the idle sessions hold their transactions", "surface": "Performance" },
+    { "signal": "T4: Sessions By State (sessions_by_state) idle in transaction equals the concurrency; Oldest Transaction (longest_transaction_time_sec) climbs to holdSeconds each cycle", "surface": "Azure Monitor", "note": "PostgreSQL enhanced metrics (metrics.collector_database_activity on)." },
+    { "signal": "T4: Sessions By WaitEventType (sessions_by_wait_event_type) Lock for the blocked writers", "surface": "Azure Monitor" },
+    { "signal": "T4: Oldest xmin Age (oldest_backend_xmin_age) grows while the baseline writes", "surface": "Azure Monitor" }
+  ],
+  "expectedSymptoms": [
+    "Sessions in state 'idle in transaction' with open transactions and no running query",
+    "Writers wait on Lock:transactionid, and pg_blocking_pids points at an idle session",
+    "The oldest transaction's age grows until the idle sessions roll back, then drops",
+    "Dead rows the baseline creates can't be vacuumed while the horizon is held"
+  ],
+  "queryLevelEvidence": [
+    "ContosoCare.Workload status --target T4: idle-in-transaction sessions, blockers, and the oldest transaction",
+    "pg_stat_activity where state = 'idle in transaction', with pg_blocking_pids(pid) for the writers",
+    "demo.scenario_run_events records idle-acquired and idle-rolled-back with backend PIDs"
+  ],
+  "reset": "Every idle transaction rolls back, so the claims stay as seeded; reset ends any leftover ContosoCare.Demo/idle-in-transaction session with pg_terminate_backend and verifies no demo transaction is open."
+}

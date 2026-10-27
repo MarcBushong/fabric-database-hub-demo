@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>ContosoCare.Workload</AssemblyName>
+    <RootNamespace>ContosoCare.Workload</RootNamespace>
+    <Description>Contoso Care Operations workload runner for the Fabric Database Hub hybrid SQL demo.</Description>
+    <!-- Framework-dependent and small (ADR 0010, Phase 11): English resources only; publish with -r win-x64 for one native SNI. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Restore win-x64 as well, so the lock file covers 'dotnet publish -r win-x64' and locked-mode restores pass. -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Azure.Identity" />
+    <PackageReference Include="Microsoft.Data.SqlClient" />
+    <PackageReference Include="Microsoft.Data.SqlClient.Extensions.Azure" />
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="System.CommandLine" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ContosoCare.Workload.Tests" />
+  </ItemGroup>
+
+  <!-- The scenario catalog, activity profiles, and demo T-SQL are embedded from the repository at build time, so the
+       runner ships as one artifact and can't drift from the files the tests validate. The missing-index remediation
+       script is deliberately not embedded: the runner can't apply it. -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\..\scenarios\**\scenario.json" LogicalName="scenarios/%(RecursiveDir)%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\..\scenarios\activity-profiles.json" LogicalName="scenarios/activity-profiles.json" />
+    <EmbeddedResource Include="..\..\..\database\common\0*.sql;..\..\..\database\common\1*.sql" LogicalName="sql/%(Filename)%(Extension)" />
+    <!-- T4 (Phase 24): the PostgreSQL schema, seed, control objects, and scenario steps. -->
+    <EmbeddedResource Include="..\..\..\database\postgresql\0*.sql;..\..\..\database\postgresql\1*.sql" LogicalName="pgsql/%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- The Azure extension brings the Windows broker's native runtime (about 3 MB) for interactive sign-in. The runner
+       only uses managed identity, so publish leaves it out; -p:KeepBrokerRuntime=true keeps it. -->
+  <Target Name="RemoveBrokerNativeRuntime" AfterTargets="ComputeResolvedFilesToPublishList" Condition="'$(KeepBrokerRuntime)' != 'true'">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="$([System.String]::Copy('%(Filename)').StartsWith('msalruntime'))" />
+    </ItemGroup>
+  </Target>
+</Project>

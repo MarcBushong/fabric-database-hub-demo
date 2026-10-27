@@ -1,0 +1,28 @@
+# Local configuration holds subscription and tenant IDs; never commit it.
+config/demo.config.json
+config/*.local.json
+
+# Script and validation output
+out/
+
+# Bicep build output (azuredeploy.json at the repo root is the only committed template)
+infra/**/*.json
+
+# .NET
+bin/
+obj/
+TestResults/
+*.user
+.vs/
+
+# Node and Python tooling
+node_modules/
+__pycache__/
+.venv/
+
+# Editors and OS files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db

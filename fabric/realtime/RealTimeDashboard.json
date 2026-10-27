@@ -1,0 +1,1130 @@
+{
+  "$schema": "https://dataexplorer.azure.com/static/d/schema/52/dashboard.json",
+  "schema_version": "52",
+  "title": "Database Hub demo - live view",
+  "autoRefresh": {
+    "enabled": true,
+    "defaultInterval": "1m",
+    "minInterval": "1m"
+  },
+  "baseQueries": [],
+  "dataSources": [
+    {
+      "id": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1",
+      "name": "SQL telemetry (Database Hub, preview)",
+      "scopeId": "kusto",
+      "kind": "manual-kusto",
+      "clusterUri": "https://adx.centralus.arcdataservices.com/kusto/",
+      "database": "ArcSqlTelemetry"
+    }
+  ],
+  "pages": [
+    {
+      "name": "Estate pulse",
+      "id": "7f1e76e8-8e22-594f-a60f-c51d2bec421c"
+    },
+    {
+      "name": "Incident",
+      "id": "ab7fd829-77a8-56a7-ae68-8649f2587158"
+    },
+    {
+      "name": "Resources",
+      "id": "8189ea3d-9185-54bf-9f3a-97cf6f08d468"
+    }
+  ],
+  "parameters": [
+    {
+      "kind": "duration",
+      "id": "0aadbe1f-0879-589e-bcdb-6cc3873fee45",
+      "displayName": "Time range",
+      "description": "",
+      "beginVariableName": "_startTime",
+      "endVariableName": "_endTime",
+      "defaultValue": {
+        "kind": "dynamic",
+        "count": 1,
+        "unit": "hours"
+      },
+      "showOnPages": {
+        "kind": "all"
+      }
+    },
+    {
+      "kind": "string",
+      "id": "f1ac8418-71dc-5814-ae00-92ff44550834",
+      "displayName": "Target",
+      "description": "T1, T2, T3, or all of them.",
+      "variableName": "_selectedTargets",
+      "selectionType": "array",
+      "includeAllOption": true,
+      "allIsNull": true,
+      "defaultValue": {
+        "kind": "all"
+      },
+      "dataSource": {
+        "kind": "static",
+        "values": [
+          {
+            "displayText": "T1 sqlvm01 (SQL Server on Azure VM)",
+            "value": "T1"
+          },
+          {
+            "displayText": "T2 arcsql01 (SQL Server enabled by Azure Arc)",
+            "value": "T2"
+          },
+          {
+            "displayText": "T3 ContosoCare (Azure SQL Database)",
+            "value": "T3"
+          }
+        ]
+      },
+      "showOnPages": {
+        "kind": "all"
+      }
+    }
+  ],
+  "queries": [
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nunion withsource=TableName SqlServer*\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize Rows = count(), Tables = dcount(TableName), LastSampleUTC = max(SampleTimeUTC), Instances = dcount(SqlServerInstanceName)\n        by Target, ResourceType, ResourceName\n| order by Target asc\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| extend MinutesSinceLastSample = round((now() - LastSampleUTC) / 1m, 1)\n| join kind=rightouter (datatable(Target: string) ['T1', 'T2', 'T3'] | where isempty(_selectedTargets) or Target in (_selectedTargets)) on Target\n| extend Target = iff(isempty(Target), Target1, Target)\n| extend State = case(isnull(LastSampleUTC), 'No data', MinutesSinceLastSample <= 15, 'Fresh', 'Stale'),\n         Freshness = iff(isnull(LastSampleUTC), 'no data in range', strcat(tostring(MinutesSinceLastSample), ' min ago'))\n| project Target, State, Freshness, Resource = ResourceName, ResourceType, Tables, Rows, Instances, LastSampleUTC, MinutesSinceLastSample\n| order by Target asc",
+      "id": "6ec155e7-842d-5b52-98f5-970ba3dac474",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerCPUUtilization\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize Samples = count() by Target, Bucket = bin(SampleTimeUTC, _bin)\n| order by Bucket asc\n| where isempty(_selectedTargets) or Target in (_selectedTargets)",
+      "id": "cd3ac4e6-69f6-515d-a6fa-1a6ddfa39448",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerPerformanceCountersCommon\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| where CounterType == 65792\n| where CounterName in ('Processes blocked', 'Active Transactions', 'User Connections')\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize MaxValue = max(CounterValue), AvgValue = avg(CounterValue)\n        by Target, ResourceName, SqlServerInstanceName, CounterName, Bucket = bin(SampleTimeUTC, _bin)\n| order by Bucket asc\n| take 50000\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| where CounterName == 'Processes blocked'\n| summarize arg_max(Bucket, MaxValue) by Target, SqlServerInstanceName\n| summarize BlockedProcesses = toint(max(MaxValue)), AsOfUTC = max(Bucket) by Target\n| order by Target asc",
+      "id": "bb69ab83-7dc9-5f11-b822-e0404f96f349",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerPerformanceCountersCommon\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| where CounterType == 65792\n| where CounterName in ('Processes blocked', 'Active Transactions', 'User Connections')\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize MaxValue = max(CounterValue), AvgValue = avg(CounterValue)\n        by Target, ResourceName, SqlServerInstanceName, CounterName, Bucket = bin(SampleTimeUTC, _bin)\n| order by Bucket asc\n| take 50000\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| where CounterName == 'Processes blocked'\n| summarize BlockedProcesses = max(MaxValue) by Target, Bucket\n| order by Bucket asc",
+      "id": "256b9631-3cbc-5735-b00e-378b326da5f0",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerWaitStats\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| where WaitCategory !in ('Idle', 'Unknown')\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize (FirstT, FirstW, FirstC) = arg_min(SampleTimeUTC, WaitTimeMs, WaitingTasksCount),\n            (LastT, LastW, LastC) = arg_max(SampleTimeUTC, WaitTimeMs, WaitingTasksCount)\n        by Target, ResourceID, SqlServerInstanceName, WaitCategory, WaitType, Bucket = bin(SampleTimeUTC, _bin)\n| extend T = pack_array(FirstT, LastT), W = pack_array(FirstW, LastW), C = pack_array(FirstC, LastC)\n| mv-expand T to typeof(datetime), W to typeof(long), C to typeof(long)\n| distinct Target, ResourceID, SqlServerInstanceName, WaitCategory, WaitType, Bucket, T, W, C\n| sort by ResourceID asc, SqlServerInstanceName asc, WaitType asc, T asc\n| extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)\n                and WaitType == prev(WaitType) and W >= prev(W) and C >= prev(C)\n| extend WaitMs = iff(Keep, W - prev(W), long(0)), Tasks = iff(Keep, C - prev(C), long(0))\n| summarize WaitMs = sum(WaitMs), Tasks = sum(Tasks) by Target, WaitCategory, PageIoLatch = WaitType startswith 'PAGEIOLATCH', Bucket\n| where WaitMs > 0\n| order by Bucket asc\n| take 50000\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| summarize WaitSeconds = round(sum(WaitMs) / 1000.0, 1) by WaitCategory, Bucket\n| order by Bucket asc",
+      "id": "77b5c872-b0eb-552c-baf4-c8fc7ede49fd",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerActiveSessions\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| where DatabaseName =~ _db\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize Sessions = dcount(SessionID), Running = dcountif(SessionID, SessionStatus == 'running')\n        by Target, SqlServerInstanceName, SampleTimeUTC\n| summarize MaxSessions = max(Sessions), AvgSessions = avg(Sessions), MaxRunning = max(Running)\n        by Target, SqlServerInstanceName, Bucket = bin(SampleTimeUTC, _bin)\n| order by Bucket asc\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| summarize ActiveSessions = sum(MaxSessions) by Target, Bucket\n| order by Bucket asc",
+      "id": "03cc343c-6613-53c2-82f9-f71a374d618a",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerPerformanceCountersCommon\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| where CounterType == 272696576\n| where CounterName in ('Number of Deadlocks/sec', 'Batch Requests/sec', 'Transactions/sec', 'Log Bytes Flushed/sec')\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize (FirstT, FirstV) = arg_min(SampleTimeUTC, CounterValue), (LastT, LastV) = arg_max(SampleTimeUTC, CounterValue)\n        by Target, ResourceID, SqlServerInstanceName, CounterName, InstanceName, Bucket = bin(SampleTimeUTC, _bin)\n| extend T = pack_array(FirstT, LastT), V = pack_array(FirstV, LastV)\n| mv-expand T to typeof(datetime), V to typeof(real)\n| distinct Target, ResourceID, SqlServerInstanceName, CounterName, InstanceName, Bucket, T, V\n| sort by ResourceID asc, SqlServerInstanceName asc, CounterName asc, InstanceName asc, T asc\n| extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)\n                and CounterName == prev(CounterName) and InstanceName == prev(InstanceName) and V >= prev(V)\n| extend Delta = iff(Keep, V - prev(V), real(0)), Seconds = iff(Keep, datetime_diff('second', T, prev(T)), long(0))\n| summarize Delta = sum(Delta), Seconds = sum(Seconds) by Target, CounterName, InstanceName, Bucket\n| order by Bucket asc\n| take 50000\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| where CounterName == 'Batch Requests/sec' and Seconds > 0\n| extend Rate = Delta / Seconds, IsTotal = InstanceName =~ '_Total'\n| summarize TotalRate = sumif(Rate, IsTotal), TotalRows = countif(IsTotal), AllRate = sum(Rate) by Target, Bucket\n| extend BatchRequestsPerSec = round(iff(TotalRows > 0, TotalRate, AllRate), 2)\n| project Target, Bucket, BatchRequestsPerSec\n| order by Bucket asc",
+      "id": "ea5b9ab3-84ff-5e12-bb37-2ef840223f2c",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerCPUUtilization\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| extend CpuPercent = iff(ResourceType =~ 'servers/databases', AvgCPUPercent, coalesce(todouble(SQLProcessCPUPercent), AvgCPUPercent))\n| summarize AvgCPU = avg(CpuPercent), MaxCPU = max(CpuPercent) by Target, ResourceName, SqlServerInstanceName, Bucket = bin(SampleTimeUTC, _bin)\n| order by Bucket asc\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| summarize CpuPercent = round(max(AvgCPU), 1) by Target, Bucket\n| order by Bucket asc",
+      "id": "20aa1c79-0ad2-55c5-8bf0-3dab803eec36",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerCPUUtilization\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| extend CpuPercent = iff(ResourceType =~ 'servers/databases', AvgCPUPercent, coalesce(todouble(SQLProcessCPUPercent), AvgCPUPercent))\n| summarize AvgCPU = round(avg(CpuPercent), 1), P95CPU = round(percentile(CpuPercent, 95), 1),\n            MaxCPU = round(max(CpuPercent), 1), PctTimeAbove80 = round(100.0 * countif(CpuPercent > 80.0) / count(), 1)\n        by Target, ResourceType, ResourceName, SqlServerInstanceName\n| order by Target asc\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| summarize P95CpuPercent = max(P95CPU), MaxCpuPercent = max(MaxCPU), PctTimeAbove80 = max(PctTimeAbove80) by Target\n| order by Target asc",
+      "id": "46d7a629-e235-5d80-9c6a-1794b8d85eea",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerMemoryUtilization\n| where SampleTimeUTC between ((_end - 1h) .. _end)\n| where ResourceGroup =~ _rg\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize arg_max(SampleTimeUTC, MemorySizeMB) by Target, SqlServerInstanceName, MemoryClerkType, MemoryClerkName\n| summarize MemoryMB = round(sum(MemorySizeMB), 1), LastSampleUTC = max(SampleTimeUTC) by Target, SqlServerInstanceName, MemoryClerkType\n| where MemoryMB >= 1\n| order by Target asc, MemoryMB desc\n| take 1000\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| summarize MemoryMB = round(sum(MemoryMB), 1) by Target, MemoryClerkType\n| order by Target asc, MemoryMB desc\n| extend Rank = row_number(1, prev(Target) != Target)\n| where Rank <= 6\n| project Target, MemoryClerkType, MemoryMB",
+      "id": "61a9275d-9108-5ff5-aa9c-f2d540e050ed",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerStorageIO\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| where FileType in ('Data', 'Log')\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize (FirstT, R1, W1, RS1, WS1, NR1, NW1) = arg_min(SampleTimeUTC, NumOfBytesRead, NumOfBytesWritten, IOStallReadMs, IOStallWriteMs, NumOfReads, NumOfWrites),\n            (LastT, R2, W2, RS2, WS2, NR2, NW2) = arg_max(SampleTimeUTC, NumOfBytesRead, NumOfBytesWritten, IOStallReadMs, IOStallWriteMs, NumOfReads, NumOfWrites)\n        by Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, Bucket = bin(SampleTimeUTC, _bin)\n| extend T = pack_array(FirstT, LastT), R = pack_array(R1, R2), W = pack_array(W1, W2), RS = pack_array(RS1, RS2),\n         WS = pack_array(WS1, WS2), NR = pack_array(NR1, NR2), NW = pack_array(NW1, NW2)\n| mv-expand T to typeof(datetime), R to typeof(long), W to typeof(long), RS to typeof(long), WS to typeof(long), NR to typeof(long), NW to typeof(long)\n| distinct Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, Bucket, T, R, W, RS, WS, NR, NW\n| sort by ResourceID asc, SqlServerInstanceName asc, DatabaseID asc, FileID asc, T asc\n| extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)\n                and DatabaseID == prev(DatabaseID) and FileID == prev(FileID)\n                and R >= prev(R) and W >= prev(W) and RS >= prev(RS) and WS >= prev(WS) and NR >= prev(NR) and NW >= prev(NW)\n| extend dR = iff(Keep, R - prev(R), long(0)), dW = iff(Keep, W - prev(W), long(0)), dRS = iff(Keep, RS - prev(RS), long(0)),\n         dWS = iff(Keep, WS - prev(WS), long(0)), dNR = iff(Keep, NR - prev(NR), long(0)), dNW = iff(Keep, NW - prev(NW), long(0))\n| summarize ReadMB = round(sum(dR) / 1048576.0, 2), WriteMB = round(sum(dW) / 1048576.0, 2), ReadStallMs = sum(dRS),\n            WriteStallMs = sum(dWS), Reads = sum(dNR), Writes = sum(dNW) by Target, FileType, Bucket\n| order by Bucket asc\n| take 50000\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| summarize IoMB = round(sum(ReadMB) + sum(WriteMB), 2) by Target, Bucket\n| order by Bucket asc",
+      "id": "2c884d12-a5fe-547d-9ba0-208821b5e570",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    },
+    {
+      "dataSource": {
+        "kind": "inline",
+        "dataSourceId": "5f307cfc-9520-57a9-89a5-9b6efa88d9e1"
+      },
+      "text": "let _start = _startTime;\nlet _end = _endTime;\nlet _bin = case(_endTime - _startTime <= 2h, 1m, _endTime - _startTime <= 12h, 5m, 15m);\nlet _rg = {{ResourceGroup}};\nlet _db = 'ContosoCare';\nlet _t1 = 'sqlvm01';\nlet _t2 = 'arcsql01';\nlet _t3prefix = 'azuresql01-';\nlet _t3suffix = '/ContosoCare';\nlet _target = (resourceType: string, resourceName: string) {\n    case(resourceType == 'virtualMachines' and resourceName =~ _t1, 'T1',\n         resourceType == 'machines' and resourceName =~ _t2, 'T2',\n         resourceType == 'servers/databases' and resourceName startswith _t3prefix and resourceName endswith _t3suffix, 'T3',\n         '')\n};\nSqlServerStorageIO\n| where SampleTimeUTC between (_start .. _end)\n| where ResourceGroup =~ _rg\n| where FileType in ('Data', 'Log')\n| extend Target = _target(ResourceType, ResourceName)\n| where isnotempty(Target)\n| summarize (FirstT, R1, W1, RS1, WS1, NR1, NW1) = arg_min(SampleTimeUTC, NumOfBytesRead, NumOfBytesWritten, IOStallReadMs, IOStallWriteMs, NumOfReads, NumOfWrites),\n            (LastT, R2, W2, RS2, WS2, NR2, NW2) = arg_max(SampleTimeUTC, NumOfBytesRead, NumOfBytesWritten, IOStallReadMs, IOStallWriteMs, NumOfReads, NumOfWrites)\n        by Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, Bucket = bin(SampleTimeUTC, _bin)\n| extend T = pack_array(FirstT, LastT), R = pack_array(R1, R2), W = pack_array(W1, W2), RS = pack_array(RS1, RS2),\n         WS = pack_array(WS1, WS2), NR = pack_array(NR1, NR2), NW = pack_array(NW1, NW2)\n| mv-expand T to typeof(datetime), R to typeof(long), W to typeof(long), RS to typeof(long), WS to typeof(long), NR to typeof(long), NW to typeof(long)\n| distinct Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, Bucket, T, R, W, RS, WS, NR, NW\n| sort by ResourceID asc, SqlServerInstanceName asc, DatabaseID asc, FileID asc, T asc\n| extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)\n                and DatabaseID == prev(DatabaseID) and FileID == prev(FileID)\n                and R >= prev(R) and W >= prev(W) and RS >= prev(RS) and WS >= prev(WS) and NR >= prev(NR) and NW >= prev(NW)\n| extend dR = iff(Keep, R - prev(R), long(0)), dW = iff(Keep, W - prev(W), long(0)), dRS = iff(Keep, RS - prev(RS), long(0)),\n         dWS = iff(Keep, WS - prev(WS), long(0)), dNR = iff(Keep, NR - prev(NR), long(0)), dNW = iff(Keep, NW - prev(NW), long(0))\n| summarize ReadMB = round(sum(dR) / 1048576.0, 2), WriteMB = round(sum(dW) / 1048576.0, 2), ReadStallMs = sum(dRS),\n            WriteStallMs = sum(dWS), Reads = sum(dNR), Writes = sum(dNW) by Target, FileType, Bucket\n| order by Bucket asc\n| take 50000\n| where isempty(_selectedTargets) or Target in (_selectedTargets)\n| summarize ReadMB = round(sum(ReadMB), 1), WriteMB = round(sum(WriteMB), 1), Reads = sum(Reads), Writes = sum(Writes),\n            ReadStallMs = sum(ReadStallMs), WriteStallMs = sum(WriteStallMs) by Target\n| extend ReadLatencyMs = iff(Target == 'T3' or Reads == 0, real(null), round(1.0 * ReadStallMs / Reads, 2)),\n         WriteLatencyMs = iff(Target == 'T3' or Writes == 0, real(null), round(1.0 * WriteStallMs / Writes, 2))\n| project Target, ReadMB, WriteMB, Reads, Writes, ReadLatencyMs, WriteLatencyMs\n| order by Target asc",
+      "id": "6ae74d4e-318d-5404-b5be-ed79b0b50365",
+      "usedVariables": [
+        "_startTime",
+        "_endTime",
+        "_selectedTargets"
+      ]
+    }
+  ],
+  "tiles": [
+    {
+      "id": "0cae3852-5757-5efe-8431-bd9a6b17c376",
+      "title": "About this view",
+      "visualType": "markdownCard",
+      "pageId": "7f1e76e8-8e22-594f-a60f-c51d2bec421c",
+      "layout": {
+        "x": 0,
+        "y": 0,
+        "width": 24,
+        "height": 2
+      },
+      "markdownText": "**Live view of the Database Hub telemetry endpoint (preview).** Samples arrive a few minutes after the activity, and each viewer sees only the resources their own Azure access allows. No data is not zero.",
+      "visualOptions": {}
+    },
+    {
+      "id": "eb52ae9f-d5c4-5924-b907-552766553600",
+      "title": "Freshness per target",
+      "visualType": "multistat",
+      "pageId": "7f1e76e8-8e22-594f-a60f-c51d2bec421c",
+      "layout": {
+        "x": 0,
+        "y": 2,
+        "width": 10,
+        "height": 5
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "6ec155e7-842d-5b52-98f5-970ba3dac474"
+      },
+      "visualOptions": {
+        "multiStat__textSize": "large",
+        "multiStat__labelColumn": "Target",
+        "multiStat__valueColumn": "Freshness",
+        "multiStat__displayOrientation": "horizontal",
+        "multiStat__slot": {
+          "width": 3,
+          "height": 1
+        },
+        "colorRulesDisabled": false,
+        "colorRules": [
+          {
+            "id": "bf0e1745-b596-5608-82c1-4eda46a14f12",
+            "ruleName": "Fresh",
+            "applyTo": "cells",
+            "visualType": "multistat",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": null,
+            "conditions": [
+              {
+                "column": "State",
+                "operator": "==",
+                "values": [
+                  "Fresh"
+                ]
+              }
+            ],
+            "color": "green",
+            "tag": "",
+            "icon": "completed",
+            "hideText": false
+          },
+          {
+            "id": "85c9f00e-782a-5336-82b7-844a362de879",
+            "ruleName": "Stale",
+            "applyTo": "cells",
+            "visualType": "multistat",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": null,
+            "conditions": [
+              {
+                "column": "State",
+                "operator": "==",
+                "values": [
+                  "Stale"
+                ]
+              }
+            ],
+            "color": "yellow",
+            "tag": "",
+            "icon": "warning",
+            "hideText": false
+          },
+          {
+            "id": "9770b463-a2b6-5c0e-86d2-4d5d4aee9661",
+            "ruleName": "No data",
+            "applyTo": "cells",
+            "visualType": "multistat",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": null,
+            "conditions": [
+              {
+                "column": "State",
+                "operator": "==",
+                "values": [
+                  "No data"
+                ]
+              }
+            ],
+            "color": "red",
+            "tag": "",
+            "icon": "critical",
+            "hideText": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "cf65d4fc-2d8d-593d-911d-6bc9d62f2e6f",
+      "title": "Reporting per target: tables, rows, and the newest sample",
+      "visualType": "table",
+      "pageId": "7f1e76e8-8e22-594f-a60f-c51d2bec421c",
+      "layout": {
+        "x": 10,
+        "y": 2,
+        "width": 14,
+        "height": 5
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "6ec155e7-842d-5b52-98f5-970ba3dac474"
+      },
+      "visualOptions": {
+        "table__enableRenderLinks": false,
+        "table__renderLinks": [],
+        "colorRulesDisabled": false,
+        "colorRules": [
+          {
+            "id": "539cfff4-9087-5d6e-bac5-e28d6d409285",
+            "ruleName": "Fresh",
+            "applyTo": "cells",
+            "visualType": "table",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": "State",
+            "conditions": [
+              {
+                "column": "State",
+                "operator": "==",
+                "values": [
+                  "Fresh"
+                ]
+              }
+            ],
+            "color": "green",
+            "tag": "",
+            "icon": "completed",
+            "hideText": false
+          },
+          {
+            "id": "abb3592a-d7ad-5e90-a33b-76613d5bc55b",
+            "ruleName": "Stale",
+            "applyTo": "cells",
+            "visualType": "table",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": "State",
+            "conditions": [
+              {
+                "column": "State",
+                "operator": "==",
+                "values": [
+                  "Stale"
+                ]
+              }
+            ],
+            "color": "yellow",
+            "tag": "",
+            "icon": "warning",
+            "hideText": false
+          },
+          {
+            "id": "f9421a3f-6984-5582-a11a-16e5b08264fa",
+            "ruleName": "No data",
+            "applyTo": "cells",
+            "visualType": "table",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": "State",
+            "conditions": [
+              {
+                "column": "State",
+                "operator": "==",
+                "values": [
+                  "No data"
+                ]
+              }
+            ],
+            "color": "red",
+            "tag": "",
+            "icon": "critical",
+            "hideText": false
+          }
+        ],
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": []
+      }
+    },
+    {
+      "id": "58773133-6bca-5be0-9f3e-e6bda77db7ab",
+      "title": "Telemetry heartbeat: CPU samples per bin",
+      "visualType": "timechart",
+      "pageId": "7f1e76e8-8e22-594f-a60f-c51d2bec421c",
+      "layout": {
+        "x": 0,
+        "y": 7,
+        "width": 24,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "cd3ac4e6-69f6-515d-a6fa-1a6ddfa39448"
+      },
+      "visualOptions": {
+        "xColumn": "Bucket",
+        "yColumns": [
+          "Samples"
+        ],
+        "seriesColumns": [
+          "Target"
+        ],
+        "hideLegend": false,
+        "legendLocation": "bottom",
+        "xColumnTitle": "",
+        "yColumnTitle": "samples",
+        "xAxisScale": "linear",
+        "yAxisScale": "linear",
+        "yAxisMinimumValue": null,
+        "yAxisMaximumValue": null,
+        "yAxisRight": false,
+        "horizontalLine": "",
+        "verticalLine": "",
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": [],
+        "multipleYAxes": {
+          "base": {
+            "id": "-1",
+            "columns": [],
+            "label": "",
+            "yAxisMinimumValue": null,
+            "yAxisMaximumValue": null,
+            "yAxisScale": "linear",
+            "horizontalLines": []
+          },
+          "additional": [],
+          "showMultiplePanels": false
+        }
+      }
+    },
+    {
+      "id": "e8c77038-fc40-5b54-b84c-f3c0dc89f732",
+      "title": "Processes blocked, latest sample",
+      "visualType": "multistat",
+      "pageId": "ab7fd829-77a8-56a7-ae68-8649f2587158",
+      "layout": {
+        "x": 0,
+        "y": 0,
+        "width": 24,
+        "height": 3
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "bb69ab83-7dc9-5f11-b822-e0404f96f349"
+      },
+      "visualOptions": {
+        "multiStat__textSize": "large",
+        "multiStat__labelColumn": "Target",
+        "multiStat__valueColumn": "BlockedProcesses",
+        "multiStat__displayOrientation": "horizontal",
+        "multiStat__slot": {
+          "width": 3,
+          "height": 1
+        },
+        "colorRulesDisabled": false,
+        "colorRules": [
+          {
+            "id": "7ef5e6d5-3bb7-5dc6-96c0-ef9179cb4a0f",
+            "ruleName": "No blocking",
+            "applyTo": "cells",
+            "visualType": "multistat",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": null,
+            "conditions": [
+              {
+                "column": "BlockedProcesses",
+                "operator": "==",
+                "values": [
+                  "0"
+                ]
+              }
+            ],
+            "color": "green",
+            "tag": "",
+            "icon": "completed",
+            "hideText": false
+          },
+          {
+            "id": "ad57f4fc-faf9-5827-a19e-aa66e9df01da",
+            "ruleName": "Blocking",
+            "applyTo": "cells",
+            "visualType": "multistat",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": null,
+            "conditions": [
+              {
+                "column": "BlockedProcesses",
+                "operator": ">",
+                "values": [
+                  "0"
+                ]
+              }
+            ],
+            "color": "red",
+            "tag": "",
+            "icon": "critical",
+            "hideText": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "21a8d9e1-90f9-5198-a316-27c07ffebe21",
+      "title": "Processes blocked",
+      "visualType": "timechart",
+      "pageId": "ab7fd829-77a8-56a7-ae68-8649f2587158",
+      "layout": {
+        "x": 0,
+        "y": 3,
+        "width": 12,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "256b9631-3cbc-5735-b00e-378b326da5f0"
+      },
+      "visualOptions": {
+        "xColumn": "Bucket",
+        "yColumns": [
+          "BlockedProcesses"
+        ],
+        "seriesColumns": [
+          "Target"
+        ],
+        "hideLegend": false,
+        "legendLocation": "bottom",
+        "xColumnTitle": "",
+        "yColumnTitle": "processes",
+        "xAxisScale": "linear",
+        "yAxisScale": "linear",
+        "yAxisMinimumValue": null,
+        "yAxisMaximumValue": null,
+        "yAxisRight": false,
+        "horizontalLine": "",
+        "verticalLine": "",
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": [],
+        "multipleYAxes": {
+          "base": {
+            "id": "-1",
+            "columns": [],
+            "label": "",
+            "yAxisMinimumValue": null,
+            "yAxisMaximumValue": null,
+            "yAxisScale": "linear",
+            "horizontalLines": []
+          },
+          "additional": [],
+          "showMultiplePanels": false
+        }
+      }
+    },
+    {
+      "id": "4a2e5ca9-eb1a-5a63-98cc-6f5f79fc7570",
+      "title": "Waits by category, seconds per bin (Lock means blocking)",
+      "visualType": "timechart",
+      "pageId": "ab7fd829-77a8-56a7-ae68-8649f2587158",
+      "layout": {
+        "x": 12,
+        "y": 3,
+        "width": 12,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "77b5c872-b0eb-552c-baf4-c8fc7ede49fd"
+      },
+      "visualOptions": {
+        "xColumn": "Bucket",
+        "yColumns": [
+          "WaitSeconds"
+        ],
+        "seriesColumns": [
+          "WaitCategory"
+        ],
+        "hideLegend": false,
+        "legendLocation": "bottom",
+        "xColumnTitle": "",
+        "yColumnTitle": "seconds",
+        "xAxisScale": "linear",
+        "yAxisScale": "linear",
+        "yAxisMinimumValue": null,
+        "yAxisMaximumValue": null,
+        "yAxisRight": false,
+        "horizontalLine": "",
+        "verticalLine": "",
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": [],
+        "multipleYAxes": {
+          "base": {
+            "id": "-1",
+            "columns": [],
+            "label": "",
+            "yAxisMinimumValue": null,
+            "yAxisMaximumValue": null,
+            "yAxisScale": "linear",
+            "horizontalLines": []
+          },
+          "additional": [],
+          "showMultiplePanels": false
+        }
+      }
+    },
+    {
+      "id": "2404a4ee-9043-5dd5-af5f-ca5ed2ff289f",
+      "title": "Active sessions in ContosoCare",
+      "visualType": "timechart",
+      "pageId": "ab7fd829-77a8-56a7-ae68-8649f2587158",
+      "layout": {
+        "x": 0,
+        "y": 9,
+        "width": 8,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "03cc343c-6613-53c2-82f9-f71a374d618a"
+      },
+      "visualOptions": {
+        "xColumn": "Bucket",
+        "yColumns": [
+          "ActiveSessions"
+        ],
+        "seriesColumns": [
+          "Target"
+        ],
+        "hideLegend": false,
+        "legendLocation": "bottom",
+        "xColumnTitle": "",
+        "yColumnTitle": "sessions",
+        "xAxisScale": "linear",
+        "yAxisScale": "linear",
+        "yAxisMinimumValue": null,
+        "yAxisMaximumValue": null,
+        "yAxisRight": false,
+        "horizontalLine": "",
+        "verticalLine": "",
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": [],
+        "multipleYAxes": {
+          "base": {
+            "id": "-1",
+            "columns": [],
+            "label": "",
+            "yAxisMinimumValue": null,
+            "yAxisMaximumValue": null,
+            "yAxisScale": "linear",
+            "horizontalLines": []
+          },
+          "additional": [],
+          "showMultiplePanels": false
+        }
+      }
+    },
+    {
+      "id": "72cce709-d309-501c-8a6c-ee1d12cfce08",
+      "title": "Batch requests per second",
+      "visualType": "timechart",
+      "pageId": "ab7fd829-77a8-56a7-ae68-8649f2587158",
+      "layout": {
+        "x": 8,
+        "y": 9,
+        "width": 8,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "ea5b9ab3-84ff-5e12-bb37-2ef840223f2c"
+      },
+      "visualOptions": {
+        "xColumn": "Bucket",
+        "yColumns": [
+          "BatchRequestsPerSec"
+        ],
+        "seriesColumns": [
+          "Target"
+        ],
+        "hideLegend": false,
+        "legendLocation": "bottom",
+        "xColumnTitle": "",
+        "yColumnTitle": "requests/s",
+        "xAxisScale": "linear",
+        "yAxisScale": "linear",
+        "yAxisMinimumValue": null,
+        "yAxisMaximumValue": null,
+        "yAxisRight": false,
+        "horizontalLine": "",
+        "verticalLine": "",
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": [],
+        "multipleYAxes": {
+          "base": {
+            "id": "-1",
+            "columns": [],
+            "label": "",
+            "yAxisMinimumValue": null,
+            "yAxisMaximumValue": null,
+            "yAxisScale": "linear",
+            "horizontalLines": []
+          },
+          "additional": [],
+          "showMultiplePanels": false
+        }
+      }
+    },
+    {
+      "id": "07a296a5-fc0a-5e6b-a900-5c287d702a4f",
+      "title": "CPU % (T3: % of the service tier limit)",
+      "visualType": "timechart",
+      "pageId": "ab7fd829-77a8-56a7-ae68-8649f2587158",
+      "layout": {
+        "x": 16,
+        "y": 9,
+        "width": 8,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "20aa1c79-0ad2-55c5-8bf0-3dab803eec36"
+      },
+      "visualOptions": {
+        "xColumn": "Bucket",
+        "yColumns": [
+          "CpuPercent"
+        ],
+        "seriesColumns": [
+          "Target"
+        ],
+        "hideLegend": false,
+        "legendLocation": "bottom",
+        "xColumnTitle": "",
+        "yColumnTitle": "% CPU",
+        "xAxisScale": "linear",
+        "yAxisScale": "linear",
+        "yAxisMinimumValue": null,
+        "yAxisMaximumValue": null,
+        "yAxisRight": false,
+        "horizontalLine": "",
+        "verticalLine": "",
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": [],
+        "multipleYAxes": {
+          "base": {
+            "id": "-1",
+            "columns": [],
+            "label": "",
+            "yAxisMinimumValue": null,
+            "yAxisMaximumValue": null,
+            "yAxisScale": "linear",
+            "horizontalLines": []
+          },
+          "additional": [],
+          "showMultiplePanels": false
+        }
+      }
+    },
+    {
+      "id": "10c559ce-98ad-5c5a-ac32-0cd65d5d460c",
+      "title": "CPU, 95th percentile over the time range (%)",
+      "visualType": "multistat",
+      "pageId": "8189ea3d-9185-54bf-9f3a-97cf6f08d468",
+      "layout": {
+        "x": 0,
+        "y": 0,
+        "width": 24,
+        "height": 3
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "46d7a629-e235-5d80-9c6a-1794b8d85eea"
+      },
+      "visualOptions": {
+        "multiStat__textSize": "large",
+        "multiStat__labelColumn": "Target",
+        "multiStat__valueColumn": "P95CpuPercent",
+        "multiStat__displayOrientation": "horizontal",
+        "multiStat__slot": {
+          "width": 3,
+          "height": 1
+        },
+        "colorRulesDisabled": false,
+        "colorRules": [
+          {
+            "id": "759be180-04f0-5123-89a1-ea91bd8d7e37",
+            "ruleName": "Under 70",
+            "applyTo": "cells",
+            "visualType": "multistat",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": null,
+            "conditions": [
+              {
+                "column": "P95CpuPercent",
+                "operator": "<",
+                "values": [
+                  "70"
+                ]
+              }
+            ],
+            "color": "green",
+            "tag": "",
+            "icon": "completed",
+            "hideText": false
+          },
+          {
+            "id": "385f76e7-e2d3-5183-b19f-7bc243be2019",
+            "ruleName": "70 or more",
+            "applyTo": "cells",
+            "visualType": "multistat",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": null,
+            "conditions": [
+              {
+                "column": "P95CpuPercent",
+                "operator": ">=",
+                "values": [
+                  "70"
+                ]
+              }
+            ],
+            "color": "yellow",
+            "tag": "",
+            "icon": "warning",
+            "hideText": false
+          },
+          {
+            "id": "8e889e68-051e-54b5-89f4-df4c0a6354da",
+            "ruleName": "80 or more",
+            "applyTo": "cells",
+            "visualType": "multistat",
+            "ruleType": "colorByCondition",
+            "chainingOperator": "and",
+            "colorStyle": "bold",
+            "applyToColumn": null,
+            "conditions": [
+              {
+                "column": "P95CpuPercent",
+                "operator": ">=",
+                "values": [
+                  "80"
+                ]
+              }
+            ],
+            "color": "red",
+            "tag": "",
+            "icon": "critical",
+            "hideText": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "1538af5d-54b9-506a-9c39-049f7e0c20a4",
+      "title": "CPU % (T3: % of the service tier limit)",
+      "visualType": "timechart",
+      "pageId": "8189ea3d-9185-54bf-9f3a-97cf6f08d468",
+      "layout": {
+        "x": 0,
+        "y": 3,
+        "width": 12,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "20aa1c79-0ad2-55c5-8bf0-3dab803eec36"
+      },
+      "visualOptions": {
+        "xColumn": "Bucket",
+        "yColumns": [
+          "CpuPercent"
+        ],
+        "seriesColumns": [
+          "Target"
+        ],
+        "hideLegend": false,
+        "legendLocation": "bottom",
+        "xColumnTitle": "",
+        "yColumnTitle": "% CPU",
+        "xAxisScale": "linear",
+        "yAxisScale": "linear",
+        "yAxisMinimumValue": null,
+        "yAxisMaximumValue": null,
+        "yAxisRight": false,
+        "horizontalLine": "",
+        "verticalLine": "",
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": [],
+        "multipleYAxes": {
+          "base": {
+            "id": "-1",
+            "columns": [],
+            "label": "",
+            "yAxisMinimumValue": null,
+            "yAxisMaximumValue": null,
+            "yAxisScale": "linear",
+            "horizontalLines": []
+          },
+          "additional": [],
+          "showMultiplePanels": false
+        }
+      }
+    },
+    {
+      "id": "f424d5e4-a345-576c-bc50-5f26350de810",
+      "title": "Largest memory clerks, MB at the latest sample",
+      "visualType": "bar",
+      "pageId": "8189ea3d-9185-54bf-9f3a-97cf6f08d468",
+      "layout": {
+        "x": 12,
+        "y": 3,
+        "width": 12,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "61a9275d-9108-5ff5-aa9c-f2d540e050ed"
+      },
+      "visualOptions": {
+        "xColumn": "MemoryClerkType",
+        "yColumns": [
+          "MemoryMB"
+        ],
+        "seriesColumns": [
+          "Target"
+        ],
+        "hideLegend": false,
+        "legendLocation": "bottom",
+        "xColumnTitle": "",
+        "yColumnTitle": "MB",
+        "xAxisScale": "linear",
+        "yAxisScale": "linear",
+        "yAxisMinimumValue": null,
+        "yAxisMaximumValue": null,
+        "yAxisRight": false,
+        "horizontalLine": "",
+        "verticalLine": "",
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": [],
+        "multipleYAxes": {
+          "base": {
+            "id": "-1",
+            "columns": [],
+            "label": "",
+            "yAxisMinimumValue": null,
+            "yAxisMaximumValue": null,
+            "yAxisScale": "linear",
+            "horizontalLines": []
+          },
+          "additional": [],
+          "showMultiplePanels": false
+        }
+      }
+    },
+    {
+      "id": "9c49e26e-89be-5bfa-8580-71c49e8ba9b1",
+      "title": "Data and log IO, MB per bin",
+      "visualType": "timechart",
+      "pageId": "8189ea3d-9185-54bf-9f3a-97cf6f08d468",
+      "layout": {
+        "x": 0,
+        "y": 9,
+        "width": 12,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "2c884d12-a5fe-547d-9ba0-208821b5e570"
+      },
+      "visualOptions": {
+        "xColumn": "Bucket",
+        "yColumns": [
+          "IoMB"
+        ],
+        "seriesColumns": [
+          "Target"
+        ],
+        "hideLegend": false,
+        "legendLocation": "bottom",
+        "xColumnTitle": "",
+        "yColumnTitle": "MB",
+        "xAxisScale": "linear",
+        "yAxisScale": "linear",
+        "yAxisMinimumValue": null,
+        "yAxisMaximumValue": null,
+        "yAxisRight": false,
+        "horizontalLine": "",
+        "verticalLine": "",
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": [],
+        "multipleYAxes": {
+          "base": {
+            "id": "-1",
+            "columns": [],
+            "label": "",
+            "yAxisMinimumValue": null,
+            "yAxisMaximumValue": null,
+            "yAxisScale": "linear",
+            "horizontalLines": []
+          },
+          "additional": [],
+          "showMultiplePanels": false
+        }
+      }
+    },
+    {
+      "id": "6276cae5-da9c-58be-a944-187f88fb32e4",
+      "title": "Storage IO over the time range (latency not available for T3)",
+      "visualType": "table",
+      "pageId": "8189ea3d-9185-54bf-9f3a-97cf6f08d468",
+      "layout": {
+        "x": 12,
+        "y": 9,
+        "width": 12,
+        "height": 6
+      },
+      "queryRef": {
+        "kind": "query",
+        "queryId": "6ae74d4e-318d-5404-b5be-ed79b0b50365"
+      },
+      "visualOptions": {
+        "table__enableRenderLinks": false,
+        "table__renderLinks": [],
+        "colorRulesDisabled": true,
+        "colorRules": [],
+        "crossFilterDisabled": false,
+        "crossFilter": [],
+        "drillthroughDisabled": false,
+        "drillthrough": []
+      }
+    }
+  ]
+}

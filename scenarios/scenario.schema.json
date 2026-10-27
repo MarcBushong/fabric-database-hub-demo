@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/scenarios/scenario.schema.json",
+  "title": "Contoso Care demo scenario (ADR 0010)",
+  "description": "One bounded scenario: its limits, parameters, target applicability, and the signals a presenter should expect. The runner embeds these files; demo.fn_scenario_catalog() mirrors the maximum durations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "title", "summary", "orchestration", "procedure", "duration", "concurrency", "intensity", "targets", "expectedHubSignals", "expectedSymptoms", "reset"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$", "maxLength": 32, "description": "Kebab-case ID; also the folder name and part of the application name ContosoCare.Demo/<id>/<runId>." },
+    "title": { "type": "string", "minLength": 3, "maxLength": 60 },
+    "summary": { "type": "string", "minLength": 20, "maxLength": 600 },
+    "orchestration": { "enum": ["workers", "locking", "chain", "pairs", "slow-consumer", "capacity"], "description": "workers: N sessions run the procedure. locking: a holder, contenders, optional normal workers, and an optional deadlock pair. chain: a head blocker, chained links (depth x branches), an optional lock escalator, and optional normal workers. pairs: N pairs of sessions (sides 1 and 2). slow-consumer: N sessions whose client reads the procedure's result set slowly. capacity: N CPU sessions and ioWorkers IO sessions (Phase 25b)." },
+    "procedure": { "type": "string", "pattern": "^demo\\.usp_scenario_[a-z_]+$", "description": "The bounded entry point: the T-SQL procedure in database/common/120-scenario-procedures.sql for T1 to T3, and the PostgreSQL step function of the same name in database/postgresql/120-scenario-functions.sql for T4." },
+    "duration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["defaultSeconds", "maxSeconds"],
+      "properties": {
+        "defaultSeconds": { "type": "integer", "minimum": 30, "maximum": 14400 },
+        "maxSeconds": { "type": "integer", "minimum": 30, "maximum": 14400, "description": "Hard maximum; the runner and demo.usp_run_begin clamp to it." }
+      }
+    },
+    "concurrency": { "$ref": "#/$defs/range" },
+    "intensity": {
+      "allOf": [
+        { "$ref": "#/$defs/range" },
+        { "properties": { "max": { "maximum": 10 } } }
+      ]
+    },
+    "targets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applicable", "default"],
+      "properties": {
+        "applicable": { "$ref": "#/$defs/targetList", "description": "Where the scenario can run. Every SQL Server incident runs on T1, T2, and T3 because the Database Agent's target coverage is undocumented (ADR 0013); T4 (PostgreSQL) runs the scenarios that list it (ADR 0019)." },
+        "default": { "$ref": "#/$defs/targetList", "description": "Where the architecture places it by default." },
+        "notes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "T1": { "type": "string" },
+            "T2": { "type": "string" },
+            "T3": { "type": "string" },
+            "T4": { "type": "string" }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][A-Za-z0-9]*$" },
+      "additionalProperties": { "$ref": "#/$defs/parameter" }
+    },
+    "freeSpace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["marginMb"],
+      "description": "Local free space the runner checks before it starts on T1 or T2 (on T2, the guest's VHDX).",
+      "properties": {
+        "dataMbFromParameter": { "type": "string" },
+        "marginMb": { "type": "integer", "minimum": 0, "maximum": 65536 }
+      }
+    },
+    "expectedHubSignals": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["signal", "surface"],
+        "properties": {
+          "signal": { "type": "string", "minLength": 3 },
+          "surface": { "enum": ["Performance", "Estate", "Database Agent", "Telemetry", "Query Store", "DMVs", "Azure Monitor"] },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "expectedSymptoms": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 10 } },
+    "queryLevelEvidence": { "type": "array", "items": { "type": "string", "minLength": 10 } },
+    "reset": { "type": "string", "minLength": 10, "description": "How the target returns to a known state after the run." }
+  },
+  "$defs": {
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default", "min", "max", "description"],
+      "properties": {
+        "default": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "min": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "max": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "description": { "type": "string", "minLength": 5 }
+      }
+    },
+    "targetList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["T1", "T2", "T3", "T4"] }
+    },
+    "parameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "default", "description"],
+      "properties": {
+        "type": { "enum": ["integer", "boolean", "string"] },
+        "default": { "type": ["integer", "boolean", "string"] },
+        "minimum": { "type": "integer" },
+        "maximum": { "type": "integer" },
+        "enum": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "defaultByTarget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "T1": { "type": ["integer", "boolean", "string"] },
+            "T2": { "type": ["integer", "boolean", "string"] },
+            "T3": { "type": ["integer", "boolean", "string"] },
+            "T4": { "type": ["integer", "boolean", "string"] }
+          }
+        },
+        "sqlParameter": { "type": ["string", "null"], "pattern": "^@[a-z_]+$" },
+        "description": { "type": "string", "minLength": 10 }
+      }
+    }
+  }
+}

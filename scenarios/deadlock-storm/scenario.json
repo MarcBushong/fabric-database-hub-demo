@@ -1,0 +1,39 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "deadlock-storm",
+  "title": "Deadlock storm",
+  "summary": "Pairs of sessions deadlock with each other round after round: in 'order' rounds side 1 locks inventory row A then B while side 2 locks B then A; in 'conversion' rounds both sides read row A with HOLDLOCK and then both update it. Side 2 runs at DEADLOCK_PRIORITY LOW, so it's the victim (error 1205). Every round rolls back, each victim is recorded as a deadlock-victim event, and each session stops after maxRounds rounds.",
+  "orchestration": "pairs",
+  "procedure": "demo.usp_scenario_deadlock_storm",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 2, "min": 1, "max": 8, "description": "Session pairs; each pair deadlocks with itself on its own two inventory rows (101 to 116), apart from locking-blocking's rows 1 and 2." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pause between rounds: about 10 seconds at 1, 1 second at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T1"],
+    "notes": {
+      "T3": "Row versioning doesn't prevent these deadlocks: both shapes take exclusive or HOLDLOCK shared locks. With optimized locking, the deadlock graph shows transaction-ID (xactlock) resources."
+    }
+  },
+  "parameters": {
+    "shape": { "type": "string", "default": "mixed", "enum": ["mixed", "order", "conversion"], "description": "order: two rows locked in opposite order. conversion: a shared lock (HOLDLOCK) that both sides try to convert to an update. mixed: alternate the two each round.", "sqlParameter": "@shape" },
+    "maxRounds": { "type": "integer", "default": 60, "minimum": 1, "maximum": 300, "description": "Rounds per session at most, so a run causes at most concurrency x maxRounds deadlocks.", "sqlParameter": "@max_rounds" }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerPerformanceCountersCommon: Number of Deadlocks/sec above 0 (a cumulative counter: deltas per bin)", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: Lock wait category (LCK_M_X, LCK_M_U) for the second of each pair until the deadlock monitor picks a victim", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: Errors/sec rising with the 1205 errors", "surface": "Performance" },
+    { "signal": "A deadlock finding with the two statements and a recommended access-order change that needs approval", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
+  ],
+  "expectedSymptoms": [
+    "Repeated error 1205: one session of each pair is chosen as the deadlock victim every round",
+    "Short lock waits (up to the deadlock monitor's interval) before each victim is picked",
+    "Alternating deadlock shapes in the deadlock graphs: key locks in opposite order, and a shared-to-exclusive conversion on one key"
+  ],
+  "queryLevelEvidence": [
+    "demo.scenario_run_events: one deadlock-victim event per victim (pair, shape, round, session ID), 500 at most per run",
+    "The system_health session's xml_deadlock_report events on SQL Server (needs VIEW SERVER STATE)",
+    "The microsoft-sql plugin's diagnose-blocking-and-deadlocks skill"
+  ],
+  "reset": "Every round rolls back, so the inventory rows stay as seeded. Reset stops the run and kills leftover ContosoCare.Demo/ sessions in this database only."
+}

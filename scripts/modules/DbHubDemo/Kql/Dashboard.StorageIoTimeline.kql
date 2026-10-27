@@ -1,0 +1,6 @@
+// Data and log IO per target and bin, MB read plus MB written, after Live.StorageIoDeltas.kql and
+// Dashboard.SelectTargets.kql. ReadMB and WriteMB are already per-file deltas (rule 2 in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry, checked
+// 2026-10-21), so summing them is correct.
+| summarize IoMB = round(sum(ReadMB) + sum(WriteMB), 2) by Target, Bucket
+| order by Bucket asc

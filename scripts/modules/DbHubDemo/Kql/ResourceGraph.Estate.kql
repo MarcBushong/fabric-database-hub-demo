@@ -1,0 +1,27 @@
+// The demo's SQL resources as Azure Resource Graph sees them. Resource Graph is the inventory source the
+// Database Hub uses for its Overview and Estate pages
+// (https://learn.microsoft.com/fabric/database/hub/overview, checked 2026-10-20). Sent to the documented
+// Resources API (https://learn.microsoft.com/rest/api/azureresourcegraph/resourcegraph/resources/resources)
+// with the subscription in the request body.
+// T1 appears through its SQL virtual machine resource, T2 through its Arc SQL Server instance, T3 as an
+// Azure SQL database, and T4 as an Azure Database for PostgreSQL flexible server (the Estate lists flexible
+// servers, not their databases: https://learn.microsoft.com/fabric/database/hub/monitor-postgresql, checked
+// 2026-10-23); the VM, the Arc machine, and the logical server are listed too, for diagnosis.
+// Parameters, rendered by Test-DemoHubEstate: SubscriptionId (string), ResourceGroup (string).
+resources
+| where subscriptionId =~ {{SubscriptionId}}
+| where resourceGroup =~ {{ResourceGroup}}
+| where type in~ ('microsoft.compute/virtualmachines', 'microsoft.sqlvirtualmachine/sqlvirtualmachines', 'microsoft.hybridcompute/machines', 'microsoft.azurearcdata/sqlserverinstances', 'microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.dbforpostgresql/flexibleservers')
+| extend status = iff(type =~ 'microsoft.dbforpostgresql/flexibleservers', tostring(properties.state), tostring(properties.status)),
+         createdUtc = tostring(properties.creationDate),
+         edition = tostring(properties.edition),
+         licenseType = tostring(properties.licenseType),
+         version = tostring(properties.version),
+         sqlImageSku = tostring(properties.sqlImageSku),
+         sqlServerLicenseType = tostring(properties.sqlServerLicenseType),
+         monitoringEnabled = tostring(properties.monitoring.enabled),
+         provisioningState = tostring(properties.provisioningState),
+         skuName = tostring(sku.name)
+| project id, name, type, location, resourceGroup, status, createdUtc, edition, licenseType, version, sqlImageSku, sqlServerLicenseType, monitoringEnabled, provisioningState, skuName
+| order by type asc, name asc
+| take 200

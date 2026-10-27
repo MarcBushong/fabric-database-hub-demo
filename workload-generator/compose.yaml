@@ -1,0 +1,33 @@
+# Local test bed for the workload runner (ADR 0010): SQL Server 2022 Developer in a container, plus the runner image.
+# Nothing here reaches Azure. Run from the repository root:
+#
+#   $env:MSSQL_SA_PASSWORD = '<a strong password you choose>'   # never commit it; it lives only in your shell
+#   docker compose --file workload-generator/compose.yaml up --detach sql
+#   docker compose --file workload-generator/compose.yaml exec sql bash -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -P "$MSSQL_SA_PASSWORD" -Q "CREATE DATABASE ContosoCare"'
+#   docker compose --file workload-generator/compose.yaml run --rm runner setup --target T2 --server sql --sql-login-from-environment --include-base-schema --seed-scale 1
+#   docker compose --file workload-generator/compose.yaml run --rm runner run --target T2 --server sql --sql-login-from-environment --scenario locking-blocking --duration 2m
+#   docker compose --file workload-generator/compose.yaml down
+#
+# The container login is SQL authentication, which the demo targets never use (ADR 0009): T1 and T2 use Windows
+# authentication and T3 is Microsoft Entra only. The password reaches the runner only through the environment.
+services:
+  sql:
+    image: mcr.microsoft.com/mssql/server:2022-CU27-ubuntu-22.04
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in your shell first}
+    ports:
+      - "127.0.0.1:14333:1433"
+
+  runner:
+    build:
+      context: ..
+      dockerfile: workload-generator/Dockerfile
+    environment:
+      CONTOSOCARE_SQL_USER: sa
+      CONTOSOCARE_SQL_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in your shell first}
+    depends_on:
+      - sql
+    profiles:
+      - tools

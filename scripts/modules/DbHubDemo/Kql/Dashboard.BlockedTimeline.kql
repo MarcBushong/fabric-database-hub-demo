@@ -1,0 +1,6 @@
+// Processes blocked per target and bin (the highest gauge value in each bin), after Live.CounterGauges.kql and
+// Dashboard.SelectTargets.kql. A gauge (CounterType 65792) is read directly: rule 3 in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry (checked 2026-10-21).
+| where CounterName == 'Processes blocked'
+| summarize BlockedProcesses = max(MaxValue) by Target, Bucket
+| order by Bucket asc

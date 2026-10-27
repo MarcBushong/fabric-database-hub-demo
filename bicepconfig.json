@@ -1,0 +1,20 @@
+{
+  "analyzers": {
+    "core": {
+      "enabled": true,
+      "rules": {
+        "secure-secrets-in-params": { "level": "error" },
+        "outputs-should-not-contain-secrets": { "level": "error" },
+        "secure-parameter-default": { "level": "error" },
+        "protect-commandtoexecute-secrets": { "level": "error" },
+        "adminusername-should-not-be-literal": { "level": "error" },
+        "no-hardcoded-env-urls": { "level": "error" },
+        "no-hardcoded-location": { "level": "error" },
+        "no-unused-params": { "level": "error" },
+        "no-unused-vars": { "level": "error" },
+        "use-recent-api-versions": { "level": "warning" },
+        "use-stable-vm-image": { "level": "warning" }
+      }
+    }
+  }
+}

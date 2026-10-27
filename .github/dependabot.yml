@@ -1,0 +1,43 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: nuget
+    directory: /workload-generator
+    schedule:
+      interval: weekly
+    groups:
+      nuget:
+        patterns: ["*"]
+    commit-message:
+      prefix: "build"
+
+  - package-ecosystem: dotnet-sdk
+    directory: /workload-generator
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build"
+
+  - package-ecosystem: docker
+    directory: /workload-generator
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build"
+
+  - package-ecosystem: devcontainers
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore"

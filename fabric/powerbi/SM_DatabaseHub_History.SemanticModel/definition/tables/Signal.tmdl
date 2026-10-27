@@ -1,0 +1,71 @@
+/// The signals that the Signal explorer can show. Disconnected on purpose: it only selects which measure Signal Value returns, with its unit, format, and attention threshold.
+table Signal
+
+    /// The key that Signal Value switches on.
+    column 'Signal Key'
+        dataType: string
+        isHidden
+        isNameInferred
+        sourceColumn: [Signal Key]
+
+    /// The signal's name as the explorer lists it.
+    column Signal
+        dataType: string
+        isNameInferred
+        sourceColumn: [Signal]
+        sortByColumn: 'Signal Sort'
+
+    /// Unit of the signal's values: %, processes, s, deadlocks, transactions, MB, requests, or sessions.
+    column Unit
+        dataType: string
+        isNameInferred
+        sourceColumn: [Unit]
+
+    /// The incident signal family the signal belongs to: cpu, blocking, io, log_rate, or activity.
+    column 'Signal Family'
+        dataType: string
+        isNameInferred
+        sourceColumn: [Signal Family]
+
+    /// Format string for Signal Value's dynamic format.
+    column 'Format String'
+        dataType: string
+        isHidden
+        isNameInferred
+        sourceColumn: [Format String]
+
+    /// Value at which a bin needs attention; 0 means no threshold line.
+    column 'Attention Threshold'
+        dataType: double
+        isHidden
+        isNameInferred
+        summarizeBy: none
+        sourceColumn: [Attention Threshold]
+
+    column 'Signal Sort'
+        dataType: int64
+        isHidden
+        isNameInferred
+        summarizeBy: none
+        sourceColumn: [Signal Sort]
+
+    partition Signal = calculated
+        mode: import
+        source =
+                DATATABLE (
+                    "Signal Key", STRING, "Signal", STRING, "Unit", STRING, "Signal Family", STRING,
+                    "Format String", STRING, "Attention Threshold", DOUBLE, "Signal Sort", INTEGER,
+                    {
+                        { "cpu", "CPU, average per bin", "%", "cpu", "#,0.0"" %""", 80, 1 },
+                        { "cpu_peak", "CPU, peak per bin", "%", "cpu", "#,0.0"" %""", 80, 2 },
+                        { "blocked", "Blocked processes, peak per bin", "processes", "blocking", "#,0", 1, 3 },
+                        { "lock_wait", "Lock waits per bin", "s", "blocking", "#,0.0", 1, 4 },
+                        { "deadlocks", "Deadlocks per bin", "deadlocks", "blocking", "#,0", 1, 5 },
+                        { "transactions", "Active transactions, peak per bin", "transactions", "blocking", "#,0", 0, 6 },
+                        { "buffer_io_wait", "Buffer IO (PAGEIOLATCH) waits per bin", "s", "io", "#,0.0", 1, 7 },
+                        { "io_mb", "Data and log IO per bin", "MB", "io", "#,0.0", 0, 8 },
+                        { "log_rate_wait", "Log Rate Governor waits per bin", "s", "log_rate", "#,0.0", 0.1, 9 },
+                        { "batch_requests", "Batch requests per bin", "requests", "activity", "#,0", 0, 10 },
+                        { "sessions", "Active sessions in ContosoCare, peak per bin", "sessions", "activity", "#,0", 0, 11 }
+                    }
+                )

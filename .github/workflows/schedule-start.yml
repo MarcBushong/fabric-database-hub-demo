@@ -1,0 +1,30 @@
+name: schedule-start
+
+# Scheduled start with warm-up (plan section 9.4, C3): starts the VMs about 45 minutes before a demo, resumes
+# or recreates T3, lets the baseline run for 30 minutes, and checks that telemetry arrives, so Hub charts
+# have history. Off unless the repository variable DBHUB_SCHEDULES_ENABLED is 'true'; a scheduled run uses the
+# environment DBHUB_SCHEDULE_ENVIRONMENT (default demo). Edit the cron (UTC) for your demo times.
+on:
+  schedule:
+    - cron: "15 15 * * 1-5"
+  workflow_dispatch:
+
+# Least privilege (ADR 0022): only the job that signs in to Azure may request an OpenID Connect token.
+permissions:
+  contents: read
+
+jobs:
+  start:
+    permissions:
+      contents: read
+      id-token: write
+    if: vars.DBHUB_SCHEDULES_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/reusable-demo-run.yml
+    with:
+      # The schedule environment (no reviewers) only for scheduled runs; a run by hand uses the reviewed one (ADR 0022).
+      environment: ${{ github.event_name == 'schedule' && vars.DBHUB_SCHEDULE_ENVIRONMENT || 'demo' }}
+      script: start-demo
+      parameters: '{"WarmUpMinutes": 30, "WaitForWarmUp": true}'
+      bicep: true
+      timeout-minutes: 120
+    secrets: inherit

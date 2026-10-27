@@ -1,0 +1,182 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/bookmark/2.1.0/schema.json",
+  "displayName": "Explorer reset",
+  "name": "9c68242860afc50fbe9f",
+  "options": {
+    "applyOnlyToTargetVisuals": true,
+    "targetVisualNames": [
+      "a1e5d6c11b09a291ccb4",
+      "219270ae01fc36327e2d",
+      "7c1591c2051c509cb541",
+      "b0a55e5c1dc1f71a21a7"
+    ],
+    "suppressActiveSection": true,
+    "suppressDisplay": true
+  },
+  "explorationState": {
+    "version": "1.3",
+    "activeSection": "bad5e0f930ba51e21ed8",
+    "sections": {
+      "bad5e0f930ba51e21ed8": {
+        "visualContainers": {
+          "a1e5d6c11b09a291ccb4": {
+            "filters": {
+              "byExpr": [
+                {
+                  "name": "02181576fd3fa27e7e73",
+                  "type": "Advanced",
+                  "expression": {
+                    "Column": {
+                      "Expression": {
+                        "SourceRef": {
+                          "Entity": "Date"
+                        }
+                      },
+                      "Property": "Date"
+                    }
+                  },
+                  "howCreated": 0
+                }
+              ]
+            },
+            "singleVisual": {
+              "visualType": "slicer",
+              "objects": {},
+              "activeProjections": {
+                "Values": [
+                  {
+                    "Column": {
+                      "Expression": {
+                        "SourceRef": {
+                          "Entity": "Date"
+                        }
+                      },
+                      "Property": "Date"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "219270ae01fc36327e2d": {
+            "filters": {
+              "byExpr": [
+                {
+                  "name": "70cc43ed994436b6ab67",
+                  "type": "Categorical",
+                  "expression": {
+                    "Column": {
+                      "Expression": {
+                        "SourceRef": {
+                          "Entity": "Target"
+                        }
+                      },
+                      "Property": "Target Short"
+                    }
+                  },
+                  "howCreated": 0
+                }
+              ]
+            },
+            "singleVisual": {
+              "visualType": "advancedSlicerVisual",
+              "objects": {},
+              "activeProjections": {
+                "Values": [
+                  {
+                    "Column": {
+                      "Expression": {
+                        "SourceRef": {
+                          "Entity": "Target"
+                        }
+                      },
+                      "Property": "Target Short"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "7c1591c2051c509cb541": {
+            "filters": {
+              "byExpr": [
+                {
+                  "name": "6560a5e729568655ff5a",
+                  "type": "Categorical",
+                  "expression": {
+                    "Column": {
+                      "Expression": {
+                        "SourceRef": {
+                          "Entity": "Signal"
+                        }
+                      },
+                      "Property": "Signal"
+                    }
+                  },
+                  "howCreated": 0
+                }
+              ]
+            },
+            "singleVisual": {
+              "visualType": "slicer",
+              "objects": {},
+              "activeProjections": {
+                "Values": [
+                  {
+                    "Column": {
+                      "Expression": {
+                        "SourceRef": {
+                          "Entity": "Signal"
+                        }
+                      },
+                      "Property": "Signal"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "b0a55e5c1dc1f71a21a7": {
+            "filters": {
+              "byExpr": [
+                {
+                  "name": "2685207e259cdf855537",
+                  "type": "Categorical",
+                  "expression": {
+                    "Column": {
+                      "Expression": {
+                        "SourceRef": {
+                          "Entity": "Status"
+                        }
+                      },
+                      "Property": "Status"
+                    }
+                  },
+                  "howCreated": 0
+                }
+              ]
+            },
+            "singleVisual": {
+              "visualType": "listSlicer",
+              "objects": {},
+              "activeProjections": {
+                "Values": [
+                  {
+                    "Column": {
+                      "Expression": {
+                        "SourceRef": {
+                          "Entity": "Status"
+                        }
+                      },
+                      "Property": "Status"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

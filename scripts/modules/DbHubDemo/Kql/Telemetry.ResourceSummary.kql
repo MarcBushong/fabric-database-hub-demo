@@ -1,0 +1,27 @@
+// Which demo targets report performance telemetry, with row counts and the first and last sample.
+// Based on query 1 ("Find the resources you can query") in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-20). Rules applied: 1 (filter on SampleTimeUTC first), 4 (count the instances per
+// ResourceID), 5 (compare ResourceID case-insensitively), 10 (row limit). CPU samples arrive every 10 s
+// (15 s for Azure SQL Database), so they show whether a target is reporting.
+// Rows from other resources in the demo resource group are returned too, so a ResourceID that differs
+// from the expected one is visible instead of looking like missing telemetry.
+// Parameters, rendered by Get-DemoHubTelemetryKql: Lookback (timespan), Since (datetime), Targets
+// (dynamic array of ResourceIDs), SubscriptionId (string), ResourceGroup (string).
+let lookback = {{Lookback}};
+let since = {{Since}};
+let targetIds = {{Targets}};
+let demoSubscription = {{SubscriptionId}};
+let demoResourceGroup = {{ResourceGroup}};
+SqlServerCPUUtilization
+| where SampleTimeUTC > ago(lookback)
+| where ResourceID in~ (targetIds) or (SubscriptionID =~ demoSubscription and ResourceGroup =~ demoResourceGroup)
+| summarize Rows = count(),
+            RowsSince = countif(SampleTimeUTC >= since),
+            FirstSampleUTC = min(SampleTimeUTC),
+            FirstSampleSinceUTC = minif(SampleTimeUTC, SampleTimeUTC >= since),
+            LastSampleUTC = max(SampleTimeUTC),
+            Instances = dcount(SqlServerInstanceName)
+        by ResourceID, ResourceType, ResourceName, ResourceGroup
+| order by ResourceID asc
+| take 100

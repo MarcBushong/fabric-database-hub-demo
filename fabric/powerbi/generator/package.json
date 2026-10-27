@@ -1,0 +1,19 @@
+{
+  "name": "dbhub-pbir-generator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deterministic generator for the RPT_DatabaseHub_History PBIR report from the Design Brief in fabric/powerbi/_brief/report-spec.md (Phase 19).",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "generate": "node src/generate.js",
+    "check": "node src/generate.js --check",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
+  }
+}

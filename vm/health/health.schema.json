@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/vm/health/health.schema.json",
+  "title": "VM bootstrap health",
+  "description": "C:\\ProgramData\\DbHubDemo\\health.json on T1 and the T2 host. Write-DemoVmHealth writes it after every run of the bootstrap state machine (ADR 0003), and the validator reads it through Run Command (ADR 0012). It is redacted and never holds secrets.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "role", "computerName", "state", "status", "message", "generation", "instructions", "warnings", "rebootCount", "updatedUtc", "steps", "details"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "role": { "description": "EvalArcVm is the opt-in evaluation-only T2 (t2Mode EvaluationOnlyAzureVm, ADR 0006).", "enum": ["SqlVm", "ArcHost", "EvalArcVm"] },
+    "computerName": { "type": "string" },
+    "state": {
+      "description": "Machine state. WaitingForArcOnboarding and WaitingForProductKey wait for the orchestrator (Phase 7); WaitingForGuestSql waits for the T2 guest's SQL Server before the workload runner is installed in it (Phase 13); WaitingForInput waits for other input, such as the runner's Run Command chunks; ManualActionRequired carries operator instructions.",
+      "enum": ["NotStarted", "InProgress", "RebootPending", "WaitingForArcOnboarding", "WaitingForProductKey", "WaitingForGuestSql", "WaitingForInput", "ManualActionRequired", "Ready", "Failed"]
+    },
+    "status": {
+      "description": "ADR 0012 status: Ready is Pass (Warning when warnings exist), Failed is Fail, ManualActionRequired is Manual action required, and in-flight states are Warning.",
+      "enum": ["Pass", "Fail", "Warning", "Manual action required", "Not supported", "Not selected"]
+    },
+    "message": { "type": "string" },
+    "currentStep": { "type": ["string", "null"] },
+    "generation": { "description": "<bundle SHA-256 prefix>-<loader run UTC>; a new generation re-checks every step.", "type": "string" },
+    "instructions": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "description": "For example, media trusted on first use because no SHA-256 was pinned.", "type": "array", "items": { "type": "string" } },
+    "rebootCount": { "type": "integer", "minimum": 0 },
+    "startedUtc": { "type": ["string", "null"] },
+    "updatedUtc": { "type": "string" },
+    "completedUtc": { "type": ["string", "null"] },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status", "attempts"],
+        "properties": {
+          "name": { "type": "string" },
+          "status": { "enum": ["Pending", "Running", "Succeeded", "NotSelected", "Retrying", "Failed", "RebootPending", "Waiting", "ManualActionRequired", "InProgress"] },
+          "attempts": { "type": "integer", "minimum": 0 },
+          "completedUtc": { "type": ["string", "null"] },
+          "lastError": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "details": {
+      "description": "Role-specific facts: host size and Secure Boot, guest state over PowerShell Direct, evaluation days left, SQL Server edition and version, and Arc onboarding.",
+      "type": "object"
+    }
+  }
+}

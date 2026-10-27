@@ -1,0 +1,8 @@
+// The six largest memory clerk types per target at the latest sample, in MB, after Live.MemoryClerks.kql and
+// Dashboard.SelectTargets.kql. SqlServerMemoryUtilization is a gauge table
+// (https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry, checked 2026-10-21).
+| summarize MemoryMB = round(sum(MemoryMB), 1) by Target, MemoryClerkType
+| order by Target asc, MemoryMB desc
+| extend Rank = row_number(1, prev(Target) != Target)
+| where Rank <= 6
+| project Target, MemoryClerkType, MemoryMB

@@ -1,0 +1,17 @@
+# Dependencies and build output
+node_modules/
+dist/
+
+# Deploy-time files with real IDs, URLs, or keys: configure-fabric-app.ps1 and `rayfin up` write them in the
+# Git-ignored copy under out/fabric-app, but keep them out of Git here too.
+.env
+.env.*
+!rayfin/.env.example
+rayfin/.env
+rayfin/.deployments.json
+rayfin/.temp/
+public/rayfin.config.json
+public/dbhub-app.json
+
+# Logs
+*.log

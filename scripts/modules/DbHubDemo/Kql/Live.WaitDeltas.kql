@@ -1,0 +1,29 @@
+// Wait time per wait category and bin, from deltas of the cumulative wait counters, with PAGEIOLATCH flagged.
+// Based on query 5 ('What is one resource waiting on?') in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-21), applied per bin. Rules applied: 1 (filter on SampleTimeUTC first), 2 (per-series
+// deltas that skip resets, never sums of the cumulative columns), 4 (series by ResourceID and
+// SqlServerInstanceName), 6 (exclude the Idle and Unknown categories), 10 (row limit).
+// Contract: runs after Live.Prelude.kql, which defines _start, _end, _bin, _rg, _db, and _target(). The body is
+// identical to WAITS_KQL in fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, and the Real-Time Dashboard
+// (fabric/realtime) is generated from this file; tests/unit/Fabric.Dashboard.Tests.ps1 fails if they drift.
+SqlServerWaitStats
+| where SampleTimeUTC between (_start .. _end)
+| where ResourceGroup =~ _rg
+| where WaitCategory !in ('Idle', 'Unknown')
+| extend Target = _target(ResourceType, ResourceName)
+| where isnotempty(Target)
+| summarize (FirstT, FirstW, FirstC) = arg_min(SampleTimeUTC, WaitTimeMs, WaitingTasksCount),
+            (LastT, LastW, LastC) = arg_max(SampleTimeUTC, WaitTimeMs, WaitingTasksCount)
+        by Target, ResourceID, SqlServerInstanceName, WaitCategory, WaitType, Bucket = bin(SampleTimeUTC, _bin)
+| extend T = pack_array(FirstT, LastT), W = pack_array(FirstW, LastW), C = pack_array(FirstC, LastC)
+| mv-expand T to typeof(datetime), W to typeof(long), C to typeof(long)
+| distinct Target, ResourceID, SqlServerInstanceName, WaitCategory, WaitType, Bucket, T, W, C
+| sort by ResourceID asc, SqlServerInstanceName asc, WaitType asc, T asc
+| extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)
+                and WaitType == prev(WaitType) and W >= prev(W) and C >= prev(C)
+| extend WaitMs = iff(Keep, W - prev(W), long(0)), Tasks = iff(Keep, C - prev(C), long(0))
+| summarize WaitMs = sum(WaitMs), Tasks = sum(Tasks) by Target, WaitCategory, PageIoLatch = WaitType startswith 'PAGEIOLATCH', Bucket
+| where WaitMs > 0
+| order by Bucket asc
+| take 50000

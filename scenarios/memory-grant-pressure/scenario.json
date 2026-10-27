@@ -1,0 +1,37 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "memory-grant-pressure",
+  "title": "Memory grant pressure",
+  "summary": "Concurrent large sorts, each reserving a big memory grant up front: the documented MIN_GRANT_PERCENT hint asks for grantPercent of the most one query may get (25% of the workspace memory in the default workload group). Only a few fit at once, so the rest wait in the RESOURCE_SEMAPHORE queue while the buffer pool gives memory up. The sorts read appointments times a multiplier from the intensity; nothing is written.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_memory_grants",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 8, "min": 2, "max": 16, "description": "Sessions running sorts at once; at grantPercent 100 about four grants fit, so the rest queue." },
+  "intensity": { "default": 6, "min": 1, "max": 10, "description": "Rows per sort (appointments times 8 per level) and a shorter pause: about 2 seconds at 1, none at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T2"],
+    "notes": {
+      "T3": "Azure SQL Database honors MIN_GRANT_PERCENT within the service objective's memory, so the queue forms sooner at 1 vCore."
+    }
+  },
+  "parameters": {
+    "grantPercent": { "type": "integer", "default": 100, "minimum": 10, "maximum": 100, "description": "MIN_GRANT_PERCENT for each sort: the share of the per-query grant limit it reserves (100 means the whole 25% of the workspace that one query may take).", "sqlParameter": "@grant_percent" }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerWaitStats: Memory wait category (RESOURCE_SEMAPHORE) with several waiting tasks", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: Granted Workspace Memory (KB) at its ceiling, Page life expectancy falling", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersDetailed: Memory Grants Pending above 0 when the target's Detailed table lists it", "surface": "Telemetry", "note": "List the counters with the query in the telemetry page's Schema section." },
+    { "signal": "SqlServerMemoryUtilization: the buffer pool clerk shrinks while the grants are held", "surface": "Performance" }
+  ],
+  "expectedSymptoms": [
+    "Sessions waiting on RESOURCE_SEMAPHORE before their sorts start",
+    "sys.dm_exec_query_memory_grants shows a few granted requests and a queue of waiting ones",
+    "Query duration grows with the queue, while CPU stays below its peak"
+  ],
+  "queryLevelEvidence": [
+    "sys.dm_exec_query_memory_grants: requested, granted, and waiting grants (needs VIEW SERVER STATE or VIEW DATABASE STATE)",
+    "Query Store: the sort with a large memory grant and low used memory"
+  ],
+  "reset": "Read-only: nothing to undo. Grants are released when each query ends or its session closes. Reset kills leftover ContosoCare.Demo/ sessions."
+}

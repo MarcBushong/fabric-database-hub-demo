@@ -1,0 +1,33 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "inefficient-query",
+  "title": "Inefficient query",
+  "summary": "A frequent front-desk lookup by the numeric part of the MRN. The problem variant wraps the indexed column in RIGHT(), so uq_patients_mrn can't be seeked and every call scans care.patients: modest cost per call, high cost in total because it runs constantly. The healthy variant compares the full MRN and seeks, for a Query Store before-and-after comparison.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_inefficient_query",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 4, "min": 1, "max": 32, "description": "Front-desk sessions running the lookup." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace: about 2 lookups per second per session at 1, back to back at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T2", "T3"]
+  },
+  "parameters": {
+    "variant": { "type": "string", "default": "problem", "enum": ["problem", "healthy"], "description": "problem: RIGHT(mrn, 7) = @digits (scan). healthy: mrn = 'SYN-' + @digits (seek).", "sqlParameter": "@variant" }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerCPUUtilization and Batch Requests/sec above the baseline", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: many short ContosoCare.Demo/inefficient-query requests", "surface": "Performance" },
+    { "signal": "An inefficient-query finding that names the non-SARGable predicate", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
+  ],
+  "expectedSymptoms": [
+    "One lookup dominates total CPU and logical reads through sheer execution count",
+    "Its plan scans care.patients although an index on mrn exists",
+    "variant=healthy keeps the same execution rate with a fraction of the reads"
+  ],
+  "queryLevelEvidence": [
+    "Query Store: top queries by total logical reads and execution count; compare the problem and healthy query texts",
+    "The plan: Clustered Index Scan on care.patients with a RIGHT() predicate"
+  ],
+  "reset": "Read-only; nothing to undo."
+}

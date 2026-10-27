@@ -1,0 +1,60 @@
+/// Every analysis key that the notebooks write to telemetry_snapshots and analysis_findings, with its group and grain.
+table Analysis
+
+    /// Join key, the analysis value the notebooks write (for example cpu, wait_deltas, or telemetry_coverage).
+    column 'Analysis Key'
+        dataType: string
+        isHidden
+        isNameInferred
+        sourceColumn: [Analysis Key]
+
+    /// Business name of the analysis.
+    column Analysis
+        dataType: string
+        isNameInferred
+        sourceColumn: [Analysis]
+        sortByColumn: 'Analysis Sort'
+
+    /// The signal area: Estate, CPU, Locks and blocking, Throughput, Waits, IO, Memory, Storage, Readiness, or Incidents.
+    column 'Analysis Group'
+        dataType: string
+        isNameInferred
+        sourceColumn: [Analysis Group]
+
+    /// What one row means: per bin, per analysis window, latest sample, per incident, or per run.
+    column Grain
+        dataType: string
+        isNameInferred
+        sourceColumn: [Grain]
+
+    column 'Analysis Sort'
+        dataType: int64
+        isHidden
+        isNameInferred
+        summarizeBy: none
+        sourceColumn: [Analysis Sort]
+
+    partition Analysis = calculated
+        mode: import
+        source =
+                DATATABLE (
+                    "Analysis Key", STRING, "Analysis", STRING, "Analysis Group", STRING, "Grain", STRING, "Analysis Sort", INTEGER,
+                    {
+                        { "estate_pulse", "Estate pulse", "Estate", "Per analysis window", 1 },
+                        { "cpu", "CPU", "CPU", "Per bin", 2 },
+                        { "gauges", "Blocking and transaction gauges", "Locks and blocking", "Per bin", 3 },
+                        { "sessions", "Active sessions", "Locks and blocking", "Per bin", 4 },
+                        { "counter_deltas", "Throughput and deadlock counters", "Throughput", "Per bin", 5 },
+                        { "wait_deltas", "Wait deltas", "Waits", "Per bin", 6 },
+                        { "wait_profile", "Wait profile", "Waits", "Per analysis window", 7 },
+                        { "storage_io", "Storage IO", "IO", "Per bin", 8 },
+                        { "memory_clerks", "Memory clerks", "Memory", "Latest sample", 9 },
+                        { "database_growth", "Database growth", "Storage", "Latest sample", 10 },
+                        { "telemetry_coverage", "Telemetry coverage", "Readiness", "Latest sample per table", 11 },
+                        { "telemetry_access", "Telemetry access", "Readiness", "Per run", 12 },
+                        { "blocking", "Blocking", "Locks and blocking", "Per incident", 13 },
+                        { "consumption", "Consumption", "CPU and waits", "Per analysis window", 14 },
+                        { "correlation", "Scenario correlation", "Incidents", "Per scenario window", 15 },
+                        { "real_time_dashboard", "Real-Time Dashboard", "Readiness", "Per run", 16 }
+                    }
+                )

@@ -1,0 +1,15 @@
+# Used by BuildKit for workload-generator/Dockerfile. The build context is the repository root, because the
+# runner embeds scenarios/ and database/common/:  docker build --file workload-generator/Dockerfile .
+# Send only what the build needs.
+*
+!scenarios
+!database
+!workload-generator
+database/*
+!database/common
+workload-generator/tests
+workload-generator/out
+**/bin
+**/obj
+**/TestResults
+**/*.md

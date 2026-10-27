@@ -1,0 +1,29 @@
+// Cumulative performance counters as per-bin deltas: deadlocks, batch requests, transactions, and log bytes
+// flushed. Based on query 9 ('What is one resource's throughput and deadlock count?') in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-21), applied per bin. Rules applied: 1 (filter on SampleTimeUTC first), 2 (keep the first
+// and last sample of each series in each bin, sum the increase between adjacent samples, and skip any
+// interval where the value goes down), 3 (only CounterType 272696576; divide Delta by Seconds for a rate),
+// 4 (series by ResourceID and SqlServerInstanceName), 10 (row limit).
+// Contract: runs after Live.Prelude.kql, which defines _start, _end, _bin, _rg, _db, and _target(). The body is
+// identical to RATES_KQL in fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, and the Real-Time Dashboard
+// (fabric/realtime) is generated from this file; tests/unit/Fabric.Dashboard.Tests.ps1 fails if they drift.
+SqlServerPerformanceCountersCommon
+| where SampleTimeUTC between (_start .. _end)
+| where ResourceGroup =~ _rg
+| where CounterType == 272696576
+| where CounterName in ('Number of Deadlocks/sec', 'Batch Requests/sec', 'Transactions/sec', 'Log Bytes Flushed/sec')
+| extend Target = _target(ResourceType, ResourceName)
+| where isnotempty(Target)
+| summarize (FirstT, FirstV) = arg_min(SampleTimeUTC, CounterValue), (LastT, LastV) = arg_max(SampleTimeUTC, CounterValue)
+        by Target, ResourceID, SqlServerInstanceName, CounterName, InstanceName, Bucket = bin(SampleTimeUTC, _bin)
+| extend T = pack_array(FirstT, LastT), V = pack_array(FirstV, LastV)
+| mv-expand T to typeof(datetime), V to typeof(real)
+| distinct Target, ResourceID, SqlServerInstanceName, CounterName, InstanceName, Bucket, T, V
+| sort by ResourceID asc, SqlServerInstanceName asc, CounterName asc, InstanceName asc, T asc
+| extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)
+                and CounterName == prev(CounterName) and InstanceName == prev(InstanceName) and V >= prev(V)
+| extend Delta = iff(Keep, V - prev(V), real(0)), Seconds = iff(Keep, datetime_diff('second', T, prev(T)), long(0))
+| summarize Delta = sum(Delta), Seconds = sum(Seconds) by Target, CounterName, InstanceName, Bucket
+| order by Bucket asc
+| take 50000

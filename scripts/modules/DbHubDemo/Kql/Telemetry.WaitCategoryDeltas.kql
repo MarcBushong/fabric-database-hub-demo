@@ -1,0 +1,28 @@
+// Wait time per wait category for each demo target, from deltas of the cumulative wait counters.
+// Based on query 5 ("Top waits for one resource") in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-20), applied to the demo's few targets (sorting is fine for a handful of resources; the
+// doc's query 6 pattern is for a whole estate). Rules applied: 1 (filter on SampleTimeUTC first),
+// 2 (SqlServerWaitStats is cumulative: sum the increase between adjacent samples of one series and skip
+// the first sample and any interval where a value goes down, never last minus first or max() - min()),
+// 4 (group by ResourceID and SqlServerInstanceName), 5 (compare ResourceID case-insensitively),
+// 6 (exclude the Idle and Unknown categories), 10 (row limit).
+// Parameters, rendered by Get-DemoHubTelemetryKql: Lookback (timespan), Targets (dynamic array of ResourceIDs).
+let lookback = {{Lookback}};
+let targetIds = {{Targets}};
+SqlServerWaitStats
+| where SampleTimeUTC > ago(lookback)
+| where ResourceID in~ (targetIds)
+| where WaitCategory !in ('Idle', 'Unknown')
+| project ResourceID, SqlServerInstanceName, WaitCategory, WaitType, SampleTimeUTC, WaitTimeMs, WaitingTasksCount
+| sort by ResourceID asc, SqlServerInstanceName asc, WaitType asc, SampleTimeUTC asc
+| extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)
+                and WaitType == prev(WaitType) and WaitTimeMs >= prev(WaitTimeMs)
+                and WaitingTasksCount >= prev(WaitingTasksCount)
+| extend DeltaWaitMs = iff(Keep, WaitTimeMs - prev(WaitTimeMs), long(0)),
+         DeltaTasks = iff(Keep, WaitingTasksCount - prev(WaitingTasksCount), long(0))
+| summarize WaitMs = sum(DeltaWaitMs), Tasks = sum(DeltaTasks) by ResourceID, SqlServerInstanceName, WaitCategory
+| where WaitMs > 0
+| extend WaitSeconds = round(WaitMs / 1000.0, 1)
+| order by ResourceID asc, WaitMs desc
+| take 200

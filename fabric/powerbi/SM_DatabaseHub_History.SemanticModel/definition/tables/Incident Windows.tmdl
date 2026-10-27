@@ -1,0 +1,442 @@
+/// One incident window from dbo.incident_windows: a recorded incident request with its expected-signal verdict, or a signal episode that NB_DatabaseHub_LiveActivity detected in the telemetry. Also the incident page's picker, newest first. The "focus" measures describe the picked incident, or the latest one in context.
+table 'Incident Windows'
+
+    /// Incident windows in context.
+    measure Incidents = COUNTROWS ( 'Incident Windows' )
+        formatString: #,0
+        displayFolder: Incident
+
+    /// TRUE when the telemetry bin in context lies inside an incident window of the targets in context.
+    measure 'In Incident Window' =
+            VAR B = SELECTEDVALUE ( 'Telemetry Snapshots'[Bucket UTC] )
+            RETURN
+                NOT ISBLANK ( B )
+                    && CALCULATE (
+                        COUNTROWS ( 'Incident Windows' ),
+                        'Incident Windows'[Window Start UTC] <= B,
+                        'Incident Windows'[Window End UTC] > B
+                    ) > 0
+        isHidden
+        displayFolder: Incident
+
+    /// The picker's incident, or the latest window in context (a drillthrough target narrows it).
+    measure 'Focus Incident Key' =
+            IF (
+                HASONEVALUE ( 'Incident Windows'[Incident Key] ),
+                SELECTEDVALUE ( 'Incident Windows'[Incident Key] ),
+                MAXX (
+                    TOPN ( 1, 'Incident Windows', 'Incident Windows'[Window Start UTC], DESC, 'Incident Windows'[Incident Key], DESC ),
+                    'Incident Windows'[Incident Key]
+                )
+            )
+        isHidden
+        displayFolder: Incident
+
+    /// 1 when there's a focus incident, 0 otherwise.
+    measure 'Has Incident' = IF ( NOT ISBLANK ( [Focus Incident Key] ), 1, 0 )
+        formatString: 0
+        isHidden
+        displayFolder: Incident
+
+    /// Target key of the focus incident.
+    measure 'Focus Target Key' =
+            VAR K = [Focus Incident Key]
+            RETURN CALCULATE ( MAX ( 'Incident Windows'[Target Key] ), REMOVEFILTERS ( 'Incident Windows' ), 'Incident Windows'[Incident Key] = K )
+        isHidden
+        displayFolder: Incident
+
+    /// Start of the focus incident's window (UTC).
+    measure 'Focus Window Start UTC' =
+            VAR K = [Focus Incident Key]
+            RETURN CALCULATE ( MAX ( 'Incident Windows'[Window Start UTC] ), REMOVEFILTERS ( 'Incident Windows' ), 'Incident Windows'[Incident Key] = K )
+        formatString: yyyy-mm-dd hh:nn
+        displayFolder: Incident
+
+    /// End of the focus incident's window (UTC).
+    measure 'Focus Window End UTC' =
+            VAR K = [Focus Incident Key]
+            RETURN CALCULATE ( MAX ( 'Incident Windows'[Window End UTC] ), REMOVEFILTERS ( 'Incident Windows' ), 'Incident Windows'[Incident Key] = K )
+        formatString: yyyy-mm-dd hh:nn
+        displayFolder: Incident
+
+    /// Signal family of the focus incident: blocking, cpu, io, or log_rate.
+    measure 'Focus Signal Family' =
+            VAR K = [Focus Incident Key]
+            RETURN CALCULATE ( MAX ( 'Incident Windows'[Signal Family] ), REMOVEFILTERS ( 'Incident Windows' ), 'Incident Windows'[Incident Key] = K )
+        isHidden
+        displayFolder: Incident
+
+    /// Source of the focus incident: Recorded request or Detected signal.
+    measure 'Focus Source' =
+            VAR K = [Focus Incident Key]
+            RETURN CALCULATE ( MAX ( 'Incident Windows'[Source] ), REMOVEFILTERS ( 'Incident Windows' ), 'Incident Windows'[Incident Key] = K )
+        isHidden
+        displayFolder: Incident
+
+    /// Scenario of the focus incident, for recorded requests.
+    measure 'Focus Scenario' =
+            VAR K = [Focus Incident Key]
+            RETURN CALCULATE ( MAX ( 'Incident Windows'[Scenario] ), REMOVEFILTERS ( 'Incident Windows' ), 'Incident Windows'[Incident Key] = K )
+        isHidden
+        displayFolder: Incident
+
+    /// Expected-signal verdict of the focus incident (an ADR 0012 status).
+    measure 'Focus Correlation Status' =
+            VAR K = [Focus Incident Key]
+            RETURN CALCULATE ( MAX ( 'Incident Windows'[Correlation Status Key] ), REMOVEFILTERS ( 'Incident Windows' ), 'Incident Windows'[Incident Key] = K )
+        isHidden
+        displayFolder: Incident
+
+    /// Start of the timeline: the window padded by 15 minutes (TELEMETRY_LAG_MINUTES), or the latest analysis window without an incident.
+    measure 'Focus Range Start UTC' =
+            IF (
+                [Has Incident] = 1,
+                [Focus Window Start UTC] - 15 / 1440,
+                CALCULATE ( MAX ( 'Telemetry Snapshots'[Window Start UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "cpu" )
+            )
+        formatString: yyyy-mm-dd hh:nn
+        isHidden
+        displayFolder: Incident
+
+    /// End of the timeline: the window padded by 15 minutes, or the latest analysis window without an incident.
+    measure 'Focus Range End UTC' =
+            IF (
+                [Has Incident] = 1,
+                [Focus Window End UTC] + 15 / 1440,
+                CALCULATE ( MAX ( 'Telemetry Snapshots'[Window End UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "cpu" )
+            )
+        formatString: yyyy-mm-dd hh:nn
+        isHidden
+        displayFolder: Incident
+
+    /// The focus incident's own signal; batch requests stand in when there's no incident.
+    measure 'Focus Signal Raw' =
+            SWITCH (
+                [Focus Signal Family],
+                "blocking", [Blocked Processes (peak)],
+                "cpu", [CPU (%)],
+                "io", [Buffer IO Wait (s)],
+                "log_rate", [Log Rate Governor Wait (s)],
+                [Batch Requests]
+            )
+        formatString: #,0.0
+        isHidden
+        displayFolder: Incident
+
+    /// The focus incident's signal per bin on its target, inside the padded range.
+    measure 'Focus Signal Value' =
+            VAR TargetKey = [Focus Target Key]
+            VAR RangeStart = [Focus Range Start UTC]
+            VAR RangeEnd = [Focus Range End UTC]
+            RETURN
+                IF (
+                    ISBLANK ( TargetKey ),
+                    CALCULATE (
+                        [Focus Signal Raw],
+                        KEEPFILTERS ( 'Telemetry Snapshots'[Bucket UTC] >= RangeStart ),
+                        KEEPFILTERS ( 'Telemetry Snapshots'[Bucket UTC] <= RangeEnd )
+                    ),
+                    CALCULATE (
+                        [Focus Signal Raw],
+                        KEEPFILTERS ( TREATAS ( { TargetKey }, 'Target'[Target Key] ) ),
+                        KEEPFILTERS ( 'Telemetry Snapshots'[Bucket UTC] >= RangeStart ),
+                        KEEPFILTERS ( 'Telemetry Snapshots'[Bucket UTC] <= RangeEnd )
+                    )
+                )
+        displayFolder: Incident
+        formatStringDefinition = SWITCH ( [Focus Signal Family], "cpu", "#,0.0"" %""", "blocking", "#,0", "io", "#,0.0", "log_rate", "#,0.0", "#,0" )
+
+    /// Height of the shaded band: the highest point of the signal in the padded range.
+    measure 'Focus Range Peak' =
+            VAR RangeStart = [Focus Range Start UTC]
+            VAR RangeEnd = [Focus Range End UTC]
+            RETURN
+                CALCULATE (
+                    MAXX ( VALUES ( 'Telemetry Snapshots'[Bucket UTC] ), [Focus Signal Value] ),
+                    REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC] ),
+                    'Telemetry Snapshots'[Bucket UTC] >= RangeStart,
+                    'Telemetry Snapshots'[Bucket UTC] <= RangeEnd
+                )
+        formatString: #,0.0
+        isHidden
+        displayFolder: Incident
+
+    /// The shaded incident window: the range peak for telemetry bins inside the window, blank outside it and for samples that aren't bins (coverage, growth, and memory snapshots), so the columns join into one band.
+    measure 'Focus Window Band' =
+            VAR B = SELECTEDVALUE ( 'Telemetry Snapshots'[Bucket UTC] )
+            VAR IsBin =
+                CALCULATE (
+                    COUNTROWS ( 'Telemetry Snapshots' ),
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] IN { "cpu", "gauges", "wait_deltas", "counter_deltas", "sessions", "storage_io" } )
+                ) > 0
+            RETURN
+                IF ( NOT ISBLANK ( B ) && IsBin && B >= [Focus Window Start UTC] && B < [Focus Window End UTC], [Focus Range Peak] )
+        displayFolder: Incident
+        formatStringDefinition = SWITCH ( [Focus Signal Family], "cpu", "#,0.0"" %""", "blocking", "#,0", "io", "#,0.0", "log_rate", "#,0.0", "#,0" )
+
+    /// Highest value of the signal inside the focus incident's window.
+    measure 'Focus Peak' =
+            VAR WindowStart = [Focus Window Start UTC]
+            VAR WindowEnd = [Focus Window End UTC]
+            RETURN
+                CALCULATE (
+                    MAXX ( VALUES ( 'Telemetry Snapshots'[Bucket UTC] ), [Focus Signal Value] ),
+                    REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC] ),
+                    'Telemetry Snapshots'[Bucket UTC] >= WindowStart,
+                    'Telemetry Snapshots'[Bucket UTC] < WindowEnd
+                )
+        displayFolder: Incident
+        formatStringDefinition = SWITCH ( [Focus Signal Family], "cpu", "#,0.0"" %""", "blocking", "#,0", "io", "#,0.0", "log_rate", "#,0.0", "#,0" )
+
+    /// A markers-only series: one labeled point at the peak inside the window.
+    measure 'Focus Peak Point' =
+            VAR B = SELECTEDVALUE ( 'Telemetry Snapshots'[Bucket UTC] )
+            VAR V = [Focus Signal Value]
+            RETURN
+                IF (
+                    NOT ISBLANK ( B ) && NOT ISBLANK ( V ) && V = [Focus Peak]
+                        && B >= [Focus Window Start UTC] && B < [Focus Window End UTC],
+                    V
+                )
+        displayFolder: Incident
+        formatStringDefinition = SWITCH ( [Focus Signal Family], "cpu", "#,0.0"" %""", "blocking", "#,0", "io", "#,0.0", "log_rate", "#,0.0", "#,0" )
+
+    /// Average of the signal in the 15 minutes before the window.
+    measure 'Focus Baseline' =
+            VAR WindowStart = [Focus Window Start UTC]
+            RETURN
+                IF (
+                    NOT ISBLANK ( WindowStart ),
+                    CALCULATE (
+                        AVERAGEX (
+                            FILTER ( VALUES ( 'Telemetry Snapshots'[Bucket UTC] ), NOT ISBLANK ( [Focus Signal Value] ) ),
+                            [Focus Signal Value]
+                        ),
+                        REMOVEFILTERS ( 'Telemetry Snapshots'[Bucket UTC] ),
+                        'Telemetry Snapshots'[Bucket UTC] >= WindowStart - 15 / 1440,
+                        'Telemetry Snapshots'[Bucket UTC] < WindowStart
+                    )
+                )
+        displayFolder: Incident
+        formatStringDefinition = SWITCH ( [Focus Signal Family], "cpu", "#,0.0"" %""", "blocking", "#,0", "io", "#,0.0", "log_rate", "#,0.0", "#,0" )
+
+    /// The timeline's threshold line: 80 for CPU incidents, blank otherwise.
+    measure 'Focus Threshold' = IF ( [Focus Signal Family] = "cpu", 80 )
+        formatString: #,0.#
+        displayFolder: Incident
+
+    /// Length of the focus incident's window in minutes.
+    measure 'Focus Duration (min)' = DATEDIFF ( [Focus Window Start UTC], [Focus Window End UTC], MINUTE )
+        formatString: #,0
+        displayFolder: Incident
+
+    /// Plain-language name of the focus signal.
+    measure 'Focus Signal Label' =
+            IF (
+                [Has Incident] = 0,
+                "Batch requests",
+                SWITCH ( [Focus Signal Family], "blocking", "Blocking", "cpu", "CPU pressure", "io", "IO pressure", "log_rate", "Log-rate pressure", "Activity" )
+            )
+        isHidden
+        displayFolder: Incident
+
+    /// The peak with its unit, in words.
+    measure 'Focus Peak Label' =
+            VAR P = [Focus Peak]
+            RETURN
+                SWITCH (
+                    [Focus Signal Family],
+                    "blocking", FORMAT ( P, "0" ) & " blocked processes",
+                    "cpu", FORMAT ( P, "0.0" ) & " % CPU",
+                    "io", FORMAT ( P, "0.0" ) & " s of Buffer IO waits per bin",
+                    "log_rate", FORMAT ( P, "0.0" ) & " s of Log Rate Governor waits per bin",
+                    FORMAT ( P, "#,0" ) & " batch requests per bin"
+                )
+        isHidden
+        displayFolder: Incident
+
+    /// Azure resource name of the focus incident's target, for the Database Agent prompt.
+    measure 'Focus Resource Name' =
+            VAR TargetKey = [Focus Target Key]
+            RETURN
+                CALCULATE (
+                    MAX ( 'Telemetry Snapshots'[Resource Name] ),
+                    REMOVEFILTERS (),
+                    'Telemetry Snapshots'[Target Key] = TargetKey,
+                    'Telemetry Snapshots'[Analysis Key] = "cpu"
+                )
+        isHidden
+        displayFolder: Incident
+
+    /// Where the window comes from: a recorded request with its verdict, or a detected signal.
+    measure 'Focus Evidence Sentence' =
+            SWITCH (
+                [Focus Source],
+                "Recorded request",
+                    "The notebook requested this run (" & [Focus Scenario] & "), and the expected-signal check says " & [Focus Correlation Status] & ".",
+                "Detected signal",
+                    "The telemetry itself shows this window; no notebook request covers it, so it likely came from PowerShell, GitHub Actions, or the business-day profile.",
+                ""
+            )
+        isHidden
+        displayFolder: Incident
+
+    /// The verdict tile's status: the expected-signal verdict, or Not selected without an incident.
+    measure 'Focus Verdict' = IF ( [Has Incident] = 0, "Not selected", [Focus Correlation Status] )
+        displayFolder: Incident
+
+    /// Rail color of the verdict tile: lit only for attention statuses.
+    measure 'Focus Verdict Rail Color' =
+            SWITCH ( [Focus Verdict], "Fail", "#FF4D5A", "Manual action required", "#8CEEEE", "Warning", "#FFB020", "#2A2A3A" )
+        isHidden
+        displayFolder: Incident
+
+    /// The peak's signed change against the 15 minutes before the window; the verdict tile's label names the comparison.
+    measure 'Focus Peak Delta Label' =
+            VAR Peak = [Focus Peak]
+            RETURN IF ( NOT ISBLANK ( Peak ), FORMAT ( Peak - [Focus Baseline], "+#,0.0;-#,0.0;0" ) )
+        displayFolder: Incident
+
+    /// Incident page title: which signal, which target, how high, and when; or an empty-state sentence.
+    measure 'Incident Headline' =
+            SWITCH (
+                TRUE (),
+                [Has Telemetry Bins] = 0, "No telemetry history yet: run NB_DatabaseHub_LiveActivity to capture an analysis window",
+                [Has Incident] = 0, "No incident captured yet: the estate's baseline, minute by minute",
+                [Focus Signal Label] & " on " & [Focus Target Key] & " peaked at " & [Focus Peak Label] & ", "
+                    & FORMAT ( [Focus Window Start UTC], "d mmm hh:nn" ) & "–" & FORMAT ( [Focus Window End UTC], "hh:nn" ) & " UTC"
+            )
+        displayFolder: Incident
+
+    /// The incident page's callout: what happened, the evidence, and the Database Agent prompt to continue live in the Hub; or the steps to capture an incident.
+    measure 'Incident Narrative' =
+            SWITCH (
+                TRUE (),
+                [Has Telemetry Bins] = 0,
+                    "Run NB_DatabaseHub_LiveActivity (Run all is safe). It saves telemetry snapshots and incident windows to LH_DatabaseHub, and this page reads them. The live views stay in Database Hub and the Real-Time Dashboard.",
+                [Has Incident] = 0,
+                    "No incident window is in the lakehouse yet. Start one, for example ./scripts/demo-control.ps1 -Target T1 -Scenario incident:locking-blocking -Duration 15, wait 15 minutes for the telemetry, then run NB_DatabaseHub_LiveActivity. Until then, this chart shows the latest healthy baseline.",
+                "What happened: " & [Focus Signal Label] & " on " & [Focus Target Key]
+                    & IF ( ISBLANK ( [Focus Baseline] ), " peaked at ", " rose from " & FORMAT ( [Focus Baseline], "#,0.0" ) & " in the 15 minutes before to " )
+                    & [Focus Peak Label] & ", for " & FORMAT ( [Focus Duration (min)], "0" ) & " minutes. "
+                    & "Evidence: " & [Focus Evidence Sentence] & " "
+                    & "Next: in Database Hub, ask the Database Agent ""Investigate what happened on " & [Focus Resource Name] & " between "
+                    & FORMAT ( [Focus Window Start UTC], "hh:nn" ) & " and " & FORMAT ( [Focus Window End UTC], "hh:nn" ) & " UTC."""
+            )
+        displayFolder: Incident
+
+    /// Alt text of the incident timeline, which states what the chart shows in words.
+    measure 'Incident Timeline Alt Text' =
+            IF (
+                [Has Incident] = 0,
+                "Line chart of batch requests per bin for the latest analysis window; no incident window is recorded yet.",
+                "Line chart of " & [Focus Signal Label] & " per bin on " & [Focus Target Key] & " from " & FORMAT ( [Focus Range Start UTC], "hh:nn" )
+                    & " to " & FORMAT ( [Focus Range End UTC], "hh:nn" ) & " UTC. The shaded band is the incident window; the peak is " & [Focus Peak Label] & "."
+            )
+        displayFolder: Incident
+
+    column 'Incident Key'
+        dataType: string
+        isHidden
+        sourceColumn: incident_key
+
+    /// The incident for the picker, for example "2026-10-21 14:05 UTC · T1 · Blocking (detected)", newest first.
+    column Incident
+        dataType: string
+        sourceColumn: incident_label
+        sortByColumn: 'Incident Sort'
+
+    column 'Incident Sort'
+        dataType: int64
+        isHidden
+        summarizeBy: none
+        sourceColumn: incident_sort
+
+    /// Recorded request (a notebook-dispatched incident) or Detected signal (an episode found in the telemetry).
+    column Source
+        dataType: string
+        sourceColumn: source
+
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// The incident scenario, for recorded requests.
+    column Scenario
+        dataType: string
+        sourceColumn: scenario
+
+    /// The incident's signal: blocking, cpu, io, or log_rate.
+    column 'Signal Family'
+        dataType: string
+        sourceColumn: signal_family
+
+    column 'Request ID'
+        dataType: string
+        isHidden
+        sourceColumn: request_id
+
+    /// Start of the incident window (UTC).
+    column 'Window Start UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: window_start_utc
+
+    /// End of the incident window (UTC).
+    column 'Window End UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: window_end_utc
+
+    /// Length of the incident window in minutes.
+    column 'Duration (min)'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: duration_minutes
+
+    column 'Peak Value'
+        dataType: double
+        isHidden
+        summarizeBy: none
+        sourceColumn: peak_value
+
+    column 'Peak Unit'
+        dataType: string
+        isHidden
+        sourceColumn: peak_unit
+
+    column 'Correlation Status Key'
+        dataType: string
+        isHidden
+        sourceColumn: correlation_status
+
+    /// Evidence for the window as redacted JSON: the correlation details and any detected episodes.
+    column 'Correlation Evidence'
+        dataType: string
+        sourceColumn: correlation_evidence
+
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    column 'Captured At UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: captured_at_utc
+
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'Incident Windows' = entity
+        mode: directLake
+        source
+            entityName: incident_windows
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

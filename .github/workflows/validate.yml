@@ -1,0 +1,46 @@
+name: validate
+
+# Static validation on every pull request and on main: no Azure sign-in, no Azure calls.
+# Run it by hand with "live" set to also validate a deployed environment: the live job calls
+# scripts/validate.ps1 (Phase 14) through the shared OpenID Connect runner, uploads out/validate.jsonl as
+# an artifact, and fails when validate.ps1 exits nonzero (1 means at least one Fail; ADR 0012).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      live:
+        description: Also validate a deployed environment (needs the GitHub environment's Azure variables)
+        type: boolean
+        default: false
+      environment:
+        description: GitHub environment to validate when live is set
+        type: string
+        default: demo
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Static checks
+    uses: ./.github/workflows/reusable-static-checks.yml
+
+  live:
+    name: Live validation
+    if: github.event_name == 'workflow_dispatch' && inputs.live
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/reusable-demo-run.yml
+    with:
+      environment: ${{ inputs.environment }}
+      script: validate
+      parameters: '{"ConfigPath": "config/demo.config.json", "OutputPath": "out/validate.jsonl"}'
+      timeout-minutes: 60
+    secrets: inherit

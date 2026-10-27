@@ -1,0 +1,42 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "connection-surge",
+  "title": "Connection surge (capacity maxed)",
+  "summary": "A burst of application connections fills the server's connection slots: the runner opens a few connections a second until only headroom slots stay free below max_connections, holds them (each pings now and then, so most sit idle), then tries overshoot more that the server refuses as too many connections. It releases them all, pauses, and repeats until the run ends. PostgreSQL (T4) only.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_connection_surge",
+  "duration": { "defaultSeconds": 300, "maxSeconds": 900 },
+  "concurrency": { "default": 5, "min": 1, "max": 16, "description": "Connections opened per second while a wave ramps up." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "How often each held connection pings: every 15 seconds at 1, every second at 10." },
+  "targets": {
+    "applicable": ["T4"],
+    "default": ["T4"],
+    "notes": {
+      "T4": "The Burstable B1ms tier allows about 50 connections; superuser_reserved_connections and reserved_connections are always left free, plus headroom, so reset and an administrator can still connect."
+    }
+  },
+  "parameters": {
+    "headroom": { "type": "integer", "default": 2, "minimum": 1, "maximum": 20, "description": "Connection slots left free below max_connections, after the reserved ones." },
+    "overshoot": { "type": "integer", "default": 2, "minimum": 0, "maximum": 5, "description": "Connection attempts past the limit in each wave; the server refuses them (SQLSTATE 53300), which Database Hub counts as failed connections." },
+    "maxConnections": { "type": "integer", "default": 60, "minimum": 5, "maximum": 400, "description": "A hard cap on the connections a wave holds, whatever the server allows." },
+    "holdSeconds": { "type": "integer", "default": 120, "minimum": 10, "maximum": 600, "description": "How long each wave holds its connections (never past the run's deadline)." },
+    "pauseSeconds": { "type": "integer", "default": 30, "minimum": 0, "maximum": 300, "description": "Quiet time between waves." }
+  },
+  "expectedHubSignals": [
+    { "signal": "T4: Connections (active_connections) climbs to the server's limit each wave", "surface": "Performance" },
+    { "signal": "T4: Failed connections (connections_failed) above 0 while a wave overshoots", "surface": "Performance" },
+    { "signal": "T4: Sessions By State (sessions_by_state) idle jumps; TCP Connection Backlog (tcp_connection_backlog) may rise", "surface": "Azure Monitor", "note": "PostgreSQL enhanced metrics, in the Azure portal's Metrics; Hub's PostgreSQL dashboard shows connections and failed connections." }
+  ],
+  "expectedSymptoms": [
+    "The server's connection count reaches max_connections minus the reserved slots and headroom",
+    "New connections from applications fail with 'remaining connection slots are reserved' or 'too many clients' (SQLSTATE 53300)",
+    "Most surge sessions sit idle; CPU stays low, so the bottleneck is connection capacity, not compute",
+    "Connections drop back to the baseline between waves"
+  ],
+  "queryLevelEvidence": [
+    "ContosoCare.Workload status --target T4: connections against max_connections, sessions by state",
+    "pg_stat_activity grouped by application_name and state shows the ContosoCare.Demo/connection-surge sessions",
+    "demo.scenario_run_events records each wave's size and the refused attempts"
+  ],
+  "reset": "Every surge connection closes when the run ends or stops; reset ends any leftover ContosoCare.Demo/connection-surge session with pg_terminate_backend. Nothing is written."
+}

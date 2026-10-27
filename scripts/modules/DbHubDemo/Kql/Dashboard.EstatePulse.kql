@@ -1,0 +1,12 @@
+// Estate pulse tiles, after Live.EstatePulse.kql and Dashboard.SelectTargets.kql: one row per selected target,
+// including a target that sent nothing in the time range, so missing telemetry shows as "No data" instead of
+// disappearing ("Missing telemetry isn't zero utilization or proof that a server is healthy",
+// https://learn.microsoft.com/fabric/database/hub/monitor, checked 2026-10-21). State uses the 15-minute
+// freshness threshold of the TELEMETRY.T1-T3 checks (Test-DemoHubTelemetry -FreshMinutes 15).
+| extend MinutesSinceLastSample = round((now() - LastSampleUTC) / 1m, 1)
+| join kind=rightouter (datatable(Target: string) ['T1', 'T2', 'T3'] | where isempty(_selectedTargets) or Target in (_selectedTargets)) on Target
+| extend Target = iff(isempty(Target), Target1, Target)
+| extend State = case(isnull(LastSampleUTC), 'No data', MinutesSinceLastSample <= 15, 'Fresh', 'Stale'),
+         Freshness = iff(isnull(LastSampleUTC), 'no data in range', strcat(tostring(MinutesSinceLastSample), ' min ago'))
+| project Target, State, Freshness, Resource = ResourceName, ResourceType, Tables, Rows, Instances, LastSampleUTC, MinutesSinceLastSample
+| order by Target asc

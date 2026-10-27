@@ -1,0 +1,38 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "log-flush-waits",
+  "title": "Log flush waits",
+  "summary": "Commit-heavy singleton inserts: every session inserts one small row per transaction into demo.commit_scratch, so every commit waits for its log flush (WRITELOG). Each session deletes its rows every 1,000 inserts, so the table stays small, and stops after maxRows commits, at the deadline, or on a stop request. Business data is never touched.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_commit_flood",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 8, "min": 1, "max": 16, "description": "Sessions committing at once; more sessions mean more commits waiting on each log flush." },
+  "intensity": { "default": 10, "min": 1, "max": 10, "description": "Commit pace: a pause of about 200 ms after every 20 commits at 1, none at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T1"],
+    "notes": {
+      "T1": "Simple recovery: the log truncates at checkpoints and stays under its 8 GB cap; the free-space check runs first.",
+      "T2": "Simple recovery: the log stays under its 4 GB cap; the free-space check runs first.",
+      "T3": "Commits wait on the remote log (WRITELOG); past the service objective's log rate they also wait on Log Rate Governor."
+    }
+  },
+  "parameters": {
+    "maxRows": { "type": "integer", "default": 200000, "minimum": 1000, "maximum": 2000000, "description": "Commits per session at most (about 0.5 KB of log each).", "sqlParameter": "@max_rows" }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerWaitStats: Tran Log IO wait category (WRITELOG) with many short waits", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: Log Flushes/sec (SQL Server only), Log Bytes Flushed/sec, Transactions/sec, and Write Transactions/sec rising", "surface": "Performance" },
+    { "signal": "SqlServerStorageIO: many small writes to the ContosoCare log file", "surface": "Performance" }
+  ],
+  "expectedSymptoms": [
+    "WRITELOG as the top wait, with a high waiting-task count and a low average wait",
+    "One log flush per commit: Log Flushes/sec close to the commit rate",
+    "No growth: the scratch rows are deleted every 1,000 commits"
+  ],
+  "queryLevelEvidence": [
+    "sys.dm_io_virtual_file_stats for the log file: writes and write stall (needs VIEW SERVER STATE)",
+    "sys.dm_exec_requests: wait_type WRITELOG on the ContosoCare.Demo/log-flush-waits sessions"
+  ],
+  "reset": "Each session deletes its rows when it ends; auto-cleanup and reset truncate demo.commit_scratch. Business data is never touched."
+}

@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ContosoCare.Workload/ContosoCare.Workload.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ContosoCare.Workload.Tests/ContosoCare.Workload.Tests.csproj" />
+  </Folder>
+</Solution>

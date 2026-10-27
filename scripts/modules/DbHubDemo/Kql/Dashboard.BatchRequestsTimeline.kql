@@ -1,0 +1,12 @@
+// Batch requests per second per target and bin, after Live.CounterDeltas.kql and Dashboard.SelectTargets.kql:
+// each row's delta divided by its elapsed seconds (rule 3 in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry, checked
+// 2026-10-21). Like the live-activity notebook, it prefers the _Total instance when a counter has one and sums the
+// instances otherwise. The shared body adds up the series of one target, so the rate is exact for one SQL Server
+// instance per target, which is the demo's layout.
+| where CounterName == 'Batch Requests/sec' and Seconds > 0
+| extend Rate = Delta / Seconds, IsTotal = InstanceName =~ '_Total'
+| summarize TotalRate = sumif(Rate, IsTotal), TotalRows = countif(IsTotal), AllRate = sum(Rate) by Target, Bucket
+| extend BatchRequestsPerSec = round(iff(TotalRows > 0, TotalRate, AllRate), 2)
+| project Target, Bucket, BatchRequestsPerSec
+| order by Bucket asc

@@ -1,0 +1,58 @@
+name: Bug report
+description: Something in the demo's code or documentation doesn't work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. This repository is public: **don't paste secrets, tokens, or real IDs.**
+        Replace subscription, tenant, object, client, and workspace IDs, the T3 and T4 server names' random suffix,
+        and your account with placeholders such as `<subscriptionId>` before you submit.
+        For a deployment that doesn't finish, use the **Deployment problem** template instead.
+        For security issues, follow SECURITY.md instead of opening an issue.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Deployment (deploy.ps1 / deploy.yml)
+        - T1 SQL Server on Azure VM
+        - T2 Arc-enabled SQL Server (nested guest)
+        - T3 Azure SQL Database
+        - T4 Azure Database for PostgreSQL flexible server
+        - Database Hub or Database Agent
+        - Fabric notebooks, Real-Time Dashboard, report, or app
+        - Workload generator or scenarios
+        - Cost, start, stop, or destroy
+        - GitHub Actions workflows
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include the result lines (checkId, status, message) if you have them, with every ID replaced.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: input
+    id: version
+    attributes:
+      label: Repo commit or release
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Before you submit
+      options:
+        - label: I replaced every subscription, tenant, object, client, and workspace ID, and my account, with placeholders.
+          required: true

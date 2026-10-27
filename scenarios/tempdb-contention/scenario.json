@@ -1,0 +1,38 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "tempdb-contention",
+  "title": "tempdb allocation contention",
+  "summary": "Many sessions create, fill, index, and drop temporary tables back to back. The index added after CREATE TABLE stops SQL Server from caching the tables, so every iteration allocates pages and system catalog rows in tempdb, and the sessions queue on tempdb's allocation and catalog pages (PAGELATCH waits). The #tables belong to the scenario's own sessions and are dropped every iteration; tempdb is the only place outside ContosoCare it touches, as any #table does.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_tempdb_contention",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 16, "min": 2, "max": 32, "description": "Sessions creating and dropping temporary tables at once; contention grows with sessions per scheduler." },
+  "intensity": { "default": 8, "min": 1, "max": 10, "description": "Pause between iterations: about 200 ms at 1, none at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T2"],
+    "notes": {
+      "T1": "tempdb lives on the VM's local temporary disk.",
+      "T3": "Azure SQL Database's tempdb is managed by the service; with 1 vCore at most, fewer sessions run at once, so expect fewer latch waits and more CPU waits."
+    }
+  },
+  "parameters": {
+    "rowsPerTable": { "type": "integer", "default": 200, "minimum": 10, "maximum": 2000, "description": "Rows each temporary table gets (400 bytes each), so at most about 800 KB per session at a time.", "sqlParameter": "@rows_per_table" }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerWaitStats: Buffer Latch wait category (PAGELATCH_EX, PAGELATCH_SH, PAGELATCH_UP) on tempdb pages", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: Temp Tables Creation Rate and Active Temp Tables rising, Free Space in tempdb (KB) moving", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: SQL Re-Compilations/sec rising (each new #table recompiles the statements that use it)", "surface": "Performance" },
+    { "signal": "SqlServerCPUUtilization: CPU rising with the DDL churn", "surface": "Performance" }
+  ],
+  "expectedSymptoms": [
+    "Sessions waiting on PAGELATCH_* in database 2 (tempdb), on allocation (PFS, GAM, SGAM) and system catalog pages",
+    "Thousands of temporary tables created and dropped per minute",
+    "No growth: every #table is dropped right after use"
+  ],
+  "queryLevelEvidence": [
+    "sys.dm_exec_requests: wait_type PAGELATCH_* with a wait_resource of 2:<file>:<page> (needs VIEW SERVER STATE)",
+    "sys.dm_os_waiting_tasks: resource_description in tempdb while the run lasts"
+  ],
+  "reset": "Nothing persists: every #table is dropped each iteration, and SQL Server drops any that remain when the session closes. Reset kills leftover ContosoCare.Demo/ sessions."
+}

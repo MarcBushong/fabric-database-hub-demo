@@ -1,0 +1,60 @@
+/// UTC calendar, 2026-01-01 to 2030-12-31, marked as the date table. Every fact table relates to it through Report Date UTC, the UTC date of the row's primary time, so a midnight-spanning incident falls on its start date.
+table Date
+    dataCategory: Time
+
+    /// The UTC calendar date.
+    column Date
+        dataType: dateTime
+        isKey
+        formatString: d mmm yyyy
+        isNameInferred
+        sourceColumn: [Date]
+
+    /// Calendar year.
+    column Year
+        dataType: int64
+        formatString: 0
+        isNameInferred
+        summarizeBy: none
+        sourceColumn: [Year]
+
+    column 'Month Key'
+        dataType: int64
+        isHidden
+        formatString: 0
+        isNameInferred
+        summarizeBy: none
+        sourceColumn: [Month Key]
+
+    /// Month and year, for example Oct 2026, sorted by calendar order.
+    column Month
+        dataType: string
+        isNameInferred
+        sourceColumn: [Month]
+        sortByColumn: 'Month Key'
+
+    /// Day of the month.
+    column Day
+        dataType: int64
+        formatString: 0
+        isNameInferred
+        summarizeBy: none
+        sourceColumn: [Day]
+
+    /// The date as a label, for example 21 Oct 2026.
+    column 'Date Label'
+        dataType: string
+        isNameInferred
+        sourceColumn: [Date Label]
+
+    partition Date = calculated
+        mode: import
+        source =
+                ADDCOLUMNS (
+                    CALENDAR ( DATE ( 2026, 1, 1 ), DATE ( 2030, 12, 31 ) ),
+                    "Year", YEAR ( [Date] ),
+                    "Month Key", YEAR ( [Date] ) * 100 + MONTH ( [Date] ),
+                    "Month", FORMAT ( [Date], "mmm yyyy" ),
+                    "Day", DAY ( [Date] ),
+                    "Date Label", FORMAT ( [Date], "d mmm yyyy" )
+                )

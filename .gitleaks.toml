@@ -1,0 +1,47 @@
+# gitleaks configuration (Phase 14, ADR 0009). gitleaks reads it from the repository root, for the CI job
+# "Secret scan" (.github/workflows/reusable-static-checks.yml) and for the pre-commit hook. Every default
+# rule stays on; this file adds two rules and one narrow allowlist. https://github.com/gitleaks/gitleaks#configuration
+
+title = "fabric-database-hub-demo"
+
+# The rule below was checked with the gitleaks pinned in config/versions.json (tools.gitleaks); an older gitleaks
+# only warns.
+minVersion = "8.30.1"
+
+[extend]
+useDefault = true
+
+# The default jwt rule needs a quote, a backtick, a space, a semicolon, or the end of the line after the token,
+# so it misses one inside an XML element or followed by '&' in a URL, where a tool's log or a copied command line
+# can hold one. The scripts' redaction rule (DbHubDemo.psm1, 'jwt') matches whatever follows. This rule matches
+# the same shape: three base64url segments, the first two starting with eyJ.
+[[rules]]
+id = "jwt-any-delimiter"
+description = "A JSON Web Token, such as an Azure access token, whatever character follows it."
+regex = '''\b(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})'''
+entropy = 3
+keywords = ["eyj"]
+
+# An Azure Automation webhook URL is a bearer secret: whoever has it starts the runbook, and Azure shows it only once
+# (ADR 0020). scripts/setup-activity-control.ps1 keeps it only in Key Vault; this rule finds one anywhere else. The
+# scripts' redaction rule (DbHubDemo.psm1, 'automation-webhook') matches the same shape.
+[[rules]]
+id = "azure-automation-webhook"
+description = "An Azure Automation webhook URL, whose token starts a runbook."
+regex = '''(?i)https://[a-z0-9.-]+\.azure-automation\.net/webhooks\?token=([A-Za-z0-9%+/=_-]{20,})'''
+entropy = 3
+keywords = ["azure-automation.net"]
+
+# config/versions.json pins GitHub Actions and plugins by their public 40-hex commit SHAs. The default
+# sourcegraph-access-token rule matches any 40-hex value once its keyword appears in the scanned text, and
+# "sourcegraph" appears inside "resourcegraph" in that file, so a scan of the whole file (gitleaks dir) flagged
+# all eight pins (2026-10-21). CI's history scan reads each commit's added lines and didn't, but a commit that
+# changed both parts of the file would. Only that rule, only that file, and only "sha", "commit", and
+# "pluginCommit" values: a Sourcegraph token on any other line of that file, or in any other file, is still found.
+[[allowlists]]
+description = "Public commit SHA pins in config/versions.json"
+targetRules = ["sourcegraph-access-token"]
+condition = "AND"
+paths = ['''(?:^|[\\/])config[\\/]versions\.json$''']
+regexTarget = "line"
+regexes = ['''"(?:sha|commit|pluginCommit)"\s*:\s*"[0-9a-f]{40}"''']

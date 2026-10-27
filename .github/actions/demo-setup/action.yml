@@ -1,0 +1,99 @@
+name: Set up a demo run
+description: >
+  Masks the environment's identifiers first, then installs the pinned Bicep and .NET SDK when asked, signs in to Azure
+  with OpenID Connect (azure/login, no secret), and writes config/demo.config.json from the GitHub environment's
+  DBHUB_CONFIG_JSON secret, with azureAccount set to the OpenID Connect client ID (the account the subscription guard
+  expects), then validates it against the schema. Shared by the deploy, demo-control, destroy, and scheduled
+  workflows (plan section 9.5). The identifiers are environment secrets so that GitHub masks them, because a public
+  repository's Actions logs are public (ADR 0022); they aren't credentials.
+
+inputs:
+  client-id:
+    description: The identity's client ID (the environment secret AZURE_CLIENT_ID, from setup-github-oidc.ps1).
+    required: true
+  tenant-id:
+    description: The tenant ID (the environment secret AZURE_TENANT_ID).
+    required: true
+  subscription-id:
+    description: The subscription ID (the environment secret AZURE_SUBSCRIPTION_ID).
+    required: true
+  config-json:
+    description: The demo configuration (the environment secret DBHUB_CONFIG_JSON); it holds identifiers, not secrets.
+    required: true
+  bicep:
+    description: Install the Bicep version pinned in config/versions.json.
+    required: false
+    default: "false"
+  dotnet:
+    description: Install the .NET SDK pinned in workload-generator/global.json (to publish the runner).
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # First, before anything can print them: GitHub masks a secret only in its exact form, and DBHUB_CONFIG_JSON
+    # only as a whole, so every ID in it, and each ID in lowercase and uppercase, gets its own add-mask (ADR 0022).
+    - name: Mask the environment's identifiers
+      shell: pwsh
+      env:
+        DBHUB_MASK_CLIENT_ID: ${{ inputs.client-id }}
+        DBHUB_MASK_TENANT_ID: ${{ inputs.tenant-id }}
+        DBHUB_MASK_SUBSCRIPTION_ID: ${{ inputs.subscription-id }}
+        DBHUB_CONFIG_JSON: ${{ inputs.config-json }}
+      run: |
+        Import-Module -Name ./scripts/modules/DbHubDemo/DbHubDemo.psd1
+        Register-DemoLogMask -Value @($env:DBHUB_MASK_CLIENT_ID, $env:DBHUB_MASK_TENANT_ID, $env:DBHUB_MASK_SUBSCRIPTION_ID)
+        if (-not [string]::IsNullOrWhiteSpace($env:DBHUB_CONFIG_JSON)) {
+          try {
+            $config = $env:DBHUB_CONFIG_JSON | ConvertFrom-Json -AsHashtable
+          }
+          catch {
+            throw 'The environment secret DBHUB_CONFIG_JSON is not valid JSON. Set it again from config/demo.config.json (setup-github-oidc.ps1 -ConfigureGitHub).'
+          }
+          Register-DemoLogMask -Config $config
+        }
+        $names = [ordered]@{ AZURE_CLIENT_ID = $env:DBHUB_MASK_CLIENT_ID; AZURE_TENANT_ID = $env:DBHUB_MASK_TENANT_ID; AZURE_SUBSCRIPTION_ID = $env:DBHUB_MASK_SUBSCRIPTION_ID; DBHUB_CONFIG_JSON = $env:DBHUB_CONFIG_JSON }
+        $missing = @($names.Keys | Where-Object { [string]::IsNullOrWhiteSpace($names[$_]) })
+        if ($missing.Count -gt 0) {
+          throw ('The GitHub environment has no secret {0}. Run scripts/setup-github-oidc.ps1 -ConfigureGitHub, or set them with gh secret set --env. Environment variables are no longer read, because a public repository''s logs are public (ADR 0022).' -f ($missing -join ', '))
+        }
+
+    - name: Install the pinned .NET SDK
+      if: inputs.dotnet == 'true'
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        global-json-file: workload-generator/global.json
+
+    - name: Sign in to Azure with OpenID Connect
+      uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+      with:
+        client-id: ${{ inputs.client-id }}
+        tenant-id: ${{ inputs.tenant-id }}
+        subscription-id: ${{ inputs.subscription-id }}
+
+    - name: Install the pinned Bicep version
+      if: inputs.bicep == 'true'
+      shell: pwsh
+      run: |
+        $version = (Get-Content -LiteralPath config/versions.json -Raw | ConvertFrom-Json).tools.bicep
+        az bicep install --version "v$version"
+        az bicep version
+
+    - name: Write and validate the demo configuration
+      shell: pwsh
+      env:
+        DBHUB_CONFIG_JSON: ${{ inputs.config-json }}
+        DBHUB_AZURE_ACCOUNT: ${{ inputs.client-id }}
+      run: |
+        if ([string]::IsNullOrWhiteSpace($env:DBHUB_CONFIG_JSON)) {
+          throw 'The GitHub environment has no DBHUB_CONFIG_JSON secret. Run scripts/setup-github-oidc.ps1 -ConfigureGitHub, or set it with gh secret set --env.'
+        }
+        # azure/login signs the Azure CLI in as the OpenID Connect identity, so that client ID is the account the
+        # subscription guard expects here (azureAccount), whatever the copied configuration says.
+        $config = $env:DBHUB_CONFIG_JSON | ConvertFrom-Json -AsHashtable
+        $config['azureAccount'] = $env:DBHUB_AZURE_ACCOUNT
+        Set-Content -LiteralPath config/demo.config.json -Value ($config | ConvertTo-Json -Depth 32) -Encoding utf8NoBOM
+        Import-Module -Name ./scripts/modules/DbHubDemo/DbHubDemo.psd1
+        $null = Get-DemoConfig -Path config/demo.config.json
+        Write-Output 'The demo configuration is valid.'

@@ -1,0 +1,16 @@
+// Estate pulse: which demo targets report telemetry in the window, from how many tables, how many rows, and
+// the newest sample. Based on 'List the tables that have recent data' and query 1 ('Find the resources you
+// can query') in https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-21). Rules applied: 1 (filter on SampleTimeUTC first), 4 (count the instances per
+// target), and an aggregation as the row limit (rule 10).
+// Contract: runs after Live.Prelude.kql, which defines _start, _end, _bin, _rg, _db, and _target(). The body is
+// identical to PULSE_KQL in fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, and the Real-Time Dashboard
+// (fabric/realtime) is generated from this file; tests/unit/Fabric.Dashboard.Tests.ps1 fails if they drift.
+union withsource=TableName SqlServer*
+| where SampleTimeUTC between (_start .. _end)
+| where ResourceGroup =~ _rg
+| extend Target = _target(ResourceType, ResourceName)
+| where isnotempty(Target)
+| summarize Rows = count(), Tables = dcount(TableName), LastSampleUTC = max(SampleTimeUTC), Instances = dcount(SqlServerInstanceName)
+        by Target, ResourceType, ResourceName
+| order by Target asc

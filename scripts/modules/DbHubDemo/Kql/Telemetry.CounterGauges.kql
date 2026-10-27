@@ -1,0 +1,24 @@
+// Gauge and percentage performance counters for each demo target, read directly.
+// Based on query 8 ("Blocking and memory pressure across the estate") in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-20). Rules applied: 1 (filter on SampleTimeUTC first), 3 (branch on CounterType:
+// 65792 is a gauge and 537003264 a percentage that's already calculated, so both are read directly;
+// cumulative counters, CounterType 272696576, are in Telemetry.CounterRates.kql), 4 (group by ResourceID
+// and SqlServerInstanceName), 5 (compare ResourceID case-insensitively), 10 (row limit).
+// Parameters, rendered by Get-DemoHubTelemetryKql: Lookback (timespan), Targets (dynamic array of
+// ResourceIDs), CounterNames (dynamic array of counter names).
+let lookback = {{Lookback}};
+let targetIds = {{Targets}};
+let counterNames = {{CounterNames}};
+SqlServerPerformanceCountersCommon
+| where SampleTimeUTC > ago(lookback)
+| where ResourceID in~ (targetIds)
+| where CounterType in (65792, 537003264)
+| where CounterName in (counterNames)
+| summarize AvgValue = round(avg(CounterValue), 2),
+            MinValue = min(CounterValue),
+            MaxValue = max(CounterValue),
+            LastSampleUTC = max(SampleTimeUTC)
+        by ResourceID, SqlServerInstanceName, CounterName, CounterType
+| order by ResourceID asc, CounterName asc
+| take 500

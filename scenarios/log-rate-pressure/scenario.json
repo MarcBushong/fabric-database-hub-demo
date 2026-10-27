@@ -1,0 +1,40 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "log-rate-pressure",
+  "title": "Log-rate pressure",
+  "summary": "Write-heavy batches of 3,000-byte rows into demo.log_rate_scratch, each deleted right after it commits, so the table stays small while the log keeps working. The run asks for 2 MB of log per second per intensity level. On Azure SQL Database, more than the service objective's log rate shows up as log-rate governance; on SQL Server it shows up as WRITELOG waits and log flushes. Each run stops after maxLogMb of log, at its deadline, or on a stop request.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_log_rate_pressure",
+  "duration": { "defaultSeconds": 300, "maxSeconds": 900 },
+  "concurrency": { "default": 2, "min": 1, "max": 8, "description": "Writer sessions; they share the run's log budget and requested rate." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Requested log rate: 2 MB per second per level (10 MB/s at the default), unthrottled at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T3"],
+    "notes": {
+      "T3": "The service backs up and truncates the log; the run's maxLogMb budget bounds how much it generates.",
+      "T1": "Simple recovery: the log truncates at checkpoints and stays under its 8 GB cap.",
+      "T2": "Simple recovery: the log stays under its 4 GB cap; the runner checks the guest volume first."
+    }
+  },
+  "parameters": {
+    "maxLogMb": { "type": "integer", "default": 2048, "minimum": 64, "maximum": 8192, "defaultByTarget": { "T2": 1024 }, "description": "Total log to generate across all sessions (an estimate); the run ends early when it's reached.", "sqlParameter": "@max_log_mb" }
+  },
+  "freeSpace": { "marginMb": 2048 },
+  "expectedHubSignals": [
+    { "signal": "SqlServerWaitStats: Log Rate Governor wait category (LOG_RATE_GOVERNOR) on T3", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: Tran Log IO (WRITELOG) on T1 and T2", "surface": "Performance" },
+    { "signal": "SqlServerPerformanceCountersCommon: Log Bytes Flushed/sec and Log Flushes/sec rising", "surface": "Performance" },
+    { "signal": "SqlServerStorageIO: writes on the log file", "surface": "Performance" }
+  ],
+  "expectedSymptoms": [
+    "Write throughput flattens at the service objective's log rate on T3, with sessions waiting on log-rate governance",
+    "On SQL Server, sustained log writes and WRITELOG waits",
+    "Data size stays flat: every batch is deleted after it commits"
+  ],
+  "queryLevelEvidence": [
+    "sys.dm_db_resource_stats avg_log_write_percent near 100 on T3",
+    "sys.dm_exec_requests wait_type LOG_RATE_GOVERNOR or WRITELOG for ContosoCare.Demo/log-rate-pressure sessions"
+  ],
+  "reset": "Auto-cleanup and reset truncate demo.log_rate_scratch; business data is never touched."
+}

@@ -1,0 +1,5 @@
+// The Real-Time Dashboard's Target parameter (_selectedTargets, a multiple-selection fixed-values parameter): keep
+// the selected targets, or every target when "Select all" sends an empty value. The isempty() pattern for "Select
+// all" is the one in https://learn.microsoft.com/fabric/real-time-intelligence/dashboard-parameters (checked
+// 2026-10-21). Appended to a Live.*.kql body or to Dashboard.Heartbeat.kql, whose rows carry Target.
+| where isempty(_selectedTargets) or Target in (_selectedTargets)

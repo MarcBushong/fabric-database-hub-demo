@@ -1,0 +1,81 @@
+# PSRule for Azure (plan section 9.5). CI runs it against infra/main.bicepparam.
+configuration:
+  AZURE_BICEP_FILE_EXPANSION: true
+  AZURE_BICEP_PARAMS_FILE_EXPANSION: true
+  # The default is 5 seconds. The template restores AVM modules from the registry and nests modules, which
+  # the docs list as reasons to raise it; a busy machine also timed out locally (2026-10-20). Since T3 joined
+  # the template (Phase 8), the Bicep build of main.bicepparam alone takes about 5 seconds on a loaded workstation.
+  # https://azure.github.io/PSRule.Rules.Azure/setup/setup-bicep/#configuring-timeout
+  AZURE_BICEP_FILE_EXPANSION_TIMEOUT: 60
+
+include:
+  module:
+    - PSRule.Rules.Azure
+
+input:
+  pathIgnore:
+    - "**"
+    - "!infra/**/*.bicepparam"
+
+output:
+  culture:
+    - en-US
+
+# Findings accepted by design. Target names come from the expanded template, which uses a fixed
+# placeholder subscription, so they're stable in CI.
+suppression:
+  # Azure Bastion needs outbound RDP and SSH to the virtual network (ADR 0007).
+  Azure.NSG.LateralTraversal:
+    - nsg-dbhub-demo-bastion
+  # VM subnets set defaultOutboundAccess explicitly to keep the default cheapest; outboundMode
+  # NatGateway is the alternative (ADR 0017).
+  Azure.VNET.PrivateSubnet:
+    - vnet-dbhub-demo
+  # Phase 6 VMs. One instance of each by design: the demo tolerates single-VM downtime, and an
+  # availability set or a second zone would break the cost ceilings (ADR 0016). A zone is optional and
+  # turns on Premium SSD v2 data disks (C10).
+  Azure.VM.Standalone:
+    - sqlvm01
+    - archost01
+  # lowest-cost has no data disks: T1's data and log stay on its Standard SSD OS disk to keep within the
+  # monthly ceiling; demo-day and enhanced-performance use Standard SSD data disks, or Premium SSD v2
+  # with a zone (ADR 0016).
+  Azure.VM.SQLServerDisk:
+    - sqlvm01
+  # No Log Analytics workspace by design: Hub telemetry is Microsoft-managed, and a workspace plus data
+  # collection rules would add cost (architecture, ADR 0016).
+  Azure.VM.AMA:
+    - sqlvm01
+    - archost01
+  # The VMs are deallocated outside demo windows and patch with AutomaticByOS. An Update Manager
+  # maintenance configuration would schedule work that conflicts with auto-shutdown and demo windows.
+  Azure.VM.MaintenanceConfig:
+    - sqlvm01
+    - archost01
+  # Phase 8, T3. Microsoft Defender for Azure SQL is a subscription-level Defender for Cloud plan (the
+  # tenant's policies enforce it here, and the cost estimate prices it, ADR 0016); a server-level
+  # securityAlertPolicies resource would duplicate it.
+  Azure.SQL.DefenderCloud:
+    - azuresql01-16cc7e
+  # Auditing needs a storage account, Log Analytics workspace, or event hub, and the demo deploys none by
+  # design (ADR 0016: no storage accounts, Hub telemetry is Microsoft-managed).
+  Azure.SQL.Auditing:
+    - azuresql01-16cc7e
+  # Classic vulnerability assessment needs a storage account; the express configuration comes with the
+  # Defender for Azure SQL plan above.
+  Azure.SQL.VAScan:
+    - azuresql01-16cc7e
+  # A single serverless demo database with synthetic data and no availability target; it pauses when
+  # idle, so the default maintenance window is acceptable.
+  Azure.SQL.MaintenanceWindow:
+    - azuresql01-16cc7e/ContosoCare
+  # Phase 24, T4 (ADR 0019): the smallest Burstable flexible server with synthetic data and no availability
+  # target, stopped outside demo windows. High availability isn't available on the Burstable tier, and
+  # geo-redundant backups would only add cost for synthetic data (ADR 0016); a custom maintenance window would
+  # schedule work that conflicts with the stop schedule, so the system-managed one applies.
+  Azure.PostgreSQL.GeoRedundantBackup:
+    - pgflex01-16cc7e
+  Azure.PostgreSQL.ZoneRedundantHA:
+    - pgflex01-16cc7e
+  Azure.PostgreSQL.MaintenanceWindow:
+    - pgflex01-16cc7e

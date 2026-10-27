@@ -1,0 +1,41 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "capacity-max",
+  "title": "Capacity maxed out",
+  "summary": "Every scheduler busy and the storage at its cap at the same time. CPU sessions run back-to-back CPU-heavy reports at MAXDOP 1, one scheduler each, more sessions than schedulers (on Azure SQL Database, CPU at the vCore limit). IO sessions scan and update a scratch set (shared with io-pressure) that the first one grows to scratchMb after a free-space check, so reads miss the buffer pool once it's bigger than memory. Business data is only read.",
+  "orchestration": "capacity",
+  "procedure": "demo.usp_scenario_capacity_max",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1200 },
+  "concurrency": { "default": 8, "min": 2, "max": 16, "description": "CPU sessions; T1 and T2 have 2 vCPUs and T3 at most 1 vCore, so 8 keeps every scheduler busy with several runnable tasks each." },
+  "intensity": { "default": 10, "min": 1, "max": 10, "description": "CPU work per report and the pause between units of work: about 1 second at 1, none at 10." },
+  "targets": {
+    "applicable": ["T1", "T2", "T3"],
+    "default": ["T1", "T2", "T3"],
+    "notes": {
+      "T1": "The ContosoCare data file sits on the VM's managed disk (the OS disk in lowest-cost, a data disk otherwise) with its IOPS and throughput caps; the 16 GB data cap leaves room for the default 6 GB scratch set, and the runner checks free space first.",
+      "T2": "The guest's VHDX sits on the host's disk; the 8 GB data cap keeps the default scratch set at 4 GB with a 512 MB margin.",
+      "T3": "CPU at the serverless maximum vCores and reads governed by the service objective (IO stalls queued by resource governance)."
+    }
+  },
+  "parameters": {
+    "ioWorkers": { "type": "integer", "default": 4, "minimum": 0, "maximum": 8, "description": "Sessions scanning and updating the scratch set (0 for CPU only)." },
+    "scratchMb": { "type": "integer", "default": 4096, "minimum": 64, "maximum": 6144, "defaultByTarget": { "T1": 6144, "T2": 4096, "T3": 2048 }, "description": "Size of the scratch data set in MB, shared with io-pressure. Reads become physical once it no longer fits in the buffer pool.", "sqlParameter": "@scratch_mb" }
+  },
+  "freeSpace": { "dataMbFromParameter": "scratchMb", "marginMb": 2048 },
+  "expectedHubSignals": [
+    { "signal": "SqlServerCPUUtilization: SQLProcessCPUPercent (SQL Server) or AvgCPUPercent (Azure SQL Database, of the vCore limit) at or near 100", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: CPU wait category (SOS_SCHEDULER_YIELD) and signal waits from runnable tasks", "surface": "Performance" },
+    { "signal": "SqlServerWaitStats: Buffer IO wait category (PAGEIOLATCH_SH) once the scratch set exceeds memory", "surface": "Performance" },
+    { "signal": "SqlServerStorageIO: IO stalls on the ContosoCare data file at the disk's caps; on Azure SQL Database, IOStallQueuedReadMs from IO governance", "surface": "Performance" }
+  ],
+  "expectedSymptoms": [
+    "CPU pinned near 100% with every scheduler busy and several runnable tasks each",
+    "Read IO at the disk's IOPS or throughput cap, with rising read latency",
+    "Everything else on the target slows down: the healthy baseline's requests take longer"
+  ],
+  "queryLevelEvidence": [
+    "sys.dm_os_schedulers: runnable_tasks_count above 0 on every scheduler (needs VIEW SERVER STATE)",
+    "sys.dm_io_virtual_file_stats for the ContosoCare data file, or sys.dm_db_resource_stats on Azure SQL Database"
+  ],
+  "reset": "Auto-cleanup and reset truncate demo.io_scratch when no io-pressure or capacity-max run still uses it; the space stays allocated for the next run, and business data is only read."
+}

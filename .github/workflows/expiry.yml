@@ -1,0 +1,28 @@
+name: expiry
+
+# Scheduled destroy of an expired environment (plan section 9.4, C4): when the resource group's expiresOn
+# tag (expiresOn in the configuration) has passed, destroy.ps1 deletes the Arc resources and the resource
+# group; otherwise it does nothing. Off unless DBHUB_SCHEDULES_ENABLED is 'true'.
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+# Least privilege (ADR 0022): only the job that signs in to Azure may request an OpenID Connect token.
+permissions:
+  contents: read
+
+jobs:
+  expire:
+    permissions:
+      contents: read
+      id-token: write
+    if: vars.DBHUB_SCHEDULES_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/reusable-demo-run.yml
+    with:
+      # The schedule environment (no reviewers) only for scheduled runs; a run by hand uses the reviewed one (ADR 0022).
+      environment: ${{ github.event_name == 'schedule' && vars.DBHUB_SCHEDULE_ENVIRONMENT || 'demo' }}
+      script: destroy
+      parameters: '{"Force": true, "IfExpired": true}'
+      timeout-minutes: 90
+    secrets: inherit

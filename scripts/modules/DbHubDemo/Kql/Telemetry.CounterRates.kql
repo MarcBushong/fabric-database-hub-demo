@@ -1,0 +1,31 @@
+// Cumulative performance counters for each demo target, as totals and per-second rates for the window.
+// Based on query 9 ("Throughput and deadlocks for one resource") in
+// https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
+// (checked 2026-10-20). Rules applied: 1 (filter on SampleTimeUTC first), 2 (sum the increase between
+// adjacent samples of one series and skip the first sample and any interval where the value goes down),
+// 3 (branch on CounterType: only 272696576, the cumulative type, is read here, and the delta is divided by
+// the elapsed seconds; gauges are in Telemetry.CounterGauges.kql), 4 (group by ResourceID and
+// SqlServerInstanceName), 5 (compare ResourceID case-insensitively), 10 (row limit).
+// Parameters, rendered by Get-DemoHubTelemetryKql: Lookback (timespan), Targets (dynamic array of
+// ResourceIDs), CounterNames (dynamic array of counter names).
+let lookback = {{Lookback}};
+let targetIds = {{Targets}};
+let counterNames = {{CounterNames}};
+SqlServerPerformanceCountersCommon
+| where SampleTimeUTC > ago(lookback)
+| where ResourceID in~ (targetIds)
+| where CounterType == 272696576
+| where CounterName in (counterNames)
+| project ResourceID, SqlServerInstanceName, CounterName, InstanceName, SampleTimeUTC, CounterValue
+| sort by ResourceID asc, SqlServerInstanceName asc, CounterName asc, InstanceName asc, SampleTimeUTC asc
+| extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)
+                and CounterName == prev(CounterName) and InstanceName == prev(InstanceName)
+                and CounterValue >= prev(CounterValue)
+| extend Delta = iff(Keep, CounterValue - prev(CounterValue), 0.0),
+         Sec = iff(Keep, datetime_diff('second', SampleTimeUTC, prev(SampleTimeUTC)), long(0))
+| summarize Delta = sum(Delta), ElapsedSec = sum(Sec) by ResourceID, SqlServerInstanceName, CounterName, InstanceName
+| summarize TotalEvents = sum(Delta), ElapsedSec = max(ElapsedSec) by ResourceID, SqlServerInstanceName, CounterName
+| where ElapsedSec > 0
+| extend PerSecond = round(TotalEvents / ElapsedSec, 3)
+| order by ResourceID asc, CounterName asc
+| take 500

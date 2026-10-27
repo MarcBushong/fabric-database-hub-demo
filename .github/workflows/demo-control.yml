@@ -1,0 +1,75 @@
+name: demo-control
+
+# Changes the activity on the demo's targets (ADR 0010, ADR 0011). The inputs match what the live-activity
+# notebook dispatches (fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, prerequisite P9): every value is
+# a string. scripts/demo-control.ps1 validates them, and everything ends before the next auto-shutdown.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment
+        type: string
+        required: true
+        default: demo
+      target:
+        description: Target (an incident on all runs on the scenario's default target)
+        type: choice
+        default: all
+        options:
+          - all
+          - T1
+          - T2
+          - T3
+          - T4
+      scenario:
+        description: baseline, business-day, off, or incident:<scenario>
+        type: string
+        required: true
+        default: baseline
+      duration:
+        description: Minutes, 1-240 (everything also stops at auto-shutdown)
+        type: string
+        default: "30"
+      concurrency:
+        description: Sessions, 1-64 (empty for the scenario's default)
+        type: string
+        default: ""
+      intensity:
+        description: 1-10 (empty for the scenario's default)
+        type: string
+        default: ""
+      reset-before:
+        description: Reset the target first
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+      auto-cleanup:
+        description: Clean up the scenario's scratch data afterward
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+
+# Least privilege (ADR 0022): only the job that signs in to Azure may request an OpenID Connect token.
+permissions:
+  contents: read
+
+jobs:
+  control:
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/reusable-demo-run.yml
+    with:
+      environment: ${{ inputs.environment }}
+      script: demo-control
+      parameters: >-
+        {"Target": ${{ toJSON(inputs.target) }}, "Scenario": ${{ toJSON(inputs.scenario) }},
+        "Duration": ${{ toJSON(inputs.duration) }}, "Concurrency": ${{ toJSON(inputs.concurrency) }},
+        "Intensity": ${{ toJSON(inputs.intensity) }}, "ResetBefore": ${{ toJSON(inputs.reset-before) }},
+        "AutoCleanup": ${{ toJSON(inputs.auto-cleanup) }}, "RequestedBy": "demo-control.yml"}
+      timeout-minutes: 30
+    secrets: inherit

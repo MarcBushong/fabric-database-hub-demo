@@ -1,0 +1,71 @@
+name: Deployment problem
+description: A deployment, start, stop, or destroy that doesn't finish, or a check that isn't Pass.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying the demo. This repository is public, so **replace every ID before you paste anything**:
+        subscription, tenant, object, client, and workspace IDs, the T3 and T4 server names' random suffix
+        (for example `azuresql01-<suffix>`), resource IDs, and your account. Never paste a token, a password, or a
+        webhook URL. [Troubleshooting](https://github.com/MarcBushong/fabric-database-hub-demo/blob/main/docs/troubleshooting.md)
+        covers the common results first.
+  - type: dropdown
+    id: script
+    attributes:
+      label: What did you run?
+      options:
+        - preflight.ps1
+        - deploy.ps1
+        - start-demo.ps1
+        - stop-demo.ps1
+        - destroy.ps1
+        - configure-fabric.ps1, configure-powerbi.ps1, or configure-fabric-app.ps1
+        - setup-github-oidc.ps1 or setup-github-repo.ps1
+        - A GitHub Actions workflow
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: The exact command
+      description: For example `./scripts/deploy.ps1 -FromStage T2`, with any ID replaced.
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: The results that aren't Pass
+      description: The checkId, status, and message of each Fail, Warning, or Manual action required, from the script's table or its out/<script>.jsonl file, with every ID replaced.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of ./scripts/status.ps1
+      description: Run `./scripts/status.ps1` (read-only) and paste its table, with every ID replaced. It shows the VMs, T3, T4, the activity profiles, Bastion, and the cost so far.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Your setup
+      description: The region, the profile (for example lowest-cost), t2SqlInstallMode, networkMode, whether you run it locally or in GitHub Actions, and your PowerShell and Azure CLI versions (`$PSVersionTable.PSVersion`, `az version`). No IDs.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Repo commit or release
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Before you submit
+      options:
+        - label: I replaced every subscription, tenant, object, client, and workspace ID, the server names' suffix, and my account with placeholders.
+          required: true
+        - label: The output contains no token, password, connection string, or webhook URL.
+          required: true

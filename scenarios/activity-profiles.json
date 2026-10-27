@@ -1,0 +1,49 @@
+{
+  "$schema": "./activity-profiles.schema.json",
+  "pollSeconds": 10,
+  "minimumRunSeconds": 60,
+  "baseline": {
+    "scenario": "healthy-baseline",
+    "chunkMinutes": 30,
+    "concurrency": 2,
+    "intensity": 3,
+    "byTarget": {
+      "T3": { "concurrency": 1, "intensity": 2 },
+      "T4": { "concurrency": 1, "intensity": 2 }
+    }
+  },
+  "profiles": {
+    "baseline": {
+      "description": "The steady Contoso Care OLTP mix, recorded as back-to-back 30-minute runs.",
+      "defaultDurationMinutes": 480,
+      "maxDurationMinutes": 720,
+      "baseline": true
+    },
+    "business-day": {
+      "description": "The baseline plus bounded incidents at fixed minutes past each UTC hour: blocking and long transactions on T1; CPU, missing index, IO, and inefficient queries on T2; the CPU cap and log-rate pressure on T3; a connection surge, idle-in-transaction blockers, and CPU at its ceiling on T4.",
+      "defaultDurationMinutes": 480,
+      "maxDurationMinutes": 720,
+      "baseline": true,
+      "cycleMinutes": 60,
+      "incidents": [
+        { "target": "T1", "scenario": "locking-blocking", "startMinute": 10, "durationMinutes": 8 },
+        { "target": "T1", "scenario": "locking-blocking", "startMinute": 40, "durationMinutes": 6, "parameters": { "holdSeconds": "90", "deadlock": "true" } },
+        { "target": "T2", "scenario": "cpu-pressure", "startMinute": 5, "durationMinutes": 8 },
+        { "target": "T2", "scenario": "missing-index", "startMinute": 20, "durationMinutes": 8 },
+        { "target": "T2", "scenario": "io-pressure", "startMinute": 35, "durationMinutes": 8 },
+        { "target": "T2", "scenario": "inefficient-query", "startMinute": 50, "durationMinutes": 6 },
+        { "target": "T3", "scenario": "resource-governance", "startMinute": 15, "durationMinutes": 5 },
+        { "target": "T3", "scenario": "log-rate-pressure", "startMinute": 45, "durationMinutes": 5 },
+        { "target": "T4", "scenario": "connection-surge", "startMinute": 8, "durationMinutes": 4, "parameters": { "holdSeconds": "90" } },
+        { "target": "T4", "scenario": "idle-in-transaction", "startMinute": 22, "durationMinutes": 8 },
+        { "target": "T4", "scenario": "cpu-pressure", "startMinute": 42, "durationMinutes": 6 }
+      ]
+    },
+    "incident": {
+      "description": "incident:<scenario>: one bounded run of the scenario from the moment the profile is set, with the baseline beside it unless --with-baseline false. The duration defaults to the scenario's default.",
+      "defaultDurationMinutes": 10,
+      "maxDurationMinutes": 120,
+      "baseline": true
+    }
+  }
+}
