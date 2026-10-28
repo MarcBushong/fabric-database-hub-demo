@@ -14,7 +14,9 @@ demo's group:
 - SQL Server must run Standard edition, and the host's and the guest's passwords are rotated;
 - with -Onboard, the deny rule goes and the copy is onboarded fresh in the test group: Standard, license type
   PAYG, and monitoring must pass;
-- the source's Arc machine must be untouched during the test (its properties and Activity Log);
+- the source's Arc machine must be untouched during the test: the same properties, the same last status change
+  when it was already Disconnected, and no Administrative operation in its Activity Log (Resource Health and
+  other events are listed, but they aren't operations);
 - the test group is deleted through the destroy path, with the residual check.
 The snapshot is tagged boot-verified, then onboard-verified, and older golden snapshots are deleted once the
 newest one passes, unless -KeepOlderSnapshots. This PC and its display stay awake until it finishes. It never signs in or changes the Azure CLI context. Exit code: 0 Pass or Warning, 1 Fail.

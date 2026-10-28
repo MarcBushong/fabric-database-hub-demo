@@ -383,7 +383,11 @@ Describe 'Test-DemoT2GoldenSnapshot' {
             markerRenamed = $true
         }
         $script:releaseSucceeded = $true
+        $script:sourceBeforeStatus = 'Disconnected'
+        $script:sourceBeforeChange = '2026-10-22T12:50:00Z'
         $script:sourceAfterStatus = 'Disconnected'
+        $script:sourceAfterChange = '2026-10-22T12:50:00Z'
+        $script:activityLog = @()
         $script:sourceReads = 0
         $script:adapterConnected = 0
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
@@ -407,8 +411,12 @@ Describe 'Test-DemoT2GoldenSnapshot' {
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -MockWith {
             $script:sourceReads++
-            $status = if ($script:sourceReads -ge 2) { $script:sourceAfterStatus } else { 'Disconnected' }
-            [pscustomobject]@{ properties = [pscustomobject]@{ status = $status; lastStatusChange = '2026-10-22T12:50:00Z'; vmId = 'machine-1'; agentVersion = '1.0'; provisioningState = 'Succeeded' } }
+            $after = $script:sourceReads -ge 2
+            $status = if ($after) { $script:sourceAfterStatus } else { $script:sourceBeforeStatus }
+            $change = if ($after) { $script:sourceAfterChange } else { $script:sourceBeforeChange }
+            # 'now': a status change at the time of the read, inside the test's window.
+            if ($change -eq 'now') { $change = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [System.Globalization.CultureInfo]::InvariantCulture) }
+            [pscustomobject]@{ properties = [pscustomobject]@{ status = $status; lastStatusChange = $change; vmId = 'machine-1'; agentVersion = '1.0'; provisioningState = 'Succeeded' } }
         }
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoEnvironment -MockWith {
             $script:calls.Add('teardown ' + $Config['environment'])
@@ -429,7 +437,7 @@ Describe 'Test-DemoT2GoldenSnapshot' {
                 '^network nsg rule show' { return [pscustomobject]@{ access = 'Deny'; direction = 'Outbound'; destinationAddressPrefix = '*'; priority = 90 } }
                 '^network nsg rule delete' { return (New-AzResult) }
                 '^tag update' { return (New-AzResult -StdOut '{}') }
-                '^monitor activity-log list' { return @() }
+                '^monitor activity-log list' { return $script:activityLog }
                 '^snapshot delete' { return (New-AzResult) }
                 default { throw ('unexpected: {0}' -f $text) }
             }
@@ -577,6 +585,60 @@ Describe 'Test-DemoT2GoldenSnapshot' {
         $script:snapshots = @(InModuleScope DbHubDemo -Parameters @{ Item = $recent } { ConvertFrom-DemoGoldenSnapshot -Snapshot $Item })
         $results = @(Test-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
         ($results | Where-Object checkId -EQ 'GOLDEN.TEST.SOURCE').status | Should -Be 'Warning'
+        ($results | Where-Object checkId -EQ 'GOLDEN.TEST').status | Should -Be 'Pass'
+    }
+
+    It 'passes a source that only Resource Health events mention, and keeps every entry with its category in the evidence' {
+        # The 2026-10-28 proof: Disconnected before and after with the same last status change, and Resource Health
+        # events about the machine while its host was deallocated.
+        $script:activityLog = @(
+            [pscustomobject]@{ operation = 'Microsoft.Resourcehealth/healthevent/Resolved/action'; category = 'ResourceHealth'; status = 'Resolved'; time = [DateTime]::UtcNow.ToString('o') }
+            [pscustomobject]@{ operation = 'Microsoft.Resourcehealth/healthevent/Activated/action'; category = 'ResourceHealth'; status = 'Active'; time = [DateTime]::UtcNow.ToString('o') }
+        )
+        $results = @(Test-DemoT2GoldenSnapshot -Config $config -Onboard -Confirm:$false)
+        $source = $results | Where-Object checkId -EQ 'GOLDEN.TEST.SOURCE'
+        $source.status | Should -Be 'Pass'
+        $source.message | Should -Match '2 other event\(s\) there \(ResourceHealth\) aren''t operations'
+        @($source.evidence['operations']).Count | Should -Be 0
+        @($source.evidence['otherEvents']).Count | Should -Be 2
+        @($source.evidence['otherEvents'] | ForEach-Object { $_.category } | Sort-Object -Unique) | Should -Be @('ResourceHealth')
+        ($results | Where-Object checkId -EQ 'GOLDEN.TEST').status | Should -Be 'Pass'
+        @($script:calls | Where-Object { $_ -match '^az monitor activity-log list .*category: category\.value' }).Count | Should -Be 1
+    }
+
+    It 'fails when the Activity Log shows an Administrative operation on the source' {
+        $script:activityLog = @(
+            [pscustomobject]@{ operation = 'Microsoft.HybridCompute/machines/write'; category = 'Administrative'; status = 'Succeeded'; time = [DateTime]::UtcNow.ToString('o') }
+            [pscustomobject]@{ operation = 'Microsoft.Resourcehealth/healthevent/Activated/action'; category = 'ResourceHealth'; status = 'Active'; time = [DateTime]::UtcNow.ToString('o') }
+        )
+        $results = @(Test-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
+        $source = $results | Where-Object checkId -EQ 'GOLDEN.TEST.SOURCE'
+        $source.status | Should -Be 'Fail'
+        $source.message | Should -Match 'shows 1 operation\(s\) on it'
+        @($source.evidence['operations']).Count | Should -Be 1
+        @($source.evidence['otherEvents']).Count | Should -Be 1
+        ($results | Where-Object checkId -EQ 'GOLDEN.TEST').status | Should -Be 'Fail'
+    }
+
+    It 'fails when a source that was Disconnected before the test has a later status change after it' {
+        # Connected for a while during the test, and Disconnected again by the time it's read.
+        $script:sourceAfterChange = 'now'
+        $results = @(Test-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
+        $source = $results | Where-Object checkId -EQ 'GOLDEN.TEST.SOURCE'
+        $source.status | Should -Be 'Fail'
+        $source.message | Should -Match 'its status changed during the test'
+        ($results | Where-Object checkId -EQ 'GOLDEN.TEST').status | Should -Be 'Fail'
+    }
+
+    It 'doesn''t fail a source that read Connected right after its capture and turned Disconnected during the test' {
+        $recent = New-SnapshotJson
+        $recent.tags | Add-Member -NotePropertyName 'dbhubDiskVerifiedUtc' -NotePropertyValue ([DateTime]::UtcNow.AddMinutes(-5).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        $script:snapshots = @(InModuleScope DbHubDemo -Parameters @{ Item = $recent } { ConvertFrom-DemoGoldenSnapshot -Snapshot $Item })
+        $script:sourceBeforeStatus = 'Connected'
+        $script:sourceBeforeChange = [DateTime]::UtcNow.AddMinutes(-40).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        $script:sourceAfterChange = 'now'
+        $results = @(Test-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
+        ($results | Where-Object checkId -EQ 'GOLDEN.TEST.SOURCE').status | Should -Not -Be 'Fail'
         ($results | Where-Object checkId -EQ 'GOLDEN.TEST').status | Should -Be 'Pass'
     }
 
