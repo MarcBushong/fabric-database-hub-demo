@@ -135,6 +135,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Changed
 
+- The README starts with "Deploy it, step by step", right after "At a glance": where the demo deploys (your subscription and resource groups, your Fabric workspace, and where you run the scripts), what to line up first, and ten numbered steps from getting the code to removing it.
 - Phase 13: `stop-demo.ps1` and the scheduled stop set every activity profile to `off`, and the VMs no longer restart the configured profile at every boot, so a VM start alone doesn't keep T3's serverless database awake (R183).
 - Phase 13: Run Commands busy with a policy-installed extension, such as an `MDE.Windows` update, are retried for about 12.5 minutes instead of about 4.5, and a deallocated VM fails at once with a message to start it (R49).
 - Phase 13: after a template deployment, T1's monitoring check treats the SQL IaaS extension's `Updating` state as a wait, not a failure.
