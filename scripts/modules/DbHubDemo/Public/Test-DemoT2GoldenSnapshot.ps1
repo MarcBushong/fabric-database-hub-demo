@@ -35,9 +35,13 @@ function Test-DemoT2GoldenSnapshot {
        with Azure Connected Machine Onboarding on the test group, attached to the copy, so the onboarding uses it
        and not the caller's token (ADR 0009); otherwise the caller's short-lived token is used. Onboarding passes,
        or warns only about sign-in data the sweep after it removed. The snapshot is tagged onboard-verified.
-    7. Reads the source's Arc machine again, and its Activity Log for the test's window: the same machine ID,
+    7. Reads the source's Arc machine again, and its Activity Log for the test's window: the same machine ID;
        not Connected (a status change during the window may only be its decay to Disconnected, because its
-       host is deallocated), and no operation on it, or GOLDEN.TEST.SOURCE fails.
+       host is deallocated); a source that was already Disconnected before the test keeps its last status
+       change, so a short Connected period that ended before this read fails too; and no Administrative entry,
+       that is no operation, on it; or GOLDEN.TEST.SOURCE fails. Resource Health, Policy, and other categories'
+       events, such as its availability while its host is deallocated, aren't operations: the evidence lists
+       every entry with its category (operations, otherEvents).
     8. Deletes the test group with the destroy path (Remove-DemoEnvironment: Arc resources first, then the
        group, then the residual check), unless -KeepTestGroup. When the tested snapshot is the newest and
        passed (boot-verified, and onboard-verified with -Onboard), older golden snapshots of the prefix are
@@ -511,12 +515,17 @@ function Test-DemoT2GoldenSnapshot {
         # 7. The source, after.
         try {
             $sourceAfter = & $readSource
-            $operations = @()
-            $log = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('monitor', 'activity-log', 'list', '--resource-id', $sourceId, '--start-time', $windowStart.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture), '--query', '[].{operation: operationName.value, status: status.value, time: eventTimestamp}', '--output', 'json') -AsJson -AllowFailure
+            $entries = @()
+            $log = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('monitor', 'activity-log', 'list', '--resource-id', $sourceId, '--start-time', $windowStart.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture), '--query', '[].{operation: operationName.value, category: category.value, status: status.value, time: eventTimestamp}', '--output', 'json') -AsJson -AllowFailure
             if ($null -ne $log) {
-                $operations = @($log | Where-Object { $null -ne $_ })
+                $entries = @($log | Where-Object { $null -ne $_ })
             }
-            $sourceEvidence = [ordered]@{ before = $sourceBefore; after = $sourceAfter; operations = @($operations | Select-Object -First 10); windowStartUtc = $windowStart.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) }
+            # Only Administrative entries are operations on the machine. Resource Health, Policy, and the other
+            # categories are events about it, such as its availability while its host is deallocated; an entry
+            # without a category counts as an operation, so the check stays closed.
+            $operations = @($entries | Where-Object { @('', 'Administrative') -contains [string](Get-DemoMemberValue -InputObject $_ -Name 'category') })
+            $otherEvents = @($entries | Where-Object { @('', 'Administrative') -notcontains [string](Get-DemoMemberValue -InputObject $_ -Name 'category') })
+            $sourceEvidence = [ordered]@{ before = $sourceBefore; after = $sourceAfter; operations = $operations; otherEvents = $otherEvents; windowStartUtc = $windowStart.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) }
             # Azure marks a machine Disconnected about 15 minutes after its last heartbeat, so a source captured just
             # before the test can still read Connected; a Connected source well past that has something heartbeating
             # as it. The capture shut the source's guest down before the disk check.
@@ -528,7 +537,13 @@ function Test-DemoT2GoldenSnapshot {
             if ([bool]$sourceAfter['exists']) {
                 $changedUtc = & $toUtc $sourceAfter['lastStatusChangeUtc']
                 if ($sourceBefore['vmId'] -ne $sourceAfter['vmId']) { $sourceProblems.Add('its machine ID changed') }
-                if ($sourceAfter['status'] -eq 'Connected' -and $null -ne $changedUtc -and $changedUtc -ge $windowStart) {
+                # A source already Disconnected before the test keeps its last status change; a different one means it
+                # connected in between, even if it reads Disconnected again now. A source that still read Connected
+                # right after its capture decays to Disconnected on its own, which the checks below allow.
+                if ([bool]$sourceBefore['exists'] -and [string]$sourceBefore['status'] -eq 'Disconnected' -and [string]$sourceBefore['lastStatusChangeUtc'] -ne [string]$sourceAfter['lastStatusChangeUtc']) {
+                    $sourceProblems.Add('its status changed during the test')
+                }
+                elseif ($sourceAfter['status'] -eq 'Connected' -and $null -ne $changedUtc -and $changedUtc -ge $windowStart) {
                     $sourceProblems.Add('it turned Connected during the test')
                 }
                 elseif ($sourceAfter['status'] -eq 'Connected' -and $quietMinutes -gt 20) {
@@ -546,7 +561,12 @@ function Test-DemoT2GoldenSnapshot {
                 & $add 'GOLDEN.TEST.SOURCE' 'Warning' ('The source''s Arc machine {0}/{1} kept the same machine ID and has no operation in the Activity Log, but {2}.' -f $sourceGroup, $sourceName, ($sourceNotes -join '; ')) $sourceEvidence 'Read its status again in a few minutes: it must be Disconnected.'
             }
             else {
-                & $add 'GOLDEN.TEST.SOURCE' 'Pass' ('The source''s Arc machine {0}/{1} is untouched: the same machine ID, {2}, and no operation in the Activity Log since {3:HH:mm} UTC.' -f $sourceGroup, $sourceName, $(if ($sourceAfter['exists']) { $sourceAfter['status'] } else { 'absent before and after' }), $windowStart) $sourceEvidence
+                $otherText = ''
+                if ($otherEvents.Count -gt 0) {
+                    $categories = @($otherEvents | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'category') } | Sort-Object -Unique) -join ', '
+                    $otherText = '; {0} other event(s) there ({1}) aren''t operations' -f $otherEvents.Count, $categories
+                }
+                & $add 'GOLDEN.TEST.SOURCE' 'Pass' ('The source''s Arc machine {0}/{1} is untouched: the same machine ID, {2}, and no operation in the Activity Log since {3:HH:mm} UTC{4}.' -f $sourceGroup, $sourceName, $(if ($sourceAfter['exists']) { $sourceAfter['status'] } else { 'absent before and after' }), $windowStart, $otherText) $sourceEvidence
             }
         }
         catch {

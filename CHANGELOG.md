@@ -184,6 +184,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Fixed
 
+- Phase 26d (live, 2026-10-28): the golden recapture's proof failed `GOLDEN.TEST.SOURCE` on two Resource Health events about the source's Arc machine (its availability while its host was deallocated), although the machine was untouched. The check now counts only Administrative Activity Log entries as operations, keeps every entry with its category in the evidence (`operations`, `otherEvents`), and fails when a source that was Disconnected before the test has a different last status change after it, so a short Connected period still shows.
 - The golden recapture's host compaction (`Invoke-DemoHostCompact`) reported a guest disk's file name with `[System.IO.Path]::GetFileName`, which doesn't split a Windows path on Linux, so its unit test failed on the Linux CI runner. It now splits on both separators.
 - Phase 6: the bootstrap loader extracted `bundle-<sha12>.zip.partial` with `Expand-Archive`, which Windows PowerShell 5.1 rejects for any extension but `.zip`, so no VM would have bootstrapped. It now extracts a renamed `.zip` with `ZipFile.ExtractToDirectory`, and a test runs it in Windows PowerShell 5.1.
 - Phase 6: generated VM passwords no longer use `%`, `!`, or `^`, which broke or could break `az.cmd` command lines on Windows.
