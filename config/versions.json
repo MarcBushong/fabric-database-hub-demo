@@ -29,6 +29,10 @@
     "cliPackage": "@microsoft/rayfin-cli",
     "cliVersion": "1.36.2",
     "sdkVersion": "1.36.2",
+    "overrides": {
+      "note": "Phase 27: npm overrides in fabric/app/package.json, for a transitive package with a security advisory whose parents' newest releases still declare a vulnerable range. Each entry names the advisory and its parents' declared ranges. A Pester test checks that package.json's overrides match these exactly and that the lock file resolves every copy of the package to its override, and src/test/overrides.test.ts runs the Rayfin code that uses it. Remove an override once a pinned release of its parent depends on a fixed version. Not overridden: @azure/msal-node (GHSA-xcx6-jx8p-x3h5, fixed in 7.1.0), a dev dependency of the Rayfin CLI 1.36.2 (^5.5.0, and ^6.0.0 through tedious and @azure/identity 4.14.0): the CLI never runs the advisory's code path (a confidential client's authorization code flow), and nothing offline can prove its interactive sign-in with MSAL Node 7 (risk R540 in docs/implementation-report.md).",
+      "zod": { "version": "4.6.7", "advisory": "GHSA-mrhx-c7xc-m3w5", "fixedIn": "4.6.6", "requiredBy": [ "@microsoft/rayfin-tools-common 1.36.2: ~4.3.6", "eslint-plugin-react-hooks 7.1.1: ^3.25.0 || ^4.0.0" ] }
+    },
     "supportedNodeMajors": [20, 22, 24],
     "ciNodeVersion": "24",
     "template": {

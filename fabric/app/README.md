@@ -88,9 +88,22 @@ fabric/app/
   src/visuals/                 the seven custom visuals and their pure layout code (layout.ts)
   src/pages/                   Estate, Incidents, Readiness, and Live links
   src/theme/                   the three themes and their contrast tests
+  src/test/                    the test setup, and the test of the npm override with Rayfin's code
   scripts/export-queries.ts    writes the catalog as connector payloads for the deploy-time check
   scripts/check-licenses.mjs   the production license check
 ```
+
+### Overrides and known advisories
+
+`package.json` has one npm override, for a security advisory in a package that the pinned Rayfin packages bring in. No Rayfin release declares a fixed version yet, not even the newest prerelease (checked 2026-10-28), so the override is outside its parent's declared range. `config/versions.json` (`fabricApp.overrides`) records it and why, and a Pester test keeps that record, `package.json`, and the lock file in sync (Phase 27).
+
+| Package | Override | Advisory | Declared by | Proof |
+|---|---|---|---|---|
+| `zod` | 4.6.7 | [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), fixed in 4.6.6 | `@microsoft/rayfin-tools-common` 1.36.2 (`~4.3.6`), through the SDK's connectors and the CLI; `eslint-plugin-react-hooks` (`^3.25.0 \|\| ^4.0.0`) | `src/test/overrides.test.ts` runs Rayfin's template manifest validation (`rayfin init`), its only use of zod: the same results as with 4.3.6, but for one message that now names the closest match. The app's browser bundle has no zod |
+
+Remove the override once a pinned Rayfin release depends on zod 4.6.6 or later.
+
+**Not overridden:** [GHSA-xcx6-jx8p-x3h5](https://github.com/advisories/GHSA-xcx6-jx8p-x3h5) in `@azure/msal-node` (high), so `npm audit` still reports it, for `@azure/msal-node`, `@azure/identity`, and `@microsoft/rayfin-cli`. It's a dev dependency of the Rayfin CLI 1.36.2, which declares `^5.5.0` (and `^6.0.0` through `tedious` and `@azure/identity`), and it's fixed only in 7.1.0. The advisory is about a confidential client's authorization code flow, which the CLI never runs: it signs in as a public client (in the browser, with a device code, or silently), and `tedious` gets an access token. MSAL Node 7 is two major versions on, and nothing offline can prove the CLI's interactive sign-in with it ([R540](../../docs/implementation-report.md#risk-register)). The production dependencies have no known advisory: `npm audit --omit=dev` reports none.
 
 ## Deploy
 
@@ -150,7 +163,7 @@ What the live check found (2026-10-22, anonymous requests only):
 ```powershell
 cd fabric/app
 npm ci
-npm run verify   # typecheck, lint, Vitest (unit, page, and theme-contrast tests), license check, build
+npm run verify   # typecheck, lint, Vitest (unit, page, theme-contrast, and override tests), license check, build
 ```
 
 `./tests/Invoke-StaticValidation.ps1 -Check FabricApp` runs the same in the repository's static validation, and the `Fabric App` CI job runs it on Node.js 24. The tests use fixture rows shaped like the connector's results; no test reaches Fabric.
