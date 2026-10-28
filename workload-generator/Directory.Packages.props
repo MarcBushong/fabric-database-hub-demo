@@ -7,12 +7,12 @@
 
   <ItemGroup>
     <!-- Azure.Identity was already in the graph through Microsoft.Data.SqlClient.Extensions.Azure; T4 (Phase 24) uses its managed identity credential directly for PostgreSQL tokens. -->
-    <PackageVersion Include="Azure.Identity" Version="1.18.0" />
+    <PackageVersion Include="Azure.Identity" Version="1.21.0" />
     <PackageVersion Include="Microsoft.Data.SqlClient" Version="7.1.1" />
     <PackageVersion Include="Microsoft.Data.SqlClient.Extensions.Azure" Version="7.1.1" />
     <!-- T4, Azure Database for PostgreSQL flexible server (Phase 24, ADR 0019). -->
     <PackageVersion Include="Npgsql" Version="10.0.3" />
-    <PackageVersion Include="System.CommandLine" Version="2.0.13" />
+    <PackageVersion Include="System.CommandLine" Version="2.0.14" />
   </ItemGroup>
 
   <ItemGroup Label="Transitive pins">
@@ -21,7 +21,7 @@
   </ItemGroup>
 
   <ItemGroup Label="Tests">
-    <PackageVersion Include="JsonSchema.Net" Version="9.4.1" />
+    <PackageVersion Include="JsonSchema.Net" Version="9.5.0" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageVersion Include="Microsoft.SqlServer.TransactSql.ScriptDom" Version="180.140.0" />
     <PackageVersion Include="xunit.v3" Version="4.0.2" />
