@@ -91,6 +91,24 @@ Describe 'Fabric App source' {
         @($entries | Where-Object { $_.Value['integrity'] -notmatch '^sha512-' } | ForEach-Object { $_.Key }) | Should -BeNullOrEmpty
     }
 
+    It 'pins each npm override exactly, as config/versions.json records it, and resolves every copy of the package to it' {
+        $package = Get-Content -LiteralPath (Join-Path -Path $script:appRoot -ChildPath 'package.json') -Raw | ConvertFrom-Json -AsHashtable
+        $lock = Get-Content -LiteralPath (Join-Path -Path $script:appRoot -ChildPath 'package-lock.json') -Raw | ConvertFrom-Json -AsHashtable
+        $overrides = if ($package.ContainsKey('overrides')) { $package['overrides'] } else { @{} }
+        $recorded = if ($script:appSettings.ContainsKey('overrides')) { $script:appSettings['overrides'] } else { @{} }
+        (@($overrides.Keys | Sort-Object) -join ', ') | Should -Be (@($recorded.Keys | Where-Object { $_ -ne 'note' } | Sort-Object) -join ', ') -Because 'config/versions.json records every override in fabricApp.overrides'
+        foreach ($name in $overrides.Keys) {
+            $overrides[$name] | Should -BeOfType [string] -Because "$name is overridden with one version for every parent"
+            $overrides[$name] | Should -Match '^\d+\.\d+\.\d+$' -Because "the $name override must be pinned exactly"
+            $overrides[$name] | Should -Be $recorded[$name]['version'] -Because $name
+            $recorded[$name]['advisory'] | Should -Match '^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$' -Because "an override exists only for an advisory ($name)"
+            @($recorded[$name]['requiredBy']).Count | Should -BeGreaterThan 0 -Because "the parents that declare $name's range are recorded"
+            $copies = @($lock['packages'].GetEnumerator() | Where-Object { $_.Key -match ('(^|/)node_modules/{0}$' -f [regex]::Escape($name)) })
+            $copies.Count | Should -BeGreaterThan 0 -Because "$name is in the lock file"
+            @($copies | Where-Object { $_.Value['version'] -ne $overrides[$name] } | ForEach-Object { '{0}@{1}' -f $_.Key, $_.Value['version'] }) | Should -BeNullOrEmpty
+        }
+    }
+
     It 'keeps deploy-time files out of Git' {
         $ignore = Get-Content -LiteralPath (Join-Path -Path $script:appRoot -ChildPath '.gitignore')
         foreach ($entry in 'rayfin/.env', 'rayfin/.deployments.json', 'rayfin/.temp/', '.env.*', 'public/rayfin.config.json', 'public/dbhub-app.json') {
