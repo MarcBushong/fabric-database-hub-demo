@@ -93,7 +93,7 @@ flowchart TB
 5. **The ending:** the run ends with one banner. **DONE** means Database Hub shows every target, with where to look. **NOT DONE** says why, the single next action, and the exact command, usually `./scripts/deploy.ps1` again, which continues where it stopped. If the window closes or the PC restarts, run `./scripts/deploy.ps1` again; you never need a flag to continue.
 6. **See it:** open **Database Hub** in the Fabric portal ([Database Hub](https://learn.microsoft.com/fabric/database/hub/overview)) and look at Estate and Performance. Then start an incident, for example `./scripts/demo-control.ps1 -Target T1 -Scenario incident:blocking-chain -Duration 15`, and investigate it with the Database Agent, approving or cancelling each action it proposes.
 7. **Keep the finished build** (recommended): `./scripts/capture-t2-golden.ps1`, then `./scripts/test-t2-golden.ps1 -Onboard`, so the next redeploy restores T2 in about 30 to 45 minutes with no build and no guided stop.
-8. **The Insights app** (optional): when the two optional tenant settings are on, `./scripts/configure-fabric-app.ps1 -SignIn`, with one browser sign-in that only you can do. Open the app from its item in the workspace.
+8. **The Insights app** (optional): when the two optional tenant settings are on, `./scripts/configure-fabric-app.ps1 -SignIn`, with one browser sign-in that only you can do. Open the app from its item in the workspace. When `deploy.ps1` couldn't add it, the **DONE** banner and the status page say why, never as a **Fail**, and what to do first.
 9. **Between sessions:** `./scripts/stop-demo.ps1`, and `./scripts/start-demo.ps1` next time, which takes about 8 minutes. The VMs also shut down every evening at `autoShutdownTime`.
 10. **Remove it:** `./scripts/destroy.ps1`.
 
@@ -117,6 +117,7 @@ Pay-as-you-go SQL Server without a product key is documented only in setup's wiz
 - **The status page,** `out/deploy-status.html`, opens at the start and updates itself every 10 to 15 seconds, offline. Its banner says **Deploying, no action needed** (you can step away), **Waiting for you**, **Done**, or **Stopped, not done**, with every step of every track below it: its status, its time, and a one-line message. An Azure-side wait, such as an extension that a policy in your tenant installs, says "no action needed". `./scripts/status.ps1 -Watch` shows the same in a second terminal, anywhere.
 - **Keep the machine on:** `deploy.ps1` keeps a Windows PC and its display awake until it ends; plug a laptop in and leave it open. On macOS and Linux, keep it awake yourself.
 - **If something goes wrong:** run `./scripts/deploy.ps1` again. When **NOT DONE** repeats, `./scripts/collect-diagnostics.ps1` writes a redacted zip for a **Deployment problem** issue ([getting help](#getting-help)).
+- **To stop it:** Ctrl+C stops the run within seconds, its background processes too; the PC may sleep again, and the status page says **Stopped, not done** with the command that continues where it stopped. Stopped at the guided stop, Bastion stays up and the host password isn't rotated until the next run finishes that step; if you're done for the day, `./scripts/stop-demo.ps1` removes Bastion and rotates the password ([details](docs/deployment.md#one-command-one-guided-stop-phase-28)).
 
 ### Options: ProductKey and Developer
 
