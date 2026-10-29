@@ -361,9 +361,12 @@ Describe 'The guided stop''s prompt (brief items 4 and 13)' {
         $text | Should -Match 'Time limit: 4[45] minutes'
         $text | Should -Match 'Use pay-as-you-go billing through Microsoft Azure'
         $text | Should -Match 'Help, then Reset password'
-        $text | Should -Match ('Portal: ' + [regex]::Escape($script:url))
+        # In GitHub Actions the module's log masking writes the subscription's GUID as *** (Phase 26c).
+        $text | Should -Match 'Portal: https://portal\.azure\.com/#@contoso\.example/resource/subscriptions/[^/]+/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Compute/virtualMachines/archost01'
         $script:printed | Should -Contain 'ATTENTION'
-        @($script:printed | Where-Object { $_ -match '^BROWSER ' }).Count | Should -BeGreaterThan 0
+        # A Linux machine without xdg-open (some CI images) has no way to open a browser, and says so instead.
+        $canOpen = $IsWindows -or $IsMacOS -or $null -ne (Get-Command -Name 'xdg-open' -ErrorAction SilentlyContinue)
+        @($script:printed | Where-Object { $_ -match '^BROWSER ' }).Count -gt 0 | Should -Be $canOpen
         @($script:printed | Where-Object { $_ -like 'HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP - *out/deploy-status.html*' }).Count | Should -Be 1
     }
 
