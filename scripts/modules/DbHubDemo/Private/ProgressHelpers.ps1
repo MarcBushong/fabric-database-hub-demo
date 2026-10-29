@@ -866,7 +866,7 @@ function Get-DemoProgressBanner {
         }
         $lines.Add('Where to look: open Database Hub in the Fabric portal and look at Estate and Performance; then start an incident (./scripts/demo-control.ps1) and investigate it with the Database Agent.')
         foreach ($entry in @($Model['optional'])) {
-            $lines.Add(('Optional, not needed for the demo: {0}. {1}' -f [string]$entry['name'], [string]$entry['howTo']))
+            $lines.Add(('Optional, not needed for the demo: {0}. {1} {2}' -f [string]$entry['name'], [string]$entry['message'], [string]$entry['howTo']))
         }
         $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip the build and the guided stop.')
         return [pscustomobject]@{ Kind = 'Done'; Title = 'Done'; Lines = $lines.ToArray(); Command = ''; Link = ''; Countdown = '' }

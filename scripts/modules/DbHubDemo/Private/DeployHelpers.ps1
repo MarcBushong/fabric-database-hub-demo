@@ -528,6 +528,13 @@ function Invoke-DemoFabricAppStage {
     The Fabric track's app step: runs scripts/configure-fabric-app.ps1 (Phase 19b, the Fabric app over the history
     model) when this checkout has it, and returns its records; DEPLOY.FABRIC.APP is Not selected otherwise. Phase
     19b verifies the app itself. Internal.
+
+    .DESCRIPTION
+    The app is optional (brief item 15), so here its records are never a Fail: a Fail becomes Manual action required
+    (evidence reportedStatus Fail), every record is marked optional (evidence optional insightsApp, which
+    Test-DemoOptionalResult reads), and the records that aren't the app's own (the script's own workspace and capacity
+    checks, for example) say they're the app's. -WorkspaceId is the workspace the Fabric step resolved or created, so
+    the script doesn't look it up by name again (Phase 28 live finding).
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -535,12 +542,83 @@ function Invoke-DemoFabricAppStage {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [string] $ConfigPath = ''
+        [string] $ConfigPath = '',
+
+        [AllowEmptyString()]
+        [string] $WorkspaceId = ''
     )
 
     $scriptPath = Join-Path -Path $script:RepoRoot -ChildPath 'scripts/configure-fabric-app.ps1'
     if (-not (Test-Path -LiteralPath $scriptPath)) {
         return @(New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'scripts/configure-fabric-app.ps1 (Phase 19b) isn''t in this checkout, so the Fabric app wasn''t deployed.')
     }
-    return @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.FABRIC.APP')
+    $argument = @{}
+    if ($WorkspaceId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        $argument['WorkspaceId'] = $WorkspaceId
+    }
+    $records = @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.FABRIC.APP' -Argument $argument)
+    return @(foreach ($record in $records) {
+            ConvertTo-DemoOptionalAppRecord -Record $record
+        })
+}
+
+function ConvertTo-DemoOptionalAppRecord {
+    # One record of the optional Insights app's step as deploy.ps1 reports it (brief item 15; Phase 28 live finding):
+    # marked optional, a Fail as Manual action required, and named as the app's when it isn't one of its own checks.
+    # Internal.
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Record
+    )
+
+    $own = [string]$Record.checkId -like 'FABRIC.APP.*' -or [string]$Record.checkId -eq 'DEPLOY.FABRIC.APP'
+    $marks = [ordered]@{ optional = 'insightsApp' }
+    if ([string]$Record.status -eq 'Fail') {
+        $marks['reportedStatus'] = 'Fail'
+        $Record.status = 'Manual action required'
+        if (-not [string](Get-DemoMemberValue -InputObject $Record -Name 'remediation')) {
+            $Record | Add-Member -NotePropertyName 'remediation' -NotePropertyValue 'To add the optional Insights app, run ./scripts/configure-fabric-app.ps1 -SignIn.' -Force
+        }
+    }
+    $evidence = Get-DemoMemberValue -InputObject $Record -Name 'evidence'
+    if ($evidence -is [System.Collections.IDictionary]) {
+        foreach ($key in $marks.Keys) {
+            $evidence[$key] = $marks[$key]
+        }
+    }
+    elseif ($null -ne $evidence -and $evidence -isnot [string] -and $evidence -isnot [System.ValueType]) {
+        foreach ($key in $marks.Keys) {
+            $evidence | Add-Member -NotePropertyName $key -NotePropertyValue $marks[$key] -Force
+        }
+    }
+    else {
+        $Record | Add-Member -NotePropertyName 'evidence' -NotePropertyValue ([pscustomobject]$marks) -Force
+    }
+    if (-not $own -and [string]$Record.message -notlike 'Optional Insights app:*') {
+        $Record.message = 'Optional Insights app: {0}' -f [string]$Record.message
+    }
+    return $Record
+}
+
+function Get-DemoResolvedWorkspaceId {
+    # The Fabric workspace's ID that configure-fabric.ps1's records name (FABRIC.RESOLVE.WORKSPACE: found, created, or the
+    # fabric.workspaceId override), or '' when none did. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $pattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    $named = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'FABRIC.RESOLVE.WORKSPACE' -and [string]$_.status -ne 'Fail' })
+    for ($index = $named.Count - 1; $index -ge 0; $index--) {
+        $id = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $named[$index] -Name 'evidence') -Name 'workspaceId')
+        if ($id -match $pattern -and $id -ne '00000000-0000-0000-0000-000000000000') {
+            return $id.ToLowerInvariant()
+        }
+    }
+    return ''
 }

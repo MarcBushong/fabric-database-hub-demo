@@ -1202,14 +1202,20 @@ function Invoke-DemoDeploymentTrack {
                     $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $fabricConfigPath)
                     & $addAll $powerBI
                     & $partDone 'Fabric.Report' $powerBI
-                    # The Insights app is optional and never stops the track or blocks DONE (brief item 15): its results stay
-                    # in the report, and the DONE banner says how to add it later.
+                    # The Insights app is optional and never stops the track or blocks DONE (brief item 15). It gets the
+                    # workspace the step above just resolved or created, so it doesn't look it up by name again (live, a
+                    # second lookup right after the creation failed, and the app was skipped), and its results are never a
+                    # Fail: the status page and DONE show the actual reason and how to add it later (Phase 28 live finding).
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.App' -State 'Running' -Message 'Optional.'
-                    $fabricApp = @(Invoke-DemoFabricAppStage -Config $Config -ConfigPath $fabricConfigPath)
+                    $fabricApp = @(Invoke-DemoFabricAppStage -Config $Config -ConfigPath $fabricConfigPath -WorkspaceId (Get-DemoResolvedWorkspaceId -Result $fabric))
                     & $addAll $fabricApp
-                    $appStatus = Get-DemoWorstStatus -Status @($fabricApp | ForEach-Object { [string]$_.status })
-                    $appState = if ($appStatus -in 'Fail', 'Manual action required') { 'Skipped' } else { ConvertTo-DemoProgressState -Status $appStatus }
-                    Set-DemoProgressStep -Path $progress -Id 'Fabric.App' -State $appState -Status $appStatus -Message $(if ($appState -eq 'Skipped') { 'Optional, not added: a Fabric administrator turns on Fabric Apps (preview) and Dataset Execute Queries REST API, then you run ./scripts/configure-fabric-app.ps1 -SignIn (a browser sign-in only you can do).' } else { 'Optional.' })
+                    $app = Get-DemoInsightsAppSummary -Result $fabricApp
+                    if ($null -ne $app) {
+                        Set-DemoProgressStep -Path $progress -Id 'Fabric.App' -State $app.State -Status $app.Status -Message $app.StepMessage
+                    }
+                    else {
+                        Set-DemoProgressStep -Path $progress -Id 'Fabric.App' -State 'Skipped' -Status 'Not selected' -Message 'Optional: its step reported nothing.'
+                    }
                     if (& $hasStatus @($fabric + $powerBI) 'Fail') {
                         $outcome = 'Fail'
                     }

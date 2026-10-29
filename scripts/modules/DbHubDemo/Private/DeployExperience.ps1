@@ -126,9 +126,10 @@ function Get-DemoDeploymentNotice {
 function Get-DemoOptionalItem {
     <#
     .SYNOPSIS
-    The optional parts that didn't finish and never block DONE (brief item 15): the Insights app (FABRIC.APP.*,
-    DEPLOY.FABRIC.APP) and the history report's data check when the Execute Queries setting is off
-    (FABRIC.SEMANTICMODEL.* Manual action required), each with how to add it later. Pure. Internal.
+    The optional parts that didn't finish and never block DONE (brief item 15): the Insights app (its step's records,
+    Get-DemoInsightsAppSummary) and the history report's data check when the Execute Queries setting is off
+    (FABRIC.SEMANTICMODEL.* Manual action required), each with the actual reason and how to add it later (Phase 28 live
+    finding). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -139,20 +140,13 @@ function Get-DemoOptionalItem {
 
     $items = [System.Collections.Generic.List[object]]::new()
     $open = @($Result | Where-Object { $null -ne $_ -and [string]$_.status -in 'Fail', 'Manual action required' })
-    $app = @($open | Where-Object { [string]$_.checkId -like 'FABRIC.APP.*' -or [string]$_.checkId -eq 'DEPLOY.FABRIC.APP' })
-    if ($app.Count -gt 0) {
-        $onlyBrowser = @($app | Where-Object { [string]$_.checkId -ne 'FABRIC.APP.BROWSER' }).Count -eq 0
-        if ($onlyBrowser) {
-            $items.Add([ordered]@{ name = 'the Insights app'; message = 'It''s deployed; a person confirms it once in the browser.'; howTo = [string]$app[0].remediation })
-        }
-        else {
-            $first = $app | Where-Object { [string]$_.checkId -ne 'FABRIC.APP.BROWSER' } | Select-Object -First 1
-            $items.Add([ordered]@{
-                    name    = 'the Insights app (Fabric Apps preview)'
-                    message = ('It wasn''t added: {0}' -f [string]$first.message)
-                    howTo   = 'To add it later: a Fabric administrator turns on the tenant settings Fabric Apps (preview) and Dataset Execute Queries REST API; then you run ./scripts/configure-fabric-app.ps1 -SignIn, which opens a browser for your own sign-in (an assistant can''t do that sign-in for you).'
-                })
-        }
+    $app = Get-DemoInsightsAppSummary -Result $Result
+    if ($null -ne $app -and $app.Status -eq 'Manual action required') {
+        $items.Add([ordered]@{
+                name    = $(if ($app.Deployed) { 'the Insights app' } else { 'the Insights app (Fabric Apps preview)' })
+                message = $app.Reason
+                howTo   = $app.HowTo
+            })
     }
     $model = @($open | Where-Object { [string]$_.checkId -like 'FABRIC.SEMANTICMODEL.*' -and [string]$_.status -eq 'Manual action required' })
     if ($model.Count -gt 0) {
@@ -165,9 +159,9 @@ function Get-DemoOptionalItem {
     return $items.ToArray()
 }
 
-function Test-DemoOptionalResult {
-    # True for a result that never blocks DONE: the optional Insights app's, or the history report's data check waiting
-    # for the Execute Queries setting (brief item 15). Internal.
+function Test-DemoInsightsAppRecord {
+    # True for a record of the optional Insights app's step: its own checks (FABRIC.APP.*, DEPLOY.FABRIC.APP), or one its
+    # step reported and marked optional (Invoke-DemoFabricAppStage). Internal.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -179,7 +173,88 @@ function Test-DemoOptionalResult {
         return $false
     }
     $id = [string]$Result.checkId
-    return ($id -like 'FABRIC.APP.*' -or $id -eq 'DEPLOY.FABRIC.APP' -or ($id -like 'FABRIC.SEMANTICMODEL.*' -and [string]$Result.status -eq 'Manual action required'))
+    if ($id -like 'FABRIC.APP.*' -or $id -eq 'DEPLOY.FABRIC.APP') {
+        return $true
+    }
+    return ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Result -Name 'evidence') -Name 'optional') -eq 'insightsApp')
+}
+
+function Get-DemoInsightsAppSummary {
+    <#
+    .SYNOPSIS
+    The optional Insights app's outcome from its step's records, never a Fail (brief item 15; Phase 28 live finding):
+    State (Done or Skipped, for the status page), Status (Pass, Warning, Manual action required, or Not selected), Reason
+    (the first record that kept it from being added, with its check ID), HowTo (that record's own fix, then the
+    sign-in that adds it), StepMessage (both, in one line), and Deployed. $null without any of its records. Pure.
+    Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $records = @($Result | Where-Object { Test-DemoInsightsAppRecord -Result $_ })
+    if ($records.Count -eq 0) {
+        return $null
+    }
+    $signIn = 'run ./scripts/configure-fabric-app.ps1 -SignIn, which opens a browser for your own sign-in (an assistant can''t do that sign-in for you), then deploys the app'
+    $deployed = @($records | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' -and [string]$_.status -eq 'Pass' }).Count -gt 0
+    $open = @($records | Where-Object { [string]$_.status -in 'Fail', 'Manual action required' })
+    $blocking = @($open | Where-Object { [string]$_.checkId -ne 'FABRIC.APP.BROWSER' })
+    if ($blocking.Count -gt 0) {
+        $first = $blocking[0]
+        $lead = if ($deployed) { 'It''s deployed, but' } else { 'It wasn''t added:' }
+        $reason = '{0} {1}: {2}' -f $lead, [string]$first.checkId, (([string]$first.message) -replace '^Optional Insights app: ', '').TrimEnd()
+        $fix = ([string](Get-DemoMemberValue -InputObject $first -Name 'remediation')).Trim()
+        # Its own fix first (unless it's the sign-in or a tenant setting), then the tenant settings while they're open, then
+        # the sign-in that deploys the app.
+        $steps = [System.Collections.Generic.List[string]]::new()
+        if ([string]$first.checkId -notin 'FABRIC.APP.TENANTSETTING', 'FABRIC.APP.EXECUTEQUERIES', 'FABRIC.APP.SIGNIN' -and $fix -and $fix -notmatch 'configure-fabric-app\.ps1') {
+            $steps.Add($fix.TrimEnd('.'))
+        }
+        if (@($open | Where-Object { [string]$_.checkId -in 'FABRIC.APP.TENANTSETTING', 'FABRIC.APP.EXECUTEQUERIES' }).Count -gt 0) {
+            $steps.Add('a Fabric administrator turns on the tenant settings Fabric Apps (preview) and Dataset Execute Queries REST API, if they aren''t on')
+        }
+        $steps.Add($signIn)
+        $howTo = 'To add it later: {0}.' -f ($steps -join '; then ')
+        return [pscustomobject]@{ State = $(if ($deployed) { 'Done' } else { 'Skipped' }); Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('Optional. {0} {1}' -f $reason, $howTo); Deployed = $deployed }
+    }
+    if ($open.Count -gt 0) {
+        # Deployed and checked; a person confirms it once in the browser.
+        $reason = 'It''s deployed: {0}' -f ([string]$open[0].message).TrimEnd()
+        $howTo = ([string](Get-DemoMemberValue -InputObject $open[0] -Name 'remediation')).Trim()
+        return [pscustomobject]@{ State = 'Done'; Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('Optional. {0} {1}' -f $reason, $howTo).TrimEnd(); Deployed = $true }
+    }
+    if ($deployed) {
+        # A Not selected record beside a deploy that passed (the workspace passed in, for example) changes nothing.
+        $statuses = @($records | ForEach-Object { [string]$_.status } | Where-Object { $_ -ne 'Not selected' })
+        $worst = if ($statuses.Count -gt 0) { Get-DemoWorstStatus -Status $statuses } else { 'Pass' }
+        return [pscustomobject]@{ State = 'Done'; Status = $worst; Reason = 'It''s deployed and checked.'; HowTo = ''; StepMessage = 'Optional: deployed and checked.'; Deployed = $true }
+    }
+    # Not deployed, with nothing for a person to fix: skipped on purpose (a dry run, or a checkout without the app).
+    $skipped = @($records | Where-Object { [string]$_.status -eq 'Not selected' -and [string]$_.checkId -in 'FABRIC.APP.DEPLOY', 'DEPLOY.FABRIC.APP' }) + @($records | Where-Object { [string]$_.status -eq 'Not selected' })
+    $reason = if ($skipped.Count -gt 0) { 'It wasn''t added: {0}' -f ([string]$skipped[0].message).TrimEnd() } else { 'It wasn''t added.' }
+    $howTo = 'To add it later, {0}.' -f $signIn
+    return [pscustomobject]@{ State = 'Skipped'; Status = 'Not selected'; Reason = $reason; HowTo = $howTo; StepMessage = ('Optional. {0} {1}' -f $reason, $howTo); Deployed = $false }
+}
+
+function Test-DemoOptionalResult {
+    # True for a result that never blocks DONE: the optional Insights app's (Test-DemoInsightsAppRecord), or the history
+    # report's data check waiting for the Execute Queries setting (brief item 15). Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $Result
+    )
+
+    if ($null -eq $Result) {
+        return $false
+    }
+    $id = [string]$Result.checkId
+    return ((Test-DemoInsightsAppRecord -Result $Result) -or ($id -like 'FABRIC.SEMANTICMODEL.*' -and [string]$Result.status -eq 'Manual action required'))
 }
 
 function Get-DemoT4OffReason {
@@ -598,7 +673,7 @@ function Get-DemoDeploymentOutcomeLine {
                 if ($note) { $lines.Add([string]$note) }
             }
             foreach ($item in @($Outcome.Optional)) {
-                $lines.Add(('Optional, not needed for the demo: {0}. {1}' -f $item['name'], $item['howTo']))
+                $lines.Add(('Optional, not needed for the demo: {0}. {1} {2}' -f $item['name'], $item['message'], $item['howTo']))
             }
         }
     }

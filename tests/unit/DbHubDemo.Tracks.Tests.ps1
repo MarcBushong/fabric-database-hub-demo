@@ -416,6 +416,35 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:powerBIStatus = 'Fail'
         (InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }).Status | Should -Be 'Fail'
     }
+
+    It 'gives the optional Insights app the workspace the Fabric step resolved, and shows its actual reason, never a Fail, on the status page (Phase 28 live finding)' {
+        # Live: the app's own lookup by name of the workspace just created failed, and the page showed Skipped with a
+        # status of Fail and a generic message about tenant settings that were on.
+        $workspaceId = '44444444-4444-4444-4444-444444444444'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith {
+            New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Created the Fabric workspace.' -Evidence ([ordered]@{ workspaceId = '44444444-4444-4444-4444-444444444444'; source = 'created' })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.REPORT' }
+        $script:appWorkspace = ''
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith {
+            $script:appWorkspace = [string]$PesterBoundParameters['WorkspaceId']
+            New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Rayfin CLI isn''t signed in, so the app can''t be deployed unattended.' -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn.'
+            New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'Not deployed: FABRIC.APP.SIGNIN needs attention first.'
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $script:context['ProgressPath'] = $progress
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Pass' -Because 'the optional app never stops the track'
+        $script:appWorkspace | Should -Be $workspaceId
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $app = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Fabric.App') { $item } } })[0]
+        $app['state'] | Should -Be 'Skipped'
+        $app['status'] | Should -Be 'Manual action required'
+        $app['message'] | Should -Match ([regex]::Escape('FABRIC.APP.SIGNIN: The Rayfin CLI isn''t signed in'))
+        $app['message'] | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
+        $app['message'] | Should -Not -Match 'tenant settings' -Because 'nothing says the tenant settings are the cause'
+    }
     It 'reconnects a golden snapshot''s source host on an existing image-built archost01' {
         $script:context['T2Source'] = 'existing-build'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenSourceRelease -MockWith { $script:calls.Add('source release'); New-TestResult 'T2.GOLDEN.SOURCE' }

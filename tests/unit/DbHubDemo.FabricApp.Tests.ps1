@@ -573,4 +573,25 @@ Describe 'configure-fabric-app.ps1' {
         ($records | Where-Object checkId -EQ 'FABRIC.APP.ITEMS').status | Should -Be 'Manual action required'
         ($records | Where-Object checkId -EQ 'FABRIC.APP.DEPLOY').status | Should -Be 'Not selected'
     }
+
+    It 'takes -WorkspaceId as an override, so a workspace deploy.ps1 just resolved isn''t looked up by name again (Phase 28 live finding)' {
+        # Live: deploy.ps1's Fabric track had just created the workspace, and the app's own lookup by name failed.
+        $config = Get-HubTestConfig
+        $config['tenantId'] = $script:tenantId
+        $config['fabric'].Remove('workspaceId')
+        $config['fabric']['workspaceName'] = 'Database Hub Demo P28 proof'
+        $path = Join-Path -Path $TestDrive -ChildPath 'by-name.config.json'
+        $config | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding utf8NoBOM
+        Mock -ModuleName DbHubDemo -CommandName Read-DemoHubFabricList -MockWith { throw 'No lookup by name is expected with -WorkspaceId.' }
+        Mock -CommandName Test-DemoFabricWorkspace -MockWith { @() }
+        Mock -CommandName Resolve-DemoFabricAppItem -MockWith { New-DemoResult -CheckId 'FABRIC.APP.ITEMS' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'No model.' -Evidence @{ semanticModelId = '' } }
+        $output = Join-Path -Path $TestDrive -ChildPath 'override.jsonl'
+        $null = & $script:configureApp -ConfigPath $path -OutputPath $output -FabricToken $script:token -WorkspaceId $script:workspaceId 6>&1
+        $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
+        $resolved = $records | Where-Object checkId -EQ 'FABRIC.RESOLVE.WORKSPACE'
+        $resolved.status | Should -Be 'Not selected'
+        $resolved.message | Should -Match 'override'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Read-DemoHubFabricList -Times 0 -Exactly
+        Should -Invoke -CommandName Resolve-DemoFabricAppItem -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq $script:workspaceId }
+    }
 }

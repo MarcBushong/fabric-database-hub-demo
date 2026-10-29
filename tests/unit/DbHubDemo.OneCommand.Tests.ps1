@@ -216,7 +216,7 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
     It 'is DONE with the optional Insights app listed and how to add it later, when its prerequisites aren''t met' {
         $config = New-TestConfig -WithT4
         $result = @(New-DoneResult -WithT4) + @(
-            (New-DemoResult -CheckId 'FABRIC.APP.PREREQUISITES' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'Fabric Apps (preview) is off in the tenant.' -Remediation 'Ask a Fabric administrator.')
+            (New-DemoResult -CheckId 'FABRIC.APP.TENANTSETTING' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Fabric tenant setting "Fabric Apps (preview)" is disabled.' -Remediation 'Ask a Fabric administrator.')
             (New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.DATA' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'Execute Queries is off.' -Remediation 'Turn it on.')
         )
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
@@ -227,6 +227,28 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $lines | Should -Match 'Fabric Apps \(preview\) and Dataset Execute Queries REST API'
         $lines | Should -Match 'configure-fabric-app\.ps1 -SignIn'
         $lines | Should -Match 'an assistant can''t do that sign-in for you'
+    }
+
+    It 'is DONE when the optional app''s own workspace lookup failed, and says that, not a tenant setting, is why (Phase 28 live finding)' {
+        # Live: the app's step failed FABRIC.RESOLVE.WORKSPACE, a check ID that isn't the app's own, so it would have
+        # counted as a Fail of the demo, and the page blamed tenant settings that were on.
+        $config = New-TestConfig -WithT4
+        $appRecords = InModuleScope DbHubDemo {
+            foreach ($record in @(
+                    (New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'Your Fabric workspaces couldn''t be listed: HTTP 429.' -Remediation 'Check your Fabric access, then run the script again.')
+                    (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'The Fabric workspace isn''t resolved, so nothing was deployed.')
+                )) {
+                ConvertTo-DemoOptionalAppRecord -Record $record
+            }
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult -WithT4) + @($appRecords)); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done'
+        $outcome.ExitCode | Should -Be 0
+        @($outcome.Optional).Count | Should -Be 1
+        $outcome.Optional[0]['message'] | Should -Match ([regex]::Escape('FABRIC.RESOLVE.WORKSPACE: Your Fabric workspaces couldn''t be listed'))
+        $outcome.Optional[0]['howTo'] | Should -Not -Match 'tenant settings'
+        $lines = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join ' '
+        $lines | Should -Match ([regex]::Escape('Optional, not needed for the demo: the Insights app (Fabric Apps preview). It wasn''t added: FABRIC.RESOLVE.WORKSPACE'))
     }
 
     It 'says T4 isn''t deployed and why: off in the configuration, or after the Burstable fallback' {

@@ -54,7 +54,7 @@ Sources:
 Demo configuration (default: config/demo.config.json): the subscription, tenant, azureAccount, and fabric.workspaceId.
 
 .PARAMETER WorkspaceId
-Deploy into this workspace instead of fabric.workspaceId.
+Deploy into this workspace instead of fabric.workspaceId. It's an override: the workspace isn't looked up by name.
 
 .PARAMETER FabricToken
 A Fabric REST API token you already have, as a SecureString. Without it, the script uses the Azure CLI after the
@@ -216,7 +216,15 @@ elseif (-not ($WorkspaceId -and $FabricToken)) {
 }
 $tenantId = if ($config) { [string]$config['tenantId'] } else { '' }
 # The workspace by name (Phase 26a, ADR 0021): resolved here, and created when it's missing and fabric.createIfMissing
-# is true, or taken from the fabric.workspaceId override. The app needs no lakehouse of its own.
+# is true, or taken from the fabric.workspaceId override. The app needs no lakehouse of its own. -WorkspaceId is an
+# override too, so a workspace the caller already has isn't looked up by name again: deploy.ps1's Fabric track passes
+# the one it just resolved or created (Phase 28 live finding: a second lookup right after the creation failed).
+if ($config -and $WorkspaceId) {
+    if (-not ($config['fabric'] -is [System.Collections.IDictionary])) {
+        $config['fabric'] = @{}
+    }
+    $config['fabric']['workspaceId'] = $WorkspaceId
+}
 $resolveWorkspace = {
     param([securestring] $Token)
     $resolve = @{ Config = $config; Create = $true; SkipLakehouse = $true; TimeoutSeconds = $TimeoutSeconds; WhatIf = [bool]$WhatIfPreference; Confirm = $false }
