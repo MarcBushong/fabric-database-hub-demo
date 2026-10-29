@@ -242,6 +242,20 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $after.Reason | Should -Match 'T1, T2, and T3 in Estate'
     }
 
+    It 'lets a t4SkuName the configuration sets win over a recorded "no T4", so DONE still needs T4 (review finding 5)' {
+        $sized = New-TestConfig -WithT4
+        $sized['t4SkuName'] = 'Standard_D2ds_v5'
+        (InModuleScope DbHubDemo -Parameters @{ Config = $sized } { Get-DemoT4OffReason -Config $Config -State ([pscustomobject]@{ T4Sku = 'None' }) }) | Should -BeNullOrEmpty
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = (New-FinishedState -WithT4 -T4Sku 'None'); Config = $sized } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'NotDone' -Because 'a T4 that''s on must show in Database Hub'
+        $outcome.Missing | Should -Contain 'HUB.ESTATE.T4'
+        $outcome.Missing | Should -Contain 'METRICS.T4'
+        ($outcome.Notes -join ' ') | Should -Not -Match 'Azure refused both Burstable sizes'
+
+        # t4Enabled false in the file is the reason, whatever an earlier fallback recorded.
+        (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4OffReason -Config $Config -State ([pscustomobject]@{ T4Sku = 'None' }) }) | Should -Match 't4Enabled is false in your configuration'
+    }
+
     It 'states plainly in Developer mode that T2 has no performance data or agent findings' {
         $config = New-TestConfig -InstallMode 'Developer'
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -InstallMode 'Developer'); State = (New-FinishedState); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
@@ -292,6 +306,26 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-TestResult 'PREFLIGHT.P1.SUBSCRIPTION'); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -Config $Config -WhatIfRun }
         $outcome.Kind | Should -Be 'WhatIf'
         $outcome.ExitCode | Should -Be 0
+    }
+
+    It 'judges a -Sequential run by its recorded stage, which records no tracks, so it can be DONE (review finding 4)' {
+        $config = New-TestConfig
+        $sequentialState = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; T4Sku = '' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = $sequentialState; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Sequential }
+        $outcome.Kind | Should -Be 'Done'
+        $outcome.ExitCode | Should -Be 0
+
+        $open = [pscustomobject]@{ Stage = 'Monitoring'; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; T4Sku = '' }
+        $notDone = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = $open; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Sequential }
+        $notDone.Kind | Should -Be 'NotDone'
+        $notDone.ExitCode | Should -Be 2
+        $notDone.Reason | Should -Match 'Not every stage finished: the last one recorded is Monitoring'
+        # A plain deploy.ps1 continues after the recorded stage, with the guided stop that -Sequential doesn't have.
+        $notDone.NextCommand | Should -Be './scripts/deploy.ps1'
+
+        # Without a state, the run's DEPLOY.STAGE.VALIDATION stands in.
+        $stand = @(New-DoneResult) + @(New-TestResult 'DEPLOY.STAGE.VALIDATION')
+        (InModuleScope DbHubDemo -Parameters @{ Result = $stand; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $null -Config $Config -Sequential }).Kind | Should -Be 'Done'
     }
 }
 
@@ -388,6 +422,14 @@ Describe 'The guided stop''s prompt (brief items 4 and 13)' {
         ($script:printed -join ' ') | Should -Match 'Reminder: the guided stop still waits for you'
         @($script:printed | Where-Object { $_ -like 'HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP*' }).Count | Should -Be 1
     }
+
+    It 'points the handoff line at the console, not a page that doesn''t exist, without a status page (review finding 2)' {
+        $line = InModuleScope DbHubDemo { Get-DemoHumanActionLine -PagePath '' -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(30)) }
+        $line | Should -BeLike 'HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP - *'
+        $line | Should -Not -Match 'deploy-status\.html'
+        $line | Should -Match 'printed above in deploy\.ps1''s console'
+        (InModuleScope DbHubDemo { Get-DemoHumanActionLine -PagePath 'out/deploy-status.html' }) | Should -Match 'Steps and link: out/deploy-status\.html \(or \./scripts/status\.ps1 -Watch\)\.$'
+    }
 }
 
 Describe 'The host credential at the guided stop (ADR 0009)' {
@@ -447,6 +489,72 @@ Describe 'The host credential at the guided stop (ADR 0009)' {
         $rotation = $results | Where-Object { $_.checkId -eq 'STOP.HOSTPASSWORD' }
         $rotation.status | Should -Be 'Warning'
         $rotation.remediation | Should -Match 'Reset password'
+    }
+}
+
+Describe 'Test-DemoClipboard: only a clipboard the person can paste from (review finding 3)' {
+    BeforeAll {
+        $script:clipboardVariables = 'CODESPACES', 'SSH_CLIENT', 'SSH_TTY', 'AZUREPS_HOST_ENVIRONMENT', 'DISPLAY', 'WAYLAND_DISPLAY'
+    }
+
+    BeforeEach {
+        $script:savedVariables = @{}
+        foreach ($name in $script:clipboardVariables) {
+            $script:savedVariables[$name] = [System.Environment]::GetEnvironmentVariable($name)
+            [System.Environment]::SetEnvironmentVariable($name, $null)
+        }
+        # PowerShell 7's Set-Clipboard doesn't fail on Linux without xclip or a display: it keeps the text in its own process.
+        Mock -ModuleName DbHubDemo -CommandName Set-Clipboard -MockWith { }
+        $script:tools = @()
+        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -in 'xclip', 'pbcopy' } -MockWith { if ($Name -in $script:tools) { [pscustomobject]@{ Name = $Name; Source = ('/usr/bin/{0}' -f $Name) } } }
+    }
+
+    AfterEach {
+        foreach ($name in $script:clipboardVariables) {
+            [System.Environment]::SetEnvironmentVariable($name, $script:savedVariables[$name])
+        }
+    }
+
+    It 'never counts one in GitHub Codespaces, an SSH session, or Azure Cloud Shell, even when Set-Clipboard doesn''t fail' {
+        foreach ($case in @(@{ CODESPACES = 'true' }, @{ SSH_CLIENT = 'test-client 50000 22' }, @{ SSH_TTY = '/dev/pts/0' }, @{ AZUREPS_HOST_ENVIRONMENT = 'cloud-shell/1.0' })) {
+            $name = @($case.Keys)[0]
+            [System.Environment]::SetEnvironmentVariable($name, $case[$name])
+            (InModuleScope DbHubDemo { Test-DemoClipboard }) | Should -BeFalse -Because $name
+            [System.Environment]::SetEnvironmentVariable($name, $null)
+        }
+    }
+
+    It 'on Linux, counts one only with an X display and xclip' {
+        (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'Linux' }) | Should -BeFalse -Because 'no display and no xclip'
+        $script:tools = @('xclip')
+        (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'Linux' }) | Should -BeFalse -Because 'xclip but no display'
+        $env:WAYLAND_DISPLAY = 'wayland-0'
+        (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'Linux' }) | Should -BeFalse -Because 'xclip is an X client, and Wayland alone gives it no display'
+        $env:DISPLAY = ':0'
+        (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'Linux' }) | Should -BeTrue
+        $script:tools = @()
+        (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'Linux' }) | Should -BeFalse -Because 'a display but no xclip'
+    }
+
+    It 'on macOS, counts one only with pbcopy; on Windows, when Set-Clipboard takes text' {
+        (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'MacOS' }) | Should -BeFalse
+        $script:tools = @('pbcopy')
+        (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'MacOS' }) | Should -BeTrue
+        (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'Windows' }) | Should -BeTrue
+        Mock -ModuleName DbHubDemo -CommandName Set-Clipboard -MockWith { throw 'The clipboard is in use.' }
+        (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'Windows' }) | Should -BeFalse
+    }
+
+    It 'sends a session whose Set-Clipboard only pretends (an SSH session here) to the portal''s Reset password, with no password set' {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoKeyVaultSetting -MockWith { [pscustomobject]@{ Enabled = $false } }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoVmLocalPassword -MockWith { throw 'no password may be set' }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = "demoadmin`n"; StdErr = '' } }
+        $env:SSH_TTY = '/dev/pts/0'
+        $credential = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoGuidedStopCredential -Config $Config }
+        $credential.Mode | Should -Be 'portalReset'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoVmLocalPassword -Times 0 -Exactly
     }
 }
 
@@ -618,6 +726,60 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $restart.Restarted | Should -BeFalse
         $restart.Reason | Should -Match 'guided stop'
         $script:restarts | Should -Be 0
+    }
+
+    It 'never restarts the T2 host mid-build, or while a golden Release runs on it (review finding 6)' {
+        $script:trackT2 = 'Bootstraps'
+        $script:healthFails = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = ''; TrackT2 = $script:trackT2; Stage = ''; T2Source = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { if ($script:healthFails) { throw 'Run Command timed out.' }; $script:health }
+        foreach ($building in 'InProgress', 'RebootPending') {
+            $script:health = [pscustomobject]@{ state = $building; currentStep = 'GuestVhdx' }
+            $restart = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }
+            $restart.Restarted | Should -BeFalse -Because $building
+            $restart.Reason | Should -Match 'guest build is running \(step GuestVhdx\)'
+        }
+        # A host whose bootstrap ran, and whose health can't be read, may be building: no restart.
+        $script:healthFails = $true
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }).Reason | Should -Match 'health couldn''t be read'
+        # While a golden Release runs on it in this process (deploy.ps1 sends its artifacts meanwhile).
+        $script:healthFails = $false
+        $script:health = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboardingBeforeWizard' }
+        $during = InModuleScope DbHubDemo -Parameters @{ Config = $config } {
+            $key = '{0}/archost01' -f (Get-DemoResourceGroupName -Config $Config)
+            $script:DemoHostAction[$key] = 'Release'
+            try {
+                Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false
+            }
+            finally {
+                $script:DemoHostAction.Remove($key)
+            }
+        }
+        $during.Restarted | Should -BeFalse
+        $during.Reason | Should -Match 'the golden Release is running on it'
+        $script:restarts | Should -Be 0
+        # A new host whose bootstrap never ran has nothing to interrupt.
+        $script:trackT2 = 'Artifacts'
+        $script:healthFails = $true
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }).Restarted | Should -BeTrue
+        $script:restarts | Should -Be 1
+    }
+
+    It 'marks the T2 host busy while a golden guest action runs on it, and clears the mark afterward, even when it fails (review finding 6)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $script:flagDuring = InModuleScope DbHubDemo { @($script:DemoHostAction.Values) -join ',' }
+            if ($script:actionThrows) {
+                throw 'the Run Command failed'
+            }
+            [pscustomobject]@{ Succeeded = $true; Output = '{"succeeded":true}'; ExecutionState = 'Succeeded'; ExitCode = 0; Error = ''; WhileRunningError = '' }
+        }
+        foreach ($throws in $false, $true) {
+            $script:actionThrows = $throws
+            $script:flagDuring = ''
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' }
+            $script:flagDuring | Should -Be 'Release'
+            (InModuleScope DbHubDemo { $script:DemoHostAction.Count }) | Should -Be 0
+        }
     }
 
     It 'goes on after the watchdog when the extensions settle after the restart' {

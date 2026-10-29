@@ -31,7 +31,9 @@ Prompt for the SQL Server product key (input hidden). ProductKey mode only.
 
 .PARAMETER Force
 Onboard even when the host doesn't wait for onboarding, for example to repair a connection after the host
-finished. A stale Arc machine is still deleted before onboarding.
+finished. A stale Arc machine is still deleted before onboarding. In PaygWizard mode it also configures the
+license type and monitoring without waiting for the host's setup check, so use it only when SQL Server Standard
+already runs in arcsql01.
 
 .PARAMETER UseHostIdentity
 Require the host identity id-<prefix>-<env>-arc-onboard: fail when it isn't attached to archost01 instead of

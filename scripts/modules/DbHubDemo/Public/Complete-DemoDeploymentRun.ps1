@@ -30,6 +30,9 @@ function Complete-DemoDeploymentRun {
     .PARAMETER SkipFabric
     The run skipped the Fabric track.
 
+    .PARAMETER Sequential
+    The run was deploy.ps1 -Sequential: judged by its recorded stage, since it records no tracks.
+
     .EXAMPLE
     $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $results
     #>
@@ -53,7 +56,9 @@ function Complete-DemoDeploymentRun {
         [AllowEmptyString()]
         [string] $StopAfter = '',
 
-        [switch] $SkipFabric
+        [switch] $SkipFabric,
+
+        [switch] $Sequential
     )
 
     $judgedState = $State
@@ -67,7 +72,7 @@ function Complete-DemoDeploymentRun {
         }
     }
     try {
-        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric
+        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential
     }
     catch {
         $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; Optional = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }

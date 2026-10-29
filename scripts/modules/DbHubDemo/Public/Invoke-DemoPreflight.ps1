@@ -57,9 +57,10 @@ function Invoke-DemoPreflight {
     so. 0 (the default) always reads every definition and saves nothing.
 
     .PARAMETER DeferPolicyInventory
-    With networkMode public or private, leave the policy inventory to the caller (deploy.ps1 runs it alongside the
-    template, Phase 28): PREFLIGHT.POLICY.INVENTORY and PREFLIGHT.POLICY.SQLPUBLIC are Not selected, with the
-    configured mode. Ignored with networkMode auto, which needs the inventory.
+    With networkMode private, leave the policy inventory to the caller (deploy.ps1 runs it alongside the template,
+    Phase 28): PREFLIGHT.POLICY.INVENTORY and PREFLIGHT.POLICY.SQLPUBLIC are Not selected, with the configured mode.
+    Ignored with networkMode auto, which needs the inventory, and with public, whose conflict with a Modify policy that
+    turns SQL public access off must stop the run before anything is created (review finding 7).
 
     .EXAMPLE
     Invoke-DemoPreflight -Config (Get-DemoConfig -Path ./config/demo.config.json)
@@ -416,12 +417,14 @@ function Invoke-DemoPreflight {
         }
     }
 
-    # Policy inventory: read-only; resolves networkMode auto and reports conflicts. Phase 28: with networkMode public or
-    # private it resolves nothing the template needs, so -DeferPolicyInventory leaves it to deploy.ps1, which runs it
-    # alongside the template; the what-if below still catches a policy that denies part of the deployment.
+    # Policy inventory: read-only; resolves networkMode auto and reports conflicts. Phase 28: with networkMode private it
+    # resolves nothing the template needs, so -DeferPolicyInventory leaves it to deploy.ps1, which runs it alongside the
+    # template; the what-if below still catches a policy that denies part of the deployment. Never with public (review
+    # finding 7): a Modify policy that turns SQL public access off isn't a denial the what-if sees, and its conflict
+    # (PREFLIGHT.POLICY.SQLPUBLIC Fail) must stop the run before anything is created.
     $configuredNetworkMode = if ($Config['networkMode']) { [string]$Config['networkMode'] } else { 'auto' }
     $network = $null
-    if ($DeferPolicyInventory -and -not $SkipPolicyInventory -and $configuredNetworkMode -in 'public', 'private') {
+    if ($DeferPolicyInventory -and -not $SkipPolicyInventory -and $configuredNetworkMode -eq 'private') {
         $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredNetworkMode -PolicyUnknown
         Add-Check 'PREFLIGHT.POLICY.INVENTORY' 'subscription' 'Not selected' ('Deferred: networkMode is {0}, so the policy inventory resolves nothing the template needs. deploy.ps1 runs it alongside the template and adds its results at the end; the what-if check below catches policy denials before anything is created.' -f $configuredNetworkMode) -Evidence @{ deferred = $true }
         Add-Check 'PREFLIGHT.POLICY.SQLPUBLIC' 'subscription' 'Not selected' ('networkMode is {0}, as configured; the deferred policy inventory reports any conflict at the end of the run.' -f $configuredNetworkMode) -Evidence @{ configuredNetworkMode = $configuredNetworkMode; effectiveNetworkMode = $configuredNetworkMode; assumed = $false; policies = @(); deferred = $true }

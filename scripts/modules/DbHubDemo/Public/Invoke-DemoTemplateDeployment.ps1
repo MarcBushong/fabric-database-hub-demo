@@ -26,8 +26,10 @@ function Invoke-DemoTemplateDeployment {
        Standard_B1ms deploys again with Standard_B2s, and a refused Standard_B2s deploys again without T4, each with
        the DEPLOY.T4.SKU Warning (the second names t4SkuName: Standard_D2ds_v5 and its price); -T4StartSku starts one
        size on when preflight already ruled the default out. What was used is recorded in the resource group's T4Sku
-       tag for later runs (Resolve-DemoEffectiveConfig). A General Purpose size is never chosen on its own. The VMs
-       that exist are read again before each attempt, so a VM a failed attempt created never gets an osProfile again.
+       tag for later runs (Resolve-DemoEffectiveConfig). A deployment with T4 in it clears a recorded None, and any
+       record once the configuration sets t4SkuName (review finding 5). A General Purpose size is never chosen on its
+       own. The VMs that exist are read again before each attempt, so a VM a failed attempt created never gets an
+       osProfile again.
 
     Deployment success alone is never Pass (ADR 0012): the result is DEPLOY.TEMPLATE Pass only with the
     provisioning state Succeeded, and later stages check what was deployed.
@@ -204,6 +206,14 @@ function Invoke-DemoTemplateDeployment {
         $tags[(Get-DemoDeploymentStateTagName)['T4Sku']] = $T4StartSku
         $message = if ($T4StartSku -eq 'None') { 'Preflight found that the region offers neither of T4''s Burstable sizes, so this deployment creates no T4; t4Enabled stays as you configured it, and nothing larger is chosen for you.' } else { 'Preflight found that the region doesn''t offer T4''s default Standard_B1ms, so this deployment uses Standard_B2s, the same Burstable class, and later runs keep it.' }
         $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message $message -Evidence ([ordered]@{ startSku = $T4StartSku }) -Remediation $(if ($T4StartSku -eq 'None') { 'To add T4, set "t4SkuName": "Standard_D2ds_v5" (General Purpose; estimate-cost.ps1 prices it), then run ./scripts/deploy.ps1.' } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+    }
+    # Review finding 5: a recorded "no T4" (or any record, once the configuration sets t4SkuName) no longer holds when
+    # this deployment has T4 in it, so it's cleared; the template carries the group's tags, so it's cleared in them. A
+    # fallback that Azure forces again below records its choice anew.
+    $t4TagName = (Get-DemoDeploymentStateTagName)['T4Sku']
+    $t4Recorded = [string]$tags[$t4TagName]
+    if ($t4Recorded -and $Action -eq 'Create' -and (Test-DemoT4Enabled -Config $effective) -and ($t4Explicit -or $t4Recorded -eq 'None')) {
+        $tags[$t4TagName] = ''
     }
     for ($attempt = 1; $attempt -le 4; $attempt++) {
         if ($attempt -gt 1) {

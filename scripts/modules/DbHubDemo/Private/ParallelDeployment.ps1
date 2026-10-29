@@ -135,10 +135,11 @@ function Start-DemoPolicyInventoryJob {
     guard, while the template and the tracks run (Phase 28, brief goal 5). Internal.
 
     .DESCRIPTION
-    Only with networkMode public or private, where the inventory resolves nothing the template needs; the what-if
-    check in preflight still catches a policy that denies part of the deployment. The job writes each
-    PREFLIGHT.POLICY.* result as one DBHUB-RESULT line, as a track does (Receive-DemoDeploymentTrackOutput reads them),
-    and a failed read as the PREFLIGHT.POLICY.INVENTORY Warning, as preflight does.
+    Only with networkMode private, where the inventory resolves nothing the template needs; the what-if check in
+    preflight still catches a policy that denies part of the deployment. Not with public (review finding 7): a Modify
+    policy that turns SQL public access off isn't a denial, so preflight's own check must stop that run first. The job
+    writes each PREFLIGHT.POLICY.* result as one DBHUB-RESULT line, as a track does (Receive-DemoDeploymentTrackOutput
+    reads them), and a failed read as the PREFLIGHT.POLICY.INVENTORY Warning, as preflight does.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([System.Management.Automation.Job])]
@@ -244,10 +245,11 @@ function Invoke-DemoParallelDeployment {
        out when T4 is off; Developer mode leaves out T2's telemetry, PAYG, and monitoring.
 
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
-    does; -ProgressPath is the status page's model, which each stage and track updates; with networkMode public or
-    private the policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
+    does; -ProgressPath is the status page's model, which each stage and track updates; with networkMode private the
+    policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
     its results replace preflight's placeholders at the end; preflight's T4 startSku starts the Burstable fallback;
-    and this process prompts the person at the guided stop when the T2 track process reports it Ready.
+    and this process prompts the person at the guided stop when the T2 track process reports it Ready in the progress
+    model; without one (-NoStatusPage), the T2 track process prompts the person itself.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([object[]])]
@@ -368,7 +370,7 @@ function Invoke-DemoParallelDeployment {
         ImportNotebooks       = [bool]$ImportNotebooks
         ImportDashboard       = $true
         # Phase 28: the status page's model, and who prompts the person at the guided stop: this process, which owns
-        # the console, the clipboard, and the browser, when the tracks run in their own processes.
+        # the console, the clipboard, and the browser, when the tracks run in their own processes and the model exists.
         ProgressPath          = $ProgressPath
         PagePath              = $PagePath
         PromptInParent        = $false
@@ -402,10 +404,11 @@ function Invoke-DemoParallelDeployment {
     $jobs = [ordered]@{}
     $summaries = [ordered]@{}
     $trackResults = [ordered]@{}
-    # Phase 28 (brief goal 5): with networkMode public or private, the policy inventory resolves nothing the template
-    # needs, so it runs in its own process alongside the template and the tracks, and its results replace preflight's
-    # placeholders at the end. With auto it stays in preflight, as before.
-    $deferPolicy = $useJobs -and [bool]$plan.Preflight -and -not $SkipPolicyInventory -and [string]$Config['networkMode'] -in 'public', 'private'
+    # Phase 28 (brief goal 5): with networkMode private, the policy inventory resolves nothing the template needs, so it
+    # runs in its own process alongside the template and the tracks, and its results replace preflight's placeholders at
+    # the end. With auto it stays in preflight, as before, and with public too (review finding 7): a Modify policy that
+    # turns SQL public access off isn't a denial the what-if sees, so PREFLIGHT.POLICY.SQLPUBLIC must stop the run first.
+    $deferPolicy = $useJobs -and [bool]$plan.Preflight -and -not $SkipPolicyInventory -and [string]$Config['networkMode'] -eq 'private'
     $policyJob = $null
     $policy = @{ Collected = $false; Applied = $false; Items = @() }
     $t4StartSku = ''
@@ -606,8 +609,10 @@ function Invoke-DemoParallelDeployment {
             & $ensureContext
             $context['HandoffPath'] = $handoff
             $context['HandoffTimeoutMinutes'] = $TrackTimeoutMinutes
-            # This process prompts the person at the guided stop ($guidedTick); the T2 track process prepares it.
-            $context['PromptInParent'] = $true
+            # This process prompts the person at the guided stop ($guidedTick) when the T2 track process can tell it, through
+            # the progress model, that the stop is ready; without a model (-NoStatusPage, or a page that couldn't be set
+            # up) the T2 track process prompts the person itself, and its console lines reach this console.
+            $context['PromptInParent'] = [bool]$ProgressPath
             # A golden T2 starts its Restore once the template has deployed archost01 in this run; a deployment
             # record older than two minutes before now belongs to an earlier run.
             $context['EarlyT2'] = [bool]$plan.Infrastructure -and [string]$context.T2Source -eq 'golden'

@@ -303,6 +303,30 @@ Describe 'Invoke-DemoTemplateDeployment' {
         $script:sizes | Should -Be @('Standard_D2ds_v5')
         @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).Count | Should -Be 0
     }
+
+    It 'clears a recorded "no T4" once a size is deployed, and when the configuration sets t4SkuName (review finding 5)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'abc123'; owner = 'your-alias'; DbHubT4Sku = 'None' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+        $withT4 = New-TestConfig -WithT4
+        $withT4['t4SkuName'] = 'Standard_D2ds_v5'
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
+        $deployment.Succeeded | Should -BeTrue
+        $deployment.T4Enabled | Should -BeTrue
+        # The template carries the group's tags, so the stale record goes in them.
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be ''
+
+        # A T4 left on in a configuration without a size (a sequential run reads no record) clears it once it's deployed.
+        $script:deployCalls.Clear()
+        Invoke-DemoTemplateDeployment -Config (New-TestConfig -WithT4) -NetworkMode private -T3UseFreeLimit $false | Out-Null
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be ''
+
+        # With T4 off, the record stays.
+        $script:deployCalls.Clear()
+        Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false | Out-Null
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
+    }
 }
 
 Describe 'Invoke-DemoDeployment' {
@@ -363,6 +387,20 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith { $script:order.Add('Telemetry:' + ($Target -join ',')); New-TestResult 'HUB.TELEMETRY.T1' 'Pass' 'hub' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmAssociatedService -MockWith { $script:order.Add('Inventory:' + $ListedStatus); New-TestResult 'T1.SQLVM.ASSOCIATEDSERVICES' 'Pass' 't1' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { $script:order.Add('RunnerStatus'); [pscustomobject]@{ Status = 'Pass'; Result = (New-TestResult 'WORKLOAD.T1.COMMAND' 'Pass' 'workload' 'T1') } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith { $script:order.Add('DoneGate'); New-TestResult 'HUB.ESTATE.T1' 'Pass' 'hub' 'T1' }
+    }
+
+    It 'runs DONE''s read-only checks after the validation, as the parallel path does, so a sequential run can end DONE (review finding 4)' {
+        $results = Invoke-DemoDeployment -Config $config
+        $script:order[-1] | Should -Be 'DoneGate'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -Times 1 -Exactly -ParameterFilter { $Requirement -contains 'HUB.ESTATE.T1' -and $Requirement -contains 'T2.ARC.SQLINSTANCE' -and $Requirement -contains 'FABRIC.ITEMS.REQUIRED' -and $Requirement -notcontains 'HUB.ESTATE.T4' }
+        ($results | Where-Object { $_.checkId -eq 'HUB.ESTATE.T1' }).status | Should -Be 'Pass'
+
+        # Not while a stage is open (T2 in PaygWizard mode, which -Sequential doesn't guide): that run isn't done anyway.
+        $script:order.Clear()
+        $script:arcStatus = 'Manual action required'
+        Invoke-DemoDeployment -Config $config | Out-Null
+        $script:order | Should -Not -Contain 'DoneGate'
     }
 
     It 'runs every stage in the live-proven order' {
@@ -370,7 +408,7 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Be @(
             'Preflight', 'Template', 'Bundle', 'SendBundle:sqlvm01', 'SendBundle:archost01', 'Publish', 'SendRunner:sqlvm01', 'SendRunner:archost01',
             'Template+Bundle', 'Loader:sqlvm01', 'Loader:archost01', 'T1Ready', 'Group', 'T3Setup', 'EnableT3', 'TestT3',
-            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus'
+            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate'
         )
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         $script:state.Stage | Should -Be 'Validation'

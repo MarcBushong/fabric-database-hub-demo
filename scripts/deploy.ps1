@@ -33,10 +33,10 @@ artifacts sent meanwhile; then its loader, Arc onboarding and configuration with
 telemetry), T4 (the PostgreSQL flexible server's checks and its Azure Monitor metrics; T1's track sets it
 up through the P6 group, and a stopped T4 is started before the template; Phase 24, ADR 0019), and Fabric
 (the notebooks, the Real-Time Dashboard, the history report, and the optional Insights app).
-The bundle and the runner are built while Preflight runs. With networkMode public or private, the policy inventory
-runs alongside the deployment instead of before it. The validation then checks Database Hub's estate for every target,
-the runner, the Hub checklist with the T3 gate, and the dashboard's tiles, and DEPLOY.TIMING records each track's steps
-and the total.
+The bundle and the runner are built while Preflight runs. With networkMode private, the policy inventory runs
+alongside the deployment instead of before it (with public or auto it stays in preflight). The validation then checks
+Database Hub's estate for every target, the runner, the Hub checklist with the T3 gate, and the dashboard's tiles, and
+DEPLOY.TIMING records each track's steps and the total.
 
 -Sequential runs the earlier single sequence of Invoke-DemoDeployment: Preflight, Infrastructure, Artifacts
 (the bootstrap bundle and the workload runner, in Run Command chunks), Bootstraps (the loaders, then T1
@@ -268,7 +268,7 @@ try {
     }
     finally {
         # Always one ending, even after Ctrl+C: the model and the page say DONE or NOT DONE, and the PC may sleep again.
-        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric
+        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential
         $null = Exit-DemoKeepAwake
         if (-not $finished) {
             Write-DemoDeploymentOutcome -Outcome $outcome -WorkspaceName $workspaceName

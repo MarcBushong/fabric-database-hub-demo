@@ -202,25 +202,36 @@ Describe 'Invoke-DemoPreflight' {
         (Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').status | Should -Be 'Fail'
     }
 
-    It 'leaves the policy inventory to deploy.ps1 with networkMode public or private, and keeps it with auto (Phase 28)' {
+    It 'leaves the policy inventory to deploy.ps1 only with networkMode private, and keeps it with public and auto (Phase 28; review finding 7)' {
         Set-HappyAzMock
-        $public = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
-        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $public[$key] = $config[$key] }
-        $public['networkMode'] = 'public'
-        $results = Invoke-DemoPreflight -Config $public -SkipWhatIf -DeferPolicyInventory
+        $private = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $private[$key] = $config[$key] }
+        $private['networkMode'] = 'private'
+        $results = Invoke-DemoPreflight -Config $private -SkipWhatIf -DeferPolicyInventory
         $inventory = $results | Where-Object checkId -eq 'PREFLIGHT.POLICY.INVENTORY'
         $inventory.status | Should -Be 'Not selected'
         $inventory.message | Should -Match 'Deferred'
         $inventory.evidence.deferred | Should -BeTrue
-        $sqlPublic = $results | Where-Object checkId -eq 'PREFLIGHT.POLICY.SQLPUBLIC'
-        $sqlPublic.status | Should -Be 'Not selected'
-        $sqlPublic.evidence.effectiveNetworkMode | Should -Be 'public'
+        $sqlPrivate = $results | Where-Object checkId -eq 'PREFLIGHT.POLICY.SQLPUBLIC'
+        $sqlPrivate.status | Should -Be 'Not selected'
+        $sqlPrivate.evidence.effectiveNetworkMode | Should -Be 'private'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match 'policyAssignments' }
 
-        # networkMode auto needs the inventory, so it isn't deferred.
+        # networkMode public under a Modify policy that turns SQL public access off: the what-if catches only Deny, so
+        # preflight's own SQL public-access check must stop the run before anything is created, as before Phase 28.
+        $public = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $public[$key] = $config[$key] }
+        $public['networkMode'] = 'public'
+        $script:policyAssignmentsJson = $script:sqlPublicOffAssignmentsJson
+        $publicResults = Invoke-DemoPreflight -Config $public -SkipWhatIf -DeferPolicyInventory
+        ($publicResults | Where-Object checkId -eq 'PREFLIGHT.POLICY.INVENTORY').message | Should -Not -Match 'Deferred'
+        ($publicResults | Where-Object checkId -eq 'PREFLIGHT.POLICY.SQLPUBLIC').status | Should -Be 'Fail'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match 'policyAssignments' }
+
+        # networkMode auto needs the inventory, so it isn't deferred either.
+        $script:policyAssignmentsJson = '{"value":[]}'
         $auto = Invoke-DemoPreflight -Config $config -SkipWhatIf -DeferPolicyInventory
         ($auto | Where-Object checkId -eq 'PREFLIGHT.POLICY.INVENTORY').status | Should -Be 'Pass'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match 'policyAssignments' }
     }
 
     It 'passes every automated check in a ready subscription' {

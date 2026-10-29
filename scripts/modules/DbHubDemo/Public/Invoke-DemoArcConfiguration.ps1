@@ -19,9 +19,11 @@ function Invoke-DemoArcConfiguration {
        duplicates.
     5. Once the host is past onboarding (or with -Force), converges the Azure extension for SQL Server, its
        license type, the sqlServerInstances resource, and monitoring (Set-DemoArcSqlConfiguration). In
-       PaygWizard mode, while the host's step is ArcOnboardingBeforeWizard, GuidedSetup, or SqlSetupWizard, that
-       waits (T2.ARC.CONFIGURATION Manual action required) until the host's setup check passes, so a wrong install
-       never gets pay-as-you-go (Phase 28); deploy.ps1's guided stop then runs this sequence again.
+       PaygWizard mode without -Force, while the host's step is ArcOnboardingBeforeWizard, GuidedSetup, or
+       SqlSetupWizard and its health doesn't show the setup check passed (Standard in the guest, nothing armed), that
+       waits (T2.ARC.CONFIGURATION Manual action required), so a wrong install never gets pay-as-you-go (Phase 28);
+       deploy.ps1's guided stop then runs this sequence again. A golden copy (-Force) waits at
+       ArcOnboardingBeforeWizard after its Release with Standard already in the guest, so it's configured at once.
     6. Reports T2.ARC.CONNECTED, T2.ARC.NODUPLICATES, and T2.ARC.DISCONNECTEDDAYS (Get-DemoArcCheck).
     Every step is re-runnable. Under -WhatIf only the guard runs. In the evaluation-only mode, once the VM's
     Azure guest agent is disabled (the procedure's last step), Run Command can't read its health; a Connected
@@ -34,7 +36,8 @@ function Invoke-DemoArcConfiguration {
     The SQL Server product key for ProductKey mode (prerequisite P10), as a SecureString.
 
     .PARAMETER Force
-    Onboard and configure even when the host doesn't wait for onboarding (Invoke-DemoArcOnboarding -Force).
+    Onboard and configure even when the host doesn't wait for onboarding (Invoke-DemoArcOnboarding -Force), and
+    without PaygWizard mode's wait for the host's setup check (deploy.ps1's golden path).
 
     .PARAMETER UseHostIdentity
     Require the least-privilege host identity (assignRoles = true): onboarding fails when it isn't attached.
@@ -171,13 +174,17 @@ function Invoke-DemoArcConfiguration {
         $results.Add((New-DemoArcResult -CheckId 'T2.ARC.CONFIGURATION' -Target $target -Status 'Not selected' -Message ('Configuring SQL Server enabled by Azure Arc was skipped because {0}.' -f $why) -Remediation 'Run configure-arc.ps1 again when the host waits for onboarding, or add -WaitForHostMinutes.' -DocUrl $target.Setting.DocUrls['configuration']))
         return $results.ToArray()
     }
+    $currentStep = [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep')
+    # The host's setup check (PaygWizard): Standard runs in the guest and the guided stop isn't armed. A golden copy
+    # settles at ArcOnboardingBeforeWizard after its Release while its guest already runs Standard.
+    $setupPassed = [string](Get-DemoMemberValue -InputObject $health -Name 'sqlEdition') -like 'Standard*' -and [string](Get-DemoMemberValue -InputObject $health -Name 'guidedArmed') -ne 'True'
     if ($SkipConfiguration) {
         $results.Add((New-DemoArcResult -CheckId 'T2.ARC.CONFIGURATION' -Target $target -Status 'Not selected' -Message '-SkipConfiguration: the Azure extension for SQL Server, its license type, and monitoring were left alone.' -DocUrl $target.Setting.DocUrls['configuration']))
     }
-    elseif ($target.InstallMode -eq 'PaygWizard' -and -not $target.EvaluationOnly -and $hostState -ne 'Ready' -and [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep') -in 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard') {
+    elseif (-not $Force -and $target.InstallMode -eq 'PaygWizard' -and -not $target.EvaluationOnly -and $hostState -ne 'Ready' -and $currentStep -in 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard' -and -not $setupPassed) {
         # Phase 28: no license type or monitoring before the host's setup check passed, so a wrong install (Evaluation,
-        # Developer, a named instance) never gets pay-as-you-go.
-        $results.Add((New-DemoArcResult -CheckId 'T2.ARC.CONFIGURATION' -Target $target -Status 'Manual action required' -Message ('{0} waits for the SQL Server setup step in {1} (host step {2}), so the Azure extension for SQL Server, its license type, and monitoring wait until the host''s setup check passes.' -f $target.HostVmName, $target.MachineName, [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep')) -Remediation 'Run ./scripts/deploy.ps1: it opens Bastion, guides you through the pre-filled setup (pay-as-you-go, Standard), and continues on its own.' -DocUrl $target.Setting.DocUrls['configuration']))
+        # Developer, a named instance) never gets pay-as-you-go. -Force (the golden path) skips the wait.
+        $results.Add((New-DemoArcResult -CheckId 'T2.ARC.CONFIGURATION' -Target $target -Status 'Manual action required' -Message ('{0} waits for the SQL Server setup step in {1} (host step {2}), so the Azure extension for SQL Server, its license type, and monitoring wait until the host''s setup check passes.' -f $target.HostVmName, $target.MachineName, $currentStep) -Remediation 'Run ./scripts/deploy.ps1: it opens Bastion, guides you through the pre-filled setup (pay-as-you-go, Standard), and continues on its own.' -DocUrl $target.Setting.DocUrls['configuration']))
     }
     else {
         foreach ($item in @(Set-DemoArcSqlConfiguration -Config $Config -WaitMinutes $WaitMinutes -Confirm:$false)) {

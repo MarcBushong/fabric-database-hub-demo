@@ -160,17 +160,9 @@ elseif ($Interactive -and $ResetAdminPassword -and -not $whatIf -and $noFail) {
     $hostVm = if ([string]$config['t2Mode'] -eq 'EvaluationOnlyAzureVm') { 'arcsql01' } else { 'archost01' }
     $portalSteps = 'In the Azure portal, open {0}, then Help, then Reset password, and set a password you''ll use once; stop-demo.ps1 rotates it afterward.' -f $hostVm
     # The clipboard is checked before anything changes: the password is never displayed, so without a
-    # clipboard there'd be no way to hand it over.
-    $clipboard = $false
-    if (Get-Command -Name 'Set-Clipboard' -ErrorAction SilentlyContinue) {
-        try {
-            Set-Clipboard -Value ' '
-            $clipboard = $true
-        }
-        catch {
-            $clipboard = $false
-        }
-    }
+    # clipboard there'd be no way to hand it over. Set-Clipboard doesn't fail where there's none (Linux without xclip
+    # or a display, GitHub Codespaces, an SSH session, Cloud Shell), so the module's check decides (Phase 28).
+    $clipboard = [bool](& (Get-Module -Name 'DbHubDemo') { Test-DemoClipboard })
     if (-not $clipboard) {
         $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'This session has no working clipboard, so no one-time password was set: it''s never displayed.' -Remediation $portalSteps -DocUrl 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'))
         # The person may now set a password in the portal: the state records the handover, so stop-demo.ps1 rotates it

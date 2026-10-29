@@ -7,7 +7,8 @@
 #   deleting, don't block: chunk deletes are never waited for, and 25 managed Run Commands per VM are allowed.
 # - A watchdog: when that wait, a chunk Run Command, or the loader stays non-terminal past about 15 to 20 minutes, it saves
 #   the VM's instance view (agent and extension statuses, redacted) for the diagnostics bundle, restarts that VM once
-#   (T1 only before its bootstrap, and the T2 host only while its guest isn't in the guided stop), and the run goes on.
+#   (the T2 host never during the guided stop, the golden Release, or its guest build: Get-DemoHostRestartBlocker), and
+#   the run goes on. While the Release runs, archost01's artifacts go without the wait or the watchdog.
 #   Still stuck: the run ends NOT DONE, naming the extension and the next step.
 # Sources (checked 2026-10-29):
 # - az vm get-instance-view: https://learn.microsoft.com/cli/azure/vm#az-vm-get-instance-view
@@ -198,11 +199,60 @@ function Save-DemoVmInstanceView {
     }
 }
 
+function Get-DemoHostRestartBlocker {
+    <#
+    .SYNOPSIS
+    Why the watchdog mustn't restart the T2 host now, or '' when it may (review finding 6): the guided stop's time limit
+    is open (its guest may be in the middle of setup); a golden guest action, the Release, runs on it in this process
+    (Invoke-DemoGoldenGuestAction); or its guest build runs (health state InProgress or RebootPending). A host whose
+    bootstrap never ran (no T2 step past Artifacts, no stage past Artifacts, not a golden copy) has nothing to
+    interrupt, so its health isn't read; for any other host, health that can't be read counts as a build that may be
+    running. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9-]{0,14}$')]
+        [string] $VmName = 'archost01'
+    )
+
+    $state = Get-DemoDeploymentState -Config $Config
+    $until = ConvertTo-DemoRunCommandUtc -Value (Get-DemoMemberValue -InputObject $state -Name 'GuidedStopUtc')
+    if ($null -ne $until -and $until -gt [System.DateTime]::UtcNow) {
+        return 'its guest may be in the middle of SQL Server setup (the guided stop)'
+    }
+    $key = '{0}/{1}' -f (Get-DemoResourceGroupName -Config $Config), $VmName
+    if ($script:DemoHostAction.ContainsKey($key)) {
+        return ('the golden {0} is running on it' -f $script:DemoHostAction[$key])
+    }
+    $track = [string](Get-DemoMemberValue -InputObject $state -Name 'TrackT2')
+    $stage = [string](Get-DemoMemberValue -InputObject $state -Name 'Stage')
+    $bootstrapped = $track -in 'Bootstraps', 'T2', 'Telemetry' -or [string](Get-DemoMemberValue -InputObject $state -Name 'T2Source') -eq 'golden' -or ($stage -and (Test-DemoDeploymentStageReached -Recorded $stage -Stage 'Bootstraps'))
+    if (-not $bootstrapped) {
+        return ''
+    }
+    try {
+        $health = Get-DemoVmHealth -Config $Config -VmName $VmName -View Summary -TimeoutSeconds 120
+    }
+    catch {
+        return ('its health couldn''t be read ({0}), and its guest build may be running' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    $hostState = [string](Get-DemoMemberValue -InputObject $health -Name 'state')
+    if ($hostState -in 'InProgress', 'RebootPending') {
+        return ('its guest build is running (step {0})' -f [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep'))
+    }
+    return ''
+}
+
 function Restart-DemoVmOnce {
     <#
     .SYNOPSIS
     The watchdog's restart: 'az vm restart' for one VM, at most once per deploy.ps1 process, then the wait for its VM
-    agent. Never the T2 host while the guided stop's request is valid (its guest may be in the middle of setup).
+    agent. Never the T2 host while Get-DemoHostRestartBlocker names a reason: the guided stop's request is valid (its
+    guest may be in the middle of setup), the golden Release runs on it, or its guest build runs (review finding 6).
     Returns Restarted, Reason, and AtUtc. Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
@@ -224,10 +274,9 @@ function Restart-DemoVmOnce {
         return [pscustomobject]@{ Restarted = $false; Reason = 'it was restarted once already in this run'; AtUtc = $script:DemoVmRestarted[$key] }
     }
     if ($VmName -eq 'archost01') {
-        $state = Get-DemoDeploymentState -Config $Config
-        $until = ConvertTo-DemoRunCommandUtc -Value (Get-DemoMemberValue -InputObject $state -Name 'GuidedStopUtc')
-        if ($null -ne $until -and $until -gt [System.DateTime]::UtcNow) {
-            return [pscustomobject]@{ Restarted = $false; Reason = 'its guest may be in the middle of SQL Server setup (the guided stop)'; AtUtc = $null }
+        $blocker = Get-DemoHostRestartBlocker -Config $Config -VmName $VmName
+        if ($blocker) {
+            return [pscustomobject]@{ Restarted = $false; Reason = $blocker; AtUtc = $null }
         }
     }
     if (-not $PSCmdlet.ShouldProcess($VmName, 'Restart the VM once, because its Azure-side work is stuck')) {

@@ -183,7 +183,9 @@ function Test-DemoOptionalResult {
 
 function Get-DemoT4OffReason {
     # Why T4 isn't deployed, or '' when it is (brief item 16): t4Enabled false in the configuration, or the Burstable
-    # fallback (Phase 28) found no size Azure accepts. Pure. Internal.
+    # fallback (Phase 28) found no size Azure accepts. Decided from the effective configuration, as the deployment
+    # decides (Resolve-DemoEffectiveConfig), so a t4SkuName the configuration sets wins over a recorded "no T4" (review
+    # finding 5). Pure. Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -193,10 +195,10 @@ function Get-DemoT4OffReason {
         [object] $State
     )
 
-    if ($Config.Contains('t4Enabled') -and $null -ne $Config['t4Enabled'] -and -not [bool]$Config['t4Enabled'] -and [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') -ne 'None') {
+    if (-not (Test-DemoT4Enabled -Config $Config)) {
         return 'T4 (Azure Database for PostgreSQL) isn''t deployed: t4Enabled is false in your configuration.'
     }
-    if ([string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') -eq 'None') {
+    if (-not (Test-DemoT4Enabled -Config (Resolve-DemoEffectiveConfig -Config $Config -State $State))) {
         return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both Burstable sizes, Standard_B1ms and Standard_B2s, in {0} (SkuNotAvailable). To add it, set t4SkuName to Standard_D2ds_v5 (General Purpose; DEPLOY.T4.SKU gives its price), then run ./scripts/deploy.ps1.' -f [string]$Config['location'])
     }
     return ''
@@ -400,7 +402,10 @@ function Get-DemoDeploymentOutcome {
     -SkipFabric) finished according to the resource group's state; a Pass for every DONE requirement
     (Get-DemoDoneRequirement: Database Hub's own views of every target); no Fail; and no Manual action required except
     the Hub tenant setting's reminder (PREFLIGHT.P4.HUBSETTING, which no API reads) and the optional parts
-    (Test-DemoOptionalResult). Without a state, this run's DEPLOY.TRACK results stand in.
+    (Test-DemoOptionalResult). Without a state, this run's DEPLOY.TRACK results stand in. -Sequential (deploy.ps1
+    -Sequential, which records stages and no tracks) needs the recorded stage Validation instead of the tracks (or,
+    without a state, this run's DEPLOY.STAGE.VALIDATION Pass), and the same DONE requirements, which its validation
+    checks (review finding 4).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -420,7 +425,9 @@ function Get-DemoDeploymentOutcome {
         [AllowEmptyString()]
         [string] $StopAfter = '',
 
-        [switch] $SkipFabric
+        [switch] $SkipFabric,
+
+        [switch] $Sequential
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
@@ -454,7 +461,22 @@ function Get-DemoDeploymentOutcome {
         $expected['Fabric'] = 'Fabric'
     }
     $unfinished = [System.Collections.Generic.List[string]]::new()
-    foreach ($track in $expected.Keys) {
+    $lastStage = ''
+    if ($Sequential) {
+        # deploy.ps1 -Sequential records only its last finished stage, never a track (review finding 4): its stages are
+        # done once Validation is recorded, or, without a state, once this run's validation passed.
+        if ($null -ne $State) {
+            $lastStage = [string](Get-DemoMemberValue -InputObject $State -Name 'Stage')
+            $stagesDone = $lastStage -eq 'Validation'
+        }
+        else {
+            $stagesDone = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.STAGE.VALIDATION' -and [string]$_.status -eq 'Pass' }).Count -gt 0
+        }
+        if (-not $stagesDone) {
+            $unfinished.Add('Stages')
+        }
+    }
+    foreach ($track in @($expected.Keys | Where-Object { -not $Sequential })) {
         $done = $false
         if ($null -ne $State) {
             $done = [string](Get-DemoMemberValue -InputObject $State -Name ('Track{0}' -f $track)) -eq $expected[$track]
@@ -499,6 +521,10 @@ function Get-DemoDeploymentOutcome {
     elseif ($StopAfter) {
         $outcome.Reason = 'Stopped after {0}, as asked (-StopAfter).' -f $StopAfter
         $outcome.Next = 'Run {0} to continue.' -f $Command
+    }
+    elseif ($unfinished.Count -gt 0 -and $Sequential) {
+        $outcome.Reason = 'Not every stage finished: the last one recorded is {0}.' -f $(if ($lastStage) { $lastStage } else { 'none' })
+        $outcome.Next = 'Run {0}: it continues after the last stage that finished, with the guided stop that -Sequential doesn''t have.' -f $Command
     }
     elseif ($unfinished.Count -gt 0) {
         $outcome.Reason = 'Not every target finished: {0}.' -f ($unfinished -join ', ')

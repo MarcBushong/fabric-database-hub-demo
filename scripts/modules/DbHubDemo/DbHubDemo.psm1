@@ -26,6 +26,10 @@ $script:DemoAzGuardActive = $false
 # Phase 28: the VMs deploy.ps1's watchdog restarted in this process (Restart-DemoVmOnce restarts each at most once).
 $script:DemoVmRestarted = @{}
 
+# Review fix (Phase 28): the golden guest action (the Release) running on the T2 host in this process, keyed
+# '<resource group>/archost01' (Invoke-DemoGoldenGuestAction). The watchdog never restarts the host meanwhile.
+$script:DemoHostAction = @{}
+
 # Azure CLI verbs that only read. Any other command (and every token request) needs the validated context.
 $script:AzReadOnlyVerbs = @('show', 'list', 'exists', 'get-instance-view', 'list-skus', 'list-usage', 'list-usages', 'list-versions', 'show-deleted', 'list-locations', 'version')
 

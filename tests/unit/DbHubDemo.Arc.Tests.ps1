@@ -815,6 +815,42 @@ Describe 'Invoke-DemoArcConfiguration' {
         ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Pass'
     }
 
+    It 'configures a golden copy (-Force) whose host waits at ArcOnboardingBeforeWizard after the Release (review finding 1)' {
+        # The Release renames the host's Arc marker, so a copy settles at ArcOnboardingBeforeWizard while its guest
+        # already runs Standard; the read can also predate the guest's facts (no edition yet).
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { [pscustomobject]@{ Health = $script:health; Polls = 0 } }
+        foreach ($edition in 'Standard Edition (64-bit)', '') {
+            $script:health = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboardingBeforeWizard'; sqlEdition = $edition; guidedArmed = $false }
+            $results = @(Invoke-DemoArcConfiguration -Config (New-TestConfig) -Force -WaitMinutes 1)
+            ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Pass'
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoArcSqlConfiguration -Times 2 -Exactly
+    }
+
+    It 'configures without -Force once the guest runs Standard and nothing is armed (the host''s setup check passed)' {
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { [pscustomobject]@{ Health = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboardingBeforeWizard'; sqlEdition = 'Standard Edition (64-bit)'; guidedArmed = $false }; Polls = 0 } }
+        $results = @(Invoke-DemoArcConfiguration -Config (New-TestConfig) -WaitMinutes 1)
+        ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoArcSqlConfiguration -Times 1 -Exactly
+    }
+
+    It 'waits for the setup check in PaygWizard mode while setup hasn''t happened or is armed' {
+        $cases = @(
+            @{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboardingBeforeWizard'; sqlEdition = ''; guidedArmed = $false }
+            @{ state = 'InProgress'; currentStep = 'GuidedSetup'; sqlEdition = ''; guidedArmed = $false }
+            @{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; sqlEdition = 'Enterprise Evaluation Edition (64-bit)'; guidedArmed = $false }
+            @{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; sqlEdition = 'Standard Edition (64-bit)'; guidedArmed = $true }
+        )
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { [pscustomobject]@{ Health = $script:health; Polls = 0 } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcOnboarding -MockWith { New-DemoResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'Connected.' -Evidence @{ azureStatus = 'Connected' } }
+        foreach ($case in $cases) {
+            $script:health = [pscustomobject]$case
+            $results = @(Invoke-DemoArcConfiguration -Config (New-TestConfig) -WaitMinutes 1)
+            ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Manual action required' -Because ('{0} at {1}' -f $case.state, $case.currentStep)
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoArcSqlConfiguration -Times 0 -Exactly
+    }
+
     It 'checks an evaluation-only VM through Azure once its guest agent is disabled' {
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { throw 'Run Command timed out.' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -MockWith { New-TestMachine }

@@ -34,7 +34,9 @@ function Invoke-DemoDeployment {
     9. Fabric: configure-fabric.ps1 (the Hub checklist, and the notebook import with -ImportNotebooks or
        fabric.importNotebooks). Not selected with -SkipFabric.
     10. Validation: Test-DemoHubTelemetry for each ready target, the runner's status on T1, and a summary that
-        lists every Manual action required item with its exact steps.
+        lists every Manual action required item with its exact steps. Since Phase 28 (review finding 4), with no
+        stage open and nothing failed, DONE's read-only checks follow (Invoke-DemoDoneGate: Database Hub's estate,
+        T4's metrics, T2's PAYG and monitoring, and the Fabric items), so deploy.ps1 -Sequential can end DONE.
 
     A Fail stops the run, and nothing after it runs. Manual action required never stops it and is never
     hidden: it's in the results and in DEPLOY.SUMMARY. Deployment success alone is never Pass (ADR 0012).
@@ -285,6 +287,7 @@ function Invoke-DemoDeployment {
         }
     }
 
+    $validated = $false
     for ($index = $startIndex; $index -le $stopIndex; $index++) {
         $stage = $stages[$index]
         Write-DemoLog -Message ('Stage {0} of {1}: {2}.' -f ($index + 1), $stages.Count, $stage)
@@ -628,8 +631,20 @@ function Invoke-DemoDeployment {
                 }
                 & $recordStage 'Validation'
                 & $stageResult 'Validation' 'Pass' ('The validation ran for {0}.' -f ($targets -join ', '))
+                $validated = $true
             }
         }
+    }
+
+    # DONE's read-only checks, as the parallel path runs them once every track finished (Phase 28, review finding 4):
+    # after this run's validation, with no stage open and nothing failed, each DONE requirement the results don't show
+    # passing yet (Database Hub's estate, T4's metrics, T2's PAYG and monitoring, the Fabric items) is checked, so a
+    # sequential run is judged by the same requirements and can end DONE.
+    if ($validated -and -not $context.OpenStage -and -not (& $hasStatus $results.ToArray() 'Fail')) {
+        $current = Get-DemoDeploymentState -Config $Config
+        $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool](Get-DemoT4OffReason -Config $Config -State $current)) -SkipFabric:$SkipFabric
+        & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes)
     }
 
     $all = $results.ToArray()

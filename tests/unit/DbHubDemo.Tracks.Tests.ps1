@@ -277,6 +277,46 @@ Describe 'Invoke-DemoDeploymentTrack' {
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.READY' }).status | Should -Be 'Pass'
     }
 
+    It 'sends archost01''s artifacts during the Release without the extension wait or the watchdog, which wait for the Artifacts step (review finding 6)' {
+        $script:state.BundleSentTo = @()
+        $script:state.RunnerSentTo = @()
+        $script:inRelease = $false
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
+            $script:calls.Add('release')
+            $alongside = Get-Variable -Name 'WhileRunning' -ValueOnly -ErrorAction SilentlyContinue
+            $whileError = ''
+            $script:inRelease = $true
+            try {
+                if ($null -ne $alongside) {
+                    & $alongside
+                }
+            }
+            catch {
+                $whileError = $_.Exception.Message
+            }
+            finally {
+                $script:inRelease = $false
+            }
+            [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 600; Data = $script:releaseData; WhileRunningError = $whileError }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith { $script:calls.Add(('settle {0} release={1}' -f $VmName, $script:inRelease)); [pscustomobject]@{ Settled = $true; Results = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmWatchdog -MockWith { $script:calls.Add(('watchdog {0} release={1}' -f $VmName, $script:inRelease)); [pscustomobject]@{ Restarted = $false; Saved = ''; Items = @(); Result = (New-TestResult ('DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()) 'Warning') } }
+        # The chunks get stuck while the Release runs, and go through afterward.
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoChunkSet -MockWith {
+            $script:calls.Add(('chunks {0} release={1}' -f $VmName, $script:inRelease))
+            if ($script:inRelease) {
+                throw 'no chunk finished for 5 minutes'
+            }
+            @($File | ForEach-Object { [pscustomobject]@{ Description = $_.Description; Sha256 = $_.Sha256; ChunkCount = 1; Seconds = 90 } })
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Restore', 'Artifacts', 'Bootstraps') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:calls | Where-Object { $_ -match '^(settle|watchdog) .*release=True' }) | Should -BeNullOrEmpty
+        $script:calls | Should -Contain 'chunks archost01 release=True'
+        $script:calls | Should -Contain 'settle archost01 release=False'
+        $script:calls | Should -Contain 'chunks archost01 release=False'
+    }
+
     It 'fails the T2 step when the host''s own last step failed, instead of passing on the Arc checks (live, 2026-10-27)' {
         # The host installs T2's runner after onboarding; live, setup --target T2 failed while every Arc check passed.
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { $script:calls.Add('health ' + $VmName); [pscustomobject]@{ Health = [pscustomobject]@{ state = 'Failed'; message = 'Step WorkloadRunner failed: setup --target T2: Fail.' }; Polls = 4 } }
@@ -827,31 +867,53 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:calls | Should -Contain 'job T2 delay=5 earlyT2=False bundle=False'
         }
 
-        It 'runs the policy inventory alongside the deployment with networkMode public, and its results replace preflight''s placeholders (Phase 28)' {
-            $public = New-TestConfig
-            $public['networkMode'] = 'public'
+        It 'runs the policy inventory alongside the deployment only with networkMode private, and its results replace preflight''s placeholders (Phase 28; review finding 7)' {
+            $private = New-TestConfig
+            $private['networkMode'] = 'private'
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -MockWith {
                 $script:calls.Add(('preflight defer={0}' -f [bool]$DeferPolicyInventory))
                 New-TestResult 'PREFLIGHT.P1.SUBSCRIPTION'
                 New-DemoResult -CheckId 'PREFLIGHT.POLICY.INVENTORY' -Area 'preflight' -Target 'subscription' -Status 'Not selected' -Message 'Deferred.' -Evidence @{ deferred = $true }
-                New-DemoResult -CheckId 'PREFLIGHT.POLICY.SQLPUBLIC' -Area 'preflight' -Target 'subscription' -Status 'Not selected' -Message 'Deferred.' -Evidence @{ effectiveNetworkMode = 'public'; deferred = $true }
+                New-DemoResult -CheckId 'PREFLIGHT.POLICY.SQLPUBLIC' -Area 'preflight' -Target 'subscription' -Status 'Not selected' -Message 'Deferred.' -Evidence @{ effectiveNetworkMode = 'private'; deferred = $true }
             }
             Mock -ModuleName DbHubDemo -CommandName Start-DemoPolicyInventoryJob -MockWith { $script:calls.Add('policy job'); Start-ThreadJob -Name 'dbhub-policy-inventory' -ScriptBlock { } }
             Mock -ModuleName DbHubDemo -CommandName Receive-DemoDeploymentTrackOutput -ParameterFilter { $Job.Name -eq 'dbhub-policy-inventory' } -MockWith {
                 [pscustomobject]@{ Results = @((New-TestResult 'PREFLIGHT.POLICY.INVENTORY'), (New-TestResult 'PREFLIGHT.POLICY.SQLPUBLIC')); Summary = $null }
             }
-            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $public } { Invoke-DemoParallelDeployment -Config $Config })
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $private } { Invoke-DemoParallelDeployment -Config $Config })
             $script:calls | Should -Contain 'preflight defer=True'
             $script:calls | Should -Contain 'policy job'
             @($results | Where-Object { $_.checkId -eq 'PREFLIGHT.POLICY.INVENTORY' }).status | Should -Be @('Pass')
             @($results | Where-Object { $_.checkId -eq 'PREFLIGHT.POLICY.SQLPUBLIC' }).status | Should -Be @('Pass')
 
-            # networkMode auto needs the inventory in preflight, as before.
-            $script:calls.Clear()
+            # networkMode public keeps the inventory in preflight: a Modify policy that turns SQL public access off, which
+            # the what-if doesn't catch, must stop the run before anything is created. auto needs it too.
+            foreach ($mode in 'public', 'auto') {
+                $script:calls.Clear()
+                $script:received = @{}
+                $other = New-TestConfig
+                $other['networkMode'] = $mode
+                InModuleScope DbHubDemo -Parameters @{ Config = $other } { Invoke-DemoParallelDeployment -Config $Config } | Out-Null
+                $script:calls | Should -Contain 'preflight defer=False' -Because $mode
+                $script:calls | Should -Not -Contain 'policy job'
+            }
+        }
+
+        It 'lets the T2 track process prompt the person itself when there''s no progress model (-NoStatusPage; review finding 2)' {
+            $script:promptInParent = @{}
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoDeploymentTrackJob -MockWith {
+                $script:promptInParent[$Track] = [bool]$Context['PromptInParent']
+                $script:handoffDir = [string]$Context['HandoffPath']
+                Start-ThreadJob -Name ('dbhub-track-{0}' -f $Track) -ScriptBlock { }
+            }
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -WaitForT2 } | Out-Null
+            $script:promptInParent['T2'] | Should -BeFalse -Because 'only a progress model tells this process that the guided stop is ready'
+
             $script:received = @{}
-            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config } | Out-Null
-            $script:calls | Should -Contain 'preflight defer=False'
-            $script:calls | Should -Not -Contain 'policy job'
+            $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+            InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog) -GuidedStop 'Pending') -Confirm:$false }
+            InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -WaitForT2 -ProgressPath $Path } | Out-Null
+            $script:promptInParent['T2'] | Should -BeTrue
         }
 
         It 'prompts the person in this process when the T2 track process reports the guided stop ready (Phase 28)' {

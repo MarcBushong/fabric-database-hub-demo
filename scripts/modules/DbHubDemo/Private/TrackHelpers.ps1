@@ -590,9 +590,11 @@ function Invoke-DemoDeploymentTrack {
     }
 
     # Sends the bundle and the runner to one VM, together, unless it already has exactly those chunks. What
-    # this process already sent or confirmed isn't sent or reported again.
+    # this process already sent or confirmed isn't sent or reported again. -DuringRelease (archost01's artifacts while the
+    # golden Release runs on it): no extension wait and no watchdog, which could restart the host mid-Release; a send that
+    # gets stuck then throws, and the Artifacts step sends what's left afterward (review finding 6).
     $send = {
-        param([string] $VmName)
+        param([string] $VmName, [bool] $DuringRelease = $false)
         $target = Get-DemoVmTarget -VmName $VmName
         $artifacts = & $resolveArtifacts
         $missing = [System.Collections.Generic.List[object]]::new()
@@ -631,7 +633,7 @@ function Invoke-DemoDeploymentTrack {
         # Phase 28 (brief item 14): the VM's extensions settle first, and a stuck chunk set gets the watchdog (the VM's
         # instance view saved, one restart) and one more try, one chunk at a time.
         $progressId = '{0}.Artifacts' -f $(if ($VmName -eq 'sqlvm01') { 'T1' } else { 'T2' })
-        if (-not (& $settle $VmName $progressId)) {
+        if (-not $DuringRelease -and -not (& $settle $VmName $progressId)) {
             throw ('Azure''s extension work on {0} didn''t finish, so its artifacts weren''t sent (DEPLOY.EXTENSIONS_{1}).' -f $VmName, $VmName.ToUpperInvariant())
         }
         try {
@@ -639,7 +641,7 @@ function Invoke-DemoDeploymentTrack {
         }
         catch {
             $problem = Protect-DemoText -Text $_.Exception.Message
-            if ($problem -match 'isn''t running|deallocated|changed after it was built|doesn''t exist|failed on the VM') {
+            if ($DuringRelease -or $problem -match 'isn''t running|deallocated|changed after it was built|doesn''t exist|failed on the VM') {
                 throw
             }
             Write-DemoLog -Level Warning -Message ('{0}: sending the artifacts got stuck ({1}); the watchdog steps in, then they go one chunk at a time.' -f $VmName, $problem)
@@ -963,8 +965,9 @@ function Invoke-DemoDeploymentTrack {
                         }
                     }
                     # archost01's bundle and runner travel in their own Run Commands while the Release runs; they
-                    # put nothing on the network, and the Artifacts step sends whatever didn't arrive (ADR 0018).
-                    $alongside = if ('Artifacts' -in $Step) { { & $send 'archost01' } } else { $null }
+                    # put nothing on the network, and the Artifacts step sends whatever didn't arrive (ADR 0018). No
+                    # extension wait or watchdog meanwhile: a restart would interrupt the Release (review finding 6).
+                    $alongside = if ('Artifacts' -in $Step) { { & $send 'archost01' $true } } else { $null }
                     $release = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -TimeoutSeconds 3600 -WhileRunning $alongside
                     if ([string](Get-DemoMemberValue -InputObject $release -Name 'WhileRunningError')) {
                         Write-DemoLog -Level Warning -Message ('Track T2: archost01''s artifacts didn''t all arrive during the Release; the Artifacts step sends them: {0}' -f $release.WhileRunningError)

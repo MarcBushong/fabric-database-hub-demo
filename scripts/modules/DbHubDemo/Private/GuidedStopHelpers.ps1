@@ -11,6 +11,9 @@
 # - FlashWindowEx: https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-flashwindowex
 # - GetConsoleWindow: https://learn.microsoft.com/windows/console/getconsolewindow
 # - Console.Beep: https://learn.microsoft.com/dotnet/api/system.console.beep
+# - Set-Clipboard (xclip on Linux, pbcopy on macOS; SSH_CLIENT and SSH_TTY mark an SSH session):
+#   https://learn.microsoft.com/powershell/module/microsoft.powershell.management/set-clipboard
+# - GitHub Codespaces' CODESPACES variable: https://docs.github.com/codespaces/developing-in-a-codespace/default-environment-variables-for-your-codespace
 
 function Get-DemoHostStepOrder {
     # The T2 host's state-machine steps in order (Get-DemoHostStepPlan in vm/bootstrap/Invoke-HostBootstrap.ps1; a test
@@ -243,12 +246,40 @@ function Wait-DemoT2HostBuild {
 }
 
 function Test-DemoClipboard {
-    # True when this session has a clipboard that takes text (Set-Clipboard; Codespaces, Cloud Shell, and many SSH
-    # sessions don't). Internal.
+    # True when this session has a clipboard the person at the keyboard can paste from (review finding 3). PowerShell
+    # 7's Set-Clipboard doesn't fail where there's none: on Linux it needs xclip and on macOS pbcopy (Set-Clipboard's
+    # documentation, https://learn.microsoft.com/powershell/module/microsoft.powershell.management/set-clipboard), and
+    # without the tool, or when xclip has no X display, it keeps the text inside its own process. So: never in GitHub
+    # Codespaces (CODESPACES), an SSH session (SSH_CLIENT or SSH_TTY, as that page detects one: the clipboard there
+    # isn't the person's), or Azure Cloud Shell; on macOS only with pbcopy; on Linux only with an X display (DISPLAY,
+    # which XWayland sets too) and xclip; on Windows when Set-Clipboard takes text. -Platform is for tests. Internal.
     [CmdletBinding()]
     [OutputType([bool])]
-    param()
+    param(
+        [ValidateSet('', 'Windows', 'MacOS', 'Linux')]
+        [string] $Platform = ''
+    )
 
+    if (-not $Platform) {
+        $Platform = if ($IsWindows) { 'Windows' } elseif ($IsMacOS) { 'MacOS' } else { 'Linux' }
+    }
+    $variable = { param([string] $Name) [string][System.Environment]::GetEnvironmentVariable($Name) }
+    # Azure Cloud Shell sets AZUREPS_HOST_ENVIRONMENT to cloud-shell/<version>, which Learn doesn't document, so it's
+    # only a second line: Cloud Shell is Linux without a display, which the Linux rule below refuses anyway.
+    if ((& $variable 'CODESPACES') -eq 'true' -or (& $variable 'SSH_CLIENT') -or (& $variable 'SSH_TTY') -or (& $variable 'AZUREPS_HOST_ENVIRONMENT') -like 'cloud-shell*') {
+        return $false
+    }
+    if ($Platform -eq 'Linux' -and -not (& $variable 'DISPLAY')) {
+        return $false
+    }
+    $tool = switch ($Platform) {
+        'MacOS' { 'pbcopy' }
+        'Linux' { 'xclip' }
+        default { '' }
+    }
+    if ($tool -and -not (Get-Command -Name $tool -CommandType Application -ErrorAction SilentlyContinue)) {
+        return $false
+    }
     if (-not (Get-Command -Name 'Set-Clipboard' -ErrorAction SilentlyContinue)) {
         return $false
     }
@@ -447,8 +478,9 @@ function Get-DemoHumanActionLine {
     )
 
     $until = if ($null -ne $DeadlineUtc) { ', by {0} (local time)' -f ([datetime]$DeadlineUtc).ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
-    $page = if ($PagePath) { $PagePath } else { 'out/deploy-status.html' }
-    return ('HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP - a person signs in to {0} through Bastion and finishes SQL Server setup in arcsql01 (pay-as-you-go, Standard, Use Azure Login; about 10 minutes){1}. No assistant can do these sign-ins. Steps and link: {2} (or ./scripts/status.ps1 -Watch).' -f $HostVm, $until, $page)
+    # Without a status page (-NoStatusPage, or one that couldn't be set up) the steps are only in the console.
+    $where = if ($PagePath) { '{0} (or ./scripts/status.ps1 -Watch)' -f $PagePath } else { 'printed above in deploy.ps1''s console (there''s no status page in this run; ./scripts/status.ps1 shows where the host is)' }
+    return ('HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP - a person signs in to {0} through Bastion and finishes SQL Server setup in arcsql01 (pay-as-you-go, Standard, Use Azure Login; about 10 minutes){1}. No assistant can do these sign-ins. Steps and link: {2}.' -f $HostVm, $until, $where)
 }
 
 function Show-DemoGuidedStopPrompt {
@@ -656,7 +688,8 @@ function Invoke-DemoT2GuidedStop {
     4. Arc onboarding when the host waits for it, without the SQL Server configuration, which waits for the setup check.
     5. Waits for the host to open the pre-filled setup in the guest (SqlSetupWizard), and for Bastion.
     6. The prompt: the status page's guidedStop turns Ready; deploy.ps1's own process prompts the person (Context
-       PromptInParent), or this process does (in-process runs).
+       PromptInParent, set only when the progress model exists), or this process does (in-process runs, and track
+       processes without a model, such as -NoStatusPage: its console lines reach deploy.ps1's console).
     7. Waits for the host's setup check, relaying its message (a wrong install's documented fix), until it passes, the
        deadline passes (TimedOut), or the host fails.
     8. Always: Complete-DemoGuidedStop.

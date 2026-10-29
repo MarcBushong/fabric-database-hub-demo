@@ -518,11 +518,17 @@ function Invoke-DemoGoldenGuestAction {
         $arguments['WhileRunning'] = $WhileRunning
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    # The watchdog never restarts the host while this runs on it (Restart-DemoVmOnce; review finding 6).
+    $busyKey = '{0}/archost01' -f $(if ($ResourceGroupName) { $ResourceGroupName } else { Get-DemoResourceGroupName -Config $Config })
+    $script:DemoHostAction[$busyKey] = $Action
     try {
         $run = Invoke-DemoVmRunCommand @arguments
     }
     catch {
         return [pscustomobject]@{ Succeeded = $false; Data = $null; Error = $_.Exception.Message; Seconds = [int]$watch.Elapsed.TotalSeconds; WhileRunningError = '' }
+    }
+    finally {
+        $script:DemoHostAction.Remove($busyKey)
     }
     $data = $null
     if ($null -ne $run) {

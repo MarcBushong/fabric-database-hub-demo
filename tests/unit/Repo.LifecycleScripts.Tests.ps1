@@ -265,6 +265,14 @@ Describe 'Lifecycle scripts' {
             Should -Invoke -CommandName Start-Transcript -Times 0 -Exactly
         }
 
+        It 'judges a -Sequential run as one, so it can end DONE (review finding 4)' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $outputPath -Sequential
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Invoke-DemoDeployment -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('Parallel') }
+            Should -Invoke -CommandName Complete-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['Sequential'] }
+        }
+
         It 'writes the configuration first when there''s none, then deploys; and stops NOT DONE with the fix when it can''t' {
             $fresh = Join-Path -Path $TestDrive -ChildPath ('fresh-' + [guid]::NewGuid().ToString('N') + '.local.json')
             $capture['template'] = Get-Content -LiteralPath $configPath -Raw
@@ -329,6 +337,7 @@ Describe 'Lifecycle scripts' {
         Should -Invoke -CommandName Start-DemoEnvironment -Times 1 -Exactly -ParameterFilter { $SkipCostCheck }
 
         Mock -CommandName Set-Clipboard -MockWith { throw 'no clipboard here' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoClipboard -MockWith { $false }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -ConfigPath $configPath -Interactive -ResetAdminPassword -OutputPath $outputPath
         ($capture['exported'] | Where-Object { $_.checkId -eq 'START.HOSTPASSWORD' }).status | Should -Be 'Manual action required'
         ($capture['exported'] | Where-Object { $_.checkId -eq 'START.HOSTPASSWORD' }).remediation | Should -Match 'Reset password'
@@ -337,10 +346,31 @@ Describe 'Lifecycle scripts' {
         $capture['state']['HostPasswordSet'] | Should -Not -BeNullOrEmpty
     }
 
+    It 'start-demo.ps1 sets no password where Set-Clipboard only pretends to work (GitHub Codespaces; review finding 3)' {
+        Mock -CommandName Start-DemoEnvironment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        Mock -CommandName Set-DemoVmLocalPassword -MockWith { New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'set' -Evidence @{ userName = 'demoadmin' } }
+        Mock -CommandName Export-DemoResult -MockWith { $capture['exported'] = $Result }
+        # PowerShell 7's Set-Clipboard on Linux without xclip or a display keeps the text in its own process and doesn't fail.
+        Mock -CommandName Set-Clipboard -MockWith { $capture['clipboard'].Add([string]$Value) }
+        Mock -ModuleName DbHubDemo -CommandName Set-Clipboard -MockWith { }
+        $saved = $env:CODESPACES
+        try {
+            $env:CODESPACES = 'true'
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -ConfigPath $configPath -Interactive -ResetAdminPassword -OutputPath $outputPath
+        }
+        finally {
+            $env:CODESPACES = $saved
+        }
+        Should -Invoke -CommandName Set-DemoVmLocalPassword -Times 0 -Exactly
+        ($capture['exported'] | Where-Object { $_.checkId -eq 'START.HOSTPASSWORD' }).status | Should -Be 'Manual action required'
+        $capture['clipboard'].Count | Should -Be 0
+    }
+
     It 'start-demo.ps1 puts the one-time password on the clipboard only, never in the results' {
         Mock -CommandName Start-DemoEnvironment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
         Mock -CommandName Export-DemoResult -MockWith { $capture['exported'] = $Result }
         Mock -CommandName Set-Clipboard -MockWith { $capture['clipboard'].Add([string]$Value) }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoClipboard -MockWith { $true }
         Mock -CommandName Set-DemoVmLocalPassword -MockWith {
             $capture['sent'] = [System.Net.NetworkCredential]::new('', $Password).Password
             New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'set' -Evidence @{ userName = 'demoadmin' }
