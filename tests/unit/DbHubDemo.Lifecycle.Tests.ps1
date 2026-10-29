@@ -388,6 +388,56 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmAssociatedService -MockWith { $script:order.Add('Inventory:' + $ListedStatus); New-TestResult 'T1.SQLVM.ASSOCIATEDSERVICES' 'Pass' 't1' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { $script:order.Add('RunnerStatus'); [pscustomobject]@{ Status = 'Pass'; Result = (New-TestResult 'WORKLOAD.T1.COMMAND' 'Pass' 'workload' 'T1') } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith { $script:order.Add('DoneGate'); New-TestResult 'HUB.ESTATE.T1' 'Pass' 'hub' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:order.Add('PowerBI'); New-TestResult 'FABRIC.REPORT' 'Pass' 'fabric' 'fabric' }
+    }
+
+    It 'imports the Real-Time Dashboard and the history model and report in the Fabric stage, as the parallel Fabric track does (review follow-up)' {
+        # FABRIC.ITEMS.REQUIRED needs them, and a new workspace has neither.
+        $results = Invoke-DemoDeployment -Config $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['ImportDashboard'] }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -Times 1 -Exactly
+        $script:order[$script:order.IndexOf('Fabric') + 1] | Should -Be 'PowerBI'
+        ($results | Where-Object { $_.checkId -eq 'FABRIC.REPORT' }).status | Should -Be 'Pass'
+
+        # A Power BI Fail stops the run at the Fabric stage, as a Fabric Fail does.
+        $script:order.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:order.Add('PowerBI'); New-TestResult 'FABRIC.REPORT' 'Fail' 'fabric' 'fabric' }
+        $failed = Invoke-DemoDeployment -Config $config
+        ($failed | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.FABRIC' }).status | Should -Be 'Fail'
+        $script:order | Should -Not -Contain 'DoneGate'
+    }
+
+    It 'can end DONE on a new workspace, because its Fabric stage creates what FABRIC.ITEMS.REQUIRED looks for (review follow-up)' {
+        # Before, every stage passed on a new workspace and the run still ended NOT DONE with exit code 1.
+        $names = InModuleScope DbHubDemo { Get-DemoFabricAppSetting }
+        $script:workspace = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $script:required = @([string]$names['dashboardName'], [string]$names['semanticModelName'], [string]$names['reportName'])
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith {
+            $script:order.Add('Fabric')
+            if ([bool]$PesterBoundParameters['ImportDashboard']) {
+                $null = $script:workspace.Add($script:required[0])
+            }
+            New-TestResult 'HUB.CHECKLIST' 'Pass' 'hub' 'fabric'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith {
+            $script:order.Add('PowerBI')
+            $null = $script:workspace.Add($script:required[1])
+            $null = $script:workspace.Add($script:required[2])
+            New-TestResult 'FABRIC.REPORT' 'Pass' 'fabric' 'fabric'
+        }
+        # DONE's read-only checks: every target shows in Database Hub, and the Fabric items pass only when they're in the workspace.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith {
+            $missing = @($script:required | Where-Object { -not $script:workspace.Contains($_) })
+            foreach ($id in @($Requirement | Where-Object { $_ -ne 'FABRIC.ITEMS.REQUIRED' })) {
+                New-TestResult $id 'Pass' 'hub' 'subscription'
+            }
+            New-TestResult 'FABRIC.ITEMS.REQUIRED' $(if ($missing.Count -eq 0) { 'Pass' } else { 'Fail' }) 'fabric' 'fabric'
+        }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $results; State = $script:state; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Sequential }
+        ($results | Where-Object { $_.checkId -eq 'FABRIC.ITEMS.REQUIRED' }).status | Should -Be 'Pass'
+        $outcome.Kind | Should -Be 'Done' -Because ('Missing: {0}; reason: {1}' -f (@($outcome.Missing) -join ', '), $outcome.Reason)
+        $outcome.ExitCode | Should -Be 0
     }
 
     It 'runs DONE''s read-only checks after the validation, as the parallel path does, so a sequential run can end DONE (review finding 4)' {
@@ -408,7 +458,7 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Be @(
             'Preflight', 'Template', 'Bundle', 'SendBundle:sqlvm01', 'SendBundle:archost01', 'Publish', 'SendRunner:sqlvm01', 'SendRunner:archost01',
             'Template+Bundle', 'Loader:sqlvm01', 'Loader:archost01', 'T1Ready', 'Group', 'T3Setup', 'EnableT3', 'TestT3',
-            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate'
+            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate'
         )
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         $script:state.Stage | Should -Be 'Validation'

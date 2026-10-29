@@ -31,8 +31,10 @@ function Invoke-DemoDeployment {
     8. T2: Invoke-DemoArcConfiguration: onboarding when the host waits for it, then the extension, license
        type, and monitoring (T2.ARC.MONITORING), then T2's activity profile. In PaygWizard mode it reports
        Manual action required with the wizard steps; the stage stays open, and the later stages still run.
-    9. Fabric: configure-fabric.ps1 (the Hub checklist, and the notebook import with -ImportNotebooks or
-       fabric.importNotebooks). Not selected with -SkipFabric.
+    9. Fabric: configure-fabric.ps1 (the Hub checklist, the Real-Time Dashboard, and the notebook import with
+       -ImportNotebooks or fabric.importNotebooks), then configure-powerbi.ps1 (the history semantic model and
+       report), as the parallel Fabric track imports them (Phase 28 review follow-up); the optional Insights app stays
+       configure-fabric-app.ps1's. Not selected with -SkipFabric.
     10. Validation: Test-DemoHubTelemetry for each ready target, the runner's status on T1, and a summary that
         lists every Manual action required item with its exact steps. Since Phase 28 (review finding 4), with no
         stage open and nothing failed, DONE's read-only checks follow (Invoke-DemoDoneGate: Database Hub's estate,
@@ -607,14 +609,23 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Fabric' 'Not selected' 'The Fabric stage was skipped (-SkipFabric).'
                     continue
                 }
-                $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -ImportNotebooks:$importNotebooks -NewNotebooksOnly)
+                # The notebooks, the Hub checklist, and the Real-Time Dashboard, then the history semantic model and report, as the
+                # parallel Fabric track imports them (review follow-up): DONE's FABRIC.ITEMS.REQUIRED looks for all of them, and a
+                # new workspace has none. The optional Insights app stays configure-fabric-app.ps1's.
+                $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -ImportNotebooks:$importNotebooks -NewNotebooksOnly -ImportDashboard)
                 & $addAll $fabric
                 if (& $hasStatus $fabric 'Fail') {
                     & $stageResult 'Fabric' 'Fail' 'A Fabric or Database Hub check failed.' 'Read the HUB.* and FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
                     return $results.ToArray()
                 }
+                $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $ConfigPath)
+                & $addAll $powerBI
+                if (& $hasStatus $powerBI 'Fail') {
+                    & $stageResult 'Fabric' 'Fail' 'The history semantic model or report failed.' 'Read the FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
+                    return $results.ToArray()
+                }
                 & $recordStage 'Fabric'
-                & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran{0}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }))
+                & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }))
             }
             'Validation' {
                 $targets = @('T1', 'T3')
