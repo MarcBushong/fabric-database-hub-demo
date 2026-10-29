@@ -56,6 +56,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force
+# Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
+$ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
+$OutputPath = Resolve-DemoUserPath -Path $OutputPath
 
 $config = Get-DemoConfig -Path $ConfigPath
 $results = @(Invoke-DemoPreflight -Config $config -SkipProviderRegistration:$SkipProviderRegistration -SkipWhatIf:$SkipWhatIf -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours)

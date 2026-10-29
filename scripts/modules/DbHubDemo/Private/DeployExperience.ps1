@@ -18,10 +18,11 @@ function Get-DemoDeployCommand {
     )
 
     $default = [System.IO.Path]::GetFullPath((Join-Path -Path $script:RepoRoot -ChildPath 'config/demo.config.json'))
-    if ($ConfigPath -and [System.IO.Path]::GetFullPath($ConfigPath) -ne $default) {
-        $full = [System.IO.Path]::GetFullPath($ConfigPath)
+    # Relative to PowerShell's current location, not the process's working directory (review fix 8).
+    $full = Resolve-DemoUserPath -Path $ConfigPath
+    if ($full -and $full -ne $default) {
         $root = [System.IO.Path]::GetFullPath($script:RepoRoot).TrimEnd('\', '/')
-        $shown = if ($full.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { './' + ($full.Substring($root.Length + 1) -replace '\\', '/') } else { $ConfigPath }
+        $shown = if ($full.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { './' + ($full.Substring($root.Length + 1) -replace '\\', '/') } else { $full }
         return ('./scripts/deploy.ps1 -ConfigPath "{0}"' -f $shown)
     }
     return './scripts/deploy.ps1'

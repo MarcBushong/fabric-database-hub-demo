@@ -175,7 +175,8 @@ function Initialize-DemoConfig {
     $results = [System.Collections.Generic.List[object]]::new()
     $nextSteps = [System.Collections.Generic.List[string]]::new()
     $zeroGuid = '00000000-0000-0000-0000-000000000000'
-    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    # Relative to PowerShell's current location, not the process's working directory (review fix 8).
+    $fullPath = Resolve-DemoUserPath -Path $Path
     $dryRun = [bool]$WhatIfPreference
     $interactive = -not $NonInteractive -and (Test-DemoInteractiveSession)
     $docs = @{

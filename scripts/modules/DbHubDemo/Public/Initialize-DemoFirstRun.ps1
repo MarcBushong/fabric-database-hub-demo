@@ -37,7 +37,7 @@ function Initialize-DemoFirstRun {
         [pscustomobject] $Environment = $null
     )
 
-    $full = [System.IO.Path]::GetFullPath($ConfigPath)
+    $full = Resolve-DemoUserPath -Path $ConfigPath
     if (Test-Path -LiteralPath $full -PathType Leaf) {
         return [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = $full; NextSteps = @(); Outcome = $null }
     }

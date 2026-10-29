@@ -94,6 +94,7 @@
         'Resolve-DemoNetworkMode'
         'Resolve-DemoT1SecurityType'
         'Resolve-DemoT3FreeOfferError'
+        'Resolve-DemoUserPath'
         'Send-DemoBootstrapBundle'
         'Send-DemoWorkloadRunner'
         'Set-DemoArcSqlConfiguration'

@@ -58,7 +58,7 @@ function Export-DemoDiagnosticBundle {
     if (-not $Directory) {
         $Directory = Join-Path -Path $script:RepoRoot -ChildPath 'out'
     }
-    $Directory = [System.IO.Path]::GetFullPath($Directory)
+    $Directory = Resolve-DemoUserPath -Path $Directory
     $stamp = [System.DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
     if (-not $Path) {
         $Path = Join-Path -Path $Directory -ChildPath ('diagnostics-{0}.zip' -f $stamp)

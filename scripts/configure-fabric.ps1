@@ -264,6 +264,9 @@ $ErrorActionPreference = 'Stop'
 if (-not (Get-Module -Name 'DbHubDemo')) {
     Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
 }
+# Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
+$ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
+$OutputPath = Resolve-DemoUserPath -Path $OutputPath
 
 $config = $null
 if (Test-Path -LiteralPath $ConfigPath) {

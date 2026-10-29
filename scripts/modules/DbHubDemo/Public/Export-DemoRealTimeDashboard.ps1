@@ -44,6 +44,7 @@ function Export-DemoRealTimeDashboard {
         [switch] $PassThru
     )
 
+    $Path = Resolve-DemoUserPath -Path $Path
     $json = ConvertTo-DemoDashboardJson -Document (ConvertTo-DemoDashboardDocument -SpecPath $SpecPath)
     $parsed = $json | ConvertFrom-Json -AsHashtable -Depth 64
     $problems = @(Test-DemoDashboardDocument -Document $parsed)

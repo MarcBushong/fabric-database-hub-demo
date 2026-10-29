@@ -56,8 +56,8 @@ function Publish-DemoWorkloadRunner {
         [switch] $Force
     )
 
-    $root = [System.IO.Path]::GetFullPath($RepositoryRoot)
-    $output = [System.IO.Path]::GetFullPath($OutputDirectory)
+    $root = Resolve-DemoUserPath -Path $RepositoryRoot
+    $output = Resolve-DemoUserPath -Path $OutputDirectory
     $versions = Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
     $pins = $versions['workloadRunner']
     if ($null -eq $pins) {

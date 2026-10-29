@@ -46,7 +46,7 @@ function Get-DemoFabricSemanticModelDefinition {
         [string] $DisplayName = 'SM_DatabaseHub_History'
     )
 
-    $root = [System.IO.Path]::GetFullPath($Path)
+    $root = Resolve-DemoUserPath -Path $Path
     $pbism = Join-Path -Path $root -ChildPath 'definition.pbism'
     $definitionDir = Join-Path -Path $root -ChildPath 'definition'
     if (-not (Test-Path -LiteralPath $pbism -PathType Leaf) -or -not (Test-Path -LiteralPath $definitionDir -PathType Container)) {

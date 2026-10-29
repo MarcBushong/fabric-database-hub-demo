@@ -106,6 +106,27 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
         $script:backup = Join-Path -Path $TestDrive -ChildPath 'backup'
     }
 
+    It 'writes a relative -Path under PowerShell''s current location, not the process''s working directory (review fix 8)' {
+        # .NET resolves relative paths against [Environment]::CurrentDirectory, which Push-Location doesn't change.
+        $location = Join-Path -Path $TestDrive -ChildPath ('location-' + [guid]::NewGuid().ToString('N'))
+        $elsewhere = Join-Path -Path $TestDrive -ChildPath ('process-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path (Join-Path -Path $location -ChildPath 'config'), (Join-Path -Path $elsewhere -ChildPath 'config') -Force
+        $saved = [System.Environment]::CurrentDirectory
+        Push-Location -LiteralPath $location
+        try {
+            [System.Environment]::CurrentDirectory = $elsewhere
+            $init = Initialize-DemoConfig -Path './config/proof.local.json' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        }
+        finally {
+            [System.Environment]::CurrentDirectory = $saved
+            Pop-Location
+        }
+        $init.Written | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path -Path $location -ChildPath 'config/proof.local.json') -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path -Path $elsewhere -ChildPath 'config/proof.local.json') | Should -BeFalse
+        (Get-InitResult $init 'INIT.CONFIG').evidence.path | Should -Be ([System.IO.Path]::Combine($location, 'config', 'proof.local.json'))
+    }
+
     It 'writes a schema-valid configuration from the sign-in, with the notebooks imported into a new workspace and the capacity never managed' {
         $init = Initialize-DemoConfig -Path $script:path -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
         $init.Written | Should -BeTrue

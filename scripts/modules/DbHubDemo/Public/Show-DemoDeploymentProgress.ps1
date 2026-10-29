@@ -45,6 +45,7 @@ function Show-DemoDeploymentProgress {
         [int] $MaxRefresh = 0
     )
 
+    $Path = Resolve-DemoUserPath -Path $Path
     if (-not $Path) {
         $Path = (Get-DemoProgressPath).Model
     }

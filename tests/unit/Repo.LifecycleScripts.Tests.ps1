@@ -273,6 +273,37 @@ Describe 'Lifecycle scripts' {
             Should -Invoke -CommandName Complete-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['Sequential'] }
         }
 
+        It 'resolves relative paths against PowerShell''s location, not the process''s working directory (review fix 8)' {
+            # .NET resolves relative paths against [Environment]::CurrentDirectory, which Push-Location doesn't change.
+            $location = Join-Path -Path $TestDrive -ChildPath ('location-' + [guid]::NewGuid().ToString('N'))
+            $elsewhere = Join-Path -Path $TestDrive -ChildPath ('process-' + [guid]::NewGuid().ToString('N'))
+            $null = New-Item -ItemType Directory -Path (Join-Path -Path $location -ChildPath 'config'), $elsewhere -Force
+            Copy-Item -LiteralPath $configPath -Destination (Join-Path -Path $location -ChildPath 'config/proof.local.json')
+            Mock -CommandName Initialize-DemoFirstRun -MockWith { $capture['firstRun'] = $ConfigPath; [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = $ConfigPath; NextSteps = @(); Outcome = $null } }
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            Mock -CommandName Show-DemoDeploymentProgress -MockWith { $capture['watched'] = $Path; 'Done' }
+            Mock -CommandName Initialize-DemoConfig -MockWith { $capture['initPath'] = $Path; [pscustomobject]@{ Written = $true; Results = @(); NextSteps = @() } }
+            $saved = [System.Environment]::CurrentDirectory
+            Push-Location -LiteralPath $location
+            try {
+                [System.Environment]::CurrentDirectory = $elsewhere
+                & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath './config/proof.local.json' -OutputPath './out/deploy.jsonl'
+                & (Join-Path -Path $repoRoot -ChildPath 'scripts/status.ps1') -ConfigPath './config/proof.local.json' -OutputPath './out/status.jsonl' -Watch
+                & (Join-Path -Path $repoRoot -ChildPath 'scripts/init.ps1') -ConfigPath './config/new.local.json' -OutputPath './out/init.jsonl' -NonInteractive
+            }
+            finally {
+                [System.Environment]::CurrentDirectory = $saved
+                Pop-Location
+            }
+            $out = Join-Path -Path $location -ChildPath 'out'
+            Test-Path -LiteralPath (Join-Path -Path $out -ChildPath 'deploy.jsonl') -PathType Leaf | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path -Path $elsewhere -ChildPath 'out') | Should -BeFalse
+            $capture['firstRun'] | Should -Be ([System.IO.Path]::Combine($location, 'config', 'proof.local.json'))
+            Should -Invoke -CommandName Start-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { $OutputDirectory -eq $out -and $ConfigPath -eq ([System.IO.Path]::Combine($location, 'config', 'proof.local.json')) }
+            $capture['watched'] | Should -Be ([System.IO.Path]::Combine($location, 'out', 'deploy-progress.json'))
+            $capture['initPath'] | Should -Be ([System.IO.Path]::Combine($location, 'config', 'new.local.json'))
+        }
+
         It 'writes the configuration first when there''s none, then deploys; and stops NOT DONE with the fix when it can''t' {
             $fresh = Join-Path -Path $TestDrive -ChildPath ('fresh-' + [guid]::NewGuid().ToString('N') + '.local.json')
             $capture['template'] = Get-Content -LiteralPath $configPath -Raw
@@ -474,5 +505,48 @@ Describe 'Lifecycle scripts' {
         Mock -CommandName Get-DemoEnvironmentStatus -MockWith { New-DemoResult -CheckId 'STATUS.T3' -Area 't3' -Target 'T3' -Status 'Fail' -Message 'broken' }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/status.ps1') -ConfigPath $configPath -OutputPath $outputPath
         $LASTEXITCODE | Should -Be 1
+    }
+}
+
+Describe 'Paths the scripts are given (review fix 8)' {
+    It 'every script resolves each *Path parameter against PowerShell''s location before it uses it' {
+        # .NET file APIs resolve a relative path against [Environment]::CurrentDirectory, which Set-Location doesn't change.
+        $offenders = foreach ($file in Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts') -Filter '*.ps1' -File) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            $text = Get-Content -LiteralPath $file.FullName -Raw
+            foreach ($parameter in @($ast.ParamBlock.Parameters)) {
+                $name = $parameter.Name.VariablePath.UserPath
+                if ($name -like '*Path' -and $text -notmatch ('(?m)^\${0} = (@\()?Resolve-DemoUserPath -Path \${0}\b' -f $name)) {
+                    '{0}: -{1}' -f $file.Name, $name
+                }
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
+
+    It 'Resolve-DemoUserPath resolves against the location, keeps an empty path empty, and refuses a path outside the file system' {
+        $location = Join-Path -Path $TestDrive -ChildPath ('resolve-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $location -Force
+        $saved = [System.Environment]::CurrentDirectory
+        Push-Location -LiteralPath $location
+        try {
+            [System.Environment]::CurrentDirectory = [System.IO.Path]::GetTempPath()
+            Resolve-DemoUserPath -Path './config/../config/x.json' | Should -Be ([System.IO.Path]::Combine($location, 'config', 'x.json'))
+            @(Resolve-DemoUserPath -Path 'a.json', '') | Should -Be @(([System.IO.Path]::Combine($location, 'a.json')), '')
+            Resolve-DemoUserPath -Path $location | Should -Be $location
+        }
+        finally {
+            [System.Environment]::CurrentDirectory = $saved
+            Pop-Location
+        }
+        if ($IsWindows) {
+            Push-Location -LiteralPath 'HKCU:\'
+            try {
+                { Resolve-DemoUserPath -Path './x.json' } | Should -Throw "*isn't a file-system path*"
+            }
+            finally {
+                Pop-Location
+            }
+        }
     }
 }

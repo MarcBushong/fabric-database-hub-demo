@@ -143,6 +143,10 @@ $ErrorActionPreference = 'Stop'
 if (-not (Get-Module -Name 'DbHubDemo')) {
     Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
 }
+# Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
+$ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
+$StagePath = Resolve-DemoUserPath -Path $StagePath
+$OutputPath = Resolve-DemoUserPath -Path $OutputPath
 
 $guidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 $sourcePath = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../fabric/app'))

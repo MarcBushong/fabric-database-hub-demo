@@ -15,6 +15,8 @@ function Get-DemoProgressPath {
     if (-not $Directory) {
         $Directory = Join-Path -Path $script:RepoRoot -ChildPath 'out'
     }
+    # The model and the page are written with .NET file calls, so the directory is made absolute first (review fix 8).
+    $Directory = Resolve-DemoUserPath -Path $Directory
     return [pscustomobject]@{
         Directory = $Directory
         Model     = Join-Path -Path $Directory -ChildPath 'deploy-progress.json'

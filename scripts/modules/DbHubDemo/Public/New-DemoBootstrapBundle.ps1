@@ -92,7 +92,7 @@ function New-DemoBootstrapBundle {
     $manifestBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(($manifest | ConvertTo-Json -Depth 10).Replace("`r`n", "`n"))
 
     $fileName = 'dbhub-bootstrap-{0}-{1}.zip' -f $version, $contentSha256.Substring(0, 12)
-    $zipPath = Join-Path -Path ([System.IO.Path]::GetFullPath($OutputDirectory)) -ChildPath $fileName
+    $zipPath = Join-Path -Path (Resolve-DemoUserPath -Path $OutputDirectory) -ChildPath $fileName
     if (-not $PSCmdlet.ShouldProcess($zipPath, 'Create the bootstrap bundle')) {
         return
     }

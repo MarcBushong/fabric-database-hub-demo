@@ -95,7 +95,7 @@ function Get-DemoFabricDashboardDefinition {
 
     $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($rendered)
     if ($OutFile) {
-        [System.IO.File]::WriteAllBytes([System.IO.Path]::GetFullPath($OutFile), $bytes)
+        [System.IO.File]::WriteAllBytes((Resolve-DemoUserPath -Path $OutFile), $bytes)
     }
     [pscustomobject]@{
         PSTypeName  = 'DbHubDemo.FabricItemDefinition'
