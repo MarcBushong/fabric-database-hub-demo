@@ -6,6 +6,9 @@ function Start-DemoDeploymentRun {
 
     .DESCRIPTION
     - Keep-awake: Enter-DemoKeepAwake (Windows; deploy.ps1 calls Exit-DemoKeepAwake in its finally block).
+    - Ctrl+C: Enable-DemoRunCancelWatch records it, so a stop skips slow Azure cleanups and ends the track processes
+      within seconds, and Complete-DemoDeploymentRun -Stopped leaves the page at Stopped, not done (Phase 28 live
+      finding). A stop or a failure while this function runs ends the page and keep-awake itself.
     - Progress: out/deploy-progress.json with the steps of every track (Get-DemoProgressCatalog), and
       out/deploy-status.html, rewritten every 10 seconds by a thread job of this process and opened in the default
       browser (Open-DemoProgressPage; in GitHub Codespaces it prints how to preview it). Not in GitHub Actions, and not
@@ -64,6 +67,8 @@ function Start-DemoDeploymentRun {
     )
 
     $environment = Get-DemoRunEnvironment
+    # A Ctrl+C from now on is recorded, so the stop skips slow Azure cleanups and takes seconds (Phase 28 live finding).
+    $null = Enable-DemoRunCancelWatch
     $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
     $paths = Get-DemoProgressPath -Directory $OutputDirectory
     $command = Get-DemoDeployCommand -ConfigPath $ConfigPath
@@ -82,31 +87,48 @@ function Start-DemoDeploymentRun {
     if (-not $PSCmdlet.ShouldProcess($paths.Model, 'Write the status page and keep this PC awake')) {
         return $run
     }
-    $run.KeepAwake = Enter-DemoKeepAwake
-    $pageLine = ''
-    if (-not $NoStatusPage -and -not $environment.GitHubActions) {
-        $catalog = Get-DemoProgressCatalog -InstallMode $installMode -T4Enabled:(Test-DemoT4Enabled -Config $Config) -SkipFabric:$SkipFabric
-        $model = New-DemoProgressModel -Catalog $catalog -Environment ([string]$Config['environment']) -ResourceGroup (Get-DemoResourceGroupName -Config $Config) -Command $command -PagePath $paths.Page -Expect @{ text = $expect.Text; humanText = $expect.HumanText; guidedStop = $expect.GuidedStop } -GuidedStop $(if ($expect.GuidedStop) { 'Pending' } else { 'NotSelected' })
-        try {
-            Initialize-DemoProgress -Path $paths.Model -Model $model -Confirm:$false
-            Write-DemoProgressPage -ModelPath $paths.Model -PagePath $paths.Page
-            $run.ProgressPath = $paths.Model
-            $run.PagePath = $paths.Page
-            $run.Writer = Start-DemoProgressPageWriter -ModelPath $paths.Model -PagePath $paths.Page
-            $pageLine = Open-DemoProgressPage -PagePath $paths.Page -NoBrowser:($NoBrowser -or $environment.Ci)
+    $started = $false
+    try {
+        $run.KeepAwake = Enter-DemoKeepAwake
+        $pageLine = ''
+        if (-not $NoStatusPage -and -not $environment.GitHubActions) {
+            $catalog = Get-DemoProgressCatalog -InstallMode $installMode -T4Enabled:(Test-DemoT4Enabled -Config $Config) -SkipFabric:$SkipFabric
+            $model = New-DemoProgressModel -Catalog $catalog -Environment ([string]$Config['environment']) -ResourceGroup (Get-DemoResourceGroupName -Config $Config) -Command $command -PagePath $paths.Page -Expect @{ text = $expect.Text; humanText = $expect.HumanText; guidedStop = $expect.GuidedStop } -GuidedStop $(if ($expect.GuidedStop) { 'Pending' } else { 'NotSelected' })
+            try {
+                Initialize-DemoProgress -Path $paths.Model -Model $model -Confirm:$false
+                Write-DemoProgressPage -ModelPath $paths.Model -PagePath $paths.Page
+                $run.ProgressPath = $paths.Model
+                $run.PagePath = $paths.Page
+                $run.Writer = Start-DemoProgressPageWriter -ModelPath $paths.Model -PagePath $paths.Page
+                $pageLine = Open-DemoProgressPage -PagePath $paths.Page -NoBrowser:($NoBrowser -or $environment.Ci)
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('The status page couldn''t be set up, so the console is the only view: {0}' -f $_.Exception.Message)
+            }
         }
-        catch {
-            Write-DemoLog -Level Warning -Message ('The status page couldn''t be set up, so the console is the only view: {0}' -f $_.Exception.Message)
+        $notices = Get-DemoDeploymentNotice -Environment $environment -InstallMode $installMode -WaitForT2:$WaitForT2 -PagePath $run.PagePath
+        Write-DemoConsoleBlock -Color 'Cyan' -Line (Get-DemoBannerLine -Title ('deploy.ps1: environment {0}, resource group {1}' -f $Config['environment'], (Get-DemoResourceGroupName -Config $Config)))
+        Write-DemoConsoleBlock -Color 'White' -Line $expect.Lines
+        $more = @(
+            $(if ($run.KeepAwake) { 'This PC stays awake until deploy.ps1 ends.' })
+            $pageLine
+        ) | Where-Object { $_ }
+        Write-DemoConsoleBlock -Color 'Gray' -Line @($more)
+        Write-DemoConsoleBlock -Color 'Yellow' -Line $notices
+        $started = $true
+    }
+    finally {
+        if (-not $started) {
+            # Stopped (Ctrl+C) or failed while starting, before deploy.ps1 holds the run (Phase 28 live finding): the page
+            # still ends at Stopped, not done, with the command to continue, its writer stops, and the PC may sleep again.
+            try {
+                $null = Complete-DemoDeploymentRun -Run $run -Config $Config -State $null -Stopped:(Test-DemoRunCancelled)
+            }
+            catch {
+                Write-DemoLog -Level Debug -Message ('The status page couldn''t be ended: {0}' -f $_.Exception.Message)
+            }
+            $null = Exit-DemoKeepAwake
         }
     }
-    $notices = Get-DemoDeploymentNotice -Environment $environment -InstallMode $installMode -WaitForT2:$WaitForT2 -PagePath $run.PagePath
-    Write-DemoConsoleBlock -Color 'Cyan' -Line (Get-DemoBannerLine -Title ('deploy.ps1: environment {0}, resource group {1}' -f $Config['environment'], (Get-DemoResourceGroupName -Config $Config)))
-    Write-DemoConsoleBlock -Color 'White' -Line $expect.Lines
-    $more = @(
-        $(if ($run.KeepAwake) { 'This PC stays awake until deploy.ps1 ends.' })
-        $pageLine
-    ) | Where-Object { $_ }
-    Write-DemoConsoleBlock -Color 'Gray' -Line @($more)
-    Write-DemoConsoleBlock -Color 'Yellow' -Line $notices
     return $run
 }

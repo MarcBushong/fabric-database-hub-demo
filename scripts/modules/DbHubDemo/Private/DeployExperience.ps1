@@ -406,7 +406,8 @@ function Get-DemoDeploymentOutcome {
     (Test-DemoOptionalResult). Without a state, this run's DEPLOY.TRACK results stand in. -Sequential (deploy.ps1
     -Sequential, which records stages and no tracks) needs the recorded stage Validation instead of the tracks (or,
     without a state, this run's DEPLOY.STAGE.VALIDATION Pass), and the same DONE requirements, which its validation
-    checks (review finding 4).
+    checks (review finding 4). -Stopped (Ctrl+C) is NOT DONE with the resume command, and -GuidedStopOpen adds what the
+    open guided stop leaves until then (Phase 28 live finding).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -428,7 +429,11 @@ function Get-DemoDeploymentOutcome {
 
         [switch] $SkipFabric,
 
-        [switch] $Sequential
+        [switch] $Sequential,
+
+        [switch] $Stopped,
+
+        [switch] $GuidedStopOpen
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
@@ -452,6 +457,15 @@ function Get-DemoDeploymentOutcome {
         $outcome.ExitCode = if ($fails.Count -gt 0) { 1 } else { 0 }
         $outcome.Reason = if ($fails.Count -gt 0) { ('What if: {0} check(s) failed, so a deployment would stop at preflight: {1}.' -f $fails.Count, (($fails | Select-Object -First 3 | ForEach-Object { $_.checkId }) -join ', ')) } else { 'What if: the checks and the template''s what-if ran; nothing was deployed.' }
         $outcome.Next = 'Run ./scripts/deploy.ps1 without -WhatIf to deploy.'
+        return [pscustomobject]$outcome
+    }
+    if ($Stopped) {
+        # Ctrl+C (Phase 28 live finding): whatever it had reached, a stopped run isn't DONE, and nothing is lost.
+        $outcome.Reason = 'You stopped deploy.ps1 (Ctrl+C) before it finished. What it finished is kept, and the resource group''s state records where it stopped.'
+        $outcome.Next = 'Run {0} again when you''re ready: it continues where it stopped.' -f $Command
+        if ($GuidedStopOpen) {
+            $outcome.Next += ' It stopped at the guided stop, so on-demand Bastion stays up and archost01''s password from the guided stop isn''t rotated until the next run finishes the guided stop; if you''re stopping for the day instead, run ./scripts/stop-demo.ps1, which removes Bastion and rotates the password.'
+        }
         return [pscustomobject]$outcome
     }
     $expected = [ordered]@{ T1 = 'Telemetry'; T2 = 'Telemetry' }

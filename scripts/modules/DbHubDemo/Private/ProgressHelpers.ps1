@@ -632,6 +632,45 @@ function Set-DemoProgressStep {
     }
 }
 
+function Set-DemoProgressStopped {
+    <#
+    .SYNOPSIS
+    After a stop (Ctrl+C), moves every step that was still running, or waiting for a person, back to Pending with
+    -Message, so the status page shows where the next run continues, not steps that run on (Phase 28 live finding). A
+    step that ended with a status keeps it. Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [string] $Message
+    )
+
+    if (-not $Path) {
+        return
+    }
+    Update-DemoProgress -Path $Path -Data @{ Text = (Protect-DemoProgressText -Text $Message) } -Action {
+        param($Model, $Change)
+        $now = Get-DemoUnixTime
+        foreach ($track in @($Model['tracks'])) {
+            foreach ($item in @($track['steps'])) {
+                $open = [string]$item['state'] -eq 'Running' -or ([string]$item['state'] -eq 'Action needed' -and -not [string]$item['status'])
+                if ($open) {
+                    $item['state'] = 'Pending'
+                    $item['status'] = ''
+                    $item['azureSide'] = $false
+                    # Its clock stops at the stop: the time shown is how long it ran.
+                    $item['endedAt'] = if ([long]$item['startedAt'] -gt 0) { $now } else { 0 }
+                    $item['message'] = [string]$Change['Text']
+                }
+            }
+        }
+    }
+}
+
 function Set-DemoProgressValue {
     # Merges -Value into one section of the progress model: run, guidedStop, or expect; or replaces optional. Internal.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]

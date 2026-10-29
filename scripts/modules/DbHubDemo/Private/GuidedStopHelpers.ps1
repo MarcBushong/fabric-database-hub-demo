@@ -678,8 +678,8 @@ function Get-DemoUtcNow {
 function Invoke-DemoT2GuidedStop {
     <#
     .SYNOPSIS
-    The PaygWizard guided stop in deploy.ps1's T2 track (Phase 28). Returns Status (Done, NotNeeded, TimedOut, or
-    Failed) and Results. Internal.
+    The PaygWizard guided stop in deploy.ps1's T2 track (Phase 28). Returns Status (Done, NotNeeded, TimedOut, Failed,
+    or Stopped) and Results. Internal.
 
     .DESCRIPTION
     1. Nothing to do when the host is past setup already (NotNeeded).
@@ -692,7 +692,8 @@ function Invoke-DemoT2GuidedStop {
        processes without a model, such as -NoStatusPage: its console lines reach deploy.ps1's console).
     7. Waits for the host's setup check, relaying its message (a wrong install's documented fix), until it passes, the
        deadline passes (TimedOut), or the host fails.
-    8. Always: Complete-DemoGuidedStop.
+    8. Always: Complete-DemoGuidedStop, except when deploy.ps1 was stopped (Test-DemoRunCancelled; Stopped): its Azure
+       calls would hold the stop for minutes, so the next deploy.ps1 or stop-demo.ps1 does them (Phase 28 live finding).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -862,8 +863,21 @@ function Invoke-DemoT2GuidedStop {
     }
     finally {
         $minutes = [int]$started.Elapsed.TotalMinutes
-        $results.AddRange([object[]]@(Complete-DemoGuidedStop -Config $Config -Confirm:$false))
+        if (Test-DemoRunCancelled) {
+            # deploy.ps1 was stopped (Ctrl+C; Phase 28 live finding): the cleanup's Azure calls would hold the stop for
+            # minutes. The host's request expires on its own, and the host then turns the guest's one-time sign-in off;
+            # the next deploy.ps1 picks the guided stop up again, and stop-demo.ps1 removes Bastion and rotates the host
+            # password; deploy.ps1's own ending says so on the status page.
+            $status = 'Stopped'
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message ('deploy.ps1 was stopped during the guided stop, {0} minutes after it began. Bastion stays up and the host password isn''t rotated yet; the host''s request expires on its own, and the host then turns the guest''s one-time sign-in off.' -f $minutes) -Remediation 'Run ./scripts/deploy.ps1 again to continue the guided stop; or, to stop for now, ./scripts/stop-demo.ps1, which removes Bastion and rotates the host password.' -DocUrl $docUrl))
+        }
+        else {
+            $results.AddRange([object[]]@(Complete-DemoGuidedStop -Config $Config -Confirm:$false))
+        }
         switch ($status) {
+            'Stopped' {
+                # Nothing more here: deploy.ps1's own ending writes the status page.
+            }
             'Done' {
                 Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Done' -Status 'Pass' -Message ('Done in {0} minutes.' -f $minutes)
                 Set-DemoProgressStep -Path $progress -Id 'T2.SetupCheck' -State 'Done' -Status 'Pass' -Message 'Standard, the default instance MSSQLSERVER, and the Azure extension.'

@@ -370,6 +370,64 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $model['run']['nextCommand'] | Should -Be './scripts/deploy.ps1'
         Get-Content -LiteralPath $run.PagePath -Raw | Should -Match 'Stopped, not done'
     }
+
+    It 'ends a stopped run at Stopped, not done, with the command to continue, without an Azure call, and moves its running steps back to Pending (Phase 28 live finding)' {
+        $config = New-TestConfig
+        $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+        InModuleScope DbHubDemo { $script:DemoRunCancelWatch } | Should -BeTrue -Because 'the run records Ctrl+C from its start'
+        InModuleScope DbHubDemo -Parameters @{ Path = $run.ProgressPath } {
+            Set-DemoProgressStep -Path $Path -Id 'Preflight' -State 'Done' -Status 'Pass' -Message 'Passed.'
+            Set-DemoProgressStep -Path $Path -Id 'T1.Bootstraps' -State 'Running' -Message 'The loader runs.'
+            Set-DemoProgressStep -Path $Path -Id 'T2.GuidedStop' -State 'Action needed' -Message 'Waiting for you.'
+            Set-DemoProgressValue -Path $Path -Section 'guidedStop' -Value @{ state = 'Ready' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { throw 'a stopped run makes no Azure call' }
+        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @() -Stopped
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -Times 0 -Exactly
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.ExitCode | Should -Be 2
+        $outcome.Reason | Should -Match 'Ctrl\+C'
+        $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+        $outcome.Next | Should -Match ([regex]::Escape('./scripts/stop-demo.ps1')) -Because 'it stopped at the guided stop, which leaves Bastion up and the password unrotated'
+        $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $model['run']['state'] | Should -Be 'NotDone'
+        $model['run']['nextCommand'] | Should -Be './scripts/deploy.ps1'
+        $steps = @{}
+        foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { $steps[[string]$item['id']] = $item } }
+        $steps['Preflight']['state'] | Should -Be 'Done'
+        $steps['T1.Bootstraps']['state'] | Should -Be 'Pending'
+        $steps['T1.Bootstraps']['message'] | Should -Match 'Stopped here \(Ctrl\+C\)'
+        $steps['T2.GuidedStop']['state'] | Should -Be 'Pending'
+        $page = Get-Content -LiteralPath $run.PagePath -Raw
+        $page | Should -Match 'Stopped, not done'
+        $page | Should -Match ([regex]::Escape('Run: ./scripts/deploy.ps1'))
+        InModuleScope DbHubDemo { $script:DemoRunCancelWatch } | Should -BeFalse -Because 'a later command in the same session never reads this run''s Ctrl+C as its own'
+    }
+
+    It 'ends the page and keep-awake itself when it''s stopped while it starts, before deploy.ps1 holds the run (Phase 28 live finding)' {
+        Mock -ModuleName DbHubDemo -CommandName Exit-DemoKeepAwake -MockWith { $true }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentNotice -MockWith { throw 'stopped while the banner was printed' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { throw 'a stopped start makes no Azure call' }
+        # The cancel marker stands in for the Ctrl+C that Enable-DemoRunCancelWatch records in a console.
+        $marker = Join-Path -Path $TestDrive -ChildPath ('cancel-' + [guid]::NewGuid().ToString('N') + '.xml')
+        Set-Content -LiteralPath $marker -Value 'stop'
+        $saved = $env:DBHUB_CANCEL_FILE
+        try {
+            $env:DBHUB_CANCEL_FILE = $marker
+            { Start-DemoDeploymentRun -Config (New-TestConfig) -WaitForT2 -OutputDirectory $script:out -Confirm:$false } | Should -Throw -ExpectedMessage 'stopped while the banner was printed'
+        }
+        finally {
+            $env:DBHUB_CANCEL_FILE = $saved
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Exit-DemoKeepAwake -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -Times 0 -Exactly
+        $model = Get-Content -LiteralPath (Join-Path -Path $script:out -ChildPath 'deploy-progress.json') -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $model['run']['state'] | Should -Be 'NotDone'
+        $model['run']['reason'] | Should -Match 'Ctrl\+C'
+        $model['run']['nextCommand'] | Should -Be './scripts/deploy.ps1'
+        Get-Content -LiteralPath (Join-Path -Path $script:out -ChildPath 'deploy-status.html') -Raw | Should -Match 'Stopped, not done'
+        InModuleScope DbHubDemo { $script:DemoRunCancelWatch } | Should -BeFalse
+    }
 }
 
 Describe 'The guided stop''s prompt (brief items 4 and 13)' {
@@ -630,6 +688,23 @@ Describe 'Invoke-DemoT2GuidedStop: the stop, then the run continues on its own' 
         $script:calls.Count | Should -Be 0
     }
 
+    It 'leaves its Azure cleanup to the next run, and the status page to deploy.ps1, when deploy.ps1 was stopped (Phase 28 live finding)' {
+        # Live, Ctrl+C here seemed to do nothing: stopping this track ran its cleanup first, minutes of Azure calls.
+        $script:health.Enqueue($script:wizard)
+        $script:clock = [DateTime]::UtcNow
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:clock = $script:clock.AddMinutes(10); $script:clock }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressValue -MockWith { $script:calls.Add(('page {0} {1}' -f $Section, [string]$Value['state'])) }
+        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:wizard } { Invoke-DemoT2GuidedStop -Config $Config -Context @{ ProgressPath = 'progress.json' } -Health $Health -DeadlineUtc ([DateTime]::UtcNow) -PollSeconds 10 }
+        $stop.Status | Should -Be 'Stopped'
+        $script:calls | Should -Not -Contain 'cleanup'
+        $script:calls | Should -Not -Contain 'page guidedStop TimedOut'
+        $stopped = $stop.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }
+        $stopped.status | Should -Be 'Manual action required'
+        $stopped.message | Should -Match 'Bastion stays up'
+        $stopped.remediation | Should -Match ([regex]::Escape('./scripts/stop-demo.ps1'))
+    }
+
     It 'knows the host''s phases, and the host''s step list matches the VM side''s plan' {
         (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestVhdx' }) }).Phase | Should -Be 'Build'
         (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard' }) }).Phase | Should -Be 'GuidedStop'
@@ -833,6 +908,227 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $settle.Settled | Should -BeTrue
         @($settle.Results).Count | Should -Be 1
         $settle.Results[0].status | Should -Be 'Warning'
+    }
+}
+
+Describe 'Stopping a run with Ctrl+C (Phase 28 live finding)' {
+    BeforeAll {
+        $modulePath = Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1'
+        $pwshPath = (Get-Process -Id $PID).Path
+        # Starts a hidden PowerShell process that runs -Command, and returns it.
+        function Start-TestPwsh([string] $Command) {
+            $info = [System.Diagnostics.ProcessStartInfo]::new($pwshPath)
+            foreach ($argument in '-NoProfile', '-NonInteractive', '-EncodedCommand', [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Command))) {
+                $info.ArgumentList.Add($argument)
+            }
+            $info.UseShellExecute = $false
+            $info.CreateNoWindow = $true
+            return [System.Diagnostics.Process]::Start($info)
+        }
+        function Wait-TestFile([string] $Path, [int] $Seconds = 60) {
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not (Test-Path -LiteralPath $Path) -and $watch.Elapsed.TotalSeconds -lt $Seconds) {
+                Start-Sleep -Milliseconds 200
+            }
+            return (Test-Path -LiteralPath $Path)
+        }
+    }
+
+    It 'records a real Ctrl+C without changing what it does, and only while deploy.ps1''s run lasts' -Skip:(-not $IsWindows) {
+        # A console of its own, where the child sends Ctrl+C to itself (GenerateConsoleCtrlEvent): PowerShell still stops
+        # the script at once, and the stop is recorded for the finally blocks.
+        $log = Join-Path -Path $TestDrive -ChildPath ('ctrlc-' + [guid]::NewGuid().ToString('N') + '.log')
+        $script = Join-Path -Path $TestDrive -ChildPath ('ctrlc-' + [guid]::NewGuid().ToString('N') + '.ps1')
+        $body = @'
+param([string] $ModulePath, [string] $Log)
+Import-Module -Name $ModulePath
+$module = Get-Module -Name 'DbHubDemo'
+$null = & $module { Enable-DemoRunCancelWatch }
+Add-Type -Namespace 'DbHubDemoTest' -Name 'ConsoleBreak' -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint group); [DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(System.IntPtr handler, bool add);'
+$null = [DbHubDemoTest.ConsoleBreak]::SetConsoleCtrlHandler([System.IntPtr]::Zero, $false)
+$watch = [System.Diagnostics.Stopwatch]::StartNew()
+try {
+    $null = [DbHubDemoTest.ConsoleBreak]::GenerateConsoleCtrlEvent(0, 0)
+    Start-Sleep -Seconds 30
+    Add-Content -LiteralPath $Log -Value 'not stopped'
+}
+finally {
+    Add-Content -LiteralPath $Log -Value ('stopped after {0} ms' -f [int]$watch.Elapsed.TotalMilliseconds)
+    Add-Content -LiteralPath $Log -Value ('cancelled={0}' -f (& $module { Test-DemoRunCancelled }))
+    & $module { Disable-DemoRunCancelWatch }
+    Add-Content -LiteralPath $Log -Value ('after the run={0}' -f (& $module { Test-DemoRunCancelled }))
+}
+'@
+        [System.IO.File]::WriteAllText($script, $body)
+        $child = Start-Process -FilePath $pwshPath -ArgumentList '-NoProfile', '-File', ('"{0}"' -f $script), '-ModulePath', ('"{0}"' -f $modulePath), '-Log', ('"{0}"' -f $log) -WindowStyle Hidden -PassThru
+        $child.WaitForExit(90000) | Should -BeTrue
+        $lines = @(Get-Content -LiteralPath $log)
+        $lines | Should -Not -Contain 'not stopped'
+        $stoppedAfter = [int](($lines | Where-Object { $_ -like 'stopped after *' } | Select-Object -First 1) -replace '\D', '')
+        $stoppedAfter | Should -BeLessThan 5000
+        $lines | Should -Contain 'cancelled=True'
+        $lines | Should -Contain 'after the run=False' -Because 'a later command in the same session never reads the run''s Ctrl+C as its own'
+    }
+
+    It 'ends the run''s jobs within seconds: one that honors the stop ends by itself, and one that doesn''t is ended with its processes' {
+        # Before the live finding, deploy.ps1's finally block called Stop-Job and waited for each track's own cleanup.
+        $marker = Join-Path -Path $TestDrive -ChildPath ('cancel-' + [guid]::NewGuid().ToString('N') + '.xml')
+        $politeTrack = {
+            param([string] $Marker)
+            'DBHUB-PID {0}' -f $PID
+            $env:DBHUB_CANCEL_FILE = $Marker
+            try {
+                'started'
+                Start-Sleep -Seconds 120
+            }
+            finally {
+                if (-not (Test-Path -LiteralPath $env:DBHUB_CANCEL_FILE)) {
+                    Start-Sleep -Seconds 60
+                }
+            }
+        }
+        $polite = Start-Job -ArgumentList $marker -ScriptBlock $politeTrack
+        $stubborn = Start-ThreadJob -ScriptBlock {
+            try {
+                Start-Sleep -Seconds 120
+            }
+            finally {
+                [System.Threading.Thread]::Sleep(6000)
+            }
+        }
+        $script:stubbornId = $stubborn.InstanceId
+        $script:killed = 0
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoJobProcessId -ParameterFilter { $Job.InstanceId -eq $script:stubbornId } -MockWith { 4242 }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoProcessTree -MockWith { $script:killed = $ProcessId; $true }
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        while (@($polite.ChildJobs[0].Output | Where-Object { $_ -eq 'started' }).Count -eq 0 -and $watch.Elapsed.TotalSeconds -lt 60) {
+            Start-Sleep -Milliseconds 200
+        }
+        [System.IO.File]::WriteAllText($marker, 'stopped')
+        try {
+            $watch.Restart()
+            $ended = @(InModuleScope DbHubDemo -Parameters @{ Jobs = @($polite, $stubborn) } { Stop-DemoRunJob -Job $Jobs -GraceSeconds 3 })
+            $watch.Elapsed.TotalSeconds | Should -BeLessThan 10
+            $ended | Should -Be @($stubborn.Name)
+            $script:killed | Should -Be 4242
+            $polite.State | Should -Be 'Stopped' -Because 'it skipped its slow cleanup, so it ended by itself'
+            Get-Job -Id $polite.Id -ErrorAction SilentlyContinue | Should -BeNullOrEmpty -Because 'a job that ended is removed'
+        }
+        finally {
+            $null = Wait-Job -Job $stubborn -Timeout 30
+            Remove-Job -Job $stubborn -Force -ErrorAction SilentlyContinue
+            Remove-Job -Job $polite -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'ends a process with every process it started, and never a process that isn''t PowerShell' {
+        $directory = Join-Path -Path $TestDrive -ChildPath ('tree-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $directory
+        $childFile = Join-Path -Path $directory -ChildPath 'child.pid'
+        $grandchildFile = Join-Path -Path $directory -ChildPath 'grandchild.pid'
+        $grandchild = "Set-Content -LiteralPath '{0}' -Value `$PID; Start-Sleep -Seconds 120" -f $grandchildFile
+        $encoded = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($grandchild))
+        $child = Start-TestPwsh ("Set-Content -LiteralPath '{0}' -Value `$PID; & '{1}' -NoProfile -NonInteractive -EncodedCommand {2}" -f $childFile, $pwshPath, $encoded)
+        $other = $null
+        try {
+            Wait-TestFile -Path $grandchildFile | Should -BeTrue
+            $grandchildId = [int](Get-Content -LiteralPath $grandchildFile -Raw)
+            InModuleScope DbHubDemo -Parameters @{ Id = $child.Id } { Stop-DemoProcessTree -ProcessId $Id } | Should -BeTrue
+            $child.HasExited | Should -BeTrue
+            Start-Sleep -Milliseconds 500
+            Get-Process -Id $grandchildId -ErrorAction SilentlyContinue | Should -BeNullOrEmpty -Because 'the processes it started end with it'
+
+            # A process ID that now belongs to something else is left alone.
+            $info = if ($IsWindows) { [System.Diagnostics.ProcessStartInfo]::new('ping.exe', '-n 60 127.0.0.1') } else { [System.Diagnostics.ProcessStartInfo]::new('sleep', '60') }
+            $info.UseShellExecute = $false
+            $info.CreateNoWindow = $true
+            $info.RedirectStandardOutput = $true
+            $other = [System.Diagnostics.Process]::Start($info)
+            InModuleScope DbHubDemo -Parameters @{ Id = $other.Id } { Stop-DemoProcessTree -ProcessId $Id } | Should -BeFalse
+            $other.HasExited | Should -BeFalse
+        }
+        finally {
+            foreach ($process in @($child, $other) | Where-Object { $null -ne $_ }) {
+                if (-not $process.HasExited) {
+                    $process.Kill($true)
+                }
+                $process.Dispose()
+            }
+        }
+    }
+
+    It 'keeps the process ID a job reports first' {
+        $job = Start-ThreadJob -ScriptBlock { 'DBHUB-PID 4242' }
+        try {
+            $null = Wait-Job -Job $job -Timeout 30
+            InModuleScope DbHubDemo -Parameters @{ Job = $job } {
+                $null = Receive-DemoDeploymentTrackOutput -Job $Job
+                Get-DemoJobProcessId -Job $Job
+            } | Should -Be 4242
+        }
+        finally {
+            Remove-Job -Job $job -Force
+        }
+    }
+
+    It 'has every job of deploy.ps1 report its process ID first, and the track jobs know the cancel marker and their private directory' {
+        foreach ($name in 'Start-DemoDeploymentTrackJob', 'Start-DemoArtifactBuildJob', 'Start-DemoPolicyInventoryJob') {
+            $text = InModuleScope DbHubDemo -Parameters @{ Name = $name } { (Get-Command -Name $Name).ScriptBlock.ToString() }
+            $reported = $text.IndexOf("'DBHUB-PID {0}' -f `$PID", [System.StringComparison]::Ordinal)
+            $reported | Should -BeGreaterThan 0 -Because $name
+            $reported | Should -BeLessThan $text.IndexOf('Import-Module -Name $', [System.StringComparison]::Ordinal) -Because ('{0} reports it before anything slow' -f $name)
+        }
+        $track = InModuleScope DbHubDemo { (Get-Command -Name 'Start-DemoDeploymentTrackJob').ScriptBlock.ToString() }
+        $track | Should -Match ([regex]::Escape('$env:DBHUB_CANCEL_FILE = Join-Path -Path $handoffPath -ChildPath ''cancel.xml'''))
+        $track | Should -Match ([regex]::Escape('$env:DBHUB_PRIVATE_ROOT = Join-Path -Path $handoffPath -ChildPath ''private'''))
+    }
+
+    It 'puts a track process''s private files under the run''s handoff directory, which deploy.ps1 deletes even after ending the process' {
+        $root = Join-Path -Path $TestDrive -ChildPath ('handoff-' + [guid]::NewGuid().ToString('N'))
+        $private = Join-Path -Path $root -ChildPath 'private'
+        $null = New-Item -ItemType Directory -Path $private -Force
+        $saved = $env:DBHUB_PRIVATE_ROOT
+        $made = @()
+        try {
+            $env:DBHUB_PRIVATE_ROOT = $private
+            $made += InModuleScope DbHubDemo { Initialize-DemoPrivateDirectory -Prefix 'dbhub-rc' }
+            [System.IO.Path]::GetFullPath((Split-Path -Path $made[0] -Parent)) | Should -Be ([System.IO.Path]::GetFullPath($private))
+            # Without the run's directory (outside a track process), the user's temporary folder, as before.
+            $env:DBHUB_PRIVATE_ROOT = Join-Path -Path $root -ChildPath 'missing'
+            $made += InModuleScope DbHubDemo { Initialize-DemoPrivateDirectory -Prefix 'dbhub-rc' }
+            [System.IO.Path]::GetFullPath((Split-Path -Path $made[1] -Parent)).TrimEnd([System.IO.Path]::DirectorySeparatorChar) | Should -Be ([System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd([System.IO.Path]::DirectorySeparatorChar))
+        }
+        finally {
+            $env:DBHUB_PRIVATE_ROOT = $saved
+            foreach ($path in $made) {
+                InModuleScope DbHubDemo -Parameters @{ Path = $path } { Remove-DemoPrivateDirectory -Path $Path -Confirm:$false } | Out-Null
+            }
+        }
+    }
+
+    It 'stops waiting for the Azure CLI within a second when the run is stopped, and ends the CLI with it' {
+        # Before the live finding, a time-limited CLI call waited in one WaitForExit, which a stop can't interrupt.
+        $pidFile = Join-Path -Path $TestDrive -ChildPath ('cli-' + [guid]::NewGuid().ToString('N') + '.pid')
+        $command = "Set-Content -LiteralPath '{0}' -Value `$PID; Start-Sleep -Seconds 30" -f $pidFile
+        $runner = [powershell]::Create()
+        $null = $runner.AddScript({
+                param([string] $ModulePath, [string] $FilePath, [string] $Text)
+                Import-Module -Name $ModulePath
+                & (Get-Module -Name 'DbHubDemo') { param($Path, $Value) Invoke-DemoAzProcess -FilePath $Path -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $Value) -TimeoutSeconds 300 } $FilePath $Text
+            }).AddArgument($modulePath).AddArgument($pwshPath).AddArgument($command)
+        $null = $runner.BeginInvoke()
+        try {
+            Wait-TestFile -Path $pidFile | Should -BeTrue
+            $cliId = [int](Get-Content -LiteralPath $pidFile -Raw)
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            $runner.Stop()
+            $watch.Elapsed.TotalSeconds | Should -BeLessThan 5
+            Start-Sleep -Milliseconds 500
+            Get-Process -Id $cliId -ErrorAction SilentlyContinue | Should -BeNullOrEmpty -Because 'the CLI ends with the stop instead of running on'
+        }
+        finally {
+            $runner.Dispose()
+        }
     }
 }
 

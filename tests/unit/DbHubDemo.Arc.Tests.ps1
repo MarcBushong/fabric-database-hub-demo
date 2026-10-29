@@ -190,6 +190,19 @@ Describe 'Invoke-DemoVmRunCommand' {
         $script:runCommands.Count | Should -Be 0
     }
 
+    It 'leaves the Run Command for the next run instead of waiting to delete it when deploy.ps1 was stopped (Phase 28 live finding)' {
+        # A stop (Ctrl+C) runs this finally block, and the delete's wait would hold the stop for minutes.
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoRunCommand -MockWith { throw 'The pipeline has been stopped.' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
+        { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -ProtectedParameter @{ AccessToken = $script:fakeToken } -PollIntervalSeconds 0 } | Should -Throw '*stopped*'
+        $methods = @($script:calls.Method)
+        [array]::LastIndexOf($methods, 'delete') | Should -BeLessThan ([array]::IndexOf($methods, 'put')) -Because 'only the leftover delete before the PUT ran'
+        $script:runCommands.Keys | Should -Contain 'DbHubDemo-HealthRead'
+        $put = @($script:calls | Where-Object Method -eq 'put')
+        Test-Path -LiteralPath (Split-Path -Path $put[0].BodyPath -Parent) | Should -BeFalse -Because 'the private body still goes'
+        ($script:logs -join ' ') | Should -Match 'left for the next run'
+    }
+
     It 'runs -WhileRunning once, after Azure accepted the Run Command and before waiting for it (ADR 0018)' {
         $script:seen = [System.Collections.Generic.List[string]]::new()
         $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-Golden' -Script 'Write-Output 1' -PollIntervalSeconds 0 -WhileRunning { $script:seen.Add(('{0} {1}' -f $script:calls.Count, $script:calls[$script:calls.Count - 1].Method)); 'ignored output' }

@@ -375,6 +375,17 @@ Describe 'Send-DemoBootstrapBundle' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'Azure is still deleting' }
     }
 
+    It 'leaves its end-of-run cleanup to the next run when deploy.ps1 was stopped (Phase 28 live finding)' {
+        # A stop (Ctrl+C) runs this finally block; the cleanup's wait would hold the stop for up to CleanupWaitSeconds.
+        $script:stuckDeletes = $true
+        $script:cleanupWaited = $false
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoChunkRunCommandGone -MockWith { $script:cleanupWaited = $true; @() }
+        $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'sqlvm01' -ChunkSizeKiB 1 -CleanupWaitSeconds 300 })
+        $script:cleanupWaited | Should -BeFalse
+        @($sent[0].LeftoverRunCommands).Count | Should -Be 0
+    }
+
     It 'goes on one chunk at a time after a stall, when no chunk finishes for StallSeconds while several run (Phase 28)' {
         $script:runningReads = 20
         $script:clock = [DateTime]::UtcNow

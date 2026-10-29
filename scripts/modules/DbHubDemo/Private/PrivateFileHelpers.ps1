@@ -8,7 +8,9 @@ function Initialize-DemoPrivateDirectory {
     here and passed to the Azure CLI as --body @<file>, so the values never appear on a command line or in a
     log (ADR 0009). On Windows the directory is created with a protected ACL holding one entry: full control
     for the current user, without inherited entries. On Linux and macOS its mode is 700, as chmod 700 sets
-    it. The caller deletes the directory in a finally block with Remove-DemoPrivateDirectory.
+    it. The caller deletes the directory in a finally block with Remove-DemoPrivateDirectory. In deploy.ps1's track
+    processes the directory goes under DBHUB_PRIVATE_ROOT, inside the run's private handoff directory, so deploy.ps1
+    deletes it even when a stop has to end the process before its finally block runs (Phase 28 live finding).
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -17,7 +19,12 @@ function Initialize-DemoPrivateDirectory {
         [string] $Prefix = 'dbhub'
     )
 
-    $path = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('{0}-{1}' -f $Prefix, [guid]::NewGuid().ToString('N'))
+    $root = [System.IO.Path]::GetTempPath()
+    $runRoot = [string]$env:DBHUB_PRIVATE_ROOT
+    if ($runRoot -and [System.IO.Directory]::Exists($runRoot)) {
+        $root = $runRoot
+    }
+    $path = Join-Path -Path $root -ChildPath ('{0}-{1}' -f $Prefix, [guid]::NewGuid().ToString('N'))
     if ($IsWindows) {
         $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
         $security = [System.Security.AccessControl.DirectorySecurity]::new()

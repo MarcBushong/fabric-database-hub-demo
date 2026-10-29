@@ -22,6 +22,8 @@ One command, one guided stop (Phase 28):
   -Resume does.
 - It ends with one banner: DONE (Database Hub shows every target, and where to look) or NOT DONE (why, the single next
   action, and the exact command). The exit code is 0 only when it's DONE (and for a -WhatIf with no Fail).
+- Ctrl+C stops it within seconds, track processes included: their slow Azure cleanups are left to the next run or
+  stop-demo.ps1, the PC may sleep again, and the status page says Stopped, not done, with the command to continue.
 
 By default (ADR 0018), Preflight runs first, then four tracks, each in its own PowerShell process with its
 own subscription guard, started before the template so their guards run while it deploys: T1 (T3 set up
@@ -197,6 +199,7 @@ $outDirectory = Split-Path -Path ([System.IO.Path]::GetFullPath($OutputPath)) -P
 # The console's transcript, for ./scripts/collect-diagnostics.ps1 (every line on the console is already redacted).
 # https://learn.microsoft.com/powershell/module/microsoft.powershell.host/start-transcript
 $transcript = $false
+$awake = ''
 if (-not $environment.GitHubActions -and -not $whatIf) {
     try {
         $logPath = Join-Path -Path $outDirectory -ChildPath ('logs/deploy-{0}.log' -f [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture))
@@ -226,10 +229,13 @@ try {
     $workspaceName = if ($config['fabric'] -is [System.Collections.IDictionary]) { [string]$config['fabric']['workspaceName'] } else { '' }
     # Wait for T2 by default (brief goal 2); CI keeps returning early unless -WaitForT2.
     $waitForT2Now = -not $NoWaitForT2 -and (-not $environment.Ci -or $WaitForT2) -and -not $Sequential
+    # A Ctrl+C while the run's experience starts still lets the PC sleep again (the outer finally block below).
+    $awake = 'starting'
     $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -WhatIf:$whatIf -Confirm:$false
     $results = @()
     $outcome = $null
     $finished = $false
+    $stopped = $false
     try {
         $parameters = @{
             Config                = $config
@@ -264,15 +270,25 @@ try {
         try {
             $results = @(Invoke-DemoDeployment @parameters)
         }
+        catch [System.OperationCanceledException] {
+            # Ctrl+C that the wait for the tracks noticed itself (Phase 28 live finding): the ending below says so.
+            $stopped = $true
+        }
         catch {
             $results = @($results) + @(New-DemoResult -CheckId 'DEPLOY.RUN' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('deploy.ps1 stopped: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run ./scripts/deploy.ps1 again; it continues where it stopped. If it stops the same way, ./scripts/collect-diagnostics.ps1 makes a redacted zip for a Deployment problem issue.')
         }
         $finished = $true
     }
     finally {
-        # Always one ending, even after Ctrl+C: the model and the page say DONE or NOT DONE, and the PC may sleep again.
-        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential
-        $null = Exit-DemoKeepAwake
+        # Always one ending, even after Ctrl+C, and fast then: the model and the page say DONE or NOT DONE (Stopped, not
+        # done, with the command to continue), and the PC may sleep again whatever happens (Phase 28 live finding).
+        try {
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @($results) -WhatIfRun:$whatIf -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:($stopped -or -not $finished)
+        }
+        finally {
+            $null = Exit-DemoKeepAwake
+            $awake = 'released'
+        }
         if (-not $finished) {
             Write-DemoDeploymentOutcome -Outcome $outcome -WorkspaceName $workspaceName
         }
@@ -287,6 +303,10 @@ try {
     exit ([int]$outcome.ExitCode)
 }
 finally {
+    # Stopped while its experience was starting (Ctrl+C), before the block above could let the PC sleep again.
+    if ($awake -eq 'starting') {
+        $null = Exit-DemoKeepAwake
+    }
     if ($transcript) {
         $null = Stop-Transcript -ErrorAction SilentlyContinue
     }

@@ -72,8 +72,9 @@ function Invoke-DemoAzProcess {
     PowerShell's Legacy argument passing does; otherwise each argument is passed as is. Standard input is
     closed, so nothing can wait for a reply, and stdout and stderr are read without blocking. When the time
     limit passes, the whole process tree is stopped (for az.cmd: cmd.exe and Python) and the result has
-    ExitCode -1. Output is decoded like PowerShell decodes native output ([Console]::OutputEncoding) and
-    trailing line breaks are trimmed, so the result matches the untimed path.
+    ExitCode -1. The wait goes half a second at a time, so a stop (Ctrl+C) gets through within half a second, and
+    the CLI's process tree ends with it (Phase 28 live finding). Output is decoded like PowerShell decodes native
+    output ([Console]::OutputEncoding) and trailing line breaks are trimmed, so the result matches the untimed path.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -117,7 +118,13 @@ function Invoke-DemoAzProcess {
         $process.StandardInput.Close()
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        # Half a second at a time, so a stop (Ctrl+C) gets through between the waits instead of after the whole time
+        # limit; the finally block then ends the CLI (Phase 28 live finding).
+        $waited = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $process.WaitForExit(500)) {
+            if ($waited.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+                continue
+            }
             try {
                 $process.Kill($true)
             }
@@ -144,6 +151,16 @@ function Invoke-DemoAzProcess {
         }
     }
     finally {
+        # Left before the CLI ended (a stop or an error): it and its children end too, instead of running on.
+        try {
+            if (-not $process.HasExited) {
+                $process.Kill($true)
+                $null = $process.WaitForExit(5000)
+            }
+        }
+        catch {
+            Write-Verbose -Message 'The Azure CLI process wasn''t running.'
+        }
         $process.Dispose()
     }
 }

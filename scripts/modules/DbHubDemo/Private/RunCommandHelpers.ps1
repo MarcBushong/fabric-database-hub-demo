@@ -620,8 +620,9 @@ function Send-DemoChunkSet {
     finally {
         Remove-Item -LiteralPath $bodyPath -Force -ErrorAction SilentlyContinue
         try {
-            # A VM that isn't running gets no cleanup now; its next run's cleanup does it.
-            $shared['Leftover'] = if ($shared['VmStopped']) { @() } else { @(Wait-DemoChunkRunCommandGone -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -TimeoutSeconds $CleanupWaitSeconds) }
+            # A VM that isn't running gets no cleanup now, and neither does a stopped run (Ctrl+C, Phase 28 live finding):
+            # the next run's cleanup does it.
+            $shared['Leftover'] = if ($shared['VmStopped'] -or (Test-DemoRunCancelled)) { @() } else { @(Wait-DemoChunkRunCommandGone -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -TimeoutSeconds $CleanupWaitSeconds) }
             if (@($shared['Leftover']).Count -gt 0) {
                 Write-DemoLog -Level Warning -Message ('{0}: Azure is still deleting {1} chunk Run Command(s) ({2}); that''s Azure-side and finishes on its own, and the next run checks again.' -f $VmName, @($shared['Leftover']).Count, (@($shared['Leftover']) -join ', '))
             }

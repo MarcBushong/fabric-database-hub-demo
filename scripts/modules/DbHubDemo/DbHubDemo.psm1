@@ -30,6 +30,12 @@ $script:DemoVmRestarted = @{}
 # '<resource group>/archost01' (Invoke-DemoGoldenGuestAction). The watchdog never restarts the host meanwhile.
 $script:DemoHostAction = @{}
 
+# Phase 28 live finding: the process ID each of deploy.ps1's background jobs reported first (DBHUB-PID), keyed by the
+# job's InstanceId, so a stop can end a job's process when Stop-Job would wait (Stop-DemoRunJob); and whether a
+# deploy.ps1 run records Ctrl+C now (Enable-DemoRunCancelWatch to Disable-DemoRunCancelWatch).
+$script:DemoJobProcessId = @{}
+$script:DemoRunCancelWatch = $false
+
 # Azure CLI verbs that only read. Any other command (and every token request) needs the validated context.
 $script:AzReadOnlyVerbs = @('show', 'list', 'exists', 'get-instance-view', 'list-skus', 'list-usage', 'list-usages', 'list-versions', 'show-deleted', 'list-locations', 'version')
 

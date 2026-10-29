@@ -40,6 +40,8 @@ function Start-DemoDeploymentTrackJob {
     $contextXml = [System.Management.Automation.PSSerializer]::Serialize($Context, 20)
     $job = {
         param([string] $ModulePath, [string] $ConfigXml, [string] $TrackName, [string] $ContextXml, [string[]] $Steps, [int] $Delay)
+        # This process's ID first, so deploy.ps1 can end it at once when it's stopped (Stop-DemoRunJob).
+        'DBHUB-PID {0}' -f $PID
         $ErrorActionPreference = 'Stop'
         $env:DBHUB_LOG_TRACK = $TrackName
         if ($Delay -gt 0) {
@@ -52,6 +54,14 @@ function Start-DemoDeploymentTrackJob {
         }
         $configValue = [System.Management.Automation.PSSerializer]::Deserialize($ConfigXml)
         $contextValue = [System.Management.Automation.PSSerializer]::Deserialize($ContextXml)
+        # The run's cancel marker, which tells this process's finally blocks to skip slow Azure cleanups when deploy.ps1
+        # stops it (Test-DemoRunCancelled), and its private files under the handoff directory, which deploy.ps1 deletes
+        # even when it has to end this process (Initialize-DemoPrivateDirectory). Phase 28 live finding.
+        $handoffPath = [string]$contextValue['HandoffPath']
+        if ($handoffPath) {
+            $env:DBHUB_CANCEL_FILE = Join-Path -Path $handoffPath -ChildPath 'cancel.xml'
+            $env:DBHUB_PRIVATE_ROOT = Join-Path -Path $handoffPath -ChildPath 'private'
+        }
         try {
             $guard = Assert-DemoAzContext -SubscriptionId ([string]$configValue['subscriptionId']) -TenantId ([string]$configValue['tenantId']) -Account ([string]$configValue['azureAccount'])
             Write-DemoLog -Message ('Subscription guard in this process: {0}.' -f $guard.status)
@@ -97,6 +107,8 @@ function Start-DemoArtifactBuildJob {
     $modulePath = Join-Path -Path $script:RepoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1'
     $build = {
         param([string] $BuildModulePath, [bool] $NoRunner, [string] $Directory)
+        # This process's ID first, so deploy.ps1 can end it at once when it's stopped (Stop-DemoRunJob).
+        'DBHUB-PID {0}' -f $PID
         $ErrorActionPreference = 'Stop'
         $env:DBHUB_LOG_TRACK = 'Build'
         $value = [pscustomobject]@{ Bundle = $null; Runner = $null; Error = '' }
@@ -158,6 +170,8 @@ function Start-DemoPolicyInventoryJob {
     $configXml = [System.Management.Automation.PSSerializer]::Serialize($Config, 20)
     $inventory = {
         param([string] $InventoryModulePath, [string] $InventoryConfigXml, [int] $Hours)
+        # This process's ID first, so deploy.ps1 can end it at once when it's stopped (Stop-DemoRunJob).
+        'DBHUB-PID {0}' -f $PID
         $ErrorActionPreference = 'Stop'
         $env:DBHUB_LOG_TRACK = 'Policy'
         Import-Module -Name $InventoryModulePath -Force
@@ -183,8 +197,9 @@ function Start-DemoPolicyInventoryJob {
 function Receive-DemoDeploymentTrackOutput {
     <#
     .SYNOPSIS
-    Reads what a track job wrote since the last read: its results and its summary (deserialized), and its log
-    lines, which go to the console as they arrive. Returns Results and Summary. Internal.
+    Reads what a track job wrote since the last read: its results and its summary (deserialized), its process ID
+    (DBHUB-PID, kept for Stop-DemoRunJob), and its log lines, which go to the console as they arrive. Returns Results
+    and Summary. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -204,6 +219,10 @@ function Receive-DemoDeploymentTrackOutput {
         }
         elseif ($line.StartsWith('DBHUB-SUMMARY ', [System.StringComparison]::Ordinal)) {
             $summary = [System.Management.Automation.PSSerializer]::Deserialize($line.Substring(14))
+        }
+        elseif ($line -match '^DBHUB-PID (\d{1,10})$') {
+            # The job's process, for Stop-DemoRunJob (Phase 28 live finding).
+            $script:DemoJobProcessId[$Job.InstanceId.ToString()] = [int]$Matches[1]
         }
     }
     foreach ($problem in @($jobErrors)) {
@@ -534,14 +553,26 @@ function Invoke-DemoParallelDeployment {
                 break
             }
             if ([DateTime]::UtcNow -ge $Deadline) {
-                foreach ($job in $running) {
-                    Stop-Job -Job $job -ErrorAction SilentlyContinue
+                # Their slow Azure cleanups are skipped, so they stop within seconds (Phase 28 live finding).
+                try {
+                    Write-DemoTrackHandoff -Path $handoff -Name 'cancel' -Value ([pscustomobject]@{ Reason = 'deadline'; Utc = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) }) -Confirm:$false
                 }
+                catch {
+                    Write-DemoLog -Level Debug -Message ('The cancel marker wasn''t written: {0}' -f $_.Exception.Message)
+                }
+                $null = Stop-DemoRunJob -Job $running
                 $runningNames = @($running | ForEach-Object { $_.Name }) -join ', '
                 $results.Add((New-DemoResult -CheckId 'DEPLOY.TRACKS' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('{0} track(s) were still running after {1} minutes and were stopped: {2}.' -f $running.Count, $TrackTimeoutMinutes, $runningNames) -Remediation 'Run deploy.ps1 -Resume: each track continues after its last finished step.'))
                 break
             }
-            Start-Sleep -Seconds 10
+            # Ten seconds, in one-second steps: a Ctrl+C that PowerShell didn't act on ends the wait within a second
+            # (Enable-DemoRunCancelWatch; Phase 28 live finding).
+            for ($second = 0; $second -lt 10; $second++) {
+                if (Test-DemoRunCancelled) {
+                    throw [System.OperationCanceledException]::new('deploy.ps1 was stopped (Ctrl+C) before the tracks finished.')
+                }
+                Start-Sleep -Seconds 1
+            }
         }
         & $collect
         foreach ($track in @($jobs.Keys)) {
@@ -549,13 +580,19 @@ function Invoke-DemoParallelDeployment {
                 $trackResults[$track].Add((New-DemoResult -CheckId ('DEPLOY.TRACK.{0}' -f $track.ToUpperInvariant()) -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('Track {0}''s process ended without a summary (job state {1}).' -f $track, $jobs[$track].State) -Remediation 'Run deploy.ps1 -Resume: the track continues after its last finished step.'))
                 $summaries[$track] = [pscustomobject]@{ Track = $track; Status = 'Fail'; Steps = @(); Timing = @{}; ReadyUtc = @{} }
             }
-            Remove-Job -Job $jobs[$track] -Force -ErrorAction SilentlyContinue
+            # A job whose process had to be ended still reads Running for about a minute; Remove-Job would wait for it.
+            if ($jobs[$track].State -notin 'NotStarted', 'Running', 'Stopping') {
+                Remove-Job -Job $jobs[$track] -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
     try {
         if ($useJobs) {
             $handoff = Initialize-DemoPrivateDirectory -Prefix 'dbhub-tracks'
+            # The track processes' private files go here (DBHUB_PRIVATE_ROOT), so they go with the handoff directory even
+            # when a stop has to end a process (Phase 28 live finding). It inherits the handoff directory's protection.
+            $null = [System.IO.Directory]::CreateDirectory((Join-Path -Path $handoff -ChildPath 'private'))
             if ($needsArtifacts) {
                 $buildJob = Start-DemoArtifactBuildJob -HandoffPath $handoff -SkipRunner:$SkipRunner -Confirm:$false
             }
@@ -752,10 +789,22 @@ function Invoke-DemoParallelDeployment {
         & $applyPolicy 5
     }
     finally {
-        # Cancelled or finished: no track process outlives deploy.ps1, and the handoff directory goes.
-        foreach ($job in @(@($jobs.Values) + @($buildJob) + @($policyJob) | Where-Object { $null -ne $_ })) {
-            Stop-Job -Job $job -ErrorAction SilentlyContinue
-            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        # Finished, failed, or stopped (Ctrl+C): no job process outlives deploy.ps1, within seconds, and the handoff
+        # directory goes, with the tracks' private files in it. A job still running gets the cancel marker first, so its
+        # slow Azure cleanups (Run Command deletes, the guided stop's Bastion removal and password rotation) are left to
+        # the next deploy.ps1 or stop-demo.ps1 instead of holding the stop for minutes (Phase 28 live finding).
+        $runJobs = @(@($jobs.Values) + @($buildJob) + @($policyJob) | Where-Object { $null -ne $_ })
+        if ($handoff -and @($runJobs | Where-Object { $_.State -in 'NotStarted', 'Running', 'Stopping' }).Count -gt 0) {
+            try {
+                Write-DemoTrackHandoff -Path $handoff -Name 'cancel' -Value ([pscustomobject]@{ Reason = 'stopped'; Utc = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) }) -Confirm:$false
+            }
+            catch {
+                Write-DemoLog -Level Debug -Message ('The cancel marker wasn''t written: {0}' -f $_.Exception.Message)
+            }
+        }
+        $ended = @(Stop-DemoRunJob -Job $runJobs)
+        if ($ended.Count -gt 0) {
+            Write-DemoLog -Level Warning -Message ('Stopped: {0} ended at once; the next ./scripts/deploy.ps1 continues their work.' -f ($ended -join ', '))
         }
         if ($handoff) {
             Remove-DemoPrivateDirectory -Path $handoff -Confirm:$false | Out-Null

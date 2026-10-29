@@ -241,8 +241,10 @@ function Write-DemoTrackHandoff {
 
     .DESCRIPTION
     'artifacts' comes from the build process: Bundle, Runner, and Error. 'infrastructure' comes from
-    deploy.ps1 once the template finished: Succeeded, LoaderSettings, T3UseFreeLimit, and Message. Nothing in
-    either is secret.
+    deploy.ps1 once the template finished: Succeeded, LoaderSettings, T3UseFreeLimit, and Message. 'cancel' comes from
+    deploy.ps1 when it stops the tracks (Ctrl+C, or their time limit): Reason and Utc; the track processes' finally
+    blocks then skip their slow Azure cleanups (Test-DemoRunCancelled; Phase 28 live finding). Nothing in any of them
+    is secret.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -250,7 +252,7 @@ function Write-DemoTrackHandoff {
         [string] $Path,
 
         [Parameter(Mandatory)]
-        [ValidateSet('artifacts', 'infrastructure')]
+        [ValidateSet('artifacts', 'infrastructure', 'cancel')]
         [string] $Name,
 
         [Parameter(Mandatory)]
@@ -1074,7 +1076,7 @@ function Invoke-DemoDeploymentTrack {
                                 $outcome = 'Fail'
                                 break
                             }
-                            if ($guided.Status -eq 'TimedOut') {
+                            if ($guided.Status -in 'TimedOut', 'Stopped') {
                                 $outcome = 'Open'
                                 break
                             }

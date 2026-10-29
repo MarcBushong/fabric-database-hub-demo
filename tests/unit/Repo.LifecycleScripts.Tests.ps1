@@ -254,6 +254,70 @@ Describe 'Lifecycle scripts' {
             Should -Invoke -CommandName Exit-DemoKeepAwake -Times 1 -Exactly
         }
 
+        It 'ends Stopped, not done, without a Fail, and lets the PC sleep again when the wait for the tracks notices Ctrl+C (Phase 28 live finding)' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { throw [System.OperationCanceledException]::new('deploy.ps1 was stopped (Ctrl+C) before the tracks finished.') }
+            $capture['kind'] = 'NotDone'
+            $capture['exit'] = 2
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 2
+            Should -Invoke -CommandName Complete-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['Stopped'] -and @($Result | Where-Object { $_.checkId -eq 'DEPLOY.RUN' }).Count -eq 0 }
+            Should -Invoke -CommandName Exit-DemoKeepAwake -Times 1 -Exactly
+        }
+
+        It 'ends with one banner, Stopped, not done, and releases the PC within seconds when a stop (as Ctrl+C makes one) interrupts it (Phase 28 live finding)' {
+            # A real pipeline stop, the one PowerShell makes for Ctrl+C, in a runspace of its own with stand-ins for the
+            # deployment's commands; before the fix, the ending didn't know the run was stopped.
+            $log = Join-Path -Path $TestDrive -ChildPath ('stop-' + [guid]::NewGuid().ToString('N') + '.log')
+            $runner = [powershell]::Create()
+            $null = $runner.AddScript({
+                    param([string] $ModulePath, [string] $Deploy, [string] $ConfigFile, [string] $OutputFile, [string] $LogFile)
+                    Import-Module -Name $ModulePath
+                    # Stand-ins for the deployment's commands. Simple functions: the parameters they don't name land in $args.
+                    . ([scriptblock]::Create(("function global:Write-StopTestLog([string] `$Text) {{ [System.IO.File]::AppendAllText('{0}', `$Text + [System.Environment]::NewLine) }}" -f ($LogFile -replace "'", "''"))))
+                    function global:Get-DemoRunEnvironment { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+                    function global:Start-Transcript { }
+                    function global:Stop-Transcript { }
+                    function global:Initialize-DemoFirstRun { [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = ''; NextSteps = @(); Outcome = $null } }
+                    function global:Start-DemoDeploymentRun { [pscustomobject]@{ ProgressPath = ''; PagePath = ''; Writer = $null; KeepAwake = $true; StartedUtc = [DateTime]::UtcNow; Command = './scripts/deploy.ps1'; Environment = $null; InstallMode = 'PaygWizard'; WaitForT2 = $true } }
+                    function global:Invoke-DemoDeployment { Write-StopTestLog 'deploying'; Start-Sleep -Seconds 60; Write-StopTestLog 'not stopped' }
+                    function global:Complete-DemoDeploymentRun {
+                        param([switch] $Stopped)
+                        Write-StopTestLog ('complete stopped={0}' -f [bool]$Stopped)
+                        [pscustomobject]@{ Kind = 'NotDone'; ExitCode = 2; Minutes = 1; Reason = 'stopped'; Next = 'continue'; NextCommand = './scripts/deploy.ps1'; Optional = @(); Notes = @(); Resume = '' }
+                    }
+                    function global:Exit-DemoKeepAwake { Write-StopTestLog 'awake released'; $true }
+                    function global:Write-DemoDeploymentOutcome { param($Outcome) Write-StopTestLog ('banner {0}' -f $Outcome.Kind) }
+                    & $Deploy -ConfigPath $ConfigFile -OutputPath $OutputFile
+                }).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1')).AddArgument($configPath).AddArgument($outputPath).AddArgument($log)
+            $null = $runner.BeginInvoke()
+            try {
+                $watch = [System.Diagnostics.Stopwatch]::StartNew()
+                while (-not ((Test-Path -LiteralPath $log) -and (Get-Content -LiteralPath $log) -contains 'deploying') -and $watch.Elapsed.TotalSeconds -lt 90) {
+                    Start-Sleep -Milliseconds 200
+                }
+                $watch.Restart()
+                $runner.Stop()
+                $watch.Elapsed.TotalSeconds | Should -BeLessThan 10
+                $lines = @(Get-Content -LiteralPath $log)
+                $lines | Should -Not -Contain 'not stopped'
+                $lines | Should -Contain 'complete stopped=True'
+                $lines | Should -Contain 'awake released'
+                $lines | Should -Contain 'banner NotDone'
+            }
+            finally {
+                $runner.Dispose()
+            }
+        }
+
+        It 'lets the PC sleep again when it''s stopped while the run''s experience starts (Phase 28 live finding)' {
+            Mock -CommandName Start-DemoDeploymentRun -MockWith { throw 'stopped while the run started' }
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            { & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $outputPath } | Should -Throw -ExpectedMessage 'stopped while the run started'
+            Should -Invoke -CommandName Invoke-DemoDeployment -Times 0 -Exactly
+            Should -Invoke -CommandName Exit-DemoKeepAwake -Times 1 -Exactly
+            Should -Invoke -CommandName Stop-Transcript -Times 1 -Exactly
+        }
+
         It 'keeps GitHub Actions'' exit codes and inputs as before' {
             Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'DEPLOY.T2.BACKGROUND' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'building' }
             Mock -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $true; Ci = $true; Interactive = $false; Codespaces = $false; Windows = $false } }

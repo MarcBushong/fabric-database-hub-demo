@@ -33,6 +33,11 @@ function Complete-DemoDeploymentRun {
     .PARAMETER Sequential
     The run was deploy.ps1 -Sequential: judged by its recorded stage, since it records no tracks.
 
+    .PARAMETER Stopped
+    The run was stopped (Ctrl+C) before it finished: NOT DONE with the resume command, without reading the resource
+    group's state, so the ending takes no Azure call; a Ctrl+C that Enable-DemoRunCancelWatch recorded counts too. Steps
+    still running on the status page go back to Pending with the reason (Phase 28 live finding).
+
     .EXAMPLE
     $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $results
     #>
@@ -58,11 +63,14 @@ function Complete-DemoDeploymentRun {
 
         [switch] $SkipFabric,
 
-        [switch] $Sequential
+        [switch] $Sequential,
+
+        [switch] $Stopped
     )
 
+    $wasStopped = [bool]$Stopped -or (-not $WhatIfRun -and (Test-DemoRunCancelled))
     $judgedState = $State
-    if (-not $PSBoundParameters.ContainsKey('State') -and -not $WhatIfRun) {
+    if (-not $PSBoundParameters.ContainsKey('State') -and -not $WhatIfRun -and -not $wasStopped) {
         try {
             $judgedState = Get-DemoDeploymentState -Config $Config
         }
@@ -71,8 +79,19 @@ function Complete-DemoDeploymentRun {
             $judgedState = $null
         }
     }
+    # Whether the guided stop was open when the run stopped: the model's guidedStop says so without an Azure call.
+    $guidedOpen = $false
+    if ($wasStopped -and $Run.ProgressPath) {
+        try {
+            $model = Read-DemoProgress -Path ([string]$Run.ProgressPath)
+            $guidedOpen = $null -ne $model -and [string]$model['guidedStop']['state'] -in 'Preparing', 'Ready'
+        }
+        catch {
+            $guidedOpen = $false
+        }
+    }
     try {
-        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential
+        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen
     }
     catch {
         $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; Optional = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }
@@ -87,7 +106,12 @@ function Complete-DemoDeploymentRun {
         if ($outcome.Kind -eq 'Done') {
             Set-DemoProgressStep -Path $Run.ProgressPath -Id 'Validation' -State 'Done' -Message ('Done in {0} minutes.' -f $minutes)
         }
+        elseif ($wasStopped) {
+            Set-DemoProgressStopped -Path $Run.ProgressPath -Message ('Stopped here (Ctrl+C); {0} continues from this step.' -f $Run.Command)
+        }
     }
     Stop-DemoProgressPageWriter -Job $Run.Writer -ModelPath ([string]$Run.ProgressPath) -PagePath ([string]$Run.PagePath)
+    # The run is over: a later Ctrl+C in this session belongs to another command.
+    Disable-DemoRunCancelWatch
     return $outcome
 }

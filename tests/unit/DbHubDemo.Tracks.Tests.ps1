@@ -906,6 +906,46 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:calls | Should -Contain 'job T2 delay=5 earlyT2=False bundle=False'
         }
 
+        It 'stops the track processes within seconds when deploy.ps1 is stopped, after telling them to skip their slow cleanups (Phase 28 live finding)' {
+            # Live, Ctrl+C at the guided stop seemed to do nothing: this finally block waited for the T2 track's cleanup.
+            $script:t2Job = $null
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoDeploymentTrackJob -MockWith {
+                $script:handoffDir = [string]$Context['HandoffPath']
+                if ($Track -ne 'T2') {
+                    return (Start-ThreadJob -Name ('dbhub-track-{0}' -f $Track) -ScriptBlock { })
+                }
+                # The T2 track at the guided stop: its cleanup takes minutes unless deploy.ps1 left the cancel marker.
+                $guidedStopTrack = {
+                    param([string] $Marker)
+                    try {
+                        Start-Sleep -Seconds 120
+                    }
+                    finally {
+                        if (-not (Test-Path -LiteralPath $Marker)) {
+                            [System.Threading.Thread]::Sleep(30000)
+                        }
+                    }
+                }
+                $script:t2Job = Start-ThreadJob -Name 'dbhub-track-T2' -ArgumentList (Join-Path -Path $script:handoffDir -ChildPath 'cancel.xml') -ScriptBlock $guidedStopTrack
+                return $script:t2Job
+            }
+            # Ctrl+C, as the wait for the tracks notices it.
+            Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                { InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config } } | Should -Throw -ExceptionType ([System.OperationCanceledException])
+                $watch.Elapsed.TotalSeconds | Should -BeLessThan 10
+                $script:t2Job.State | Should -Be 'Stopped' -Because 'the cancel marker came first, so it skipped its cleanup and ended by itself'
+                Test-Path -LiteralPath $script:handoffDir | Should -BeFalse
+            }
+            finally {
+                if ($null -ne $script:t2Job) {
+                    $null = Wait-Job -Job $script:t2Job -Timeout 40
+                    Remove-Job -Job $script:t2Job -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
         It 'runs the policy inventory alongside the deployment only with networkMode private, and its results replace preflight''s placeholders (Phase 28; review finding 7)' {
             $private = New-TestConfig
             $private['networkMode'] = 'private'

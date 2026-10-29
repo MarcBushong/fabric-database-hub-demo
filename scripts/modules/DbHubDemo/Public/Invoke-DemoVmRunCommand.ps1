@@ -235,13 +235,21 @@ function Invoke-DemoVmRunCommand {
         }
         finally {
             Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
-            try {
-                $removed = Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false
+            $stopped = Test-DemoRunCancelled
+            if ($stopped) {
+                # deploy.ps1 was stopped (Ctrl+C): deleting the Run Command can take minutes, so the next run's cleanup
+                # deletes it before it creates the same name again (Phase 28 live finding).
+                Write-DemoLog -Level Warning -Message ('{0}: stopped; the Run Command {1} is left for the next run to delete.' -f $VmName, $RunCommandName)
             }
-            catch {
-                Write-DemoLog -Level Warning -Message ('{0}: the Run Command {1} could not be deleted: {2}' -f $VmName, $RunCommandName, $_.Exception.Message)
+            else {
+                try {
+                    $removed = Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false
+                }
+                catch {
+                    Write-DemoLog -Level Warning -Message ('{0}: the Run Command {1} could not be deleted: {2}' -f $VmName, $RunCommandName, $_.Exception.Message)
+                }
             }
-            if (-not $removed) {
+            if (-not $removed -and -not $stopped) {
                 Write-DemoLog -Level Warning -Message ('{0}: the Run Command {1} is still being deleted; delete it with az vm run-command delete if it remains.' -f $VmName, $RunCommandName)
             }
         }
