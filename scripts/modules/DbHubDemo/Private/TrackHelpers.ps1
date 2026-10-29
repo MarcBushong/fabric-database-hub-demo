@@ -79,7 +79,10 @@ function Invoke-DemoBootstrapLoaderRun {
         [int] $RunnerChunkCount = 0,
 
         [ValidateRange(60, 7200)]
-        [int] $TimeoutSeconds = 1800
+        [int] $TimeoutSeconds = 1800,
+
+        [ValidateRange(0, 7200)]
+        [int] $StartTimeoutSeconds = 0
     )
 
     $role = if ($VmName -eq 'sqlvm01') { 'SqlVm' } else { 'ArcHost' }
@@ -105,14 +108,17 @@ function Invoke-DemoBootstrapLoaderRun {
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-Bootstrap' -Script $script -Parameter $parameters -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 10 -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-Bootstrap' -Script $script -Parameter $parameters -TimeoutSeconds $TimeoutSeconds -PollIntervalSeconds 10 -StartTimeoutSeconds $StartTimeoutSeconds -Confirm:$false
     }
     catch {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('The bootstrap loader on {0} could not run: {1}' -f $VmName, (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run deploy.ps1 -Resume; a conflict with an extension that a policy installs clears within minutes.' -DocUrl $docUrl)
     }
-    $evidence = [ordered]@{ vmName = $VmName; bundle = $BundleSha256.Substring(0, 12).ToLowerInvariant(); runner = $(if ($RunnerSha256) { $RunnerSha256.Substring(0, 12).ToLowerInvariant() } else { '' }); seconds = [int]$watch.Elapsed.TotalSeconds }
+    $evidence = [ordered]@{ vmName = $VmName; bundle = $BundleSha256.Substring(0, 12).ToLowerInvariant(); runner = $(if ($RunnerSha256) { $RunnerSha256.Substring(0, 12).ToLowerInvariant() } else { '' }); seconds = [int]$watch.Elapsed.TotalSeconds; notStarted = [bool](Get-DemoMemberValue -InputObject $run -Name 'NotStarted') }
     if ($null -ne $run -and $run.Succeeded) {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('The bootstrap loader on {0} finished in {1} seconds: the bundle is verified and installed, and a new bootstrap generation is running.' -f $VmName, $evidence['seconds']) -Evidence $evidence -DocUrl $docUrl)
+    }
+    if ($evidence['notStarted']) {
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('The bootstrap loader on {0} didn''t start within {1} minutes: the VM agent is still busy with Azure-side extension work.' -f $VmName, [int]($StartTimeoutSeconds / 60)) -Evidence $evidence -Remediation 'deploy.ps1''s watchdog restarts the VM once and runs the loader again; if it stays stuck, run ./scripts/deploy.ps1 again later.' -DocUrl $docUrl)
     }
     $detail = if ($null -eq $run) { 'no result' } elseif ($run.Error) { [string]$run.Error } else { [string]$run.Output }
     if ($detail.Length -gt 1000) {
@@ -517,8 +523,15 @@ function Invoke-DemoDeploymentTrack {
     $recordState = -not [bool](& $option 'NoState' $false)
     $handoff = [string](& $option 'HandoffPath' '')
     $handoffMinutes = [int](& $option 'HandoffTimeoutMinutes' 120)
+    # The status page's model (Phase 28); empty when there's none, and every update is then a no-op.
+    $progress = [string](& $option 'ProgressPath' '')
+    # Phase 28's settle waits and watchdog (brief item 14); tests shorten them through the context.
+    $settleMinutes = [int](& $option 'SettleMinutes' 20)
+    $settleAfterMinutes = [int](& $option 'SettleAfterRestartMinutes' 10)
+    $settlePoll = [int](& $option 'SettlePollSeconds' 30)
+    $loaderStartSeconds = [int](& $option 'LoaderStartSeconds' 900)
     # What the closures below share and change (a closure's assignments stay in its own scope).
-    $shared = @{ Infrastructure = $null; Artifacts = $null; Sent = [System.Collections.Generic.HashSet[string]]::new(); Group = $null; Setup = $null; PrincipalId = '' }
+    $shared = @{ Infrastructure = $null; Artifacts = $null; Sent = [System.Collections.Generic.HashSet[string]]::new(); Group = $null; Setup = $null; PrincipalId = ''; Settled = [System.Collections.Generic.HashSet[string]]::new() }
 
     # True when the template succeeded. A track started before it waits for deploy.ps1's word, then takes the
     # loader settings and T3's free-offer choice from it; a track started after it has nothing to wait for.
@@ -541,6 +554,15 @@ function Invoke-DemoDeploymentTrack {
                 $freeValue = Get-DemoMemberValue -InputObject $value -Name 'T3UseFreeLimit'
                 if ($null -ne $freeValue) {
                     $Context['T3UseFreeLimit'] = [bool]$freeValue
+                }
+                # T4's size as the template settled it (Phase 28's Burstable fallback), for T4's track and T1's T4 step.
+                $t4Value = Get-DemoMemberValue -InputObject $value -Name 'T4Enabled'
+                if ($null -ne $t4Value) {
+                    $Config['t4Enabled'] = [bool]$t4Value
+                }
+                $t4Sku = [string](Get-DemoMemberValue -InputObject $value -Name 'T4SkuName')
+                if ($t4Sku) {
+                    $Config['t4SkuName'] = $t4Sku
                 }
             }
         }
@@ -606,7 +628,40 @@ function Invoke-DemoDeploymentTrack {
         $files = @(foreach ($item in $missing) {
                 [pscustomobject]@{ Path = [string]$item.Artifact.Path; Sha256 = $item.Sha; SizeBytes = [long](Get-DemoMemberValue -InputObject $item.Artifact -Name 'SizeBytes'); Description = $(if ($item.Kind -eq 'Bundle') { 'bootstrap bundle' } else { 'workload runner' }) }
             })
-        $sent = @(Send-DemoChunkSet -Config $Config -File $files -VmName $VmName -ChunkSizeKiB $chunkSize -Parallelism $parallelism)
+        # Phase 28 (brief item 14): the VM's extensions settle first, and a stuck chunk set gets the watchdog (the VM's
+        # instance view saved, one restart) and one more try, one chunk at a time.
+        $progressId = '{0}.Artifacts' -f $(if ($VmName -eq 'sqlvm01') { 'T1' } else { 'T2' })
+        if (-not (& $settle $VmName $progressId)) {
+            throw ('Azure''s extension work on {0} didn''t finish, so its artifacts weren''t sent (DEPLOY.EXTENSIONS_{1}).' -f $VmName, $VmName.ToUpperInvariant())
+        }
+        try {
+            $sent = @(Send-DemoChunkSet -Config $Config -File $files -VmName $VmName -ChunkSizeKiB $chunkSize -Parallelism $parallelism)
+        }
+        catch {
+            $problem = Protect-DemoText -Text $_.Exception.Message
+            if ($problem -match 'isn''t running|deallocated|changed after it was built|doesn''t exist|failed on the VM') {
+                throw
+            }
+            Write-DemoLog -Level Warning -Message ('{0}: sending the artifacts got stuck ({1}); the watchdog steps in, then they go one chunk at a time.' -f $VmName, $problem)
+            $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('sending its artifacts got stuck ({0})' -f $problem) -ProgressPath $progress -ProgressId $progressId
+            $results.Add($watchdog.Result)
+            try {
+                $sent = @(Send-DemoChunkSet -Config $Config -File $files -VmName $VmName -ChunkSizeKiB $chunkSize -Parallelism 1)
+            }
+            catch {
+                $activity = Get-DemoVmExtensionActivity -Config $Config -VmName $VmName
+                $results.Add((New-DemoVmStuckResult -VmName $VmName -What 'Sending the artifacts' -Item $activity.Labels -Minutes 30 -Restarted $watchdog.Restarted))
+                throw ('Sending the artifacts to {0} is still stuck after the watchdog (DEPLOY.EXTENSIONS_{1}).' -f $VmName, $VmName.ToUpperInvariant())
+            }
+        }
+        $first = @($sent | Select-Object -First 1)
+        if ($first.Count -gt 0 -and [bool](Get-DemoMemberValue -InputObject $first[0] -Name 'Stalled')) {
+            & $note ('DEPLOY.ARTIFACTS.STALL_{0}' -f $VmName.ToUpperInvariant()) $target 'Warning' ('{0}: no chunk finished for 5 minutes while several ran, so the rest went one at a time. Azure was busy with the VM''s extensions (Azure-side; nothing to do).' -f $VmName)
+        }
+        $leftover = if ($first.Count -gt 0) { @(Get-DemoMemberValue -InputObject $first[0] -Name 'LeftoverRunCommands') | Where-Object { $_ } } else { @() }
+        if (@($leftover).Count -gt 0) {
+            & $note ('DEPLOY.ARTIFACTS.CLEANUP_{0}' -f $VmName.ToUpperInvariant()) $target 'Warning' ('Azure was still deleting {0} chunk Run Command(s) on {1} when its artifacts arrived ({2}). That''s Azure-side and doesn''t block the loader (a VM allows 25 managed Run Commands); the next run''s cleanup checks again.' -f @($leftover).Count, $VmName, (@($leftover) -join ', ')) 'Nothing to do; if they stay for hours, see docs/troubleshooting.md (Run Commands stuck in Deleting).'
+        }
         foreach ($item in $missing) {
             $one = @($sent | Where-Object { [string]$_.Sha256 -eq $item.Sha }) | Select-Object -First 1
             if ($recordState) {
@@ -617,7 +672,8 @@ function Invoke-DemoDeploymentTrack {
             $null = $shared['Sent'].Add($item.Key)
         }
     }
-    # Runs a VM's loader with the chunks that reached it, then reports the result.
+    # Runs a VM's loader with the chunks that reached it, then reports the result. Its extensions settle first; a loader
+    # that doesn't start within LoaderStartSeconds gets the watchdog and one more try (brief item 14).
     $load = {
         param([string] $VmName, [string] $SettingsKey)
         $state = Get-DemoDeploymentState -Config $Config
@@ -625,11 +681,39 @@ function Invoke-DemoDeploymentTrack {
             & $note ('INFRA.BOOTSTRAP.LOADER_{0}' -f $VmName.ToUpperInvariant()) (Get-DemoVmTarget -VmName $VmName) 'Fail' ('The bootstrap bundle hasn''t reached {0}, so its loader can''t run.' -f $VmName) 'Run deploy.ps1 -FromStage Artifacts.'
             return $false
         }
+        $progressId = '{0}.Bootstraps' -f $(if ($VmName -eq 'sqlvm01') { 'T1' } else { 'T2' })
+        if (-not (& $settle $VmName $progressId)) {
+            return $false
+        }
         $settings = Get-DemoMemberValue -InputObject (& $option 'LoaderSettings' $null) -Name $SettingsKey
         $runnerSha = if ($state.RunnerSha256 -and $VmName -in $state.RunnerSentTo) { $state.RunnerSha256 } else { '' }
-        $loader = Invoke-DemoBootstrapLoaderRun -Config $Config -VmName $VmName -BundleSha256 $state.BundleSha256 -ChunkCount $state.BundleChunkCount -Settings $settings -RunnerSha256 $runnerSha -RunnerChunkCount $(if ($runnerSha) { $state.RunnerChunkCount } else { 0 })
+        $runLoader = { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName $VmName -BundleSha256 $state.BundleSha256 -ChunkCount $state.BundleChunkCount -Settings $settings -RunnerSha256 $runnerSha -RunnerChunkCount $(if ($runnerSha) { $state.RunnerChunkCount } else { 0 }) -StartTimeoutSeconds $loaderStartSeconds }
+        $loader = & $runLoader
+        if ($loader.status -ne 'Pass' -and [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
+            $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('its bootstrap loader didn''t start within {0} minutes' -f [int]($loaderStartSeconds / 60)) -ProgressPath $progress -ProgressId $progressId
+            $results.Add($watchdog.Result)
+            $loader = & $runLoader
+            if ($loader.status -ne 'Pass' -and [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
+                $activity = Get-DemoVmExtensionActivity -Config $Config -VmName $VmName
+                $results.Add((New-DemoVmStuckResult -VmName $VmName -What 'The bootstrap loader' -Item $activity.Labels -Minutes ([int](2 * $loaderStartSeconds / 60)) -Restarted $watchdog.Restarted))
+            }
+        }
         $results.Add($loader)
         return ($loader.status -eq 'Pass')
+    }
+    # Waits for a VM's extensions to settle before its next Run Command, once per step (Invoke-DemoVmSettle).
+    $settle = {
+        param([string] $VmName, [string] $ProgressId)
+        $key = '{0}/{1}' -f $VmName, $ProgressId
+        if ($shared['Settled'].Contains($key)) {
+            return $true
+        }
+        $wait = Invoke-DemoVmSettle -Config $Config -VmName $VmName -ProgressPath $progress -ProgressId $ProgressId -FirstMinutes $settleMinutes -AfterRestartMinutes $settleAfterMinutes -PollSeconds $settlePoll
+        & $addAll @($wait.Results)
+        if ($wait.Settled) {
+            $null = $shared['Settled'].Add($key)
+        }
+        return [bool]$wait.Settled
     }
     $telemetry = {
         param([string[]] $Targets)
@@ -650,6 +734,16 @@ function Invoke-DemoDeploymentTrack {
             $shared['Group'] = $group
         }
         return $group
+    }
+
+    # One part of a step the status page shows on its own (Phase 28): Done with its worst ADR 0012 status, and the first
+    # result that isn't a Pass as its message.
+    $partDone = {
+        param([string[]] $Ids, [object[]] $Items)
+        $worst = Get-DemoWorstStatus -Status @($Items | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.status })
+        $partState = if ($worst) { ConvertTo-DemoProgressState -Status $worst } else { 'Done' }
+        $firstOpen = @($Items | Where-Object { $null -ne $_ -and [string]$_.status -notin 'Pass', 'Not selected' } | Select-Object -First 1)
+        Set-DemoProgressStep -Path $progress -Id $Ids -State $partState -Status $worst -Message $(if ($firstOpen.Count -gt 0) { [string]$firstOpen[0].message } else { '' })
     }
 
     # Before the template finished: only what can't collide with it (ADR 0018).
@@ -700,6 +794,13 @@ function Invoke-DemoDeploymentTrack {
         }
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         Write-DemoLog -Message ('Track {0}: {1}.' -f $Track, $name)
+        # The status page (Phase 28): the step runs; T2's T2 step and the Fabric step report their own parts.
+        $stepIds = @(Get-DemoProgressStepId -Track $Track -Step $name)
+        $ownProgress = ('{0}/{1}' -f $Track, $name) -in 'T2/T2', 'Fabric/Fabric'
+        $resultsBefore = $results.Count
+        if (-not $ownProgress -and $stepIds.Count -gt 0) {
+            Set-DemoProgressStep -Path $progress -Id $stepIds -State 'Running' -Message ''
+        }
         $outcome = 'Pass'
         try {
             switch ('{0}/{1}' -f $Track, $name) {
@@ -914,13 +1015,50 @@ function Invoke-DemoDeploymentTrack {
                 'T2/T2' {
                     $source = [string](& $option 'T2Source' '')
                     $golden = $source -in 'golden', 'existing-golden'
+                    $waiting = -not $golden -and [bool](& $option 'WaitForT2' $false)
+                    $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
                     $arcArguments = @{ Config = $Config; WaitMinutes = [int](& $option 'ArcWaitMinutes' 45); Confirm = $false }
                     if ($golden) {
                         $arcArguments['Force'] = $true
                     }
-                    else {
-                        $arcArguments['WaitForHostMinutes'] = if ([bool](& $option 'WaitForT2' $false)) { [int](& $option 'T2WaitMinutes' 120) } else { 0 }
+                    elseif ($waiting) {
+                        # Phase 28: wait for the build (bounded by T2WaitMinutes) with progress, then, in PaygWizard mode, the
+                        # guided stop; then configure-arc's sequence waits for the host to finish after setup.
+                        $t2Deadline = [DateTime]::UtcNow.AddMinutes([int](& $option 'T2WaitMinutes' 180))
+                        $build = Wait-DemoT2HostBuild -Config $Config -DeadlineUtc $t2Deadline -ProgressPath $progress -PollSeconds ([int](& $option 'HostPollSeconds' 300)) -StartedUtc $firstStepUtc
+                        if ($build.Failed) {
+                            Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Failed' -Status 'Fail' -Message ([string](Get-DemoMemberValue -InputObject $build.Health -Name 'message'))
+                            & $note 'DEPLOY.T2.HOST' 'T2' 'Fail' ('archost01 failed at step {0}: {1}' -f [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep'), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'message')) 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full) and C:\ProgramData\DbHubDemo\logs on it, fix the cause, then run ./scripts/deploy.ps1 again.'
+                            $outcome = 'Fail'
+                            break
+                        }
+                        if ($build.TimedOut) {
+                            Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Action needed' -Status 'Manual action required' -Message 'The build didn''t finish within the wait.'
+                            & $note 'DEPLOY.T2.WAIT' 'T2' 'Manual action required' ('archost01''s guest build didn''t finish within {0} minutes (it reports step {1}); it goes on in the background.' -f [int](& $option 'T2WaitMinutes' 180), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep')) 'Run ./scripts/deploy.ps1 again (or ./scripts/deploy.ps1 -FromStage T2): it waits for T2 again and continues. A slow first build is in docs/troubleshooting.md.'
+                            $outcome = 'Open'
+                            break
+                        }
+                        Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Done' -Status 'Pass' -Message 'The host and its guest are built.'
+                        if ($installMode -eq 'PaygWizard') {
+                            $guided = Invoke-DemoT2GuidedStop -Config $Config -Context $Context -Health $build.Health -DeadlineUtc $t2Deadline
+                            & $addAll @($guided.Results)
+                            if ($guided.Status -eq 'Failed') {
+                                $outcome = 'Fail'
+                                break
+                            }
+                            if ($guided.Status -eq 'TimedOut') {
+                                $outcome = 'Open'
+                                break
+                            }
+                        }
+                        $left = [int][System.Math]::Max(30, ($t2Deadline - [DateTime]::UtcNow).TotalMinutes)
+                        $arcArguments['WaitForHostMinutes'] = [System.Math]::Min(360, $left)
+                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Running' -Message 'archost01 removes the sign-in data setup and Arc onboarding leave, then configures and seeds the database.'
                     }
+                    else {
+                        $arcArguments['WaitForHostMinutes'] = 0
+                    }
+                    Set-DemoProgressStep -Path $progress -Id 'T2.Monitoring' -State 'Running' -Message 'Arc onboarding, the Azure extension for SQL Server, PAYG, and monitoring.'
                     $plainKey = [string]$env:DBHUB_SQL_PRODUCT_KEY
                     $secureKey = $null
                     if ($plainKey) {
@@ -943,6 +1081,10 @@ function Invoke-DemoDeploymentTrack {
                         }
                     }
                     & $addAll $arc
+                    $onboarding = @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.ONBOARDING', 'T2.ARC.CONNECTED' })
+                    if ($onboarding.Count -gt 0) {
+                        & $partDone 'T2.ArcOnboarding' $onboarding
+                    }
                     if (& $hasStatus $arc 'Fail') {
                         $outcome = 'Fail'
                         break
@@ -950,13 +1092,19 @@ function Invoke-DemoDeploymentTrack {
                     $connected = @($arc | Where-Object { [string]$_.checkId -eq 'T2.ARC.CONNECTED' -and $_.status -eq 'Pass' }).Count -gt 0
                     if ((& $hasStatus $arc 'Manual action required') -or -not $connected) {
                         if (-not $golden -and -not [bool](& $option 'WaitForT2' $false)) {
-                            & $note 'DEPLOY.T2.BACKGROUND' 'T2' 'Manual action required' 'archost01 builds its guest in the background (the build takes a while, and PaygWizard mode then waits for the setup-wizard step); T1, T3, and Fabric didn''t wait for it.' 'Follow it with ./scripts/status.ps1; when the host waits for onboarding (or after the wizard step), run ./scripts/deploy.ps1 -FromStage T2. deploy.ps1 -WaitForT2 waits instead.'
+                            & $note 'DEPLOY.T2.BACKGROUND' 'T2' 'Manual action required' 'archost01 builds its guest in the background (-NoWaitForT2, or a run in CI); T1, T3, T4, and Fabric didn''t wait for it.' 'Run ./scripts/deploy.ps1 again in about an hour, without -NoWaitForT2: it waits for T2, guides you through its one step in PaygWizard mode, and finishes it. ./scripts/status.ps1 shows where the host is.'
+                            Set-DemoProgressStep -Path $progress -Id 'T2.Monitoring' -State 'Skipped' -Message 'T2 builds in the background; a later ./scripts/deploy.ps1 finishes it.'
                             $outcome = 'Background'
                         }
                         else {
+                            Set-DemoProgressStep -Path $progress -Id 'T2.Monitoring' -State 'Action needed' -Status 'Manual action required' -Message ((@($arc | Where-Object { [string]$_.status -eq 'Manual action required' } | Select-Object -First 1 | ForEach-Object { [string]$_.message })) -join '')
                             $outcome = 'Open'
                         }
                         break
+                    }
+                    & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION' })
+                    if (-not $golden) {
+                        Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Done' -Message 'Done: no sign-in data is left in the guest or on the host.'
                     }
                     $current = Get-DemoDeploymentState -Config $Config
                     $skip = if (-not $current.RunnerSha256 -or 'archost01' -notin $current.RunnerSentTo) { 'T2 has no workload runner (-SkipRunner, or it wasn''t sent to archost01).' } else { '' }
@@ -995,6 +1143,11 @@ function Invoke-DemoDeploymentTrack {
                     }
                 }
                 'T4/Telemetry' {
+                    if (-not (Test-DemoT4Enabled -Config $Config)) {
+                        # Phase 28's Burstable fallback left T4 out of this deployment (DEPLOY.T4.SKU says why).
+                        & $note 'METRICS.T4' 'T4' 'Not selected' 'T4 isn''t deployed in this run (DEPLOY.T4.SKU says why), so it has no metrics.'
+                        break
+                    }
                     $current = Get-DemoT4State -Config $Config
                     $metrics = Test-DemoT4MetricFlow -Config $Config -ServerId $current.Names.ServerId -State $current.State -WaitMinutes ([int](& $option 'TelemetryWaitMinutes' 15))
                     $results.Add($metrics)
@@ -1008,14 +1161,24 @@ function Invoke-DemoDeploymentTrack {
                 'Fabric/Fabric' {
                     $import = [bool](& $option 'ImportNotebooks' $false) -or [bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')
                     $fabricConfigPath = [string](& $option 'ConfigPath' '')
+                    Set-DemoProgressStep -Path $progress -Id 'Fabric.Items' -State 'Running' -Message ''
                     $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks)
                     & $addAll $fabric
+                    & $partDone 'Fabric.Items' $fabric
                     # The history semantic model and report (Phase 19), then the Fabric app when Phase 19b's script exists.
+                    Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message ''
                     $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $fabricConfigPath)
                     & $addAll $powerBI
+                    & $partDone 'Fabric.Report' $powerBI
+                    # The Insights app is optional and never stops the track or blocks DONE (brief item 15): its results stay
+                    # in the report, and the DONE banner says how to add it later.
+                    Set-DemoProgressStep -Path $progress -Id 'Fabric.App' -State 'Running' -Message 'Optional.'
                     $fabricApp = @(Invoke-DemoFabricAppStage -Config $Config -ConfigPath $fabricConfigPath)
                     & $addAll $fabricApp
-                    if (& $hasStatus @($fabric + $powerBI + $fabricApp) 'Fail') {
+                    $appStatus = Get-DemoWorstStatus -Status @($fabricApp | ForEach-Object { [string]$_.status })
+                    $appState = if ($appStatus -in 'Fail', 'Manual action required') { 'Skipped' } else { ConvertTo-DemoProgressState -Status $appStatus }
+                    Set-DemoProgressStep -Path $progress -Id 'Fabric.App' -State $appState -Status $appStatus -Message $(if ($appState -eq 'Skipped') { 'Optional, not added: a Fabric administrator turns on Fabric Apps (preview) and Dataset Execute Queries REST API, then you run ./scripts/configure-fabric-app.ps1 -SignIn (a browser sign-in only you can do).' } else { 'Optional.' })
+                    if (& $hasStatus @($fabric + $powerBI) 'Fail') {
                         $outcome = 'Fail'
                     }
                 }
@@ -1029,6 +1192,28 @@ function Invoke-DemoDeploymentTrack {
             $outcome = 'Fail'
         }
         $timing[$name] = [int]$watch.Elapsed.TotalSeconds
+        if (-not $ownProgress -and $stepIds.Count -gt 0) {
+            $stepResults = @($results | Select-Object -Skip $resultsBefore)
+            $worst = Get-DemoWorstStatus -Status @($stepResults | ForEach-Object { [string]$_.status })
+            $stepState = switch ($outcome) { 'Pass' { 'Done' } 'Background' { 'Skipped' } 'Open' { 'Action needed' } default { 'Failed' } }
+            $first = @($stepResults | Where-Object { [string]$_.status -notin 'Pass', 'Not selected' } | Select-Object -First 1)
+            $stepMessage = if ($first.Count -gt 0) { [string]$first[0].message } else { 'Done in {0}.' -f (Format-DemoProgressDuration -Seconds ([long]$timing[$name])) }
+            Set-DemoProgressStep -Path $progress -Id $stepIds -State $stepState -Status $worst -Message $stepMessage
+        }
+        elseif ($ownProgress -and $outcome -eq 'Fail') {
+            # A step that reports its own parts ended in an exception: the part still running shows it.
+            Update-DemoProgress -Path $progress -Data @{ Ids = $stepIds } -Action {
+                param($Model, $Change)
+                foreach ($id in $Change['Ids']) {
+                    $item = Find-DemoProgressStep -Model $Model -Id $id
+                    if ($null -ne $item -and [string]$item['state'] -eq 'Running') {
+                        $item['state'] = 'Failed'
+                        $item['status'] = 'Fail'
+                        $item['endedAt'] = Get-DemoUnixTime
+                    }
+                }
+            }
+        }
         if ($outcome -ne 'Pass') {
             $status = $outcome
             break

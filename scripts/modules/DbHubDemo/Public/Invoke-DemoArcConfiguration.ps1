@@ -19,8 +19,9 @@ function Invoke-DemoArcConfiguration {
        duplicates.
     5. Once the host is past onboarding (or with -Force), converges the Azure extension for SQL Server, its
        license type, the sqlServerInstances resource, and monitoring (Set-DemoArcSqlConfiguration). In
-       PaygWizard mode the SQL checks report Manual action required until the setup-wizard step is done; run
-       configure-arc.ps1 again afterward.
+       PaygWizard mode, while the host's step is ArcOnboardingBeforeWizard, GuidedSetup, or SqlSetupWizard, that
+       waits (T2.ARC.CONFIGURATION Manual action required) until the host's setup check passes, so a wrong install
+       never gets pay-as-you-go (Phase 28); deploy.ps1's guided stop then runs this sequence again.
     6. Reports T2.ARC.CONNECTED, T2.ARC.NODUPLICATES, and T2.ARC.DISCONNECTEDDAYS (Get-DemoArcCheck).
     Every step is re-runnable. Under -WhatIf only the guard runs. In the evaluation-only mode, once the VM's
     Azure guest agent is disabled (the procedure's last step), Run Command can't read its health; a Connected
@@ -172,6 +173,11 @@ function Invoke-DemoArcConfiguration {
     }
     if ($SkipConfiguration) {
         $results.Add((New-DemoArcResult -CheckId 'T2.ARC.CONFIGURATION' -Target $target -Status 'Not selected' -Message '-SkipConfiguration: the Azure extension for SQL Server, its license type, and monitoring were left alone.' -DocUrl $target.Setting.DocUrls['configuration']))
+    }
+    elseif ($target.InstallMode -eq 'PaygWizard' -and -not $target.EvaluationOnly -and $hostState -ne 'Ready' -and [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep') -in 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard') {
+        # Phase 28: no license type or monitoring before the host's setup check passed, so a wrong install (Evaluation,
+        # Developer, a named instance) never gets pay-as-you-go.
+        $results.Add((New-DemoArcResult -CheckId 'T2.ARC.CONFIGURATION' -Target $target -Status 'Manual action required' -Message ('{0} waits for the SQL Server setup step in {1} (host step {2}), so the Azure extension for SQL Server, its license type, and monitoring wait until the host''s setup check passes.' -f $target.HostVmName, $target.MachineName, [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep')) -Remediation 'Run ./scripts/deploy.ps1: it opens Bastion, guides you through the pre-filled setup (pay-as-you-go, Standard), and continues on its own.' -DocUrl $target.Setting.DocUrls['configuration']))
     }
     else {
         foreach ($item in @(Set-DemoArcSqlConfiguration -Config $Config -WaitMinutes $WaitMinutes -Confirm:$false)) {

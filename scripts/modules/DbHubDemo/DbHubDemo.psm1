@@ -23,6 +23,9 @@ $script:AzCommandsWithoutSubscription = @('bicep', 'version', 'extension', 'conf
 $script:DemoAzContext = $null
 $script:DemoAzGuardActive = $false
 
+# Phase 28: the VMs deploy.ps1's watchdog restarted in this process (Restart-DemoVmOnce restarts each at most once).
+$script:DemoVmRestarted = @{}
+
 # Azure CLI verbs that only read. Any other command (and every token request) needs the validated context.
 $script:AzReadOnlyVerbs = @('show', 'list', 'exists', 'get-instance-view', 'list-skus', 'list-usage', 'list-usages', 'list-versions', 'show-deleted', 'list-locations', 'version')
 

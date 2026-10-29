@@ -101,7 +101,17 @@ Describe 'Invoke-DemoPreflight' {
         $refused = { param([string] $Sku, [string] $Zone) ConvertTo-Json -Depth 20 -InputObject @{ name = 'pgflex01'; properties = @{ provisioningState = 'Failed'; timestamp = '2026-10-26T14:11:42Z'; parameters = @{ sizing = @{ value = @{ skuName = $Sku; tier = 'Burstable' } }; availabilityZone = @{ value = $Zone } }; error = @{ code = 'DeploymentFailed'; details = @(@{ code = 'ResourceDeploymentFailure'; details = $null }) } } } }
         $script:pgOperationsJson = ConvertTo-Json -Depth 20 -InputObject @(@{ properties = @{ provisioningState = 'Failed'; targetResource = @{ resourceType = 'Microsoft.DBforPostgreSQL/flexibleServers' }; statusMessage = @{ status = 'Failed'; error = @{ code = 'SkuNotAvailable'; message = 'Specified SKU is not supported in this region. Please choose a different SKU.' } } } })
         $script:pgDeploymentJson = & $refused 'Standard_B1ms' ''
+        # Phase 28: the default size falls back on its own, so a refusal on record starts the run one size on (a Warning).
         $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Match 'starts with Standard_B2s, the same Burstable class'
+        $check.evidence.startSku | Should -Be 'Standard_B2s'
+
+        # A size the configuration sets never changes on its own: that refusal is still a Fail.
+        $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
+        $pinned['t4SkuName'] = 'Standard_B1ms'
+        $check = Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
         $check.status | Should -Be 'Fail'
         $check.remediation | Should -Match 'Set t4SkuName to Standard_B2s, the documented fallback'
 
@@ -160,6 +170,57 @@ Describe 'Invoke-DemoPreflight' {
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $off[$key] = $config[$key] }
         $off['t4Enabled'] = $false
         (Invoke-DemoPreflight -Config $off -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').status | Should -Be 'Not selected'
+    }
+
+    It 'reads T4''s sizes with az postgres flexible-server list-skus first, and starts the Burstable fallback early when the default isn''t listed (Phase 28)' {
+        Set-HappyAzMock
+        $script:listSkus = { param([string[]] $Burstable) ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @($Burstable | ForEach-Object { @{ name = $_ } }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '17' }, @{ name = '18' }) }) }
+        $script:listSkusJson = & $script:listSkus @('Standard_B1ms', 'Standard_B2s')
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:listSkusJson; StdErr = '' } }
+        $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $check.status | Should -Be 'Pass'
+        $check.evidence.source | Should -Be 'az postgres flexible-server list-skus'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match 'locations/westus3/capabilities' }
+
+        $script:listSkusJson = & $script:listSkus @('Standard_B2s')
+        $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $check.status | Should -Be 'Warning'
+        $check.evidence.startSku | Should -Be 'Standard_B2s'
+        $check.message | Should -Match 'starts with Standard_B2s'
+
+        $script:listSkusJson = & $script:listSkus @()
+        $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $check.status | Should -Be 'Warning'
+        $check.evidence.startSku | Should -Be 'None'
+        $check.remediation | Should -Match 'Standard_D2ds_v5'
+
+        # A size the configuration sets that the region doesn't list is a Fail before anything is created.
+        $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
+        $pinned['t4SkuName'] = 'Standard_B1ms'
+        $script:listSkusJson = & $script:listSkus @('Standard_B2s')
+        (Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').status | Should -Be 'Fail'
+    }
+
+    It 'leaves the policy inventory to deploy.ps1 with networkMode public or private, and keeps it with auto (Phase 28)' {
+        Set-HappyAzMock
+        $public = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $public[$key] = $config[$key] }
+        $public['networkMode'] = 'public'
+        $results = Invoke-DemoPreflight -Config $public -SkipWhatIf -DeferPolicyInventory
+        $inventory = $results | Where-Object checkId -eq 'PREFLIGHT.POLICY.INVENTORY'
+        $inventory.status | Should -Be 'Not selected'
+        $inventory.message | Should -Match 'Deferred'
+        $inventory.evidence.deferred | Should -BeTrue
+        $sqlPublic = $results | Where-Object checkId -eq 'PREFLIGHT.POLICY.SQLPUBLIC'
+        $sqlPublic.status | Should -Be 'Not selected'
+        $sqlPublic.evidence.effectiveNetworkMode | Should -Be 'public'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match 'policyAssignments' }
+
+        # networkMode auto needs the inventory, so it isn't deferred.
+        $auto = Invoke-DemoPreflight -Config $config -SkipWhatIf -DeferPolicyInventory
+        ($auto | Where-Object checkId -eq 'PREFLIGHT.POLICY.INVENTORY').status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match 'policyAssignments' }
     }
 
     It 'passes every automated check in a ready subscription' {

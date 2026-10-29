@@ -78,7 +78,9 @@ function Invoke-DemoDeployment {
     How long to wait for T1's bootstrap to be Ready.
 
     .PARAMETER T2WaitMinutes
-    How long the T2 stage waits for the host to reach the Arc onboarding step (0: don't wait).
+    How long the T2 stage waits for the host to reach the Arc onboarding step (0: don't wait). With -Parallel and
+    -WaitForT2: how long the T2 track waits for the guest build and, in PaygWizard mode, the guided stop (Phase 28;
+    deploy.ps1's default is 180).
 
     .PARAMETER MonitoringWaitMinutes
     How long to wait for T1's monitoring plugin, including a SQL IaaS extension that's Updating.
@@ -103,6 +105,16 @@ function Invoke-DemoDeployment {
 
     .PARAMETER ArcWaitMinutes
     With -Parallel: how long configure-arc's sequence waits for the extension and the SQL Server instance.
+
+    .PARAMETER AutoResume
+    With -Parallel: continue an unfinished deployment (the state's last stage is set and isn't Validation), as -Resume
+    does, when neither -Resume nor -FromStage is given (Phase 28; deploy.ps1 passes it, except in GitHub Actions).
+
+    .PARAMETER ProgressPath
+    With -Parallel: the progress model behind the live status page (Phase 28), which every stage and track updates.
+
+    .PARAMETER PagePath
+    With -Parallel: the status page, named in the guided stop's prompt.
 
     .EXAMPLE
     Invoke-DemoDeployment -Config $config -Resume
@@ -138,7 +150,7 @@ function Invoke-DemoDeployment {
         [int] $T1WaitMinutes = 45,
 
         [ValidateRange(0, 360)]
-        [int] $T2WaitMinutes = 120,
+        [int] $T2WaitMinutes = 180,
 
         [ValidateRange(0, 60)]
         [int] $MonitoringWaitMinutes = 20,
@@ -157,7 +169,13 @@ function Invoke-DemoDeployment {
         [int] $ChunkParallelism = 8,
 
         [ValidateRange(5, 120)]
-        [int] $ArcWaitMinutes = 45
+        [int] $ArcWaitMinutes = 45,
+
+        [switch] $AutoResume,
+
+        [string] $ProgressPath = '',
+
+        [string] $PagePath = ''
     )
 
     if ($Parallel) {
@@ -180,6 +198,9 @@ function Invoke-DemoDeployment {
             ChunkParallelism      = $ChunkParallelism
             WaitForT2             = $WaitForT2
             ArcWaitMinutes        = $ArcWaitMinutes
+            AutoResume            = $AutoResume
+            ProgressPath          = $ProgressPath
+            PagePath              = $PagePath
         }
         return (Invoke-DemoParallelDeployment @parallelArguments)
     }

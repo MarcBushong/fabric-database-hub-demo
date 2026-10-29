@@ -7,8 +7,8 @@ function Set-DemoDeploymentState {
     Merges the given values into the group's tags with 'az tag update --operation Merge', which Contributor
     can do, so other tags stay. Keys are the property names of Get-DemoDeploymentState: Stage, BundleSha256,
     BundleChunkCount, RunnerSha256, RunnerChunkCount, BundleSentTo, RunnerSentTo (arrays become a comma list),
-    NetworkMode, T3UseFreeLimit, T3AdminGroupName, BastionExpiresUtc, HostPasswordSet, and FabricCapacityResumed and
-    FabricCapacityResumedUtc (fabric.manageCapacity, Phase 26b). A Stage value also
+    NetworkMode, T3UseFreeLimit, T3AdminGroupName, BastionExpiresUtc, HostPasswordSet, FabricCapacityResumed and
+    FabricCapacityResumedUtc (fabric.manageCapacity, Phase 26b), and GuidedStopUtc and T4Sku (Phase 28). A Stage value also
     sets StageUtc. A value that the Azure CLI can't carry safely on Windows (a double quote or a percent sign)
     is left out with a warning. The template keeps these tags on every redeployment, because deploy.ps1 passes
     the group's existing tags (ADR 0002).

@@ -56,6 +56,11 @@ function Invoke-DemoPreflight {
     (Get-DemoPolicyConstraint -CacheHours). The assignments are listed every time; the reused results say
     so. 0 (the default) always reads every definition and saves nothing.
 
+    .PARAMETER DeferPolicyInventory
+    With networkMode public or private, leave the policy inventory to the caller (deploy.ps1 runs it alongside the
+    template, Phase 28): PREFLIGHT.POLICY.INVENTORY and PREFLIGHT.POLICY.SQLPUBLIC are Not selected, with the
+    configured mode. Ignored with networkMode auto, which needs the inventory.
+
     .EXAMPLE
     Invoke-DemoPreflight -Config (Get-DemoConfig -Path ./config/demo.config.json)
     #>
@@ -72,7 +77,9 @@ function Invoke-DemoPreflight {
         [switch] $SkipPolicyInventory,
 
         [ValidateRange(0, 720)]
-        [int] $PolicyCacheHours = 0
+        [int] $PolicyCacheHours = 0,
+
+        [switch] $DeferPolicyInventory
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -251,41 +258,76 @@ function Invoke-DemoPreflight {
     }
 
     # T4 (Phase 24, ADR 0019): the region offers the configured size in its tier's edition (Burstable, or General
-    # Purpose for the documented D2ds_v5 option) and the pinned PostgreSQL major version, read from the documented
-    # Location Based Capabilities API.
+    # Purpose for the documented D2ds_v5 option) and the pinned PostgreSQL major version, read with
+    # 'az postgres flexible-server list-skus' (Phase 28, brief item 10), or the documented Location Based Capabilities API
+    # when the Azure CLI can't answer. When the configuration doesn't set t4SkuName, the Burstable fallback (B1ms, then
+    # B2s, then no T4) applies, so a missing B1ms isn't a Fail: the evidence's startSku tells deploy.ps1 where to start.
     if (Test-DemoT4Enabled -Config $Config) {
         $postgres = Get-DemoPostgresSetting
         $t4Sku = Get-DemoT4SkuName -Config $Config
         $t4Tier = (Get-DemoT4SkuSpec -SkuName $t4Sku).Tier
-        $capabilityUrl = 'https://management.azure.com/subscriptions/{0}/providers/Microsoft.DBforPostgreSQL/locations/{1}/capabilities?api-version={2}' -f $subscriptionId, $location, $postgres['capabilitiesApiVersion']
-        $capabilities = Invoke-Az -Arguments @('rest', '--method', 'get', '--url', $capabilityUrl, '--output', 'json') -Json -AllowFailure
-        # Get-DemoMemberList returns its list as one object: assign it before piping.
-        $capabilityItems = Get-DemoMemberList -InputObject $capabilities -Name 'value'
+        $t4Explicit = $Config.Contains('t4SkuName') -and -not [string]::IsNullOrWhiteSpace([string]$Config['t4SkuName'])
+        $capabilitySource = 'az postgres flexible-server list-skus'
+        $listed = @(Invoke-Az -Arguments @('postgres', 'flexible-server', 'list-skus', '--location', $location, '--output', 'json') -Json -AllowFailure | Where-Object { $null -ne $_ })
+        $capabilityItems = if ($listed.Count -eq 1 -and $null -ne (Get-DemoMemberValue -InputObject $listed[0] -Name 'value')) { Get-DemoMemberList -InputObject $listed[0] -Name 'value' } else { $listed }
+        # Only an answer in the shape this check reads counts (the capability's supportedServerEditions); anything else
+        # falls back to the REST API at the version config/versions.json pins.
+        $capabilityItems = @($capabilityItems | Where-Object { $null -ne (Get-DemoMemberValue -InputObject $_ -Name 'supportedServerEditions') })
+        if (@($capabilityItems).Count -eq 0) {
+            $capabilitySource = 'Location Based Capabilities'
+            $capabilityUrl = 'https://management.azure.com/subscriptions/{0}/providers/Microsoft.DBforPostgreSQL/locations/{1}/capabilities?api-version={2}' -f $subscriptionId, $location, $postgres['capabilitiesApiVersion']
+            $capabilities = Invoke-Az -Arguments @('rest', '--method', 'get', '--url', $capabilityUrl, '--output', 'json') -Json -AllowFailure
+            # Get-DemoMemberList returns its list as one object: assign it before piping.
+            $capabilityItems = Get-DemoMemberList -InputObject $capabilities -Name 'value'
+        }
         $capability = $capabilityItems | Select-Object -First 1
         $editions = Get-DemoMemberList -InputObject $capability -Name 'supportedServerEditions'
-        $edition = $editions | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') -eq $t4Tier } | Select-Object -First 1
-        $skuItems = Get-DemoMemberList -InputObject $edition -Name 'supportedServerSkus'
-        $skus = @($skuItems | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') })
+        $skusOf = {
+            param([string] $Tier)
+            $edition = $editions | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') -eq $Tier } | Select-Object -First 1
+            $skuItems = Get-DemoMemberList -InputObject $edition -Name 'supportedServerSkus'
+            @($skuItems | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') })
+        }
+        $skus = @(& $skusOf $t4Tier)
         $versionItems = Get-DemoMemberList -InputObject $capability -Name 'supportedServerVersions'
         $versions = @($versionItems | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') })
-        $t4Evidence = @{ sku = $t4Sku; tier = $t4Tier; majorVersion = [string]$postgres['majorVersion']; editionSkus = $skus; versions = $versions }
+        $t4Evidence = @{ sku = $t4Sku; tier = $t4Tier; majorVersion = [string]$postgres['majorVersion']; editionSkus = $skus; versions = $versions; source = $capabilitySource; explicit = $t4Explicit; startSku = '' }
+        $capabilityDoc = 'https://learn.microsoft.com/cli/azure/postgres/flexible-server#az-postgres-flexible-server-list-skus'
+        $versionOffered = [string]$postgres['majorVersion'] -in $versions
         if ($null -eq $capability) {
-            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('The PostgreSQL flexible server capabilities of {0} couldn''t be read, so T4''s size and version weren''t checked.' -f $location) -Evidence $t4Evidence -Remediation 'Run preflight again once Microsoft.DBforPostgreSQL is registered.' -DocUrl 'https://learn.microsoft.com/rest/api/postgresql/flexibleserver/location-based-capabilities/execute'
+            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('The PostgreSQL flexible server sizes of {0} couldn''t be read, so T4''s size and version weren''t checked.' -f $location) -Evidence $t4Evidence -Remediation 'Run preflight again once Microsoft.DBforPostgreSQL is registered.' -DocUrl $capabilityDoc
         }
-        elseif ($t4Sku -in $skus -and [string]$postgres['majorVersion'] -in $versions) {
-            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Pass' ('{0} offers T4''s {1} {2} and PostgreSQL {3}.' -f $location, $t4Tier, $t4Sku, $postgres['majorVersion']) -Evidence $t4Evidence -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute'
+        elseif ($t4Sku -in $skus -and $versionOffered) {
+            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Pass' ('{0} offers T4''s {1} {2} and PostgreSQL {3} ({4}).' -f $location, $t4Tier, $t4Sku, $postgres['majorVersion'], $capabilitySource) -Evidence $t4Evidence -DocUrl $capabilityDoc
+        }
+        elseif (-not $t4Explicit -and $versionOffered -and $t4Sku -eq 'Standard_B1ms' -and 'Standard_B2s' -in $skus) {
+            $t4Evidence['startSku'] = 'Standard_B2s'
+            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} doesn''t list T4''s default Standard_B1ms, so deploy.ps1 starts with Standard_B2s, the same Burstable class (Phase 28''s fallback; estimate-cost.ps1 prices it).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $capabilityDoc
+        }
+        elseif (-not $t4Explicit -and $versionOffered -and $t4Sku -like 'Standard_B*') {
+            $t4Evidence['startSku'] = 'None'
+            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists neither of T4''s Burstable sizes (Standard_B1ms, Standard_B2s), so deploy.ps1 finishes without T4, and DONE says so. Nothing larger is chosen for you.' -f $location) -Evidence $t4Evidence -Remediation 'To add T4, set "t4SkuName": "Standard_D2ds_v5" (General Purpose; estimate-cost.ps1 prices it), or set t4Enabled to false to leave it out on purpose.' -DocUrl $capabilityDoc
         }
         else {
             Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Fail' ('{0} doesn''t offer T4''s {1} {2} with PostgreSQL {3}.' -f $location, $t4Tier, $t4Sku, $postgres['majorVersion']) -Evidence $t4Evidence -Remediation 'Pick a region that offers it, or set t4Enabled to false (Phase 24, ADR 0019).' -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute'
         }
         # The capability list doesn't show a size that's temporarily unavailable: Azure refused B1ms with
         # SkuNotAvailable on 2026-10-26 while the list included it. A refusal on record for this size and zone is a
-        # Fail; a first try in another zone is a Warning. Nothing upsizes T4 on its own.
+        # Fail for a size the configuration sets; for the default, deploy.ps1's Burstable fallback starts one size on
+        # (Phase 28), which is a Warning.
         $refused = Get-DemoT4CreateFailure -Config $Config
         if ($null -ne $refused -and $refused.Sku -eq $t4Sku) {
             $t4Zone = Get-DemoT4AvailabilityZone -Config $Config
-            $skuStatus = if ($t4Zone -and $t4Zone -ne $refused.Zone) { 'Warning' } else { 'Fail' }
-            $results.Add((New-DemoT4SkuFailureResult -CheckId 'PREFLIGHT.T4.SKU' -Failure $refused -Status $skuStatus -NextZone $t4Zone))
+            $otherZone = $t4Zone -and $t4Zone -ne $refused.Zone
+            if (-not $otherZone -and -not $t4Explicit -and $t4Sku -in 'Standard_B1ms', 'Standard_B2s') {
+                $start = if ($t4Sku -eq 'Standard_B1ms') { 'Standard_B2s' } else { 'None' }
+                $t4Evidence['startSku'] = $start
+                $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $(if ($start -eq 'None') { 'finishes without T4 (nothing larger is chosen for you)' } else { 'starts with Standard_B2s, the same Burstable class' })) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName (Standard_D2ds_v5 is the documented General Purpose option).' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+            }
+            else {
+                $skuStatus = if ($otherZone) { 'Warning' } else { 'Fail' }
+                $results.Add((New-DemoT4SkuFailureResult -CheckId 'PREFLIGHT.T4.SKU' -Failure $refused -Status $skuStatus -NextZone $t4Zone))
+            }
         }
     }
     else {
@@ -374,10 +416,17 @@ function Invoke-DemoPreflight {
         }
     }
 
-    # Policy inventory: read-only; resolves networkMode auto and reports conflicts.
+    # Policy inventory: read-only; resolves networkMode auto and reports conflicts. Phase 28: with networkMode public or
+    # private it resolves nothing the template needs, so -DeferPolicyInventory leaves it to deploy.ps1, which runs it
+    # alongside the template; the what-if below still catches a policy that denies part of the deployment.
     $configuredNetworkMode = if ($Config['networkMode']) { [string]$Config['networkMode'] } else { 'auto' }
     $network = $null
-    if ($SkipPolicyInventory) {
+    if ($DeferPolicyInventory -and -not $SkipPolicyInventory -and $configuredNetworkMode -in 'public', 'private') {
+        $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredNetworkMode -PolicyUnknown
+        Add-Check 'PREFLIGHT.POLICY.INVENTORY' 'subscription' 'Not selected' ('Deferred: networkMode is {0}, so the policy inventory resolves nothing the template needs. deploy.ps1 runs it alongside the template and adds its results at the end; the what-if check below catches policy denials before anything is created.' -f $configuredNetworkMode) -Evidence @{ deferred = $true }
+        Add-Check 'PREFLIGHT.POLICY.SQLPUBLIC' 'subscription' 'Not selected' ('networkMode is {0}, as configured; the deferred policy inventory reports any conflict at the end of the run.' -f $configuredNetworkMode) -Evidence @{ configuredNetworkMode = $configuredNetworkMode; effectiveNetworkMode = $configuredNetworkMode; assumed = $false; policies = @(); deferred = $true }
+    }
+    elseif ($SkipPolicyInventory) {
         $network = Resolve-DemoNetworkMode -ConfiguredMode $configuredNetworkMode -PolicyUnknown
         $assumption = if ($network.Assumed) { ' (private works under any policy)' } else { '' }
         Add-Check 'PREFLIGHT.POLICY.INVENTORY' 'subscription' 'Not selected' 'The policy inventory was skipped (-SkipPolicyInventory). The what-if check still catches policy denials.'

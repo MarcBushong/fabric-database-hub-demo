@@ -1,9 +1,9 @@
 # ADR 0006: SQL Server editions, guest OS, and licensing
 
 - **Status:** Accepted
-- **Date:** 2026-10-19 (revised the same day for plan §9, Revision 2)
-- **Decision source:** User-directed (Q1a, Q1b, Q2a, Q2b, Q2c) and plan §9.2 (T2 install modes), §9.4 (C6)
-- **Related:** [ADR 0003](0003-t2-host-size-security-type-bootstrap.md), [ADR 0005](0005-arc-onboarding-authentication.md), [ADR 0015](0015-mirroring-deferral.md), [ADR 0016](0016-cost-profiles.md), [limitations](../limitations.md)
+- **Date:** 2026-10-19 (revised the same day for plan §9, Revision 2; amended 2026-10-29 for Phase 28: one command, one guided stop)
+- **Decision source:** User-directed (Q1a, Q1b, Q2a, Q2b, Q2c) and plan §9.2 (T2 install modes), §9.4 (C6); the owner's decision of 2026-10-29 for the guided stop (user-directed)
+- **Related:** [ADR 0003](0003-t2-host-size-security-type-bootstrap.md), [ADR 0005](0005-arc-onboarding-authentication.md), [ADR 0009](0009-secrets-handling.md), [ADR 0015](0015-mirroring-deferral.md), [ADR 0016](0016-cost-profiles.md), [ADR 0018](0018-fast-redeploy-parallel-tracks-golden-snapshot.md), [limitations](../limitations.md)
 
 ## Context
 
@@ -33,7 +33,7 @@
 
 | Mode | How | Manual steps | Hub Performance | Arc license type |
 |---|---|---|---|---|
-| `PaygWizard` (default, Q2b) | Guest build is automated; **one documented setup-wizard step** per guest build: "Use pay-as-you-go billing through Microsoft Azure", then Standard | One per guest build; automation resumes when it detects the instance | Yes | PAYG |
+| `PaygWizard` (default, Q2b) | Guest build is automated; **one documented setup-wizard step** per guest build: "Use pay-as-you-go billing through Microsoft Azure", then Standard. Since Phase 28, a guided stop in `deploy.ps1`'s run, with setup pre-filled ([amendment](#amendment-one-command-one-guided-stop-phase-28-2026-10-29)) | One per guest build; automation resumes when it detects the instance | Yes | PAYG |
 | `ProductKey` (prerequisite P10) | Unattended `/PID` install. The key is a secure input passed only in protected Run Command parameters and never stored (ADR 0009). | None | Yes | PAYG or Paid (Software Assurance), per the customer's entitlement, which they attest to |
 | `Developer` | Unattended Developer edition install | None | **No. Estate only.** | Not applicable |
 
@@ -61,7 +61,7 @@ Excluded from v1 (Q2c, ADR 0015).
 - **Positive:** every target can show Hub Performance in the default and `ProductKey` modes. Zero-touch options exist for customers who need them.
 - **Negative:**
   - SQL licenses bill while the VMs run (ADR 0016).
-  - The default mode keeps one manual step per guest build (plan risk R25).
+  - The default mode keeps one manual step per guest build (plan risk R25); since Phase 28 it's a guided stop of about 10 minutes in `deploy.ps1`'s run, and a golden snapshot (ADR 0018) still removes it from redeploys.
   - A T2 host left deallocated for more than 30 days breaks Arc PAYG. `status.ps1` warns at 21 and 28 days disconnected, and the expiry workflow can park or destroy T2 (C4).
 - **Risks accepted:** guest OS licensing in nested Hyper-V isn't documented (R21). The owner confirmed the evaluation approach.
 
@@ -119,6 +119,24 @@ Implemented and statically tested; live validation pending.
 - **The instance resource:** `arcsql01` shows Standard edition, license type PAYG, SQL Server 2022, and about 4 billable cores for the 2-vCPU guest, which matches the four-core minimum the estimate uses.
 - **The extension:** the wizard deployed `WindowsAgent.SqlServer` 1.1.3547.472 with an empty `LicenseType` setting; `configure-arc.ps1` set it to PAYG with the other settings kept. Provisioning took about 30 minutes because of intermittent download failures inside the guest (R72 in the implementation report).
 - **Monitoring:** turned on by `configure-arc.ps1`; Phase 9's validator saw T2 telemetry about 7 minutes later.
+
+## Amendment: one command, one guided stop (Phase 28, 2026-10-29)
+
+**The owner's decision (2026-10-29, verbatim):** "I want the build to run and not give a template that is reliant on me. This whole thing should be one click independent for anyone." And: "I need to have performance data and database agent findings. I also need it to be straightforward for the user to spin up and deploy."
+
+- **T2's default stays `PaygWizard`, as a guided wizard:** one command (`./scripts/deploy.ps1` after `az login`) with one prompted stop, after which the deploy finishes T2 by itself, with no second command ([deployment](../deployment.md#the-guided-stop-paygwizard), [ADR 0018](0018-fast-redeploy-parallel-tracks-golden-snapshot.md#amendments-2026-10-29-phase-28-one-command-one-guided-stop)).
+- **The opt-in modes stay as they are:** `ProductKey` is fully unattended with the user's own Standard key and license type PAYG or Paid; `Developer` is fully unattended, with T2 in Estate only and no T2 performance data or Database Agent findings, which the deploy's **DONE** banner says plainly.
+- **No shared golden image:** nothing depends on the owner's resources. A golden snapshot is per environment, captured by whoever deployed it (ADR 0018), so a first run anywhere builds T2 and has the guided stop.
+- **The facts behind it** (Microsoft Learn, checked 2026-10-29): pay-as-you-go without a product key is documented only in setup's wizard: from the command prompt, `/PID` is optional and installs Evaluation without it, and there's no parameter that selects pay-as-you-go ([install from the command prompt](https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-from-the-command-prompt)). Arc monitoring, which feeds Hub Performance, needs Standard or Enterprise with license type PAYG or Software Assurance ([Arc SQL monitoring](https://learn.microsoft.com/sql/sql-server/azure-arc/sql-monitoring)).
+
+**What's automated around the person's choice**, with documented mechanisms only:
+
+- **Setup pre-filled from a configuration file** ([install using a configuration file](https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-using-a-configuration-file); `ACTION="Install"` with `UIMODE="Normal"`, so every page shows with its values in place): the Database Engine and the Azure extension (`FEATURES=...,AZUREEXTENSION`), the default instance, the virtual service accounts, `BUILTIN\Administrators` as sysadmins, TCP, no product updates during setup, and the Azure extension's subscription, resource group, region, and tenant (`AZURESUBSCRIPTIONID`, `AZURERESOURCEGROUP`, `AZUREREGION`, `AZURETENANTID`). The file holds no secret: generating it refuses `PID`, any password, a service principal, and the license acceptance, so the person accepts the license terms in setup. What's left for the person: **Use pay-as-you-go billing through Microsoft Azure** and **Standard** on the **Edition** page, **Use Azure Login** on the **Azure Extension for SQL Server** page, and **Install**.
+- **The hops to that page:** a logon task in the guest opens the pre-filled setup, a logon task on the host opens [Virtual Machine Connection](https://learn.microsoft.com/windows-server/virtualization/hyper-v/virtual-machine-connection) to the guest at the operator's sign-in ([New-ScheduledTaskTrigger -AtLogOn](https://learn.microsoft.com/powershell/module/scheduledtasks/new-scheduledtasktrigger)), and the guest signs itself in once for the step ([ADR 0009](0009-secrets-handling.md#phase-28-amendment-the-guests-one-automatic-sign-in-and-the-portal-password-reset-2026-10-29)). Both tasks and the guest's setup folder are removed afterward.
+- **The check of the person's result**, before anything is onboarded or configured: the default instance `MSSQLSERVER` runs, the guest's Administrator is sysadmin, the edition is Standard, and setup's generated `ConfigurationFile.ini` in its [log folder](https://learn.microsoft.com/sql/database-engine/install-windows/view-and-read-sql-server-setup-log-files) lists `AZUREEXTENSION`. Pay-as-you-go itself can't be read in the guest before the extension reports it; with pay-as-you-go, setup's Edition page can't leave the extension out, so the feature is the readable sign, and `T2.ARC.SQLINSTANCE` then checks the license type in Azure. A wrong install isn't onboarded: Evaluation, Developer, or Express gets setup's documented [edition upgrade](https://learn.microsoft.com/sql/database-engine/install-windows/upgrade-downgrade-sql-server-edition-setup) to Standard, and Enterprise (a downgrade), a named instance, a missing sysadmin, or no Azure extension get the documented [uninstall](https://learn.microsoft.com/sql/sql-server/install/uninstall-an-existing-instance-of-sql-server-setup) and a new install; the deploy keeps waiting and checks again.
+- **Unchanged:** `GuestSignInCleanup` right after setup, Arc's PAYG and monitoring through `configure-arc.ps1`, and the `ProductKey` and `Developer` paths.
+
+Unit-tested (`tests/unit/Vm.GuidedSetup.Tests.ps1`, `tests/unit/Vm.HostPlan.Tests.ps1`); not yet run live. A live proof needs a person at the guided stop.
 
 ## Sources (checked 2026-10-19)
 

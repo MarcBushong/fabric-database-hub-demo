@@ -208,11 +208,15 @@ function Wait-DemoRunCommand {
         [System.Nullable[datetime]] $NotBeforeUtc = $null,
 
         [ValidateRange(0, 3600)]
-        [int] $StaleGraceSeconds = 120
+        [int] $StaleGraceSeconds = 120,
+
+        [ValidateRange(0, 7200)]
+        [int] $StartTimeoutSeconds = 0
     )
 
     $terminal = @('Succeeded', 'Failed', 'TimedOut', 'Canceled')
     $deadline = [System.DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $startDeadline = if ($StartTimeoutSeconds -gt 0) { [System.DateTime]::UtcNow.AddSeconds($StartTimeoutSeconds) } else { [System.DateTime]::MaxValue }
     # Counted in polls rather than wall-clock time, so the grace follows the poll interval.
     $staleLimit = [int][System.Math]::Ceiling($StaleGraceSeconds / [System.Math]::Max(1, $PollIntervalSeconds))
     $stalePolls = 0
@@ -225,15 +229,19 @@ function Wait-DemoRunCommand {
             if ($stalePolls -ge $staleLimit -or [System.DateTime]::UtcNow -ge $deadline) {
                 $state | Add-Member -NotePropertyName 'WaitTimedOut' -NotePropertyValue $false
                 $state | Add-Member -NotePropertyName 'Stale' -NotePropertyValue $true
+                $state | Add-Member -NotePropertyName 'NotStarted' -NotePropertyValue $false
                 return $state
             }
             $stalePolls++
             Start-Sleep -Seconds $PollIntervalSeconds
             continue
         }
-        if ($done -or $state.NotFound -or [System.DateTime]::UtcNow -ge $deadline) {
+        # Phase 28's watchdog: a script that hasn't started by -StartTimeoutSeconds waits behind the VM's extension work.
+        $notStarted = -not $done -and -not $state.NotFound -and [string]$state.ExecutionState -notin 'Running' -and [System.DateTime]::UtcNow -ge $startDeadline
+        if ($done -or $state.NotFound -or $notStarted -or [System.DateTime]::UtcNow -ge $deadline) {
             $state | Add-Member -NotePropertyName 'WaitTimedOut' -NotePropertyValue (-not $done -and -not $state.NotFound)
             $state | Add-Member -NotePropertyName 'Stale' -NotePropertyValue $false
+            $state | Add-Member -NotePropertyName 'NotStarted' -NotePropertyValue ([bool]$notStarted)
             return $state
         }
         Start-Sleep -Seconds $PollIntervalSeconds
@@ -245,7 +253,9 @@ function Remove-DemoRunCommand {
     .SYNOPSIS
     Deletes a managed Run Command and waits until it's gone, so a VM never holds more than one chunk Run
     Command (Azure allows 25 managed Run Commands per VM). Deleting also stops a script that's still
-    running. Internal; returns $true when the Run Command is gone.
+    running. With -NoWait it returns as soon as Azure accepted the delete (Phase 28: a delete that a busy
+    extension holds no longer stalls the next chunk). Internal; returns $true when the Run Command is gone, or
+    with -NoWait when Azure accepted the delete.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([bool])]
@@ -260,7 +270,9 @@ function Remove-DemoRunCommand {
         [int] $WaitSeconds = 180,
 
         [ValidateRange(0, 300)]
-        [int] $PollIntervalSeconds = 5
+        [int] $PollIntervalSeconds = 5,
+
+        [switch] $NoWait
     )
 
     if (-not $PSCmdlet.ShouldProcess($Url, 'Delete the Run Command')) {
@@ -270,6 +282,9 @@ function Remove-DemoRunCommand {
     if ($delete.ExitCode -ne 0 -and -not (Test-DemoAzNotFound -Text $delete.StdErr)) {
         Write-DemoLog -Level Warning -Message ('Deleting a Run Command failed: {0}' -f ([string]$delete.StdErr).Trim())
         return $false
+    }
+    if ($NoWait) {
+        return $true
     }
     $deadline = [System.DateTime]::UtcNow.AddSeconds($WaitSeconds)
     while ($true) {
@@ -285,7 +300,46 @@ function Remove-DemoRunCommand {
 }
 
 function Clear-DemoChunkRunCommand {
-    # Deletes every DbHubDemo-Chunk-* Run Command left on a VM, for example by an interrupted run. Internal.
+    # Deletes every DbHubDemo-Chunk-* Run Command left on a VM, for example by an interrupted run, without waiting for
+    # Azure to finish each delete. Returns the names it asked Azure to delete. Internal.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $BaseUrl,
+
+        [Parameter(Mandatory)]
+        [string] $ApiVersion
+    )
+
+    $names = Get-DemoChunkRunCommandName -SubscriptionId $SubscriptionId -BaseUrl $BaseUrl -ApiVersion $ApiVersion
+    if ($null -eq $names) {
+        Write-DemoLog -Level Warning -Message 'The Run Commands on the VM could not be listed, so leftover chunk Run Commands were not checked.'
+        return @()
+    }
+    $removed = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in @($names)) {
+        $url = '{0}/{1}?api-version={2}' -f $BaseUrl, $name, $ApiVersion
+        $result = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('rest', '--method', 'delete', '--url', $url) -AllowFailure
+        if ($result.ExitCode -eq 0 -or (Test-DemoAzNotFound -Text $result.StdErr)) {
+            $removed.Add($name)
+        }
+        else {
+            Write-DemoLog -Level Warning -Message ('The leftover Run Command {0} could not be deleted: {1}' -f $name, ([string]$result.StdErr).Trim())
+        }
+    }
+    if ($removed.Count -gt 0) {
+        Write-DemoLog -Message ('Deleted {0} leftover chunk Run Command(s): {1}.' -f $removed.Count, ($removed -join ', '))
+    }
+    return $removed.ToArray()
+}
+
+function Get-DemoChunkRunCommandName {
+    # The DbHubDemo-Chunk-* Run Commands a VM still lists (a Run Command Azure is deleting is still listed), or $null
+    # when they can't be listed. Internal.
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
@@ -301,28 +355,62 @@ function Clear-DemoChunkRunCommand {
 
     $list = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('rest', '--method', 'get', '--url', ('{0}?api-version={1}' -f $BaseUrl, $ApiVersion)) -AsJson -AllowFailure
     if ($null -eq $list) {
-        Write-DemoLog -Level Warning -Message 'The Run Commands on the VM could not be listed, so leftover chunk Run Commands were not checked.'
+        return $null
+    }
+    $items = Get-DemoMemberValue -InputObject $list -Name 'value'
+    return @(foreach ($item in @($items)) {
+            $name = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
+            if ($name -like 'DbHubDemo-Chunk-*') {
+                $name
+            }
+        })
+}
+
+function Wait-DemoChunkRunCommandGone {
+    <#
+    .SYNOPSIS
+    The one bounded cleanup at the end of a chunk set (Phase 28): asks Azure to delete what's left, then waits at most
+    -TimeoutSeconds until no chunk Run Command is listed. Returns the names still listed, which the caller reports as a
+    Warning: a delete that a busy extension holds finishes on its own, and the next run's cleanup checks again. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $BaseUrl,
+
+        [Parameter(Mandatory)]
+        [string] $ApiVersion,
+
+        [ValidateRange(0, 1800)]
+        [int] $TimeoutSeconds = 120,
+
+        [ValidateRange(1, 60)]
+        [int] $PollSeconds = 10
+    )
+
+    $asked = @(Clear-DemoChunkRunCommand -SubscriptionId $SubscriptionId -BaseUrl $BaseUrl -ApiVersion $ApiVersion | Where-Object { $_ -is [string] -and $_ })
+    if ($asked.Count -eq 0) {
         return @()
     }
-    $removed = [System.Collections.Generic.List[string]]::new()
-    $items = Get-DemoMemberValue -InputObject $list -Name 'value'
-    foreach ($item in @($items)) {
-        $name = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
-        if ($name -like 'DbHubDemo-Chunk-*') {
-            $url = '{0}/{1}?api-version={2}' -f $BaseUrl, $name, $ApiVersion
-            $result = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('rest', '--method', 'delete', '--url', $url) -AllowFailure
-            if ($result.ExitCode -eq 0 -or (Test-DemoAzNotFound -Text $result.StdErr)) {
-                $removed.Add($name)
-            }
-            else {
-                Write-DemoLog -Level Warning -Message ('The leftover Run Command {0} could not be deleted: {1}' -f $name, ([string]$result.StdErr).Trim())
-            }
+    $deadline = [System.DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $left = Get-DemoChunkRunCommandName -SubscriptionId $SubscriptionId -BaseUrl $BaseUrl -ApiVersion $ApiVersion
+        if ($null -eq $left) {
+            # They can't be listed: nothing to wait for here; the next run's cleanup checks again.
+            return $asked
         }
+        if (@($left).Count -eq 0) {
+            return @()
+        }
+        if ([System.DateTime]::UtcNow -ge $deadline) {
+            return @($left)
+        }
+        Start-Sleep -Seconds $PollSeconds
     }
-    if ($removed.Count -gt 0) {
-        Write-DemoLog -Message ('Deleted {0} leftover chunk Run Command(s): {1}.' -f $removed.Count, ($removed -join ', '))
-    }
-    return $removed.ToArray()
 }
 
 function Send-DemoChunkSet {
@@ -337,11 +425,15 @@ function Send-DemoChunkSet {
     workload runner (7) in one wave of 8 instead of one after the other (ADR 0018). For each chunk: PUT the
     managed Run Command DbHubDemo-Chunk-<sha12>-<nnn> with 'az rest' (the body in a temporary file; a 409
     Conflict is retried with backoff), read its instance view until the script is terminal (exit code 0
-    required), then DELETE it. Up to -Parallelism chunk Run Commands run at once, read every 10 seconds;
-    with 1 they go one at a time. Leftover DbHubDemo-Chunk-* Run Commands are deleted before the first chunk
-    and again in a finally block, so two calls must never run on one VM at once: one call with every file is
-    how they travel together. Returns one object per file, in order: Description, Sha256, ChunkCount, and
-    Seconds (until its last chunk was delivered).
+    required), then DELETE it without waiting for Azure to finish the delete (Phase 28: a delete that a busy,
+    usually policy-installed, extension holds cost up to 3 minutes per chunk before; R49, R336). Up to
+    -Parallelism chunk Run Commands run at once, read every 10 seconds; with 1 they go one at a time. When no
+    chunk finishes for -StallSeconds while several run, the rest go one at a time (Stalled). Leftover
+    DbHubDemo-Chunk-* Run Commands are deleted before the first chunk, and once at the end, in a finally block,
+    with one bounded wait of -CleanupWaitSeconds; the names Azure still lists then are returned as
+    LeftoverRunCommands for the caller's Warning. Two calls must never run on one VM at once: one call with
+    every file is how they travel together. Returns one object per file, in order: Description, Sha256,
+    ChunkCount, Seconds (until its last chunk was delivered), Stalled, and LeftoverRunCommands.
 
     Managed Run Command runs scripts in parallel, 25 per VM at most
     (https://learn.microsoft.com/azure/virtual-machines/run-command-overview, checked 2026-10-23).
@@ -369,7 +461,13 @@ function Send-DemoChunkSet {
         [int] $TimeoutSeconds = 600,
 
         [ValidateRange(1, 16)]
-        [int] $Parallelism = 1
+        [int] $Parallelism = 1,
+
+        [ValidateRange(30, 3600)]
+        [int] $StallSeconds = 300,
+
+        [ValidateRange(0, 1800)]
+        [int] $CleanupWaitSeconds = 120
     )
 
     $subscriptionId = $Config['subscriptionId']
@@ -404,6 +502,8 @@ function Send-DemoChunkSet {
     $baseUrl = Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName
     $maxConflictRetries = 9
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    # What the closures below share and change: the last time a chunk finished, a stall, and the cleanup's leftovers.
+    $shared = @{ LastProgressUtc = (Get-DemoUtcNow); Stalled = $false; Leftover = @(); VmStopped = $false }
     $bodyPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('dbhub-chunk-{0}.json' -f [guid]::NewGuid().ToString('N'))
     foreach ($entry in $entries) {
         Write-DemoLog -Message ('{0}: sending {1} {2} ({3} bytes) in {4} chunk(s) of {5} KiB.' -f $VmName, $entry.Description, $entry.Sha256.Substring(0, 12), $entry.SizeBytes, $entry.ChunkCount, $ChunkSizeKiB)
@@ -435,6 +535,7 @@ function Send-DemoChunkSet {
                     break
                 }
                 if (Test-DemoAzVmNotRunning -Text $put.StdErr) {
+                    $shared['VmStopped'] = $true
                     throw ('{0} isn''t running (deallocated), so it can''t receive chunks; start it first (start-demo.ps1), then send again.' -f $VmName)
                 }
                 if ($attempt -le $maxConflictRetries -and (Test-DemoAzConflict -Text $put.StdErr)) {
@@ -458,9 +559,10 @@ function Send-DemoChunkSet {
                 $detail = if ($State.Error) { $State.Error } else { $State.Output }
                 throw ('{0}: chunk {1} of {2} failed on the VM (execution state {3}, provisioning state {4}, exit code {5}): {6}' -f $VmName, $Chunk.Index, $Chunk.Count, $State.ExecutionState, $State.ProvisioningState, $State.ExitCode, $detail)
             }
-            if (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $Url -Confirm:$false)) {
-                Write-DemoLog -Level Warning -Message ('{0}: the Run Command for chunk {1} of {2} is still being deleted; the cleanup at the end checks again.' -f $VmName, $Chunk.Index, $Chunk.Count)
+            if (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $Url -NoWait -Confirm:$false)) {
+                Write-DemoLog -Level Warning -Message ('{0}: the Run Command for chunk {1} of {2} couldn''t be deleted yet; the cleanup at the end tries again.' -f $VmName, $Chunk.Index, $Chunk.Count)
             }
+            $shared['LastProgressUtc'] = Get-DemoUtcNow
             Write-DemoLog -Message ('{0}: chunk {1} of {2} delivered ({3} bytes, SHA-256 {4}).' -f $VmName, $Chunk.Index, $Chunk.Count, $Chunk.SizeBytes, $Chunk.Sha256.Substring(0, 12))
             $entry = $Item.Entry
             $entry.Left--
@@ -484,8 +586,10 @@ function Send-DemoChunkSet {
         else {
             $terminal = @('Succeeded', 'Failed', 'TimedOut', 'Canceled')
             $active = [System.Collections.Generic.List[object]]::new()
+            $limit = $Parallelism
+            $shared['LastProgressUtc'] = Get-DemoUtcNow
             while ($pending.Count -gt 0 -or $active.Count -gt 0) {
-                while ($active.Count -lt $Parallelism -and $pending.Count -gt 0) {
+                while ($active.Count -lt $limit -and $pending.Count -gt 0) {
                     $item = $pending.Dequeue()
                     $url = & $putChunk $item.Chunk
                     $active.Add([pscustomobject]@{ Item = $item; Url = $url; DeadlineUtc = [System.DateTime]::UtcNow.AddSeconds($TimeoutSeconds + 300) })
@@ -503,20 +607,31 @@ function Send-DemoChunkSet {
                     & $finishChunk $running.Item $running.Url $state
                     $null = $active.Remove($running)
                 }
+                # A stall (no chunk finished for StallSeconds while several run): the rest go one at a time, which a busy
+                # extension handles better than a queue of parallel ones (Phase 28).
+                if ($limit -gt 1 -and $active.Count -gt 0 -and ((Get-DemoUtcNow) - [datetime]$shared['LastProgressUtc']).TotalSeconds -ge $StallSeconds) {
+                    $limit = 1
+                    $shared['Stalled'] = $true
+                    Write-DemoLog -Level Warning -Message ('{0}: no chunk finished for {1} seconds while {2} ran, so the rest go one at a time. Azure is busy with the VM''s extensions (Azure-side; nothing to do).' -f $VmName, $StallSeconds, $active.Count)
+                }
             }
         }
     }
     finally {
         Remove-Item -LiteralPath $bodyPath -Force -ErrorAction SilentlyContinue
         try {
-            Clear-DemoChunkRunCommand -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion | Out-Null
+            # A VM that isn't running gets no cleanup now; its next run's cleanup does it.
+            $shared['Leftover'] = if ($shared['VmStopped']) { @() } else { @(Wait-DemoChunkRunCommandGone -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -TimeoutSeconds $CleanupWaitSeconds) }
+            if (@($shared['Leftover']).Count -gt 0) {
+                Write-DemoLog -Level Warning -Message ('{0}: Azure is still deleting {1} chunk Run Command(s) ({2}); that''s Azure-side and finishes on its own, and the next run checks again.' -f $VmName, @($shared['Leftover']).Count, (@($shared['Leftover']) -join ', '))
+            }
         }
         catch {
             Write-DemoLog -Level Warning -Message ('{0}: leftover chunk Run Commands could not be checked: {1}' -f $VmName, $_.Exception.Message)
         }
     }
     return @(foreach ($entry in $entries) {
-            [pscustomobject]@{ Description = $entry.Description; Sha256 = $entry.Sha256; ChunkCount = $entry.ChunkCount; Seconds = $entry.Seconds }
+            [pscustomobject]@{ Description = $entry.Description; Sha256 = $entry.Sha256; ChunkCount = $entry.ChunkCount; Seconds = $entry.Seconds; Stalled = [bool]$shared['Stalled']; LeftoverRunCommands = @($shared['Leftover']) }
         })
 }
 

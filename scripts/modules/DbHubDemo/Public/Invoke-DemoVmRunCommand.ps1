@@ -70,6 +70,11 @@ function Invoke-DemoVmRunCommand {
     archost01's artifacts in other Run Commands during the golden Release (ADR 0018). It runs once, after
     the Run Command was created; its output is discarded, and an error is logged and returned, never thrown.
 
+    .PARAMETER StartTimeoutSeconds
+    Phase 28's watchdog: when the script hasn't started running this long after the Run Command was created (it
+    waits behind the VM's extension work), stop waiting; the result has NotStarted set, and the Run Command is
+    deleted as usual. 0 (the default) waits the whole timeout.
+
     .EXAMPLE
     Invoke-DemoVmRunCommand -Config $config -VmName archost01 -RunCommandName DbHubDemo-HealthRead -Script (Get-Content ./vm/health/Get-DemoHealth.ps1 -Raw) -Parameter @{ View = 'Summary' }
     #>
@@ -103,7 +108,10 @@ function Invoke-DemoVmRunCommand {
         [ValidateRange(0, 300)]
         [int] $PollIntervalSeconds = 10,
 
-        [scriptblock] $WhileRunning = $null
+        [scriptblock] $WhileRunning = $null,
+
+        [ValidateRange(0, 7200)]
+        [int] $StartTimeoutSeconds = 0
     )
 
     $subscriptionId = $Config['subscriptionId']
@@ -223,7 +231,7 @@ function Invoke-DemoVmRunCommand {
                 }
             }
 
-            $state = Wait-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -TimeoutSeconds ($TimeoutSeconds + 300) -PollIntervalSeconds $PollIntervalSeconds -NotBeforeUtc $notBeforeUtc
+            $state = Wait-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -TimeoutSeconds ($TimeoutSeconds + 300) -PollIntervalSeconds $PollIntervalSeconds -NotBeforeUtc $notBeforeUtc -StartTimeoutSeconds $StartTimeoutSeconds
         }
         finally {
             Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
@@ -264,6 +272,7 @@ function Invoke-DemoVmRunCommand {
         Output            = if ($stale) { '' } else { [string]$state.Output }
         Error             = if ($stale) { 'The Run Command reported an earlier run with the same name instead of running the script.' } else { [string]$state.Error }
         WaitTimedOut      = [bool]$state.WaitTimedOut
+        NotStarted        = [bool](Get-DemoMemberValue -InputObject $state -Name 'NotStarted')
         Stale             = $stale
         Removed           = [bool]$removed
         Seconds           = [System.Math]::Round($stopwatch.Elapsed.TotalSeconds, 1)

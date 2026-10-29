@@ -101,8 +101,15 @@ function Stop-DemoEnvironment {
     $state = Get-DemoDeploymentState -Config $Config
     $sessionOver = ($bastion.status -eq 'Pass' -or -not $IfExpired)
     if ($state.HostPasswordUtc -and $sessionOver) {
-        # Set-DemoVmLocalPassword reports Manual action required, with the steps, when the host isn't running.
-        $results.Add((Set-DemoVmLocalPassword -Config $Config -VmName $hostVm -Rotate -Confirm:$false))
+        # Set-DemoVmLocalPassword reports Manual action required, with the steps, when the host isn't running. A rotation
+        # that fails on a running host is a Warning with the portal's way (Phase 28): the state still records the handover,
+        # so the next start-demo.ps1 or stop-demo.ps1 rotates it again. That covers a password a person set in the portal
+        # at the guided stop too.
+        $rotation = Set-DemoVmLocalPassword -Config $Config -VmName $hostVm -Rotate -Confirm:$false
+        if ([string]$rotation.status -eq 'Fail') {
+            $rotation = New-DemoResult -CheckId 'STOP.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('{0} The password set for the last session is still valid until it''s rotated.' -f $rotation.message) -Evidence $rotation.evidence -Remediation ('Run ./scripts/stop-demo.ps1 -RemoveBastionOnly again, which rotates it, or in the Azure portal open {0}, then Help, then Reset password, and set a random value you don''t keep.' -f $hostVm) -DocUrl 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'
+        }
+        $results.Add($rotation)
     }
     if ($sessionOver -and (Get-DemoKeyVaultSetting -Config $Config).Enabled) {
         # The opt-in vault's copy goes too, even when the host couldn't be rotated: nobody needs it after the session.

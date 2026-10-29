@@ -172,7 +172,15 @@ elseif ($Interactive -and $ResetAdminPassword -and -not $whatIf -and $noFail) {
         }
     }
     if (-not $clipboard) {
-        $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'This session has no working clipboard, so no one-time password was set: it''s never displayed.' -Remediation $portalSteps))
+        $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'This session has no working clipboard, so no one-time password was set: it''s never displayed.' -Remediation $portalSteps -DocUrl 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'))
+        # The person may now set a password in the portal: the state records the handover, so stop-demo.ps1 rotates it
+        # (Phase 28, ADR 0009).
+        try {
+            Set-DemoDeploymentState -Config $config -Value @{ HostPasswordSet = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The handover wasn''t recorded, so after you reset the password in the portal, reset it again to a random value you don''t keep: {0}' -f $_.Exception.Message)
+        }
     }
     else {
         $password = New-DemoAdminPassword

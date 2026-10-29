@@ -10,6 +10,21 @@ function Get-DemoResourceGroupName {
     return ('rg-{0}-{1}' -f $Config['prefix'], $Config['environment'])
 }
 
+function Get-DemoMainDeploymentName {
+    # The template's subscription-scope deployment record: <prefix>-<environment>-main, which is dbhub-demo-main with the
+    # defaults, as before. With the prefix in it (Phase 28), an environment with its own prefix, such as a throwaway proof,
+    # never replaces, reads, or deletes another environment's record. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $prefix = if ([string]$Config['prefix']) { [string]$Config['prefix'] } else { 'dbhub' }
+    return ('{0}-{1}-main' -f $prefix, $Config['environment'])
+}
+
 function Get-DemoHostVmName {
     # The T2 VM: archost01 (nested, the default) or arcsql01 (evaluation-only mode, ADR 0006). Internal.
     [CmdletBinding()]
@@ -69,6 +84,10 @@ function Get-DemoDeploymentStateTagName {
         # fabric.manageCapacity (Phase 26b): the capacity start-demo.ps1 resumed, "<resource group>/<name>", and when.
         FabricCapacityResumed    = 'DbHubFabricCapacityResumed'
         FabricCapacityResumedUtc = 'DbHubFabricCapacityResumedUtc'
+        # Phase 28: until when the PaygWizard guided stop's request on the T2 host is valid (empty when there's none), and the
+        # size T4's Burstable fallback settled on (Standard_B2s, or None when Azure refused both) for later runs.
+        GuidedStopUtc            = 'DbHubGuidedStopUtc'
+        T4Sku                    = 'DbHubT4Sku'
     }
 }
 

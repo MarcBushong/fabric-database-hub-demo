@@ -7,7 +7,7 @@ function Get-DemoTeardownManifest {
     .DESCRIPTION
     Some of what a destroy must leave clean can't be found once the resource group is gone, so it's read first:
     - the resource group's ID and its deploymentId tag; when the group is already gone, the deploymentId comes
-      from the outputs of the subscription-scope deployment dbhub-<environment>-main, if it still exists;
+      from the outputs of the subscription-scope deployment <prefix>-<environment>-main, if it still exists;
     - the Microsoft Entra principals that live and die with demo resources: the system-assigned identities of
       the VMs, the Arc machine, and the T3 server, and any user-assigned identity in the group (the optional Arc
       onboarding identity), from one Azure Resource Graph query (through Invoke-DemoRestRequest with a verified
@@ -36,7 +36,7 @@ function Get-DemoTeardownManifest {
 
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
-    $deploymentName = 'dbhub-{0}-main' -f $Config['environment']
+    $deploymentName = Get-DemoMainDeploymentName -Config $Config
     $groupExists = Test-DemoResourceGroupExist -Config $Config
     $notes = [System.Collections.Generic.List[string]]::new()
 

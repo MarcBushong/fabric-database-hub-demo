@@ -241,6 +241,9 @@ Describe 'Send-DemoBootstrapBundle' {
         $script:conflictsLeft = 0
         $script:putError = ''
         $script:failName = ''
+        # Phase 28: reads that find a chunk still running, and deletes Azure holds (a busy extension).
+        $script:runningReads = 0
+        $script:stuckDeletes = $false
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
@@ -265,7 +268,9 @@ Describe 'Send-DemoBootstrapBundle' {
                     return [pscustomobject]@{ ExitCode = 0; StdOut = '{}'; StdErr = '' }
                 }
                 'delete' {
-                    $script:runCommands.Remove($name)
+                    if (-not $script:stuckDeletes) {
+                        $script:runCommands.Remove($name)
+                    }
                     return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
                 }
                 default {
@@ -277,8 +282,12 @@ Describe 'Send-DemoBootstrapBundle' {
                         return $notFound
                     }
                     $failed = $name -eq $script:failName
+                    $running = $script:runningReads -gt 0
+                    if ($running) {
+                        $script:runningReads--
+                    }
                     $view = @{
-                        executionState = if ($failed) { 'Failed' } else { 'Succeeded' }
+                        executionState = if ($failed) { 'Failed' } elseif ($running) { 'Running' } else { 'Succeeded' }
                         exitCode       = if ($failed) { 1 } else { 0 }
                         output         = ''
                         error          = if ($failed) { 'Chunk 2: SHA-256 mismatch (expected a, got b). Nothing was written.' } else { '' }
@@ -289,7 +298,7 @@ Describe 'Send-DemoBootstrapBundle' {
         }
     }
 
-    It 'sends each chunk with PUT, waits for exit code 0, and deletes it before the next one' {
+    It 'sends each chunk with PUT, waits for exit code 0, and deletes it before the next one without waiting for the delete (Phase 28)' {
         $result = Send-DemoBootstrapBundle -Config $config -Bundle $sendBundle -VmName 'sqlvm01' -ChunkSizeKiB 1
 
         $result.VmName | Should -Be 'sqlvm01'
@@ -297,8 +306,9 @@ Describe 'Send-DemoBootstrapBundle' {
         $result.ChunkCount | Should -Be $expectedChunks.Count
         $result.Seconds | Should -BeGreaterOrEqual 0
         $expectedChunks.Count | Should -BeGreaterThan 1
-        # List (cleanup), then PUT, GET, DELETE, GET (gone) per chunk, then list (final cleanup).
-        $sequence = @('get') + @(foreach ($chunk in $expectedChunks) { 'put', 'get', 'delete', 'get' }) + @('get')
+        # List (cleanup), then PUT, GET, DELETE per chunk, never waiting for the delete (Phase 28), then list (the one
+        # bounded cleanup at the end, which finds nothing left).
+        $sequence = @('get') + @(foreach ($chunk in $expectedChunks) { 'put', 'get', 'delete' }) + @('get')
         $script:calls.Method | Should -Be $sequence
         $puts = @($script:calls | Where-Object Method -eq 'put')
         $puts.Name | Should -Be $expectedChunks.Name
@@ -353,6 +363,27 @@ Describe 'Send-DemoBootstrapBundle' {
         $script:calls[1].Method | Should -Be 'delete'
         $script:calls[1].Name | Should -Be 'DbHubDemo-Chunk-aaaaaaaaaaaa-007'
         $script:runCommands.Keys | Should -Be @('DbHubDemo-Bootstrap')
+    }
+
+    It 'never waits on a delete Azure holds: one bounded cleanup at the end reports what''s left (Phase 28, R49)' {
+        $script:stuckDeletes = $true
+        $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'sqlvm01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 })
+        $sent[0].ChunkCount | Should -Be $expectedChunks.Count
+        @($sent[0].LeftoverRunCommands) | Should -Be @($expectedChunks.Name)
+        # Each chunk's Run Command is read only for its result, never polled after its delete.
+        @($script:calls | Where-Object { $_.Method -eq 'get' -and $_.Name }).Count | Should -Be $expectedChunks.Count
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'Azure is still deleting' }
+    }
+
+    It 'goes on one chunk at a time after a stall, when no chunk finishes for StallSeconds while several run (Phase 28)' {
+        $script:runningReads = 20
+        $script:clock = [DateTime]::UtcNow
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:clock = $script:clock.AddSeconds(20); $script:clock }
+        $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'sqlvm01' -ChunkSizeKiB 1 -Parallelism 4 -StallSeconds 30 })
+        $sent[0].Stalled | Should -BeTrue
+        $sent[0].ChunkCount | Should -Be $expectedChunks.Count
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'so the rest go one at a time' }
+        $script:runCommands.Count | Should -Be 0
     }
 
     It 'makes no Azure calls with -WhatIf' {

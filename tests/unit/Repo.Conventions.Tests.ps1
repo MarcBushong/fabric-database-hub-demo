@@ -64,7 +64,8 @@ Describe 'Repository layout' {
 
     It 'has the script scripts/<_>.ps1 with #Requires and comment-based help' -ForEach @(
         'init', 'deploy', 'preflight', 'configure-fabric', 'configure-powerbi', 'configure-fabric-app', 'configure-arc', 'configure-monitoring', 'validate',
-        'start-demo', 'stop-demo', 'reset-demo', 'status', 'estimate-cost', 'destroy', 'setup-github-oidc', 'setup-github-repo', 'setup-activity-control'
+        'start-demo', 'stop-demo', 'reset-demo', 'status', 'estimate-cost', 'destroy', 'setup-github-oidc', 'setup-github-repo', 'setup-activity-control',
+        'collect-diagnostics'
     ) {
         $path = Join-Path -Path $repoRoot -ChildPath "scripts/$_.ps1"
         Test-Path -LiteralPath $path | Should -BeTrue

@@ -16,7 +16,7 @@ function Remove-DemoEnvironment {
        waits until the group is gone. T1's managed identity, and with it its membership in the P6 group, goes
        with the VM. With the Key Vault opt-in, the vault goes into soft delete with the group (DESTROY.KEYVAULT
        says for how long); a later deploy.ps1 recovers it.
-    4. Deletes the subscription-scope deployment record dbhub-<environment>-main, which outlives the group and
+    4. Deletes the subscription-scope deployment record <prefix>-<environment>-main, which outlives the group and
        holds the template's parameters and outputs (DESTROY.DEPLOYMENT), and the budget at the group's scope,
        which outlives the group too (live, 2026-10-22; DESTROY.BUDGET).
     5. Test-DemoTeardownResidue checks that nothing is left: the group, anything carrying the environment's
@@ -266,7 +266,7 @@ function Remove-DemoEnvironment {
     }
 
     # The subscription-scope deployment record outlives the group (history only, but it holds the parameters).
-    $deploymentName = 'dbhub-{0}-main' -f $Config['environment']
+    $deploymentName = Get-DemoMainDeploymentName -Config $Config
     $deploymentDoc = 'https://learn.microsoft.com/cli/azure/deployment/sub#az-deployment-sub-delete'
     $record = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('deployment', 'sub', 'show', '--name', $deploymentName, '--query', 'name', '--output', 'tsv') -AllowFailure
     if ($record.ExitCode -ne 0 -and (Test-DemoAzNotFound -Text ([string]$record.StdErr))) {

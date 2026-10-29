@@ -294,6 +294,9 @@ function Format-DemoSignInSweep {
         if ([int]$Counts.archives -gt 0) { $parts += ('{0} archive(s) in setup''s log folders that couldn''t be checked' -f [int]$Counts.archives) }
         if ([int]$Counts.filesUnverified -gt 0) { $parts += ('{0} unreadable file(s)' -f [int]$Counts.filesUnverified) }
         if ([int]$Counts.appTokens + [int]$Counts.eventLogAppTokens -gt 0) { $parts += ('{0} token(s) of an application or managed identity' -f ([int]$Counts.appTokens + [int]$Counts.eventLogAppTokens)) }
+        $autoLogon = @('autoLogonEnabled', 'autoLogonSecrets', 'autoLogonPasswords', 'autoLogonUnverified' | Where-Object { $Counts.PSObject.Properties[$_] -and [int]$Counts.$_ -gt 0 })
+        if ($autoLogon.Count -gt 0) { $parts += ('automatic sign-in left armed ({0})' -f ($autoLogon -join ', ')) }
+        if ($Counts.PSObject.Properties['autoLogonUserNames'] -and [int]$Counts.autoLogonUserNames -gt 0) { $parts += 'the Winlogon DefaultUserName value' }
         if ($parts.Count -eq 0) { return 'nothing' }
         return ($parts -join ', ')
     }

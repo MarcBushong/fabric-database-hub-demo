@@ -11,8 +11,14 @@ converge. Progress is in C:\ProgramData\DbHubDemo\state.json and health.json. Wi
 Install modes (t2SqlInstallMode, ADR 0006):
 - ProductKey and Developer: unattended setup, then WaitingForArcOnboarding until the orchestrator writes
   arc-onboarded.json (Phase 7).
-- PaygWizard: WaitingForArcOnboarding first; once Arc is connected, Manual action required with the exact
-  setup-wizard steps, polling until a Standard instance is detected.
+- PaygWizard: WaitingForArcOnboarding first; once Arc is connected, GuidedSetup prepares the guided stop (Phase 28):
+  SQL Server setup pre-filled from a configuration file with a logon task in the guest, and Virtual Machine Connection
+  at an administrator's sign-in to this host. SqlSetupWizard then reports Manual action required; while deploy.ps1 waits
+  for a person (its request in guided-setup-request.json), the guest signs itself in once and opens the setup. The host
+  checks what was installed (Standard, the default instance, the Azure extension), shows the documented fix when it's
+  wrong, and once it's right cleans up: automatic sign-in off, its LSA secret and Winlogon values gone, the guest
+  password rotated, the console signed out. Invoke-DemoHostGuidedSetupGuard runs that cleanup before every pass when no
+  person is expected any more.
 In every mode, GuestSignInCleanup then removes the sign-in data that Arc onboarding and, in PaygWizard mode, the
 setup wizard's interactive sign-in leave in the guest and on the host, and verifies that none remains; the build
 stops there if any remains (ADR 0009). It runs again whenever a new bundle generation arrives.
@@ -36,7 +42,7 @@ Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Vm.psd1
 . (Join-Path -Path $PSScriptRoot -ChildPath 'HostSteps.ps1')
 # The sign-in data sweep (ADR 0009); dot-sourcing only defines its functions.
 . (Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-DemoSignInResidue.ps1')
-foreach ($guestScript in @('GuestVhdx.ps1', 'GuestVm.ps1', 'GuestHardening.ps1', 'GuestSql.ps1', 'GuestWorkload.ps1')) {
+foreach ($guestScript in @('GuestVhdx.ps1', 'GuestVm.ps1', 'GuestHardening.ps1', 'GuestSql.ps1', 'GuestWorkload.ps1', 'GuestSetup.ps1')) {
     . ([System.IO.Path]::Combine($script:HostBundleRoot, 'vm', 'hyperv-guest', $guestScript))
 }
 
@@ -217,15 +223,24 @@ function Get-DemoHostStepPlan {
             NotSelectedMessage = 'ProductKey and Developer modes onboard Arc after the unattended install.'
             Test = { param($Step) Test-DemoArcOnboarded -MarkerPath $Step.Context.ArcMarkerPath -MachineName $Step.Context.GuestName -GuestVmId (Get-DemoHostGuestVmId -Name $Step.Context.GuestName) }
             Set = { New-DemoVmStepResult -Outcome 'Waiting' -WaitState 'WaitingForArcOnboarding' -Message 'Waiting for the orchestrator to onboard arcsql01 to Azure Arc before the setup-wizard step, so the wizard finds the existing connection (deploy.ps1 stage 5, ADR 0005, ADR 0006).' } }
-        @{ Name = 'SqlSetupWizard'; Mode = @('PaygWizard')
+        @{ Name = 'GuidedSetup'; Mode = @('PaygWizard')
             When = { param($Step) $Step.Context.Mode -in $Step.Mode }
             NotSelectedMessage = 'ProductKey and Developer modes install SQL Server unattended.'
-            Test = { param($Step) (Test-DemoHostGuestReachable -Context $Step.Context) -and (Test-DemoHostSqlEdition -Context $Step.Context) }
+            Test = { param($Step) (Test-DemoHostGuestReachable -Context $Step.Context) -and (Test-DemoHostGuidedSetup -Context $Step.Context) }
             Set = { param($Step)
                 if (-not (Wait-DemoHostGuest -Context $Step.Context)) {
                     return (New-DemoVmStepResult -Outcome 'InProgress' -Message 'Waiting for the guest to start.')
                 }
-                Get-DemoHostWizardResult -Context $Step.Context } }
+                Initialize-DemoHostGuidedSetup -Context $Step.Context } }
+        @{ Name = 'SqlSetupWizard'; Mode = @('PaygWizard')
+            When = { param($Step) $Step.Context.Mode -in $Step.Mode }
+            NotSelectedMessage = 'ProductKey and Developer modes install SQL Server unattended.'
+            Test = { param($Step) (Test-DemoHostGuestReachable -Context $Step.Context) -and (Test-DemoHostGuidedSetupDone -Context $Step.Context) }
+            Set = { param($Step)
+                if (-not (Wait-DemoHostGuest -Context $Step.Context)) {
+                    return (New-DemoVmStepResult -Outcome 'InProgress' -Message 'Waiting for the guest to start.')
+                }
+                Invoke-DemoHostGuidedSetupStep -Context $Step.Context } }
         @{ Name = 'GuestSignInCleanup'
             Test = { param($Step) (Test-DemoHostGuestReachable -Context $Step.Context) -and (Test-DemoHostGuestSignInClean -Context $Step.Context) }
             Set = { param($Step)
@@ -277,6 +292,9 @@ function Get-DemoHostHealthDetail {
         host         = Get-DemoHostInstanceInfo
         arcOnboarded = Test-DemoArcOnboarded -MarkerPath $Context.ArcMarkerPath -MachineName $Context.GuestName -GuestVmId (Get-DemoHostGuestVmId -Name $Context.GuestName)
         guest        = [ordered]@{ name = $Context.GuestName; state = 'NotCreated' }
+    }
+    if ($Context.Mode -eq 'PaygWizard') {
+        $detail.guidedSetup = Get-DemoHostGuidedSetupDetail -Context $Context
     }
     $vm = Get-VM -Name $Context.GuestName -ErrorAction SilentlyContinue
     if ($vm) {
@@ -331,6 +349,10 @@ function Invoke-DemoHostBootstrap {
         # The operator's clipboard helper for the PaygWizard step lives next to the state files.
         Copy-Item -LiteralPath ([System.IO.Path]::Combine($BundleRoot, 'vm', 'hyperv-guest', 'Copy-GuestCredential.ps1')) -Destination (Join-Path -Path $StateRoot -ChildPath 'Copy-GuestCredential.ps1') -Force
         $plan = Get-DemoHostStepPlan -Context $context
+        if ($context.Mode -eq 'PaygWizard') {
+            # The guided stop's cleanup always runs: armed automatic sign-in goes once no person is expected (Phase 28).
+            Invoke-DemoHostGuidedSetupGuard -Context $context
+        }
         return (Invoke-DemoVmStateMachine -Step $plan -Generation ([string]$settings['generation']) -HealthDetail { Get-DemoHostHealthDetail -Context $context })
     }
     finally {

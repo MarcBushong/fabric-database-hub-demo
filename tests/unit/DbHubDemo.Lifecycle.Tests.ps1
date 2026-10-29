@@ -236,6 +236,8 @@ Describe 'Invoke-DemoTemplateDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -Times 1 -Exactly -ParameterFilter { $T4Exists }
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -Times 0 -Exactly
 
+        # A size the configuration sets never changes on its own (Phase 28): a refusal stays a Fail with the fallback named.
+        $withT4['t4SkuName'] = 'Standard_B1ms'
         $script:t4State = 'NotFound'
         $script:templateFails = $true
         $script:t4Failure = [pscustomobject]@{ Sku = 'Standard_B1ms'; Zone = ''; TimeUtc = '2026-10-26T14:11:42Z' }
@@ -247,7 +249,59 @@ Describe 'Invoke-DemoTemplateDeployment' {
         $sku.status | Should -Be 'Fail'
         $sku.message | Should -Match 'Standard_B1ms with no zone preference'
         $sku.remediation | Should -Match 'Set t4SkuName to Standard_B2s, the documented fallback'
-        $sku.remediation | Should -Match 'Nothing changes the size on its own'
+        $sku.remediation | Should -Match 'A size you set is never changed on its own'
+    }
+
+    It 'falls back on its own from a refused Standard_B1ms to Standard_B2s, then to no T4, and records it, when the configuration doesn''t set the size (Phase 28)' {
+        $withT4 = New-TestConfig -WithT4
+        $withT4.Contains('t4SkuName') | Should -BeFalse -Because 'the schema has no default for it'
+        $script:sizes = [System.Collections.Generic.List[string]]::new()
+        $script:recordedSku = [System.Collections.Generic.List[string]]::new()
+        $script:failures = [System.Collections.Generic.Queue[object]]::new()
+        $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_B1ms'; Zone = ''; TimeUtc = '2026-10-26T14:11:42Z' })
+        $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_B2s'; Zone = ''; TimeUtc = '2026-10-26T14:31:42Z' })
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -MockWith { if ($script:failures.Count -gt 0) { $script:failures.Dequeue() } else { $null } }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recordedSku.Add([string]$Value['T4Sku']) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { $null }
+        # The template fails while T4 is in it (SkuNotAvailable) and succeeds without it.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:sizes.Add($(if ($Config['t4Enabled']) { if ($Config.Contains('t4SkuName')) { [string]$Config['t4SkuName'] } else { 'default' } } else { 'none' }))
+            $script:templateFails = [bool]$Config['t4Enabled']
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
+        $deployment.Succeeded | Should -BeTrue
+        $script:sizes | Should -Be @('default', 'Standard_B2s', 'none')
+        $script:recordedSku | Should -Be @('Standard_B2s', 'None')
+        $deployment.T4Enabled | Should -BeFalse
+        $fallbacks = @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' })
+        @($fallbacks.status) | Should -Be @('Warning', 'Warning')
+        $fallbacks[0].message | Should -Match 'tries Standard_B2s, the same Burstable class'
+        $fallbacks[1].message | Should -Match 't4Enabled stays as you configured it'
+        $fallbacks[1].remediation | Should -Match '"t4SkuName": "Standard_D2ds_v5"'
+        $fallbacks[1].remediation | Should -Match 'dated example'
+        # The template keeps the choice in the resource group's tags too.
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
+        ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Pass'
+    }
+
+    It 'starts the fallback one size on when preflight already ruled the default out, and never for a size the configuration sets (Phase 28)' {
+        $withT4 = New-TestConfig -WithT4
+        $script:sizes = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:sizes.Add($(if ($Config['t4Enabled']) { if ($Config.Contains('t4SkuName')) { [string]$Config['t4SkuName'] } else { 'default' } } else { 'none' }))
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit } } }
+        }
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'Standard_B2s'
+        $script:sizes | Should -Be @('Standard_B2s')
+        ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).status | Should -Be 'Warning'
+        $deployment.T4SkuName | Should -Be 'Standard_B2s'
+
+        $script:sizes.Clear()
+        $withT4['t4SkuName'] = 'Standard_D2ds_v5'
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'None'
+        $script:sizes | Should -Be @('Standard_D2ds_v5')
+        @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).Count | Should -Be 0
     }
 }
 

@@ -63,7 +63,7 @@ Option 2.
 1. Record a manifest, read-only: the group's `deploymentId` tag (or, once the group is gone, the `deploymentId` output of the subscription deployment record), the Microsoft Entra principal IDs of every managed identity in the group, and the names the check needs. It's written to `out/destroy-manifest-<environment>.json`, names and IDs only; a run that finds the group already gone keeps the manifest recorded while it existed.
 2. Delete every `Microsoft.AzureArcData/sqlServerInstances` resource in the group (T2's, and T1's unified-inventory instances), then every `Microsoft.HybridCompute/machines` resource.
 3. Delete the resource group and wait until it's gone.
-4. Delete the subscription deployment record `dbhub-<environment>-main`, which outlives the group (`DESTROY.DEPLOYMENT`), and the budget at the group's scope, which outlives it too (`DESTROY.BUDGET`, live finding 2026-10-22).
+4. Delete the subscription deployment record `<prefix>-<environment>-main` (`dbhub-<environment>-main` before Phase 28, whatever the prefix), which outlives the group (`DESTROY.DEPLOYMENT`), and the budget at the group's scope, which outlives it too (`DESTROY.BUDGET`, live finding 2026-10-22).
 5. Run the residual check (`Test-DemoTeardownResidue`, `TEARDOWN.RESIDUAL.*`), summed up in `DESTROY.RESIDUAL`.
 
 **Changes from the decision above:**

@@ -7,7 +7,8 @@ function Get-DemoVmHealth {
     .DESCRIPTION
     Runs vm/health/Get-DemoHealth.ps1 with Invoke-DemoVmRunCommand (Run Command DbHubDemo-HealthRead, deleted
     afterward) and returns the parsed JSON. -View Summary (the default) returns only role, state, status,
-    message, currentStep, generation, updatedUtc, installMode, arcOnboarded, guestState, and sqlEdition, which
+    message, currentStep, generation, updatedUtc, installMode, arcOnboarded, guestState, and sqlEdition, plus
+    the PaygWizard guided stop's guidedArmed, guidedRequest, guidedLast, and guidedLeft (Phase 28), which
     always fits in the 4 KB the instance view keeps. Under -WhatIf nothing runs and the result is $null. Throws
     when the Run Command fails or its output doesn't parse.
 

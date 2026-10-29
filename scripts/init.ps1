@@ -5,7 +5,9 @@ Writes your demo configuration (config/demo.config.json) from your Azure CLI sig
 looked up by hand (Phase 26b, ADR 0023).
 
 .DESCRIPTION
-Run it once after 'az login', before preflight.ps1:
+deploy.ps1 runs it for you when there's no configuration yet (Phase 28), so 'az login' then ./scripts/deploy.ps1 is
+enough. Run it yourself to choose the options below, or to write a second configuration. Run it once after 'az login',
+before preflight.ps1:
 
   az login                                   # you sign in; add --use-device-code in a codespace
   ./scripts/init.ps1 -CreateAdminGroup       # asks only when there's a real choice
@@ -23,8 +25,9 @@ What it does, in order:
 3. Finds the Microsoft Entra security group for T3's and T4's administrators (P6) by name, by default
    <prefix>-<environment>-sql-admins. With -CreateAdminGroup it creates it with you as the owner when it's missing; a
    tenant that doesn't allow that gets Manual action required with the steps for an administrator.
-4. Asks how T2 installs SQL Server: PaygWizard (the default: Hub Performance on T2, after a one-time setup wizard of
-   about an hour) or Developer (no wizard; T2 in Hub's Estate only).
+4. Asks how T2 installs SQL Server: PaygWizard (the default: Hub Performance on T2; once per guest build, deploy.ps1
+   stops for about 10 minutes of pre-filled SQL Server setup through Bastion, the guided stop) or Developer (no stop;
+   T2 in Hub's Estate only).
 5. Writes the configuration, validated against config/environment.schema.json. Git ignores the file, and it holds no
    secrets. An existing file is replaced only with -Force, after a copy to out/config-backup. -WhatIf writes nothing
    and creates no group.

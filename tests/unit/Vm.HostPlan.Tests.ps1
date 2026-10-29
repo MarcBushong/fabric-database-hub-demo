@@ -63,7 +63,7 @@ Describe 'T2 host step plan' {
         $plan.Name | Should -Be @(
             'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'DataDisk', 'GuestOsMedia',
             'GuestVhdx', 'GuestVm', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall', 'ArcOnboarding',
-            'ArcOnboardingBeforeWizard', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner')
+            'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner')
     }
 
     It 'reads guest sizing from settings.json and the network from vm/dsc/host.psd1' {
@@ -113,13 +113,19 @@ Describe 'T2 host step plan' {
     }
 
     Context 'PaygWizard' {
-        It 'waits for Arc first, then asks for the setup wizard, then configures and seeds' {
+        It 'waits for Arc first, prepares the guided setup, then waits for deploy.ps1''s guided stop, then configures and seeds' {
             $context = New-TestHostContext -Mode 'PaygWizard'
             Set-ReadyHostMock
             $script:arcConnected = $false
             $script:sqlReady = $false
             $script:configured = $false
             $script:seeded = $false
+            # Phase 28: the GuidedSetup step puts the pre-filled setup and its logon tasks in place; the guest's checks run
+            # over PowerShell Direct, which these tests don't have.
+            $script:guidedPrepared = $false
+            Mock -CommandName Test-DemoHostGuidedSetup -MockWith { $script:guidedPrepared }
+            Mock -CommandName Initialize-DemoHostGuidedSetup -MockWith { $script:guidedPrepared = $true }
+            Mock -CommandName Get-DemoHostSetupCheck -MockWith { [pscustomobject]@{ Ok = $script:sqlReady; Problem = $(if ($script:sqlReady) { '' } else { 'NotInstalled' }); SetupRunning = $false; Message = ''; Fix = @() } }
             $plan = Get-DemoHostStepPlan -Context $context
 
             Invoke-DemoVmStateMachine -Step $plan -Generation 'g1' | Should -Be 'WaitingForArcOnboarding'
@@ -131,10 +137,12 @@ Describe 'T2 host step plan' {
 
             $script:arcConnected = $true
             Invoke-DemoVmStateMachine -Step $plan -Generation 'g1' | Should -Be 'ManualActionRequired'
+            Should -Invoke -CommandName Initialize-DemoHostGuidedSetup -Times 1 -Exactly
             $health = Get-Content -LiteralPath (Join-Path -Path $context.Root -ChildPath 'health.json') -Raw | ConvertFrom-Json
             $health.status | Should -Be 'Manual action required'
+            $health.message | Should -Match 'run \./scripts/deploy\.ps1'
             ($health.instructions -join ' ') | Should -Match 'pay-as-you-go'
-            ($health.instructions -join ' ') | Should -Match 'E:\\setup.exe'
+            ($health.instructions -join ' ') | Should -Match 'Start-GuidedSetup\.ps1'
             ($health.instructions -join ' ') | Should -Match 'Copy-GuestCredential.ps1'
             Should -Invoke -CommandName Install-DemoGuestSql -Times 0
 

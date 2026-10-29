@@ -561,33 +561,6 @@ function Install-DemoHostGuestSql {
     }
 }
 
-function Get-DemoHostWizardResult {
-    # PaygWizard: report Manual action required with the exact steps, and why the check still fails.
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.Collections.IDictionary] $Context
-    )
-
-    $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
-    $drive = Mount-DemoGuestIso -Name $Context.GuestName -Credential $credential -IsoPath (Get-DemoHostGuestIsoPath -Context $Context)
-    $instance = Get-DemoGuestSqlInstance -Name $Context.GuestName -Credential $credential
-    $message = 'Arc is connected. Install SQL Server Standard in arcsql01 with the setup wizard, choosing pay-as-you-go billing (ADR 0006). The host checks every 5 minutes and continues on its own.'
-    if ($instance.ServiceExists -and -not $instance.Running) {
-        $message = 'SQL Server is installed in arcsql01 but its service is not running. Start the MSSQLSERVER service, or finish the setup wizard.'
-    }
-    elseif ($instance.Running -and $instance.Error) {
-        $message = 'SQL Server is running in arcsql01, but the guest Administrator cannot sign in to it. Add the Administrator account as a SQL Server administrator (setup wizard: Add Current User).'
-    }
-    elseif ($instance.Running -and -not $instance.IsSysAdmin) {
-        $message = 'SQL Server is running in arcsql01, but the guest Administrator is not a sysadmin. Add it as a SQL Server administrator.'
-    }
-    elseif ($instance.Running -and [string]$instance.Edition -notlike 'Standard*') {
-        $message = ('SQL Server in arcsql01 is {0}; this mode needs Standard with pay-as-you-go billing. Uninstall it and run the setup wizard again.' -f $instance.Edition)
-    }
-    return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message $message -Instruction (Get-DemoPaygWizardInstruction -GuestName $Context.GuestName -MediaDrive $drive))
-}
-
 function Get-DemoHostDatabaseStatus {
     # Database, Query Store, growth caps, runner role, and seed state, read inside the guest.
     [CmdletBinding()]
