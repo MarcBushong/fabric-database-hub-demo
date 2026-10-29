@@ -388,7 +388,13 @@ function Invoke-DemoControlRunner {
         $full = @($arguments) + @('--target', 'T2')
         $run = Invoke-Command -VMName $guestName -Credential $credential -ArgumentList $guest.ToolsFolder, $full, $timeout -ErrorAction Stop -ScriptBlock {
             param($Folder, $Arguments, $TimeoutSeconds)
-            Import-Module -Name (Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1') -Force
+            $modulePath = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
+            if (-not (Test-Path -LiteralPath $modulePath)) {
+                # Before SQL Server setup, the guest has no demo module yet (Phase 28 live finding): the caller reports
+                # Not selected, not a Warning.
+                throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
+            }
+            Import-Module -Name $modulePath -Force
             $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $Folder).InstallRecord
             if ($null -eq $install) {
                 throw 'The workload runner is not installed in the guest yet.'

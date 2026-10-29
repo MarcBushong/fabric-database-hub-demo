@@ -1318,6 +1318,18 @@ Describe 'Get-DemoEnvironmentStatus with the runner''s own profile get output' {
         }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadAction -Times 2 -Exactly -ParameterFilter { $Action -eq 'Runner' -and $Request['arguments'][0] -eq 'profile' -and $Request['arguments'][1] -eq 'get' }
     }
+
+    It 'reports T2''s profile as Not selected, not a Warning, before T2 is set up (Phase 28 live finding)' {
+        # Before SQL Server setup, the guest has no demo module, so its Import-Module fails.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadAction -ParameterFilter { $Request['target'] -eq 'T2' } -MockWith {
+            @{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = 'Fail'; message = 'The control action failed: The specified module ''C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1'' was not loaded because no valid module file was found in any module directory.'; evidence = @{} }
+        }
+        $results = Get-DemoEnvironmentStatus -Config $config -Detail
+        $t2 = $results | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T2' }
+        $t2.status | Should -Be 'Not selected'
+        $t2.message | Should -Match 'T2 isn''t set up yet'
+        ($results | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T1' }).status | Should -Be 'Pass'
+    }
 }
 Describe 'Remove-DemoEnvironment' {
     BeforeAll {
@@ -1449,6 +1461,9 @@ Describe 'Invoke-DemoControl' {
         (Invoke-DemoControl -Config $config -Target T1 -Scenario 'incident:no-such-scenario' -Confirm:$false | Where-Object { $_.checkId -eq 'CONTROL.REQUEST' }).status | Should -Be 'Fail'
         $script:calls.Count | Should -Be 0
         $script:t2Message = 'The workload runner is not installed in the guest yet.'
+        (Invoke-DemoControl -Config $config -Target T2 -Scenario baseline -Confirm:$false | Where-Object { $_.checkId -eq 'CONTROL.T2' }).status | Should -Be 'Warning'
+        # Before T2's setup, the guest has no demo module yet (Phase 28 live finding): a Warning too, not a Fail.
+        $script:t2Message = 'The control action failed: The specified module ''C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1'' was not loaded because no valid module file was found in any module directory.'
         (Invoke-DemoControl -Config $config -Target T2 -Scenario baseline -Confirm:$false | Where-Object { $_.checkId -eq 'CONTROL.T2' }).status | Should -Be 'Warning'
     }
 }
@@ -1709,6 +1724,30 @@ Describe 'Set-DemoTargetProfile' {
 
         $script:message = 'The workload runner is not installed in the guest yet.'
         (& (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName off -CheckPrefix STOP } $config).status | Should -Be 'Not selected'
+    }
+
+    It 'reports T2 as Not selected, not set up yet, when stop-demo.ps1 runs before its setup and the guest has no demo module (Phase 28 live finding)' {
+        # Live: stop-demo.ps1 at the guided stop gave STOP.PROFILE_T2 a Warning with the guest's Import-Module error.
+        $script:attempts = 0
+        $script:failFirst = 9
+        $script:message = 'The control action failed: The specified module ''C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1'' was not loaded because no valid module file was found in any module directory.'
+        $stop = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName off -CheckPrefix STOP } $config
+        $stop.status | Should -Be 'Not selected'
+        $stop.message | Should -Match 'T2 isn''t set up yet'
+        $stop.message | Should -Match 'no activity runs there to turn off'
+        # What the guest says since this fix, before it imports anything.
+        $script:message = 'The control action failed: T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
+        (& (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName baseline -CheckPrefix START } $config).status | Should -Be 'Not selected'
+        $vmScript = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoWorkloadControl.ps1') -Raw
+        $vmScript | Should -Match ([regex]::Escape('if (-not (Test-Path -LiteralPath $modulePath)) {'))
+        $thrown = [regex]::Match($vmScript, "throw '(T2 isn''t set up yet(?:[^']|'')*)'").Groups[1].Value -replace "''", "'"
+        $thrown | Should -Not -BeNullOrEmpty
+        & (Get-Module -Name DbHubDemo) { param($t) Test-DemoT2NotSetUpText -Text $t } ('The control action failed: ' + $thrown) | Should -BeTrue
+        # Any other T2 problem stays a Warning, and so does any other target's.
+        $script:message = 'The control action failed: The module manifest DbHubDemo.Vm.psd1 could not be processed.'
+        (& (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName off -CheckPrefix STOP } $config).status | Should -Be 'Warning'
+        $script:message = 'The specified module was not loaded because no valid module file was found in any module directory.'
+        (& (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T1 -ProfileName off -CheckPrefix STOP } $config).status | Should -Be 'Warning'
     }
 }
 

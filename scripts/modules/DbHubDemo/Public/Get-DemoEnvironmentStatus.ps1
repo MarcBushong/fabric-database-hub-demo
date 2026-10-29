@@ -240,6 +240,10 @@ function Get-DemoEnvironmentStatus {
                 $read = Invoke-DemoWorkloadCommand -Config $Config -Target $target -ArgumentList 'profile', 'get', '--json' -TimeoutSeconds 300 -Confirm:$false
             }
             catch {
+                if ($target -eq 'T2' -and (Test-DemoT2NotSetUpText -Text $_.Exception.Message)) {
+                    $results.Add((New-DemoResult -CheckId 'STATUS.PROFILE_T2' -Area 'workload' -Target 'T2' -Status 'Not selected' -Message 'T2 isn''t set up yet: the guest gets its demo module and workload runner after SQL Server setup, so it has no activity profile to read.'))
+                    continue
+                }
                 $results.Add((New-DemoResult -CheckId ('STATUS.PROFILE_{0}' -f $target) -Area 'workload' -Target $target -Status 'Warning' -Message ('{0}: the activity profile couldn''t be read: {1}' -f $target, $_.Exception.Message)))
                 continue
             }
@@ -247,6 +251,10 @@ function Get-DemoEnvironmentStatus {
             $record = @($read.Records) | Where-Object { $null -ne (Get-DemoMemberValue -InputObject $_ -Name 'name') } | Select-Object -First 1
             $stdout = [string](Get-DemoMemberValue -InputObject $read -Name 'StdOut')
             if ($null -eq $record -or $read.Status -notin 'Pass', 'Warning') {
+                if ($target -eq 'T2' -and (Test-DemoT2NotSetUpText -Text ([string]$read.Result.message))) {
+                    $results.Add((New-DemoResult -CheckId 'STATUS.PROFILE_T2' -Area 'workload' -Target 'T2' -Status 'Not selected' -Message 'T2 isn''t set up yet: the guest gets its demo module and workload runner after SQL Server setup, so it has no activity profile to read.'))
+                    continue
+                }
                 $readStatus = if ($target -eq 'T2') { 'Warning' } else { [string]$read.Status }
                 if ($readStatus -notin 'Pass', 'Warning') { $readStatus = 'Warning' }
                 $results.Add((New-DemoResult -CheckId ('STATUS.PROFILE_{0}' -f $target) -Area 'workload' -Target $target -Status $readStatus -Message ('{0}: the activity profile couldn''t be read: {1}' -f $target, [string]$read.Result.message)))

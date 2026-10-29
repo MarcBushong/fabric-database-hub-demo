@@ -300,6 +300,25 @@ function Stop-DemoGuestVm {
     return (New-DemoResult -CheckId 'STOP.GUEST' -Area 'infra' -Target 'T2' -Status $status -Message $message -Evidence $evidence -Remediation $remediation)
 }
 
+function Test-DemoT2NotSetUpText {
+    <#
+    .SYNOPSIS
+    True when a T2 workload command failed only because the guest isn't set up yet: it gets its demo module
+    (C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1) and the workload runner after SQL Server setup, so before that the
+    guest's Import-Module fails ("was not loaded because no valid module file was found"), or the runner isn't installed.
+    A Not selected, never a Warning (Phase 28 live finding: stop-demo.ps1 before T2's setup). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    return [bool]([string]$Text -match '(?i)not installed|no workload runner|isn''t set up yet|was not loaded because no valid module file was found')
+}
+
 function Set-DemoTargetProfile {
     <#
     .SYNOPSIS
@@ -311,8 +330,9 @@ function Set-DemoTargetProfile {
     before the next auto-shutdown (--not-after). The T3 and T4 profiles are files on T1, so setting them never
     wakes T3 or connects to T4. A target the caller can't reach (-SkipReason) is Not selected. A profile that can't be set is a
     Warning, not a Fail: the demo's resources are fine, the profile ends at the auto-shutdown anyway, and
-    demo-control.yml or start-demo.ps1 -ActivityProfile sets it again; a T2 guest without the runner yet is
-    Not selected. -Attempts retries a target that isn't reachable yet, such as a T2 guest that's still
+    demo-control.yml or start-demo.ps1 -ActivityProfile sets it again; a T2 guest that isn't set up yet (no demo module or
+    workload runner before SQL Server setup; Test-DemoT2NotSetUpText) is Not selected. -Attempts retries a target that
+    isn't reachable yet, such as a T2 guest that's still
     booting.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Callers confirm once for the whole start or stop; Invoke-DemoWorkloadCommand is called with -Confirm:$false.')]
@@ -389,8 +409,8 @@ function Set-DemoTargetProfile {
         }
         return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status $run.Status -Message $message -Evidence $evidence -DocUrl $docUrl)
     }
-    if ($Target -eq 'T2' -and $detail -match '(?i)not installed|no workload runner') {
-        return (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Not selected' -Message ('T2: the guest has no workload runner yet (it''s installed once the guest''s SQL Server runs), so its profile wasn''t set to {0}.' -f $ProfileName) -Evidence $evidence)
+    if ($Target -eq 'T2' -and (Test-DemoT2NotSetUpText -Text $detail)) {
+        return (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Not selected' -Message ('T2 isn''t set up yet: the guest gets its demo module and workload runner after SQL Server setup, so its activity profile wasn''t set to {0}{1}.' -f $ProfileName, $(if ($ProfileName -eq 'off') { ', and no activity runs there to turn off' } else { '' })) -Evidence $evidence)
     }
     $remediation = if ($ProfileName -eq 'off') {
         'The profile still ends at the auto-shutdown it was set for, and nothing sets it again at boot unless activityProfileOnBoot is true. To turn it off now, run stop-demo.ps1 again while the VM runs, or demo-control.yml with scenario off.'
