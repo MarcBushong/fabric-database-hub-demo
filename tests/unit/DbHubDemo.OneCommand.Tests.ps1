@@ -729,22 +729,19 @@ Describe 'Run Commands never stall a run (brief item 14)' {
     }
 
     It 'never restarts the T2 host mid-build, or while a golden Release runs on it (review finding 6)' {
-        $script:trackT2 = 'Bootstraps'
-        $script:healthFails = $false
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = ''; TrackT2 = $script:trackT2; Stage = ''; T2Source = '' } }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { if ($script:healthFails) { throw 'Run Command timed out.' }; $script:health }
-        foreach ($building in 'InProgress', 'RebootPending') {
-            $script:health = [pscustomobject]@{ state = $building; currentStep = 'GuestVhdx' }
-            $restart = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }
-            $restart.Restarted | Should -BeFalse -Because $building
-            $restart.Reason | Should -Match 'guest build is running \(step GuestVhdx\)'
-        }
-        # A host whose bootstrap ran, and whose health can't be read, may be building: no restart.
-        $script:healthFails = $true
-        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }).Reason | Should -Match 'health couldn''t be read'
+        # Judged from the deployment state, not the host's health (review follow-up): the agent that would read it is what's stuck.
+        $script:stateValues = @{ GuidedStopUtc = ''; Stage = 'Infrastructure'; TrackT1 = 'Monitoring'; TrackT2 = 'Bootstraps'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '2026-10-29T15:00:00Z' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]$script:stateValues }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'The watchdog must not read health through a Run Command.' }
+        $restart = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }
+        $restart.Restarted | Should -BeFalse
+        $restart.Reason | Should -Match 'guest build may be running'
+        # A state that can't be read may hide a build: no restart.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { throw 'The resource group''s tags couldn''t be read.' }
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }).Reason | Should -Match 'deployment state couldn''t be read'
         # While a golden Release runs on it in this process (deploy.ps1 sends its artifacts meanwhile).
-        $script:healthFails = $false
-        $script:health = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboardingBeforeWizard' }
+        $script:stateValues = @{ GuidedStopUtc = ''; Stage = 'Infrastructure'; TrackT1 = 'Monitoring'; TrackT2 = 'Restore'; TrackT4 = ''; TrackFabric = ''; T2Source = 'golden'; T2BuildUtc = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]$script:stateValues }
         $during = InModuleScope DbHubDemo -Parameters @{ Config = $config } {
             $key = '{0}/archost01' -f (Get-DemoResourceGroupName -Config $Config)
             $script:DemoHostAction[$key] = 'Release'
@@ -758,9 +755,8 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $during.Restarted | Should -BeFalse
         $during.Reason | Should -Match 'the golden Release is running on it'
         $script:restarts | Should -Be 0
-        # A new host whose bootstrap never ran has nothing to interrupt.
-        $script:trackT2 = 'Artifacts'
-        $script:healthFails = $true
+        # A new host whose loader never ran has nothing to interrupt.
+        $script:stateValues = @{ GuidedStopUtc = ''; Stage = 'Infrastructure'; TrackT1 = 'Bootstraps'; TrackT2 = 'Artifacts'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '' }
         (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }).Restarted | Should -BeTrue
         $script:restarts | Should -Be 1
     }
@@ -780,6 +776,52 @@ Describe 'Run Commands never stall a run (brief item 14)' {
             $script:flagDuring | Should -Be 'Release'
             (InModuleScope DbHubDemo { $script:DemoHostAction.Count }) | Should -Be 0
         }
+    }
+
+    It 'restarts a golden copy stuck after its Release without reading its health through a Run Command (review follow-up)' {
+        # A golden redeploy's host is a new VM: policy-installed extensions can hold its Run Commands (R336), so a health
+        # read through a Run Command times out exactly then.
+        $script:healthReads = 0
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:healthReads++; throw 'Run Command timed out.' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = ''; Stage = 'Infrastructure'; TrackT1 = 'Monitoring'; TrackT2 = 'Restore'; TrackT4 = ''; TrackFabric = ''; T2Source = 'golden'; T2BuildUtc = '' } }
+        $restart = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }
+        $restart.Restarted | Should -BeTrue
+        $script:restarts | Should -Be 1
+        $script:healthReads | Should -Be 0
+    }
+
+    It 'judges whether the T2 host may be building from the deployment state alone, never its health (review follow-up)' {
+        $script:healthReads = 0
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:healthReads++; [pscustomobject]@{ state = 'Ready' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith {
+            $values = [ordered]@{ GuidedStopUtc = ''; Stage = ''; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; T2Source = ''; T2BuildUtc = '' }
+            foreach ($key in $script:stateValues.Keys) {
+                $values[$key] = $script:stateValues[$key]
+            }
+            [pscustomobject]$values
+        }
+        $blocker = { InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoHostRestartBlocker -Config $Config } }
+        # A generation the loader started that nobody saw finish, even after a rerun from Artifacts recorded an earlier step.
+        $script:stateValues = @{ T2BuildUtc = '2026-10-29T15:00:00Z'; TrackT1 = 'Monitoring'; TrackT2 = 'Restore'; T2Source = 'build' }
+        & $blocker | Should -Match 'bootstrap generation'
+        # The track's last step is the loader (a state written before the build was recorded on its own).
+        $script:stateValues = @{ TrackT1 = 'Monitoring'; TrackT2 = 'Bootstraps'; T2Source = 'build' }
+        & $blocker | Should -Match 'bootstrap generation'
+        # A sequential run's stages between the loaders and T2.
+        $script:stateValues = @{ Stage = 'Monitoring' }
+        & $blocker | Should -Match 'guest build may be running'
+        # Nothing running: a new host before its loader, a golden copy after its Release, a host whose T2 step finished,
+        # and a sequential run that finished.
+        foreach ($values in @(
+                @{ TrackT1 = 'Bootstraps'; TrackT2 = 'Artifacts'; T2Source = 'build' }
+                @{ TrackT1 = 'Monitoring'; TrackT2 = 'Artifacts'; T2Source = 'golden' }
+                @{ TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; T2Source = 'build' }
+                @{ Stage = 'Validation' }
+            )) {
+            $script:stateValues = $values
+            & $blocker | Should -BeNullOrEmpty -Because (($values.GetEnumerator() | ForEach-Object { '{0}={1}' -f $_.Key, $_.Value }) -join ' ')
+        }
+        $script:healthReads | Should -Be 0
     }
 
     It 'goes on after the watchdog when the extensions settle after the restart' {

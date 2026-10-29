@@ -202,12 +202,18 @@ function Save-DemoVmInstanceView {
 function Get-DemoHostRestartBlocker {
     <#
     .SYNOPSIS
-    Why the watchdog mustn't restart the T2 host now, or '' when it may (review finding 6): the guided stop's time limit
-    is open (its guest may be in the middle of setup); a golden guest action, the Release, runs on it in this process
-    (Invoke-DemoGoldenGuestAction); or its guest build runs (health state InProgress or RebootPending). A host whose
-    bootstrap never ran (no T2 step past Artifacts, no stage past Artifacts, not a golden copy) has nothing to
-    interrupt, so its health isn't read; for any other host, health that can't be read counts as a build that may be
-    running. Internal.
+    Why the watchdog mustn't restart the T2 host now, or '' when it may (review finding 6 and its follow-up): the guided
+    stop's time limit is open (its guest may be in the middle of setup); a golden guest action, the Release, runs on it in
+    this process (Invoke-DemoGoldenGuestAction); or its guest build may be running. Judged from the deployment state
+    alone, never through the host's VM agent, which is what's stuck when the watchdog asks (R336). Internal.
+
+    .DESCRIPTION
+    A guest build may be running while T2BuildUtc is set (the host's loader started a bootstrap generation that nobody has
+    seen finish; the Release of a new golden copy and the end of the T2 step clear it), while the T2 track's last step is
+    Bootstraps (a state written before T2BuildUtc existed), or, for a sequential run's state (no track recorded), while
+    the recorded stage is between Bootstraps and T2. So a new host before its loader, a golden copy after its Release
+    (until its loader starts a new generation), and a host whose T2 step finished may be restarted; a state that can't be
+    read may not.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -219,7 +225,12 @@ function Get-DemoHostRestartBlocker {
         [string] $VmName = 'archost01'
     )
 
-    $state = Get-DemoDeploymentState -Config $Config
+    try {
+        $state = Get-DemoDeploymentState -Config $Config
+    }
+    catch {
+        return ('the deployment state couldn''t be read ({0}), so its guest build may be running' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
     $until = ConvertTo-DemoRunCommandUtc -Value (Get-DemoMemberValue -InputObject $state -Name 'GuidedStopUtc')
     if ($null -ne $until -and $until -gt [System.DateTime]::UtcNow) {
         return 'its guest may be in the middle of SQL Server setup (the guided stop)'
@@ -228,21 +239,18 @@ function Get-DemoHostRestartBlocker {
     if ($script:DemoHostAction.ContainsKey($key)) {
         return ('the golden {0} is running on it' -f $script:DemoHostAction[$key])
     }
+    $building = [string](Get-DemoMemberValue -InputObject $state -Name 'T2BuildUtc')
+    if ($building) {
+        return ('its loader started a bootstrap generation at {0} that hasn''t been seen to finish, so its guest build may be running' -f $building)
+    }
     $track = [string](Get-DemoMemberValue -InputObject $state -Name 'TrackT2')
+    if ($track -eq 'Bootstraps') {
+        return 'its loader started a bootstrap generation (the T2 track''s last step is Bootstraps), so its guest build may be running'
+    }
+    $tracks = @(foreach ($name in 'TrackT1', 'TrackT2', 'TrackT4', 'TrackFabric') { [string](Get-DemoMemberValue -InputObject $state -Name $name) }) -join ''
     $stage = [string](Get-DemoMemberValue -InputObject $state -Name 'Stage')
-    $bootstrapped = $track -in 'Bootstraps', 'T2', 'Telemetry' -or [string](Get-DemoMemberValue -InputObject $state -Name 'T2Source') -eq 'golden' -or ($stage -and (Test-DemoDeploymentStageReached -Recorded $stage -Stage 'Bootstraps'))
-    if (-not $bootstrapped) {
-        return ''
-    }
-    try {
-        $health = Get-DemoVmHealth -Config $Config -VmName $VmName -View Summary -TimeoutSeconds 120
-    }
-    catch {
-        return ('its health couldn''t be read ({0}), and its guest build may be running' -f (Protect-DemoText -Text $_.Exception.Message))
-    }
-    $hostState = [string](Get-DemoMemberValue -InputObject $health -Name 'state')
-    if ($hostState -in 'InProgress', 'RebootPending') {
-        return ('its guest build is running (step {0})' -f [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep'))
+    if (-not $tracks -and $stage -and (Test-DemoDeploymentStageReached -Recorded $stage -Stage 'Bootstraps') -and -not (Test-DemoDeploymentStageReached -Recorded $stage -Stage 'T2')) {
+        return ('the recorded stage is {0}, after the loaders and before T2 finished, so its guest build may be running' -f $stage)
     }
     return ''
 }
@@ -252,8 +260,8 @@ function Restart-DemoVmOnce {
     .SYNOPSIS
     The watchdog's restart: 'az vm restart' for one VM, at most once per deploy.ps1 process, then the wait for its VM
     agent. Never the T2 host while Get-DemoHostRestartBlocker names a reason: the guided stop's request is valid (its
-    guest may be in the middle of setup), the golden Release runs on it, or its guest build runs (review finding 6).
-    Returns Restarted, Reason, and AtUtc. Internal.
+    guest may be in the middle of setup), the golden Release runs on it, or its guest build may be running, judged from
+    the deployment state (review finding 6 and its follow-up). Returns Restarted, Reason, and AtUtc. Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]

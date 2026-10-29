@@ -88,6 +88,9 @@ function Get-DemoDeploymentStateTagName {
         # size T4's Burstable fallback settled on (Standard_B2s, or None when Azure refused both) for later runs.
         GuidedStopUtc            = 'DbHubGuidedStopUtc'
         T4Sku                    = 'DbHubT4Sku'
+        # Phase 28 review follow-up: when the T2 host's loader started a bootstrap generation that nobody has seen finish (empty
+        # when none runs), so deploy.ps1's watchdog never restarts the host during its guest build (Get-DemoHostRestartBlocker).
+        T2BuildUtc               = 'DbHubT2BuildUtc'
     }
 }
 

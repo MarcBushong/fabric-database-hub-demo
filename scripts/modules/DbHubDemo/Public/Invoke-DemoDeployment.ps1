@@ -434,6 +434,16 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Bootstraps' 'Fail' 'The deployment that adds the loaders failed.' 'Fix the cause in DEPLOY.TEMPLATE, then run deploy.ps1 -Resume.'
                     return $results.ToArray()
                 }
+                if (-not $whatIf -and $hostVm -eq 'archost01') {
+                    # The host's loader starts a bootstrap generation that builds its guest; until T2 is done, deploy.ps1's
+                    # watchdog never restarts the host (Get-DemoHostRestartBlocker, Phase 28 review follow-up).
+                    try {
+                        Set-DemoDeploymentState -Config $Config -Value @{ T2BuildUtc = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
+                    }
+                    catch {
+                        Write-DemoLog -Level Warning -Message ('The T2 host''s bootstrap generation wasn''t recorded: {0}' -f $_.Exception.Message)
+                    }
+                }
                 $loaders = @(foreach ($vm in $vmNames) { Wait-DemoBootstrapLoader -Config $Config -VmName $vm })
                 & $addAll $loaders
                 if (& $hasStatus $loaders 'Fail') {
@@ -600,7 +610,8 @@ function Invoke-DemoDeployment {
                 $profileName = if ($Config['activityProfile']) { [string]$Config['activityProfile'] } else { 'baseline' }
                 $t2Skip = if (-not $current.RunnerSha256 -or 'archost01' -notin $current.RunnerSentTo) { 'T2 has no workload runner (-SkipRunner, or it wasn''t sent to archost01).' } else { '' }
                 $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $t2Skip -RequestedBy 'deploy'))
-                & $recordStage 'T2'
+                # The guest build is done, so the bootstrap generation's record goes (Get-DemoHostRestartBlocker).
+                & $recordStage 'T2' @{ T2BuildUtc = '' }
                 & $stageResult 'T2' 'Pass' 'T2 is onboarded to Azure Arc, configured, and monitored.'
             }
             'Fabric' {

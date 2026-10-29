@@ -277,6 +277,45 @@ Describe 'Invoke-DemoDeploymentTrack' {
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.READY' }).status | Should -Be 'Pass'
     }
 
+    It 'records when archost01''s loader starts a bootstrap generation, and clears it after a new golden copy''s Release and after the T2 step (review follow-up)' {
+        # The watchdog never restarts the host while that generation may still build its guest (Get-DemoHostRestartBlocker).
+        $script:state.BundleSentTo = @()
+        $script:state.RunnerSentTo = @()
+        $script:buildMarks = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith {
+            $value = $PesterBoundParameters['Value']
+            if ($null -ne $value -and $value.Contains('T2BuildUtc')) {
+                $script:buildMarks.Add($(if ($value['T2BuildUtc']) { 'set' } else { 'clear' }))
+            }
+            if ($PesterBoundParameters['AddKind'] -eq 'Bundle') {
+                $script:state.BundleSha256 = $PesterBoundParameters['Sha256']
+                $script:state.BundleSentTo = @($PesterBoundParameters['AddVm'])
+            }
+            elseif ($PesterBoundParameters['AddKind'] -eq 'Runner') {
+                $script:state.RunnerSha256 = $PesterBoundParameters['Sha256']
+                $script:state.RunnerSentTo = @($PesterBoundParameters['AddVm'])
+            }
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Restore', 'Artifacts', 'Bootstraps', 'T2', 'Telemetry') }
+        $outcome.Status | Should -Be 'Pass'
+        $script:buildMarks | Should -Be @('clear', 'set', 'clear')
+
+        # A copy that an earlier run released keeps the record: that run's loader may have started a generation since.
+        $script:buildMarks.Clear()
+        $script:releaseData = [pscustomobject]@{ role = 'Copy'; captured = $true; guestState = 'Running' }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Restore') }
+        $script:buildMarks.Count | Should -Be 0
+
+        # A loader that never started records nothing; T1's loader never does.
+        $script:buildMarks.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoBootstrapLoaderRun -MockWith { New-DemoResult -CheckId ('INFRA.BOOTSTRAP.LOADER_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'not started' -Evidence @{ notStarted = $true } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmWatchdog -MockWith { [pscustomobject]@{ Restarted = $false; Saved = ''; Items = @(); Result = (New-TestResult ('DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()) 'Warning') } }
+        $script:context['T2Source'] = 'build'
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps') }
+        $script:buildMarks.Count | Should -Be 0
+    }
+
     It 'sends archost01''s artifacts during the Release without the extension wait or the watchdog, which wait for the Artifacts step (review finding 6)' {
         $script:state.BundleSentTo = @()
         $script:state.RunnerSentTo = @()

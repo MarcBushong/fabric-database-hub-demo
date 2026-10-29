@@ -701,7 +701,26 @@ function Invoke-DemoDeploymentTrack {
             }
         }
         $results.Add($loader)
+        if ($VmName -eq 'archost01' -and -not [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
+            # The loader ran, so a bootstrap generation that may build the guest has started (review follow-up).
+            & $recordT2Build ([DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture))
+        }
         return ($loader.status -eq 'Pass')
+    }
+    # Records when the T2 host's loader started a bootstrap generation, or clears it once nothing is building: after the
+    # Release of a new golden copy and after the T2 step. While it's set, the watchdog never restarts the host; the record
+    # survives a rerun that repeats earlier steps, which the track's own step tag doesn't (Get-DemoHostRestartBlocker).
+    $recordT2Build = {
+        param([string] $Value)
+        if (-not $recordState) {
+            return
+        }
+        try {
+            Set-DemoDeploymentStateLocked -Config $Config -Value @{ T2BuildUtc = $Value } -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('Track T2: archost01''s bootstrap generation wasn''t recorded: {0}' -f $_.Exception.Message)
+        }
     }
     # Waits for a VM's extensions to settle before its next Run Command, once per step (Invoke-DemoVmSettle).
     $settle = {
@@ -1006,6 +1025,12 @@ function Invoke-DemoDeploymentTrack {
                     $releasedEarlier = $evidence['role'] -eq 'Copy' -and [string]::IsNullOrEmpty([string]$evidence['reset'])
                     $message = if ($releasedEarlier) { 'archost01 is a copy of the golden snapshot that an earlier run released; its guest is on its network and starts with the host.' } elseif ($evidence['role'] -eq 'Copy') { 'archost01 is a copy of the golden snapshot: {0}, SQL Server runs {1}, the guest''s password was rotated, and the guest is back on its network.' -f $resetText, $evidence['sqlEdition'] } elseif ($evidence['captured']) { 'archost01 is the host the snapshot was taken from: its guest is reconnected and starts with the host again.' } else { 'archost01 has no capture record: nothing to release.' }
                     & $note 'DEPLOY.T2.RESTORE' 'T2' 'Pass' $message '' $evidence
+                    # A copy that this Release just released runs no bootstrap generation until its loader starts one, so
+                    # the record goes (review follow-up). One that an earlier run released keeps it: that run's loader may
+                    # have started a generation since.
+                    if ($evidence['role'] -eq 'Copy' -and -not $releasedEarlier) {
+                        & $recordT2Build ''
+                    }
                 }
                 'T2/Artifacts' {
                     & $send 'archost01'
@@ -1106,6 +1131,8 @@ function Invoke-DemoDeploymentTrack {
                         break
                     }
                     & $partDone 'T2.Monitoring' @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.SQLEXTENSION' })
+                    # The guest is built, set up, onboarded, and monitored: its bootstrap generation's record goes (review follow-up).
+                    & $recordT2Build ''
                     if (-not $golden) {
                         Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Done' -Message 'Done: no sign-in data is left in the guest or on the host.'
                     }

@@ -13,7 +13,8 @@ function Get-DemoDeploymentState {
     T2Source (golden or build), FabricCapacityResumed and FabricCapacityResumedUtc (the capacity start-demo.ps1 resumed
     with fabric.manageCapacity, as "<resource group>/<name>", Phase 26b), GuidedStopUtc (until when the PaygWizard guided
     stop's request is valid) and T4Sku (the size T4's Burstable fallback settled on: Standard_B2s, or None; Phase 28),
-    and Tags (every tag on the group). Read-only.
+    T2BuildUtc (when the T2 host's loader started a bootstrap generation that nobody has seen finish; empty when none
+    runs; Phase 28 review follow-up), and Tags (every tag on the group). Read-only.
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -62,6 +63,7 @@ function Get-DemoDeploymentState {
         FabricCapacityResumedUtc = & $read 'FabricCapacityResumedUtc'
         GuidedStopUtc     = & $read 'GuidedStopUtc'
         T4Sku             = & $read 'T4Sku'
+        T2BuildUtc        = & $read 'T2BuildUtc'
         Tags              = $tags
     }
 }

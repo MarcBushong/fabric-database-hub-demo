@@ -22,7 +22,7 @@ BeforeAll {
         $state = [ordered]@{
             Exists = $true; Stage = ''; StageUtc = ''; BundleSha256 = ''; BundleChunkCount = 0; RunnerSha256 = ''; RunnerChunkCount = 0
             BundleSentTo = @(); RunnerSentTo = @(); NetworkMode = 'private'; T3UseFreeLimit = $false; T3AdminGroupName = 'DbHub T3 Admins'
-            BastionExpiresUtc = ''; HostPasswordUtc = ''; Tags = @{ deploymentId = 'abc123' }
+            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; Tags = @{ deploymentId = 'abc123' }
         }
         foreach ($key in $Values.Keys) {
             $state[$key] = $Values[$key]
@@ -438,6 +438,20 @@ Describe 'Invoke-DemoDeployment' {
         ($results | Where-Object { $_.checkId -eq 'FABRIC.ITEMS.REQUIRED' }).status | Should -Be 'Pass'
         $outcome.Kind | Should -Be 'Done' -Because ('Missing: {0}; reason: {1}' -f (@($outcome.Missing) -join ', '), $outcome.Reason)
         $outcome.ExitCode | Should -Be 0
+    }
+
+    It 'records that the T2 host''s loader started a bootstrap generation, and clears it once T2 is done (review follow-up)' {
+        # The watchdog never restarts the host while that generation may still build its guest (Get-DemoHostRestartBlocker).
+        Invoke-DemoDeployment -Config $config | Out-Null
+        $marks = @($script:recorded | Where-Object { $_.Contains('T2BuildUtc') } | ForEach-Object { if ($_['T2BuildUtc']) { 'set' } else { 'clear' } })
+        $marks | Should -Be @('set', 'clear')
+        $script:state.T2BuildUtc | Should -BeNullOrEmpty
+
+        # T2 left open (the wizard step waits): the generation stays on record.
+        $script:recorded.Clear()
+        $script:arcStatus = 'Manual action required'
+        Invoke-DemoDeployment -Config $config | Out-Null
+        @($script:recorded | Where-Object { $_.Contains('T2BuildUtc') } | ForEach-Object { if ($_['T2BuildUtc']) { 'set' } else { 'clear' } }) | Should -Be @('set')
     }
 
     It 'runs DONE''s read-only checks after the validation, as the parallel path does, so a sequential run can end DONE (review finding 4)' {
