@@ -58,8 +58,10 @@ summary). It has no guided stop.
   to change the Azure CLI's default subscription. Every Azure call carries the configured subscription.
 - Results go to the console, to -OutputPath as JSON lines, and in GitHub Actions to the job summary; the console's
   transcript goes to out/logs (not in GitHub Actions). ./scripts/collect-diagnostics.ps1 zips them, redacted.
-  Exit code: 0 when DONE, 1 when NOT DONE with a Fail, 2 when NOT DONE otherwise. GitHub Actions keeps the earlier
-  codes: 0 Pass or Warning, 1 Fail, 2 Manual action required with -TreatManualAsError.
+  Exit code: 0 when DONE, 1 when NOT DONE with a Fail, 2 when NOT DONE otherwise. After Ctrl+C, PowerShell usually ends
+  the script itself, with its own exit code; the console and the status page still say NOT DONE with the command that
+  continues. GitHub Actions keeps the earlier codes: 0 Pass or Warning, 1 Fail, 2 Manual action required with
+  -TreatManualAsError.
 
 .PARAMETER ConfigPath
 Demo configuration (default: config/demo.config.json). When it doesn't exist yet, deploy.ps1 writes it first.
