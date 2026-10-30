@@ -84,10 +84,10 @@ function Invoke-DemoVmPowerAction {
         Start-Sleep -Seconds $PollSeconds
         $current = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
         if ($current -eq $wanted) {
-            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1} after {2:N0} seconds.' -f $VmName, $wanted.Split('/')[1], $watch.Elapsed.TotalSeconds) -Evidence ([ordered]@{ before = $before; after = $current }))
+            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1} after {2:N0} seconds.' -f $VmName, $wanted.Split('/')[1], $watch.Elapsed.TotalSeconds) -Evidence ([ordered]@{ before = $before; after = $current; issued = $verb }))
         }
     }
-    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still {1} after {2} seconds.' -f $VmName, $current, $TimeoutSeconds) -Remediation 'Check the VM in the portal; run the script again.' -Evidence ([ordered]@{ before = $before; after = $current }))
+    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still {1} after {2} seconds.' -f $VmName, $current, $TimeoutSeconds) -Remediation 'Check the VM in the portal; run the script again.' -Evidence ([ordered]@{ before = $before; after = $current; issued = $verb }))
 }
 
 function Request-DemoVmStart {
@@ -239,11 +239,18 @@ function Wait-DemoStoppedStart {
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $notRunning = [System.Collections.Generic.List[string]]::new()
+    # What this run itself started: its own request (Request-DemoVmStart), or the start Invoke-DemoVmPowerAction issued
+    # once a VM that was still stopping had settled; never one that was already starting (Phase 28 review).
+    $issued = [System.Collections.Generic.List[string]]::new()
     foreach ($vm in @($Request.Vms.Keys)) {
         $item = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:([bool]$Request.Vms[$vm].Requested)
         $results.Add($item)
         if ([string]$item.status -ne 'Pass') {
             $notRunning.Add($vm)
+        }
+        $itemEvidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
+        if ([bool]$Request.Vms[$vm].Requested -or [string](Get-DemoMemberValue -InputObject $itemEvidence -Name 'issued') -eq 'start') {
+            $issued.Add($vm)
         }
     }
     # The T2 guest starts with its host (its automatic start action), except on a golden snapshot's source host,
@@ -262,7 +269,10 @@ function Wait-DemoStoppedStart {
     }
     $minutes = [int][System.Math]::Ceiling($watch.Elapsed.TotalMinutes)
     $vms = @($Request.Vms.Keys)
-    $evidence = [ordered]@{ vms = $vms; notRunning = $notRunning.ToArray(); t4 = $(if ($null -ne $t4) { [string]$t4.status } else { '' }); minutes = $minutes }
+    $t4Started = $null -ne $t4 -and [string]$t4.status -eq 'Pass'
+    $evidence = [ordered]@{ vms = $vms; started = $issued.ToArray(); notRunning = $notRunning.ToArray(); t4 = $(if ($null -ne $t4) { [string]$t4.status } else { '' }); minutes = $minutes }
+    # Remembered for the ending's line about what bills: what this run started and now runs, and T4 when it started it.
+    Add-DemoProgressStartedVm -Path $ProgressPath -Name (@($issued | Where-Object { $_ -notin $notRunning }) + @(if ($t4Started) { 'T4' }))
     $t4Text = if ($null -eq $t4) { '' } elseif ([string]$t4.status -eq 'Pass') { ' T4 is Ready.' } else { ' T4: {0}' -f [string]$t4.message }
     if ($notRunning.Count -gt 0) {
         $message = '{0} isn''t running, so the steps that need it can''t run (Run Command needs a running VM).{1}' -f ($notRunning -join ' and '), $t4Text
@@ -272,7 +282,6 @@ function Wait-DemoStoppedStart {
     }
     $message = if ($vms.Count -gt 0) { 'Started {0}, which had been stopped, in about {1} minute(s).{2}' -f ($vms -join ' and '), $minutes, $t4Text } elseif ([string]$t4.status -eq 'Pass') { 'Started T4, which had been stopped; it''s Ready.' } else { 'T4 was stopped, and it isn''t Ready: {0}' -f [string]$t4.message }
     $status = if ($null -ne $t4 -and [string]$t4.status -ne 'Pass') { 'Warning' } else { 'Pass' }
-    Add-DemoProgressStartedVm -Path $ProgressPath -Name (@($vms) + @(if ($null -ne $t4 -and [string]$t4.status -eq 'Pass') { 'T4' }))
     $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status $status -Message $message -Evidence $evidence -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-start'))
     Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status $status -Message $message
     return $results.ToArray()

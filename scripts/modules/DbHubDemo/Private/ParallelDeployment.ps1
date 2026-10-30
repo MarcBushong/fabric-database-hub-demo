@@ -743,7 +743,7 @@ function Invoke-DemoParallelDeployment {
                 if ($null -ne $stoppedStart -and @($stoppedStart.Requested).Count -gt 0) {
                     # What this run asked to start keeps running, and billing (ADR 0016), until a stop.
                     $message = 'This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')
-                    $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Evidence ([ordered]@{ vms = @($stoppedStart.Requested); notRunning = @(); afterPreflightFail = $true }) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
+                    $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Evidence ([ordered]@{ vms = @($stoppedStart.Requested); started = @($stoppedStart.Requested); notRunning = @(); afterPreflightFail = $true }) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
                     Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status 'Warning' -Message $message
                 }
                 return $results.ToArray()
@@ -829,11 +829,7 @@ function Invoke-DemoParallelDeployment {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
             & $ensureContext
             Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Running' -Message 'Deploying the template (about 7 to 9 minutes).'
-            if (-not $whatIf -and -not [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')) {
-                # A first deployment creates the VMs (and T4), which run and bill from then on, even when the run stops: the
-                # ending names them when the run isn't DONE (Phase 28).
-                Add-DemoProgressStartedVm -Path $ProgressPath -Name (@('sqlvm01', (Get-DemoHostVmName -Config $Config)) + @(if (-not $skipT4) { 'T4' }))
-            }
+            $firstDeployment = -not $whatIf -and -not [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')
             $deployArguments = @{
                 Config                  = $Config
                 Action                  = $(if ($whatIf) { 'WhatIf' } else { 'Create' })
@@ -892,6 +888,12 @@ function Invoke-DemoParallelDeployment {
                     $Config = $copy
                     $skipT4 = -not [bool]$deployedT4
                 }
+            }
+            if ($firstDeployment) {
+                # What the template created runs and bills from now on, even when the run stops: the ending names it when
+                # the run isn't DONE. Only after the template succeeded, and T4 only when it was deployed (Phase 28 review:
+                # a failed template, or the Burstable fallback ending without T4, named what didn't exist).
+                Add-DemoProgressStartedVm -Path $ProgressPath -Name (@('sqlvm01', (Get-DemoHostVmName -Config $Config)) + @(if (-not $skipT4) { 'T4' }))
             }
             try {
                 Set-DemoDeploymentState -Config $Config -Value @{ Stage = 'Infrastructure'; NetworkMode = $context.NetworkMode; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T3AdminGroupName = [string]$context.T3AdminGroupName; T2Source = $(if ($context.T2Source -eq 'golden') { 'golden' } elseif ($context.T2Source -like 'existing-*') { $context.T2Source -replace '^existing-', '' } else { 'build' }) } -Confirm:$false

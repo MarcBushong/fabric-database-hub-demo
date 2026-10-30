@@ -1712,6 +1712,40 @@ Describe 'Write-DemoResultReport' {
             $env:GITHUB_STEP_SUMMARY = $previous
         }
     }
+
+    It 'logs a check''s remediation once when two sources report the same check and remediation, and keeps the table and the job summary complete (Phase 28 live run)' {
+        # Live, 2026-10-30: PREFLIGHT.FABRIC.VIEWERLICENSE's remediation came twice, from preflight and from the Fabric track.
+        $summary = Join-Path -Path $TestDrive -ChildPath 'deduplicated.md'
+        $previous = $env:GITHUB_STEP_SUMMARY
+        $env:GITHUB_STEP_SUMMARY = $summary
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $licence = 'For viewers of the report or the app: assign Pro or PPU licenses (P11).'
+        $results = @(
+            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.VIEWERLICENSE' -Area 'preflight' -Target 'fabric' -Status 'Warning' -Message 'The capacity is F2.' -Remediation $licence
+            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.VIEWERLICENSE' -Area 'preflight' -Target 'fabric' -Status 'Warning' -Message 'The capacity is F2.' -Remediation $licence
+            New-DemoResult -CheckId 'HUB.ESTATE.T1' -Area 'hub' -Target 'T1' -Status 'Warning' -Message 'Not in Estate yet.' -Remediation 'Wait about 10 minutes.'
+            New-DemoResult -CheckId 'HUB.ESTATE.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'Not in Estate.' -Remediation 'Wait about 10 minutes.'
+            New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The app is deployed.' -Remediation 'Open the app once in the browser.'
+            New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The app is deployed.' -Remediation 'Open the app once in the browser.'
+        )
+        try {
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+            $table = @(Write-DemoResultReport -Result $results -Title 'deploy.ps1' 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+        }
+        finally {
+            $env:GITHUB_STEP_SUMMARY = $previous
+        }
+        $script:logged | Should -Be @(
+            ('PREFLIGHT.FABRIC.VIEWERLICENSE: {0}' -f $licence)
+            'HUB.ESTATE.T1: Wait about 10 minutes.'
+            '1 item(s) need you (Manual action required):'
+            '  FABRIC.APP.BROWSER: Open the app once in the browser.'
+        )
+        ([regex]::Matches($table, 'PREFLIGHT\.FABRIC\.VIEWERLICENSE')).Count | Should -Be 2 -Because 'the table keeps every result'
+        $text = Get-Content -LiteralPath $summary -Raw
+        ([regex]::Matches($text, '\| PREFLIGHT\.FABRIC\.VIEWERLICENSE \| Warning \|')).Count | Should -Be 2
+        ([regex]::Matches($text, '\*\*FABRIC\.APP\.BROWSER:\*\*')).Count | Should -Be 2 -Because 'the job summary is unchanged'
+    }
 }
 
 Describe 'Run Command waits and a VM that isn''t running (R49)' {
@@ -1874,6 +1908,12 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocating' }
         $script:billing = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Add-DemoProgressStartedVm -MockWith { $script:billing.Add((@($PesterBoundParameters['Name']) -join ',')) }
+        # Invoke-DemoVmPowerAction issues the start for the one that was still stopping once it has settled.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith {
+            $script:calls.Add(('running {0} requested={1}' -f $VmName, [bool]$PesterBoundParameters['StartRequested']))
+            $issued = if ([bool]$PesterBoundParameters['StartRequested']) { '' } else { 'start' }
+            New-DemoResult -CheckId ('START.VM_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T1' -Status 'Pass' -Message ('{0} is running.' -f $VmName) -Evidence ([ordered]@{ issued = $issued })
+        }
         $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
         $request.Needed | Should -BeTrue
         $request.Requested | Should -Be @('sqlvm01') -Because 'only what this run asked to start bills because of it'
@@ -1890,6 +1930,20 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $done.message | Should -Match 'Started sqlvm01 and archost01, which had been stopped'
         $script:page[-1] | Should -Match '^StartVms\|\|Pass\|Started sqlvm01 and archost01'
         $script:billing[-1] | Should -Be 'sqlvm01,archost01' -Because 'the one that was still stopping was started too'
+        @($done.evidence.started) | Should -Be @('sqlvm01', 'archost01')
+    }
+
+    It 'records as billing because of this run only the VMs it issued a start for, not one that was already starting (Phase 28 review)' {
+        # Reviewer, 2026-10-30: the record named every VM that wasn't running, including one something else was starting.
+        $script:power = @{ sqlvm01 = 'PowerState/starting'; archost01 = 'PowerState/deallocated' }
+        $script:billing = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Add-DemoProgressStartedVm -MockWith { $script:billing.Add((@($PesterBoundParameters['Name']) -join ',')) }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $request.Requested | Should -Be @('archost01')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request -ProgressPath 'progress.json' })
+        $script:calls | Should -Contain 'running sqlvm01 requested=False' -Because 'a VM that''s starting is only waited for'
+        $script:billing[-1] | Should -Be 'archost01'
+        @(($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).evidence.started) | Should -Be @('archost01')
     }
 
     It 'starts a stopped T4 and waits for it, and leaves T1''s monitoring plugin to the caller''s check on every run (Phase 28 live finding)' {
@@ -2178,10 +2232,13 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         foreach ($state in 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($state)
         }
-        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' } $config
+        # The Monitoring step has already given the plugin its grace (Invoke-DemoSqlVmMonitoringWait), so it passes 0.
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -NotRunningGraceMinutes 0 } $config
         $result.checkId | Should -Be 'DEPLOY.T1.MONITORING'
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'wasn''t running after the deployment \(DatabaseMonitorArcPlugin: \{"State":"NotRunning"\}\); the SQL IaaS Agent service was restarted'
+        $script:readsAtRestart | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly -ParameterFilter { $Seconds -eq 60 }
     }
 
     It 'waits for the agent''s first plugin status after boot, and leaves a plugin that comes up Running alone' {
@@ -2198,29 +2255,79 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
     }
 
     It 'waits for the agent''s first plugin status before it restarts a NotRunning plugin, then checks for Running and OK' {
-        # Live, 2026-10-26: a restart while the status was still empty left the plugin NotRunning for hours.
-        foreach ($state in 'Empty', 'NotRunning', 'NotRunning', 'Running') {
+        # Live, 2026-10-26: a restart while the status was still empty left the plugin NotRunning for hours. Then the
+        # NotRunning plugin gets the short grace (three reads a minute apart) before the restart (live, 2026-10-30).
+        foreach ($state in 'Empty', 'NotRunning', 'NotRunning', 'NotRunning', 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($state)
         }
         $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c } $config
-        $script:readsAtRestart | Should -Be 2
+        $script:readsAtRestart | Should -Be 5
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'wasn''t running after the start \(DatabaseMonitorArcPlugin: \{"State":"NotRunning"\}\); the SQL IaaS Agent service was restarted'
         $result.evidence.restarted | Should -BeTrue
+        $result.evidence.gracePolls | Should -Be 3
         $result.evidence.after | Should -Match '"State":"Running","MetricsUploadStatus":"OK"'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $VmName -eq 'sqlvm01' -and $Script -match "Restart-Service -Name 'SQLIaaSExtension' -Force" }
     }
 
-    It 'restarts the SQL IaaS Agent when the plugin stayed NotRunning after the start, and waits for Running and OK' {
-        # Live, 2026-10-22: NotRunning for more than 90 minutes after a deallocation and start; Running a minute after the restart.
-        foreach ($state in 'NotRunning', 'NotRunning', 'Running') {
+    It 'restarts the SQL IaaS Agent when the plugin stays NotRunning through the short grace after the start, not 20 minutes later, and waits for Running and OK (Phase 28 live finding)' {
+        # Live, 2026-10-22: NotRunning for more than 90 minutes after a deallocation and start; Running a minute after the
+        # restart. Live, 2026-10-30: about 2 of 3 starts left it NotRunning, and it never started by itself.
+        foreach ($state in 'NotRunning', 'NotRunning', 'NotRunning', 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($state)
         }
         $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -PollSeconds 1 } $config
-        $script:readsAtRestart | Should -Be 1
+        $script:readsAtRestart | Should -Be 4 -Because 'the first read, then three more during the 3-minute grace'
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'restarted'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 3 -Exactly -ParameterFilter { $Seconds -eq 60 }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $VmName -eq 'sqlvm01' -and $Script -match "Restart-Service -Name 'SQLIaaSExtension' -Force" }
+    }
+
+    It 'counts the grace in elapsed time, the reads included, and never sleeps past its end (Phase 28 live finding)' {
+        # Live, 2026-10-30: each read takes 15 to 20 seconds, so a wait counted in reads ran 25 minutes instead of 20.
+        $script:pluginStates.Enqueue('NotRunning')
+        $script:now = [datetime]::new(2026, 10, 30, 13, 30, 0, [System.DateTimeKind]::Utc)
+        $script:sleeps = [System.Collections.Generic.List[int]]::new()
+        $script:restartAt = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:sleeps.Add([int]$Seconds); $script:now = $script:now.AddSeconds($Seconds) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm extension show ' } -MockWith {
+            $script:reads++
+            $script:now = $script:now.AddSeconds(20)
+            New-TestSqlIaasExtension -PluginState $(if ($null -ne $script:restartAt) { 'Running' } else { 'NotRunning' })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $script:readsAtRestart = $script:reads
+            $script:restartAt = $script:now
+            [pscustomobject]@{ Succeeded = $true; Output = 'SQLIaaSExtension is Running.' }
+        }
+        $start = $script:now
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' } $config
+        $result.status | Should -Be 'Pass'
+        @($script:sleeps)[0..2] | Should -Be @(60, 60, 20) -Because 'the last sleep ends with the 3-minute grace'
+        $script:readsAtRestart | Should -Be 4
+        ($script:restartAt - $start).TotalSeconds | Should -Be 220 -Because 'the first read (20 s), then the grace of 180 s, and the read that ends it'
+    }
+
+    It 'says on the console and the status page that it waits for a NotRunning plugin, and leaves one that starts by itself alone (Phase 28 live finding)' {
+        foreach ($state in 'NotRunning', 'NotRunning', 'Running') {
+            $script:pluginStates.Enqueue($state)
+        }
+        $script:page = [System.Collections.Generic.List[string]]::new()
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:page.Add(('{0}|{1}|{2}' -f (@($PesterBoundParameters['Id']) -join ','), [bool]$PesterBoundParameters['AzureSide'], $PesterBoundParameters['Message'])) }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -ProgressPath 'progress.json' } $config
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'is running \(upload status ''OK''\), reported \d+ seconds after the check began'
+        $result.evidence.gracePolls | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
+        $script:page | Should -Be @(
+            'T1.Monitoring|True|T1''s monitoring plugin reports NotRunning; start-demo.ps1 restarts it if it doesn''t start by itself within 3 minutes; no action needed.'
+            'T1.Monitoring|True|T1''s monitoring plugin reports NotRunning (1 min so far); start-demo.ps1 restarts it if it doesn''t start by itself within 2 minutes; no action needed.'
+        )
+        $script:logged | Should -Be @('T1''s monitoring plugin reports NotRunning; start-demo.ps1 restarts it if it doesn''t start by itself within 3 minutes; no action needed.') -Because 'a console line on the first read, then every few minutes'
     }
 
     It 'restarts the SQL IaaS Agent when the plugin still has no status after the bounded wait' {
@@ -2253,16 +2360,20 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
     }
 
-    It 'says on the status page, as it restarts the agent, that T1''s monitoring stopped and is restarting with no action needed (Phase 28 live finding)' {
+    It 'says on the status page, as it restarts the agent, that T1''s monitoring plugin is restarting with no action needed (Phase 28 live finding)' {
         foreach ($state in 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($state)
         }
         $script:page = [System.Collections.Generic.List[string]]::new()
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:page.Add(('{0}|{1}|{2}|{3}|{4}' -f (@($PesterBoundParameters['Id']) -join ','), $PesterBoundParameters['State'], $PesterBoundParameters['Status'], [bool]$PesterBoundParameters['AzureSide'], $PesterBoundParameters['Message'])) }
-        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -ProgressPath 'progress.json' } $config
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -NotRunningGraceMinutes 0 -ProgressPath 'progress.json' } $config
         $result.status | Should -Be 'Pass'
-        $script:page | Should -Be @('T1.Monitoring|Running||True|T1''s monitoring stopped after a restart; restarting it, no action needed.')
+        $script:page | Should -Be @('T1.Monitoring|Running||True|Restarting T1''s monitoring plugin, which stopped after a restart; no action needed.')
         $script:readsAtRestart | Should -Be 1 -Because 'the message comes just before the restart'
+        $script:logged[0] | Should -Be 'sqlvm01''s monitoring plugin reports DatabaseMonitorArcPlugin: {"State":"NotRunning"}; restarting the SQL IaaS Agent service so it starts again; no action needed.'
+        $script:logged[1] | Should -Be 'The SQL IaaS Agent service on sqlvm01 restarted; waiting up to 5 minutes for its monitoring plugin to report Running and OK; no action needed.'
 
         # The check deploy.ps1 runs on every run: the step shows it, and a failure is a Warning, never an exception.
         $script:page.Clear()
@@ -2273,5 +2384,90 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         $check.message | Should -Match 'T1''s monitoring plugin couldn''t be checked: The VM isn''t running'
         $script:page[0] | Should -Be 'T1.Monitoring|Running||True|Checking T1''s monitoring plugin, which can stop after a restart: no action needed.'
         $script:page[-1] | Should -Match '^T1\.Monitoring\|\|Warning\|False\|T1''s monitoring plugin couldn''t be checked'
+    }
+}
+
+Describe 'Invoke-DemoSqlVmMonitoringWait: a deployment step''s T1 monitoring (Phase 28 live finding, 2026-10-30)' {
+    BeforeAll {
+        $config = New-TestConfig
+        $script:waitRemediation = 'Run configure-monitoring.ps1 -WaitMinutes 15, or check again later.'
+        function New-StuckMonitoring {
+            New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message 'The DatabaseWatcheronAzureVM flag is set on sqlvm01, but DatabaseMonitorArcPlugin doesn''t report Running and OK yet (state ''NotRunning'', upload '''').' -Remediation $script:waitRemediation -Evidence ([ordered]@{ provisioningState = 'Succeeded'; featureFlagEnabled = $true; pluginState = 'NotRunning'; powerState = 'PowerState/running'; pending = $true; stoppedForRestart = $true })
+        }
+    }
+
+    BeforeEach {
+        # Live, b18a028's rerun from deallocated VMs: the step waited 25 minutes on a NotRunning plugin, the restart brought it
+        # back in 17 seconds, and the console still printed the wait's "Run configure-monitoring.ps1 -WaitMinutes 15".
+        $script:calls = [System.Collections.Generic.List[string]]::new()
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $script:restoreStatus = 'Pass'
+        $script:reread = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add(('wait {0} grace {1}' -f $PesterBoundParameters['WaitMinutes'], $PesterBoundParameters['NotRunningGraceMinutes'])); New-StuckMonitoring }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith {
+            $script:calls.Add(('restore {0} grace {1}' -f $PesterBoundParameters['CheckId'], $PesterBoundParameters['NotRunningGraceMinutes']))
+            New-DemoResult -CheckId $PesterBoundParameters['CheckId'] -Area 't1' -Target 'T1' -Status $script:restoreStatus -Message 'sqlvm01''s monitoring plugin wasn''t running after the deployment; the SQL IaaS Agent service was restarted, and it''s Running with uploads OK after 17 seconds.' -Remediation $(if ($script:restoreStatus -eq 'Pass') { '' } else { './scripts/configure-monitoring.ps1 -WaitMinutes 15 checks it again.' }) -Evidence ([ordered]@{ restarted = $true })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -MockWith {
+            $script:calls.Add('reread')
+            if ($script:reread -eq 'Pass') {
+                New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'sqlvm01 reports DatabaseMonitorArcPlugin Running with MetricsUploadStatus OK.' -Evidence ([ordered]@{ pluginState = 'Running'; pending = $false })
+            }
+            else {
+                New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'Azure couldn''t be read: timeout.'
+            }
+        }
+    }
+
+    It 'restarts a plugin still NotRunning after the short grace, then reports T1.SQLVM.MONITORING as it is then, so the console doesn''t tell the person to act' {
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -ProgressPath 'progress.json' } $config)
+        $script:calls | Should -Be @('wait 20 grace 3', 'restore DEPLOY.T1.MONITORING grace 0', 'reread') -Because 'the flag was set before this run, and the restart waits no second grace'
+        @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING', 'DEPLOY.T1.MONITORING')
+        $results[0].status | Should -Be 'Pass'
+        $results[0].remediation | Should -BeNullOrEmpty
+        $results[0].message | Should -Match 'The plugin had reported NotRunning; the SQL IaaS Agent service was restarted \(DEPLOY\.T1\.MONITORING\)\.$'
+        $results[0].evidence.restartCheckId | Should -Be 'DEPLOY.T1.MONITORING'
+        $results[0].evidence.restarted | Should -BeTrue
+        $results[0].evidence.pluginStateBefore | Should -Be 'NotRunning'
+
+        $previous = $env:GITHUB_STEP_SUMMARY
+        $env:GITHUB_STEP_SUMMARY = ''
+        try {
+            Write-DemoResultReport -Result $results -Title 'deploy.ps1' 6>$null
+        }
+        finally {
+            $env:GITHUB_STEP_SUMMARY = $previous
+        }
+        @($script:logged | Where-Object { $_ -like 'T1.SQLVM.MONITORING*' }) | Should -BeNullOrEmpty
+
+        # When this run merged the flag (T1's Bootstraps step), the plugin gets the longer grace first.
+        $script:calls.Clear()
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -JustMerged } $config
+        $script:calls[0] | Should -Be 'wait 20 grace 5'
+    }
+
+    It 'keeps the wait''s Warning, superseded and without a remediation, when T1.SQLVM.MONITORING can''t be read again after the restart' {
+        $script:reread = 'Fail'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -CheckId 'START.T1.MONITORING' } $config)
+        @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING', 'START.T1.MONITORING')
+        $results[0].status | Should -Be 'Warning'
+        $results[0].remediation | Should -BeNullOrEmpty
+        $results[0].message | Should -Match 'Superseded: the SQL IaaS Agent service was restarted, and the plugin reported Running with uploads OK \(START\.T1\.MONITORING\)\.$'
+        $results[0].evidence.superseded | Should -BeTrue
+    }
+
+    It 'leaves the wait''s Warning and its remediation when the restart didn''t bring the plugin back, and restarts nothing that isn''t stuck' {
+        $script:restoreStatus = 'Warning'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].remediation | Should -Be $script:waitRemediation
+        $results[1].status | Should -Be 'Warning'
+        $script:calls | Should -Not -Contain 'reread'
+
+        $script:calls.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add('wait'); New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'Running and OK.' -Evidence ([ordered]@{ pluginState = 'Running' }) }
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c } $config)
+        @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING')
+        $script:calls | Should -Be @('wait')
     }
 }

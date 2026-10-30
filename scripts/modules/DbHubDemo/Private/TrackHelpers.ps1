@@ -510,6 +510,9 @@ function Invoke-DemoDeploymentTrack {
     $status = 'Pass'
     $startedUtc = [DateTime]::UtcNow
     $firstStepUtc = $null
+    # True when T1's Bootstraps step merged the monitoring flag in this run: the Monitoring step then gives a NotRunning
+    # plugin the longer grace before the agent's restart (Get-DemoSqlVmPluginGrace; Phase 28 live finding, 2026-10-30).
+    $monitoringMerged = $false
     $early = [System.Collections.Generic.List[string]]::new()
     $option = { param([string] $Name, $Default) if ($Context.Contains($Name) -and $null -ne $Context[$Name]) { $Context[$Name] } else { $Default } }
     $addAll = { param([object[]] $Items) foreach ($item in @($Items)) { if ($null -ne $item -and [string]$item.checkId -ne 'PREFLIGHT.GUARD.CONTEXT') { $results.Add($item) } } }
@@ -857,6 +860,8 @@ function Invoke-DemoDeploymentTrack {
                         # step confirms it (ADR 0018).
                         try {
                             $merge = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes 0 -Confirm:$false
+                            $mergeActions = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $merge -Name 'evidence') -Name 'actions'
+                            $monitoringMerged = @($mergeActions | Where-Object { $_ }).Count -gt 0
                             Write-DemoLog -Message ('Track T1: T1''s monitoring, set while T1 bootstraps: {0}' -f $merge.message)
                         }
                         catch {
@@ -944,15 +949,14 @@ function Invoke-DemoDeploymentTrack {
                     }
                 }
                 'T1/Monitoring' {
-                    $monitoring = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes ([int](& $option 'MonitoringWaitMinutes' 20)) -Confirm:$false
-                    $results.Add($monitoring)
-                    if ($monitoring.status -eq 'Fail') {
+                    # Live (2026-10-30): a plugin that reports NotRunning rarely starts by itself, and the agent's restart
+                    # brings it back, so the wait gives it only a short grace (3 minutes when the flag was set before this
+                    # run, 5 when this run merged it), counted in elapsed time, with a console line and the status page
+                    # saying so; after a restart that worked, T1.SQLVM.MONITORING is read again (Invoke-DemoSqlVmMonitoringWait).
+                    $monitoring = @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes ([int](& $option 'MonitoringWaitMinutes' 20)) -JustMerged:$monitoringMerged -ProgressPath $progress)
+                    & $addAll $monitoring
+                    if ([string]$monitoring[0].status -eq 'Fail') {
                         $outcome = 'Fail'
-                    }
-                    elseif (Test-DemoSqlVmMonitoringStuck -Result $monitoring) {
-                        # The template run can leave the plugin NotRunning, and waiting doesn't bring it back; the
-                        # agent's restart does, as in start-demo.ps1 (live, 2026-10-27).
-                        $results.Add((Restore-DemoSqlVmMonitoringPlugin -Config $Config -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment'))
                     }
                 }
                 'T1/Telemetry' {

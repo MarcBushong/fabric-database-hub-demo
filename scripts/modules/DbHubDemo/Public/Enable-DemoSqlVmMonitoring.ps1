@@ -21,7 +21,13 @@ function Enable-DemoSqlVmMonitoring {
        --settings @<file>, with the file in a private temporary directory that's deleted afterward. A 409
        Conflict is retried.
     4. Waits up to -WaitMinutes for DatabaseMonitorArcPlugin to report State Running and MetricsUploadStatus
-       OK, which takes about 3 to 15 minutes; with 0 it reports what it sees now.
+       OK, which takes about 3 to 15 minutes; with 0 it reports what it sees now. -WaitMinutes bounds the whole call in
+       elapsed time, reads and the merge included (a read takes 15 to 20 seconds). While it waits, the console gets a
+       line every few minutes and -ProgressPath's -ProgressStepId the wait's state (Phase 28 live finding, 2026-10-30).
+       With -NotRunningGraceMinutes, the wait ends once the plugin has reported a state other than Running (NotRunning)
+       for that long, at least 5 minutes when this call merged the flag (Get-DemoSqlVmPluginGrace), because a NotRunning
+       plugin rarely starts by itself and the agent's restart does (the caller's Restore-DemoSqlVmMonitoringPlugin;
+       live, 2026-10-30: the Monitoring step waited 20 minutes first, 25 with the reads).
     T1 also needs outbound HTTPS to telemetry.<region>.arcdataservices.com, which the NSG's HTTPS rule allows
     (ADR 0007). Under -WhatIf nothing is written.
 
@@ -33,6 +39,17 @@ function Enable-DemoSqlVmMonitoring {
 
     .PARAMETER PollIntervalSeconds
     Seconds between reads while waiting.
+
+    .PARAMETER NotRunningGraceMinutes
+    0 (the default) waits the whole -WaitMinutes. Above 0, how long a plugin that reports a state other than Running
+    is waited for before the wait ends, so the caller can restart the agent: deploy.ps1 passes 3 when the flag was
+    set before the run, and 5 when the run merged it.
+
+    .PARAMETER ProgressPath
+    The status page's progress model, whose -ProgressStepId shows the wait; empty for none.
+
+    .PARAMETER ProgressStepId
+    The status page's step (T1.Monitoring).
 
     .EXAMPLE
     Enable-DemoSqlVmMonitoring -Config $config -WaitMinutes 15
@@ -47,19 +64,37 @@ function Enable-DemoSqlVmMonitoring {
         [int] $WaitMinutes = 0,
 
         [ValidateRange(1, 600)]
-        [int] $PollIntervalSeconds = 60
+        [int] $PollIntervalSeconds = 60,
+
+        [ValidateRange(0, 60)]
+        [int] $NotRunningGraceMinutes = 0,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [string] $ProgressStepId = 'T1.Monitoring'
     )
 
+    # The whole wait counts elapsed time, reads and the merge included, and no sleep runs past its end: live (2026-10-30),
+    # a 20-minute wait counted in reads took 25, because each read takes 15 to 20 seconds. Get-DemoUtcNow lets tests count
+    # the reads' time.
+    $startUtc = Get-DemoUtcNow
+    $slept = 0
+    $budget = $WaitMinutes * 60
     $state = Get-DemoSqlVmMonitoringState -Config $Config
     $setting = $state.Setting
     $flagName = [string]$setting['featureFlag']
     $actions = [System.Collections.Generic.List[string]]::new()
-    $attempts = [int][System.Math]::Ceiling($WaitMinutes * 60 / $PollIntervalSeconds)
     $blocked = ConvertTo-DemoSqlVmMonitoringResult -State $state -PrerequisitesOnly
     # An extension that a template deployment is still updating is a wait (Phase 13 live finding).
-    while ($null -ne $blocked -and [bool]$blocked.evidence['pending'] -and $attempts -gt 0) {
-        $attempts--
-        Start-Sleep -Seconds $PollIntervalSeconds
+    while ($null -ne $blocked -and [bool]$blocked.evidence['pending']) {
+        $spent = [System.Math]::Max(((Get-DemoUtcNow) - $startUtc).TotalSeconds, $slept)
+        if ($spent -ge $budget) {
+            break
+        }
+        $pause = [int][System.Math]::Max(1, [System.Math]::Min($PollIntervalSeconds, [System.Math]::Ceiling($budget - $spent)))
+        Start-Sleep -Seconds $pause
+        $slept += $pause
         $state = Get-DemoSqlVmMonitoringState -Config $Config
         $blocked = ConvertTo-DemoSqlVmMonitoringResult -State $state -PrerequisitesOnly
     }
@@ -102,10 +137,47 @@ function Enable-DemoSqlVmMonitoring {
     }
 
     $result = ConvertTo-DemoSqlVmMonitoringResult -State $state -Action $actions.ToArray()
-    for ($i = 0; $i -lt $attempts -and [bool]$result.evidence['pending']; $i++) {
-        Start-Sleep -Seconds $PollIntervalSeconds
+    $graceMinutes = $NotRunningGraceMinutes
+    if ($graceMinutes -gt 0 -and $actions.Count -gt 0) {
+        # The setting takes a few minutes to apply after the merge.
+        $graceMinutes = [System.Math]::Max($graceMinutes, [int](Get-DemoSqlVmPluginGrace).JustMerged)
+    }
+    $graceSeconds = $graceMinutes * 60
+    $notRunningSince = -1.0
+    $stoppedForRestart = $false
+    $marker = $null
+    while ([bool]$result.evidence['pending']) {
+        $spent = [System.Math]::Max(((Get-DemoUtcNow) - $startUtc).TotalSeconds, $slept)
+        if ($spent -ge $budget) {
+            break
+        }
+        $pluginState = [string]$result.evidence['pluginState']
+        $notRunning = $graceSeconds -gt 0 -and $pluginState -and $pluginState -ne 'Running'
+        if (-not $notRunning) {
+            $notRunningSince = -1.0
+        }
+        elseif ($notRunningSince -lt 0) {
+            $notRunningSince = $spent
+        }
+        if ($notRunning -and $spent - $notRunningSince -ge $graceSeconds) {
+            $stoppedForRestart = $true
+            break
+        }
+        $end = if ($notRunning) { [System.Math]::Min($budget, $notRunningSince + $graceSeconds) } else { $budget }
+        $restartIn = if ($notRunning) { [int][System.Math]::Ceiling(($end - $spent) / 60) } else { -1 }
+        $marker = Show-DemoSqlVmPluginWait -State $pluginState -Minutes ([int][System.Math]::Floor($spent / 60)) -RestartInMinutes $restartIn -WaitLeftMinutes ([int][System.Math]::Ceiling(($budget - $spent) / 60)) -Marker $marker -ProgressPath $ProgressPath -ProgressStepId $ProgressStepId
+        $pause = [int][System.Math]::Max(1, [System.Math]::Min($PollIntervalSeconds, [System.Math]::Ceiling($end - $spent)))
+        Start-Sleep -Seconds $pause
+        $slept += $pause
         $state = Get-DemoSqlVmMonitoringState -Config $Config
         $result = ConvertTo-DemoSqlVmMonitoringResult -State $state -Action $actions.ToArray()
+    }
+    if ($budget -gt 0) {
+        $result.evidence['waitedSeconds'] = [int][System.Math]::Max(((Get-DemoUtcNow) - $startUtc).TotalSeconds, $slept)
+    }
+    if ($graceSeconds -gt 0) {
+        $result.evidence['notRunningGraceMinutes'] = $graceMinutes
+        $result.evidence['stoppedForRestart'] = $stoppedForRestart
     }
     return $result
 }

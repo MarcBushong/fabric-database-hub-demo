@@ -538,13 +538,14 @@ function Get-DemoStartedVm {
         $recorded = Get-DemoMemberValue -InputObject $run -Name 'startedVms'
         & $add $recorded
     }
-    # A VM whose start failed (DEPLOY.VMSTART Fail names it) isn't running; one that started is, whatever the status.
+    # What this run itself started (evidence started; never a VM that was already starting), less a VM whose start failed
+    # (notRunning names it).
     $down = [System.Collections.Generic.List[string]]::new()
     foreach ($item in @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.VMSTART' })) {
         $evidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
-        $vms = Get-DemoMemberValue -InputObject $evidence -Name 'vms'
+        $started = Get-DemoMemberValue -InputObject $evidence -Name 'started'
         $notRunning = Get-DemoMemberValue -InputObject $evidence -Name 'notRunning'
-        & $add $vms
+        & $add $started
         foreach ($name in @($notRunning)) {
             if ($name) {
                 $down.Add([string]$name)
@@ -788,7 +789,8 @@ function Invoke-DemoTelemetryRecovery {
     start-demo.ps1 found it Running), the run's T1 track had finished in an earlier run, and the final check failed
     TELEMETRY.T1; restarting the SQL IaaS Agent service brought the plugin back in 161 seconds.
     - T1: Invoke-DemoT1MonitoringCheck (DEPLOY.T1.MONITORING): the plugin's state, and the agent's restart when it isn't
-      running, once; the status page says "T1's monitoring stopped after a restart; restarting it, no action needed".
+      running after the short grace, once; the status page says "Restarting T1's monitoring plugin, which stopped after a
+      restart; no action needed."
     - T2: Get-DemoArcCheck -Check Connected, Monitoring, read-only. There's no cheap repair: monitoring is a setting of
       the Arc SQL Server instance, which a restart doesn't turn off, and the T2 step converges it.
     - T3: Invoke-DemoT3WarmUp (T3.WARMUP, T3.PROPERTY): wakes a paused database, and reads its extended property.

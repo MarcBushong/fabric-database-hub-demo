@@ -337,7 +337,7 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Preflight' 'Fail' 'Preflight has at least one Fail, so nothing was deployed.' 'Fix each Fail above (its remediation says how), then run deploy.ps1 again.'
                     if ($null -ne $stoppedStart -and @($stoppedStart.Requested).Count -gt 0) {
                         # What this run asked to start keeps running, and billing (ADR 0016), until a stop.
-                        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')) -Evidence ([ordered]@{ vms = @($stoppedStart.Requested); notRunning = @(); afterPreflightFail = $true }) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
+                        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')) -Evidence ([ordered]@{ vms = @($stoppedStart.Requested); started = @($stoppedStart.Requested); notRunning = @(); afterPreflightFail = $true }) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
                     }
                     return $results.ToArray()
                 }
@@ -592,19 +592,19 @@ function Invoke-DemoDeployment {
                 }
             }
             'Monitoring' {
-                $monitoring = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes $MonitoringWaitMinutes -Confirm:$false
-                $results.Add($monitoring)
+                # A NotRunning plugin gets the short grace, then the agent's restart, and T1.SQLVM.MONITORING is read
+                # again after a restart that worked (Invoke-DemoSqlVmMonitoringWait; live, 2026-10-27 and 2026-10-30).
+                $monitoringResults = @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes $MonitoringWaitMinutes)
+                foreach ($item in $monitoringResults) {
+                    $results.Add($item)
+                }
+                $monitoring = $monitoringResults[0]
                 if ($monitoring.status -eq 'Fail') {
                     & $stageResult 'Monitoring' 'Fail' 'T1 performance monitoring couldn''t be turned on.' $monitoring.remediation
                     return $results.ToArray()
                 }
-                if (Test-DemoSqlVmMonitoringStuck -Result $monitoring) {
-                    # The template run can leave the plugin NotRunning, and waiting doesn't bring it back (live, 2026-10-27).
-                    $monitoring = Restore-DemoSqlVmMonitoringPlugin -Config $Config -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment'
-                    $results.Add($monitoring)
-                }
                 & $recordStage 'Monitoring'
-                & $stageResult 'Monitoring' 'Pass' ('T1 performance monitoring: {0}.' -f $monitoring.status)
+                & $stageResult 'Monitoring' 'Pass' ('T1 performance monitoring: {0}.' -f $monitoringResults[-1].status)
             }
             'T2' {
                 $arcArguments = @{ Config = $Config; WaitForHostMinutes = $T2WaitMinutes; WaitMinutes = 15; Confirm = $false }

@@ -1145,6 +1145,81 @@ Describe 'T1 SQL VM performance monitoring' {
         }
         (Enable-DemoSqlVmMonitoring -Config $config).status | Should -Be 'Warning'
     }
+
+    Context 'a plugin that doesn''t report Running and OK (Phase 28 live finding, 2026-10-30)' {
+        BeforeEach {
+            # Live, b18a028's rerun from deallocated VMs: the flag was set, the plugin reported NotRunning, and the Monitoring
+            # step polled it for 20 minutes (25 with the reads, about 20 seconds each) before the agent's restart.
+            $script:flag = '{"FeatureFlags":[{"Name":"DatabaseWatcheronAzureVM","Enable":true}]}' | ConvertFrom-Json
+            $script:notRunning = 'SqlIaasAgent: OK; DatabaseMonitorArcPlugin: {"State":"NotRunning"}'
+            $script:now = [datetime]::new(2026, 10, 30, 13, 29, 21, [System.DateTimeKind]::Utc)
+            $script:sleeps = [System.Collections.Generic.List[int]]::new()
+            $script:reads = 0
+            $script:message = $script:notRunning
+            $script:settings = $script:flag
+            $script:page = [System.Collections.Generic.List[string]]::new()
+            $script:logged = [System.Collections.Generic.List[string]]::new()
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+            Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:sleeps.Add([int]$Seconds); $script:now = $script:now.AddSeconds($Seconds) }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoSqlVmMonitoringState -MockWith {
+                $script:reads++
+                $script:now = $script:now.AddSeconds(20)
+                New-SqlVmState -Settings $script:settings -Message $script:message
+            }
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:page.Add(('{0}|{1}|{2}|{3}' -f (@($PesterBoundParameters['Id']) -join ','), $PesterBoundParameters['State'], [bool]$PesterBoundParameters['AzureSide'], $PesterBoundParameters['Message'])) }
+        }
+
+        It 'ends the wait after the short grace when the flag was already set, so the agent''s restart comes after about 3 minutes, not 20, and says so on the console and the status page' {
+            $start = $script:now
+            $result = Enable-DemoSqlVmMonitoring -Config $config -WaitMinutes 20 -NotRunningGraceMinutes 3 -ProgressPath 'progress.json' -Confirm:$false
+            $result.status | Should -Be 'Warning'
+            $result.evidence.stoppedForRestart | Should -BeTrue
+            $result.evidence.notRunningGraceMinutes | Should -Be 3
+            $result.evidence.waitedSeconds | Should -Be 220 -Because 'the first read (20 s), then 180 s of NotRunning, counted in elapsed time with the reads'
+            ($script:now - $start).TotalSeconds | Should -Be 220
+            @($script:sleeps) | Should -Be @(60, 60, 20) -Because 'no sleep runs past the grace'
+            InModuleScope -ModuleName DbHubDemo -Parameters @{ R = $result } { param($R) Test-DemoSqlVmMonitoringStuck -Result $R } | Should -BeTrue -Because 'the caller restarts the agent next'
+            $script:page | Should -Be @(
+                'T1.Monitoring|Running|True|T1''s monitoring plugin reports NotRunning; the deployment restarts it if it doesn''t start by itself within 3 minutes; no action needed.'
+                'T1.Monitoring|Running|True|T1''s monitoring plugin reports NotRunning (1 min so far); the deployment restarts it if it doesn''t start by itself within 2 minutes; no action needed.'
+                'T1.Monitoring|Running|True|T1''s monitoring plugin reports NotRunning (3 min so far); the deployment restarts it if it doesn''t start by itself within 1 minute; no action needed.'
+            )
+            $script:logged | Should -Be @(
+                'T1''s monitoring plugin reports NotRunning; the deployment restarts it if it doesn''t start by itself within 3 minutes; no action needed.'
+                'T1''s monitoring plugin reports NotRunning (3 min so far); the deployment restarts it if it doesn''t start by itself within 1 minute; no action needed.'
+            ) -Because 'a console line when the wait starts, then every few minutes'
+        }
+
+        It 'gives the plugin the longer grace when this call merged the flag, and still ends the wait after about 5 minutes, not 20' {
+            $script:settings = $null
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoSqlVmMonitoringState -MockWith {
+                $script:reads++
+                $script:now = $script:now.AddSeconds(20)
+                New-SqlVmState -Settings $(if ($script:reads -eq 1) { $null } else { $script:flag }) -Message $(if ($script:reads -eq 1) { '' } else { $script:notRunning })
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '{}'; StdErr = '' } }
+            $result = Enable-DemoSqlVmMonitoring -Config $config -WaitMinutes 20 -NotRunningGraceMinutes 3 -Confirm:$false
+            $result.evidence.actions[0] | Should -Match '^Merged DatabaseWatcheronAzureVM'
+            $result.evidence.notRunningGraceMinutes | Should -Be 5
+            $result.evidence.stoppedForRestart | Should -BeTrue
+            $result.evidence.waitedSeconds | Should -Be 360 -Because 'two reads (40 s), then reads a minute apart until NotRunning has lasted 5 minutes'
+            @($script:sleeps) | Should -Be @(60, 60, 60, 60)
+        }
+
+        It 'bounds the whole wait in elapsed time, the reads included, not in reads times the interval' {
+            # A plugin with no status yet is waited for the whole -WaitMinutes: 20 minutes of elapsed time, not 21 reads.
+            $script:message = ''
+            $result = Enable-DemoSqlVmMonitoring -Config $config -WaitMinutes 20 -NotRunningGraceMinutes 3 -Confirm:$false
+            $result.status | Should -Be 'Warning'
+            $result.evidence.stoppedForRestart | Should -BeFalse
+            $result.evidence.waitedSeconds | Should -BeLessOrEqual (1200 + 20) -Because 'it ends with the first read after 20 minutes'
+            $result.evidence.waitedSeconds | Should -BeGreaterOrEqual 1200
+            $script:reads | Should -Be 16 -Because 'counted in reads, 20 polls at 80 seconds each took 27 minutes'
+            $script:logged[0] | Should -Be 'T1''s monitoring plugin has no status yet; waiting up to 20 minutes more for Running and OK; no action needed.'
+            @($script:logged).Count | Should -Be 6 -Because 'a console line every few minutes (at 0, 3, 7, 11, 15, and 19), never silent'
+        }
+    }
 }
 
 Describe 'Phase 7 template and configuration' {

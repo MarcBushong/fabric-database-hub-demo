@@ -905,10 +905,13 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $config = New-TestConfig
         $config['autoShutdownTime'] = '1900'
         $config['autoShutdownTimeZone'] = 'Pacific Standard Time'
-        $started = New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'Started sqlvm01 and archost01, which had been stopped, in about 1 minute(s).' -Evidence ([ordered]@{ vms = @('sqlvm01', 'archost01'); notRunning = @(); t4 = ''; minutes = 1 })
+        $started = New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'Started sqlvm01 and archost01, which had been stopped, in about 1 minute(s).' -Evidence ([ordered]@{ vms = @('sqlvm01', 'archost01'); started = @('sqlvm01', 'archost01'); notRunning = @(); t4 = ''; minutes = 1 })
         $names = @(InModuleScope DbHubDemo -Parameters @{ Result = @($started) } { Get-DemoStartedVm -Result $Result })
         $names | Should -Be @('sqlvm01', 'archost01')
-        $failed = New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message 'archost01 isn''t running.' -Evidence ([ordered]@{ vms = @('sqlvm01', 'archost01'); notRunning = @('archost01'); t4 = 'Pass'; minutes = 5 })
+        # Only what this run issued a start for counts: not a VM that something else was already starting (Phase 28 review).
+        $waitedFor = New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'Started sqlvm01 and archost01, which had been stopped, in about 1 minute(s).' -Evidence ([ordered]@{ vms = @('sqlvm01', 'archost01'); started = @('archost01'); notRunning = @(); t4 = ''; minutes = 1 })
+        @(InModuleScope DbHubDemo -Parameters @{ Result = @($waitedFor) } { Get-DemoStartedVm -Result $Result }) | Should -Be @('archost01')
+        $failed = New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message 'archost01 isn''t running.' -Evidence ([ordered]@{ vms = @('sqlvm01', 'archost01'); started = @('sqlvm01', 'archost01'); notRunning = @('archost01'); t4 = 'Pass'; minutes = 5 })
         $model = @{ run = @{ startedVms = @('sqlvm01', 'archost01') } }
         @(InModuleScope DbHubDemo -Parameters @{ Result = @($failed); Model = $model } { Get-DemoStartedVm -Result $Result -Model $Model }) | Should -Be @('sqlvm01', 'T4')
 
