@@ -459,6 +459,58 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
         @($done.Confirm).Count | Should -Be 0
     }
 
+    It 'judges the Hub setting by its latest read, so the Fabric track''s read supersedes preflight''s (Phase 28 review)' {
+        # The reviewer's case: an administrator turned the setting on during the run. Preflight read it as disabled, and
+        # the Fabric track, later in the same run, as enabled.
+        $result = @(New-DoneResult) + @((New-HubSettingResult 'Disabled' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Enabled'))
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done'
+        $outcome.ExitCode | Should -Be 0
+        @($outcome.Confirm).Count | Should -Be 0
+        $summary = InModuleScope DbHubDemo -Parameters @{ Result = $result } { Get-DemoDeploySummary -Result $Result }
+        @($summary.Evidence['manual']).Count | Should -Be 0
+        $summary.Message | Should -Not -Match 'disabled'
+
+        # The other way round, the later read decides too; and a later read that couldn't happen keeps an earlier "off".
+        $turnedOff = @(New-DoneResult) + @((New-HubSettingResult 'Enabled' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Disabled'))
+        $off = InModuleScope DbHubDemo -Parameters @{ Result = $turnedOff; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $off.Kind | Should -Be 'NotDone'
+        $off.Reason | Should -Match '^FABRIC\.P4\.HUBSETTING: .* is disabled'
+        $unreadAfter = @(New-DoneResult) + @((New-HubSettingResult 'Disabled' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Forbidden'))
+        $stillOff = InModuleScope DbHubDemo -Parameters @{ Result = $unreadAfter; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $stillOff.Kind | Should -Be 'NotDone'
+        $stillOff.Reason | Should -Match '^PREFLIGHT\.P4\.HUBSETTING: .* is disabled'
+        @($stillOff.Confirm | Where-Object { $_['key'] -eq 'P4' }).Count | Should -Be 0
+    }
+
+    It 'reads the Hub setting once more before the run is judged, only when its latest read said disabled (Phase 28 review)' {
+        $preflightOff = New-HubSettingResult 'Disabled' 'PREFLIGHT.P4.HUBSETTING'
+        $fabricOn = New-HubSettingResult 'Enabled'
+        $fabricOff = New-HubSettingResult 'Disabled'
+        $requirement = @(InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' -T4Off })
+        $script:reread = $fabricOn
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricHubSetting -MockWith { $script:reread }
+        $result = @(New-DoneResult) + @($preflightOff)
+        $gate = @(InModuleScope DbHubDemo -Parameters @{ Result = $result; Config = (New-TestConfig); Requirement = $requirement } { Invoke-DemoDoneGate -Config $Config -Result $Result -Requirement $Requirement })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricHubSetting -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'FABRIC.P4.HUBSETTING' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@($result) + @($gate)); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done' -Because 'the setting was turned on during the run'
+
+        # Still off: NOT DONE with the true wording, after one more read.
+        $script:reread = $fabricOff
+        $gate = @(InModuleScope DbHubDemo -Parameters @{ Result = $result; Config = (New-TestConfig); Requirement = $requirement } { Invoke-DemoDoneGate -Config $Config -Result $Result -Requirement $Requirement })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricHubSetting -Times 2 -Exactly
+        $notDone = InModuleScope DbHubDemo -Parameters @{ Result = (@($result) + @($gate)); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $notDone.Kind | Should -Be 'NotDone'
+        $notDone.Reason | Should -Match '^FABRIC\.P4\.HUBSETTING: .* is disabled \(read through the Fabric admin API\)'
+
+        # Read as on, or never read: no extra read.
+        foreach ($latest in $fabricOn, (New-TestResult 'TEST.NOTHING')) {
+            $null = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($latest)); Config = (New-TestConfig); Requirement = $requirement } { Invoke-DemoDoneGate -Config $Config -Result $Result -Requirement $Requirement }
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricHubSetting -Times 2 -Exactly
+    }
+
     It 'is NOT DONE, exit code 1, for a failed requirement, and names only that, not what''s left to confirm' {
         $result = @(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T1' }) + @((New-TestResult 'TELEMETRY.T1' 'Fail'), (New-HubSettingResult 'Forbidden'))
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
@@ -689,6 +741,23 @@ Describe 'The history model''s blank measures right after a first deployment (Ph
     }
 }
 
+Describe 'The Preflight step''s message in plain words (Phase 28 live run, 2026-10-30)' {
+    It 'says whether T3 uses the free offer, and where T2 comes from, in words rather than raw values, on both deployment paths' {
+        # Live: "Preflight passed (network mode private, T3 free offer False, T2 source existing-build)."
+        InModuleScope DbHubDemo {
+            Get-DemoPreflightPassText -NetworkMode 'private' -T3UseFreeLimit $false -T2Source 'existing-build' | Should -Be 'Preflight passed (network mode: private; T3 free offer: not used; T2 source: the existing host, built from the image).'
+            Get-DemoPreflightPassText -NetworkMode 'public' -T3UseFreeLimit $true -T2Source 'golden' | Should -Be 'Preflight passed (network mode: public; T3 free offer: used; T2 source: a copy of the golden snapshot).'
+            Get-DemoPreflightPassText -NetworkMode 'private' -T3UseFreeLimit $false -T2Source 'build' | Should -Be 'Preflight passed (network mode: private; T3 free offer: not used; T2 source: a new build from the image).'
+            Get-DemoPreflightPassText -NetworkMode 'private' -T3UseFreeLimit $true | Should -Be 'Preflight passed (network mode: private; T3 free offer: used).'
+        }
+        foreach ($file in 'Private/ParallelDeployment.ps1', 'Public/Invoke-DemoDeployment.ps1') {
+            $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath ('scripts/modules/DbHubDemo/{0}' -f $file)) -Raw
+            $text | Should -Match ([regex]::Escape("& `$stageResult 'Preflight' 'Pass' (Get-DemoPreflightPassText -NetworkMode ([string]`$context.NetworkMode) -T3UseFreeLimit ([bool]`$context.T3UseFreeLimit)")) -Because $file
+            $text | Should -Not -Match 'T3 free offer \{1\}' -Because $file
+        }
+    }
+}
+
 Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 and 7, item 11)' {
     BeforeEach {
         $script:out = Join-Path -Path $TestDrive -ChildPath ('out-' + [guid]::NewGuid().ToString('N'))
@@ -809,6 +878,50 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $page | Should -Match 'Stopped, not done'
         $page | Should -Match ([regex]::Escape('Run: ./scripts/deploy.ps1'))
         InModuleScope DbHubDemo { $script:DemoRunCancelWatch } | Should -BeFalse -Because 'a later command in the same session never reads this run''s Ctrl+C as its own'
+    }
+
+    It 'names, in one line, what this run started or created and how it stops, when the run isn''t DONE, even after Ctrl+C (Phase 28)' {
+        $config = New-TestConfig
+        $config['autoShutdownTime'] = '1900'
+        $config['autoShutdownTimeZone'] = 'Pacific Standard Time'
+        $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+        # A first deployment created the VMs and T4, and a later step started one of them again: each is named once.
+        InModuleScope DbHubDemo -Parameters @{ Path = $run.ProgressPath } {
+            Add-DemoProgressStartedVm -Path $Path -Name 'sqlvm01', 'archost01', 'T4'
+            Add-DemoProgressStartedVm -Path $Path -Name 'sqlvm01'
+        }
+        (Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20)['run']['startedVms'] | Should -Be @('sqlvm01', 'archost01', 'T4')
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { throw 'a stopped run makes no Azure call' }
+        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @() -Stopped
+        $note = 'Running and billing, because this run started or created them: sqlvm01, archost01, and T4. ./scripts/stop-demo.ps1 stops them now; otherwise the nightly auto-shutdown stops sqlvm01 and archost01 at 19:00 (Pacific Standard Time).'
+        @($outcome.Notes) | Should -Contain $note
+        $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
+        @($lines | Where-Object { $_ -eq $note }).Count | Should -Be 1
+        $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $model['run']['reason'] | Should -Match ([regex]::Escape('Running and billing, because this run started or created them'))
+    }
+
+    It 'takes what started from this run''s DEPLOY.VMSTART without a model, leaves out a VM that didn''t start, and adds nothing to DONE (Phase 28)' {
+        $config = New-TestConfig
+        $config['autoShutdownTime'] = '1900'
+        $config['autoShutdownTimeZone'] = 'Pacific Standard Time'
+        $started = New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'Started sqlvm01 and archost01, which had been stopped, in about 1 minute(s).' -Evidence ([ordered]@{ vms = @('sqlvm01', 'archost01'); notRunning = @(); t4 = ''; minutes = 1 })
+        $names = @(InModuleScope DbHubDemo -Parameters @{ Result = @($started) } { Get-DemoStartedVm -Result $Result })
+        $names | Should -Be @('sqlvm01', 'archost01')
+        $failed = New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message 'archost01 isn''t running.' -Evidence ([ordered]@{ vms = @('sqlvm01', 'archost01'); notRunning = @('archost01'); t4 = 'Pass'; minutes = 5 })
+        $model = @{ run = @{ startedVms = @('sqlvm01', 'archost01') } }
+        @(InModuleScope DbHubDemo -Parameters @{ Result = @($failed); Model = $model } { Get-DemoStartedVm -Result $Result -Model $Model }) | Should -Be @('sqlvm01', 'T4')
+
+        $done = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($started)); State = (New-FinishedState); Config = $config; Names = $names } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -StartedVm $Names }
+        $done.Kind | Should -Be 'Done'
+        @($done.Notes | Where-Object { $_ -match 'billing' }).Count | Should -Be 0
+        $result = @(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T1' }) + @((New-TestResult 'TELEMETRY.T1' 'Fail'), $started)
+        $notDone = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $config; Names = $names } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -StartedVm $Names -Command './scripts/deploy.ps1 -ConfigPath ./config/proof.json' }
+        $notDone.Kind | Should -Be 'NotDone'
+        @($notDone.Notes) | Should -Contain 'Running and billing, because this run started or created them: sqlvm01 and archost01. ./scripts/stop-demo.ps1 -ConfigPath ./config/proof.json stops them now; otherwise the nightly auto-shutdown stops them at 19:00 (Pacific Standard Time).'
+        $config['autoShutdownTime'] = ''
+        $plain = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBillingNote -Config $Config -Name 'sqlvm01' }
+        $plain | Should -Be 'Running and billing, because this run started or created it: sqlvm01. ./scripts/stop-demo.ps1 stops it now.'
     }
 
     It 'ends the page and keep-awake itself when it''s stopped while it starts, before deploy.ps1 holds the run (Phase 28 live finding)' {
@@ -1108,6 +1221,29 @@ Describe 'Invoke-DemoT2GuidedStop: the stop, then the run continues on its own' 
         $again = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $old } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
         $again.Status | Should -Be 'Done'
         $script:calls | Should -Contain 'prompt'
+    }
+
+    It 'asks for the person anyway when the host''s preparation didn''t finish in time, says so, and leads with Add... (Phase 28 review)' {
+        # The host gives up waiting for its preparation after about 15 minutes or 3 passes (guidedSignIn fallback), so a
+        # preparation that never finishes can't keep a person from being asked.
+        $fallback = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'Setup''s Azure sign-in wasn''t prepared automatically, so Internet Explorer may block it. The guest is signed in, and SQL Server setup opens there now.'; guidedSignIn = 'fallback' }
+        foreach ($item in @($fallback, $script:after)) {
+            $script:health.Enqueue($item)
+        }
+        $script:values = [System.Collections.Generic.List[object]]::new()
+        $script:steps = [System.Collections.Generic.List[string]]::new()
+        $script:warnings = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressValue -MockWith { $script:values.Add($Value) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:steps.Add([string]$PesterBoundParameters['Message']) }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ([string]$PesterBoundParameters['Level'] -eq 'Warning') { $script:warnings.Add([string]$PesterBoundParameters['Message']) } }
+        Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopPrompt -MockWith { $script:calls.Add('prompt fallback=' + [bool]$PesterBoundParameters['SignInFallback']) }
+        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:waitingArc } { Invoke-DemoT2GuidedStop -Config $Config -Context @{ ProgressPath = 'progress.json' } -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
+        $stop.Status | Should -Be 'Done'
+        $script:calls | Should -Contain 'prompt fallback=True'
+        @($script:values | Where-Object { $_.Contains('signInFallback') -and [bool]$_['signInFallback'] }).Count | Should -Be 1
+        @($script:steps | Where-Object { $_ -match 'The automatic preparation of setup''s Azure sign-in didn''t finish: if Internet Explorer blocks the sign-in, select Add\.\.\.' }).Count | Should -Be 1
+        @($script:warnings | Where-Object { $_ -match 'couldn''t prepare setup''s Azure sign-in automatically' }).Count | Should -Be 1
+        ($stop.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }).message | Should -Match 'The automatic preparation of setup''s Azure sign-in didn''t finish, so the person was asked anyway'
     }
 
     It 'requests the stop, starts Bastion without waiting, onboards Arc first, prompts once, and continues when the host''s check passes' {

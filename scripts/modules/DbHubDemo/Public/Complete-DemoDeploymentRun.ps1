@@ -79,19 +79,22 @@ function Complete-DemoDeploymentRun {
             $judgedState = $null
         }
     }
-    # Whether the guided stop was open when the run stopped: the model's guidedStop says so without an Azure call.
+    # Whether the guided stop was open when the run stopped, and what this run started or created: the model says so
+    # without an Azure call.
     $guidedOpen = $false
-    if ($wasStopped -and $Run.ProgressPath) {
+    $model = $null
+    if ($Run.ProgressPath) {
         try {
             $model = Read-DemoProgress -Path ([string]$Run.ProgressPath)
-            $guidedOpen = $null -ne $model -and [string]$model['guidedStop']['state'] -in 'Preparing', 'Ready'
+            $guidedOpen = $wasStopped -and $null -ne $model -and [string]$model['guidedStop']['state'] -in 'Preparing', 'Ready'
         }
         catch {
             $guidedOpen = $false
         }
     }
     try {
-        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen
+        $startedVms = @(Get-DemoStartedVm -Result @($Result) -Model $model)
+        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen -StartedVm $startedVms
     }
     catch {
         $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; Optional = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }

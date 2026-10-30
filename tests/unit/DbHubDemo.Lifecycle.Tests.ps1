@@ -1654,6 +1654,64 @@ Describe 'Write-DemoResultReport' {
         $text | Should -Match '\*\*T2\.PAYGWIZARD:\*\* Open Bastion and run the wizard\.'
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'T2.PAYGWIZARD: Open Bastion' }
     }
+
+    It 'logs Warnings that share a remediation, 3 or more, as one line, keeps each Fail on its own line, and leaves the table and the job summary complete (Phase 28 live run)' {
+        # Live, 2026-10-30: about 58 blank-measure Warnings with the same remediation came right before the DONE banner.
+        $summary = Join-Path -Path $TestDrive -ChildPath 'grouped.md'
+        $previous = $env:GITHUB_STEP_SUMMARY
+        $env:GITHUB_STEP_SUMMARY = $summary
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $blank = 'Expected before a scenario runs. Run one, then check the model again.'
+        $results = @(
+            foreach ($measure in 'TELEMETRY.AVG_CPU', 'TELEMETRY.MAX_WAIT', 'INCIDENT.COUNT') {
+                New-DemoResult -CheckId ('FABRIC.SEMANTICMODEL.MEASURE.{0}' -f $measure) -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The measure is blank.' -Remediation $blank
+            }
+            New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.ROWS' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'No rows.' -Remediation $blank
+            New-DemoResult -CheckId 'HUB.ESTATE.T1' -Area 'hub' -Target 'T1' -Status 'Warning' -Message 'Not in Estate yet.' -Remediation 'Wait about 10 minutes.'
+            New-DemoResult -CheckId 'HUB.ESTATE.T2' -Area 'hub' -Target 'T2' -Status 'Warning' -Message 'Not in Estate yet.' -Remediation 'Wait about 10 minutes.'
+            New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Pass' -Message 'Telemetry arrives.'
+        )
+        try {
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+            $table = @(Write-DemoResultReport -Result $results -Title 'deploy.ps1' 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+        }
+        finally {
+            $env:GITHUB_STEP_SUMMARY = $previous
+        }
+        $script:logged | Should -Be @(
+            ('3 checks (FABRIC.SEMANTICMODEL.MEASURE.*, e.g. FABRIC.SEMANTICMODEL.MEASURE.TELEMETRY.AVG_CPU, FABRIC.SEMANTICMODEL.MEASURE.TELEMETRY.MAX_WAIT): {0}' -f $blank)
+            ('FABRIC.SEMANTICMODEL.ROWS: {0}' -f $blank)
+            'HUB.ESTATE.T1: Wait about 10 minutes.'
+            'HUB.ESTATE.T2: Wait about 10 minutes.'
+        )
+        $text = Get-Content -LiteralPath $summary -Raw
+        foreach ($item in $results) {
+            $table | Should -Match ([regex]::Escape($item.checkId))
+            $text | Should -Match ([regex]::Escape(('| {0} | {1} |' -f $item.checkId, $item.status)))
+        }
+    }
+
+    It 'says, after a run that ended DONE, that none of its Manual action required items keeps it from DONE (Phase 28 live run)' {
+        # Live, 2026-10-30: "2 item(s) need you" came right before a DONE banner whose summary said nothing else needed the person.
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $results = @(
+            New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The app is deployed.' -Remediation 'Open the app once in the browser.'
+            New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status 'Manual action required' -Message 'Nothing else needs you for DONE.'
+        )
+        $previous = $env:GITHUB_STEP_SUMMARY
+        $env:GITHUB_STEP_SUMMARY = ''
+        try {
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+            Write-DemoResultReport -Result $results -Title 'deploy.ps1' -OutcomeDone 6>$null
+            $script:logged | Should -Be @('2 item(s) are Manual action required; none of them keeps this run from DONE:', '  FABRIC.APP.BROWSER: Open the app once in the browser.', '  DEPLOY.SUMMARY: Nothing else needs you for DONE.')
+            $script:logged.Clear()
+            Write-DemoResultReport -Result $results -Title 'deploy.ps1' 6>$null
+            $script:logged[0] | Should -Be '2 item(s) need you (Manual action required):'
+        }
+        finally {
+            $env:GITHUB_STEP_SUMMARY = $previous
+        }
+    }
 }
 
 Describe 'Run Command waits and a VM that isn''t running (R49)' {
@@ -1814,11 +1872,14 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
 
     It 'asks a deallocated VM to start without waiting, waits for one that''s still stopping, and says so on the status page' {
         $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocating' }
+        $script:billing = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Add-DemoProgressStartedVm -MockWith { $script:billing.Add((@($PesterBoundParameters['Name']) -join ',')) }
         $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
         $request.Needed | Should -BeTrue
         $request.Requested | Should -Be @('sqlvm01') -Because 'only what this run asked to start bills because of it'
+        $script:billing | Should -Be @('sqlvm01') -Because 'the ending names what this run started, even after Ctrl+C (Phase 28)'
         $script:calls | Should -Be @('request sqlvm01') -Because 'a VM that''s still deallocating is only waited for'
-        $script:page[0] | Should -Match ([regex]::Escape('StartVms|Running||Starting the VMs that were stopped: no action needed (sqlvm01 (deallocated), archost01 (deallocating)).'))
+        $script:page[0] | Should -Be 'StartVms|Running||Starting sqlvm01 (deallocated) and archost01 (deallocating), which were stopped; no action needed from you.'
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request -ProgressPath 'progress.json' })
         $script:calls | Should -Contain 'running sqlvm01 requested=True'
         $script:calls | Should -Contain 'running archost01 requested=False'
@@ -1828,6 +1889,7 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $done.status | Should -Be 'Pass'
         $done.message | Should -Match 'Started sqlvm01 and archost01, which had been stopped'
         $script:page[-1] | Should -Match '^StartVms\|\|Pass\|Started sqlvm01 and archost01'
+        $script:billing[-1] | Should -Be 'sqlvm01,archost01' -Because 'the one that was still stopping was started too'
     }
 
     It 'starts a stopped T4 and waits for it, and leaves T1''s monitoring plugin to the caller''s check on every run (Phase 28 live finding)' {
@@ -1841,11 +1903,24 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $request = InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
         $request.Names | Should -Be @('sqlvm01 (stopped)', 'T4 (stopped)')
         $request.Requested | Should -Be @('sqlvm01', 'T4')
+        $script:page[0] | Should -Be 'StartVms|Running||Starting sqlvm01 and T4, which were stopped; no action needed from you.'
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
         # The plugin can stop hours after a start, so deploy.ps1 checks it on every run, not only after it started sqlvm01.
         $script:calls | Should -Be @('request sqlvm01', 't4 0 requested=False', 'running sqlvm01 requested=True', 't4 15 requested=True')
         $results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' } | Should -BeNullOrEmpty
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).message | Should -Match 'T4 is Ready'
+    }
+
+    It 'says in plain words which VMs start because they were stopped, and that nothing is needed from the person (Phase 28 live run)' {
+        # Live, 2026-10-30: "Starting the VMs that were stopped: no action needed (sqlvm01 (deallocated), archost01
+        # (deallocated))" read as if nothing were needed for those VMs.
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $script:page[0] | Should -Be 'StartVms|Running||Starting sqlvm01 and archost01, which were stopped (deallocated); no action needed from you.'
+        $script:page.Clear()
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/stopped' }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $script:page[0] | Should -Be 'StartVms|Running||Starting archost01, which was stopped; no action needed from you.'
     }
 
     It 'fails with the next action when a VM still doesn''t run, so nothing needs it' {

@@ -337,7 +337,7 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Preflight' 'Fail' 'Preflight has at least one Fail, so nothing was deployed.' 'Fix each Fail above (its remediation says how), then run deploy.ps1 again.'
                     if ($null -ne $stoppedStart -and @($stoppedStart.Requested).Count -gt 0) {
                         # What this run asked to start keeps running, and billing (ADR 0016), until a stop.
-                        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
+                        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')) -Evidence ([ordered]@{ vms = @($stoppedStart.Requested); notRunning = @(); afterPreflightFail = $true }) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
                     }
                     return $results.ToArray()
                 }
@@ -355,7 +355,7 @@ function Invoke-DemoDeployment {
                     $context.T3AdminGroupName = $group
                 }
                 & $ensureContext
-                & $stageResult 'Preflight' 'Pass' ('Preflight passed (network mode {0}, T3 free offer {1}).' -f $context.NetworkMode, $context.T3UseFreeLimit)
+                & $stageResult 'Preflight' 'Pass' (Get-DemoPreflightPassText -NetworkMode ([string]$context.NetworkMode) -T3UseFreeLimit ([bool]$context.T3UseFreeLimit))
             }
             'Infrastructure' {
                 & $ensureContext

@@ -512,7 +512,10 @@ function Show-DemoGuidedStopPrompt {
         [AllowEmptyString()]
         [string] $PagePath = '',
 
-        [switch] $NoBrowser
+        [switch] $NoBrowser,
+
+        # The host's automatic preparation of setup's sign-in didn't finish in time (Phase 28 review): Add... comes first.
+        [switch] $SignInFallback
     )
 
     $left = [int][System.Math]::Max(0, ($DeadlineUtc - [System.DateTime]::UtcNow).TotalMinutes)
@@ -523,7 +526,7 @@ function Show-DemoGuidedStopPrompt {
         ('Time limit: {0} minutes, until {1} (local time). After that, deploy.ps1 stops; run ./scripts/deploy.ps1 again and it waits for this step again.' -f $left, $until)
         ('Portal: {0}' -f $Url)
     )
-    Write-DemoConsoleBlock -Color 'White' -Line (Get-DemoGuidedStopInstruction -HostVm $HostVm -HostUser $HostUser -SignInWay $SignInWay -SignInText $SignInText)
+    Write-DemoConsoleBlock -Color 'White' -Line (Get-DemoGuidedStopInstruction -HostVm $HostVm -HostUser $HostUser -SignInWay $SignInWay -SignInText $SignInText -SignInFallback:$SignInFallback)
     $opened = $false
     if (-not $NoBrowser -and [string]$env:CODESPACES -ne 'true' -and $Url -match '^https://portal\.azure\.com/') {
         try {
@@ -847,6 +850,10 @@ function Invoke-DemoT2GuidedStop {
     $now = (Get-DemoUtcNow)
     $deadline = if ($DeadlineUtc -gt $now.AddMinutes($PersonMinutes + 20)) { $DeadlineUtc } else { $now.AddMinutes($PersonMinutes + 20) }
     $status = 'TimedOut'
+    # The host's automatic preparation of setup's sign-in didn't finish in time, and it asks for the person anyway, with
+    # Add... first (health guidedSignIn fallback; Phase 28 review).
+    $signInFallback = $false
+    $fallbackNote = ' The automatic preparation of setup''s Azure sign-in didn''t finish, so the person was asked anyway, with Add... in Internet Explorer''s dialog as the way past a blocked sign-in.'
     $started = [System.Diagnostics.Stopwatch]::StartNew()
     Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Running' -Message 'Preparing: Bastion, Arc onboarding, the pre-filled setup, setup''s Azure sign-in, and the guest''s one-time sign-in (about 10 to 15 minutes).'
     Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'Preparing'; message = 'Preparing Bastion and the pre-filled setup (about 10 to 15 minutes); nothing to do yet.'; deadlineAt = (Get-DemoUnixTime -Value $deadline); hostVm = 'archost01' }
@@ -906,9 +913,10 @@ function Invoke-DemoT2GuidedStop {
                     break guided
                 }
                 # Setup's Azure sign-in must be ready first (Phase 28 live finding): a health without guidedSignIn comes
-                # from a host bundle that predates it.
+                # from a host bundle that predates it. At fallback the host gave up waiting for it and asks anyway.
                 $signIn = Get-DemoMemberValue -InputObject $health -Name 'guidedSignIn'
-                $ready = $phase.Step -eq 'SqlSetupWizard' -and $phase.State -eq 'ManualActionRequired' -and ($null -eq $signIn -or [string]$signIn -eq 'ready')
+                $ready = $phase.Step -eq 'SqlSetupWizard' -and $phase.State -eq 'ManualActionRequired' -and ($null -eq $signIn -or [string]$signIn -in 'ready', 'fallback')
+                $signInFallback = [string]$signIn -eq 'fallback'
                 if (-not $ready) {
                     if ((Get-DemoUtcNow) -ge $deadline) {
                         break guided
@@ -937,15 +945,18 @@ function Invoke-DemoT2GuidedStop {
             }
             $url = Get-DemoPortalVmUrl -Config $Config -VmName 'archost01'
             $hostMessage = [string](Get-DemoMemberValue -InputObject $health -Name 'message')
-            Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'Ready'; url = $url; deadlineAt = (Get-DemoUnixTime -Value $deadline); promptedAt = (Get-DemoUnixTime); message = $hostMessage }
-            Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Action needed' -Message 'Waiting for you: sign in through Bastion and finish SQL Server setup (see the banner).'
+            if ($signInFallback) {
+                Write-DemoLog -Level Warning -Message 'T2: archost01 couldn''t prepare setup''s Azure sign-in automatically in time; you''re asked anyway. If Internet Explorer blocks the sign-in, select Add... in its dialog, then Use Azure Login again.'
+            }
+            Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'Ready'; url = $url; deadlineAt = (Get-DemoUnixTime -Value $deadline); promptedAt = (Get-DemoUnixTime); message = $hostMessage; signInFallback = $signInFallback }
+            Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Action needed' -Message $(if ($signInFallback) { 'Waiting for you: sign in through Bastion and finish SQL Server setup (see the banner). The automatic preparation of setup''s Azure sign-in didn''t finish: if Internet Explorer blocks the sign-in, select Add... in its dialog.' } else { 'Waiting for you: sign in through Bastion and finish SQL Server setup (see the banner).' })
             Write-DemoLog -Message 'T2: the guided stop is ready: Bastion is up, and arcsql01 has opened the pre-filled SQL Server setup.'
             $nextReminder = (Get-DemoUtcNow).AddMinutes(5)
             if (-not $inParent) {
                 $credential = Invoke-DemoGuidedStopCredential -Config $Config -ExpiresUtc $deadline
                 $results.AddRange([object[]]@($credential.Results))
                 Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ credential = $credential.Mode; credentialText = $credential.Text; hostUser = $credential.UserName }
-                Show-DemoGuidedStopPrompt -Url $url -DeadlineUtc $deadline -HostUser $credential.UserName -SignInWay $credential.Mode -SignInText $credential.Text -PagePath ([string]$Context['PagePath'])
+                Show-DemoGuidedStopPrompt -Url $url -DeadlineUtc $deadline -HostUser $credential.UserName -SignInWay $credential.Mode -SignInText $credential.Text -PagePath ([string]$Context['PagePath']) -SignInFallback:$signInFallback
             }
             while ($true) {
                 Start-Sleep -Seconds $PollSeconds
@@ -1006,7 +1017,7 @@ function Invoke-DemoT2GuidedStop {
                 Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Done' -Status 'Pass' -Message ('Done in {0} minutes.' -f $minutes)
                 Set-DemoProgressStep -Path $progress -Id 'T2.SetupCheck' -State 'Done' -Status 'Pass' -Message 'Standard, the default instance MSSQLSERVER, and the Azure extension.'
                 Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'Done'; message = 'SQL Server setup is done; deploy.ps1 finishes T2 on its own.' }
-                $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Pass' -Message ('SQL Server Standard is set up in arcsql01 as the default instance with the Azure extension (the host''s check passed), {0} minutes after the guided stop began; Bastion is removed and the host password rotated.' -f $minutes) -DocUrl $docUrl))
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Pass' -Message (('SQL Server Standard is set up in arcsql01 as the default instance with the Azure extension (the host''s check passed), {0} minutes after the guided stop began; Bastion is removed and the host password rotated.' -f $minutes) + $(if ($signInFallback) { $fallbackNote } else { '' })) -DocUrl $docUrl))
             }
             'Failed' {
                 Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Failed' -Status 'Fail' -Message 'The guided stop couldn''t go on; see the results.'
@@ -1016,7 +1027,7 @@ function Invoke-DemoT2GuidedStop {
                 $until = $deadline.ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
                 Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Action needed' -Status 'Manual action required' -Message ('Nobody finished SQL Server setup by {0}.' -f $until)
                 Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'TimedOut'; message = ('The time limit ({0}) passed.' -f $until) }
-                $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message ('Nobody finished SQL Server setup in arcsql01 by the time limit ({0}). The guest''s one-time sign-in was turned off, Bastion was removed, and the host password rotated.' -f $until) -Remediation 'Run ./scripts/deploy.ps1 again when you have about 15 minutes: it opens Bastion, guides you through the pre-filled setup again, and continues.' -DocUrl $docUrl))
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message (('Nobody finished SQL Server setup in arcsql01 by the time limit ({0}). The guest''s one-time sign-in was turned off, Bastion was removed, and the host password rotated.' -f $until) + $(if ($signInFallback) { $fallbackNote } else { '' })) -Remediation 'Run ./scripts/deploy.ps1 again when you have about 15 minutes: it opens Bastion, guides you through the pre-filled setup again, and continues.' -DocUrl $docUrl))
             }
         }
     }

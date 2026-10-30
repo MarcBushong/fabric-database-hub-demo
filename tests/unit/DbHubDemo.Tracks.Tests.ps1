@@ -1026,11 +1026,15 @@ Describe 'Invoke-DemoParallelDeployment' {
             @($calls | Where-Object { $_ -like 't4 start*' }).Count | Should -Be 2 -Because 'the template''s own start finds it started'
         }
 
-        It 'starts nothing, and reads nothing, on a first deployment' {
+        It 'starts nothing, and reads nothing, on a first deployment, and records the VMs it creates, which bill from then on (Phase 28)' {
             Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Exists = $false; $state }
+            Mock -ModuleName DbHubDemo -CommandName Add-DemoProgressStartedVm -MockWith { $script:calls.Add('billing ' + (@($PesterBoundParameters['Name']) -join ',')) }
             $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
             Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -Times 0 -Exactly
             $script:calls | Should -Not -Contain 'request sqlvm01'
+            $calls = @($script:calls)
+            $calls | Should -Contain 'billing sqlvm01,archost01'
+            $calls.IndexOf('billing sqlvm01,archost01') | Should -BeLessThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'template*' })) -Because 'a stop during the template still leaves the VMs it creates'
         }
 
         It 'says what it started keeps running when preflight then fails' {
@@ -1040,6 +1044,7 @@ Describe 'Invoke-DemoParallelDeployment' {
             $warning = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
             $warning.status | Should -Be 'Warning'
             $warning.message | Should -Match 'This run started sqlvm01 while preflight ran; it keeps running until \./scripts/stop-demo\.ps1'
+            @($warning.evidence.vms) | Should -Be @('sqlvm01') -Because 'the ending names what bills (Phase 28)'
             Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
         }
     }

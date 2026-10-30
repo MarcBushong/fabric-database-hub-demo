@@ -297,7 +297,7 @@ try {
         }
     }
 
-    Write-DemoResultReport -Result $results -Title 'deploy.ps1'
+    Write-DemoResultReport -Result $results -Title 'deploy.ps1' -OutcomeDone:($null -ne $outcome -and [string]$outcome.Kind -eq 'Done')
     Export-DemoResult -Result $results -Path $OutputPath
     Write-DemoDeploymentOutcome -Outcome $outcome -WorkspaceName $workspaceName
     if ($environment.GitHubActions) {

@@ -370,8 +370,8 @@ function New-DemoProgressModel {
         updatedAt     = $NowUnix
         heartbeatAt   = $NowUnix
         expect        = $expectation
-        run           = [ordered]@{ state = 'Running'; endedAt = 0; reason = ''; next = ''; nextCommand = ''; exitCode = $null; diagnostics = '' }
-        guidedStop    = [ordered]@{ state = $GuidedStop; message = ''; url = ''; deadlineAt = 0; promptedAt = 0; hostVm = 'archost01'; hostUser = ''; credential = ''; credentialText = '' }
+        run           = [ordered]@{ state = 'Running'; endedAt = 0; reason = ''; next = ''; nextCommand = ''; exitCode = $null; diagnostics = ''; startedVms = @() }
+        guidedStop    = [ordered]@{ state = $GuidedStop; message = ''; url = ''; deadlineAt = 0; promptedAt = 0; hostVm = 'archost01'; hostUser = ''; credential = ''; credentialText = ''; signInFallback = $false }
         optional      = @()
         confirm       = @()
         tracks        = $tracks.ToArray()
@@ -677,6 +677,36 @@ function Set-DemoProgressStopped {
     }
 }
 
+function Add-DemoProgressStartedVm {
+    # Records in the progress model what this run started or created, which runs and bills until a stop (Phase 28): VMs
+    # by name, and T4. deploy.ps1's ending names them when the run isn't DONE, even after Ctrl+C, when only the model
+    # knows (Get-DemoStartedVm). Each name once. Nothing without a model. Internal.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string] $Path,
+
+        [AllowEmptyCollection()]
+        [string[]] $Name = @()
+    )
+
+    $names = @($Name | Where-Object { $_ })
+    if (-not $Path -or $names.Count -eq 0) {
+        return
+    }
+    Update-DemoProgress -Path $Path -Data @{ Names = $names } -Action {
+        param($Model, $Change)
+        $list = [System.Collections.Generic.List[string]]::new()
+        foreach ($item in @(@($Model['run']['startedVms']) + @($Change['Names']))) {
+            if ($item -and -not $list.Contains([string]$item)) {
+                $list.Add([string]$item)
+            }
+        }
+        $Model['run']['startedVms'] = $list.ToArray()
+    }
+}
+
 function Set-DemoProgressValue {
     # Merges -Value into one section of the progress model: run, guidedStop, or expect; or replaces optional, or confirm
     # (the lines DONE lists under "Please confirm"; Phase 28 live finding). Internal.
@@ -823,7 +853,11 @@ function Get-DemoGuidedStopInstruction {
         [string] $SignInWay = '',
 
         [AllowEmptyString()]
-        [string] $SignInText = ''
+        [string] $SignInText = '',
+
+        # The host's automatic preparation of setup's sign-in didn't finish in time (Phase 28 review): the steps lead
+        # with Add... in Internet Explorer's dialog, the way past a blocked sign-in that worked live.
+        [switch] $SignInFallback
     )
 
     $user = if ($HostUser) { $HostUser } else { 'the VM''s administrator (Azure portal: {0}, Settings, Reset password shows its user name)' -f $HostVm }
@@ -833,7 +867,7 @@ function Get-DemoGuidedStopInstruction {
         'portalReset' { 'This session has no working clipboard, so no password was set or shown. First, in the Azure portal, open {0}, then Help, then Reset password: keep the user name {1}, type a password of your own choosing twice, and select Update (about a minute). Use that password. It''s rotated afterward.' -f $HostVm, $user }
         default { 'If you don''t have its password, set one of your own: in the Azure portal, open {0}, then Help, then Reset password (keep the user name). ./scripts/stop-demo.ps1 rotates it afterward.' -f $HostVm }
     }
-    return @(
+    $steps = @(
         ('1. Sign in to {0} through Bastion: in the Azure portal, open {0}, select Connect, then Bastion (the browser opens {0}''s page). User name: {1}. {2}' -f $HostVm, $user, $password)
         ('2. {0} opens Virtual Machine Connection to {1} by itself. {1} is already signed in, and SQL Server setup is open and pre-filled.' -f $HostVm, $GuestName)
         '3. On the Edition page, select "Use pay-as-you-go billing through Microsoft Azure", then Standard. Select Next.'
@@ -842,6 +876,11 @@ function Get-DemoGuidedStopInstruction {
         '6. Select Next on the pre-filled pages, then Install (about 10 to 15 minutes). When setup says Complete, select Close.'
         ('7. Close the Bastion tab. deploy.ps1 checks what was installed (Standard, the default instance, the Azure extension) and continues on its own; if something''s wrong, the host''s message here says how to fix it.')
     )
+    if ($SignInFallback) {
+        $first = 'First: the automatic preparation of setup''s Azure sign-in didn''t finish, so Internet Explorer may block it. On the Azure Extension for SQL Server page, if the Azure Login window stays blank, or Internet Explorer says content from https://login.microsoftonline.com is blocked, select Add..., then Add, then Close, and select "Use Azure Login" again; repeat for any other sign-in site it names.'
+        return @(@($first) + $steps)
+    }
+    return $steps
 }
 
 function Get-DemoProgressBanner {
@@ -914,7 +953,7 @@ function Get-DemoProgressBanner {
     if ([string]$guided['state'] -eq 'Ready') {
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add('One step needs you now, for about 10 minutes: SQL Server setup in the T2 guest, through Bastion. Nothing else needs you.')
-        foreach ($line in @(Get-DemoGuidedStopInstruction -HostVm ([string]$guided['hostVm']) -HostUser ([string]$guided['hostUser']) -SignInWay ([string]$guided['credential']) -SignInText ([string]$guided['credentialText']))) {
+        foreach ($line in @(Get-DemoGuidedStopInstruction -HostVm ([string]$guided['hostVm']) -HostUser ([string]$guided['hostUser']) -SignInWay ([string]$guided['credential']) -SignInText ([string]$guided['credentialText']) -SignInFallback:([bool]$guided['signInFallback']))) {
             $lines.Add($line)
         }
         if ([string]$guided['message']) {

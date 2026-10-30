@@ -304,6 +304,20 @@ function Test-DemoTenantSettingRead {
     return 'Read'
 }
 
+function Get-DemoHubSettingLatestRead {
+    # The latest P4 result (PREFLIGHT.P4.HUBSETTING or FABRIC.P4.HUBSETTING) that read the Hub tenant setting through the
+    # Fabric admin API (Test-DemoTenantSettingRead Read or Disabled), or $null when none did. A later read supersedes an
+    # earlier one, so a setting an administrator turned on during the run counts as on (Phase 28 review). Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    return (@($Result | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -in 'PREFLIGHT.P4.HUBSETTING', 'FABRIC.P4.HUBSETTING' -and (Test-DemoTenantSettingRead -Result $_) -ne 'Unread' }) | Select-Object -Last 1)
+}
+
 function Test-DemoConfirmOnlyResult {
     <#
     .SYNOPSIS
@@ -315,7 +329,9 @@ function Test-DemoConfirmOnlyResult {
     .DESCRIPTION
     - The Database Hub tenant setting (P4: PREFLIGHT.P4.HUBSETTING, FABRIC.P4.HUBSETTING) that wasn't read (no token, not
       a Fabric administrator, not found): decided from its evidence (Test-DemoTenantSettingRead), so a setting the Fabric
-      admin API read as disabled still blocks DONE, whichever check ID read it.
+      admin API read as disabled still blocks DONE, whichever check ID read it. With -Context (the run's results), the
+      latest read decides (Get-DemoHubSettingLatestRead): only that read blocks, and only when it says disabled, so the
+      Fabric track's read supersedes preflight's (Phase 28 review).
     - FABRIC.P5.CAPACITY on an Active capacity whose SKU the check doesn't recognize (a Trial: its SKU name isn't
       documented).
     - HUB.PRESENTER.*: with assignRoles false (the default, ADR 0008), an administrator grants the presenters' roles.
@@ -325,7 +341,10 @@ function Test-DemoConfirmOnlyResult {
     [OutputType([bool])]
     param(
         [AllowNull()]
-        [object] $Result
+        [object] $Result,
+
+        [AllowEmptyCollection()]
+        [object[]] $Context = @()
     )
 
     if ($null -eq $Result -or [string](Get-DemoMemberValue -InputObject $Result -Name 'status') -ne 'Manual action required') {
@@ -333,7 +352,11 @@ function Test-DemoConfirmOnlyResult {
     }
     $id = [string]$Result.checkId
     if ($id -in 'PREFLIGHT.P4.HUBSETTING', 'FABRIC.P4.HUBSETTING') {
-        return ((Test-DemoTenantSettingRead -Result $Result) -ne 'Disabled')
+        if (@($Context).Count -eq 0) {
+            return ((Test-DemoTenantSettingRead -Result $Result) -ne 'Disabled')
+        }
+        $latest = Get-DemoHubSettingLatestRead -Result $Context
+        return -not ($null -ne $latest -and [object]::ReferenceEquals($latest, $Result) -and (Test-DemoTenantSettingRead -Result $Result) -eq 'Disabled')
     }
     if ($id -eq 'FABRIC.P5.CAPACITY') {
         $evidence = Get-DemoMemberValue -InputObject $Result -Name 'evidence'
@@ -367,13 +390,13 @@ function Get-DemoConfirmItem {
             $items.Add([ordered]@{ key = $Key; checkId = $CheckId; text = (ConvertTo-DemoPlainText -Value $Text) })
         }
     }
-    # P4: a setting a check read decides; otherwise the latest reminder, which says it couldn't be checked and why.
+    # P4: the latest read decides (on for the organization: nothing; on only for groups: its Warning; off: it blocks DONE
+    # instead, Phase 28 review); without a read, the latest reminder, which says it couldn't be checked and why.
     $hub = @($all | Where-Object { [string]$_.checkId -in 'PREFLIGHT.P4.HUBSETTING', 'FABRIC.P4.HUBSETTING' })
-    $readHub = @($hub | Where-Object { (Test-DemoTenantSettingRead -Result $_) -ne 'Unread' })
-    if ($readHub.Count -gt 0) {
-        $grouped = @($readHub | Where-Object { [string]$_.status -eq 'Warning' } | Select-Object -Last 1)
-        if ($grouped.Count -gt 0 -and @($readHub | Where-Object { (Test-DemoTenantSettingRead -Result $_) -eq 'Disabled' }).Count -eq 0) {
-            & $add 'P4' ([string]$grouped[0].checkId) ([string]$grouped[0].message)
+    $latestRead = Get-DemoHubSettingLatestRead -Result $all
+    if ($null -ne $latestRead) {
+        if ([string]$latestRead.status -eq 'Warning') {
+            & $add 'P4' ([string]$latestRead.checkId) ([string]$latestRead.message)
         }
     }
     else {
@@ -411,6 +434,37 @@ function ConvertTo-DemoPlainText {
     return ((@($parts | Where-Object { $_ }) -join ' ') -replace '\s+', ' ').Trim()
 }
 
+function Get-DemoPreflightPassText {
+    # The Preflight step's Pass message in plain words (Phase 28 live run, 2026-10-30: it said "T3 free offer False" and
+    # "T2 source existing-build"). Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $NetworkMode = '',
+
+        [bool] $T3UseFreeLimit,
+
+        [AllowEmptyString()]
+        [string] $T2Source = ''
+    )
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add(('network mode: {0}' -f $(if ($NetworkMode) { $NetworkMode } else { 'not decided yet' })))
+    $parts.Add(('T3 free offer: {0}' -f $(if ($T3UseFreeLimit) { 'used' } else { 'not used' })))
+    if ($T2Source) {
+        $source = switch ($T2Source) {
+            'golden' { 'a copy of the golden snapshot' }
+            'existing-golden' { 'the existing host, from the golden snapshot' }
+            'existing-build' { 'the existing host, built from the image' }
+            'build' { 'a new build from the image' }
+            default { $T2Source }
+        }
+        $parts.Add(('T2 source: {0}' -f $source))
+    }
+    return ('Preflight passed ({0}).' -f ($parts -join '; '))
+}
+
 function Get-DemoDeploySummary {
     <#
     .SYNOPSIS
@@ -431,7 +485,7 @@ function Get-DemoDeploySummary {
     $all = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' })
     $failed = @($all | Where-Object { [string]$_.status -eq 'Fail' })
     $manual = @($all | Where-Object { [string]$_.status -eq 'Manual action required' })
-    $actionable = @($manual | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_) -and -not (Test-DemoOptionalResult -Result $_) })
+    $actionable = @($manual | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_ -Context $all) -and -not (Test-DemoOptionalResult -Result $_) })
     $steps = @($actionable | ForEach-Object {
             $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $_ -Name 'remediation')
             '{0}: {1}' -f [string]$_.checkId, $(if ($fix) { $fix } else { ConvertTo-DemoPlainText -Value $_.message })
@@ -454,6 +508,85 @@ function Get-DemoDeploySummary {
         $FinishedText
     }
     return [pscustomobject]@{ Status = $status; Message = $message.Trim(); Evidence = ([ordered]@{ manual = $steps; confirm = $confirm; failed = @($failed | ForEach-Object { [string]$_.checkId }) }) }
+}
+
+function Get-DemoStartedVm {
+    # What this run started or created, which runs and bills until a stop (Phase 28): the progress model's record
+    # (Add-DemoProgressStartedVm; the only one after Ctrl+C) and this run's DEPLOY.VMSTART evidence, each once. Pure.
+    # Internal.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [AllowNull()]
+        [object] $Model
+    )
+
+    $names = [System.Collections.Generic.List[string]]::new()
+    $add = {
+        param($Value)
+        foreach ($item in @($Value)) {
+            if ($item -and -not $names.Contains([string]$item)) {
+                $names.Add([string]$item)
+            }
+        }
+    }
+    if ($null -ne $Model) {
+        $run = Get-DemoMemberValue -InputObject $Model -Name 'run'
+        $recorded = Get-DemoMemberValue -InputObject $run -Name 'startedVms'
+        & $add $recorded
+    }
+    # A VM whose start failed (DEPLOY.VMSTART Fail names it) isn't running; one that started is, whatever the status.
+    $down = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.VMSTART' })) {
+        $evidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
+        $vms = Get-DemoMemberValue -InputObject $evidence -Name 'vms'
+        $notRunning = Get-DemoMemberValue -InputObject $evidence -Name 'notRunning'
+        & $add $vms
+        foreach ($name in @($notRunning)) {
+            if ($name) {
+                $down.Add([string]$name)
+            }
+        }
+        if ([string](Get-DemoMemberValue -InputObject $evidence -Name 't4') -eq 'Pass') {
+            & $add 'T4'
+        }
+    }
+    return @($names | Where-Object { $_ -notin $down })
+}
+
+function Get-DemoBillingNote {
+    # The one line a NOT DONE or stopped run's banner adds when this run started or created VMs (Phase 28): what runs and
+    # bills now, and how it stops: stop-demo.ps1 now, or the nightly auto-shutdown at its configured time. '' when
+    # nothing was started. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [System.Collections.IDictionary] $Config = @{},
+
+        [AllowEmptyCollection()]
+        [string[]] $Name = @(),
+
+        [string] $Command = './scripts/deploy.ps1'
+    )
+
+    $names = @($Name | Where-Object { $_ } | Select-Object -Unique)
+    if ($names.Count -eq 0) {
+        return ''
+    }
+    $join = { param([string[]] $Items) if ($Items.Count -le 2) { $Items -join ' and ' } else { '{0}, and {1}' -f ($Items[0..($Items.Count - 2)] -join ', '), $Items[-1] } }
+    $them = if ($names.Count -eq 1) { 'it' } else { 'them' }
+    $stop = (Get-DemoStopDemoCommand -Command $Command) -replace ' -RemoveBastionOnly', ''
+    $vms = @($names | Where-Object { $_ -ne 'T4' })
+    $shutdown = ''
+    if ($vms.Count -gt 0 -and [string]$Config['autoShutdownTime'] -match '^([01]\d|2[0-3])([0-5]\d)$') {
+        $clock = '{0}:{1}' -f $Matches[1], $Matches[2]
+        $zone = if ([string]$Config['autoShutdownTimeZone']) { ' ({0})' -f [string]$Config['autoShutdownTimeZone'] } else { '' }
+        $shutdown = '; otherwise the nightly auto-shutdown stops {0} at {1}{2}' -f $(if ($vms.Count -eq $names.Count) { $them } else { & $join $vms }), $clock, $zone
+    }
+    return ('Running and billing, because this run started or created {0}: {1}. {2} stops {0} now{3}.' -f $them, (& $join $names), $stop, $shutdown)
 }
 
 function Get-DemoT4OffReason {
@@ -777,7 +910,9 @@ function Invoke-DemoDoneGate {
     The telemetry comes last (Invoke-DemoTelemetryCheck): when nothing else this gate checked failed, a target whose
     telemetry didn't come gets its monitoring checked, and its telemetry once more, before the run is judged (Phase 28
     live finding, 2026-10-30: T1's plugin had stopped after a restart, and the run ended NOT DONE on TELEMETRY.T1).
-    -ProgressPath is the status page's model, whose Validation step says so.
+    -ProgressPath is the status page's model, whose Validation step says so. When the latest read of the Hub tenant
+    setting in -Result says it's off, it's read once more (FABRIC.P4.HUBSETTING, one call to the Fabric admin API), so a
+    setting an administrator turned on during the run doesn't keep it from DONE (Phase 28 review).
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -798,12 +933,17 @@ function Invoke-DemoDoneGate {
         [string] $ProgressPath = ''
     )
 
+    $results = [System.Collections.Generic.List[object]]::new()
+    $hubRead = Get-DemoHubSettingLatestRead -Result $Result
+    if ($null -ne $hubRead -and (Test-DemoTenantSettingRead -Result $hubRead) -eq 'Disabled') {
+        Write-DemoLog -Message ('{0} read the Hub tenant setting as disabled earlier in this run; reading it once more before the run is judged.' -f [string]$hubRead.checkId)
+        $results.Add((Test-DemoFabricHubSetting -Config $Config -CheckId 'FABRIC.P4.HUBSETTING'))
+    }
     $missing = @((Test-DemoDoneEvidence -Result $Result -Requirement $Requirement).Missing)
     if ($missing.Count -eq 0) {
-        return @()
+        return $results.ToArray()
     }
     Write-DemoLog -Message ('Checking what DONE needs and this run didn''t show yet: {0}.' -f ($missing -join ', '))
-    $results = [System.Collections.Generic.List[object]]::new()
     $estate = @($missing | Where-Object { $_ -like 'HUB.ESTATE.*' } | ForEach-Object { $_.Substring(11) })
     if ($estate.Count -gt 0) {
         $results.AddRange([object[]]@(Test-DemoHubEstate -Config $Config -Target $estate))
@@ -884,14 +1024,20 @@ function Get-DemoDeploymentOutcome {
 
         [switch] $Stopped,
 
-        [switch] $GuidedStopOpen
+        [switch] $GuidedStopOpen,
+
+        # What this run started or created (Get-DemoStartedVm): a NOT DONE or stopped run names it, since it bills until
+        # a stop (Phase 28).
+        [AllowEmptyCollection()]
+        [string[]] $StartedVm = @()
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
+    $billing = Get-DemoBillingNote -Config $Config -Name $StartedVm -Command $Command
     $core = @($all | Where-Object { -not (Test-DemoOptionalResult -Result $_) })
     $fails = @($core | Where-Object { [string]$_.status -eq 'Fail' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' })
     # Only what a person or a rerun can act on blocks DONE; what only a person can confirm is listed instead.
-    $manual = @($core | Where-Object { [string]$_.status -eq 'Manual action required' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' -and -not (Test-DemoConfirmOnlyResult -Result $_) })
+    $manual = @($core | Where-Object { [string]$_.status -eq 'Manual action required' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' -and -not (Test-DemoConfirmOnlyResult -Result $_ -Context $all) })
     $optional = @(Get-DemoOptionalItem -Result $all)
     $confirm = @(Get-DemoConfirmItem -Result $all)
     $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
@@ -918,6 +1064,9 @@ function Get-DemoDeploymentOutcome {
         $outcome.Next = 'Run {0} again when you''re ready: it continues where it stopped.' -f $Command
         if ($GuidedStopOpen) {
             $outcome.Next += ' It stopped at the guided stop: on-demand Bastion stays up, and the host password from the guided stop stays valid, until the next run cleans them up when it gets to T2, whether or not setup finished meanwhile (it isn''t DONE before), or ./scripts/stop-demo.ps1 does. Stopping for the day? Run ./scripts/stop-demo.ps1 now.'
+        }
+        if ($billing) {
+            $outcome.Notes = @($outcome.Notes) + @($billing)
         }
         return [pscustomobject]$outcome
     }
@@ -1033,6 +1182,9 @@ function Get-DemoDeploymentOutcome {
     }
     if ($leftover -and -not $leftoverShown) {
         $outcome.Notes = @($outcome.Notes) + @(('Also still open from an earlier guided stop or session: {0}. {1} removes Bastion and rotates the host password; DONE waits for it.' -f $leftover, $stopCommand))
+    }
+    if ($billing) {
+        $outcome.Notes = @($outcome.Notes) + @($billing)
     }
     $outcome.ExitCode = if ($fails.Count -gt 0) { 1 } else { 2 }
     return [pscustomobject]$outcome

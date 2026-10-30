@@ -342,6 +342,16 @@ function Get-DemoGuidedSignInHost {
         'aadcdn.msauth.net', 'aadcdn.msftauthimages.net', 'aadcdn.msauthimages.net')
 }
 
+function Get-DemoGuidedSignInFallbackText {
+    # What the person does first when setup's Azure sign-in wasn't prepared automatically (Initialize-DemoHostGuidedSignIn's
+    # bound, Phase 28 review): Add... in Internet Explorer's dialog, which worked live on 2026-10-30. Pure.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    return 'Setup''s Azure sign-in wasn''t prepared automatically, so Internet Explorer may block it: on the Azure Extension for SQL Server page, if the Azure Login window stays blank, or Internet Explorer says content from https://login.microsoftonline.com is blocked, select Add..., then Add, then Close, and select Use Azure Login again; repeat for any other sign-in site it names.'
+}
+
 function Invoke-DemoGuestSignInBrowserAction {
     <#
     .SYNOPSIS
@@ -352,7 +362,8 @@ function Invoke-DemoGuestSignInBrowserAction {
 
     .DESCRIPTION
     Prepare snapshots the administrator's site-to-zone entries (ZoneMap\Domains and ZoneMap\EscDomains, unless the host
-    passes the snapshot of an earlier Prepare), turns IE ESC off for administrators (IsInstalled 0), and maps each sign-in
+    passes the snapshot of an earlier Prepare), without the sign-in hosts' Trusted sites values, so Restore always removes
+    those; turns IE ESC off for administrators (IsInstalled 0), and maps each sign-in
     host to the Trusted sites zone (an https DWORD of 2) under both keys: Domains applies while IE ESC is off, EscDomains
     while it's on. Restore turns IE ESC on for administrators and users (IsInstalled 1, the Windows Server default), and
     puts the entries back as the snapshot had them: what was added or changed since goes, the dialog's Add... included;
@@ -513,8 +524,18 @@ function Invoke-DemoGuestSignInBrowserAction {
             & $setEsc $adminKey 0
             if ($zoneMap) {
                 if ($null -eq $snapshot) {
+                    # A fresh snapshot leaves out the sign-in hosts' Trusted sites values (https 2), so Restore always
+                    # removes them: they can already be there from an earlier Prepare whose PowerShell Direct call failed
+                    # before it returned, or from setup's dialog (Add...) (Phase 28 review).
                     $before = & $readEntries
-                    $SnapshotJson = ConvertTo-Json -InputObject ([ordered]@{ keyList = @($before.Keys); valueList = @($before.Values) }) -Compress
+                    $ours = @(foreach ($name in $SignInHost) {
+                            $parts = & $split $name
+                            foreach ($map in $maps) {
+                                '{0}\{1}\{2}|https=2' -f $map, $parts.Domain, $parts.Sub
+                            }
+                        })
+                    $kept = @($before.Values | Where-Object { $ours -notcontains $_ })
+                    $SnapshotJson = ConvertTo-Json -InputObject ([ordered]@{ keyList = @($before.Keys); valueList = $kept }) -Compress
                 }
                 foreach ($name in $SignInHost) {
                     $parts = & $split $name
@@ -890,8 +911,9 @@ function Save-DemoGuidedSetupArmed {
 
 function Get-DemoGuidedSignInRecord {
     # The host's record of what the guided stop changed in the guest for setup's Azure sign-in (written before the change:
-    # state Preparing, Ready, or Restoring, and the snapshot of the Trusted sites entries before), or $null. An unreadable
-    # record still means "restore": it's never ignored.
+    # state Preparing, Ready, Fallback (the preparation didn't finish in time, and the person is asked anyway), or
+    # Restoring; the request it's for, when its preparation first started, and its passes; and the snapshot of the
+    # Trusted sites entries before), or $null. An unreadable record still means "restore": it's never ignored.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -1192,24 +1214,78 @@ function Initialize-DemoHostGuidedSignIn {
     doesn't reach it, so this runs first. The record is written before the guest changes, so a run that stops midway
     still restores them (Restore-DemoHostGuidedSignIn). A sign-in host that couldn't be mapped is only logged: the person
     can select Add... in setup's dialog.
+    Bounded (Phase 28 review): the record holds when this request's preparation first started (firstPreparedUtc) and its
+    passes. When it isn't ready after -MaxMinutes or -MaxPasses, a Warning is logged, the record's state turns Fallback,
+    and $null is returned, so setup opens and the person is asked anyway, with Add... in Internet Explorer's dialog as the
+    way past a blocked sign-in, which worked live; the host's health then says signIn fallback, which deploy.ps1 shows.
+    The record still drives the cleanup, so the done check and the golden gates don't change. A check that fails after
+    the preparation was ready for this request doesn't take the person's step back.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [System.Collections.IDictionary] $Context,
 
-        [string] $RequestId = ''
+        [string] $RequestId = '',
+
+        [ValidateRange(1, 240)]
+        [int] $MaxMinutes = 15,
+
+        [ValidateRange(1, 20)]
+        [int] $MaxPasses = 3
     )
 
     $path = Get-DemoGuidedSetupPath -Root $Context.Root
     $guest = $Context.GuestName
     $prefix = 'Preparing setup''s Azure sign-in in {0} (Azure-side, no action needed):' -f $guest
+    $retry = 'the host tries again within about 5 minutes, and asks for you anyway after about {0} minutes' -f $MaxMinutes
+    $passLimit = $MaxPasses
+    # The record comes first: it counts this request's passes for the bound, and a run that stops midway still restores
+    # what was changed.
+    $record = Get-DemoGuidedSignInRecord -Path $path
+    if ($null -eq $record) {
+        $record = @{ schemaVersion = 1; snapshot = ''; state = 'Preparing' }
+    }
+    if ([string]$record['requestId'] -ne $RequestId -or -not [string]$record['firstPreparedUtc']) {
+        $record['requestId'] = $RequestId
+        $record['firstPreparedUtc'] = Get-DemoVmUtcNow
+        $record['passes'] = 0
+        if ([string]$record['state'] -ne 'Ready') {
+            $record['state'] = 'Preparing'
+        }
+    }
+    elseif ([string]$record['state'] -eq 'Fallback') {
+        # This request stopped waiting for the preparation: setup opens, and the person uses Add... when it's needed.
+        return $null
+    }
+    $wasReady = ([string]$record['state'] -eq 'Ready')
+    $record['passes'] = [int]$record['passes'] + 1
+    Save-DemoGuidedSignInRecord -Path $path -Value $record
+    $notReady = {
+        param([string] $Message, [string] $Problem)
+        if ($wasReady) {
+            Write-DemoVmLog -Level 'Warning' -Message ('Setup''s Azure sign-in in {0} was prepared earlier for this request, and checking it again failed ({1}); setup stays open, and the cleanup still restores the browser settings.' -f $guest, $Problem)
+            return $null
+        }
+        $since = [datetime]::MinValue
+        $parsed = [datetime]::TryParse([string]$record['firstPreparedUtc'], [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$since)
+        if ([int]$record['passes'] -lt $passLimit -and (-not $parsed -or [DateTime]::UtcNow -lt $since.AddMinutes($MaxMinutes))) {
+            return (New-DemoVmStepResult -Outcome 'InProgress' -Message $Message)
+        }
+        $record['state'] = 'Fallback'
+        $record['fallbackUtc'] = Get-DemoVmUtcNow
+        $record['fallbackReason'] = $Problem
+        Save-DemoGuidedSignInRecord -Path $path -Value $record
+        Write-DemoVmLog -Level 'Warning' -Message ('Setup''s Azure sign-in in {0} wasn''t prepared automatically after {1} pass(es) ({2}). Setup opens and the person is asked anyway: if Internet Explorer blocks the sign-in, they select Add... in its dialog. The cleanup still turns IE Enhanced Security Configuration back on and removes the Trusted sites entries.' -f $guest, [int]$record['passes'], $Problem)
+        return $null
+    }
     $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
     try {
         $webView2 = Test-DemoGuestWebView2 -Name $guest -Credential $credential
     }
     catch {
-        return (New-DemoVmStepResult -Outcome 'InProgress' -Message ('{0} the guest couldn''t be asked about the WebView2 runtime yet ({1}); the host tries again within about 5 minutes.' -f $prefix, (Protect-DemoVmText -Text $_.Exception.Message)))
+        $problem = Protect-DemoVmText -Text $_.Exception.Message
+        return (& $notReady ('{0} the guest couldn''t be asked about the WebView2 runtime yet ({1}); {2}.' -f $prefix, $problem, $retry) ('the guest couldn''t be asked about the WebView2 runtime: {0}' -f $problem))
     }
     if (-not $webView2) {
         $problem = ''
@@ -1217,22 +1293,12 @@ function Initialize-DemoHostGuidedSignIn {
             Install-DemoHostGuestWebView2 -Context $Context
         }
         catch {
-            $problem = ' ({0})' -f (Protect-DemoVmText -Text $_.Exception.Message)
+            $problem = Protect-DemoVmText -Text $_.Exception.Message
         }
         if (-not (Test-DemoHostGuestWebView2 -Context $Context)) {
-            return (New-DemoVmStepResult -Outcome 'InProgress' -Message ('{0} the WebView2 runtime isn''t installed in the guest yet{1}; the host tries again within about 5 minutes, and nobody is asked before it''s there.' -f $prefix, $problem))
+            return (& $notReady ('{0} the WebView2 runtime isn''t installed in the guest yet{1}; {2}.' -f $prefix, $(if ($problem) { ' ({0})' -f $problem } else { '' }), $retry) ('the WebView2 runtime isn''t installed{0}' -f $(if ($problem) { ': ' + $problem } else { '' })))
         }
     }
-    $record = Get-DemoGuidedSignInRecord -Path $path
-    $wasReady = $false
-    if ($null -eq $record) {
-        $record = @{ schemaVersion = 1; snapshot = '' }
-    }
-    else {
-        $wasReady = ([string]$record['state'] -eq 'Ready')
-    }
-    $record['state'] = 'Preparing'
-    $record['requestId'] = $RequestId
     $record['preparedUtc'] = Get-DemoVmUtcNow
     $record['webView2'] = $true
     Save-DemoGuidedSignInRecord -Path $path -Value $record
@@ -1241,7 +1307,8 @@ function Initialize-DemoHostGuidedSignIn {
         $state = Invoke-Command -VMName $guest -Credential $credential -ErrorAction Stop -ScriptBlock ${function:Invoke-DemoGuestSignInBrowserAction} -ArgumentList 'Prepare', $hosts, $Context.Guest.AdministratorName, ([string]$record['snapshot'])
     }
     catch {
-        return (New-DemoVmStepResult -Outcome 'InProgress' -Message ('{0} IE Enhanced Security Configuration couldn''t be turned off for administrators yet ({1}); the host tries again within about 5 minutes.' -f $prefix, (Protect-DemoVmText -Text $_.Exception.Message)))
+        $problem = Protect-DemoVmText -Text $_.Exception.Message
+        return (& $notReady ('{0} IE Enhanced Security Configuration couldn''t be turned off for administrators yet ({1}); {2}.' -f $prefix, $problem, $retry) ('IE Enhanced Security Configuration couldn''t be turned off: {0}' -f $problem))
     }
     if (-not [string]$record['snapshot'] -and [string]$state.snapshotJson) {
         $record['snapshot'] = [string]$state.snapshotJson
@@ -1257,7 +1324,7 @@ function Initialize-DemoHostGuidedSignIn {
     }
     Save-DemoGuidedSignInRecord -Path $path -Value $record
     if (-not $escOff) {
-        return (New-DemoVmStepResult -Outcome 'InProgress' -Message ('{0} IE Enhanced Security Configuration is still on for administrators in the guest; the host tries again within about 5 minutes, and nobody is asked before it''s off.' -f $prefix))
+        return (& $notReady ('{0} IE Enhanced Security Configuration is still on for administrators in the guest; {1}.' -f $prefix, $retry) 'IE Enhanced Security Configuration is still on for administrators')
     }
     if (-not $wasReady) {
         if ($mapped.Count -lt $hosts.Count) {
@@ -1501,8 +1568,9 @@ function Invoke-DemoHostGuidedSetupStep {
     The SqlSetupWizard step's Set in PaygWizard mode (Phase 28): checks what's installed, cleans up once the right
     instance is there, and while deploy.ps1 waits for a person (a valid request), prepares setup's Azure sign-in
     (Initialize-DemoHostGuidedSignIn: WebView2, IE ESC off for administrators, the Trusted sites; until that's done the
-    step is InProgress, so nobody is asked), then opens the pre-filled setup in the guest: in a session that's already
-    signed in, or through one automatic sign-in. Returns a step result.
+    step is InProgress, so nobody is asked, for about 15 minutes or 3 passes at most, after which the person is asked
+    anyway, with Add... in Internet Explorer's dialog first), then opens the pre-filled setup in the guest: in a session
+    that's already signed in, or through one automatic sign-in. Returns a step result.
     #>
     [CmdletBinding()]
     param(
@@ -1562,8 +1630,15 @@ function Invoke-DemoHostGuidedSetupStep {
     if ($null -ne $prepared) {
         return $prepared
     }
+    # The automatic preparation didn't finish in time (Phase 28 review): the person is asked anyway, Add... first.
+    $lead = ''
+    $signInRecord = Get-DemoGuidedSignInRecord -Path $path
+    if ($null -ne $signInRecord -and [string]$signInRecord['state'] -eq 'Fallback') {
+        $lead = (Get-DemoGuidedSignInFallbackText) + ' '
+        $instructions = @(Get-DemoGuidedSignInFallbackText) + $instructions
+    }
     if ($check.SetupRunning) {
-        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('SQL Server setup is open in {0}: choose Use pay-as-you-go billing through Microsoft Azure and Standard, sign in with Use Azure Login, then Install.{1}' -f $Context.GuestName, $problem) -Instruction $instructions)
+        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('{2}SQL Server setup is open in {0}: choose Use pay-as-you-go billing through Microsoft Azure and Standard, sign in with Use Azure Login, then Install.{1}' -f $Context.GuestName, $problem, $lead) -Instruction $instructions)
     }
     $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
     if (Test-DemoGuestConsoleSession -Name $Context.GuestName -Credential $credential) {
@@ -1578,20 +1653,20 @@ function Invoke-DemoHostGuidedSetupStep {
             $armed['lastLaunchUtc'] = Get-DemoVmUtcNow
             Save-DemoGuidedSetupArmed -Path $path -Value $armed
         }
-        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('The guest is signed in, and SQL Server setup opens there now.{0}' -f $problem) -Instruction $instructions)
+        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('{1}The guest is signed in, and SQL Server setup opens there now.{0}' -f $problem, $lead) -Instruction $instructions)
     }
     $arms = 0
     if ($null -ne $armed -and [string]$armed['requestId'] -eq $request.RequestId) {
         $arms = [int]$armed['arms']
     }
     if ($arms -ge $MaxArms) {
-        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('The guest''s automatic sign-in didn''t open setup after {0} tries. In Virtual Machine Connection, sign in to {1} as Administrator (C:\ProgramData\DbHubDemo\Copy-GuestCredential.ps1 copies the password), then run C:\DbHubDemo\setup\Start-GuidedSetup.ps1.{2}' -f $MaxArms, $Context.GuestName, $problem) -Instruction $instructions)
+        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('{3}The guest''s automatic sign-in didn''t open setup after {0} tries. In Virtual Machine Connection, sign in to {1} as Administrator (C:\ProgramData\DbHubDemo\Copy-GuestCredential.ps1 copies the password), then run C:\DbHubDemo\setup\Start-GuidedSetup.ps1.{2}' -f $MaxArms, $Context.GuestName, $problem, $lead) -Instruction $instructions)
     }
     if ($null -ne $armed) {
         Disable-DemoHostGuestAutoLogon -Context $Context -Reason 'Retry'
     }
     Enable-DemoHostGuestAutoLogon -Context $Context -RequestId $request.RequestId -Arms ($arms + 1)
-    return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('The guest restarts, signs itself in once, and opens the pre-filled SQL Server setup in about 2 minutes.{0}' -f $problem) -Instruction $instructions)
+    return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('{1}The guest restarts, signs itself in once, and opens the pre-filled SQL Server setup in about 2 minutes.{0}' -f $problem, $lead) -Instruction $instructions)
 }
 
 function Test-DemoHostGuidedSetupDone {
@@ -1621,8 +1696,9 @@ function Test-DemoHostGuidedSetupDone {
 
 function Get-DemoHostGuidedSetupDetail {
     # For health.json (details.guidedSetup): whether automatic sign-in is armed, deploy.ps1's request, setup's sign-in
-    # preparation (signIn: none, preparing, ready, or restoring; deploy.ps1 asks for a person only at ready), and the last
-    # cleanup (its reason, what it found, and what failed). Names and times only. Never throws.
+    # preparation (signIn: none, preparing, ready, fallback, or restoring; deploy.ps1 asks for a person at ready, and at
+    # fallback, when the preparation didn't finish in time, with Add... first), and the last cleanup (its reason, what it
+    # found, and what failed). Names and times only. Never throws.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]

@@ -619,7 +619,7 @@ function Invoke-DemoParallelDeployment {
                 }
                 & $addAll @($credential.Results)
                 Set-DemoProgressValue -Path $ProgressPath -Section 'guidedStop' -Value @{ credential = $credential.Mode; credentialText = $credential.Text; hostUser = $credential.UserName }
-                Show-DemoGuidedStopPrompt -Url ([string]$stop['url']) -DeadlineUtc $deadline -HostVm ([string]$stop['hostVm']) -HostUser $credential.UserName -SignInWay $credential.Mode -SignInText $credential.Text -PagePath $PagePath
+                Show-DemoGuidedStopPrompt -Url ([string]$stop['url']) -DeadlineUtc $deadline -HostVm ([string]$stop['hostVm']) -HostUser $credential.UserName -SignInWay $credential.Mode -SignInText $credential.Text -PagePath $PagePath -SignInFallback:([bool]$stop['signInFallback'])
                 $guided.NextReminder = [DateTime]::UtcNow.AddMinutes(5)
             }
             elseif ([DateTime]::UtcNow -ge $guided.NextReminder) {
@@ -743,7 +743,7 @@ function Invoke-DemoParallelDeployment {
                 if ($null -ne $stoppedStart -and @($stoppedStart.Requested).Count -gt 0) {
                     # What this run asked to start keeps running, and billing (ADR 0016), until a stop.
                     $message = 'This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')
-                    $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
+                    $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Evidence ([ordered]@{ vms = @($stoppedStart.Requested); notRunning = @(); afterPreflightFail = $true }) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
                     Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status 'Warning' -Message $message
                 }
                 return $results.ToArray()
@@ -770,7 +770,7 @@ function Invoke-DemoParallelDeployment {
             }
             & $ensureContext
             $mark.Invoke('Preflight', $watch)
-            & $stageResult 'Preflight' 'Pass' ('Preflight passed (network mode {0}, T3 free offer {1}, T2 source {2}).' -f $context.NetworkMode, $context.T3UseFreeLimit, $context.T2Source)
+            & $stageResult 'Preflight' 'Pass' (Get-DemoPreflightPassText -NetworkMode ([string]$context.NetworkMode) -T3UseFreeLimit ([bool]$context.T3UseFreeLimit) -T2Source ([string]$context.T2Source))
         }
         if (-not $whatIf) {
             & $ensureContext
@@ -829,6 +829,11 @@ function Invoke-DemoParallelDeployment {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
             & $ensureContext
             Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Running' -Message 'Deploying the template (about 7 to 9 minutes).'
+            if (-not $whatIf -and -not [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')) {
+                # A first deployment creates the VMs (and T4), which run and bill from then on, even when the run stops: the
+                # ending names them when the run isn't DONE (Phase 28).
+                Add-DemoProgressStartedVm -Path $ProgressPath -Name (@('sqlvm01', (Get-DemoHostVmName -Config $Config)) + @(if (-not $skipT4) { 'T4' }))
+            }
             $deployArguments = @{
                 Config                  = $Config
                 Action                  = $(if ($whatIf) { 'WhatIf' } else { 'Create' })
@@ -1051,8 +1056,10 @@ function Invoke-DemoParallelDeployment {
         catch {
             Write-DemoLog -Level Warning -Message ('The validation ran, but the stage wasn''t recorded: {0}' -f $_.Exception.Message)
         }
-        # What only a person can confirm, and the optional parts, don't make this step look blocked (Phase 28 live finding).
-        $validationStatus = Get-DemoWorstStatus -Status @($results | Select-Object -Skip $validationStart | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_) -and -not (Test-DemoOptionalResult -Result $_) } | ForEach-Object { [string]$_.status })
+        # What only a person can confirm, and the optional parts, don't make this step look blocked (Phase 28 live finding);
+        # the Hub tenant setting by its latest read (Phase 28 review).
+        $runSoFar = $results.ToArray()
+        $validationStatus = Get-DemoWorstStatus -Status @($results | Select-Object -Skip $validationStart | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_ -Context $runSoFar) -and -not (Test-DemoOptionalResult -Result $_) } | ForEach-Object { [string]$_.status })
         Set-DemoProgressStep -Path $ProgressPath -Id 'Validation' -Status $(if ($validationStatus) { $validationStatus } else { 'Pass' }) -Message $(if ($allTracksDone) { 'Database Hub''s estate, telemetry, and metrics checked for every target.' } else { 'Checked what finished; the rest waits for the unfinished tracks.' })
     }
     $mark.Invoke('Validation', $validationWatch)

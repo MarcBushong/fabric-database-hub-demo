@@ -308,6 +308,22 @@ Describe 'Setup''s Azure sign-in: prepared before anyone is asked, restored afte
             Test-Path -LiteralPath ('{0}\EscDomains' -f $script:zone) | Should -BeFalse
             @(Get-ChildItem -LiteralPath $script:zone -Recurse | ForEach-Object { $_.PSChildName }) | Should -Be @('Domains', 'contoso.com', 'www')
         }
+
+        It 'leaves the sign-in hosts out of a fresh snapshot, so Restore takes them out even after a Prepare whose return was lost (Phase 28 review)' {
+            # The first Prepare's changes are there, but its PowerShell Direct call failed before the host saved the
+            # snapshot, so the next pass takes a fresh one; the dialog's Add... writes the same kind of entry.
+            $null = Invoke-DemoGuestSignInBrowserAction -Action Prepare -SignInHost $script:hosts -ActiveSetupRoot $script:as -UserRoot $script:user
+            $second = Invoke-DemoGuestSignInBrowserAction -Action Prepare -SignInHost $script:hosts -ActiveSetupRoot $script:as -UserRoot $script:user
+            $snapshot = $second.snapshotJson | ConvertFrom-Json
+            @($snapshot.valueList) | Should -Be @('Domains\contoso.com\www|https=2') -Because 'a sign-in host''s Trusted sites value is never what was there before'
+            $restored = Invoke-DemoGuestSignInBrowserAction -Action Restore -SignInHost $script:hosts -SnapshotJson $second.snapshotJson -ActiveSetupRoot $script:as -UserRoot $script:user
+            $restored.restored | Should -BeTrue
+            @($restored.hostsMapped).Count | Should -Be 0
+            foreach ($map in 'Domains', 'EscDomains') {
+                Get-ItemProperty -LiteralPath ('{0}\{1}\microsoftonline.com\login' -f $script:zone, $map) -Name 'https' -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+            }
+            (Get-ItemProperty -LiteralPath ('{0}\Domains\contoso.com\www' -f $script:zone) -Name 'https').https | Should -Be 2
+        }
     }
 
     Context 'on the host' {
@@ -369,7 +385,7 @@ Describe 'Setup''s Azure sign-in: prepared before anyone is asked, restored afte
             $script:lastSnapshot | Should -Be '{"keyList":[],"valueList":[]}'
         }
 
-        It 'asks nobody while a prerequisite is missing: no arm, no setup, and the step says it''s Azure-side preparation' {
+        It 'asks nobody while a prerequisite is missing, within the bound: no arm, no setup, and the step says it''s Azure-side preparation' {
             Write-TestRequest -Context $context -ExpiresUtc ([DateTime]::UtcNow.AddMinutes(45))
             Mock -CommandName Test-DemoGuestConsoleSession -MockWith { $true }
             $script:webView2 = $false
@@ -378,26 +394,79 @@ Describe 'Setup''s Azure sign-in: prepared before anyone is asked, restored afte
             $result.Outcome | Should -Be 'InProgress'
             $result.Message | Should -Match 'Azure-side, no action needed'
             $result.Message | Should -Match 'WebView2 runtime isn''t installed'
+            $result.Message | Should -Match 'asks for you anyway after about 15 minutes'
             $script:order | Should -Not -Contain 'guest Prepare'
             $script:order | Should -Not -Contain 'start setup'
             $script:order | Should -Not -Contain 'arm'
-            (Get-DemoHostGuidedSetupDetail -Context $context).signIn | Should -Be 'none'
+            (Get-DemoHostGuidedSetupDetail -Context $context).signIn | Should -Be 'preparing' -Because 'the record counts this request''s passes from the first'
 
-            # WebView2 is there, but IE ESC is still on for administrators: still nobody is asked.
-            $script:order.Clear()
-            $script:webView2 = $true
-            $script:escAdmin = 1
-            $result = Invoke-DemoHostGuidedSetupStep -Context $context
-            $result.Outcome | Should -Be 'InProgress'
-            $result.Message | Should -Match 'Enhanced Security Configuration is still on for administrators'
-            $script:order | Should -Be @('check WebView2', 'guest Prepare')
-            (Get-DemoHostGuidedSetupDetail -Context $context).signIn | Should -Be 'preparing'
-
-            # A guest that can't be asked: no install attempt, and nobody is asked.
+            # A guest that can't be asked: no install attempt, and nobody is asked yet.
             $script:order.Clear()
             Mock -CommandName Test-DemoGuestWebView2 -MockWith { throw 'The virtual machine is not running.' }
             (Invoke-DemoHostGuidedSetupStep -Context $context).Outcome | Should -Be 'InProgress'
             $script:order.Count | Should -Be 0
+            (Read-DemoVmJsonFile -Path $script:path.HostSignIn)['passes'] | Should -Be 2
+        }
+
+        It 'asks for the person anyway, Add... first and with a Warning, when the preparation isn''t ready after 3 passes, and the record still drives the cleanup (Phase 28 review)' {
+            # Fail open: a preparation that never finishes (IE ESC still on here) would otherwise keep a colleague waiting
+            # on "Azure-side, no action needed" until deploy.ps1's time limit, though Add... in setup's dialog works.
+            Write-TestRequest -Context $context -ExpiresUtc ([DateTime]::UtcNow.AddMinutes(45))
+            Mock -CommandName Test-DemoGuestConsoleSession -MockWith { $true }
+            Mock -CommandName Write-DemoVmLog -MockWith { if ([string]$PesterBoundParameters['Level'] -eq 'Warning') { $script:order.Add('warning: ' + [string]$PesterBoundParameters['Message']) } }
+            $script:escAdmin = 1
+            foreach ($pass in 1, 2) {
+                $result = Invoke-DemoHostGuidedSetupStep -Context $context
+                $result.Outcome | Should -Be 'InProgress' -Because ('pass {0} is within the bound' -f $pass)
+                $result.Message | Should -Match 'Enhanced Security Configuration is still on for administrators'
+            }
+            $script:order | Should -Not -Contain 'start setup'
+            $script:order.Clear()
+            $result = Invoke-DemoHostGuidedSetupStep -Context $context
+            $result.Outcome | Should -Be 'ManualActionRequired'
+            $result.Message | Should -Match '^Setup''s Azure sign-in wasn''t prepared automatically, so Internet Explorer may block it'
+            @($result.Instruction)[0] | Should -Match ([regex]::Escape('select Add..., then Add, then Close, and select Use Azure Login again'))
+            $script:order | Should -Contain 'start setup'
+            @($script:order | Where-Object { $_ -like 'warning: *wasn''t prepared automatically after 3 pass(es)*IE Enhanced Security Configuration is still on*' }).Count | Should -Be 1
+            (Read-DemoVmJsonFile -Path $script:path.HostSignIn)['state'] | Should -Be 'Fallback'
+            (Get-DemoHostGuidedSetupDetail -Context $context).signIn | Should -Be 'fallback'
+
+            # The next pass doesn't prepare or wait again for this request.
+            $script:order.Clear()
+            (Invoke-DemoHostGuidedSetupStep -Context $context).Outcome | Should -Be 'ManualActionRequired'
+            $script:order | Should -Not -Contain 'guest Prepare'
+
+            # The record still drives the cleanup: the setup step isn't done before it, and it turns IE ESC back on.
+            Mock -CommandName Test-DemoHostSqlEdition -MockWith { $true }
+            Remove-Item -LiteralPath $script:path.HostArmed -Force -ErrorAction SilentlyContinue
+            Test-DemoHostGuidedSetupDone -Context $context | Should -BeFalse
+            Restore-DemoHostGuidedSignIn -Context $context
+            $script:order | Should -Contain 'guest Restore'
+            Test-Path -LiteralPath $script:path.HostSignIn | Should -BeFalse
+            Test-DemoHostGuidedSetupDone -Context $context | Should -BeTrue
+        }
+
+        It 'asks for the person anyway once about 15 minutes passed since this request''s preparation began, even before 3 passes (Phase 28 review)' {
+            Write-TestRequest -Context $context -ExpiresUtc ([DateTime]::UtcNow.AddMinutes(45))
+            Mock -CommandName Test-DemoGuestConsoleSession -MockWith { $true }
+            $began = [DateTime]::UtcNow.AddMinutes(-16).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+            Save-DemoGuidedSignInRecord -Path $script:path -Value @{ schemaVersion = 1; state = 'Preparing'; snapshot = ''; requestId = 'request-0001'; firstPreparedUtc = $began; passes = 1 }
+            Mock -CommandName Test-DemoGuestWebView2 -MockWith { throw 'The virtual machine is not running.' }
+            (Invoke-DemoHostGuidedSetupStep -Context $context).Outcome | Should -Be 'ManualActionRequired'
+            $record = Read-DemoVmJsonFile -Path $script:path.HostSignIn
+            $record['state'] | Should -Be 'Fallback'
+            $record['passes'] | Should -Be 2
+            $record['fallbackReason'] | Should -Match 'WebView2'
+
+            # A new request starts over: the preparation is tried again.
+            $request = Read-DemoVmJsonFile -Path $script:path.HostRequest
+            $request['requestId'] = 'request-0002'
+            Write-DemoVmJsonFile -Path $script:path.HostRequest -InputObject $request
+            Mock -CommandName Test-DemoGuestWebView2 -MockWith { $script:order.Add('check WebView2'); $true }
+            $script:order.Clear()
+            Invoke-DemoHostGuidedSetupStep -Context $context | Out-Null
+            $script:order | Should -Contain 'guest Prepare'
+            (Read-DemoVmJsonFile -Path $script:path.HostSignIn)['state'] | Should -Be 'Ready'
         }
 
         It 'restores IE ESC and the Trusted sites in the cleanup after success, failure, and timeout, but not between two arms' {

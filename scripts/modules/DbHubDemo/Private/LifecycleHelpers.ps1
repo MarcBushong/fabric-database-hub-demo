@@ -187,9 +187,18 @@ function Request-DemoStoppedStart {
     # What this run itself asked to start, which bills until a stop (a VM that was still deallocating is only waited for).
     $request.Requested = @(@($request.Vms.Keys | Where-Object { $request.Vms[$_].Requested }) + @(if ($null -ne $request.T4 -and [string]$request.T4.status -eq 'Pass') { 'T4' }))
     $request.Needed = $request.Vms.Count -gt 0 -or $null -ne $request.T4
+    # Remembered for deploy.ps1's ending, which names what runs and bills when the run isn't DONE, even after Ctrl+C.
+    Add-DemoProgressStartedVm -Path $ProgressPath -Name $request.Requested
     if ($names.Count -gt 0) {
         Write-DemoLog -Message ('Starting what was stopped (the nightly auto-shutdown, stop-demo.ps1, or a stop): {0}. It boots while the run goes on.' -f ($names -join ', '))
-        Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -State 'Running' -Message ('Starting the VMs that were stopped: no action needed ({0}).' -f ($names -join ', '))
+        # Plain words for the person (Phase 28 live run, 2026-10-30): which VMs start, why, and that nothing is needed
+        # from them; a state is named once when they share it.
+        $stoppedItems = @(@(foreach ($vm in $request.Vms.Keys) { [pscustomobject]@{ Name = $vm; State = $request.Vms[$vm].Before.Split('/')[-1] } }) + @(if ($null -ne $request.T4 -and [string]$request.T4.status -eq 'Pass') { [pscustomobject]@{ Name = 'T4'; State = 'stopped' } }))
+        $states = @($stoppedItems | ForEach-Object { $_.State } | Select-Object -Unique)
+        $labels = @(foreach ($entry in $stoppedItems) { if ($states.Count -gt 1 -and $entry.State -ne 'stopped') { '{0} ({1})' -f $entry.Name, $entry.State } else { $entry.Name } })
+        $list = if ($labels.Count -le 2) { $labels -join ' and ' } else { '{0}, and {1}' -f ($labels[0..($labels.Count - 2)] -join ', '), $labels[-1] }
+        $why = if ($states.Count -eq 1 -and $states[0] -ne 'stopped') { ' ({0})' -f $states[0] } else { '' }
+        Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -State 'Running' -Message ('Starting {0}, which {1} stopped{2}; no action needed from you.' -f $list, $(if ($stoppedItems.Count -eq 1) { 'was' } else { 'were' }), $why)
     }
     elseif (-not $request.Needed) {
         Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -State 'Skipped' -Message 'Not needed: nothing was stopped.'
@@ -263,6 +272,7 @@ function Wait-DemoStoppedStart {
     }
     $message = if ($vms.Count -gt 0) { 'Started {0}, which had been stopped, in about {1} minute(s).{2}' -f ($vms -join ' and '), $minutes, $t4Text } elseif ([string]$t4.status -eq 'Pass') { 'Started T4, which had been stopped; it''s Ready.' } else { 'T4 was stopped, and it isn''t Ready: {0}' -f [string]$t4.message }
     $status = if ($null -ne $t4 -and [string]$t4.status -ne 'Pass') { 'Warning' } else { 'Pass' }
+    Add-DemoProgressStartedVm -Path $ProgressPath -Name (@($vms) + @(if ($null -ne $t4 -and [string]$t4.status -eq 'Pass') { 'T4' }))
     $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status $status -Message $message -Evidence $evidence -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-start'))
     Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status $status -Message $message
     return $results.ToArray()

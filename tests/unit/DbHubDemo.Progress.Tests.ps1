@@ -294,6 +294,30 @@ Describe 'The guided stop''s steps' {
         ($script:printed -join ' ') | Should -Match 'WAITING FOR YOU'
         ($script:printed -join ' ') | Should -Match ([regex]::Escape('select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close.'))
     }
+
+    It 'lead with Add... and say the automatic preparation didn''t finish, when the host asks anyway (Phase 28 review)' {
+        $steps = @(InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -HostUser 'demoadmin' -SignInWay 'clipboard' -SignInFallback })
+        $steps[0] | Should -Match '^First: the automatic preparation of setup''s Azure sign-in didn''t finish, so Internet Explorer may block it\.'
+        $steps[0] | Should -Match ([regex]::Escape('select Add..., then Add, then Close, and select "Use Azure Login" again'))
+        $steps[1] | Should -Match '^1\. Sign in to archost01 through Bastion'
+        @(InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -HostUser 'demoadmin' -SignInWay 'clipboard' })[0] | Should -Match '^1\. ' -Because 'without the fallback, the steps start as before'
+
+        # The status page's Waiting banner, from the model the T2 track writes.
+        $model = New-TestModel
+        $model['guidedStop']['state'] = 'Ready'
+        $model['guidedStop']['deadlineAt'] = 1793000000 + 2700
+        $model['guidedStop']['credential'] = 'clipboard'
+        $model['guidedStop']['signInFallback'] = $true
+        $banner = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
+        @($banner.Lines)[1] | Should -Match '^First: the automatic preparation of setup''s Azure sign-in didn''t finish'
+
+        # The console's WAITING FOR YOU banner too.
+        $script:printed = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoConsoleBlock -MockWith { foreach ($line in @($Line)) { $script:printed.Add([string]$line) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAttention -MockWith { }
+        InModuleScope DbHubDemo { Show-DemoGuidedStopPrompt -Url 'https://portal.azure.com/#resource/x' -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(45)) -HostUser 'demoadmin' -SignInWay 'clipboard' -NoBrowser -SignInFallback }
+        ($script:printed -join ' ') | Should -Match 'First: the automatic preparation of setup''s Azure sign-in didn''t finish'
+    }
 }
 
 Describe 'Show-DemoDeploymentProgress (status.ps1 -Watch)' {

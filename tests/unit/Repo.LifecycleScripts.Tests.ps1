@@ -231,6 +231,19 @@ Describe 'Lifecycle scripts' {
             Should -Invoke -CommandName Start-DemoDeploymentRun -Times 4 -Exactly
         }
 
+        It 'tells the result report whether the run ended DONE, so its Manual action required heading doesn''t contradict DONE (Phase 28 live run)' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            $deploy = Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1'
+            & $deploy -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Write-DemoResultReport -Times 1 -Exactly -ParameterFilter { $Title -eq 'deploy.ps1' -and $OutcomeDone }
+            $capture['kind'] = 'NotDone'
+            $capture['exit'] = 2
+            & $deploy -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 2
+            Should -Invoke -CommandName Write-DemoResultReport -Times 1 -Exactly -ParameterFilter { $Title -eq 'deploy.ps1' -and -not $OutcomeDone }
+        }
+
         It 'continues an unfinished deployment without a flag, keeps the PC awake until the end, and exits nonzero when it isn''t done' {
             Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
             $capture['kind'] = 'NotDone'
