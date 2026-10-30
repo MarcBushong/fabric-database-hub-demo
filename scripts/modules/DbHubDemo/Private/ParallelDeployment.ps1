@@ -40,8 +40,9 @@ function Start-DemoDeploymentTrackJob {
     $contextXml = [System.Management.Automation.PSSerializer]::Serialize($Context, 20)
     $job = {
         param([string] $ModulePath, [string] $ConfigXml, [string] $TrackName, [string] $ContextXml, [string[]] $Steps, [int] $Delay)
-        # This process's ID first, so deploy.ps1 can end it at once when it's stopped (Stop-DemoRunJob).
-        'DBHUB-PID {0}' -f $PID
+        # This process's ID and start time first, so deploy.ps1 can end it at once when it's stopped, and never a process
+        # that gets the same ID later (Stop-DemoRunJob).
+        'DBHUB-PID {0} {1}' -f $PID, $(try { [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks } catch { 0 })
         $ErrorActionPreference = 'Stop'
         $env:DBHUB_LOG_TRACK = $TrackName
         if ($Delay -gt 0) {
@@ -107,8 +108,9 @@ function Start-DemoArtifactBuildJob {
     $modulePath = Join-Path -Path $script:RepoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1'
     $build = {
         param([string] $BuildModulePath, [bool] $NoRunner, [string] $Directory)
-        # This process's ID first, so deploy.ps1 can end it at once when it's stopped (Stop-DemoRunJob).
-        'DBHUB-PID {0}' -f $PID
+        # This process's ID and start time first, so deploy.ps1 can end it at once when it's stopped, and never a process
+        # that gets the same ID later (Stop-DemoRunJob).
+        'DBHUB-PID {0} {1}' -f $PID, $(try { [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks } catch { 0 })
         $ErrorActionPreference = 'Stop'
         $env:DBHUB_LOG_TRACK = 'Build'
         $value = [pscustomobject]@{ Bundle = $null; Runner = $null; Error = '' }
@@ -170,8 +172,9 @@ function Start-DemoPolicyInventoryJob {
     $configXml = [System.Management.Automation.PSSerializer]::Serialize($Config, 20)
     $inventory = {
         param([string] $InventoryModulePath, [string] $InventoryConfigXml, [int] $Hours)
-        # This process's ID first, so deploy.ps1 can end it at once when it's stopped (Stop-DemoRunJob).
-        'DBHUB-PID {0}' -f $PID
+        # This process's ID and start time first, so deploy.ps1 can end it at once when it's stopped, and never a process
+        # that gets the same ID later (Stop-DemoRunJob).
+        'DBHUB-PID {0} {1}' -f $PID, $(try { [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks } catch { 0 })
         $ErrorActionPreference = 'Stop'
         $env:DBHUB_LOG_TRACK = 'Policy'
         Import-Module -Name $InventoryModulePath -Force
@@ -197,9 +200,9 @@ function Start-DemoPolicyInventoryJob {
 function Receive-DemoDeploymentTrackOutput {
     <#
     .SYNOPSIS
-    Reads what a track job wrote since the last read: its results and its summary (deserialized), its process ID
-    (DBHUB-PID, kept for Stop-DemoRunJob), and its log lines, which go to the console as they arrive. Returns Results
-    and Summary. Internal.
+    Reads what a track job wrote since the last read: its results and its summary (deserialized), its process ID and
+    start time (DBHUB-PID, kept for Stop-DemoRunJob), and its log lines, which go to the console as they arrive. Returns
+    Results and Summary. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -220,9 +223,11 @@ function Receive-DemoDeploymentTrackOutput {
         elseif ($line.StartsWith('DBHUB-SUMMARY ', [System.StringComparison]::Ordinal)) {
             $summary = [System.Management.Automation.PSSerializer]::Deserialize($line.Substring(14))
         }
-        elseif ($line -match '^DBHUB-PID (\d{1,10})$') {
-            # The job's process, for Stop-DemoRunJob (Phase 28 live finding).
-            $script:DemoJobProcessId[$Job.InstanceId.ToString()] = [int]$Matches[1]
+        elseif ($line -match '^DBHUB-PID (\d{1,10})(?: (\d{1,19}))?$') {
+            # The job's process and its start time, for Stop-DemoRunJob (Phase 28 live finding and its review).
+            $key = $Job.InstanceId.ToString()
+            $script:DemoJobProcessId[$key] = [int]$Matches[1]
+            $script:DemoJobProcessStart[$key] = if ($Matches[2]) { [long]$Matches[2] } else { [long]0 }
         }
     }
     foreach ($problem in @($jobErrors)) {

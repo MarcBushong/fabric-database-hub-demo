@@ -92,13 +92,31 @@ function Get-DemoJobProcessId {
     return 0
 }
 
+function Get-DemoJobProcessStart {
+    # The start time (UTC ticks) that a job of deploy.ps1 reported with its process ID (DBHUB-PID), or 0. Internal.
+    [CmdletBinding()]
+    [OutputType([long])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.Job] $Job
+    )
+
+    $key = $Job.InstanceId.ToString()
+    if ($script:DemoJobProcessStart.ContainsKey($key)) {
+        return [long]$script:DemoJobProcessStart[$key]
+    }
+    return [long]0
+}
+
 function Stop-DemoProcessTree {
     <#
     .SYNOPSIS
     Ends one of deploy.ps1's own job processes and every process it started (Process.Kill with entireProcessTree), and
-    waits up to 5 seconds for it to go. Only a PowerShell process, so a process ID that was reused never ends anything
-    else. Returns whether it's gone; never throws. Internal.
+    waits up to 5 seconds for it to go. Only a PowerShell process, and, with -StartTicks, only the process that started
+    then (within a second), so a process ID that was reused never ends anything else. Returns whether the job's process
+    is gone; never throws. Internal.
     https://learn.microsoft.com/dotnet/api/system.diagnostics.process.kill
+    https://learn.microsoft.com/dotnet/api/system.diagnostics.process.starttime
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Ends only this run''s own job processes, while deploy.ps1 stops.')]
     [CmdletBinding()]
@@ -106,7 +124,10 @@ function Stop-DemoProcessTree {
     param(
         [Parameter(Mandatory)]
         [ValidateRange(1, [int]::MaxValue)]
-        [int] $ProcessId
+        [int] $ProcessId,
+
+        [ValidateRange(0, [long]::MaxValue)]
+        [long] $StartTicks = 0
     )
 
     try {
@@ -118,6 +139,10 @@ function Stop-DemoProcessTree {
     try {
         if ($process.ProcessName -notmatch '^(pwsh|powershell)$') {
             return $false
+        }
+        if ($StartTicks -gt 0 -and [System.Math]::Abs($process.StartTime.ToUniversalTime().Ticks - $StartTicks) -gt [System.TimeSpan]::TicksPerSecond) {
+            # Another PowerShell process has the ID now: the job's own process is gone already (Phase 28 review).
+            return $true
         }
         $process.Kill($true)
         return $process.WaitForExit(5000)
@@ -146,8 +171,8 @@ function Stop-DemoRunJob {
     The running jobs get Stop-Job together, from a separate PowerShell instance, so this process waits at most
     -GraceSeconds: a track process that has the run's cancel marker skips its slow Azure cleanups and stops in about a
     second. A job that's still running then has its process ended, with every process it started, by the process ID
-    it reported first (DBHUB-PID; Stop-DemoProcessTree). Such a job isn't removed: PowerShell takes about a minute to
-    notice that its process is gone, and nothing waits for that.
+    and start time it reported first (DBHUB-PID; Stop-DemoProcessTree). Such a job isn't removed: PowerShell takes about
+    a minute to notice that its process is gone, and nothing waits for that.
     https://learn.microsoft.com/powershell/module/microsoft.powershell.core/stop-job
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Stops only this run''s own jobs, while deploy.ps1 stops.')]
@@ -195,7 +220,7 @@ function Stop-DemoRunJob {
         }
         foreach ($item in @($running | Where-Object { [string]$_.State -in $active })) {
             $processId = Get-DemoJobProcessId -Job $item
-            if ($processId -gt 0 -and (Stop-DemoProcessTree -ProcessId $processId)) {
+            if ($processId -gt 0 -and (Stop-DemoProcessTree -ProcessId $processId -StartTicks (Get-DemoJobProcessStart -Job $item))) {
                 $ended.Add([string]$item.Name)
             }
         }

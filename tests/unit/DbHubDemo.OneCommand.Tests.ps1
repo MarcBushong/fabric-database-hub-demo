@@ -1183,24 +1183,45 @@ finally {
         }
     }
 
-    It 'keeps the process ID a job reports first' {
-        $job = Start-ThreadJob -ScriptBlock { 'DBHUB-PID 4242' }
+    It 'keeps the process ID a job reports first, with its start time' {
+        $job = Start-ThreadJob -ScriptBlock { 'DBHUB-PID 4242 638000000000000000' }
+        $old = Start-ThreadJob -ScriptBlock { 'DBHUB-PID 4243' }
         try {
-            $null = Wait-Job -Job $job -Timeout 30
-            InModuleScope DbHubDemo -Parameters @{ Job = $job } {
+            $null = Wait-Job -Job $job, $old -Timeout 30
+            $read = InModuleScope DbHubDemo -Parameters @{ Job = $job; Old = $old } {
                 $null = Receive-DemoDeploymentTrackOutput -Job $Job
-                Get-DemoJobProcessId -Job $Job
-            } | Should -Be 4242
+                $null = Receive-DemoDeploymentTrackOutput -Job $Old
+                @((Get-DemoJobProcessId -Job $Job), (Get-DemoJobProcessStart -Job $Job), (Get-DemoJobProcessId -Job $Old), (Get-DemoJobProcessStart -Job $Old))
+            }
+            $read | Should -Be @(4242, 638000000000000000, 4243, 0)
         }
         finally {
-            Remove-Job -Job $job -Force
+            Remove-Job -Job $job, $old -Force
         }
     }
 
-    It 'has every job of deploy.ps1 report its process ID first, and the track jobs know the cancel marker and their private directory' {
+    It 'never ends a PowerShell process that got the job''s process ID later: its start time differs (Phase 28 review)' {
+        $process = Start-TestPwsh 'Start-Sleep -Seconds 120'
+        try {
+            $started = $process.StartTime.ToUniversalTime().Ticks
+            # A job whose process started a minute earlier: the process with that ID now is another one.
+            InModuleScope DbHubDemo -Parameters @{ Id = $process.Id; Ticks = ($started - [System.TimeSpan]::TicksPerMinute) } { Stop-DemoProcessTree -ProcessId $Id -StartTicks $Ticks } | Should -BeTrue -Because 'the job''s own process is gone'
+            $process.HasExited | Should -BeFalse
+            InModuleScope DbHubDemo -Parameters @{ Id = $process.Id; Ticks = $started } { Stop-DemoProcessTree -ProcessId $Id -StartTicks $Ticks } | Should -BeTrue
+            $process.HasExited | Should -BeTrue
+        }
+        finally {
+            if (-not $process.HasExited) {
+                $process.Kill($true)
+            }
+            $process.Dispose()
+        }
+    }
+
+    It 'has every job of deploy.ps1 report its process ID and start time first, and the track jobs know the cancel marker and their private directory' {
         foreach ($name in 'Start-DemoDeploymentTrackJob', 'Start-DemoArtifactBuildJob', 'Start-DemoPolicyInventoryJob') {
             $text = InModuleScope DbHubDemo -Parameters @{ Name = $name } { (Get-Command -Name $Name).ScriptBlock.ToString() }
-            $reported = $text.IndexOf("'DBHUB-PID {0}' -f `$PID", [System.StringComparison]::Ordinal)
+            $reported = $text.IndexOf("'DBHUB-PID {0} {1}' -f `$PID, `$(try { [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks } catch { 0 })", [System.StringComparison]::Ordinal)
             $reported | Should -BeGreaterThan 0 -Because $name
             $reported | Should -BeLessThan $text.IndexOf('Import-Module -Name $', [System.StringComparison]::Ordinal) -Because ('{0} reports it before anything slow' -f $name)
         }
