@@ -1081,8 +1081,9 @@ Describe 'Invoke-DemoParallelDeployment' {
                 }
                 # The T2 track at the guided stop: its cleanup takes minutes unless deploy.ps1 left the cancel marker.
                 $guidedStopTrack = {
-                    param([string] $Marker)
+                    param([string] $Marker, [System.Threading.ManualResetEventSlim] $Running)
                     try {
+                        $Running.Set()
                         Start-Sleep -Seconds 120
                     }
                     finally {
@@ -1091,7 +1092,11 @@ Describe 'Invoke-DemoParallelDeployment' {
                         }
                     }
                 }
-                $script:t2Job = Start-ThreadJob -Name 'dbhub-track-T2' -ArgumentList (Join-Path -Path $script:handoffDir -ChildPath 'cancel.xml') -ScriptBlock $guidedStopTrack
+                $running = [System.Threading.ManualResetEventSlim]::new($false)
+                $script:t2Job = Start-ThreadJob -Name 'dbhub-track-T2' -ArgumentList (Join-Path -Path $script:handoffDir -ChildPath 'cancel.xml'), $running -ScriptBlock $guidedStopTrack
+                # A thread job stopped before its script starts ends Failed, not Stopped (CI on ubuntu-latest, 2026-10-30, a
+                # 260 ms run): the T2 track is well inside its work at the guided stop, so this waits until the job is too.
+                $null = $running.Wait(15000)
                 return $script:t2Job
             }
             # Ctrl+C, as the wait for the tracks notices it.
