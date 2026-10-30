@@ -579,7 +579,7 @@ Describe 'configure-fabric-app.ps1' {
         $config = Get-HubTestConfig
         $config['tenantId'] = $script:tenantId
         $config['fabric'].Remove('workspaceId')
-        $config['fabric']['workspaceName'] = 'Database Hub Demo P28 proof'
+        $config['fabric']['workspaceName'] = 'Database Hub Demo test'
         $path = Join-Path -Path $TestDrive -ChildPath 'by-name.config.json'
         $config | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding utf8NoBOM
         Mock -ModuleName DbHubDemo -CommandName Read-DemoHubFabricList -MockWith { throw 'No lookup by name is expected with -WorkspaceId.' }

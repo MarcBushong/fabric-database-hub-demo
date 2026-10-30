@@ -1856,11 +1856,11 @@ Describe 'An environment with its own prefix (the live proof, Phase 28)' {
     It 'names the template''s subscription deployment record after the prefix, so another environment''s record is never replaced, read, or deleted' {
         $default = New-TestConfig
         $proof = New-TestConfig
-        $proof['prefix'] = 'dbhubp28'
+        $proof['prefix'] = 'dbhubalt'
         InModuleScope DbHubDemo -Parameters @{ Default = $default; Proof = $proof } {
             Get-DemoMainDeploymentName -Config $Default | Should -Be 'dbhub-demo-main' -Because 'the default prefix keeps the record it had before Phase 28'
-            Get-DemoMainDeploymentName -Config $Proof | Should -Be 'dbhubp28-demo-main'
-            Get-DemoResourceGroupName -Config $Proof | Should -Be 'rg-dbhubp28-demo'
+            Get-DemoMainDeploymentName -Config $Proof | Should -Be 'dbhubalt-demo-main'
+            Get-DemoResourceGroupName -Config $Proof | Should -Be 'rg-dbhubalt-demo'
         }
         # The deploy, its outputs' read, the destroy's manifest and delete, and the residual check all use it.
         $moduleRoot = Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo'
