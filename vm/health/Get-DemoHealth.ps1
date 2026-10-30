@@ -11,7 +11,9 @@ With -View Summary (Phase 7), only the fields the orchestrator gates on are prin
 the first 500 characters of message, currentStep, generation, updatedUtc, and from details the install mode,
 Arc onboarding, the guest's state, and its SQL Server edition. Since Phase 28 it also prints the PaygWizard
 guided stop's state (details.guidedSetup): whether automatic sign-in is armed in the guest, deploy.ps1's
-request (none, valid, expired, or invalid), the last cleanup's reason, and up to five problems it left. That
+request (none, valid, expired, or invalid), setup's sign-in preparation (none, preparing, ready, or restoring:
+the WebView2 runtime, IE Enhanced Security Configuration off for administrators, and the Trusted sites entries;
+deploy.ps1 asks for a person only at ready), the last cleanup's reason, and up to five problems it left. That
 always fits in 4 KB, even when instructions are long.
 
 .PARAMETER Root
@@ -72,6 +74,7 @@ if ($View -eq 'Summary') {
         sqlEdition    = & $read $health @('details', 'guest', 'sql', 'edition')
         guidedArmed   = & $read $health @('details', 'guidedSetup', 'armed')
         guidedRequest = & $read $health @('details', 'guidedSetup', 'request')
+        guidedSignIn  = & $read $health @('details', 'guidedSetup', 'signIn')
         guidedLast    = & $read $health @('details', 'guidedSetup', 'lastReason')
         guidedLeft    = @(& $read $health @('details', 'guidedSetup', 'lastProblems') | Where-Object { $_ } | Select-Object -First 5)
     }

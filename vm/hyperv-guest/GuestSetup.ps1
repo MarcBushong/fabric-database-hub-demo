@@ -14,10 +14,19 @@
 #   https://learn.microsoft.com/windows/win32/secauthn/protecting-the-automatic-logon-password,
 #   https://learn.microsoft.com/windows/win32/secauthn/msgina-dll-features, and
 #   https://learn.microsoft.com/sysinternals/downloads/autologon
+# - Setup's Azure sign-in is prepared before anyone is asked, before that sign-in, and before setup opens (Phase 28 live
+#   finding, 2026-10-30): setup's Use Azure Login opened in an IE-based browser control, which IE Enhanced Security
+#   Configuration blocked though the WebView2 runtime was installed (MSAL.NET documents its legacy, IE-based web view
+#   for Microsoft Entra ID authorities: https://learn.microsoft.com/entra/msal/dotnet/advanced/webview2), and a change
+#   made while setup runs doesn't reach it. So the host checks WebView2 (installing it when it's missing), turns IE ESC
+#   off for administrators (https://learn.microsoft.com/azure/storage/file-sync/file-sync-deployment-guide#prepare-windows-server-to-use-with-azure-file-sync),
+#   and maps the Microsoft sign-in hosts to the Trusted sites zone for the guest's Administrator (ZoneMap\Domains and
+#   EscDomains: https://learn.microsoft.com/previous-versions/troubleshoot/browsers/security-privacy/ie-security-zones-registry-entries).
 # The automatic sign-in is armed only while deploy.ps1 waits for a person (a request it writes on the host, with an
 # expiry), and its cleanup always runs: when setup has installed the right instance, when the request expires or goes,
 # and before the next arm. The cleanup turns automatic sign-in off, deletes the LSA secret and the Winlogon
-# DefaultUserName and DefaultPassword values, rotates the guest administrator's password, and signs the console out;
+# DefaultUserName and DefaultPassword values, rotates the guest administrator's password, signs the console out, and
+# (except before the next arm) turns IE ESC back on and puts the Trusted sites entries back as they were;
 # GuestSignInCleanup then runs as before.
 
 function Get-DemoGuidedSetupPath {
@@ -38,6 +47,7 @@ function Get-DemoGuidedSetupPath {
         GuestLog           = $guestFolder + '\guided-setup.log'
         HostRequest        = Join-Path -Path $Root -ChildPath 'guided-setup-request.json'
         HostArmed          = Join-Path -Path $Root -ChildPath 'guided-setup-armed.json'
+        HostSignIn         = Join-Path -Path $Root -ChildPath 'guided-setup-signin.json'
         HostLast           = Join-Path -Path $Root -ChildPath 'guided-setup-last.json'
         HostConsoleScript  = Join-Path -Path $Root -ChildPath 'Open-GuestConsole.ps1'
         HostSteps          = Join-Path -Path $Root -ChildPath 'guided-setup-steps.txt'
@@ -318,6 +328,286 @@ function Test-DemoAutoLogonClear {
     return (-not [bool]$State.autoAdminLogon -and -not [bool]$State.autoLogonCount -and -not [bool]$State.defaultUserName -and -not [bool]$State.defaultPassword -and -not [bool]$State.lsaSecret)
 }
 
+function Get-DemoGuidedSignInHost {
+    # The Microsoft sign-in hosts that setup's Use Azure Login loads, which the guided stop maps to the Trusted sites zone
+    # for the guest's Administrator, as exact hosts: the Azure portal's documented authentication hosts
+    # (https://learn.microsoft.com/azure/azure-portal/azure-portal-safelist-urls#azure-portal-urls-for-proxy-bypass,
+    # checked 2026-10-30). A site that isn't here can still be added in setup's dialog (Add...). Pure.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    return @(
+        'login.microsoftonline.com', 'login.microsoft.com', 'login.live.com', 'aadcdn.msftauth.net', 'logincdn.msftauth.net',
+        'aadcdn.msauth.net', 'aadcdn.msftauthimages.net', 'aadcdn.msauthimages.net')
+}
+
+function Invoke-DemoGuestSignInBrowserAction {
+    <#
+    .SYNOPSIS
+    Reads, prepares, or restores what the guided stop changes in the guest for setup's Azure sign-in: IE Enhanced Security
+    Configuration for administrators, and the guest administrator's Trusted sites entries for the Microsoft sign-in hosts.
+    Self-contained: the host runs it in the guest over PowerShell Direct. Returns what it found and did: host names,
+    counts, and the entries' names, never a value of anyone's.
+
+    .DESCRIPTION
+    Prepare snapshots the administrator's site-to-zone entries (ZoneMap\Domains and ZoneMap\EscDomains, unless the host
+    passes the snapshot of an earlier Prepare), turns IE ESC off for administrators (IsInstalled 0), and maps each sign-in
+    host to the Trusted sites zone (an https DWORD of 2) under both keys: Domains applies while IE ESC is off, EscDomains
+    while it's on. Restore turns IE ESC on for administrators and users (IsInstalled 1, the Windows Server default), and
+    puts the entries back as the snapshot had them: what was added or changed since goes, the dialog's Add... included;
+    without a snapshot, the sign-in hosts' entries go. Read reports both.
+    The entries are the per-user registry items Microsoft documents, not the Site to Zone Assignment List policy, which
+    would lock the user's own zone settings and so the dialog's Add.... The administrator's hive is HKEY_USERS\<SID>
+    while it's loaded; otherwise it's loaded from the profile (Win32_UserProfile) with reg load, and unloaded after.
+    Sources: https://learn.microsoft.com/azure/storage/file-sync/file-sync-deployment-guide#prepare-windows-server-to-use-with-azure-file-sync,
+    https://learn.microsoft.com/previous-versions/troubleshoot/browsers/security-privacy/ie-security-zones-registry-entries,
+    https://learn.microsoft.com/entra/identity/hybrid/connect/how-to-connect-sso-quick-start,
+    https://learn.microsoft.com/previous-versions/windows/desktop/legacy/ee886409(v=vs.85),
+    https://learn.microsoft.com/windows-server/administration/windows-commands/reg-load, and
+    https://learn.microsoft.com/windows-server/administration/windows-commands/reg-unload
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Read', 'Prepare', 'Restore')]
+        [string] $Action = 'Read',
+
+        [string[]] $SignInHost = @(),
+
+        [string] $UserName = 'Administrator',
+
+        [string] $SnapshotJson = '',
+
+        [string] $ActiveSetupRoot = 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components',
+
+        [string] $UserRoot = ''
+    )
+
+    $adminKey = $ActiveSetupRoot + '\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}'
+    $usersKey = $ActiveSetupRoot + '\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}'
+    $maps = @('Domains', 'EscDomains')
+    foreach ($name in $SignInHost) {
+        if ([string]$name -notmatch '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+){2,}$') {
+            throw ('Not a host name the zone map can hold: {0}' -f $name)
+        }
+    }
+    $readEsc = {
+        param([string] $Path)
+        # 1 on, 0 off, -1 when the component doesn't exist (Server Core has no IE ESC).
+        $item = Get-ItemProperty -LiteralPath $Path -Name 'IsInstalled' -ErrorAction SilentlyContinue
+        if ($null -eq $item) {
+            return -1
+        }
+        return [int]$item.IsInstalled
+    }
+    $setEsc = {
+        param([string] $Path, [int] $Value)
+        if (Test-Path -LiteralPath $Path) {
+            Set-ItemProperty -LiteralPath $Path -Name 'IsInstalled' -Value $Value
+        }
+    }
+    $split = {
+        # A host's key under Domains: its domain (the last two labels), then the rest as one subkey.
+        param([string] $HostName)
+        $labels = @($HostName.ToLowerInvariant().Split('.'))
+        [pscustomobject]@{ Domain = ('{0}.{1}' -f $labels[$labels.Count - 2], $labels[$labels.Count - 1]); Sub = (@($labels[0..($labels.Count - 3)]) -join '.') }
+    }
+
+    $hive = 'Loaded'
+    $mount = ''
+    $root = $UserRoot
+    if (-not $root) {
+        $sid = (New-Object -TypeName 'System.Security.Principal.NTAccount' -ArgumentList $UserName).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $root = 'Registry::HKEY_USERS\{0}' -f $sid
+        if (-not (Test-Path -LiteralPath $root)) {
+            $root = ''
+            $hive = 'Unavailable'
+            $userProfile = @(Get-CimInstance -ClassName 'Win32_UserProfile' -Filter ("SID='{0}'" -f $sid) -ErrorAction SilentlyContinue) | Select-Object -First 1
+            if ($null -ne $userProfile -and [string]$userProfile.LocalPath) {
+                $file = '{0}\NTUSER.DAT' -f ([string]$userProfile.LocalPath).TrimEnd('\')
+                if (Test-Path -LiteralPath $file -PathType Leaf) {
+                    $previous = $ErrorActionPreference
+                    $ErrorActionPreference = 'Continue'
+                    & reg.exe load 'HKU\DbHubDemoGuidedSignIn' $file 2>&1 | Out-Null
+                    $loaded = ($LASTEXITCODE -eq 0)
+                    $ErrorActionPreference = $previous
+                    if ($loaded) {
+                        $mount = 'HKU\DbHubDemoGuidedSignIn'
+                        $root = 'Registry::HKEY_USERS\DbHubDemoGuidedSignIn'
+                        $hive = 'Mounted'
+                    }
+                }
+            }
+        }
+    }
+    $zoneMap = ''
+    if ($root) {
+        $zoneMap = '{0}\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap' -f $root
+    }
+    $readEntries = {
+        # Every key under Domains and EscDomains, and every value as key|name=data.
+        $keys = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        $values = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        foreach ($map in $maps) {
+            $base = '{0}\{1}' -f $zoneMap, $map
+            if (-not (Test-Path -LiteralPath $base)) {
+                continue
+            }
+            # The map key itself counts, so one that Prepare created goes again when it's empty.
+            $keys.Add($map)
+            $baseKey = Get-Item -LiteralPath $base
+            $baseName = [string]$baseKey.Name
+            $baseKey.Close()
+            foreach ($key in @(Get-ChildItem -LiteralPath $base -Recurse -ErrorAction SilentlyContinue)) {
+                $relative = '{0}{1}' -f $map, ([string]$key.Name).Substring($baseName.Length)
+                $keys.Add($relative)
+                foreach ($valueName in @($key.GetValueNames())) {
+                    if ($valueName) {
+                        $values.Add(('{0}|{1}={2}' -f $relative, $valueName, [string]$key.GetValue($valueName)))
+                    }
+                }
+                $key.Close()
+            }
+        }
+        [pscustomobject]@{ Keys = $keys.ToArray(); Values = $values.ToArray() }
+    }
+    $mapped = {
+        # The sign-in hosts that are Trusted sites (https 2) under both keys.
+        if ($zoneMap) {
+            foreach ($name in $SignInHost) {
+                $parts = & $split $name
+                $both = $true
+                foreach ($map in $maps) {
+                    $item = Get-ItemProperty -LiteralPath ('{0}\{1}\{2}\{3}' -f $zoneMap, $map, $parts.Domain, $parts.Sub) -Name 'https' -ErrorAction SilentlyContinue
+                    if ($null -eq $item -or [int]$item.https -ne 2) {
+                        $both = $false
+                    }
+                }
+                if ($both) {
+                    $name
+                }
+            }
+        }
+    }
+    $removeEmpty = {
+        param([string] $Path)
+        if (Test-Path -LiteralPath $Path) {
+            $key = Get-Item -LiteralPath $Path
+            $empty = ($key.SubKeyCount -eq 0 -and $key.ValueCount -eq 0)
+            $key.Close()
+            if ($empty) {
+                Remove-Item -LiteralPath $Path -Force
+            }
+        }
+    }
+
+    $snapshot = $null
+    if ($SnapshotJson) {
+        $snapshot = $SnapshotJson | ConvertFrom-Json
+    }
+    $changed = 0
+    $restored = $false
+    $result = $null
+    try {
+        if ($Action -eq 'Prepare') {
+            & $setEsc $adminKey 0
+            if ($zoneMap) {
+                if ($null -eq $snapshot) {
+                    $before = & $readEntries
+                    $SnapshotJson = ConvertTo-Json -InputObject ([ordered]@{ keyList = @($before.Keys); valueList = @($before.Values) }) -Compress
+                }
+                foreach ($name in $SignInHost) {
+                    $parts = & $split $name
+                    foreach ($map in $maps) {
+                        $path = '{0}\{1}\{2}\{3}' -f $zoneMap, $map, $parts.Domain, $parts.Sub
+                        if (-not (Test-Path -LiteralPath $path)) {
+                            New-Item -Path $path -Force | Out-Null
+                        }
+                        $item = Get-ItemProperty -LiteralPath $path -Name 'https' -ErrorAction SilentlyContinue
+                        if ($null -eq $item -or [int]$item.https -ne 2) {
+                            New-ItemProperty -LiteralPath $path -Name 'https' -PropertyType DWord -Value 2 -Force | Out-Null
+                            $changed++
+                        }
+                    }
+                }
+            }
+        }
+        elseif ($Action -eq 'Restore') {
+            & $setEsc $adminKey 1
+            & $setEsc $usersKey 1
+            if (-not $zoneMap) {
+                # The hive can't be read: nothing there can be checked, which is right only when nothing was added.
+                $restored = ($null -eq $snapshot)
+            }
+            elseif ($null -ne $snapshot) {
+                $beforeKeys = @($snapshot.keyList | Where-Object { $_ })
+                $beforeValues = @($snapshot.valueList | Where-Object { $_ })
+                $now = & $readEntries
+                foreach ($entry in @($now.Values)) {
+                    if ($beforeValues -contains $entry) {
+                        continue
+                    }
+                    $keyAndRest = ([string]$entry).Split([char[]]'|', 2)
+                    $nameAndData = $keyAndRest[1].Split([char[]]'=', 2)
+                    $path = '{0}\{1}' -f $zoneMap, $keyAndRest[0]
+                    $prefix = '{0}|{1}=' -f $keyAndRest[0], $nameAndData[0]
+                    $old = @($beforeValues | Where-Object { ([string]$_).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1
+                    if ($null -ne $old) {
+                        Set-ItemProperty -LiteralPath $path -Name $nameAndData[0] -Value ([int]([string]$old).Substring($prefix.Length))
+                    }
+                    else {
+                        Remove-ItemProperty -LiteralPath $path -Name $nameAndData[0]
+                    }
+                    $changed++
+                }
+                foreach ($relative in @(@($now.Keys) | Where-Object { $beforeKeys -notcontains $_ } | Sort-Object -Property Length -Descending)) {
+                    & $removeEmpty ('{0}\{1}' -f $zoneMap, $relative)
+                }
+                $after = & $readEntries
+                $restored = (@($after.Values | Where-Object { $beforeValues -notcontains $_ }).Count -eq 0 -and @($after.Keys | Where-Object { $beforeKeys -notcontains $_ }).Count -eq 0)
+            }
+            else {
+                foreach ($name in $SignInHost) {
+                    $parts = & $split $name
+                    foreach ($map in $maps) {
+                        $path = '{0}\{1}\{2}\{3}' -f $zoneMap, $map, $parts.Domain, $parts.Sub
+                        $item = Get-ItemProperty -LiteralPath $path -Name 'https' -ErrorAction SilentlyContinue
+                        if ($null -ne $item -and [int]$item.https -eq 2) {
+                            Remove-ItemProperty -LiteralPath $path -Name 'https'
+                            $changed++
+                        }
+                        & $removeEmpty $path
+                        & $removeEmpty ('{0}\{1}\{2}' -f $zoneMap, $map, $parts.Domain)
+                    }
+                }
+                $restored = (@(& $mapped).Count -eq 0)
+            }
+        }
+        $result = [pscustomobject]@{
+            action       = $Action
+            ieEscAdmin   = (& $readEsc $adminKey)
+            ieEscUsers   = (& $readEsc $usersKey)
+            hive         = $hive
+            hostsMapped  = @(& $mapped)
+            snapshotJson = $SnapshotJson
+            changed      = $changed
+            restored     = $restored
+        }
+    }
+    finally {
+        if ($mount) {
+            # The provider's key handles must close before the hive can unload.
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+            $previous = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            & reg.exe unload $mount 2>&1 | Out-Null
+            $ErrorActionPreference = $previous
+        }
+    }
+    return $result
+}
+
 function Get-DemoGuidedSetupLauncherText {
     <#
     .SYNOPSIS
@@ -368,6 +658,9 @@ try {
     if (-not $image.Attached) {
         $image = Mount-DiskImage -ImagePath $isoPath -PassThru
     }
+    # Setup's Azure sign-in opens in an IE-based control, which reads IE Enhanced Security Configuration when setup starts.
+    $esc = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}' -Name 'IsInstalled' -ErrorAction SilentlyContinue
+    Write-GuidedLog ('IE Enhanced Security Configuration for administrators as setup starts: {0}.' -f $(if ($null -ne $esc -and [int]$esc.IsInstalled -eq 1) { 'on' } else { 'off' }))
     $drive = [string]($image | Get-Volume).DriveLetter
     $setup = '{0}:\setup.exe' -f $drive
     $instances = @(Get-Service -Name 'MSSQLSERVER', 'MSSQL$*' -ErrorAction SilentlyContinue)
@@ -593,6 +886,44 @@ function Save-DemoGuidedSetupArmed {
     )
 
     Write-DemoVmJsonFile -Path $Path.HostArmed -InputObject $Value
+}
+
+function Get-DemoGuidedSignInRecord {
+    # The host's record of what the guided stop changed in the guest for setup's Azure sign-in (written before the change:
+    # state Preparing, Ready, or Restoring, and the snapshot of the Trusted sites entries before), or $null. An unreadable
+    # record still means "restore": it's never ignored.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path.HostSignIn -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $value = Read-DemoVmJsonFile -Path $Path.HostSignIn
+    }
+    catch {
+        $value = $null
+    }
+    if ($null -eq $value) {
+        return @{ schemaVersion = 1; state = 'Restoring'; snapshot = '' }
+    }
+    return $value
+}
+
+function Save-DemoGuidedSignInRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Value
+    )
+
+    Write-DemoVmJsonFile -Path $Path.HostSignIn -InputObject $Value
 }
 
 function Get-DemoGuestSetupFact {
@@ -845,6 +1176,139 @@ function Remove-DemoHostGuidedSetup {
     }
 }
 
+function Initialize-DemoHostGuidedSignIn {
+    <#
+    .SYNOPSIS
+    Prepares setup's Azure sign-in in the guest before anyone is asked, before the guest's automatic sign-in, and before
+    setup opens (Phase 28 live finding, 2026-10-30): the WebView2 runtime is installed (the GuestWebView2 step's
+    installer when it's missing), IE Enhanced Security Configuration is off for administrators, and the Microsoft sign-in
+    hosts are Trusted sites for the guest's Administrator. Returns $null when it's ready, or an InProgress step result:
+    Azure-side preparation, nothing for the person yet; the host tries again at its next pass.
+
+    .DESCRIPTION
+    Live, setup's Use Azure Login opened in an IE-based browser control, which IE ESC blocked, though WebView2 was
+    installed. MSAL.NET documents that it uses its legacy, IE-based web view for Microsoft Entra ID authorities, whatever
+    is installed (https://learn.microsoft.com/entra/msal/dotnet/advanced/webview2), and a change made while setup runs
+    doesn't reach it, so this runs first. The record is written before the guest changes, so a run that stops midway
+    still restores them (Restore-DemoHostGuidedSignIn). A sign-in host that couldn't be mapped is only logged: the person
+    can select Add... in setup's dialog.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [string] $RequestId = ''
+    )
+
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    $guest = $Context.GuestName
+    $prefix = 'Preparing setup''s Azure sign-in in {0} (Azure-side, no action needed):' -f $guest
+    $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+    try {
+        $webView2 = Test-DemoGuestWebView2 -Name $guest -Credential $credential
+    }
+    catch {
+        return (New-DemoVmStepResult -Outcome 'InProgress' -Message ('{0} the guest couldn''t be asked about the WebView2 runtime yet ({1}); the host tries again within about 5 minutes.' -f $prefix, (Protect-DemoVmText -Text $_.Exception.Message)))
+    }
+    if (-not $webView2) {
+        $problem = ''
+        try {
+            Install-DemoHostGuestWebView2 -Context $Context
+        }
+        catch {
+            $problem = ' ({0})' -f (Protect-DemoVmText -Text $_.Exception.Message)
+        }
+        if (-not (Test-DemoHostGuestWebView2 -Context $Context)) {
+            return (New-DemoVmStepResult -Outcome 'InProgress' -Message ('{0} the WebView2 runtime isn''t installed in the guest yet{1}; the host tries again within about 5 minutes, and nobody is asked before it''s there.' -f $prefix, $problem))
+        }
+    }
+    $record = Get-DemoGuidedSignInRecord -Path $path
+    $wasReady = $false
+    if ($null -eq $record) {
+        $record = @{ schemaVersion = 1; snapshot = '' }
+    }
+    else {
+        $wasReady = ([string]$record['state'] -eq 'Ready')
+    }
+    $record['state'] = 'Preparing'
+    $record['requestId'] = $RequestId
+    $record['preparedUtc'] = Get-DemoVmUtcNow
+    $record['webView2'] = $true
+    Save-DemoGuidedSignInRecord -Path $path -Value $record
+    $hosts = @(Get-DemoGuidedSignInHost)
+    try {
+        $state = Invoke-Command -VMName $guest -Credential $credential -ErrorAction Stop -ScriptBlock ${function:Invoke-DemoGuestSignInBrowserAction} -ArgumentList 'Prepare', $hosts, $Context.Guest.AdministratorName, ([string]$record['snapshot'])
+    }
+    catch {
+        return (New-DemoVmStepResult -Outcome 'InProgress' -Message ('{0} IE Enhanced Security Configuration couldn''t be turned off for administrators yet ({1}); the host tries again within about 5 minutes.' -f $prefix, (Protect-DemoVmText -Text $_.Exception.Message)))
+    }
+    if (-not [string]$record['snapshot'] -and [string]$state.snapshotJson) {
+        $record['snapshot'] = [string]$state.snapshotJson
+    }
+    $mapped = @($state.hostsMapped | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    # 0 is off; -1 means the component doesn't exist, so nothing blocks the sign-in.
+    $escOff = ([int]$state.ieEscAdmin -ne 1)
+    $record['ieEscAdmin'] = [int]$state.ieEscAdmin
+    $record['hive'] = [string]$state.hive
+    $record['hostsMapped'] = $mapped
+    if ($escOff) {
+        $record['state'] = 'Ready'
+    }
+    Save-DemoGuidedSignInRecord -Path $path -Value $record
+    if (-not $escOff) {
+        return (New-DemoVmStepResult -Outcome 'InProgress' -Message ('{0} IE Enhanced Security Configuration is still on for administrators in the guest; the host tries again within about 5 minutes, and nobody is asked before it''s off.' -f $prefix))
+    }
+    if (-not $wasReady) {
+        if ($mapped.Count -lt $hosts.Count) {
+            Write-DemoVmLog -Level 'Warning' -Message ('Setup''s Azure sign-in in {0}: IE Enhanced Security Configuration is off for administrators until the cleanup, but only {1} of the {2} Microsoft sign-in hosts are Trusted sites for its Administrator (registry hive: {3}). If setup''s sign-in says Internet Explorer blocks a site, select Add... for it.' -f $guest, $mapped.Count, $hosts.Count, [string]$record['hive'])
+        }
+        else {
+            Write-DemoVmLog -Message ('Prepared setup''s Azure sign-in in {0}: the WebView2 runtime is installed, IE Enhanced Security Configuration is off for administrators until the cleanup, and the {1} Microsoft sign-in hosts are Trusted sites for its Administrator.' -f $guest, $hosts.Count)
+        }
+    }
+    return $null
+}
+
+function Restore-DemoHostGuidedSignIn {
+    <#
+    .SYNOPSIS
+    Undoes Initialize-DemoHostGuidedSignIn, as part of the guided stop's cleanup after success, failure, or timeout: IE
+    Enhanced Security Configuration on again for administrators and users (the Windows Server default), and the guest
+    Administrator's Trusted sites entries as they were before (the sign-in hosts go, and so do sites added with Add...
+    meanwhile). The record goes only once that's checked; otherwise this throws (fail closed), and the host tries again at
+    its next pass.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    $record = Get-DemoGuidedSignInRecord -Path $path
+    $snapshot = ''
+    if ($null -ne $record) {
+        $snapshot = [string]$record['snapshot']
+        $record['state'] = 'Restoring'
+        Save-DemoGuidedSignInRecord -Path $path -Value $record
+    }
+    $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+    $state = Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ScriptBlock ${function:Invoke-DemoGuestSignInBrowserAction} -ArgumentList 'Restore', @(Get-DemoGuidedSignInHost), $Context.Guest.AdministratorName, $snapshot
+    $left = @()
+    if ([int]$state.ieEscAdmin -eq 0 -or [int]$state.ieEscUsers -eq 0) {
+        $left += 'IE Enhanced Security Configuration is still off'
+    }
+    if (-not [bool]$state.restored) {
+        $left += ('the Trusted sites entries aren''t as they were (registry hive: {0})' -f [string]$state.hive)
+    }
+    if ($left.Count -gt 0) {
+        throw ('The guided stop''s browser settings in {0} weren''t restored: {1}. The host tries again at its next pass (fail closed).' -f $Context.GuestName, ($left -join '; '))
+    }
+    Remove-Item -LiteralPath $path.HostSignIn -Force -ErrorAction SilentlyContinue
+    Write-DemoVmLog -Message ('Restored the browser settings in {0}: IE Enhanced Security Configuration is on for administrators and users, and the Trusted sites entries are as they were before the guided stop ({1} removed or put back).' -f $Context.GuestName, [int]$state.changed)
+}
+
 function Enable-DemoHostGuestAutoLogon {
     <#
     .SYNOPSIS
@@ -881,8 +1345,10 @@ function Disable-DemoHostGuestAutoLogon {
     .SYNOPSIS
     The guided stop's cleanup, which always runs (setup done, the request expired or gone, or before another arm): turns
     automatic sign-in off and deletes the LSA secret and the Winlogon DefaultUserName and DefaultPassword values, rotates
-    the guest Administrator's password, signs the console out, and checks that nothing is left. The record goes only when
-    every part worked, so a failed cleanup runs again at the next run; a leftover throws (fail closed).
+    the guest Administrator's password, signs the console out, checks that nothing is left, and, except before another
+    arm, turns IE Enhanced Security Configuration back on and puts the Trusted sites entries back as they were
+    (Restore-DemoHostGuidedSignIn). The record goes only when every part worked, so a failed cleanup runs again at the
+    next run; a leftover throws (fail closed).
     #>
     [CmdletBinding()]
     param(
@@ -938,6 +1404,16 @@ function Disable-DemoHostGuestAutoLogon {
     catch {
         $problems.Add(('checking after the cleanup ({0})' -f $_.Exception.Message))
     }
+    if ($Reason -ne 'Retry') {
+        # Setup's sign-in no longer needs IE ESC off or the Trusted sites entries (Phase 28 live finding, 2026-10-30).
+        # Before another arm they stay: that arm's sign-in needs them.
+        try {
+            Restore-DemoHostGuidedSignIn -Context $Context
+        }
+        catch {
+            $problems.Add(('restoring IE Enhanced Security Configuration and the Trusted sites ({0})' -f $_.Exception.Message))
+        }
+    }
     $leftovers = @()
     if ($null -ne $found) {
         $leftovers = @('autoAdminLogon', 'autoLogonCount', 'defaultUserName', 'defaultPassword', 'lsaSecret' | Where-Object { [bool]$found.$_ })
@@ -985,8 +1461,9 @@ function Invoke-DemoHostGuidedSetupGuard {
     <#
     .SYNOPSIS
     Runs before every pass of the host's state machine: finishes a guest password rotation that stopped midway, and when
-    automatic sign-in is armed but no person is expected any more (deploy.ps1's request expired or went), runs the
-    cleanup. Cheap when nothing is armed. Never throws: a failed cleanup is logged and runs again 5 minutes later.
+    automatic sign-in is armed, or setup's sign-in is prepared (IE ESC off and the Trusted sites entries), but no person
+    is expected any more (deploy.ps1's request expired or went), runs the cleanup. Cheap when nothing is armed or
+    prepared. Never throws: a failed cleanup is logged and runs again 5 minutes later.
     #>
     [CmdletBinding()]
     param(
@@ -997,7 +1474,8 @@ function Invoke-DemoHostGuidedSetupGuard {
     Resolve-DemoGuestPendingSecret -Context $Context
     $path = Get-DemoGuidedSetupPath -Root $Context.Root
     $armed = Get-DemoGuidedSetupArmed -Path $path
-    if ($null -eq $armed) {
+    $prepared = Test-Path -LiteralPath $path.HostSignIn -PathType Leaf
+    if ($null -eq $armed -and -not $prepared) {
         return
     }
     $request = Get-DemoGuidedSetupRequest -Path $path
@@ -1005,7 +1483,12 @@ function Invoke-DemoHostGuidedSetupGuard {
         return
     }
     try {
-        Disable-DemoHostGuestAutoLogon -Context $Context -Reason $(if ($request.Expired) { 'Expired' } else { 'NoRequest' })
+        if ($null -ne $armed) {
+            Disable-DemoHostGuestAutoLogon -Context $Context -Reason $(if ($request.Expired) { 'Expired' } else { 'NoRequest' })
+        }
+        else {
+            Restore-DemoHostGuidedSignIn -Context $Context
+        }
     }
     catch {
         Write-DemoVmLog -Level 'Warning' -Message $_.Exception.Message
@@ -1016,8 +1499,10 @@ function Invoke-DemoHostGuidedSetupStep {
     <#
     .SYNOPSIS
     The SqlSetupWizard step's Set in PaygWizard mode (Phase 28): checks what's installed, cleans up once the right
-    instance is there, and while deploy.ps1 waits for a person (a valid request), opens the pre-filled setup in the guest:
-    in a session that's already signed in, or through one automatic sign-in. Returns a step result.
+    instance is there, and while deploy.ps1 waits for a person (a valid request), prepares setup's Azure sign-in
+    (Initialize-DemoHostGuidedSignIn: WebView2, IE ESC off for administrators, the Trusted sites; until that's done the
+    step is InProgress, so nobody is asked), then opens the pre-filled setup in the guest: in a session that's already
+    signed in, or through one automatic sign-in. Returns a step result.
     #>
     [CmdletBinding()]
     param(
@@ -1062,7 +1547,20 @@ function Invoke-DemoHostGuidedSetupStep {
         if ($null -ne $armed) {
             Disable-DemoHostGuestAutoLogon -Context $Context -Reason $(if ($request.Expired) { 'Expired' } else { 'NoRequest' })
         }
+        elseif (Test-Path -LiteralPath $path.HostSignIn -PathType Leaf) {
+            try {
+                Restore-DemoHostGuidedSignIn -Context $Context
+            }
+            catch {
+                Write-DemoVmLog -Level 'Warning' -Message $_.Exception.Message
+            }
+        }
         return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('Arc is connected. The SQL Server setup step waits for you: run ./scripts/deploy.ps1, which opens Bastion and guides you, and the guest opens the pre-filled setup.{0}' -f $problem) -Instruction $instructions)
+    }
+    # Before setup opens and before the guest signs in: a change made while setup runs doesn't reach it.
+    $prepared = Initialize-DemoHostGuidedSignIn -Context $Context -RequestId $request.RequestId
+    if ($null -ne $prepared) {
+        return $prepared
     }
     if ($check.SetupRunning) {
         return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('SQL Server setup is open in {0}: choose Use pay-as-you-go billing through Microsoft Azure and Standard, sign in with Use Azure Login, then Install.{1}' -f $Context.GuestName, $problem) -Instruction $instructions)
@@ -1098,9 +1596,9 @@ function Invoke-DemoHostGuidedSetupStep {
 
 function Test-DemoHostGuidedSetupDone {
     # The SqlSetupWizard step's check in PaygWizard mode: Standard runs as the default instance with the guest's
-    # Administrator as sysadmin (as before Phase 28, so an existing or golden host converges unchanged), and nothing is
-    # armed. While the guided stop is armed, the step's Set runs the full setup check, the Azure extension included.
-    # Never throws.
+    # Administrator as sysadmin (as before Phase 28, so an existing or golden host converges unchanged), nothing is armed,
+    # and setup's sign-in preparation is undone (IE ESC on, the Trusted sites as before). While the guided stop is armed,
+    # the step's Set runs the full setup check, the Azure extension included. Never throws.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -1110,7 +1608,7 @@ function Test-DemoHostGuidedSetupDone {
 
     try {
         $path = Get-DemoGuidedSetupPath -Root $Context.Root
-        if ($null -ne (Get-DemoGuidedSetupArmed -Path $path)) {
+        if ($null -ne (Get-DemoGuidedSetupArmed -Path $path) -or (Test-Path -LiteralPath $path.HostSignIn -PathType Leaf)) {
             return $false
         }
         return [bool](Test-DemoHostSqlEdition -Context $Context)
@@ -1122,7 +1620,8 @@ function Test-DemoHostGuidedSetupDone {
 }
 
 function Get-DemoHostGuidedSetupDetail {
-    # For health.json (details.guidedSetup): whether automatic sign-in is armed, deploy.ps1's request, and the last
+    # For health.json (details.guidedSetup): whether automatic sign-in is armed, deploy.ps1's request, setup's sign-in
+    # preparation (signIn: none, preparing, ready, or restoring; deploy.ps1 asks for a person only at ready), and the last
     # cleanup (its reason, what it found, and what failed). Names and times only. Never throws.
     [CmdletBinding()]
     param(
@@ -1130,7 +1629,7 @@ function Get-DemoHostGuidedSetupDetail {
         [System.Collections.IDictionary] $Context
     )
 
-    $detail = [ordered]@{ armed = $false; request = 'none'; requestExpiresUtc = ''; lastReason = ''; lastDisarmedUtc = ''; lastFound = @(); lastProblems = @() }
+    $detail = [ordered]@{ armed = $false; request = 'none'; requestExpiresUtc = ''; signIn = 'none'; lastReason = ''; lastDisarmedUtc = ''; lastFound = @(); lastProblems = @() }
     try {
         $path = Get-DemoGuidedSetupPath -Root $Context.Root
         $detail.armed = Test-Path -LiteralPath $path.HostArmed -PathType Leaf
@@ -1138,6 +1637,10 @@ function Get-DemoHostGuidedSetupDetail {
         $detail.request = if ($request.Valid) { 'valid' } elseif ($request.Expired) { 'expired' } elseif ($request.Exists) { 'invalid' } else { 'none' }
         if ($null -ne $request.ExpiresUtc) {
             $detail.requestExpiresUtc = ([datetime]$request.ExpiresUtc).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        $signIn = Get-DemoGuidedSignInRecord -Path $path
+        if ($null -ne $signIn) {
+            $detail.signIn = if ([string]$signIn['state']) { ([string]$signIn['state']).ToLowerInvariant() } else { 'preparing' }
         }
         $last = Read-DemoVmJsonFile -Path $path.HostLast
         if ($null -ne $last) {
@@ -1168,7 +1671,7 @@ function Get-DemoGuidedSetupStepText {
         ('1. The Virtual Machine Connection window shows {0}, which signed itself in and opened SQL Server setup, pre-filled.' -f $GuestName)
         '2. On the Edition page, select "Use pay-as-you-go billing through Microsoft Azure", then Standard. Select Next.'
         '3. Accept the license terms. Select Next on the pages that follow.'
-        '4. On the Azure Extension for SQL Server page, select "Use Azure Login" and sign in with your own Azure account. Never enter a service principal secret.'
+        '4. On the Azure Extension for SQL Server page, select "Use Azure Login" and sign in with your own Azure account. Never enter a service principal secret. If Internet Explorer says content from a site is blocked by Enhanced Security Configuration, select Add... for each site it names, then "Use Azure Login" again.'
         '5. Select Next on the pre-filled pages (features, the default instance, service accounts, administrators), then Install.'
         '6. When setup says Complete, select Close. The host signs the guest out, rotates its password, and continues on its own; deploy.ps1 then finishes T2.'
         ''

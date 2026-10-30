@@ -68,6 +68,9 @@ Describe 'The guided stop''s setup configuration file (Phase 28, brief item 5)' 
         $launcher | Should -Match 'Invoke-DemoGuestAutoLogonAction -Action Clear'
         $launcher | Should -Match ([regex]::Escape('/ConfigurationFile='))
         $launcher.IndexOf('Invoke-DemoGuestAutoLogonAction -Action Clear') | Should -BeLessThan $launcher.IndexOf('/ConfigurationFile=')
+        # What setup's sign-in will meet, in the guest's log: IE ESC is read as setup starts (Phase 28 live finding).
+        $launcher | Should -Match 'IE Enhanced Security Configuration for administrators as setup starts'
+        $launcher.IndexOf('as setup starts') | Should -BeLessThan $launcher.IndexOf('/ConfigurationFile=')
         { Get-DemoGuidedSetupLauncherText -IsoPath "C:\media\it's.iso" -Path $path } | Should -Throw
     }
 }
@@ -108,11 +111,13 @@ Describe 'Automatic sign-in: kept only as the LSA secret, and always cleaned up 
                 [pscustomobject]@{ action = $action; before = (New-TestAutoLogonState $true); after = $script:after }
             }
             Mock -CommandName Update-DemoGuestSecret -MockWith { $script:order.Add('rotate') }
+            # Setup's sign-in preparation goes back last (Phase 28 live finding); its own tests are further down.
+            Mock -CommandName Restore-DemoHostGuidedSignIn -MockWith { $script:order.Add('restore browser') }
         }
 
         It 'signs out, turns it off and deletes the secret and the values, rotates the password, checks, and drops the record' {
             Disable-DemoHostGuestAutoLogon -Context $context -Reason 'Installed'
-            $script:order | Should -Be @('signout', 'Clear', 'rotate', 'Read')
+            $script:order | Should -Be @('signout', 'Clear', 'rotate', 'Read', 'restore browser')
             Test-Path -LiteralPath $script:path.HostArmed | Should -BeFalse
             $last = Read-DemoVmJsonFile -Path $script:path.HostLast
             $last['reason'] | Should -Be 'Installed'
@@ -166,6 +171,8 @@ Describe 'The SqlSetupWizard step with the guided stop (Phase 28, brief items 5 
         Mock -CommandName Enable-DemoHostGuestAutoLogon -MockWith { $script:calls.Add(('arm {0}' -f $Arms)); Save-DemoGuidedSetupArmed -Path $script:path -Value @{ requestId = $RequestId; arms = $Arms } }
         Mock -CommandName Disable-DemoHostGuestAutoLogon -MockWith { $script:calls.Add('disable ' + $Reason); Remove-Item -LiteralPath $script:path.HostArmed -ErrorAction SilentlyContinue }
         Mock -CommandName Remove-DemoHostGuidedSetup -MockWith { $script:calls.Add('remove tasks') }
+        # Setup's sign-in is ready here; its own tests are in the next Describe.
+        Mock -CommandName Initialize-DemoHostGuidedSignIn -MockWith { }
     }
 
     It 'waits for deploy.ps1 when no person is expected, and tells the person to run it' {
@@ -211,6 +218,264 @@ Describe 'The SqlSetupWizard step with the guided stop (Phase 28, brief items 5 
         $script:calls | Should -Be @('disable Installed', 'remove tasks')
     }
 
+}
+
+Describe 'Setup''s Azure sign-in: prepared before anyone is asked, restored after (Phase 28 live finding, 2026-10-30)' {
+    # Live, setup's Use Azure Login opened in an IE-based control, and IE Enhanced Security Configuration blocked
+    # login.microsoftonline.com, though the GuestWebView2 step had succeeded; turning IE ESC off while setup was open
+    # didn't reach setup.
+
+    It 'refuses a name the zone map can''t hold, before it changes anything' {
+        { Invoke-DemoGuestSignInBrowserAction -Action Prepare -SignInHost @('login') -ActiveSetupRoot 'TestRegistry:\none' -UserRoot 'TestRegistry:\none' } | Should -Throw '*zone map*'
+        @(Get-DemoGuidedSignInHost) | Should -Contain 'login.microsoftonline.com'
+        @(Get-DemoGuidedSignInHost | Where-Object { $_ -notmatch '^[a-z0-9-]+(\.[a-z0-9-]+){2}$' }).Count | Should -Be 0 -Because 'each is an exact host, a domain and one subkey'
+    }
+
+    Context 'in the guest''s registry' -Skip:(-not $IsWindows) {
+        BeforeEach {
+            $script:as = 'TestRegistry:\as'
+            $script:user = 'TestRegistry:\user'
+            $script:zone = 'TestRegistry:\user\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap'
+            Remove-Item -LiteralPath $script:as, $script:user -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($id in '{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}', '{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}') {
+                New-Item -Path ('{0}\{1}' -f $script:as, $id) -Force | Out-Null
+                New-ItemProperty -LiteralPath ('{0}\{1}' -f $script:as, $id) -Name 'IsInstalled' -PropertyType DWord -Value 1 -Force | Out-Null
+            }
+            # What was there before the guided stop: a site the person trusts, and an empty domain key.
+            New-Item -Path ('{0}\Domains\contoso.com\www' -f $script:zone) -Force | Out-Null
+            New-ItemProperty -LiteralPath ('{0}\Domains\contoso.com\www' -f $script:zone) -Name 'https' -PropertyType DWord -Value 2 -Force | Out-Null
+            New-Item -Path ('{0}\EscDomains\microsoftonline.com' -f $script:zone) -Force | Out-Null
+            $script:hosts = @(Get-DemoGuidedSignInHost)
+        }
+
+        It 'turns IE ESC off for administrators only, trusts each sign-in host under Domains and EscDomains, and keeps the first snapshot' {
+            $state = Invoke-DemoGuestSignInBrowserAction -Action Prepare -SignInHost $script:hosts -ActiveSetupRoot $script:as -UserRoot $script:user
+            $state.ieEscAdmin | Should -Be 0
+            $state.ieEscUsers | Should -Be 1
+            @($state.hostsMapped) | Should -Be $script:hosts
+            foreach ($map in 'Domains', 'EscDomains') {
+                $key = '{0}\{1}\microsoftonline.com\login' -f $script:zone, $map
+                (Get-ItemProperty -LiteralPath $key -Name 'https').https | Should -Be 2
+                (Get-Item -LiteralPath $key).GetValueKind('https') | Should -Be 'DWord'
+            }
+            $snapshot = $state.snapshotJson | ConvertFrom-Json
+            @($snapshot.valueList) | Should -Be @('Domains\contoso.com\www|https=2')
+            @($snapshot.keyList) | Should -Contain 'EscDomains\microsoftonline.com'
+            @($snapshot.keyList) | Should -Not -Contain 'EscDomains\microsoftonline.com\login'
+            $again = Invoke-DemoGuestSignInBrowserAction -Action Prepare -SignInHost $script:hosts -SnapshotJson $state.snapshotJson -ActiveSetupRoot $script:as -UserRoot $script:user
+            $again.snapshotJson | Should -Be $state.snapshotJson -Because 'a second pass keeps what was there before the guided stop'
+            $again.changed | Should -Be 0
+        }
+
+        It 'turns IE ESC back on for administrators and users, and puts the entries back as they were, the dialog''s Add... included' {
+            $state = Invoke-DemoGuestSignInBrowserAction -Action Prepare -SignInHost $script:hosts -ActiveSetupRoot $script:as -UserRoot $script:user
+            # Meanwhile: Add... in setup's dialog (IE ESC on, so EscDomains), users' IE ESC off in Server Manager, and a
+            # site that was there changed.
+            New-Item -Path ('{0}\EscDomains\example.net\sso' -f $script:zone) -Force | Out-Null
+            New-ItemProperty -LiteralPath ('{0}\EscDomains\example.net\sso' -f $script:zone) -Name 'https' -PropertyType DWord -Value 2 -Force | Out-Null
+            Set-ItemProperty -LiteralPath ('{0}\Domains\contoso.com\www' -f $script:zone) -Name 'https' -Value 4
+            Set-ItemProperty -LiteralPath ($script:as + '\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}') -Name 'IsInstalled' -Value 0
+            $restored = Invoke-DemoGuestSignInBrowserAction -Action Restore -SignInHost $script:hosts -SnapshotJson $state.snapshotJson -ActiveSetupRoot $script:as -UserRoot $script:user
+            $restored.restored | Should -BeTrue
+            $restored.ieEscAdmin | Should -Be 1
+            $restored.ieEscUsers | Should -Be 1
+            @($restored.hostsMapped).Count | Should -Be 0
+            Test-Path -LiteralPath ('{0}\EscDomains\example.net' -f $script:zone) | Should -BeFalse
+            Test-Path -LiteralPath ('{0}\Domains\microsoftonline.com' -f $script:zone) | Should -BeFalse
+            Test-Path -LiteralPath ('{0}\EscDomains\microsoftonline.com' -f $script:zone) | Should -BeTrue -Because 'it was there before, empty'
+            Test-Path -LiteralPath ('{0}\EscDomains\microsoftonline.com\login' -f $script:zone) | Should -BeFalse
+            (Get-ItemProperty -LiteralPath ('{0}\Domains\contoso.com\www' -f $script:zone) -Name 'https').https | Should -Be 2
+        }
+
+        It 'takes out only the sign-in hosts when there''s no snapshot' {
+            $null = Invoke-DemoGuestSignInBrowserAction -Action Prepare -SignInHost $script:hosts -ActiveSetupRoot $script:as -UserRoot $script:user
+            New-Item -Path ('{0}\EscDomains\example.net\sso' -f $script:zone) -Force | Out-Null
+            New-ItemProperty -LiteralPath ('{0}\EscDomains\example.net\sso' -f $script:zone) -Name 'https' -PropertyType DWord -Value 2 -Force | Out-Null
+            $restored = Invoke-DemoGuestSignInBrowserAction -Action Restore -SignInHost $script:hosts -ActiveSetupRoot $script:as -UserRoot $script:user
+            $restored.restored | Should -BeTrue
+            $restored.ieEscAdmin | Should -Be 1
+            @($restored.hostsMapped).Count | Should -Be 0
+            Test-Path -LiteralPath ('{0}\EscDomains\example.net\sso' -f $script:zone) | Should -BeTrue -Because 'without a snapshot it can''t tell that from a site trusted before'
+            (Get-ItemProperty -LiteralPath ('{0}\Domains\contoso.com\www' -f $script:zone) -Name 'https').https | Should -Be 2
+        }
+
+        It 'leaves no key it created, the map keys included' {
+            Remove-Item -LiteralPath ('{0}\EscDomains' -f $script:zone) -Recurse -Force
+            $state = Invoke-DemoGuestSignInBrowserAction -Action Prepare -SignInHost $script:hosts -ActiveSetupRoot $script:as -UserRoot $script:user
+            Test-Path -LiteralPath ('{0}\EscDomains\microsoftonline.com\login' -f $script:zone) | Should -BeTrue
+            $restored = Invoke-DemoGuestSignInBrowserAction -Action Restore -SignInHost $script:hosts -SnapshotJson $state.snapshotJson -ActiveSetupRoot $script:as -UserRoot $script:user
+            $restored.restored | Should -BeTrue
+            Test-Path -LiteralPath ('{0}\EscDomains' -f $script:zone) | Should -BeFalse
+            @(Get-ChildItem -LiteralPath $script:zone -Recurse | ForEach-Object { $_.PSChildName }) | Should -Be @('Domains', 'contoso.com', 'www')
+        }
+    }
+
+    Context 'on the host' {
+        BeforeEach {
+            $context = New-TestHostContext
+            $script:path = Get-DemoGuidedSetupPath -Root $context.Root
+            $script:order = [System.Collections.Generic.List[string]]::new()
+            $script:webView2 = $true
+            $script:escAdmin = 0
+            $script:restored = $true
+            $script:lastSnapshot = $null
+            Mock -CommandName Get-DemoGuestCredential -MockWith { New-TestCredential }
+            Mock -CommandName Get-DemoHostSetupCheck -MockWith { [pscustomobject]@{ Ok = $false; Problem = 'NotInstalled'; SetupRunning = $false; Message = 'SQL Server isn''t installed in arcsql01 yet.'; Fix = @() } }
+            Mock -CommandName Test-DemoGuestConsoleSession -MockWith { $false }
+            Mock -CommandName Enable-DemoHostGuestAutoLogon -MockWith { $script:order.Add('arm') }
+            Mock -CommandName Test-DemoGuestWebView2 -MockWith { $script:order.Add('check WebView2'); $script:webView2 }
+            Mock -CommandName Test-DemoHostGuestWebView2 -MockWith { $script:order.Add('check WebView2 again'); $script:webView2 }
+            Mock -CommandName Install-DemoHostGuestWebView2 -MockWith { $script:order.Add('install WebView2'); $script:webView2 = $true }
+            Mock -CommandName Invoke-Command -MockWith {
+                $arguments = @($PesterBoundParameters['ArgumentList'])
+                if ($arguments.Count -eq 0 -or $null -eq $arguments[0]) {
+                    $script:order.Add('start setup')
+                    return
+                }
+                $action = [string]$arguments[0]
+                $script:order.Add('guest ' + $action)
+                $script:lastSnapshot = [string]$arguments[3]
+                $restore = $action -eq 'Restore'
+                [pscustomobject]@{
+                    action       = $action
+                    ieEscAdmin   = $(if ($restore) { $(if ($script:restored) { 1 } else { 0 }) } else { $script:escAdmin })
+                    ieEscUsers   = 1
+                    hive         = 'Loaded'
+                    hostsMapped  = $(if ($restore) { @() } else { @(Get-DemoGuidedSignInHost) })
+                    snapshotJson = '{"keyList":[],"valueList":[]}'
+                    changed      = 16
+                    restored     = ($restore -and $script:restored)
+                }
+            }
+        }
+
+        It 'installs a missing WebView2 runtime, turns IE ESC off and trusts the sign-in hosts, records it, and only then arms the guest''s sign-in' {
+            Write-TestRequest -Context $context -ExpiresUtc ([DateTime]::UtcNow.AddMinutes(45))
+            $script:webView2 = $false
+            $result = Invoke-DemoHostGuidedSetupStep -Context $context
+            $result.Outcome | Should -Be 'ManualActionRequired'
+            $script:order | Should -Be @('check WebView2', 'install WebView2', 'check WebView2 again', 'guest Prepare', 'arm')
+            $record = Read-DemoVmJsonFile -Path $script:path.HostSignIn
+            $record['state'] | Should -Be 'Ready'
+            $record['snapshot'] | Should -Be '{"keyList":[],"valueList":[]}'
+            (Get-DemoHostGuidedSetupDetail -Context $context).signIn | Should -Be 'ready'
+
+            # The next pass, in the session the automatic sign-in opened: the same snapshot goes back to the guest, and
+            # setup opens there.
+            $script:order.Clear()
+            Mock -CommandName Test-DemoGuestConsoleSession -MockWith { $true }
+            Invoke-DemoHostGuidedSetupStep -Context $context | Out-Null
+            $script:order | Should -Be @('check WebView2', 'guest Prepare', 'start setup')
+            $script:lastSnapshot | Should -Be '{"keyList":[],"valueList":[]}'
+        }
+
+        It 'asks nobody while a prerequisite is missing: no arm, no setup, and the step says it''s Azure-side preparation' {
+            Write-TestRequest -Context $context -ExpiresUtc ([DateTime]::UtcNow.AddMinutes(45))
+            Mock -CommandName Test-DemoGuestConsoleSession -MockWith { $true }
+            $script:webView2 = $false
+            Mock -CommandName Install-DemoHostGuestWebView2 -MockWith { $script:order.Add('install WebView2'); throw 'The WebView2 runtime installer is not validly signed by Microsoft; it was deleted (fail closed).' }
+            $result = Invoke-DemoHostGuidedSetupStep -Context $context
+            $result.Outcome | Should -Be 'InProgress'
+            $result.Message | Should -Match 'Azure-side, no action needed'
+            $result.Message | Should -Match 'WebView2 runtime isn''t installed'
+            $script:order | Should -Not -Contain 'guest Prepare'
+            $script:order | Should -Not -Contain 'start setup'
+            $script:order | Should -Not -Contain 'arm'
+            (Get-DemoHostGuidedSetupDetail -Context $context).signIn | Should -Be 'none'
+
+            # WebView2 is there, but IE ESC is still on for administrators: still nobody is asked.
+            $script:order.Clear()
+            $script:webView2 = $true
+            $script:escAdmin = 1
+            $result = Invoke-DemoHostGuidedSetupStep -Context $context
+            $result.Outcome | Should -Be 'InProgress'
+            $result.Message | Should -Match 'Enhanced Security Configuration is still on for administrators'
+            $script:order | Should -Be @('check WebView2', 'guest Prepare')
+            (Get-DemoHostGuidedSetupDetail -Context $context).signIn | Should -Be 'preparing'
+
+            # A guest that can't be asked: no install attempt, and nobody is asked.
+            $script:order.Clear()
+            Mock -CommandName Test-DemoGuestWebView2 -MockWith { throw 'The virtual machine is not running.' }
+            (Invoke-DemoHostGuidedSetupStep -Context $context).Outcome | Should -Be 'InProgress'
+            $script:order.Count | Should -Be 0
+        }
+
+        It 'restores IE ESC and the Trusted sites in the cleanup after success, failure, and timeout, but not between two arms' {
+            Mock -CommandName Invoke-DemoGuestSignOut -MockWith { 1 }
+            Mock -CommandName Start-Sleep -MockWith { }
+            Mock -CommandName Update-DemoGuestSecret -MockWith { }
+            Mock -CommandName Invoke-Command -MockWith { [pscustomobject]@{ action = 'Clear'; before = (New-TestAutoLogonState $false); after = (New-TestAutoLogonState $false) } }
+            Mock -CommandName Restore-DemoHostGuidedSignIn -MockWith { $script:order.Add('restore') }
+            foreach ($reason in 'Installed', 'Expired', 'NoRequest', 'Leftover') {
+                Save-DemoGuidedSetupArmed -Path $script:path -Value @{ requestId = 'request-0001'; arms = 1 }
+                Disable-DemoHostGuestAutoLogon -Context $context -Reason $reason
+            }
+            $script:order | Should -Be @('restore', 'restore', 'restore', 'restore')
+            $script:order.Clear()
+            Save-DemoGuidedSetupArmed -Path $script:path -Value @{ requestId = 'request-0001'; arms = 1 }
+            Disable-DemoHostGuestAutoLogon -Context $context -Reason 'Retry'
+            $script:order.Count | Should -Be 0 -Because 'the next arm''s sign-in needs them'
+
+            # Fail closed: a restore that fails makes the cleanup throw, and keeps both records for the next pass.
+            Save-DemoGuidedSetupArmed -Path $script:path -Value @{ requestId = 'request-0001'; arms = 1 }
+            Save-DemoGuidedSignInRecord -Path $script:path -Value @{ schemaVersion = 1; state = 'Ready'; snapshot = '' }
+            Mock -CommandName Restore-DemoHostGuidedSignIn -MockWith { throw 'IE Enhanced Security Configuration is still off.' }
+            { Disable-DemoHostGuestAutoLogon -Context $context -Reason 'Installed' } | Should -Throw '*restoring IE Enhanced Security Configuration*'
+            Test-Path -LiteralPath $script:path.HostArmed | Should -BeTrue
+            Test-Path -LiteralPath $script:path.HostSignIn | Should -BeTrue
+        }
+
+        It 'drops its record only once the guest says it''s restored, and the setup step isn''t done before' {
+            Save-DemoGuidedSignInRecord -Path $script:path -Value @{ schemaVersion = 1; state = 'Ready'; snapshot = '{"keyList":["Domains\\contoso.com"],"valueList":[]}' }
+            Mock -CommandName Test-DemoHostSqlEdition -MockWith { $true }
+            Test-DemoHostGuidedSetupDone -Context $context | Should -BeFalse -Because 'IE ESC may still be off'
+            $script:restored = $false
+            { Restore-DemoHostGuidedSignIn -Context $context } | Should -Throw '*fail closed*'
+            (Read-DemoVmJsonFile -Path $script:path.HostSignIn)['state'] | Should -Be 'Restoring'
+            (Get-DemoHostGuidedSetupDetail -Context $context).signIn | Should -Be 'restoring'
+            $script:restored = $true
+            Restore-DemoHostGuidedSignIn -Context $context
+            $script:lastSnapshot | Should -Be '{"keyList":["Domains\\contoso.com"],"valueList":[]}' -Because 'the guest gets the snapshot from before the guided stop'
+            Test-Path -LiteralPath $script:path.HostSignIn | Should -BeFalse
+            Test-DemoHostGuidedSetupDone -Context $context | Should -BeTrue
+        }
+
+        It 'restores them when nothing is armed and nobody is expected any more, before a pass and in the step, never while deploy.ps1 waits' {
+            Mock -CommandName Resolve-DemoGuestPendingSecret -MockWith { }
+            Mock -CommandName Restore-DemoHostGuidedSignIn -MockWith { $script:order.Add('restore') }
+            Mock -CommandName Disable-DemoHostGuestAutoLogon -MockWith { $script:order.Add('disable') }
+            Save-DemoGuidedSignInRecord -Path $script:path -Value @{ schemaVersion = 1; state = 'Ready'; snapshot = '' }
+            Write-TestRequest -Context $context -ExpiresUtc ([DateTime]::UtcNow.AddMinutes(30))
+            Invoke-DemoHostGuidedSetupGuard -Context $context
+            $script:order.Count | Should -Be 0
+            Write-TestRequest -Context $context -ExpiresUtc ([DateTime]::UtcNow.AddMinutes(-1))
+            Invoke-DemoHostGuidedSetupGuard -Context $context
+            $script:order | Should -Be @('restore')
+            $script:order.Clear()
+            (Invoke-DemoHostGuidedSetupStep -Context $context).Outcome | Should -Be 'ManualActionRequired'
+            $script:order | Should -Be @('restore')
+        }
+
+        It 'tells the person what to do when Internet Explorer still blocks the sign-in, and blames no missing WebView2' {
+            $steps = (Get-DemoGuidedSetupStepText -GuestName 'arcsql01') -join ' '
+            $steps | Should -Match 'Add\.\.\. for each site it names'
+            $instructions = (Get-DemoPaygWizardInstruction -GuestName 'arcsql01') -join ' '
+            $instructions | Should -Match 'Add\.\.\. for each site it names, then Use Azure Login again'
+            $instructions | Should -Match 'Server Manager > Local Server'
+            $instructions | Should -Match 'a change made while setup is open doesn''t reach it'
+            $instructions | Should -Not -Match 'WebView2 runtime is missing'
+        }
+
+        It 'reports the preparation in the health summary deploy.ps1 reads' {
+            $root = Join-Path -Path $TestDrive -ChildPath ('health-' + [guid]::NewGuid().ToString('N'))
+            $null = New-Item -ItemType Directory -Path $root -Force
+            $health = [ordered]@{ schemaVersion = 1; state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'The guest restarts.'; details = [ordered]@{ guidedSetup = [ordered]@{ armed = $true; request = 'valid'; signIn = 'ready'; lastReason = ''; lastProblems = @() } } }
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), (ConvertTo-Json -InputObject $health -Depth 6))
+            $summary = (& (Join-Path -Path $repoRoot -ChildPath 'vm/health/Get-DemoHealth.ps1') -Root $root -View Summary) | ConvertFrom-Json
+            $summary.guidedSignIn | Should -Be 'ready'
+            $summary.guidedArmed | Should -BeTrue
+        }
+    }
 }
 
 Describe 'The host''s setup check (Get-DemoHostSetupCheck, brief item 6)' {

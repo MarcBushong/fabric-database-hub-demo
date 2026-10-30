@@ -432,8 +432,9 @@ function Test-DemoHostGuestWebView2 {
 }
 
 function Install-DemoHostGuestWebView2 {
-    # PaygWizard: installs the WebView2 runtime in the guest before the setup wizard, so "Use Azure Login" on the
-    # Azure Extension for SQL Server page can sign in (pay-as-you-go needs that page).
+    # PaygWizard: installs the WebView2 runtime in the guest before the setup wizard. The guided stop checks it again,
+    # and installs it when it's missing, before it asks for anyone (Initialize-DemoHostGuidedSignIn); setup's own sign-in
+    # opened in an IE-based control in the 2026-10-30 live proof, so that also turns IE ESC off for administrators.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]

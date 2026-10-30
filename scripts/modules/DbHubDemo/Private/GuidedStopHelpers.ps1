@@ -783,7 +783,11 @@ function Invoke-DemoT2GuidedStop {
     2. The host's request (Set-DemoGuidedStopRequest), valid until the deadline: at least -PersonMinutes after the prompt.
     3. On-demand Bastion, deployed in the background (New-DemoBastion -NoWait).
     4. Arc onboarding when the host waits for it, without the SQL Server configuration, which waits for the setup check.
-    5. Waits for the host to open the pre-filled setup in the guest (SqlSetupWizard), and for Bastion.
+    5. Waits for the host to open the pre-filled setup in the guest (SqlSetupWizard), and for Bastion. The host first
+       prepares setup's Azure sign-in (Phase 28 live finding: the WebView2 runtime, and IE Enhanced Security
+       Configuration off for administrators); until its health says guidedSignIn ready, nobody is asked, and the status
+       page shows the host's message as Azure-side preparation. A host whose health has no guidedSignIn (a bundle from
+       before) is ready at its step as before.
     6. The prompt: the status page's guidedStop turns Ready; deploy.ps1's own process prompts the person (Context
        PromptInParent, set only when the progress model exists), or this process does (in-process runs, and track
        processes without a model, such as -NoStatusPage: its console lines reach deploy.ps1's console).
@@ -844,7 +848,7 @@ function Invoke-DemoT2GuidedStop {
     $deadline = if ($DeadlineUtc -gt $now.AddMinutes($PersonMinutes + 20)) { $DeadlineUtc } else { $now.AddMinutes($PersonMinutes + 20) }
     $status = 'TimedOut'
     $started = [System.Diagnostics.Stopwatch]::StartNew()
-    Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Running' -Message 'Preparing: Bastion, Arc onboarding, the pre-filled setup, and the guest''s one-time sign-in (about 10 to 15 minutes).'
+    Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Running' -Message 'Preparing: Bastion, Arc onboarding, the pre-filled setup, setup''s Azure sign-in, and the guest''s one-time sign-in (about 10 to 15 minutes).'
     Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'Preparing'; message = 'Preparing Bastion and the pre-filled setup (about 10 to 15 minutes); nothing to do yet.'; deadlineAt = (Get-DemoUnixTime -Value $deadline); hostVm = 'archost01' }
     try {
         :guided do {
@@ -901,12 +905,22 @@ function Invoke-DemoT2GuidedStop {
                     $status = 'Failed'
                     break guided
                 }
-                $ready = $phase.Step -eq 'SqlSetupWizard' -and $phase.State -eq 'ManualActionRequired'
+                # Setup's Azure sign-in must be ready first (Phase 28 live finding): a health without guidedSignIn comes
+                # from a host bundle that predates it.
+                $signIn = Get-DemoMemberValue -InputObject $health -Name 'guidedSignIn'
+                $ready = $phase.Step -eq 'SqlSetupWizard' -and $phase.State -eq 'ManualActionRequired' -and ($null -eq $signIn -or [string]$signIn -eq 'ready')
                 if (-not $ready) {
                     if ((Get-DemoUtcNow) -ge $deadline) {
                         break guided
                     }
-                    Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ message = ('archost01 prepares the pre-filled setup (step {0}); nothing to do yet.' -f $phase.Step) }
+                    $waitMessage = 'archost01 prepares the pre-filled setup (step {0}); nothing to do yet.' -f $phase.Step
+                    $hostMessage = [string](Get-DemoMemberValue -InputObject $health -Name 'message')
+                    if ($phase.Step -eq 'SqlSetupWizard' -and $phase.State -ne 'ManualActionRequired' -and $hostMessage) {
+                        # The host's own words: what it prepares, Azure-side, with nothing for the person yet.
+                        $waitMessage = $hostMessage
+                        Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Running' -Message $hostMessage -AzureSide
+                    }
+                    Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ message = $waitMessage }
                     Start-Sleep -Seconds 60
                 }
             }

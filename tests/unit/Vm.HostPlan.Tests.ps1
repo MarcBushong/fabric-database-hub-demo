@@ -416,7 +416,9 @@ Describe 'GuestWebView2 step (PaygWizard)' {
     It 'tells the operator to use Azure Login on the Azure extension page' {
         $text = (Get-DemoPaygWizardInstruction -GuestName 'arcsql01' -MediaDrive 'E') -join ' '
         $text | Should -Match 'Use Azure Login'
-        $text | Should -Match 'WebView2'
+        # Phase 28 live finding (2026-10-30): the sign-in is an IE-based control, which IE ESC blocks; WebView2 was there.
+        $text | Should -Match 'Enhanced Security Configuration'
+        $text | Should -Not -Match 'WebView2 runtime is missing'
         $text | Should -Match 'Never enter a service principal secret'
         $text | Should -Not -Match 'Do not enter credentials'
     }

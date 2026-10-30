@@ -728,8 +728,42 @@ Describe 'Invoke-DemoT2GuidedStop: the stop, then the run continues on its own' 
         $script:states = [System.Collections.Generic.Queue[object]]::new()
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { if ($script:states.Count -gt 0) { $script:states.Dequeue() } else { [pscustomobject]@{ HostPasswordUtc = ''; GuidedStopUtc = '' } } }
         $script:waitingArc = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboardingBeforeWizard'; message = 'waiting for Arc' }
-        $script:wizard = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'SQL Server setup is open in arcsql01.' }
+        $script:wizard = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'SQL Server setup is open in arcsql01.'; guidedSignIn = 'ready' }
         $script:after = [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup'; message = 'Cleaning up.' }
+    }
+
+    It 'asks nobody while the host prepares setup''s Azure sign-in, and shows that as Azure-side preparation (Phase 28 live finding, 2026-10-30)' {
+        # Live, IE Enhanced Security Configuration blocked setup's sign-in. The host now turns it off, and checks
+        # WebView2, before it opens setup; its health says guidedSignIn ready only then.
+        $preparing = [pscustomobject]@{ state = 'InProgress'; currentStep = 'SqlSetupWizard'; message = 'Preparing setup''s Azure sign-in in arcsql01 (Azure-side, no action needed): the WebView2 runtime isn''t installed in the guest yet; the host tries again within about 5 minutes.'; guidedSignIn = 'preparing' }
+        # Before the host has seen the request: the step still waits for deploy.ps1, and nothing is prepared.
+        $stale = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'Arc is connected. The SQL Server setup step waits for you: run ./scripts/deploy.ps1.'; guidedSignIn = 'none' }
+        foreach ($item in @($stale, $preparing, $script:wizard, $script:after)) {
+            $script:health.Enqueue($item)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:calls.Add('health'); if ($script:health.Count -gt 1) { $script:health.Dequeue() } else { $script:health.Peek() } }
+        $script:pages = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressValue -MockWith { if ($Value.Contains('message')) { $script:pages.Add([string]$Value['message']) } }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { if ($PesterBoundParameters['AzureSide']) { $script:pages.Add('Azure-side step: ' + $PesterBoundParameters['Message']) } }
+        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:waitingArc } { Invoke-DemoT2GuidedStop -Config $Config -Context @{ ProgressPath = 'progress.json' } -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
+        $stop.Status | Should -Be 'Done'
+        $asked = $script:calls.IndexOf('credential')
+        $asked | Should -BeGreaterThan 0
+        @($script:calls[0..$asked] | Where-Object { $_ -eq 'health' }).Count | Should -Be 3 -Because 'nobody is asked before the host says its sign-in preparation is ready'
+        $script:calls[$asked + 1] | Should -Be 'prompt'
+        @($script:pages | Where-Object { $_ -match '^Preparing setup''s Azure sign-in in arcsql01 \(Azure-side, no action needed\)' }).Count | Should -BeGreaterThan 0
+        @($script:pages | Where-Object { $_ -match '^Azure-side step: Preparing setup''s Azure sign-in' }).Count | Should -BeGreaterThan 0
+
+        # A host whose bundle predates the field (no guidedSignIn): ready at its step, as before.
+        $script:calls.Clear()
+        $script:health.Clear()
+        $old = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'SQL Server setup is open in arcsql01.' }
+        foreach ($item in @($old, $script:after)) {
+            $script:health.Enqueue($item)
+        }
+        $again = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $old } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
+        $again.Status | Should -Be 'Done'
+        $script:calls | Should -Contain 'prompt'
     }
 
     It 'requests the stop, starts Bastion without waiting, onboards Arc first, prompts once, and continues when the host''s check passes' {

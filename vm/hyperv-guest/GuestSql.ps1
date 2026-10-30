@@ -142,8 +142,9 @@ function Get-DemoSetupProcess {
 
 function Test-DemoIeEscEnabled {
     # True when Internet Explorer Enhanced Security Configuration is on for administrators and for users, the
-    # Windows Server default. An operator may turn it off during the wizard, though the Azure sign-in doesn't need
-    # that (it needs WebView2). A component that doesn't exist counts as on.
+    # Windows Server default. The PaygWizard guided stop turns it off for administrators while setup's Azure sign-in, an
+    # IE-based control, needs it, and back on in its cleanup (Phase 28 live finding, 2026-10-30). A component that
+    # doesn't exist counts as on.
     [CmdletBinding()]
     [OutputType([bool])]
     param(

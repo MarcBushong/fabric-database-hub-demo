@@ -197,7 +197,7 @@ function Get-DemoHostStepPlan {
                 Copy-DemoHostGuestSqlMedia -Context $Step.Context } }
         @{ Name = 'GuestWebView2'; Mode = @('PaygWizard')
             When = { param($Step) $Step.Context.Mode -in $Step.Mode }
-            NotSelectedMessage = 'Only the PaygWizard setup wizard signs in to Azure, in a window that needs the WebView2 runtime.'
+            NotSelectedMessage = 'Only the PaygWizard guided stop asks for setup''s Azure sign-in, and installs the WebView2 runtime before it.'
             Test = { param($Step) (Test-DemoHostGuestReachable -Context $Step.Context) -and (Test-DemoHostGuestWebView2 -Context $Step.Context) }
             Set = { param($Step)
                 if (-not (Wait-DemoHostGuest -Context $Step.Context)) {
