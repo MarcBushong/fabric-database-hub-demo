@@ -389,6 +389,43 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { $script:order.Add('RunnerStatus'); [pscustomobject]@{ Status = 'Pass'; Result = (New-TestResult 'WORKLOAD.T1.COMMAND' 'Pass' 'workload' 'T1') } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith { $script:order.Add('DoneGate'); New-TestResult 'HUB.ESTATE.T1' 'Pass' 'hub' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:order.Add('PowerBI'); New-TestResult 'FABRIC.REPORT' 'Pass' 'fabric' 'fabric' }
+        # Phase 28 live finding: what's stopped starts before the first stage that needs it; here both VMs run.
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
+    }
+
+    It 'starts deallocated VMs while preflight runs, and runs them before the first stage that needs them; running ones are only read (Phase 28 live finding)' {
+        Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $true }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Running:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenSourceRelease -MockWith { $script:order.Add('SourceRelease') }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:order.Add('T1Monitoring'); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/running' }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $script:order[0..3] | Should -Be @('Request:sqlvm01', 'Preflight', 'Running:sqlvm01', 'Template') -Because 'it boots while preflight runs, and runs before the template'
+        $script:order | Should -Not -Contain 'Request:archost01'
+        $script:order | Should -Not -Contain 'Running:archost01'
+        $script:order | Should -Not -Contain 'T1Monitoring' -Because 'the Monitoring stage runs in this run'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).status | Should -Be 'Pass'
+
+        # A resume at T2: both start before it, with the golden source's guest and T1's monitoring plugin, which no
+        # Monitoring stage of this run checks.
+        $script:order.Clear()
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        $script:state = New-TestState @{ Stage = 'Monitoring'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+        Invoke-DemoDeployment -Config $config -Resume | Out-Null
+        $script:order[0..6] | Should -Be @('Request:sqlvm01', 'Request:archost01', 'Running:sqlvm01', 'Running:archost01', 'SourceRelease', 'T1Monitoring', 'Arc')
+    }
+
+    It 'says what it started keeps running when preflight then fails, and deploys nothing (Phase 28 live finding)' {
+        Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $true }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Running:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/stopped' }
+        $script:preflightStatus = 'Fail'
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $script:order | Should -Be @('Request:sqlvm01', 'Request:archost01', 'Preflight')
+        $warning = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $warning.status | Should -Be 'Warning'
+        $warning.message | Should -Match 'This run started sqlvm01 and archost01 while preflight ran; it keeps running until \./scripts/stop-demo\.ps1'
     }
 
     It 'imports the Real-Time Dashboard and the history model and report in the Fabric stage, as the parallel Fabric track does (review follow-up)' {
@@ -1698,6 +1735,95 @@ Describe 'Invoke-DemoVmPowerAction' {
         $result.status | Should -Be 'Fail'
         $result.message | Should -Match 'wasn''t found'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 0 -Exactly
+    }
+}
+
+Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts what was stopped (Phase 28 live finding)' {
+    BeforeAll {
+        $config = New-TestConfig
+    }
+
+    BeforeEach {
+        # Live, 2026-10-30: a rerun after the nightly auto-shutdown found the VMs deallocated, and its first Run Command failed.
+        $script:calls = [System.Collections.Generic.List[string]]::new()
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
+        $script:page = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
+        Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:calls.Add('request ' + $VmName); $true }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith {
+            $script:calls.Add(('running {0} requested={1}' -f $VmName, [bool]$PesterBoundParameters['StartRequested']))
+            New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) $(if ($VmName -eq $script:noStart) { 'Warning' } else { 'Pass' }) 'infra' 'T1'
+        }
+        $script:noStart = ''
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenSourceRelease -MockWith { $script:calls.Add('source release'); New-TestResult 'T2.GOLDEN.SOURCE' 'Pass' 't2' 'T2' }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:calls.Add('t1 monitoring'); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:page.Add(('{0}|{1}|{2}|{3}' -f (@($PesterBoundParameters['Id']) -join ','), $PesterBoundParameters['State'], $PesterBoundParameters['Status'], $PesterBoundParameters['Message'])) }
+    }
+
+    It 'leaves running VMs and a Ready T4 alone, read-only, and says nothing needed starting' {
+        $withT4 = New-TestConfig -WithT4
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { $script:calls.Add('t4 ' + $PesterBoundParameters['WaitMinutes']); New-DemoResult -CheckId 'DEPLOY.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'T4 was already running (Ready).' -Evidence ([ordered]@{ stateBefore = 'Ready'; stateAfter = 'Ready' }) }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $request.Needed | Should -BeFalse
+        $script:calls | Should -Be @('t4 0') -Because 'Invoke-DemoT4PowerAction only reads a T4 that''s Ready'
+        $script:page | Should -Be @('StartVms|Skipped||Not needed: nothing was stopped.')
+        @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request -RestoreT1Monitoring }) | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -Times 0 -Exactly
+    }
+
+    It 'asks a deallocated VM to start without waiting, waits for one that''s still stopping, and says so on the status page' {
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocating' }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $request.Needed | Should -BeTrue
+        $request.Requested | Should -Be @('sqlvm01') -Because 'only what this run asked to start bills because of it'
+        $script:calls | Should -Be @('request sqlvm01') -Because 'a VM that''s still deallocating is only waited for'
+        $script:page[0] | Should -Match ([regex]::Escape('StartVms|Running||Starting the VMs that were stopped: no action needed (sqlvm01 (deallocated), archost01 (deallocating)).'))
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request -ProgressPath 'progress.json' })
+        $script:calls | Should -Contain 'running sqlvm01 requested=True'
+        $script:calls | Should -Contain 'running archost01 requested=False'
+        $script:calls | Should -Contain 'source release' -Because 'a golden snapshot''s source host gets its guest back, as start-demo.ps1 does'
+        $script:calls | Should -Not -Contain 't1 monitoring' -Because 'T1''s Monitoring step runs in this run'
+        $done = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $done.status | Should -Be 'Pass'
+        $done.message | Should -Match 'Started sqlvm01 and archost01, which had been stopped'
+        $script:page[-1] | Should -Match '^StartVms\|\|Pass\|Started sqlvm01 and archost01'
+    }
+
+    It 'restores T1''s monitoring plugin when no Monitoring step runs, starts a stopped T4 and waits for it' {
+        $withT4 = New-TestConfig -WithT4
+        $script:power = @{ sqlvm01 = 'PowerState/stopped'; archost01 = 'PowerState/running' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith {
+            $script:calls.Add(('t4 {0} requested={1}' -f $PesterBoundParameters['WaitMinutes'], [bool]$PesterBoundParameters['Requested']))
+            $after = if ([int]$PesterBoundParameters['WaitMinutes'] -gt 0) { 'Ready' } else { 'Starting' }
+            New-DemoResult -CheckId 'DEPLOY.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 is {0}.' -f $after) -Evidence ([ordered]@{ stateBefore = 'Stopped'; stateAfter = $after })
+        }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
+        $request.Names | Should -Be @('sqlvm01 (stopped)', 'T4 (stopped)')
+        $request.Requested | Should -Be @('sqlvm01', 'T4')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request -RestoreT1Monitoring })
+        $script:calls | Should -Be @('request sqlvm01', 't4 0 requested=False', 'running sqlvm01 requested=True', 't1 monitoring', 't4 15 requested=True')
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' }).status | Should -Be 'Pass'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).message | Should -Match 'T4 is Ready'
+    }
+
+    It 'fails with the next action when a VM still doesn''t run, so nothing needs it' {
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/deallocated' }
+        $script:noStart = 'archost01'
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        $failed = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match 'archost01 isn''t running'
+        $failed.remediation | Should -Match ([regex]::Escape('./scripts/start-demo.ps1'))
+        $script:calls | Should -Not -Contain 'source release' -Because 'the host isn''t running'
+    }
+
+    It 'starts nothing in a what-if' {
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -WhatIf }
+        $request.Needed | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Request-DemoVmStart -Times 0 -Exactly
     }
 }
 

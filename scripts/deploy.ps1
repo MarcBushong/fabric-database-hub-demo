@@ -19,7 +19,8 @@ One command, one guided stop (Phase 28):
   onboarding, PAYG, monitoring, and telemetry. -NoWaitForT2 opts out; GitHub Actions and other CI systems don't wait
   unless -WaitForT2.
 - Run it again with no parameters and it continues an unfinished deployment (the resource group's state tags), as
-  -Resume does.
+  -Resume does. It starts VMs that were stopped, for example by the nightly auto-shutdown or stop-demo.ps1, and a
+  stopped T4, while preflight runs; running VMs are only read.
 - It ends with one banner: DONE (Database Hub shows every target, and where to look) or NOT DONE (why, the single next
   action, and the exact command). The exit code is 0 only when it's DONE (and for a -WhatIf with no Fail).
 - Ctrl+C stops it within seconds, track processes included: their slow Azure cleanups are left to the next run or

@@ -6,7 +6,10 @@ function Invoke-DemoDeployment {
 
     .DESCRIPTION
     Every stage is idempotent, and a re-run converges. The last stage that finished is recorded in the
-    resource group's tags (Set-DemoDeploymentState), so -Resume continues after it from any machine. Stages:
+    resource group's tags (Set-DemoDeploymentState), so -Resume continues after it from any machine. On an existing
+    environment, what's stopped (the nightly auto-shutdown, stop-demo.ps1, a stop) starts while preflight runs, and runs
+    before the first stage that needs it (Request-DemoStoppedStart, Wait-DemoStoppedStart; Phase 28 live finding).
+    Stages:
 
     1. Preflight: Invoke-DemoPreflight (subscription guard, P1-P6, region, sizes, quota, policy, cost). Any
        Fail stops here. It resolves the network mode, the T3 free offer, and the P6 group's name.
@@ -292,15 +295,36 @@ function Invoke-DemoDeployment {
     }
 
     $validated = $false
+    # Phase 28 live finding (2026-10-30), as in the parallel path: what's stopped starts while preflight runs, and runs
+    # before the first stage that needs it. Running VMs are only read; nothing on a first deployment or a what-if.
+    $stoppedStart = $null
+    $stoppedWaited = $false
+    $vmStagesInRange = $startIndex -le $stopIndex -and @($stages[$startIndex..$stopIndex] | Where-Object { $_ -ne 'Preflight' }).Count -gt 0
+    if (-not $whatIf -and [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists') -and $vmStagesInRange) {
+        $stoppedStart = Request-DemoStoppedStart -Config $Config -SkipT4:(-not (Test-DemoT4Enabled -Config $Config)) -Confirm:$false
+    }
     for ($index = $startIndex; $index -le $stopIndex; $index++) {
         $stage = $stages[$index]
         Write-DemoLog -Message ('Stage {0} of {1}: {2}.' -f ($index + 1), $stages.Count, $stage)
+        if ($stage -ne 'Preflight' -and $null -ne $stoppedStart -and -not $stoppedWaited) {
+            $stoppedWaited = $true
+            $monitoringInRange = [array]::IndexOf($stages, 'Monitoring') -ge $index -and [array]::IndexOf($stages, 'Monitoring') -le $stopIndex
+            $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -RestoreT1Monitoring:(-not $monitoringInRange))
+            & $addAll $started
+            if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
+                return $results.ToArray()
+            }
+        }
         switch ($stage) {
             'Preflight' {
                 $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf)
                 & $addAll $preflight
                 if (& $hasStatus $preflight 'Fail') {
                     & $stageResult 'Preflight' 'Fail' 'Preflight has at least one Fail, so nothing was deployed.' 'Fix each Fail above (its remediation says how), then run deploy.ps1 again.'
+                    if ($null -ne $stoppedStart -and @($stoppedStart.Requested).Count -gt 0) {
+                        # What this run asked to start keeps running, and billing (ADR 0016), until a stop.
+                        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
+                    }
                     return $results.ToArray()
                 }
                 $pick = { param([string] $CheckId, [string] $Key) $item = $preflight | Where-Object { $_.checkId -eq $CheckId } | Select-Object -First 1; Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name $Key }
@@ -328,8 +352,9 @@ function Invoke-DemoDeployment {
                     T3UseFreeLimit          = [bool]$context.T3UseFreeLimit
                     T3AdminGroupDisplayName = [string]$context.T3AdminGroupName
                 }
-                if (-not $whatIf -and (Test-DemoT4Enabled -Config $Config)) {
-                    # A stopped T4 rejects the template's update, so it starts first (Phase 24, ADR 0019).
+                if (-not $whatIf -and (Test-DemoT4Enabled -Config $Config) -and @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.START' -and [string]$_.status -eq 'Pass' }).Count -eq 0) {
+                    # A stopped T4 rejects the template's update, so it starts first (Phase 24, ADR 0019), unless this run
+                    # already started it.
                     $t4Start = Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 20 -CheckPrefix DEPLOY
                     if ($t4Start.status -ne 'Not selected') {
                         $results.Add($t4Start)

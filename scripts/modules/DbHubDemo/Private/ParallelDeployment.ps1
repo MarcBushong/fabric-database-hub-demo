@@ -247,6 +247,9 @@ function Invoke-DemoParallelDeployment {
     Invoke-DemoDeployment -Parallel calls it. Internal.
 
     .DESCRIPTION
+    0. On an existing environment, what's stopped (the nightly auto-shutdown, stop-demo.ps1, a stop) starts while
+       preflight runs (Request-DemoStoppedStart: the VMs, and T4 when it's deployed), and runs before the tracks start or
+       the template deploys (Wait-DemoStoppedStart, DEPLOY.VMSTART; Phase 28 live finding). Running VMs are only read.
     1. The subscription guard; then the bootstrap bundle and the workload runner start building in their own
        process (Start-DemoArtifactBuildJob), which hands them over through a private handoff directory.
        Preflight (Invoke-DemoPreflight) and the T2 source (Resolve-DemoT2Source, PREFLIGHT.T2.SOURCE). Any
@@ -603,6 +606,18 @@ function Invoke-DemoParallelDeployment {
             }
         }
 
+        # 0. Phase 28 live finding (2026-10-30): a rerun after the nightly auto-shutdown, stop-demo.ps1, or a stop found
+        # the VMs deallocated, and its first Run Command failed. What's stopped is asked to start now, so it boots while
+        # preflight runs; running VMs are only read. Nothing on a first deployment, a what-if, or a run that needs no VM.
+        $stoppedStart = $null
+        $needsVms = -not $whatIf -and [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists') -and ([bool]$plan.Infrastructure -or @($order).Count -gt 0 -or [bool]$plan.Validation)
+        if ($needsVms) {
+            $stoppedStart = Request-DemoStoppedStart -Config $Config -SkipT4:$skipT4 -ProgressPath $ProgressPath -Confirm:$false
+        }
+        else {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -State 'Skipped' -Message $(if ([bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')) { 'Not part of this run.' } else { 'Not needed: nothing is deployed yet.' })
+        }
+
         # 1. Preflight and the T2 source.
         if ($plan.Preflight) {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -615,6 +630,12 @@ function Invoke-DemoParallelDeployment {
             $context.T2SnapshotId = $source.SnapshotId
             if ((& $hasStatus $preflight 'Fail') -or $source.Result.status -eq 'Fail') {
                 & $stageResult 'Preflight' 'Fail' 'Preflight has at least one Fail, so nothing was deployed.' 'Fix each Fail above (its remediation says how), then run deploy.ps1 again.'
+                if ($null -ne $stoppedStart -and @($stoppedStart.Requested).Count -gt 0) {
+                    # What this run asked to start keeps running, and billing (ADR 0016), until a stop.
+                    $message = 'This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')
+                    $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
+                    Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status 'Warning' -Message $message
+                }
                 return $results.ToArray()
             }
             $pick = { param([string] $CheckId, [string] $Key) $item = $preflight | Where-Object { $_.checkId -eq $CheckId } | Select-Object -First 1; Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name $Key }
@@ -644,6 +665,16 @@ function Invoke-DemoParallelDeployment {
         if (-not $whatIf) {
             & $ensureContext
             Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -T2Source ([string]$context.T2Source)
+        }
+
+        # The VMs that were stopped run before anything needs them: the tracks' Run Commands, and the template's
+        # extensions. A VM that doesn't start stops the run here, with the next action (DEPLOY.VMSTART).
+        if ($null -ne $stoppedStart) {
+            $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -ProgressPath $ProgressPath -RestoreT1Monitoring:('Monitoring' -notin @($plan.Tracks['T1'])))
+            & $addAll $started
+            if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
+                return $results.ToArray()
+            }
         }
 
         # 2. The track processes, a few seconds apart, so their guards run while the template deploys.
@@ -687,9 +718,10 @@ function Invoke-DemoParallelDeployment {
             if ($t4StartSku) {
                 $deployArguments['T4StartSku'] = $t4StartSku
             }
-            if (-not $whatIf -and -not $skipT4) {
+            if (-not $whatIf -and -not $skipT4 -and @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.START' -and [string]$_.status -eq 'Pass' }).Count -eq 0) {
                 # A stopped flexible server rejects every other management operation, including the template's
-                # update, so a stopped T4 starts first (Phase 24, ADR 0019). Not selected when T4 doesn't exist yet.
+                # update, so a stopped T4 starts first (Phase 24, ADR 0019), unless this run already started it. Not
+                # selected when T4 doesn't exist yet.
                 $t4Start = Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 20 -CheckPrefix DEPLOY
                 if ($t4Start.status -ne 'Not selected') {
                     $results.Add($t4Start)

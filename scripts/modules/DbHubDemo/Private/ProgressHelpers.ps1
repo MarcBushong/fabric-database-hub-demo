@@ -113,11 +113,12 @@ function Get-DemoProgressCatalog {
     The status page's ordered steps per track (Phase 28, brief item 11). Pure. Internal.
 
     .DESCRIPTION
-    Preflight; Infrastructure; T1 (artifacts, bootstrap, activity, monitoring, telemetry); T3; T4; Fabric (the
-    optional Insights app included, marked optional); T2 (a golden restore, or the host build, and in PaygWizard mode
-    the guided stop and the setup check, then the sign-in cleanup, Arc onboarding, PAYG and monitoring, and
-    telemetry; Set-DemoProgressPlan skips what the T2 source doesn't use); Validation. Each step has an id, a label,
-    and the track steps (Get-DemoTrackStep) it belongs to.
+    Preflight, with the start of the VMs that were stopped (StartVms; Phase 28 live finding); Infrastructure; T1
+    (artifacts, bootstrap, activity, monitoring, telemetry); T3; T4; Fabric (the optional Insights app included, marked
+    optional); T2 (a golden restore, or the host build, and in PaygWizard mode the guided stop and the setup check, then
+    the sign-in cleanup, Arc onboarding, PAYG and monitoring, and telemetry; Set-DemoProgressPlan skips what the T2
+    source doesn't use); Validation. Each step has an id, a label, and the track steps (Get-DemoTrackStep) it belongs
+    to.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -132,7 +133,11 @@ function Get-DemoProgressCatalog {
 
     $step = { param([string] $Id, [string] $Label, [string[]] $From, [bool] $Optional = $false) [ordered]@{ id = $Id; label = $Label; from = @($From); optional = $Optional } }
     $tracks = [System.Collections.Generic.List[object]]::new()
-    $tracks.Add([ordered]@{ name = 'Preflight'; label = 'Preflight'; steps = @(& $step 'Preflight' 'Checks before anything is created' @('Preflight')) })
+    $tracks.Add([ordered]@{ name = 'Preflight'; label = 'Preflight'; steps = @(
+                (& $step 'StartVms' 'Start the VMs that were stopped (the nightly auto-shutdown, stop-demo.ps1)' @('StartVms'))
+                (& $step 'Preflight' 'Checks before anything is created' @('Preflight'))
+            )
+        })
     $tracks.Add([ordered]@{ name = 'Infrastructure'; label = 'Infrastructure'; steps = @(& $step 'Infrastructure' 'Azure resources (the template)' @('Infrastructure')) })
     $tracks.Add([ordered]@{ name = 'T1'; label = 'T1: SQL Server on an Azure VM (sqlvm01)'; steps = @(
                 (& $step 'T1.Artifacts' 'Artifacts to sqlvm01' @('T1/Artifacts'))

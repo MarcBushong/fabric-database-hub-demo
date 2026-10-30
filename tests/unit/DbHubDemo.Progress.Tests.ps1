@@ -43,6 +43,9 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         $productKey = New-TestModel -InstallMode 'ProductKey'
         @(($productKey['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] }) | Should -Not -Contain 'T2.GuidedStop'
         @($productKey['tracks'] | ForEach-Object { $_['name'] }) | Should -Not -Contain 'T4'
+        # Phase 28 live finding: a rerun starts the VMs that were stopped first, and the page says so.
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Preflight' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('StartVms', 'Preflight')
+        (Get-TestStep -Model $model -Id 'StartVms')['label'] | Should -Match 'VMs that were stopped'
     }
 
     It 'marks the Insights app optional, and every step starts Pending' {
