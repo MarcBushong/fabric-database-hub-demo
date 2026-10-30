@@ -81,7 +81,7 @@ function Get-DemoFabricItemReadBack {
         }
     }
     catch {
-        return (& $result 'Warning' ("The import worked, but reading back the definition of {0} stopped: {1}" -f $target, (Protect-DemoText -Text $_.Exception.Message)) $retry)
+        return (& $result 'Warning' ("The import worked, but reading back the definition of {0} stopped: {1}" -f $target, (Get-DemoExceptionText -Exception $_.Exception)) $retry)
     }
 
     $definition = Get-DemoMemberValue -InputObject $body -Name 'definition'

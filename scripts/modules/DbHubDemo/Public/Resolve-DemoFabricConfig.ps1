@@ -229,10 +229,26 @@ function Resolve-DemoFabricConfig {
                         $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces' -f $base) -Body $body -Token $Token
                     }
                     catch {
-                        $created = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Protect-DemoText -Text $_.Exception.Message) } }
+                        $created = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Get-DemoExceptionText -Exception $_.Exception) } }
                     }
                     $newId = [string](Get-DemoMemberValue -InputObject $created.Body -Name 'id')
-                    if ($created.StatusCode -in 200, 201 -and $newId) {
+                    $code = [string](Get-DemoMemberValue -InputObject $created.Body -Name 'errorCode')
+                    $taken = $created.StatusCode -eq 409 -or $code -match '(?i)AlreadyInUse|AlreadyExists|NameConflict'
+                    $takenMatch = $null
+                    if ($taken) {
+                        # A create sent again after a network error can find the workspace its first attempt made (Phase
+                        # 28 live finding, 2026-10-30): it's then resolved by name, as one found at the start is.
+                        $again = Read-DemoHubFabricList -Uri ('{0}/workspaces' -f $base) -Token $Token -MaxPages $MaxPages
+                        $againShared = @($again.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'type') -ine 'Personal' })
+                        $takenMatch = @(Select-DemoFabricNamed -Items $againShared -Name $setting.WorkspaceName)
+                    }
+                    if ($taken -and @($takenMatch).Count -eq 1) {
+                        $workspace = @($takenMatch)[0]
+                        $state['WorkspaceId'] = ([string](Get-DemoMemberValue -InputObject $workspace -Name 'id')).ToLowerInvariant()
+                        $state['WorkspaceName'] = [string](Get-DemoMemberValue -InputObject $workspace -Name 'displayName')
+                        & $add 'FABRIC.RESOLVE.WORKSPACE' 'Pass' ('Found the Fabric workspace "{0}" by name: its create said it already exists (a request sent again after a network error finds what the first one made).' -f $state['WorkspaceName']) ([ordered]@{ workspaceId = $state['WorkspaceId']; workspaceName = $state['WorkspaceName']; capacityId = [string](Get-DemoMemberValue -InputObject $workspace -Name 'capacityId'); source = 'name' }) '' $doc['ListWorkspaces']
+                    }
+                    elseif ($created.StatusCode -in 200, 201 -and $newId) {
                         $state['WorkspaceId'] = $newId.ToLowerInvariant()
                         $state['WorkspaceCreated'] = $true
                         $state['CapacityId'] = $capacity.CapacityId
@@ -279,7 +295,7 @@ function Resolve-DemoFabricConfig {
                 $assigned = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces/{1}/assignToCapacity' -f $base, $state['WorkspaceId']) -Body ([ordered]@{ capacityId = $capacity.CapacityId }) -Token $Token
             }
             catch {
-                $assigned = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Protect-DemoText -Text $_.Exception.Message) } }
+                $assigned = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Get-DemoExceptionText -Exception $_.Exception) } }
             }
             $evidence = [ordered]@{ workspaceId = $state['WorkspaceId']; capacityId = $capacity.CapacityId; capacityName = $setting.CapacityName }
             if ($assigned.StatusCode -in 200, 202) {
@@ -371,7 +387,7 @@ function Resolve-DemoFabricConfig {
                         $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces/{1}/lakehouses' -f $base, $state['WorkspaceId']) -Body $body -Token $Token
                     }
                     catch {
-                        $created = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Protect-DemoText -Text $_.Exception.Message) } }
+                        $created = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Get-DemoExceptionText -Exception $_.Exception) } }
                     }
                     $code = [string](Get-DemoMemberValue -InputObject $created.Body -Name 'errorCode')
                     $failure = ''

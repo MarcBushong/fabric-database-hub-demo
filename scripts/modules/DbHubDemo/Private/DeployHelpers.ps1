@@ -436,7 +436,9 @@ function Invoke-DemoFabricScriptStep {
 
     .DESCRIPTION
     Only the parameters the script declares are passed (ConfigPath, OutputPath, and Confirm), plus -Argument. A
-    script that throws, or writes no records, is reported as -CheckId Fail. Without -ConfigPath, the configuration
+    script that throws, or writes no records, is reported as -CheckId Fail, with the innermost cause of an exception; one
+    that a network error stopped after its retries (Invoke-DemoTransientRetry) has evidence networkError and says to run
+    deploy.ps1 again, which resumes the step (Phase 28 live finding, 2026-10-30). Without -ConfigPath, the configuration
     goes to a file in a private temporary directory that's deleted afterward; it holds no secrets.
     #>
     [CmdletBinding()]
@@ -478,7 +480,12 @@ function Invoke-DemoFabricScriptStep {
             $null = Invoke-DemoRepositoryScript -Path $ScriptPath -Argument $arguments
         }
         catch {
-            return @(New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} stopped: {1}' -f $name, (Protect-DemoText -Text $_.Exception.Message)) -Remediation ('Run ./scripts/{0} yourself to see its output.' -f $name))
+            # A network error that lasted through the retries (Invoke-DemoTransientRetry) needs only a rerun, which resumes
+            # this step (Phase 28 live finding, 2026-10-30); anything else, the script's own output.
+            if (Test-DemoNetworkFailure -Exception $_.Exception) {
+                return @(New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} stopped: {1}' -f $name, (Get-DemoExceptionText -Exception $_.Exception)) -Evidence ([ordered]@{ networkError = $true }) -Remediation 'Run ./scripts/deploy.ps1 again: it resumes where it stopped (a network error lasted through the retries).')
+            }
+            return @(New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} stopped: {1}' -f $name, (Get-DemoExceptionText -Exception $_.Exception)) -Remediation ('Run ./scripts/{0} yourself to see its output.' -f $name))
         }
         if (-not (Test-Path -LiteralPath $output)) {
             return @(New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} wrote no results.' -f $name) -Remediation ('Run ./scripts/{0} yourself to see its output.' -f $name))

@@ -89,7 +89,8 @@ function Invoke-DemoSemanticModelRefresh {
     $refreshOnce = {
         try {
             $body = [ordered]@{ type = 'full'; commitMode = 'transactional'; retryCount = 0 }
-            $response = Invoke-DemoPowerBIRequest -Method Post -Uri $refreshesUri -Body $body -Token $Token
+            # A second request would queue a second refresh, so it's sent again only when it never reached the service.
+            $response = Invoke-DemoPowerBIRequest -Method Post -Uri $refreshesUri -Body $body -Token $Token -NotIdempotent
             if ($response.StatusCode -ne 202) {
                 return (& $refused $response 'The refresh request was refused')
             }
@@ -137,7 +138,11 @@ function Invoke-DemoSemanticModelRefresh {
             }
         }
         catch {
-            return (& $new 'Fail' ('The refresh stopped: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) 'Run the script again; the refresh is idempotent.')
+            # A network error that lasted through the retries (Invoke-DemoTransientRetry) says so, with its innermost cause.
+            if (Test-DemoNetworkFailure -Exception $_.Exception) {
+                $evidence['networkError'] = $true
+            }
+            return (& $new 'Fail' ('The refresh stopped: {0}' -f (Get-DemoExceptionText -Exception $_.Exception)) 'Run the script again; the refresh is idempotent.')
         }
     }
 

@@ -417,6 +417,11 @@ function Invoke-DemoRestRequest {
     never compared or kept), or gives none, nothing is retried. A failure after a challenge names the request,
     the status, and the WWW-Authenticate header with its claims value redacted.
 
+    A transient failure (a network error, HTTP 408, 429, 502, 503, or 504) is sent again by Invoke-DemoTransientRetry,
+    up to 4 attempts: reads, PUTs, and the POSTs that only read; a request that creates or adds something only when it
+    never reached the service, or on HTTP 429 (Phase 28 live finding, 2026-10-30). A network error that lasts is StdErr,
+    with its innermost cause.
+
     Returns the shape of an Azure CLI call: ExitCode (0 for a 2xx answer, 1 otherwise), StdOut (the response
     body), StdErr (the redacted error), and StatusCode, plus Retried (the request was sent again with a fresh
     token), Challenge (what happened after a claims challenge, or ''), and Authenticate (the redacted
@@ -506,12 +511,16 @@ function Invoke-DemoRestRequest {
         $request['Body'] = $Body
         $request['ContentType'] = 'application/json'
     }
+    # A transient failure is sent again (Invoke-DemoTransientRetry; Phase 28 live finding, 2026-10-30): any read, a PUT, and
+    # the POSTs that only read (Microsoft Graph's getByIds and checkMemberGroups, Resource Graph queries); a request that
+    # creates or adds something only when it never reached the service, or on HTTP 429.
+    $repeatable = $Method -in 'GET', 'PUT' -or ($Method -eq 'POST' -and $Uri -match '(?i)/directoryObjects/getByIds$|/checkMemberGroups$|/providers/Microsoft\.ResourceGraph/resources\?')
     $send = {
         try {
-            $response = Invoke-WebRequest @request
+            $response = Invoke-DemoTransientRetry -Send { param([hashtable] $Call) Invoke-WebRequest @Call } -State $request -Target ([uri]$Uri).Host -NotIdempotent:(-not $repeatable)
         }
         catch {
-            return [pscustomobject]@{ Status = 0; Content = ''; Authenticate = ''; Error = (Protect-DemoText -Text $_.Exception.Message) }
+            return [pscustomobject]@{ Status = 0; Content = ''; Authenticate = ''; Error = (Get-DemoExceptionText -Exception $_.Exception) }
         }
         $content = if ($response.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($response.Content) } else { [string]$response.Content }
         $headers = Get-DemoMemberValue -InputObject $response -Name 'Headers'

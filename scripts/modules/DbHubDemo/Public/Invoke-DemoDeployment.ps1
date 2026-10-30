@@ -312,11 +312,28 @@ function Invoke-DemoDeployment {
     # 2026-10-30), so a run that ends with the validation and has no Monitoring stage checks it once the VMs run.
     $inRange = { param([string] $Name) $position = [array]::IndexOf($stages, $Name); $position -ge $startIndex -and $position -le $stopIndex }
     $checkT1Monitoring = $existing -and (& $inRange 'Validation') -and -not (& $inRange 'Monitoring')
+    # -Sequential records only its stage, never a track, so once preflight passes, the records of the parallel tracks whose
+    # steps this run does again are lowered (all of them from preflight): a later parallel -Resume then runs those steps
+    # again instead of trusting an earlier run's record (Get-DemoTrackRecordReset; Phase 28 live finding, 2026-10-30).
+    $trackReset = @{}
+    if (-not $whatIf -and $startIndex -le $stopIndex) {
+        $trackPlan = Resolve-DemoTrackPlan -FromStage $stages[$startIndex] -StopAfter $stages[$stopIndex] -SkipFabric:$SkipFabric -SkipT4:(-not (Test-DemoT4Enabled -Config $Config))
+        $trackReset = Get-DemoTrackRecordReset -Plan $trackPlan -State $state -FreshStart:($startIndex -eq 0)
+    }
     for ($index = $startIndex; $index -le $stopIndex; $index++) {
         $stage = $stages[$index]
         Write-DemoLog -Message ('Stage {0} of {1}: {2}.' -f ($index + 1), $stages.Count, $stage)
         if ($stage -ne 'Preflight' -and -not $vmsReady) {
             $vmsReady = $true
+            if ($trackReset.Count -gt 0) {
+                try {
+                    Set-DemoDeploymentState -Config $Config -Value $trackReset -Confirm:$false
+                    Write-DemoLog -Message ('The track records an earlier run left were reset ({0}), so a later resume can''t skip a step this run doesn''t finish.' -f ((@($trackReset.Keys | Sort-Object) | ForEach-Object { $_ -replace '^Track', '' }) -join ', '))
+                }
+                catch {
+                    Write-DemoLog -Level Warning -Message ('The track records an earlier run left couldn''t be reset, so a later resume could skip a step this run doesn''t finish: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+                }
+            }
             if ($null -ne $stoppedStart) {
                 $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart)
                 & $addAll $started
@@ -593,7 +610,8 @@ function Invoke-DemoDeployment {
             }
             'Monitoring' {
                 # A NotRunning plugin gets the short grace, then the agent's restart, and T1.SQLVM.MONITORING is read
-                # again after a restart that worked (Invoke-DemoSqlVmMonitoringWait; live, 2026-10-27 and 2026-10-30).
+                # again once the restart has run, so a Fail there stops the stage with its own cause
+                # (Invoke-DemoSqlVmMonitoringWait; live, 2026-10-27 and 2026-10-30).
                 $monitoringResults = @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes $MonitoringWaitMinutes)
                 foreach ($item in $monitoringResults) {
                     $results.Add($item)

@@ -1219,6 +1219,42 @@ Describe 'T1 SQL VM performance monitoring' {
             $script:logged[0] | Should -Be 'T1''s monitoring plugin has no status yet; waiting up to 20 minutes more for Running and OK; no action needed.'
             @($script:logged).Count | Should -Be 6 -Because 'a console line every few minutes (at 0, 3, 7, 11, 15, and 19), never silent'
         }
+
+        It 'ends the wait at the first NotRunning read with a grace of 0, as start-demo.ps1 does after it recreates T3, still gives a flag it merges 5 minutes, and waits the whole time without a grace' {
+            # The owner's decision, 2026-10-30: start-demo.ps1 restarts a NotRunning plugin at once; presenters run it before
+            # each session.
+            $result = Enable-DemoSqlVmMonitoring -Config $config -WaitMinutes 20 -NotRunningGraceMinutes 0 -Confirm:$false
+            $result.evidence.stoppedForRestart | Should -BeTrue
+            $result.evidence.notRunningGraceMinutes | Should -Be 0
+            $result.evidence.waitedSeconds | Should -Be 20 -Because 'one read, and no sleep'
+            @($script:sleeps) | Should -BeNullOrEmpty
+            $script:reads | Should -Be 1
+
+            # A flag this call merges still gets 5 minutes: the setting takes a few minutes to apply.
+            $script:reads = 0
+            $script:sleeps.Clear()
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoSqlVmMonitoringState -MockWith {
+                $script:reads++
+                $script:now = $script:now.AddSeconds(20)
+                New-SqlVmState -Settings $(if ($script:reads -eq 1) { $null } else { $script:flag }) -Message $(if ($script:reads -eq 1) { '' } else { $script:notRunning })
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '{}'; StdErr = '' } }
+            $result = Enable-DemoSqlVmMonitoring -Config $config -WaitMinutes 20 -NotRunningGraceMinutes 0 -Confirm:$false
+            $result.evidence.notRunningGraceMinutes | Should -Be 5
+            $result.evidence.waitedSeconds | Should -Be 360
+
+            # Without -NotRunningGraceMinutes (configure-monitoring.ps1), a NotRunning plugin is waited for the whole time.
+            $script:reads = 0
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoSqlVmMonitoringState -MockWith {
+                $script:reads++
+                $script:now = $script:now.AddSeconds(20)
+                New-SqlVmState -Settings $script:flag -Message $script:notRunning
+            }
+            $result = Enable-DemoSqlVmMonitoring -Config $config -WaitMinutes 5 -Confirm:$false
+            $result.status | Should -Be 'Warning'
+            $result.evidence.Contains('stoppedForRestart') | Should -BeFalse
+            $result.evidence.waitedSeconds | Should -BeGreaterOrEqual 300
+        }
     }
 }
 

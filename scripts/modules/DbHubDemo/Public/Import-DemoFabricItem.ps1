@@ -158,6 +158,9 @@ function Import-DemoFabricItem {
             404 { 'The workspace wasn''t found: check fabric.workspaceName in config/demo.config.json (or the fabric.workspaceId override, or -WorkspaceId).' }
             default { 'Run the script again; it is idempotent. ' + $p5 }
         }
+        if ($evidence.Contains('networkError')) {
+            $remediation = 'Run the script again: a network error lasted through the retries, and the import is idempotent.'
+        }
         New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message $Message -Evidence $evidence `
             -Remediation $remediation -DocUrl $docUrl
     }
@@ -264,7 +267,12 @@ function Import-DemoFabricItem {
         }
     }
     catch {
-        return (& $fail ("The import of {0} stopped: {1}" -f $target, (Protect-DemoText -Text $_.Exception.Message)) 0)
+        # A network error that lasted through the retries (Invoke-DemoTransientRetry): a rerun is the fix, and deploy.ps1's
+        # NOT DONE says so (Test-DemoNetworkResult; Phase 28 live finding, 2026-10-30).
+        if (Test-DemoNetworkFailure -Exception $_.Exception) {
+            $evidence['networkError'] = $true
+        }
+        return (& $fail ("The import of {0} stopped: {1}" -f $target, (Get-DemoExceptionText -Exception $_.Exception)) 0)
     }
 
     $evidence['itemId'] = $itemId

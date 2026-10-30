@@ -219,12 +219,72 @@ function Get-DemoProgressStepId {
     }
 }
 
+function Get-DemoProgressStepLabel {
+    <#
+    .SYNOPSIS
+    A status-page step's label (Get-DemoProgressCatalog) as it reads in a console sentence: without its parenthetical or
+    its colon's detail, lowercased unless it starts with an abbreviation, and with T3 or T4 in front of their steps,
+    which T1's track runs. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Id
+    )
+
+    foreach ($track in @(Get-DemoProgressCatalog -T4Enabled)) {
+        foreach ($item in @($track['steps'])) {
+            if ([string]$item['id'] -ne $Id) {
+                continue
+            }
+            $label = ([string]$item['label'] -replace '\s*\([^()]*\)\s*$', '' -replace ':.*$', '').Trim()
+            if ($label.Length -gt 1 -and [char]::IsUpper($label[0]) -and [char]::IsLower($label[1])) {
+                $label = [string][char]::ToLowerInvariant($label[0]) + $label.Substring(1)
+            }
+            $group = ($Id -split '\.')[0]
+            if ($group -in 'T3', 'T4') {
+                $label = '{0} {1}' -f $group, ($label -replace '^set up\b', 'setup')
+            }
+            return $label
+        }
+    }
+    return $Id
+}
+
+function Get-DemoStepFailureLine {
+    <#
+    .SYNOPSIS
+    The console line a track logs as soon as one of its steps fails (Phase 28 live finding, 2026-10-30: the console said
+    nothing until the final banner): what failed, why, and that the run goes on and a rerun resumes it. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Label,
+
+        [AllowEmptyString()]
+        [string] $Message = ''
+    )
+
+    $why = (ConvertTo-DemoPlainText -Value $Message).Trim().TrimEnd('.')
+    if ($why.Length -gt 300) {
+        $why = $why.Substring(0, 297) + '...'
+    }
+    if (-not $why) {
+        $why = 'its results say why'
+    }
+    return ('The {0} step failed: {1}. The other tracks continue; the run ends NOT DONE, and ./scripts/deploy.ps1 resumes it.' -f $Label, $why)
+}
+
 function Set-DemoProgressPlan {
     <#
     .SYNOPSIS
     Marks the progress model's steps by this run's plan (Resolve-DemoTrackPlan): a step a resumed run picks up after is
-    Done (an earlier run finished it), a step outside the run is Skipped, and the T2 steps its source doesn't use are
-    Skipped (a golden restore has no build or guided stop; a build has no restore). Internal.
+    Done (an earlier run finished it), the step it picks up at says it didn't finish in the previous run and runs again,
+    a step outside the run is Skipped, and the T2 steps its source doesn't use are Skipped (a golden restore has no build
+    or guided stop; a build has no restore). Internal.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
     [CmdletBinding()]
@@ -244,33 +304,50 @@ function Set-DemoProgressPlan {
     if (-not $Path) {
         return
     }
+    # The T2 steps its source doesn't use.
+    $unused = if ($T2Source -in 'golden', 'existing-golden') {
+        @{ 'T2.HostBuild' = 'Golden'; 'T2.GuidedStop' = 'Golden'; 'T2.SetupCheck' = 'Golden'; 'T2.SignInCleanup' = 'Golden' }
+    }
+    elseif ($T2Source) {
+        @{ 'T2.Restore' = 'Build' }
+    }
+    else {
+        @{}
+    }
     $map = @{}
     foreach ($track in 'T1', 'T2', 'T4', 'Fabric') {
         $names = @((Get-DemoTrackStep -Track $track).Keys)
         $planned = @($Plan.Tracks[$track])
         $firstIndex = if ($planned.Count -gt 0) { [array]::IndexOf($names, [string]$planned[0]) } else { $names.Count }
+        # A resumed track picks up at the step its previous run didn't finish, which says so on the first row this run uses
+        # (Phase 28 live finding, 2026-10-30).
+        $again = [bool]$Resume
         for ($i = 0; $i -lt $names.Count; $i++) {
-            $verdict = if ($names[$i] -in $planned) { 'Run' } elseif ($Resume -and $i -lt $firstIndex) { 'Earlier' } else { 'Skip' }
             foreach ($id in @(Get-DemoProgressStepId -Track $track -Step $names[$i])) {
-                $map[$id] = $verdict
+                if ($names[$i] -in $planned) {
+                    if ($unused.Contains($id)) {
+                        $map[$id] = $unused[$id]
+                    }
+                    elseif ($again) {
+                        $map[$id] = 'Again'
+                        $again = $false
+                    }
+                    else {
+                        $map[$id] = 'Run'
+                    }
+                }
+                elseif ($Resume -and $i -lt $firstIndex) {
+                    $map[$id] = 'Earlier'
+                }
+                else {
+                    $map[$id] = 'Skip'
+                }
             }
         }
     }
     $map['Preflight'] = if ($Plan.Preflight) { 'Run' } elseif ($Resume) { 'Earlier' } else { 'Skip' }
     $map['Infrastructure'] = if ($Plan.Infrastructure) { 'Run' } elseif ($Resume) { 'Earlier' } else { 'Skip' }
     $map['Validation'] = if ($Plan.Validation) { 'Run' } else { 'Skip' }
-    if ($T2Source -in 'golden', 'existing-golden') {
-        foreach ($id in 'T2.HostBuild', 'T2.GuidedStop', 'T2.SetupCheck', 'T2.SignInCleanup') {
-            if ($map[$id] -eq 'Run') {
-                $map[$id] = 'Golden'
-            }
-        }
-    }
-    elseif ($T2Source) {
-        if ($map['T2.Restore'] -eq 'Run') {
-            $map['T2.Restore'] = 'Build'
-        }
-    }
     Update-DemoProgress -Path $Path -Data @{ Map = $map } -Action {
         param($Model, $Change)
         $now = Get-DemoUnixTime
@@ -279,12 +356,20 @@ function Set-DemoProgressPlan {
                 $verdict = [string]$Change['Map'][[string]$item['id']]
                 $text = switch ($verdict) {
                     'Earlier' { 'Finished in an earlier run.' }
+                    'Again' { 'Didn''t finish in the previous run; running it again.' }
                     'Skip' { 'Not part of this run.' }
                     'Golden' { 'Restored from the golden snapshot: no build and no guided stop.' }
                     'Build' { 'No golden snapshot: the host builds its guest instead.' }
                     default { '' }
                 }
                 if (-not $text) {
+                    continue
+                }
+                if ($verdict -eq 'Again') {
+                    $item['state'] = 'Pending'
+                    $item['message'] = $text
+                    $item['startedAt'] = 0
+                    $item['endedAt'] = 0
                     continue
                 }
                 $item['state'] = if ($verdict -eq 'Earlier') { 'Done' } else { 'Skipped' }

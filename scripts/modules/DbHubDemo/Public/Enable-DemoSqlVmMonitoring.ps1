@@ -25,9 +25,10 @@ function Enable-DemoSqlVmMonitoring {
        elapsed time, reads and the merge included (a read takes 15 to 20 seconds). While it waits, the console gets a
        line every few minutes and -ProgressPath's -ProgressStepId the wait's state (Phase 28 live finding, 2026-10-30).
        With -NotRunningGraceMinutes, the wait ends once the plugin has reported a state other than Running (NotRunning)
-       for that long, at least 5 minutes when this call merged the flag (Get-DemoSqlVmPluginGrace), because a NotRunning
-       plugin rarely starts by itself and the agent's restart does (the caller's Restore-DemoSqlVmMonitoringPlugin;
-       live, 2026-10-30: the Monitoring step waited 20 minutes first, 25 with the reads).
+       for that long (0: at its first such read), at least 5 minutes when this call merged the flag
+       (Get-DemoSqlVmPluginGrace), because a NotRunning plugin rarely starts by itself and the agent's restart does (the
+       caller's Restore-DemoSqlVmMonitoringPlugin; live, 2026-10-30: the Monitoring step waited 20 minutes first, 25 with
+       the reads).
     T1 also needs outbound HTTPS to telemetry.<region>.arcdataservices.com, which the NSG's HTTPS rule allows
     (ADR 0007). Under -WhatIf nothing is written.
 
@@ -41,9 +42,10 @@ function Enable-DemoSqlVmMonitoring {
     Seconds between reads while waiting.
 
     .PARAMETER NotRunningGraceMinutes
-    0 (the default) waits the whole -WaitMinutes. Above 0, how long a plugin that reports a state other than Running
-    is waited for before the wait ends, so the caller can restart the agent: deploy.ps1 passes 3 when the flag was
-    set before the run, and 5 when the run merged it.
+    -1 (the default) waits the whole -WaitMinutes. 0 or more: how long a plugin that reports a state other than Running
+    is waited for before the wait ends, so the caller can restart the agent (0 ends it at the first such read): deploy.ps1's
+    T1 Monitoring step passes 3 when the flag was set before the run and 5 when the run merged it, and start-demo.ps1,
+    after it recreates T3, passes 0. After a merge in this call, it's at least 5.
 
     .PARAMETER ProgressPath
     The status page's progress model, whose -ProgressStepId shows the wait; empty for none.
@@ -66,8 +68,8 @@ function Enable-DemoSqlVmMonitoring {
         [ValidateRange(1, 600)]
         [int] $PollIntervalSeconds = 60,
 
-        [ValidateRange(0, 60)]
-        [int] $NotRunningGraceMinutes = 0,
+        [ValidateRange(-1, 60)]
+        [int] $NotRunningGraceMinutes = -1,
 
         [AllowEmptyString()]
         [string] $ProgressPath = '',
@@ -137,8 +139,9 @@ function Enable-DemoSqlVmMonitoring {
     }
 
     $result = ConvertTo-DemoSqlVmMonitoringResult -State $state -Action $actions.ToArray()
-    $graceMinutes = $NotRunningGraceMinutes
-    if ($graceMinutes -gt 0 -and $actions.Count -gt 0) {
+    $graceOn = $NotRunningGraceMinutes -ge 0
+    $graceMinutes = [System.Math]::Max(0, $NotRunningGraceMinutes)
+    if ($graceOn -and $actions.Count -gt 0) {
         # The setting takes a few minutes to apply after the merge.
         $graceMinutes = [System.Math]::Max($graceMinutes, [int](Get-DemoSqlVmPluginGrace).JustMerged)
     }
@@ -152,7 +155,7 @@ function Enable-DemoSqlVmMonitoring {
             break
         }
         $pluginState = [string]$result.evidence['pluginState']
-        $notRunning = $graceSeconds -gt 0 -and $pluginState -and $pluginState -ne 'Running'
+        $notRunning = $graceOn -and $pluginState -and $pluginState -ne 'Running'
         if (-not $notRunning) {
             $notRunningSince = -1.0
         }
@@ -175,7 +178,7 @@ function Enable-DemoSqlVmMonitoring {
     if ($budget -gt 0) {
         $result.evidence['waitedSeconds'] = [int][System.Math]::Max(((Get-DemoUtcNow) - $startUtc).TotalSeconds, $slept)
     }
-    if ($graceSeconds -gt 0) {
+    if ($graceOn) {
         $result.evidence['notRunningGraceMinutes'] = $graceMinutes
         $result.evidence['stoppedForRestart'] = $stoppedForRestart
     }

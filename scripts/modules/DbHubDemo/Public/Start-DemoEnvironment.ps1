@@ -16,9 +16,7 @@ function Start-DemoEnvironment {
        after a deallocation (live, 2026-10-22), gets the SQL IaaS Agent service restarted
        (START.T1.MONITORING, Restore-DemoSqlVmMonitoringPlugin): first it waits up to 5 minutes for the agent to
        report the plugin's status, because a restart right after boot, before that, left it NotRunning (live,
-       2026-10-26), then gives a NotRunning plugin the same short grace as deploy.ps1's Monitoring step (3 minutes,
-       Get-DemoSqlVmPluginGrace; live, 2026-10-30, it rarely starts by itself), restarts the service only when the
-       plugin still isn't Running, and checks for Running and OK.
+       2026-10-26), then restarts the service only when the plugin isn't Running, and checks for Running and OK.
        A one-time host password left from an earlier session that couldn't be rotated is rotated now, unless
        -Interactive; with the Key Vault opt-in, the vault's copy is disabled too (START.KEYVAULT.CLEANUP).
        Before the VMs start, with the on-demand activity control (control.enabled, ADR 0020), a pending auto-stop
@@ -37,8 +35,8 @@ function Start-DemoEnvironment {
        Enable-DemoT3Workload, the readiness gate (Test-DemoT3Readiness: Resource Graph, the extended property,
        and fresh telemetry, otherwise a Warning with the measured lag), and T1's monitoring: a template
        deployment keeps the SQL IaaS extension Updating for about 10 minutes, which is a wait, not a failure
-       (Invoke-DemoSqlVmMonitoringWait: Enable-DemoSqlVmMonitoring -WaitMinutes, as configure-monitoring.ps1 -Target T1
-       does, with the short grace and the agent's restart for a NotRunning plugin).
+       (Invoke-DemoSqlVmMonitoringWait -RestartAtOnce: Enable-DemoSqlVmMonitoring -WaitMinutes, as configure-monitoring.ps1
+       -Target T1 does, then the agent's restart at once for a NotRunning plugin).
     4a. T4, the PostgreSQL flexible server (Phase 24, ADR 0019): its start is requested with the VMs
        (Servers - Start) and confirmed before its profile is set (START.T4.START). -SkipT4 leaves it stopped.
     5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, baseline by default)
@@ -206,8 +204,7 @@ function Start-DemoEnvironment {
 
     # After a deallocation, T1's monitoring plugin can stay NotRunning, so T1 sends no performance telemetry
     # (live, 2026-10-22); the SQL IaaS Agent service is restarted when it does, once the agent has reported the
-    # plugin's status (live, 2026-10-26: a restart before that left it NotRunning) and a NotRunning plugin has had the
-    # same short grace as deploy.ps1's (live, 2026-10-30: it rarely starts by itself).
+    # plugin's status (live, 2026-10-26: a restart before that left it NotRunning).
     if ($running['sqlvm01']) {
         $results.Add((Restore-DemoSqlVmMonitoringPlugin -Config $Config))
     }
@@ -269,8 +266,8 @@ function Start-DemoEnvironment {
                     $results.Add($item)
                 }
                 # The redeployment keeps the SQL IaaS extension Updating for about 10 minutes: a wait. A plugin it leaves
-                # NotRunning gets the short grace, then the agent's restart (Invoke-DemoSqlVmMonitoringWait; live, 2026-10-30).
-                foreach ($item in @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes $MonitoringWaitMinutes -CheckId 'START.T1.MONITORING')) {
+                # NotRunning gets the agent's restart at once, as after a start (Invoke-DemoSqlVmMonitoringWait; live, 2026-10-30).
+                foreach ($item in @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes $MonitoringWaitMinutes -RestartAtOnce -CheckId 'START.T1.MONITORING')) {
                     $results.Add($item)
                 }
             }

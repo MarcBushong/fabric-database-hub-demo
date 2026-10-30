@@ -104,6 +104,65 @@ Describe 'Resolve-DemoTrackPlan' {
     }
 }
 
+Describe 'Get-DemoTrackRecordReset: a resume trusts only what was recorded since the last fresh start (Phase 28 live finding, 2026-10-30)' {
+    BeforeAll {
+        # Live: a full run ended DONE; a fresh run's Fabric step then failed, so DbHubTrackFabric kept the DONE run's
+        # "Fabric", and the next plain deploy.ps1 resumed past the step and ended DONE without it.
+        function New-DoneState {
+            $state = New-TestState
+            $state.Stage = 'Validation'
+            $state.TrackT1 = 'Telemetry'
+            $state.TrackT2 = 'Telemetry'
+            $state.TrackT4 = 'Telemetry'
+            $state.TrackFabric = 'Fabric'
+            $state
+        }
+    }
+
+    It 'clears every track''s record on a fresh start, including the tracks the run doesn''t run' {
+        $state = New-DoneState
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -SkipFabric) -State $State -FreshStart }
+        $reset.Keys | Sort-Object | Should -Be @('TrackFabric', 'TrackT1', 'TrackT2', 'TrackT4')
+        @($reset.Values | Where-Object { $_ -ne '' }) | Should -BeNullOrEmpty
+
+        # Without -FreshStart, a full plan clears the tracks it runs from their first step, and leaves the others.
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -SkipFabric) -State $State }
+        $reset.Keys | Sort-Object | Should -Be @('TrackT1', 'TrackT2', 'TrackT4')
+        $reset.Contains('TrackFabric') | Should -BeFalse
+    }
+
+    It 'changes nothing on a resume, and nothing that isn''t recorded' {
+        $state = New-TestState
+        $state.Stage = 'Monitoring'
+        $state.TrackT1 = 'Monitoring'
+        $state.TrackT2 = 'Bootstraps'
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -Resume -State $State) -State $State }
+        $reset.Count | Should -Be 0
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = (New-TestState) } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan) -State $State -FreshStart }
+        $reset.Count | Should -Be 0
+    }
+
+    It 'lowers a record to the step before where -FromStage starts its track, and never raises one' {
+        $state = New-DoneState
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -FromStage 'T4') -State $State }
+        $reset['TrackT1'] | Should -Be 'T3'
+        $reset['TrackT2'] | Should -Be 'Bootstraps'
+        $reset['TrackT4'] | Should -Be ''
+        $reset['TrackFabric'] | Should -Be ''
+
+        # -FromStage Validation runs only the Telemetry steps, so Fabric keeps its record.
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -FromStage 'Validation') -State $State }
+        $reset['TrackT1'] | Should -Be 'Monitoring'
+        $reset['TrackT2'] | Should -Be 'T2'
+        $reset.Contains('TrackFabric') | Should -BeFalse
+
+        # An older record stays as it is.
+        $state.TrackT1 = 'Bootstraps'
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -FromStage 'T4') -State $State }
+        $reset.Contains('TrackT1') | Should -BeFalse
+    }
+}
+
 Describe 'Resolve-DemoT2Source' {
     BeforeEach {
         $config = New-TestConfig
@@ -461,6 +520,42 @@ Describe 'Invoke-DemoDeploymentTrack' {
         (InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }).Status | Should -Be 'Fail'
     }
 
+    It 'says on the console, as soon as a step fails, what failed and why, and that a rerun resumes it, once (Phase 28 live finding, 2026-10-30)' {
+        # Live: the history report step failed on a TLS error at about 19:24 UTC, and the console said nothing until the banner.
+        $script:warned = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ($PesterBoundParameters['Level'] -eq 'Warning') { $script:warned.Add([string]$PesterBoundParameters['Message']) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith {
+            New-DemoResult -CheckId 'DEPLOY.POWERBI' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts: The SSL connection could not be established.' -Evidence ([ordered]@{ networkError = $true }) -Remediation 'Run ./scripts/deploy.ps1 again: it resumes where it stopped (a network error lasted through the retries).'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { New-TestResult 'DEPLOY.FABRIC.APP' 'Not selected' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Fail'
+        @($script:warned) | Should -Be @('The history report step failed: configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts: The SSL connection could not be established. The other tracks continue; the run ends NOT DONE, and ./scripts/deploy.ps1 resumes it.')
+
+        # Any other step: its own label, once.
+        $script:warned.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSqlVmMonitoringWait -MockWith { New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring', 'Telemetry') }
+        $outcome.Status | Should -Be 'Fail'
+        @($script:warned) | Should -Be @('The monitoring step failed: Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden. The other tracks continue; the run ends NOT DONE, and ./scripts/deploy.ps1 resumes it.')
+
+        # A step that throws: the track's own result, with the innermost cause and, for a network error, a rerun as the fix.
+        $script:warned.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSqlVmMonitoringWait -MockWith {
+            $failure = [System.Net.Http.HttpRequestException]::new('A network error reached management.azure.com on each of 4 attempts: The SSL connection could not be established.')
+            $failure.Data['DbHubDemo.NetworkError'] = $true
+            throw $failure
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring') }
+        $track = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.TRACK.T1' }
+        $track.message | Should -Be 'Track T1 stopped at Monitoring: A network error reached management.azure.com on each of 4 attempts: The SSL connection could not be established.'
+        $track.evidence.networkError | Should -BeTrue
+        $track.remediation | Should -Be 'Run ./scripts/deploy.ps1 again: the track continues at Monitoring (a network error lasted through the retries).'
+        @($script:warned).Count | Should -Be 1
+        $script:warned[0] | Should -Match '^The monitoring step failed: Track T1 stopped at Monitoring: A network error reached'
+    }
+
     It 'gives the optional Insights app the workspace the Fabric step resolved, and shows its actual reason, never a Fail, on the status page (Phase 28 live finding)' {
         # Live: the app's own lookup by name of the workspace just created failed, and the page showed Skipped with a
         # status of Fail and a generic message about tenant settings that were on.
@@ -540,6 +635,37 @@ Describe 'Invoke-DemoDeploymentTrack' {
         }
         $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring') }
         @($script:calls | Where-Object { $_ -like 'restore*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'stops T1''s track on a Fail read right after the restart, with its own cause and fix, and doesn''t record the step (Phase 28 review)' {
+        # Reviewer, 2026-10-30, reproduced: a read right after the restart that came back Fail (uploads that fail with HTTP
+        # 403) was replaced by the wait's Warning, superseded and without a remediation, and the track went on to a vaguer
+        # NOT DONE on TELEMETRY.T1.
+        $script:records = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith {
+            $value = $PesterBoundParameters['Value']
+            if ($null -ne $value -and $value.Contains('TrackT1')) {
+                $script:records.Add([string]$value['TrackT1'])
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith {
+            [pscustomobject]@{ checkId = 'T1.SQLVM.MONITORING'; status = 'Warning'; message = 'NotRunning'; remediation = 'Run configure-monitoring.ps1 -WaitMinutes 15, or check again later.'; docUrl = ''; evidence = [ordered]@{ provisioningState = 'Succeeded'; featureFlagEnabled = $true; pluginState = 'NotRunning'; powerState = 'PowerState/running'; pending = $true } }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith {
+            New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'Restarted; Running with uploads OK after 17 seconds.' -Evidence ([ordered]@{ restarted = $true })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -MockWith {
+            New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.' -Remediation 'Check the VM''s system-assigned identity and outbound HTTPS to telemetry.<location>.arcdataservices.com:443.' -Evidence ([ordered]@{ pluginState = 'Running'; metricsUploadStatus = 'HTTP 403 Forbidden'; pending = $false })
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring', 'Telemetry') }
+        $outcome.Status | Should -Be 'Fail'
+        $outcome.Steps | Should -BeNullOrEmpty
+        $monitoring = @($outcome.Results | Where-Object { $_.checkId -eq 'T1.SQLVM.MONITORING' })
+        @($monitoring.status) | Should -Be @('Fail')
+        $monitoring[0].remediation | Should -Match 'system-assigned identity'
+        $monitoring[0].evidence.restarted | Should -BeTrue
+        $script:calls | Should -Not -Contain 'telemetry T1' -Because 'the track stops at the step whose own cause is known'
+        $script:records | Should -Not -Contain 'Monitoring'
     }
 
     It 'gives T1''s plugin the longer grace when its Bootstraps step merged the monitoring flag in this run (Phase 28 live finding)' {
@@ -889,6 +1015,136 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Validation'; $state }
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
         $script:calls | Should -Contain 'preflight'
+    }
+
+    Context 'track records across runs (Phase 28 live finding, 2026-10-30)' {
+        BeforeEach {
+            # The resource group's tags, kept across the runs of one test: what Set-DemoDeploymentState writes,
+            # Get-DemoDeploymentState reads.
+            $script:tags = @{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith {
+                $state = New-TestState
+                foreach ($key in $script:tags.Keys) {
+                    $state.$key = $script:tags[$key]
+                }
+                $state
+            }
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith {
+                $script:calls.Add('state ' + (@($Value.Keys | Sort-Object | ForEach-Object { if ($_ -like 'Track*') { '{0}={1}' -f $_, $Value[$_] } else { $_ } }) -join ','))
+                foreach ($key in $Value.Keys) {
+                    $script:tags[$key] = [string]$Value[$key]
+                }
+            }
+            # A run that skips the template reads the loader settings from the last deployment's outputs.
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+            # Each step that succeeds records itself, as the track does (Set-DemoDeploymentStateLocked); $script:failStep fails.
+            $script:failStep = ''
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+                $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
+                $done = [System.Collections.Generic.List[string]]::new()
+                $status = 'Pass'
+                $trackResults = [System.Collections.Generic.List[object]]::new()
+                foreach ($name in $Step) {
+                    if ($script:failStep -eq ('{0}/{1}' -f $Track, $name)) {
+                        $status = 'Fail'
+                        $trackResults.Add((New-TestResult ('DEPLOY.STEP.{0}' -f $name.ToUpperInvariant()) 'Fail'))
+                        break
+                    }
+                    $done.Add($name)
+                    $script:tags[('Track{0}' -f $Track)] = $name
+                }
+                if ($status -eq 'Pass' -and $Track -eq 'T1') {
+                    foreach ($id in 'T3.PROPERTY', 'TELEMETRY.T1', 'TELEMETRY.T3') {
+                        $trackResults.Add((New-TestResult $id))
+                    }
+                }
+                if ($status -eq 'Pass' -and $Track -eq 'T2') {
+                    foreach ($id in 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'TELEMETRY.T2') {
+                        $trackResults.Add((New-TestResult $id))
+                    }
+                }
+                [pscustomobject]@{ Track = $Track; Status = $status; Steps = $done.ToArray(); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults.ToArray() }
+            }
+        }
+
+        It 'runs the Fabric step again on the next plain deploy.ps1 when it failed in a fresh run after a DONE run' {
+            # Live: 13:14 a full run ended DONE; 15:14 a fresh run's Fabric step failed (a transient TLS error), and
+            # DbHubTrackFabric still said Fabric; 15:40 a plain deploy.ps1 resumed, showed Fabric as finished in an earlier
+            # run, and ended DONE without running it.
+            $script:failStep = 'Fabric/Fabric'
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $calls = @($script:calls)
+            $calls | Should -Contain 'track Fabric: Fabric'
+            $reset = [array]::IndexOf($calls, 'state TrackFabric=,TrackT1=,TrackT2=')
+            $reset | Should -BeGreaterThan ([array]::IndexOf($calls, 'preflight')) -Because 'a run that starts over clears every record once preflight passed'
+            $reset | Should -BeLessThan ([array]::IndexOf($calls, 'template disk=golden')) -Because 'the template carries the group''s tags it reads at its start'
+            $reset | Should -BeLessThan ([array]::IndexOf($calls, 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'))
+            $script:tags['TrackFabric'] | Should -Be ''
+            $script:tags['Stage'] | Should -Be 'Monitoring'
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Not -Be 'Pass'
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Results = $results } { Get-DemoDeploymentOutcome -Result $Results -State (Get-DemoDeploymentState -Config $Config) -Config $Config -Command './scripts/deploy.ps1' }
+            $outcome.Done | Should -BeFalse
+            $outcome.Unfinished | Should -Contain 'Fabric'
+
+            # The next plain deploy.ps1 continues the unfinished deployment, and the Fabric step runs again.
+            $script:calls.Clear()
+            $script:failStep = ''
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $script:calls | Should -Not -Contain 'preflight'
+            $script:calls | Should -Contain 'track Fabric: Fabric'
+            @($script:calls | Where-Object { $_ -match '^track T[12]' }) | Should -BeNullOrEmpty -Because 'T1 and T2 finished in the fresh run'
+            @($script:calls | Where-Object { $_ -match '^state .*Track' }) | Should -BeNullOrEmpty -Because 'a resume keeps the records it continues'
+            $script:tags['TrackFabric'] | Should -Be 'Fabric'
+            $script:tags['Stage'] | Should -Be 'Validation'
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+        }
+
+        It 'runs a T1 step again on the next plain deploy.ps1 when the fresh run''s T1 track failed at its first step' {
+            # Without the reset, DbHubTrackT1 kept the DONE run's Telemetry, and the resume skipped the whole T1 track.
+            $script:failStep = 'T1/T3Setup'
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
+            $script:tags['TrackT1'] | Should -Be ''
+            $script:tags['Stage'] | Should -Be 'Infrastructure'
+
+            $script:calls.Clear()
+            $script:failStep = ''
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
+            $script:calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+            $script:tags['TrackT1'] | Should -Be 'Telemetry'
+            $script:tags['Stage'] | Should -Be 'Validation'
+
+            # A T1 step after the first one fails: the resume continues at it.
+            $script:tags['Stage'] = 'Validation'
+            $script:calls.Clear()
+            $script:failStep = 'T1/Monitoring'
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
+            $script:tags['TrackT1'] | Should -Be 'Activity'
+            $script:calls.Clear()
+            $script:failStep = ''
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
+            $script:calls | Should -Contain 'track T1: Monitoring,Telemetry'
+        }
+
+        It 'keeps the records on -Resume, and lowers on -FromStage only those of the tracks it runs again, as before' {
+            $script:tags = @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Bootstraps'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -Resume }
+            $script:calls | Should -Contain 'track T2: T2,Telemetry'
+            @($script:calls | Where-Object { $_ -match '^state .*Track' }) | Should -BeNullOrEmpty
+
+            $script:calls.Clear()
+            $script:tags = @{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Validation' }
+            $script:calls | Should -Contain 'state TrackT1=Monitoring,TrackT2=T2'
+            $script:calls | Should -Contain 'track T1: Telemetry'
+            $script:tags['TrackFabric'] | Should -Be 'Fabric' -Because '-FromStage Validation doesn''t run the Fabric step'
+            $script:tags['TrackT1'] | Should -Be 'Telemetry'
+
+            # -FromStage Preflight starts over, as a plain deploy.ps1 does after a DONE run.
+            $script:calls.Clear()
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Preflight' -SkipFabric }
+            $script:calls | Should -Contain 'state TrackFabric=,TrackT1=,TrackT2='
+            $script:tags['TrackFabric'] | Should -Be '' -Because 'a run that starts over trusts nothing an earlier run recorded, even for a track it skips'
+        }
     }
 
     It 'starts T4''s Burstable fallback where preflight says, and DONE and the clock follow what T4 got (Phase 28)' {

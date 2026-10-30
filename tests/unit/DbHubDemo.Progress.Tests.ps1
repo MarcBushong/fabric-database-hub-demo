@@ -116,9 +116,52 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         (Get-TestStep -Model $model -Id 'T1.Artifacts')['state'] | Should -Be 'Done'
         (Get-TestStep -Model $model -Id 'T1.Artifacts')['message'] | Should -Match 'earlier run'
         (Get-TestStep -Model $model -Id 'T1.Telemetry')['state'] | Should -Be 'Pending'
+        (Get-TestStep -Model $model -Id 'T1.Telemetry')['message'] | Should -BeNullOrEmpty
         (Get-TestStep -Model $model -Id 'T2.HostBuild')['state'] | Should -Be 'Skipped'
         (Get-TestStep -Model $model -Id 'T2.GuidedStop')['message'] | Should -Match 'golden snapshot'
         (Get-TestStep -Model $model -Id 'T2.Restore')['state'] | Should -Be 'Pending'
+        # Where each resumed track picks up (Phase 28 live finding, 2026-10-30).
+        (Get-TestStep -Model $model -Id 'T3.Checks')['state'] | Should -Be 'Pending'
+        (Get-TestStep -Model $model -Id 'T3.Checks')['message'] | Should -Be 'Didn''t finish in the previous run; running it again.'
+        (Get-TestStep -Model $model -Id 'T2.Restore')['message'] | Should -Be 'Didn''t finish in the previous run; running it again.'
+    }
+
+    It 'shows a step a fresh run left unfinished as running again on the resume, never as finished in an earlier run (Phase 28 live finding, 2026-10-30)' {
+        # Live: the fresh run's Fabric step failed; the resume's page said "Finished in an earlier run." for Fabric.Items,
+        # Fabric.Report, and Fabric.App, and the step never ran again. Its record now goes when a run starts over.
+        $path = New-TestModelFile
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+            $state = [pscustomobject]@{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = '' }
+            $plan = Resolve-DemoTrackPlan -Resume -State $state -SkipT4
+            Set-DemoProgressPlan -Path $Path -Plan $plan -Resume -T2Source 'golden'
+        }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        (Get-TestStep -Model $model -Id 'Fabric.Items')['state'] | Should -Be 'Pending'
+        (Get-TestStep -Model $model -Id 'Fabric.Items')['message'] | Should -Be 'Didn''t finish in the previous run; running it again.'
+        foreach ($id in 'Fabric.Report', 'Fabric.App') {
+            (Get-TestStep -Model $model -Id $id)['state'] | Should -Be 'Pending'
+            (Get-TestStep -Model $model -Id $id)['message'] | Should -Not -Match 'earlier run'
+        }
+        (Get-TestStep -Model $model -Id 'T1.Telemetry')['state'] | Should -Be 'Done'
+        (Get-TestStep -Model $model -Id 'T2.Telemetry')['message'] | Should -Be 'Finished in an earlier run.'
+    }
+
+    It 'puts a resumed golden T2''s note on the first row it uses, and nothing on a run that doesn''t resume' {
+        $path = New-TestModelFile
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+            $state = [pscustomobject]@{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Bootstraps'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            $plan = Resolve-DemoTrackPlan -Resume -State $state -SkipT4
+            Set-DemoProgressPlan -Path $Path -Plan $plan -Resume -T2Source 'existing-golden'
+        }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        (Get-TestStep -Model $model -Id 'T2.HostBuild')['message'] | Should -Match 'golden snapshot'
+        (Get-TestStep -Model $model -Id 'T2.ArcOnboarding')['message'] | Should -Be 'Didn''t finish in the previous run; running it again.'
+        (Get-TestStep -Model $model -Id 'T2.Monitoring')['message'] | Should -BeNullOrEmpty
+
+        $path = New-TestModelFile
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } { Set-DemoProgressPlan -Path $Path -Plan (Resolve-DemoTrackPlan -SkipT4) -T2Source 'golden' }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        @($model['tracks'] | ForEach-Object { $_['steps'] } | Where-Object { [string]$_['message'] -match 'previous run' }) | Should -BeNullOrEmpty
     }
 }
 

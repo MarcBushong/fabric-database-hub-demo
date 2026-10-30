@@ -775,6 +775,26 @@ function Invoke-DemoParallelDeployment {
         if (-not $whatIf) {
             & $ensureContext
             Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -T2Source ([string]$context.T2Source)
+            # The tracks' records describe this run before any track writes, and before the template reads the group's tags
+            # (Phase 28 live finding, 2026-10-30: a fresh run's failed Fabric step kept an earlier run's record, and the next
+            # plain deploy.ps1 resumed past it). A run that starts over clears them all; any other run lowers those of the
+            # tracks it runs from an earlier step. T2's early Restore writes only after the template's resource group update.
+            $reset = Get-DemoTrackRecordReset -Plan $plan -State $state -FreshStart:(-not $Resume -and (-not $FromStage -or $FromStage -eq 'Preflight'))
+            if ($reset.Count -gt 0) {
+                try {
+                    Set-DemoDeploymentState -Config $Config -Value $reset -Confirm:$false
+                    # The validation's $trackFinished reads a track this run doesn't start from $state.
+                    foreach ($key in $reset.Keys) {
+                        if ($null -ne $state.PSObject.Properties[$key]) {
+                            $state.$key = $reset[$key]
+                        }
+                    }
+                    Write-DemoLog -Message ('The track records an earlier run left were reset ({0}), so a later resume can''t skip a step this run doesn''t finish.' -f ((@($reset.Keys | Sort-Object) | ForEach-Object { $_ -replace '^Track', '' }) -join ', '))
+                }
+                catch {
+                    Write-DemoLog -Level Warning -Message ('The track records an earlier run left couldn''t be reset, so a later resume could skip a step this run doesn''t finish: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+                }
+            }
         }
 
         # The VMs that were stopped run before anything needs them: the tracks' Run Commands, and the template's

@@ -385,7 +385,10 @@ function Resolve-DemoTrackPlan {
     A step runs when its sequential stage lies between -FromStage and -StopAfter, so those switches mean what
     they meant before. -Resume continues each track after the last step it recorded (DbHubTrackT1,
     DbHubTrackT2, DbHubTrackT4, DbHubTrackFabric); a group that only has the sequential DbHubDeployStage
-    resumes after it. -SkipT4 (T4 off in the configuration) leaves the T4 track empty.
+    resumes after it. -SkipT4 (T4 off in the configuration) leaves the T4 track empty. A run that starts over clears every
+    track's record, and any other run lowers the records of the tracks it runs, before any of them writes
+    (Get-DemoTrackRecordReset), so a resume never trusts a record older than a step that has failed since (Phase 28 live
+    finding, 2026-10-30).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -448,6 +451,60 @@ function Resolve-DemoTrackPlan {
         Tracks         = $tracks
         Validation     = (& $inRange 'Validation')
     }
+}
+
+function Get-DemoTrackRecordReset {
+    <#
+    .SYNOPSIS
+    The track records (DbHubTrackT1, DbHubTrackT2, DbHubTrackT4, DbHubTrackFabric) a run sets before any track writes, so a
+    later -Resume trusts only what this run, or the run it continues, recorded (Phase 28 live finding, 2026-10-30). Pure.
+    Internal.
+
+    .DESCRIPTION
+    A track's record is its last finished step, written only when a step succeeds, so a run that runs a track again from
+    the start, whose step then fails, left the record of an earlier run: live, a fresh run's Fabric step failed while
+    DbHubTrackFabric still said Fabric from the run before, and the next plain deploy.ps1 resumed past it and ended DONE
+    without running it again. For each track -Plan runs, its record is lowered to the step before the track's first
+    step in this run: cleared when the track runs from its first step, and never raised, so a resumed track (whose first
+    step follows its record) keeps it, and -FromStage keeps an older record. With -FreshStart (a run from preflight that
+    doesn't resume), every track's record is cleared, run or not (-StopAfter, -SkipFabric): a later resume then trusts
+    only what was recorded since. Otherwise a track the plan doesn't run keeps its record. Returns the
+    Set-DemoDeploymentState values to write; empty when nothing changes.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Plan,
+
+        [AllowNull()]
+        [object] $State,
+
+        [switch] $FreshStart
+    )
+
+    $reset = @{}
+    foreach ($track in 'T1', 'T2', 'T4', 'Fabric') {
+        $key = 'Track{0}' -f $track
+        $recorded = [string](Get-DemoMemberValue -InputObject $State -Name $key)
+        if (-not $recorded) {
+            continue
+        }
+        if ($FreshStart) {
+            $reset[$key] = ''
+            continue
+        }
+        $planned = @($Plan.Tracks[$track])
+        if ($planned.Count -eq 0) {
+            continue
+        }
+        $names = @((Get-DemoTrackStep -Track $track).Keys)
+        $firstIndex = [array]::IndexOf($names, [string]$planned[0])
+        if ($firstIndex -ge 0 -and [array]::IndexOf($names, $recorded) -ge $firstIndex) {
+            $reset[$key] = if ($firstIndex -gt 0) { $names[$firstIndex - 1] } else { '' }
+        }
+    }
+    return $reset
 }
 
 function Invoke-DemoDeploymentTrack {
@@ -765,13 +822,19 @@ function Invoke-DemoDeploymentTrack {
     }
 
     # One part of a step the status page shows on its own (Phase 28): Done with its worst ADR 0012 status, and the first
-    # result that isn't a Pass as its message.
+    # result that isn't a Pass as its message. A part that fails says so on the console at once (Phase 28 live finding,
+    # 2026-10-30), once per step.
     $partDone = {
         param([string[]] $Ids, [object[]] $Items)
         $worst = Get-DemoWorstStatus -Status @($Items | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.status })
         $partState = if ($worst) { ConvertTo-DemoProgressState -Status $worst } else { 'Done' }
         $firstOpen = @($Items | Where-Object { $null -ne $_ -and [string]$_.status -notin 'Pass', 'Not selected' } | Select-Object -First 1)
         Set-DemoProgressStep -Path $progress -Id $Ids -State $partState -Status $worst -Message $(if ($firstOpen.Count -gt 0) { [string]$firstOpen[0].message } else { '' })
+        if ($worst -eq 'Fail' -and -not $shared['FailureLogged']) {
+            $failed = @($Items | Where-Object { $null -ne $_ -and [string]$_.status -eq 'Fail' } | Select-Object -First 1)
+            Write-DemoLog -Level Warning -Message (Get-DemoStepFailureLine -Label (Get-DemoProgressStepLabel -Id $Ids[0]) -Message ([string]$failed[0].message))
+            $shared['FailureLogged'] = $true
+        }
     }
 
     # Before the template finished: only what can't collide with it (ADR 0018).
@@ -826,6 +889,7 @@ function Invoke-DemoDeploymentTrack {
         $stepIds = @(Get-DemoProgressStepId -Track $Track -Step $name)
         $ownProgress = ('{0}/{1}' -f $Track, $name) -in 'T2/T2', 'Fabric/Fabric'
         $resultsBefore = $results.Count
+        $shared['FailureLogged'] = $false
         if (-not $ownProgress -and $stepIds.Count -gt 0) {
             Set-DemoProgressStep -Path $progress -Id $stepIds -State 'Running' -Message ''
         }
@@ -952,7 +1016,8 @@ function Invoke-DemoDeploymentTrack {
                     # Live (2026-10-30): a plugin that reports NotRunning rarely starts by itself, and the agent's restart
                     # brings it back, so the wait gives it only a short grace (3 minutes when the flag was set before this
                     # run, 5 when this run merged it), counted in elapsed time, with a console line and the status page
-                    # saying so; after a restart that worked, T1.SQLVM.MONITORING is read again (Invoke-DemoSqlVmMonitoringWait).
+                    # saying so; once the restart has run, T1.SQLVM.MONITORING is read again, and a Fail there (uploads that
+                    # fail, for example) stops the step with its own cause (Invoke-DemoSqlVmMonitoringWait).
                     $monitoring = @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes ([int](& $option 'MonitoringWaitMinutes' 20)) -JustMerged:$monitoringMerged -ProgressPath $progress)
                     & $addAll $monitoring
                     if ([string]$monitoring[0].status -eq 'Fail') {
@@ -1232,7 +1297,13 @@ function Invoke-DemoDeploymentTrack {
             }
         }
         catch {
-            & $note ('DEPLOY.TRACK.{0}' -f $Track.ToUpperInvariant()) $(if ($Track -eq 'Fabric') { 'fabric' } else { $Track }) 'Fail' ('Track {0} stopped at {1}: {2}' -f $Track, $name, (Protect-DemoText -Text $_.Exception.Message)) ('Fix the cause, then run deploy.ps1 -Resume: the track continues at {0}.' -f $name)
+            if (Test-DemoNetworkFailure -Exception $_.Exception) {
+                # A network error that lasted through the retries (Invoke-DemoTransientRetry): a rerun resumes here.
+                & $note ('DEPLOY.TRACK.{0}' -f $Track.ToUpperInvariant()) $(if ($Track -eq 'Fabric') { 'fabric' } else { $Track }) 'Fail' ('Track {0} stopped at {1}: {2}' -f $Track, $name, (Get-DemoExceptionText -Exception $_.Exception)) ('Run ./scripts/deploy.ps1 again: the track continues at {0} (a network error lasted through the retries).' -f $name) ([ordered]@{ networkError = $true })
+            }
+            else {
+                & $note ('DEPLOY.TRACK.{0}' -f $Track.ToUpperInvariant()) $(if ($Track -eq 'Fabric') { 'fabric' } else { $Track }) 'Fail' ('Track {0} stopped at {1}: {2}' -f $Track, $name, (Get-DemoExceptionText -Exception $_.Exception)) ('Fix the cause, then run deploy.ps1 -Resume: the track continues at {0}.' -f $name)
+            }
             $outcome = 'Fail'
         }
         if ($Track -eq 'T2' -and $name -eq 'T2' -and @($results | Select-Object -Skip $resultsBefore | Where-Object { [string]$_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).Count -eq 0) {
@@ -1270,6 +1341,16 @@ function Invoke-DemoDeploymentTrack {
             }
         }
         if ($outcome -ne 'Pass') {
+            if ($outcome -eq 'Fail' -and -not $shared['FailureLogged']) {
+                # The console says so at once, not only the status page and the final banner (Phase 28 live finding).
+                $stepFailures = @($results | Select-Object -Skip $resultsBefore | Where-Object { [string]$_.status -eq 'Fail' } | Select-Object -First 1)
+                $failureLabel = switch ('{0}/{1}' -f $Track, $name) {
+                    'T2/T2' { 'T2 build and Arc onboarding' }
+                    'Fabric/Fabric' { 'Fabric' }
+                    default { if ($stepIds.Count -gt 0) { Get-DemoProgressStepLabel -Id $stepIds[0] } else { $name } }
+                }
+                Write-DemoLog -Level Warning -Message (Get-DemoStepFailureLine -Label $failureLabel -Message $(if ($stepFailures.Count -gt 0) { [string]$stepFailures[0].message } else { '' }))
+            }
             $status = $outcome
             break
         }

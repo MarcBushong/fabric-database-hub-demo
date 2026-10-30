@@ -633,6 +633,46 @@ Describe 'Invoke-DemoDeployment' {
         $script:state.Stage | Should -Be 'Infrastructure'
     }
 
+    It 'resets the parallel tracks'' records once its preflight passed, so a later plain deploy.ps1 never resumes past a step this run does again (Phase 28 live finding, 2026-10-30)' {
+        # -Sequential records only its stages; a parallel run's records from before it could let a later parallel resume skip
+        # a step that this run did again and that failed.
+        $script:state = New-TestState @{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith {
+            $script:recorded.Add(@{} + $Value)
+            if ($Value.Contains('TrackT1')) {
+                $script:order.Add('ResetTracks')
+            }
+            foreach ($key in $Value.Keys) {
+                $script:state.$key = $Value[$key]
+            }
+        }
+        Invoke-DemoDeployment -Config $config -StopAfter Infrastructure | Out-Null
+        $script:order | Should -Be @('Preflight', 'ResetTracks', 'Template')
+        $script:state.TrackT1 | Should -Be ''
+        $script:state.TrackT2 | Should -Be ''
+        $script:state.TrackFabric | Should -Be '' -Because 'a run that starts over trusts nothing recorded before it'
+
+        # A preflight Fail resets nothing.
+        $script:order.Clear()
+        $script:state = New-TestState @{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+        $script:preflightStatus = 'Fail'
+        Invoke-DemoDeployment -Config $config | Out-Null
+        $script:order | Should -Be @('Preflight')
+        $script:state.TrackFabric | Should -Be 'Fabric'
+
+        # -Resume lowers only the records of the steps it does again.
+        $script:order.Clear()
+        $script:recorded.Clear()
+        $script:preflightStatus = 'Pass'
+        $script:state = New-TestState @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+        Invoke-DemoDeployment -Config $config -Resume | Out-Null
+        $script:order[0..1] | Should -Be @('ResetTracks', 'Arc')
+        $reset = @($script:recorded | Where-Object { $_.ContainsKey('TrackT1') })[0]
+        $reset['TrackT1'] | Should -Be 'Monitoring'
+        $reset['TrackT2'] | Should -Be 'Bootstraps'
+        $reset['TrackFabric'] | Should -Be ''
+    }
+
     It 'deploys the opt-in Key Vault after the template, and a vault Fail is reported without stopping the run' {
         $vaultConfig = New-TestConfig
         $vaultConfig['assignRoles'] = $true
@@ -1125,6 +1165,10 @@ Describe 'Start-DemoEnvironment' {
         $script:t3Exists = $false
         Start-DemoEnvironment -Config $config -ActivityProfile 'off' -Confirm:$false | Out-Null
         $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Template:abab:cdcd', 'Group', 'T3Setup', 'EnableT3', 'Gate', 'Monitoring:20', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off')
+        # A plugin the redeployment leaves NotRunning gets the agent's restart at once, as after a start (the owner's
+        # decision, 2026-10-30), never the whole wait.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['NotRunningGraceMinutes'] -eq 0 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('NotRunningGraceMinutes') } -Because 'the check after the start restarts at once, its default'
     }
 
     It 'rotates a one-time password left from an earlier session, retries T2 while its guest boots, and warms up with -WaitForWarmUp' {
@@ -2188,6 +2232,9 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
             $plugin = switch ($PluginState) {
                 'Empty' { '' }
                 'Running' { 'DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"};' }
+                # The documented troubleshooting symptom of a blocked endpoint or identity (enable-performance-monitoring-sql-vm).
+                'RunningHttp403' { 'DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"HTTP 403 Forbidden"};' }
+                'RunningNoUpload' { 'DatabaseMonitorArcPlugin: {"State":"Running"};' }
                 default { 'DatabaseMonitorArcPlugin: {"State":"' + $PluginState + '"};' }
             }
             [pscustomobject]@{
@@ -2227,6 +2274,26 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
     }
 
+    It 'passes a running plugin only with uploads OK, and hands back uploads that fail with their cause and fix, without a restart (Phase 28 review)' {
+        # Reviewer, 2026-10-30: the early Pass checked only State Running, so a plugin that started by itself with its uploads
+        # already failing passed here, and the deployment step lost the real cause.
+        $script:pluginStates.Enqueue('RunningHttp403')
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' } $config
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be 'sqlvm01''s monitoring plugin is running, but its uploads fail (HTTP 403 Forbidden); a restart of the SQL IaaS Agent doesn''t fix that.'
+        $result.remediation | Should -Match '^Check sqlvm01''s system-assigned identity and outbound HTTPS to telemetry\.[a-z0-9]+\.arcdataservices\.com:443, then run \./scripts/configure-monitoring\.ps1\.$'
+        $result.evidence.restarted | Should -BeFalse
+        $result.evidence.after | Should -Match 'HTTP 403 Forbidden'
+
+        $script:pluginStates.Clear()
+        $script:pluginStates.Enqueue('RunningNoUpload')
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c } $config
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be 'sqlvm01''s monitoring plugin is running, but its uploads aren''t OK yet (upload status '''').'
+        $result.remediation | Should -Match 'configure-monitoring\.ps1 -WaitMinutes 15'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly -Because 'a restart of the agent doesn''t fix uploads'
+    }
+
     It 'reports as the deployment''s check when deploy.ps1 calls it after its wait (Phase 25d)' {
         # Live, 2026-10-27: after the deployment's template run the plugin stayed NotRunning; the restart brought it back.
         foreach ($state in 'NotRunning', 'Running') {
@@ -2255,33 +2322,44 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
     }
 
     It 'waits for the agent''s first plugin status before it restarts a NotRunning plugin, then checks for Running and OK' {
-        # Live, 2026-10-26: a restart while the status was still empty left the plugin NotRunning for hours. Then the
-        # NotRunning plugin gets the short grace (three reads a minute apart) before the restart (live, 2026-10-30).
-        foreach ($state in 'Empty', 'NotRunning', 'NotRunning', 'NotRunning', 'NotRunning', 'Running') {
+        # Live, 2026-10-26: a restart while the status was still empty left the plugin NotRunning for hours.
+        foreach ($state in 'Empty', 'NotRunning', 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($state)
         }
         $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c } $config
-        $script:readsAtRestart | Should -Be 5
+        $script:readsAtRestart | Should -Be 2
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'wasn''t running after the start \(DatabaseMonitorArcPlugin: \{"State":"NotRunning"\}\); the SQL IaaS Agent service was restarted'
         $result.evidence.restarted | Should -BeTrue
-        $result.evidence.gracePolls | Should -Be 3
+        $result.evidence.gracePolls | Should -Be 0
         $result.evidence.after | Should -Match '"State":"Running","MetricsUploadStatus":"OK"'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $VmName -eq 'sqlvm01' -and $Script -match "Restart-Service -Name 'SQLIaaSExtension' -Force" }
     }
 
-    It 'restarts the SQL IaaS Agent when the plugin stays NotRunning through the short grace after the start, not 20 minutes later, and waits for Running and OK (Phase 28 live finding)' {
+    It 'restarts the SQL IaaS Agent at once when the plugin stayed NotRunning after the start, with no grace by default, and waits for Running and OK' {
         # Live, 2026-10-22: NotRunning for more than 90 minutes after a deallocation and start; Running a minute after the
-        # restart. Live, 2026-10-30: about 2 of 3 starts left it NotRunning, and it never started by itself.
-        foreach ($state in 'NotRunning', 'NotRunning', 'NotRunning', 'NotRunning', 'Running') {
+        # restart. start-demo.ps1 and deploy.ps1's check beside the tracks keep this immediate restart (the owner's decision,
+        # 2026-10-30: presenters run start-demo.ps1 before each session).
+        foreach ($state in 'NotRunning', 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($state)
         }
         $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -PollSeconds 1 } $config
-        $script:readsAtRestart | Should -Be 4 -Because 'the first read, then three more during the 3-minute grace'
+        $script:readsAtRestart | Should -Be 1
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'restarted'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 3 -Exactly -ParameterFilter { $Seconds -eq 60 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly -ParameterFilter { $Seconds -eq 60 }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $VmName -eq 'sqlvm01' -and $Script -match "Restart-Service -Name 'SQLIaaSExtension' -Force" }
+
+        # With a grace, the restart comes after it: the first read, then three more a minute apart.
+        $script:pluginStates.Clear()
+        $script:reads = 0
+        foreach ($state in 'NotRunning', 'NotRunning', 'NotRunning', 'NotRunning', 'Running') {
+            $script:pluginStates.Enqueue($state)
+        }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -PollSeconds 1 -NotRunningGraceMinutes 3 } $config
+        $script:readsAtRestart | Should -Be 4
+        $result.evidence.gracePolls | Should -Be 3
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 3 -Exactly -ParameterFilter { $Seconds -eq 60 }
     }
 
     It 'counts the grace in elapsed time, the reads included, and never sleeps past its end (Phase 28 live finding)' {
@@ -2303,14 +2381,14 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
             [pscustomobject]@{ Succeeded = $true; Output = 'SQLIaaSExtension is Running.' }
         }
         $start = $script:now
-        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' } $config
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -NotRunningGraceMinutes 3 } $config
         $result.status | Should -Be 'Pass'
         @($script:sleeps)[0..2] | Should -Be @(60, 60, 20) -Because 'the last sleep ends with the 3-minute grace'
         $script:readsAtRestart | Should -Be 4
         ($script:restartAt - $start).TotalSeconds | Should -Be 220 -Because 'the first read (20 s), then the grace of 180 s, and the read that ends it'
     }
 
-    It 'says on the console and the status page that it waits for a NotRunning plugin, and leaves one that starts by itself alone (Phase 28 live finding)' {
+    It 'says on the console and the status page, with a grace, that it waits for a NotRunning plugin, and leaves one that starts by itself alone (Phase 28 live finding)' {
         foreach ($state in 'NotRunning', 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($state)
         }
@@ -2318,16 +2396,16 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         $script:logged = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:page.Add(('{0}|{1}|{2}' -f (@($PesterBoundParameters['Id']) -join ','), [bool]$PesterBoundParameters['AzureSide'], $PesterBoundParameters['Message'])) }
-        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -ProgressPath 'progress.json' } $config
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -NotRunningGraceMinutes 3 -ProgressPath 'progress.json' } $config
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'is running \(upload status ''OK''\), reported \d+ seconds after the check began'
         $result.evidence.gracePolls | Should -Be 2
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
         $script:page | Should -Be @(
-            'T1.Monitoring|True|T1''s monitoring plugin reports NotRunning; start-demo.ps1 restarts it if it doesn''t start by itself within 3 minutes; no action needed.'
-            'T1.Monitoring|True|T1''s monitoring plugin reports NotRunning (1 min so far); start-demo.ps1 restarts it if it doesn''t start by itself within 2 minutes; no action needed.'
+            'T1.Monitoring|True|T1''s monitoring plugin reports NotRunning; the deployment restarts it if it doesn''t start by itself within 3 minutes; no action needed.'
+            'T1.Monitoring|True|T1''s monitoring plugin reports NotRunning (1 min so far); the deployment restarts it if it doesn''t start by itself within 2 minutes; no action needed.'
         )
-        $script:logged | Should -Be @('T1''s monitoring plugin reports NotRunning; start-demo.ps1 restarts it if it doesn''t start by itself within 3 minutes; no action needed.') -Because 'a console line on the first read, then every few minutes'
+        $script:logged | Should -Be @('T1''s monitoring plugin reports NotRunning; the deployment restarts it if it doesn''t start by itself within 3 minutes; no action needed.') -Because 'a console line on the first read, then every few minutes'
     }
 
     It 'restarts the SQL IaaS Agent when the plugin still has no status after the bounded wait' {
@@ -2382,6 +2460,7 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         $check.checkId | Should -Be 'DEPLOY.T1.MONITORING'
         $check.status | Should -Be 'Warning'
         $check.message | Should -Match 'T1''s monitoring plugin couldn''t be checked: The VM isn''t running'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('NotRunningGraceMinutes') } -Because 'the check beside the tracks restarts at once, Restore''s default (the owner''s decision, 2026-10-30)'
         $script:page[0] | Should -Be 'T1.Monitoring|Running||True|Checking T1''s monitoring plugin, which can stop after a restart: no action needed.'
         $script:page[-1] | Should -Match '^T1\.Monitoring\|\|Warning\|False\|T1''s monitoring plugin couldn''t be checked'
     }
@@ -2402,20 +2481,31 @@ Describe 'Invoke-DemoSqlVmMonitoringWait: a deployment step''s T1 monitoring (Ph
         $script:calls = [System.Collections.Generic.List[string]]::new()
         $script:logged = [System.Collections.Generic.List[string]]::new()
         $script:restoreStatus = 'Pass'
+        $script:restoreRestarted = $true
         $script:reread = 'Pass'
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add(('wait {0} grace {1}' -f $PesterBoundParameters['WaitMinutes'], $PesterBoundParameters['NotRunningGraceMinutes'])); New-StuckMonitoring }
         Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith {
             $script:calls.Add(('restore {0} grace {1}' -f $PesterBoundParameters['CheckId'], $PesterBoundParameters['NotRunningGraceMinutes']))
-            New-DemoResult -CheckId $PesterBoundParameters['CheckId'] -Area 't1' -Target 'T1' -Status $script:restoreStatus -Message 'sqlvm01''s monitoring plugin wasn''t running after the deployment; the SQL IaaS Agent service was restarted, and it''s Running with uploads OK after 17 seconds.' -Remediation $(if ($script:restoreStatus -eq 'Pass') { '' } else { './scripts/configure-monitoring.ps1 -WaitMinutes 15 checks it again.' }) -Evidence ([ordered]@{ restarted = $true })
+            $message = if (-not $script:restoreRestarted) { 'sqlvm01''s monitoring plugin is running (upload status ''OK''), reported 200 seconds after the check began.' } else { 'sqlvm01''s monitoring plugin wasn''t running after the deployment; the SQL IaaS Agent service was restarted, and it''s Running with uploads OK after 17 seconds.' }
+            New-DemoResult -CheckId $PesterBoundParameters['CheckId'] -Area 't1' -Target 'T1' -Status $script:restoreStatus -Message $message -Remediation $(if ($script:restoreStatus -eq 'Pass') { '' } else { './scripts/configure-monitoring.ps1 -WaitMinutes 15 checks it again.' }) -Evidence ([ordered]@{ restarted = $script:restoreRestarted })
         }
+        # T1.SQLVM.MONITORING read right after, as ConvertTo-DemoSqlVmMonitoringResult and Test-DemoSqlVmMonitoring report it.
         Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -MockWith {
             $script:calls.Add('reread')
-            if ($script:reread -eq 'Pass') {
-                New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'sqlvm01 reports DatabaseMonitorArcPlugin Running with MetricsUploadStatus OK.' -Evidence ([ordered]@{ pluginState = 'Running'; pending = $false })
-            }
-            else {
-                New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'Azure couldn''t be read: timeout.'
+            switch ($script:reread) {
+                'Pass' {
+                    New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'sqlvm01 reports DatabaseMonitorArcPlugin Running with MetricsUploadStatus OK.' -Evidence ([ordered]@{ pluginState = 'Running'; metricsUploadStatus = 'OK'; pending = $false })
+                }
+                'Fail' {
+                    New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.' -Remediation 'Check the VM''s system-assigned identity and outbound HTTPS to telemetry.<location>.arcdataservices.com:443.' -Evidence ([ordered]@{ pluginState = 'Running'; metricsUploadStatus = 'HTTP 403 Forbidden'; pending = $false })
+                }
+                'Pending' {
+                    New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message 'The DatabaseWatcheronAzureVM flag is set on sqlvm01, but DatabaseMonitorArcPlugin doesn''t report Running and OK yet (state ''Running'', upload '''').' -Remediation $script:waitRemediation -Evidence ([ordered]@{ pluginState = 'Running'; metricsUploadStatus = ''; pending = $true })
+                }
+                default {
+                    throw 'The operation timed out.'
+                }
             }
         }
     }
@@ -2445,24 +2535,84 @@ Describe 'Invoke-DemoSqlVmMonitoringWait: a deployment step''s T1 monitoring (Ph
         $script:calls.Clear()
         $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -JustMerged } $config
         $script:calls[0] | Should -Be 'wait 20 grace 5'
+
+        # start-demo.ps1, after it recreates T3, restarts a NotRunning plugin at once (the owner's decision, 2026-10-30).
+        $script:calls.Clear()
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -RestartAtOnce -CheckId 'START.T1.MONITORING' } $config
+        @($script:calls)[0..1] | Should -Be @('wait 20 grace 0', 'restore START.T1.MONITORING grace 0')
     }
 
-    It 'keeps the wait''s Warning, superseded and without a remediation, when T1.SQLVM.MONITORING can''t be read again after the restart' {
-        $script:reread = 'Fail'
+    It 'marks the wait''s Warning superseded, without a remediation and without claiming uploads OK, when a read right after the restart is still a wait' {
+        # Phase 28 review (2026-10-30): "superseded" only for a read that's still a wait, with what that read shows.
+        $script:reread = 'Pending'
         $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -CheckId 'START.T1.MONITORING' } $config)
         @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING', 'START.T1.MONITORING')
         $results[0].status | Should -Be 'Warning'
         $results[0].remediation | Should -BeNullOrEmpty
-        $results[0].message | Should -Match 'Superseded: the SQL IaaS Agent service was restarted, and the plugin reported Running with uploads OK \(START\.T1\.MONITORING\)\.$'
+        $results[0].message | Should -Match 'Superseded: the SQL IaaS Agent service was restarted \(START\.T1\.MONITORING\); a read right after shows state ''Running'', upload ''''\.$'
+        $results[0].message | Should -Not -Match 'uploads OK'
         $results[0].evidence.superseded | Should -BeTrue
+        $results[0].evidence.restarted | Should -BeTrue
+    }
+
+    It 'returns a Fail read right after a restart that passed unchanged, with its own cause and fix and the restart in its evidence (Phase 28 review)' {
+        # Reviewer, 2026-10-30, reproduced: the Fail went to the else branch, which returned the wait's Warning, superseded,
+        # without a remediation, and with "...restarted, and the plugin reported Running with uploads OK".
+        $script:reread = 'Fail'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING', 'DEPLOY.T1.MONITORING')
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.'
+        $results[0].remediation | Should -Be 'Check the VM''s system-assigned identity and outbound HTTPS to telemetry.<location>.arcdataservices.com:443.'
+        $results[0].evidence.metricsUploadStatus | Should -Be 'HTTP 403 Forbidden'
+        $results[0].evidence.restartCheckId | Should -Be 'DEPLOY.T1.MONITORING'
+        $results[0].evidence.restarted | Should -BeTrue
+        $results[0].evidence.pluginStateBefore | Should -Be 'NotRunning'
+        $results[0].evidence.Contains('superseded') | Should -BeFalse
+    }
+
+    It 'returns a Fail read unchanged when the plugin started without a restart, and when the restart didn''t help (Phase 28 review)' {
+        # The reviewer's second variant: Restore found the plugin Running (no restart), and the read right after is a Fail.
+        $script:reread = 'Fail'
+        $script:restoreRestarted = $false
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.'
+        $results[0].remediation | Should -Match 'system-assigned identity'
+        $results[0].evidence.restarted | Should -BeFalse
+        $results[0].message | Should -Not -Match 'Superseded|uploads OK'
+
+        $script:restoreRestarted = $true
+        $script:restoreStatus = 'Warning'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[1].status | Should -Be 'Warning'
+
+        # A read that throws is a Fail too, as Test-DemoSqlVmMonitoring reports one, never a superseded Warning.
+        $script:restoreStatus = 'Pass'
+        $script:reread = 'Throw'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'Azure couldn''t be read: The operation timed out.'
+        $results[0].evidence.restarted | Should -BeTrue
+    }
+
+    It 'names a restart in a Pass read only when there was one' {
+        $script:restoreRestarted = $false
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Pass'
+        $results[0].message | Should -Match 'The plugin had reported NotRunning; then it started without a restart \(DEPLOY\.T1\.MONITORING\)\.$'
+        $results[0].evidence.restarted | Should -BeFalse
     }
 
     It 'leaves the wait''s Warning and its remediation when the restart didn''t bring the plugin back, and restarts nothing that isn''t stuck' {
         $script:restoreStatus = 'Warning'
+        $script:reread = 'Pending'
         $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
         $results[0].remediation | Should -Be $script:waitRemediation
+        $results[0].message | Should -Not -Match 'Superseded'
         $results[1].status | Should -Be 'Warning'
-        $script:calls | Should -Not -Contain 'reread'
+        $script:calls | Should -Contain 'reread' -Because 'a read right after can show a Fail with its own cause'
 
         $script:calls.Clear()
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add('wait'); New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'Running and OK.' -Evidence ([ordered]@{ pluginState = 'Running' }) }
