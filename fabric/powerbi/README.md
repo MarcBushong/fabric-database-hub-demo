@@ -62,6 +62,7 @@ How to read the data check:
 - A measure that raises a DAX error is a **Fail**.
 - A measure that returns blank over the whole history is evaluated again per telemetry bin, incident, and signal, the context its visual sets (the incident band, the threshold lines). It's a **Pass** when it returns a value there.
 - A measure that stays blank is a **Warning**. That's expected until a bounded scenario runs and the live-activity notebook records it, because the scenario and incident measures have nothing to show yet. Phase 20's end-to-end run checks them again.
+- Right after a first deployment, while the history tables are still empty (`FABRIC.SEMANTICMODEL.ROWS` is a **Warning**), `deploy.ps1` reports those blank measures as one **Warning**, `FABRIC.SEMANTICMODEL.MEASURES`: the history report is empty until `NB_DatabaseHub_LiveActivity` saves its first snapshots (Phase 28 live finding, 2026-10-30). `configure-powerbi.ps1 -CheckModelData` still reports every measure.
 - Execute Queries doesn't run INFO functions, so `INFO.MEASURES()` is **Not supported** there, and the per-measure queries are the check.
 
 The report is generated, not hand-edited: change the spec or the model, then run the [generator](generator/README.md). For a Power BI Desktop preview against the deployed model, the generator writes a copy outside Git with the full `byConnection` form.

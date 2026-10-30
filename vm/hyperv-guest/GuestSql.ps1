@@ -142,8 +142,9 @@ function Get-DemoSetupProcess {
 
 function Test-DemoIeEscEnabled {
     # True when Internet Explorer Enhanced Security Configuration is on for administrators and for users, the
-    # Windows Server default. An operator may turn it off during the wizard, though the Azure sign-in doesn't need
-    # that (it needs WebView2). A component that doesn't exist counts as on.
+    # Windows Server default. The PaygWizard guided stop turns it off for administrators while setup's Azure sign-in, an
+    # IE-based control, needs it, and back on in its cleanup (Phase 28 live finding, 2026-10-30). A component that
+    # doesn't exist counts as on.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -294,6 +295,9 @@ function Format-DemoSignInSweep {
         if ([int]$Counts.archives -gt 0) { $parts += ('{0} archive(s) in setup''s log folders that couldn''t be checked' -f [int]$Counts.archives) }
         if ([int]$Counts.filesUnverified -gt 0) { $parts += ('{0} unreadable file(s)' -f [int]$Counts.filesUnverified) }
         if ([int]$Counts.appTokens + [int]$Counts.eventLogAppTokens -gt 0) { $parts += ('{0} token(s) of an application or managed identity' -f ([int]$Counts.appTokens + [int]$Counts.eventLogAppTokens)) }
+        $autoLogon = @('autoLogonEnabled', 'autoLogonSecrets', 'autoLogonPasswords', 'autoLogonUnverified' | Where-Object { $Counts.PSObject.Properties[$_] -and [int]$Counts.$_ -gt 0 })
+        if ($autoLogon.Count -gt 0) { $parts += ('automatic sign-in left armed ({0})' -f ($autoLogon -join ', ')) }
+        if ($Counts.PSObject.Properties['autoLogonUserNames'] -and [int]$Counts.autoLogonUserNames -gt 0) { $parts += 'the Winlogon DefaultUserName value' }
         if ($parts.Count -eq 0) { return 'nothing' }
         return ($parts -join ', ')
     }

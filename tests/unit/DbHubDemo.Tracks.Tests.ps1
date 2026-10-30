@@ -104,6 +104,65 @@ Describe 'Resolve-DemoTrackPlan' {
     }
 }
 
+Describe 'Get-DemoTrackRecordReset: a resume trusts only what was recorded since the last fresh start (Phase 28 live finding, 2026-10-30)' {
+    BeforeAll {
+        # Live: a full run ended DONE; a fresh run's Fabric step then failed, so DbHubTrackFabric kept the DONE run's
+        # "Fabric", and the next plain deploy.ps1 resumed past the step and ended DONE without it.
+        function New-DoneState {
+            $state = New-TestState
+            $state.Stage = 'Validation'
+            $state.TrackT1 = 'Telemetry'
+            $state.TrackT2 = 'Telemetry'
+            $state.TrackT4 = 'Telemetry'
+            $state.TrackFabric = 'Fabric'
+            $state
+        }
+    }
+
+    It 'clears every track''s record on a fresh start, including the tracks the run doesn''t run' {
+        $state = New-DoneState
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -SkipFabric) -State $State -FreshStart }
+        $reset.Keys | Sort-Object | Should -Be @('TrackFabric', 'TrackT1', 'TrackT2', 'TrackT4')
+        @($reset.Values | Where-Object { $_ -ne '' }) | Should -BeNullOrEmpty
+
+        # Without -FreshStart, a full plan clears the tracks it runs from their first step, and leaves the others.
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -SkipFabric) -State $State }
+        $reset.Keys | Sort-Object | Should -Be @('TrackT1', 'TrackT2', 'TrackT4')
+        $reset.Contains('TrackFabric') | Should -BeFalse
+    }
+
+    It 'changes nothing on a resume, and nothing that isn''t recorded' {
+        $state = New-TestState
+        $state.Stage = 'Monitoring'
+        $state.TrackT1 = 'Monitoring'
+        $state.TrackT2 = 'Bootstraps'
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -Resume -State $State) -State $State }
+        $reset.Count | Should -Be 0
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = (New-TestState) } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan) -State $State -FreshStart }
+        $reset.Count | Should -Be 0
+    }
+
+    It 'lowers a record to the step before where -FromStage starts its track, and never raises one' {
+        $state = New-DoneState
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -FromStage 'T4') -State $State }
+        $reset['TrackT1'] | Should -Be 'T3'
+        $reset['TrackT2'] | Should -Be 'Bootstraps'
+        $reset['TrackT4'] | Should -Be ''
+        $reset['TrackFabric'] | Should -Be ''
+
+        # -FromStage Validation runs only the Telemetry steps, so Fabric keeps its record.
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -FromStage 'Validation') -State $State }
+        $reset['TrackT1'] | Should -Be 'Monitoring'
+        $reset['TrackT2'] | Should -Be 'T2'
+        $reset.Contains('TrackFabric') | Should -BeFalse
+
+        # An older record stays as it is.
+        $state.TrackT1 = 'Bootstraps'
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -FromStage 'T4') -State $State }
+        $reset.Contains('TrackT1') | Should -BeFalse
+    }
+}
+
 Describe 'Resolve-DemoT2Source' {
     BeforeEach {
         $config = New-TestConfig
@@ -257,6 +316,8 @@ Describe 'Invoke-DemoDeploymentTrack' {
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoT3Workload -MockWith { $script:calls.Add('t3workload'); New-TestResult 'WORKLOAD.T3' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoT3 -MockWith { $script:calls.Add('t3checks'); New-TestResult 'T3.DATABASE' }
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add('monitoring'); New-TestResult 'T1.SQLVM.MONITORING' }
+        # Phase 28: the VM's extensions settle before its artifacts and its loader (brief item 14); its own tests are in DbHubDemo.OneCommand.Tests.ps1.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith { [pscustomobject]@{ Settled = $true; Results = @() } }
     }
 
     It 'restores a golden T2 host: passwords and the reset first, then its artifacts, loader, onboarding with -Force, profile, and telemetry' {
@@ -273,6 +334,85 @@ Describe 'Invoke-DemoDeploymentTrack' {
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.RESTORE' }).status | Should -Be 'Pass'
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.RESTORE' }).message | Should -Match 'reset locally, SQL Server runs Standard Edition'
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.READY' }).status | Should -Be 'Pass'
+    }
+
+    It 'records when archost01''s loader starts a bootstrap generation, and clears it after a new golden copy''s Release and after the T2 step (review follow-up)' {
+        # The watchdog never restarts the host while that generation may still build its guest (Get-DemoHostRestartBlocker).
+        $script:state.BundleSentTo = @()
+        $script:state.RunnerSentTo = @()
+        $script:buildMarks = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith {
+            $value = $PesterBoundParameters['Value']
+            if ($null -ne $value -and $value.Contains('T2BuildUtc')) {
+                $script:buildMarks.Add($(if ($value['T2BuildUtc']) { 'set' } else { 'clear' }))
+            }
+            if ($PesterBoundParameters['AddKind'] -eq 'Bundle') {
+                $script:state.BundleSha256 = $PesterBoundParameters['Sha256']
+                $script:state.BundleSentTo = @($PesterBoundParameters['AddVm'])
+            }
+            elseif ($PesterBoundParameters['AddKind'] -eq 'Runner') {
+                $script:state.RunnerSha256 = $PesterBoundParameters['Sha256']
+                $script:state.RunnerSentTo = @($PesterBoundParameters['AddVm'])
+            }
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Restore', 'Artifacts', 'Bootstraps', 'T2', 'Telemetry') }
+        $outcome.Status | Should -Be 'Pass'
+        $script:buildMarks | Should -Be @('clear', 'set', 'clear')
+
+        # A copy that an earlier run released keeps the record: that run's loader may have started a generation since.
+        $script:buildMarks.Clear()
+        $script:releaseData = [pscustomobject]@{ role = 'Copy'; captured = $true; guestState = 'Running' }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Restore') }
+        $script:buildMarks.Count | Should -Be 0
+
+        # A loader that never started records nothing; T1's loader never does.
+        $script:buildMarks.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoBootstrapLoaderRun -MockWith { New-DemoResult -CheckId ('INFRA.BOOTSTRAP.LOADER_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'not started' -Evidence @{ notStarted = $true } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmWatchdog -MockWith { [pscustomobject]@{ Restarted = $false; Saved = ''; Items = @(); Result = (New-TestResult ('DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()) 'Warning') } }
+        $script:context['T2Source'] = 'build'
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps') }
+        $script:buildMarks.Count | Should -Be 0
+    }
+
+    It 'sends archost01''s artifacts during the Release without the extension wait or the watchdog, which wait for the Artifacts step (review finding 6)' {
+        $script:state.BundleSentTo = @()
+        $script:state.RunnerSentTo = @()
+        $script:inRelease = $false
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
+            $script:calls.Add('release')
+            $alongside = Get-Variable -Name 'WhileRunning' -ValueOnly -ErrorAction SilentlyContinue
+            $whileError = ''
+            $script:inRelease = $true
+            try {
+                if ($null -ne $alongside) {
+                    & $alongside
+                }
+            }
+            catch {
+                $whileError = $_.Exception.Message
+            }
+            finally {
+                $script:inRelease = $false
+            }
+            [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 600; Data = $script:releaseData; WhileRunningError = $whileError }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith { $script:calls.Add(('settle {0} release={1}' -f $VmName, $script:inRelease)); [pscustomobject]@{ Settled = $true; Results = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmWatchdog -MockWith { $script:calls.Add(('watchdog {0} release={1}' -f $VmName, $script:inRelease)); [pscustomobject]@{ Restarted = $false; Saved = ''; Items = @(); Result = (New-TestResult ('DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()) 'Warning') } }
+        # The chunks get stuck while the Release runs, and go through afterward.
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoChunkSet -MockWith {
+            $script:calls.Add(('chunks {0} release={1}' -f $VmName, $script:inRelease))
+            if ($script:inRelease) {
+                throw 'no chunk finished for 5 minutes'
+            }
+            @($File | ForEach-Object { [pscustomobject]@{ Description = $_.Description; Sha256 = $_.Sha256; ChunkCount = 1; Seconds = 90 } })
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Restore', 'Artifacts', 'Bootstraps') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:calls | Where-Object { $_ -match '^(settle|watchdog) .*release=True' }) | Should -BeNullOrEmpty
+        $script:calls | Should -Contain 'chunks archost01 release=True'
+        $script:calls | Should -Contain 'settle archost01 release=False'
+        $script:calls | Should -Contain 'chunks archost01 release=False'
     }
 
     It 'fails the T2 step when the host''s own last step failed, instead of passing on the Arc checks (live, 2026-10-27)' {
@@ -323,6 +463,50 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:calls | Should -Not -Contain 'telemetry T2'
     }
 
+    It 'cleans up what an earlier guided stop left open at the end of the T2 step: after -NoWaitForT2, on a golden redeploy, and once when the guided stop isn''t needed (Phase 28 review)' {
+        # The review: a rerun after a Ctrl+C at the guided stop, with setup finished meanwhile, could end DONE with Bastion
+        # up and the handed-over host password valid.
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); $script:state.HostPasswordUtc = ''; @() }
+        $cleanups = { @($script:calls | Where-Object { $_ -eq 'cleanup' }).Count }
+
+        # -NoWaitForT2 (this context doesn't wait): T2 goes on in the background, and the step still cleans up.
+        $script:context['T2Source'] = 'build'
+        $script:arcConnected = $false
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Background'
+        & $cleanups | Should -Be 1
+        ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).status | Should -Be 'Pass'
+
+        # A golden redeploy.
+        $script:calls.Clear()
+        $script:context['T2Source'] = 'golden'
+        $script:arcConnected = $true
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Pass'
+        & $cleanups | Should -Be 1
+
+        # The default wait: setup finished after the Ctrl+C, so the guided stop isn't needed; it cleans up, and the step
+        # doesn't again.
+        $script:calls.Clear()
+        $script:context['T2Source'] = 'build'
+        $script:context['WaitForT2'] = $true
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Failed = $false; TimedOut = $false; Health = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.' } } }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Pass'
+        & $cleanups | Should -Be 1
+        @($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).Count | Should -Be 1
+        ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }).status | Should -Be 'Not selected'
+
+        # Nothing open: nothing to clean up.
+        $script:calls.Clear()
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        & $cleanups | Should -Be 0
+        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' } | Should -BeNullOrEmpty
+    }
+
     It 'runs the Fabric track: notebooks and dashboard, the history report, then the Fabric app step' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { $script:calls.Add('fabric stage'); New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:calls.Add('powerbi'); New-TestResult 'FABRIC.SEMANTICMODEL.DATA' $script:powerBIStatus }
@@ -334,6 +518,71 @@ Describe 'Invoke-DemoDeploymentTrack' {
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APP' }).status | Should -Be 'Not selected'
         $script:powerBIStatus = 'Fail'
         (InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }).Status | Should -Be 'Fail'
+    }
+
+    It 'says on the console, as soon as a step fails, what failed and why, and that a rerun resumes it, once (Phase 28 live finding, 2026-10-30)' {
+        # Live: the history report step failed on a TLS error at about 19:24 UTC, and the console said nothing until the banner.
+        $script:warned = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ($PesterBoundParameters['Level'] -eq 'Warning') { $script:warned.Add([string]$PesterBoundParameters['Message']) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith {
+            New-DemoResult -CheckId 'DEPLOY.POWERBI' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts: The SSL connection could not be established.' -Evidence ([ordered]@{ networkError = $true }) -Remediation 'Run ./scripts/deploy.ps1 again: it resumes where it stopped (a network error lasted through the retries).'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { New-TestResult 'DEPLOY.FABRIC.APP' 'Not selected' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Fail'
+        @($script:warned) | Should -Be @('The history report step failed: configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts: The SSL connection could not be established. The other tracks continue; the run ends NOT DONE, and ./scripts/deploy.ps1 resumes it.')
+
+        # Any other step: its own label, once.
+        $script:warned.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSqlVmMonitoringWait -MockWith { New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring', 'Telemetry') }
+        $outcome.Status | Should -Be 'Fail'
+        @($script:warned) | Should -Be @('The monitoring step failed: Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden. The other tracks continue; the run ends NOT DONE, and ./scripts/deploy.ps1 resumes it.')
+
+        # A step that throws: the track's own result, with the innermost cause and, for a network error, a rerun as the fix.
+        $script:warned.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSqlVmMonitoringWait -MockWith {
+            $failure = [System.Net.Http.HttpRequestException]::new('A network error reached management.azure.com on each of 4 attempts: The SSL connection could not be established.')
+            $failure.Data['DbHubDemo.NetworkError'] = $true
+            throw $failure
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring') }
+        $track = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.TRACK.T1' }
+        $track.message | Should -Be 'Track T1 stopped at Monitoring: A network error reached management.azure.com on each of 4 attempts: The SSL connection could not be established.'
+        $track.evidence.networkError | Should -BeTrue
+        $track.remediation | Should -Be 'Run ./scripts/deploy.ps1 again: the track continues at Monitoring (a network error lasted through the retries).'
+        @($script:warned).Count | Should -Be 1
+        $script:warned[0] | Should -Match '^The monitoring step failed: Track T1 stopped at Monitoring: A network error reached'
+    }
+
+    It 'gives the optional Insights app the workspace the Fabric step resolved, and shows its actual reason, never a Fail, on the status page (Phase 28 live finding)' {
+        # Live: the app's own lookup by name of the workspace just created failed, and the page showed Skipped with a
+        # status of Fail and a generic message about tenant settings that were on.
+        $workspaceId = '44444444-4444-4444-4444-444444444444'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith {
+            New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Created the Fabric workspace.' -Evidence ([ordered]@{ workspaceId = '44444444-4444-4444-4444-444444444444'; source = 'created' })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.REPORT' }
+        $script:appWorkspace = ''
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith {
+            $script:appWorkspace = [string]$PesterBoundParameters['WorkspaceId']
+            New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Rayfin CLI isn''t signed in, so the app can''t be deployed unattended.' -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn.'
+            New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'Not deployed: FABRIC.APP.SIGNIN needs attention first.'
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $script:context['ProgressPath'] = $progress
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Pass' -Because 'the optional app never stops the track'
+        $script:appWorkspace | Should -Be $workspaceId
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $app = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Fabric.App') { $item } } })[0]
+        $app['state'] | Should -Be 'Skipped'
+        $app['status'] | Should -Be 'Manual action required'
+        $app['message'] | Should -Match ([regex]::Escape('FABRIC.APP.SIGNIN: The Rayfin CLI isn''t signed in'))
+        $app['message'] | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
+        $app['message'] | Should -Not -Match 'tenant settings' -Because 'nothing says the tenant settings are the cause'
     }
     It 'reconnects a golden snapshot''s source host on an existing image-built archost01' {
         $script:context['T2Source'] = 'existing-build'
@@ -357,16 +606,27 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $outcome.ReadyUtc['T3'] | Should -Not -BeNullOrEmpty
     }
 
-    It 'restarts T1''s monitoring agent when its plugin is still NotRunning after the Monitoring step''s wait (live, 2026-10-27)' {
+    It 'restarts T1''s monitoring agent when its plugin is still NotRunning after the Monitoring step''s short grace, and reports T1.SQLVM.MONITORING as it is then, on a later deploy too (live, 2026-10-27 and 2026-10-30)' {
+        # Live, b18a028's rerun: the T1 track ran again on a later deploy, the step waited 25 minutes before the restart, and
+        # the console then still printed the wait's "Run configure-monitoring.ps1 -WaitMinutes 15".
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith {
-            $script:calls.Add('monitoring')
-            [pscustomobject]@{ checkId = 'T1.SQLVM.MONITORING'; status = 'Warning'; message = 'NotRunning'; evidence = [ordered]@{ provisioningState = 'Succeeded'; featureFlagEnabled = $true; pluginState = 'NotRunning'; powerState = 'PowerState/running'; pending = $true } }
+            $script:calls.Add(('monitoring wait {0} grace {1}' -f $PesterBoundParameters['WaitMinutes'], $PesterBoundParameters['NotRunningGraceMinutes']))
+            [pscustomobject]@{ checkId = 'T1.SQLVM.MONITORING'; status = 'Warning'; message = 'NotRunning'; remediation = 'Run configure-monitoring.ps1 -WaitMinutes 15, or check again later.'; docUrl = ''; evidence = [ordered]@{ provisioningState = 'Succeeded'; featureFlagEnabled = $true; pluginState = 'NotRunning'; powerState = 'PowerState/running'; pending = $true } }
         }
-        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:calls.Add(('restore {0} {1}' -f $CheckId, $Occasion)); New-TestResult 'DEPLOY.T1.MONITORING' }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith {
+            $script:calls.Add(('restore {0} {1} grace {2}' -f $CheckId, $Occasion, $PesterBoundParameters['NotRunningGraceMinutes']))
+            New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'Restarted; Running with uploads OK after 17 seconds.' -Evidence ([ordered]@{ restarted = $true })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -MockWith { $script:calls.Add('reread'); New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'sqlvm01 reports DatabaseMonitorArcPlugin Running with MetricsUploadStatus OK.' }
+        $script:context['MonitoringWaitMinutes'] = 20
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring') }
         $outcome.Status | Should -Be 'Pass'
-        @($script:calls | Where-Object { $_ -notmatch '^state' }) | Should -Be @('monitoring', 'restore DEPLOY.T1.MONITORING the deployment')
+        @($script:calls | Where-Object { $_ -notmatch '^state' }) | Should -Be @('monitoring wait 20 grace 3', 'restore DEPLOY.T1.MONITORING the deployment grace 0', 'reread')
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' }).status | Should -Be 'Pass'
+        $monitoring = @($outcome.Results | Where-Object { $_.checkId -eq 'T1.SQLVM.MONITORING' })
+        @($monitoring.status) | Should -Be @('Pass') -Because 'the wait''s Warning is replaced by the read after the restart'
+        $monitoring[0].evidence.restartCheckId | Should -Be 'DEPLOY.T1.MONITORING'
+        @($outcome.Results | Where-Object { $_.status -in 'Warning', 'Fail' -and $_.remediation }) | Should -BeNullOrEmpty -Because 'nothing tells the person to act on a plugin that runs'
 
         $script:calls.Clear()
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith {
@@ -374,7 +634,73 @@ Describe 'Invoke-DemoDeploymentTrack' {
             [pscustomobject]@{ checkId = 'T1.SQLVM.MONITORING'; status = 'Warning'; message = 'Updating'; evidence = [ordered]@{ provisioningState = 'Updating'; featureFlagEnabled = $true; pluginState = ''; powerState = 'PowerState/running'; pending = $true } }
         }
         $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring') }
-        $script:calls | Should -Not -Contain 'restore DEPLOY.T1.MONITORING the deployment'
+        @($script:calls | Where-Object { $_ -like 'restore*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'stops T1''s track on a Fail read right after the restart, with its own cause and fix, and doesn''t record the step (Phase 28 review)' {
+        # Reviewer, 2026-10-30, reproduced: a read right after the restart that came back Fail (uploads that fail with HTTP
+        # 403) was replaced by the wait's Warning, superseded and without a remediation, and the track went on to a vaguer
+        # NOT DONE on TELEMETRY.T1.
+        $script:records = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith {
+            $value = $PesterBoundParameters['Value']
+            if ($null -ne $value -and $value.Contains('TrackT1')) {
+                $script:records.Add([string]$value['TrackT1'])
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith {
+            [pscustomobject]@{ checkId = 'T1.SQLVM.MONITORING'; status = 'Warning'; message = 'NotRunning'; remediation = 'Run configure-monitoring.ps1 -WaitMinutes 15, or check again later.'; docUrl = ''; evidence = [ordered]@{ provisioningState = 'Succeeded'; featureFlagEnabled = $true; pluginState = 'NotRunning'; powerState = 'PowerState/running'; pending = $true } }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith {
+            New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'Restarted; Running with uploads OK after 17 seconds.' -Evidence ([ordered]@{ restarted = $true })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -MockWith {
+            New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.' -Remediation 'Check the VM''s system-assigned identity and outbound HTTPS to telemetry.<location>.arcdataservices.com:443.' -Evidence ([ordered]@{ pluginState = 'Running'; metricsUploadStatus = 'HTTP 403 Forbidden'; pending = $false })
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring', 'Telemetry') }
+        $outcome.Status | Should -Be 'Fail'
+        $outcome.Steps | Should -BeNullOrEmpty
+        $monitoring = @($outcome.Results | Where-Object { $_.checkId -eq 'T1.SQLVM.MONITORING' })
+        @($monitoring.status) | Should -Be @('Fail')
+        $monitoring[0].remediation | Should -Match 'system-assigned identity'
+        $monitoring[0].evidence.restarted | Should -BeTrue
+        $script:calls | Should -Not -Contain 'telemetry T1' -Because 'the track stops at the step whose own cause is known'
+        $script:records | Should -Not -Contain 'Monitoring'
+    }
+
+    It 'gives T1''s plugin the longer grace when its Bootstraps step merged the monitoring flag in this run (Phase 28 live finding)' {
+        $script:state.BundleSentTo = @('sqlvm01')
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith {
+            $script:calls.Add(('monitoring wait {0} grace {1}' -f $PesterBoundParameters['WaitMinutes'], $PesterBoundParameters['NotRunningGraceMinutes']))
+            $actions = if ([int]$PesterBoundParameters['WaitMinutes'] -eq 0) { @('Merged DatabaseWatcheronAzureVM into the SqlIaasExtension public settings.') } else { @() }
+            New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'Running and OK.' -Evidence ([ordered]@{ actions = $actions })
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps', 'Monitoring') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:calls | Where-Object { $_ -like 'monitoring*' }) | Should -Be @('monitoring wait 0 grace ', 'monitoring wait 20 grace 5')
+    }
+
+    It 'checks T1''s missing telemetry again, after checking its plugin once, before the Telemetry step fails (Phase 28 live finding, 2026-10-30)' {
+        $script:telemetryPolls = 0
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith {
+            $script:telemetryPolls++
+            $script:calls.Add(('telemetry {0}' -f ($Target -join ',')))
+            foreach ($t in $Target) {
+                if ($t -eq 'T1' -and $script:telemetryPolls -eq 1) {
+                    New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'No performance telemetry from T1 (sqlvm01) in the last 60 minutes.' -Evidence ([ordered]@{ resourceId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01'; rows = 0 })
+                }
+                else {
+                    New-TestResult ('TELEMETRY.{0}' -f $t)
+                }
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:calls.Add(('restore {0} {1}' -f $CheckId, $Occasion)); New-TestResult 'DEPLOY.T1.MONITORING' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Telemetry') }
+        $outcome.Status | Should -Be 'Pass'
+        $outcome.Steps | Should -Be @('Telemetry')
+        @($script:calls | Where-Object { $_ -notmatch '^state' }) | Should -Be @('telemetry T1', 'restore DEPLOY.T1.MONITORING the deployment', 'telemetry T1')
+        @($outcome.Results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' }).status | Should -Be @('Pass')
+        $outcome.ReadyUtc['T1'] | Should -Not -BeNullOrEmpty
     }
 
     It 'stops a track at a Fail and doesn''t run its later steps' {
@@ -597,6 +923,13 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -MockWith { $script:calls.Add('t3 status from T1'); [pscustomobject]@{ Status = 'Pass'; Message = 'ok'; Rows = @([pscustomobject]@{ performance_monitoring = 'true' }) } }
         $script:inventoryStatus = 'Pass'
         Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmAssociatedService -MockWith { $script:calls.Add(('inventory wait={0} listed={1}' -f $WaitMinutes, $ListedStatus)); New-TestResult 'T1.SQLVM.ASSOCIATEDSERVICES' $script:inventoryStatus }
+        # Phase 28's DONE gate checks the required Fabric items by name (brief item 16).
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricRequiredItem -MockWith { $script:calls.Add('fabric items'); New-TestResult 'FABRIC.ITEMS.REQUIRED' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith { $script:calls.Add('gate telemetry ' + ($Target -join ',')); foreach ($t in $Target) { New-TestResult ('TELEMETRY.{0}' -f $t) } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcCheck -MockWith { $script:calls.Add('gate arc ' + ($Check -join ',')); foreach ($c in $Check) { New-TestResult ('T2.ARC.{0}' -f $c.ToUpperInvariant()) } }
+        # Phase 28 live finding: what's stopped starts before anything needs it; here both VMs run unless a test says not.
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -665,6 +998,370 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).status | Should -Be 'Warning'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Manual action required'
         $script:calls | Should -Contain 'estate T1,T3'
+        # DONE's read-only checks wait until every track finished (Phase 28).
+        $script:calls | Should -Not -Contain 'fabric items'
+    }
+
+    It 'continues an unfinished deployment on its own with -AutoResume, and starts over once the last one finished (Phase 28)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Bootstraps'; $state }
+        # A run that skips the template reads the loader settings from the last deployment's outputs.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
+        $script:calls | Should -Not -Contain 'preflight'
+        $script:calls | Should -Contain 'track T1: T3,T4,Activity,Monitoring,Telemetry'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'continues it, as deploy\.ps1 -Resume does' }
+
+        $script:calls.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Validation'; $state }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
+        $script:calls | Should -Contain 'preflight'
+    }
+
+    Context 'track records across runs (Phase 28 live finding, 2026-10-30)' {
+        BeforeEach {
+            # The resource group's tags, kept across the runs of one test: what Set-DemoDeploymentState writes,
+            # Get-DemoDeploymentState reads.
+            $script:tags = @{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith {
+                $state = New-TestState
+                foreach ($key in $script:tags.Keys) {
+                    $state.$key = $script:tags[$key]
+                }
+                $state
+            }
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith {
+                $script:calls.Add('state ' + (@($Value.Keys | Sort-Object | ForEach-Object { if ($_ -like 'Track*') { '{0}={1}' -f $_, $Value[$_] } else { $_ } }) -join ','))
+                foreach ($key in $Value.Keys) {
+                    $script:tags[$key] = [string]$Value[$key]
+                }
+            }
+            # A run that skips the template reads the loader settings from the last deployment's outputs.
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+            # Each step that succeeds records itself, as the track does (Set-DemoDeploymentStateLocked); $script:failStep fails.
+            $script:failStep = ''
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+                $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
+                $done = [System.Collections.Generic.List[string]]::new()
+                $status = 'Pass'
+                $trackResults = [System.Collections.Generic.List[object]]::new()
+                foreach ($name in $Step) {
+                    if ($script:failStep -eq ('{0}/{1}' -f $Track, $name)) {
+                        $status = 'Fail'
+                        $trackResults.Add((New-TestResult ('DEPLOY.STEP.{0}' -f $name.ToUpperInvariant()) 'Fail'))
+                        break
+                    }
+                    $done.Add($name)
+                    $script:tags[('Track{0}' -f $Track)] = $name
+                }
+                if ($status -eq 'Pass' -and $Track -eq 'T1') {
+                    foreach ($id in 'T3.PROPERTY', 'TELEMETRY.T1', 'TELEMETRY.T3') {
+                        $trackResults.Add((New-TestResult $id))
+                    }
+                }
+                if ($status -eq 'Pass' -and $Track -eq 'T2') {
+                    foreach ($id in 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'TELEMETRY.T2') {
+                        $trackResults.Add((New-TestResult $id))
+                    }
+                }
+                [pscustomobject]@{ Track = $Track; Status = $status; Steps = $done.ToArray(); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults.ToArray() }
+            }
+        }
+
+        It 'runs the Fabric step again on the next plain deploy.ps1 when it failed in a fresh run after a DONE run' {
+            # Live: 13:14 a full run ended DONE; 15:14 a fresh run's Fabric step failed (a transient TLS error), and
+            # DbHubTrackFabric still said Fabric; 15:40 a plain deploy.ps1 resumed, showed Fabric as finished in an earlier
+            # run, and ended DONE without running it.
+            $script:failStep = 'Fabric/Fabric'
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $calls = @($script:calls)
+            $calls | Should -Contain 'track Fabric: Fabric'
+            $reset = [array]::IndexOf($calls, 'state TrackFabric=,TrackT1=,TrackT2=')
+            $reset | Should -BeGreaterThan ([array]::IndexOf($calls, 'preflight')) -Because 'a run that starts over clears every record once preflight passed'
+            $reset | Should -BeLessThan ([array]::IndexOf($calls, 'template disk=golden')) -Because 'the template carries the group''s tags it reads at its start'
+            $reset | Should -BeLessThan ([array]::IndexOf($calls, 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'))
+            $script:tags['TrackFabric'] | Should -Be ''
+            $script:tags['Stage'] | Should -Be 'Monitoring'
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Not -Be 'Pass'
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Results = $results } { Get-DemoDeploymentOutcome -Result $Results -State (Get-DemoDeploymentState -Config $Config) -Config $Config -Command './scripts/deploy.ps1' }
+            $outcome.Done | Should -BeFalse
+            $outcome.Unfinished | Should -Contain 'Fabric'
+
+            # The next plain deploy.ps1 continues the unfinished deployment, and the Fabric step runs again.
+            $script:calls.Clear()
+            $script:failStep = ''
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $script:calls | Should -Not -Contain 'preflight'
+            $script:calls | Should -Contain 'track Fabric: Fabric'
+            @($script:calls | Where-Object { $_ -match '^track T[12]' }) | Should -BeNullOrEmpty -Because 'T1 and T2 finished in the fresh run'
+            @($script:calls | Where-Object { $_ -match '^state .*Track' }) | Should -BeNullOrEmpty -Because 'a resume keeps the records it continues'
+            $script:tags['TrackFabric'] | Should -Be 'Fabric'
+            $script:tags['Stage'] | Should -Be 'Validation'
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+        }
+
+        It 'runs a T1 step again on the next plain deploy.ps1 when the fresh run''s T1 track failed at its first step' {
+            # Without the reset, DbHubTrackT1 kept the DONE run's Telemetry, and the resume skipped the whole T1 track.
+            $script:failStep = 'T1/T3Setup'
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
+            $script:tags['TrackT1'] | Should -Be ''
+            $script:tags['Stage'] | Should -Be 'Infrastructure'
+
+            $script:calls.Clear()
+            $script:failStep = ''
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
+            $script:calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+            $script:tags['TrackT1'] | Should -Be 'Telemetry'
+            $script:tags['Stage'] | Should -Be 'Validation'
+
+            # A T1 step after the first one fails: the resume continues at it.
+            $script:tags['Stage'] = 'Validation'
+            $script:calls.Clear()
+            $script:failStep = 'T1/Monitoring'
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
+            $script:tags['TrackT1'] | Should -Be 'Activity'
+            $script:calls.Clear()
+            $script:failStep = ''
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
+            $script:calls | Should -Contain 'track T1: Monitoring,Telemetry'
+        }
+
+        It 'keeps the records on -Resume, and lowers on -FromStage only those of the tracks it runs again, as before' {
+            $script:tags = @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Bootstraps'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -Resume }
+            $script:calls | Should -Contain 'track T2: T2,Telemetry'
+            @($script:calls | Where-Object { $_ -match '^state .*Track' }) | Should -BeNullOrEmpty
+
+            $script:calls.Clear()
+            $script:tags = @{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Validation' }
+            $script:calls | Should -Contain 'state TrackT1=Monitoring,TrackT2=T2'
+            $script:calls | Should -Contain 'track T1: Telemetry'
+            $script:tags['TrackFabric'] | Should -Be 'Fabric' -Because '-FromStage Validation doesn''t run the Fabric step'
+            $script:tags['TrackT1'] | Should -Be 'Telemetry'
+
+            # -FromStage Preflight starts over, as a plain deploy.ps1 does after a DONE run.
+            $script:calls.Clear()
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Preflight' -SkipFabric }
+            $script:calls | Should -Contain 'state TrackFabric=,TrackT1=,TrackT2='
+            $script:tags['TrackFabric'] | Should -Be '' -Because 'a run that starts over trusts nothing an earlier run recorded, even for a track it skips'
+        }
+    }
+
+    It 'starts T4''s Burstable fallback where preflight says, and DONE and the clock follow what T4 got (Phase 28)' {
+        $withT4 = New-TestConfig -WithT4
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-TestResult 'DEPLOY.T4.START' 'Not selected' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -MockWith {
+            $script:calls.Add('preflight')
+            New-TestResult 'PREFLIGHT.P1.SUBSCRIPTION'
+            New-DemoResult -CheckId 'PREFLIGHT.T4.CAPABILITY' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message 'westus3 lists neither Burstable size.' -Evidence @{ startSku = 'None' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
+            $script:calls.Add(('template start={0}' -f (Get-Variable -Name 'T4StartSku' -ValueOnly -ErrorAction SilentlyContinue)))
+            [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $false; T4SkuName = '' }
+        }
+        $script:t4InTracks = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $script:t4InTracks.Add(('{0}:{1}' -f $Track, [bool]$Config['t4Enabled']))
+            $trackResults = switch ($Track) {
+                'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) }
+                'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2')) }
+                default { @() }
+            }
+            [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $script:calls | Should -Contain 'template start=None'
+        $script:t4InTracks | Should -Contain 'T1:False'
+        $script:calls | Should -Contain 'estate T1,T3,T2'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue -Because 'T4 isn''t deployed, so DONE doesn''t need its estate or metrics'
+    }
+
+    It 'stops the clock only when T4''s estate and metrics passed too, when T4 is on (ADR 0018 as amended)' {
+        $withT4 = New-TestConfig -WithT4
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-TestResult 'DEPLOY.T4.START' 'Not selected' }
+        $script:t4Metrics = 'Warning'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $trackResults = switch ($Track) {
+                'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) }
+                'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2')) }
+                'T4' { @(New-TestResult 'METRICS.T4' $script:t4Metrics) }
+                default { @() }
+            }
+            [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Names = [pscustomobject]@{ ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4MetricFlow -MockWith { $script:calls.Add('gate metrics'); New-TestResult 'METRICS.T4' $script:t4Metrics }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $script:calls | Should -Contain 'estate T1,T3,T2,T4'
+        $script:calls | Should -Contain 'gate metrics'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeFalse
+        $script:t4Metrics = 'Pass'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).message | Should -Match 'T4''s metrics'
+    }
+
+    It 'checks T1''s monitoring plugin on a resumed run whose T1 track finished earlier, before the tracks, and checks it again before DONE''s missing T1 telemetry fails the run (Phase 28 live finding, 2026-10-30)' {
+        # Live: the resumed run ended NOT DONE on TELEMETRY.T1, because T1's plugin had stopped after a restart and the T1
+        # track, finished in an earlier run, never checked it.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Monitoring'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state.TrackFabric = 'Fabric'; $state }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:calls.Add(('restore {0} {1}' -f $CheckId, $Occasion)); New-TestResult 'DEPLOY.T1.MONITORING' }
+        $script:gatePolls = 0
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith {
+            $script:gatePolls++
+            $script:calls.Add('gate telemetry ' + ($Target -join ','))
+            foreach ($t in $Target) {
+                if ($t -eq 'T1' -and $script:gatePolls -eq 1) {
+                    New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'No performance telemetry from T1 (sqlvm01) in the last 60 minutes.' -Evidence ([ordered]@{ resourceId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01'; rows = 0 })
+                }
+                else {
+                    New-TestResult ('TELEMETRY.{0}' -f $t)
+                }
+            }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+        $calls = @($script:calls)
+        $firstTrack = [array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'track *' })
+        $calls[$firstTrack] | Should -Be 'track T2: T2,Telemetry'
+        @($calls | Where-Object { $_ -like 'track T1*' }) | Should -BeNullOrEmpty -Because 'T1''s track finished in an earlier run'
+        $calls.IndexOf('restore DEPLOY.T1.MONITORING the deployment') | Should -BeLessThan $firstTrack -Because 'the plugin is checked once the VMs run, before the tracks'
+        $gate = $calls.IndexOf('gate telemetry T1,T3')
+        $gate | Should -BeGreaterThan $firstTrack
+        $calls[($gate + 1)..($gate + 2)] | Should -Be @('restore DEPLOY.T1.MONITORING the deployment', 'gate telemetry T1')
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' -and $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+    }
+
+    Context 'with VMs that were stopped (Phase 28 live finding, 2026-10-30)' {
+        BeforeEach {
+            # A rerun after the nightly auto-shutdown found the VMs deallocated, and its first Run Command failed.
+            Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:calls.Add('request ' + $VmName); $true }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith {
+                $script:calls.Add(('running {0} requested={1}' -f $VmName, [bool]$PesterBoundParameters['StartRequested']))
+                New-DemoResult -CheckId ('START.VM_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T1' -Status $(if ($VmName -in $script:noStart) { 'Warning' } else { 'Pass' }) -Message ('{0} is running.' -f $VmName)
+            }
+            $script:noStart = @()
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenSourceRelease -MockWith { $script:calls.Add('source release') }
+            Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:calls.Add('t1 monitoring'); New-TestResult 'DEPLOY.T1.MONITORING' }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        }
+
+        It 'starts a deallocated VM while preflight runs, has it running before the template and the tracks, and only reads a running one' {
+            $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/running' }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+            $calls = @($script:calls)
+            $calls.IndexOf('request sqlvm01') | Should -BeLessThan $calls.IndexOf('preflight') -Because 'it boots while preflight runs'
+            $calls.IndexOf('running sqlvm01 requested=True') | Should -BeGreaterThan $calls.IndexOf('preflight')
+            $calls.IndexOf('running sqlvm01 requested=True') | Should -BeLessThan $calls.IndexOf('template disk=golden')
+            $calls.IndexOf('running sqlvm01 requested=True') | Should -BeLessThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'track *' }))
+            $calls | Should -Not -Contain 'request archost01'
+            @($calls | Where-Object { $_ -like 'running archost01*' }) | Should -BeNullOrEmpty -Because 'a running VM is only read'
+            $calls | Should -Not -Contain 'source release' -Because 'archost01 wasn''t started'
+            $calls | Should -Not -Contain 't1 monitoring' -Because 'T1''s own Monitoring step runs in this run'
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).status | Should -Be 'Pass'
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+        }
+
+        It 'starts them before any Run Command when it resumes, with the golden source''s guest and T1''s monitoring plugin' {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Monitoring'; $state.TrackT2 = 'T2'; $state }
+            $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $calls = @($script:calls)
+            $calls | Should -Not -Contain 'preflight'
+            $firstTrack = [array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'track *' })
+            $firstTrack | Should -BeGreaterThan 0
+            foreach ($expected in 'request sqlvm01', 'request archost01', 'running sqlvm01 requested=True', 'running archost01 requested=True', 'source release', 't1 monitoring') {
+                $calls.IndexOf($expected) | Should -BeGreaterOrEqual 0 -Because $expected
+                $calls.IndexOf($expected) | Should -BeLessThan $firstTrack -Because ('{0} comes before any track runs a Run Command' -f $expected)
+            }
+            $calls | Should -Contain 'track T1: Telemetry'
+        }
+
+        It 'stops with DEPLOY.VMSTART and the next action when a VM doesn''t start, before the template and the tracks' {
+            $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+            $script:noStart = @('archost01')
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+            $vmStart = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+            $vmStart.status | Should -Be 'Fail'
+            $vmStart.message | Should -Match 'archost01 isn''t running'
+            $vmStart.remediation | Should -Match ([regex]::Escape('./scripts/deploy.ps1 again'))
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
+        }
+
+        It 'starts a stopped T4 with the VMs, waits for it before the template, and doesn''t start it a second time' {
+            $withT4 = New-TestConfig -WithT4
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith {
+                $script:calls.Add(('t4 start wait={0} requested={1}' -f $PesterBoundParameters['WaitMinutes'], [bool]$PesterBoundParameters['Requested']))
+                $after = if ([int]$PesterBoundParameters['WaitMinutes'] -gt 0) { 'Ready' } else { 'Starting' }
+                New-DemoResult -CheckId 'DEPLOY.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 is {0}.' -f $after) -Evidence ([ordered]@{ stateBefore = 'Stopped'; stateAfter = $after })
+            }
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+            $calls = @($script:calls)
+            $calls.IndexOf('t4 start wait=0 requested=False') | Should -BeLessThan $calls.IndexOf('preflight')
+            $calls.IndexOf('t4 start wait=15 requested=True') | Should -BeLessThan $calls.IndexOf('template disk=golden')
+            @($calls | Where-Object { $_ -like 't4 start*' }).Count | Should -Be 2 -Because 'the template''s own start finds it started'
+        }
+
+        It 'starts nothing, and reads nothing, on a first deployment, and records the VMs it creates once the template succeeded, which bill from then on (Phase 28)' {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Exists = $false; $state }
+            Mock -ModuleName DbHubDemo -CommandName Add-DemoProgressStartedVm -MockWith { $script:calls.Add('billing ' + (@($PesterBoundParameters['Name']) -join ',')) }
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -Times 0 -Exactly
+            $script:calls | Should -Not -Contain 'request sqlvm01'
+            $calls = @($script:calls)
+            @($calls | Where-Object { $_ -like 'billing*' }) | Should -Be @('billing sqlvm01,archost01')
+            $calls.IndexOf('billing sqlvm01,archost01') | Should -BeGreaterThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'template*' })) -Because 'only a template that succeeded created them'
+            $calls.IndexOf('billing sqlvm01,archost01') | Should -BeLessThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'track *' })) -Because 'a stop during the tracks still leaves the VMs it created'
+        }
+
+        It 'records T4 for a first deployment only when the template deployed it: the Burstable fallback can leave it out (Phase 28 review)' {
+            # Reviewer, 2026-10-30: a NOT DONE first run said both "T4 isn't deployed" and "Running and billing: ... and T4".
+            $withT4 = New-TestConfig -WithT4
+            $script:t4Deployed = $false
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Exists = $false; $state }
+            Mock -ModuleName DbHubDemo -CommandName Add-DemoProgressStartedVm -MockWith { $script:calls.Add('billing ' + (@($PesterBoundParameters['Name']) -join ',')) }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-DemoResult -CheckId 'DEPLOY.T4.START' -Area 'infra' -Target 'T4' -Status 'Not selected' -Message 'T4 doesn''t exist yet.' }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
+                $script:calls.Add('template')
+                [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $script:t4Deployed; T4SkuName = '' }
+            }
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+            @($script:calls | Where-Object { $_ -like 'billing*' }) | Should -Be @('billing sqlvm01,archost01') -Because 'the fallback ended without T4'
+
+            $script:calls.Clear()
+            $script:t4Deployed = $true
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+            @($script:calls | Where-Object { $_ -like 'billing*' }) | Should -Be @('billing sqlvm01,archost01,T4')
+        }
+
+        It 'records nothing as billing when a first deployment''s template fails, because it created nothing (Phase 28 review)' {
+            # Reviewer, 2026-10-30: a template that failed validation said sqlvm01, archost01, and T4 were billing.
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Exists = $false; $state }
+            Mock -ModuleName DbHubDemo -CommandName Add-DemoProgressStartedVm -MockWith { $script:calls.Add('billing ' + (@($PesterBoundParameters['Name']) -join ',')) }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
+                $script:calls.Add('template')
+                [pscustomobject]@{ Succeeded = $false; Results = @(New-TestResult 'DEPLOY.TEMPLATE' 'Fail'); Outputs = @{}; Changes = @(); T3UseFreeLimit = $true }
+            }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Fail'
+            @($script:calls | Where-Object { $_ -like 'billing*' }) | Should -BeNullOrEmpty
+            @(InModuleScope DbHubDemo -Parameters @{ Results = $results } { Get-DemoStartedVm -Result $Results }) | Should -BeNullOrEmpty
+        }
+
+        It 'says what it started keeps running when preflight then fails' {
+            $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/running' }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -MockWith { New-TestResult 'PREFLIGHT.P3.QUOTA' 'Fail' }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+            $warning = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+            $warning.status | Should -Be 'Warning'
+            $warning.message | Should -Match 'This run started sqlvm01 while preflight ran; it keeps running until \./scripts/stop-demo\.ps1'
+            @($warning.evidence.vms) | Should -Be @('sqlvm01')
+            @($warning.evidence.started) | Should -Be @('sqlvm01') -Because 'the ending names what bills (Phase 28)'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
+        }
     }
 
     Context 'with track processes (ADR 0018)' {
@@ -748,6 +1445,140 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:source = 'build'
             InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config } | Out-Null
             $script:calls | Should -Contain 'job T2 delay=5 earlyT2=False bundle=False'
+        }
+
+        It 'stops the track processes within seconds when deploy.ps1 is stopped, after telling them to skip their slow cleanups (Phase 28 live finding)' {
+            # Live, Ctrl+C at the guided stop seemed to do nothing: this finally block waited for the T2 track's cleanup.
+            $script:t2Job = $null
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoDeploymentTrackJob -MockWith {
+                $script:handoffDir = [string]$Context['HandoffPath']
+                if ($Track -ne 'T2') {
+                    return (Start-ThreadJob -Name ('dbhub-track-{0}' -f $Track) -ScriptBlock { })
+                }
+                # The T2 track at the guided stop: its cleanup takes minutes unless deploy.ps1 left the cancel marker.
+                $guidedStopTrack = {
+                    param([string] $Marker, [System.Threading.ManualResetEventSlim] $Running)
+                    try {
+                        $Running.Set()
+                        Start-Sleep -Seconds 120
+                    }
+                    finally {
+                        if (-not (Test-Path -LiteralPath $Marker)) {
+                            [System.Threading.Thread]::Sleep(30000)
+                        }
+                    }
+                }
+                $running = [System.Threading.ManualResetEventSlim]::new($false)
+                $script:t2Job = Start-ThreadJob -Name 'dbhub-track-T2' -ArgumentList (Join-Path -Path $script:handoffDir -ChildPath 'cancel.xml'), $running -ScriptBlock $guidedStopTrack
+                # A thread job stopped before its script starts ends Failed, not Stopped (CI on ubuntu-latest, 2026-10-30, a
+                # 260 ms run): the T2 track is well inside its work at the guided stop, so this waits until the job is too.
+                $null = $running.Wait(15000)
+                return $script:t2Job
+            }
+            # Ctrl+C, as the wait for the tracks notices it.
+            Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                { InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config } } | Should -Throw -ExceptionType ([System.OperationCanceledException])
+                $watch.Elapsed.TotalSeconds | Should -BeLessThan 10
+                $script:t2Job.State | Should -Be 'Stopped' -Because 'the cancel marker came first, so it skipped its cleanup and ended by itself'
+                Test-Path -LiteralPath $script:handoffDir | Should -BeFalse
+            }
+            finally {
+                if ($null -ne $script:t2Job) {
+                    $null = Wait-Job -Job $script:t2Job -Timeout 40
+                    Remove-Job -Job $script:t2Job -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        It 'checks T1''s monitoring plugin in its own process beside the tracks when T1''s track finished earlier, and collects its result (Phase 28 live finding, 2026-10-30)' {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Monitoring'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state.TrackFabric = 'Fabric'; $state }
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoT1MonitoringJob -MockWith {
+                $script:calls.Add(('monitoring job occasion={0} handoff={1}' -f $Occasion, [bool]$HandoffPath))
+                Start-ThreadJob -Name 'dbhub-t1-monitoring' -ScriptBlock { }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Receive-DemoDeploymentTrackOutput -ParameterFilter { $Job.Name -eq 'dbhub-t1-monitoring' } -MockWith {
+                [pscustomobject]@{ Results = @(New-TestResult 'DEPLOY.T1.MONITORING'); Summary = $null }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT1MonitoringCheck -MockWith { throw 'the check runs in its own process, so the guided stop''s prompt never waits for it' }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -AutoResume })
+            $calls = @($script:calls)
+            $calls | Should -Contain 'monitoring job occasion=the deployment handoff=True'
+            $calls.IndexOf('monitoring job occasion=the deployment handoff=True') | Should -BeGreaterThan $calls.IndexOf('job T2 delay=0 earlyT2=False bundle=False') -Because 'the tracks start first'
+            @($results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' }).status | Should -Be @('Pass')
+            Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoT1MonitoringJob -Times 1 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT1MonitoringCheck -Times 0 -Exactly
+        }
+
+        It 'runs the policy inventory alongside the deployment only with networkMode private, and its results replace preflight''s placeholders (Phase 28; review finding 7)' {
+            $private = New-TestConfig
+            $private['networkMode'] = 'private'
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -MockWith {
+                $script:calls.Add(('preflight defer={0}' -f [bool]$DeferPolicyInventory))
+                New-TestResult 'PREFLIGHT.P1.SUBSCRIPTION'
+                New-DemoResult -CheckId 'PREFLIGHT.POLICY.INVENTORY' -Area 'preflight' -Target 'subscription' -Status 'Not selected' -Message 'Deferred.' -Evidence @{ deferred = $true }
+                New-DemoResult -CheckId 'PREFLIGHT.POLICY.SQLPUBLIC' -Area 'preflight' -Target 'subscription' -Status 'Not selected' -Message 'Deferred.' -Evidence @{ effectiveNetworkMode = 'private'; deferred = $true }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoPolicyInventoryJob -MockWith { $script:calls.Add('policy job'); Start-ThreadJob -Name 'dbhub-policy-inventory' -ScriptBlock { } }
+            Mock -ModuleName DbHubDemo -CommandName Receive-DemoDeploymentTrackOutput -ParameterFilter { $Job.Name -eq 'dbhub-policy-inventory' } -MockWith {
+                [pscustomobject]@{ Results = @((New-TestResult 'PREFLIGHT.POLICY.INVENTORY'), (New-TestResult 'PREFLIGHT.POLICY.SQLPUBLIC')); Summary = $null }
+            }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $private } { Invoke-DemoParallelDeployment -Config $Config })
+            $script:calls | Should -Contain 'preflight defer=True'
+            $script:calls | Should -Contain 'policy job'
+            @($results | Where-Object { $_.checkId -eq 'PREFLIGHT.POLICY.INVENTORY' }).status | Should -Be @('Pass')
+            @($results | Where-Object { $_.checkId -eq 'PREFLIGHT.POLICY.SQLPUBLIC' }).status | Should -Be @('Pass')
+
+            # networkMode public keeps the inventory in preflight: a Modify policy that turns SQL public access off, which
+            # the what-if doesn't catch, must stop the run before anything is created. auto needs it too.
+            foreach ($mode in 'public', 'auto') {
+                $script:calls.Clear()
+                $script:received = @{}
+                $other = New-TestConfig
+                $other['networkMode'] = $mode
+                InModuleScope DbHubDemo -Parameters @{ Config = $other } { Invoke-DemoParallelDeployment -Config $Config } | Out-Null
+                $script:calls | Should -Contain 'preflight defer=False' -Because $mode
+                $script:calls | Should -Not -Contain 'policy job'
+            }
+        }
+
+        It 'lets the T2 track process prompt the person itself when there''s no progress model (-NoStatusPage; review finding 2)' {
+            $script:promptInParent = @{}
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoDeploymentTrackJob -MockWith {
+                $script:promptInParent[$Track] = [bool]$Context['PromptInParent']
+                $script:handoffDir = [string]$Context['HandoffPath']
+                Start-ThreadJob -Name ('dbhub-track-{0}' -f $Track) -ScriptBlock { }
+            }
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -WaitForT2 } | Out-Null
+            $script:promptInParent['T2'] | Should -BeFalse -Because 'only a progress model tells this process that the guided stop is ready'
+
+            $script:received = @{}
+            $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+            InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog) -GuidedStop 'Pending') -Confirm:$false }
+            InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -WaitForT2 -ProgressPath $Path } | Out-Null
+            $script:promptInParent['T2'] | Should -BeTrue
+        }
+
+        It 'prompts the person in this process when the T2 track process reports the guided stop ready (Phase 28)' {
+            $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+            InModuleScope DbHubDemo -Parameters @{ Path = $progress } {
+                $model = New-DemoProgressModel -Catalog (Get-DemoProgressCatalog) -GuidedStop 'Pending'
+                $model['guidedStop']['state'] = 'Ready'
+                $model['guidedStop']['url'] = 'https://portal.azure.com/#@contoso.example/resource/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/archost01'
+                $model['guidedStop']['deadlineAt'] = Get-DemoUnixTime -Value ([DateTime]::UtcNow.AddMinutes(45))
+                Initialize-DemoProgress -Path $Path -Model $model -Confirm:$false
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGuidedStopCredential -MockWith { $script:calls.Add('credential'); [pscustomobject]@{ Mode = 'portalReset'; UserName = 'demoadmin'; Text = ''; Results = @(New-TestResult 'DEPLOY.T2.HOSTPASSWORD') } }
+            Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopPrompt -MockWith { $script:calls.Add(('prompt {0}' -f $SignInWay)) }
+            Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopReminder -MockWith { $script:calls.Add('reminder') }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -ProgressPath $Path })
+            @($script:calls | Where-Object { $_ -eq 'credential' }).Count | Should -Be 1
+            $script:calls | Should -Contain 'prompt portalReset'
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.T2.HOSTPASSWORD' }).status | Should -Be 'Pass'
+            $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+            $model['guidedStop']['credential'] | Should -Be 'portalReset'
+            $model['guidedStop']['hostUser'] | Should -Be 'demoadmin'
         }
     }
 }

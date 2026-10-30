@@ -61,9 +61,10 @@ function Invoke-DemoHubFabricGet {
 
     .DESCRIPTION
     Invoke-DemoFabricRequest sends the SecureString token with '-Authentication Bearer' only to
-    https://api.fabric.microsoft.com/v1, retries HTTP 429 after Retry-After, and returns StatusCode, Headers,
-    and the parsed Body without throwing on HTTP errors. A network error or a refused URI throws; this adapter
-    returns that as StatusCode 0 with the redacted message. Returns StatusCode, Body, and Error (empty on 2xx).
+    https://api.fabric.microsoft.com/v1, retries a transient failure (Invoke-DemoTransientRetry: a network error, and HTTP
+    408, 429, 502, 503, and 504), and returns StatusCode, Headers, and the parsed Body without throwing on HTTP errors. A
+    network error that lasts, or a refused URI, throws; this adapter returns that as StatusCode 0 with the redacted
+    message and its innermost cause. Returns StatusCode, Body, and Error (empty on 2xx).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -80,7 +81,7 @@ function Invoke-DemoHubFabricGet {
         $response = Invoke-DemoFabricRequest -Method Get -Uri $Uri -Token $Token
     }
     catch {
-        return [pscustomobject]@{ StatusCode = 0; Body = $null; Error = ('No response: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) }
+        return [pscustomobject]@{ StatusCode = 0; Body = $null; Error = ('No response: {0}' -f (Get-DemoExceptionText -Exception $_.Exception)) }
     }
     $code = [int]$response.StatusCode
     $errorText = ''

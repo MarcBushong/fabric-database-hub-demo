@@ -250,7 +250,7 @@ function Test-DemoConfigPathIgnored {
         [string] $Path
     )
 
-    $full = [System.IO.Path]::GetFullPath($Path)
+    $full = Resolve-DemoUserPath -Path $Path
     $root = [System.IO.Path]::GetFullPath($script:RepoRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
     $comparison = if ($IsWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
     if (-not $full.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, $comparison)) {

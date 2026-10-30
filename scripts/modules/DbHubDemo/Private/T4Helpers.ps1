@@ -24,8 +24,9 @@ function Get-DemoT4SkuName {
     <#
     T4's compute size: the t4SkuName setting, or the profile's size (Standard_B1ms) when it isn't set. Standard_B2s
     is the documented fallback when Azure answers SkuNotAvailable for B1ms, and Standard_D2ds_v5 the documented
-    General Purpose option the owner chose on 2026-10-26 after both were refused; nothing changes it on its own
-    (Phase 24, ADR 0019). Internal.
+    General Purpose option the owner chose on 2026-10-26 after both were refused (Phase 24, ADR 0019). Since Phase 28,
+    a run whose configuration doesn't set t4SkuName falls back from B1ms to B2s, then to no T4, on its own, and records
+    it (Resolve-DemoEffectiveConfig); a size the configuration sets never changes. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -208,13 +209,13 @@ function New-DemoT4SkuFailureResult {
 
     $where = if ($Failure.Zone) { 'zone {0}' -f $Failure.Zone } else { 'no zone preference' }
     $evidence = [ordered]@{ refusedSku = $Failure.Sku; refusedZone = $Failure.Zone; refusedUtc = $Failure.TimeUtc; fallbackSku = 'Standard_B2s' }
-    $remediation = 'Set t4SkuName to Standard_B2s, the documented fallback (2 vCores, 4 GiB; about four times the hourly list price of B1ms, which estimate-cost.ps1 prices at run time), and run deploy.ps1 again; or keep the size and try once more with t4AvailabilityZone set to another zone the region lists. Nothing changes the size on its own.'
+    $remediation = 'Set t4SkuName to Standard_B2s, the documented fallback (2 vCores, 4 GiB; about four times the hourly list price of B1ms, which estimate-cost.ps1 prices at run time), and run deploy.ps1 again; or keep the size and try once more with t4AvailabilityZone set to another zone the region lists. A size you set is never changed on its own.'
     if ($Failure.Sku -eq 'Standard_B2s') {
         # Live, 2026-10-26: West US 3 refused the fallback too; the owner then chose the General Purpose option.
-        $remediation = 'Standard_B2s is already the documented Burstable fallback. Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), try once more with t4AvailabilityZone set to a zone the region lists, set t4SkuName to Standard_D2ds_v5, the documented General Purpose option (2 vCores, 8 GiB; a much higher hourly price and 7-day restart worst case, which estimate-cost.ps1 prices at run time), or set t4Enabled to false until Azure accepts the size. Nothing changes the size on its own.'
+        $remediation = 'Standard_B2s is already the documented Burstable fallback. Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), try once more with t4AvailabilityZone set to a zone the region lists, set t4SkuName to Standard_D2ds_v5, the documented General Purpose option (2 vCores, 8 GiB; a much higher hourly price and 7-day restart worst case, which estimate-cost.ps1 prices at run time), or set t4Enabled to false until Azure accepts the size. A size you set is never changed on its own.'
     }
     elseif ($Failure.Sku -match '^Standard_D') {
-        $remediation = 'The demo documents no further size. Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), and set t4Enabled to false until Azure accepts a size. Nothing changes the size on its own.'
+        $remediation = 'The demo documents no further size. Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), and set t4Enabled to false until Azure accepts a size. A size you set is never changed on its own.'
     }
     $docUrl = 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'
     if ($Status -eq 'Warning') {
@@ -223,6 +224,90 @@ function New-DemoT4SkuFailureResult {
     }
     $message = 'Azure refused to create T4 at size {0} with {1} at {2}: SkuNotAvailable ("Specified SKU is not supported in this region"), although the region''s capability list includes it, so the size is unavailable there for now.' -f $Failure.Sku, $where, $Failure.TimeUtc
     return (New-DemoResult -CheckId $CheckId -Area 't4' -Target 'T4' -Status 'Fail' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl $docUrl)
+}
+
+function New-DemoT4FallbackResult {
+    <#
+    .SYNOPSIS
+    DEPLOY.T4.SKU for Phase 28's Burstable fallback (brief item 6, ADR 0019): a Warning that Azure refused T4's size and
+    what the run does now: Standard_B2s, the same Burstable class, or no T4 at all, with the exact General Purpose option
+    (t4SkuName: Standard_D2ds_v5) and its price from the Retail Prices API, or a dated example when the API doesn't
+    answer. Never a General Purpose size on its own. Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $Refused,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Standard_B2s', 'None')]
+        [string] $Next
+    )
+
+    $where = if ($Refused.Zone) { 'zone {0}' -f $Refused.Zone } else { 'no zone preference' }
+    $docUrl = 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'
+    $evidence = [ordered]@{ refusedSku = $Refused.Sku; refusedZone = $Refused.Zone; refusedUtc = $Refused.TimeUtc; next = $Next }
+    if ($Next -eq 'Standard_B2s') {
+        $message = 'Azure refused T4''s size {0} with {1} at {2} (SkuNotAvailable). This run tries Standard_B2s, the same Burstable class (2 vCores, 4 GiB; about four times the hourly list price of B1ms, which estimate-cost.ps1 prices at run time), and later runs keep it.' -f $Refused.Sku, $where, $Refused.TimeUtc
+        return (New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName in your configuration: a size you set is never changed.' -DocUrl $docUrl)
+    }
+    $option = [ordered]@{}
+    foreach ($key in $Config.Keys) {
+        $option[$key] = $Config[$key]
+    }
+    $option['t4SkuName'] = 'Standard_D2ds_v5'
+    $price = Get-DemoT4HourlyPrice -Config $option
+    $priceText = if ($null -ne $price) {
+        'about {0:N3} USD an hour at list price in {1} (Azure Retail Prices API, read now)' -f $price, [string]$Config['location']
+    }
+    else {
+        'about 0.18 USD an hour (a dated example: the West US 3 list price on 2026-10-26; estimate-cost.ps1 prices it at run time)'
+    }
+    $evidence['optionSku'] = 'Standard_D2ds_v5'
+    $evidence['optionHourlyUsd'] = $price
+    $message = 'Azure refused both of T4''s Burstable sizes, Standard_B1ms and then Standard_B2s ({0}, at {1}; SkuNotAvailable), so this run finishes without T4: t4Enabled stays as you configured it, but the server isn''t created, and nothing larger is chosen for you.' -f $where, $Refused.TimeUtc
+    $remediation = 'To add T4, set "t4SkuName": "Standard_D2ds_v5" in your configuration (General Purpose: 2 vCores, 8 GiB, {0}, with a 7-day restart worst case; ADR 0019), then run ./scripts/deploy.ps1. Or ask for the Burstable sizes with a Region access request (Learn: Resolve capacity errors).' -f $priceText
+    return (New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl $docUrl)
+}
+
+function Resolve-DemoEffectiveConfig {
+    <#
+    .SYNOPSIS
+    The configuration with what earlier runs settled that the file doesn't say (Phase 28): T4's size from the Burstable
+    fallback, recorded in the resource group's T4Sku tag (Standard_B2s, or None for no T4). A t4SkuName the file sets
+    always wins. Returns the configuration itself when nothing applies, otherwise a copy. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.IDictionary])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $State
+    )
+
+    $recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku')
+    $explicit = $Config.Contains('t4SkuName') -and -not [string]::IsNullOrWhiteSpace([string]$Config['t4SkuName'])
+    if (-not $recorded -or $explicit -or $recorded -notin 'Standard_B2s', 'None') {
+        return $Config
+    }
+    $copy = [ordered]@{}
+    foreach ($key in $Config.Keys) {
+        $copy[$key] = $Config[$key]
+    }
+    if ($recorded -eq 'None') {
+        $copy['t4Enabled'] = $false
+    }
+    else {
+        $copy['t4SkuName'] = $recorded
+    }
+    return $copy
 }
 
 function Get-DemoT4Name {

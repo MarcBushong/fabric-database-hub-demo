@@ -10,6 +10,21 @@ function Get-DemoResourceGroupName {
     return ('rg-{0}-{1}' -f $Config['prefix'], $Config['environment'])
 }
 
+function Get-DemoMainDeploymentName {
+    # The template's subscription-scope deployment record: <prefix>-<environment>-main, which is dbhub-demo-main with the
+    # defaults, as before. With the prefix in it (Phase 28), an environment with its own prefix, such as a throwaway proof,
+    # never replaces, reads, or deletes another environment's record. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $prefix = if ([string]$Config['prefix']) { [string]$Config['prefix'] } else { 'dbhub' }
+    return ('{0}-{1}-main' -f $prefix, $Config['environment'])
+}
+
 function Get-DemoHostVmName {
     # The T2 VM: archost01 (nested, the default) or arcsql01 (evaluation-only mode, ADR 0006). Internal.
     [CmdletBinding()]
@@ -69,6 +84,13 @@ function Get-DemoDeploymentStateTagName {
         # fabric.manageCapacity (Phase 26b): the capacity start-demo.ps1 resumed, "<resource group>/<name>", and when.
         FabricCapacityResumed    = 'DbHubFabricCapacityResumed'
         FabricCapacityResumedUtc = 'DbHubFabricCapacityResumedUtc'
+        # Phase 28: until when the PaygWizard guided stop's request on the T2 host is valid (empty when there's none), and the
+        # size T4's Burstable fallback settled on (Standard_B2s, or None when Azure refused both) for later runs.
+        GuidedStopUtc            = 'DbHubGuidedStopUtc'
+        T4Sku                    = 'DbHubT4Sku'
+        # Phase 28 review follow-up: when the T2 host's loader started a bootstrap generation that nobody has seen finish (empty
+        # when none runs), so deploy.ps1's watchdog never restarts the host during its guest build (Get-DemoHostRestartBlocker).
+        T2BuildUtc               = 'DbHubT2BuildUtc'
     }
 }
 
@@ -414,7 +436,9 @@ function Invoke-DemoFabricScriptStep {
 
     .DESCRIPTION
     Only the parameters the script declares are passed (ConfigPath, OutputPath, and Confirm), plus -Argument. A
-    script that throws, or writes no records, is reported as -CheckId Fail. Without -ConfigPath, the configuration
+    script that throws, or writes no records, is reported as -CheckId Fail, with the innermost cause of an exception; one
+    that a network error stopped after its retries (Invoke-DemoTransientRetry) has evidence networkError and says to run
+    deploy.ps1 again, which resumes the step (Phase 28 live finding, 2026-10-30). Without -ConfigPath, the configuration
     goes to a file in a private temporary directory that's deleted afterward; it holds no secrets.
     #>
     [CmdletBinding()]
@@ -456,7 +480,12 @@ function Invoke-DemoFabricScriptStep {
             $null = Invoke-DemoRepositoryScript -Path $ScriptPath -Argument $arguments
         }
         catch {
-            return @(New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} stopped: {1}' -f $name, (Protect-DemoText -Text $_.Exception.Message)) -Remediation ('Run ./scripts/{0} yourself to see its output.' -f $name))
+            # A network error that lasted through the retries (Invoke-DemoTransientRetry) needs only a rerun, which resumes
+            # this step (Phase 28 live finding, 2026-10-30); anything else, the script's own output.
+            if (Test-DemoNetworkFailure -Exception $_.Exception) {
+                return @(New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} stopped: {1}' -f $name, (Get-DemoExceptionText -Exception $_.Exception)) -Evidence ([ordered]@{ networkError = $true }) -Remediation 'Run ./scripts/deploy.ps1 again: it resumes where it stopped (a network error lasted through the retries).')
+            }
+            return @(New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} stopped: {1}' -f $name, (Get-DemoExceptionText -Exception $_.Exception)) -Remediation ('Run ./scripts/{0} yourself to see its output.' -f $name))
         }
         if (-not (Test-Path -LiteralPath $output)) {
             return @(New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} wrote no results.' -f $name) -Remediation ('Run ./scripts/{0} yourself to see its output.' -f $name))
@@ -497,7 +526,51 @@ function Invoke-DemoPowerBIStage {
     if ($CheckModelData) {
         $argument['CheckModelData'] = $true
     }
-    return @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.POWERBI' -Argument $argument)
+    $records = @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.POWERBI' -Argument $argument)
+    return @(Merge-DemoBlankMeasureResult -Result $records)
+}
+
+function Merge-DemoBlankMeasureResult {
+    <#
+    .SYNOPSIS
+    deploy.ps1's view of the history model's data check (Phase 28 live finding, 2026-10-30): before
+    NB_DatabaseHub_LiveActivity has saved any snapshot (FABRIC.SEMANTICMODEL.ROWS is the Warning that no history is
+    written yet), every measure is blank, and the about 40 FABRIC.SEMANTICMODEL.MEASURE.* Warnings become one,
+    FABRIC.SEMANTICMODEL.MEASURES, which says that's expected right after a first deployment and keeps their check IDs
+    in its evidence. A measure that fails, or returns a value, stays as it is; with history written, nothing changes.
+    configure-powerbi.ps1 itself still reports every measure. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $all = @($Result | Where-Object { $null -ne $_ })
+    $rows = @($all | Where-Object { [string]$_.checkId -eq 'FABRIC.SEMANTICMODEL.ROWS' }) | Select-Object -Last 1
+    if ($null -eq $rows -or [string]$rows.status -ne 'Warning') {
+        return $all
+    }
+    $blank = @($all | Where-Object { [string]$_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.*' -and [string]$_.status -eq 'Warning' })
+    if ($blank.Count -lt 2) {
+        return $all
+    }
+    $ids = @($blank | ForEach-Object { [string]$_.checkId })
+    $merged = New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURES' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The history report is empty until NB_DatabaseHub_LiveActivity saves its first snapshots; that''s expected right after a first deployment ({0} measures are blank for now).' -f $blank.Count) -Evidence ([ordered]@{ blankMeasures = $ids }) -Remediation 'Nothing to do now: ./scripts/stop-demo.ps1 -SaveHistory (or ./scripts/configure-fabric.ps1 -RunLiveActivity) runs NB_DatabaseHub_LiveActivity, which saves the snapshots the report shows; ./scripts/configure-powerbi.ps1 -CheckModelData then checks every measure again.' -DocUrl 'https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group'
+    $kept = [System.Collections.Generic.List[object]]::new()
+    $placed = $false
+    foreach ($item in $all) {
+        if ([string]$item.checkId -in $ids -and [string]$item.status -eq 'Warning') {
+            if (-not $placed) {
+                $kept.Add($merged)
+                $placed = $true
+            }
+            continue
+        }
+        $kept.Add($item)
+    }
+    return $kept.ToArray()
 }
 
 function Invoke-DemoFabricAppStage {
@@ -506,6 +579,13 @@ function Invoke-DemoFabricAppStage {
     The Fabric track's app step: runs scripts/configure-fabric-app.ps1 (Phase 19b, the Fabric app over the history
     model) when this checkout has it, and returns its records; DEPLOY.FABRIC.APP is Not selected otherwise. Phase
     19b verifies the app itself. Internal.
+
+    .DESCRIPTION
+    The app is optional (brief item 15), so here its records are never a Fail: a Fail becomes Manual action required
+    (evidence reportedStatus Fail), every record is marked optional (evidence optional insightsApp, which
+    Test-DemoOptionalResult reads), and the records that aren't the app's own (the script's own workspace and capacity
+    checks, for example) say they're the app's. -WorkspaceId is the workspace the Fabric step resolved or created, so
+    the script doesn't look it up by name again (Phase 28 live finding).
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -513,12 +593,83 @@ function Invoke-DemoFabricAppStage {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [string] $ConfigPath = ''
+        [string] $ConfigPath = '',
+
+        [AllowEmptyString()]
+        [string] $WorkspaceId = ''
     )
 
     $scriptPath = Join-Path -Path $script:RepoRoot -ChildPath 'scripts/configure-fabric-app.ps1'
     if (-not (Test-Path -LiteralPath $scriptPath)) {
         return @(New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'scripts/configure-fabric-app.ps1 (Phase 19b) isn''t in this checkout, so the Fabric app wasn''t deployed.')
     }
-    return @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.FABRIC.APP')
+    $argument = @{}
+    if ($WorkspaceId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        $argument['WorkspaceId'] = $WorkspaceId
+    }
+    $records = @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.FABRIC.APP' -Argument $argument)
+    return @(foreach ($record in $records) {
+            ConvertTo-DemoOptionalAppRecord -Record $record
+        })
+}
+
+function ConvertTo-DemoOptionalAppRecord {
+    # One record of the optional Insights app's step as deploy.ps1 reports it (brief item 15; Phase 28 live finding):
+    # marked optional, a Fail as Manual action required, and named as the app's when it isn't one of its own checks.
+    # Internal.
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Record
+    )
+
+    $own = [string]$Record.checkId -like 'FABRIC.APP.*' -or [string]$Record.checkId -eq 'DEPLOY.FABRIC.APP'
+    $marks = [ordered]@{ optional = 'insightsApp' }
+    if ([string]$Record.status -eq 'Fail') {
+        $marks['reportedStatus'] = 'Fail'
+        $Record.status = 'Manual action required'
+        if (-not [string](Get-DemoMemberValue -InputObject $Record -Name 'remediation')) {
+            $Record | Add-Member -NotePropertyName 'remediation' -NotePropertyValue 'To add the optional Insights app, run ./scripts/configure-fabric-app.ps1 -SignIn.' -Force
+        }
+    }
+    $evidence = Get-DemoMemberValue -InputObject $Record -Name 'evidence'
+    if ($evidence -is [System.Collections.IDictionary]) {
+        foreach ($key in $marks.Keys) {
+            $evidence[$key] = $marks[$key]
+        }
+    }
+    elseif ($null -ne $evidence -and $evidence -isnot [string] -and $evidence -isnot [System.ValueType]) {
+        foreach ($key in $marks.Keys) {
+            $evidence | Add-Member -NotePropertyName $key -NotePropertyValue $marks[$key] -Force
+        }
+    }
+    else {
+        $Record | Add-Member -NotePropertyName 'evidence' -NotePropertyValue ([pscustomobject]$marks) -Force
+    }
+    if (-not $own -and [string]$Record.message -notlike 'Optional Insights app:*') {
+        $Record.message = 'Optional Insights app: {0}' -f [string]$Record.message
+    }
+    return $Record
+}
+
+function Get-DemoResolvedWorkspaceId {
+    # The Fabric workspace's ID that configure-fabric.ps1's records name (FABRIC.RESOLVE.WORKSPACE: found, created, or the
+    # fabric.workspaceId override), or '' when none did. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $pattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    $named = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'FABRIC.RESOLVE.WORKSPACE' -and [string]$_.status -ne 'Fail' })
+    for ($index = $named.Count - 1; $index -ge 0; $index--) {
+        $id = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $named[$index] -Name 'evidence') -Name 'workspaceId')
+        if ($id -match $pattern -and $id -ne '00000000-0000-0000-0000-000000000000') {
+            return $id.ToLowerInvariant()
+        }
+    }
+    return ''
 }

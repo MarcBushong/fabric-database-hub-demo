@@ -275,7 +275,7 @@ function Invoke-DemoHubHttp {
     }
     catch {
         $statusCode = 0
-        $errorText = Protect-DemoText -Text $_.Exception.Message
+        $errorText = Get-DemoExceptionText -Exception $_.Exception
     }
     finally {
         $request.Clear()

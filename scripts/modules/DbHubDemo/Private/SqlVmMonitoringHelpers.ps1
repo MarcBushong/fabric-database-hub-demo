@@ -132,6 +132,103 @@ function Get-DemoSqlVmMonitoringStatus {
     return [pscustomobject]$result
 }
 
+function Get-DemoSqlVmPluginGrace {
+    <#
+    .SYNOPSIS
+    How long T1's monitoring plugin, while it reports a state other than Running, gets to start by itself before the SQL
+    IaaS Agent service is restarted, in minutes: FlagSet when the DatabaseWatcheronAzureVM flag was set before this run,
+    JustMerged when this run merged it. Reads during the grace come every PollSeconds, and a console line every
+    LogEveryMinutes. Internal.
+
+    .DESCRIPTION
+    Live (2026-10-30, Phase 28): after a start from deallocation the plugin reported {"State":"NotRunning"} in about 2 of 3
+    starts and didn't start by itself (30 minutes, and once for hours), while the agent's restart brought it to Running
+    and OK in 2 to 3 minutes; the deployment's Monitoring step waited 20 minutes before it restarted the agent. After the
+    flag is merged, the setting takes a few minutes to apply (most data within three to five minutes):
+    https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm (checked
+    2026-10-30). Only the deployment's T1 Monitoring step (and -Sequential's) gives this grace; start-demo.ps1 and the check
+    beside the tracks restart a NotRunning plugin at once, as they always did (the owner's decision, 2026-10-30), and a
+    plugin this run merged the flag for gets JustMerged everywhere.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    return [pscustomobject]@{ FlagSet = 3; JustMerged = 5; PollSeconds = 60; LogEveryMinutes = 3 }
+}
+
+function Get-DemoSqlVmPluginWaitText {
+    <#
+    .SYNOPSIS
+    The console line and status-page message while T1's monitoring plugin is waited for (Phase 28 live finding,
+    2026-10-30): with -RestartInMinutes, the restart that follows when it doesn't start by itself; otherwise the wait
+    that's left. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $State = '',
+
+        [ValidateRange(0, 1440)]
+        [int] $Minutes = 0,
+
+        [int] $RestartInMinutes = -1,
+
+        [int] $WaitLeftMinutes = 0,
+
+        [string] $Actor = 'the deployment'
+    )
+
+    $span = { param([int] $Count) if ($Count -eq 1) { '1 minute' } else { '{0} minutes' -f $Count } }
+    $reported = if ($State -eq 'Running') { 'is running, without OK uploads yet' } elseif ($State) { 'reports {0}' -f $State } else { 'has no status yet' }
+    $soFar = if ($Minutes -gt 0) { ' ({0} min so far)' -f $Minutes } else { '' }
+    if ($RestartInMinutes -ge 0) {
+        return ('T1''s monitoring plugin {0}{1}; {2} restarts it if it doesn''t start by itself within {3}; no action needed.' -f $reported, $soFar, $Actor, (& $span ([Math]::Max(1, $RestartInMinutes))))
+    }
+    return ('T1''s monitoring plugin {0}{1}; waiting up to {2} more for Running and OK; no action needed.' -f $reported, $soFar, (& $span ([Math]::Max(1, $WaitLeftMinutes))))
+}
+
+function Show-DemoSqlVmPluginWait {
+    <#
+    .SYNOPSIS
+    Shows a wait for T1's monitoring plugin (Get-DemoSqlVmPluginWaitText): the status page's step on every read, and a
+    console line on the first read, when the plugin's state changes, and every few minutes (Get-DemoSqlVmPluginGrace),
+    so a wait is never silent (Phase 28 live finding, 2026-10-30). Returns the marker for the next call. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyString()]
+        [string] $State = '',
+
+        [ValidateRange(0, 1440)]
+        [int] $Minutes = 0,
+
+        [int] $RestartInMinutes = -1,
+
+        [int] $WaitLeftMinutes = 0,
+
+        [string] $Actor = 'the deployment',
+
+        [AllowNull()]
+        [object] $Marker = $null,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [string] $ProgressStepId = 'T1.Monitoring'
+    )
+
+    $text = Get-DemoSqlVmPluginWaitText -State $State -Minutes $Minutes -RestartInMinutes $RestartInMinutes -WaitLeftMinutes $WaitLeftMinutes -Actor $Actor
+    Set-DemoProgressStep -Path $ProgressPath -Id $ProgressStepId -State 'Running' -AzureSide -Message $text
+    if ($null -eq $Marker -or [string]$Marker.State -ne $State -or $Minutes - [int]$Marker.Minutes -ge [int](Get-DemoSqlVmPluginGrace).LogEveryMinutes) {
+        Write-DemoLog -Message $text
+        return [pscustomobject]@{ State = $State; Minutes = $Minutes }
+    }
+    return $Marker
+}
+
 function Restore-DemoSqlVmMonitoringPlugin {
     <#
     .SYNOPSIS
@@ -155,6 +252,19 @@ function Restore-DemoSqlVmMonitoringPlugin {
     Live (2026-10-27, Phase 25d): a deployment's template run left the plugin NotRunning too (at 14:11 UTC, still
     at 14:45), while the deployment's Monitoring step only waited for it, so deploy.ps1 calls this as well
     (-CheckId DEPLOY.T1.MONITORING, -Occasion 'the deployment') when that wait ends without Running and OK.
+    Live (2026-10-30, Phase 28): the plugin, Running after start-demo.ps1, was NotRunning again less than 90 minutes
+    later, so deploy.ps1 checks it on every run (Invoke-DemoT1MonitoringCheck). With -ProgressPath, the status page's
+    -ProgressStepId says so while the service restarts: "Restarting T1's monitoring plugin, which stopped after a
+    restart; no action needed."
+    -NotRunningGraceMinutes is 0 by default: a plugin that reports NotRunning gets the restart at once, the proven
+    behavior that start-demo.ps1 and deploy.ps1's check beside the tracks keep (the owner's decision, 2026-10-30:
+    presenters run start-demo.ps1 before each session). Above 0, it first gets that long to start by itself, read once a
+    minute, with a console line and the status page saying so. The deployment's T1 Monitoring step gives its grace in
+    Enable-DemoSqlVmMonitoring's wait instead, and then passes 0.
+    A plugin that's Running is a Pass only with MetricsUploadStatus OK (Phase 28 review, 2026-10-30). Running with uploads
+    that fail (an HTTP error, the documented troubleshooting symptom) is a Warning that names the VM's identity and outbound
+    HTTPS to the telemetry endpoint, and anything else not OK is a Warning to check again; neither restarts the agent,
+    which doesn't fix uploads.
     Sources: https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm
     and https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/sql-agent-extension-troubleshoot-known-issues
     (checked 2026-10-22).
@@ -170,6 +280,9 @@ function Restore-DemoSqlVmMonitoringPlugin {
         [ValidateRange(0, 30)]
         [int] $SettleMinutes = 5,
 
+        [ValidateRange(0, 30)]
+        [int] $NotRunningGraceMinutes = 0,
+
         [ValidateRange(1, 30)]
         [int] $WaitMinutes = 5,
 
@@ -180,7 +293,12 @@ function Restore-DemoSqlVmMonitoringPlugin {
         [string] $CheckId = 'START.T1.MONITORING',
 
         [ValidateSet('the start', 'the deployment')]
-        [string] $Occasion = 'the start'
+        [string] $Occasion = 'the start',
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [string] $ProgressStepId = 'T1.Monitoring'
     )
 
     $checkId = $CheckId
@@ -214,11 +332,48 @@ function Restore-DemoSqlVmMonitoringPlugin {
     }
     $settledSeconds = [int]$settle.Elapsed.TotalSeconds
     $reported = [bool]($state.Plugin.Found -and $state.Plugin.State)
-    $evidence = [ordered]@{ before = $state.Plugin.Message; settlePolls = $settlePolls; settledSeconds = $settledSeconds; restarted = $false; after = '' }
+    $evidence = [ordered]@{ before = $state.Plugin.Message; settlePolls = $settlePolls; settledSeconds = $settledSeconds; gracePolls = 0; restarted = $false; after = '' }
+    if ($reported -and $state.Plugin.State -ne 'Running' -and $NotRunningGraceMinutes -gt 0) {
+        # A plugin that reports NotRunning gets a short grace to start by itself; live (2026-10-30) it rarely does, and the
+        # restart below brings it back in 2 to 3 minutes. The grace counts elapsed time, reads included (a read takes 15
+        # to 20 seconds); a sleep never runs past its end.
+        $grace = Get-DemoSqlVmPluginGrace
+        $graceSeconds = $NotRunningGraceMinutes * 60
+        $actor = if ($Occasion -eq 'the start') { 'start-demo.ps1' } else { 'the deployment' }
+        $graceStartUtc = Get-DemoUtcNow
+        $graceSlept = 0
+        $gracePolls = 0
+        $marker = $null
+        while ($state.Plugin.State -ne 'Running') {
+            $spent = [System.Math]::Max(((Get-DemoUtcNow) - $graceStartUtc).TotalSeconds, $graceSlept)
+            if ($spent -ge $graceSeconds) {
+                break
+            }
+            $marker = Show-DemoSqlVmPluginWait -State $state.Plugin.State -Minutes ([int][System.Math]::Floor($spent / 60)) -RestartInMinutes ([int][System.Math]::Ceiling(($graceSeconds - $spent) / 60)) -Actor $actor -Marker $marker -ProgressPath $ProgressPath -ProgressStepId $ProgressStepId
+            $pause = [int][System.Math]::Max(1, [System.Math]::Min([int]$grace.PollSeconds, [System.Math]::Ceiling($graceSeconds - $spent)))
+            Start-Sleep -Seconds $pause
+            $graceSlept += $pause
+            $gracePolls++
+            $state = & $read
+        }
+        $evidence['gracePolls'] = $gracePolls
+        $evidence['before'] = $state.Plugin.Message
+        $reported = [bool]($state.Plugin.Found -and $state.Plugin.State)
+    }
     if ($state.Plugin.State -eq 'Running') {
         $evidence['after'] = $state.Plugin.Message
-        $waited = if ($settlePolls -gt 0) { ', reported {0:N0} seconds after the check began' -f $settledSeconds } else { '' }
-        return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Pass' -Message ('{0}''s monitoring plugin is running (upload status ''{1}''){2}.' -f $VmName, $state.Plugin.MetricsUploadStatus, $waited) -Evidence $evidence -DocUrl $docUrl)
+        $upload = [string]$state.Plugin.MetricsUploadStatus
+        if ($upload -eq 'OK') {
+            $waited = if ($settlePolls -gt 0 -or $evidence['gracePolls'] -gt 0) { ', reported {0:N0} seconds after the check began' -f $settle.Elapsed.TotalSeconds } else { '' }
+            return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Pass' -Message ('{0}''s monitoring plugin is running (upload status ''{1}''){2}.' -f $VmName, $upload, $waited) -Evidence $evidence -DocUrl $docUrl)
+        }
+        # Running without uploads OK isn't a Pass, and a restart doesn't fix uploads that fail (the VM's identity, or outbound
+        # HTTPS to the telemetry endpoint), so the plugin's real state goes back, as the documented troubleshooting symptom
+        # (ConvertTo-DemoSqlVmMonitoringResult's Fail) or a wait (Phase 28 review, 2026-10-30).
+        if ($upload -match '(?i)http|error|\b[45]\d\d\b') {
+            return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Warning' -Message ('{0}''s monitoring plugin is running, but its uploads fail ({1}); a restart of the SQL IaaS Agent doesn''t fix that.' -f $VmName, $upload) -Remediation ('Check {0}''s system-assigned identity and outbound HTTPS to telemetry.{1}.arcdataservices.com:443, then run ./scripts/configure-monitoring.ps1.' -f $VmName, [string]$Config['location']) -Evidence $evidence -DocUrl $docUrl)
+        }
+        return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Warning' -Message ('{0}''s monitoring plugin is running, but its uploads aren''t OK yet (upload status ''{1}'').' -f $VmName, $upload) -Remediation './scripts/configure-monitoring.ps1 -WaitMinutes 15 checks it again; ./scripts/validate.ps1 -Area Telemetry shows whether T1''s data arrives.' -Evidence $evidence -DocUrl $docUrl)
     }
     # The SQL IaaS Agent's main service (vm/dsc/sqlvm.psd1 AgentServiceName; the known-issues page above).
     $service = 'SQLIaaSExtension'
@@ -228,12 +383,14 @@ Restart-Service -Name '$service' -Force
 [Console]::Out.WriteLine(('$service is {0}.' -f (Get-Service -Name '$service').Status))
 "@
     $before = if ($reported) { $state.Plugin.Message } else { 'no plugin status after {0:N0} seconds' -f $settledSeconds }
-    Write-DemoLog -Message ('{0}''s monitoring plugin reports {1}; restarting the SQL IaaS Agent service so it starts again.' -f $VmName, $before)
+    Write-DemoLog -Message ('{0}''s monitoring plugin reports {1}; restarting the SQL IaaS Agent service so it starts again; no action needed.' -f $VmName, $before)
+    Set-DemoProgressStep -Path $ProgressPath -Id $ProgressStepId -State 'Running' -AzureSide -Message 'Restarting T1''s monitoring plugin, which stopped after a restart; no action needed.'
     $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-MonitoringRestart' -Script $script -TimeoutSeconds 300
     $evidence['restarted'] = [bool]$run.Succeeded
     if (-not $run.Succeeded) {
         return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Warning' -Message ('{0}''s monitoring plugin isn''t running ({1}), and the SQL IaaS Agent service couldn''t be restarted.' -f $VmName, $before) -Remediation ('Restart the {0} service on {1}, or run ./scripts/configure-monitoring.ps1.' -f $service, $VmName) -Evidence $evidence -DocUrl $docUrl)
     }
+    Write-DemoLog -Message ('The SQL IaaS Agent service on {0} restarted; waiting up to {1} minutes for its monitoring plugin to report Running and OK; no action needed.' -f $VmName, $WaitMinutes)
     $polls = 0
     $maxPolls = [int][Math]::Ceiling($WaitMinutes * 60 / $PollSeconds)
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -250,6 +407,185 @@ Restart-Service -Name '$service' -Force
     $after = if ($state.Plugin.Message) { $state.Plugin.Message } else { 'no plugin status' }
     return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Warning' -Message ('{0}''s monitoring plugin still reports {1} {2} minutes after the SQL IaaS Agent service was restarted, so T1 may send no performance telemetry.' -f $VmName, $after, $WaitMinutes) -Remediation './scripts/configure-monitoring.ps1 -WaitMinutes 15 checks it again; ./scripts/validate.ps1 -Area Telemetry shows whether data arrives.' -Evidence $evidence -DocUrl $docUrl)
 }
+
+function Invoke-DemoT1MonitoringCheck {
+    <#
+    .SYNOPSIS
+    T1's monitoring plugin, checked by a deploy.ps1 run that has no T1 Monitoring step of its own, and before a NOT DONE
+    for T1's telemetry (Phase 28 live finding, 2026-10-30): Restore-DemoSqlVmMonitoringPlugin as DEPLOY.T1.MONITORING,
+    with the status page's T1 Monitoring step. Never throws: a check that can't run is a Warning. Internal.
+
+    .DESCRIPTION
+    Live: start-demo.ps1 found the plugin Running at 07:47; by 09:12 the SQL IaaS Agent extension reported
+    DatabaseMonitorArcPlugin {"State":"NotRunning"}, and the resumed deploy.ps1, whose T1 track had finished in an earlier
+    run, ended NOT DONE on TELEMETRY.T1. Restarting the agent's service brought the plugin to Running and OK in 161
+    seconds. A NotRunning plugin is restarted at once, as start-demo.ps1 does (Restore-DemoSqlVmMonitoringPlugin's
+    default); only the T1 Monitoring step gives it a grace first.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateSet('the start', 'the deployment')]
+        [string] $Occasion = 'the deployment',
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    $stepId = 'T1.Monitoring'
+    Set-DemoProgressStep -Path $ProgressPath -Id $stepId -State 'Running' -AzureSide -Message 'Checking T1''s monitoring plugin, which can stop after a restart: no action needed.'
+    try {
+        $result = Restore-DemoSqlVmMonitoringPlugin -Config $Config -CheckId 'DEPLOY.T1.MONITORING' -Occasion $Occasion -ProgressPath $ProgressPath -ProgressStepId $stepId
+    }
+    catch {
+        $result = New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message ('T1''s monitoring plugin couldn''t be checked: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation './scripts/start-demo.ps1 checks it, and restarts the SQL IaaS Agent service when the plugin isn''t running; ./scripts/validate.ps1 -Area Telemetry shows whether T1''s data arrives.' -DocUrl 'https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm'
+    }
+    Set-DemoProgressStep -Path $ProgressPath -Id $stepId -Status ([string]$result.status) -Message ([string]$result.message)
+    return $result
+}
+
+function Invoke-DemoSqlVmMonitoringWait {
+    <#
+    .SYNOPSIS
+    T1's monitoring in a deployment step (deploy.ps1's T1 Monitoring step, -Sequential's Monitoring stage, and
+    start-demo.ps1 after it recreates T3): Enable-DemoSqlVmMonitoring's wait, bounded in elapsed time, with the short
+    grace for a NotRunning plugin (Get-DemoSqlVmPluginGrace: 3 minutes, or 5 when this run merged the flag, -JustMerged;
+    none with -RestartAtOnce, which start-demo.ps1 passes, though a flag this call merges still gets 5); the agent's
+    restart when the plugin is stuck (Restore-DemoSqlVmMonitoringPlugin, with no grace of its own); and after a restart
+    that worked, T1.SQLVM.MONITORING as it is then (Get-DemoSqlVmMonitoringAfterRestart). Returns T1.SQLVM.MONITORING,
+    then the restart's result when there was one. Internal.
+
+    .DESCRIPTION
+    Live (2026-10-30, Phase 28): after a start from deallocation, the step waited 20 minutes (25 with the reads) on a
+    NotRunning plugin before the restart, which brought it back in 17 seconds; then the wait's Warning still told the person
+    to run configure-monitoring.ps1. Every deploy.ps1 run whose T1 track runs this step, the first or a later one, takes
+    this path. start-demo.ps1 restarts a NotRunning plugin at once, as it always did after a start (the owner's decision,
+    2026-10-30: presenters run it before each session).
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateRange(0, 60)]
+        [int] $WaitMinutes = 20,
+
+        [switch] $JustMerged,
+
+        [switch] $RestartAtOnce,
+
+        [ValidateSet('START.T1.MONITORING', 'DEPLOY.T1.MONITORING')]
+        [string] $CheckId = 'DEPLOY.T1.MONITORING',
+
+        [ValidateSet('the start', 'the deployment')]
+        [string] $Occasion = 'the deployment',
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    $grace = Get-DemoSqlVmPluginGrace
+    $graceMinutes = if ($RestartAtOnce) { 0 } elseif ($JustMerged) { [int]$grace.JustMerged } else { [int]$grace.FlagSet }
+    $monitoring = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes $WaitMinutes -NotRunningGraceMinutes $graceMinutes -ProgressPath $ProgressPath -Confirm:$false
+    if ([string]$monitoring.status -eq 'Fail' -or -not (Test-DemoSqlVmMonitoringStuck -Result $monitoring)) {
+        return @($monitoring)
+    }
+    # The template run, or a start, can leave the plugin NotRunning, and waiting doesn't bring it back; the agent's restart
+    # does (live, 2026-10-27 and 2026-10-30). The grace is spent.
+    $restore = Restore-DemoSqlVmMonitoringPlugin -Config $Config -CheckId $CheckId -Occasion $Occasion -NotRunningGraceMinutes 0 -ProgressPath $ProgressPath
+    return @((Get-DemoSqlVmMonitoringAfterRestart -Config $Config -Monitoring $monitoring -Restore $restore), $restore)
+}
+
+function Get-DemoSqlVmMonitoringAfterRestart {
+    <#
+    .SYNOPSIS
+    The T1.SQLVM.MONITORING to report once Restore-DemoSqlVmMonitoringPlugin has dealt with a plugin the wait left stuck
+    (Phase 28 live finding, 2026-10-30), so the console never tells the person to act on a plugin that runs, and never hides
+    a real failure. Internal.
+
+    .DESCRIPTION
+    Unless -Restore is missing or Not selected, T1.SQLVM.MONITORING is read again, read-only (Test-DemoSqlVmMonitoring),
+    and the restart goes into the result's evidence (restartCheckId, restarted, pluginStateBefore):
+    - A Fail (uploads that fail, a read that fails) is the result, unchanged, so the step stops on it with its own cause and
+      fix (Phase 28 review, 2026-10-30), whether or not the restart passed.
+    - A Pass, or a Warning that isn't a wait, is the result, with the restart named in its message.
+    - A wait (the plugin not Running and OK yet): after a restart that passed, -Monitoring's Warning, superseded, without a
+      remediation, and with what the read shows, never a claim of uploads OK; after one that didn't, -Monitoring
+      unchanged, with its remediation.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [object] $Monitoring,
+
+        [AllowNull()]
+        [object] $Restore
+    )
+
+    $restoreStatus = [string](Get-DemoMemberValue -InputObject $Restore -Name 'status')
+    if ($null -eq $Restore -or $restoreStatus -in '', 'Not selected') {
+        return $Monitoring
+    }
+    $docUrl = 'https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm'
+    $restoreId = [string](Get-DemoMemberValue -InputObject $Restore -Name 'checkId')
+    $restarted = [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Restore -Name 'evidence') -Name 'restarted')
+    $before = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Monitoring -Name 'evidence') -Name 'pluginState')
+    $shownBefore = if ($before) { $before } else { 'no status' }
+    try {
+        $now = Test-DemoSqlVmMonitoring -Config $Config
+    }
+    catch {
+        # As Test-DemoSqlVmMonitoring reports a read that fails.
+        $now = New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message ('Azure couldn''t be read: {0}' -f $_.Exception.Message) -DocUrl $docUrl
+    }
+    $nowStatus = [string](Get-DemoMemberValue -InputObject $now -Name 'status')
+    $nowEvidence = Get-DemoMemberValue -InputObject $now -Name 'evidence'
+    # The result's evidence, with the restart.
+    $withRestart = {
+        param([object] $Result, [System.Collections.IDictionary] $Extra)
+        $merged = [ordered]@{}
+        $resultEvidence = Get-DemoMemberValue -InputObject $Result -Name 'evidence'
+        if ($resultEvidence -is [System.Collections.IDictionary]) {
+            foreach ($key in $resultEvidence.Keys) {
+                $merged[[string]$key] = $resultEvidence[$key]
+            }
+        }
+        $merged['restartCheckId'] = $restoreId
+        $merged['restarted'] = $restarted
+        $merged['pluginStateBefore'] = $before
+        foreach ($key in $Extra.Keys) {
+            $merged[[string]$key] = $Extra[$key]
+        }
+        $merged
+    }
+    $rebuild = {
+        param([object] $Result, [string] $Message, [string] $Remediation, [System.Collections.IDictionary] $Extra)
+        New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status ([string]$Result.status) -Message $Message -Evidence (& $withRestart $Result $Extra) -Remediation $Remediation -DocUrl ([string](Get-DemoMemberValue -InputObject $Result -Name 'docUrl'))
+    }
+    if ($nowStatus -eq 'Fail') {
+        return (& $rebuild $now ([string]$now.message) ([string](Get-DemoMemberValue -InputObject $now -Name 'remediation')) @{})
+    }
+    if ($nowStatus -eq 'Pass' -or ($nowStatus -eq 'Warning' -and -not [bool](Get-DemoMemberValue -InputObject $nowEvidence -Name 'pending'))) {
+        $how = if ($restarted) { 'the SQL IaaS Agent service was restarted' } else { 'then it started without a restart' }
+        return (& $rebuild $now ('{0} The plugin had reported {1}; {2} ({3}).' -f [string]$now.message, $shownBefore, $how, $restoreId) ([string](Get-DemoMemberValue -InputObject $now -Name 'remediation')) @{})
+    }
+    if ($restoreStatus -ne 'Pass') {
+        return $Monitoring
+    }
+    $nowState = [string](Get-DemoMemberValue -InputObject $nowEvidence -Name 'pluginState')
+    $nowUpload = [string](Get-DemoMemberValue -InputObject $nowEvidence -Name 'metricsUploadStatus')
+    $how = if ($restarted) { 'the SQL IaaS Agent service was restarted' } else { 'the plugin started without a restart' }
+    return (& $rebuild $Monitoring ('{0} Superseded: {1} ({2}); a read right after shows state ''{3}'', upload ''{4}''.' -f [string]$Monitoring.message, $how, $restoreId, $nowState, $nowUpload) '' @{ superseded = $true })
+}
+
 function Test-DemoSqlVmMonitoringStuck {
     <#
     .SYNOPSIS

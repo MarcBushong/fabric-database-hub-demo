@@ -133,7 +133,7 @@ function Invoke-DemoControl {
         if (-not $message) {
             $message = '{0}: the runner exited with code {1}.' -f $item, $run.ExitCode
         }
-        if ($status -eq 'Fail' -and $item -eq 'T2' -and $message -match '(?i)not installed|no workload|isn''t running|not running|PowerShell Direct|guest') {
+        if ($status -eq 'Fail' -and $item -eq 'T2' -and ($message -match '(?i)not installed|no workload|isn''t running|not running|PowerShell Direct|guest' -or (Test-DemoT2NotSetUpText -Text $message))) {
             $status = 'Warning'
             $message = 'T2''s runner isn''t ready yet (the guest needs SQL Server first): ' + $message
         }

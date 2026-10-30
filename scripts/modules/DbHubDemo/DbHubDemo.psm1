@@ -23,6 +23,21 @@ $script:AzCommandsWithoutSubscription = @('bicep', 'version', 'extension', 'conf
 $script:DemoAzContext = $null
 $script:DemoAzGuardActive = $false
 
+# Phase 28: the VMs deploy.ps1's watchdog restarted in this process (Restart-DemoVmOnce restarts each at most once).
+$script:DemoVmRestarted = @{}
+
+# Review fix (Phase 28): the golden guest action (the Release) running on the T2 host in this process, keyed
+# '<resource group>/archost01' (Invoke-DemoGoldenGuestAction). The watchdog never restarts the host meanwhile.
+$script:DemoHostAction = @{}
+
+# Phase 28 live finding: the process ID each of deploy.ps1's background jobs reported first (DBHUB-PID), keyed by the
+# job's InstanceId, so a stop can end a job's process when Stop-Job would wait (Stop-DemoRunJob), with the process's start
+# time (UTC ticks), so a process that gets the same ID later is never ended; and whether a deploy.ps1 run records Ctrl+C
+# now (Enable-DemoRunCancelWatch to Disable-DemoRunCancelWatch).
+$script:DemoJobProcessId = @{}
+$script:DemoJobProcessStart = @{}
+$script:DemoRunCancelWatch = $false
+
 # Azure CLI verbs that only read. Any other command (and every token request) needs the validated context.
 $script:AzReadOnlyVerbs = @('show', 'list', 'exists', 'get-instance-view', 'list-skus', 'list-usage', 'list-usages', 'list-versions', 'show-deleted', 'list-locations', 'version')
 

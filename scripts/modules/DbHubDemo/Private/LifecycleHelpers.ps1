@@ -84,10 +84,10 @@ function Invoke-DemoVmPowerAction {
         Start-Sleep -Seconds $PollSeconds
         $current = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
         if ($current -eq $wanted) {
-            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1} after {2:N0} seconds.' -f $VmName, $wanted.Split('/')[1], $watch.Elapsed.TotalSeconds) -Evidence ([ordered]@{ before = $before; after = $current }))
+            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1} after {2:N0} seconds.' -f $VmName, $wanted.Split('/')[1], $watch.Elapsed.TotalSeconds) -Evidence ([ordered]@{ before = $before; after = $current; issued = $verb }))
         }
     }
-    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still {1} after {2} seconds.' -f $VmName, $current, $TimeoutSeconds) -Remediation 'Check the VM in the portal; run the script again.' -Evidence ([ordered]@{ before = $before; after = $current }))
+    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still {1} after {2} seconds.' -f $VmName, $current, $TimeoutSeconds) -Remediation 'Check the VM in the portal; run the script again.' -Evidence ([ordered]@{ before = $before; after = $current; issued = $verb }))
 }
 
 function Request-DemoVmStart {
@@ -121,6 +121,170 @@ function Request-DemoVmStart {
     }
     $run = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('vm', 'start', '--resource-group', $resourceGroupName, '--name', $VmName, '--no-wait') -Label ('{0}: start' -f $VmName)
     return ($run.ExitCode -eq 0)
+}
+
+function Request-DemoStoppedStart {
+    <#
+    .SYNOPSIS
+    deploy.ps1 on an existing environment (Phase 28 live finding, 2026-10-30): asks Azure to start the demo VMs that are
+    deallocated or stopped, and T4 when it's deployed and stopped, without waiting, so they boot while preflight runs.
+    Returns what Wait-DemoStoppedStart waits for: Needed, Vms (each VM that wasn't running, with its power state and
+    whether a start was requested), T4 (the start request's result, or $null), Names (for the status page), and Requested
+    (what this run asked to start). Internal.
+
+    .DESCRIPTION
+    The nightly auto-shutdown, stop-demo.ps1, or a Ctrl+C followed by a stop leaves the VMs deallocated, and every Run
+    Command then fails ("the VM isn't running"), so "run ./scripts/deploy.ps1 again; it continues where it stopped"
+    didn't. Each VM's power state is read (Get-DemoVmPowerState): a running VM, and one that doesn't exist yet (a first
+    deployment, or a golden restore the template creates), is left alone, read-only; a deallocated or stopped one gets
+    'az vm start --no-wait' (Request-DemoVmStart); one that's still deallocating, stopping, or starting is only waited
+    for later (Invoke-DemoVmPowerAction). T4 gets Servers - Start when it's deployed and stopped
+    (Invoke-DemoT4PowerAction -WaitMinutes 0, which only reads a T4 that's Ready). T3, serverless, resumes on its own at
+    the first connection. The status page's StartVms step says what starts, with no action needed.
+    Source: https://learn.microsoft.com/cli/azure/vm#az-vm-start (checked 2026-10-30).
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [switch] $SkipT4,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    $request = [pscustomobject]@{ Needed = $false; Vms = [ordered]@{}; T4 = $null; Names = @(); Requested = @() }
+    $subscriptionId = [string]$Config['subscriptionId']
+    $resourceGroupName = Get-DemoResourceGroupName -Config $Config
+    $power = [ordered]@{}
+    foreach ($vm in 'sqlvm01', (Get-DemoHostVmName -Config $Config)) {
+        $power[$vm] = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $vm
+    }
+    $stopped = @($power.Keys | Where-Object { $power[$_] -and $power[$_] -ne 'PowerState/running' })
+    $t4On = -not $SkipT4 -and (Test-DemoT4Enabled -Config $Config)
+    if (($stopped.Count -gt 0 -or $t4On) -and -not $PSCmdlet.ShouldProcess($resourceGroupName, 'Start the demo VMs, and T4, that are stopped')) {
+        return $request
+    }
+    foreach ($vm in $stopped) {
+        $requested = $false
+        if ($power[$vm] -in 'PowerState/deallocated', 'PowerState/stopped') {
+            $requested = [bool](Request-DemoVmStart -Config $Config -VmName $vm)
+        }
+        $request.Vms[$vm] = [pscustomobject]@{ Before = [string]$power[$vm]; Requested = $requested }
+    }
+    if ($t4On) {
+        # A T4 that's Ready is only read; one whose start failed is reported by Wait-DemoStoppedStart.
+        $t4 = Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 0 -CheckPrefix DEPLOY
+        $before = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $t4 -Name 'evidence') -Name 'stateBefore')
+        if ([string]$t4.status -eq 'Fail' -or ([string]$t4.status -eq 'Pass' -and $before -and $before -ne 'Ready')) {
+            $request.T4 = $t4
+        }
+    }
+    $names = @(foreach ($vm in $request.Vms.Keys) { '{0} ({1})' -f $vm, $request.Vms[$vm].Before.Split('/')[-1] }) + @(if ($null -ne $request.T4 -and [string]$request.T4.status -eq 'Pass') { 'T4 (stopped)' })
+    $request.Names = @($names)
+    # What this run itself asked to start, which bills until a stop (a VM that was still deallocating is only waited for).
+    $request.Requested = @(@($request.Vms.Keys | Where-Object { $request.Vms[$_].Requested }) + @(if ($null -ne $request.T4 -and [string]$request.T4.status -eq 'Pass') { 'T4' }))
+    $request.Needed = $request.Vms.Count -gt 0 -or $null -ne $request.T4
+    # Remembered for deploy.ps1's ending, which names what runs and bills when the run isn't DONE, even after Ctrl+C.
+    Add-DemoProgressStartedVm -Path $ProgressPath -Name $request.Requested
+    if ($names.Count -gt 0) {
+        Write-DemoLog -Message ('Starting what was stopped (the nightly auto-shutdown, stop-demo.ps1, or a stop): {0}. It boots while the run goes on.' -f ($names -join ', '))
+        # Plain words for the person (Phase 28 live run, 2026-10-30): which VMs start, why, and that nothing is needed
+        # from them; a state is named once when they share it.
+        $stoppedItems = @(@(foreach ($vm in $request.Vms.Keys) { [pscustomobject]@{ Name = $vm; State = $request.Vms[$vm].Before.Split('/')[-1] } }) + @(if ($null -ne $request.T4 -and [string]$request.T4.status -eq 'Pass') { [pscustomobject]@{ Name = 'T4'; State = 'stopped' } }))
+        $states = @($stoppedItems | ForEach-Object { $_.State } | Select-Object -Unique)
+        $labels = @(foreach ($entry in $stoppedItems) { if ($states.Count -gt 1 -and $entry.State -ne 'stopped') { '{0} ({1})' -f $entry.Name, $entry.State } else { $entry.Name } })
+        $list = if ($labels.Count -le 2) { $labels -join ' and ' } else { '{0}, and {1}' -f ($labels[0..($labels.Count - 2)] -join ', '), $labels[-1] }
+        $why = if ($states.Count -eq 1 -and $states[0] -ne 'stopped') { ' ({0})' -f $states[0] } else { '' }
+        Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -State 'Running' -Message ('Starting {0}, which {1} stopped{2}; no action needed from you.' -f $list, $(if ($stoppedItems.Count -eq 1) { 'was' } else { 'were' }), $why)
+    }
+    elseif (-not $request.Needed) {
+        Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -State 'Skipped' -Message 'Not needed: nothing was stopped.'
+    }
+    return $request
+}
+
+function Wait-DemoStoppedStart {
+    <#
+    .SYNOPSIS
+    Waits for what Request-DemoStoppedStart started (Phase 28 live finding): each VM until it runs
+    (Invoke-DemoVmPowerAction, START.VM_*), the guest of a golden snapshot's source host (Invoke-DemoGoldenSourceRelease,
+    as start-demo.ps1 does; any other T2 guest starts with its host), and T4 until it's Ready (DEPLOY.T4.START). Returns
+    the results with DEPLOY.VMSTART: Pass when every VM runs, Fail when one doesn't, because every Run Command on it would
+    fail, so the caller stops there. Updates the status page's StartVms step. Nothing when nothing was stopped. T1's
+    monitoring plugin, which can stop after a restart, is the caller's next check (Invoke-DemoT1MonitoringCheck), on
+    every run without a T1 Monitoring step, whether or not this run started sqlvm01. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Request,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [ValidateRange(1, 60)]
+        [int] $T4WaitMinutes = 15
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $Request -or -not [bool]$Request.Needed) {
+        return $results.ToArray()
+    }
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $notRunning = [System.Collections.Generic.List[string]]::new()
+    # What this run itself started: its own request (Request-DemoVmStart), or the start Invoke-DemoVmPowerAction issued
+    # once a VM that was still stopping had settled; never one that was already starting (Phase 28 review).
+    $issued = [System.Collections.Generic.List[string]]::new()
+    foreach ($vm in @($Request.Vms.Keys)) {
+        $item = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:([bool]$Request.Vms[$vm].Requested)
+        $results.Add($item)
+        if ([string]$item.status -ne 'Pass') {
+            $notRunning.Add($vm)
+        }
+        $itemEvidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
+        if ([bool]$Request.Vms[$vm].Requested -or [string](Get-DemoMemberValue -InputObject $itemEvidence -Name 'issued') -eq 'start') {
+            $issued.Add($vm)
+        }
+    }
+    # The T2 guest starts with its host (its automatic start action), except on a golden snapshot's source host,
+    # whose air-gapped guest is reconnected first, as start-demo.ps1 does.
+    $hostVm = Get-DemoHostVmName -Config $Config
+    if ($Request.Vms.Contains($hostVm) -and $hostVm -notin $notRunning) {
+        $release = Invoke-DemoGoldenSourceRelease -Config $Config
+        if ($null -ne $release) {
+            $results.Add($release)
+        }
+    }
+    $t4 = $null
+    if ($null -ne $Request.T4) {
+        $t4 = if ([string]$Request.T4.status -eq 'Pass') { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes $T4WaitMinutes -CheckPrefix DEPLOY -Requested } else { $Request.T4 }
+        $results.Add($t4)
+    }
+    $minutes = [int][System.Math]::Ceiling($watch.Elapsed.TotalMinutes)
+    $vms = @($Request.Vms.Keys)
+    $t4Started = $null -ne $t4 -and [string]$t4.status -eq 'Pass'
+    $evidence = [ordered]@{ vms = $vms; started = $issued.ToArray(); notRunning = $notRunning.ToArray(); t4 = $(if ($null -ne $t4) { [string]$t4.status } else { '' }); minutes = $minutes }
+    # Remembered for the ending's line about what bills: what this run started and now runs, and T4 when it started it.
+    Add-DemoProgressStartedVm -Path $ProgressPath -Name (@($issued | Where-Object { $_ -notin $notRunning }) + @(if ($t4Started) { 'T4' }))
+    $t4Text = if ($null -eq $t4) { '' } elseif ([string]$t4.status -eq 'Pass') { ' T4 is Ready.' } else { ' T4: {0}' -f [string]$t4.message }
+    if ($notRunning.Count -gt 0) {
+        $message = '{0} isn''t running, so the steps that need it can''t run (Run Command needs a running VM).{1}' -f ($notRunning -join ' and '), $t4Text
+        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message $message -Evidence $evidence -Remediation ('Start {0} in the Azure portal, or run ./scripts/start-demo.ps1, then run ./scripts/deploy.ps1 again: it continues where it stopped.' -f ($notRunning -join ' and ')) -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-start'))
+        Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status 'Fail' -Message $message
+        return $results.ToArray()
+    }
+    $message = if ($vms.Count -gt 0) { 'Started {0}, which had been stopped, in about {1} minute(s).{2}' -f ($vms -join ' and '), $minutes, $t4Text } elseif ([string]$t4.status -eq 'Pass') { 'Started T4, which had been stopped; it''s Ready.' } else { 'T4 was stopped, and it isn''t Ready: {0}' -f [string]$t4.message }
+    $status = if ($null -ne $t4 -and [string]$t4.status -ne 'Pass') { 'Warning' } else { 'Pass' }
+    $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status $status -Message $message -Evidence $evidence -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-start'))
+    Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status $status -Message $message
+    return $results.ToArray()
 }
 
 function Get-DemoBastionInfo {
@@ -300,6 +464,25 @@ function Stop-DemoGuestVm {
     return (New-DemoResult -CheckId 'STOP.GUEST' -Area 'infra' -Target 'T2' -Status $status -Message $message -Evidence $evidence -Remediation $remediation)
 }
 
+function Test-DemoT2NotSetUpText {
+    <#
+    .SYNOPSIS
+    True when a T2 workload command failed only because the guest isn't set up yet: it gets its demo module
+    (C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1) and the workload runner after SQL Server setup, so before that the
+    guest's Import-Module fails ("was not loaded because no valid module file was found"), or the runner isn't installed.
+    A Not selected, never a Warning (Phase 28 live finding: stop-demo.ps1 before T2's setup). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    return [bool]([string]$Text -match '(?i)not installed|no workload runner|isn''t set up yet|was not loaded because no valid module file was found')
+}
+
 function Set-DemoTargetProfile {
     <#
     .SYNOPSIS
@@ -311,8 +494,9 @@ function Set-DemoTargetProfile {
     before the next auto-shutdown (--not-after). The T3 and T4 profiles are files on T1, so setting them never
     wakes T3 or connects to T4. A target the caller can't reach (-SkipReason) is Not selected. A profile that can't be set is a
     Warning, not a Fail: the demo's resources are fine, the profile ends at the auto-shutdown anyway, and
-    demo-control.yml or start-demo.ps1 -ActivityProfile sets it again; a T2 guest without the runner yet is
-    Not selected. -Attempts retries a target that isn't reachable yet, such as a T2 guest that's still
+    demo-control.yml or start-demo.ps1 -ActivityProfile sets it again; a T2 guest that isn't set up yet (no demo module or
+    workload runner before SQL Server setup; Test-DemoT2NotSetUpText) is Not selected. -Attempts retries a target that
+    isn't reachable yet, such as a T2 guest that's still
     booting.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Callers confirm once for the whole start or stop; Invoke-DemoWorkloadCommand is called with -Confirm:$false.')]
@@ -389,8 +573,8 @@ function Set-DemoTargetProfile {
         }
         return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status $run.Status -Message $message -Evidence $evidence -DocUrl $docUrl)
     }
-    if ($Target -eq 'T2' -and $detail -match '(?i)not installed|no workload runner') {
-        return (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Not selected' -Message ('T2: the guest has no workload runner yet (it''s installed once the guest''s SQL Server runs), so its profile wasn''t set to {0}.' -f $ProfileName) -Evidence $evidence)
+    if ($Target -eq 'T2' -and (Test-DemoT2NotSetUpText -Text $detail)) {
+        return (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Not selected' -Message ('T2 isn''t set up yet: the guest gets its demo module and workload runner after SQL Server setup, so its activity profile wasn''t set to {0}{1}.' -f $ProfileName, $(if ($ProfileName -eq 'off') { ', and no activity runs there to turn off' } else { '' })) -Evidence $evidence)
     }
     $remediation = if ($ProfileName -eq 'off') {
         'The profile still ends at the auto-shutdown it was set for, and nothing sets it again at boot unless activityProfileOnBoot is true. To turn it off now, run stop-demo.ps1 again while the VM runs, or demo-control.yml with scenario off.'

@@ -167,16 +167,34 @@ Describe 'Test-DemoFabricHubSetting (P4)' {
         }
     }
 
-    It 'asks for the manual check, with the portal steps, without calling anything unless -FabricAdmin' {
-        Initialize-HubFabricMock -Handler { throw 'must not be called' }
+    It 'reads the setting through the admin API on every call, without -FabricAdmin, and logs the attempt and its outcome, never the token (Phase 28 live finding)' {
+        # Live, 2026-10-30: deploy.ps1 never passed -FabricAdmin, so the check always said "Confirm that ... is enabled",
+        # and the run's ending showed that as its reason while the setting was on.
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add(('{0}|{1}' -f $PesterBoundParameters['Level'], $PesterBoundParameters['Message'])) }
+        Set-SettingPage @(@{ value = @(@{ settingName = 'HubSetting'; title = $script:title; enabled = $true; tenantSettingGroup = 'Database hub' }) })
         $result = Test-DemoFabricHubSetting -Config $config
         $result.checkId | Should -Be 'FABRIC.P4.HUBSETTING'
-        $result.status | Should -Be 'Manual action required'
-        $result.remediation | Should -Match ([regex]::Escape($script:title))
-        $result.remediation | Should -Match 'Tenant settings'
-        $result.remediation | Should -Match '-FabricAdmin'
-        $script:HubFabricCalls.Count | Should -Be 0
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -Times 0
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'is enabled for the organization \(read through the Fabric admin API\)'
+        $result.evidence.checkedThroughApi | Should -BeTrue
+        $result.evidence.settingRead | Should -BeTrue
+        $result.evidence.matchedBy | Should -Be 'title'
+        $script:HubFabricCalls.Count | Should -Be 1
+        $script:HubFabricCalls[0].Uri | Should -Be 'https://api.fabric.microsoft.com/v1/admin/tenantsettings'
+        ($script:logged -join "`n") | Should -Match 'reading the Fabric tenant settings through the admin API \(Tenants - List Tenant Settings\)'
+        ($script:logged -join "`n") | Should -Match 'read 1 tenant setting\(s\) in 1 page\(s\); "Users can access the Database hub \(preview\)" matched by title \(settingName HubSetting\): enabled for the organization'
+        ($script:logged -join "`n") | Should -Not -Match ([regex]::Escape($script:token))
+        ($result | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($script:token))
+
+        # Preflight reads it the same way, under its own check ID.
+        $preflight = Test-DemoFabricHubSetting -Config $config -CheckId 'PREFLIGHT.P4.HUBSETTING'
+        $preflight.checkId | Should -Be 'PREFLIGHT.P4.HUBSETTING'
+        $preflight.area | Should -Be 'preflight'
+        $preflight.status | Should -Be 'Pass'
+
+        # -FabricAdmin is still accepted, and changes nothing.
+        (Test-DemoFabricHubSetting -Config $config -FabricAdmin).status | Should -Be 'Pass'
     }
 
     It 'passes when the setting is enabled for the organization, reading every page with the Phase 12 token' {
@@ -225,13 +243,39 @@ Describe 'Test-DemoFabricHubSetting (P4)' {
         $missing.evidence.similarTitles | Should -Contain 'Database Hub insights (preview)'
     }
 
-    It 'asks for the manual check when the admin API refuses the caller' {
+    It 'says it couldn''t check the setting, not that it''s off, when the admin API refuses the caller (Phase 28 live finding)' {
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add(('{0}|{1}' -f $PesterBoundParameters['Level'], $PesterBoundParameters['Message'])) }
         Initialize-HubFabricMock -Handler { ConvertTo-HubFabricResponse -StatusCode 403 -Body @{ errorCode = 'Forbidden'; message = 'The caller is not a Fabric administrator' } }
-        $result = Test-DemoFabricHubSetting -Config $config -FabricAdmin
+        $result = Test-DemoFabricHubSetting -Config $config
         $result.status | Should -Be 'Manual action required'
-        $result.message | Should -Match 'Fabric administrator'
-        $result.message | Should -Match 'HTTP 403: Forbidden'
+        $result.message | Should -Be ('Couldn''t check the Fabric tenant setting "{0}" (needs a Fabric administrator; HTTP 403): please confirm it''s enabled.' -f $script:title)
+        $result.message | Should -Not -Match 'disabled|not enabled'
+        $result.remediation | Should -Match 'Nothing to change when Database Hub opens for you'
+        $result.evidence.checkedThroughApi | Should -BeTrue
+        $result.evidence.settingRead | Should -BeFalse
         $result.evidence.statusCode | Should -Be 403
+        $result.evidence.error | Should -Match 'HTTP 403: Forbidden'
+        ($script:logged -join "`n") | Should -Match 'Warning\|P4 \(FABRIC\.P4\.HUBSETTING\): couldn''t check the Fabric tenant setting .* \(needs a Fabric administrator; HTTP 403\)\. It''s a reminder to confirm the setting, not a sign that it''s disabled\. The API said: HTTP 403: Forbidden'
+        (InModuleScope DbHubDemo -Parameters @{ Item = $result } { Test-DemoConfirmOnlyResult -Result $Item }) | Should -BeTrue -Because 'a setting that couldn''t be read never keeps deploy.ps1 from DONE'
+    }
+
+    It 'says the setting is disabled only when the admin API read it so, which keeps deploy.ps1 from DONE (Phase 28 live finding)' {
+        Set-SettingPage @(@{ value = @(@{ settingName = 'HubSetting'; title = $script:title; enabled = $false }) })
+        $result = Test-DemoFabricHubSetting -Config $config
+        $result.status | Should -Be 'Manual action required'
+        $result.message | Should -Be ('The Fabric tenant setting "{0}" is disabled (read through the Fabric admin API), so nobody in the tenant can open Database Hub.' -f $script:title)
+        $result.remediation | Should -Match 'sets it to Enabled for the entire organization'
+        $result.remediation | Should -Match ([regex]::Escape('Then run ./scripts/deploy.ps1 again.'))
+        $result.evidence.settingRead | Should -BeTrue
+        $result.evidence.enabled | Should -BeFalse
+        (InModuleScope DbHubDemo -Parameters @{ Item = $result } { Test-DemoConfirmOnlyResult -Result $Item }) | Should -BeFalse
+
+        # An answer without an enabled value is a reminder, never "disabled".
+        Set-SettingPage @(@{ value = @(@{ settingName = 'HubSetting'; title = $script:title }) })
+        $unknown = Test-DemoFabricHubSetting -Config $config
+        $unknown.message | Should -Match 'Couldn''t check the Fabric tenant setting .* has no enabled value'
+        $unknown.evidence.settingRead | Should -BeFalse
     }
 
     It 'asks for the manual check without a token, after a network error, or without the Phase 12 helpers' {

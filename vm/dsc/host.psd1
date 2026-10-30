@@ -36,11 +36,14 @@
         SqlDeveloper  = 'sqlServer2022Developer'
     }
 
-    # PaygWizard: the setup wizard's "Use Azure Login" signs in through the WebView2 runtime, which Windows
-    # Server 2022 doesn't include; without it the sign-in window stays blank (live finding, 2026-10-21). The
-    # Evergreen Standalone Installer carries the whole runtime over HTTPS; the bootstrapper downloads it over
-    # HTTP (port 80), which the guest's NSG blocks. It's evergreen, so it's verified by its Microsoft
-    # Authenticode signature instead of a pinned hash.
+    # PaygWizard: the WebView2 runtime, which Windows Server 2022 doesn't include, installed in the guest before the setup
+    # wizard (live finding, 2026-10-21), and checked again before the guided stop asks for anyone. Setup's Use Azure
+    # Login itself opened in an IE-based control in the 2026-10-30 live proof, which IE Enhanced Security Configuration
+    # blocked; MSAL.NET documents that legacy web view for Microsoft Entra ID authorities, so the guided stop also turns
+    # IE ESC off for administrators while setup runs (vm/hyperv-guest/GuestSetup.ps1). The Evergreen Standalone
+    # Installer carries the whole runtime over HTTPS; the bootstrapper downloads it over HTTP (port 80), which the
+    # guest's NSG blocks. It's evergreen, so it's verified by its Microsoft Authenticode signature instead of a pinned
+    # hash.
     # https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution
     WebView2         = @{
         Url                   = 'https://go.microsoft.com/fwlink/?linkid=2124701'

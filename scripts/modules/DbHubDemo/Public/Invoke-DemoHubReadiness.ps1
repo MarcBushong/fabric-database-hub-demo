@@ -28,7 +28,7 @@ function Invoke-DemoHubReadiness {
     Targets for the Estate, telemetry, and gate checks.
 
     .PARAMETER FabricAdmin
-    The caller is a Fabric administrator, so P4 is read through the Fabric admin API.
+    Accepted for compatibility: since Phase 28, P4 is read through the Fabric admin API on every run.
 
     .PARAMETER FabricToken
     A Fabric REST API token the operator already has, as a SecureString, for P4 and P5. Without it, the

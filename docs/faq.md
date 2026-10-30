@@ -9,10 +9,10 @@ Contributor on an existing Azure subscription, Database Hub enabled in your Fabr
 No. If you aren't signed in to the demo's tenant, sign in yourself with `az login --tenant <tenantId>` and press Enter at the subscription selector for no changes. Every Azure call names the configured subscription, and the subscription guard checks that subscription's tenant and account before anything is written; the scripts never sign in or change your default. On a shared machine you can give the demo its own Azure CLI profile ([prerequisites](prerequisites.md#optional-a-separate-azure-cli-profile)).
 
 **What's the one command?**
-`./scripts/deploy.ps1`. It runs every stage in order, reports anything manual with its exact steps, and continues with `-Resume`. The GitHub Actions `deploy` workflow runs the same stages ([deployment](deployment.md)).
+`./scripts/deploy.ps1`, after `az login`. Since Phase 28 it writes your configuration on the first run, deploys everything, waits for T2 with one guided stop in `PaygWizard` mode, keeps your PC awake, shows a live status page, and ends **DONE** or **NOT DONE** with the exact next command. Run it again with no parameters to continue where it stopped. The GitHub Actions `deploy` workflow runs the same stages ([deployment](deployment.md#one-command-one-guided-stop-phase-28)).
 
 **How long does the first deployment take?**
-Longer than any later run: most of it is the T2 guest build, which downloads about 6.2 GB of media, plus the one T2 setup-wizard step. Later runs skip what's already in place. The [deployment guide](deployment.md#expected-duration) records the measured durations.
+About 2 to 3 hours in the default `PaygWizard` mode, an estimate from documented step times: most of it is the T2 guest build, which downloads about 6.2 GB of media, and a person is needed once, about 60 to 90 minutes in, for about 10 minutes. `ProductKey` and `Developer` take about 1.5 to 2.5 hours with no person. Later runs skip what's already in place, and a redeploy from a golden snapshot takes about 30 to 45 minutes. The [deployment guide](deployment.md#expected-duration) records the measured durations.
 
 **Is it safe to run `deploy.ps1` again?**
 That's the design: every stage is idempotent, state lives in the resource group's tags, and Arc onboarding detects an existing machine instead of creating a duplicate (`T2.ARC.NODUPLICATES`). Reruns on the live environment converged with no duplicate Arc resources in Phases 20 and 22 ([acceptance checklist](implementation-report.md#acceptance-checklist)).
@@ -26,7 +26,10 @@ Hub Performance needs Standard or Enterprise. On Developer, SQL VMs report only 
 The Arc agent isn't supported on Azure VMs except for evaluation. A nested guest is a separate machine that can be Arc-enabled, and it worked live. The demo discloses it as a simulated on-premises server, never a real one.
 
 **Why is there a manual step on T2?**
-Pay-as-you-go SQL Server without a product key is documented only in the setup wizard, so in the default `PaygWizard` mode a person runs it once per guest build, with **Use Azure Login**. `ProductKey` mode (P10) is fully unattended; `Developer` mode is unattended but gives T2 Estate only ([ADR 0006](adr/0006-sql-editions-and-licensing.md)).
+Pay-as-you-go SQL Server without a product key is documented only in the setup wizard, so in the default `PaygWizard` mode a person makes that choice once per guest build, with **Use Azure Login**. Since Phase 28 it's a guided stop of about 10 minutes in the same `deploy.ps1` run: everything around the choice is automated, and setup opens pre-filled. `ProductKey` mode (P10) is fully unattended; `Developer` mode is unattended but gives T2 Estate only ([ADR 0006](adr/0006-sql-editions-and-licensing.md)).
+
+**Can an AI assistant run the deployment for me?**
+Yes, apart from about 10 minutes at the guided stop, when you sign in through Bastion, choose pay-as-you-go and Standard, and sign in to Azure in setup; no assistant should do those sign-ins for you. The run prints `HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP ...` for it to relay, and waits for you. `ProductKey` mode is fully unattended ([README](../README.md#running-it-with-an-ai-assistant)).
 
 **Why is there no Key Vault?**
 The default path needs only Contributor, and Contributor can't grant itself vault data roles. VM passwords are used once and discarded, and break-glass access is a VMAccess reset ([ADR 0009](adr/0009-secrets-handling.md)). An opt-in vault for the one-time host password exists for accounts that can assign roles ([deployment](deployment.md#opt-in-the-password-in-key-vault-instead-of-the-clipboard)).

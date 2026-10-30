@@ -616,9 +616,17 @@ Describe 'deploy.ps1''s A1 re-grant (Invoke-DemoActivityControlRegrant)' {
         foreach ($file in 'Public/Invoke-DemoDeployment.ps1', 'Private/ParallelDeployment.ps1') {
             $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath ('scripts/modules/DbHubDemo/{0}' -f $file)) -Raw
             $text | Should -Match 'Invoke-DemoActivityControlRegrant -Config \$Config -ConfigPath \$ConfigPath -Confirm:\$false' -Because $file
+            # Since Phase 28 both paths build DEPLOY.SUMMARY in one place, which keeps an Owner's step apart from what
+            # only a person can confirm.
+            $text | Should -Match 'Get-DemoDeploySummary -Result \$all' -Because $file
         }
-        $deploy = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/Public/Invoke-DemoDeployment.ps1') -Raw
-        $deploy | Should -Match "status -eq 'Manual action required'"
+        $summary = InModuleScope -ModuleName DbHubDemo {
+            $grant = New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message 'A1 wasn''t granted: the caller isn''t an Owner.' -Remediation 'An Owner of the subscription runs, signed in with multifactor authentication: ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole'
+            Get-DemoDeploySummary -Result @($grant)
+        }
+        $summary.Status | Should -Be 'Manual action required'
+        $summary.Message | Should -Match ([regex]::Escape('1 item(s) need you: CONTROL.ROLE.A1: An Owner of the subscription runs, signed in with multifactor authentication: ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole'))
+        @($summary.Evidence['manual']).Count | Should -Be 1
     }
 }
 

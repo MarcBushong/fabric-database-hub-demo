@@ -273,6 +273,29 @@ Describe 'Resolve-DemoFabricConfig' {
         (Get-Record $taken 'FABRIC.RESOLVE.WORKSPACE').remediation | Should -Match 'already exists, and you can''t access it'
     }
 
+    It 'finds by name the workspace its own create made, when the create sent again after a lost answer finds the name taken (Phase 28 live finding)' {
+        # The first create reached Fabric, but its answer was lost (HTTP 502); Invoke-DemoTransientRetry sent it again.
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $workspacesUri; Responses = @(
+                    New-FabricResponse -Status 200 -Body @{ value = @() }
+                    New-FabricResponse -Status 200 -Body @{ value = @($demoWorkspace) }
+                ) }
+            @{ Method = 'Get'; Match = $capacitiesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($activeCapacity) }) }
+            @{ Method = 'Post'; Match = $workspacesUri; Responses = @(
+                    New-FabricResponse -Status 502 -Body $null
+                    New-FabricResponse -Status 409 -Body @{ errorCode = 'WorkspaceNameAlreadyExists'; message = 'The name is in use.' }
+                ) }
+        )
+        $resolution = Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token -Create -SkipLakehouse -Confirm:$false
+        $record = Get-Record $resolution 'FABRIC.RESOLVE.WORKSPACE'
+        $record.status | Should -Be 'Pass'
+        $record.message | Should -Match '^Found the Fabric workspace "Database Hub Demo" by name: its create said it already exists'
+        $record.evidence.source | Should -Be 'name'
+        $resolution.WorkspaceId | Should -Be $workspaceId
+        @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -match $workspacesUri }).Count | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 5 }
+    }
+
     It 'is a Fail for an unexpected error' {
         Set-FabricMock -Routes @(
             @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 500 -Body @{ errorCode = 'UnknownError'; message = 'An error occurred.' }) }

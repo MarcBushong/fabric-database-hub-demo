@@ -6,7 +6,12 @@ function Invoke-DemoDeployment {
 
     .DESCRIPTION
     Every stage is idempotent, and a re-run converges. The last stage that finished is recorded in the
-    resource group's tags (Set-DemoDeploymentState), so -Resume continues after it from any machine. Stages:
+    resource group's tags (Set-DemoDeploymentState), so -Resume continues after it from any machine. On an existing
+    environment, what's stopped (the nightly auto-shutdown, stop-demo.ps1, a stop) starts while preflight runs, and runs
+    before the first stage that needs it (Request-DemoStoppedStart, Wait-DemoStoppedStart; Phase 28 live finding). Then,
+    on a run that ends with the validation and has no Monitoring stage, T1's monitoring plugin is checked, and restarted
+    when it isn't running (Invoke-DemoT1MonitoringCheck, DEPLOY.T1.MONITORING; Phase 28 live finding, 2026-10-30).
+    Stages:
 
     1. Preflight: Invoke-DemoPreflight (subscription guard, P1-P6, region, sizes, quota, policy, cost). Any
        Fail stops here. It resolves the network mode, the T3 free offer, and the P6 group's name.
@@ -30,11 +35,19 @@ function Invoke-DemoDeployment {
        configure-monitoring.ps1 -Target T1 -WaitMinutes does; Updating is a wait, not a failure.
     8. T2: Invoke-DemoArcConfiguration: onboarding when the host waits for it, then the extension, license
        type, and monitoring (T2.ARC.MONITORING), then T2's activity profile. In PaygWizard mode it reports
-       Manual action required with the wizard steps; the stage stays open, and the later stages still run.
-    9. Fabric: configure-fabric.ps1 (the Hub checklist, and the notebook import with -ImportNotebooks or
-       fabric.importNotebooks). Not selected with -SkipFabric.
+       Manual action required with the wizard steps; the stage stays open, and the later stages still run. What an
+       earlier guided stop or session left open (Bastion, a handed-over host password) is cleaned up here too
+       (Clear-DemoGuidedStopLeftover; Phase 28 review).
+    9. Fabric: configure-fabric.ps1 (the Hub checklist, the Real-Time Dashboard, and the notebook import with
+       -ImportNotebooks or fabric.importNotebooks), then configure-powerbi.ps1 (the history semantic model and
+       report), as the parallel Fabric track imports them (Phase 28 review follow-up); the optional Insights app stays
+       configure-fabric-app.ps1's. Not selected with -SkipFabric.
     10. Validation: Test-DemoHubTelemetry for each ready target, the runner's status on T1, and a summary that
-        lists every Manual action required item with its exact steps.
+        lists every Manual action required item with its exact steps. A target whose telemetry didn't come gets its
+        monitoring checked, and its telemetry once more, before the run is judged (Invoke-DemoTelemetryCheck; Phase 28
+        live finding, 2026-10-30). Since Phase 28 (review finding 4), with no
+        stage open and nothing failed, DONE's read-only checks follow (Invoke-DemoDoneGate: Database Hub's estate,
+        T4's metrics, T2's PAYG and monitoring, and the Fabric items), so deploy.ps1 -Sequential can end DONE.
 
     A Fail stops the run, and nothing after it runs. Manual action required never stops it and is never
     hidden: it's in the results and in DEPLOY.SUMMARY. Deployment success alone is never Pass (ADR 0012).
@@ -78,7 +91,9 @@ function Invoke-DemoDeployment {
     How long to wait for T1's bootstrap to be Ready.
 
     .PARAMETER T2WaitMinutes
-    How long the T2 stage waits for the host to reach the Arc onboarding step (0: don't wait).
+    How long the T2 stage waits for the host to reach the Arc onboarding step (0: don't wait). With -Parallel and
+    -WaitForT2: how long the T2 track waits for the guest build and, in PaygWizard mode, the guided stop (Phase 28;
+    deploy.ps1's default is 180).
 
     .PARAMETER MonitoringWaitMinutes
     How long to wait for T1's monitoring plugin, including a SQL IaaS extension that's Updating.
@@ -103,6 +118,16 @@ function Invoke-DemoDeployment {
 
     .PARAMETER ArcWaitMinutes
     With -Parallel: how long configure-arc's sequence waits for the extension and the SQL Server instance.
+
+    .PARAMETER AutoResume
+    With -Parallel: continue an unfinished deployment (the state's last stage is set and isn't Validation), as -Resume
+    does, when neither -Resume nor -FromStage is given (Phase 28; deploy.ps1 passes it, except in GitHub Actions).
+
+    .PARAMETER ProgressPath
+    With -Parallel: the progress model behind the live status page (Phase 28), which every stage and track updates.
+
+    .PARAMETER PagePath
+    With -Parallel: the status page, named in the guided stop's prompt.
 
     .EXAMPLE
     Invoke-DemoDeployment -Config $config -Resume
@@ -138,7 +163,7 @@ function Invoke-DemoDeployment {
         [int] $T1WaitMinutes = 45,
 
         [ValidateRange(0, 360)]
-        [int] $T2WaitMinutes = 120,
+        [int] $T2WaitMinutes = 180,
 
         [ValidateRange(0, 60)]
         [int] $MonitoringWaitMinutes = 20,
@@ -157,7 +182,13 @@ function Invoke-DemoDeployment {
         [int] $ChunkParallelism = 8,
 
         [ValidateRange(5, 120)]
-        [int] $ArcWaitMinutes = 45
+        [int] $ArcWaitMinutes = 45,
+
+        [switch] $AutoResume,
+
+        [string] $ProgressPath = '',
+
+        [string] $PagePath = ''
     )
 
     if ($Parallel) {
@@ -180,6 +211,9 @@ function Invoke-DemoDeployment {
             ChunkParallelism      = $ChunkParallelism
             WaitForT2             = $WaitForT2
             ArcWaitMinutes        = $ArcWaitMinutes
+            AutoResume            = $AutoResume
+            ProgressPath          = $ProgressPath
+            PagePath              = $PagePath
         }
         return (Invoke-DemoParallelDeployment @parallelArguments)
     }
@@ -264,15 +298,64 @@ function Invoke-DemoDeployment {
         }
     }
 
+    $validated = $false
+    # Phase 28 live finding (2026-10-30), as in the parallel path: what's stopped starts while preflight runs, and runs
+    # before the first stage that needs it. Running VMs are only read; nothing on a first deployment or a what-if.
+    $stoppedStart = $null
+    $vmsReady = $false
+    $vmStagesInRange = $startIndex -le $stopIndex -and @($stages[$startIndex..$stopIndex] | Where-Object { $_ -ne 'Preflight' }).Count -gt 0
+    $existing = -not $whatIf -and [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')
+    if ($existing -and $vmStagesInRange) {
+        $stoppedStart = Request-DemoStoppedStart -Config $Config -SkipT4:(-not (Test-DemoT4Enabled -Config $Config)) -Confirm:$false
+    }
+    # T1's monitoring plugin can stop after a restart, hours after start-demo.ps1 found it running (Phase 28 live finding,
+    # 2026-10-30), so a run that ends with the validation and has no Monitoring stage checks it once the VMs run.
+    $inRange = { param([string] $Name) $position = [array]::IndexOf($stages, $Name); $position -ge $startIndex -and $position -le $stopIndex }
+    $checkT1Monitoring = $existing -and (& $inRange 'Validation') -and -not (& $inRange 'Monitoring')
+    # -Sequential records only its stage, never a track, so once preflight passes, the records of the parallel tracks whose
+    # steps this run does again are lowered (all of them from preflight): a later parallel -Resume then runs those steps
+    # again instead of trusting an earlier run's record (Get-DemoTrackRecordReset; Phase 28 live finding, 2026-10-30).
+    $trackReset = @{}
+    if (-not $whatIf -and $startIndex -le $stopIndex) {
+        $trackPlan = Resolve-DemoTrackPlan -FromStage $stages[$startIndex] -StopAfter $stages[$stopIndex] -SkipFabric:$SkipFabric -SkipT4:(-not (Test-DemoT4Enabled -Config $Config))
+        $trackReset = Get-DemoTrackRecordReset -Plan $trackPlan -State $state -FreshStart:($startIndex -eq 0)
+    }
     for ($index = $startIndex; $index -le $stopIndex; $index++) {
         $stage = $stages[$index]
         Write-DemoLog -Message ('Stage {0} of {1}: {2}.' -f ($index + 1), $stages.Count, $stage)
+        if ($stage -ne 'Preflight' -and -not $vmsReady) {
+            $vmsReady = $true
+            if ($trackReset.Count -gt 0) {
+                try {
+                    Set-DemoDeploymentState -Config $Config -Value $trackReset -Confirm:$false
+                    Write-DemoLog -Message ('The track records an earlier run left were reset ({0}), so a later resume can''t skip a step this run doesn''t finish.' -f ((@($trackReset.Keys | Sort-Object) | ForEach-Object { $_ -replace '^Track', '' }) -join ', '))
+                }
+                catch {
+                    Write-DemoLog -Level Warning -Message ('The track records an earlier run left couldn''t be reset, so a later resume could skip a step this run doesn''t finish: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+                }
+            }
+            if ($null -ne $stoppedStart) {
+                $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart)
+                & $addAll $started
+                if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
+                    return $results.ToArray()
+                }
+            }
+            if ($checkT1Monitoring) {
+                $occasion = if ($null -ne $stoppedStart -and $stoppedStart.Vms.Contains('sqlvm01')) { 'the start' } else { 'the deployment' }
+                $results.Add((Invoke-DemoT1MonitoringCheck -Config $Config -Occasion $occasion))
+            }
+        }
         switch ($stage) {
             'Preflight' {
                 $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf)
                 & $addAll $preflight
                 if (& $hasStatus $preflight 'Fail') {
                     & $stageResult 'Preflight' 'Fail' 'Preflight has at least one Fail, so nothing was deployed.' 'Fix each Fail above (its remediation says how), then run deploy.ps1 again.'
+                    if ($null -ne $stoppedStart -and @($stoppedStart.Requested).Count -gt 0) {
+                        # What this run asked to start keeps running, and billing (ADR 0016), until a stop.
+                        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')) -Evidence ([ordered]@{ vms = @($stoppedStart.Requested); started = @($stoppedStart.Requested); notRunning = @(); afterPreflightFail = $true }) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
+                    }
                     return $results.ToArray()
                 }
                 $pick = { param([string] $CheckId, [string] $Key) $item = $preflight | Where-Object { $_.checkId -eq $CheckId } | Select-Object -First 1; Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name $Key }
@@ -289,7 +372,7 @@ function Invoke-DemoDeployment {
                     $context.T3AdminGroupName = $group
                 }
                 & $ensureContext
-                & $stageResult 'Preflight' 'Pass' ('Preflight passed (network mode {0}, T3 free offer {1}).' -f $context.NetworkMode, $context.T3UseFreeLimit)
+                & $stageResult 'Preflight' 'Pass' (Get-DemoPreflightPassText -NetworkMode ([string]$context.NetworkMode) -T3UseFreeLimit ([bool]$context.T3UseFreeLimit))
             }
             'Infrastructure' {
                 & $ensureContext
@@ -300,8 +383,9 @@ function Invoke-DemoDeployment {
                     T3UseFreeLimit          = [bool]$context.T3UseFreeLimit
                     T3AdminGroupDisplayName = [string]$context.T3AdminGroupName
                 }
-                if (-not $whatIf -and (Test-DemoT4Enabled -Config $Config)) {
-                    # A stopped T4 rejects the template's update, so it starts first (Phase 24, ADR 0019).
+                if (-not $whatIf -and (Test-DemoT4Enabled -Config $Config) -and @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.START' -and [string]$_.status -eq 'Pass' }).Count -eq 0) {
+                    # A stopped T4 rejects the template's update, so it starts first (Phase 24, ADR 0019), unless this run
+                    # already started it.
                     $t4Start = Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 20 -CheckPrefix DEPLOY
                     if ($t4Start.status -ne 'Not selected') {
                         $results.Add($t4Start)
@@ -407,6 +491,16 @@ function Invoke-DemoDeployment {
                 if (-not $deployment.Succeeded) {
                     & $stageResult 'Bootstraps' 'Fail' 'The deployment that adds the loaders failed.' 'Fix the cause in DEPLOY.TEMPLATE, then run deploy.ps1 -Resume.'
                     return $results.ToArray()
+                }
+                if (-not $whatIf -and $hostVm -eq 'archost01') {
+                    # The host's loader starts a bootstrap generation that builds its guest; until T2 is done, deploy.ps1's
+                    # watchdog never restarts the host (Get-DemoHostRestartBlocker, Phase 28 review follow-up).
+                    try {
+                        Set-DemoDeploymentState -Config $Config -Value @{ T2BuildUtc = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
+                    }
+                    catch {
+                        Write-DemoLog -Level Warning -Message ('The T2 host''s bootstrap generation wasn''t recorded: {0}' -f $_.Exception.Message)
+                    }
                 }
                 $loaders = @(foreach ($vm in $vmNames) { Wait-DemoBootstrapLoader -Config $Config -VmName $vm })
                 & $addAll $loaders
@@ -515,19 +609,20 @@ function Invoke-DemoDeployment {
                 }
             }
             'Monitoring' {
-                $monitoring = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes $MonitoringWaitMinutes -Confirm:$false
-                $results.Add($monitoring)
+                # A NotRunning plugin gets the short grace, then the agent's restart, and T1.SQLVM.MONITORING is read
+                # again once the restart has run, so a Fail there stops the stage with its own cause
+                # (Invoke-DemoSqlVmMonitoringWait; live, 2026-10-27 and 2026-10-30).
+                $monitoringResults = @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes $MonitoringWaitMinutes)
+                foreach ($item in $monitoringResults) {
+                    $results.Add($item)
+                }
+                $monitoring = $monitoringResults[0]
                 if ($monitoring.status -eq 'Fail') {
                     & $stageResult 'Monitoring' 'Fail' 'T1 performance monitoring couldn''t be turned on.' $monitoring.remediation
                     return $results.ToArray()
                 }
-                if (Test-DemoSqlVmMonitoringStuck -Result $monitoring) {
-                    # The template run can leave the plugin NotRunning, and waiting doesn't bring it back (live, 2026-10-27).
-                    $monitoring = Restore-DemoSqlVmMonitoringPlugin -Config $Config -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment'
-                    $results.Add($monitoring)
-                }
                 & $recordStage 'Monitoring'
-                & $stageResult 'Monitoring' 'Pass' ('T1 performance monitoring: {0}.' -f $monitoring.status)
+                & $stageResult 'Monitoring' 'Pass' ('T1 performance monitoring: {0}.' -f $monitoringResults[-1].status)
             }
             'T2' {
                 $arcArguments = @{ Config = $Config; WaitForHostMinutes = $T2WaitMinutes; WaitMinutes = 15; Confirm = $false }
@@ -553,6 +648,10 @@ function Invoke-DemoDeployment {
                     }
                 }
                 & $addAll $arc
+                # What an earlier guided stop or session left open (setup can finish after a Ctrl+C at a parallel run's guided
+                # stop, which skipped its cleanup) goes, whatever the Arc configuration found, so DONE never comes with it
+                # (Phase 28 review).
+                & $addAll @(Clear-DemoGuidedStopLeftover -Config $Config)
                 if (& $hasStatus $arc 'Fail') {
                     & $stageResult 'T2' 'Fail' 'T2''s Arc onboarding or configuration failed.' 'Read the T2.* results, fix the cause, then run deploy.ps1 -FromStage T2.'
                     return $results.ToArray()
@@ -574,7 +673,8 @@ function Invoke-DemoDeployment {
                 $profileName = if ($Config['activityProfile']) { [string]$Config['activityProfile'] } else { 'baseline' }
                 $t2Skip = if (-not $current.RunnerSha256 -or 'archost01' -notin $current.RunnerSentTo) { 'T2 has no workload runner (-SkipRunner, or it wasn''t sent to archost01).' } else { '' }
                 $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $t2Skip -RequestedBy 'deploy'))
-                & $recordStage 'T2'
+                # The guest build is done, so the bootstrap generation's record goes (Get-DemoHostRestartBlocker).
+                & $recordStage 'T2' @{ T2BuildUtc = '' }
                 & $stageResult 'T2' 'Pass' 'T2 is onboarded to Azure Arc, configured, and monitored.'
             }
             'Fabric' {
@@ -583,21 +683,32 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Fabric' 'Not selected' 'The Fabric stage was skipped (-SkipFabric).'
                     continue
                 }
-                $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -ImportNotebooks:$importNotebooks -NewNotebooksOnly)
+                # The notebooks, the Hub checklist, and the Real-Time Dashboard, then the history semantic model and report, as the
+                # parallel Fabric track imports them (review follow-up): DONE's FABRIC.ITEMS.REQUIRED looks for all of them, and a
+                # new workspace has none. The optional Insights app stays configure-fabric-app.ps1's.
+                $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -ImportNotebooks:$importNotebooks -NewNotebooksOnly -ImportDashboard)
                 & $addAll $fabric
                 if (& $hasStatus $fabric 'Fail') {
                     & $stageResult 'Fabric' 'Fail' 'A Fabric or Database Hub check failed.' 'Read the HUB.* and FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
                     return $results.ToArray()
                 }
+                $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $ConfigPath)
+                & $addAll $powerBI
+                if (& $hasStatus $powerBI 'Fail') {
+                    & $stageResult 'Fabric' 'Fail' 'The history semantic model or report failed.' 'Read the FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
+                    return $results.ToArray()
+                }
                 & $recordStage 'Fabric'
-                & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran{0}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }))
+                & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }))
             }
             'Validation' {
                 $targets = @('T1', 'T3')
                 if ($context.T2Complete) {
                     $targets = @('T1', 'T2', 'T3')
                 }
-                & $addAll @(Test-DemoHubTelemetry -Config $Config -Target $targets -WaitMinutes $TelemetryWaitMinutes)
+                # A target whose telemetry didn't come gets its monitoring checked, and its telemetry once more, unless a
+                # stage is open, so the run isn't DONE anyway (Invoke-DemoTelemetryCheck; Phase 28 live finding).
+                & $addAll @(Invoke-DemoTelemetryCheck -Config $Config -Target $targets -WaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath -ProgressStepId 'Validation' -NoRecovery:([bool]$context.OpenStage))
                 # T1's AssociatedServices step must have converged: unified inventory lists only the engine (a Fail).
                 $results.Add((Test-DemoSqlVmAssociatedService -Config $Config -WaitMinutes 10 -ListedStatus 'Fail'))
                 $current = Get-DemoDeploymentState -Config $Config
@@ -607,16 +718,25 @@ function Invoke-DemoDeployment {
                 }
                 & $recordStage 'Validation'
                 & $stageResult 'Validation' 'Pass' ('The validation ran for {0}.' -f ($targets -join ', '))
+                $validated = $true
             }
         }
     }
 
+    # DONE's read-only checks, as the parallel path runs them once every track finished (Phase 28, review finding 4):
+    # after this run's validation, with no stage open and nothing failed, each DONE requirement the results don't show
+    # passing yet (Database Hub's estate, T4's metrics, T2's PAYG and monitoring, the Fabric items) is checked, so a
+    # sequential run is judged by the same requirements and can end DONE.
+    if ($validated -and -not $context.OpenStage -and -not (& $hasStatus $results.ToArray() 'Fail')) {
+        $current = Get-DemoDeploymentState -Config $Config
+        $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool](Get-DemoT4OffReason -Config $Config -State $current)) -SkipFabric:$SkipFabric
+        & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
+    }
+
     $all = $results.ToArray()
-    $manual = @($all | Where-Object { $_.status -eq 'Manual action required' })
-    $failed = @($all | Where-Object { $_.status -eq 'Fail' })
-    $steps = @($manual | ForEach-Object { '{0}: {1}' -f $_.checkId, $(if ($_.remediation) { $_.remediation } else { $_.message }) })
-    $summaryStatus = if ($failed.Count -gt 0) { 'Fail' } elseif ($manual.Count -gt 0) { 'Manual action required' } else { 'Pass' }
-    $summaryMessage = if ($manual.Count -gt 0) { ('{0} item(s) need you: {1}' -f $manual.Count, ($steps -join ' | ')) } elseif ($failed.Count -gt 0) { ('{0} check(s) failed.' -f $failed.Count) } else { 'Every stage that ran finished.' }
-    $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $summaryStatus -Message $summaryMessage -Evidence ([ordered]@{ manual = $steps; failed = @($failed | ForEach-Object { $_.checkId }) })))
+    # Phase 28 live finding (2026-10-30): what only a person can confirm is listed once each, apart from what needs you.
+    $summary = Get-DemoDeploySummary -Result $all -FinishedText 'Every stage that ran finished.'
+    $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $summary.Status -Message $summary.Message -Evidence $summary.Evidence))
     return $results.ToArray()
 }

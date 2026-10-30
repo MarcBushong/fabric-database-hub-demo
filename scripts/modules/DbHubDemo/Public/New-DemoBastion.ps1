@@ -22,6 +22,10 @@ function New-DemoBastion {
     .PARAMETER Hours
     Hours until the bastion-cleanup workflow removes it; defaults to bastionMaxHours, and is capped at it.
 
+    .PARAMETER NoWait
+    Start the deployment and return at once (az deployment group create --no-wait), for deploy.ps1's guided stop,
+    which prepares the guest meanwhile and then waits for the deployment named bastion-on-demand (Phase 28).
+
     .EXAMPLE
     New-DemoBastion -Config $config
     #>
@@ -32,7 +36,9 @@ function New-DemoBastion {
         [System.Collections.IDictionary] $Config,
 
         [ValidateRange(0, 24)]
-        [int] $Hours = 0
+        [int] $Hours = 0,
+
+        [switch] $NoWait
     )
 
     $subscriptionId = [string]$Config['subscriptionId']
@@ -74,7 +80,11 @@ function New-DemoBastion {
     try {
         $path = Write-DemoPrivateFile -Directory $directory -Name 'bastion.parameters.json' -Content ($parameters | ConvertTo-Json -Depth 10)
         Write-DemoLog -Message ('Deploying {0} (Basic) and {1}; this takes about 8 minutes.' -f $bastionName, $publicIpName)
-        $run = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('deployment', 'group', 'create', '--resource-group', $resourceGroupName, '--name', 'bastion-on-demand', '--template-file', (Join-Path -Path $script:RepoRoot -ChildPath 'infra/modules/bastion.bicep'), '--parameters', "@$path") -AllowFailure
+        $arguments = [System.Collections.Generic.List[string]]::new([string[]]@('deployment', 'group', 'create', '--resource-group', $resourceGroupName, '--name', 'bastion-on-demand', '--template-file', (Join-Path -Path $script:RepoRoot -ChildPath 'infra/modules/bastion.bicep'), '--parameters', "@$path"))
+        if ($NoWait) {
+            $arguments.Add('--no-wait')
+        }
+        $run = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList $arguments.ToArray() -AllowFailure
     }
     finally {
         Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
@@ -87,6 +97,9 @@ function New-DemoBastion {
     }
     catch {
         Write-DemoLog -Level Warning -Message ('The Bastion expiry wasn''t recorded on the resource group: {0}' -f $_.Exception.Message)
+    }
+    if ($NoWait) {
+        return (New-DemoResult -CheckId 'START.BASTION' -Area 'infra' -Target 'T2' -Status 'Pass' -Message ('{0} is being deployed (about 8 minutes) and stays until {1}.' -f $bastionName, $expires) -Evidence ([ordered]@{ bastionName = $bastionName; publicIpName = $publicIpName; expiresUtc = $expires; noWait = $true }) -DocUrl $docUrl)
     }
     return (New-DemoResult -CheckId 'START.BASTION' -Area 'infra' -Target 'T2' -Status 'Pass' -Message ('{0} is ready until {1}. In the Azure portal, open archost01, select Connect, then Bastion.' -f $bastionName, $expires) -Evidence ([ordered]@{ bastionName = $bastionName; publicIpName = $publicIpName; expiresUtc = $expires }) -DocUrl $docUrl)
 }

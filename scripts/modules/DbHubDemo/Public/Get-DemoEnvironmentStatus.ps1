@@ -11,6 +11,9 @@ function Get-DemoEnvironmentStatus {
     - STATUS.VM_SQLVM01 and STATUS.VM_<T2 VM>: the power state and, for a running VM, its health summary
       (Get-DemoVmHealth, a read-only Run Command). With -Detail, the full health, which includes the guest's
       evaluation days left and the workload runner.
+    - STATUS.T2.AUTOSIGNIN (Phase 28, Get-DemoGuidedSignInStatus), only when there's something to say: Pass while the
+      guest's one-time automatic sign-in waits for a guided stop; a Warning when it's armed with no guided stop
+      waiting or its last cleanup didn't finish (archost01's next pass removes the leftovers; status stays read-only).
     - STATUS.T3: whether T3 exists and its status (Online, Paused); Not selected after stop-demo.ps1 -RemoveT3.
     - STATUS.T4 (Phase 24, ADR 0019): T4's state; while it runs, its live Azure Monitor metrics from the last
       15 minutes (CPU, memory, connections, CPU credits, and the enhanced metrics: sessions by state and by
@@ -152,6 +155,13 @@ function Get-DemoEnvironmentStatus {
                 $message += (' Guest evaluation days left: {0}.' -f $days)
             }
             $results.Add((New-DemoResult -CheckId ('STATUS.VM_{0}' -f $vm.ToUpperInvariant()) -Area $target.ToLowerInvariant() -Target $target -Status $healthStatus -Message $message -Evidence $evidence))
+            if ($vm -eq $hostVm) {
+                # The guest's one-time automatic sign-in for the guided stop (Phase 28): armed or left over.
+                $autoSignIn = Get-DemoGuidedSignInStatus -Health $health
+                if ($null -ne $autoSignIn) {
+                    $results.Add($autoSignIn)
+                }
+            }
         }
         catch {
             $results.Add((New-DemoResult -CheckId ('STATUS.VM_{0}' -f $vm.ToUpperInvariant()) -Area $target.ToLowerInvariant() -Target $target -Status 'Warning' -Message ('{0} is running, but its health couldn''t be read: {1}' -f $vm, $_.Exception.Message)))
@@ -230,6 +240,10 @@ function Get-DemoEnvironmentStatus {
                 $read = Invoke-DemoWorkloadCommand -Config $Config -Target $target -ArgumentList 'profile', 'get', '--json' -TimeoutSeconds 300 -Confirm:$false
             }
             catch {
+                if ($target -eq 'T2' -and (Test-DemoT2NotSetUpText -Text $_.Exception.Message)) {
+                    $results.Add((New-DemoResult -CheckId 'STATUS.PROFILE_T2' -Area 'workload' -Target 'T2' -Status 'Not selected' -Message 'T2 isn''t set up yet: the guest gets its demo module and workload runner after SQL Server setup, so it has no activity profile to read.'))
+                    continue
+                }
                 $results.Add((New-DemoResult -CheckId ('STATUS.PROFILE_{0}' -f $target) -Area 'workload' -Target $target -Status 'Warning' -Message ('{0}: the activity profile couldn''t be read: {1}' -f $target, $_.Exception.Message)))
                 continue
             }
@@ -237,6 +251,10 @@ function Get-DemoEnvironmentStatus {
             $record = @($read.Records) | Where-Object { $null -ne (Get-DemoMemberValue -InputObject $_ -Name 'name') } | Select-Object -First 1
             $stdout = [string](Get-DemoMemberValue -InputObject $read -Name 'StdOut')
             if ($null -eq $record -or $read.Status -notin 'Pass', 'Warning') {
+                if ($target -eq 'T2' -and (Test-DemoT2NotSetUpText -Text ([string]$read.Result.message))) {
+                    $results.Add((New-DemoResult -CheckId 'STATUS.PROFILE_T2' -Area 'workload' -Target 'T2' -Status 'Not selected' -Message 'T2 isn''t set up yet: the guest gets its demo module and workload runner after SQL Server setup, so it has no activity profile to read.'))
+                    continue
+                }
                 $readStatus = if ($target -eq 'T2') { 'Warning' } else { [string]$read.Status }
                 if ($readStatus -notin 'Pass', 'Warning') { $readStatus = 'Warning' }
                 $results.Add((New-DemoResult -CheckId ('STATUS.PROFILE_{0}' -f $target) -Area 'workload' -Target $target -Status $readStatus -Message ('{0}: the activity profile couldn''t be read: {1}' -f $target, [string]$read.Result.message)))

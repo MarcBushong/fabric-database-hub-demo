@@ -35,7 +35,8 @@ function Start-DemoEnvironment {
        Enable-DemoT3Workload, the readiness gate (Test-DemoT3Readiness: Resource Graph, the extended property,
        and fresh telemetry, otherwise a Warning with the measured lag), and T1's monitoring: a template
        deployment keeps the SQL IaaS extension Updating for about 10 minutes, which is a wait, not a failure
-       (Enable-DemoSqlVmMonitoring -WaitMinutes, as configure-monitoring.ps1 -Target T1 does).
+       (Invoke-DemoSqlVmMonitoringWait -RestartAtOnce: Enable-DemoSqlVmMonitoring -WaitMinutes, as configure-monitoring.ps1
+       -Target T1 does, then the agent's restart at once for a NotRunning plugin).
     4a. T4, the PostgreSQL flexible server (Phase 24, ADR 0019): its start is requested with the VMs
        (Servers - Start) and confirmed before its profile is set (START.T4.START). -SkipT4 leaves it stopped.
     5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, baseline by default)
@@ -264,8 +265,11 @@ function Start-DemoEnvironment {
                 foreach ($item in @($gate.Results)) {
                     $results.Add($item)
                 }
-                # The redeployment keeps the SQL IaaS extension Updating for about 10 minutes: a wait.
-                $results.Add((Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes $MonitoringWaitMinutes -Confirm:$false))
+                # The redeployment keeps the SQL IaaS extension Updating for about 10 minutes: a wait. A plugin it leaves
+                # NotRunning gets the agent's restart at once, as after a start (Invoke-DemoSqlVmMonitoringWait; live, 2026-10-30).
+                foreach ($item in @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes $MonitoringWaitMinutes -RestartAtOnce -CheckId 'START.T1.MONITORING')) {
+                    $results.Add($item)
+                }
             }
         }
     }

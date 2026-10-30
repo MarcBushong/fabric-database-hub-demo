@@ -108,6 +108,9 @@ $ErrorActionPreference = 'Stop'
 if (-not (Get-Module -Name 'DbHubDemo')) {
     Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
 }
+# Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
+$ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
+$OutputPath = Resolve-DemoUserPath -Path $OutputPath
 
 $config = Get-DemoConfig -Path $ConfigPath
 # Preference variables don't reach module functions, so -WhatIf is passed on explicitly.
@@ -160,19 +163,19 @@ elseif ($Interactive -and $ResetAdminPassword -and -not $whatIf -and $noFail) {
     $hostVm = if ([string]$config['t2Mode'] -eq 'EvaluationOnlyAzureVm') { 'arcsql01' } else { 'archost01' }
     $portalSteps = 'In the Azure portal, open {0}, then Help, then Reset password, and set a password you''ll use once; stop-demo.ps1 rotates it afterward.' -f $hostVm
     # The clipboard is checked before anything changes: the password is never displayed, so without a
-    # clipboard there'd be no way to hand it over.
-    $clipboard = $false
-    if (Get-Command -Name 'Set-Clipboard' -ErrorAction SilentlyContinue) {
+    # clipboard there'd be no way to hand it over. Set-Clipboard doesn't fail where there's none (Linux without xclip
+    # or a display, GitHub Codespaces, an SSH session, Cloud Shell), so the module's check decides (Phase 28).
+    $clipboard = [bool](& (Get-Module -Name 'DbHubDemo') { Test-DemoClipboard })
+    if (-not $clipboard) {
+        $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'This session has no working clipboard, so no one-time password was set: it''s never displayed.' -Remediation $portalSteps -DocUrl 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'))
+        # The person may now set a password in the portal: the state records the handover, so stop-demo.ps1 rotates it
+        # (Phase 28, ADR 0009).
         try {
-            Set-Clipboard -Value ' '
-            $clipboard = $true
+            Set-DemoDeploymentState -Config $config -Value @{ HostPasswordSet = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
         }
         catch {
-            $clipboard = $false
+            Write-DemoLog -Level Warning -Message ('The handover wasn''t recorded, so after you reset the password in the portal, reset it again to a random value you don''t keep: {0}' -f $_.Exception.Message)
         }
-    }
-    if (-not $clipboard) {
-        $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'This session has no working clipboard, so no one-time password was set: it''s never displayed.' -Remediation $portalSteps))
     }
     else {
         $password = New-DemoAdminPassword

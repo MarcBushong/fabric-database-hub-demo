@@ -227,7 +227,10 @@ Describe 'T4 sizes (Phase 24)' {
     It 'offers D2ds_v5 only as a setting: the schema and the template allow it, B1ms stays the default, and the template derives the tier from the size' {
         $schema = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/environment.schema.json') -Raw | ConvertFrom-Json -AsHashtable
         $schema.properties['t4SkuName'].enum | Should -Be @('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5')
-        $schema.properties['t4SkuName'].default | Should -Be 'Standard_B1ms'
+        # Phase 28: the schema has no default, so an unset size is told apart from one you set (only an unset one falls
+        # back on its own); the profile's size, Standard_B1ms, is what an unset one deploys.
+        $schema.properties['t4SkuName'].Contains('default') | Should -BeFalse
+        (New-TestConfig).Contains('t4SkuName') | Should -BeFalse
         $template = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'azuredeploy.json') -Raw | ConvertFrom-Json -AsHashtable
         $template.parameters['t4SkuName'].allowedValues | Should -Contain 'Standard_D2ds_v5'
         $template.parameters['t4SkuName'].defaultValue | Should -Be 'Standard_B1ms'

@@ -385,7 +385,8 @@ function Get-DemoProtectedSqlProductKey {
 function Get-DemoPaygWizardInstruction {
     <#
     .SYNOPSIS
-    The exact setup-wizard steps for PaygWizard mode (ADR 0006, docs/deployment.md).
+    The exact steps of the PaygWizard guided stop (ADR 0006, Phase 28, docs/deployment.md). deploy.ps1 brings the person
+    here: Bastion is ready, the guest has signed itself in once, and SQL Server setup waits pre-filled.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
@@ -396,20 +397,18 @@ function Get-DemoPaygWizardInstruction {
         [string] $MediaDrive = ''
     )
 
-    $setupPath = 'setup.exe on the SQL Server media drive'
+    $setupPath = 'C:\DbHubDemo\setup\Start-GuidedSetup.ps1 (it opens setup pre-filled)'
     if ($MediaDrive) {
-        $setupPath = '{0}:\setup.exe (the SQL Server media is mounted)' -f $MediaDrive
+        $setupPath = '{0}:\setup.exe (the SQL Server media is mounted), or C:\DbHubDemo\setup\Start-GuidedSetup.ps1 to open it pre-filled' -f $MediaDrive
     }
     return @(
-        'Run ./scripts/start-demo.ps1 -Interactive -ResetAdminPassword to create Bastion and get a one-time host password.'
-        'In the Azure portal, connect to archost01 with Bastion.'
-        ('On the host, run C:\ProgramData\DbHubDemo\Copy-GuestCredential.ps1 to copy the {0} administrator password to the clipboard. It is never displayed.' -f $GuestName)
-        ('Open Hyper-V Manager, connect to {0}, and sign in as Administrator.' -f $GuestName)
-        ('In the guest, run {0}. Select Installation > New SQL Server standalone installation.' -f $setupPath)
-        'On the Edition page, select Use pay-as-you-go billing through Microsoft Azure, then Standard.'
-        'On the Azure Extension for SQL Server page, select Use Azure Login and sign in with your own Azure account. Pay-as-you-go needs this page, and the subscription, resource group, and region are locked to the existing Arc connection. Never enter a service principal secret. If the sign-in window stays blank, the WebView2 runtime is missing in the guest (the GuestWebView2 step installs it).'
-        'Select Database Engine Services (leave Azure Extension for SQL Server selected), and keep the default instance (MSSQLSERVER).'
-        'Choose Windows authentication mode, select Add Current User as a SQL Server administrator, and install.'
-        'Close setup and the SQL Server Installation Center. Within about 5 minutes the host detects the instance, removes the sign-in data that setup leaves in the guest, checks that none remains, and continues on its own.'
+        'Run ./scripts/deploy.ps1 on your PC: it creates Bastion, opens it in your browser, and tells you when this step is ready (it continues where it stopped).'
+        'In the Azure portal, connect to archost01 with Bastion (Connect > Bastion), with the user name and password the deploy gives you, or with a password you set under Help > Reset password.'
+        ('A Virtual Machine Connection window to {0} opens on its own: the guest has signed itself in once and opened SQL Server setup, pre-filled.' -f $GuestName)
+        'On the Edition page, select Use pay-as-you-go billing through Microsoft Azure, then Standard. Accept the license terms.'
+        'On the Azure Extension for SQL Server page, select Use Azure Login and sign in with your own Azure account. Pay-as-you-go needs this page, and the subscription, resource group, and region are locked to the existing Arc connection. Never enter a service principal secret. The sign-in window is an Internet Explorer-based control, so before setup opens the host turns IE Enhanced Security Configuration off for administrators and adds the Microsoft sign-in sites to Trusted sites, and undoes both afterward. If the Azure Login window still stays blank, or Internet Explorer says content from https://login.microsoftonline.com is blocked, follow the dialog''s directions: select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close. Then select Use Azure Login again. Repeat for any other sign-in site it names. (Confirmed live on 2026-10-30; turning IE Enhanced Security Configuration off while setup is open doesn''t help.)'
+        'Select Next on the pre-filled pages (Database Engine Services and Azure Extension for SQL Server, the default instance MSSQLSERVER, the service accounts, and BUILTIN\Administrators as administrators), then Install.'
+        'When setup says Complete, select Close. Within a few minutes the host checks the edition and the instance, signs the guest out, rotates its password, removes the sign-in data that setup leaves in the guest, checks that none remains, and continues on its own.'
+        ('If the window shows a sign-in screen instead: in an elevated PowerShell on archost01, run C:\ProgramData\DbHubDemo\Copy-GuestCredential.ps1 (it never displays the password), use Clipboard > Type clipboard text to sign in to {0} as Administrator, and run {1}.' -f $GuestName, $setupPath)
     )
 }

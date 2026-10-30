@@ -1,0 +1,1756 @@
+# The PaygWizard guided stop inside the T2 guest (ADR 0006, ADR 0009, Phase 28). Windows PowerShell 5.1 on the Hyper-V
+# host; every in-guest action runs over PowerShell Direct. Dot-sourced by vm/bootstrap/Invoke-HostBootstrap.ps1.
+#
+# What it automates, with documented mechanisms only, so the person at the guided stop only chooses pay-as-you-go and
+# Standard, signs in to Azure on setup's Azure page, and selects Install:
+# - SQL Server setup pre-filled from a configuration file (/ConfigurationFile, UIMODE Normal), which holds no secret:
+#   https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-using-a-configuration-file and
+#   https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-from-the-command-prompt
+# - A logon task in the guest that starts it, and a logon task on the host that opens Virtual Machine Connection to the
+#   guest: https://learn.microsoft.com/powershell/module/scheduledtasks/new-scheduledtasktrigger and
+#   https://learn.microsoft.com/windows-server/virtualization/hyper-v/virtual-machine-connection
+# - The guest signs itself in once for the step: Windows automatic logon with AutoLogonCount 1, and a temporary password
+#   kept only as the LSA DefaultPassword secret (LsaStorePrivateData), never as the Winlogon DefaultPassword value:
+#   https://learn.microsoft.com/windows/win32/secauthn/protecting-the-automatic-logon-password,
+#   https://learn.microsoft.com/windows/win32/secauthn/msgina-dll-features, and
+#   https://learn.microsoft.com/sysinternals/downloads/autologon
+# - Setup's Azure sign-in is prepared before anyone is asked, before that sign-in, and before setup opens (Phase 28 live
+#   finding, 2026-10-30): setup's Use Azure Login opened in an IE-based browser control, which IE Enhanced Security
+#   Configuration blocked though the WebView2 runtime was installed (MSAL.NET documents its legacy, IE-based web view
+#   for Microsoft Entra ID authorities: https://learn.microsoft.com/entra/msal/dotnet/advanced/webview2), and a change
+#   made while setup runs doesn't reach it. So the host checks WebView2 (installing it when it's missing), turns IE ESC
+#   off for administrators (https://learn.microsoft.com/azure/storage/file-sync/file-sync-deployment-guide#prepare-windows-server-to-use-with-azure-file-sync),
+#   and maps the Microsoft sign-in hosts to the Trusted sites zone for the guest's Administrator (ZoneMap\Domains and
+#   EscDomains: https://learn.microsoft.com/previous-versions/troubleshoot/browsers/security-privacy/ie-security-zones-registry-entries).
+# The automatic sign-in is armed only while deploy.ps1 waits for a person (a request it writes on the host, with an
+# expiry), and its cleanup always runs: when setup has installed the right instance, when the request expires or goes,
+# and before the next arm. The cleanup turns automatic sign-in off, deletes the LSA secret and the Winlogon
+# DefaultUserName and DefaultPassword values, rotates the guest administrator's password, signs the console out, and
+# (except before the next arm) turns IE ESC back on and puts the Trusted sites entries back as they were;
+# GuestSignInCleanup then runs as before.
+
+function Get-DemoGuidedSetupPath {
+    # Where the guided setup's files live: in the guest, and in the host's state folder.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Root
+    )
+
+    $guestFolder = 'C:\DbHubDemo\setup'
+    return [pscustomobject]@{
+        GuestFolder        = $guestFolder
+        GuestConfiguration = $guestFolder + '\ConfigurationFile.ini'
+        GuestLauncher      = $guestFolder + '\Start-GuidedSetup.ps1'
+        GuestStatus        = $guestFolder + '\guided-setup-status.json'
+        GuestLog           = $guestFolder + '\guided-setup.log'
+        HostRequest        = Join-Path -Path $Root -ChildPath 'guided-setup-request.json'
+        HostArmed          = Join-Path -Path $Root -ChildPath 'guided-setup-armed.json'
+        HostSignIn         = Join-Path -Path $Root -ChildPath 'guided-setup-signin.json'
+        HostLast           = Join-Path -Path $Root -ChildPath 'guided-setup-last.json'
+        HostConsoleScript  = Join-Path -Path $Root -ChildPath 'Open-GuestConsole.ps1'
+        HostSteps          = Join-Path -Path $Root -ChildPath 'guided-setup-steps.txt'
+    }
+}
+
+function Get-DemoGuidedSetupConfigurationText {
+    <#
+    .SYNOPSIS
+    The SQL Server setup configuration file for the guided stop: every page that documented parameters can pre-fill, and
+    nothing secret. Pure, so tests read it on any operating system.
+
+    .DESCRIPTION
+    ACTION Install with UIMODE Normal shows every page with these values in place: the Database Engine and the Azure
+    extension (FEATURES), the default instance, the virtual service accounts, BUILTIN\Administrators as sysadmins (the
+    host connects as the guest's Administrator), TCP on, no product updates during setup, and the Azure extension's
+    subscription, resource group, region, and tenant when they're given (the guest's existing Arc connection fills them
+    in too). There is no /PID (pay-as-you-go without a product key is documented only on setup's Edition page), no
+    service principal or secret, and no license acceptance: the person accepts the license terms in setup.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Sql,
+
+        [System.Collections.IDictionary] $Azure = @{}
+    )
+
+    $guid = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    $rules = @(
+        @{ Name = 'AZURESUBSCRIPTIONID'; Key = 'SubscriptionId'; Pattern = $guid }
+        @{ Name = 'AZURERESOURCEGROUP'; Key = 'ResourceGroup'; Pattern = '^[A-Za-z0-9._()-]{1,90}$' }
+        @{ Name = 'AZUREREGION'; Key = 'Region'; Pattern = '^[a-z0-9]{2,40}$' }
+        @{ Name = 'AZURETENANTID'; Key = 'TenantId'; Pattern = $guid }
+    )
+    $values = [ordered]@{
+        ACTION              = 'Install'
+        UIMODE              = 'Normal'
+        FEATURES            = ('{0},AZUREEXTENSION' -f $Sql['Features'])
+        INSTANCENAME        = [string]$Sql['InstanceName']
+        INSTANCEID          = [string]$Sql['InstanceName']
+        SQLSVCACCOUNT       = [string]$Sql['ServiceAccount']
+        AGTSVCACCOUNT       = [string]$Sql['AgentAccount']
+        AGTSVCSTARTUPTYPE   = 'Automatic'
+        SQLSYSADMINACCOUNTS = [string]$Sql['SysAdminAccounts']
+        TCPENABLED          = '1'
+        UPDATEENABLED       = 'False'
+    }
+    foreach ($rule in $rules) {
+        $value = ''
+        if ($Azure.Contains($rule.Key)) {
+            $value = [string]$Azure[$rule.Key]
+        }
+        if ($value -match $rule.Pattern) {
+            $values[$rule.Name] = $value
+        }
+    }
+    $lines = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $lines.Add('; Fabric Database Hub demo: SQL Server 2022 setup for the PaygWizard guided stop (Phase 28, ADR 0006).')
+    $lines.Add('; Generated on the T2 host. It holds no secret. In setup you choose Use pay-as-you-go billing through Microsoft Azure')
+    $lines.Add('; and Standard, accept the license terms, sign in with Use Azure Login on the Azure Extension page, and select Install.')
+    $lines.Add('[OPTIONS]')
+    foreach ($name in $values.Keys) {
+        $value = [string]$values[$name]
+        if ($value -match '["\r\n]') {
+            throw ('The setup configuration value {0} contains a character the file can''t hold.' -f $name)
+        }
+        if ($name -eq 'FEATURES') {
+            $lines.Add(('{0}={1}' -f $name, $value))
+        }
+        else {
+            $lines.Add(('{0}="{1}"' -f $name, $value))
+        }
+    }
+    $text = ($lines -join "`r`n") + "`r`n"
+    if ($text -match '(?im)^\s*(PID|[A-Z]*PASSWORD|AZURESERVICEPRINCIPAL[A-Z]*|IACCEPTSQLSERVERLICENSETERMS)\s*=') {
+        throw 'The setup configuration file must not carry a product key, a password, a service principal, or the license acceptance.'
+    }
+    return $text
+}
+
+function Invoke-DemoGuestAutoLogonAction {
+    <#
+    .SYNOPSIS
+    Reads, arms, or clears Windows automatic sign-in on this machine. Self-contained: the host runs it in the guest over
+    PowerShell Direct, and the guided setup launcher embeds it. Returns what it found; never a value.
+
+    .DESCRIPTION
+    Arm keeps the password only as the LSA DefaultPassword secret (LsaStorePrivateData, LSA_UNICODE_STRING from the
+    SecureString's unmanaged copy, zeroed after), sets AutoAdminLogon 1, DefaultUserName, DefaultDomainName, and
+    AutoLogonCount 1, and deletes a Winlogon DefaultPassword value: Windows signs in once at the next start. Clear sets
+    AutoAdminLogon 0, deletes AutoLogonCount and the Winlogon DefaultPassword and DefaultUserName values, and deletes the
+    LSA secret (LsaStorePrivateData with no data). Read reports each of them as present or not; the LSA secret's
+    presence comes from LsaRetrievePrivateData, whose buffer is freed without being read.
+    Sources: https://learn.microsoft.com/windows/win32/secauthn/protecting-the-automatic-logon-password,
+    https://learn.microsoft.com/windows/win32/secauthn/msgina-dll-features,
+    https://learn.microsoft.com/windows/win32/api/ntsecapi/nf-ntsecapi-lsastoreprivatedata, and
+    https://learn.microsoft.com/windows/win32/api/ntsecapi/nf-ntsecapi-lsaretrieveprivatedata
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Read', 'Arm', 'Clear')]
+        [string] $Action = 'Read',
+
+        [securestring] $Password,
+
+        [string] $UserName = 'Administrator',
+
+        [string] $Domain = ''
+    )
+
+    $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    if (-not ('DbHubDemoLsa' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security;
+
+public static class DbHubDemoLsa
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LsaString { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LsaAttributes { public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
+
+    [DllImport("advapi32.dll")] private static extern uint LsaOpenPolicy(IntPtr systemName, ref LsaAttributes attributes, uint access, out IntPtr policy);
+    [DllImport("advapi32.dll")] private static extern uint LsaStorePrivateData(IntPtr policy, ref LsaString keyName, IntPtr privateData);
+    [DllImport("advapi32.dll")] private static extern uint LsaRetrievePrivateData(IntPtr policy, ref LsaString keyName, out IntPtr privateData);
+    [DllImport("advapi32.dll")] private static extern uint LsaFreeMemory(IntPtr buffer);
+    [DllImport("advapi32.dll")] private static extern uint LsaClose(IntPtr policy);
+    [DllImport("advapi32.dll")] private static extern int LsaNtStatusToWinError(uint status);
+
+    private const uint GetPrivateInformation = 0x00000004;
+    private const uint CreateSecret = 0x00000020;
+    private const uint NameNotFound = 0xC0000034;
+
+    private static IntPtr Open(uint access)
+    {
+        LsaAttributes attributes = new LsaAttributes();
+        attributes.Length = Marshal.SizeOf(typeof(LsaAttributes));
+        IntPtr policy;
+        uint status = LsaOpenPolicy(IntPtr.Zero, ref attributes, access, out policy);
+        if (status != 0) { throw new Win32Exception(LsaNtStatusToWinError(status)); }
+        return policy;
+    }
+
+    private static LsaString Name(string name, IntPtr buffer)
+    {
+        LsaString value = new LsaString();
+        value.Buffer = buffer;
+        value.Length = (ushort)(name.Length * 2);
+        value.MaximumLength = (ushort)((name.Length + 1) * 2);
+        return value;
+    }
+
+    public static bool Exists(string name)
+    {
+        IntPtr policy = Open(GetPrivateInformation);
+        IntPtr nameBuffer = Marshal.StringToHGlobalUni(name);
+        try
+        {
+            LsaString key = Name(name, nameBuffer);
+            IntPtr data;
+            uint status = LsaRetrievePrivateData(policy, ref key, out data);
+            if (data != IntPtr.Zero) { LsaFreeMemory(data); }
+            if (status == 0) { return true; }
+            if (status == NameNotFound) { return false; }
+            throw new Win32Exception(LsaNtStatusToWinError(status));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(nameBuffer);
+            LsaClose(policy);
+        }
+    }
+
+    public static void Store(string name, SecureString secret)
+    {
+        IntPtr policy = Open(CreateSecret);
+        IntPtr nameBuffer = Marshal.StringToHGlobalUni(name);
+        IntPtr secretBuffer = IntPtr.Zero;
+        IntPtr secretValue = IntPtr.Zero;
+        try
+        {
+            LsaString key = Name(name, nameBuffer);
+            uint status;
+            if (secret == null)
+            {
+                status = LsaStorePrivateData(policy, ref key, IntPtr.Zero);
+                if (status == NameNotFound) { status = 0; }
+            }
+            else
+            {
+                secretBuffer = Marshal.SecureStringToGlobalAllocUnicode(secret);
+                LsaString data = new LsaString();
+                data.Buffer = secretBuffer;
+                data.Length = (ushort)(secret.Length * 2);
+                data.MaximumLength = (ushort)((secret.Length + 1) * 2);
+                secretValue = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(LsaString)));
+                Marshal.StructureToPtr(data, secretValue, false);
+                status = LsaStorePrivateData(policy, ref key, secretValue);
+            }
+            if (status != 0) { throw new Win32Exception(LsaNtStatusToWinError(status)); }
+        }
+        finally
+        {
+            if (secretValue != IntPtr.Zero) { Marshal.FreeHGlobal(secretValue); }
+            if (secretBuffer != IntPtr.Zero) { Marshal.ZeroFreeGlobalAllocUnicode(secretBuffer); }
+            Marshal.FreeHGlobal(nameBuffer);
+            LsaClose(policy);
+        }
+    }
+}
+'@
+    }
+    $read = {
+        $item = Get-ItemProperty -LiteralPath $winlogon -ErrorAction SilentlyContinue
+        $has = {
+            param([string] $Name)
+            return ($null -ne $item -and $null -ne $item.PSObject.Properties[$Name])
+        }
+        $autoAdminLogon = $false
+        if (& $has 'AutoAdminLogon') {
+            $autoAdminLogon = ([string]$item.AutoAdminLogon -eq '1')
+        }
+        $userName = $false
+        if (& $has 'DefaultUserName') {
+            $userName = -not [string]::IsNullOrEmpty([string]$item.DefaultUserName)
+        }
+        [pscustomobject]@{
+            autoAdminLogon  = $autoAdminLogon
+            autoLogonCount  = [bool](& $has 'AutoLogonCount')
+            defaultUserName = $userName
+            defaultPassword = [bool](& $has 'DefaultPassword')
+            lsaSecret       = [DbHubDemoLsa]::Exists('DefaultPassword')
+        }
+    }
+    $before = & $read
+    if ($Action -eq 'Arm') {
+        if ($null -eq $Password -or $Password.Length -lt 12) {
+            throw 'Arming automatic sign-in needs the temporary password.'
+        }
+        [DbHubDemoLsa]::Store('DefaultPassword', $Password)
+        Remove-ItemProperty -LiteralPath $winlogon -Name 'DefaultPassword' -ErrorAction SilentlyContinue
+        Set-ItemProperty -LiteralPath $winlogon -Name 'DefaultUserName' -Value $UserName
+        if ($Domain) {
+            Set-ItemProperty -LiteralPath $winlogon -Name 'DefaultDomainName' -Value $Domain
+        }
+        New-ItemProperty -LiteralPath $winlogon -Name 'AutoLogonCount' -PropertyType DWord -Value 1 -Force | Out-Null
+        Set-ItemProperty -LiteralPath $winlogon -Name 'AutoAdminLogon' -Value '1'
+    }
+    elseif ($Action -eq 'Clear') {
+        Set-ItemProperty -LiteralPath $winlogon -Name 'AutoAdminLogon' -Value '0'
+        foreach ($name in 'AutoLogonCount', 'DefaultPassword', 'DefaultUserName') {
+            Remove-ItemProperty -LiteralPath $winlogon -Name $name -ErrorAction SilentlyContinue
+        }
+        [DbHubDemoLsa]::Store('DefaultPassword', $null)
+    }
+    $after = & $read
+    return [pscustomobject]@{ action = $Action; before = $before; after = $after }
+}
+
+function Test-DemoAutoLogonClear {
+    # True when Invoke-DemoGuestAutoLogonAction's state shows no automatic sign-in and nothing it keeps.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $State
+    )
+
+    if ($null -eq $State) {
+        return $false
+    }
+    return (-not [bool]$State.autoAdminLogon -and -not [bool]$State.autoLogonCount -and -not [bool]$State.defaultUserName -and -not [bool]$State.defaultPassword -and -not [bool]$State.lsaSecret)
+}
+
+function Get-DemoGuidedSignInHost {
+    # The Microsoft sign-in hosts that setup's Use Azure Login loads, which the guided stop maps to the Trusted sites zone
+    # for the guest's Administrator, as exact hosts: the Azure portal's documented authentication hosts
+    # (https://learn.microsoft.com/azure/azure-portal/azure-portal-safelist-urls#azure-portal-urls-for-proxy-bypass,
+    # checked 2026-10-30). A site that isn't here can still be added in setup's dialog (Add...). Pure.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    return @(
+        'login.microsoftonline.com', 'login.microsoft.com', 'login.live.com', 'aadcdn.msftauth.net', 'logincdn.msftauth.net',
+        'aadcdn.msauth.net', 'aadcdn.msftauthimages.net', 'aadcdn.msauthimages.net')
+}
+
+function Get-DemoGuidedSignInFallbackText {
+    # What the person does first when setup's Azure sign-in wasn't prepared automatically (Initialize-DemoHostGuidedSignIn's
+    # bound, Phase 28 review): Add... in Internet Explorer's dialog, which worked live on 2026-10-30. Pure.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    return 'Setup''s Azure sign-in wasn''t prepared automatically, so Internet Explorer may block it: on the Azure Extension for SQL Server page, if the Azure Login window stays blank, or Internet Explorer says content from https://login.microsoftonline.com is blocked, select Add..., then Add, then Close, and select Use Azure Login again; repeat for any other sign-in site it names.'
+}
+
+function Invoke-DemoGuestSignInBrowserAction {
+    <#
+    .SYNOPSIS
+    Reads, prepares, or restores what the guided stop changes in the guest for setup's Azure sign-in: IE Enhanced Security
+    Configuration for administrators, and the guest administrator's Trusted sites entries for the Microsoft sign-in hosts.
+    Self-contained: the host runs it in the guest over PowerShell Direct. Returns what it found and did: host names,
+    counts, and the entries' names, never a value of anyone's.
+
+    .DESCRIPTION
+    Prepare snapshots the administrator's site-to-zone entries (ZoneMap\Domains and ZoneMap\EscDomains, unless the host
+    passes the snapshot of an earlier Prepare), without the sign-in hosts' Trusted sites values, so Restore always removes
+    those; turns IE ESC off for administrators (IsInstalled 0), and maps each sign-in
+    host to the Trusted sites zone (an https DWORD of 2) under both keys: Domains applies while IE ESC is off, EscDomains
+    while it's on. Restore turns IE ESC on for administrators and users (IsInstalled 1, the Windows Server default), and
+    puts the entries back as the snapshot had them: what was added or changed since goes, the dialog's Add... included;
+    without a snapshot, the sign-in hosts' entries go. Read reports both.
+    The entries are the per-user registry items Microsoft documents, not the Site to Zone Assignment List policy, which
+    would lock the user's own zone settings and so the dialog's Add.... The administrator's hive is HKEY_USERS\<SID>
+    while it's loaded; otherwise it's loaded from the profile (Win32_UserProfile) with reg load, and unloaded after.
+    Sources: https://learn.microsoft.com/azure/storage/file-sync/file-sync-deployment-guide#prepare-windows-server-to-use-with-azure-file-sync,
+    https://learn.microsoft.com/previous-versions/troubleshoot/browsers/security-privacy/ie-security-zones-registry-entries,
+    https://learn.microsoft.com/entra/identity/hybrid/connect/how-to-connect-sso-quick-start,
+    https://learn.microsoft.com/previous-versions/windows/desktop/legacy/ee886409(v=vs.85),
+    https://learn.microsoft.com/windows-server/administration/windows-commands/reg-load, and
+    https://learn.microsoft.com/windows-server/administration/windows-commands/reg-unload
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Read', 'Prepare', 'Restore')]
+        [string] $Action = 'Read',
+
+        [string[]] $SignInHost = @(),
+
+        [string] $UserName = 'Administrator',
+
+        [string] $SnapshotJson = '',
+
+        [string] $ActiveSetupRoot = 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components',
+
+        [string] $UserRoot = ''
+    )
+
+    $adminKey = $ActiveSetupRoot + '\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}'
+    $usersKey = $ActiveSetupRoot + '\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}'
+    $maps = @('Domains', 'EscDomains')
+    foreach ($name in $SignInHost) {
+        if ([string]$name -notmatch '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+){2,}$') {
+            throw ('Not a host name the zone map can hold: {0}' -f $name)
+        }
+    }
+    $readEsc = {
+        param([string] $Path)
+        # 1 on, 0 off, -1 when the component doesn't exist (Server Core has no IE ESC).
+        $item = Get-ItemProperty -LiteralPath $Path -Name 'IsInstalled' -ErrorAction SilentlyContinue
+        if ($null -eq $item) {
+            return -1
+        }
+        return [int]$item.IsInstalled
+    }
+    $setEsc = {
+        param([string] $Path, [int] $Value)
+        if (Test-Path -LiteralPath $Path) {
+            Set-ItemProperty -LiteralPath $Path -Name 'IsInstalled' -Value $Value
+        }
+    }
+    $split = {
+        # A host's key under Domains: its domain (the last two labels), then the rest as one subkey.
+        param([string] $HostName)
+        $labels = @($HostName.ToLowerInvariant().Split('.'))
+        [pscustomobject]@{ Domain = ('{0}.{1}' -f $labels[$labels.Count - 2], $labels[$labels.Count - 1]); Sub = (@($labels[0..($labels.Count - 3)]) -join '.') }
+    }
+
+    $hive = 'Loaded'
+    $mount = ''
+    $root = $UserRoot
+    if (-not $root) {
+        $sid = (New-Object -TypeName 'System.Security.Principal.NTAccount' -ArgumentList $UserName).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $root = 'Registry::HKEY_USERS\{0}' -f $sid
+        if (-not (Test-Path -LiteralPath $root)) {
+            $root = ''
+            $hive = 'Unavailable'
+            $userProfile = @(Get-CimInstance -ClassName 'Win32_UserProfile' -Filter ("SID='{0}'" -f $sid) -ErrorAction SilentlyContinue) | Select-Object -First 1
+            if ($null -ne $userProfile -and [string]$userProfile.LocalPath) {
+                $file = '{0}\NTUSER.DAT' -f ([string]$userProfile.LocalPath).TrimEnd('\')
+                if (Test-Path -LiteralPath $file -PathType Leaf) {
+                    $previous = $ErrorActionPreference
+                    $ErrorActionPreference = 'Continue'
+                    & reg.exe load 'HKU\DbHubDemoGuidedSignIn' $file 2>&1 | Out-Null
+                    $loaded = ($LASTEXITCODE -eq 0)
+                    $ErrorActionPreference = $previous
+                    if ($loaded) {
+                        $mount = 'HKU\DbHubDemoGuidedSignIn'
+                        $root = 'Registry::HKEY_USERS\DbHubDemoGuidedSignIn'
+                        $hive = 'Mounted'
+                    }
+                }
+            }
+        }
+    }
+    $zoneMap = ''
+    if ($root) {
+        $zoneMap = '{0}\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap' -f $root
+    }
+    $readEntries = {
+        # Every key under Domains and EscDomains, and every value as key|name=data.
+        $keys = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        $values = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        foreach ($map in $maps) {
+            $base = '{0}\{1}' -f $zoneMap, $map
+            if (-not (Test-Path -LiteralPath $base)) {
+                continue
+            }
+            # The map key itself counts, so one that Prepare created goes again when it's empty.
+            $keys.Add($map)
+            $baseKey = Get-Item -LiteralPath $base
+            $baseName = [string]$baseKey.Name
+            $baseKey.Close()
+            foreach ($key in @(Get-ChildItem -LiteralPath $base -Recurse -ErrorAction SilentlyContinue)) {
+                $relative = '{0}{1}' -f $map, ([string]$key.Name).Substring($baseName.Length)
+                $keys.Add($relative)
+                foreach ($valueName in @($key.GetValueNames())) {
+                    if ($valueName) {
+                        $values.Add(('{0}|{1}={2}' -f $relative, $valueName, [string]$key.GetValue($valueName)))
+                    }
+                }
+                $key.Close()
+            }
+        }
+        [pscustomobject]@{ Keys = $keys.ToArray(); Values = $values.ToArray() }
+    }
+    $mapped = {
+        # The sign-in hosts that are Trusted sites (https 2) under both keys.
+        if ($zoneMap) {
+            foreach ($name in $SignInHost) {
+                $parts = & $split $name
+                $both = $true
+                foreach ($map in $maps) {
+                    $item = Get-ItemProperty -LiteralPath ('{0}\{1}\{2}\{3}' -f $zoneMap, $map, $parts.Domain, $parts.Sub) -Name 'https' -ErrorAction SilentlyContinue
+                    if ($null -eq $item -or [int]$item.https -ne 2) {
+                        $both = $false
+                    }
+                }
+                if ($both) {
+                    $name
+                }
+            }
+        }
+    }
+    $removeEmpty = {
+        param([string] $Path)
+        if (Test-Path -LiteralPath $Path) {
+            $key = Get-Item -LiteralPath $Path
+            $empty = ($key.SubKeyCount -eq 0 -and $key.ValueCount -eq 0)
+            $key.Close()
+            if ($empty) {
+                Remove-Item -LiteralPath $Path -Force
+            }
+        }
+    }
+
+    $snapshot = $null
+    if ($SnapshotJson) {
+        $snapshot = $SnapshotJson | ConvertFrom-Json
+    }
+    $changed = 0
+    $restored = $false
+    $result = $null
+    try {
+        if ($Action -eq 'Prepare') {
+            & $setEsc $adminKey 0
+            if ($zoneMap) {
+                if ($null -eq $snapshot) {
+                    # A fresh snapshot leaves out the sign-in hosts' Trusted sites values (https 2), so Restore always
+                    # removes them: they can already be there from an earlier Prepare whose PowerShell Direct call failed
+                    # before it returned, or from setup's dialog (Add...) (Phase 28 review).
+                    $before = & $readEntries
+                    $ours = @(foreach ($name in $SignInHost) {
+                            $parts = & $split $name
+                            foreach ($map in $maps) {
+                                '{0}\{1}\{2}|https=2' -f $map, $parts.Domain, $parts.Sub
+                            }
+                        })
+                    $kept = @($before.Values | Where-Object { $ours -notcontains $_ })
+                    $SnapshotJson = ConvertTo-Json -InputObject ([ordered]@{ keyList = @($before.Keys); valueList = $kept }) -Compress
+                }
+                foreach ($name in $SignInHost) {
+                    $parts = & $split $name
+                    foreach ($map in $maps) {
+                        $path = '{0}\{1}\{2}\{3}' -f $zoneMap, $map, $parts.Domain, $parts.Sub
+                        if (-not (Test-Path -LiteralPath $path)) {
+                            New-Item -Path $path -Force | Out-Null
+                        }
+                        $item = Get-ItemProperty -LiteralPath $path -Name 'https' -ErrorAction SilentlyContinue
+                        if ($null -eq $item -or [int]$item.https -ne 2) {
+                            New-ItemProperty -LiteralPath $path -Name 'https' -PropertyType DWord -Value 2 -Force | Out-Null
+                            $changed++
+                        }
+                    }
+                }
+            }
+        }
+        elseif ($Action -eq 'Restore') {
+            & $setEsc $adminKey 1
+            & $setEsc $usersKey 1
+            if (-not $zoneMap) {
+                # The hive can't be read: nothing there can be checked, which is right only when nothing was added.
+                $restored = ($null -eq $snapshot)
+            }
+            elseif ($null -ne $snapshot) {
+                $beforeKeys = @($snapshot.keyList | Where-Object { $_ })
+                $beforeValues = @($snapshot.valueList | Where-Object { $_ })
+                $now = & $readEntries
+                foreach ($entry in @($now.Values)) {
+                    if ($beforeValues -contains $entry) {
+                        continue
+                    }
+                    $keyAndRest = ([string]$entry).Split([char[]]'|', 2)
+                    $nameAndData = $keyAndRest[1].Split([char[]]'=', 2)
+                    $path = '{0}\{1}' -f $zoneMap, $keyAndRest[0]
+                    $prefix = '{0}|{1}=' -f $keyAndRest[0], $nameAndData[0]
+                    $old = @($beforeValues | Where-Object { ([string]$_).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) }) | Select-Object -First 1
+                    if ($null -ne $old) {
+                        Set-ItemProperty -LiteralPath $path -Name $nameAndData[0] -Value ([int]([string]$old).Substring($prefix.Length))
+                    }
+                    else {
+                        Remove-ItemProperty -LiteralPath $path -Name $nameAndData[0]
+                    }
+                    $changed++
+                }
+                foreach ($relative in @(@($now.Keys) | Where-Object { $beforeKeys -notcontains $_ } | Sort-Object -Property Length -Descending)) {
+                    & $removeEmpty ('{0}\{1}' -f $zoneMap, $relative)
+                }
+                $after = & $readEntries
+                $restored = (@($after.Values | Where-Object { $beforeValues -notcontains $_ }).Count -eq 0 -and @($after.Keys | Where-Object { $beforeKeys -notcontains $_ }).Count -eq 0)
+            }
+            else {
+                foreach ($name in $SignInHost) {
+                    $parts = & $split $name
+                    foreach ($map in $maps) {
+                        $path = '{0}\{1}\{2}\{3}' -f $zoneMap, $map, $parts.Domain, $parts.Sub
+                        $item = Get-ItemProperty -LiteralPath $path -Name 'https' -ErrorAction SilentlyContinue
+                        if ($null -ne $item -and [int]$item.https -eq 2) {
+                            Remove-ItemProperty -LiteralPath $path -Name 'https'
+                            $changed++
+                        }
+                        & $removeEmpty $path
+                        & $removeEmpty ('{0}\{1}\{2}' -f $zoneMap, $map, $parts.Domain)
+                    }
+                }
+                $restored = (@(& $mapped).Count -eq 0)
+            }
+        }
+        $result = [pscustomobject]@{
+            action       = $Action
+            ieEscAdmin   = (& $readEsc $adminKey)
+            ieEscUsers   = (& $readEsc $usersKey)
+            hive         = $hive
+            hostsMapped  = @(& $mapped)
+            snapshotJson = $SnapshotJson
+            changed      = $changed
+            restored     = $restored
+        }
+    }
+    finally {
+        if ($mount) {
+            # The provider's key handles must close before the hive can unload.
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+            $previous = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            & reg.exe unload $mount 2>&1 | Out-Null
+            $ErrorActionPreference = $previous
+        }
+    }
+    return $result
+}
+
+function Get-DemoGuidedSetupLauncherText {
+    <#
+    .SYNOPSIS
+    The script the guest's logon task runs (Start-GuidedSetup.ps1): it first clears the automatic sign-in that started the
+    session (its stored password isn't needed again), then opens SQL Server setup pre-filled from the configuration file,
+    or the SQL Server Installation Center when an instance exists (for Maintenance > Edition Upgrade or a removal), and
+    waits until setup closes. It writes its state to a JSON file and a log, never a value. Pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $IsoPath,
+
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path
+    )
+
+    foreach ($value in @($IsoPath, $Path.GuestConfiguration, $Path.GuestStatus, $Path.GuestLog)) {
+        if ($value -match "['`r`n]") {
+            throw 'A guided setup path contains a character the launcher can''t hold.'
+        }
+    }
+    $function = 'function Invoke-DemoGuestAutoLogonAction {' + ${function:Invoke-DemoGuestAutoLogonAction}.ToString() + '}'
+    $body = @'
+$ErrorActionPreference = 'Stop'
+$setupNames = @('ScenarioEngine', 'setup', 'SetupARP', 'LandingPage')
+function Write-GuidedLog([string] $Message) {
+    Add-Content -LiteralPath $logPath -Value ('{0} {1}' -f [DateTime]::UtcNow.ToString('o'), $Message) -Encoding ASCII
+}
+function Write-GuidedStatus([string] $State, [string] $Detail, [object] $ExitCode) {
+    $value = [ordered]@{ schemaVersion = 1; state = $State; detail = $Detail; exitCode = $ExitCode; updatedUtc = [DateTime]::UtcNow.ToString('o') }
+    [System.IO.File]::WriteAllText($statusPath, (ConvertTo-Json -InputObject $value -Compress), (New-Object -TypeName 'System.Text.UTF8Encoding' -ArgumentList $false))
+}
+try {
+    try {
+        $cleared = Invoke-DemoGuestAutoLogonAction -Action Clear
+        Write-GuidedLog ('Cleared the automatic sign-in settings (the LSA secret was there before: {0}).' -f [bool]$cleared.before.lsaSecret)
+    }
+    catch {
+        Write-GuidedLog ('Clearing the automatic sign-in settings failed; the host clears them: ' + $_.Exception.Message)
+    }
+    if (@(Get-Process -Name $setupNames -ErrorAction SilentlyContinue).Count -gt 0) {
+        Write-GuidedLog 'SQL Server setup is already open.'
+        return
+    }
+    $image = Get-DiskImage -ImagePath $isoPath
+    if (-not $image.Attached) {
+        $image = Mount-DiskImage -ImagePath $isoPath -PassThru
+    }
+    # Setup's Azure sign-in opens in an IE-based control, which reads IE Enhanced Security Configuration when setup starts.
+    $esc = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}' -Name 'IsInstalled' -ErrorAction SilentlyContinue
+    Write-GuidedLog ('IE Enhanced Security Configuration for administrators as setup starts: {0}.' -f $(if ($null -ne $esc -and [int]$esc.IsInstalled -eq 1) { 'on' } else { 'off' }))
+    $drive = [string]($image | Get-Volume).DriveLetter
+    $setup = '{0}:\setup.exe' -f $drive
+    $instances = @(Get-Service -Name 'MSSQLSERVER', 'MSSQL$*' -ErrorAction SilentlyContinue)
+    if ($instances.Count -eq 0) {
+        Write-GuidedStatus 'SetupOpen' 'A new installation, pre-filled from the configuration file.' $null
+        Write-GuidedLog 'Opening SQL Server setup with the configuration file.'
+        $process = Start-Process -FilePath $setup -ArgumentList ('/ConfigurationFile="{0}"' -f $configurationPath) -PassThru
+    }
+    else {
+        Write-GuidedStatus 'InstallationCenter' 'An instance exists: the SQL Server Installation Center opens for Maintenance > Edition Upgrade or a removal.' $null
+        Write-GuidedLog 'An instance exists; opening the SQL Server Installation Center.'
+        $process = Start-Process -FilePath $setup -PassThru
+    }
+    $null = $process.Handle
+    $process.WaitForExit()
+    while (@(Get-Process -Name $setupNames -ErrorAction SilentlyContinue).Count -gt 0) {
+        Start-Sleep -Seconds 10
+    }
+    Write-GuidedStatus 'Closed' 'Setup closed.' $process.ExitCode
+    Write-GuidedLog ('Setup closed with exit code {0}.' -f $process.ExitCode)
+}
+catch {
+    Write-GuidedStatus 'Failed' ([string]$_.Exception.Message) $null
+    Write-GuidedLog ('The guided setup launcher failed: ' + $_.Exception.Message)
+}
+'@
+    $header = @(
+        '# Fabric Database Hub demo (Phase 28): the guest''s logon task runs this during the PaygWizard guided stop. It clears the'
+        '# automatic sign-in that started the session, then opens SQL Server setup pre-filled from the configuration file. Generated'
+        '# on the T2 host; it holds no secret.'
+        ('$isoPath = ''{0}''' -f $IsoPath)
+        ('$configurationPath = ''{0}''' -f $Path.GuestConfiguration)
+        ('$statusPath = ''{0}''' -f $Path.GuestStatus)
+        ('$logPath = ''{0}''' -f $Path.GuestLog)
+    ) -join "`r`n"
+    return ($header + "`r`n" + $function + "`r`n" + ($body -replace "(?<!`r)`n", "`r`n"))
+}
+
+function Get-DemoGuidedSetupTaskDefinition {
+    <#
+    .SYNOPSIS
+    The guided stop's two logon tasks, as plain values: in the guest, DbHubDemo-GuidedSetup runs the launcher at the
+    Administrator's logon (interactive, highest privileges); on the host, DbHubDemo-GuestConsole opens Virtual Machine
+    Connection at any administrator's logon. Pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Guest', 'Host')]
+        [string] $Kind,
+
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path,
+
+        [string] $UserName = 'Administrator'
+    )
+
+    if ($Kind -eq 'Guest') {
+        return [pscustomobject]@{
+            TaskName    = 'DbHubDemo-GuidedSetup'
+            Execute     = 'powershell.exe'
+            Argument    = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $Path.GuestLauncher
+            UserId      = $UserName
+            GroupId     = ''
+            Description = 'Fabric Database Hub demo: opens the pre-filled SQL Server setup for the PaygWizard guided stop (Phase 28). Removed once the step is done.'
+        }
+    }
+    return [pscustomobject]@{
+        TaskName    = 'DbHubDemo-GuestConsole'
+        Execute     = 'powershell.exe'
+        Argument    = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $Path.HostConsoleScript
+        UserId      = ''
+        GroupId     = 'BUILTIN\Administrators'
+        Description = 'Fabric Database Hub demo: opens Virtual Machine Connection to the guest during the PaygWizard guided stop (Phase 28). Removed once the step is done.'
+    }
+}
+
+function Register-DemoGuidedSetupTask {
+    # Registers a task from Get-DemoGuidedSetupTaskDefinition where this runs: on the host, or in the guest over PowerShell
+    # Direct (the definition crosses as a hashtable). Self-contained for that reason.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Definition
+    )
+
+    $action = New-ScheduledTaskAction -Execute $Definition['Execute'] -Argument $Definition['Argument']
+    if ($Definition['GroupId']) {
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal -GroupId $Definition['GroupId'] -RunLevel Highest
+    }
+    else {
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $Definition['UserId']
+        $principal = New-ScheduledTaskPrincipal -UserId $Definition['UserId'] -LogonType Interactive -RunLevel Highest
+    }
+    $taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 4) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName $Definition['TaskName'] -Action $action -Trigger $trigger -Principal $principal -Settings $taskSettings -Description $Definition['Description'] -Force | Out-Null
+}
+
+function ConvertTo-DemoTaskHashtable {
+    # A task definition as a hashtable, so it crosses PowerShell Direct intact.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Definition
+    )
+
+    $table = @{}
+    foreach ($property in $Definition.PSObject.Properties) {
+        $table[$property.Name] = [string]$property.Value
+    }
+    return $table
+}
+
+function Get-DemoGuestConsoleScriptText {
+    # The host script the DbHubDemo-GuestConsole task runs: Virtual Machine Connection to the guest, and the steps beside it.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $GuestName,
+
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path
+    )
+
+    if ($GuestName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $Path.HostSteps -match "['`r`n]") {
+        throw 'The guest name or the steps path isn''t valid.'
+    }
+    return (@(
+            '# Fabric Database Hub demo (Phase 28): at your sign-in to the T2 host during the PaygWizard guided stop, opens Virtual'
+            '# Machine Connection to the guest, where SQL Server setup waits pre-filled, and the steps beside it.'
+            ('$guest = ''{0}''' -f $GuestName)
+            ('$steps = ''{0}''' -f $Path.HostSteps)
+            '$vmconnect = Join-Path -Path $env:SystemRoot -ChildPath ''System32\vmconnect.exe'''
+            'if (Test-Path -LiteralPath $vmconnect) { Start-Process -FilePath $vmconnect -ArgumentList ''localhost'', $guest }'
+            'if (Test-Path -LiteralPath $steps) { Start-Process -FilePath ''notepad.exe'' -ArgumentList (''"{0}"'' -f $steps) }'
+        ) -join "`r`n") + "`r`n"
+}
+
+function Get-DemoGuidedSetupRequest {
+    <#
+    .SYNOPSIS
+    The request deploy.ps1 writes on the host while it waits for a person at the guided stop
+    (vm/bootstrap/Set-DemoGuidedSetupRequest.ps1): Valid while it hasn't expired. Never throws.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $result = [ordered]@{ Exists = $false; Valid = $false; Expired = $false; RequestId = ''; ExpiresUtc = $null; Azure = @{} }
+    if (-not (Test-Path -LiteralPath $Path.HostRequest -PathType Leaf)) {
+        return [pscustomobject]$result
+    }
+    $result.Exists = $true
+    try {
+        $request = Read-DemoVmJsonFile -Path $Path.HostRequest
+    }
+    catch {
+        return [pscustomobject]$result
+    }
+    if ($null -eq $request) {
+        return [pscustomobject]$result
+    }
+    $expires = [datetime]::MinValue
+    $parsed = [datetime]::TryParse([string]$request['expiresUtc'], [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$expires)
+    $result.RequestId = [string]$request['requestId']
+    if ($parsed) {
+        $result.ExpiresUtc = $expires
+        $result.Valid = $expires -gt $NowUtc.ToUniversalTime() -and $result.RequestId -match '^[A-Za-z0-9-]{8,64}$'
+        $result.Expired = $expires -le $NowUtc.ToUniversalTime()
+    }
+    $azure = @{}
+    foreach ($key in 'SubscriptionId', 'ResourceGroup', 'Region', 'TenantId') {
+        $name = $key.Substring(0, 1).ToLowerInvariant() + $key.Substring(1)
+        if ($request.Contains($name)) {
+            $azure[$key] = [string]$request[$name]
+        }
+    }
+    $result.Azure = $azure
+    return [pscustomobject]$result
+}
+
+function Get-DemoGuidedSetupArmed {
+    # The host's record that automatic sign-in is armed in the guest (written before the arm), or $null.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path.HostArmed -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $value = Read-DemoVmJsonFile -Path $Path.HostArmed
+    }
+    catch {
+        $value = $null
+    }
+    if ($null -eq $value) {
+        # An unreadable record still means "clean up": it's never ignored.
+        return @{ requestId = ''; arms = 0; armedUtc = ''; okSinceUtc = ''; lastLaunchUtc = '' }
+    }
+    return $value
+}
+
+function Save-DemoGuidedSetupArmed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Value
+    )
+
+    Write-DemoVmJsonFile -Path $Path.HostArmed -InputObject $Value
+}
+
+function Get-DemoGuidedSignInRecord {
+    # The host's record of what the guided stop changed in the guest for setup's Azure sign-in (written before the change:
+    # state Preparing, Ready, Fallback (the preparation didn't finish in time, and the person is asked anyway), or
+    # Restoring; the request it's for, when its preparation first started, and its passes; and the snapshot of the
+    # Trusted sites entries before), or $null. An unreadable record still means "restore": it's never ignored.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path.HostSignIn -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $value = Read-DemoVmJsonFile -Path $Path.HostSignIn
+    }
+    catch {
+        $value = $null
+    }
+    if ($null -eq $value) {
+        return @{ schemaVersion = 1; state = 'Restoring'; snapshot = '' }
+    }
+    return $value
+}
+
+function Save-DemoGuidedSignInRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Path,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Value
+    )
+
+    Write-DemoVmJsonFile -Path $Path.HostSignIn -InputObject $Value
+}
+
+function Get-DemoGuestSetupFact {
+    # Over PowerShell Direct, read-only: the SQL Server instance services, setup processes, and the newest configuration
+    # file setup generated for an installation (its documented log folder), with its FEATURES. Never a value.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [Parameter(Mandatory = $true)]
+        [pscredential] $Credential
+    )
+
+    return (Invoke-Command -VMName $Name -Credential $Credential -ErrorAction Stop -ScriptBlock {
+            $named = @(Get-Service -Name 'MSSQL$*' -ErrorAction SilentlyContinue | ForEach-Object { ([string]$_.Name).Substring(6) })
+            $default = [bool](Get-Service -Name 'MSSQLSERVER' -ErrorAction SilentlyContinue)
+            $setup = @(Get-Process -Name 'ScenarioEngine', 'setup', 'SetupARP', 'LandingPage' -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.ProcessName } | Select-Object -Unique)
+            $features = $null
+            $files = @(Get-ChildItem -Path 'C:\Program Files\Microsoft SQL Server\*\Setup Bootstrap\Log\*\ConfigurationFile.ini' -ErrorAction SilentlyContinue | Sort-Object -Property LastWriteTimeUtc -Descending)
+            foreach ($file in $files) {
+                $text = [System.IO.File]::ReadAllText($file.FullName)
+                if ($text -match '(?im)^\s*ACTION\s*=\s*"?Install"?\s*$' -and $text -match '(?im)^\s*FEATURES\s*=\s*"?([^"\r\n]+)"?\s*$') {
+                    $features = [string]$Matches[1]
+                    break
+                }
+            }
+            [pscustomobject]@{ DefaultInstance = $default; NamedInstances = $named; SetupProcess = $setup; Features = $features }
+        })
+}
+
+function Get-DemoHostSetupCheck {
+    <#
+    .SYNOPSIS
+    Checks what the person installed at the guided stop (PaygWizard): the default instance MSSQLSERVER, running, with the
+    guest's Administrator as sysadmin, Standard edition, and setup's Azure extension (which pay-as-you-go needs). Returns
+    Ok, Problem, SetupRunning, Edition, Message, and Fix (the documented steps that fix what's wrong).
+
+    .DESCRIPTION
+    Pay-as-you-go itself can't be read in the guest before the Azure extension reports it; the Azure extension feature in
+    setup's generated configuration file is the readable sign (setup's Edition page can't leave it out with
+    pay-as-you-go). Setup's documented log folder holds that file:
+    https://learn.microsoft.com/sql/database-engine/install-windows/view-and-read-sql-server-setup-log-files. The fixes
+    follow https://learn.microsoft.com/sql/database-engine/install-windows/upgrade-downgrade-sql-server-edition-setup
+    (Evaluation, Developer, and Express upgrade in place to Standard; Enterprise to Standard is a downgrade) and
+    https://learn.microsoft.com/sql/sql-server/install/uninstall-an-existing-instance-of-sql-server-setup.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+    $facts = Get-DemoGuestSetupFact -Name $Context.GuestName -Credential $credential
+    $instance = Get-DemoGuestSqlInstance -Name $Context.GuestName -Credential $credential
+    $guest = $Context.GuestName
+    $remove = 'In {0}, open Settings > Apps > Installed apps, select Microsoft SQL Server 2022 (64-bit) > Uninstall, choose Remove, select the instance and all its features, and finish (Learn: Uninstall an existing instance of SQL Server). The deploy then reopens the pre-filled setup: choose Use pay-as-you-go billing through Microsoft Azure and Standard.' -f $guest
+    $check = [ordered]@{ Ok = $false; Problem = ''; SetupRunning = (@($facts.SetupProcess).Count -gt 0); Edition = [string]$instance.Edition; AzureExtension = $null; Message = ''; Fix = @() }
+    if ($null -ne $facts.Features) {
+        $check.AzureExtension = ([string]$facts.Features -match '(?i)\bAZUREEXTENSION\b')
+    }
+    if (-not $facts.DefaultInstance -and @($facts.NamedInstances).Count -gt 0) {
+        $check.Problem = 'NamedInstance'
+        $check.Message = 'SQL Server was installed as the named instance {0}; the demo needs the default instance (MSSQLSERVER).' -f (@($facts.NamedInstances) -join ', ')
+        $check.Fix = @($remove)
+    }
+    elseif (-not $facts.DefaultInstance) {
+        $check.Problem = 'NotInstalled'
+        $check.Message = 'SQL Server isn''t installed in {0} yet.' -f $guest
+    }
+    elseif (-not $instance.Running) {
+        $check.Problem = 'Stopped'
+        $check.Message = 'SQL Server is installed in {0}, but its service isn''t running.' -f $guest
+        $check.Fix = @('Start the SQL Server (MSSQLSERVER) service in the guest, or finish setup.')
+    }
+    elseif ($instance.Error -or -not $instance.IsSysAdmin) {
+        $check.Problem = 'NotSysadmin'
+        $check.Message = 'SQL Server runs in {0}, but the guest''s Administrator can''t sign in to it as a sysadmin.' -f $guest
+        $check.Fix = @($remove)
+    }
+    elseif ([string]$instance.Edition -like 'Enterprise*' -and [string]$instance.Edition -notlike '*Evaluation*') {
+        $check.Problem = 'Edition'
+        $check.Message = 'SQL Server in {0} is {1}; the demo needs Standard with pay-as-you-go, and Enterprise to Standard is a downgrade that setup can''t do in place.' -f $guest, $instance.Edition
+        $check.Fix = @($remove)
+    }
+    elseif ([string]$instance.Edition -notlike 'Standard*') {
+        $check.Problem = 'Edition'
+        $check.Message = 'SQL Server in {0} is {1}; the demo needs Standard with pay-as-you-go.' -f $guest, $instance.Edition
+        $check.Fix = @(
+            ('In the SQL Server Installation Center that the deploy opens in {0}, select Maintenance > Edition Upgrade; on the Product Key page choose Standard (pay-as-you-go through Microsoft Azure, or your own Standard product key), accept the license terms, select the instance MSSQLSERVER, then Upgrade (Learn: In-place change of SQL Server edition: Evaluation, Developer, and Express upgrade to Standard).' -f $guest)
+            ('Or: {0}' -f $remove)
+        )
+    }
+    elseif ($check.AzureExtension -eq $false) {
+        $check.Problem = 'NoAzureExtension'
+        $check.Message = 'SQL Server Standard runs in {0}, but setup didn''t include the Azure extension for SQL Server, so pay-as-you-go wasn''t chosen.' -f $guest
+        $check.Fix = @($remove)
+    }
+    else {
+        $check.Ok = $true
+        $check.Message = 'SQL Server Standard runs in {0} as the default instance, with the Azure extension.' -f $guest
+    }
+    return [pscustomobject]$check
+}
+
+function Test-DemoGuestConsoleSession {
+    # True when someone is signed in at the guest's console (an explorer.exe session).
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [Parameter(Mandatory = $true)]
+        [pscredential] $Credential
+    )
+
+    $sessions = @(Invoke-Command -VMName $Name -Credential $Credential -ErrorAction Stop -ScriptBlock {
+            @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.SessionId } | Where-Object { $_ -gt 0 } | Select-Object -Unique)
+        })
+    return ($sessions.Count -gt 0)
+}
+
+function Invoke-DemoGuestSignOut {
+    # Signs out every interactive session in the guest (logoff <session id>; an explorer.exe session is one). Returns how
+    # many. https://learn.microsoft.com/windows-server/administration/windows-commands/logoff
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [Parameter(Mandatory = $true)]
+        [pscredential] $Credential
+    )
+
+    return [int](Invoke-Command -VMName $Name -Credential $Credential -ErrorAction Stop -ScriptBlock {
+            $ids = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.SessionId } | Where-Object { $_ -gt 0 } | Select-Object -Unique)
+            foreach ($id in $ids) {
+                $previous = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                & logoff.exe $id 2>&1 | Out-Null
+                $ErrorActionPreference = $previous
+            }
+            $ids.Count
+        })
+}
+
+function Initialize-DemoHostGuidedSetup {
+    <#
+    .SYNOPSIS
+    The GuidedSetup step (PaygWizard): puts the launcher and the configuration file in the guest with its logon task, and
+    the console script, the steps, and the logon task on the host. Nothing is armed here, and nothing secret is written.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    $request = Get-DemoGuidedSetupRequest -Path $path
+    $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+    $configuration = Get-DemoGuidedSetupConfigurationText -Sql $Context.Guest.Sql -Azure $request.Azure
+    $launcher = Get-DemoGuidedSetupLauncherText -IsoPath (Get-DemoHostGuestIsoPath -Context $Context) -Path $path
+    $guestTask = ConvertTo-DemoTaskHashtable -Definition (Get-DemoGuidedSetupTaskDefinition -Kind 'Guest' -Path $path -UserName $Context.Guest.AdministratorName)
+    $register = ${function:Register-DemoGuidedSetupTask}.ToString()
+    Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ArgumentList $path.GuestFolder, $path.GuestConfiguration, $configuration, $path.GuestLauncher, $launcher, $guestTask, $register -ScriptBlock {
+        param($Folder, $ConfigurationPath, $ConfigurationText, $LauncherPath, $LauncherText, $Task, $RegisterText)
+        if (-not (Test-Path -LiteralPath $Folder)) {
+            New-Item -ItemType Directory -Path $Folder -Force | Out-Null
+        }
+        $ascii = New-Object -TypeName 'System.Text.ASCIIEncoding'
+        [System.IO.File]::WriteAllText($ConfigurationPath, $ConfigurationText, $ascii)
+        [System.IO.File]::WriteAllText($LauncherPath, $LauncherText, $ascii)
+        $registerTask = [scriptblock]::Create($RegisterText)
+        & $registerTask -Definition $Task
+    }
+    $ascii = New-Object -TypeName 'System.Text.ASCIIEncoding'
+    [System.IO.File]::WriteAllText($path.HostConsoleScript, (Get-DemoGuestConsoleScriptText -GuestName $Context.GuestName -Path $path), $ascii)
+    [System.IO.File]::WriteAllText($path.HostSteps, ((@(Get-DemoGuidedSetupStepText -GuestName $Context.GuestName) -join "`r`n") + "`r`n"), $ascii)
+    Register-DemoGuidedSetupTask -Definition (ConvertTo-DemoTaskHashtable -Definition (Get-DemoGuidedSetupTaskDefinition -Kind 'Host' -Path $path))
+    Write-DemoVmLog -Message ('Prepared the guided setup: the pre-filled SQL Server setup and its logon task in {0}, and Virtual Machine Connection at an administrator''s sign-in to this host.' -f $Context.GuestName)
+}
+
+function Test-DemoHostGuidedSetup {
+    # The GuidedSetup step's check: the right instance is already installed, or the launcher, the configuration file, and
+    # both logon tasks are in place. Never throws.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    try {
+        if (Test-DemoHostSqlEdition -Context $Context) {
+            return $true
+        }
+        $path = Get-DemoGuidedSetupPath -Root $Context.Root
+        if (-not (Test-Path -LiteralPath $path.HostConsoleScript) -or -not (Get-ScheduledTask -TaskName 'DbHubDemo-GuestConsole' -ErrorAction SilentlyContinue)) {
+            return $false
+        }
+        $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+        return [bool](Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ArgumentList $path.GuestConfiguration, $path.GuestLauncher -ScriptBlock {
+                param($ConfigurationPath, $LauncherPath)
+                (Test-Path -LiteralPath $ConfigurationPath) -and (Test-Path -LiteralPath $LauncherPath) -and [bool](Get-ScheduledTask -TaskName 'DbHubDemo-GuidedSetup' -ErrorAction SilentlyContinue)
+            })
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('Guided setup check: {0}' -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Remove-DemoHostGuidedSetup {
+    # After the step: removes both logon tasks, the host's console script and steps, and the guest's setup folder. Never
+    # throws; what it couldn't remove is logged and stays harmless (the tasks only open a window and a pre-filled setup).
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Context.GuestName, 'Remove the guided setup''s logon tasks and files')) {
+        return
+    }
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    try {
+        if (Get-ScheduledTask -TaskName 'DbHubDemo-GuestConsole' -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName 'DbHubDemo-GuestConsole' -Confirm:$false
+        }
+        foreach ($file in $path.HostConsoleScript, $path.HostSteps) {
+            Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+        }
+        $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+        Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ArgumentList $path.GuestFolder -ScriptBlock {
+            param($Folder)
+            if (Get-ScheduledTask -TaskName 'DbHubDemo-GuidedSetup' -ErrorAction SilentlyContinue) {
+                Unregister-ScheduledTask -TaskName 'DbHubDemo-GuidedSetup' -Confirm:$false
+            }
+            Remove-Item -LiteralPath $Folder -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('The guided setup''s tasks and files couldn''t all be removed: {0}' -f $_.Exception.Message)
+    }
+}
+
+function Initialize-DemoHostGuidedSignIn {
+    <#
+    .SYNOPSIS
+    Prepares setup's Azure sign-in in the guest before anyone is asked, before the guest's automatic sign-in, and before
+    setup opens (Phase 28 live finding, 2026-10-30): the WebView2 runtime is installed (the GuestWebView2 step's
+    installer when it's missing), IE Enhanced Security Configuration is off for administrators, and the Microsoft sign-in
+    hosts are Trusted sites for the guest's Administrator. Returns $null when it's ready, or an InProgress step result:
+    Azure-side preparation, nothing for the person yet; the host tries again at its next pass.
+
+    .DESCRIPTION
+    Live, setup's Use Azure Login opened in an IE-based browser control, which IE ESC blocked, though WebView2 was
+    installed. MSAL.NET documents that it uses its legacy, IE-based web view for Microsoft Entra ID authorities, whatever
+    is installed (https://learn.microsoft.com/entra/msal/dotnet/advanced/webview2), and a change made while setup runs
+    doesn't reach it, so this runs first. The record is written before the guest changes, so a run that stops midway
+    still restores them (Restore-DemoHostGuidedSignIn). A sign-in host that couldn't be mapped is only logged: the person
+    can select Add... in setup's dialog.
+    Bounded (Phase 28 review): the record holds when this request's preparation first started (firstPreparedUtc) and its
+    passes. When it isn't ready after -MaxMinutes or -MaxPasses, a Warning is logged, the record's state turns Fallback,
+    and $null is returned, so setup opens and the person is asked anyway, with Add... in Internet Explorer's dialog as the
+    way past a blocked sign-in, which worked live; the host's health then says signIn fallback, which deploy.ps1 shows.
+    The record still drives the cleanup, so the done check and the golden gates don't change. A check that fails after
+    the preparation was ready for this request doesn't take the person's step back.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [string] $RequestId = '',
+
+        [ValidateRange(1, 240)]
+        [int] $MaxMinutes = 15,
+
+        [ValidateRange(1, 20)]
+        [int] $MaxPasses = 3
+    )
+
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    $guest = $Context.GuestName
+    $prefix = 'Preparing setup''s Azure sign-in in {0} (Azure-side, no action needed):' -f $guest
+    $retry = 'the host tries again within about 5 minutes, and asks for you anyway after about {0} minutes' -f $MaxMinutes
+    $passLimit = $MaxPasses
+    # The record comes first: it counts this request's passes for the bound, and a run that stops midway still restores
+    # what was changed.
+    $record = Get-DemoGuidedSignInRecord -Path $path
+    if ($null -eq $record) {
+        $record = @{ schemaVersion = 1; snapshot = ''; state = 'Preparing' }
+    }
+    if ([string]$record['requestId'] -ne $RequestId -or -not [string]$record['firstPreparedUtc']) {
+        $record['requestId'] = $RequestId
+        $record['firstPreparedUtc'] = Get-DemoVmUtcNow
+        $record['passes'] = 0
+        if ([string]$record['state'] -ne 'Ready') {
+            $record['state'] = 'Preparing'
+        }
+    }
+    elseif ([string]$record['state'] -eq 'Fallback') {
+        # This request stopped waiting for the preparation: setup opens, and the person uses Add... when it's needed.
+        return $null
+    }
+    $wasReady = ([string]$record['state'] -eq 'Ready')
+    $record['passes'] = [int]$record['passes'] + 1
+    Save-DemoGuidedSignInRecord -Path $path -Value $record
+    $notReady = {
+        param([string] $Message, [string] $Problem)
+        if ($wasReady) {
+            Write-DemoVmLog -Level 'Warning' -Message ('Setup''s Azure sign-in in {0} was prepared earlier for this request, and checking it again failed ({1}); setup stays open, and the cleanup still restores the browser settings.' -f $guest, $Problem)
+            return $null
+        }
+        $since = [datetime]::MinValue
+        $parsed = [datetime]::TryParse([string]$record['firstPreparedUtc'], [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$since)
+        if ([int]$record['passes'] -lt $passLimit -and (-not $parsed -or [DateTime]::UtcNow -lt $since.AddMinutes($MaxMinutes))) {
+            return (New-DemoVmStepResult -Outcome 'InProgress' -Message $Message)
+        }
+        $record['state'] = 'Fallback'
+        $record['fallbackUtc'] = Get-DemoVmUtcNow
+        $record['fallbackReason'] = $Problem
+        Save-DemoGuidedSignInRecord -Path $path -Value $record
+        Write-DemoVmLog -Level 'Warning' -Message ('Setup''s Azure sign-in in {0} wasn''t prepared automatically after {1} pass(es) ({2}). Setup opens and the person is asked anyway: if Internet Explorer blocks the sign-in, they select Add... in its dialog. The cleanup still turns IE Enhanced Security Configuration back on and removes the Trusted sites entries.' -f $guest, [int]$record['passes'], $Problem)
+        return $null
+    }
+    $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+    try {
+        $webView2 = Test-DemoGuestWebView2 -Name $guest -Credential $credential
+    }
+    catch {
+        $problem = Protect-DemoVmText -Text $_.Exception.Message
+        return (& $notReady ('{0} the guest couldn''t be asked about the WebView2 runtime yet ({1}); {2}.' -f $prefix, $problem, $retry) ('the guest couldn''t be asked about the WebView2 runtime: {0}' -f $problem))
+    }
+    if (-not $webView2) {
+        $problem = ''
+        try {
+            Install-DemoHostGuestWebView2 -Context $Context
+        }
+        catch {
+            $problem = Protect-DemoVmText -Text $_.Exception.Message
+        }
+        if (-not (Test-DemoHostGuestWebView2 -Context $Context)) {
+            return (& $notReady ('{0} the WebView2 runtime isn''t installed in the guest yet{1}; {2}.' -f $prefix, $(if ($problem) { ' ({0})' -f $problem } else { '' }), $retry) ('the WebView2 runtime isn''t installed{0}' -f $(if ($problem) { ': ' + $problem } else { '' })))
+        }
+    }
+    $record['preparedUtc'] = Get-DemoVmUtcNow
+    $record['webView2'] = $true
+    Save-DemoGuidedSignInRecord -Path $path -Value $record
+    $hosts = @(Get-DemoGuidedSignInHost)
+    try {
+        $state = Invoke-Command -VMName $guest -Credential $credential -ErrorAction Stop -ScriptBlock ${function:Invoke-DemoGuestSignInBrowserAction} -ArgumentList 'Prepare', $hosts, $Context.Guest.AdministratorName, ([string]$record['snapshot'])
+    }
+    catch {
+        $problem = Protect-DemoVmText -Text $_.Exception.Message
+        return (& $notReady ('{0} IE Enhanced Security Configuration couldn''t be turned off for administrators yet ({1}); {2}.' -f $prefix, $problem, $retry) ('IE Enhanced Security Configuration couldn''t be turned off: {0}' -f $problem))
+    }
+    if (-not [string]$record['snapshot'] -and [string]$state.snapshotJson) {
+        $record['snapshot'] = [string]$state.snapshotJson
+    }
+    $mapped = @($state.hostsMapped | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    # 0 is off; -1 means the component doesn't exist, so nothing blocks the sign-in.
+    $escOff = ([int]$state.ieEscAdmin -ne 1)
+    $record['ieEscAdmin'] = [int]$state.ieEscAdmin
+    $record['hive'] = [string]$state.hive
+    $record['hostsMapped'] = $mapped
+    if ($escOff) {
+        $record['state'] = 'Ready'
+    }
+    Save-DemoGuidedSignInRecord -Path $path -Value $record
+    if (-not $escOff) {
+        return (& $notReady ('{0} IE Enhanced Security Configuration is still on for administrators in the guest; {1}.' -f $prefix, $retry) 'IE Enhanced Security Configuration is still on for administrators')
+    }
+    if (-not $wasReady) {
+        if ($mapped.Count -lt $hosts.Count) {
+            Write-DemoVmLog -Level 'Warning' -Message ('Setup''s Azure sign-in in {0}: IE Enhanced Security Configuration is off for administrators until the cleanup, but only {1} of the {2} Microsoft sign-in hosts are Trusted sites for its Administrator (registry hive: {3}). If setup''s sign-in says Internet Explorer blocks a site, select Add... for it.' -f $guest, $mapped.Count, $hosts.Count, [string]$record['hive'])
+        }
+        else {
+            Write-DemoVmLog -Message ('Prepared setup''s Azure sign-in in {0}: the WebView2 runtime is installed, IE Enhanced Security Configuration is off for administrators until the cleanup, and the {1} Microsoft sign-in hosts are Trusted sites for its Administrator.' -f $guest, $hosts.Count)
+        }
+    }
+    return $null
+}
+
+function Restore-DemoHostGuidedSignIn {
+    <#
+    .SYNOPSIS
+    Undoes Initialize-DemoHostGuidedSignIn, as part of the guided stop's cleanup after success, failure, or timeout: IE
+    Enhanced Security Configuration on again for administrators and users (the Windows Server default), and the guest
+    Administrator's Trusted sites entries as they were before (the sign-in hosts go, and so do sites added with Add...
+    meanwhile). The record goes only once that's checked; otherwise this throws (fail closed), and the host tries again at
+    its next pass.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    $record = Get-DemoGuidedSignInRecord -Path $path
+    $snapshot = ''
+    if ($null -ne $record) {
+        $snapshot = [string]$record['snapshot']
+        $record['state'] = 'Restoring'
+        Save-DemoGuidedSignInRecord -Path $path -Value $record
+    }
+    $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+    $state = Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ScriptBlock ${function:Invoke-DemoGuestSignInBrowserAction} -ArgumentList 'Restore', @(Get-DemoGuidedSignInHost), $Context.Guest.AdministratorName, $snapshot
+    $left = @()
+    if ([int]$state.ieEscAdmin -eq 0 -or [int]$state.ieEscUsers -eq 0) {
+        $left += 'IE Enhanced Security Configuration is still off'
+    }
+    if (-not [bool]$state.restored) {
+        $left += ('the Trusted sites entries aren''t as they were (registry hive: {0})' -f [string]$state.hive)
+    }
+    if ($left.Count -gt 0) {
+        throw ('The guided stop''s browser settings in {0} weren''t restored: {1}. The host tries again at its next pass (fail closed).' -f $Context.GuestName, ($left -join '; '))
+    }
+    Remove-Item -LiteralPath $path.HostSignIn -Force -ErrorAction SilentlyContinue
+    Write-DemoVmLog -Message ('Restored the browser settings in {0}: IE Enhanced Security Configuration is on for administrators and users, and the Trusted sites entries are as they were before the guided stop ({1} removed or put back).' -f $Context.GuestName, [int]$state.changed)
+}
+
+function Enable-DemoHostGuestAutoLogon {
+    <#
+    .SYNOPSIS
+    Arms the guest's one automatic sign-in for the guided stop: the record first (so a run that dies midway still cleans
+    up), then a new random password for the guest's Administrator through the usual rotation, the LSA secret and the
+    Winlogon values (AutoLogonCount 1), and a restart of the guest; its logon task then opens the pre-filled setup.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $RequestId,
+
+        [int] $Arms = 1
+    )
+
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    $record = @{ schemaVersion = 1; requestId = $RequestId; arms = $Arms; armedUtc = (Get-DemoVmUtcNow); okSinceUtc = ''; lastLaunchUtc = '' }
+    Save-DemoGuidedSetupArmed -Path $path -Value $record
+    Update-DemoGuestSecret -SecretPath $Context.SecretPath -Name $Context.GuestName -UserName $Context.Guest.AdministratorName
+    $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+    $state = Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ScriptBlock ${function:Invoke-DemoGuestAutoLogonAction} -ArgumentList 'Arm', $credential.Password, $Context.Guest.AdministratorName, $Context.GuestName
+    if (-not [bool]$state.after.autoAdminLogon -or -not [bool]$state.after.lsaSecret -or [bool]$state.after.defaultPassword) {
+        throw 'Automatic sign-in wasn''t armed as expected in the guest (the LSA secret or AutoAdminLogon is missing, or a Winlogon DefaultPassword value exists).'
+    }
+    Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction SilentlyContinue -ScriptBlock { Restart-Computer -Force }
+    Write-DemoVmLog -Message ('Armed one automatic sign-in in {0} for the guided stop (attempt {1}); the guest restarts, signs in, and opens the pre-filled SQL Server setup.' -f $Context.GuestName, $Arms)
+}
+
+function Disable-DemoHostGuestAutoLogon {
+    <#
+    .SYNOPSIS
+    The guided stop's cleanup, which always runs (setup done, the request expired or gone, or before another arm): turns
+    automatic sign-in off and deletes the LSA secret and the Winlogon DefaultUserName and DefaultPassword values, rotates
+    the guest Administrator's password, signs the console out, checks that nothing is left, and, except before another
+    arm, turns IE Enhanced Security Configuration back on and puts the Trusted sites entries back as they were
+    (Restore-DemoHostGuidedSignIn). The record goes only when every part worked, so a failed cleanup runs again at the
+    next run; a leftover throws (fail closed).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Installed', 'Expired', 'NoRequest', 'Retry', 'Leftover')]
+        [string] $Reason
+    )
+
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    $problems = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $found = $null
+    $left = $null
+    $signedOut = 0
+    # Sign-out first: Windows records the last console user in DefaultUserName at a sign-in, so the values are cleared
+    # once no session can write them again.
+    try {
+        $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+        $signedOut = Invoke-DemoGuestSignOut -Name $Context.GuestName -Credential $credential
+        if ($signedOut -gt 0) {
+            Start-Sleep -Seconds 15
+        }
+    }
+    catch {
+        $problems.Add(('signing the console out ({0})' -f $_.Exception.Message))
+    }
+    try {
+        $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+        $cleared = Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ScriptBlock ${function:Invoke-DemoGuestAutoLogonAction} -ArgumentList 'Clear'
+        $found = $cleared.before
+        if (-not (Test-DemoAutoLogonClear -State $cleared.after)) {
+            $problems.Add('the automatic sign-in settings')
+        }
+    }
+    catch {
+        $problems.Add(('clearing the automatic sign-in settings ({0})' -f $_.Exception.Message))
+    }
+    try {
+        Update-DemoGuestSecret -SecretPath $Context.SecretPath -Name $Context.GuestName -UserName $Context.Guest.AdministratorName
+    }
+    catch {
+        $problems.Add(('rotating the guest password ({0})' -f $_.Exception.Message))
+    }
+    try {
+        $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+        $left = (Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ScriptBlock ${function:Invoke-DemoGuestAutoLogonAction} -ArgumentList 'Read').after
+        if (-not (Test-DemoAutoLogonClear -State $left)) {
+            $problems.Add('a check after the cleanup')
+        }
+    }
+    catch {
+        $problems.Add(('checking after the cleanup ({0})' -f $_.Exception.Message))
+    }
+    if ($Reason -ne 'Retry') {
+        # Setup's sign-in no longer needs IE ESC off or the Trusted sites entries (Phase 28 live finding, 2026-10-30).
+        # Before another arm they stay: that arm's sign-in needs them.
+        try {
+            Restore-DemoHostGuidedSignIn -Context $Context
+        }
+        catch {
+            $problems.Add(('restoring IE Enhanced Security Configuration and the Trusted sites ({0})' -f $_.Exception.Message))
+        }
+    }
+    $leftovers = @()
+    if ($null -ne $found) {
+        $leftovers = @('autoAdminLogon', 'autoLogonCount', 'defaultUserName', 'defaultPassword', 'lsaSecret' | Where-Object { [bool]$found.$_ })
+    }
+    $last = [ordered]@{ schemaVersion = 1; reason = $Reason; disarmedUtc = (Get-DemoVmUtcNow); found = $leftovers; signedOut = $signedOut; problems = @($problems) }
+    Write-DemoVmJsonFile -Path $path.HostLast -InputObject $last
+    if ($problems.Count -gt 0) {
+        throw ('The guided stop''s cleanup in {0} didn''t finish ({1}); it runs again at the next run (fail closed).' -f $Context.GuestName, ($problems -join '; '))
+    }
+    Remove-Item -LiteralPath $path.HostArmed -Force -ErrorAction SilentlyContinue
+    Write-DemoVmLog -Message ('Cleaned up the guided stop in {0} ({1}): automatic sign-in off and its LSA secret and Winlogon values gone (found: {2}), the guest password rotated, {3} console session(s) signed out.' -f $Context.GuestName, $Reason, $(if ($leftovers.Count) { $leftovers -join ', ' } else { 'nothing' }), $signedOut)
+}
+
+function Resolve-DemoGuestPendingSecret {
+    # A rotation that stopped midway leaves guest-administrator.bin.pending: promote it when it's the one that signs in,
+    # delete it when the main one still does. Never throws.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $pending = $Context.SecretPath + '.pending'
+    if (-not (Test-Path -LiteralPath $pending -PathType Leaf)) {
+        return
+    }
+    try {
+        $main = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+        if (Test-DemoGuestOnline -Name $Context.GuestName -Credential $main) {
+            Remove-Item -LiteralPath $pending -Force
+            return
+        }
+        $candidate = Get-DemoGuestCredential -SecretPath $pending -UserName $Context.Guest.AdministratorName
+        if (Test-DemoGuestOnline -Name $Context.GuestName -Credential $candidate) {
+            Move-Item -LiteralPath $pending -Destination $Context.SecretPath -Force
+            Write-DemoVmLog -Message 'A guest password rotation had stopped midway; its new password is the one that signs in, so it was kept.'
+        }
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('A pending guest password couldn''t be resolved yet: {0}' -f $_.Exception.Message)
+    }
+}
+
+function Invoke-DemoHostGuidedSetupGuard {
+    <#
+    .SYNOPSIS
+    Runs before every pass of the host's state machine: finishes a guest password rotation that stopped midway, and when
+    automatic sign-in is armed, or setup's sign-in is prepared (IE ESC off and the Trusted sites entries), but no person
+    is expected any more (deploy.ps1's request expired or went), runs the cleanup. Cheap when nothing is armed or
+    prepared. Never throws: a failed cleanup is logged and runs again 5 minutes later.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    Resolve-DemoGuestPendingSecret -Context $Context
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    $armed = Get-DemoGuidedSetupArmed -Path $path
+    $prepared = Test-Path -LiteralPath $path.HostSignIn -PathType Leaf
+    if ($null -eq $armed -and -not $prepared) {
+        return
+    }
+    $request = Get-DemoGuidedSetupRequest -Path $path
+    if ($request.Valid) {
+        return
+    }
+    try {
+        if ($null -ne $armed) {
+            Disable-DemoHostGuestAutoLogon -Context $Context -Reason $(if ($request.Expired) { 'Expired' } else { 'NoRequest' })
+        }
+        else {
+            Restore-DemoHostGuidedSignIn -Context $Context
+        }
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message $_.Exception.Message
+    }
+}
+
+function Invoke-DemoHostGuidedSetupStep {
+    <#
+    .SYNOPSIS
+    The SqlSetupWizard step's Set in PaygWizard mode (Phase 28): checks what's installed, cleans up once the right
+    instance is there, and while deploy.ps1 waits for a person (a valid request), prepares setup's Azure sign-in
+    (Initialize-DemoHostGuidedSignIn: WebView2, IE ESC off for administrators, the Trusted sites; until that's done the
+    step is InProgress, so nobody is asked, for about 15 minutes or 3 passes at most, after which the person is asked
+    anyway, with Add... in Internet Explorer's dialog first), then opens the pre-filled setup in the guest: in a session
+    that's already signed in, or through one automatic sign-in. Returns a step result.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [ValidateRange(1, 120)]
+        [int] $CloseGraceMinutes = 15,
+
+        [ValidateRange(1, 10)]
+        [int] $MaxArms = 3
+    )
+
+    $path = Get-DemoGuidedSetupPath -Root $Context.Root
+    $check = Get-DemoHostSetupCheck -Context $Context
+    $armed = Get-DemoGuidedSetupArmed -Path $path
+    $instructions = @(Get-DemoPaygWizardInstruction -GuestName $Context.GuestName)
+    if ($check.Ok) {
+        # Setup is done. While it still shows its Complete page, give the person a moment, then clean up anyway.
+        if ($check.SetupRunning -and $null -ne $armed) {
+            $since = [datetime]::MinValue
+            if (-not [datetime]::TryParse([string]$armed['okSinceUtc'], [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$since)) {
+                $armed['okSinceUtc'] = Get-DemoVmUtcNow
+                Save-DemoGuidedSetupArmed -Path $path -Value $armed
+                $since = [DateTime]::UtcNow
+            }
+            if ([DateTime]::UtcNow -lt $since.AddMinutes($CloseGraceMinutes)) {
+                return (New-DemoVmStepResult -Outcome 'InProgress' -Message ('{0} Select Close in setup; within {1} minutes the host signs the guest out, rotates its password, and continues on its own.' -f $check.Message, $CloseGraceMinutes))
+            }
+        }
+        Disable-DemoHostGuestAutoLogon -Context $Context -Reason 'Installed'
+        Remove-DemoHostGuidedSetup -Context $Context
+        return
+    }
+
+    $request = Get-DemoGuidedSetupRequest -Path $path
+    $problem = ''
+    if ($check.Problem -ne 'NotInstalled') {
+        $problem = ' {0} Fix: {1}' -f $check.Message, (@($check.Fix) -join ' ')
+    }
+    if (-not $request.Valid) {
+        if ($null -ne $armed) {
+            Disable-DemoHostGuestAutoLogon -Context $Context -Reason $(if ($request.Expired) { 'Expired' } else { 'NoRequest' })
+        }
+        elseif (Test-Path -LiteralPath $path.HostSignIn -PathType Leaf) {
+            try {
+                Restore-DemoHostGuidedSignIn -Context $Context
+            }
+            catch {
+                Write-DemoVmLog -Level 'Warning' -Message $_.Exception.Message
+            }
+        }
+        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('Arc is connected. The SQL Server setup step waits for you: run ./scripts/deploy.ps1, which opens Bastion and guides you, and the guest opens the pre-filled setup.{0}' -f $problem) -Instruction $instructions)
+    }
+    # Before setup opens and before the guest signs in: a change made while setup runs doesn't reach it.
+    $prepared = Initialize-DemoHostGuidedSignIn -Context $Context -RequestId $request.RequestId
+    if ($null -ne $prepared) {
+        return $prepared
+    }
+    # The automatic preparation didn't finish in time (Phase 28 review): the person is asked anyway, Add... first.
+    $lead = ''
+    $signInRecord = Get-DemoGuidedSignInRecord -Path $path
+    if ($null -ne $signInRecord -and [string]$signInRecord['state'] -eq 'Fallback') {
+        $lead = (Get-DemoGuidedSignInFallbackText) + ' '
+        $instructions = @(Get-DemoGuidedSignInFallbackText) + $instructions
+    }
+    if ($check.SetupRunning) {
+        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('{2}SQL Server setup is open in {0}: choose Use pay-as-you-go billing through Microsoft Azure and Standard, sign in with Use Azure Login, then Install.{1}' -f $Context.GuestName, $problem, $lead) -Instruction $instructions)
+    }
+    $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+    if (Test-DemoGuestConsoleSession -Name $Context.GuestName -Credential $credential) {
+        # Someone is signed in (the automatic sign-in, or a person): open setup, or the Installation Center for a fix, there.
+        if ($null -eq $armed) {
+            $armed = @{ schemaVersion = 1; requestId = $request.RequestId; arms = 0; armedUtc = ''; okSinceUtc = ''; lastLaunchUtc = '' }
+        }
+        $last = [datetime]::MinValue
+        $known = [datetime]::TryParse([string]$armed['lastLaunchUtc'], [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$last)
+        if (-not $known -or [DateTime]::UtcNow -ge $last.AddMinutes(4)) {
+            Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ScriptBlock { Start-ScheduledTask -TaskName 'DbHubDemo-GuidedSetup' }
+            $armed['lastLaunchUtc'] = Get-DemoVmUtcNow
+            Save-DemoGuidedSetupArmed -Path $path -Value $armed
+        }
+        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('{1}The guest is signed in, and SQL Server setup opens there now.{0}' -f $problem, $lead) -Instruction $instructions)
+    }
+    $arms = 0
+    if ($null -ne $armed -and [string]$armed['requestId'] -eq $request.RequestId) {
+        $arms = [int]$armed['arms']
+    }
+    if ($arms -ge $MaxArms) {
+        return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('{3}The guest''s automatic sign-in didn''t open setup after {0} tries. In Virtual Machine Connection, sign in to {1} as Administrator (C:\ProgramData\DbHubDemo\Copy-GuestCredential.ps1 copies the password), then run C:\DbHubDemo\setup\Start-GuidedSetup.ps1.{2}' -f $MaxArms, $Context.GuestName, $problem, $lead) -Instruction $instructions)
+    }
+    if ($null -ne $armed) {
+        Disable-DemoHostGuestAutoLogon -Context $Context -Reason 'Retry'
+    }
+    Enable-DemoHostGuestAutoLogon -Context $Context -RequestId $request.RequestId -Arms ($arms + 1)
+    return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message ('{1}The guest restarts, signs itself in once, and opens the pre-filled SQL Server setup in about 2 minutes.{0}' -f $problem, $lead) -Instruction $instructions)
+}
+
+function Test-DemoHostGuidedSetupDone {
+    # The SqlSetupWizard step's check in PaygWizard mode: Standard runs as the default instance with the guest's
+    # Administrator as sysadmin (as before Phase 28, so an existing or golden host converges unchanged), nothing is armed,
+    # and setup's sign-in preparation is undone (IE ESC on, the Trusted sites as before). While the guided stop is armed,
+    # the step's Set runs the full setup check, the Azure extension included. Never throws.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    try {
+        $path = Get-DemoGuidedSetupPath -Root $Context.Root
+        if ($null -ne (Get-DemoGuidedSetupArmed -Path $path) -or (Test-Path -LiteralPath $path.HostSignIn -PathType Leaf)) {
+            return $false
+        }
+        return [bool](Test-DemoHostSqlEdition -Context $Context)
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('SQL Server setup check in the guest: {0}' -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Get-DemoHostGuidedSetupDetail {
+    # For health.json (details.guidedSetup): whether automatic sign-in is armed, deploy.ps1's request, setup's sign-in
+    # preparation (signIn: none, preparing, ready, fallback, or restoring; deploy.ps1 asks for a person at ready, and at
+    # fallback, when the preparation didn't finish in time, with Add... first), and the last cleanup (its reason, what it
+    # found, and what failed). Names and times only. Never throws.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $detail = [ordered]@{ armed = $false; request = 'none'; requestExpiresUtc = ''; signIn = 'none'; lastReason = ''; lastDisarmedUtc = ''; lastFound = @(); lastProblems = @() }
+    try {
+        $path = Get-DemoGuidedSetupPath -Root $Context.Root
+        $detail.armed = Test-Path -LiteralPath $path.HostArmed -PathType Leaf
+        $request = Get-DemoGuidedSetupRequest -Path $path
+        $detail.request = if ($request.Valid) { 'valid' } elseif ($request.Expired) { 'expired' } elseif ($request.Exists) { 'invalid' } else { 'none' }
+        if ($null -ne $request.ExpiresUtc) {
+            $detail.requestExpiresUtc = ([datetime]$request.ExpiresUtc).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        $signIn = Get-DemoGuidedSignInRecord -Path $path
+        if ($null -ne $signIn) {
+            $detail.signIn = if ([string]$signIn['state']) { ([string]$signIn['state']).ToLowerInvariant() } else { 'preparing' }
+        }
+        $last = Read-DemoVmJsonFile -Path $path.HostLast
+        if ($null -ne $last) {
+            $detail.lastReason = [string]$last['reason']
+            $detail.lastDisarmedUtc = [string]$last['disarmedUtc']
+            $detail.lastFound = @($last['found'] | Where-Object { $_ })
+            $detail.lastProblems = @($last['problems'] | Where-Object { $_ })
+        }
+    }
+    catch {
+        $detail['error'] = Protect-DemoVmText -Text $_.Exception.Message
+    }
+    return $detail
+}
+
+function Get-DemoGuidedSetupStepText {
+    # The short steps the host's console task opens beside Virtual Machine Connection.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $GuestName
+    )
+
+    return @(
+        ('Fabric Database Hub demo: the one step that needs you ({0}, SQL Server setup)' -f $GuestName)
+        ''
+        ('1. The Virtual Machine Connection window shows {0}, which signed itself in and opened SQL Server setup, pre-filled.' -f $GuestName)
+        '2. On the Edition page, select "Use pay-as-you-go billing through Microsoft Azure", then Standard. Select Next.'
+        '3. Accept the license terms. Select Next on the pages that follow.'
+        '4. On the Azure Extension for SQL Server page, select "Use Azure Login" and sign in with your own Azure account. Never enter a service principal secret. If the Azure Login window stays blank, or Internet Explorer says content from https://login.microsoftonline.com is blocked, follow the dialog''s directions: select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close. Then select "Use Azure Login" again. Repeat for any other sign-in site it names. (Confirmed live on 2026-10-30; turning IE Enhanced Security Configuration off while setup is open doesn''t help.)'
+        '5. Select Next on the pre-filled pages (features, the default instance, service accounts, administrators), then Install.'
+        '6. When setup says Complete, select Close. The host signs the guest out, rotates its password, and continues on its own; deploy.ps1 then finishes T2.'
+        ''
+        ('If the window shows a sign-in screen instead: in an elevated PowerShell on this host, run C:\ProgramData\DbHubDemo\Copy-GuestCredential.ps1, then in Virtual Machine Connection select Clipboard > Type clipboard text, sign in as Administrator, and run C:\DbHubDemo\setup\Start-GuidedSetup.ps1.')
+    )
+}

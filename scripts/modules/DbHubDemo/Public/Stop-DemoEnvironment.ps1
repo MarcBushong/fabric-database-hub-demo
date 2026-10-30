@@ -9,6 +9,8 @@ function Stop-DemoEnvironment {
     - Default: removes on-demand Bastion and then its public IP, including a public IP left over after an
       interrupted delete (C8); rotates the T2 host's administrator password if a one-time password was set,
       and with the Key Vault opt-in disables the vault's copy (Disable-DemoHostPasswordSecret, STOP.KEYVAULT);
+      once Bastion is gone, clears the record of a guided stop whose cleanup didn't finish (GuidedStopUtc, as after a
+      Ctrl+C at the guided stop), so deploy.ps1's DONE no longer waits for it (Phase 28 review);
       sets every target's activity profile to off, so nothing restarts on the next boot (R183); stops the
       guest arcsql01 cleanly over PowerShell Direct; then deallocates the T2 VM and sqlvm01. T3 isn't
       touched: with its profile off (the T3 profile is a file on T1, so this doesn't wake it), serverless
@@ -20,8 +22,8 @@ function Stop-DemoEnvironment {
       it can't deallocate a later session's VMs (STOP.CONTROL.AUTOSTOP).
     - -ParkT2 (C4): only the T2 side, and only T2's profile goes off; T1, T3, and T4 keep running, for
       agent-focused demos on T1 and T3.
-    - -RemoveBastionOnly: only Bastion and the password rotation; with -IfExpired, a Bastion host goes only
-      after its expiry tag (the bastion-cleanup workflow), and a leftover public IP goes at once.
+    - -RemoveBastionOnly: only Bastion, the password rotation, and the guided stop's record; with -IfExpired, a Bastion
+      host goes only after its expiry tag (the bastion-cleanup workflow), and a leftover public IP goes at once.
     - -RemoveT3: also deletes T3 and its private endpoint (Remove-DemoT3; the user-directed lifecycle). The
       next start-demo.ps1 recreates it under the same names.
     - Phase 26b (ADR 0023), both opt-in and skipped with -ParkT2: -SaveHistory (or fabric.saveHistoryOnStop) runs
@@ -101,12 +103,29 @@ function Stop-DemoEnvironment {
     $state = Get-DemoDeploymentState -Config $Config
     $sessionOver = ($bastion.status -eq 'Pass' -or -not $IfExpired)
     if ($state.HostPasswordUtc -and $sessionOver) {
-        # Set-DemoVmLocalPassword reports Manual action required, with the steps, when the host isn't running.
-        $results.Add((Set-DemoVmLocalPassword -Config $Config -VmName $hostVm -Rotate -Confirm:$false))
+        # Set-DemoVmLocalPassword reports Manual action required, with the steps, when the host isn't running. A rotation
+        # that fails on a running host is a Warning with the portal's way (Phase 28): the state still records the handover,
+        # so the next start-demo.ps1 or stop-demo.ps1 rotates it again. That covers a password a person set in the portal
+        # at the guided stop too.
+        $rotation = Set-DemoVmLocalPassword -Config $Config -VmName $hostVm -Rotate -Confirm:$false
+        if ([string]$rotation.status -eq 'Fail') {
+            $rotation = New-DemoResult -CheckId 'STOP.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('{0} The password set for the last session is still valid until it''s rotated.' -f $rotation.message) -Evidence $rotation.evidence -Remediation ('Run ./scripts/stop-demo.ps1 -RemoveBastionOnly again, which rotates it, or in the Azure portal open {0}, then Help, then Reset password, and set a random value you don''t keep.' -f $hostVm) -DocUrl 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'
+        }
+        $results.Add($rotation)
     }
     if ($sessionOver -and (Get-DemoKeyVaultSetting -Config $Config).Enabled) {
         # The opt-in vault's copy goes too, even when the host couldn't be rotated: nobody needs it after the session.
         $results.Add((Disable-DemoHostPasswordSecret -Config $Config -VmName $hostVm -CheckId 'STOP.KEYVAULT' -Confirm:$false))
+    }
+    if ($sessionOver -and [string]$bastion.status -in 'Pass', 'Not selected' -and [string](Get-DemoMemberValue -InputObject $state -Name 'GuidedStopUtc')) {
+        # The guided stop's Bastion is gone, so deploy.ps1's DONE no longer waits for it (Get-DemoGuidedStopLeftover;
+        # Phase 28 review); the host's request expires on its own.
+        try {
+            Set-DemoDeploymentState -Config $Config -Value @{ GuidedStopUtc = '' } -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The guided stop''s end wasn''t recorded on the resource group: {0}' -f $_.Exception.Message)
+        }
     }
     if ($RemoveBastionOnly) {
         return $results.ToArray()
