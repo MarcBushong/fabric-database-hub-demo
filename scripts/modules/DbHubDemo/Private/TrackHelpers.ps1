@@ -1229,6 +1229,17 @@ function Invoke-DemoDeploymentTrack {
             & $note ('DEPLOY.TRACK.{0}' -f $Track.ToUpperInvariant()) $(if ($Track -eq 'Fabric') { 'fabric' } else { $Track }) 'Fail' ('Track {0} stopped at {1}: {2}' -f $Track, $name, (Protect-DemoText -Text $_.Exception.Message)) ('Fix the cause, then run deploy.ps1 -Resume: the track continues at {0}.' -f $name)
             $outcome = 'Fail'
         }
+        if ($Track -eq 'T2' -and $name -eq 'T2' -and @($results | Select-Object -Skip $resultsBefore | Where-Object { [string]$_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).Count -eq 0) {
+            # Whatever the step reached (-NoWaitForT2, a golden redeploy, a failure), and unless the guided stop's NotNeeded
+            # already did: what an earlier guided stop or session left open goes, so DONE never comes with it (Phase 28
+            # review). Nothing while deploy.ps1 is being stopped.
+            try {
+                & $addAll @(Clear-DemoGuidedStopLeftover -Config $Config)
+            }
+            catch {
+                & $note 'DEPLOY.T2.GUIDEDLEFTOVER' 'T2' 'Warning' ('What an earlier guided stop left open couldn''t be checked: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly: it removes Bastion and rotates the host password, and leaves the VMs running.'
+            }
+        }
         $timing[$name] = [int]$watch.Elapsed.TotalSeconds
         if (-not $ownProgress -and $stepIds.Count -gt 0) {
             $stepResults = @($results | Select-Object -Skip $resultsBefore)

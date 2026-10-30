@@ -579,7 +579,8 @@ function Complete-DemoGuidedStop {
     The guided stop's cleanup on deploy.ps1's side, run whatever happened: clears the host's request (the host then
     turns the guest's one-time sign-in off), removes Bastion, rotates the host password when one was handed over (a
     Warning when it can't be: stop-demo.ps1 rotates it later), disables the Key Vault copy with the opt-in, and clears
-    the state's request time. Returns the results. Internal.
+    the state's request time once Bastion is gone: while Bastion couldn't be removed, the record stays, so the next run
+    tries again and isn't DONE before (Get-DemoGuidedStopLeftover; Phase 28 review). Returns the results. Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([object[]])]
@@ -597,7 +598,8 @@ function Complete-DemoGuidedStop {
         $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDCLEANUP' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('{0} The request expires on its own, and the host then turns the guest''s one-time sign-in off and cleans up.' -f $clear.message) -Remediation 'Nothing to do; ./scripts/check-sign-in-data.ps1 confirms the guest is clean.'))
     }
     $bastion = Remove-DemoBastion -Config $Config -Confirm:$false
-    if ([string]$bastion.status -notin 'Pass', 'Not selected') {
+    $bastionGone = [string]$bastion.status -in 'Pass', 'Not selected'
+    if (-not $bastionGone) {
         $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.BASTION' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('Bastion couldn''t be removed after the guided stop: {0}' -f $bastion.message) -Remediation 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly; the bastion-cleanup workflow also removes it after its expiry.'))
     }
     $state = $null
@@ -619,11 +621,104 @@ function Complete-DemoGuidedStop {
     if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
         $results.Add((Disable-DemoHostPasswordSecret -Config $Config -VmName 'archost01' -CheckId 'DEPLOY.T2.KEYVAULT' -Confirm:$false))
     }
-    try {
-        Set-DemoDeploymentStateLocked -Config $Config -Value @{ GuidedStopUtc = '' } -Confirm:$false
+    if ($bastionGone) {
+        try {
+            Set-DemoDeploymentStateLocked -Config $Config -Value @{ GuidedStopUtc = '' } -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The guided stop''s end wasn''t recorded: {0}' -f $_.Exception.Message)
+        }
     }
-    catch {
-        Write-DemoLog -Level Warning -Message ('The guided stop''s end wasn''t recorded: {0}' -f $_.Exception.Message)
+    return $results.ToArray()
+}
+
+function Get-DemoGuidedStopLeftover {
+    <#
+    .SYNOPSIS
+    What a guided stop or a session left open, from the deployment state (Phase 28 review): a guided stop whose cleanup
+    didn't finish (GuidedStopUtc, as after a Ctrl+C at the guided stop: its on-demand Bastion may still be up), and a
+    handed-over host password that isn't rotated yet (HostPasswordUtc, which the guided stop and start-demo.ps1
+    -Interactive record). Returns what to name, or '' when nothing is open or there's no state. DONE waits for both
+    (Get-DemoDeploymentOutcome). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $State
+    )
+
+    if ($null -eq $State) {
+        return ''
+    }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    if ([string](Get-DemoMemberValue -InputObject $State -Name 'GuidedStopUtc')) {
+        $parts.Add('the guided stop''s on-demand Bastion (its cleanup didn''t finish)')
+    }
+    $handedOver = [string](Get-DemoMemberValue -InputObject $State -Name 'HostPasswordUtc')
+    if ($handedOver) {
+        $parts.Add(('the T2 host''s password, handed over at {0} and not rotated yet' -f $handedOver))
+    }
+    return ($parts -join ', and ')
+}
+
+function Clear-DemoGuidedStopLeftover {
+    <#
+    .SYNOPSIS
+    Cleans up what an earlier guided stop or session left open, before T2 counts as done (Phase 28 review). When the
+    deployment state records it (Get-DemoGuidedStopLeftover), runs Complete-DemoGuidedStop, which clears the host's
+    request, removes Bastion, rotates the host password, and disables the Key Vault copy; then reads the state again.
+    Returns its results with DEPLOY.T2.GUIDEDLEFTOVER: Pass when nothing is left; Manual action required naming
+    stop-demo.ps1 when something is, so the run isn't DONE with it. Returns nothing when nothing is recorded, when
+    deploy.ps1 is being stopped (Test-DemoRunCancelled: the next run does it), and in the evaluation-only mode, which
+    has no guided stop (DONE still waits, and stop-demo.ps1 does it). Internal.
+
+    .DESCRIPTION
+    After a Ctrl+C at the guided stop, the guided stop skips its cleanup (Phase 28 live finding), and setup may finish
+    in the guest anyway. The next run's guided stop is then NotNeeded, and before this, nothing removed Bastion or
+    rotated the password, and the run could end DONE. The guided stop's NotNeeded runs this, and so do the T2 track's T2
+    step at its end, whatever it reached (-NoWaitForT2, a golden redeploy), and deploy.ps1 -Sequential's T2 stage.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ((Test-DemoRunCancelled) -or (Get-DemoHostVmName -Config $Config) -ne 'archost01') {
+        return $results.ToArray()
+    }
+    $readState = {
+        try {
+            Get-DemoDeploymentState -Config $Config
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The deployment state couldn''t be read to check what a guided stop left open: {0}' -f $_.Exception.Message)
+            $null
+        }
+    }
+    $open = Get-DemoGuidedStopLeftover -State (& $readState)
+    if (-not $open) {
+        return $results.ToArray()
+    }
+    if (-not $PSCmdlet.ShouldProcess('archost01', ('Clean up {0}' -f $open))) {
+        return $results.ToArray()
+    }
+    Write-DemoLog -Message ('T2: {0} is still open from an earlier guided stop or session; cleaning it up now.' -f $open)
+    $results.AddRange([object[]]@(Complete-DemoGuidedStop -Config $Config -Confirm:$false))
+    $after = & $readState
+    $left = Get-DemoGuidedStopLeftover -State $after
+    $remediation = 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly: it removes Bastion and rotates the host password, and leaves the VMs running.'
+    if ($null -eq $after) {
+        $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDLEFTOVER' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('The cleanup of {0} ran, but the deployment state couldn''t be read to confirm it.' -f $open) -Remediation ('./scripts/status.ps1 shows whether Bastion is still up. {0}' -f $remediation)))
+    }
+    elseif ($left) {
+        $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDLEFTOVER' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message ('{0} is still open after the cleanup, so the run isn''t DONE: DONE never leaves access to the T2 host behind.' -f $left) -Remediation $remediation))
+    }
+    else {
+        $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDLEFTOVER' -Area 'infra' -Target 'T2' -Status 'Pass' -Message ('Cleaned up what an earlier guided stop or session left open ({0}); none of it is left.' -f $open)))
     }
     return $results.ToArray()
 }
@@ -682,7 +777,9 @@ function Invoke-DemoT2GuidedStop {
     or Stopped) and Results. Internal.
 
     .DESCRIPTION
-    1. Nothing to do when the host is past setup already (NotNeeded).
+    1. Nothing to do when the host is past setup already (NotNeeded), except what an earlier guided stop left open:
+       Clear-DemoGuidedStopLeftover removes its Bastion and rotates the handed-over host password, as after a Ctrl+C
+       at the guided stop when setup finished anyway (Phase 28 review).
     2. The host's request (Set-DemoGuidedStopRequest), valid until the deadline: at least -PersonMinutes after the prompt.
     3. On-demand Bastion, deployed in the background (New-DemoBastion -NoWait).
     4. Arc onboarding when the host waits for it, without the SQL Server configuration, which waits for the setup check.
@@ -693,7 +790,8 @@ function Invoke-DemoT2GuidedStop {
     7. Waits for the host's setup check, relaying its message (a wrong install's documented fix), until it passes, the
        deadline passes (TimedOut), or the host fails.
     8. Always: Complete-DemoGuidedStop, except when deploy.ps1 was stopped (Test-DemoRunCancelled; Stopped): its Azure
-       calls would hold the stop for minutes, so the next deploy.ps1 or stop-demo.ps1 does them (Phase 28 live finding).
+       calls would hold the stop for minutes, so the next deploy.ps1 (Clear-DemoGuidedStopLeftover, whether or not setup
+       finished meanwhile) or stop-demo.ps1 does them (Phase 28 live finding and its review).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -722,9 +820,20 @@ function Invoke-DemoT2GuidedStop {
     $docUrl = 'https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-using-a-configuration-file'
     $phase = Get-DemoT2HostPhase -Health $Health
     if ($phase.Phase -in 'AfterSetup', 'Ready') {
-        Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop', 'T2.SetupCheck' -State 'Done' -Message 'Not needed: SQL Server is already set up in arcsql01.'
-        Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'NotSelected'; message = 'SQL Server is already set up in arcsql01.' }
         $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Not selected' -Message 'SQL Server is already set up in arcsql01, so no step needs you.' -DocUrl $docUrl))
+        # Setup can finish after a Ctrl+C at the guided stop, which skipped its cleanup: Bastion and the handed-over host
+        # password go now, or the run isn't DONE (Phase 28 review).
+        $leftover = @(Clear-DemoGuidedStopLeftover -Config $Config)
+        $results.AddRange([object[]]$leftover)
+        $cleaned = @($leftover | Where-Object { [string]$_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }) | Select-Object -First 1
+        $stepMessage = 'Not needed: SQL Server is already set up in arcsql01.'
+        $stepStatus = ''
+        if ($null -ne $cleaned) {
+            $stepMessage = '{0} {1}' -f $stepMessage, [string]$cleaned.message
+            $stepStatus = [string]$cleaned.status
+        }
+        Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop', 'T2.SetupCheck' -State 'Done' -Status $stepStatus -Message $stepMessage
+        Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'NotSelected'; message = 'SQL Server is already set up in arcsql01.' }
         return [pscustomobject]@{ Status = 'NotNeeded'; Results = $results.ToArray() }
     }
     if ($phase.Phase -eq 'Failed') {
@@ -866,10 +975,11 @@ function Invoke-DemoT2GuidedStop {
         if (Test-DemoRunCancelled) {
             # deploy.ps1 was stopped (Ctrl+C; Phase 28 live finding): the cleanup's Azure calls would hold the stop for
             # minutes. The host's request expires on its own, and the host then turns the guest's one-time sign-in off;
-            # the next deploy.ps1 picks the guided stop up again, and stop-demo.ps1 removes Bastion and rotates the host
-            # password; deploy.ps1's own ending says so on the status page.
+            # the next deploy.ps1 picks the guided stop up again, or cleans up after it when setup finished meanwhile
+            # (Clear-DemoGuidedStopLeftover), and stop-demo.ps1 removes Bastion and rotates the host password; deploy.ps1's
+            # own ending says so on the status page.
             $status = 'Stopped'
-            $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message ('deploy.ps1 was stopped during the guided stop, {0} minutes after it began. Bastion stays up and the host password isn''t rotated yet; the host''s request expires on its own, and the host then turns the guest''s one-time sign-in off.' -f $minutes) -Remediation 'Run ./scripts/deploy.ps1 again to continue the guided stop; or, to stop for now, ./scripts/stop-demo.ps1, which removes Bastion and rotates the host password.' -DocUrl $docUrl))
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message ('deploy.ps1 was stopped during the guided stop, {0} minutes after it began. Bastion stays up and the host password isn''t rotated yet; the host''s request expires on its own, and the host then turns the guest''s one-time sign-in off.' -f $minutes) -Remediation 'Run ./scripts/deploy.ps1 again: it continues the guided stop, or, when setup finished meanwhile, removes Bastion and rotates the host password, and it isn''t DONE before. To stop for now, ./scripts/stop-demo.ps1 removes Bastion and rotates the host password.' -DocUrl $docUrl))
         }
         else {
             $results.AddRange([object[]]@(Complete-DemoGuidedStop -Config $Config -Confirm:$false))

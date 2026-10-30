@@ -404,6 +404,50 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:calls | Should -Not -Contain 'telemetry T2'
     }
 
+    It 'cleans up what an earlier guided stop left open at the end of the T2 step: after -NoWaitForT2, on a golden redeploy, and once when the guided stop isn''t needed (Phase 28 review)' {
+        # The review: a rerun after a Ctrl+C at the guided stop, with setup finished meanwhile, could end DONE with Bastion
+        # up and the handed-over host password valid.
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); $script:state.HostPasswordUtc = ''; @() }
+        $cleanups = { @($script:calls | Where-Object { $_ -eq 'cleanup' }).Count }
+
+        # -NoWaitForT2 (this context doesn't wait): T2 goes on in the background, and the step still cleans up.
+        $script:context['T2Source'] = 'build'
+        $script:arcConnected = $false
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Background'
+        & $cleanups | Should -Be 1
+        ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).status | Should -Be 'Pass'
+
+        # A golden redeploy.
+        $script:calls.Clear()
+        $script:context['T2Source'] = 'golden'
+        $script:arcConnected = $true
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Pass'
+        & $cleanups | Should -Be 1
+
+        # The default wait: setup finished after the Ctrl+C, so the guided stop isn't needed; it cleans up, and the step
+        # doesn't again.
+        $script:calls.Clear()
+        $script:context['T2Source'] = 'build'
+        $script:context['WaitForT2'] = $true
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Failed = $false; TimedOut = $false; Health = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.' } } }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Pass'
+        & $cleanups | Should -Be 1
+        @($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).Count | Should -Be 1
+        ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }).status | Should -Be 'Not selected'
+
+        # Nothing open: nothing to clean up.
+        $script:calls.Clear()
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        & $cleanups | Should -Be 0
+        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' } | Should -BeNullOrEmpty
+    }
+
     It 'runs the Fabric track: notebooks and dashboard, the history report, then the Fabric app step' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { $script:calls.Add('fabric stage'); New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:calls.Add('powerbi'); New-TestResult 'FABRIC.SEMANTICMODEL.DATA' $script:powerBIStatus }

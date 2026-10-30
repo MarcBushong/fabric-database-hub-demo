@@ -324,6 +324,46 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $outcome.Next | Should -Match 'deploy\.ps1 again when you have about 15 minutes'
     }
 
+    It 'is never DONE while a guided stop''s Bastion or a handed-over host password is still open, and names stop-demo.ps1 (Phase 28 review)' {
+        # The review: after a Ctrl+C at the guided stop, setup finished anyway, and the next run ended DONE with Bastion up
+        # and the handed-over password valid.
+        $config = New-TestConfig
+        $password = New-FinishedState
+        $password.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = $password; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.ExitCode | Should -Be 2
+        $outcome.Reason | Should -Match 'host''s password, handed over at 2026-10-29T15:00:00Z and not rotated yet'
+        $outcome.NextCommand | Should -Be './scripts/stop-demo.ps1 -RemoveBastionOnly'
+        $outcome.Next | Should -Match 'removes Bastion and rotates the host password'
+        $lines = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n"
+        $lines | Should -Match ([regex]::Escape('Run: ./scripts/stop-demo.ps1 -RemoveBastionOnly'))
+
+        # The guided stop's own record (its cleanup didn't finish), with a configuration of its own: the command keeps it.
+        $bastion = New-FinishedState
+        $bastion.GuidedStopUtc = '2026-10-29T16:00:00Z'
+        $own = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = $bastion; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command './scripts/deploy.ps1 -ConfigPath "./config/proof.local.json"' }
+        $own.Kind | Should -Be 'NotDone'
+        $own.Reason | Should -Match 'the guided stop''s on-demand Bastion'
+        $own.NextCommand | Should -Be './scripts/stop-demo.ps1 -RemoveBastionOnly -ConfigPath "./config/proof.local.json"'
+
+        # deploy.ps1 -Sequential is judged the same way.
+        $sequential = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '2026-10-29T15:00:00Z' }
+        (InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = $sequential; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Sequential }).Kind | Should -Be 'NotDone'
+
+        # The T2 step's own record of a cleanup that couldn't finish names the same command.
+        $leftover = @(New-DoneResult) + @(New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDLEFTOVER' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'Still open.' -Remediation 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly.')
+        $step = InModuleScope DbHubDemo -Parameters @{ Result = $leftover; State = $password; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $step.Reason | Should -Match 'DEPLOY\.T2\.GUIDEDLEFTOVER'
+        $step.NextCommand | Should -Be './scripts/stop-demo.ps1 -RemoveBastionOnly'
+
+        # Another reason first: the leftover is still said.
+        $unfinished = [pscustomobject]@{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'T2'; TrackT4 = ''; TrackFabric = 'Fabric'; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '2026-10-29T15:00:00Z' }
+        $both = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = $unfinished; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $both.Reason | Should -Match 'Not every target finished: T2'
+        ($both.Notes -join ' ') | Should -Match 'Also still open from an earlier guided stop or session'
+    }
+
     It 'is WHAT IF, exit code 0, for a -WhatIf without a Fail' {
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-TestResult 'PREFLIGHT.P1.SUBSCRIPTION'); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -Config $Config -WhatIfRun }
         $outcome.Kind | Should -Be 'WhatIf'
@@ -411,6 +451,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $outcome.Reason | Should -Match 'Ctrl\+C'
         $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
         $outcome.Next | Should -Match ([regex]::Escape('./scripts/stop-demo.ps1')) -Because 'it stopped at the guided stop, which leaves Bastion up and the password unrotated'
+        $outcome.Next | Should -Match 'until the next run cleans them up when it gets to T2, whether or not setup finished meanwhile' -Because 'the next run cleans up even when setup finished after the stop (Phase 28 review)'
         $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
         $model['run']['state'] | Should -Be 'NotDone'
         $model['run']['nextCommand'] | Should -Be './scripts/deploy.ps1'
@@ -570,6 +611,34 @@ Describe 'The host credential at the guided stop (ADR 0009)' {
         $rotation.status | Should -Be 'Warning'
         $rotation.remediation | Should -Match 'Reset password'
     }
+
+    It 'keeps the guided stop''s record while its Bastion couldn''t be removed, so the next run tries again and DONE waits (Phase 28 review)' {
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoGuidedStopRequest -MockWith { New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDREQUEST' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'cleared' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ HostPasswordUtc = ''; GuidedStopUtc = '2026-10-29T16:00:00Z' } }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { $script:order.Add('state ' + (@($Value.Keys) -join ',')) }
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoBastion -MockWith { New-DemoResult -CheckId 'STOP.BASTION' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'Deleting bas-dbhub failed.' }
+        $failed = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Complete-DemoGuidedStop -Config $Config -Confirm:$false })
+        ($failed | Where-Object { $_.checkId -eq 'DEPLOY.T2.BASTION' }).status | Should -Be 'Warning'
+        $script:order | Should -Not -Contain 'state GuidedStopUtc'
+
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoBastion -MockWith { New-DemoResult -CheckId 'STOP.BASTION' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'deleted' }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Complete-DemoGuidedStop -Config $Config -Confirm:$false }
+        $script:order | Should -Contain 'state GuidedStopUtc'
+    }
+
+    It 'stop-demo.ps1 clears the guided stop''s record once Bastion is gone, so DONE no longer waits for it (Phase 28 review)' {
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ HostPasswordUtc = ''; GuidedStopUtc = '2026-10-29T16:00:00Z'; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoBastion -MockWith { New-DemoResult -CheckId 'STOP.BASTION' -Area 'infra' -Target 'T2' -Status 'Not selected' -Message 'There''s no Bastion host or Bastion public IP to remove.' }
+        $null = @(Stop-DemoEnvironment -Config $config -RemoveBastionOnly -Confirm:$false)
+        $script:order | Should -Contain 'state GuidedStopUtc'
+
+        # A Bastion that couldn't be removed keeps it.
+        $script:order.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoBastion -MockWith { New-DemoResult -CheckId 'STOP.BASTION' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'Deleting bas-dbhub failed.' }
+        $null = @(Stop-DemoEnvironment -Config $config -RemoveBastionOnly -Confirm:$false)
+        $script:order | Should -Not -Contain 'state GuidedStopUtc'
+    }
 }
 
 Describe 'Test-DemoClipboard: only a clipboard the person can paste from (review finding 3)' {
@@ -655,6 +724,9 @@ Describe 'Invoke-DemoT2GuidedStop: the stop, then the run continues on its own' 
         Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopPrompt -MockWith { $script:calls.Add('prompt') }
         Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopReminder -MockWith { $script:calls.Add('reminder') }
         Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); @() }
+        # The deployment state that Clear-DemoGuidedStopLeftover reads: nothing open unless a test queues more.
+        $script:states = [System.Collections.Generic.Queue[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { if ($script:states.Count -gt 0) { $script:states.Dequeue() } else { [pscustomobject]@{ HostPasswordUtc = ''; GuidedStopUtc = '' } } }
         $script:waitingArc = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboardingBeforeWizard'; message = 'waiting for Arc' }
         $script:wizard = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'SQL Server setup is open in arcsql01.' }
         $script:after = [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup'; message = 'Cleaning up.' }
@@ -708,6 +780,38 @@ Describe 'Invoke-DemoT2GuidedStop: the stop, then the run continues on its own' 
         $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:after } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) }
         $stop.Status | Should -Be 'NotNeeded'
         $script:calls.Count | Should -Be 0
+    }
+
+    It 'removes what an earlier guided stop left open when setup finished after a Ctrl+C, so the run isn''t DONE with it (Phase 28 review)' {
+        # The review: Ctrl+C at the guided stop skipped its cleanup, setup finished in the guest anyway, and the next run's
+        # guided stop returned NotNeeded and ended DONE with Bastion up and the handed-over password valid.
+        $ready = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.' }
+        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '2026-10-29T16:00:00Z' })
+        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = ''; GuidedStopUtc = '' })
+        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $ready } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) }
+        $stop.Status | Should -Be 'NotNeeded'
+        $script:calls | Should -Be @('cleanup')
+        $cleaned = $stop.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }
+        $cleaned.status | Should -Be 'Pass'
+        $cleaned.message | Should -Match 'host''s password, handed over at 2026-10-29T15:00:00Z'
+
+        # A password that's still valid afterward (the rotation failed): Manual action required, naming stop-demo.ps1.
+        $script:calls.Clear()
+        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '' })
+        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '' })
+        $left = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:after } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) }
+        $script:calls | Should -Be @('cleanup')
+        $open = $left.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }
+        $open.status | Should -Be 'Manual action required'
+        $open.remediation | Should -Match ([regex]::Escape('./scripts/stop-demo.ps1 -RemoveBastionOnly'))
+
+        # While deploy.ps1 is being stopped, nothing: the next run does it.
+        $script:calls.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
+        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '2026-10-29T16:00:00Z' })
+        $stopped = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $ready } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) }
+        $script:calls.Count | Should -Be 0
+        $stopped.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' } | Should -BeNullOrEmpty
     }
 
     It 'leaves its Azure cleanup to the next run, and the status page to deploy.ps1, when deploy.ps1 was stopped (Phase 28 live finding)' {

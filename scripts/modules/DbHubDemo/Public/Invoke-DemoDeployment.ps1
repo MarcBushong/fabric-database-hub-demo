@@ -30,7 +30,9 @@ function Invoke-DemoDeployment {
        configure-monitoring.ps1 -Target T1 -WaitMinutes does; Updating is a wait, not a failure.
     8. T2: Invoke-DemoArcConfiguration: onboarding when the host waits for it, then the extension, license
        type, and monitoring (T2.ARC.MONITORING), then T2's activity profile. In PaygWizard mode it reports
-       Manual action required with the wizard steps; the stage stays open, and the later stages still run.
+       Manual action required with the wizard steps; the stage stays open, and the later stages still run. What an
+       earlier guided stop or session left open (Bastion, a handed-over host password) is cleaned up here too
+       (Clear-DemoGuidedStopLeftover; Phase 28 review).
     9. Fabric: configure-fabric.ps1 (the Hub checklist, the Real-Time Dashboard, and the notebook import with
        -ImportNotebooks or fabric.importNotebooks), then configure-powerbi.ps1 (the history semantic model and
        report), as the parallel Fabric track imports them (Phase 28 review follow-up); the optional Insights app stays
@@ -589,6 +591,10 @@ function Invoke-DemoDeployment {
                     }
                 }
                 & $addAll $arc
+                # What an earlier guided stop or session left open (setup can finish after a Ctrl+C at a parallel run's guided
+                # stop, which skipped its cleanup) goes, whatever the Arc configuration found, so DONE never comes with it
+                # (Phase 28 review).
+                & $addAll @(Clear-DemoGuidedStopLeftover -Config $Config)
                 if (& $hasStatus $arc 'Fail') {
                     & $stageResult 'T2' 'Fail' 'T2''s Arc onboarding or configuration failed.' 'Read the T2.* results, fix the cause, then run deploy.ps1 -FromStage T2.'
                     return $results.ToArray()

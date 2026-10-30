@@ -28,6 +28,23 @@ function Get-DemoDeployCommand {
     return './scripts/deploy.ps1'
 }
 
+function Get-DemoStopDemoCommand {
+    # The exact './scripts/stop-demo.ps1 -RemoveBastionOnly' for the configuration of a deploy.ps1 command
+    # (Get-DemoDeployCommand), with its -ConfigPath. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $Command = './scripts/deploy.ps1'
+    )
+
+    $stop = './scripts/stop-demo.ps1 -RemoveBastionOnly'
+    if ($Command -match '^\./scripts/deploy\.ps1(?<rest>( .*)?)$') {
+        return ('{0}{1}' -f $stop, $Matches['rest'])
+    }
+    return $stop
+}
+
 function Get-DemoDeploymentExpectation {
     <#
     .SYNOPSIS
@@ -482,7 +499,9 @@ function Get-DemoDeploymentOutcome {
     -Sequential, which records stages and no tracks) needs the recorded stage Validation instead of the tracks (or,
     without a state, this run's DEPLOY.STAGE.VALIDATION Pass), and the same DONE requirements, which its validation
     checks (review finding 4). -Stopped (Ctrl+C) is NOT DONE with the resume command, and -GuidedStopOpen adds what the
-    open guided stop leaves until then (Phase 28 live finding).
+    open guided stop leaves until then (Phase 28 live finding). DONE also never comes while the state records what a
+    guided stop or session left open (Get-DemoGuidedStopLeftover: the guided stop's Bastion, a handed-over host password
+    that isn't rotated): that's NOT DONE naming stop-demo.ps1 -RemoveBastionOnly (Phase 28 review).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -539,10 +558,14 @@ function Get-DemoDeploymentOutcome {
         $outcome.Reason = 'You stopped deploy.ps1 (Ctrl+C) before it finished. What it finished is kept, and the resource group''s state records where it stopped.'
         $outcome.Next = 'Run {0} again when you''re ready: it continues where it stopped.' -f $Command
         if ($GuidedStopOpen) {
-            $outcome.Next += ' It stopped at the guided stop, so on-demand Bastion stays up and archost01''s password from the guided stop isn''t rotated until the next run finishes the guided stop; if you''re stopping for the day instead, run ./scripts/stop-demo.ps1, which removes Bastion and rotates the password.'
+            $outcome.Next += ' It stopped at the guided stop: on-demand Bastion stays up, and the host password from the guided stop stays valid, until the next run cleans them up when it gets to T2, whether or not setup finished meanwhile (it isn''t DONE before), or ./scripts/stop-demo.ps1 does. Stopping for the day? Run ./scripts/stop-demo.ps1 now.'
         }
         return [pscustomobject]$outcome
     }
+    # What a guided stop or session left open (Phase 28 review): DONE never comes with it.
+    $leftover = Get-DemoGuidedStopLeftover -State $State
+    $stopCommand = Get-DemoStopDemoCommand -Command $Command
+    $leftoverNext = 'Run {0}: it removes Bastion and rotates the host password, and leaves the VMs running. Then run {1} again.' -f $stopCommand, $Command
     $expected = [ordered]@{ T1 = 'Telemetry'; T2 = 'Telemetry' }
     if (-not $t4Off) {
         $expected['T4'] = 'Telemetry'
@@ -582,7 +605,7 @@ function Get-DemoDeploymentOutcome {
     $outcome.Unfinished = $unfinished.ToArray()
     $evidence = Test-DemoDoneEvidence -Result $core -Requirement (Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool]$t4Off) -SkipFabric:$SkipFabric)
     $outcome.Missing = @($evidence.Missing)
-    if ($fails.Count -eq 0 -and $manual.Count -eq 0 -and $unfinished.Count -eq 0 -and $evidence.Complete -and -not $StopAfter) {
+    if ($fails.Count -eq 0 -and $manual.Count -eq 0 -and $unfinished.Count -eq 0 -and $evidence.Complete -and -not $StopAfter -and -not $leftover) {
         $outcome.Kind = 'Done'
         $outcome.Done = $true
         $outcome.ExitCode = 0
@@ -595,6 +618,7 @@ function Get-DemoDeploymentOutcome {
         $outcome.Reason = 'Database Hub shows every target: {0} in Estate, with {1}{2}.{3}{4}' -f $targets, $performance, $metrics, $t2, $fabricText
         return [pscustomobject]$outcome
     }
+    $leftoverShown = $false
     $blocking = @($fails) + @($manual) | Select-Object -First 1
     if ($null -ne $blocking) {
         $message = [string]$blocking.message
@@ -602,10 +626,17 @@ function Get-DemoDeploymentOutcome {
             $message = $message.Substring(0, 397) + '...'
         }
         $outcome.Reason = '{0}: {1}' -f $blocking.checkId, $message
-        $fix = [string]$blocking.remediation
-        $outcome.Next = if ($fix) { $fix } else { 'Fix the cause in the message above.' }
-        if ($outcome.Next -notmatch 'deploy\.ps1') {
-            $outcome.Next = '{0} Then run {1}.' -f $outcome.Next.TrimEnd(), $Command
+        if ([string]$blocking.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER') {
+            $outcome.Next = $leftoverNext
+            $outcome.NextCommand = $stopCommand
+            $leftoverShown = $true
+        }
+        else {
+            $fix = [string]$blocking.remediation
+            $outcome.Next = if ($fix) { $fix } else { 'Fix the cause in the message above.' }
+            if ($outcome.Next -notmatch 'deploy\.ps1') {
+                $outcome.Next = '{0} Then run {1}.' -f $outcome.Next.TrimEnd(), $Command
+            }
         }
     }
     elseif ($StopAfter) {
@@ -620,10 +651,19 @@ function Get-DemoDeploymentOutcome {
         $outcome.Reason = 'Not every target finished: {0}.' -f ($unfinished -join ', ')
         $outcome.Next = 'Run {0}: it continues the unfinished track(s).' -f $Command
     }
+    elseif ($leftover) {
+        $outcome.Reason = 'Still open from an earlier guided stop or session: {0}. DONE never leaves access to the T2 host behind.' -f $leftover
+        $outcome.Next = $leftoverNext
+        $outcome.NextCommand = $stopCommand
+        $leftoverShown = $true
+    }
     else {
         $first = $evidence.Missing[0]
         $outcome.Reason = if ($null -ne $evidence.Problem) { '{0} hasn''t passed yet ({1}): {2}' -f $first, $evidence.Problem.status, ([string]$evidence.Problem.message) } else { '{0} wasn''t checked yet. Database Hub must show it before the demo is done.' -f $first }
         $outcome.Next = 'Telemetry and estate entries can take a few more minutes after a deployment. Wait about 10 minutes, then run {0}: it checks again.' -f $Command
+    }
+    if ($leftover -and -not $leftoverShown) {
+        $outcome.Notes = @($outcome.Notes) + @(('Also still open from an earlier guided stop or session: {0}. {1} removes Bastion and rotates the host password; DONE waits for it.' -f $leftover, $stopCommand))
     }
     $outcome.ExitCode = if ($fails.Count -gt 0) { 1 } else { 2 }
     return [pscustomobject]$outcome

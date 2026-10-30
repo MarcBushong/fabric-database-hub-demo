@@ -454,6 +454,31 @@ Describe 'Invoke-DemoDeployment' {
         @($script:recorded | Where-Object { $_.Contains('T2BuildUtc') } | ForEach-Object { if ($_['T2BuildUtc']) { 'set' } else { 'clear' } }) | Should -Be @('set')
     }
 
+    It 'cleans up in the T2 stage what an earlier guided stop left open, and isn''t DONE while it stays open (Phase 28 review)' {
+        # After a Ctrl+C at a parallel run's guided stop, setup can finish anyway; a -Sequential rerun left Bastion up and
+        # the handed-over host password valid, and could end DONE.
+        $script:state = New-TestState @{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '2026-10-29T16:00:00Z' }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith {
+            $script:order.Add('Cleanup')
+            $script:state.HostPasswordUtc = ''
+            $script:state.GuidedStopUtc = ''
+            @()
+        }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $script:order[$script:order.IndexOf('Arc') + 1] | Should -Be 'Cleanup'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).status | Should -Be 'Pass'
+
+        # A cleanup that couldn't rotate the password: the run says so, names stop-demo.ps1, and isn't DONE.
+        $script:order.Clear()
+        $script:state = New-TestState @{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '' }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:order.Add('Cleanup'); @() }
+        $open = @(Invoke-DemoDeployment -Config $config)
+        ($open | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).status | Should -Be 'Manual action required'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $open; State = $script:state; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Sequential }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.NextCommand | Should -Be './scripts/stop-demo.ps1 -RemoveBastionOnly'
+    }
+
     It 'runs DONE''s read-only checks after the validation, as the parallel path does, so a sequential run can end DONE (review finding 4)' {
         $results = Invoke-DemoDeployment -Config $config
         $script:order[-1] | Should -Be 'DoneGate'
