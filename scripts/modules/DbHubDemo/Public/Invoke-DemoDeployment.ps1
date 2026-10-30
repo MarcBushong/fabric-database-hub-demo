@@ -8,7 +8,9 @@ function Invoke-DemoDeployment {
     Every stage is idempotent, and a re-run converges. The last stage that finished is recorded in the
     resource group's tags (Set-DemoDeploymentState), so -Resume continues after it from any machine. On an existing
     environment, what's stopped (the nightly auto-shutdown, stop-demo.ps1, a stop) starts while preflight runs, and runs
-    before the first stage that needs it (Request-DemoStoppedStart, Wait-DemoStoppedStart; Phase 28 live finding).
+    before the first stage that needs it (Request-DemoStoppedStart, Wait-DemoStoppedStart; Phase 28 live finding). Then,
+    on a run that ends with the validation and has no Monitoring stage, T1's monitoring plugin is checked, and restarted
+    when it isn't running (Invoke-DemoT1MonitoringCheck, DEPLOY.T1.MONITORING; Phase 28 live finding, 2026-10-30).
     Stages:
 
     1. Preflight: Invoke-DemoPreflight (subscription guard, P1-P6, region, sizes, quota, policy, cost). Any
@@ -41,7 +43,9 @@ function Invoke-DemoDeployment {
        report), as the parallel Fabric track imports them (Phase 28 review follow-up); the optional Insights app stays
        configure-fabric-app.ps1's. Not selected with -SkipFabric.
     10. Validation: Test-DemoHubTelemetry for each ready target, the runner's status on T1, and a summary that
-        lists every Manual action required item with its exact steps. Since Phase 28 (review finding 4), with no
+        lists every Manual action required item with its exact steps. A target whose telemetry didn't come gets its
+        monitoring checked, and its telemetry once more, before the run is judged (Invoke-DemoTelemetryCheck; Phase 28
+        live finding, 2026-10-30). Since Phase 28 (review finding 4), with no
         stage open and nothing failed, DONE's read-only checks follow (Invoke-DemoDoneGate: Database Hub's estate,
         T4's metrics, T2's PAYG and monitoring, and the Fabric items), so deploy.ps1 -Sequential can end DONE.
 
@@ -298,21 +302,31 @@ function Invoke-DemoDeployment {
     # Phase 28 live finding (2026-10-30), as in the parallel path: what's stopped starts while preflight runs, and runs
     # before the first stage that needs it. Running VMs are only read; nothing on a first deployment or a what-if.
     $stoppedStart = $null
-    $stoppedWaited = $false
+    $vmsReady = $false
     $vmStagesInRange = $startIndex -le $stopIndex -and @($stages[$startIndex..$stopIndex] | Where-Object { $_ -ne 'Preflight' }).Count -gt 0
-    if (-not $whatIf -and [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists') -and $vmStagesInRange) {
+    $existing = -not $whatIf -and [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')
+    if ($existing -and $vmStagesInRange) {
         $stoppedStart = Request-DemoStoppedStart -Config $Config -SkipT4:(-not (Test-DemoT4Enabled -Config $Config)) -Confirm:$false
     }
+    # T1's monitoring plugin can stop after a restart, hours after start-demo.ps1 found it running (Phase 28 live finding,
+    # 2026-10-30), so a run that ends with the validation and has no Monitoring stage checks it once the VMs run.
+    $inRange = { param([string] $Name) $position = [array]::IndexOf($stages, $Name); $position -ge $startIndex -and $position -le $stopIndex }
+    $checkT1Monitoring = $existing -and (& $inRange 'Validation') -and -not (& $inRange 'Monitoring')
     for ($index = $startIndex; $index -le $stopIndex; $index++) {
         $stage = $stages[$index]
         Write-DemoLog -Message ('Stage {0} of {1}: {2}.' -f ($index + 1), $stages.Count, $stage)
-        if ($stage -ne 'Preflight' -and $null -ne $stoppedStart -and -not $stoppedWaited) {
-            $stoppedWaited = $true
-            $monitoringInRange = [array]::IndexOf($stages, 'Monitoring') -ge $index -and [array]::IndexOf($stages, 'Monitoring') -le $stopIndex
-            $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -RestoreT1Monitoring:(-not $monitoringInRange))
-            & $addAll $started
-            if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
-                return $results.ToArray()
+        if ($stage -ne 'Preflight' -and -not $vmsReady) {
+            $vmsReady = $true
+            if ($null -ne $stoppedStart) {
+                $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart)
+                & $addAll $started
+                if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
+                    return $results.ToArray()
+                }
+            }
+            if ($checkT1Monitoring) {
+                $occasion = if ($null -ne $stoppedStart -and $stoppedStart.Vms.Contains('sqlvm01')) { 'the start' } else { 'the deployment' }
+                $results.Add((Invoke-DemoT1MonitoringCheck -Config $Config -Occasion $occasion))
             }
         }
         switch ($stage) {
@@ -674,7 +688,9 @@ function Invoke-DemoDeployment {
                 if ($context.T2Complete) {
                     $targets = @('T1', 'T2', 'T3')
                 }
-                & $addAll @(Test-DemoHubTelemetry -Config $Config -Target $targets -WaitMinutes $TelemetryWaitMinutes)
+                # A target whose telemetry didn't come gets its monitoring checked, and its telemetry once more, unless a
+                # stage is open, so the run isn't DONE anyway (Invoke-DemoTelemetryCheck; Phase 28 live finding).
+                & $addAll @(Invoke-DemoTelemetryCheck -Config $Config -Target $targets -WaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath -ProgressStepId 'Validation' -NoRecovery:([bool]$context.OpenStage))
                 # T1's AssociatedServices step must have converged: unified inventory lists only the engine (a Fail).
                 $results.Add((Test-DemoSqlVmAssociatedService -Config $Config -WaitMinutes 10 -ListedStatus 'Fail'))
                 $current = Get-DemoDeploymentState -Config $Config
@@ -697,15 +713,12 @@ function Invoke-DemoDeployment {
         $current = Get-DemoDeploymentState -Config $Config
         $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
         $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool](Get-DemoT4OffReason -Config $Config -State $current)) -SkipFabric:$SkipFabric
-        & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes)
+        & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
     }
 
     $all = $results.ToArray()
-    $manual = @($all | Where-Object { $_.status -eq 'Manual action required' })
-    $failed = @($all | Where-Object { $_.status -eq 'Fail' })
-    $steps = @($manual | ForEach-Object { '{0}: {1}' -f $_.checkId, $(if ($_.remediation) { $_.remediation } else { $_.message }) })
-    $summaryStatus = if ($failed.Count -gt 0) { 'Fail' } elseif ($manual.Count -gt 0) { 'Manual action required' } else { 'Pass' }
-    $summaryMessage = if ($manual.Count -gt 0) { ('{0} item(s) need you: {1}' -f $manual.Count, ($steps -join ' | ')) } elseif ($failed.Count -gt 0) { ('{0} check(s) failed.' -f $failed.Count) } else { 'Every stage that ran finished.' }
-    $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $summaryStatus -Message $summaryMessage -Evidence ([ordered]@{ manual = $steps; failed = @($failed | ForEach-Object { $_.checkId }) })))
+    # Phase 28 live finding (2026-10-30): what only a person can confirm is listed once each, apart from what needs you.
+    $summary = Get-DemoDeploySummary -Result $all -FinishedText 'Every stage that ran finished.'
+    $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $summary.Status -Message $summary.Message -Evidence $summary.Evidence))
     return $results.ToArray()
 }

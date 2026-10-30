@@ -268,6 +268,32 @@ Describe 'The guided stop''s steps' {
         $vault = InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -SignInWay 'keyVault' -SignInText 'It''s the secret archost01-admin in kv-dbhub.' }
         ($vault -join ' ') | Should -Match 'kv-dbhub'
     }
+
+    It 'tell the person what to do when the Azure Login window stays blank or Internet Explorer blocks it, on the console and the status page (the owner, 2026-10-30)' {
+        $steps = @(InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -HostUser 'demoadmin' -SignInWay 'clipboard' })
+        $azure = @($steps | Where-Object { $_ -like '5. On the Azure Extension for SQL Server page*' })
+        $azure.Count | Should -Be 1
+        $azure[0] | Should -Match 'If the Azure Login window stays blank, or Internet Explorer says content from https://login\.microsoftonline\.com is blocked, follow the dialog''s directions'
+        $azure[0] | Should -Match ([regex]::Escape('select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close. Then select "Use Azure Login" again. Repeat for any other sign-in site it names.'))
+        $azure[0] | Should -Match ([regex]::Escape('(Confirmed live on 2026-10-30; turning IE Enhanced Security Configuration off while setup is open doesn''t help.)'))
+        ($steps -join ' ') | Should -Not -Match 'WebView2'
+
+        # The status page's Waiting banner shows the same steps.
+        $model = New-TestModel
+        $model['guidedStop']['state'] = 'Ready'
+        $model['guidedStop']['deadlineAt'] = 1793000000 + 2700
+        $model['guidedStop']['credential'] = 'clipboard'
+        $banner = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
+        ($banner.Lines -join ' ') | Should -Match ([regex]::Escape('select Add..., then Add, to put the Microsoft sign-in page in Trusted sites'))
+
+        # The console's WAITING FOR YOU banner too.
+        $script:printed = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoConsoleBlock -MockWith { foreach ($line in @($Line)) { $script:printed.Add([string]$line) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAttention -MockWith { }
+        InModuleScope DbHubDemo { Show-DemoGuidedStopPrompt -Url 'https://portal.azure.com/#resource/x' -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(45)) -HostUser 'demoadmin' -SignInWay 'clipboard' -NoBrowser }
+        ($script:printed -join ' ') | Should -Match 'WAITING FOR YOU'
+        ($script:printed -join ' ') | Should -Match ([regex]::Escape('select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close.'))
+    }
 }
 
 Describe 'Show-DemoDeploymentProgress (status.ps1 -Watch)' {

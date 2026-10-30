@@ -531,6 +531,29 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:calls | Should -Not -Contain 'restore DEPLOY.T1.MONITORING the deployment'
     }
 
+    It 'checks T1''s missing telemetry again, after checking its plugin once, before the Telemetry step fails (Phase 28 live finding, 2026-10-30)' {
+        $script:telemetryPolls = 0
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith {
+            $script:telemetryPolls++
+            $script:calls.Add(('telemetry {0}' -f ($Target -join ',')))
+            foreach ($t in $Target) {
+                if ($t -eq 'T1' -and $script:telemetryPolls -eq 1) {
+                    New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'No performance telemetry from T1 (sqlvm01) in the last 60 minutes.' -Evidence ([ordered]@{ resourceId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01'; rows = 0 })
+                }
+                else {
+                    New-TestResult ('TELEMETRY.{0}' -f $t)
+                }
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:calls.Add(('restore {0} {1}' -f $CheckId, $Occasion)); New-TestResult 'DEPLOY.T1.MONITORING' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Telemetry') }
+        $outcome.Status | Should -Be 'Pass'
+        $outcome.Steps | Should -Be @('Telemetry')
+        @($script:calls | Where-Object { $_ -notmatch '^state' }) | Should -Be @('telemetry T1', 'restore DEPLOY.T1.MONITORING the deployment', 'telemetry T1')
+        @($outcome.Results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' }).status | Should -Be @('Pass')
+        $outcome.ReadyUtc['T1'] | Should -Not -BeNullOrEmpty
+    }
+
     It 'stops a track at a Fail and doesn''t run its later steps' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoBootstrapLoaderRun -MockWith { New-TestResult 'INFRA.BOOTSTRAP.LOADER_SQLVM01' 'Fail' }
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Artifacts', 'Bootstraps', 'T3') }
@@ -899,6 +922,39 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).message | Should -Match 'T4''s metrics'
     }
 
+    It 'checks T1''s monitoring plugin on a resumed run whose T1 track finished earlier, before the tracks, and checks it again before DONE''s missing T1 telemetry fails the run (Phase 28 live finding, 2026-10-30)' {
+        # Live: the resumed run ended NOT DONE on TELEMETRY.T1, because T1's plugin had stopped after a restart and the T1
+        # track, finished in an earlier run, never checked it.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Monitoring'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state.TrackFabric = 'Fabric'; $state }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:calls.Add(('restore {0} {1}' -f $CheckId, $Occasion)); New-TestResult 'DEPLOY.T1.MONITORING' }
+        $script:gatePolls = 0
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith {
+            $script:gatePolls++
+            $script:calls.Add('gate telemetry ' + ($Target -join ','))
+            foreach ($t in $Target) {
+                if ($t -eq 'T1' -and $script:gatePolls -eq 1) {
+                    New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'No performance telemetry from T1 (sqlvm01) in the last 60 minutes.' -Evidence ([ordered]@{ resourceId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01'; rows = 0 })
+                }
+                else {
+                    New-TestResult ('TELEMETRY.{0}' -f $t)
+                }
+            }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+        $calls = @($script:calls)
+        $firstTrack = [array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'track *' })
+        $calls[$firstTrack] | Should -Be 'track T2: T2,Telemetry'
+        @($calls | Where-Object { $_ -like 'track T1*' }) | Should -BeNullOrEmpty -Because 'T1''s track finished in an earlier run'
+        $calls.IndexOf('restore DEPLOY.T1.MONITORING the deployment') | Should -BeLessThan $firstTrack -Because 'the plugin is checked once the VMs run, before the tracks'
+        $gate = $calls.IndexOf('gate telemetry T1,T3')
+        $gate | Should -BeGreaterThan $firstTrack
+        $calls[($gate + 1)..($gate + 2)] | Should -Be @('restore DEPLOY.T1.MONITORING the deployment', 'gate telemetry T1')
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' -and $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+    }
+
     Context 'with VMs that were stopped (Phase 28 live finding, 2026-10-30)' {
         BeforeEach {
             # A rerun after the nightly auto-shutdown found the VMs deallocated, and its first Run Command failed.
@@ -1114,6 +1170,25 @@ Describe 'Invoke-DemoParallelDeployment' {
                     Remove-Job -Job $script:t2Job -Force -ErrorAction SilentlyContinue
                 }
             }
+        }
+
+        It 'checks T1''s monitoring plugin in its own process beside the tracks when T1''s track finished earlier, and collects its result (Phase 28 live finding, 2026-10-30)' {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Monitoring'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state.TrackFabric = 'Fabric'; $state }
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoT1MonitoringJob -MockWith {
+                $script:calls.Add(('monitoring job occasion={0} handoff={1}' -f $Occasion, [bool]$HandoffPath))
+                Start-ThreadJob -Name 'dbhub-t1-monitoring' -ScriptBlock { }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Receive-DemoDeploymentTrackOutput -ParameterFilter { $Job.Name -eq 'dbhub-t1-monitoring' } -MockWith {
+                [pscustomobject]@{ Results = @(New-TestResult 'DEPLOY.T1.MONITORING'); Summary = $null }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT1MonitoringCheck -MockWith { throw 'the check runs in its own process, so the guided stop''s prompt never waits for it' }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -AutoResume })
+            $calls = @($script:calls)
+            $calls | Should -Contain 'monitoring job occasion=the deployment handoff=True'
+            $calls.IndexOf('monitoring job occasion=the deployment handoff=True') | Should -BeGreaterThan $calls.IndexOf('job T2 delay=0 earlyT2=False bundle=False') -Because 'the tracks start first'
+            @($results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' }).status | Should -Be @('Pass')
+            Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoT1MonitoringJob -Times 1 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT1MonitoringCheck -Times 0 -Exactly
         }
 
         It 'runs the policy inventory alongside the deployment only with networkMode private, and its results replace preflight''s placeholders (Phase 28; review finding 7)' {

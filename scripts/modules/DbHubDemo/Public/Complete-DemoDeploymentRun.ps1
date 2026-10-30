@@ -100,9 +100,15 @@ function Complete-DemoDeploymentRun {
     $outcome | Add-Member -NotePropertyName 'Minutes' -NotePropertyValue $minutes -Force
     if ($Run.ProgressPath) {
         $runState = if ($outcome.Kind -eq 'Done') { 'Done' } else { 'NotDone' }
-        $reason = (@([string]$outcome.Reason) + @(Get-DemoMemberValue -InputObject $outcome -Name 'Notes') | Where-Object { $_ }) -join ' '
+        # The notes are an array, which Get-DemoMemberValue returns whole: assigned first, then each note is its own item,
+        # not "System.String[]" (Phase 28 live finding, 2026-10-30).
+        $notes = Get-DemoMemberValue -InputObject $outcome -Name 'Notes'
+        $reason = (@([string]$outcome.Reason) + @($notes) | Where-Object { $_ } | ForEach-Object { [string]$_ }) -join ' '
         Set-DemoProgressValue -Path $Run.ProgressPath -Section 'run' -Value ([ordered]@{ state = $runState; endedAt = (Get-DemoUnixTime); reason = $reason; next = [string]$outcome.Next; nextCommand = [string]$outcome.NextCommand; exitCode = [int]$outcome.ExitCode })
         Set-DemoProgressValue -Path $Run.ProgressPath -Section 'optional' -Value @($outcome.Optional)
+        # What only a person can confirm, once each, which never kept the run from DONE (Phase 28 live finding).
+        $confirmValue = Get-DemoMemberValue -InputObject $outcome -Name 'Confirm'
+        Set-DemoProgressValue -Path $Run.ProgressPath -Section 'confirm' -Value @(@($confirmValue) | Where-Object { $null -ne $_ } | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'text') })
         if ($outcome.Kind -eq 'Done') {
             Set-DemoProgressStep -Path $Run.ProgressPath -Id 'Validation' -State 'Done' -Message ('Done in {0} minutes.' -f $minutes)
         }

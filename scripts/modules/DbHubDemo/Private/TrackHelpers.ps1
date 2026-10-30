@@ -739,8 +739,10 @@ function Invoke-DemoDeploymentTrack {
         return [bool]$wait.Settled
     }
     $telemetry = {
-        param([string[]] $Targets)
-        $checks = @(Test-DemoHubTelemetry -Config $Config -Target $Targets -WaitMinutes ([int](& $option 'TelemetryWaitMinutes' 15)))
+        param([string[]] $Targets, [string] $StepId = '')
+        # A target whose data didn't come gets its monitoring checked, and its telemetry once more, before the step fails
+        # (Invoke-DemoTelemetryCheck; Phase 28 live finding, 2026-10-30).
+        $checks = @(Invoke-DemoTelemetryCheck -Config $Config -Target $Targets -WaitMinutes ([int](& $option 'TelemetryWaitMinutes' 15)) -ProgressPath $progress -ProgressStepId $StepId)
         & $addAll $checks
         foreach ($target in $Targets) {
             if (@($checks | Where-Object { [string]$_.checkId -eq ('TELEMETRY.{0}' -f $target) -and [string]$_.status -eq 'Pass' }).Count -gt 0) {
@@ -955,7 +957,7 @@ function Invoke-DemoDeploymentTrack {
                 }
                 'T1/Telemetry' {
                     $targets = if ('T3' -in $done) { @('T1', 'T3') } else { @('T1') }
-                    if (-not (& $telemetry $targets)) {
+                    if (-not (& $telemetry $targets 'T1.Telemetry')) {
                         $outcome = 'Fail'
                     }
                 }
@@ -1163,7 +1165,7 @@ function Invoke-DemoDeploymentTrack {
                     $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy'))
                 }
                 'T2/Telemetry' {
-                    if (-not (& $telemetry @('T2'))) {
+                    if (-not (& $telemetry @('T2') 'T2.Telemetry')) {
                         $outcome = 'Fail'
                     }
                 }

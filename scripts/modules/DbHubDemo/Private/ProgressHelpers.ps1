@@ -373,6 +373,7 @@ function New-DemoProgressModel {
         run           = [ordered]@{ state = 'Running'; endedAt = 0; reason = ''; next = ''; nextCommand = ''; exitCode = $null; diagnostics = '' }
         guidedStop    = [ordered]@{ state = $GuidedStop; message = ''; url = ''; deadlineAt = 0; promptedAt = 0; hostVm = 'archost01'; hostUser = ''; credential = ''; credentialText = '' }
         optional      = @()
+        confirm       = @()
         tracks        = $tracks.ToArray()
     }
 }
@@ -677,7 +678,8 @@ function Set-DemoProgressStopped {
 }
 
 function Set-DemoProgressValue {
-    # Merges -Value into one section of the progress model: run, guidedStop, or expect; or replaces optional. Internal.
+    # Merges -Value into one section of the progress model: run, guidedStop, or expect; or replaces optional, or confirm
+    # (the lines DONE lists under "Please confirm"; Phase 28 live finding). Internal.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
     [CmdletBinding()]
     param(
@@ -685,10 +687,11 @@ function Set-DemoProgressValue {
         [string] $Path,
 
         [Parameter(Mandatory)]
-        [ValidateSet('run', 'guidedStop', 'expect', 'optional')]
+        [ValidateSet('run', 'guidedStop', 'expect', 'optional', 'confirm')]
         [string] $Section,
 
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [object] $Value
     )
 
@@ -708,10 +711,15 @@ function Set-DemoProgressValue {
                 [ordered]@{ name = Protect-DemoProgressText -Text ([string]$entry['name']); message = Protect-DemoProgressText -Text ([string]$entry['message']) -MaxLength 600; howTo = Protect-DemoProgressText -Text ([string]$entry['howTo']) -MaxLength 1200 }
             })
     }
+    elseif ($Section -eq 'confirm') {
+        $clean = @(foreach ($entry in @($Value | Where-Object { $_ })) {
+                Protect-DemoProgressText -Text ([string]$entry) -MaxLength 1200
+            })
+    }
     Update-DemoProgress -Path $Path -Data @{ Section = $Section; Value = $clean } -Action {
         param($Model, $Change)
-        if ($Change['Section'] -eq 'optional') {
-            $Model['optional'] = @($Change['Value'])
+        if ($Change['Section'] -in 'optional', 'confirm') {
+            $Model[$Change['Section']] = @($Change['Value'])
             return
         }
         foreach ($key in $Change['Value'].Keys) {
@@ -830,7 +838,7 @@ function Get-DemoGuidedStopInstruction {
         ('2. {0} opens Virtual Machine Connection to {1} by itself. {1} is already signed in, and SQL Server setup is open and pre-filled.' -f $HostVm, $GuestName)
         '3. On the Edition page, select "Use pay-as-you-go billing through Microsoft Azure", then Standard. Select Next.'
         '4. Accept the license terms, then select Next.'
-        '5. On the Azure Extension for SQL Server page, select "Use Azure Login" and sign in with your own Azure account. Never enter a service principal secret.'
+        '5. On the Azure Extension for SQL Server page, select "Use Azure Login" and sign in with your own Azure account. Never enter a service principal secret. If the Azure Login window stays blank, or Internet Explorer says content from https://login.microsoftonline.com is blocked, follow the dialog''s directions: select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close. Then select "Use Azure Login" again. Repeat for any other sign-in site it names. (Confirmed live on 2026-10-30; turning IE Enhanced Security Configuration off while setup is open doesn''t help.)'
         '6. Select Next on the pre-filled pages, then Install (about 10 to 15 minutes). When setup says Complete, select Close.'
         ('7. Close the Bastion tab. deploy.ps1 checks what was installed (Standard, the default instance, the Azure extension) and continues on its own; if something''s wrong, the host''s message here says how to fix it.')
     )
@@ -868,6 +876,14 @@ function Get-DemoProgressBanner {
         $lines.Add('The demo is complete.')
         if ([string]$run['reason']) {
             $lines.Add([string]$run['reason'])
+        }
+        # What only a person can confirm (Phase 28 live finding): a model from before it has no confirm section.
+        $confirm = @(@($Model['confirm']) | Where-Object { $_ })
+        if ($confirm.Count -gt 0) {
+            $lines.Add('Please confirm (a rerun can''t check these, and none of them keeps the demo from being done):')
+            foreach ($entry in $confirm) {
+                $lines.Add(('- {0}' -f [string]$entry))
+            }
         }
         $lines.Add('Where to look: open Database Hub in the Fabric portal and look at Estate and Performance; then start an incident (./scripts/demo-control.ps1) and investigate it with the Database Agent.')
         foreach ($entry in @($Model['optional'])) {

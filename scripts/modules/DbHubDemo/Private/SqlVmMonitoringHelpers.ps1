@@ -155,6 +155,10 @@ function Restore-DemoSqlVmMonitoringPlugin {
     Live (2026-10-27, Phase 25d): a deployment's template run left the plugin NotRunning too (at 14:11 UTC, still
     at 14:45), while the deployment's Monitoring step only waited for it, so deploy.ps1 calls this as well
     (-CheckId DEPLOY.T1.MONITORING, -Occasion 'the deployment') when that wait ends without Running and OK.
+    Live (2026-10-30, Phase 28): the plugin, Running after start-demo.ps1, was NotRunning again less than 90 minutes
+    later, so deploy.ps1 checks it on every run (Invoke-DemoT1MonitoringCheck). With -ProgressPath, the status page's
+    -ProgressStepId says so while the service restarts: "T1's monitoring stopped after a restart; restarting it, no
+    action needed".
     Sources: https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm
     and https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/sql-agent-extension-troubleshoot-known-issues
     (checked 2026-10-22).
@@ -180,7 +184,12 @@ function Restore-DemoSqlVmMonitoringPlugin {
         [string] $CheckId = 'START.T1.MONITORING',
 
         [ValidateSet('the start', 'the deployment')]
-        [string] $Occasion = 'the start'
+        [string] $Occasion = 'the start',
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [string] $ProgressStepId = 'T1.Monitoring'
     )
 
     $checkId = $CheckId
@@ -229,6 +238,7 @@ Restart-Service -Name '$service' -Force
 "@
     $before = if ($reported) { $state.Plugin.Message } else { 'no plugin status after {0:N0} seconds' -f $settledSeconds }
     Write-DemoLog -Message ('{0}''s monitoring plugin reports {1}; restarting the SQL IaaS Agent service so it starts again.' -f $VmName, $before)
+    Set-DemoProgressStep -Path $ProgressPath -Id $ProgressStepId -State 'Running' -AzureSide -Message 'T1''s monitoring stopped after a restart; restarting it, no action needed.'
     $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-MonitoringRestart' -Script $script -TimeoutSeconds 300
     $evidence['restarted'] = [bool]$run.Succeeded
     if (-not $run.Succeeded) {
@@ -249,6 +259,44 @@ Restart-Service -Name '$service' -Force
     $evidence['after'] = $state.Plugin.Message
     $after = if ($state.Plugin.Message) { $state.Plugin.Message } else { 'no plugin status' }
     return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Warning' -Message ('{0}''s monitoring plugin still reports {1} {2} minutes after the SQL IaaS Agent service was restarted, so T1 may send no performance telemetry.' -f $VmName, $after, $WaitMinutes) -Remediation './scripts/configure-monitoring.ps1 -WaitMinutes 15 checks it again; ./scripts/validate.ps1 -Area Telemetry shows whether data arrives.' -Evidence $evidence -DocUrl $docUrl)
+}
+
+function Invoke-DemoT1MonitoringCheck {
+    <#
+    .SYNOPSIS
+    T1's monitoring plugin, checked by a deploy.ps1 run that has no T1 Monitoring step of its own, and before a NOT DONE
+    for T1's telemetry (Phase 28 live finding, 2026-10-30): Restore-DemoSqlVmMonitoringPlugin as DEPLOY.T1.MONITORING,
+    with the status page's T1 Monitoring step. Never throws: a check that can't run is a Warning. Internal.
+
+    .DESCRIPTION
+    Live: start-demo.ps1 found the plugin Running at 07:47; by 09:12 the SQL IaaS Agent extension reported
+    DatabaseMonitorArcPlugin {"State":"NotRunning"}, and the resumed deploy.ps1, whose T1 track had finished in an earlier
+    run, ended NOT DONE on TELEMETRY.T1. Restarting the agent's service brought the plugin to Running and OK in 161
+    seconds.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateSet('the start', 'the deployment')]
+        [string] $Occasion = 'the deployment',
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    $stepId = 'T1.Monitoring'
+    Set-DemoProgressStep -Path $ProgressPath -Id $stepId -State 'Running' -AzureSide -Message 'Checking T1''s monitoring plugin, which can stop after a restart: no action needed.'
+    try {
+        $result = Restore-DemoSqlVmMonitoringPlugin -Config $Config -CheckId 'DEPLOY.T1.MONITORING' -Occasion $Occasion -ProgressPath $ProgressPath -ProgressStepId $stepId
+    }
+    catch {
+        $result = New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message ('T1''s monitoring plugin couldn''t be checked: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation './scripts/start-demo.ps1 checks it, and restarts the SQL IaaS Agent service when the plugin isn''t running; ./scripts/validate.ps1 -Area Telemetry shows whether T1''s data arrives.' -DocUrl 'https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm'
+    }
+    Set-DemoProgressStep -Path $ProgressPath -Id $stepId -Status ([string]$result.status) -Message ([string]$result.message)
+    return $result
 }
 function Test-DemoSqlVmMonitoringStuck {
     <#

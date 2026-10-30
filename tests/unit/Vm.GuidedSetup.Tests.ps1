@@ -456,14 +456,19 @@ Describe 'Setup''s Azure sign-in: prepared before anyone is asked, restored afte
             $script:order | Should -Be @('restore')
         }
 
-        It 'tells the person what to do when Internet Explorer still blocks the sign-in, and blames no missing WebView2' {
+        It 'tells the person what to do when the sign-in stays blank or Internet Explorer still blocks it, and blames no missing WebView2' {
+            # The owner (2026-10-30): the dialog's own directions, Add... then Add, got past it; turning the setting off
+            # while setup was open didn't.
             $steps = (Get-DemoGuidedSetupStepText -GuestName 'arcsql01') -join ' '
-            $steps | Should -Match 'Add\.\.\. for each site it names'
             $instructions = (Get-DemoPaygWizardInstruction -GuestName 'arcsql01') -join ' '
-            $instructions | Should -Match 'Add\.\.\. for each site it names, then Use Azure Login again'
-            $instructions | Should -Match 'Server Manager > Local Server'
-            $instructions | Should -Match 'a change made while setup is open doesn''t reach it'
-            $instructions | Should -Not -Match 'WebView2 runtime is missing'
+            foreach ($text in $steps, $instructions) {
+                $text | Should -Match 'If the Azure Login window (still )?stays blank, or Internet Explorer says content from https://login\.microsoftonline\.com is blocked'
+                $text | Should -Match ([regex]::Escape('select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close.'))
+                $text | Should -Match 'Then select "?Use Azure Login"? again\. Repeat for any other sign-in site it names\.'
+                $text | Should -Match 'Confirmed live on 2026-10-30; turning IE Enhanced Security Configuration off while setup is open doesn''t help'
+                $text | Should -Not -Match 'WebView2 runtime is missing'
+            }
+            $instructions | Should -Match 'adds the Microsoft sign-in sites to Trusted sites, and undoes both afterward'
         }
 
         It 'reports the preparation in the health summary deploy.ps1 reads' {

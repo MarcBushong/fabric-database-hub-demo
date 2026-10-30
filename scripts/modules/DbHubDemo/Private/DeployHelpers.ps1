@@ -519,7 +519,51 @@ function Invoke-DemoPowerBIStage {
     if ($CheckModelData) {
         $argument['CheckModelData'] = $true
     }
-    return @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.POWERBI' -Argument $argument)
+    $records = @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.POWERBI' -Argument $argument)
+    return @(Merge-DemoBlankMeasureResult -Result $records)
+}
+
+function Merge-DemoBlankMeasureResult {
+    <#
+    .SYNOPSIS
+    deploy.ps1's view of the history model's data check (Phase 28 live finding, 2026-10-30): before
+    NB_DatabaseHub_LiveActivity has saved any snapshot (FABRIC.SEMANTICMODEL.ROWS is the Warning that no history is
+    written yet), every measure is blank, and the about 40 FABRIC.SEMANTICMODEL.MEASURE.* Warnings become one,
+    FABRIC.SEMANTICMODEL.MEASURES, which says that's expected right after a first deployment and keeps their check IDs
+    in its evidence. A measure that fails, or returns a value, stays as it is; with history written, nothing changes.
+    configure-powerbi.ps1 itself still reports every measure. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $all = @($Result | Where-Object { $null -ne $_ })
+    $rows = @($all | Where-Object { [string]$_.checkId -eq 'FABRIC.SEMANTICMODEL.ROWS' }) | Select-Object -Last 1
+    if ($null -eq $rows -or [string]$rows.status -ne 'Warning') {
+        return $all
+    }
+    $blank = @($all | Where-Object { [string]$_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.*' -and [string]$_.status -eq 'Warning' })
+    if ($blank.Count -lt 2) {
+        return $all
+    }
+    $ids = @($blank | ForEach-Object { [string]$_.checkId })
+    $merged = New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURES' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The history report is empty until NB_DatabaseHub_LiveActivity saves its first snapshots; that''s expected right after a first deployment ({0} measures are blank for now).' -f $blank.Count) -Evidence ([ordered]@{ blankMeasures = $ids }) -Remediation 'Nothing to do now: ./scripts/stop-demo.ps1 -SaveHistory (or ./scripts/configure-fabric.ps1 -RunLiveActivity) runs NB_DatabaseHub_LiveActivity, which saves the snapshots the report shows; ./scripts/configure-powerbi.ps1 -CheckModelData then checks every measure again.' -DocUrl 'https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group'
+    $kept = [System.Collections.Generic.List[object]]::new()
+    $placed = $false
+    foreach ($item in $all) {
+        if ([string]$item.checkId -in $ids -and [string]$item.status -eq 'Warning') {
+            if (-not $placed) {
+                $kept.Add($merged)
+                $placed = $true
+            }
+            continue
+        }
+        $kept.Add($item)
+    }
+    return $kept.ToArray()
 }
 
 function Invoke-DemoFabricAppStage {

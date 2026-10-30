@@ -416,6 +416,46 @@ Describe 'Invoke-DemoDeployment' {
         $script:order[0..6] | Should -Be @('Request:sqlvm01', 'Request:archost01', 'Running:sqlvm01', 'Running:archost01', 'SourceRelease', 'T1Monitoring', 'Arc')
     }
 
+    It 'checks T1''s monitoring plugin on a run without a Monitoring stage, whether or not a VM was stopped, before the first stage that needs the VMs (Phase 28 live finding, 2026-10-30)' {
+        # Live: start-demo.ps1 found the plugin running at 07:47; by 09:12 it was NotRunning, and a resumed run whose
+        # Monitoring stage had finished earlier never noticed.
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:order.Add(('T1Monitoring:{0}:{1}' -f $CheckId, $Occasion)); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        $script:state = New-TestState @{ Stage = 'Monitoring'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+        $results = @(Invoke-DemoDeployment -Config $config -Resume)
+        $script:order[0..1] | Should -Be @('T1Monitoring:DEPLOY.T1.MONITORING:the deployment', 'Arc')
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' }).status | Should -Be 'Pass'
+
+        # A run with its own Monitoring stage leaves it to that stage.
+        $script:order.Clear()
+        $script:state = New-TestState
+        Invoke-DemoDeployment -Config $config | Out-Null
+        @($script:order | Where-Object { $_ -like 'T1Monitoring*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'checks T1''s plugin once, and T1''s telemetry again, before its validation fails for missing T1 data, then runs DONE''s checks (Phase 28 live finding, 2026-10-30)' {
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:order.Add('T1Monitoring'); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        $script:telemetryPolls = 0
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith {
+            $script:telemetryPolls++
+            $script:order.Add('Telemetry:' + ($Target -join ','))
+            foreach ($t in $Target) {
+                if ($t -eq 'T1' -and $script:telemetryPolls -eq 1) {
+                    New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'No performance telemetry from T1 (sqlvm01) in the last 60 minutes.' -Evidence ([ordered]@{ resourceId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01'; rows = 0 })
+                }
+                else {
+                    New-TestResult ('TELEMETRY.{0}' -f $t) 'Pass' 'hub' $t
+                }
+            }
+        }
+        $script:state = New-TestState @{ Stage = 'Fabric' }
+        $results = @(Invoke-DemoDeployment -Config $config -Resume)
+        $validation = $script:order.IndexOf('Telemetry:T1,T2,T3')
+        $validation | Should -BeGreaterOrEqual 0
+        $script:order[($validation + 1)..($validation + 3)] | Should -Be @('T1Monitoring', 'Telemetry:T1', 'Inventory:Fail')
+        $script:order | Should -Contain 'DoneGate' -Because 'nothing failed once T1''s data came'
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' }).status | Should -Be @('Pass')
+    }
+
     It 'says what it started keeps running when preflight then fails, and deploys nothing (Phase 28 live finding)' {
         Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $true }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Running:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
@@ -1768,7 +1808,7 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $request.Needed | Should -BeFalse
         $script:calls | Should -Be @('t4 0') -Because 'Invoke-DemoT4PowerAction only reads a T4 that''s Ready'
         $script:page | Should -Be @('StartVms|Skipped||Not needed: nothing was stopped.')
-        @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request -RestoreT1Monitoring }) | Should -BeNullOrEmpty
+        @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request }) | Should -BeNullOrEmpty
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -Times 0 -Exactly
     }
 
@@ -1790,7 +1830,7 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $script:page[-1] | Should -Match '^StartVms\|\|Pass\|Started sqlvm01 and archost01'
     }
 
-    It 'restores T1''s monitoring plugin when no Monitoring step runs, starts a stopped T4 and waits for it' {
+    It 'starts a stopped T4 and waits for it, and leaves T1''s monitoring plugin to the caller''s check on every run (Phase 28 live finding)' {
         $withT4 = New-TestConfig -WithT4
         $script:power = @{ sqlvm01 = 'PowerState/stopped'; archost01 = 'PowerState/running' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith {
@@ -1801,9 +1841,10 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $request = InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
         $request.Names | Should -Be @('sqlvm01 (stopped)', 'T4 (stopped)')
         $request.Requested | Should -Be @('sqlvm01', 'T4')
-        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request -RestoreT1Monitoring })
-        $script:calls | Should -Be @('request sqlvm01', 't4 0 requested=False', 'running sqlvm01 requested=True', 't1 monitoring', 't4 15 requested=True')
-        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' }).status | Should -Be 'Pass'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        # The plugin can stop hours after a start, so deploy.ps1 checks it on every run, not only after it started sqlvm01.
+        $script:calls | Should -Be @('request sqlvm01', 't4 0 requested=False', 'running sqlvm01 requested=True', 't4 15 requested=True')
+        $results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' } | Should -BeNullOrEmpty
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).message | Should -Match 'T4 is Ready'
     }
 
@@ -2135,5 +2176,27 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         $result.status | Should -Be 'Not selected'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'says on the status page, as it restarts the agent, that T1''s monitoring stopped and is restarting with no action needed (Phase 28 live finding)' {
+        foreach ($state in 'NotRunning', 'Running') {
+            $script:pluginStates.Enqueue($state)
+        }
+        $script:page = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:page.Add(('{0}|{1}|{2}|{3}|{4}' -f (@($PesterBoundParameters['Id']) -join ','), $PesterBoundParameters['State'], $PesterBoundParameters['Status'], [bool]$PesterBoundParameters['AzureSide'], $PesterBoundParameters['Message'])) }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -ProgressPath 'progress.json' } $config
+        $result.status | Should -Be 'Pass'
+        $script:page | Should -Be @('T1.Monitoring|Running||True|T1''s monitoring stopped after a restart; restarting it, no action needed.')
+        $script:readsAtRestart | Should -Be 1 -Because 'the message comes just before the restart'
+
+        # The check deploy.ps1 runs on every run: the step shows it, and a failure is a Warning, never an exception.
+        $script:page.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { throw 'The VM isn''t running (deallocated or stopped).' }
+        $check = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoT1MonitoringCheck -Config $c -ProgressPath 'progress.json' } $config
+        $check.checkId | Should -Be 'DEPLOY.T1.MONITORING'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Match 'T1''s monitoring plugin couldn''t be checked: The VM isn''t running'
+        $script:page[0] | Should -Be 'T1.Monitoring|Running||True|Checking T1''s monitoring plugin, which can stop after a restart: no action needed.'
+        $script:page[-1] | Should -Match '^T1\.Monitoring\|\|Warning\|False\|T1''s monitoring plugin couldn''t be checked'
     }
 }

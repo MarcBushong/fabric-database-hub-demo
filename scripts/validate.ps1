@@ -52,7 +52,7 @@ The environment's deploymentId. Read from the resource group's tag when omitted;
 to -Area Teardown so resources tagged with it are found.
 
 .PARAMETER FabricAdmin
-You're a Fabric administrator, so the Hub tenant setting (P4) is read through the Fabric admin API.
+Accepted for compatibility: since Phase 28 the Hub tenant setting (P4) is read through the Fabric admin API on every run.
 
 .PARAMETER SkipPolicyInventory
 Skip the Preflight area's policy inventory, which can take a few minutes in tenants with large policy sets.

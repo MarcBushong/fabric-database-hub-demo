@@ -158,7 +158,8 @@ function Get-DemoOptionalItem {
     $items = [System.Collections.Generic.List[object]]::new()
     $open = @($Result | Where-Object { $null -ne $_ -and [string]$_.status -in 'Fail', 'Manual action required' })
     $app = Get-DemoInsightsAppSummary -Result $Result
-    if ($null -ne $app -and $app.Status -eq 'Manual action required') {
+    # A deployed app that only waits for its browser check is under "Please confirm" instead (Get-DemoConfirmItem).
+    if ($null -ne $app -and $app.Status -eq 'Manual action required' -and -not [bool](Get-DemoMemberValue -InputObject $app -Name 'ConfirmOnly')) {
         $items.Add([ordered]@{
                 name    = $(if ($app.Deployed) { 'the Insights app' } else { 'the Insights app (Fabric Apps preview)' })
                 message = $app.Reason
@@ -239,10 +240,11 @@ function Get-DemoInsightsAppSummary {
         return [pscustomobject]@{ State = $(if ($deployed) { 'Done' } else { 'Skipped' }); Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('Optional. {0} {1}' -f $reason, $howTo); Deployed = $deployed }
     }
     if ($open.Count -gt 0) {
-        # Deployed and checked; a person confirms it once in the browser.
+        # Deployed and checked; a person confirms it once in the browser, which a rerun can't do: listed under "Please
+        # confirm", never as optional work left (Phase 28 live finding, 2026-10-30).
         $reason = 'It''s deployed: {0}' -f ([string]$open[0].message).TrimEnd()
         $howTo = ([string](Get-DemoMemberValue -InputObject $open[0] -Name 'remediation')).Trim()
-        return [pscustomobject]@{ State = 'Done'; Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('Optional. {0} {1}' -f $reason, $howTo).TrimEnd(); Deployed = $true }
+        return [pscustomobject]@{ State = 'Done'; Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('Optional. {0} {1}' -f $reason, $howTo).TrimEnd(); Deployed = $true; ConfirmOnly = $true }
     }
     if ($deployed) {
         # A Not selected record beside a deploy that passed (the workspace passed in, for example) changes nothing.
@@ -272,6 +274,186 @@ function Test-DemoOptionalResult {
     }
     $id = [string]$Result.checkId
     return ((Test-DemoInsightsAppRecord -Result $Result) -or ($id -like 'FABRIC.SEMANTICMODEL.*' -and [string]$Result.status -eq 'Manual action required'))
+}
+
+function Test-DemoTenantSettingRead {
+    <#
+    .SYNOPSIS
+    How a P4 result (PREFLIGHT.P4.HUBSETTING or FABRIC.P4.HUBSETTING) read the Hub tenant setting, from its evidence
+    (Test-DemoFabricHubSetting): Disabled when the Fabric admin API answered and the setting is off, Read when it
+    answered with the setting on, or Unread for everything else: no token, HTTP 401 or 403, not found, an older result
+    without evidence (Phase 28 live finding, 2026-10-30). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $Result
+    )
+
+    $evidence = Get-DemoMemberValue -InputObject $Result -Name 'evidence'
+    $checked = [string](Get-DemoMemberValue -InputObject $evidence -Name 'checkedThroughApi') -eq 'True'
+    $settingRead = Get-DemoMemberValue -InputObject $evidence -Name 'settingRead'
+    $enabled = Get-DemoMemberValue -InputObject $evidence -Name 'enabled'
+    if (-not $checked -or ($null -ne $settingRead -and [string]$settingRead -ne 'True') -or $null -eq $enabled -or [string]$enabled -notin 'True', 'False') {
+        return 'Unread'
+    }
+    if ([string]$enabled -eq 'False') {
+        return 'Disabled'
+    }
+    return 'Read'
+}
+
+function Test-DemoConfirmOnlyResult {
+    <#
+    .SYNOPSIS
+    True for a Manual action required result that only a person can confirm, which a rerun can't resolve, so it never
+    keeps deploy.ps1 from DONE (Phase 28 live finding, 2026-10-30: three such reminders made a run whose every DONE
+    requirement passed end NOT DONE, with a rerun as the next step). Get-DemoConfirmItem lists them under "Please
+    confirm". Internal.
+
+    .DESCRIPTION
+    - The Database Hub tenant setting (P4: PREFLIGHT.P4.HUBSETTING, FABRIC.P4.HUBSETTING) that wasn't read (no token, not
+      a Fabric administrator, not found): decided from its evidence (Test-DemoTenantSettingRead), so a setting the Fabric
+      admin API read as disabled still blocks DONE, whichever check ID read it.
+    - FABRIC.P5.CAPACITY on an Active capacity whose SKU the check doesn't recognize (a Trial: its SKU name isn't
+      documented).
+    - HUB.PRESENTER.*: with assignRoles false (the default, ADR 0008), an administrator grants the presenters' roles.
+    - FABRIC.APP.BROWSER: the optional Insights app, confirmed once in the browser.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $Result
+    )
+
+    if ($null -eq $Result -or [string](Get-DemoMemberValue -InputObject $Result -Name 'status') -ne 'Manual action required') {
+        return $false
+    }
+    $id = [string]$Result.checkId
+    if ($id -in 'PREFLIGHT.P4.HUBSETTING', 'FABRIC.P4.HUBSETTING') {
+        return ((Test-DemoTenantSettingRead -Result $Result) -ne 'Disabled')
+    }
+    if ($id -eq 'FABRIC.P5.CAPACITY') {
+        $evidence = Get-DemoMemberValue -InputObject $Result -Name 'evidence'
+        return ([string](Get-DemoMemberValue -InputObject $evidence -Name 'state') -eq 'Active' -and [bool][string](Get-DemoMemberValue -InputObject $evidence -Name 'sku'))
+    }
+    return ($id -like 'HUB.PRESENTER.*' -or $id -eq 'FABRIC.APP.BROWSER')
+}
+
+function Get-DemoConfirmItem {
+    <#
+    .SYNOPSIS
+    What deploy.ps1's ending lists under "Please confirm" (Phase 28 live finding, 2026-10-30): one line per item a
+    person confirms (Test-DemoConfirmOnlyResult), each once. The Hub tenant setting is one line whichever check reported
+    it, and none once a check read it: none when it's on for the organization, the Warning's groups when it's on only
+    for groups, and none when it's off, which blocks DONE instead. Returns Key, CheckId, and Text for each. Pure.
+    Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $all = @($Result | Where-Object { $null -ne $_ })
+    $items = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $add = {
+        param([string] $Key, [string] $CheckId, [string] $Text)
+        if ($Text -and $seen.Add($Key)) {
+            $items.Add([ordered]@{ key = $Key; checkId = $CheckId; text = (ConvertTo-DemoPlainText -Value $Text) })
+        }
+    }
+    # P4: a setting a check read decides; otherwise the latest reminder, which says it couldn't be checked and why.
+    $hub = @($all | Where-Object { [string]$_.checkId -in 'PREFLIGHT.P4.HUBSETTING', 'FABRIC.P4.HUBSETTING' })
+    $readHub = @($hub | Where-Object { (Test-DemoTenantSettingRead -Result $_) -ne 'Unread' })
+    if ($readHub.Count -gt 0) {
+        $grouped = @($readHub | Where-Object { [string]$_.status -eq 'Warning' } | Select-Object -Last 1)
+        if ($grouped.Count -gt 0 -and @($readHub | Where-Object { (Test-DemoTenantSettingRead -Result $_) -eq 'Disabled' }).Count -eq 0) {
+            & $add 'P4' ([string]$grouped[0].checkId) ([string]$grouped[0].message)
+        }
+    }
+    else {
+        $unread = @($hub | Where-Object { Test-DemoConfirmOnlyResult -Result $_ } | Select-Object -Last 1)
+        if ($unread.Count -gt 0) {
+            & $add 'P4' ([string]$unread[0].checkId) ([string]$unread[0].message)
+        }
+    }
+    foreach ($item in @($all | Where-Object { [string]$_.checkId -notin 'PREFLIGHT.P4.HUBSETTING', 'FABRIC.P4.HUBSETTING', 'FABRIC.APP.BROWSER' -and (Test-DemoConfirmOnlyResult -Result $_) })) {
+        $id = [string]$item.checkId
+        $text = if ($id -eq 'FABRIC.P5.CAPACITY') { [string](Get-DemoMemberValue -InputObject $item -Name 'remediation') } else { '{0} The commands are in its result ({1}).' -f ([string]$item.message).TrimEnd(), $id }
+        & $add $id $id $text
+    }
+    $app = Get-DemoInsightsAppSummary -Result $all
+    if ($null -ne $app -and [bool](Get-DemoMemberValue -InputObject $app -Name 'ConfirmOnly')) {
+        & $add 'FABRIC.APP.BROWSER' 'FABRIC.APP.BROWSER' ('The optional Insights app is deployed; confirm it once in the browser. {0}' -f [string]$app.HowTo)
+    }
+    return $items.ToArray()
+}
+
+function ConvertTo-DemoPlainText {
+    # One line of text from any value: an array's items joined with spaces, never "System.String[]" (Phase 28 live
+    # finding, 2026-10-30), and whitespace collapsed. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $Value
+    )
+
+    if ($null -eq $Value) {
+        return ''
+    }
+    $parts = if ($Value -is [string]) { @($Value) } elseif ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [System.Collections.IDictionary]) { @($Value | ForEach-Object { ConvertTo-DemoPlainText -Value $_ }) } else { @([string]$Value) }
+    return ((@($parts | Where-Object { $_ }) -join ' ') -replace '\s+', ' ').Trim()
+}
+
+function Get-DemoDeploySummary {
+    <#
+    .SYNOPSIS
+    DEPLOY.SUMMARY's status, message, and evidence for both deployment paths (Phase 28 live finding, 2026-10-30): Fail
+    with the failed checks; Manual action required with the items a person or a rerun acts on, each with its fix; and
+    the confirm-only items (Get-DemoConfirmItem), each once, saying that none of them keeps the run from DONE. Every
+    text is one plain line (ConvertTo-DemoPlainText). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [string] $FinishedText = 'Every stage that ran finished.'
+    )
+
+    $all = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' })
+    $failed = @($all | Where-Object { [string]$_.status -eq 'Fail' })
+    $manual = @($all | Where-Object { [string]$_.status -eq 'Manual action required' })
+    $actionable = @($manual | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_) -and -not (Test-DemoOptionalResult -Result $_) })
+    $steps = @($actionable | ForEach-Object {
+            $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $_ -Name 'remediation')
+            '{0}: {1}' -f [string]$_.checkId, $(if ($fix) { $fix } else { ConvertTo-DemoPlainText -Value $_.message })
+        })
+    $confirm = @(Get-DemoConfirmItem -Result $all | ForEach-Object { [string]$_['text'] })
+    $confirmText = if ($confirm.Count -gt 0) { ' Please confirm (none of these keeps the run from DONE): {0}' -f ($confirm -join ' | ') } else { '' }
+    $optional = @(Get-DemoOptionalItem -Result $all | ForEach-Object { [string]$_['name'] })
+    $optionalText = if ($optional.Count -gt 0) { ' Optional, not needed for the demo: {0}.' -f ($optional -join ', ') } else { '' }
+    $status = if ($failed.Count -gt 0) { 'Fail' } elseif ($manual.Count -gt 0) { 'Manual action required' } else { 'Pass' }
+    $message = if ($failed.Count -gt 0) {
+        '{0} check(s) failed.{1}' -f $failed.Count, $(if ($steps.Count -gt 0) { ' Also {0} item(s) need you: {1}' -f $steps.Count, ($steps -join ' | ') } else { '' })
+    }
+    elseif ($steps.Count -gt 0) {
+        '{0} item(s) need you: {1}{2}' -f $steps.Count, ($steps -join ' | '), $confirmText
+    }
+    elseif ($manual.Count -gt 0) {
+        '{0} Nothing else needs you for DONE.{1}{2}' -f $FinishedText, $confirmText, $optionalText
+    }
+    else {
+        $FinishedText
+    }
+    return [pscustomobject]@{ Status = $status; Message = $message.Trim(); Evidence = ([ordered]@{ manual = $steps; confirm = $confirm; failed = @($failed | ForEach-Object { [string]$_.checkId }) }) }
 }
 
 function Get-DemoT4OffReason {
@@ -427,12 +609,175 @@ function Test-DemoFabricRequiredItem {
     }
 }
 
+function Get-DemoTelemetryRetryTarget {
+    <#
+    .SYNOPSIS
+    The targets whose latest TELEMETRY.<target> result says their data didn't come (Test-DemoHubTelemetry: a Fail with
+    no rows, or the Warning whose newest sample is too old): what a stopped plugin, an agent that isn't sending, or a
+    paused database causes, and what Invoke-DemoTelemetryRecovery addresses (Phase 28 live finding, 2026-10-30). Not an
+    access or query error (evidence errorKind), an unknown resource ID, or rows under another ResourceID: checking the
+    monitoring again doesn't change those. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $targets = [System.Collections.Generic.List[string]]::new()
+    foreach ($target in 'T1', 'T2', 'T3') {
+        $latest = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq ('TELEMETRY.{0}' -f $target) }) | Select-Object -Last 1
+        if ($null -eq $latest -or [string]$latest.status -notin 'Fail', 'Warning') {
+            continue
+        }
+        $evidence = Get-DemoMemberValue -InputObject $latest -Name 'evidence'
+        if (-not [string](Get-DemoMemberValue -InputObject $evidence -Name 'resourceId') -or
+            [string](Get-DemoMemberValue -InputObject $evidence -Name 'errorKind') -or
+            [string](Get-DemoMemberValue -InputObject $evidence -Name 'telemetryResourceId')) {
+            continue
+        }
+        $targets.Add($target)
+    }
+    return $targets.ToArray()
+}
+
+function Invoke-DemoTelemetryRecovery {
+    <#
+    .SYNOPSIS
+    Before a run is judged NOT DONE for a target's telemetry (Get-DemoTelemetryRetryTarget), checks that target's
+    monitoring once, and, when it's on, waits for the telemetry, bounded, and checks it again (Phase 28 live finding,
+    2026-10-30). Returns Results (the monitoring checks, then the new TELEMETRY results) and Rechecked (the targets whose
+    telemetry was checked again). Internal.
+
+    .DESCRIPTION
+    Live: T1's monitoring plugin stopped after a restart (DatabaseMonitorArcPlugin NotRunning less than 90 minutes after
+    start-demo.ps1 found it Running), the run's T1 track had finished in an earlier run, and the final check failed
+    TELEMETRY.T1; restarting the SQL IaaS Agent service brought the plugin back in 161 seconds.
+    - T1: Invoke-DemoT1MonitoringCheck (DEPLOY.T1.MONITORING): the plugin's state, and the agent's restart when it isn't
+      running, once; the status page says "T1's monitoring stopped after a restart; restarting it, no action needed".
+    - T2: Get-DemoArcCheck -Check Connected, Monitoring, read-only. There's no cheap repair: monitoring is a setting of
+      the Arc SQL Server instance, which a restart doesn't turn off, and the T2 step converges it.
+    - T3: Invoke-DemoT3WarmUp (T3.WARMUP, T3.PROPERTY): wakes a paused database, and reads its extended property.
+    A target whose monitoring isn't on afterward isn't waited for: its own result says why. The rest get one
+    Test-DemoHubTelemetry -WaitMinutes, shown on the status page's -ProgressStepId.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('T1', 'T2', 'T3')]
+        [string[]] $Target,
+
+        [ValidateRange(0, 120)]
+        [int] $WaitMinutes = 15,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [AllowEmptyString()]
+        [string] $ProgressStepId = ''
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $wait = [System.Collections.Generic.List[string]]::new()
+    $passed = { param([object[]] $Items, [string] $CheckId) @($Items | Where-Object { $null -ne $_ -and [string]$_.checkId -eq $CheckId -and [string]$_.status -eq 'Pass' }).Count -gt 0 }
+    Write-DemoLog -Message ('No current telemetry from {0} in Database Hub; checking the monitoring once, then the telemetry again, before the run is judged.' -f (@($Target) -join ' and '))
+    foreach ($name in @($Target | Select-Object -Unique)) {
+        switch ($name) {
+            'T1' {
+                $plugin = Invoke-DemoT1MonitoringCheck -Config $Config -Occasion 'the deployment' -ProgressPath $ProgressPath
+                $results.Add($plugin)
+                if ([string]$plugin.status -eq 'Pass') {
+                    $wait.Add('T1')
+                }
+            }
+            'T2' {
+                $arc = @(Get-DemoArcCheck -Config $Config -Check 'Connected', 'Monitoring' | Where-Object { $null -ne $_ })
+                $results.AddRange([object[]]$arc)
+                $connectedFailed = @($arc | Where-Object { [string]$_.checkId -eq 'T2.ARC.CONNECTED' -and [string]$_.status -eq 'Fail' }).Count -gt 0
+                if ((& $passed $arc 'T2.ARC.MONITORING') -and -not $connectedFailed) {
+                    $wait.Add('T2')
+                }
+            }
+            'T3' {
+                $warm = @(Invoke-DemoT3WarmUp -Config $Config | Where-Object { $null -ne $_ })
+                $results.AddRange([object[]]$warm)
+                if (& $passed $warm 'T3.PROPERTY') {
+                    $wait.Add('T3')
+                }
+            }
+        }
+    }
+    if ($wait.Count -gt 0) {
+        if ($ProgressStepId) {
+            Set-DemoProgressStep -Path $ProgressPath -Id $ProgressStepId -State 'Running' -AzureSide -Message ('Waiting up to {0} minutes for telemetry from {1} in Database Hub, after checking its monitoring: no action needed.' -f $WaitMinutes, ($wait -join ' and '))
+        }
+        $again = @(Test-DemoHubTelemetry -Config $Config -Target $wait.ToArray() -WaitMinutes $WaitMinutes | Where-Object { $null -ne $_ -and [string]$_.status -ne 'Not selected' })
+        $results.AddRange([object[]]$again)
+    }
+    return [pscustomobject]@{ Results = $results.ToArray(); Rechecked = $wait.ToArray() }
+}
+
+function Invoke-DemoTelemetryCheck {
+    <#
+    .SYNOPSIS
+    Test-DemoHubTelemetry for -Target, then, for each target whose data didn't come (Get-DemoTelemetryRetryTarget), the
+    recovery once (Invoke-DemoTelemetryRecovery), whose new TELEMETRY results replace the first ones, so a run isn't
+    judged NOT DONE on telemetry that a stopped plugin held back (Phase 28 live finding, 2026-10-30). -NoRecovery only
+    checks, for a caller that already knows the run isn't DONE. Returns the results. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('T1', 'T2', 'T3')]
+        [string[]] $Target,
+
+        [ValidateRange(0, 120)]
+        [int] $WaitMinutes = 15,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [AllowEmptyString()]
+        [string] $ProgressStepId = '',
+
+        [switch] $NoRecovery
+    )
+
+    $checks = @(Test-DemoHubTelemetry -Config $Config -Target $Target -WaitMinutes $WaitMinutes | Where-Object { $null -ne $_ })
+    if ($NoRecovery) {
+        return $checks
+    }
+    $retry = @(Get-DemoTelemetryRetryTarget -Result $checks | Where-Object { $_ -in $Target })
+    if ($retry.Count -eq 0) {
+        return $checks
+    }
+    $recovery = Invoke-DemoTelemetryRecovery -Config $Config -Target $retry -WaitMinutes $WaitMinutes -ProgressPath $ProgressPath -ProgressStepId $ProgressStepId
+    $replaced = @(@($recovery.Rechecked) | ForEach-Object { 'TELEMETRY.{0}' -f $_ })
+    $kept = @($checks | Where-Object { [string]$_.checkId -notin $replaced })
+    return @(@($kept) + @($recovery.Results))
+}
+
 function Invoke-DemoDoneGate {
     <#
     .SYNOPSIS
     At the end of a run whose tracks all finished: runs each DONE requirement (Get-DemoDoneRequirement) that this run's
     results don't already show passing, read-only, so a resumed run judges every target and not only the ones it
     worked on. Returns the new results. Internal.
+
+    .DESCRIPTION
+    The telemetry comes last (Invoke-DemoTelemetryCheck): when nothing else this gate checked failed, a target whose
+    telemetry didn't come gets its monitoring checked, and its telemetry once more, before the run is judged (Phase 28
+    live finding, 2026-10-30: T1's plugin had stopped after a restart, and the run ended NOT DONE on TELEMETRY.T1).
+    -ProgressPath is the status page's model, whose Validation step says so.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -447,7 +792,10 @@ function Invoke-DemoDoneGate {
         [string[]] $Requirement = @(),
 
         [ValidateRange(0, 120)]
-        [int] $TelemetryWaitMinutes = 15
+        [int] $TelemetryWaitMinutes = 15,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
     )
 
     $missing = @((Test-DemoDoneEvidence -Result $Result -Requirement $Requirement).Missing)
@@ -461,9 +809,6 @@ function Invoke-DemoDoneGate {
         $results.AddRange([object[]]@(Test-DemoHubEstate -Config $Config -Target $estate))
     }
     $telemetry = @($missing | Where-Object { $_ -like 'TELEMETRY.*' } | ForEach-Object { $_.Substring(10) })
-    if ($telemetry.Count -gt 0) {
-        $results.AddRange([object[]]@(Test-DemoHubTelemetry -Config $Config -Target $telemetry -WaitMinutes $TelemetryWaitMinutes))
-    }
     if ('METRICS.T4' -in $missing) {
         $t4 = Get-DemoT4State -Config $Config
         $results.Add((Test-DemoT4MetricFlow -Config $Config -ServerId $t4.Names.ServerId -State $t4.State -WaitMinutes $TelemetryWaitMinutes))
@@ -477,6 +822,13 @@ function Invoke-DemoDoneGate {
     }
     if ('FABRIC.ITEMS.REQUIRED' -in $missing) {
         $results.Add((Test-DemoFabricRequiredItem -Config $Config))
+    }
+    if ($telemetry.Count -gt 0) {
+        # The recovery only when everything else DONE needs passed: otherwise the run isn't DONE whatever the telemetry shows.
+        $others = @($Requirement | Where-Object { $_ -notlike 'TELEMETRY.*' })
+        $blocked = @($results | Where-Object { $null -ne $_ -and [string]$_.status -in 'Fail', 'Manual action required' }).Count -gt 0 -or
+            -not (Test-DemoDoneEvidence -Result (@($Result) + @($results.ToArray())) -Requirement $others).Complete
+        $results.AddRange([object[]]@(Invoke-DemoTelemetryCheck -Config $Config -Target $telemetry -WaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath -ProgressStepId 'Validation' -NoRecovery:$blocked))
     }
     return $results.ToArray()
 }
@@ -494,14 +846,19 @@ function Get-DemoDeploymentOutcome {
     DONE (brief item 16) needs every track this configuration has (T1, T2, T4 unless it's off, and Fabric unless
     -SkipFabric) finished according to the resource group's state; a Pass for every DONE requirement
     (Get-DemoDoneRequirement: Database Hub's own views of every target); no Fail; and no Manual action required except
-    the Hub tenant setting's reminder (PREFLIGHT.P4.HUBSETTING, which no API reads) and the optional parts
-    (Test-DemoOptionalResult). Without a state, this run's DEPLOY.TRACK results stand in. -Sequential (deploy.ps1
+    what only a person can confirm, which a rerun can't resolve (Test-DemoConfirmOnlyResult: the Hub tenant setting
+    that couldn't be read, from either check, decided by its evidence, a capacity SKU, presenters' roles, the app's
+    browser check; Phase 28 live finding, 2026-10-30), and the optional parts (Test-DemoOptionalResult). Confirm, on every
+    outcome, lists the confirm-only items once each (Get-DemoConfirmItem), which DONE's banner shows under "Please
+    confirm". Without a state, this run's DEPLOY.TRACK results stand in. -Sequential (deploy.ps1
     -Sequential, which records stages and no tracks) needs the recorded stage Validation instead of the tracks (or,
     without a state, this run's DEPLOY.STAGE.VALIDATION Pass), and the same DONE requirements, which its validation
     checks (review finding 4). -Stopped (Ctrl+C) is NOT DONE with the resume command, and -GuidedStopOpen adds what the
     open guided stop leaves until then (Phase 28 live finding). DONE also never comes while the state records what a
     guided stop or session left open (Get-DemoGuidedStopLeftover: the guided stop's Bastion, a handed-over host password
-    that isn't rotated): that's NOT DONE naming stop-demo.ps1 -RemoveBastionOnly (Phase 28 review).
+    that isn't rotated): that's NOT DONE naming stop-demo.ps1 -RemoveBastionOnly (Phase 28 review). A NOT DONE's reason
+    names only what blocks DONE, and its next step is that item's own fix (a requirement's latest result included),
+    never a plain rerun for something a rerun can't change.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -533,8 +890,10 @@ function Get-DemoDeploymentOutcome {
     $all = @($Result | Where-Object { $null -ne $_ })
     $core = @($all | Where-Object { -not (Test-DemoOptionalResult -Result $_) })
     $fails = @($core | Where-Object { [string]$_.status -eq 'Fail' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' })
-    $manual = @($core | Where-Object { [string]$_.status -eq 'Manual action required' -and [string]$_.checkId -notin 'PREFLIGHT.P4.HUBSETTING', 'DEPLOY.SUMMARY' })
+    # Only what a person or a rerun can act on blocks DONE; what only a person can confirm is listed instead.
+    $manual = @($core | Where-Object { [string]$_.status -eq 'Manual action required' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' -and -not (Test-DemoConfirmOnlyResult -Result $_) })
     $optional = @(Get-DemoOptionalItem -Result $all)
+    $confirm = @(Get-DemoConfirmItem -Result $all)
     $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
     $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
     $t4Off = Get-DemoT4OffReason -Config $Config -State $State
@@ -545,7 +904,7 @@ function Get-DemoDeploymentOutcome {
     if ($installMode -eq 'Developer') {
         $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. ProductKey or PaygWizard mode gives them.')
     }
-    $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); Optional = $optional; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume }
+    $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); Optional = $optional; Confirm = $confirm; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume }
     if ($WhatIfRun) {
         $outcome.Kind = 'WhatIf'
         $outcome.ExitCode = if ($fails.Count -gt 0) { 1 } else { 0 }
@@ -621,7 +980,7 @@ function Get-DemoDeploymentOutcome {
     $leftoverShown = $false
     $blocking = @($fails) + @($manual) | Select-Object -First 1
     if ($null -ne $blocking) {
-        $message = [string]$blocking.message
+        $message = ConvertTo-DemoPlainText -Value $blocking.message
         if ($message.Length -gt 400) {
             $message = $message.Substring(0, 397) + '...'
         }
@@ -632,7 +991,7 @@ function Get-DemoDeploymentOutcome {
             $leftoverShown = $true
         }
         else {
-            $fix = [string]$blocking.remediation
+            $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $blocking -Name 'remediation')
             $outcome.Next = if ($fix) { $fix } else { 'Fix the cause in the message above.' }
             if ($outcome.Next -notmatch 'deploy\.ps1') {
                 $outcome.Next = '{0} Then run {1}.' -f $outcome.Next.TrimEnd(), $Command
@@ -659,8 +1018,18 @@ function Get-DemoDeploymentOutcome {
     }
     else {
         $first = $evidence.Missing[0]
-        $outcome.Reason = if ($null -ne $evidence.Problem) { '{0} hasn''t passed yet ({1}): {2}' -f $first, $evidence.Problem.status, ([string]$evidence.Problem.message) } else { '{0} wasn''t checked yet. Database Hub must show it before the demo is done.' -f $first }
-        $outcome.Next = 'Telemetry and estate entries can take a few more minutes after a deployment. Wait about 10 minutes, then run {0}: it checks again.' -f $Command
+        $problem = $evidence.Problem
+        $outcome.Reason = if ($null -ne $problem) { '{0} hasn''t passed yet ({1}): {2}' -f $first, $problem.status, (ConvertTo-DemoPlainText -Value $problem.message) } else { '{0} wasn''t checked yet. Database Hub must show it before the demo is done.' -f $first }
+        # That requirement's own fix when its result has one (a rerun alone doesn't change a renamed resource ID, for
+        # example); for telemetry, estate, or metrics that only lag, the wait they need after a deployment.
+        $lag = $null -ne $problem -and [string]$problem.status -eq 'Warning' -and (($first -like 'TELEMETRY.*' -and @(Get-DemoTelemetryRetryTarget -Result @($problem)).Count -gt 0) -or $first -like 'HUB.ESTATE.*' -or $first -eq 'METRICS.T4')
+        $fix = if ($null -ne $problem -and -not $lag) { ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $problem -Name 'remediation') } else { '' }
+        $outcome.Next = if ($fix) {
+            if ($fix -match 'deploy\.ps1') { $fix } else { '{0} Then run {1}.' -f $fix.TrimEnd(), $Command }
+        }
+        else {
+            'Telemetry and estate entries can take a few more minutes after a deployment. Wait about 10 minutes, then run {0}: it checks again.' -f $Command
+        }
     }
     if ($leftover -and -not $leftoverShown) {
         $outcome.Notes = @($outcome.Notes) + @(('Also still open from an earlier guided stop or session: {0}. {1} removes Bastion and rotates the host password; DONE waits for it.' -f $leftover, $stopCommand))
@@ -683,12 +1052,23 @@ function Get-DemoDeploymentOutcomeLine {
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
+    # Get-DemoMemberValue returns an array whole, so the notes are assigned first: each note is then its own line.
+    $notes = Get-DemoMemberValue -InputObject $Outcome -Name 'Notes'
     switch ($Outcome.Kind) {
         'Done' {
             foreach ($line in (Get-DemoBannerLine -Title 'DONE')) { $lines.Add($line) }
             $lines.Add(('The demo is complete. {0}{1}' -f $Outcome.Reason, $(if ($Minutes -gt 0) { ' This run took {0} minutes.' -f $Minutes } else { '' })))
-            foreach ($note in @(Get-DemoMemberValue -InputObject $Outcome -Name 'Notes')) {
+            foreach ($note in @($notes)) {
                 if ($note) { $lines.Add([string]$note) }
+            }
+            # What only a person can confirm, once each; none of it kept the run from DONE (Phase 28 live finding).
+            $confirmValue = Get-DemoMemberValue -InputObject $Outcome -Name 'Confirm'
+            $confirm = @(@($confirmValue) | Where-Object { $null -ne $_ })
+            if ($confirm.Count -gt 0) {
+                $lines.Add('Please confirm (a rerun can''t check these, and none of them keeps the demo from being done):')
+                foreach ($item in $confirm) {
+                    $lines.Add(('- {0}' -f (ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $item -Name 'text'))))
+                }
             }
             $lines.Add(('Where to look: open Database Hub in the Fabric portal and look at Estate and Performance; then start an incident (./scripts/demo-control.ps1) and investigate it with the Database Agent.{0}' -f $(if ($WorkspaceName) { ' The Real-Time Dashboard and the history report are in the workspace "{0}".' -f $WorkspaceName } else { '' })))
             foreach ($item in @($Outcome.Optional)) {
@@ -709,7 +1089,7 @@ function Get-DemoDeploymentOutcomeLine {
             $lines.Add(('Run: {0}' -f $Outcome.NextCommand))
             $lines.Add($Outcome.Resume)
             $lines.Add('For help, ./scripts/collect-diagnostics.ps1 makes a redacted zip to attach to a Deployment problem issue.')
-            foreach ($note in @(Get-DemoMemberValue -InputObject $Outcome -Name 'Notes')) {
+            foreach ($note in @($notes)) {
                 if ($note) { $lines.Add([string]$note) }
             }
             foreach ($item in @($Outcome.Optional)) {

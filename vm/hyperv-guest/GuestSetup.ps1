@@ -1671,7 +1671,7 @@ function Get-DemoGuidedSetupStepText {
         ('1. The Virtual Machine Connection window shows {0}, which signed itself in and opened SQL Server setup, pre-filled.' -f $GuestName)
         '2. On the Edition page, select "Use pay-as-you-go billing through Microsoft Azure", then Standard. Select Next.'
         '3. Accept the license terms. Select Next on the pages that follow.'
-        '4. On the Azure Extension for SQL Server page, select "Use Azure Login" and sign in with your own Azure account. Never enter a service principal secret. If Internet Explorer says content from a site is blocked by Enhanced Security Configuration, select Add... for each site it names, then "Use Azure Login" again.'
+        '4. On the Azure Extension for SQL Server page, select "Use Azure Login" and sign in with your own Azure account. Never enter a service principal secret. If the Azure Login window stays blank, or Internet Explorer says content from https://login.microsoftonline.com is blocked, follow the dialog''s directions: select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close. Then select "Use Azure Login" again. Repeat for any other sign-in site it names. (Confirmed live on 2026-10-30; turning IE Enhanced Security Configuration off while setup is open doesn''t help.)'
         '5. Select Next on the pre-filled pages (features, the default instance, service accounts, administrators), then Install.'
         '6. When setup says Complete, select Close. The host signs the guest out, rotates its password, and continues on its own; deploy.ps1 then finishes T2.'
         ''

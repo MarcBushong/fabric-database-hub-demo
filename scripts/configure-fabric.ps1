@@ -18,8 +18,9 @@ has no public API or ARM resource, so the checklist uses documented interfaces o
 (docs/architecture.md, "Database Hub integration"):
 - The subscription guard first: it stops the checklist with Fail unless the Azure CLI context matches the
   configured subscription and tenant and a token is available without interaction. It never signs in.
-- P4: the Fabric tenant setting "Users can access the Database hub (preview)", through the Fabric admin API
-  only with -FabricAdmin; otherwise Manual action required with the exact portal steps.
+- P4: the Fabric tenant setting "Users can access the Database hub (preview)", through the Fabric admin API on
+  every run (Phase 28): Pass when enabled; Manual action required when it's disabled, or when it couldn't be read
+  (not a Fabric administrator, no token), which is a reminder to confirm it, worded as such.
 - P5: Contributor or higher on the resolved workspace and an F or Trial capacity, through Fabric REST with your
   Fabric token.
 - P11 (optional, Phase 18): Power BI viewer licensing on the workspace's capacity (PREFLIGHT.FABRIC.VIEWERLICENSE):
@@ -93,7 +94,8 @@ Targets for the Estate, telemetry, and gate checks. Others are reported as Not s
 the PaygWizard step, its telemetry check reports that manual step instead of a failure.
 
 .PARAMETER FabricAdmin
-You are a Fabric administrator, so P4 is read through the Fabric admin API (Tenants - List Tenant Settings).
+Accepted for compatibility. Since Phase 28, P4 is read through the Fabric admin API (Tenants - List Tenant Settings) on every
+run; for a caller who isn't a Fabric administrator it's a reminder to confirm the setting, never a blocker.
 
 .PARAMETER WaitMinutes
 How long the telemetry check and the T3 gate keep polling for fresh rows. 0 checks once; 15 covers the

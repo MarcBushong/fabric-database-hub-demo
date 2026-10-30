@@ -14,7 +14,9 @@ function Invoke-DemoPreflight {
       configured, that both sizes and (for demo-day and enhanced-performance) Premium SSD v2 are offered in
       that zone; and the VM security types, resolving securityType.t1 = Auto from the image's features.
     - C6: Azure Hybrid Benefit only with the entitlement attestation.
-    - P4 and P5: the Fabric tenant setting, reported as a manual check, and the Fabric workspace and lakehouse by
+    - P4 and P5: the Fabric tenant setting, read through the Fabric admin API when the caller is a Fabric
+      administrator, otherwise a reminder to confirm it (Test-DemoFabricHubSetting -CheckId PREFLIGHT.P4.HUBSETTING;
+      Phase 28 live finding), and the Fabric workspace and lakehouse by
       name, read-only (Test-DemoFabricResolution, Phase 26a): your role and the capacity of a workspace that exists,
       or the capacity deploy.ps1 would create it on; the optional P11, Power BI viewer licensing on the workspace's
       capacity (Test-DemoFabricViewerLicense, a Warning below F64).
@@ -383,9 +385,11 @@ function Invoke-DemoPreflight {
         Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so on-demand Bastion cannot be created.' -Remediation 'Request a public IP quota increase if you need interactive access.'
     }
 
-    # P4 and P5: Fabric. No supported API reads the Hub setting without Fabric administrator rights. P5 (Phase 26a,
-    # ADR 0021): the workspace and the lakehouse by name, read-only; preflight never creates them.
-    Add-Check 'PREFLIGHT.P4.HUBSETTING' 'tenant' 'Manual action required' 'Confirm that a Fabric administrator enabled "Users can access the Database hub (preview)" and that Hub users have a Fabric Free license.' -DocUrl 'https://learn.microsoft.com/fabric/database/hub/overview'
+    # P4 and P5: Fabric. P4 (Phase 28 live finding, 2026-10-30): the Hub setting is read through the Fabric admin API,
+    # which needs a Fabric administrator; for anyone else it's a reminder to confirm it, which never stops the run or
+    # keeps it from DONE, and only a setting read as disabled does. P5 (Phase 26a, ADR 0021): the workspace and the
+    # lakehouse by name, read-only; preflight never creates them.
+    $results.Add((Test-DemoFabricHubSetting -Config $Config -CheckId 'PREFLIGHT.P4.HUBSETTING'))
     $fabricCheck = Test-DemoFabricResolution -Config $Config
     $results.Add($fabricCheck.Result)
     # P11 (optional, Phase 18): Power BI viewer licensing on the workspace's capacity; a Warning below F64.

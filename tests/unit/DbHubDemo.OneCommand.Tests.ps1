@@ -29,6 +29,24 @@ BeforeAll {
     function New-FinishedState([switch] $WithT4, [string] $T4Sku = '') {
         [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = $(if ($WithT4) { 'Telemetry' } else { '' }); TrackFabric = 'Fabric'; T4Sku = $T4Sku; GuidedStopUtc = ''; HostPasswordUtc = '' }
     }
+
+    # The Hub checks' Fabric REST mocks (Initialize-HubFabricMock), for the tenant setting's real results.
+    . (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Hub.Helpers.ps1')
+
+    # The Hub tenant setting as Test-DemoFabricHubSetting reads it through the mocked admin API (Phase 28 live finding):
+    # Forbidden (the caller isn't a Fabric administrator), Enabled, or Disabled.
+    function New-HubSettingResult([string] $Answer, [string] $CheckId = 'FABRIC.P4.HUBSETTING') {
+        $script:hubAnswer = $Answer
+        Initialize-HubFabricMock -Handler {
+            if ($script:hubAnswer -eq 'Forbidden') {
+                ConvertTo-HubFabricResponse -StatusCode 403 -Body @{ errorCode = 'Forbidden'; message = 'The caller is not a Fabric administrator' }
+            }
+            else {
+                ConvertTo-HubFabricResponse -Body @{ value = @(@{ settingName = 'HubSetting'; title = 'Users can access the Database hub (preview)'; enabled = ($script:hubAnswer -eq 'Enabled') }) }
+            }
+        }
+        Test-DemoFabricHubSetting -Config (New-TestConfig) -CheckId $CheckId
+    }
 }
 
 Describe 'What a run can expect (brief goal 7, items 3 and 13)' {
@@ -174,7 +192,7 @@ Describe 'What DONE requires (brief item 16)' {
         $seen = @((New-TestResult 'HUB.ESTATE.T1'), (New-TestResult 'HUB.ESTATE.T3'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3'), (New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'TELEMETRY.T2' 'Warning'))
         $requirement = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' }
         $new = InModuleScope DbHubDemo -Parameters @{ Config = $config; Seen = $seen; Requirement = $requirement } { Invoke-DemoDoneGate -Config $Config -Result $Seen -Requirement $Requirement -TelemetryWaitMinutes 5 }
-        $script:calls | Should -Be @('estate T2,T4', 'telemetry T2', 'metrics', 'arc Monitoring', 'inventory', 'fabric')
+        $script:calls | Should -Be @('estate T2,T4', 'metrics', 'arc Monitoring', 'inventory', 'fabric', 'telemetry T2') -Because 'the telemetry comes last, so its recovery runs only when the rest passed (Phase 28 live finding)'
         (InModuleScope DbHubDemo -Parameters @{ All = @($seen + $new); Requirement = $requirement } { Test-DemoDoneEvidence -Result $All -Requirement $Requirement }).Complete | Should -BeTrue
     }
 
@@ -391,6 +409,286 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
     }
 }
 
+Describe 'What only a person can confirm never keeps the run from DONE (Phase 28 live finding, 2026-10-30)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        # A deployed Insights app that only waits for its browser check, as the Fabric track reports it.
+        $script:appRecords = @(InModuleScope DbHubDemo {
+                foreach ($record in @(
+                        (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'The app is deployed.')
+                        (New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'A person must confirm the app in the browser: sign-in and the connector in the app can''t be checked from a script.' -Remediation 'In the Fabric portal, open the app''s item in the workspace; it shows "Connector check passed".')
+                    )) {
+                    ConvertTo-DemoOptionalAppRecord -Record $record
+                }
+            })
+    }
+
+    It 'is DONE, exit code 0, when every requirement passed and the Hub setting couldn''t be read, listing it once under "Please confirm" as couldn''t check' {
+        # Live: every DONE requirement passed, yet the run ended NOT DONE, exit 2, on FABRIC.P4.HUBSETTING's unread reminder,
+        # which read as "the setting isn't enabled" (it was), followed by System.String[].
+        $result = @(New-DoneResult) + @((New-HubSettingResult 'Forbidden' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Forbidden')) + @($script:appRecords)
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState -WithT4 -T4Sku 'None'); Config = (New-TestConfig -WithT4) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done'
+        $outcome.ExitCode | Should -Be 0
+        @($outcome.Confirm).Count | Should -Be 2
+        @($outcome.Optional).Count | Should -Be 0 -Because 'the deployed app''s browser check is to confirm, not optional work left'
+        $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
+        $text = $lines -join "`n"
+        @($lines | Where-Object { $_ -like 'Please confirm*' }).Count | Should -Be 1
+        @($lines | Where-Object { $_ -match 'Fabric tenant setting' }).Count | Should -Be 1 -Because 'the setting is one line, whichever check reported it'
+        $lines | Should -Contain '- Couldn''t check the Fabric tenant setting "Users can access the Database hub (preview)" (needs a Fabric administrator; HTTP 403): please confirm it''s enabled.'
+        $text | Should -Match '- The optional Insights app is deployed; confirm it once in the browser\.'
+        $text | Should -Not -Match 'is disabled|not enabled|System\.String\[\]'
+        @($lines | Where-Object { $_ -match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both Burstable sizes' }).Count | Should -Be 1 -Because 'the T4 note is its own line'
+    }
+
+    It 'is NOT DONE, with the true wording, only when the Hub setting was read and is disabled, and never asks to confirm a setting it read' {
+        $disabled = @(New-DoneResult) + @((New-HubSettingResult 'Forbidden' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Disabled'))
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $disabled; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.ExitCode | Should -Be 2
+        $outcome.Reason | Should -Be 'FABRIC.P4.HUBSETTING: The Fabric tenant setting "Users can access the Database hub (preview)" is disabled (read through the Fabric admin API), so nobody in the tenant can open Database Hub.'
+        $outcome.Next | Should -Match 'A Fabric administrator opens the Fabric admin portal'
+        $outcome.Next | Should -Match ([regex]::Escape('Then run ./scripts/deploy.ps1 again.'))
+        @($outcome.Confirm | Where-Object { $_['key'] -eq 'P4' }).Count | Should -Be 0 -Because 'a setting read as disabled is the reason, not a reminder'
+
+        # Read and enabled: DONE with nothing to confirm, even beside the other check's unread reminder.
+        $enabled = @(New-DoneResult) + @((New-HubSettingResult 'Forbidden' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Enabled'))
+        $done = InModuleScope DbHubDemo -Parameters @{ Result = $enabled; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $done.Kind | Should -Be 'Done'
+        @($done.Confirm).Count | Should -Be 0
+    }
+
+    It 'is NOT DONE, exit code 1, for a failed requirement, and names only that, not what''s left to confirm' {
+        $result = @(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T1' }) + @((New-TestResult 'TELEMETRY.T1' 'Fail'), (New-HubSettingResult 'Forbidden'))
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.ExitCode | Should -Be 1
+        $outcome.Reason | Should -Match '^TELEMETRY\.T1: '
+        $outcome.Reason | Should -Not -Match 'tenant setting'
+    }
+
+    It 'treats a capacity SKU to confirm and the presenters'' roles as confirm-only, and a paused capacity as a blocker' {
+        $capacity = New-DemoResult -CheckId 'FABRIC.P5.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The Fabric workspace "Database Hub Demo" is on the capacity "trial01" with SKU FT1, which this check can''t confirm runs notebooks.' -Evidence ([ordered]@{ sku = 'FT1'; state = 'Active' }) -Remediation 'Confirm that "trial01" is a Fabric Trial or F capacity.'
+        $presenter = New-DemoResult -CheckId 'HUB.PRESENTER.READER' -Area 'hub' -Target 'subscription' -Status 'Manual action required' -Message 'assignRoles is false, so Reader on the subscription must be granted by an administrator to 1 presenter(s).' -Remediation 'An administrator runs: az role assignment create (the command is in this result).'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($capacity, $presenter)); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done'
+        $texts = @($outcome.Confirm | ForEach-Object { [string]$_['text'] })
+        $texts | Should -Contain 'Confirm that "trial01" is a Fabric Trial or F capacity.'
+        ($texts -join ' ') | Should -Match 'must be granted by an administrator to 1 presenter\(s\)\. The commands are in its result \(HUB\.PRESENTER\.READER\)\.'
+
+        $paused = New-DemoResult -CheckId 'FABRIC.P5.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The capacity "f2cap" (F2) of the Fabric workspace "Database Hub Demo" is Paused, so notebooks can''t run.' -Evidence ([ordered]@{ sku = 'F2'; state = 'Paused' }) -Remediation 'A capacity administrator resumes the capacity in the Azure portal or the Fabric admin portal.'
+        $blocked = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($paused)); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $blocked.Kind | Should -Be 'NotDone'
+        $blocked.Reason | Should -Match '^FABRIC\.P5\.CAPACITY: '
+        $blocked.Next | Should -Match 'A capacity administrator resumes the capacity'
+    }
+
+    It 'names a requirement''s own fix when a rerun alone can''t change it, and the wait when telemetry only lags' {
+        $resourceId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.HybridCompute/machines/arcsql01'
+        $lookalike = New-DemoResult -CheckId 'TELEMETRY.T2' -Area 'hub' -Target 'T2' -Status 'Warning' -Message 'Telemetry for T2 (arcsql01) arrives under another ResourceID, not the expected one.' -Evidence ([ordered]@{ resourceId = $resourceId; telemetryResourceId = '/subscriptions/x' }) -Remediation 'Record the ResourceID format in docs/implementation-report.md and update Resolve-DemoHubTarget to match it.'
+        $result = @(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T2' }) + @($lookalike)
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.Next | Should -Match '^Record the ResourceID format'
+        $outcome.Next | Should -Match ([regex]::Escape('Then run ./scripts/deploy.ps1.'))
+
+        $stale = New-DemoResult -CheckId 'TELEMETRY.T2' -Area 'hub' -Target 'T2' -Status 'Warning' -Message 'T2 (arcsql01) has telemetry, but the newest sample is 40 minutes old.' -Evidence ([ordered]@{ resourceId = $resourceId; rows = 12; lagMinutes = 40 }) -Remediation 'Start the target (start-demo.ps1) and run again with -WaitMinutes 15.'
+        $lagging = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T2' }) + @($stale)); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $lagging.Next | Should -Match 'Wait about 10 minutes'
+    }
+
+    It 'summarizes the run without System.String[], with what needs you apart from what to confirm, each once (DEPLOY.SUMMARY)' {
+        $array = [pscustomobject]@{ checkId = 'DEPLOY.T2.GUIDEDSTOP'; status = 'Manual action required'; message = [string[]]@('Nobody finished', 'SQL Server setup.'); remediation = [string[]]@('Run ./scripts/deploy.ps1 again', 'when you have about 15 minutes.') }
+        $confirmItems = @((New-HubSettingResult 'Forbidden' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Forbidden')) + @($script:appRecords)
+        $summary = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($array) + $confirmItems) } { Get-DemoDeploySummary -Result $Result -FinishedText 'Every track and the validation finished.' }
+        $summary.Status | Should -Be 'Manual action required'
+        $summary.Message | Should -Match '^1 item\(s\) need you: DEPLOY\.T2\.GUIDEDSTOP: Run \./scripts/deploy\.ps1 again when you have about 15 minutes\.'
+        $summary.Message | Should -Not -Match 'System\.String\[\]'
+        ([regex]::Matches($summary.Message, 'Fabric tenant setting')).Count | Should -Be 1
+        @($summary.Evidence['confirm']).Count | Should -Be 2
+
+        $confirmOnly = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + $confirmItems) } { Get-DemoDeploySummary -Result $Result -FinishedText 'Every track and the validation finished.' }
+        $confirmOnly.Message | Should -Match '^Every track and the validation finished\. Nothing else needs you for DONE\. Please confirm \(none of these keeps the run from DONE\): Couldn''t check the Fabric tenant setting'
+        @($confirmOnly.Evidence['manual']).Count | Should -Be 0
+    }
+}
+
+Describe 'A target''s missing telemetry gets its monitoring checked once more before the run is judged (Phase 28 live finding, 2026-10-30)' {
+    BeforeAll {
+        $script:t1Id = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01'
+        # TELEMETRY.<target> shaped as Test-DemoHubTelemetry returns it.
+        function New-TelemetryResult([string] $Target, [string] $Status, [System.Collections.IDictionary] $Evidence = [ordered]@{ resourceId = $script:t1Id; rows = 0 }) {
+            New-DemoResult -CheckId ('TELEMETRY.{0}' -f $Target) -Area 'hub' -Target $Target -Status $Status -Message ('TELEMETRY.{0} {1}' -f $Target, $Status) -Evidence $Evidence
+        }
+    }
+
+    BeforeEach {
+        $script:asked = [System.Collections.Generic.List[string]]::new()
+        $script:polls = 0
+        # The first poll finds no rows for the targets in $script:missing; every later poll finds them.
+        $script:missing = @('T1')
+        $script:recheckMisses = $false
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith {
+            $script:polls++
+            $script:asked.Add(('telemetry {0} wait={1}' -f ($Target -join ','), $WaitMinutes))
+            foreach ($name in 'T1', 'T2', 'T3') {
+                if ($name -notin $Target) {
+                    New-DemoResult -CheckId ('TELEMETRY.{0}' -f $name) -Area 'hub' -Target $name -Status 'Not selected' -Message 'Not selected.'
+                }
+                elseif ($name -in $script:missing -and ($script:polls -eq 1 -or $script:recheckMisses)) {
+                    New-DemoResult -CheckId ('TELEMETRY.{0}' -f $name) -Area 'hub' -Target $name -Status 'Fail' -Message ('No performance telemetry from {0} in the last 60 minutes.' -f $name) -Evidence ([ordered]@{ resourceId = ('/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/x/{0}' -f $name); rows = 0 })
+                }
+                else {
+                    New-DemoResult -CheckId ('TELEMETRY.{0}' -f $name) -Area 'hub' -Target $name -Status 'Pass' -Message ('{0} sends performance telemetry.' -f $name)
+                }
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith {
+            $script:asked.Add(('restore {0} {1}' -f $CheckId, $Occasion))
+            New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'sqlvm01''s monitoring plugin wasn''t running after the deployment; the SQL IaaS Agent service was restarted, and it''s Running with uploads OK after 161 seconds.' -Evidence ([ordered]@{ restarted = $true })
+        }
+    }
+
+    It 'tells which targets lack their data, and leaves access errors, unknown resource IDs, and telemetry under another ID alone' {
+        $results = @(
+            (New-TelemetryResult 'T1' 'Fail')
+            (New-TelemetryResult 'T2' 'Fail' ([ordered]@{ resourceId = '/x'; rows = 0; errorKind = 'Forbidden'; statusCode = 403 }))
+            (New-TelemetryResult 'T3' 'Warning' ([ordered]@{ resourceId = '/y'; telemetryResourceId = '/z' }))
+        )
+        @(InModuleScope DbHubDemo -Parameters @{ Result = $results } { Get-DemoTelemetryRetryTarget -Result $Result }) | Should -Be @('T1')
+        $more = @(
+            (New-TelemetryResult 'T1' 'Fail' ([ordered]@{}))
+            (New-TelemetryResult 'T2' 'Warning' ([ordered]@{ resourceId = '/x'; rows = 4; lagMinutes = 40 }))
+            (New-TelemetryResult 'T3' 'Pass' ([ordered]@{ resourceId = '/y'; rows = 9 }))
+        )
+        @(InModuleScope DbHubDemo -Parameters @{ Result = $more } { Get-DemoTelemetryRetryTarget -Result $Result }) | Should -Be @('T2') -Because 'stale data is what a stopped agent leaves too; an unknown resource ID isn''t'
+    }
+
+    It 'restarts T1''s stopped plugin once, says so on the status page, waits, and replaces the miss with the new check' {
+        # Live: T1's plugin was NotRunning hours after start-demo.ps1 found it running; the restart brought it back in 161 s.
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog) -GuidedStop 'Pending') -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Path = $progress } { Invoke-DemoTelemetryCheck -Config $Config -Target 'T1', 'T3' -WaitMinutes 15 -ProgressPath $Path -ProgressStepId 'Validation' })
+        $script:asked | Should -Be @('telemetry T1,T3 wait=15', 'restore DEPLOY.T1.MONITORING the deployment', 'telemetry T1 wait=15')
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' }).status | Should -Be @('Pass') -Because 'the new check replaces the miss'
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T3' }).status | Should -Be @('Pass')
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' }).status | Should -Be @('Pass')
+        @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $steps = @{}
+        foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { $steps[[string]$item['id']] = $item } }
+        $steps['T1.Monitoring']['state'] | Should -Be 'Done'
+        $steps['T1.Monitoring']['message'] | Should -Match 'the SQL IaaS Agent service was restarted'
+        $steps['Validation']['message'] | Should -Be 'Waiting up to 15 minutes for telemetry from T1 in Database Hub, after checking its monitoring: no action needed.'
+        $steps['Validation']['azureSide'] | Should -BeTrue
+    }
+
+    It 'tries once: a second miss is the result, with no further restart' {
+        $script:recheckMisses = $true
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoTelemetryCheck -Config $Config -Target 'T1' -WaitMinutes 5 })
+        @($script:asked | Where-Object { $_ -like 'restore*' }).Count | Should -Be 1
+        @($script:asked | Where-Object { $_ -like 'telemetry*' }).Count | Should -Be 2
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' }).status | Should -Be @('Fail')
+    }
+
+    It 'doesn''t wait for a target whose monitoring is off, and waits for T2 and T3 once theirs is on' {
+        $script:missing = @('T1', 'T2', 'T3')
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:asked.Add('restore'); New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Not selected' -Message 'Performance monitoring isn''t turned on for sqlvm01.' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcCheck -MockWith { $script:asked.Add('arc ' + ($Check -join ',')); New-DemoResult -CheckId 'T2.ARC.CONNECTED' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'Connected.'; New-DemoResult -CheckId 'T2.ARC.MONITORING' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'Monitoring is on.' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3WarmUp -MockWith { $script:asked.Add('warm T3'); New-DemoResult -CheckId 'T3.WARMUP' -Area 't3' -Target 'T3' -Status 'Pass' -Message 'T3 is online.'; New-DemoResult -CheckId 'T3.PROPERTY' -Area 't3' -Target 'T3' -Status 'Pass' -Message 'The property is true.' }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoTelemetryCheck -Config $Config -Target 'T1', 'T2', 'T3' -WaitMinutes 15 })
+        $script:asked | Should -Be @('telemetry T1,T2,T3 wait=15', 'restore', 'arc Connected,Monitoring', 'warm T3', 'telemetry T2,T3 wait=15')
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' }).status | Should -Be @('Fail') -Because 'T1''s monitoring is off, so its miss stands'
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T2' }).status | Should -Be @('Pass')
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T3' }).status | Should -Be @('Pass')
+
+        # Arc monitoring off: T2 isn't waited for, and the reason is in its own result.
+        $script:asked.Clear()
+        $script:polls = 0
+        $script:missing = @('T2')
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcCheck -MockWith { $script:asked.Add('arc'); New-DemoResult -CheckId 'T2.ARC.MONITORING' -Area 't2' -Target 'T2' -Status 'Fail' -Message 'Monitoring is off.' }
+        $off = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoTelemetryCheck -Config $Config -Target 'T2' -WaitMinutes 15 })
+        $script:asked | Should -Be @('telemetry T2 wait=15', 'arc')
+        @($off | Where-Object { $_.checkId -eq 'T2.ARC.MONITORING' }).status | Should -Be @('Fail')
+    }
+
+    It 'checks once, without the recovery, for an access error or with -NoRecovery' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith {
+            $script:asked.Add('telemetry')
+            New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'The telemetry endpoint denied access.' -Evidence ([ordered]@{ resourceId = '/x'; rows = 0; errorKind = 'Forbidden'; statusCode = 403 })
+        }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoTelemetryCheck -Config $Config -Target 'T1' -WaitMinutes 15 }
+        $script:asked | Should -Be @('telemetry')
+        $script:asked.Clear()
+        $script:missing = @('T1')
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith { $script:asked.Add('telemetry'); New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'No rows.' -Evidence ([ordered]@{ resourceId = '/x'; rows = 0 }) }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoTelemetryCheck -Config $Config -Target 'T1' -WaitMinutes 15 -NoRecovery }
+        $script:asked | Should -Be @('telemetry')
+    }
+
+    It 'runs in DONE''s checks last, and only when everything else DONE needs passed' {
+        $config = New-TestConfig
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubEstate -MockWith { $script:asked.Add('estate ' + ($Target -join ',')); foreach ($t in $Target) { New-TestResult ('HUB.ESTATE.{0}' -f $t) $script:estateStatus } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmAssociatedService -MockWith { New-TestResult 'T1.SQLVM.ASSOCIATEDSERVICES' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricRequiredItem -MockWith { New-TestResult 'FABRIC.ITEMS.REQUIRED' }
+        $requirement = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' -T4Off }
+        $seen = @(New-DoneResult | Where-Object { $_.checkId -notin 'TELEMETRY.T1', 'HUB.ESTATE.T1' })
+        $script:estateStatus = 'Pass'
+        $new = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Seen = $seen; Requirement = $requirement } { Invoke-DemoDoneGate -Config $Config -Result $Seen -Requirement $Requirement -TelemetryWaitMinutes 15 })
+        $script:asked | Should -Be @('estate T1', 'telemetry T1 wait=15', 'restore DEPLOY.T1.MONITORING the deployment', 'telemetry T1 wait=15')
+        @($new | Where-Object { $_.checkId -eq 'TELEMETRY.T1' }).status | Should -Be @('Pass')
+        (InModuleScope DbHubDemo -Parameters @{ All = @($seen + $new); Requirement = $requirement } { Test-DemoDoneEvidence -Result $All -Requirement $Requirement }).Complete | Should -BeTrue
+
+        # T1's estate entry is missing too: the run isn't DONE whatever T1's telemetry shows, so nothing waits again.
+        $script:asked.Clear()
+        $script:polls = 0
+        $script:estateStatus = 'Warning'
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Seen = $seen; Requirement = $requirement } { Invoke-DemoDoneGate -Config $Config -Result $Seen -Requirement $Requirement -TelemetryWaitMinutes 15 }
+        $script:asked | Should -Be @('estate T1', 'telemetry T1 wait=15')
+    }
+}
+
+Describe 'The history model''s blank measures right after a first deployment (Phase 28 live finding, 2026-10-30)' {
+    It 'collapses the blank-measure Warnings into one while no history is written, and keeps every other record' {
+        # Live: a new workspace gave about 40 FABRIC.SEMANTICMODEL.MEASURE.* Warnings before the notebook saved anything.
+        $records = [System.Collections.Generic.List[object]]::new()
+        $records.Add((New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.ROWS' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message '5 Direct Lake tables answer: telemetry_snapshots 0.'))
+        foreach ($index in 1..40) {
+            $records.Add((New-DemoResult -CheckId ('FABRIC.SEMANTICMODEL.MEASURE.TELEMETRY_SNAPSHOTS.M{0}' -f $index) -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'Blank.'))
+        }
+        $records.Add((New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURE.VALIDATION_RESULTS.COUNT' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Returned 3.'))
+        $records.Add((New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURE.SIGNAL.BROKEN' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'A DAX error.'))
+        $records.Add((New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.DATA' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'Summary.'))
+        $merged = @(InModuleScope DbHubDemo -Parameters @{ Records = $records.ToArray() } { Merge-DemoBlankMeasureResult -Result $Records })
+        @($merged | Where-Object { [string]$_.checkId -like 'FABRIC.SEMANTICMODEL.MEASURE.*' -and $_.status -eq 'Warning' }) | Should -BeNullOrEmpty
+        $one = @($merged | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.MEASURES' })
+        $one.Count | Should -Be 1
+        $one[0].status | Should -Be 'Warning'
+        $one[0].message | Should -Be 'The history report is empty until NB_DatabaseHub_LiveActivity saves its first snapshots; that''s expected right after a first deployment (40 measures are blank for now).'
+        @($one[0].evidence.blankMeasures).Count | Should -Be 40
+        $merged.checkId | Should -Contain 'FABRIC.SEMANTICMODEL.MEASURE.VALIDATION_RESULTS.COUNT'
+        $merged.checkId | Should -Contain 'FABRIC.SEMANTICMODEL.MEASURE.SIGNAL.BROKEN'
+        $merged.Count | Should -Be 5
+
+        # With history written, every record stays as it is.
+        $records[0] = New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.ROWS' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Rows.'
+        @(InModuleScope DbHubDemo -Parameters @{ Records = $records.ToArray() } { Merge-DemoBlankMeasureResult -Result $Records }).Count | Should -Be 44
+    }
+
+    It 'applies to the deployment''s Power BI step' {
+        $script:records = @(
+            (New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.ROWS' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'No history yet.')
+            (New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURE.A.B' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'Blank.')
+            (New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURE.A.C' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'Blank.')
+        )
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricScriptStep -MockWith { $script:records }
+        $result = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoPowerBIStage -Config $Config })
+        $result.checkId | Should -Be @('FABRIC.SEMANTICMODEL.ROWS', 'FABRIC.SEMANTICMODEL.MEASURES')
+    }
+}
+
 Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 and 7, item 11)' {
     BeforeEach {
         $script:out = Join-Path -Path $TestDrive -ChildPath ('out-' + [guid]::NewGuid().ToString('N'))
@@ -431,6 +729,52 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $model['run']['state'] | Should -Be 'NotDone'
         $model['run']['nextCommand'] | Should -Be './scripts/deploy.ps1'
         Get-Content -LiteralPath $run.PagePath -Raw | Should -Match 'Stopped, not done'
+    }
+
+    It 'ends DONE on the status page with what to confirm, saying it couldn''t check the setting, never "not enabled" (Phase 28 live finding)' {
+        # Live: the page said the run stopped because the Hub setting wasn't enabled; it was on, and the check never read it.
+        $config = New-TestConfig -WithT4
+        $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+        $result = @(New-DoneResult) + @((New-HubSettingResult 'Forbidden' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Forbidden'))
+        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $result -State (New-FinishedState -WithT4 -T4Sku 'None')
+        $outcome.Kind | Should -Be 'Done'
+        $outcome.ExitCode | Should -Be 0
+        $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $model['run']['state'] | Should -Be 'Done'
+        $model['run']['reason'] | Should -Match 'Azure refused both Burstable sizes'
+        $model['run']['reason'] | Should -Not -Match 'System\.String\[\]|tenant setting'
+        @($model['confirm']).Count | Should -Be 1
+        $model['confirm'][0] | Should -Be 'Couldn''t check the Fabric tenant setting "Users can access the Database hub (preview)" (needs a Fabric administrator; HTTP 403): please confirm it''s enabled.'
+        $page = Get-Content -LiteralPath $run.PagePath -Raw
+        $page | Should -Match '<h1>Done</h1>'
+        $page | Should -Match 'Please confirm \(a rerun can&#39;t check these, and none of them keeps the demo from being done\):'
+        $page | Should -Match 'Couldn&#39;t check the Fabric tenant setting &quot;Users can access the Database hub \(preview\)&quot; \(needs a Fabric administrator; HTTP 403\): please confirm it&#39;s enabled\.'
+        $page | Should -Not -Match 'not enabled|is disabled|System\.String\[\]'
+        $console = (InModuleScope DbHubDemo -Parameters @{ Path = $run.ProgressPath } { Format-DemoProgressConsole -Model (Read-DemoProgress -Path $Path) -Width 400 }) -join "`n"
+        $console | Should -Match 'Please confirm'
+        $console | Should -Match 'Couldn''t check the Fabric tenant setting'
+    }
+
+    It 'never writes System.String[] into a NOT DONE reason that has notes, and prints each note on its own line (Phase 28 live finding)' {
+        # Live: "TELEMETRY.T1: No performance telemetry from T1 (sqlvm01) in the last 60 minutes. System.String[]".
+        $config = New-TestConfig -WithT4
+        $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+        $telemetry = New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'No performance telemetry from T1 (sqlvm01) in the last 60 minutes.'
+        $result = @(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T1' }) + @($telemetry)
+        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $result -State (New-FinishedState -WithT4 -T4Sku 'None')
+        $outcome.Kind | Should -Be 'NotDone'
+        $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $model['run']['reason'] | Should -Match '^TELEMETRY\.T1: No performance telemetry from T1 \(sqlvm01\) in the last 60 minutes\. T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both Burstable sizes'
+        $model['run']['reason'] | Should -Not -Match 'System\.String\[\]'
+        Get-Content -LiteralPath $run.PagePath -Raw | Should -Not -Match 'System\.String\[\]'
+
+        # Two notes, two lines.
+        $developer = New-TestConfig -InstallMode 'Developer'
+        $two = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -InstallMode 'Developer'); State = (New-FinishedState); Config = $developer } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        @($two.Notes).Count | Should -Be 2
+        $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $two } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
+        $lines | Should -Contain ([string]$two.Notes[0])
+        $lines | Should -Contain ([string]$two.Notes[1])
     }
 
     It 'ends a stopped run at Stopped, not done, with the command to continue, without an Azure call, and moves its running steps back to Pending (Phase 28 live finding)' {

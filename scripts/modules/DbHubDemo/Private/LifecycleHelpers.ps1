@@ -202,11 +202,11 @@ function Wait-DemoStoppedStart {
     .SYNOPSIS
     Waits for what Request-DemoStoppedStart started (Phase 28 live finding): each VM until it runs
     (Invoke-DemoVmPowerAction, START.VM_*), the guest of a golden snapshot's source host (Invoke-DemoGoldenSourceRelease,
-    as start-demo.ps1 does; any other T2 guest starts with its host), with -RestoreT1Monitoring T1's monitoring plugin
-    (Restore-DemoSqlVmMonitoringPlugin, DEPLOY.T1.MONITORING), and T4 until it's Ready (DEPLOY.T4.START). Returns the
-    results with DEPLOY.VMSTART: Pass when every VM runs, Fail when one doesn't, because every Run Command on it would
-    fail, so the caller stops there. Updates the status page's StartVms step. Nothing when nothing was stopped.
-    Internal.
+    as start-demo.ps1 does; any other T2 guest starts with its host), and T4 until it's Ready (DEPLOY.T4.START). Returns
+    the results with DEPLOY.VMSTART: Pass when every VM runs, Fail when one doesn't, because every Run Command on it would
+    fail, so the caller stops there. Updates the status page's StartVms step. Nothing when nothing was stopped. T1's
+    monitoring plugin, which can stop after a restart, is the caller's next check (Invoke-DemoT1MonitoringCheck), on
+    every run without a T1 Monitoring step, whether or not this run started sqlvm01. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -221,9 +221,7 @@ function Wait-DemoStoppedStart {
         [string] $ProgressPath = '',
 
         [ValidateRange(1, 60)]
-        [int] $T4WaitMinutes = 15,
-
-        [switch] $RestoreT1Monitoring
+        [int] $T4WaitMinutes = 15
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -247,11 +245,6 @@ function Wait-DemoStoppedStart {
         if ($null -ne $release) {
             $results.Add($release)
         }
-    }
-    # After a deallocation, T1's monitoring plugin can stay NotRunning (live, 2026-10-22), and a run that doesn't run T1's
-    # Monitoring step wouldn't notice; the plugin is restored as start-demo.ps1 does, while T4 goes on starting.
-    if ($RestoreT1Monitoring -and $Request.Vms.Contains('sqlvm01') -and 'sqlvm01' -notin $notRunning) {
-        $results.Add((Restore-DemoSqlVmMonitoringPlugin -Config $Config -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the start'))
     }
     $t4 = $null
     if ($null -ne $Request.T4) {
