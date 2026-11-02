@@ -274,7 +274,7 @@ throw $failure
     }
 }
 
-Describe 'A lasting outage costs one request''s retries, not one per item or poll (review of c7c86ec)' {
+Describe 'A lasting outage costs a bounded number of requests: a list of reads stops at the first network error, a wait at its window (reviews of c7c86ec and 76d10b2)' {
     BeforeAll {
         # An instant DNS failure on every request, as the reviewer reproduced it.
         function New-DnsFailure([string] $HostName) {
@@ -294,6 +294,32 @@ Describe 'A lasting outage costs one request''s retries, not one per item or pol
         $script:policyConfig['subscriptionId'] = $script:subscriptionId
         $script:policyConfig['tenantId'] = '66666666-7777-8888-9999-000000000000'
         $script:policyConfig['networkMode'] = 'auto'
+
+        # A fake clock that Start-Sleep moves, and a workspace read that fails with an instant DNS failure while an outage
+        # lasts (seconds from the start: From inclusive, To exclusive). Before it, the read answers -Before; after it,
+        # -Progress.
+        function Set-ClockOutageMock([int] $From = 0, [int] $To, [string] $Progress = 'Completed', [string] $Before = 'InProgress') {
+            $script:sent = [System.Collections.Generic.List[string]]::new()
+            $script:failed = 0
+            $script:start = [datetime]::new(2026, 11, 2, 15, 0, 0, [System.DateTimeKind]::Utc)
+            $script:now = $script:start
+            $script:outage = @($From, $To)
+            $script:progressAfter = $Progress
+            $script:progressBefore = $Before
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+            Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:now = $script:now.AddSeconds([int]$PesterBoundParameters['Seconds']) }
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith {
+                $script:sent.Add([string]$PesterBoundParameters['Uri'])
+                $at = ($script:now - $script:start).TotalSeconds
+                if ($at -ge $script:outage[0] -and $at -lt $script:outage[1]) {
+                    $script:failed++
+                    throw (New-DnsFailure -HostName 'api.fabric.microsoft.com')
+                }
+                $progress = if ($at -lt $script:outage[0]) { $script:progressBefore } else { $script:progressAfter }
+                New-TestResponse -Status 200 -Body @{ id = $script:workspaceId; capacityId = 'cccccccc-cccc-cccc-cccc-cccccccccccc'; capacityAssignmentProgress = $progress }
+            }
+        }
     }
 
     It 'says a request a network error stopped is one, in Invoke-DemoRestRequest''s answer' {
@@ -306,14 +332,34 @@ Describe 'A lasting outage costs one request''s retries, not one per item or pol
         $script:sent.Count | Should -Be 4
     }
 
-    It 'stops waiting for a workspace''s capacity assignment at the first read a network error stopped' {
-        # Before: each poll paid its own 4 attempts, 244 requests where the wait had made 61.
-        Set-OutageMock
+    It 'rides out an outage shorter than the capacity wait''s window, and reports the assignment it then reads (review of 76d10b2)' {
+        # The reviewer's probe: 6 failed attempts. 76d10b2 gave up after the first read's 4, at 50 seconds; c7c86ec read on.
+        Set-ClockOutageMock -To 70
+        $wait = InModuleScope DbHubDemo -Parameters @{ Token = $script:token; Workspace = $script:workspaceId } { Wait-DemoFabricCapacityAssignment -WorkspaceId $Workspace -Token $Token -TimeoutSeconds 300 }
+        $wait.Progress | Should -Be 'Completed'
+        $wait.CapacityId | Should -Be 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+        $wait.NetworkError | Should -BeFalse
+        $script:failed | Should -Be 6
+        ($script:now - $script:start).TotalSeconds | Should -Be 75
+    }
+
+    It 'ends an outage longer than the window with NetworkError at about its deadline, not later (review of 76d10b2)' {
+        Set-ClockOutageMock -To 100000
         $wait = InModuleScope DbHubDemo -Parameters @{ Token = $script:token; Workspace = $script:workspaceId } { Wait-DemoFabricCapacityAssignment -WorkspaceId $Workspace -Token $Token -TimeoutSeconds 300 }
         $wait.NetworkError | Should -BeTrue
         $wait.Progress | Should -Be 'Unknown'
         $wait.Error | Should -Match '^No response: A network error reached api\.fabric\.microsoft\.com on each of 4 attempts: No such host is known'
-        $script:sent.Count | Should -Be 4
+        $elapsed = ($script:now - $script:start).TotalSeconds
+        $elapsed | Should -BeGreaterOrEqual 300 -Because 'the wait reads on for its whole window'
+        $elapsed | Should -BeLessOrEqual 350 -Because 'it ends within one read''s attempts (50 seconds) of its deadline'
+        $script:sent.Count | Should -Be 24 -Because 'six reads of 4 attempts each, where counting only its sleeps had made 244 requests'
+
+        # A read that came back before the outage leaves the caller's Pass or Warning, as before: no NetworkError.
+        Set-ClockOutageMock -From 1 -To 100000
+        $wait = InModuleScope DbHubDemo -Parameters @{ Token = $script:token; Workspace = $script:workspaceId } { Wait-DemoFabricCapacityAssignment -WorkspaceId $Workspace -Token $Token -TimeoutSeconds 300 }
+        $wait.NetworkError | Should -BeFalse
+        $wait.Progress | Should -Be 'Unknown'
+        ($script:now - $script:start).TotalSeconds | Should -BeLessOrEqual 350
     }
 
     It 'counts the capacity wait in elapsed time, the reads included' {

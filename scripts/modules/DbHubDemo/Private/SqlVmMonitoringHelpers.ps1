@@ -657,9 +657,10 @@ function Get-DemoSqlVmMonitoringState {
 
     .DESCRIPTION
     A read that fails is told apart from one that finds nothing (review of c7c86ec): ReadErrors lists, redacted, each
-    read of the extension, the VM, or a registration that failed with anything but not found (Test-DemoAzNotFound), and
-    ConvertTo-DemoSqlVmMonitoringResult then says Azure couldn't be read, instead of reporting a missing SqlIaasExtension
-    or identity.
+    read of the extension, the VM, or the Microsoft.AzureArcData registration that failed with anything but not found
+    (Test-DemoAzNotFound), and ConvertTo-DemoSqlVmMonitoringResult then says Azure couldn't be read, instead of
+    reporting a missing SqlIaasExtension or identity. A Microsoft.Sql read that fails isn't one of them: its state is
+    'Unknown', which is the Warning an unregistered Microsoft.Sql gets, as before (review of 76d10b2).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -705,7 +706,10 @@ function Get-DemoSqlVmMonitoringState {
     foreach ($namespace in 'Microsoft.Sql', 'Microsoft.AzureArcData') {
         $provider = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('provider', 'show', '--namespace', $namespace, '--query', 'registrationState', '--output', 'tsv') -AllowFailure
         $providers[$namespace] = if ($provider.ExitCode -eq 0) { ([string]$provider.StdOut).Trim() } else { 'Unknown' }
-        if ($provider.ExitCode -ne 0 -and -not (Test-DemoAzNotFound -Text ([string]$provider.StdErr))) {
+        # Microsoft.Sql not Registered is only a Warning, so a read of it that fails stays 'Unknown' and that Warning, as
+        # before (review of 76d10b2). Microsoft.AzureArcData not Registered is a Fail either way, and its failed read says
+        # what happened.
+        if ($namespace -ne 'Microsoft.Sql' -and $provider.ExitCode -ne 0 -and -not (Test-DemoAzNotFound -Text ([string]$provider.StdErr))) {
             $readErrors.Add(('the {0} registration: {1}' -f $namespace, ((Get-DemoDeploymentErrorText -Text ([string]$provider.StdErr) -MaxLength 300) -replace '\s+', ' ')))
         }
     }
@@ -738,13 +742,14 @@ function ConvertTo-DemoSqlVmMonitoringResult {
     T1.SQLVM.MONITORING from a monitoring state (Get-DemoSqlVmMonitoringState). Internal.
 
     .DESCRIPTION
-    Fail: Azure couldn't be read (State.ReadErrors: a read of the extension, the VM, or a registration that failed with
-    anything but not found; the next deploy.ps1 resumes the step); the extension is missing, not Succeeded, or older than
-    2.0.229.0; the VM has no system-assigned
+    Fail: Azure couldn't be read (State.ReadErrors: a read of the extension, the VM, or the Microsoft.AzureArcData
+    registration that failed with anything but not found; the next deploy.ps1 resumes the step); the extension is
+    missing, not Succeeded, or older than 2.0.229.0; the VM has no system-assigned
     identity; Microsoft.AzureArcData isn't registered; the feature flag isn't set; or MetricsUploadStatus
     contains an HTTP error (the documented troubleshooting symptom for a blocked endpoint or identity).
     Warning: the flag is set but the plugin doesn't report Running and OK yet (allow 3 to 15 minutes; NotRunning
-    can mean the setting hasn't applied yet), Microsoft.Sql isn't registered (Hub needs it), or unified
+    can mean the setting hasn't applied yet), Microsoft.Sql isn't registered (Hub needs it; also when its registration
+    couldn't be read, 'Unknown'), or unified
     inventory has no instance yet. Pass: DatabaseMonitorArcPlugin reports State Running and MetricsUploadStatus
     OK. With -PrerequisitesOnly, returns the first failed prerequisite, or $null when nothing blocks writing
     the feature flag.

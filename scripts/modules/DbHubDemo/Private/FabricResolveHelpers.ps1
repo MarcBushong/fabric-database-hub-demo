@@ -203,11 +203,14 @@ function Wait-DemoFabricCapacityAssignment {
     .DESCRIPTION
     Assign To Capacity answers 202 without an operation to follow, and Create Workspace can return before the
     assignment is done, so the workspace itself is the documented signal. -TimeoutSeconds counts elapsed time, the
-    reads included (Get-DemoUtcNow), and no sleep runs past it; a read that a network error stopped after its
-    attempts (Invoke-DemoHubFabricGet's NetworkError) ends the wait at once, because every later read would pay the
-    same attempts and backoff again (review of c7c86ec: 244 requests in about 56 minutes, where the wait had taken 61
-    in 300 seconds). Returns Progress (Completed, Failed, InProgress, or Unknown), CapacityId, Error, and
-    NetworkError.
+    reads included (Get-DemoUtcNow), and no sleep runs past it, so a lasting outage costs the wait about
+    -TimeoutSeconds plus one read's attempts (review of c7c86ec: counted in sleeps only, it took 244 requests and about
+    56 minutes, where it had made 61 in 300 seconds). A read that fails, a network error included, counts as unknown,
+    and the wait goes on, so it rides out a short outage right after the workspace is created or assigned (review of
+    76d10b2: it had given up after one read's attempts, about 50 seconds). Returns Progress (Completed, Failed,
+    InProgress, or Unknown), CapacityId, Error, and NetworkError, which is true only when the time ran out without a
+    read that came back and the last read's failure was a network error; after any read that came back, the caller's
+    Pass or Warning applies, as before.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -228,10 +231,12 @@ function Wait-DemoFabricCapacityAssignment {
 
     $deadline = (Get-DemoUtcNow).AddSeconds($TimeoutSeconds)
     $slept = 0
+    $cameBack = $false
     $last = [pscustomobject]@{ Progress = 'Unknown'; CapacityId = ''; Error = ''; NetworkError = $false }
     while ($true) {
         $read = Invoke-DemoHubFabricGet -Uri ('{0}/workspaces/{1}' -f $script:FabricApiBaseUri, $WorkspaceId) -Token $Token
         if ($read.StatusCode -eq 200) {
+            $cameBack = $true
             $progress = [string](Get-DemoMemberValue -InputObject $read.Body -Name 'capacityAssignmentProgress')
             $capacityId = [string](Get-DemoMemberValue -InputObject $read.Body -Name 'capacityId')
             if (-not $progress) {
@@ -243,14 +248,15 @@ function Wait-DemoFabricCapacityAssignment {
             }
         }
         else {
+            # Unknown, and the wait goes on: a short outage passes (review of 76d10b2).
             $last = [pscustomobject]@{ Progress = 'Unknown'; CapacityId = ''; Error = $read.Error; NetworkError = [bool](Get-DemoMemberValue -InputObject $read -Name 'NetworkError') }
-            if ($last.NetworkError) {
-                return $last
-            }
         }
         # Elapsed time, the reads included; the sleeps' sum also bounds it, so a clock that doesn't move ends it too.
         $remaining = ($deadline - (Get-DemoUtcNow)).TotalSeconds
         if ($remaining -le 0 -or $slept -ge $TimeoutSeconds) {
+            if ($cameBack) {
+                $last.NetworkError = $false
+            }
             return $last
         }
         $pause = [int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, [System.Math]::Ceiling($remaining)))

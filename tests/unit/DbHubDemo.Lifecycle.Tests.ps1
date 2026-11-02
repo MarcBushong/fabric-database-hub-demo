@@ -2990,21 +2990,26 @@ Describe 'T1''s monitoring when Azure can''t be read (review of c7c86ec)' {
 
     BeforeEach {
         $script:failing = ''
+        $script:sqlRegistration = 'Registered'
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoSqlVmInventoryInstance -MockWith { [pscustomobject]@{ properties = [pscustomobject]@{ edition = 'Standard' } } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
             $joined = $ArgumentList -join ' '
-            $part = if ($joined -like 'vm extension show *') { 'extension' } elseif ($joined -like 'vm show *') { 'vm' } elseif ($joined -like 'provider show *') { 'provider' } else { 'other' }
+            $part = if ($joined -like 'vm extension show *') { 'extension' } elseif ($joined -like 'vm show *') { 'vm' } elseif ($joined -like 'provider show --namespace Microsoft.Sql *') { 'sql' } elseif ($joined -like 'provider show --namespace Microsoft.AzureArcData *') { 'arcdata' } else { 'other' }
             if ($part -eq $script:failing) {
                 return (New-AzResult -ExitCode 1 -StdErr $script:unreachable)
             }
             if ($part -eq 'extension' -and $script:failing -eq 'missing') {
                 return (New-AzResult -ExitCode 3 -StdErr "ERROR: (ResourceNotFound) The Resource 'Microsoft.Compute/virtualMachines/sqlvm01/extensions/SqlIaasExtension' under resource group 'rg-dbhub-demo' was not found.")
             }
+            if ($part -eq 'sql' -and $script:sqlRegistration -eq 'GatewayTimeout') {
+                return (New-AzResult -ExitCode 1 -StdErr "ERROR: (GatewayTimeout) The gateway did not receive a response from 'Microsoft.Resources' within the specified time period.")
+            }
             switch ($part) {
                 'extension' { return (New-AzResult -StdOut $script:extensionJson) }
                 'vm' { return (New-AzResult -StdOut '{"name":"sqlvm01","identity":{"type":"SystemAssigned"}}') }
-                'provider' { return (New-AzResult -StdOut 'Registered') }
+                'sql' { return (New-AzResult -StdOut $script:sqlRegistration) }
+                'arcdata' { return (New-AzResult -StdOut 'Registered') }
             }
             if ($joined -like 'vm get-instance-view *') {
                 return (New-AzResult -StdOut '{"instanceView":{"statuses":[{"code":"PowerState/running"}]}}')
@@ -3017,7 +3022,7 @@ Describe 'T1''s monitoring when Azure can''t be read (review of c7c86ec)' {
         foreach ($case in @(
                 @{ Failing = 'extension'; What = 'the SqlIaasExtension on sqlvm01'; Not = 'has no SqlIaasExtension' }
                 @{ Failing = 'vm'; What = 'sqlvm01'; Not = 'system-assigned managed identity' }
-                @{ Failing = 'provider'; What = 'the Microsoft\.Sql registration'; Not = 'not Registered' }
+                @{ Failing = 'arcdata'; What = 'the Microsoft\.AzureArcData registration'; Not = 'not Registered' }
             )) {
             $script:failing = $case.Failing
             $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }
@@ -3046,5 +3051,34 @@ Describe 'T1''s monitoring when Azure can''t be read (review of c7c86ec)' {
         $after.remediation | Should -Match 'Run \./scripts/deploy\.ps1 again: it resumes at T1''s Monitoring step'
         $after.evidence.restarted | Should -BeTrue
         $after.evidence.restartCheckId | Should -Be 'DEPLOY.T1.MONITORING'
+    }
+
+    It 'keeps a Microsoft.Sql registration that couldn''t be read the Warning an unregistered one gets, not a Fail (review of 76d10b2)' {
+        # 76d10b2 made a GatewayTimeout on this read a Fail that stopped T1's Monitoring step and blocked DONE.
+        $sqlWarning = 'T1 uploads telemetry, but Microsoft.Sql isn''t Registered; Database Hub needs it.'
+        foreach ($case in @(
+                @{ Registration = 'GatewayTimeout'; Failing = ''; State = 'Unknown' }
+                @{ Registration = 'Registered'; Failing = 'sql'; State = 'Unknown' }
+                @{ Registration = 'NotRegistered'; Failing = ''; State = 'NotRegistered' }
+            )) {
+            $script:sqlRegistration = $case.Registration
+            $script:failing = $case.Failing
+            $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }
+            $result.status | Should -Be 'Warning' -Because ('{0} {1}' -f $case.Registration, $case.Failing)
+            $result.message | Should -Be $sqlWarning
+            $result.evidence.providers['Microsoft.Sql'] | Should -Be $case.State
+            $result.evidence.Contains('readErrors') | Should -BeFalse
+        }
+
+        # A failed extension or VM read is still "couldn't be read", and names only what failed.
+        $script:sqlRegistration = 'GatewayTimeout'
+        foreach ($failing in 'extension', 'vm') {
+            $script:failing = $failing
+            $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }
+            $result.status | Should -Be 'Fail'
+            $result.message | Should -Match '^Azure couldn''t be read for sqlvm01''s monitoring: '
+            $result.message | Should -Not -Match 'Microsoft\.Sql|GatewayTimeout'
+            @($result.evidence.readErrors).Count | Should -Be 1
+        }
     }
 }
