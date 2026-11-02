@@ -685,6 +685,46 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         $script:order[-1] | Should -Be 'Residue:abc123'
     }
 
+    It 'replaces a manifest of the same resource group in another subscription, with a Warning, and never checks its deploymentId (review of 7fb941e)' {
+        # The default path is shared by every subscription with the same environment name, so another subscription's
+        # destroy of rg-dbhub-demo can have written it; its deploymentId and identities are another environment's.
+        $manifestPath = Join-Path -Path $TestDrive -ChildPath 'othersub/destroy-manifest-demo.json'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Path $manifestPath -Parent) -Force
+        $other = New-TestManifest
+        $other.DeploymentId = 'zzz999'
+        $other | Add-Member -NotePropertyName 'SubscriptionId' -NotePropertyValue '99999999-8888-7777-6666-555555555555'
+        $other | Add-Member -NotePropertyName 'ResourceGroupExisted' -NotePropertyValue $true
+        Set-Content -LiteralPath $manifestPath -Value ($other | ConvertTo-Json -Depth 6)
+        $script:groupExists = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { $script:order.Add('Manifest'); [pscustomobject]@{ SubscriptionId = '11111111-2222-3333-4444-555555555555'; ResourceGroupName = 'rg-dbhub-demo'; ResourceGroupExisted = $false; DeploymentId = 'abc123'; Principals = @() } }
+        $null = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
+        $script:order[-1] | Should -Be 'Residue:abc123'
+        $kept = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $kept.DeploymentId | Should -Be 'abc123'
+        $kept.SubscriptionId | Should -Be '11111111-2222-3333-4444-555555555555'
+        @($kept.Principals).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'is of rg-dbhub-demo in subscription 99999999-8888-7777-6666-555555555555, another environment, so it''s replaced' }
+    }
+
+    It 'keeps the earlier manifest of this subscription whatever the case of its ID, and one from before it was recorded' -ForEach @(
+        @{ RecordedSubscription = '11111111-2222-3333-4444-555555555555'.ToUpperInvariant() }
+        @{ RecordedSubscription = '' }
+    ) {
+        $manifestPath = Join-Path -Path $TestDrive -ChildPath ('samesub-{0}/destroy-manifest-demo.json' -f [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path (Split-Path -Path $manifestPath -Parent) -Force
+        $earlier = New-TestManifest
+        if ($RecordedSubscription) {
+            $earlier | Add-Member -NotePropertyName 'SubscriptionId' -NotePropertyValue $RecordedSubscription
+        }
+        $earlier | Add-Member -NotePropertyName 'ResourceGroupExisted' -NotePropertyValue $true
+        Set-Content -LiteralPath $manifestPath -Value ($earlier | ConvertTo-Json -Depth 6)
+        $script:groupExists = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { $script:order.Add('Manifest'); [pscustomobject]@{ SubscriptionId = '11111111-2222-3333-4444-555555555555'; ResourceGroupName = 'rg-dbhub-demo'; ResourceGroupExisted = $false; DeploymentId = ''; Principals = @() } }
+        $null = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
+        $script:order[-1] | Should -Be 'Residue:abc123'
+        @((Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).Principals).Count | Should -Be 2
+    }
+
     It 'reports a missing deployment record as Pass without deleting anything' {
         $script:recordStatus = New-AzResult -ExitCode 3 -StdErr "ERROR: (DeploymentNotFound) Deployment 'dbhub-demo-main' could not be found."
         $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
@@ -842,6 +882,34 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
             ($results | Where-Object { $_.checkId -eq 'DESTROY.MANIFEST' }).message | Should -Match 'isn''t a readable manifest'
             Get-DemoExitCode -Result $results | Should -Be 1
             $script:order.Count | Should -Be 0
+        }
+
+        It 'checks nothing with the same resource group''s manifest from another subscription, and names both subscriptions (review of 7fb941e)' {
+            # Reproduced in review: DESTROY.MANIFEST passed, and the check got the other subscription's deploymentId.
+            $other = New-TestManifest
+            $other.DeploymentId = 'zzz999'
+            $other | Add-Member -NotePropertyName 'SubscriptionId' -NotePropertyValue '99999999-8888-7777-6666-555555555555'
+            $other | Add-Member -NotePropertyName 'ResourceGroupExisted' -NotePropertyValue $true
+            Set-Content -LiteralPath $script:manifestPath -Value ($other | ConvertTo-Json -Depth 6)
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath $script:manifestPath)
+            $manifestResult = $results | Where-Object { $_.checkId -eq 'DESTROY.MANIFEST' }
+            $manifestResult.status | Should -Be 'Fail'
+            $manifestResult.message | Should -Match 'is the manifest of rg-dbhub-demo in subscription 99999999-8888-7777-6666-555555555555, not of rg-dbhub-demo in subscription 11111111-2222-3333-4444-555555555555, this configuration''s\.'
+            $manifestResult.remediation | Should -Match 'shared by every prefix and subscription with that environment name'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoTeardownResidue -Times 0 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly
+            @($results | Where-Object { $_.checkId -like 'TEARDOWN.*' -or $_.checkId -eq 'DESTROY.RESIDUAL' }) | Should -BeNullOrEmpty
+            $script:order.Count | Should -Be 0
+            Get-DemoExitCode -Result $results | Should -Be 1
+        }
+
+        It 'reads a manifest of this subscription whatever the case of its ID' {
+            $recorded = New-TestManifest
+            $recorded | Add-Member -NotePropertyName 'SubscriptionId' -NotePropertyValue '11111111-2222-3333-4444-555555555555'.ToUpperInvariant()
+            Set-Content -LiteralPath $script:manifestPath -Value ($recorded | ConvertTo-Json -Depth 6)
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath $script:manifestPath)
+            ($results | Where-Object { $_.checkId -eq 'DESTROY.MANIFEST' }).status | Should -Be 'Pass'
+            $script:order | Should -Be @('Residue:abc123')
         }
 
         It 'stops before anything when the subscription guard fails' {

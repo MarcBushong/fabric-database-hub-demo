@@ -19,7 +19,7 @@ Every script runs the subscription guard first, never signs in, and never change
   ./tests/teardown/Invoke-TeardownTest.ps1 -ConfigPath ./out/demo.config.test.json
   ```
 
-  Or run the tests directly with `-Live` (or `DBHUB_TEARDOWN_TESTS=true`) and a configuration (`-ConfigPath` or `DBHUB_TEARDOWN_CONFIG`). They read the manifest `destroy.ps1` wrote before it deleted anything, `out/destroy-manifest-<environment>.json` (or `-ManifestPath`, `DBHUB_TEARDOWN_MANIFEST`): it holds the deploymentId and the managed identities, which can't be found once the resource group is gone.
+  Or run the tests directly with `-Live` (or `DBHUB_TEARDOWN_TESTS=true`) and a configuration (`-ConfigPath` or `DBHUB_TEARDOWN_CONFIG`). They read the manifest `destroy.ps1` wrote before it deleted anything, `out/destroy-manifest-<environment>.json` (or `-ManifestPath`, `DBHUB_TEARDOWN_MANIFEST`): it holds the deploymentId and the managed identities, which can't be found once the resource group is gone. That default path is shared by every prefix and subscription with the same environment name, so the tests stop when the manifest is of another resource group or subscription.
 
   The same check with the demo's status model, as `destroy.ps1` reports it, is `./scripts/destroy.ps1 -ConfigPath <file> -ResidueOnly`: it reads the saved manifest, deletes nothing, and exits 1 only on a Fail ([Cleanup](../../docs/cleanup.md#check-again-later-read-only)).
 

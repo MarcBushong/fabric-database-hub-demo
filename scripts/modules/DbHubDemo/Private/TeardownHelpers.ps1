@@ -11,8 +11,15 @@ function Resolve-DemoTeardownManifest {
       isn't changed.
     - The group still exists (still being deleted, or partly deleted): the identities the earlier manifest
       recorded for the same deploymentId are added to the fresh one, because their resources may be gone.
-    An earlier manifest for another group, one taken after its group was gone, or one that can't be read is
-    replaced. The file holds names and IDs only, no secret.
+    An earlier manifest for another group or another subscription (its SubscriptionId, when it has one, compared
+    without regard to case), one taken after its group was gone, or one that can't be read is replaced. The default
+    path, out/destroy-manifest-<environment>.json, is shared by every prefix and subscription with that environment
+    name, so another environment's manifest can be there (Phase 28 follow-up review): it's never used for this one,
+    and replacing it is logged as a Warning. The file holds names and IDs only, no secret.
+
+    .PARAMETER SubscriptionId
+    The configured subscription, which an earlier manifest must name when it names one; by default the fresh
+    manifest's.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -20,9 +27,14 @@ function Resolve-DemoTeardownManifest {
         [Parameter(Mandatory)]
         [object] $Manifest,
 
-        [string] $Path = ''
+        [string] $Path = '',
+
+        [string] $SubscriptionId = ''
     )
 
+    if (-not $SubscriptionId) {
+        $SubscriptionId = [string](Get-DemoMemberValue -InputObject $Manifest -Name 'SubscriptionId')
+    }
     $previous = $null
     if ($Path -and (Test-Path -LiteralPath $Path -PathType Leaf)) {
         try {
@@ -31,8 +43,19 @@ function Resolve-DemoTeardownManifest {
         catch {
             Write-DemoLog -Level Warning -Message ('The earlier manifest {0} couldn''t be read, so it''s replaced.' -f $Path)
         }
-        if ($null -ne $previous -and ([string](Get-DemoMemberValue -InputObject $previous -Name 'ResourceGroupName') -ne [string](Get-DemoMemberValue -InputObject $Manifest -Name 'ResourceGroupName') -or -not [bool](Get-DemoMemberValue -InputObject $previous -Name 'ResourceGroupExisted'))) {
-            $previous = $null
+        if ($null -ne $previous) {
+            $previousGroup = [string](Get-DemoMemberValue -InputObject $previous -Name 'ResourceGroupName')
+            $previousSubscription = ([string](Get-DemoMemberValue -InputObject $previous -Name 'SubscriptionId')).Trim()
+            $otherSubscription = $previousSubscription -and -not [string]::Equals($previousSubscription, $SubscriptionId.Trim(), [System.StringComparison]::OrdinalIgnoreCase)
+            if ($otherSubscription -or $previousGroup -ne [string](Get-DemoMemberValue -InputObject $Manifest -Name 'ResourceGroupName')) {
+                # In GitHub Actions, the other subscription's ID is masked in the log too (ADR 0022).
+                Register-DemoLogMask -Value $previousSubscription
+                Write-DemoLog -Level Warning -Message ('The earlier manifest {0} is of {1}{2}, another environment, so it''s replaced. Check that environment with a manifest of its own.' -f $Path, $(if ($previousGroup) { $previousGroup } else { 'no resource group' }), $(if ($otherSubscription) { ' in subscription {0}' -f $previousSubscription } else { '' }))
+                $previous = $null
+            }
+            elseif (-not [bool](Get-DemoMemberValue -InputObject $previous -Name 'ResourceGroupExisted')) {
+                $previous = $null
+            }
         }
     }
     if ($null -ne $previous -and -not [bool](Get-DemoMemberValue -InputObject $Manifest -Name 'ResourceGroupExisted')) {
@@ -669,7 +692,14 @@ function Read-DemoTeardownManifest {
     <#
     .SYNOPSIS
     Reads the manifest destroy.ps1 wrote (names and IDs only) for a read-only rerun of the residual check, and checks
-    that it belongs to this configuration's resource group. Returns Found, Manifest, and Error. Internal.
+    that it belongs to this configuration: its resource group, and its subscription when it names one (without regard
+    to case). Returns Found, Manifest, and Error. Internal.
+
+    .DESCRIPTION
+    The default path, out/destroy-manifest-<environment>.json, is shared by every prefix and subscription with that
+    environment name, so a destroy of another environment can have written it. Its deploymentId and identities
+    would then be another environment's, and the check could pass on the wrong one (Phase 28 follow-up review), so
+    such a manifest is an Error, and nothing is checked.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -678,7 +708,10 @@ function Read-DemoTeardownManifest {
         [string] $Path,
 
         [Parameter(Mandatory)]
-        [string] $ResourceGroupName
+        [string] $ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId
     )
 
     if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -691,6 +724,13 @@ function Read-DemoTeardownManifest {
         return [pscustomobject]@{ Found = $true; Manifest = $null; Error = ('{0} isn''t a readable manifest: {1}' -f $Path, (Protect-DemoText -Text $_.Exception.Message).Trim()) }
     }
     $recordedGroup = [string](Get-DemoMemberValue -InputObject $manifest -Name 'ResourceGroupName')
+    $recordedSubscription = ([string](Get-DemoMemberValue -InputObject $manifest -Name 'SubscriptionId')).Trim()
+    if ($recordedSubscription -and -not [string]::Equals($recordedSubscription, $SubscriptionId.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+        # In GitHub Actions, both IDs are masked in the log and the results (ADR 0022); locally they stay visible.
+        Register-DemoLogMask -Value $recordedSubscription, $SubscriptionId
+        $named = if ($recordedSubscription -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { $recordedSubscription } else { 'a value that isn''t a subscription ID' }
+        return [pscustomobject]@{ Found = $true; Manifest = $null; Error = ('{0} is the manifest of {1} in subscription {2}, not of {3} in subscription {4}, this configuration''s.' -f $Path, $(if ($recordedGroup) { $recordedGroup } else { 'no resource group' }), $named, $ResourceGroupName, $SubscriptionId) }
+    }
     if ($recordedGroup -ne $ResourceGroupName) {
         return [pscustomobject]@{ Found = $true; Manifest = $null; Error = ('{0} is the manifest of {1}, not of {2}, this configuration''s resource group.' -f $Path, $(if ($recordedGroup) { $recordedGroup } else { 'no resource group' }), $ResourceGroupName) }
     }

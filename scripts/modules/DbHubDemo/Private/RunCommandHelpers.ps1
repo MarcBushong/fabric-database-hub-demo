@@ -723,6 +723,48 @@ function ConvertFrom-DemoRunCommandOutput {
     return $null
 }
 
+function Test-DemoRunCommandFinished {
+    <#
+    .SYNOPSIS
+    Whether a managed Run Command's script has ended, for the cleanup of the on-demand control's Run Commands by
+    start-demo.ps1: its execution state is terminal (Succeeded, Failed, Canceled, or TimedOut), or the state is empty
+    or Unknown and the time at the end of its name (-yyyyMMddHHmmss, UTC) is more than an hour old. Internal.
+
+    .DESCRIPTION
+    An empty or Unknown state is what a Run Command shows right after it's created, before the VM agent picks it up,
+    and after a deallocation cleared its instance view; only the age in its name tells the two apart, and the
+    control's longest timeout is 25 minutes. Without a time in its name, or in any other state (Pending, Running), it
+    isn't finished, so a control run that overlaps start-demo.ps1 never loses a Run Command it has just created
+    (Phase 28 follow-up review). The control's runbooks (Clear-DbHubOldRunCommand -FinishedOnly) use the same hour but
+    count any state that isn't terminal once the hour has passed. Execution states:
+    https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/get-by-virtual-machine
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Name,
+
+        [AllowEmptyString()]
+        [string] $ExecutionState = '',
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    if ($ExecutionState -in 'Succeeded', 'Failed', 'Canceled', 'TimedOut') {
+        return $true
+    }
+    if ($ExecutionState -and $ExecutionState -ne 'Unknown') {
+        return $false
+    }
+    $stamp = [DateTime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if ($Name -match '-(\d{14})$' -and [DateTime]::TryParseExact($Matches[1], 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$stamp)) {
+        return $stamp.AddHours(1) -lt $NowUtc.ToUniversalTime()
+    }
+    return $false
+}
+
 function Get-DemoVmRunCommandLeftover {
     <#
     .SYNOPSIS
@@ -737,7 +779,8 @@ function Get-DemoVmRunCommandLeftover {
     Running (a deployment, a check, or an on-demand run in progress). Nothing runs on a VM that isn't running, so there
     every one of them counts. Names of anything else aren't the demo's and are left out. Azure allows 25 managed Run
     Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview). Returns Ok, Error, and
-    Items (VmName, Name, Kind Control or Demo, ExecutionState, ProvisioningState).
+    Items (VmName, Name, Kind Control or Demo, ExecutionState, ProvisioningState, and Finished, by
+    Test-DemoRunCommandFinished).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -749,7 +792,9 @@ function Get-DemoVmRunCommandLeftover {
         [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9-]{0,14}$')]
         [string] $VmName,
 
-        [switch] $Running
+        [switch] $Running,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
     )
 
     $subscriptionId = [string]$Config['subscriptionId']
@@ -774,7 +819,7 @@ function Get-DemoVmRunCommandLeftover {
         if ($provisioning -eq 'Deleting' -or ($Running -and $execution -in 'Pending', 'Running')) {
             continue
         }
-        $items.Add([pscustomobject]@{ VmName = $VmName; Name = $name; Kind = $kind; ExecutionState = $execution; ProvisioningState = $provisioning })
+        $items.Add([pscustomobject]@{ VmName = $VmName; Name = $name; Kind = $kind; ExecutionState = $execution; ProvisioningState = $provisioning; Finished = (Test-DemoRunCommandFinished -Name $name -ExecutionState $execution -NowUtc $NowUtc) })
     }
     return [pscustomobject]@{ Ok = $true; Error = ''; Items = $items.ToArray() }
 }
@@ -806,10 +851,12 @@ function Remove-DemoControlRunCommand {
 
     .DESCRIPTION
     The control deletes its earlier Run Commands when a run or a reset starts, but its stop path never touches Run
-    Command (ADR 0020), so a VM keeps the last run's until the next run or this start. A VM that isn't running can't
-    have one removed, so only the VMs that run are cleaned; a list or delete that fails, for example because a VM was
-    deallocated meanwhile, is a Warning that the next start retries, never a Fail. Returns nothing with control.enabled
-    false and nothing to delete.
+    Command (ADR 0020), so a VM keeps the last run's until the next run or this start. Only finished ones go
+    (Test-DemoRunCommandFinished): a terminal execution state, or an empty or Unknown one more than an hour after the
+    time in its name, so a control run that overlaps this start keeps the Run Command it has just created (Phase 28
+    follow-up review). A VM that isn't running can't have one removed, so only the VMs that run are
+    cleaned; a list or delete that fails, for example because a VM was deallocated meanwhile, is a Warning that the
+    next start retries, never a Fail. Returns nothing with control.enabled false and nothing to delete.
     - Delete: https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/delete
     - Limit of 25 per VM: https://learn.microsoft.com/azure/virtual-machines/run-command-overview
     #>
@@ -835,7 +882,7 @@ function Remove-DemoControlRunCommand {
             $failed.Add(('{0}: the Run Commands couldn''t be listed ({1})' -f $vm, $found.Error))
             continue
         }
-        foreach ($item in @($found.Items | Where-Object { $_.Kind -eq 'Control' })) {
+        foreach ($item in @($found.Items | Where-Object { $_.Kind -eq 'Control' -and $_.Finished })) {
             if (-not $PSCmdlet.ShouldProcess(('{0}/{1}' -f $vm, $item.Name), 'Delete the on-demand control''s finished Run Command')) {
                 continue
             }
@@ -870,7 +917,9 @@ function Get-DemoRunCommandStatus {
     .SYNOPSIS
     STATUS.RUNCOMMANDS for status.ps1, read-only: the demo's leftover managed Run Commands on its VMs
     (Get-DemoVmRunCommandLeftover). Pass when there's none; a Warning that names them, with the commands that delete
-    them, otherwise, or when they can't be listed. Internal.
+    them, otherwise, or when they can't be listed. On a running VM, a control Run Command that isn't finished
+    (Test-DemoRunCommandFinished) belongs to a run in progress and isn't counted, so no delete command stops it.
+    Internal.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -894,6 +943,9 @@ function Get-DemoRunCommandStatus {
             continue
         }
         foreach ($item in @($found.Items)) {
+            if ([bool]$Running[$vm] -and $item.Kind -eq 'Control' -and -not $item.Finished) {
+                continue
+            }
             $left.Add($item)
         }
     }

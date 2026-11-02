@@ -67,7 +67,9 @@ function Remove-DemoEnvironment {
     How long to wait for the resource group to be deleted.
 
     .PARAMETER ManifestPath
-    Where to write the manifest (JSON, names and IDs only) for a later residual check.
+    Where to write the manifest (JSON, names and IDs only) for a later residual check. destroy.ps1's default,
+    out/destroy-manifest-<environment>.json, is shared by every prefix and subscription with that environment name: a
+    manifest there of another resource group or subscription is replaced, with a Warning, and never used.
 
     .PARAMETER SkipResidueCheck
     Don't run the residual check (DESTROY.RESIDUAL is Not selected).
@@ -86,7 +88,7 @@ function Remove-DemoEnvironment {
     Delete nothing: run only the residual check again, with the manifest at -ManifestPath that an earlier destroy
     wrote, and sum it up in DESTROY.RESIDUAL. The manifest isn't changed, nothing is asked, and -WhatIf isn't needed.
     No manifest there runs the check without one (DESTROY.MANIFEST Warning); one that can't be read, or that belongs
-    to another resource group, runs nothing (DESTROY.MANIFEST Fail).
+    to another resource group or another subscription, runs nothing (DESTROY.MANIFEST Fail).
 
     .PARAMETER NowUtc
     For tests: the current time.
@@ -138,10 +140,10 @@ function Remove-DemoEnvironment {
 
     # Read-only: the residual check again, with the manifest an earlier destroy recorded (Phase 28 follow-up).
     if ($ResidueOnly) {
-        $read = Read-DemoTeardownManifest -Path $ManifestPath -ResourceGroupName $resourceGroupName
+        $read = Read-DemoTeardownManifest -Path $ManifestPath -ResourceGroupName $resourceGroupName -SubscriptionId $subscriptionId
         $manifestDoc = 'https://learn.microsoft.com/azure/governance/resource-graph/overview'
         if ($read.Error) {
-            $results.Add((New-DemoResult -CheckId 'DESTROY.MANIFEST' -Area 'teardown' -Target 'subscription' -Status 'Fail' -Message ('Nothing was checked: {0}' -f $read.Error) -Remediation 'Pass the manifest that destroy.ps1 wrote for this environment (out/destroy-manifest-<environment>.json) with -ManifestPath, and the same configuration with -ConfigPath.' -DocUrl $manifestDoc))
+            $results.Add((New-DemoResult -CheckId 'DESTROY.MANIFEST' -Area 'teardown' -Target 'subscription' -Status 'Fail' -Message ('Nothing was checked: {0}' -f $read.Error) -Remediation 'Pass the manifest that destroy.ps1 wrote for this environment with -ManifestPath, and the same configuration with -ConfigPath. The default path, out/destroy-manifest-<environment>.json, is shared by every prefix and subscription with that environment name, so a later destroy of another environment replaces it there.' -DocUrl $manifestDoc))
             return $results.ToArray()
         }
         if ($read.Found) {
@@ -227,7 +229,7 @@ function Remove-DemoEnvironment {
     # Read before anything goes: the deploymentId and the identities can't be found once the group is gone.
     $manifest = $null
     try {
-        $manifest = Resolve-DemoTeardownManifest -Manifest (Get-DemoTeardownManifest -Config $Config) -Path $ManifestPath
+        $manifest = Resolve-DemoTeardownManifest -Manifest (Get-DemoTeardownManifest -Config $Config) -Path $ManifestPath -SubscriptionId $subscriptionId
     }
     catch {
         Write-DemoLog -Level Warning -Message ('The manifest for the residual check couldn''t be recorded; the check runs without it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))

@@ -2072,6 +2072,53 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         $result.status | Should -Be 'Warning'
         $result.message | Should -Match 'couldn''t all be listed: archost01: ERROR: \(AuthorizationFailed\)'
     }
+
+    It 'a control Run Command is finished when its state is terminal, or empty or Unknown an hour after the time in its name: <Name> <State>' -ForEach @(
+        @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'Succeeded'; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'Canceled'; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'TimedOut'; Finished = $true }
+        @{ Name = 'DbHubControl-monitoring-20261102120000'; State = 'Failed'; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-20261102105959'; State = ''; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-reset-20261102105959'; State = 'Unknown'; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-20261102113000'; State = ''; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-20261102113000'; State = 'Unknown'; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-20261101090000'; State = 'Running'; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-20261101090000'; State = 'Pending'; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-manual'; State = 'Unknown'; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-20261399999999'; State = ''; Finished = $false }
+    ) {
+        $now = [DateTime]::new(2026, 11, 2, 12, 0, 0, [DateTimeKind]::Utc)
+        InModuleScope DbHubDemo -Parameters @{ Name = $Name; State = $State; Now = $now } { Test-DemoRunCommandFinished -Name $Name -ExecutionState $State -NowUtc $Now } | Should -Be $Finished
+    }
+
+    It 'start-demo.ps1 never deletes a control Run Command an overlapping run has just created, and status.ps1 doesn''t count it on a running VM (review of 7fb941e)' {
+        # Right after it's created, a Run Command's execution state is empty or Unknown until the VM agent picks it up.
+        $now = [DateTime]::UtcNow
+        $at = { param([double] $MinutesAgo) $now.AddMinutes(-$MinutesAgo).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+        $new = 'DbHubControl-sqlvm01-{0}' -f (& $at 1)
+        $script:listed['sqlvm01'] = @(
+            New-RunCommand $new ''
+            New-RunCommand ('DbHubControl-monitoring-{0}' -f (& $at 2)) 'Unknown'
+            @{ name = ('DbHubControl-sqlvm01-reset-{0}' -f (& $at 3)); properties = @{ provisioningState = 'Succeeded' } }
+            New-RunCommand 'DbHubControl-sqlvm01-manual' 'Unknown'
+            New-RunCommand ('DbHubControl-sqlvm01-{0}' -f (& $at 90)) 'Unknown'
+            New-RunCommand ('DbHubControl-sqlvm01-reset-{0}' -f (& $at 120)) ''
+            New-RunCommand ('DbHubControl-monitoring-{0}' -f (& $at 5)) 'Canceled'
+        )
+        $finished = @(('DbHubControl-sqlvm01-{0}' -f (& $at 90)), ('DbHubControl-sqlvm01-reset-{0}' -f (& $at 120)), ('DbHubControl-monitoring-{0}' -f (& $at 5)))
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01') -Confirm:$false }
+        $result.status | Should -Be 'Pass'
+        $deleted = @($script:azLog | Where-Object { $_ -match '^rest --method delete' } | ForEach-Object { [regex]::Match($_, '/runCommands/([A-Za-z0-9-]+)\?').Groups[1].Value })
+        $deleted | Should -Be $finished
+        @($result.evidence.deleted) | Should -Be @($finished | ForEach-Object { 'sqlvm01/' + $_ })
+
+        $status = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01') -Running @{ sqlvm01 = $true } }
+        @($status.evidence.leftover) | Should -Be @($finished | ForEach-Object { 'sqlvm01/' + $_ })
+        @($status.evidence.deleteCommands) | Should -Not -Match ([regex]::Escape($new))
+        # A deallocated VM runs nothing, so there every one counts.
+        $status = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01') -Running @{ sqlvm01 = $false } }
+        @($status.evidence.leftover).Count | Should -Be 7
+    }
 }
 Describe 'Remove-DemoEnvironment' {
     BeforeAll {

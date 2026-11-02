@@ -58,6 +58,12 @@ Describe 'Teardown residue (live, opt-in)' -Tag 'Teardown', 'Live' -Skip:(-not $
             if ([string]$manifest.ResourceGroupName -ne $expected) {
                 throw ('The manifest is for {0}, not {1}; pass the manifest of this environment''s destroy.' -f $manifest.ResourceGroupName, $expected)
             }
+            # The default path is shared by every subscription with this environment name (Phase 28 follow-up review).
+            $property = $manifest.PSObject.Properties['SubscriptionId']
+            $recordedSubscription = if ($null -ne $property) { ([string]$property.Value).Trim() } else { '' }
+            if ($recordedSubscription -and $recordedSubscription -ne [string]$config['subscriptionId']) {
+                throw ('The manifest is of another subscription than the configured one; pass the manifest of this environment''s destroy.')
+            }
         }
         $script:residue = @{}
         $script:hasManifest = $null -ne $manifest

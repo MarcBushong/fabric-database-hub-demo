@@ -49,7 +49,9 @@ How long the residual check waits for Azure Resource Graph and Microsoft Entra t
 .PARAMETER ManifestPath
 Where to write what the residual check needs (names and IDs, no secrets), read before anything is deleted,
 so the check can run again later. With -ResidueOnly, the manifest to read. Default:
-out/destroy-manifest-<environment>.json.
+out/destroy-manifest-<environment>.json, which every prefix and subscription with that environment name shares:
+a manifest there of another resource group or subscription is never used (with -ResidueOnly, DESTROY.MANIFEST is a
+Fail), so give each environment its own path to keep both.
 
 .PARAMETER IncludeGolden
 Also delete rg-<prefix>-golden and its T2 golden snapshots (ADR 0018). Without it, the golden group stays, so
@@ -122,7 +124,8 @@ $OutputPath = Resolve-DemoUserPath -Path $OutputPath
 
 $config = Get-DemoConfig -Path $ConfigPath
 if (-not $ManifestPath) {
-    # One manifest per environment, so destroying another environment never overwrites it.
+    # One path per environment name, shared by every prefix and subscription with that name: the residual check uses a
+    # manifest there only when it's of this resource group and subscription (Read-DemoTeardownManifest).
     $ManifestPath = Join-Path -Path $PSScriptRoot -ChildPath ('../out/destroy-manifest-{0}.json' -f $config['environment'])
 }
 if ($ResidueOnly) {
