@@ -80,7 +80,8 @@ function Test-DemoT4 {
         default { & $add 'T4.SERVER' 'Warning' ('T4 ({0}) is {1}.' -f $names.ServerName, $state) $serverEvidence 'Check again in a few minutes.' $docs['stopServer'] }
     }
 
-    # The size is the t4SkuName setting (Standard_B1ms, or the documented fallback Standard_B2s; Phase 24).
+    # The size is the t4SkuName setting, or what T4's fallback settled when it isn't set (Resolve-DemoEffectiveConfig;
+    # Phase 24, Phase 28 and its follow-up).
     $wantedSku = Get-DemoT4SkuName -Config $Config
     $version = [string](Get-DemoMemberValue -InputObject $properties -Name 'version')
     $skuName = [string](Get-DemoMemberValue -InputObject $sku -Name 'name')
@@ -88,6 +89,10 @@ function Test-DemoT4 {
     $configEvidence = [ordered]@{ version = $version; pinnedMajorVersion = $names.MajorVersion; sku = $skuName; tier = [string](Get-DemoMemberValue -InputObject $sku -Name 'tier'); wantedSku = $wantedSku; storageSizeGB = $storage }
     if ($version -eq $names.MajorVersion -and (-not $wantedSku -or $skuName -eq $wantedSku)) {
         & $add 'T4.CONFIG' 'Pass' ('T4 runs PostgreSQL {0} on {1} ({2} GiB of storage), as pinned.' -f $version, $skuName, $storage) $configEvidence
+    }
+    elseif ($version -eq $names.MajorVersion -and -not (Test-DemoT4SkuExplicit -Config $Config)) {
+        # Without t4SkuName, deploy.ps1 keeps an existing server's size: its fallback never resizes one.
+        & $add 'T4.CONFIG' 'Warning' ('T4 runs PostgreSQL {0} on {1}, not {2}, which this configuration would choose for a new server; deploy.ps1 keeps an existing server''s size.' -f $version, $skuName, $wantedSku) $configEvidence 'Nothing to do to keep it. To change T4''s size, set t4SkuName to the size you want, then run deploy.ps1.' $docs['versionPolicy']
     }
     else {
         & $add 'T4.CONFIG' 'Warning' ('T4 runs PostgreSQL {0} on {1}; the pins are {2} on {3}.' -f $version, $skuName, $names.MajorVersion, $wantedSku) $configEvidence 'Redeploy with scripts/deploy.ps1 -Resume; a major version upgrade is a separate, documented operation.' $docs['versionPolicy']

@@ -1,4 +1,4 @@
-metadata description = 'T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server at the smallest Burstable size, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, and the free enhanced metrics turned on.'
+metadata description = 'T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, and the free enhanced metrics turned on.'
 
 @description('Azure region.')
 param location string
@@ -19,7 +19,7 @@ param databaseName string = 'contosocare'
 @description('PostgreSQL major version, pinned in config/versions.json (postgresql.majorVersion).')
 param postgresVersion string
 
-@description('Compute, storage, and backup sizing from config/profiles.json (profiles.<profile>.t4), with skuName from the t4SkuName setting.')
+@description('Compute, storage, and backup sizing from config/profiles.json (profiles.<profile>.t4), with skuName from the t4SkuName setting and the tier that follows it; the storage, backup, and high availability settings are valid on both tiers.')
 param sizing object
 
 @description('Availability zone when the server is created: empty for no preference, or 1, 2, or 3. Sent only when set (Phase 24).')

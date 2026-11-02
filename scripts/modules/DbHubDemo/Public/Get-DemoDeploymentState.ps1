@@ -13,8 +13,8 @@ function Get-DemoDeploymentState {
     T2Source (golden or build), FabricCapacityResumed and FabricCapacityResumedUtc (the capacity start-demo.ps1 resumed
     with fabric.manageCapacity, as "<resource group>/<name>", Phase 26b), GuidedStopUtc (until when the PaygWizard guided
     stop's request is valid; while it's still set after that, the guided stop's cleanup didn't finish and its Bastion
-    may be up, so DONE waits: Get-DemoGuidedStopLeftover, Phase 28 review) and T4Sku (the size T4's Burstable fallback
-    settled on: Standard_B2s, or None; Phase 28),
+    may be up, so DONE waits: Get-DemoGuidedStopLeftover, Phase 28 review) and T4Sku (the size T4's fallback settled
+    on: Standard_B2s, Standard_D2ds_v5, None, or Refused; Phase 28 and its follow-up, Resolve-DemoEffectiveConfig),
     T2BuildUtc (when the T2 host's loader started a bootstrap generation that nobody has seen finish; empty when none
     runs; Phase 28 review follow-up), and Tags (every tag on the group). Read-only.
 

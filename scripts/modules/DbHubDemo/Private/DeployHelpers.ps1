@@ -85,7 +85,8 @@ function Get-DemoDeploymentStateTagName {
         FabricCapacityResumed    = 'DbHubFabricCapacityResumed'
         FabricCapacityResumedUtc = 'DbHubFabricCapacityResumedUtc'
         # Phase 28: until when the PaygWizard guided stop's request on the T2 host is valid (empty when there's none), and the
-        # size T4's Burstable fallback settled on (Standard_B2s, or None when Azure refused both) for later runs.
+        # size T4's fallback settled on for later runs: Standard_B2s, Standard_D2ds_v5 (General Purpose, after its cost
+        # check), None (left out; the General Purpose step is checked again), or Refused (Phase 28 follow-up).
         GuidedStopUtc            = 'DbHubGuidedStopUtc'
         T4Sku                    = 'DbHubT4Sku'
         # Phase 28 review follow-up: when the T2 host's loader started a bootstrap generation that nobody has seen finish (empty

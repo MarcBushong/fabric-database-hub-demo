@@ -250,6 +250,12 @@ function Invoke-DemoDeployment {
         $startIndex = [array]::IndexOf($stages, 'Validation')
         Write-DemoLog -Message 'Every stage finished earlier; running the validation again.'
     }
+    # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28 and its follow-up): a
+    # "no T4" record gets the General Purpose fallback, and its cost check, again when this run deploys the template.
+    # DONE's T4 reason reads the configuration as the file has it.
+    $userConfig = $Config
+    $infrastructureIndex = [array]::IndexOf($stages, 'Infrastructure')
+    $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:(-not $whatIf -and $startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex)
 
     # Values later stages need; preflight resolves them, and a resumed run reads them from the state.
     $context = @{
@@ -258,6 +264,7 @@ function Invoke-DemoDeployment {
         T3AdminGroupName = $state.T3AdminGroupName
         T2Complete       = (Test-DemoDeploymentStageReached -Recorded $state.Stage -Stage 'T2')
         OpenStage        = ''
+        T4StartSku       = ''
     }
     # The recorded stage only moves forward over stages that finished, so -Resume never skips an open one.
     $recordStage = {
@@ -371,6 +378,8 @@ function Invoke-DemoDeployment {
                 if ($group) {
                     $context.T3AdminGroupName = $group
                 }
+                # Where T4's fallback starts (Phase 28 and its follow-up), as in the parallel path.
+                $context.T4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') })
                 & $ensureContext
                 & $stageResult 'Preflight' 'Pass' (Get-DemoPreflightPassText -NetworkMode ([string]$context.NetworkMode) -T3UseFreeLimit ([bool]$context.T3UseFreeLimit))
             }
@@ -382,6 +391,9 @@ function Invoke-DemoDeployment {
                     NetworkMode             = $context.NetworkMode
                     T3UseFreeLimit          = [bool]$context.T3UseFreeLimit
                     T3AdminGroupDisplayName = [string]$context.T3AdminGroupName
+                }
+                if ($context.T4StartSku) {
+                    $deployArguments['T4StartSku'] = $context.T4StartSku
                 }
                 if (-not $whatIf -and (Test-DemoT4Enabled -Config $Config) -and @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.START' -and [string]$_.status -eq 'Pass' }).Count -eq 0) {
                     # A stopped T4 rejects the template's update, so it starts first (Phase 24, ADR 0019), unless this run
@@ -411,8 +423,18 @@ function Invoke-DemoDeployment {
                     return $results.ToArray()
                 }
                 $context.T3UseFreeLimit = [bool]$deployment.T3UseFreeLimit
+                # What T4 got (the fallback can change its size or leave it out): the later stages, the Bootstraps stage's
+                # template included, keep it (Phase 28 follow-up).
+                $deployedT4 = Get-DemoMemberValue -InputObject $deployment -Name 'T4Enabled'
+                if ($null -ne $deployedT4) {
+                    $deployedSku = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T4SkuName')
+                    if ([bool]$deployedT4 -ne (Test-DemoT4Enabled -Config $Config) -or ([bool]$deployedT4 -and $deployedSku -and $deployedSku -ne (Get-DemoT4SkuName -Config $Config))) {
+                        $Config = if ([bool]$deployedT4 -and $deployedSku) { Copy-DemoT4Config -Config $Config -Source deployed -SkuName $deployedSku } else { Copy-DemoT4Config -Config $Config -Source deployed -Off }
+                    }
+                }
                 & $recordStage 'Infrastructure' @{ NetworkMode = $context.NetworkMode; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T3AdminGroupName = [string]$context.T3AdminGroupName }
-                & $stageResult 'Infrastructure' 'Pass' 'The infrastructure is deployed.'
+                $t4NoteValue = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T4Note')
+                & $stageResult 'Infrastructure' 'Pass' $(if ($t4NoteValue) { 'The infrastructure is deployed. ' + $t4NoteValue } else { 'The infrastructure is deployed.' })
                 if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                     # Opt-in, and only start-demo.ps1 -Interactive needs it, so a vault Fail is reported (it
                     # counts in DEPLOY.SUMMARY and the exit code) without stopping the deployment.
@@ -730,7 +752,7 @@ function Invoke-DemoDeployment {
     if ($validated -and -not $context.OpenStage -and -not (& $hasStatus $results.ToArray() 'Fail')) {
         $current = Get-DemoDeploymentState -Config $Config
         $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
-        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool](Get-DemoT4OffReason -Config $Config -State $current)) -SkipFabric:$SkipFabric
+        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool](Get-DemoT4OffReason -Config $userConfig -State $current)) -SkipFabric:$SkipFabric
         & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
     }
 

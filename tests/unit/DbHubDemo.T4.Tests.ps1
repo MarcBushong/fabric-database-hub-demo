@@ -21,11 +21,11 @@ BeforeAll {
 
     $script:serverId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123'
 
-    function New-ServerJson([string] $State = 'Ready', [string] $LocalSignIn = 'Disabled', [string] $Public = 'Disabled') {
+    function New-ServerJson([string] $State = 'Ready', [string] $LocalSignIn = 'Disabled', [string] $Public = 'Disabled', [string] $Sku = 'Standard_B1ms') {
         @{
             id         = $script:serverId
             name       = 'pgflex01-abc123'
-            sku        = @{ name = 'Standard_B1ms'; tier = 'Burstable' }
+            sku        = @{ name = $Sku; tier = $(if ($Sku -like 'Standard_B*') { 'Burstable' } else { 'GeneralPurpose' }) }
             properties = @{
                 state                    = $State
                 version                  = '18'
@@ -44,6 +44,8 @@ BeforeAll {
         $script:urlParameters = [System.Collections.Generic.List[object]]::new()
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        # No test reaches the Retail Prices API; a test that needs a price mocks Get-DemoRetailPrice.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -MockWith { throw 'The unit tests make no Retail Prices API call.' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
             # Every argument must reach az.cmd unchanged, as the real Invoke-DemoAz requires (live, 2026-10-26: an
             # encoded metrics query string with '%' failed the T4 track).
@@ -102,14 +104,14 @@ BeforeAll {
                 if (-not $script:t4.Exists) {
                     return (New-AzResult -ExitCode 1 -StdErr '(ResourceNotFound) The Resource was not found.')
                 }
-                return (New-AzResult -Json (New-ServerJson -State $script:t4.State -LocalSignIn $script:t4.PasswordAuth))
+                return (New-AzResult -Json (New-ServerJson -State $script:t4.State -LocalSignIn $script:t4.PasswordAuth -Sku $script:t4.Sku))
             }
             throw "unexpected Azure CLI call: $text"
         }
     }
 
     function Reset-T4State {
-        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true }
+        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_B1ms' }
     }
 }
 
@@ -276,10 +278,40 @@ Describe 'Invoke-DemoT4PowerAction' {
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'was already running'
         @($script:azCalls | Where-Object { $_ -match '--method post' }).Count | Should -Be 0
+        # An obviously fake price: the stop says what a restarted T4 bills at its own size (Phase 28 follow-up).
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { @([pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server Burstable BS Series Compute'; skuName = 'B1MS'; meterName = 'B1MS'; retailPrice = 0.25; unitOfMeasure = '1 Hour' }) }
         $stop = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 5 -CheckPrefix STOP }
         $stop.status | Should -Be 'Pass'
-        $stop.message | Should -Match 'starts on its own after 7 days'
+        $stop.message | Should -Match 'Azure starts it again on its own at \d{4}-\d\d-\d\d \d\d:\d\d UTC, 7 days after the stop'
+        $stop.message | Should -Match 'about 0\.250 USD an hour \(Standard_B1ms, list price\)'
         $stop.evidence.autoStartsAfterDays | Should -Be 7
+        (([datetime]$stop.evidence.autoStartUtc).ToUniversalTime() - ([datetime]$stop.evidence.stoppedUtc).ToUniversalTime()) | Should -Be ([System.TimeSpan]::FromDays(7))
+    }
+
+    It 'prices a restarted T4 at its own size, says when the daily safety stop stops it, and dates an earlier stop from the activity log (Phase 28 follow-up)' {
+        # A General Purpose server, the fallback's size, with an obviously fake vCore price.
+        $script:t4.Sku = 'Standard_D2ds_v5'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { @([pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'; skuName = 'vCore'; meterName = 'vCore'; retailPrice = 0.25; unitOfMeasure = '1 Hour' }) }
+        $controlled = New-TestConfig
+        $controlled['control']['enabled'] = $true
+        $before = [System.DateTime]::UtcNow.AddSeconds(-1)
+        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $controlled } { Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 5 -CheckPrefix STOP }
+        $stop.status | Should -Be 'Pass'
+        $stop.evidence.skuName | Should -Be 'Standard_D2ds_v5'
+        $stop.evidence.hourlyUsd | Should -Be 0.5
+        $stop.evidence.dailySafetyStop | Should -BeTrue
+        $stop.message | Should -Match 'about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the on-demand control''s daily safety stop stops it again, within a day\.$'
+        ([datetime]$stop.evidence.stoppedUtc).ToUniversalTime() | Should -BeGreaterOrEqual $before -Because 'this call''s stop is now'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -ParameterFilter { $Filter -match 'General Purpose Ddsv5 Series Compute' }
+
+        # Already stopped: the stop comes from the activity log, and without the control nothing stops it again.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4StoppedUtc -MockWith { [datetime]::new(2026, 10, 30, 18, 0, 0, [System.DateTimeKind]::Utc) }
+        $again = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PowerAction -Config $Config -Action Stop -CheckPrefix STOP }
+        $again.message | Should -Match '^T4 \(pgflex01-abc123\) was already stopped\. Azure starts it again on its own at 2026-11-06 18:00 UTC, 7 days after the stop'
+        $again.message | Should -Match 'nothing here stops it on its own \(the on-demand control''s daily safety stop isn''t set up\), so run \./scripts/stop-demo\.ps1 again once it has started'
+        ([datetime]$again.evidence.autoStartUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm', [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be '2026-11-06T18:00'
+        $again.evidence.dailySafetyStop | Should -BeFalse
+        @($script:azCalls | Where-Object { $_ -match '--method post --url \S+/stop\?' }).Count | Should -Be 1 -Because 'an already stopped server isn''t stopped again'
     }
 
     It 'says a server is now running when this caller already requested its start (-Requested, Phase 25d)' {

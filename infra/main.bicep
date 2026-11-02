@@ -228,7 +228,7 @@ param t3UseFreeLimit bool = true
 @description('Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId>: Burstable Standard_B1ms, Entra-only with the P6 group as administrator, virtual network integration in snet-pg (Phase 24, ADR 0019).')
 param t4Enabled bool = true
 
-@description('T4\'s compute size: Standard_B1ms, the smallest Burstable size (default); Standard_B2s, the documented fallback when Azure answers SkuNotAvailable for B1ms in the region; or Standard_D2ds_v5, the documented General Purpose option (2 vCores, 8 GiB) the owner chose on 2026-10-26 after both were refused. The tier follows the size (Phase 24, ADR 0019). deploy.ps1 never changes it on its own.')
+@description('T4\'s compute size: Standard_B1ms, the smallest Burstable size (default); Standard_B2s, the fallback when Azure answers SkuNotAvailable for B1ms in the region; or Standard_D2ds_v5, General Purpose (2 vCores, 8 GiB), the fallback when Azure refuses both Burstable sizes and its cost check passes. The tier follows the size, and storage, backups, and high availability are the same on both tiers (Phase 24, Phase 28 and its follow-up, ADR 0019). deploy.ps1 never resizes an existing server on its own.')
 @allowed([
   'Standard_B1ms'
   'Standard_B2s'

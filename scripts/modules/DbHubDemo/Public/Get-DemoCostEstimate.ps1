@@ -56,6 +56,11 @@ function Get-DemoCostEstimate {
     Standard HDD, LRS or ZRS) on the provisioned size, an upper bound: Azure bills an incremental snapshot's
     used size, which only the usage report shows (the used size is in the component's name).
 
+    .PARAMETER PriceCache
+    A hashtable that several estimates in one run share, so each Retail Prices query runs once: preflight prices the
+    demo, and then T4's General Purpose fallback, with the same prices (Phase 28 follow-up). Without it, each estimate
+    reads its own prices.
+
     .EXAMPLE
     Get-DemoCostEstimate -Config (Get-DemoConfig -Path ./config/demo.config.json)
 
@@ -92,7 +97,9 @@ function Get-DemoCostEstimate {
         [bool] $T3UseFreeLimit,
 
         [AllowEmptyCollection()]
-        [object[]] $GoldenSnapshots = @()
+        [object[]] $GoldenSnapshots = @(),
+
+        [hashtable] $PriceCache
     )
 
     $catalog = Get-DemoProfile
@@ -119,15 +126,16 @@ function Get-DemoCostEstimate {
         'private'
     }
 
-    $priceCache = @{}
+    $priceCache = if ($null -ne $PriceCache) { $PriceCache } else { @{} }
     $components = [System.Collections.Generic.List[object]]::new()
     $missing = [System.Collections.Generic.List[string]]::new()
 
     function Get-CachedPrice([string] $Filter) {
-        if (-not $priceCache.ContainsKey($Filter)) {
-            $priceCache[$Filter] = @(Get-DemoRetailPrice -Filter $Filter -CurrencyCode $CurrencyCode)
+        $key = '{0}|{1}' -f $CurrencyCode, $Filter
+        if (-not $priceCache.ContainsKey($key)) {
+            $priceCache[$key] = @(Get-DemoRetailPrice -Filter $Filter -CurrencyCode $CurrencyCode)
         }
-        return $priceCache[$Filter]
+        return $priceCache[$key]
     }
 
     function Add-Component([string] $Name, [string] $Basis, [object] $Item, [double] $Quantity, [string] $Unit, [switch] $Defender) {

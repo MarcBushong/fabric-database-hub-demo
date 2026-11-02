@@ -5,7 +5,9 @@ Shows the demo's status (plan section 9.6). Read-only.
 
 .DESCRIPTION
 Health per target (power state and bootstrap health), T1's SQL Server instances in unified inventory and
-its monitoring, T3's state, the active activity profile on T1 and T3 (read from T1, so T3 isn't woken),
+its monitoring, T3's state, T4's state (running: its Azure Monitor metrics; stopped: when Azure starts it again on its
+own, the stop time plus seven days, what it then bills, and whether anything stops it again; on the General Purpose
+fallback: its size and hourly list price), the active activity profile on T1 and T3 (read from T1, so T3 isn't woken),
 Arc's connection and days disconnected, on-demand Bastion and its public IP with their hourly list price
 (a Warning while either exists, including a public IP left over after an interrupted delete),
 month-to-date cost against the monthly ceiling, the next auto-shutdown, and the expiry tag. -Detail also

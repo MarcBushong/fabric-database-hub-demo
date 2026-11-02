@@ -146,7 +146,8 @@ function Start-DemoEnvironment {
         $results.Add((New-DemoResult -CheckId 'START.COST' -Area 'preflight' -Target 'subscription' -Status 'Not selected' -Message 'The cost guardrail was skipped (-SkipCostCheck).'))
     }
     else {
-        $cost = @(Test-DemoStartCost -Config $Config -NetworkMode $networkMode -T3UseFreeLimit $state.T3UseFreeLimit)
+        # T4 at the size the fallback recorded (Phase 28 follow-up), so a General Purpose T4 is priced as such.
+        $cost = @(Test-DemoStartCost -Config (Resolve-DemoEffectiveConfig -Config $Config -State $state) -NetworkMode $networkMode -T3UseFreeLimit $state.T3UseFreeLimit)
         foreach ($item in $cost) {
             $results.Add($item)
         }

@@ -21,16 +21,26 @@ function Invoke-DemoTemplateDeployment {
     5. Phase 24: an existing VM's disks whose type drifted from the profile (Get-DemoVmDiskDrift; the
        subscription's automation can switch a deallocated VM's disks to Standard HDD) keep their current type
        through diskSkuOverrides, with the DEPLOY.DISKS.DRIFT Warning; T4's availability zone goes only to a
-       server that doesn't exist yet; and a T4 size Azure refuses with SkuNotAvailable adds the DEPLOY.T4.SKU
-       Fail, whose remediation names the documented fallback (Get-DemoT4CreateFailure).
-    6. Phase 28, T4's Burstable fallback (ADR 0019), only when the configuration doesn't set t4SkuName: a refused
-       Standard_B1ms deploys again with Standard_B2s, and a refused Standard_B2s deploys again without T4, each with
-       the DEPLOY.T4.SKU Warning (the second names t4SkuName: Standard_D2ds_v5 and its price); -T4StartSku starts one
-       size on when preflight already ruled the default out. What was used is recorded in the resource group's T4Sku
-       tag for later runs (Resolve-DemoEffectiveConfig). A deployment with T4 in it clears a recorded None, and any
-       record once the configuration sets t4SkuName (review finding 5). A General Purpose size is never chosen on its
-       own. The VMs that exist are read again before each attempt, so a VM a failed attempt created never gets an
-       osProfile again.
+       server that doesn't exist yet; and a T4 size the configuration sets that Azure refuses with SkuNotAvailable
+       adds the DEPLOY.T4.SKU Fail, whose remediation names the next size (Get-DemoT4CreateFailure).
+    6. T4's fallback (Phase 28 and its follow-up, ADR 0019), only when the configuration doesn't set t4SkuName and T4
+       doesn't exist yet, and only for Azure's SkuNotAvailable (a quota, a policy denial, or a transient error fails the
+       template as before): a refused Standard_B1ms deploys again with Standard_B2s; a refused Standard_B2s moves to
+       General Purpose Standard_D2ds_v5, but only after its cost check (Get-DemoT4GeneralPurposeCost: its price from the
+       Azure Retail Prices API now, and the demo's worst-case month, T4 running every hour because Azure starts a
+       stopped server again after 7 days, with its storage and Defender plans, against monthlyCeilingUsd, and a session
+       against sessionCeilingUsd), which runs right before every General Purpose creation on the fallback's behalf;
+       over either ceiling, or without a price, T4 is left out (DbHubT4Sku None, checked again on the next run that
+       deploys the template); and a refused Standard_D2ds_v5 deploys again without T4 (Refused). Each step is a
+       DEPLOY.T4.SKU Warning, and a General Purpose T4 also gets a console line and T4Note ("T4 created as General
+       Purpose Standard_D2ds_v5 because Burstable sizes were refused here; about <price> USD an hour while running").
+       -T4StartSku starts further down when preflight already ruled sizes out. What was chosen goes into the resource
+       group's DbHubT4Sku tag at once, and into the tags the template carries, for later runs
+       (Resolve-DemoEffectiveConfig, which this function applies to a configuration that isn't resolved yet). An
+       existing server keeps its own size unless the configuration sets one (DEPLOY.T4.SKU Pass when that differs from
+       the configured size), so a redeploy never resizes it. A record no longer holds once the configuration sets
+       t4SkuName (review finding 5). The VMs that exist are read again before each attempt, so a VM a failed attempt
+       created never gets an osProfile again.
     7. Phase 28 live finding (2026-11-02): a deployment that failed while it ran (DeploymentFailed) and isn't retried
        above gets DEPLOY.TEMPLATE's Fail with the innermost errors of its failed operations, nested deployments
        included (Get-DemoDeploymentFailure, New-DemoTemplateFailureResult), for example "Microsoft.Consumption/budgets
@@ -41,8 +51,8 @@ function Invoke-DemoTemplateDeployment {
     provisioning state Succeeded, and later stages check what was deployed.
 
     Returns Succeeded, Results (DEPLOY.TEMPLATE plus any fallback Warning), Outputs (the template outputs as
-    name -> value), Changes (what-if only), T3UseFreeLimit (what was deployed), and T4Enabled and T4SkuName (what
-    T4 got).
+    name -> value), Changes (what-if only), T3UseFreeLimit (what was deployed), T4Enabled and T4SkuName (what
+    T4 got), and T4Note (the fallback's line for the console and the status page, or '').
 
     Sources (checked 2026-10-20; the last three 2026-11-02):
     - az deployment sub create: https://learn.microsoft.com/cli/azure/deployment/sub#az-deployment-sub-create
@@ -50,6 +60,9 @@ function Invoke-DemoTemplateDeployment {
     - Find error codes: https://learn.microsoft.com/azure/azure-resource-manager/troubleshooting/find-error-code
     - az deployment operation sub list: https://learn.microsoft.com/cli/azure/deployment/operation/sub#az-deployment-operation-sub-list
     - az deployment operation group list: https://learn.microsoft.com/cli/azure/deployment/operation/group#az-deployment-operation-group-list
+    - T4's compute tiers and capacity errors (2026-11-02): https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute,
+      https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors
+    - A stopped server starts again after 7 days (2026-11-02): https://learn.microsoft.com/azure/postgresql/overview
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -84,8 +97,10 @@ function Invoke-DemoTemplateDeployment {
     asks Azure to rebuild it from the image (ADR 0018).
 
     .PARAMETER T4StartSku
-    Standard_B2s or None: where T4's Burstable fallback starts when preflight already ruled out the default (Phase 28).
-    Ignored when the configuration sets t4SkuName or T4 exists.
+    Where T4's fallback starts when preflight already ruled sizes out (Phase 28 and its follow-up): Standard_B2s,
+    Standard_D2ds_v5 (General Purpose; its cost check still runs right before the attempt), None (left out: the General
+    Purpose fallback can't be created now), or Refused (Azure refused Standard_D2ds_v5 too). Ignored when the
+    configuration sets t4SkuName or T4 exists.
 
     .PARAMETER TemplatePath
     The compiled template; defaults to the repository's azuredeploy.json.
@@ -125,7 +140,7 @@ function Invoke-DemoTemplateDeployment {
 
         [string] $T2OsDiskSourceId = '',
 
-        [ValidateSet('', 'Standard_B2s', 'None')]
+        [ValidateSet('', 'Standard_B2s', 'Standard_D2ds_v5', 'None', 'Refused')]
         [string] $T4StartSku = '',
 
         [string] $TemplatePath = (Join-Path -Path $script:RepoRoot -ChildPath 'azuredeploy.json')
@@ -184,48 +199,119 @@ function Invoke-DemoTemplateDeployment {
             $results.Add((New-DemoDiskDriftResult -CheckId 'DEPLOY.DISKS.DRIFT' -Drift $drift -VmName $existing))
         }
     }
-    # T4 keeps the zone it was created in, so the configured zone goes only to a new server (Phase 24).
-    $t4On = Test-DemoT4Enabled -Config $Config
+    # T4's size (Phase 28 and its follow-up, ADR 0019). A configuration that isn't resolved yet (start-demo.ps1's T3
+    # recreation, a caller that reads no record) gets what the fallback recorded in the group's tags; a size the file sets
+    # always wins. T4 keeps the zone it was created in, so the configured zone goes only to a new server (Phase 24).
+    $t4TagName = (Get-DemoDeploymentStateTagName)['T4Sku']
+    $t4Explicit = Test-DemoT4SkuExplicit -Config $Config
+    $effective = Resolve-DemoEffectiveConfig -Config $Config -State ([pscustomobject]@{ T4Sku = [string]$tags[$t4TagName] })
+    $t4On = Test-DemoT4Enabled -Config $effective
     $t4Exists = $false
+    $t4ServerSku = ''
     if ($t4On -and $tags.Count -gt 0) {
-        $t4Exists = [bool](Get-DemoT4State -Config $Config -DeploymentId ([string]$tags['deploymentId'])).Exists
+        $t4Current = Get-DemoT4State -Config $effective -DeploymentId ([string]$tags['deploymentId'])
+        $t4Exists = [bool]$t4Current.Exists
+        $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4Current -Name 'Server')
+    }
+    # An existing server keeps its own size unless the configuration sets one: the fallback never resizes a server, so a
+    # redeploy never sends Standard_B1ms to a server created as Standard_D2ds_v5, whatever the record says (Phase 28
+    # follow-up). The record follows the server that exists: its own size, or nothing for the default size.
+    if ($t4Exists -and -not $t4Explicit -and $t4ServerSku) {
+        if ($t4ServerSku -cne (Get-DemoT4SkuName -Config $effective)) {
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Pass' -Message ('T4 exists as {0} ({1}), so this deployment keeps that size: an existing server is never resized unless t4SkuName says so.' -f $t4ServerSku, (Get-DemoT4SkuSpec -SkuName $t4ServerSku).Tier) -Evidence ([ordered]@{ serverSku = $t4ServerSku; configuredSku = (Get-DemoT4SkuName -Config $effective) }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute'))
+            $effective = Copy-DemoT4Config -Config $effective -Source server -SkuName $t4ServerSku
+        }
+        $serverRecord = if ($t4ServerSku -ceq 'Standard_B1ms') { '' } else { $t4ServerSku }
+        if ($Action -eq 'Create' -and [string]$tags[$t4TagName] -cne $serverRecord) {
+            $tags[$t4TagName] = $serverRecord
+        }
     }
 
     $useFreeLimit = $T3UseFreeLimit
-    # Phase 28: T4's Burstable fallback works on a copy of the configuration, and only for a size it doesn't set.
-    $effective = $Config
-    $t4Explicit = $Config.Contains('t4SkuName') -and -not [string]::IsNullOrWhiteSpace([string]$Config['t4SkuName'])
     $freeOfferTried = $false
+    # The fallback works on $effective, only for a server that doesn't exist yet and a size the file doesn't set.
+    $ladder = $t4On -and -not $t4Explicit -and -not $t4Exists -and $Action -eq 'Create'
     $t4Refused = [System.Collections.Generic.List[string]]::new()
-    if ($T4StartSku -and -not $t4Explicit -and $t4On -and -not $t4Exists -and $Action -eq 'Create') {
-        # Preflight's capability list (or a refusal on record) already rules out the default: start one size on.
-        $copy = [ordered]@{}
-        foreach ($key in $Config.Keys) {
-            $copy[$key] = $Config[$key]
+    $gpChecked = $false
+    $gpRefusal = $null
+    $gpHourly = $null
+    $t4Note = ''
+    # The fallback's choice goes into the tags the template carries, which would otherwise put the old value back, and,
+    # once the group exists, into the group's tags at once, so a later run (even after a stop) starts from it (Phase 28).
+    # A value the group already has isn't written again.
+    $groupSeen = $tags.Count -gt 0
+    $record = {
+        param([string] $Value)
+        if ([string]$tags[$t4TagName] -ceq $Value) {
+            return
         }
-        if ($T4StartSku -eq 'None') {
-            $copy['t4Enabled'] = $false
-            $t4Refused.AddRange([string[]]@('Standard_B1ms', 'Standard_B2s'))
+        $tags[$t4TagName] = $Value
+        if (-not $groupSeen) {
+            return
         }
-        else {
-            $copy['t4SkuName'] = $T4StartSku
-            $t4Refused.Add('Standard_B1ms')
+        try {
+            Set-DemoDeploymentState -Config $Config -Value @{ T4Sku = $Value } -Confirm:$false
         }
-        $effective = $copy
-        # The template keeps the group's tags from its parameters, so the choice goes into them too.
-        $tags[(Get-DemoDeploymentStateTagName)['T4Sku']] = $T4StartSku
-        $message = if ($T4StartSku -eq 'None') { 'Preflight found that the region offers neither of T4''s Burstable sizes, so this deployment creates no T4; t4Enabled stays as you configured it, and nothing larger is chosen for you.' } else { 'Preflight found that the region doesn''t offer T4''s default Standard_B1ms, so this deployment uses Standard_B2s, the same Burstable class, and later runs keep it.' }
-        $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message $message -Evidence ([ordered]@{ startSku = $T4StartSku }) -Remediation $(if ($T4StartSku -eq 'None') { 'To add T4, set "t4SkuName": "Standard_D2ds_v5" (General Purpose; estimate-cost.ps1 prices it), then run ./scripts/deploy.ps1.' } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+        catch {
+            Write-DemoLog -Level Warning -Message ('T4''s fallback size wasn''t recorded on the resource group, so the next run may try it again: {0}' -f $_.Exception.Message)
+        }
     }
-    # Review finding 5: a recorded "no T4" (or any record, once the configuration sets t4SkuName) no longer holds when
-    # this deployment has T4 in it, so it's cleared; the template carries the group's tags, so it's cleared in them. A
-    # fallback that Azure forces again below records its choice anew.
-    $t4TagName = (Get-DemoDeploymentStateTagName)['T4Sku']
-    $t4Recorded = [string]$tags[$t4TagName]
-    if ($t4Recorded -and $Action -eq 'Create' -and (Test-DemoT4Enabled -Config $effective) -and ($t4Explicit -or $t4Recorded -eq 'None')) {
+    if ($ladder -and $T4StartSku) {
+        # Preflight already ruled sizes out (the region's capability list, a refusal on record, or the cost check); the
+        # template carries the choice into the group's tags, as before (Phase 28).
+        $refusalDoc = 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'
+        switch ($T4StartSku) {
+            'Standard_B2s' {
+                $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_B2s'
+                $t4Refused.Add('Standard_B1ms')
+                $tags[$t4TagName] = 'Standard_B2s'
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message 'Preflight found that the region doesn''t offer T4''s default Standard_B1ms, so this deployment uses Standard_B2s, the same Burstable class, and later runs keep it.' -Evidence ([ordered]@{ startSku = $T4StartSku }) -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $refusalDoc))
+            }
+            'Standard_D2ds_v5' {
+                # The General Purpose fallback: its cost check runs right before the attempt, below.
+                $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D2ds_v5'
+                $t4Refused.AddRange([string[]]@('Standard_B1ms', 'Standard_B2s'))
+            }
+            'None' {
+                $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
+                $t4Refused.AddRange([string[]]@('Standard_B1ms', 'Standard_B2s'))
+                $tags[$t4TagName] = 'None'
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message 'Preflight left T4 out of this deployment (PREFLIGHT.T4.FALLBACK or PREFLIGHT.T4.CAPABILITY says why): Azure refuses its Burstable sizes here, and the General Purpose fallback, Standard_D2ds_v5, can''t be created now. t4Enabled stays as you configured it, and the next run that deploys the template checks the fallback again.' -Evidence ([ordered]@{ startSku = $T4StartSku }) -Remediation 'PREFLIGHT.T4.FALLBACK says what would add T4.' -DocUrl $refusalDoc))
+            }
+            'Refused' {
+                $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
+                $t4Refused.AddRange([string[]]@('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5'))
+                $tags[$t4TagName] = 'Refused'
+                $results.Add((New-DemoT4FallbackResult -Refused $null -Next 'Refused'))
+            }
+        }
+    }
+    # Review finding 5: any record no longer holds once the configuration sets t4SkuName and this deployment has T4 in it;
+    # the template carries the group's tags, so it's cleared in them.
+    if ([string]$tags[$t4TagName] -and $Action -eq 'Create' -and $t4Explicit -and (Test-DemoT4Enabled -Config $effective)) {
         $tags[$t4TagName] = ''
     }
-    for ($attempt = 1; $attempt -le 4; $attempt++) {
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        # Right before the fallback creates T4 at General Purpose, its cost check runs (Phase 28 follow-up): the price from
+        # the Azure Retail Prices API now, and the worst case, every hour of a month, against both ceilings. Over either,
+        # or without a price, T4 is left out instead. Never for a size the configuration sets.
+        if ($ladder -and -not $gpChecked -and (Test-DemoT4Enabled -Config $effective) -and (Get-DemoT4SkuSpec -SkuName (Get-DemoT4SkuName -Config $effective)).Tier -eq 'GeneralPurpose') {
+            $gpChecked = $true
+            $cost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit
+            if ($cost.Allowed) {
+                & $record 'Standard_D2ds_v5'
+                $gpHourly = $cost.HourlyUsd
+                $results.Add((New-DemoT4FallbackResult -Refused $gpRefusal -Next 'Standard_D2ds_v5' -Cost $cost))
+                Write-DemoLog -Level Warning -Message ('Azure refused T4''s Burstable sizes here, so this run creates T4 as General Purpose Standard_D2ds_v5: {0}.' -f (Format-DemoT4FallbackCostText -Cost $cost))
+            }
+            else {
+                $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
+                & $record 'None'
+                $skip = New-DemoT4FallbackResult -Refused $gpRefusal -Next 'None' -Cost $cost
+                $results.Add($skip)
+                Write-DemoLog -Level Warning -Message ('T4 isn''t created: {0}' -f $skip.message)
+            }
+        }
         if ($attempt -gt 1) {
             $vms = & $readVms
             $existing = @($vms.Existing)
@@ -315,10 +401,25 @@ function Invoke-DemoTemplateDeployment {
             $state = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $parsed -Name 'properties') -Name 'provisioningState')
             $duration = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $parsed -Name 'properties') -Name 'duration')
             $status = if ($state -eq 'Succeeded') { 'Pass' } else { 'Fail' }
-            $results.Add((New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status $status -Message ('Deployment {0}: {1} in {2}.' -f $deploymentName, $state, $duration) -Evidence ([ordered]@{ provisioningState = $state; duration = $duration; newVms = $missing; t3UseFreeLimit = $useFreeLimit; bundle = $BootstrapBundleSha256; runner = $WorkloadRunnerSha256; t2Disk = $(if ($hostSnapshotId) { 'golden: ' + ($hostSnapshotId -replace '^.*/', '') } elseif ($attachHostDisk) { 'attached' } else { 'image' }); t4Enabled = (Test-DemoT4Enabled -Config $effective); t4SkuName = (Get-DemoT4SkuName -Config $effective) }) -DocUrl $docUrl))
-            return [pscustomobject]@{ Succeeded = ($state -eq 'Succeeded'); Results = $results.ToArray(); Outputs = (ConvertTo-DemoDeploymentOutput -Deployment $parsed); Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective) }
+            $t4Deployed = Test-DemoT4Enabled -Config $effective
+            $t4SkuName = if ($t4Deployed) { Get-DemoT4SkuName -Config $effective } else { '' }
+            # Said loudly (Phase 28 follow-up): T4 created on the General Purpose fallback, with its price from the API; or
+            # left out by the fallback. The status page's Infrastructure step and DONE say it too.
+            if ($state -eq 'Succeeded' -and $t4Deployed -and $gpChecked -and $t4SkuName -ceq 'Standard_D2ds_v5') {
+                $t4Note = Format-DemoT4FallbackCreatedText -HourlyUsd $gpHourly -Location ([string]$Config['location'])
+                Write-DemoLog -Level Warning -Message $t4Note
+            }
+            elseif ($state -eq 'Succeeded' -and $t4On -and -not $t4Deployed -and $t4Refused.Count -gt 0) {
+                $t4Note = 'T4 isn''t deployed: Azure refused its Burstable sizes here, and the General Purpose fallback wasn''t created (DEPLOY.T4.SKU says why).'
+            }
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status $status -Message ('Deployment {0}: {1} in {2}.' -f $deploymentName, $state, $duration) -Evidence ([ordered]@{ provisioningState = $state; duration = $duration; newVms = $missing; t3UseFreeLimit = $useFreeLimit; bundle = $BootstrapBundleSha256; runner = $WorkloadRunnerSha256; t2Disk = $(if ($hostSnapshotId) { 'golden: ' + ($hostSnapshotId -replace '^.*/', '') } elseif ($attachHostDisk) { 'attached' } else { 'image' }); t4Enabled = $t4Deployed; t4SkuName = (Get-DemoT4SkuName -Config $effective); t4Fallback = $(if ($t4Deployed -and $gpChecked) { 'GeneralPurpose' } elseif ($t4Refused.Count -gt 0) { [string]$tags[$t4TagName] } else { '' }) }) -DocUrl $docUrl))
+            return [pscustomobject]@{ Succeeded = ($state -eq 'Succeeded'); Results = $results.ToArray(); Outputs = (ConvertTo-DemoDeploymentOutput -Deployment $parsed); Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = $t4Deployed; T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note }
         }
 
+        if ($Action -eq 'Create') {
+            # The template creates the resource group before anything else, so a later record goes into its tags too.
+            $groupSeen = $true
+        }
         $verdict = Resolve-DemoT3FreeOfferError -ErrorText ([string]$run.StdErr)
         if (-not $freeOfferTried -and $useFreeLimit -and $verdict.IsFreeOfferError) {
             Write-DemoLog -Level Warning -Message 'Azure rejected the T3 free offer; deploying again with regular General Purpose serverless.'
@@ -331,43 +432,46 @@ function Invoke-DemoTemplateDeployment {
         if ((Test-DemoT4Enabled -Config $effective) -and -not $t4Exists -and $Action -eq 'Create') {
             $t4Failure = Get-DemoT4CreateFailure -Config $effective
         }
-        # Phase 28 (brief item 6, ADR 0019): a Burstable size Azure refused, which the configuration doesn't set, falls back
-        # once to Standard_B2s, then to no T4 at all; what was used is recorded for later runs. Never a General Purpose size.
+        # The fallback (Phase 28 and its follow-up, ADR 0019): only Azure's SkuNotAvailable for the size this attempt sent,
+        # which the configuration doesn't set, moves it on: Standard_B1ms to Standard_B2s, Standard_B2s to General Purpose
+        # Standard_D2ds_v5 (after its cost check, at the top of the next attempt), and Standard_D2ds_v5 to no T4. A quota, a
+        # policy denial, or a transient error fails the template as before. What it chose is recorded for later runs.
         $current = Get-DemoT4SkuName -Config $effective
-        if ($null -ne $t4Failure -and -not $t4Explicit -and [string]$t4Failure.Sku -eq $current -and $current -in 'Standard_B1ms', 'Standard_B2s' -and $current -notin $t4Refused) {
+        if ($ladder -and $null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current -and $current -notin $t4Refused) {
             $t4Refused.Add($current)
-            $copy = [ordered]@{}
-            foreach ($key in $effective.Keys) {
-                $copy[$key] = $effective[$key]
+            switch ($current) {
+                'Standard_B1ms' {
+                    $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_B2s'
+                    & $record 'Standard_B2s'
+                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Standard_B2s'))
+                    Write-DemoLog -Level Warning -Message 'Azure refused T4''s Standard_B1ms; deploying again with Standard_B2s, the same Burstable class.'
+                }
+                'Standard_B2s' {
+                    $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D2ds_v5'
+                    $gpRefusal = $t4Failure
+                    Write-DemoLog -Level Warning -Message 'Azure refused T4''s Standard_B2s too; pricing the General Purpose fallback, Standard_D2ds_v5, before deploying again.'
+                }
+                default {
+                    # Standard_D2ds_v5, the last size the fallback tries.
+                    $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
+                    & $record 'Refused'
+                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused'))
+                    Write-DemoLog -Level Warning -Message 'Azure refused T4''s General Purpose fallback, Standard_D2ds_v5, too; deploying again without T4.'
+                }
             }
-            $recorded = if ($current -eq 'Standard_B1ms') { 'Standard_B2s' } else { 'None' }
-            if ($recorded -eq 'Standard_B2s') {
-                $copy['t4SkuName'] = 'Standard_B2s'
-            }
-            else {
-                $copy['t4Enabled'] = $false
-            }
-            $effective = $copy
-            $tagName = (Get-DemoDeploymentStateTagName)['T4Sku']
-            $tags[$tagName] = $recorded
-            try {
-                Set-DemoDeploymentState -Config $Config -Value @{ T4Sku = $recorded } -Confirm:$false
-            }
-            catch {
-                Write-DemoLog -Level Warning -Message ('T4''s fallback size wasn''t recorded on the resource group, so the next run tries the default again: {0}' -f $_.Exception.Message)
-            }
-            $results.Add((New-DemoT4FallbackResult -Config $Config -Refused $t4Failure -Next $recorded))
-            Write-DemoLog -Level Warning -Message $(if ($recorded -eq 'None') { 'Azure refused T4''s Burstable sizes; deploying again without T4.' } else { 'Azure refused T4''s Standard_B1ms; deploying again with Standard_B2s, the same Burstable class.' })
             continue
         }
         # Phase 28 live finding (2026-11-02): a deployment that failed while it ran names its cause in its operations, read
         # only now, after the free offer's and T4's own handling above, which reads the error as before.
         $cause = if ($Action -eq 'Create') { Get-DemoDeploymentFailure -Config $Config -DeploymentName $deploymentName -ErrorText ([string]$run.StdErr) } else { $null }
         $results.Add((New-DemoTemplateFailureResult -Config $Config -Verb $verb -DeploymentName $deploymentName -ErrorText ([string]$run.StdErr) -Cause $cause -DocUrl $docUrl))
-        if ($null -ne $t4Failure) {
+        if ($null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current) {
             # A size Azure refused for T4 that the configuration sets gets its own Fail, with the documented fallback (Phase 24, ADR 0019).
             $results.Add((New-DemoT4SkuFailureResult -CheckId 'DEPLOY.T4.SKU' -Failure $t4Failure))
         }
-        return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective) }
+        return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note }
     }
+    # Every attempt above returns or moves on to a next one; this is reached only if they all moved on.
+    $results.Add((New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message 'The template deployment didn''t succeed within its attempts (the T3 free offer''s and T4''s fallbacks included).' -Remediation 'Run deploy.ps1 -Resume; the results above say what each attempt changed.' -DocUrl $docUrl))
+    return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note }
 }

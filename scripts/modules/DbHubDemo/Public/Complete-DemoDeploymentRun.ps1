@@ -6,7 +6,9 @@ function Complete-DemoDeploymentRun {
 
     .DESCRIPTION
     The outcome reads the resource group's state after the run (each track's last finished step), unless -State is
-    given. Returns the outcome: Kind (Done, NotDone, or WhatIf), Done, Reason, Next, NextCommand, Optional, Unfinished,
+    given. While T4 runs on the General Purpose fallback (DbHubT4Sku Standard_D2ds_v5), its hourly list price comes from
+    this run's DEPLOY.T4.SKU, or from the Azure Retail Prices API now, for the note DONE and NOT DONE add (Phase 28
+    follow-up). Returns the outcome: Kind (Done, NotDone, or WhatIf), Done, Reason, Next, NextCommand, Optional, Unfinished,
     ExitCode, Resume, and Minutes. Never throws: a run that can't be judged is NOT DONE.
 
     .PARAMETER Run
@@ -94,7 +96,14 @@ function Complete-DemoDeploymentRun {
     }
     try {
         $startedVms = @(Get-DemoStartedVm -Result @($Result) -Model $model)
-        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen -StartedVm $startedVms
+        # T4 on the General Purpose fallback is said with its hourly list price (Phase 28 follow-up): this run's, or read
+        # from the Azure Retail Prices API now.
+        $t4Hourly = $null
+        if (-not $wasStopped -and -not $WhatIfRun -and (Test-DemoT4FallbackSize -Config $Config -State $judgedState)) {
+            $priced = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and $null -ne (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'hourlyUsd') }) | Select-Object -Last 1
+            $t4Hourly = if ($null -ne $priced) { [double](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $priced -Name 'evidence') -Name 'hourlyUsd') } else { Get-DemoT4HourlyPrice -Config $Config -SkuName 'Standard_D2ds_v5' }
+        }
+        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen -StartedVm $startedVms -T4HourlyUsd $t4Hourly
     }
     catch {
         $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; Optional = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }

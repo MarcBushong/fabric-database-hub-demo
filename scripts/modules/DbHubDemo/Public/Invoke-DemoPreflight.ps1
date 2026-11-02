@@ -262,15 +262,33 @@ function Invoke-DemoPreflight {
     }
 
     # T4 (Phase 24, ADR 0019): the region offers the configured size in its tier's edition (Burstable, or General
-    # Purpose for the documented D2ds_v5 option) and the pinned PostgreSQL major version, read with
-    # 'az postgres flexible-server list-skus' (Phase 28, brief item 10), or the documented Location Based Capabilities API
-    # when the Azure CLI can't answer. When the configuration doesn't set t4SkuName, the Burstable fallback (B1ms, then
-    # B2s, then no T4) applies, so a missing B1ms isn't a Fail: the evidence's startSku tells deploy.ps1 where to start.
-    if (Test-DemoT4Enabled -Config $Config) {
+    # Purpose for D2ds_v5) and the pinned PostgreSQL major version, read with 'az postgres flexible-server list-skus'
+    # (Phase 28, brief item 10), or the documented Location Based Capabilities API when the Azure CLI can't answer. When
+    # the configuration doesn't set t4SkuName and T4 doesn't exist yet, the fallback applies (Phase 28 and its follow-up:
+    # B1ms, then B2s, then General Purpose D2ds_v5 after its cost check, then no T4), so a size the region doesn't list
+    # isn't a Fail: the furthest step any check found is where deploy.ps1 starts (PREFLIGHT.T4.FALLBACK's startSku, with
+    # the cost check below). An existing server keeps its own size, so the fallback doesn't apply to it.
+    $t4On = Test-DemoT4Enabled -Config $Config
+    $t4Explicit = Test-DemoT4SkuExplicit -Config $Config
+    $t4Exists = $false
+    $t4ServerSku = ''
+    $t4Starts = [System.Collections.Generic.List[string]]::new()
+    if ($t4On) {
         $postgres = Get-DemoPostgresSetting
-        $t4Sku = Get-DemoT4SkuName -Config $Config
+        if (-not $t4Explicit) {
+            # One read: the server, when it exists, and its own size (Servers - Get).
+            $t4Current = Get-DemoT4State -Config $Config
+            $t4Exists = [bool](Get-DemoMemberValue -InputObject $t4Current -Name 'Exists')
+            $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4Current -Name 'Server')
+        }
+        $t4Sku = if ($t4ServerSku) { $t4ServerSku } else { Get-DemoT4SkuName -Config $Config }
         $t4Tier = (Get-DemoT4SkuSpec -SkuName $t4Sku).Tier
-        $t4Explicit = $Config.Contains('t4SkuName') -and -not [string]::IsNullOrWhiteSpace([string]$Config['t4SkuName'])
+        $t4Ladder = -not $t4Explicit -and -not $t4Exists
+        if ($t4Ladder -and $t4Tier -eq 'GeneralPurpose') {
+            # An earlier run's record (DbHubT4Sku None, then a run that deploys the template, or Standard_D2ds_v5 for a
+            # server that wasn't created): the General Purpose fallback, which its cost check below decides.
+            $t4Starts.Add('Standard_D2ds_v5')
+        }
         $capabilitySource = 'az postgres flexible-server list-skus'
         $listed = @(Invoke-Az -Arguments @('postgres', 'flexible-server', 'list-skus', '--location', $location, '--output', 'json') -Json -AllowFailure | Where-Object { $null -ne $_ })
         $capabilityItems = if ($listed.Count -eq 1 -and $null -ne (Get-DemoMemberValue -InputObject $listed[0] -Name 'value')) { Get-DemoMemberList -InputObject $listed[0] -Name 'value' } else { $listed }
@@ -292,51 +310,74 @@ function Invoke-DemoPreflight {
             $skuItems = Get-DemoMemberList -InputObject $edition -Name 'supportedServerSkus'
             @($skuItems | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') })
         }
+        $offers = { param([string] $Sku) $Sku -in @(& $skusOf (Get-DemoT4SkuSpec -SkuName $Sku).Tier) }
         $skus = @(& $skusOf $t4Tier)
         $versionItems = Get-DemoMemberList -InputObject $capability -Name 'supportedServerVersions'
         $versions = @($versionItems | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') })
-        $t4Evidence = @{ sku = $t4Sku; tier = $t4Tier; majorVersion = [string]$postgres['majorVersion']; editionSkus = $skus; versions = $versions; source = $capabilitySource; explicit = $t4Explicit; startSku = '' }
+        $t4Evidence = @{ sku = $t4Sku; tier = $t4Tier; majorVersion = [string]$postgres['majorVersion']; editionSkus = $skus; versions = $versions; source = $capabilitySource; explicit = $t4Explicit; exists = $t4Exists; startSku = '' }
         $capabilityDoc = 'https://learn.microsoft.com/cli/azure/postgres/flexible-server#az-postgres-flexible-server-list-skus'
         $versionOffered = [string]$postgres['majorVersion'] -in $versions
         if ($null -eq $capability) {
             Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('The PostgreSQL flexible server sizes of {0} couldn''t be read, so T4''s size and version weren''t checked.' -f $location) -Evidence $t4Evidence -Remediation 'Run preflight again once Microsoft.DBforPostgreSQL is registered.' -DocUrl $capabilityDoc
         }
-        elseif ($t4Sku -in $skus -and $versionOffered) {
+        elseif ($t4Exists) {
+            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Pass' ('T4 exists as {0} {1}, and deploy.ps1 keeps its size, so the sizes {2} lists matter only for a new server.' -f $t4Tier, $t4Sku, $location) -Evidence $t4Evidence -DocUrl $capabilityDoc
+        }
+        elseif ((& $offers $t4Sku) -and $versionOffered) {
             Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Pass' ('{0} offers T4''s {1} {2} and PostgreSQL {3} ({4}).' -f $location, $t4Tier, $t4Sku, $postgres['majorVersion'], $capabilitySource) -Evidence $t4Evidence -DocUrl $capabilityDoc
         }
-        elseif (-not $t4Explicit -and $versionOffered -and $t4Sku -eq 'Standard_B1ms' -and 'Standard_B2s' -in $skus) {
-            $t4Evidence['startSku'] = 'Standard_B2s'
-            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} doesn''t list T4''s default Standard_B1ms, so deploy.ps1 starts with Standard_B2s, the same Burstable class (Phase 28''s fallback; estimate-cost.ps1 prices it).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $capabilityDoc
-        }
-        elseif (-not $t4Explicit -and $versionOffered -and $t4Sku -like 'Standard_B*') {
-            $t4Evidence['startSku'] = 'None'
-            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists neither of T4''s Burstable sizes (Standard_B1ms, Standard_B2s), so deploy.ps1 finishes without T4, and DONE says so. Nothing larger is chosen for you.' -f $location) -Evidence $t4Evidence -Remediation 'To add T4, set "t4SkuName": "Standard_D2ds_v5" (General Purpose; estimate-cost.ps1 prices it), or set t4Enabled to false to leave it out on purpose.' -DocUrl $capabilityDoc
+        elseif ($t4Ladder -and $versionOffered) {
+            # The fallback's next sizes after this one, in its order; the first one the region lists is where it starts.
+            $steps = @('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5')
+            $next = @($steps | Select-Object -Skip ([array]::IndexOf($steps, $t4Sku) + 1) | Where-Object { & $offers $_ }) | Select-Object -First 1
+            $start = if ($next) { [string]$next } else { 'None' }
+            $t4Evidence['startSku'] = $start
+            $t4Starts.Add($start)
+            switch ($start) {
+                'Standard_B2s' {
+                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} doesn''t list T4''s default Standard_B1ms, so deploy.ps1 starts with Standard_B2s, the same Burstable class (Phase 28''s fallback; estimate-cost.ps1 prices it).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $capabilityDoc
+                }
+                'Standard_D2ds_v5' {
+                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists neither of T4''s Burstable sizes (Standard_B1ms, Standard_B2s), so deploy.ps1 goes to the General Purpose fallback, Standard_D2ds_v5, once its cost check passes (PREFLIGHT.T4.FALLBACK).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do: PREFLIGHT.T4.FALLBACK gives its price and worst case. To choose T4''s size yourself, set t4SkuName, or set t4Enabled to false to leave T4 out.' -DocUrl $capabilityDoc
+                }
+                default {
+                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists none of the sizes T4''s fallback tries (Standard_B1ms, Standard_B2s, Standard_D2ds_v5), so deploy.ps1 finishes without T4, and DONE says so.' -f $location) -Evidence $t4Evidence -Remediation 'Pick a region that offers one of them, or set t4Enabled to false to leave T4 out on purpose.' -DocUrl $capabilityDoc
+                }
+            }
         }
         else {
             Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Fail' ('{0} doesn''t offer T4''s {1} {2} with PostgreSQL {3}.' -f $location, $t4Tier, $t4Sku, $postgres['majorVersion']) -Evidence $t4Evidence -Remediation 'Pick a region that offers it, or set t4Enabled to false (Phase 24, ADR 0019).' -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute'
         }
         # The capability list doesn't show a size that's temporarily unavailable: Azure refused B1ms with
         # SkuNotAvailable on 2026-10-26 while the list included it. A refusal on record for this size and zone is a
-        # Fail for a size the configuration sets; for the default, deploy.ps1's Burstable fallback starts one size on
-        # (Phase 28), which is a Warning.
-        $refused = Get-DemoT4CreateFailure -Config $Config
-        if ($null -ne $refused -and $refused.Sku -eq $t4Sku) {
-            $t4Zone = Get-DemoT4AvailabilityZone -Config $Config
-            $otherZone = $t4Zone -and $t4Zone -ne $refused.Zone
-            if (-not $otherZone -and -not $t4Explicit -and $t4Sku -in 'Standard_B1ms', 'Standard_B2s') {
-                $start = if ($t4Sku -eq 'Standard_B1ms') { 'Standard_B2s' } else { 'None' }
-                $t4Evidence['startSku'] = $start
-                $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $(if ($start -eq 'None') { 'finishes without T4 (nothing larger is chosen for you)' } else { 'starts with Standard_B2s, the same Burstable class' })) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName (Standard_D2ds_v5 is the documented General Purpose option).' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
-            }
-            else {
-                $skuStatus = if ($otherZone) { 'Warning' } else { 'Fail' }
-                $results.Add((New-DemoT4SkuFailureResult -CheckId 'PREFLIGHT.T4.SKU' -Failure $refused -Status $skuStatus -NextZone $t4Zone))
+        # Fail for a size the configuration sets; otherwise deploy.ps1's fallback starts one step on, a Warning: B1ms
+        # to B2s, B2s to the General Purpose fallback (after its cost check), and D2ds_v5 to no T4 (Phase 28 follow-up).
+        if (-not $t4Exists) {
+            $refused = Get-DemoT4CreateFailure -Config $Config
+            if ($null -ne $refused -and $refused.Sku -eq $t4Sku) {
+                $t4Zone = Get-DemoT4AvailabilityZone -Config $Config
+                $otherZone = $t4Zone -and $t4Zone -ne $refused.Zone
+                if (-not $otherZone -and $t4Ladder) {
+                    $start = switch ($t4Sku) { 'Standard_B1ms' { 'Standard_B2s' } 'Standard_B2s' { 'Standard_D2ds_v5' } default { 'Refused' } }
+                    $t4Starts.Add($start)
+                    $what = switch ($start) {
+                        'Standard_B2s' { 'starts with Standard_B2s, the same Burstable class' }
+                        'Standard_D2ds_v5' { 'goes to the General Purpose fallback, Standard_D2ds_v5, once its cost check passes (PREFLIGHT.T4.FALLBACK)' }
+                        default { 'finishes without T4: it was the last size the fallback tries, and later runs don''t try again on their own' }
+                    }
+                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $what) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation $(if ($start -eq 'Refused') { 'Ask for access with a Region access request (Learn: Resolve capacity errors), then set t4SkuName; or set t4Enabled to false to leave T4 out on purpose.' } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+                }
+                else {
+                    $skuStatus = if ($otherZone) { 'Warning' } else { 'Fail' }
+                    $results.Add((New-DemoT4SkuFailureResult -CheckId 'PREFLIGHT.T4.SKU' -Failure $refused -Status $skuStatus -NextZone $t4Zone))
+                }
             }
         }
     }
     else {
         Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Not selected' 'T4 is off in this configuration (t4Enabled is false).'
     }
+    $t4Start = Select-DemoT4StartSku -Sku $t4Starts.ToArray()
 
     # T2 mode (ADR 0006). The evaluation-only fallback is opt-in, and everything about it is labeled.
     if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
@@ -519,8 +560,21 @@ function Invoke-DemoPreflight {
         }
     }
 
-    # Cost: live retail prices against the ceilings, with the subscription's Defender for Cloud plans.
-    $costParameters = @{ Config = $Config; NetworkMode = $effectiveNetworkMode; T3UseFreeLimit = $t3UseFreeLimit }
+    # Cost: live retail prices against the ceilings, with the subscription's Defender for Cloud plans. T4 is priced at the
+    # size it starts with (Phase 28 follow-up): an existing server's own size, the step the fallback starts at, or none
+    # when the fallback leaves T4 out, so a fallback whose worst case is over a ceiling leaves T4 out instead of stopping
+    # the run. The estimates share one price cache, so the fallback's own estimate reads only the prices it adds.
+    $costConfig = $Config
+    if ($t4On -and $t4Exists -and $t4ServerSku -and $t4ServerSku -cne (Get-DemoT4SkuName -Config $Config)) {
+        $costConfig = Copy-DemoT4Config -Config $Config -Source server -SkuName $t4ServerSku
+    }
+    elseif ($t4On -and $t4Start -in 'Standard_B2s', 'Standard_D2ds_v5') {
+        $costConfig = Copy-DemoT4Config -Config $Config -Source fallback -SkuName $t4Start
+    }
+    elseif ($t4On -and $t4Start -in 'None', 'Refused') {
+        $costConfig = Copy-DemoT4Config -Config $Config -Source fallback -Off
+    }
+    $costParameters = @{ Config = $costConfig; NetworkMode = $effectiveNetworkMode; T3UseFreeLimit = $t3UseFreeLimit; PriceCache = @{} }
     try {
         $costParameters['DefenderPlans'] = @(Get-DemoDefenderPlan -SubscriptionId $subscriptionId)
     }
@@ -534,7 +588,17 @@ function Invoke-DemoPreflight {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots could not be listed, so the cost estimate leaves them out: {0}' -f $_.Exception.Message)
     }
     try {
-        foreach ($result in (Get-DemoCostEstimate @costParameters).Results) {
+        $estimate = Get-DemoCostEstimate @costParameters
+        $costResults = @($estimate.Results)
+        if ($t4On) {
+            # The General Purpose fallback's cost check, and where the fallback starts (Phase 28 follow-up).
+            $fallback = Get-DemoT4FallbackPreflight -Config $Config -CostParameters $costParameters -Estimate $estimate -Start $t4Start -Explicit:$t4Explicit -Exists:$t4Exists -ServerSku $t4ServerSku
+            if ($null -ne $fallback.CostResults) {
+                $costResults = @($fallback.CostResults)
+            }
+            $results.Add($fallback.Result)
+        }
+        foreach ($result in $costResults) {
             $results.Add($result)
         }
     }

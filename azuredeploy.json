@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "4317806960365456095"
+      "templateHash": "11848242780012714981"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -433,7 +433,7 @@
         "Standard_D2ds_v5"
       ],
       "metadata": {
-        "description": "T4's compute size: Standard_B1ms, the smallest Burstable size (default); Standard_B2s, the documented fallback when Azure answers SkuNotAvailable for B1ms in the region; or Standard_D2ds_v5, the documented General Purpose option (2 vCores, 8 GiB) the owner chose on 2026-10-26 after both were refused. The tier follows the size (Phase 24, ADR 0019). deploy.ps1 never changes it on its own."
+        "description": "T4's compute size: Standard_B1ms, the smallest Burstable size (default); Standard_B2s, the fallback when Azure answers SkuNotAvailable for B1ms in the region; or Standard_D2ds_v5, General Purpose (2 vCores, 8 GiB), the fallback when Azure refuses both Burstable sizes and its cost check passes. The tier follows the size, and storage, backups, and high availability are the same on both tiers (Phase 24, Phase 28 and its follow-up, ADR 0019). deploy.ps1 never resizes an existing server on its own."
       }
     },
     "t4AvailabilityZone": {
@@ -637,7 +637,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "12963987511734943101"
+              "templateHash": "6573729177947380292"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -927,7 +927,7 @@
                 "Standard_D2ds_v5"
               ],
               "metadata": {
-                "description": "T4's compute size: Standard_B1ms (default), Standard_B2s (the documented fallback), or Standard_D2ds_v5 (the documented General Purpose option); the tier follows the size (Phase 24, ADR 0019)."
+                "description": "T4's compute size: Standard_B1ms (default), Standard_B2s (the Burstable fallback), or Standard_D2ds_v5 (the General Purpose fallback); the tier follows the size (Phase 24, Phase 28 and its follow-up, ADR 0019)."
               }
             },
             "t4AvailabilityZone": {
@@ -9684,9 +9684,9 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "18094150887899134224"
+                      "templateHash": "4168938847978769215"
                     },
-                    "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server at the smallest Burstable size, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, and the free enhanced metrics turned on."
+                    "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, and the free enhanced metrics turned on."
                   },
                   "parameters": {
                     "location": {
@@ -9727,7 +9727,7 @@
                     "sizing": {
                       "type": "object",
                       "metadata": {
-                        "description": "Compute, storage, and backup sizing from config/profiles.json (profiles.<profile>.t4), with skuName from the t4SkuName setting."
+                        "description": "Compute, storage, and backup sizing from config/profiles.json (profiles.<profile>.t4), with skuName from the t4SkuName setting and the tier that follows it; the storage, backup, and high availability settings are valid on both tiers."
                       }
                     },
                     "availabilityZone": {
