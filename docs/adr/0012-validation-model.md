@@ -139,7 +139,7 @@ Run by `scripts/configure-fabric.ps1` (`Invoke-DemoHubReadiness`) after the subs
 | Workload | `WORKLOAD.<target>.COMMAND`, `WORKLOAD.<target>.BOUNDS`, `WORKLOAD.<target>.HOST` | `Invoke-DemoWorkloadCommand ... status --json --runs 5`, then the scenario bounds and the profile host lane from the runner's status (Phase 25b) |
 | Cost | `PREFLIGHT.COST.*`, `COST.BUDGET`, `COST.AUTOSHUTDOWN`, `COST.BASTION` | The live-price estimate (reused from the Preflight area when it ran); the budget; the auto-shutdown schedules; Bastion or a public IP still billing |
 | Security | `SECURITY.SECRETSCAN.OUTPUT`, `SECURITY.SECRETSCAN.RUNCOMMANDS`, `SECURITY.SECRETSCAN.DEPLOYMENTS`, `SECURITY.RBAC.ROLEASSIGNMENTS`, `SECURITY.SECRETS.KEYVAULT`, `SECURITY.NETWORK.NOPUBLICIP`, `SECURITY.NETWORK.INBOUND` | `Find-DemoSecretLeak` (ADR 0009) over `out/`, the Run Command instance views, and the ARM deployments; role assignments and Key Vaults (ADR 0008); NICs and NSGs (ADR 0007) |
-| Teardown | `TEARDOWN.RESIDUAL` | A Resource Graph query (`Kql/ResourceGraph.Residual.kql`) for everything in the demo resource group or tagged for the environment (ADR 0002) |
+| Teardown | `TEARDOWN.RESIDUAL` | A Resource Graph query (`Kql/ResourceGraph.Residual.kql`) for everything in the demo resource group or tagged with the environment's `deploymentId` (ADR 0002); never the `solution` and `environment` tags alone, which another prefix's environment of the same name carries too (Phase 28 follow-up) |
 
 The checks that are new in Phase 14:
 
@@ -162,7 +162,7 @@ The checks that are new in Phase 14:
 | `SECURITY.SECRETS.KEYVAULT` | No Key Vault in the resource group (ADR 0009); with the Key Vault opt-in, only the opt-in vault, with Azure RBAC authorization and soft delete (its firewall, retention, and purge protection in the evidence) | Pass or Warning |
 | `SECURITY.NETWORK.NOPUBLICIP` | No network interface has a public IP | Pass or Fail |
 | `SECURITY.NETWORK.INBOUND` | No inbound allow from `*`, `Internet`, or `0.0.0.0/0` on the VM and private-endpoint NSGs (the Bastion NSG must allow HTTPS from the internet) | Pass or Fail |
-| `TEARDOWN.RESIDUAL` | Deployed: nothing tagged for the environment is outside its resource group, which destroy deletes. Destroyed: nothing of the environment remains, Arc resources included. `rg-<prefix>-control` is kept by design. | Pass; Warning (deployed) or Fail (destroyed) with the resources |
+| `TEARDOWN.RESIDUAL` | Deployed: nothing tagged for the environment is outside its resource group, which destroy deletes. Destroyed: nothing of the environment remains, Arc resources included. `rg-<prefix>-control` is kept by design. | Pass; Warning (deployed) or Fail (destroyed) with the resources; Warning after a destroy without `-DeploymentId`, since resources outside the group can't be looked for (Phase 28 follow-up) |
 | `VALIDATE.<AREA>`, `VALIDATE.DEPLOYMENT` | An area that stopped with an error (the other areas still run), or deployment checks without a resource group | Fail |
 
 **Stopped resources are expected.** The nightly auto-shutdown deallocates the VMs, so every check that needs a running VM (a Run Command, an extension instance view, or the VM's telemetry) is a **Warning** while the VM is deallocated, with the command to start it, and a Fail only when the VM doesn't exist:

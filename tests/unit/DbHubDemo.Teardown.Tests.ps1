@@ -33,6 +33,12 @@ BeforeAll {
         }
     }
 
+    # An Azure Resource Manager error as Invoke-DemoRestRequest returns it.
+    function New-ArmError([int] $Status = 404, [string] $Code = 'ResourceGroupNotFound') {
+        [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ('HTTP {0}: {{"error":{{"code":"{1}","message":"Not found in this test."}}}}' -f $Status, $Code); StatusCode = $Status }
+    }
+
+    $script:sub = '/subscriptions/11111111-2222-3333-4444-555555555555'
     $script:notFound = "ERROR: (ResourceGroupNotFound) Resource group 'rg-dbhub-demo' could not be found."
 }
 
@@ -150,6 +156,12 @@ Describe 'Test-DemoTeardownResidue' {
         $script:orgResult = $null
         $script:existing = @()
         $script:memberOf = @()
+        # Azure Resource Manager's answers for the residual check's confirmations (Resources - Get By Id), by URL
+        # pattern; anything else is returned (HTTP 200). Providers - Get lists API versions for types nothing pins.
+        $script:arm = [ordered]@{}
+        $script:providers = @{
+            'Microsoft.AzureArcData' = @(@{ resourceType = 'sqlServerInstances/databases'; apiVersions = @('2027-01-01-preview', '2026-01-01', '2025-03-01') })
+        }
         # The canaries: Resource Graph lists the configured subscription, and Microsoft Graph answers for its tenant.
         $script:graph['project subscriptionId$'] = New-GraphResult -Rows @([pscustomobject]@{ subscriptionId = '11111111-2222-3333-4444-555555555555' })
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
@@ -172,7 +184,18 @@ Describe 'Test-DemoTeardownResidue' {
             if ($Uri -match '/v1\.0/directoryObjects/([0-9a-f-]{36})/checkMemberGroups$') {
                 return (& $answer @(if ($Matches[1] -in $script:memberOf) { '77777777-7777-7777-7777-777777777777' }))
             }
-            throw ('Unexpected REST call: {0}' -f $Uri)
+            if ($Method -eq 'GET' -and $Uri -match '^https://management\.azure\.com/subscriptions/11111111-2222-3333-4444-555555555555/providers/([^/?]+)\?api-version=') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (@{ namespace = $Matches[1]; resourceTypes = @($script:providers[$Matches[1]]) } | ConvertTo-Json -Depth 6); StdErr = ''; StatusCode = 200 }
+            }
+            if ($Method -eq 'GET' -and $Uri -match '^https://management\.azure\.com/subscriptions/11111111-2222-3333-4444-555555555555/') {
+                foreach ($key in $script:arm.Keys) {
+                    if ($Uri -match $key) {
+                        return $script:arm[$key]
+                    }
+                }
+                return [pscustomobject]@{ ExitCode = 0; StdOut = '{}'; StdErr = ''; StatusCode = 200 }
+            }
+            throw ('Unexpected REST call: {0} {1}' -f $Method, $Uri)
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHubResourceGraph -MockWith {
             $script:queries.Add($Query)
@@ -308,29 +331,54 @@ Describe 'Test-DemoTeardownResidue' {
         ($results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.IDENTITIES' }).status | Should -Be 'Pass'
     }
 
-    It 'without a manifest, checks the environment''s solution and environment tags and never matches untagged resources' {
+    It 'without a manifest, looks for the resource group by its name only, warns, and never matches by the solution and environment tags' {
         $results = @(Test-DemoTeardownResidue -Config $config -Manifest $null -WaitMinutes 0)
-        ($results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.TAGGED' }).status | Should -Be 'Pass'
-        ($results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.TAGGED' }).message | Should -Match 'deploymentId is unknown'
+        $tagged = $results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.TAGGED' }
+        $tagged.status | Should -Be 'Warning'
+        $tagged.message | Should -Match 'deploymentId is unknown'
+        $tagged.remediation | Should -Match 'destroy\.ps1 -ResidueOnly -ManifestPath'
         ($results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.IDENTITIES' }).status | Should -Be 'Warning'
         $script:queries | Should -Not -Match 'deploymentId'
-        $tagged = $script:queries | Where-Object { $_ -match 'union' } | Select-Object -First 1
-        $tagged | Should -Match "tostring\(tags.solution\) =~ 'fabric-database-hub-demo' and tostring\(tags.environment\) =~ 'demo'"
+        $script:queries | Should -Not -Match 'tags\.solution|tags\.environment'
+        ($script:queries | Where-Object { $_ -match "^resourcecontainers \| where type =~ 'microsoft\.resources/subscriptions/resourcegroups'" } | Select-Object -First 1) | Should -Match "where name =~ 'rg-dbhub-demo' \| where name !~ 'rg-dbhub-control' \| project id$"
         ($script:queries | Where-Object { $_ -match 'hybridcompute' } | Select-Object -First 1) | Should -Match "resourceGroup =~ 'rg-dbhub-demo'"
     }
 
-    It 'scopes the tag and Arc queries to the environment''s tags and the group, and never counts the GitHub identity''s group' {
+    It 'scopes the tag and Arc queries to the deploymentId and the group''s exact name, and never counts the GitHub identity''s group' {
         $null = Test-DemoTeardownResidue -Config $config -Manifest (New-TestManifest) -WaitMinutes 0
         $tagged = $script:queries | Where-Object { $_ -match 'union' } | Select-Object -First 1
-        $tagged | Should -Match "tostring\(tags.deploymentId\) == 'abc123' or \(tostring\(tags.solution\) =~ 'fabric-database-hub-demo' and tostring\(tags.environment\) =~ 'demo'\)"
-        $tagged | Should -Match "resources \| where .* \| where resourceGroup !~ 'rg-dbhub-control'"
-        $tagged | Should -Match "resourcecontainers \| where .* \| where name !~ 'rg-dbhub-control'"
+        $tagged | Should -Be "resources | where tostring(tags.deploymentId) == 'abc123' | where resourceGroup !~ 'rg-dbhub-control' | project id | union (resourcecontainers | where type =~ 'microsoft.resources/subscriptions/resourcegroups' | where name =~ 'rg-dbhub-demo' or tostring(tags.deploymentId) == 'abc123' | where name !~ 'rg-dbhub-control' | project id)"
         $arc = $script:queries | Where-Object { $_ -match 'hybridcompute' } | Select-Object -First 1
-        $arc | Should -Match "resourceGroup =~ 'rg-dbhub-demo'"
-        $arc | Should -Match "contains '/resourcegroups/rg-dbhub-demo/'"
-        $arc | Should -Match "tostring\(tags.deploymentId\) == 'abc123'"
+        $arc | Should -Match "where resourceGroup =~ 'rg-dbhub-demo' or tolower\(tostring\(properties\.containerResourceId\)\) contains '/resourcegroups/rg-dbhub-demo/' or tostring\(tags\.deploymentId\) == 'abc123' \| project id$"
         $arc | Should -Match 'microsoft.azurearcdata/sqlserverinstances'
         $arc | Should -Match 'microsoft.hybridcompute/machines/extensions'
+        # Never the solution and environment tags alone, and never a resource's name.
+        $script:queries | Should -Not -Match 'tags\.solution|tags\.environment|fabric-database-hub-demo'
+        $script:queries | Should -Not -Match "\bname (=~|==|in~) .*(sqlvm01|arcsql01)"
+    }
+
+    It 'never counts another prefix''s environment with the same environment name, or a resource by its name alone (live, 2026-11-02)' {
+        # rg-dbhubalt-demo is another prefix's environment, also named demo, still deployed in the same subscription. Its
+        # resources carry solution fabric-database-hub-demo and environment demo too, under another deploymentId, and
+        # its VMs and Arc machine have this environment's names. A query that matched them by those tags, or by a
+        # name, would get them back.
+        $other = @(
+            ($script:sub + '/resourceGroups/rg-dbhubalt-demo')
+            ($script:sub + '/resourceGroups/rg-dbhubalt-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01')
+            ($script:sub + '/resourceGroups/rg-dbhubalt-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-zzz999')
+            ($script:sub + '/resourceGroups/rg-dbhubalt-demo/providers/Microsoft.DevTestLab/schedules/shutdown-computevm-sqlvm01')
+            ($script:sub + '/resourceGroups/rg-dbhubalt-demo/providers/Microsoft.HybridCompute/machines/arcsql01')
+        )
+        $script:graph["tags\.environment|tags\.solution|\bname (=~|==|in~) .*(sqlvm01|arcsql01)"] = New-GraphResult -Rows @($other | ForEach-Object { [pscustomobject]@{ id = $_ } })
+        $results = @(Test-DemoTeardownResidue -Config $config -Manifest (New-TestManifest) -WaitMinutes 0)
+        foreach ($name in 'TAGGED', 'ARC', 'GROUPRESOURCES') {
+            $result = $results | Where-Object { $_.checkId -eq "TEARDOWN.RESIDUAL.$name" }
+            $result.status | Should -Be 'Pass' -Because $name
+            @($result.evidence.remaining) | Should -BeNullOrEmpty -Because $name
+        }
+        ($results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.TAGGED' }).message | Should -Match 'deploymentId abc123, or the resource group rg-dbhub-demo'
+        @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+        @($script:rest | Where-Object { $_ -match 'rg-dbhubalt-demo' }) | Should -BeNullOrEmpty -Because 'nothing of the other environment is even read'
     }
 
     It 'reads every identity of a manifest loaded from JSON, one principal or several' {
@@ -346,19 +394,114 @@ Describe 'Test-DemoTeardownResidue' {
         ($results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.IDENTITIES' }).message | Should -Match '^1 managed identit'
     }
 
-    It 'counts role assignments at the group, under it, or for its identities, and none of another group' {
+    It 'counts role assignments at the group, under it, or for its identities in the demo''s groups, and none of another group' {
         $group = '/subscriptions/11111111-2222-3333-4444-555555555555/resourcegroups/rg-dbhub-demo'
         $script:graph['roleassignments'] = New-GraphResult -Rows @(
             [pscustomobject]@{ id = 'ra-group'; assignmentScope = $group; principalId = 'dddddddd-1111-2222-3333-444444444444' }
             [pscustomobject]@{ id = 'ra-child'; assignmentScope = $group + '/providers/microsoft.compute/virtualmachines/sqlvm01'; principalId = 'dddddddd-1111-2222-3333-444444444444' }
             [pscustomobject]@{ id = 'ra-other-group'; assignmentScope = $group + '2'; principalId = 'dddddddd-1111-2222-3333-444444444444' }
+            [pscustomobject]@{ id = 'ra-control'; assignmentScope = '/subscriptions/11111111-2222-3333-4444-555555555555/resourcegroups/rg-dbhub-control'; principalId = 'bbbbbbbb-1111-2222-3333-444444444444' }
             [pscustomobject]@{ id = 'ra-identity'; assignmentScope = '/subscriptions/11111111-2222-3333-4444-555555555555'; principalId = 'aaaaaaaa-1111-2222-3333-444444444444' }
         )
         $results = @(Test-DemoTeardownResidue -Config $config -Manifest (New-TestManifest) -WaitMinutes 0)
         $assignments = $results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.ROLEASSIGNMENTS' }
         $assignments.status | Should -Be 'Fail'
-        $assignments.evidence.remaining | Should -Be @('ra-group', 'ra-child', 'ra-identity')
+        $assignments.evidence.remaining | Should -Be @('ra-group', 'ra-child', 'ra-control')
+        # One for an identity outside the demo's groups is named too, as an orphan someone else made.
+        @($assignments.evidence.orphaned | ForEach-Object { $_.id }) | Should -Be @('ra-identity')
+        $assignments.message | Should -Match 'outside the demo''s resource groups'
         ($script:queries | Where-Object { $_ -match 'roleassignments' } | Select-Object -First 1) | Should -Match "principalId in \('aaaaaaaa-1111-2222-3333-444444444444', 'bbbbbbbb-1111-2222-3333-444444444444'\)"
+    }
+
+    It 'warns, naming its scope, about a role assignment a tenant policy gave a deleted identity outside the demo''s groups, and deletes nothing (live, 2026-11-02)' {
+        # A DeployIfNotExists policy assigned one of the demo's managed identities a role on a storage account elsewhere;
+        # the identity went with the destroy, and the assignment stayed as "Identity not found". The demo creates none
+        # outside its group: with assignRoles, its own are at or under rg-<prefix>-<environment>.
+        $scope = '/subscriptions/11111111-2222-3333-4444-555555555555/resourcegroups/rg-shared-policy/providers/microsoft.storage/storageaccounts/stsharedlogs01'
+        $script:graph['roleassignments'] = New-GraphResult -Rows @(
+            [pscustomobject]@{ id = ($scope + '/providers/Microsoft.Authorization/roleAssignments/eeeeeeee-1111-2222-3333-444444444444'); assignmentScope = $scope; principalId = 'aaaaaaaa-1111-2222-3333-444444444444'; roleDefinitionId = '/subscriptions/11111111-2222-3333-4444-555555555555/providers/microsoft.authorization/roledefinitions/ffffffff-1111-2222-3333-444444444444' }
+        )
+        $results = @(Test-DemoTeardownResidue -Config $config -Manifest (New-TestManifest) -WaitMinutes 5 -PollSeconds 5)
+        $assignments = $results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.ROLEASSIGNMENTS' }
+        $assignments.status | Should -Be 'Warning'
+        $assignments.message | Should -Match ([regex]::Escape($scope))
+        $assignments.message | Should -Match 'didn''t create them: it gives its managed identities role assignments only at or under rg-dbhub-demo, and only with assignRoles'
+        $assignments.message | Should -Match 'DeployIfNotExists'
+        $assignments.message | Should -Match 'Identity not found'
+        $assignments.remediation | Should -Match 'Owner or User Access Administrator'
+        $assignments.remediation | Should -Match ([regex]::Escape('https://learn.microsoft.com/azure/role-based-access-control/role-assignments-remove'))
+        $assignments.docUrl | Should -Be 'https://learn.microsoft.com/azure/role-based-access-control/troubleshooting#symptom---role-assignments-with-identity-not-found'
+        $assignments.evidence.orphaned[0].scope | Should -Be $scope
+        $assignments.evidence.orphaned[0].principalId | Should -Be 'aaaaaaaa-1111-2222-3333-444444444444'
+        @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+        # It doesn't go away by waiting, and nothing deletes it.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match 'role assignment delete|--method delete' }
+        @($script:rest | Where-Object { $_ -notmatch '^(GET|POST) ' }) | Should -BeNullOrEmpty
+    }
+
+    It 'reports what Resource Graph still lists in the deleted group as index records once Resource Manager says it''s gone (live, 2026-11-02)' {
+        # Live: Resource Graph listed ten databases of a deleted Arc SQL Server instance in their deleted group for more
+        # than 30 minutes, while a Resource Manager GET of each answered 404 ResourceGroupNotFound.
+        $databases = @(1..10 | ForEach-Object { '{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.AzureArcData/sqlServerInstances/ARCSQL01_MSSQLSERVER/databases/db{1:D2}' -f $script:sub, $_ })
+        $rows = New-GraphResult -Rows @($databases | ForEach-Object { [pscustomobject]@{ id = $_ } })
+        $script:graph["^resources \| where resourceGroup =~ 'rg-dbhub-demo' \| project id$"] = $rows
+        $script:graph['microsoft\.azurearcdata/sqlserverinstances/databases'] = $rows
+        $script:arm['/resourceGroups/rg-dbhub-demo/'] = New-ArmError -Status 404 -Code 'ResourceGroupNotFound'
+        $results = @(Test-DemoTeardownResidue -Config $config -Manifest (New-TestManifest) -WaitMinutes 10 -PollSeconds 30)
+        foreach ($name in 'GROUPRESOURCES', 'ARC', 'RECORDS') {
+            ($results | Where-Object { $_.checkId -eq "TEARDOWN.RESIDUAL.$name" }).status | Should -Be 'Pass' -Because $name
+        }
+        $group = $results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.GROUPRESOURCES' }
+        $group.message | Should -Match '^Only index records remain: Resource Graph still lists 10 resource\(s\) in rg-dbhub-demo \(microsoft\.azurearcdata/sqlserverinstances/databases: 10\), but Azure Resource Manager says they''re gone \(ResourceGroupNotFound\)'
+        @($group.evidence.remaining) | Should -BeNullOrEmpty
+        @($group.evidence.indexRecords).Count | Should -Be 10
+        ($results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.ARC' }).message | Should -Match 'Only index records remain: Resource Graph still lists 10 deleted Arc resource\(s\)'
+        ($results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.RECORDS' }).message | Should -Match '^Only records remain: .*Azure Resource Graph index of deleted resources, microsoft\.azurearcdata/sqlserverinstances/databases: 10'
+        @($results | Where-Object { $_.status -in 'Fail', 'Warning' }) | Should -BeNullOrEmpty
+        # One Providers - Get for the type's API version (nothing pins it), then one read per row, through
+        # Invoke-DemoRestRequest; the rows Resource Manager says are gone end the wait at once.
+        @($script:rest | Where-Object { $_ -match '^GET https://management\.azure\.com/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft\.AzureArcData\?api-version=2021-04-01 ' }).Count | Should -Be 1
+        $reads = @($script:rest | Where-Object { $_ -match '^GET https://management\.azure\.com/subscriptions/.*/databases/db\d\d\?api-version=2026-01-01 ' })
+        $reads.Count | Should -Be 10
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'rest' -and ($ArgumentList -join ' ') -match 'databases' }
+    }
+
+    It 'reads at most 25 resources from Resource Manager, and reports what it couldn''t confirm as a Warning, never a Fail' {
+        $nics = @(1..40 | ForEach-Object { '{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.Network/networkInterfaces/nic{1:D2}' -f $script:sub, $_ })
+        $script:graph["^resources \| where resourceGroup =~ 'rg-dbhub-demo' \| project id$"] = New-GraphResult -Rows @($nics | ForEach-Object { [pscustomobject]@{ id = $_ } })
+        $script:arm['/resourceGroups/rg-dbhub-demo/'] = New-ArmError -Status 404 -Code 'ResourceGroupNotFound'
+        $results = @(Test-DemoTeardownResidue -Config $config -Manifest (New-TestManifest) -WaitMinutes 0)
+        $group = $results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.GROUPRESOURCES' }
+        $group.status | Should -Be 'Warning'
+        $group.message | Should -Match '^Resource Graph still lists 15 resource\(s\) in rg-dbhub-demo that Azure Resource Manager didn''t confirm: not read: the check reads at most 25 resources'
+        $group.remediation | Should -Match 'destroy\.ps1 -ResidueOnly'
+        $group.evidence.resourceManagerReads | Should -Be 25
+        @($group.evidence.indexRecords).Count | Should -Be 25
+        @($script:rest | Where-Object { $_ -match '^GET https://management\.azure\.com/subscriptions/' }).Count | Should -Be 25 -Because 'Network interfaces have a pinned API version, so no provider is read'
+        @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+        # 0 disables the reads: every row is unconfirmed.
+        $script:rest.Clear()
+        ($(Test-DemoTeardownResidue -Config $config -Manifest (New-TestManifest) -WaitMinutes 0 -MaxResourceReads 0) | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.GROUPRESOURCES' }).status | Should -Be 'Warning'
+        @($script:rest | Where-Object { $_ -match '^GET https://management\.azure\.com/subscriptions/' }) | Should -BeNullOrEmpty
+    }
+
+    It 'still fails what Resource Manager returns, and warns about a row it answers with another error' {
+        $vm = '{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01' -f $script:sub
+        $odd = '{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.Network/networkInterfaces/nic-sqlvm01' -f $script:sub
+        $script:graph["^resources \| where resourceGroup =~ 'rg-dbhub-demo' \| project id$"] = New-GraphResult -Rows @([pscustomobject]@{ id = $vm }, [pscustomobject]@{ id = $odd })
+        $script:arm['/networkInterfaces/nic-sqlvm01\?'] = New-ArmError -Status 404 -Code 'NoRegisteredProviderFound'
+        $results = @(Test-DemoTeardownResidue -Config $config -Manifest (New-TestManifest) -WaitMinutes 0)
+        $group = $results | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.GROUPRESOURCES' }
+        $group.status | Should -Be 'Fail'
+        $group.message | Should -Match '^1 resource\(s\) are still in rg-dbhub-demo: Azure Resource Manager returned them\.'
+        $group.evidence.remaining | Should -Be @($vm, $odd)
+
+        $script:graph["^resources \| where resourceGroup =~ 'rg-dbhub-demo' \| project id$"] = New-GraphResult -Rows @([pscustomobject]@{ id = $odd })
+        $group = @(Test-DemoTeardownResidue -Config $config -Manifest (New-TestManifest) -WaitMinutes 0) | Where-Object { $_.checkId -eq 'TEARDOWN.RESIDUAL.GROUPRESOURCES' }
+        $group.status | Should -Be 'Warning'
+        $group.message | Should -Match 'didn''t confirm: Azure Resource Manager answered HTTP 404: .*NoRegisteredProviderFound'
     }
 
     It 'reports resources outside the group that name it as a Warning, and platform records as evidence' {
@@ -542,6 +685,46 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         $script:order[-1] | Should -Be 'Residue:abc123'
     }
 
+    It 'replaces a manifest of the same resource group in another subscription, with a Warning, and never checks its deploymentId (review of 7fb941e)' {
+        # The default path is shared by every subscription with the same environment name, so another subscription's
+        # destroy of rg-dbhub-demo can have written it; its deploymentId and identities are another environment's.
+        $manifestPath = Join-Path -Path $TestDrive -ChildPath 'othersub/destroy-manifest-demo.json'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Path $manifestPath -Parent) -Force
+        $other = New-TestManifest
+        $other.DeploymentId = 'zzz999'
+        $other | Add-Member -NotePropertyName 'SubscriptionId' -NotePropertyValue '99999999-8888-7777-6666-555555555555'
+        $other | Add-Member -NotePropertyName 'ResourceGroupExisted' -NotePropertyValue $true
+        Set-Content -LiteralPath $manifestPath -Value ($other | ConvertTo-Json -Depth 6)
+        $script:groupExists = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { $script:order.Add('Manifest'); [pscustomobject]@{ SubscriptionId = '11111111-2222-3333-4444-555555555555'; ResourceGroupName = 'rg-dbhub-demo'; ResourceGroupExisted = $false; DeploymentId = 'abc123'; Principals = @() } }
+        $null = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
+        $script:order[-1] | Should -Be 'Residue:abc123'
+        $kept = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $kept.DeploymentId | Should -Be 'abc123'
+        $kept.SubscriptionId | Should -Be '11111111-2222-3333-4444-555555555555'
+        @($kept.Principals).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'is of rg-dbhub-demo in subscription 99999999-8888-7777-6666-555555555555, another environment, so it''s replaced' }
+    }
+
+    It 'keeps the earlier manifest of this subscription whatever the case of its ID, and one from before it was recorded' -ForEach @(
+        @{ RecordedSubscription = '11111111-2222-3333-4444-555555555555'.ToUpperInvariant() }
+        @{ RecordedSubscription = '' }
+    ) {
+        $manifestPath = Join-Path -Path $TestDrive -ChildPath ('samesub-{0}/destroy-manifest-demo.json' -f [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path (Split-Path -Path $manifestPath -Parent) -Force
+        $earlier = New-TestManifest
+        if ($RecordedSubscription) {
+            $earlier | Add-Member -NotePropertyName 'SubscriptionId' -NotePropertyValue $RecordedSubscription
+        }
+        $earlier | Add-Member -NotePropertyName 'ResourceGroupExisted' -NotePropertyValue $true
+        Set-Content -LiteralPath $manifestPath -Value ($earlier | ConvertTo-Json -Depth 6)
+        $script:groupExists = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { $script:order.Add('Manifest'); [pscustomobject]@{ SubscriptionId = '11111111-2222-3333-4444-555555555555'; ResourceGroupName = 'rg-dbhub-demo'; ResourceGroupExisted = $false; DeploymentId = ''; Principals = @() } }
+        $null = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
+        $script:order[-1] | Should -Be 'Residue:abc123'
+        @((Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).Principals).Count | Should -Be 2
+    }
+
     It 'reports a missing deployment record as Pass without deleting anything' {
         $script:recordStatus = New-AzResult -ExitCode 3 -StdErr "ERROR: (DeploymentNotFound) Deployment 'dbhub-demo-main' could not be found."
         $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
@@ -635,7 +818,106 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         $residual = $results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }
         $residual.status | Should -Be 'Warning'
         $residual.message | Should -Match 'refused by the subscription guard'
-        $residual.remediation | Should -Match 'Invoke-TeardownTest\.ps1'
+        $residual.remediation | Should -Match 'destroy\.ps1 -ResidueOnly -ManifestPath'
+    }
+
+    Context 'destroy.ps1 -ResidueOnly: the residual check again, read-only (Phase 28 follow-up)' {
+        BeforeEach {
+            $script:manifestPath = Join-Path -Path $TestDrive -ChildPath ('residue-{0}/destroy-manifest-demo.json' -f [guid]::NewGuid().ToString('N'))
+            $null = New-Item -ItemType Directory -Path (Split-Path -Path $script:manifestPath -Parent) -Force
+            $recorded = New-TestManifest
+            $recorded | Add-Member -NotePropertyName 'ResourceGroupExisted' -NotePropertyValue $true
+            $recorded | Add-Member -NotePropertyName 'RecordedUtc' -NotePropertyValue '2026-11-02T14:05:00.0000000Z'
+            Set-Content -LiteralPath $script:manifestPath -Value ($recorded | ConvertTo-Json -Depth 6)
+            Mock -ModuleName DbHubDemo -CommandName Test-DemoTeardownResidue -MockWith {
+                # The mock runs in the test's scope, without the module's helpers; the manifest is $null without one.
+                $script:order.Add('Residue:' + $(if ($null -ne $Manifest) { [string]$Manifest.DeploymentId } else { '' }))
+                $script:checkedPrincipals = @(if ($null -ne $Manifest) { $Manifest.Principals | ForEach-Object { [string]$_.PrincipalId } })
+                New-DemoResult -CheckId 'TEARDOWN.RESIDUAL.ARC' -Area 'teardown' -Target 'T2' -Status $script:residueStatus -Message 'arc'
+            }
+        }
+
+        It 'reads the saved manifest, runs only the residual check, and deletes, records, and asks nothing' {
+            $before = (Get-FileHash -LiteralPath $script:manifestPath -Algorithm SHA256).Hash
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath $script:manifestPath)
+            $script:order | Should -Be @('Residue:abc123')
+            $script:checkedPrincipals | Should -Be @('aaaaaaaa-1111-2222-3333-444444444444', 'bbbbbbbb-1111-2222-3333-444444444444')
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -Times 0 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -Times 0 -Exactly
+            (Get-FileHash -LiteralPath $script:manifestPath -Algorithm SHA256).Hash | Should -Be $before
+            $manifestResult = $results | Where-Object { $_.checkId -eq 'DESTROY.MANIFEST' }
+            $manifestResult.status | Should -Be 'Pass'
+            $manifestResult.message | Should -Match 'recorded 2026-11-02 14:05 UTC for rg-dbhub-demo \(deploymentId abc123, 2 identit\(ies\)\)\. Nothing is deleted\.'
+            ($results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }).status | Should -Be 'Pass'
+            @($results | Where-Object { $_.checkId -like 'DESTROY.*' -and $_.checkId -notin 'DESTROY.MANIFEST', 'DESTROY.RESIDUAL' }) | Should -BeNullOrEmpty
+            Get-DemoExitCode -Result $results | Should -Be 0
+        }
+
+        It 'sums up what''s left as Fail, so destroy.ps1 -ResidueOnly exits with 1' {
+            $script:residueStatus = 'Fail'
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath $script:manifestPath)
+            ($results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }).status | Should -Be 'Fail'
+            Get-DemoExitCode -Result $results | Should -Be 1
+        }
+
+        It 'runs without a manifest when there''s none there, and says so' {
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath (Join-Path -Path $TestDrive -ChildPath 'missing/destroy-manifest-demo.json'))
+            $manifestResult = $results | Where-Object { $_.checkId -eq 'DESTROY.MANIFEST' }
+            $manifestResult.status | Should -Be 'Warning'
+            $manifestResult.message | Should -Match 'There''s no manifest at .*looks for rg-dbhub-demo by name only'
+            $script:order | Should -Be @('Residue:')
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly
+        }
+
+        It 'checks nothing with another resource group''s manifest, or one it can''t read' {
+            Set-Content -LiteralPath $script:manifestPath -Value '{"ResourceGroupName": "rg-dbhubalt-demo", "ResourceGroupExisted": true, "DeploymentId": "zzz999", "Principals": []}'
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath $script:manifestPath)
+            $manifestResult = $results | Where-Object { $_.checkId -eq 'DESTROY.MANIFEST' }
+            $manifestResult.status | Should -Be 'Fail'
+            $manifestResult.message | Should -Match 'is the manifest of rg-dbhubalt-demo, not of rg-dbhub-demo'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoTeardownResidue -Times 0 -Exactly
+            Set-Content -LiteralPath $script:manifestPath -Value '{ not json'
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath $script:manifestPath)
+            ($results | Where-Object { $_.checkId -eq 'DESTROY.MANIFEST' }).message | Should -Match 'isn''t a readable manifest'
+            Get-DemoExitCode -Result $results | Should -Be 1
+            $script:order.Count | Should -Be 0
+        }
+
+        It 'checks nothing with the same resource group''s manifest from another subscription, and names both subscriptions (review of 7fb941e)' {
+            # Reproduced in review: DESTROY.MANIFEST passed, and the check got the other subscription's deploymentId.
+            $other = New-TestManifest
+            $other.DeploymentId = 'zzz999'
+            $other | Add-Member -NotePropertyName 'SubscriptionId' -NotePropertyValue '99999999-8888-7777-6666-555555555555'
+            $other | Add-Member -NotePropertyName 'ResourceGroupExisted' -NotePropertyValue $true
+            Set-Content -LiteralPath $script:manifestPath -Value ($other | ConvertTo-Json -Depth 6)
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath $script:manifestPath)
+            $manifestResult = $results | Where-Object { $_.checkId -eq 'DESTROY.MANIFEST' }
+            $manifestResult.status | Should -Be 'Fail'
+            $manifestResult.message | Should -Match 'is the manifest of rg-dbhub-demo in subscription 99999999-8888-7777-6666-555555555555, not of rg-dbhub-demo in subscription 11111111-2222-3333-4444-555555555555, this configuration''s\.'
+            $manifestResult.remediation | Should -Match 'shared by every prefix and subscription with that environment name'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoTeardownResidue -Times 0 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly
+            @($results | Where-Object { $_.checkId -like 'TEARDOWN.*' -or $_.checkId -eq 'DESTROY.RESIDUAL' }) | Should -BeNullOrEmpty
+            $script:order.Count | Should -Be 0
+            Get-DemoExitCode -Result $results | Should -Be 1
+        }
+
+        It 'reads a manifest of this subscription whatever the case of its ID' {
+            $recorded = New-TestManifest
+            $recorded | Add-Member -NotePropertyName 'SubscriptionId' -NotePropertyValue '11111111-2222-3333-4444-555555555555'.ToUpperInvariant()
+            Set-Content -LiteralPath $script:manifestPath -Value ($recorded | ConvertTo-Json -Depth 6)
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath $script:manifestPath)
+            ($results | Where-Object { $_.checkId -eq 'DESTROY.MANIFEST' }).status | Should -Be 'Pass'
+            $script:order | Should -Be @('Residue:abc123')
+        }
+
+        It 'stops before anything when the subscription guard fails' {
+            Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { throw 'The Azure CLI is signed in to another tenant.' }
+            $results = @(Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath $script:manifestPath)
+            $results.checkId | Should -Be @('PREFLIGHT.GUARD.CONTEXT')
+            $script:order.Count | Should -Be 0
+        }
     }
 
     It 'deletes the budget at the group''s scope, which outlives the group (R273, live 2026-10-22)' {

@@ -1072,7 +1072,11 @@ function Send-DbHubRunCommand {
 
 function Clear-DbHubOldRunCommand {
     # Deletes this runbook's earlier managed Run Commands on a VM (names that start with runCommandPrefix), without
-    # waiting for the deletes.
+    # waiting for the deletes. With -FinishedOnly, only those whose script has ended: the instance view's execution
+    # state is terminal, or the time in the name is more than an hour old (the longest timeout is 25 minutes), so one
+    # whose instance view a deallocation cleared still goes. Managed Run Commands are limited to 25 per VM
+    # (https://learn.microsoft.com/azure/virtual-machines/run-command-overview); deleting one whose script still runs
+    # stops it (https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed).
     param(
         [Parameter(Mandatory = $true)]
         [object] $Context,
@@ -1080,21 +1084,64 @@ function Clear-DbHubOldRunCommand {
         [Parameter(Mandatory = $true)]
         [string] $VmName,
 
-        [string[]] $Keep = @()
+        [string[]] $Keep = @(),
+
+        [switch] $FinishedOnly
     )
 
     $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
     $base = '{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands' -f (Get-DbHubDemoPath -Settings $Context.Settings), $VmName
-    $list = Invoke-DbHubArm -Context $Context -Method GET -Path $base -ApiVersion $version
+    $listPath = $base
+    if ($FinishedOnly) {
+        $listPath = $base + '?$expand=instanceView'
+    }
+    $list = Invoke-DbHubArm -Context $Context -Method GET -Path $listPath -ApiVersion $version
     if ($list.StatusCode -ne 200) {
         return
     }
+    $deleted = New-Object -TypeName 'System.Collections.Generic.List[string]'
     foreach ($item in @(Get-DbHubMember -InputObject $list.Body -Name 'value')) {
         $name = [string](Get-DbHubMember -InputObject $item -Name 'name')
         if (-not $name.StartsWith([string]$Context.Settings.runCommandPrefix, [System.StringComparison]::Ordinal) -or $name -in $Keep -or $name -notmatch '^[A-Za-z0-9-]{1,64}$') {
             continue
         }
-        $null = Invoke-DbHubArm -Context $Context -Method DELETE -Path ('{0}/{1}' -f $base, $name) -ApiVersion $version
+        if ($FinishedOnly) {
+            $view = Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $item -Name 'properties') -Name 'instanceView'
+            $finished = [string](Get-DbHubMember -InputObject $view -Name 'executionState') -in @('Succeeded', 'Failed', 'TimedOut', 'Canceled')
+            $stamp = [DateTime]::MinValue
+            if (-not $finished -and $name -match '-(\d{14})$' -and [DateTime]::TryParseExact($Matches[1], 'yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture, ([System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$stamp)) {
+                $finished = $stamp.AddHours(1) -lt $Context.NowUtc
+            }
+            if (-not $finished) {
+                continue
+            }
+        }
+        $removed = Invoke-DbHubArm -Context $Context -Method DELETE -Path ('{0}/{1}' -f $base, $name) -ApiVersion $version
+        if ($removed.StatusCode -in 200, 202, 204, 404) {
+            $deleted.Add($name)
+        }
+    }
+    if ($deleted.Count -gt 0) {
+        Write-DbHubLog -Context $Context -Message ('{0}: deleted {1} earlier Run Command(s) of this control: {2}.' -f $VmName, $deleted.Count, ($deleted -join ', '))
+    }
+}
+
+function Clear-DbHubFinishedRunCommand {
+    # The control's finished Run Commands on the demo VMs this run or reset doesn't send one to, when they run (a
+    # deallocated VM can't remove one, so the next run tries again), at the start of the run. ADR 0020's stop path never
+    # touches Run Command, so the last run's own are deleted by the next run, or by start-demo.ps1 once the VMs run.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [string[]] $Except = @()
+    )
+
+    foreach ($vm in @([string]$Context.Settings.sqlVmName, [string]$Context.Settings.hostVmName)) {
+        if ($vm -in $Except -or (Get-DbHubVmState -Context $Context -VmName $vm) -ne 'running') {
+            continue
+        }
+        Clear-DbHubOldRunCommand -Context $Context -VmName $vm -FinishedOnly
     }
 }
 
@@ -1316,6 +1363,8 @@ function Start-DbHubActivityRun {
         $t4 = $null
     }
     $ready = Wait-DbHubReady -Context $Context -VmName @($byVm.Keys) -Tags $Tags -T4:($null -ne $t4) -MaxMinutes $WaitMinutes
+    # The control's finished Run Commands on a demo VM this run doesn't use; each VM it uses gets its own cleanup below.
+    Clear-DbHubFinishedRunCommand -Context $Context -Except @($byVm.Keys)
 
     $stamp = $Context.NowUtc.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
     $who = Get-DbHubRequester -Context $Context -RequestedBy $Request.RequestedBy
@@ -1418,6 +1467,8 @@ function Reset-DbHubActivity {
         }
         $byVm[$vm] += $target
     }
+    # The control's finished Run Commands on a demo VM this reset doesn't use; each VM it uses gets its own cleanup below.
+    Clear-DbHubFinishedRunCommand -Context $Context -Except @($byVm.Keys)
     foreach ($vm in @($byVm.Keys)) {
         if ((Get-DbHubVmState -Context $Context -VmName $vm) -ne 'running') {
             foreach ($target in $byVm[$vm]) {

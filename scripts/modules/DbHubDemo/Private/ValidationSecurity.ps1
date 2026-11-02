@@ -366,7 +366,6 @@ function Invoke-DemoValidationTeardown {
         SubscriptionId = ConvertTo-DemoKqlLiteral -Value $Context.SubscriptionId -Type String
         ResourceGroup  = ConvertTo-DemoKqlLiteral -Value $group -Type String
         ControlGroup   = ConvertTo-DemoKqlLiteral -Value $control -Type String
-        Environment    = ConvertTo-DemoKqlLiteral -Value ([string]$config['environment']) -Type String
         DeploymentId   = ConvertTo-DemoKqlLiteral -Value $Context.DeploymentId -Type String
     }
     $graph = Invoke-DemoHubResourceGraph -SubscriptionId $Context.SubscriptionId -Query $query
@@ -402,9 +401,13 @@ function Invoke-DemoValidationTeardown {
     # After destroy, anything left counts, including rows Resource Graph still lists in the deleted group.
     $residual = @($rows | Where-Object { (& $groupOf $_) -ine $control })
     if ($residual.Count -gt 0) {
-        return @(New-DemoResult -CheckId 'TEARDOWN.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status 'Fail' -Message ('{0} is gone, but {1} resource(s) of the environment remain: {2}.{3}' -f $group, $residual.Count, (& $describe $residual), $lag) -Evidence $evidence -Remediation ('Delete them (Arc SQL Server instances before their machine; az resource delete --subscription {0} --resource-group <group> --name <name> --resource-type <type>), then run validate.ps1 -Area Teardown again.' -f $Context.SubscriptionId) -DocUrl $docUrl)
+        return @(New-DemoResult -CheckId 'TEARDOWN.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status 'Fail' -Message ('{0} is gone, but {1} resource(s) of the environment remain: {2}.{3}' -f $group, $residual.Count, (& $describe $residual), $lag) -Evidence $evidence -Remediation ('Delete them (Arc SQL Server instances before their machine; az resource delete --subscription {0} --resource-group <group> --name <name> --resource-type <type>), then run validate.ps1 -Area Teardown again. destroy.ps1 -ResidueOnly checks each one with Azure Resource Manager first, so an index record of a deleted resource isn''t counted.' -f $Context.SubscriptionId) -DocUrl $docUrl)
     }
-    return @(New-DemoResult -CheckId 'TEARDOWN.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status 'Pass' -Message ('Nothing tagged for environment ''{0}'' remains in the subscription, Arc resources included: zero residual resources.{1}{2}' -f $config['environment'], $controlNote, $lag) -Evidence $evidence -DocUrl $docUrl)
+    # Only the deploymentId identifies the environment's resources outside its group (Phase 28 follow-up).
+    if (-not $Context.DeploymentId) {
+        return @(New-DemoResult -CheckId 'TEARDOWN.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status 'Warning' -Message ('Nothing of {0} remains in the subscription, but resources outside it weren''t looked for: the deploymentId is unknown now that the group is gone, and the solution and environment tags alone would match other environments with the same environment name.{1}{2}' -f $group, $controlNote, $lag) -Evidence $evidence -Remediation 'Pass -DeploymentId <id> (the manifest destroy.ps1 wrote, out/destroy-manifest-<environment>.json, has it), or run ./scripts/destroy.ps1 -ResidueOnly, which reads it.' -DocUrl $docUrl)
+    }
+    return @(New-DemoResult -CheckId 'TEARDOWN.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status 'Pass' -Message ('Nothing of environment ''{0}'' (deploymentId {1}) remains in the subscription, Arc resources included: zero residual resources.{2}{3}' -f $config['environment'], $Context.DeploymentId, $controlNote, $lag) -Evidence $evidence -DocUrl $docUrl)
 }
 
 function ConvertTo-DemoValidationRelativePath {

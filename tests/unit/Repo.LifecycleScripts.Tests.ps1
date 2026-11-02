@@ -551,6 +551,24 @@ Describe 'Lifecycle scripts' {
         Should -Invoke -CommandName Remove-DemoEnvironment -Times 1 -Exactly -ParameterFilter { $SkipResidueCheck -and $ResidueWaitMinutes -eq 2 -and $ManifestPath -match 'm\.json$' }
     }
 
+    It 'destroy.ps1 -ResidueOnly reruns only the residual check with the saved manifest, asks nothing, and keeps the destroy''s results (Phase 28 follow-up)' {
+        Mock -CommandName Remove-DemoEnvironment -MockWith { New-DemoResult -CheckId 'DESTROY.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status $capture['residue'] -Message 'residue' }
+        Mock -CommandName Export-DemoResult -MockWith { $capture['exportedTo'] = $Path }
+        $capture['residue'] = 'Pass'
+        & (Join-Path -Path $repoRoot -ChildPath 'scripts/destroy.ps1') -ConfigPath $configPath -ResidueOnly
+        $LASTEXITCODE | Should -Be 0
+        Should -Invoke -CommandName Remove-DemoEnvironment -Times 1 -Exactly -ParameterFilter { $ResidueOnly -and -not $Confirm -and $ResidueWaitMinutes -eq 10 -and $ManifestPath -match 'out[\\/]destroy-manifest-demo\.json$' -and -not $IfExpired -and -not $SkipResidueCheck -and -not $IncludeGolden -and -not $WithoutGolden }
+        $capture['exportedTo'] | Should -Match 'out[\\/]destroy-residue-demo\.jsonl$'
+        $capture['residue'] = 'Fail'
+        & (Join-Path -Path $repoRoot -ChildPath 'scripts/destroy.ps1') -ConfigPath $configPath -ResidueOnly -ManifestPath (Join-Path -Path $TestDrive -ChildPath 'saved.json') -ResidueWaitMinutes 0 -OutputPath $outputPath
+        $LASTEXITCODE | Should -Be 1
+        Should -Invoke -CommandName Remove-DemoEnvironment -Times 1 -Exactly -ParameterFilter { $ResidueOnly -and $ManifestPath -match 'saved\.json$' -and $ResidueWaitMinutes -eq 0 }
+        $capture['exportedTo'] | Should -Be $outputPath
+        # The destroy's switches don't go with it.
+        { & (Join-Path -Path $repoRoot -ChildPath 'scripts/destroy.ps1') -ConfigPath $configPath -ResidueOnly -Force } | Should -Throw
+        { & (Join-Path -Path $repoRoot -ChildPath 'scripts/destroy.ps1') -ConfigPath $configPath -ResidueOnly -IfExpired } | Should -Throw
+    }
+
     It 'reset-demo.ps1 and status.ps1 pass their switches through' {
         Mock -CommandName Reset-DemoWorkload -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
         Mock -CommandName Get-DemoEnvironmentStatus -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
