@@ -63,13 +63,14 @@ BeforeAll {
         }
     }
 
-    function New-TestState([string] $T4Sku) {
-        [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = 'Telemetry'; TrackFabric = 'Fabric'; T4Sku = $T4Sku; GuidedStopUtc = ''; HostPasswordUtc = '' }
+    function New-TestState([string] $T4Sku, [string] $TrackT4 = 'Telemetry') {
+        [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = $TrackT4; TrackFabric = 'Fabric'; T4Sku = $T4Sku; GuidedStopUtc = ''; HostPasswordUtc = '' }
     }
 
     # A fake template step: Azure answers a T4 size with $script:codes[<size>] (SkuNotAvailable, or another error code)
-    # and creates everything else; $script:server is an existing T4 server (Servers - Get's sku), or $null. What each
-    # attempt sent, the tags it carried, and what the fallback recorded at once are kept.
+    # and creates everything else; $script:server is an existing T4 server (Servers - Get's sku), or $null. With
+    # $script:freeOfferFails, Azure rejects the T3 free offer. What each attempt sent, the tags it carried, and what the
+    # fallback recorded at once are kept.
     function Initialize-TemplateHarness {
         $script:sizes = [System.Collections.Generic.List[string]]::new()
         $script:recorded = [System.Collections.Generic.List[string]]::new()
@@ -79,6 +80,7 @@ BeforeAll {
         $script:groupTags = @{ deploymentId = 'abc123' }
         $script:server = $null
         $script:cost = New-TestCost
+        $script:freeOfferFails = $false
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -MockWith { throw 'The unit tests make no Retail Prices API call.' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { $true }
@@ -111,6 +113,9 @@ BeforeAll {
             if ($joined -like 'deployment sub create *') {
                 $file = [string]$ArgumentList[[array]::IndexOf([string[]]@($ArgumentList), '--parameters') + 1]
                 $script:deployCalls.Add((Get-Content -LiteralPath $file.Substring(1) -Raw | ConvertFrom-Json -AsHashtable))
+                if ($script:freeOfferFails -and $script:deployCalls[-1]['parameters']['t3UseFreeLimit']['value']) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (ProvisioningDisabled) Cannot update paid database to free database.')
+                }
                 # Azure refuses a size only when it creates the server; an existing one isn't created again.
                 $code = [string]$script:codes[$script:currentSize]
                 if ($code -and $null -eq $script:server) {
@@ -371,6 +376,26 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         (Resolve-TestConfig -Config (New-TestConfig) -Record 'None')['t4Enabled'] | Should -BeFalse
     }
 
+    It 'checks the cost again without the T3 free offer''s allowance when Azure rejects the free offer before T4 is created (review of 20e855c)' {
+        Initialize-TemplateHarness
+        $script:freeOfferFails = $true
+        # Within the ceilings only with the free offer's allowance.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -MockWith { if ($T3UseFreeLimit) { New-TestCost } else { New-TestCost -SkipReason 'MonthlyCeiling' -MonthlyWorstCaseUsd 260 } }
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $true -T4StartSku 'Standard_D2ds_v5'
+        $deployment.Succeeded | Should -BeTrue
+        $deployment.T3UseFreeLimit | Should -BeFalse
+        $deployment.T4Enabled | Should -BeFalse -Because 'without the free offer, the worst case is over monthlyCeilingUsd'
+        @($script:sizes) | Should -Be @('Standard_D2ds_v5', 'none')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 2 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $T3UseFreeLimit -eq $false }
+        $sku = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU')
+        $sku.Count | Should -Be 1 -Because 'the second check''s result replaces the first one'
+        $sku[0].evidence.next | Should -Be 'None'
+        $sku[0].evidence.skipReason | Should -Be 'MonthlyCeiling'
+        @($script:recorded) | Should -Be @('Standard_D2ds_v5', 'None')
+        $deployment.T4Note | Should -Not -Match 'T4 created as'
+    }
+
     It 'prices the fallback with the run''s network mode, free offer, Defender plans, and snapshots, and never throws' {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDefenderPlan -MockWith { @([pscustomobject]@{ name = 'OpenSourceRelationalDatabases'; pricingTier = 'Standard'; subPlan = $null }, [pscustomobject]@{ name = 'CloudPosture'; pricingTier = 'Standard'; subPlan = $null }) }
@@ -415,14 +440,51 @@ Describe 'Guardrail 3: the console, DONE, and the status page say it, with the h
         $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
         $lines | Should -Contain $note[0]
 
-        # With the on-demand control, its daily safety stop stops T4 again.
-        $controlled = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Control); State = (New-TestState -T4Sku 'Standard_D2ds_v5') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 }
-        $controlled | Should -Match 'the on-demand control''s daily safety stop stops it again\.$'
+        # With the on-demand control, its daily safety stop stops T4 again when its schedule is in place, which
+        # stop-demo.ps1 and status.ps1 read (review of 20e855c).
+        $controlled = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Control); State = (New-TestState -T4Sku 'Standard_D2ds_v5') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 -Created $true }
+        $controlled | Should -Match 'Azure starts a stopped T4 again on its own after 7 days; the on-demand control''s daily safety stop stops it again within a day when its schedule is in place, and \./scripts/stop-demo\.ps1 and \./scripts/status\.ps1 show the date and whether it is\.$'
         # Only for the size the fallback chose: not one you set, and not a Burstable one.
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -SkuName 'Standard_D2ds_v5'); State = (New-TestState -T4Sku 'Standard_D2ds_v5') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 } | Should -BeNullOrEmpty
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-TestState -T4Sku 'Standard_B2s') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 } | Should -BeNullOrEmpty
         # No number is made up when the price can't be read.
         InModuleScope DbHubDemo { Format-DemoT4FallbackCreatedText -HourlyUsd $null -Location 'westus3' } | Should -Match 'its hourly list price couldn''t be read just now'
+    }
+
+    It 'says "created" only with evidence that the server exists (review of 20e855c): <Case>' -ForEach @(
+        @{ Case = 'this run''s template created it'; Ids = @('DEPLOY.T4.SKU:Warning:Standard_D2ds_v5', 'DEPLOY.TEMPLATE:Pass'); TrackT4 = ''; Created = $true; Pattern = '^T4 created as General Purpose Standard_D2ds_v5 because Burstable sizes were refused here; about 0\.500 USD an hour while running' }
+        @{ Case = 'T4''s own check found it'; Ids = @('T4.SERVER:Pass'); TrackT4 = ''; Created = $true; Pattern = '^T4 created as General Purpose' }
+        @{ Case = 'the T4 track finished a step'; Ids = @(); TrackT4 = 'Telemetry'; Created = $true; Pattern = '^T4 created as General Purpose' }
+        @{ Case = 'this run''s fallback was creating it and the template failed'; Ids = @('DEPLOY.T4.SKU:Warning:Standard_D2ds_v5', 'DEPLOY.TEMPLATE:Fail'); TrackT4 = 'Telemetry'; Created = $false; Pattern = '^T4 isn''t created yet: the fallback chose General Purpose Standard_D2ds_v5 because Burstable sizes were refused here, about 0\.500 USD an hour while running \(list price in westus3, Azure Retail Prices API\), but no server exists yet: no deployment has created it\. The next \./scripts/deploy\.ps1 that deploys the template creates it, after checking its price against the ceilings again\.$' }
+        @{ Case = 'T4''s own check found no server'; Ids = @('T4.SERVER:Fail'); TrackT4 = 'Telemetry'; Created = $false; Pattern = '^T4 isn''t created yet: ' }
+        @{ Case = 'nothing says'; Ids = @(); TrackT4 = ''; Created = $null; Pattern = '^The fallback chose General Purpose Standard_D2ds_v5 for T4 because Burstable sizes were refused here, about 0\.500 USD an hour while running \(list price in westus3, Azure Retail Prices API\); whether the server exists couldn''t be confirmed just now, and \./scripts/status\.ps1 shows it\.$' }
+    ) {
+        $results = @(foreach ($id in $Ids) {
+                $part = $id -split ':'
+                $evidence = [ordered]@{}
+                if ($part[0] -eq 'DEPLOY.TEMPLATE') {
+                    $evidence['t4Enabled'] = $true
+                }
+                if ($part.Count -gt 2) {
+                    $evidence['next'] = $part[2]
+                }
+                New-DemoResult -CheckId $part[0] -Area 't4' -Target 'T4' -Status $part[1] -Message 'A fake result.' -Evidence $evidence
+            })
+        $state = New-TestState -T4Sku 'Standard_D2ds_v5' -TrackT4 $TrackT4
+        $evidence = InModuleScope DbHubDemo -Parameters @{ Result = $results; State = $state } { Get-DemoT4ServerEvidence -Result $Result -State $State }
+        if ($null -eq $Created) {
+            $evidence | Should -BeNullOrEmpty
+        }
+        else {
+            $evidence | Should -Be $Created
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $state; Result = $results } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -T4HourlyUsd 0.5 }
+        $note = @($outcome.Notes | Where-Object { $_ -match 'Standard_D2ds_v5' })
+        $note.Count | Should -Be 1
+        $note[0] | Should -Match $Pattern
+        if ($Created -ne $true) {
+            $note[0] | Should -Not -Match 'T4 created as'
+        }
     }
 
     Context 'the status page' {
@@ -452,6 +514,46 @@ Describe 'Guardrail 3: the console, DONE, and the status page say it, with the h
             $model['run']['reason'] | Should -Match 'about 0\.750 USD an hour while running' -Because '2 vCores at the fake hourly vCore price, read now'
             Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -Times 1 -Exactly -ParameterFilter { $Filter -match 'General Purpose Ddsv5 Series Compute' -and $Filter -match "armRegionName eq 'westus3'" }
         }
+
+        It 'says T4 isn''t created yet when Azure refuses Standard_D2ds_v5 for another reason after the fallback chose it, and a later run reads whether it exists (review of 20e855c)' {
+            $script:codes = @{ Standard_B1ms = 'SkuNotAvailable'; Standard_B2s = 'SkuNotAvailable'; Standard_D2ds_v5 = 'QuotaExceeded' }
+            $config = New-TestConfig
+            $deployment = Invoke-TestTemplate -Config $config
+            $deployment.Succeeded | Should -BeFalse
+            @($script:sizes) | Should -Be @('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5')
+            @($script:recorded) | Should -Be @('Standard_B2s', 'Standard_D2ds_v5') -Because 'the choice is kept: the next run creates it, after its own cost check'
+            $deployment.T4Note | Should -BeNullOrEmpty
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Message -match 'T4 created as' }
+
+            # deploy.ps1's ending: the group records Standard_D2ds_v5, and the T4 track never ran.
+            $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $deployment.Results -State (New-TestState -T4Sku 'Standard_D2ds_v5' -TrackT4 '')
+            $outcome.Kind | Should -Be 'NotDone'
+            $note = @($outcome.Notes | Where-Object { $_ -match 'Standard_D2ds_v5' })
+            $note.Count | Should -Be 1
+            $note[0] | Should -Match '^T4 isn''t created yet: the fallback chose General Purpose Standard_D2ds_v5 because Burstable sizes were refused here, about 0\.500 USD an hour while running \(list price in westus3, Azure Retail Prices API\), but this run''s template deployment failed \(DEPLOY\.TEMPLATE says why\)\.'
+            ($outcome.Notes -join ' ') | Should -Not -Match 'T4 created as'
+            $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+            $model['run']['reason'] | Should -Match 'T4 isn''t created yet'
+            $model['run']['reason'] | Should -Not -Match 'T4 created as'
+            Get-Content -LiteralPath $run.PagePath -Raw | Should -Not -Match 'T4 created as'
+
+            # A later run with no results of its own: a Servers - Get decides, and says so when it can't.
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Exists = ($null -ne $script:server); State = $script:serverState; Server = $script:server; Error = '' } }
+            foreach ($case in @(
+                    @{ Server = $null; State = 'NotFound'; Note = '^T4 isn''t created yet: .+, but no server exists yet: no deployment has created it\.' }
+                    @{ Server = $null; State = 'Unknown'; Note = '^The fallback chose General Purpose Standard_D2ds_v5 for T4 .+; whether the server exists couldn''t be confirmed just now' }
+                    @{ Server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5' } }; State = 'Ready'; Note = '^T4 created as General Purpose Standard_D2ds_v5 because Burstable sizes were refused here; about 0\.750 USD an hour while running' }
+                )) {
+                $script:server = $case.Server
+                $script:serverState = $case.State
+                $later = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+                $outcome = Complete-DemoDeploymentRun -Run $later -Config $config -Result @() -State (New-TestState -T4Sku 'Standard_D2ds_v5' -TrackT4 '')
+                $found = @($outcome.Notes | Where-Object { $_ -match 'Standard_D2ds_v5' })
+                $found.Count | Should -Be 1
+                $found[0] | Should -Match $case.Note
+            }
+        }
     }
 }
 
@@ -480,7 +582,7 @@ Describe 'Guardrail 4: the size is recorded, and an existing server is never res
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -Times 1 -Exactly -ParameterFilter { $T4Exists }
     }
 
-    It 'keeps an existing server''s own size, and the record follows it: <Name>' -ForEach @(
+    It 'keeps an existing server''s own size, and keeps a record only while it matches that size (review of 20e855c): <Name>' -ForEach @(
         @{ Name = 'created as Standard_D2ds_v5 by a configuration that set it, now without t4SkuName'; Server = 'Standard_D2ds_v5'; Record = '' }
         @{ Name = 'created by the fallback'; Server = 'Standard_D2ds_v5'; Record = 'Standard_D2ds_v5' }
         @{ Name = 'a General Purpose server with a stale Burstable record'; Server = 'Standard_D2ds_v5'; Record = 'Standard_B2s' }
@@ -496,7 +598,22 @@ Describe 'Guardrail 4: the size is recorded, and an existing server is never res
         $deployment.T4SkuName | Should -Be $Server
         $script:recorded.Count | Should -Be 0
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 0 -Exactly
-        $script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Sku'] | Should -Be $(if ($Server -eq 'Standard_B1ms') { '' } else { $Server })
+        # Only the fallback writes a size, so a record that doesn't match the server is cleared, never set to its size.
+        [string]$script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Sku'] | Should -Be $(if ($Record -ceq $Server) { $Server } else { '' })
+    }
+
+    It 'claims no Burstable refusal for a Standard_D2ds_v5 server that a configuration set, once t4SkuName is removed (review of 20e855c)' {
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
+        $deployment = Invoke-TestTemplate -Config (Resolve-TestConfig -Config (New-TestConfig) -Record '' -TemplateRuns)
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D2ds_v5') -Because 'its size is kept'
+        $script:recorded.Count | Should -Be 0
+        [string]$script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Sku'] | Should -BeNullOrEmpty
+        $deployment.T4Note | Should -BeNullOrEmpty
+        # deploy.ps1's ending reads the group's record, which stays empty: DONE says nothing about a fallback.
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-TestState -T4Sku ''); Result = $deployment.Results } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -T4HourlyUsd 0.5 }
+        ($outcome.Notes -join ' ') | Should -Not -Match 'refused|fallback'
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-TestState -T4Sku '') } { Test-DemoT4FallbackSize -Config $Config -State $State } | Should -BeFalse
     }
 
     It 'resolves each record for later runs: <Record> (the template runs: <TemplateRuns>)' -ForEach @(

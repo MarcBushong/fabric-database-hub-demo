@@ -608,6 +608,9 @@ function Get-DemoT4FallbackPreflight {
       otherwise a Warning that T4 would be left out. deploy.ps1 prices it again right before it would create it.
     - Otherwise Not selected: T4 exists (its size is kept), the configuration sets t4SkuName (no fallback), or the start is
       None or Refused (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU says why).
+    Its own estimates never throw (review of 20e855c): the Burstable start's that fails is a Warning with skipReason Price,
+    and when the estimate without T4 fails, CostResults stays $null, so the run's own cost checks, a monthly-ceiling Fail
+    included, are what preflight reports.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -640,7 +643,17 @@ function Get-DemoT4FallbackPreflight {
         }
         $without = @{} + $CostParameters
         $without['Config'] = Copy-DemoT4Config -Config $Config -Source fallback -Off
-        return [pscustomobject]@{ Result = (New-DemoT4FallbackResult -Refused $null -Next 'None' -Cost $cost -CheckId $checkId); CostResults = @((Get-DemoCostEstimate @without).Results) }
+        $result = New-DemoT4FallbackResult -Refused $null -Next 'None' -Cost $cost -CheckId $checkId
+        try {
+            return [pscustomobject]@{ Result = $result; CostResults = @((Get-DemoCostEstimate @without).Results) }
+        }
+        catch {
+            # The ceilings stay checked with T4 at Standard_D2ds_v5: a hard ceiling is never skipped.
+            $problem = Protect-DemoText -Text $_.Exception.Message
+            Write-DemoLog -Level Warning -Message ('The cost estimate without T4 couldn''t be computed: {0}' -f $problem)
+            $result.message += ' The ceilings without T4 couldn''t be checked ({0}), so PREFLIGHT.COST.* still price T4 at Standard_D2ds_v5; run preflight again later.' -f $problem
+            return [pscustomobject]@{ Result = $result; CostResults = $null }
+        }
     }
     $notSelected = {
         param([string] $Message)
@@ -658,7 +671,14 @@ function Get-DemoT4FallbackPreflight {
     # A Burstable start: the General Purpose step, priced now for the record.
     $priced = @{} + $CostParameters
     $priced['Config'] = Copy-DemoT4Config -Config $Config -Source fallback -SkuName 'Standard_D2ds_v5'
-    $cost = ConvertTo-DemoT4FallbackCost -Estimate (Get-DemoCostEstimate @priced) -Config $priced['Config']
+    try {
+        $cost = ConvertTo-DemoT4FallbackCost -Estimate (Get-DemoCostEstimate @priced) -Config $priced['Config']
+    }
+    catch {
+        $problem = Protect-DemoText -Text $_.Exception.Message
+        Write-DemoLog -Level Warning -Message ('T4''s General Purpose fallback couldn''t be priced ahead: {0}' -f $problem)
+        $cost = ConvertTo-DemoT4FallbackCost -Estimate $null -Config $priced['Config'] -PriceError $problem
+    }
     $evidence = [ordered]@{ startSku = $Start; fallbackSku = 'Standard_D2ds_v5'; fallbackTier = 'GeneralPurpose' }
     foreach ($name in 'HourlyUsd', 'T4MonthlyWorstCaseUsd', 'MonthlyWorstCaseUsd', 'SessionUsd', 'MonthlyCeilingUsd', 'SessionCeilingUsd', 'DefenderIncluded', 'SkipReason') {
         $evidence[$name.Substring(0, 1).ToLowerInvariant() + $name.Substring(1)] = $cost.$name
@@ -670,7 +690,12 @@ function Get-DemoT4FallbackPreflight {
         return [pscustomobject]@{ Result = (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Pass' -Message $message -Evidence $evidence -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server'); CostResults = $null }
     }
     $skip = Get-DemoT4SkipReason -Cost $cost -Ahead
-    $message = '{0}, deploy.ps1''s General Purpose fallback, Standard_D2ds_v5, would leave T4 out instead: {1}.' -f $premise, $skip.Because
+    $message = if ($skip.Reason -eq 'Price') {
+        '{0}, deploy.ps1 prices its General Purpose fallback, Standard_D2ds_v5, right before it would create it; right now, {1}.' -f $premise, $skip.Because
+    }
+    else {
+        '{0}, deploy.ps1''s General Purpose fallback, Standard_D2ds_v5, would leave T4 out instead: {1}.' -f $premise, $skip.Because
+    }
     if (@($cost.Unpriced).Count -gt 0) {
         $message += ' Not priced, so left out of these totals: {0}.' -f (@($cost.Unpriced) -join '; ')
     }
@@ -736,8 +761,9 @@ function Resolve-DemoEffectiveConfig {
 }
 
 function Test-DemoT4FallbackSize {
-    # True when T4 runs on the General Purpose size the fallback chose (DbHubT4Sku Standard_D2ds_v5) and the configuration
-    # neither sets t4SkuName nor turns T4 off (Phase 28 follow-up). Pure. Internal.
+    # True when the fallback chose General Purpose for T4 (DbHubT4Sku Standard_D2ds_v5: only the fallback writes a size,
+    # review of 20e855c) and the configuration neither sets t4SkuName nor turns T4 off (Phase 28 follow-up). It says
+    # nothing about whether the server exists (Get-DemoT4ServerEvidence). Pure. Internal.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -753,6 +779,46 @@ function Test-DemoT4FallbackSize {
     return ([string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') -ceq 'Standard_D2ds_v5')
 }
 
+function Get-DemoT4ServerEvidence {
+    <#
+    Whether this run's results, or the T4 track's record, show T4's server (review of 20e855c): $true for a T4.SERVER Pass
+    or Warning (it exists; Fail means missing), a HUB.ESTATE.T4 or METRICS.T4 Pass, a DEPLOY.TEMPLATE Pass with T4 in the
+    template, or a T4 track that finished a step (DbHubTrackT4: its Server step fails without a server); $false for a
+    T4.SERVER Fail, or for this run's fallback creating T4 (DEPLOY.T4.SKU next Standard_D2ds_v5, which runs only for a
+    server that doesn't exist yet) with a DEPLOY.TEMPLATE Fail; $null when nothing says (a Servers - Get decides then).
+    Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [AllowNull()]
+        [object] $State
+    )
+
+    $all = @($Result | Where-Object { $null -ne $_ })
+    $seen = @($all | Where-Object {
+            $id = [string]$_.checkId
+            $status = [string]$_.status
+            ($id -eq 'T4.SERVER' -and $status -in 'Pass', 'Warning') -or ($id -in 'HUB.ESTATE.T4', 'METRICS.T4' -and $status -eq 'Pass') -or
+            ($id -eq 'DEPLOY.TEMPLATE' -and $status -eq 'Pass' -and [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 't4Enabled'))
+        })
+    if ($seen.Count -gt 0) {
+        return $true
+    }
+    $creating = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'next') -ceq 'Standard_D2ds_v5' }).Count -gt 0
+    $templateFailed = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.TEMPLATE' -and [string]$_.status -eq 'Fail' }).Count -gt 0
+    if (($creating -and $templateFailed) -or @($all | Where-Object { [string]$_.checkId -eq 'T4.SERVER' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
+        return $false
+    }
+    if ([string](Get-DemoMemberValue -InputObject $State -Name 'TrackT4')) {
+        return $true
+    }
+    return $null
+}
+
 function Format-DemoT4FallbackCreatedText {
     # "T4 created as General Purpose Standard_D2ds_v5 because Burstable sizes were refused here; about <price> USD an hour
     # while running": the console line, the status page, and DONE say it the same way (Phase 28 follow-up). -HourlyUsd
@@ -766,16 +832,35 @@ function Format-DemoT4FallbackCreatedText {
         [string] $Location = ''
     )
 
-    $price = if ($null -ne $HourlyUsd) { [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, 'about {0:N3} USD an hour while running (list price in {1}, Azure Retail Prices API)', [double]$HourlyUsd, $Location) } else { 'its hourly list price couldn''t be read just now (./scripts/estimate-cost.ps1 prices it)' }
-    return ('T4 created as General Purpose Standard_D2ds_v5 because Burstable sizes were refused here; {0}.' -f $price)
+    return ('T4 created as General Purpose Standard_D2ds_v5 because Burstable sizes were refused here; {0}.' -f (Format-DemoT4HourlyText -HourlyUsd $HourlyUsd -Location $Location))
+}
+
+function Format-DemoT4HourlyText {
+    # "about <price> USD an hour while running (list price in <region>, Azure Retail Prices API)", or that the price couldn't
+    # be read (Phase 28 follow-up). Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $HourlyUsd,
+
+        [string] $Location = ''
+    )
+
+    if ($null -ne $HourlyUsd) {
+        return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, 'about {0:N3} USD an hour while running (list price in {1}, Azure Retail Prices API)', [double]$HourlyUsd, $Location)
+    }
+    return 'its hourly list price couldn''t be read just now (./scripts/estimate-cost.ps1 prices it)'
 }
 
 function Get-DemoT4FallbackNote {
     <#
-    The line deploy.ps1's ending (DONE and NOT DONE, on the console and the status page) adds while T4 runs on the General
-    Purpose fallback (Phase 28 follow-up): Format-DemoT4FallbackCreatedText, with the hourly list price the caller read
-    from the Azure Retail Prices API, never a number written here (ADR 0016), and the 7-day restart. '' when it doesn't
-    apply (Test-DemoT4FallbackSize). Pure. Internal.
+    The line deploy.ps1's ending (DONE and NOT DONE, on the console and the status page) adds while T4's fallback has chosen
+    General Purpose Standard_D2ds_v5 (Phase 28 follow-up; Test-DemoT4FallbackSize), with the hourly list price the caller
+    read from the Azure Retail Prices API, never a number written here (ADR 0016). It says "created" only with evidence
+    that the server exists (review of 20e855c): -Created $true (Get-DemoT4ServerEvidence, or a Servers - Get) gives
+    Format-DemoT4FallbackCreatedText and the 7-day restart; $false says the size was chosen but the server isn't created
+    yet, and why (-Why); $null says it couldn't be confirmed. '' when it doesn't apply. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -786,19 +871,34 @@ function Get-DemoT4FallbackNote {
         [object] $State,
 
         [AllowNull()]
-        [object] $HourlyUsd
+        [object] $HourlyUsd,
+
+        [AllowNull()]
+        [object] $Created,
+
+        [string] $Why = ''
     )
 
     if (-not (Test-DemoT4FallbackSize -Config $Config -State $State)) {
         return ''
     }
-    $restart = if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
-        'Azure starts a stopped T4 again on its own after 7 days, and the on-demand control''s daily safety stop stops it again.'
+    $location = [string]$Config['location']
+    if ($Created -is [bool] -and $Created) {
+        # Whether the daily safety stop is scheduled isn't read here, so it's said as a condition (status.ps1 reads it).
+        $restart = if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
+            'Azure starts a stopped T4 again on its own after 7 days; the on-demand control''s daily safety stop stops it again within a day when its schedule is in place, and ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show the date and whether it is.'
+        }
+        else {
+            'Azure starts a stopped T4 again on its own after 7 days, and nothing here stops it again (no daily safety stop is set up), so ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show that date.'
+        }
+        return ('{0} {1}' -f (Format-DemoT4FallbackCreatedText -HourlyUsd $HourlyUsd -Location $location), $restart)
     }
-    else {
-        'Azure starts a stopped T4 again on its own after 7 days, and nothing here stops it again (no daily safety stop is set up), so ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show that date.'
+    $hourly = Format-DemoT4HourlyText -HourlyUsd $HourlyUsd -Location $location
+    if ($Created -is [bool]) {
+        $because = if ($Why) { $Why } else { 'no server exists yet: no deployment has created it' }
+        return ('T4 isn''t created yet: the fallback chose General Purpose Standard_D2ds_v5 because Burstable sizes were refused here, {0}, but {1}. The next ./scripts/deploy.ps1 that deploys the template creates it, after checking its price against the ceilings again.' -f $hourly, $because)
     }
-    return ('{0} {1}' -f (Format-DemoT4FallbackCreatedText -HourlyUsd $HourlyUsd -Location ([string]$Config['location'])), $restart)
+    return ('The fallback chose General Purpose Standard_D2ds_v5 for T4 because Burstable sizes were refused here, {0}; whether the server exists couldn''t be confirmed just now, and ./scripts/status.ps1 shows it.' -f $hourly)
 }
 
 function Format-DemoT4RestartText {
@@ -807,15 +907,14 @@ function Format-DemoT4RestartText {
     Azure starts a stopped flexible server again after 7 days ("The server remains stopped for seven days unless you
     restart it sooner", https://learn.microsoft.com/azure/postgresql/overview; "Server will be automatically started after
     7 days", https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server), so it's the stop time
-    plus -Days. With the on-demand control's daily safety stop (control.enabled, ADR 0020) it's stopped again within a
-    day; without it nothing here stops it again. -HourlyUsd is the caller's, from the Retail Prices API. Pure. Internal.
+    plus -Days. -SafetyStop is the on-demand control's daily safety stop (ADR 0020) as Get-DemoT4SafetyStopState read it:
+    Scheduled stops T4 again within a day; Off (the control isn't set up) and NotScheduled (setup couldn't schedule it)
+    mean nothing here stops it again; Unknown (its schedule couldn't be read) is said as a condition (review of 20e855c).
+    -HourlyUsd is the caller's, from the Retail Prices API. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Config,
-
         [AllowNull()]
         [object] $RestartUtc,
 
@@ -825,17 +924,20 @@ function Format-DemoT4RestartText {
         [object] $HourlyUsd,
 
         [ValidateRange(1, 30)]
-        [int] $Days = 7
+        [int] $Days = 7,
+
+        [ValidateSet('Off', 'Scheduled', 'NotScheduled', 'Unknown')]
+        [string] $SafetyStop = 'Off'
     )
 
     $culture = [System.Globalization.CultureInfo]::InvariantCulture
     $when = if ($null -ne $RestartUtc) { [string]::Format($culture, 'at {0:yyyy-MM-dd HH:mm} UTC, {1} days after the stop', ([datetime]$RestartUtc).ToUniversalTime(), $Days) } else { '{0} days after it was stopped' -f $Days }
     $bills = if ($null -ne $HourlyUsd) { [string]::Format($culture, ', and it then bills compute at about {0:N3} USD an hour ({1}, list price)', [double]$HourlyUsd, $SkuName) } elseif ($SkuName) { ', and it then bills compute at its size ({0})' -f $SkuName } else { ', and it then bills compute' }
-    $after = if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
-        ' until the on-demand control''s daily safety stop stops it again, within a day.'
-    }
-    else {
-        ' until it''s stopped again: nothing here stops it on its own (the on-demand control''s daily safety stop isn''t set up), so run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.'
+    $after = switch ($SafetyStop) {
+        'Scheduled' { ' until the on-demand control''s daily safety stop stops it again, within a day.' }
+        'NotScheduled' { ' until it''s stopped again: the on-demand control''s daily safety stop isn''t scheduled (./scripts/setup-activity-control.ps1 schedules it), so nothing here stops it on its own; run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.' }
+        'Unknown' { ' until it''s stopped again: the on-demand control''s daily safety stop does that within a day if it''s scheduled, which couldn''t be read just now (./scripts/validate.ps1 checks it as CONTROL.SAFETYSTOP); otherwise run ./scripts/stop-demo.ps1 again once it has started.' }
+        default { ' until it''s stopped again: nothing here stops it on its own (the on-demand control''s daily safety stop isn''t set up), so run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.' }
     }
     return ('Azure starts it again on its own {0}{1}{2}' -f $when, $bills, $after)
 }
@@ -1082,8 +1184,12 @@ function Invoke-DemoT4PowerAction {
         $evidence['autoStartUtc'] = if ($null -ne $restartUtc) { $restartUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
         $evidence['skuName'] = $serverSku
         $evidence['hourlyUsd'] = $hourly
-        $evidence['dailySafetyStop'] = [bool](Get-DemoActivityControlSetting -Config $Config).Enabled
-        $autoStart = ' ' + (Format-DemoT4RestartText -Config $Config -RestartUtc $restartUtc -SkuName $serverSku -HourlyUsd $hourly -Days $days)
+        # Whether the on-demand control's daily safety stop stops it again: its schedule, not only control.enabled (review of
+        # 20e855c).
+        $safety = Get-DemoT4SafetyStopState -Config $Config
+        $evidence['dailySafetyStop'] = $safety.State -eq 'Scheduled'
+        $evidence['safetyStop'] = $safety.State
+        $autoStart = ' ' + (Format-DemoT4RestartText -RestartUtc $restartUtc -SkuName $serverSku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State)
     }
     if ($current.State -eq $wanted) {
         $verb = if ($Action -eq 'Start') { 'running (Ready)' } else { 'stopped' }

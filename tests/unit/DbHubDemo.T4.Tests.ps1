@@ -294,17 +294,22 @@ Describe 'Invoke-DemoT4PowerAction' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { @([pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'; skuName = 'vCore'; meterName = 'vCore'; retailPrice = 0.25; unitOfMeasure = '1 Hour' }) }
         $controlled = New-TestConfig
         $controlled['control']['enabled'] = $true
+        # The schedule is read as CONTROL.SAFETYSTOP reads it (review of 20e855c); here it's in place.
+        $script:safetyState = 'Scheduled'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:safetyState; NextRunUtc = $null } }
         $before = [System.DateTime]::UtcNow.AddSeconds(-1)
         $stop = InModuleScope DbHubDemo -Parameters @{ Config = $controlled } { Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 5 -CheckPrefix STOP }
         $stop.status | Should -Be 'Pass'
         $stop.evidence.skuName | Should -Be 'Standard_D2ds_v5'
         $stop.evidence.hourlyUsd | Should -Be 0.5
         $stop.evidence.dailySafetyStop | Should -BeTrue
+        $stop.evidence.safetyStop | Should -Be 'Scheduled'
         $stop.message | Should -Match 'about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the on-demand control''s daily safety stop stops it again, within a day\.$'
         ([datetime]$stop.evidence.stoppedUtc).ToUniversalTime() | Should -BeGreaterOrEqual $before -Because 'this call''s stop is now'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -ParameterFilter { $Filter -match 'General Purpose Ddsv5 Series Compute' }
 
         # Already stopped: the stop comes from the activity log, and without the control nothing stops it again.
+        $script:safetyState = 'Off'
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4StoppedUtc -MockWith { [datetime]::new(2026, 10, 30, 18, 0, 0, [System.DateTimeKind]::Utc) }
         $again = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PowerAction -Config $Config -Action Stop -CheckPrefix STOP }
         $again.message | Should -Match '^T4 \(pgflex01-abc123\) was already stopped\. Azure starts it again on its own at 2026-11-06 18:00 UTC, 7 days after the stop'
@@ -312,6 +317,25 @@ Describe 'Invoke-DemoT4PowerAction' {
         ([datetime]$again.evidence.autoStartUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm', [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be '2026-11-06T18:00'
         $again.evidence.dailySafetyStop | Should -BeFalse
         @($script:azCalls | Where-Object { $_ -match '--method post --url \S+/stop\?' }).Count | Should -Be 1 -Because 'an already stopped server isn''t stopped again'
+    }
+
+    It 'says nothing stops a restarted T4 when the control is on but its daily safety stop <Case> (review of 20e855c)' -ForEach @(
+        @{ Case = 'couldn''t be scheduled'; SafetyStop = 'NotScheduled'; Text = 'until it''s stopped again: the on-demand control''s daily safety stop isn''t scheduled \(\./scripts/setup-activity-control\.ps1 schedules it\), so nothing here stops it on its own; run \./scripts/stop-demo\.ps1 again once it has started' }
+        @{ Case = 'couldn''t be read'; SafetyStop = 'Unknown'; Text = 'until it''s stopped again: the on-demand control''s daily safety stop does that within a day if it''s scheduled, which couldn''t be read just now \(\./scripts/validate\.ps1 checks it as CONTROL\.SAFETYSTOP\)' }
+    ) {
+        $script:t4.Sku = 'Standard_D2ds_v5'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { @([pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'; skuName = 'vCore'; meterName = 'vCore'; retailPrice = 0.25; unitOfMeasure = '1 Hour' }) }
+        $script:safetyState = $SafetyStop
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:safetyState; NextRunUtc = $null } }
+        $controlled = New-TestConfig
+        $controlled['control']['enabled'] = $true
+        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $controlled } { Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 5 -CheckPrefix STOP }
+        $stop.status | Should -Be 'Pass'
+        $stop.evidence.dailySafetyStop | Should -BeFalse
+        $stop.evidence.safetyStop | Should -Be $SafetyStop
+        $stop.message | Should -Match 'Azure starts it again on its own at \d{4}-\d\d-\d\d \d\d:\d\d UTC, 7 days after the stop'
+        $stop.message | Should -Match $Text
+        $stop.message | Should -Not -Match 'stops it again, within a day\.'
     }
 
     It 'says a server is now running when this caller already requested its start (-Requested, Phase 25d)' {

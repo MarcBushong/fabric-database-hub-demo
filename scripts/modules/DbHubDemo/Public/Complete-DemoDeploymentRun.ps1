@@ -8,8 +8,10 @@ function Complete-DemoDeploymentRun {
     The outcome reads the resource group's state after the run (each track's last finished step), unless -State is
     given. While T4 runs on the General Purpose fallback (DbHubT4Sku Standard_D2ds_v5), its hourly list price comes from
     this run's DEPLOY.T4.SKU, or from the Azure Retail Prices API now, for the note DONE and NOT DONE add (Phase 28
-    follow-up). Returns the outcome: Kind (Done, NotDone, or WhatIf), Done, Reason, Next, NextCommand, Optional, Unfinished,
-    ExitCode, Resume, and Minutes. Never throws: a run that can't be judged is NOT DONE.
+    follow-up). The note says T4 was created only with evidence that its server exists: this run's results, the T4
+    track's record, or else a Servers - Get (review of 20e855c). Returns the outcome: Kind (Done, NotDone, or WhatIf),
+    Done, Reason, Next, NextCommand, Optional, Unfinished, ExitCode, Resume, and Minutes. Never throws: a run that can't
+    be judged is NOT DONE.
 
     .PARAMETER Run
     What Start-DemoDeploymentRun returned.
@@ -97,13 +99,36 @@ function Complete-DemoDeploymentRun {
     try {
         $startedVms = @(Get-DemoStartedVm -Result @($Result) -Model $model)
         # T4 on the General Purpose fallback is said with its hourly list price (Phase 28 follow-up): this run's, or read
-        # from the Azure Retail Prices API now.
+        # from the Azure Retail Prices API now. It says "created" only with evidence that the server exists (review of
+        # 20e855c): this run's results or the T4 track's record, or else a Servers - Get.
         $t4Hourly = $null
+        $t4Created = $null
+        $t4Why = ''
         if (-not $wasStopped -and -not $WhatIfRun -and (Test-DemoT4FallbackSize -Config $Config -State $judgedState)) {
             $priced = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and $null -ne (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'hourlyUsd') }) | Select-Object -Last 1
             $t4Hourly = if ($null -ne $priced) { [double](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $priced -Name 'evidence') -Name 'hourlyUsd') } else { Get-DemoT4HourlyPrice -Config $Config -SkuName 'Standard_D2ds_v5' }
+            $t4Created = Get-DemoT4ServerEvidence -Result @($Result) -State $judgedState
+            if ($null -eq $t4Created) {
+                try {
+                    $tags = Get-DemoMemberValue -InputObject $judgedState -Name 'Tags'
+                    $deploymentId = if ($tags -is [System.Collections.IDictionary] -and [string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' }
+                    $server = Get-DemoT4State -Config $Config -DeploymentId $deploymentId
+                    if ($server.Exists) {
+                        $t4Created = $true
+                    }
+                    elseif ([string]$server.State -eq 'NotFound') {
+                        $t4Created = $false
+                    }
+                }
+                catch {
+                    Write-DemoLog -Level Warning -Message ('Whether T4''s server exists couldn''t be read: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+                }
+            }
+            if ($t4Created -is [bool] -and -not $t4Created -and @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.TEMPLATE' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
+                $t4Why = 'this run''s template deployment failed (DEPLOY.TEMPLATE says why)'
+            }
         }
-        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen -StartedVm $startedVms -T4HourlyUsd $t4Hourly
+        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen -StartedVm $startedVms -T4HourlyUsd $t4Hourly -T4Created $t4Created -T4Why $t4Why
     }
     catch {
         $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; Optional = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }

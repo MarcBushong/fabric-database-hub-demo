@@ -587,23 +587,33 @@ function Invoke-DemoPreflight {
     catch {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots could not be listed, so the cost estimate leaves them out: {0}' -f $_.Exception.Message)
     }
+    $estimate = $null
     try {
         $estimate = Get-DemoCostEstimate @costParameters
+    }
+    catch {
+        Add-Check 'PREFLIGHT.COST.SESSION' 'subscription' 'Warning' ('The cost estimate could not be computed: {0}' -f $_.Exception.Message)
+    }
+    if ($null -ne $estimate) {
         $costResults = @($estimate.Results)
         if ($t4On) {
-            # The General Purpose fallback's cost check, and where the fallback starts (Phase 28 follow-up).
-            $fallback = Get-DemoT4FallbackPreflight -Config $Config -CostParameters $costParameters -Estimate $estimate -Start $t4Start -Explicit:$t4Explicit -Exists:$t4Exists -ServerSku $t4ServerSku
-            if ($null -ne $fallback.CostResults) {
-                $costResults = @($fallback.CostResults)
+            # The General Purpose fallback's cost check, and where the fallback starts (Phase 28 follow-up). Its failure never
+            # drops the run's own cost checks, a monthly-ceiling Fail included (review of 20e855c).
+            try {
+                $fallback = Get-DemoT4FallbackPreflight -Config $Config -CostParameters $costParameters -Estimate $estimate -Start $t4Start -Explicit:$t4Explicit -Exists:$t4Exists -ServerSku $t4ServerSku
+                if ($null -ne $fallback.CostResults) {
+                    $costResults = @($fallback.CostResults)
+                }
+                $results.Add($fallback.Result)
             }
-            $results.Add($fallback.Result)
+            catch {
+                $problem = Protect-DemoText -Text $_.Exception.Message
+                $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.FALLBACK' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('T4''s General Purpose fallback couldn''t be priced in preflight: {0}. PREFLIGHT.COST.* are the run''s own estimate; deploy.ps1 prices the fallback again right before it would create anything.' -f $problem) -Evidence ([ordered]@{ startSku = $t4Start; skipReason = 'Price'; priceError = $problem }) -Remediation 'Nothing to do: run preflight again later to see the fallback''s price.' -DocUrl 'https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices'))
+            }
         }
         foreach ($result in $costResults) {
             $results.Add($result)
         }
-    }
-    catch {
-        Add-Check 'PREFLIGHT.COST.SESSION' 'subscription' 'Warning' ('The cost estimate could not be computed: {0}' -f $_.Exception.Message)
     }
 
     return $results.ToArray()

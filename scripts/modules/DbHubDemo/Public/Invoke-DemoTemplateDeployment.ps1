@@ -29,7 +29,8 @@ function Invoke-DemoTemplateDeployment {
        General Purpose Standard_D2ds_v5, but only after its cost check (Get-DemoT4GeneralPurposeCost: its price from the
        Azure Retail Prices API now, and the demo's worst-case month, T4 running every hour because Azure starts a
        stopped server again after 7 days, with its storage and Defender plans, against monthlyCeilingUsd, and a session
-       against sessionCeilingUsd), which runs right before every General Purpose creation on the fallback's behalf;
+       against sessionCeilingUsd), which runs right before every General Purpose creation on the fallback's behalf, and
+       again after Azure refuses the T3 free offer, because it counted the offer's allowance (review of 20e855c);
        over either ceiling, or without a price, T4 is left out (DbHubT4Sku None, checked again on the next run that
        deploys the template); and a refused Standard_D2ds_v5 deploys again without T4 (Refused). Each step is a
        DEPLOY.T4.SKU Warning, and a General Purpose T4 also gets a console line and T4Note ("T4 created as General
@@ -38,7 +39,8 @@ function Invoke-DemoTemplateDeployment {
        group's DbHubT4Sku tag at once, and into the tags the template carries, for later runs
        (Resolve-DemoEffectiveConfig, which this function applies to a configuration that isn't resolved yet). An
        existing server keeps its own size unless the configuration sets one (DEPLOY.T4.SKU Pass when that differs from
-       the configured size), so a redeploy never resizes it. A record no longer holds once the configuration sets
+       the configured size), so a redeploy never resizes it, and a record that doesn't match it is cleared, never set to
+       its size, so a record always means the fallback chose it. A record no longer holds once the configuration sets
        t4SkuName (review finding 5). The VMs that exist are read again before each attempt, so a VM a failed attempt
        created never gets an osProfile again.
     7. Phase 28 live finding (2026-11-02): a deployment that failed while it ran (DeploymentFailed) and isn't retried
@@ -215,15 +217,15 @@ function Invoke-DemoTemplateDeployment {
     }
     # An existing server keeps its own size unless the configuration sets one: the fallback never resizes a server, so a
     # redeploy never sends Standard_B1ms to a server created as Standard_D2ds_v5, whatever the record says (Phase 28
-    # follow-up). The record follows the server that exists: its own size, or nothing for the default size.
+    # follow-up). A record that doesn't match the server that exists no longer holds, and is cleared rather than set to the
+    # server's size: only the fallback writes a size, so a record always means the fallback chose it (review of 20e855c).
     if ($t4Exists -and -not $t4Explicit -and $t4ServerSku) {
         if ($t4ServerSku -cne (Get-DemoT4SkuName -Config $effective)) {
             $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Pass' -Message ('T4 exists as {0} ({1}), so this deployment keeps that size: an existing server is never resized unless t4SkuName says so.' -f $t4ServerSku, (Get-DemoT4SkuSpec -SkuName $t4ServerSku).Tier) -Evidence ([ordered]@{ serverSku = $t4ServerSku; configuredSku = (Get-DemoT4SkuName -Config $effective) }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute'))
             $effective = Copy-DemoT4Config -Config $effective -Source server -SkuName $t4ServerSku
         }
-        $serverRecord = if ($t4ServerSku -ceq 'Standard_B1ms') { '' } else { $t4ServerSku }
-        if ($Action -eq 'Create' -and [string]$tags[$t4TagName] -cne $serverRecord) {
-            $tags[$t4TagName] = $serverRecord
+        if ($Action -eq 'Create' -and [string]$tags[$t4TagName] -and [string]$tags[$t4TagName] -cne $t4ServerSku) {
+            $tags[$t4TagName] = ''
         }
     }
 
@@ -235,6 +237,7 @@ function Invoke-DemoTemplateDeployment {
     $gpChecked = $false
     $gpRefusal = $null
     $gpHourly = $null
+    $gpResult = $null
     $t4Note = ''
     # The fallback's choice goes into the tags the template carries, which would otherwise put the old value back, and,
     # once the group exists, into the group's tags at once, so a later run (even after a stop) starts from it (Phase 28).
@@ -301,7 +304,8 @@ function Invoke-DemoTemplateDeployment {
             if ($cost.Allowed) {
                 & $record 'Standard_D2ds_v5'
                 $gpHourly = $cost.HourlyUsd
-                $results.Add((New-DemoT4FallbackResult -Refused $gpRefusal -Next 'Standard_D2ds_v5' -Cost $cost))
+                $gpResult = New-DemoT4FallbackResult -Refused $gpRefusal -Next 'Standard_D2ds_v5' -Cost $cost
+                $results.Add($gpResult)
                 Write-DemoLog -Level Warning -Message ('Azure refused T4''s Burstable sizes here, so this run creates T4 as General Purpose Standard_D2ds_v5: {0}.' -f (Format-DemoT4FallbackCostText -Cost $cost))
             }
             else {
@@ -426,6 +430,15 @@ function Invoke-DemoTemplateDeployment {
             $results.Add($verdict.Result)
             $useFreeLimit = $false
             $freeOfferTried = $true
+            # The General Purpose fallback's cost check counted the free offer's allowance, so it runs again without it before
+            # the next attempt, and its new result replaces the old one (review of 20e855c).
+            if ($gpChecked -and (Test-DemoT4Enabled -Config $effective) -and (Get-DemoT4SkuName -Config $effective) -ceq 'Standard_D2ds_v5') {
+                $gpChecked = $false
+                if ($null -ne $gpResult) {
+                    [void]$results.Remove($gpResult)
+                    $gpResult = $null
+                }
+            }
             continue
         }
         $t4Failure = $null

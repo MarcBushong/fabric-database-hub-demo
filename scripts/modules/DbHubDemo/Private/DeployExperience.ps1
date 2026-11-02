@@ -1008,7 +1008,8 @@ function Get-DemoDeploymentOutcome {
     .SYNOPSIS
     The one ending of a deploy.ps1 run (brief item 1): Kind Done, NotDone, or WhatIf, with Reason, Next (the single next
     action), NextCommand (the exact command), Notes (what DONE states plainly: T4 off and why, T4 on the General Purpose
-    fallback with its hourly price from -T4HourlyUsd, Developer mode's T2),
+    fallback with its hourly price from -T4HourlyUsd, "created" only when -T4Created or this run's evidence shows the
+    server, Developer mode's T2),
     Optional (items that never block DONE), Unfinished (tracks that didn't finish), Missing (DONE requirements without a
     Pass), and ExitCode: 0 when DONE, 1 when NOT DONE with a Fail, 2 when NOT DONE otherwise; -WhatIfRun is 0 unless a
     check failed. Pure. Internal.
@@ -1066,7 +1067,15 @@ function Get-DemoDeploymentOutcome {
         # T4's hourly list price on the General Purpose fallback (Phase 28 follow-up), from the Azure Retail Prices API;
         # the caller reads it, so this stays pure.
         [AllowNull()]
-        [object] $T4HourlyUsd = $null
+        [object] $T4HourlyUsd = $null,
+
+        # Whether T4's server exists (review of 20e855c): $true or $false from the caller's Servers - Get; $null takes
+        # this run's results and the T4 track's record (Get-DemoT4ServerEvidence). The fallback note says "created" only
+        # when it's $true, and -T4Why says why it isn't.
+        [AllowNull()]
+        [object] $T4Created = $null,
+
+        [string] $T4Why = ''
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
@@ -1084,8 +1093,10 @@ function Get-DemoDeploymentOutcome {
     if ($t4Off) {
         $notes.Add($t4Off)
     }
-    # Said loudly (Phase 28 follow-up): T4 runs on the General Purpose fallback, with its price.
-    $t4Fallback = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd $T4HourlyUsd
+    # Said loudly (Phase 28 follow-up): T4 runs on the General Purpose fallback, with its price; "created" only with
+    # evidence that the server exists (review of 20e855c).
+    $t4Created = if ($null -ne $T4Created) { [bool]$T4Created } else { Get-DemoT4ServerEvidence -Result $all -State $State }
+    $t4Fallback = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd $T4HourlyUsd -Created $t4Created -Why $T4Why
     if ($t4Fallback) {
         $notes.Add($t4Fallback)
     }

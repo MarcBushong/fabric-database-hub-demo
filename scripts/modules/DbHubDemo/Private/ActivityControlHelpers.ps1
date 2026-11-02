@@ -1088,6 +1088,52 @@ function Set-DemoActivityControlSafetyStop {
     return (New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The daily T4 safety stop runs DbHub-Stop -Scope T4 at {0} ({1}), first at {2}; it stops T4 only when it''s running and never starts anything.' -f $when.LocalTime, $when.TimeZone, $when.StartTime) -Evidence $evidence -DocUrl $doc)
 }
 
+function Get-DemoT4SafetyStopState {
+    <#
+    .SYNOPSIS
+    Whether the on-demand control's daily T4 safety stop is in place (ADR 0020): the schedule dbhub-t4-safety-stop, enabled
+    and linked to DbHub-Stop, read as CONTROL.SAFETYSTOP reads it (Schedule - Get, Job Schedule - List). Returns State and
+    NextRunUtc. Internal.
+
+    .DESCRIPTION
+    State: Off (control.enabled is false; nothing is read), Scheduled, NotScheduled (setup-activity-control.ps1 can end
+    with "couldn't be scheduled"), or Unknown (a read failed for another reason than not found). stop-demo.ps1 and
+    status.ps1 say from it whether anything stops a T4 that Azure started again after 7 days (Phase 28 follow-up, review of
+    20e855c). Never throws.
+    - Schedule: https://learn.microsoft.com/rest/api/automation/schedule/get
+    - Job schedules: https://learn.microsoft.com/rest/api/automation/job-schedule/list-by-automation-account
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
+        return [pscustomobject]@{ State = 'Off'; NextRunUtc = $null }
+    }
+    try {
+        $name = Get-DemoActivityControlName -Config $Config
+        $version = '2024-10-23'
+        $safety = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $name.AutomationAccountId, $name.SafetyStopSchedule) -ApiVersion $version)
+        $links = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules' -f $name.AutomationAccountId) -ApiVersion $version)
+        $linked = @(@(Get-DemoActivityControlList -InputObject $links.Value -Name 'value') | Where-Object { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'schedule') -Name 'name') -eq $name.SafetyStopSchedule }).Count -gt 0
+        $properties = Get-DemoMemberValue -InputObject $safety.Value -Name 'properties'
+        if ($safety.Ok -and [bool](Get-DemoMemberValue -InputObject $properties -Name 'isEnabled') -and $linked) {
+            return [pscustomobject]@{ State = 'Scheduled'; NextRunUtc = (ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'nextRun')) }
+        }
+        if ((-not $safety.Ok -and -not $safety.Missing) -or -not $links.Ok) {
+            return [pscustomobject]@{ State = 'Unknown'; NextRunUtc = $null }
+        }
+        return [pscustomobject]@{ State = 'NotScheduled'; NextRunUtc = $null }
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The daily T4 safety stop''s schedule couldn''t be read: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return [pscustomobject]@{ State = 'Unknown'; NextRunUtc = $null }
+    }
+}
+
 function Get-DemoActivityControlWebhook {
     <#
     .SYNOPSIS

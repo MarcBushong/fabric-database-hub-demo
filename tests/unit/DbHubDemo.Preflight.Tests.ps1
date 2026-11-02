@@ -280,6 +280,51 @@ Describe 'Invoke-DemoPreflight' {
         @(Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK').Count | Should -Be 0
     }
 
+    It 'keeps the run''s own cost checks, a monthly-ceiling Fail included, when the fallback''s extra estimate fails: <Case> (review of 20e855c)' -ForEach @(
+        @{ Case = 'a Burstable start, the General Purpose estimate refused (HTTP 429)'; Burstable = @('Standard_B1ms', 'Standard_B2s'); Throws = 'fallback'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; Match = 'deploy\.ps1 prices its General Purpose fallback, Standard_D2ds_v5, right before it would create it; right now, its price couldn''t be read from the Azure Retail Prices API \(HTTP 429' }
+        @{ Case = 'a General Purpose start over a ceiling, the estimate without T4 refused (HTTP 429)'; Burstable = @(); Throws = 'off'; StartSku = 'None'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; Match = 'The ceilings without T4 couldn''t be checked \(HTTP 429.*\), so PREFLIGHT\.COST\.\* still price T4 at Standard_D2ds_v5' }
+        @{ Case = 'the fallback''s check itself throws'; Burstable = @('Standard_B1ms', 'Standard_B2s'); Throws = 'check'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; Match = '^T4''s General Purpose fallback couldn''t be priced in preflight: HTTP 429' }
+    ) {
+        Set-HappyAzMock
+        # The run's own estimate is over monthlyCeilingUsd, a Fail; obviously fake prices.
+        $script:throws = $Throws
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith {
+            $sku = if ($Config['t4Enabled'] -eq $false) { '' } elseif ($Config['t4SkuName']) { [string]$Config['t4SkuName'] } else { 'Standard_B1ms' }
+            if (($script:throws -eq 'off' -and -not $sku) -or ($script:throws -eq 'fallback' -and $sku -eq 'Standard_D2ds_v5')) {
+                throw 'HTTP 429: Too Many Requests (after 3 retries).'
+            }
+            $unit = if ($sku -eq 'Standard_D2ds_v5') { 0.1 } else { 0.01 }
+            [pscustomobject]@{
+                LightUseMonthly               = 260.0
+                SessionCost                   = 9.0
+                T4AutoRestartWorstCaseMonthly = $(if ($sku) { [System.Math]::Round($unit * 2 * 690, 2) } else { $null })
+                T4FixedMonthly                = $(if ($sku) { 20.0 } else { $null })
+                DefenderIncluded              = $true
+                MissingPrices                 = @()
+                Components                    = @(if ($sku) { [pscustomobject]@{ Name = ('T4 compute ({0})' -f $sku); UnitPrice = $unit; Quantity = 2 } })
+                Results                       = @(New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message ('Over monthlyCeilingUsd with T4 at {0}.' -f $(if ($sku) { $sku } else { 'nothing' })))
+            }
+        }
+        if ($Throws -eq 'check') {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoT4FallbackPreflight -MockWith { throw 'HTTP 429: Too Many Requests (after 3 retries).' }
+        }
+        $script:listSkusJson = ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @($Burstable | ForEach-Object { @{ name = $_ } }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '18' }) })
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:listSkusJson; StdErr = '' } }
+
+        $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
+        $monthly = @($results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY')
+        $monthly.Count | Should -Be 1
+        $monthly[0].status | Should -Be 'Fail' -Because 'a hard ceiling is never dropped, whatever the fallback''s estimate does'
+        @($results | Where-Object { $_.status -eq 'Fail' }).Count | Should -BeGreaterOrEqual 1
+        @($results | Where-Object { [string]$_.message -match 'could not be computed' }) | Should -BeNullOrEmpty
+        $fallback = @($results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK')
+        $fallback.Count | Should -Be 1
+        $fallback[0].status | Should -Be $Status
+        [string]$fallback[0].evidence.startSku | Should -Be $StartSku
+        $fallback[0].evidence.skipReason | Should -Be $SkipReason
+        $fallback[0].message | Should -Match $Match
+    }
+
     It 'leaves the policy inventory to deploy.ps1 only with networkMode private, and keeps it with public and auto (Phase 28; review finding 7)' {
         Set-HappyAzMock
         $private = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')

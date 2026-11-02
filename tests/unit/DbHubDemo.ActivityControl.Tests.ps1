@@ -193,6 +193,9 @@ BeforeAll {
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:autoStop.ToString('o') } }))
             }
             '/schedules/dbhub-t4-safety-stop$' {
+                if ($script:safetyStopReadFails) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to read the schedule.')
+                }
                 if (-not $script:safetyStop) {
                     return (Get-NotFound 'dbhub-t4-safety-stop')
                 }
@@ -264,6 +267,7 @@ BeforeAll {
         $script:jobsReadFailAt = 0
         $script:safetyStop = $true
         $script:safetyStopLinked = $true
+        $script:safetyStopReadFails = $false
         $script:connections = [System.Collections.Generic.List[object]]::new()
     }
 
@@ -975,6 +979,32 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         $status.checkId | Should -Be 'STATUS.CONTROL'
         $status.status | Should -Be 'Manual action required'
         $status.remediation | Should -Match '-GrantRole'
+    }
+
+    It 'reads the daily T4 safety stop''s schedule the same way for CONTROL.SAFETYSTOP, stop-demo.ps1, and status.ps1 (review of 20e855c): <Case>' -ForEach @(
+        @{ Case = 'scheduled and linked'; Exists = $true; Linked = $true; ReadFails = $false; State = 'Scheduled'; Status = 'Pass'; Match = '^The daily T4 safety stop is scheduled \(next 2026-10-27 23:15 UTC\)\.$' }
+        @{ Case = 'scheduled, not linked to DbHub-Stop'; Exists = $true; Linked = $false; ReadFails = $false; State = 'NotScheduled'; Status = 'Warning'; Match = 'isn''t scheduled, so a stopped T4 starts itself after 7 days' }
+        @{ Case = 'missing (setup couldn''t schedule it)'; Exists = $false; Linked = $false; ReadFails = $false; State = 'NotScheduled'; Status = 'Warning'; Match = 'isn''t scheduled, so a stopped T4 starts itself after 7 days' }
+        @{ Case = 'unreadable'; Exists = $true; Linked = $true; ReadFails = $true; State = 'Unknown'; Status = 'Warning'; Match = 'schedule couldn''t be read' }
+    ) {
+        $script:safetyStop = $Exists
+        $script:safetyStopLinked = $Linked
+        $script:safetyStopReadFails = $ReadFails
+        $safety = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Get-DemoT4SafetyStopState -Config $Config }
+        $safety.State | Should -Be $State
+        if ($State -eq 'Scheduled') {
+            $safety.NextRunUtc | Should -Be ([datetime]::new(2026, 10, 27, 23, 15, 0, [System.DateTimeKind]::Utc))
+        }
+        $check = @(Test-DemoActivityControl -Config (New-ControlConfig) -NowUtc $script:now) | Where-Object checkId -EQ 'CONTROL.SAFETYSTOP'
+        $check.status | Should -Be $Status
+        $check.message | Should -Match $Match
+        @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty -Because 'it only reads'
+    }
+
+    It 'reads nothing for the daily T4 safety stop while control.enabled is false' {
+        $safety = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -Enabled $false) } { Get-DemoT4SafetyStopState -Config $Config }
+        $safety.State | Should -Be 'Off'
+        $script:azCalls.Count | Should -Be 0
     }
 
     It 'lets Security validation accept A1 at the demo group only when the control is on' {

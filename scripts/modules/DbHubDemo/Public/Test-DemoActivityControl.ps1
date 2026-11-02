@@ -111,16 +111,18 @@ function Test-DemoActivityControl {
         }
     }
 
-    $safety = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $name.AutomationAccountId, $name.SafetyStopSchedule) -ApiVersion $version)
-    $links = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules' -f $name.AutomationAccountId) -ApiVersion $version)
-    $linked = @(@(Get-DemoActivityControlList -InputObject $links.Value -Name 'value') | Where-Object { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'schedule') -Name 'name') -eq $name.SafetyStopSchedule }).Count -gt 0
-    $enabled = $safety.Ok -and [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $safety.Value -Name 'properties') -Name 'isEnabled')
-    if ($enabled -and $linked) {
-        $next = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $safety.Value -Name 'properties') -Name 'nextRun')
-        $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The daily T4 safety stop is scheduled{0}.' -f $(if ($null -ne $next) { ' (next {0:yyyy-MM-dd HH:mm} UTC)' -f $next } else { '' })) -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server'))
+    # The same read stop-demo.ps1 and status.ps1 make to say whether anything stops a T4 Azure started again (Phase 28
+    # follow-up).
+    $safety = Get-DemoT4SafetyStopState -Config $Config
+    $safetyDoc = 'https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server'
+    if ($safety.State -eq 'Scheduled') {
+        $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The daily T4 safety stop is scheduled{0}.' -f $(if ($null -ne $safety.NextRunUtc) { ' (next {0:yyyy-MM-dd HH:mm} UTC)' -f $safety.NextRunUtc } else { '' })) -DocUrl $safetyDoc))
+    }
+    elseif ($safety.State -eq 'Unknown') {
+        $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'The daily T4 safety stop''s schedule couldn''t be read, so it may not stop a T4 that starts itself after 7 days.' -Remediation ('Run validate.ps1 again; if it stays unread, run {0}.' -f $setup) -DocUrl $safetyDoc))
     }
     else {
-        $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'The daily T4 safety stop isn''t scheduled, so a stopped T4 starts itself after 7 days and bills until something stops it.' -Remediation ('Run {0}.' -f $setup) -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server'))
+        $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'The daily T4 safety stop isn''t scheduled, so a stopped T4 starts itself after 7 days and bills until something stops it.' -Remediation ('Run {0}.' -f $setup) -DocUrl $safetyDoc))
     }
     return $results.ToArray()
 }
