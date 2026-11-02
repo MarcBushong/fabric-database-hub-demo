@@ -37,7 +37,7 @@ function Invoke-DemoFabricNotebookRun {
     A Fabric REST API token you already have, as a SecureString.
 
     .PARAMETER TimeoutMinutes
-    How long to wait for the job.
+    How long to wait for the job, in elapsed time, the reads included.
 
     .PARAMETER PollSeconds
     Seconds between reads of the job instance.
@@ -126,8 +126,15 @@ function Invoke-DemoFabricNotebookRun {
     $status = 'NotStarted'
     $state = $null
     $maxPolls = [int][System.Math]::Ceiling($TimeoutMinutes * 60.0 / $PollSeconds)
+    # Elapsed time bounds the polls too, the reads included: a read that keeps getting a transient status (HTTP 429 or
+    # 5xx) pays its attempts and backoff on every poll (review of c7c86ec). A network error that lasts throws.
+    $deadline = (Get-DemoUtcNow).AddMinutes($TimeoutMinutes)
     for ($poll = 1; $poll -le $maxPolls; $poll++) {
-        Start-Sleep -Seconds $PollSeconds
+        $remaining = ($deadline - (Get-DemoUtcNow)).TotalSeconds
+        if ($remaining -le 0) {
+            break
+        }
+        Start-Sleep -Seconds ([int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, [System.Math]::Ceiling($remaining))))
         $read = Invoke-DemoFabricRequest -Method 'Get' -Uri $location -Token $Token
         if ($read.StatusCode -ne 200) {
             continue

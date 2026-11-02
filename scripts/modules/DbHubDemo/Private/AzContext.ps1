@@ -424,8 +424,9 @@ function Invoke-DemoRestRequest {
 
     Returns the shape of an Azure CLI call: ExitCode (0 for a 2xx answer, 1 otherwise), StdOut (the response
     body), StdErr (the redacted error), and StatusCode, plus Retried (the request was sent again with a fresh
-    token), Challenge (what happened after a claims challenge, or ''), and Authenticate (the redacted
-    WWW-Authenticate header of a challenge, or '').
+    token), Challenge (what happened after a claims challenge, or ''), Authenticate (the redacted
+    WWW-Authenticate header of a challenge, or ''), and NetworkError (no answer came back, after the attempts
+    Invoke-DemoTransientRetry made, so a caller that loops can stop instead of paying them again for every item).
     - az rest: https://learn.microsoft.com/cli/azure/reference-index#az-rest
     - Microsoft Graph REST API: https://learn.microsoft.com/graph/use-the-api
     - Claims challenges: https://learn.microsoft.com/entra/identity-platform/claims-challenge
@@ -478,8 +479,8 @@ function Invoke-DemoRestRequest {
     }
 
     $answer = {
-        param([int] $ExitCode, [string] $StdOut, [string] $StdErr, [int] $StatusCode, [bool] $Retried = $false, [string] $Challenge = '', [string] $Authenticate = '')
-        [pscustomobject]@{ ExitCode = $ExitCode; StdOut = $StdOut; StdErr = $StdErr; StatusCode = $StatusCode; Retried = $Retried; Challenge = $Challenge; Authenticate = $Authenticate }
+        param([int] $ExitCode, [string] $StdOut, [string] $StdErr, [int] $StatusCode, [bool] $Retried = $false, [string] $Challenge = '', [string] $Authenticate = '', [bool] $NetworkError = $false)
+        [pscustomobject]@{ ExitCode = $ExitCode; StdOut = $StdOut; StdErr = $StdErr; StatusCode = $StatusCode; Retried = $Retried; Challenge = $Challenge; Authenticate = $Authenticate; NetworkError = $NetworkError }
     }
     $tokenRequest = @{ SubscriptionId = $SubscriptionId; Resource = $resource }
     if ($ExpectedTenantId) {
@@ -520,12 +521,12 @@ function Invoke-DemoRestRequest {
             $response = Invoke-DemoTransientRetry -Send { param([hashtable] $Call) Invoke-WebRequest @Call } -State $request -Target ([uri]$Uri).Host -NotIdempotent:(-not $repeatable)
         }
         catch {
-            return [pscustomobject]@{ Status = 0; Content = ''; Authenticate = ''; Error = (Get-DemoExceptionText -Exception $_.Exception) }
+            return [pscustomobject]@{ Status = 0; Content = ''; Authenticate = ''; Error = (Get-DemoExceptionText -Exception $_.Exception); NetworkError = (Test-DemoNetworkFailure -Exception $_.Exception) }
         }
         $content = if ($response.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($response.Content) } else { [string]$response.Content }
         $headers = Get-DemoMemberValue -InputObject $response -Name 'Headers'
         $authenticate = Get-DemoMemberValue -InputObject $headers -Name 'WWW-Authenticate'
-        [pscustomobject]@{ Status = [int]$response.StatusCode; Content = $content; Authenticate = ((@($authenticate) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) -join ', '); Error = '' }
+        [pscustomobject]@{ Status = [int]$response.StatusCode; Content = $content; Authenticate = ((@($authenticate) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) -join ', '); Error = ''; NetworkError = $false }
     }
 
     $sent = & $send
@@ -565,7 +566,7 @@ function Invoke-DemoRestRequest {
     $request = $null
 
     if ($sent.Status -eq 0) {
-        return (& $answer 1 '' $sent.Error 0 $retried $challenge $authenticateHeader)
+        return (& $answer 1 '' $sent.Error 0 $retried $challenge $authenticateHeader ([bool]$sent.NetworkError))
     }
     if ($sent.Status -ge 200 -and $sent.Status -lt 300) {
         return (& $answer 0 $sent.Content '' $sent.Status $retried $challenge $authenticateHeader)

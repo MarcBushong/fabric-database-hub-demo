@@ -212,6 +212,28 @@ Describe 'Resolve-DemoFabricConfig' {
         @($requests | Where-Object { $_.Method -ne 'Get' }).Uri | Should -Be @("$api/workspaces", "$api/workspaces/$workspaceId/lakehouses")
     }
 
+    It 'fails the created workspace''s step with networkError, after one read''s attempts, when a network error stops the capacity wait (review of c7c86ec)' {
+        # Before: the wait paid 4 attempts on every poll for 300 seconds of sleeps, then reported the workspace as created.
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @() }) }
+            @{ Method = 'Get'; Match = $capacitiesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($activeCapacity) }) }
+            @{ Method = 'Post'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 201 -Body @{ id = $workspaceId; displayName = 'Database Hub Demo'; type = 'Workspace' }) }
+        )
+        $script:workspaceReads = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -ParameterFilter { $Method -eq 'Get' -and [string]$Uri -match $workspaceUri } -MockWith {
+            $script:workspaceReads++
+            throw ([System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::NameResolutionError, 'No such host is known. (api.fabric.microsoft.com:443)', $null, $null))
+        }
+        $resolution = Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token -Create -SkipLakehouse -Confirm:$false
+        $record = Get-Record $resolution 'FABRIC.RESOLVE.WORKSPACE'
+        $record.status | Should -Be 'Fail'
+        $record.message | Should -Match '^The Fabric workspace "Database Hub Demo" was created, but whether it''s on the capacity "demo-capacity" yet couldn''t be read: No response: A network error reached api\.fabric\.microsoft\.com on each of 4 attempts'
+        $record.evidence.networkError | Should -BeTrue
+        $record.remediation | Should -Be 'Run the script again, or ./scripts/deploy.ps1, which resumes where it stopped: either finds the workspace by name. A network error stopped it (requests that are safe to repeat were retried).'
+        $script:workspaceReads | Should -Be 4
+        (InModuleScope DbHubDemo -Parameters @{ Result = $record } { Test-DemoNetworkResult -Result $Result }) | Should -BeTrue
+    }
+
     It 'follows a lakehouse''s long-running creation and reads the new lakehouse back by name' {
         Set-FabricMock -Routes @(
             @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($demoWorkspace) }) }

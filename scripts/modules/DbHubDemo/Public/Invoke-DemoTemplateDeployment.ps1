@@ -8,7 +8,8 @@ function Invoke-DemoTemplateDeployment {
     The one place the template is deployed (deploy.ps1, start-demo.ps1 when it recreates T3):
     1. Reads the resource group's tags (kept on every redeployment, ADR 0002), the VMs that already exist,
        T1's security type (Resolve-DemoT1SecurityType), and the existing budget's start date, which a
-       redeployment must keep.
+       redeployment must keep (Get-DemoBudgetStartDate: read as text, so a redeploy in a later month than the
+       budget's own sends the budget's date, not the template's default; Phase 28 live finding, 2026-11-02).
     2. Builds the parameters with Get-DemoDeploymentParameter, including the bootstrap bundle and the
        workload runner when they were sent, and writes them to a file in a private temporary directory that's
        deleted afterward. When a VM doesn't exist yet, a generated administrator password goes into that file,
@@ -30,6 +31,11 @@ function Invoke-DemoTemplateDeployment {
        record once the configuration sets t4SkuName (review finding 5). A General Purpose size is never chosen on its
        own. The VMs that exist are read again before each attempt, so a VM a failed attempt created never gets an
        osProfile again.
+    7. Phase 28 live finding (2026-11-02): a deployment that failed while it ran (DeploymentFailed) and isn't retried
+       above gets DEPLOY.TEMPLATE's Fail with the innermost errors of its failed operations, nested deployments
+       included (Get-DemoDeploymentFailure, New-DemoTemplateFailureResult), for example "Microsoft.Consumption/budgets
+       budget-dbhub-demo: 400: Start date of budgets cannot be updated. ..."; when they can't be read, the Azure
+       CLI's error, as before. A refused budget start date gets a remediation that says how to recreate the budget.
 
     Deployment success alone is never Pass (ADR 0012): the result is DEPLOY.TEMPLATE Pass only with the
     provisioning state Succeeded, and later stages check what was deployed.
@@ -38,9 +44,12 @@ function Invoke-DemoTemplateDeployment {
     name -> value), Changes (what-if only), T3UseFreeLimit (what was deployed), and T4Enabled and T4SkuName (what
     T4 got).
 
-    Sources (checked 2026-10-20):
+    Sources (checked 2026-10-20; the last three 2026-11-02):
     - az deployment sub create: https://learn.microsoft.com/cli/azure/deployment/sub#az-deployment-sub-create
     - What-if: https://learn.microsoft.com/azure/azure-resource-manager/templates/deploy-what-if
+    - Find error codes: https://learn.microsoft.com/azure/azure-resource-manager/troubleshooting/find-error-code
+    - az deployment operation sub list: https://learn.microsoft.com/cli/azure/deployment/operation/sub#az-deployment-operation-sub-list
+    - az deployment operation group list: https://learn.microsoft.com/cli/azure/deployment/operation/group#az-deployment-operation-group-list
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -130,11 +139,12 @@ function Invoke-DemoTemplateDeployment {
 
     $tags = @{}
     $existing = @()
-    $budgetStart = ''
     if (Test-DemoResourceGroupExist -Config $Config) {
         $tags = Get-DemoResourceGroupTag -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName
-        $budgetStart = Get-DemoBudgetStartDate -Config $Config
     }
+    # Azure never changes a budget's start date, so a redeployment sends the budget's own (Phase 28 live finding,
+    # 2026-11-02). Read even without the group: a budget at its scope outlives it.
+    $budgetStart = Get-DemoBudgetStartDate -Config $Config
     $securityType = Resolve-DemoT1SecurityType -Config $Config
     $hostVm = Get-DemoHostVmName -Config $Config
     $hostDiskSource = $T2OsDiskSourceId
@@ -350,7 +360,10 @@ function Invoke-DemoTemplateDeployment {
             Write-DemoLog -Level Warning -Message $(if ($recorded -eq 'None') { 'Azure refused T4''s Burstable sizes; deploying again without T4.' } else { 'Azure refused T4''s Standard_B1ms; deploying again with Standard_B2s, the same Burstable class.' })
             continue
         }
-        $results.Add((New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The template {0} failed: {1}' -f $verb, (Get-DemoDeploymentErrorText -Text $run.StdErr)) -Remediation 'Fix the cause in the message, then run deploy.ps1 -Resume. A 409 Conflict while a policy installs an extension clears within minutes.' -DocUrl $docUrl))
+        # Phase 28 live finding (2026-11-02): a deployment that failed while it ran names its cause in its operations, read
+        # only now, after the free offer's and T4's own handling above, which reads the error as before.
+        $cause = if ($Action -eq 'Create') { Get-DemoDeploymentFailure -Config $Config -DeploymentName $deploymentName -ErrorText ([string]$run.StdErr) } else { $null }
+        $results.Add((New-DemoTemplateFailureResult -Config $Config -Verb $verb -DeploymentName $deploymentName -ErrorText ([string]$run.StdErr) -Cause $cause -DocUrl $docUrl))
         if ($null -ne $t4Failure) {
             # A size Azure refused for T4 that the configuration sets gets its own Fail, with the documented fallback (Phase 24, ADR 0019).
             $results.Add((New-DemoT4SkuFailureResult -CheckId 'DEPLOY.T4.SKU' -Failure $t4Failure))

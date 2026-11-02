@@ -159,7 +159,7 @@ function Import-DemoFabricItem {
             default { 'Run the script again; it is idempotent. ' + $p5 }
         }
         if ($evidence.Contains('networkError')) {
-            $remediation = 'Run the script again: a network error lasted through the retries, and the import is idempotent.'
+            $remediation = 'Run the script again: the import is idempotent. {0}' -f (Get-DemoNetworkErrorNote)
         }
         New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message $Message -Evidence $evidence `
             -Remediation $remediation -DocUrl $docUrl
@@ -267,8 +267,8 @@ function Import-DemoFabricItem {
         }
     }
     catch {
-        # A network error that lasted through the retries (Invoke-DemoTransientRetry): a rerun is the fix, and deploy.ps1's
-        # NOT DONE says so (Test-DemoNetworkResult; Phase 28 live finding, 2026-10-30).
+        # A network error stopped the import (Invoke-DemoTransientRetry): a rerun is the fix, and deploy.ps1's NOT DONE says
+        # so (Test-DemoNetworkResult; Phase 28 live finding, 2026-10-30).
         if (Test-DemoNetworkFailure -Exception $_.Exception) {
             $evidence['networkError'] = $true
         }

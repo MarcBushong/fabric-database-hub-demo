@@ -224,4 +224,22 @@ Describe 'Invoke-DemoFabricNotebookRun' {
         $result.status | Should -Be 'Warning'
         $result.message | Should -Match 'still InProgress'
     }
+
+    It 'counts -TimeoutMinutes in elapsed time, the reads included, when every read pays its retries (review of c7c86ec)' {
+        # Each read answers HTTP 503 after its attempts and backoff, about 50 seconds; before, the polls were counted, not the time.
+        $script:reads = 0
+        $script:now = [datetime]::new(2026, 11, 2, 15, 0, 0, [System.DateTimeKind]::Utc)
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:now = $script:now.AddSeconds([int]$PesterBoundParameters['Seconds']) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -ParameterFilter { $Method -eq 'Get' } -MockWith {
+            $script:reads++
+            $script:now = $script:now.AddSeconds(50)
+            [pscustomobject]@{ StatusCode = 503; Headers = @{}; Body = $null }
+        }
+        $start = $script:now
+        $result = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -TimeoutMinutes 2 -PollSeconds 15
+        $result.status | Should -Be 'Warning'
+        $script:reads | Should -BeLessOrEqual 3 -Because 'eight polls of 65 seconds each would take more than 8 minutes'
+        ($script:now - $start).TotalMinutes | Should -BeLessOrEqual 3
+    }
 }

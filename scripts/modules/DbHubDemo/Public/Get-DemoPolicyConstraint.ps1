@@ -14,7 +14,10 @@ function Get-DemoPolicyConstraint {
 
     Every call is a GET ('az rest') through Invoke-DemoAz, made one at a time; each definition is read
     once. Large tenant policy sets can take a few minutes (about 2-3 seconds per definition), so
-    preflight has -SkipPolicyInventory. A read failure is a Warning, never a Fail.
+    preflight has -SkipPolicyInventory. A read failure is a Warning, never a Fail. A network error that lasted
+    through one definition read's attempts (Get-DemoArmResource's NetworkError) stops the reads: the definitions
+    left count as unreadable, with one Warning that says why, so a lasting outage costs one read's retries instead
+    of every definition's (review of c7c86ec).
 
     Returns the kept rules with their category, the policies that turn off public network access on SQL
     servers, the resolved network mode (Resolve-DemoNetworkMode), and PREFLIGHT.POLICY.* results:
@@ -61,14 +64,25 @@ function Get-DemoPolicyConstraint {
     $results = [System.Collections.Generic.List[object]]::new()
     $definitions = [hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
     $readErrors = [hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # A network error that lasted through one read's attempts stops the reads (review of c7c86ec): every later read would
+    # pay the same attempts and backoff again, for each of up to hundreds of definitions.
+    $network = @{ Error = ''; Skipped = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase) }
     $cachePath = ''
     $fingerprint = ''
 
     function Read-PolicyDefinition([string] $Id) {
         if (-not $definitions.ContainsKey($Id)) {
+            if ($network['Error']) {
+                $null = $network['Skipped'].Add($Id)
+                return $null
+            }
             $response = Get-DemoArmResource -SubscriptionId $subscriptionId -Url ('https://management.azure.com{0}?api-version={1}' -f $Id, $apiVersion)
             $definitions[$Id] = if ($response.Ok -and $response.Value -is [System.Collections.IDictionary]) { $response.Value } else { $null }
             $readErrors[$Id] = if ($response.Ok) { 'unexpected response' } else { $response.Error }
+            if ([bool](Get-DemoMemberValue -InputObject $response -Name 'NetworkError')) {
+                $network['Error'] = [string]$response.Error
+                Write-DemoLog -Level Warning -Message ('Policy inventory: a network error lasted through the attempts to read a definition, so no more are read; the ones left count as unreadable, and the checks cover only what was read: {0}' -f $network['Error'])
+            }
         }
         return $definitions[$Id]
     }
@@ -158,7 +172,9 @@ function Get-DemoPolicyConstraint {
         if ($isSet) {
             $set = Read-PolicyDefinition -Id $definitionId
             if ($null -eq $set) {
-                $unreadable.Add(('policy set {0} in assignment "{1}" ({2})' -f (Format-PolicyId $definitionId), $assignmentLabel, $readErrors[$definitionId]))
+                if (-not $network['Skipped'].Contains($definitionId)) {
+                    $unreadable.Add(('policy set {0} in assignment "{1}" ({2})' -f (Format-PolicyId $definitionId), $assignmentLabel, $readErrors[$definitionId]))
+                }
                 continue
             }
             $setParameters = $set['properties']['parameters']
@@ -177,7 +193,9 @@ function Get-DemoPolicyConstraint {
             $definition = Read-PolicyDefinition -Id $member.Id
             $definitionProperties = if ($null -ne $definition) { $definition['properties'] } else { $null }
             if ($definitionProperties -isnot [System.Collections.IDictionary] -or $definitionProperties['policyRule'] -isnot [System.Collections.IDictionary]) {
-                $unreadable.Add(('definition {0} in assignment "{1}" ({2})' -f (Format-PolicyId $member.Id), $assignmentLabel, $readErrors[$member.Id]))
+                if (-not $network['Skipped'].Contains($member.Id)) {
+                    $unreadable.Add(('definition {0} in assignment "{1}" ({2})' -f (Format-PolicyId $member.Id), $assignmentLabel, $readErrors[$member.Id]))
+                }
                 continue
             }
             $policyRule = $definitionProperties['policyRule']
@@ -241,6 +259,9 @@ function Get-DemoPolicyConstraint {
         }
     }
 
+    if ($network['Skipped'].Count -gt 0) {
+        $unreadable.Add(('{0} more definition(s) and set(s), not read after the network error' -f $network['Skipped'].Count))
+    }
     $complete = $listed -and $unreadable.Count -eq 0
     $incompleteNote = if ($complete) { '' } else { ', from the policies that could be read' }
     $byCategory = @{}

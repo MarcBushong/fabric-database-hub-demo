@@ -202,8 +202,12 @@ function Wait-DemoFabricCapacityAssignment {
 
     .DESCRIPTION
     Assign To Capacity answers 202 without an operation to follow, and Create Workspace can return before the
-    assignment is done, so the workspace itself is the documented signal. Returns Progress (Completed, Failed,
-    InProgress, or Unknown), CapacityId, and Error.
+    assignment is done, so the workspace itself is the documented signal. -TimeoutSeconds counts elapsed time, the
+    reads included (Get-DemoUtcNow), and no sleep runs past it; a read that a network error stopped after its
+    attempts (Invoke-DemoHubFabricGet's NetworkError) ends the wait at once, because every later read would pay the
+    same attempts and backoff again (review of c7c86ec: 244 requests in about 56 minutes, where the wait had taken 61
+    in 300 seconds). Returns Progress (Completed, Failed, InProgress, or Unknown), CapacityId, Error, and
+    NetworkError.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -222,8 +226,9 @@ function Wait-DemoFabricCapacityAssignment {
         [int] $PollSeconds = 5
     )
 
-    $waited = 0
-    $last = [pscustomobject]@{ Progress = 'Unknown'; CapacityId = ''; Error = '' }
+    $deadline = (Get-DemoUtcNow).AddSeconds($TimeoutSeconds)
+    $slept = 0
+    $last = [pscustomobject]@{ Progress = 'Unknown'; CapacityId = ''; Error = ''; NetworkError = $false }
     while ($true) {
         $read = Invoke-DemoHubFabricGet -Uri ('{0}/workspaces/{1}' -f $script:FabricApiBaseUri, $WorkspaceId) -Token $Token
         if ($read.StatusCode -eq 200) {
@@ -232,19 +237,25 @@ function Wait-DemoFabricCapacityAssignment {
             if (-not $progress) {
                 $progress = if ($capacityId) { 'Completed' } else { 'Unknown' }
             }
-            $last = [pscustomobject]@{ Progress = $progress; CapacityId = $capacityId; Error = '' }
+            $last = [pscustomobject]@{ Progress = $progress; CapacityId = $capacityId; Error = ''; NetworkError = $false }
             if ($progress -in 'Completed', 'Failed') {
                 return $last
             }
         }
         else {
-            $last = [pscustomobject]@{ Progress = 'Unknown'; CapacityId = ''; Error = $read.Error }
+            $last = [pscustomobject]@{ Progress = 'Unknown'; CapacityId = ''; Error = $read.Error; NetworkError = [bool](Get-DemoMemberValue -InputObject $read -Name 'NetworkError') }
+            if ($last.NetworkError) {
+                return $last
+            }
         }
-        if ($waited -ge $TimeoutSeconds) {
+        # Elapsed time, the reads included; the sleeps' sum also bounds it, so a clock that doesn't move ends it too.
+        $remaining = ($deadline - (Get-DemoUtcNow)).TotalSeconds
+        if ($remaining -le 0 -or $slept -ge $TimeoutSeconds) {
             return $last
         }
-        Start-Sleep -Seconds $PollSeconds
-        $waited += $PollSeconds
+        $pause = [int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, [System.Math]::Ceiling($remaining)))
+        Start-Sleep -Seconds $pause
+        $slept += $pause
     }
 }
 

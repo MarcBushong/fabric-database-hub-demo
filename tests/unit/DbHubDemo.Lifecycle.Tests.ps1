@@ -137,6 +137,10 @@ Describe 'Invoke-DemoTemplateDeployment' {
             if ($ArgumentList[0] -eq 'vm' -and $ArgumentList[1] -eq 'show') {
                 return (New-AzResult -StdOut $script:hostComputerName)
             }
+            # A failed create's operations, read for its cause; these tests' failures have none to show.
+            if ($ArgumentList[0] -eq 'deployment' -and $ArgumentList[1] -eq 'operation') {
+                return (New-AzResult -StdOut '[]')
+            }
             $file = [string]$ArgumentList[[array]::IndexOf($ArgumentList, '--parameters') + 1]
             $content = Get-Content -LiteralPath $file.Substring(1) -Raw | ConvertFrom-Json -AsHashtable
             $script:deployCalls.Add([pscustomobject]@{ Arguments = @($ArgumentList); Parameters = $content })
@@ -326,6 +330,355 @@ Describe 'Invoke-DemoTemplateDeployment' {
         $script:deployCalls.Clear()
         Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false | Out-Null
         $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
+    }
+}
+
+Describe 'The budget''s start date and a failed template''s cause (Phase 28 live finding, 2026-11-02)' {
+    BeforeAll {
+        $config = New-TestConfig
+        $script:sub = '11111111-2222-3333-4444-555555555555'
+        $script:createError = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","target":"/subscriptions/' + $script:sub + '/providers/Microsoft.Resources/deployments/dbhub-demo-main","message":"At least one resource deployment operation failed. Please list deployment operations for details. Please see https://aka.ms/arm-deployment-operations for usage details."}}'
+        $script:budgetError = 'Start date of budgets cannot be updated. Please delete and create a new budget.'
+
+        # One deployment operation as 'az deployment operation ... list' prints it.
+        function New-TestOperation([string] $Type, [string] $Name, [string] $State = 'Failed', [object] $StatusMessage = $null, [string] $Group = 'rg-dbhub-demo', [string] $StatusCode = 'BadRequest') {
+            $id = if ($Type -eq 'Microsoft.Resources/resourceGroups') { '/subscriptions/{0}/resourceGroups/{1}' -f $script:sub, $Name } elseif ($Group) { '/subscriptions/{0}/resourceGroups/{1}/providers/{2}/{3}' -f $script:sub, $Group, $Type, $Name } else { '/subscriptions/{0}/providers/{1}/{2}' -f $script:sub, $Type, $Name }
+            $properties = [ordered]@{ provisioningOperation = 'Create'; provisioningState = $State; statusCode = $(if ($State -eq 'Failed') { $StatusCode } else { 'OK' }); targetResource = [ordered]@{ id = $id; resourceType = $Type; resourceName = $Name }; timestamp = '2026-11-02T14:03:11.123456+00:00' }
+            if ($null -ne $StatusMessage) {
+                $properties['statusMessage'] = $StatusMessage
+            }
+            [ordered]@{ id = '{0}/operations/0F1E2D3C4B5A6978' -f $id; operationId = '0F1E2D3C4B5A6978'; properties = $properties }
+        }
+        function New-TestDeploymentFailed([string] $Target) {
+            [ordered]@{ status = 'Failed'; error = [ordered]@{ code = 'DeploymentFailed'; target = $Target; message = 'At least one resource deployment operation failed. Please list deployment operations for details. Please see https://aka.ms/arm-deployment-operations for usage details.'; details = @([ordered]@{ code = 'ResourceDeploymentFailure'; target = $Target; message = 'The resource write operation failed to complete successfully, because it reached terminal provisioning state ''Failed''.' }) } }
+        }
+        function ConvertTo-TestOperationJson([object[]] $Operation) {
+            ConvertTo-Json -InputObject @($Operation) -Depth 30
+        }
+        # The live finding's chain: the subscription deployment, its resource group deployment, the budget module, the budget.
+        function Set-TestBudgetChain {
+            $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(
+                (New-TestOperation -Type 'Microsoft.Resources/resourceGroups' -Name 'rg-dbhub-demo' -State 'Succeeded')
+                (New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'demo-abc123' -StatusCode 'Conflict' -StatusMessage (New-TestDeploymentFailed ('/subscriptions/{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/demo-abc123' -f $script:sub)))
+            )
+            $script:operations['rg-dbhub-demo/demo-abc123'] = ConvertTo-TestOperationJson @(
+                (New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'network' -State 'Succeeded')
+                (New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'budget' -StatusCode 'Conflict' -StatusMessage ([ordered]@{ status = 'Failed'; error = [ordered]@{ code = 'DeploymentFailed'; message = 'At least one resource deployment operation failed.'; details = @([ordered]@{ code = 'BadRequest'; message = ('{"error":{"code":"400","message":"' + $script:budgetError + '"}}') }) } }))
+            )
+            $script:operations['rg-dbhub-demo/budget'] = ConvertTo-TestOperationJson @(
+                (New-TestOperation -Type 'Microsoft.Consumption/budgets' -Name 'budget-dbhub-demo' -StatusMessage ([ordered]@{ error = [ordered]@{ code = '400'; message = $script:budgetError } }))
+            )
+        }
+        # What az prints for the budget: the whole resource as JSON, or, with --query and --output, only the start date,
+        # as the API wrote it (az applies the query itself, so the test does the same for the one query the module sends).
+        function Get-TestBudgetResponse([string[]] $Arguments) {
+            if ($script:budgetRead -eq 'Missing') {
+                return (New-AzResult -ExitCode 1 -StdErr 'ERROR: Not Found({"error":{"code":"NotFound","message":"Budget budget-dbhub-demo was not found."}})')
+            }
+            if ($script:budgetRead -eq 'Denied') {
+                return (New-AzResult -ExitCode 1 -StdErr ('ERROR: Forbidden({{"error":{{"code":"AuthorizationFailed","message":"The client was refused; correlation {0}."}}}})' -f $script:fakeSecret))
+            }
+            $queryAt = [array]::IndexOf($Arguments, '--query')
+            if ($queryAt -ge 0) {
+                $Arguments[$queryAt + 1] | Should -Be 'properties.timePeriod.startDate'
+                if ($Arguments[[array]::IndexOf($Arguments, '--output') + 1] -eq 'tsv') {
+                    return (New-AzResult -StdOut $script:budgetStart)
+                }
+                return (New-AzResult -StdOut ('"{0}"' -f $script:budgetStart))
+            }
+            $body = [ordered]@{ id = '/subscriptions/{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.Consumption/budgets/budget-dbhub-demo' -f $script:sub; name = 'budget-dbhub-demo'; type = 'Microsoft.Consumption/budgets'; properties = [ordered]@{ category = 'Cost'; amount = 250; timeGrain = 'Monthly'; timePeriod = [ordered]@{ startDate = $script:budgetStart; endDate = '2036-09-30T00:00:00Z' } } }
+            return (New-AzResult -StdOut (ConvertTo-Json -InputObject $body -Depth 10))
+        }
+    }
+
+    BeforeEach {
+        $script:azLog = [System.Collections.Generic.List[string]]::new()
+        $script:creates = [System.Collections.Generic.List[object]]::new()
+        $script:operations = @{}
+        $script:budgetRead = 'Found'
+        $script:budgetStart = '2026-10-01T00:00:00Z'
+        $script:createFails = { $false }
+        $script:createStdErr = $script:createError
+        $script:groupExists = $true
+        $script:pgDeployment = $null
+        $script:fakeSecret = -join @('Fk', 'q7', 'Lm', '29', 'Pz', 'Wd')
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { $script:groupExists }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'abc123'; owner = 'your-alias' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoExistingVmName -MockWith { @('sqlvm01', 'archost01') }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT1SecurityType -MockWith { [pscustomobject]@{ SecurityType = 'TrustedLaunch' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmDiskDrift -MockWith { @() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Exists = $false; State = 'NotFound' } }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { $null }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            $joined = $ArgumentList -join ' '
+            $script:azLog.Add($joined)
+            if ($joined -match '^rest --method get --url https://management\.azure\.com/subscriptions/[^/]+/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Consumption/budgets/budget-dbhub-demo\?api-version=') {
+                return (Get-TestBudgetResponse -Arguments $ArgumentList)
+            }
+            if ($joined -like 'vm show *') {
+                return (New-AzResult -StdOut "archost01`n")
+            }
+            if ($joined -like 'deployment sub create *') {
+                $file = [string]$ArgumentList[[array]::IndexOf($ArgumentList, '--parameters') + 1]
+                $parameters = Get-Content -LiteralPath $file.Substring(1) -Raw | ConvertFrom-Json -AsHashtable
+                $script:creates.Add($parameters)
+                if (& $script:createFails $parameters) {
+                    return (New-AzResult -ExitCode 1 -StdErr $script:createStdErr)
+                }
+                return (New-AzResult -StdOut '{"properties":{"provisioningState":"Succeeded","duration":"PT4M","outputs":{"resourceGroupName":{"value":"rg-dbhub-demo"}}}}')
+            }
+            if ($joined -match '^deployment operation (sub|group) list (?:--resource-group (\S+) )?--name (\S+)') {
+                $key = if ($Matches[1] -eq 'sub') { 'sub/' + $Matches[3] } else { $Matches[2] + '/' + $Matches[3] }
+                if ($script:operations.ContainsKey($key)) {
+                    return (New-AzResult -StdOut $script:operations[$key])
+                }
+                return (New-AzResult -ExitCode 3 -StdErr ('ERROR: (DeploymentNotFound) Deployment ''{0}'' could not be found.' -f $Matches[3]))
+            }
+            if ($joined -like 'deployment group show --resource-group rg-dbhub-demo --name pgflex01 *' -and $null -ne $script:pgDeployment) {
+                return (New-AzResult -StdOut $script:pgDeployment)
+            }
+            return (New-AzResult -ExitCode 3 -StdErr 'ERROR: (ResourceNotFound) Not faked in this test.')
+        }
+    }
+
+    AfterEach {
+        Clear-DemoSecret
+    }
+
+    Context 'Get-DemoBudgetStartDate' {
+        It 'reads the start date as the API wrote it and returns it as yyyy-MM-dd in UTC, whatever the culture and time zone' {
+            $savedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+            $savedZone = $env:TZ
+            try {
+                # A Buddhist-calendar culture writes another year with the same format string, so only the invariant culture
+                # gives 2026; on Linux, TZ moves the machine's zone west of UTC, where the local date of 2026-10-01T00:00Z is
+                # still September.
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('th-TH')
+                if (-not $IsWindows) {
+                    $env:TZ = 'America/Los_Angeles'
+                    [System.TimeZoneInfo]::ClearCachedData()
+                }
+                InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be '2026-10-01'
+            }
+            finally {
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture
+                $env:TZ = $savedZone
+                [System.TimeZoneInfo]::ClearCachedData()
+            }
+            $script:azLog[0] | Should -Match ('^rest --method get --url https://management\.azure\.com/subscriptions/{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Consumption/budgets/budget-dbhub-demo\?api-version=\S+ --query properties\.timePeriod\.startDate --output tsv --subscription {0}$' -f [regex]::Escape($script:sub))
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'Warning' }
+
+            # An offset that isn't UTC still names the day in UTC.
+            $script:budgetStart = '2026-10-01T02:00:00+02:00'
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be '2026-10-01'
+        }
+
+        It 'returns nothing, and says nothing, when there''s no budget yet (HTTP 404)' {
+            $script:budgetRead = 'Missing'
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be ''
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly
+        }
+
+        It 'logs one redacted Warning and returns nothing when the budget can''t be read, or its date isn''t the first of a month' {
+            Register-DemoSecret -Value $script:fakeSecret
+            $script:budgetRead = 'Denied'
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be ''
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'The start date of the budget budget-dbhub-demo couldn''t be read \(ERROR: Forbidden.*AuthorizationFailed.*\[REDACTED\].*\), so the template sends the first day of this month\. In a later month than the budget''s own, Azure refuses that change' -and $Message -notmatch $script:fakeSecret -and $Message -notmatch '[\r\n]' }
+
+            $script:budgetRead = 'Found'
+            $script:budgetStart = '2026-10-15T00:00:00Z'
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be ''
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'Azure returned "2026-10-15T00:00:00Z", not the first day of a month' }
+        }
+    }
+
+    Context 'Invoke-DemoTemplateDeployment' {
+        It 'sends the budget''s own start date to the template in a later month than the budget''s' {
+            # The template's default is the first day of the current month, which Azure refuses for this budget.
+            '2026-10-01' | Should -BeLessThan ([System.DateTime]::UtcNow.ToString('yyyy-MM-01', [System.Globalization.CultureInfo]::InvariantCulture))
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $deployment.Succeeded | Should -BeTrue
+            $script:creates.Count | Should -Be 1
+            $script:creates[0].parameters.budgetStartDate.value | Should -Be '2026-10-01'
+        }
+
+        It 'reads the budget even when the resource group is gone, because a budget at its scope outlives it' {
+            $script:groupExists = $false
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoExistingVmName -MockWith { @() }
+            Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false | Out-Null
+            $script:creates[0].parameters.budgetStartDate.value | Should -Be '2026-10-01'
+
+            # A new environment has no budget, so the template's default applies.
+            $script:creates.Clear()
+            $script:budgetRead = 'Missing'
+            Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false | Out-Null
+            $script:creates[0].parameters.Contains('budgetStartDate') | Should -BeFalse
+        }
+
+        It 'names the innermost error of a failed deployment''s nested operations in DEPLOY.TEMPLATE, with a remediation for the budget' {
+            Set-TestBudgetChain
+            $script:createFails = { $true }
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $deployment.Succeeded | Should -BeFalse
+            $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+            $template.status | Should -Be 'Fail'
+            $template.message | Should -Be ('The template create failed: Microsoft.Consumption/budgets budget-dbhub-demo: 400: {0}' -f $script:budgetError)
+            $template.evidence.deploymentName | Should -Be 'dbhub-demo-main'
+            $template.evidence.failedOperations.Count | Should -Be 1
+            $template.evidence.failedOperations[0].resourceType | Should -Be 'Microsoft.Consumption/budgets'
+            $template.evidence.failedOperations[0].code | Should -Be '400'
+            $template.evidence.deploymentError | Should -Match 'DeploymentFailed'
+            $template.remediation | Should -Match 'Delete the budget budget-dbhub-demo at the scope of the resource group rg-dbhub-demo \(Azure portal: Cost Management > Budgets'
+            $template.remediation | Should -Match 'Budgets - Delete\), then run \./scripts/deploy\.ps1 again: it creates the budget anew, starting the first day of this month\.'
+            $template.docUrl | Should -Be 'https://learn.microsoft.com/rest/api/consumption/budgets/delete'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation *' }) | Should -Be @(
+                ('deployment operation sub list --name dbhub-demo-main --output json --subscription {0}' -f $script:sub)
+                ('deployment operation group list --resource-group rg-dbhub-demo --name demo-abc123 --output json --subscription {0}' -f $script:sub)
+                ('deployment operation group list --resource-group rg-dbhub-demo --name budget --output json --subscription {0}' -f $script:sub)
+            )
+        }
+
+        It 'bounds the depth, the number of errors, and each message, and redacts secrets' {
+            Register-DemoSecret -Value $script:fakeSecret
+            $script:createFails = { $true }
+            # Six nested deployments in a row: only four levels are read, and the fourth's own error is used.
+            $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'level2' -StatusMessage (New-TestDeploymentFailed 'level2'))
+            foreach ($level in 2..5) {
+                $script:operations[('rg-dbhub-demo/level{0}' -f $level)] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name ('level{0}' -f ($level + 1)) -StatusMessage ([ordered]@{ status = 'Failed'; error = [ordered]@{ code = 'DeploymentFailed'; message = 'At least one resource deployment operation failed.'; details = @([ordered]@{ code = ('InnerOfLevel{0}' -f ($level + 1)); message = 'Level {0} failed.' -f ($level + 1) }) } }))
+            }
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+            $template.message | Should -Be 'The template create failed: Microsoft.Resources/deployments level5: InnerOfLevel5: Level 5 failed.'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation *' }).Count | Should -Be 4
+            @($script:azLog | Where-Object { $_ -like '*--name level5 *' }).Count | Should -Be 0
+
+            # Eight failed resources with long messages: five errors, each at most 300 characters, the secret redacted.
+            $script:azLog.Clear()
+            $long = ('{0} ' -f $script:fakeSecret) + ('word ' * 500)
+            $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'demo-abc123' -StatusMessage (New-TestDeploymentFailed 'demo-abc123'))
+            $script:operations['rg-dbhub-demo/demo-abc123'] = ConvertTo-TestOperationJson @(foreach ($index in 1..8) { New-TestOperation -Type 'Microsoft.Network/networkSecurityGroups' -Name ('nsg-{0}' -f $index) -StatusMessage ([ordered]@{ error = [ordered]@{ code = 'InvalidRequest'; message = "Line one $index`r`n$long" } }) })
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+            $template.evidence.failedOperations.Count | Should -Be 5
+            foreach ($item in $template.evidence.failedOperations) {
+                $item.message.Length | Should -BeLessOrEqual 300
+                $item.message | Should -Match '^Line one \d \[REDACTED\] word word'
+                $item.message | Should -Match '\.\.\.$'
+            }
+            $template.message.Length | Should -BeLessOrEqual ('The template create failed: '.Length + 1200)
+            $template.message | Should -Not -Match $script:fakeSecret
+            $template.message | Should -Not -Match '[\r\n]'
+            $template.message | Should -Match '^The template create failed: Microsoft\.Network/networkSecurityGroups nsg-1: InvalidRequest: Line one 1 '
+            $template.remediation | Should -Match 'Fix the cause in the message, then run deploy\.ps1 -Resume\.'
+            $template.docUrl | Should -Be 'https://learn.microsoft.com/azure/azure-resource-manager/troubleshooting/find-error-code'
+        }
+
+        It 'falls back to the Azure CLI''s error when the operations can''t be read, and reads none for an error that isn''t DeploymentFailed' {
+            $script:createFails = { $true }
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+            $template.message | Should -Be ('The template create failed: {0}' -f $script:createError)
+            $template.remediation | Should -Be 'Fix the cause in the message, then run deploy.ps1 -Resume. A 409 Conflict while a policy installs an extension clears within minutes.'
+            $template.docUrl | Should -Be 'https://learn.microsoft.com/cli/azure/deployment/sub#az-deployment-sub-create'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation sub list *' }).Count | Should -Be 1
+
+            # A validation error names its cause itself, and the record with this name can still be an earlier run's.
+            $script:azLog.Clear()
+            Set-TestBudgetChain
+            $script:createStdErr = 'ERROR: {"code":"InvalidTemplateDeployment","message":"The template deployment ''dbhub-demo-main'' is not valid according to the validation procedure."}'
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).message | Should -Match '^The template create failed: ERROR: \{"code":"InvalidTemplateDeployment"'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation *' }).Count | Should -Be 0
+
+            # An older Azure CLI's error text that still names the budget gets the budget's remediation too.
+            $script:createStdErr = $script:createError + ' {"code":"400","message":"' + $script:budgetError + '"}'
+            $script:operations.Clear()
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).remediation | Should -Match 'Delete the budget budget-dbhub-demo'
+        }
+
+        It 'shows no subscription ID, tenant ID, object ID, or account in what GitHub Actions writes' {
+            $savedActions = $env:GITHUB_ACTIONS
+            $savedSummary = $env:GITHUB_STEP_SUMMARY
+            try {
+                $env:GITHUB_ACTIONS = 'true'
+                $env:GITHUB_STEP_SUMMARY = Join-Path -Path $TestDrive -ChildPath 'summary.md'
+                InModuleScope DbHubDemo { $script:DemoLogMasks.Clear() }
+                $null = Register-DemoLogMask -Value 'operator@contoso.example' 6>&1
+                $script:createFails = { $true }
+                $denied = 'The client ''operator@contoso.example'' with object id ''aaaaaaaa-1111-2222-3333-444444444444'' does not have authorization to perform action ''Microsoft.Consumption/budgets/write'' over scope ''/subscriptions/{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.Consumption/budgets/budget-dbhub-demo'' in tenant ''66666666-7777-8888-9999-000000000000''.' -f $script:sub
+                $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'demo-abc123' -StatusMessage (New-TestDeploymentFailed 'demo-abc123'))
+                $script:operations['rg-dbhub-demo/demo-abc123'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Consumption/budgets' -Name 'budget-dbhub-demo' -StatusCode 'Forbidden' -StatusMessage ([ordered]@{ error = [ordered]@{ code = 'AuthorizationFailed'; message = $denied } }))
+                $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+                $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+                $template.message | Should -Match '^The template create failed: Microsoft\.Consumption/budgets budget-dbhub-demo: AuthorizationFailed: The client '
+                $path = Join-Path -Path $TestDrive -ChildPath 'out/deploy.jsonl'
+                Export-DemoResult -Result @($template) -Path $path
+                $written = @((Get-Content -LiteralPath $path -Raw), (Get-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Raw), (InModuleScope DbHubDemo -Parameters @{ Text = $template.message } { Protect-DemoLogText -Text $Text }))
+                foreach ($text in $written) {
+                    $text | Should -Not -Match '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+                    $text | Should -Not -Match 'operator@contoso\.example'
+                    $text | Should -Match 'AuthorizationFailed'
+                }
+            }
+            finally {
+                $env:GITHUB_ACTIONS = $savedActions
+                $env:GITHUB_STEP_SUMMARY = $savedSummary
+                InModuleScope DbHubDemo { $script:DemoLogMasks.Clear() }
+            }
+        }
+
+        It 'still falls back from a rejected free offer without reading the operations, also inside DeploymentFailed' {
+            $script:createFails = { param($Parameters) [bool]$Parameters.parameters.t3UseFreeLimit.value }
+            foreach ($stdErr in @(
+                    'ERROR: (ProvisioningDisabled) The free offer is not available in region westus3 for this subscription.'
+                    ($script:createError.TrimEnd('}') + ',"details":[{"code":"ProvisioningDisabled","message":"Cannot update paid database to free database."}]}}')
+                )) {
+                $script:creates.Clear()
+                $script:azLog.Clear()
+                $script:createStdErr = $stdErr
+                Set-TestBudgetChain
+                $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $true
+                $deployment.Succeeded | Should -BeTrue
+                $deployment.T3UseFreeLimit | Should -BeFalse
+                $script:creates.Count | Should -Be 2
+                ($deployment.Results | Where-Object { $_.checkId -eq 'T3.FREEOFFER' }).status | Should -Be 'Warning'
+                ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Pass'
+                @($script:azLog | Where-Object { $_ -like 'deployment operation *' }).Count | Should -Be 0
+            }
+        }
+
+        It 'still falls back from a refused Burstable size through T4''s own reads, and keeps DEPLOY.T4.SKU beside the cause for a size the configuration sets' {
+            $withT4 = New-TestConfig -WithT4
+            # Azure refuses T4 while it's in the template; T4's own check reads pgflex01's deployment and operations.
+            $script:createFails = { param($Parameters) [bool]$Parameters.parameters.t4Enabled.value -and [string]$Parameters.parameters.t4SkuName.value -eq 'Standard_B1ms' }
+            $script:pgDeployment = ConvertTo-Json -Depth 20 -InputObject ([ordered]@{ name = 'pgflex01'; properties = [ordered]@{ provisioningState = 'Failed'; timestamp = '2026-11-02T14:03:11.123456+00:00'; parameters = [ordered]@{ sizing = [ordered]@{ value = [ordered]@{ skuName = 'Standard_B1ms'; tier = 'Burstable' } }; availabilityZone = [ordered]@{ value = '' } }; error = [ordered]@{ code = 'DeploymentFailed'; details = @([ordered]@{ code = 'ResourceDeploymentFailure' }) } } })
+            $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'demo-abc123' -StatusMessage (New-TestDeploymentFailed 'demo-abc123'))
+            $script:operations['rg-dbhub-demo/demo-abc123'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'pgflex01' -StatusMessage (New-TestDeploymentFailed 'pgflex01'))
+            $script:operations['rg-dbhub-demo/pgflex01'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.DBforPostgreSQL/flexibleServers' -Name 'pgflex01-abc123' -StatusMessage ([ordered]@{ status = 'Failed'; error = [ordered]@{ code = 'SkuNotAvailable'; message = 'Specified SKU is not supported in this region. Please choose a different SKU.' } }))
+            $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
+            $deployment.Succeeded | Should -BeTrue
+            $deployment.T4SkuName | Should -Be 'Standard_B2s'
+            @($script:creates | ForEach-Object { [string]$_.parameters.t4SkuName.value }) | Should -Be @('Standard_B1ms', 'Standard_B2s')
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).status | Should -Be 'Warning'
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Pass'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation group list --resource-group rg-dbhub-demo --name pgflex01 *' }).Count | Should -Be 1
+            @($script:azLog | Where-Object { $_ -like 'deployment operation sub list *' }).Count | Should -Be 0
+
+            # A size the configuration sets doesn't fall back: DEPLOY.TEMPLATE names the refusal, and DEPLOY.T4.SKU still says what to do.
+            $script:creates.Clear()
+            $script:azLog.Clear()
+            $withT4['t4SkuName'] = 'Standard_B1ms'
+            $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
+            $deployment.Succeeded | Should -BeFalse
+            $script:creates.Count | Should -Be 1
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).message | Should -Be 'The template create failed: Microsoft.DBforPostgreSQL/flexibleServers pgflex01-abc123: SkuNotAvailable: Specified SKU is not supported in this region. Please choose a different SKU.'
+            $sku = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }
+            $sku.status | Should -Be 'Fail'
+            $sku.remediation | Should -Match 'Set t4SkuName to Standard_B2s, the documented fallback'
+        }
     }
 }
 
@@ -2619,5 +2972,79 @@ Describe 'Invoke-DemoSqlVmMonitoringWait: a deployment step''s T1 monitoring (Ph
         $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c } $config)
         @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING')
         $script:calls | Should -Be @('wait')
+    }
+}
+
+Describe 'T1''s monitoring when Azure can''t be read (review of c7c86ec)' {
+    BeforeAll {
+        $config = New-TestConfig
+        # What the Azure CLI writes when it can't reach Azure Resource Manager (fake host lookup failure).
+        $script:unreachable = 'ERROR: HTTPSConnectionPool(host=''management.azure.com'', port=443): Max retries exceeded with url: /subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo (Caused by NameResolutionError("Failed to resolve ''management.azure.com''"))'
+        $script:extensionJson = ConvertTo-Json -Depth 10 -InputObject ([ordered]@{
+                name              = 'SqlIaasExtension'
+                provisioningState = 'Succeeded'
+                settings          = [ordered]@{ FeatureFlags = @([ordered]@{ Name = 'DatabaseWatcheronAzureVM'; Enable = $true }) }
+                instanceView      = [ordered]@{ typeHandlerVersion = '2.0.240.0'; statuses = @([ordered]@{ code = 'ProvisioningState/succeeded'; message = 'SQL Server IaaS Agent: Healthy;DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"};' }) }
+            })
+    }
+
+    BeforeEach {
+        $script:failing = ''
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSqlVmInventoryInstance -MockWith { [pscustomobject]@{ properties = [pscustomobject]@{ edition = 'Standard' } } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            $joined = $ArgumentList -join ' '
+            $part = if ($joined -like 'vm extension show *') { 'extension' } elseif ($joined -like 'vm show *') { 'vm' } elseif ($joined -like 'provider show *') { 'provider' } else { 'other' }
+            if ($part -eq $script:failing) {
+                return (New-AzResult -ExitCode 1 -StdErr $script:unreachable)
+            }
+            if ($part -eq 'extension' -and $script:failing -eq 'missing') {
+                return (New-AzResult -ExitCode 3 -StdErr "ERROR: (ResourceNotFound) The Resource 'Microsoft.Compute/virtualMachines/sqlvm01/extensions/SqlIaasExtension' under resource group 'rg-dbhub-demo' was not found.")
+            }
+            switch ($part) {
+                'extension' { return (New-AzResult -StdOut $script:extensionJson) }
+                'vm' { return (New-AzResult -StdOut '{"name":"sqlvm01","identity":{"type":"SystemAssigned"}}') }
+                'provider' { return (New-AzResult -StdOut 'Registered') }
+            }
+            if ($joined -like 'vm get-instance-view *') {
+                return (New-AzResult -StdOut '{"instanceView":{"statuses":[{"code":"PowerState/running"}]}}')
+            }
+            return (New-AzResult -StdOut '{"sqlManagement":"Full"}')
+        }
+    }
+
+    It 'says Azure couldn''t be read, with the redacted error, instead of a missing extension, identity, or registration' {
+        foreach ($case in @(
+                @{ Failing = 'extension'; What = 'the SqlIaasExtension on sqlvm01'; Not = 'has no SqlIaasExtension' }
+                @{ Failing = 'vm'; What = 'sqlvm01'; Not = 'system-assigned managed identity' }
+                @{ Failing = 'provider'; What = 'the Microsoft\.Sql registration'; Not = 'not Registered' }
+            )) {
+            $script:failing = $case.Failing
+            $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }
+            $result.status | Should -Be 'Fail' -Because $case.Failing
+            $result.message | Should -Match ('^Azure couldn''t be read for sqlvm01''s monitoring: {0}: ERROR: HTTPSConnectionPool' -f $case.What)
+            $result.message | Should -Not -Match $case.Not
+            $result.remediation | Should -Be 'Run ./scripts/deploy.ps1 again: it resumes at T1''s Monitoring step (or run ./scripts/configure-monitoring.ps1 again).'
+            @($result.evidence.readErrors).Count | Should -BeGreaterThan 0
+        }
+
+        # Not found is still what it was: the extension is missing.
+        $script:failing = 'missing'
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }).message | Should -Be 'sqlvm01 has no SqlIaasExtension, so performance monitoring can''t run.'
+        $script:failing = ''
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }).status | Should -Be 'Pass'
+    }
+
+    It 'returns that Fail after the agent''s restart (R584), with the restart in its evidence, so the step stops on the real cause' {
+        $script:failing = 'extension'
+        $stuck = New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message 'The DatabaseWatcheronAzureVM flag is set on sqlvm01, but DatabaseMonitorArcPlugin doesn''t report Running and OK yet (state ''NotRunning'', upload '''').' -Evidence ([ordered]@{ pluginState = 'NotRunning'; pending = $true })
+        $restore = New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'Restarted.' -Evidence ([ordered]@{ restarted = $true })
+        $after = InModuleScope DbHubDemo -Parameters @{ Config = $config; Monitoring = $stuck; Restore = $restore } { Get-DemoSqlVmMonitoringAfterRestart -Config $Config -Monitoring $Monitoring -Restore $Restore }
+        $after.status | Should -Be 'Fail'
+        $after.message | Should -Match '^Azure couldn''t be read for sqlvm01''s monitoring: the SqlIaasExtension on sqlvm01: ERROR: HTTPSConnectionPool'
+        $after.message | Should -Not -Match 'has no SqlIaasExtension'
+        $after.remediation | Should -Match 'Run \./scripts/deploy\.ps1 again: it resumes at T1''s Monitoring step'
+        $after.evidence.restarted | Should -BeTrue
+        $after.evidence.restartCheckId | Should -Be 'DEPLOY.T1.MONITORING'
     }
 }

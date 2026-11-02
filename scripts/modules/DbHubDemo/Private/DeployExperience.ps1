@@ -1000,8 +1000,8 @@ function Get-DemoDeploymentOutcome {
     guided stop or session left open (Get-DemoGuidedStopLeftover: the guided stop's Bastion, a handed-over host password
     that isn't rotated): that's NOT DONE naming stop-demo.ps1 -RemoveBastionOnly (Phase 28 review). A NOT DONE's reason
     names only what blocks DONE, and its next step is that item's own fix (a requirement's latest result included),
-    never a plain rerun for something a rerun can't change; a network error that lasted through the retries
-    (Test-DemoNetworkResult) is exactly that, so its next step is the rerun, which resumes (Phase 28 live finding).
+    never a plain rerun for something a rerun can't change; a step that a network error stopped (Test-DemoNetworkResult)
+    is exactly that, so its next step is the rerun, which resumes (Phase 28 live finding).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1143,9 +1143,9 @@ function Get-DemoDeploymentOutcome {
             $leftoverShown = $true
         }
         elseif (Test-DemoNetworkResult -Result $blocking) {
-            # A network error that lasted through the retries (Invoke-DemoTransientRetry) needs only a rerun, which resumes
-            # the step; the script's own output wouldn't show more (Phase 28 live finding, 2026-10-30).
-            $outcome.Next = 'Run {0} again: a network error lasted through the retries, and it resumes where it stopped.' -f $Command
+            # A step that a network error stopped (Invoke-DemoTransientRetry) needs only a rerun, which resumes the step; the
+            # script's own output wouldn't show more (Phase 28 live finding, 2026-10-30).
+            $outcome.Next = 'Run {0} again: it resumes where it stopped. {1}' -f $Command, (Get-DemoNetworkErrorNote)
         }
         else {
             $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $blocking -Name 'remediation')

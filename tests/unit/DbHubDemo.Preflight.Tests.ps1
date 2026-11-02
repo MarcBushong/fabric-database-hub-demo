@@ -330,6 +330,26 @@ Describe 'Invoke-DemoPreflight' {
         $script:whatIfParameters.parameters.t3UseFreeLimit.value | Should -BeFalse
     }
 
+    It 'gives the what-if the budget''s own start date, read as text, as the deployment sends it (Phase 28 live finding, 2026-11-02)' {
+        Set-HappyAzMock
+        # az applies --query and --output itself: only the start date as the API wrote it, or else the whole budget as JSON.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^rest --method get --url https://management\.azure\.com/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Consumption/budgets/budget-dbhub-demo\?' } -MockWith {
+            if (-not $script:budgetStartText) {
+                return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: Not Found({"error":{"code":"NotFound","message":"Budget budget-dbhub-demo was not found."}})' }
+            }
+            $text = if ($ArgumentList -contains '--query') { $script:budgetStartText } else { '{"name":"budget-dbhub-demo","properties":{"timeGrain":"Monthly","timePeriod":{"startDate":"' + $script:budgetStartText + '"}}}' }
+            [pscustomobject]@{ ExitCode = 0; StdOut = $text; StdErr = '' }
+        }
+        $script:budgetStartText = '2026-10-01T00:00:00Z'
+        Invoke-DemoPreflight -Config $config -SkipPolicyInventory | Out-Null
+        $script:whatIfParameters.parameters.budgetStartDate.value | Should -Be '2026-10-01'
+
+        # Without a budget, the template's default applies, as for a new deployment.
+        $script:budgetStartText = ''
+        Invoke-DemoPreflight -Config $config -SkipPolicyInventory | Out-Null
+        $script:whatIfParameters.parameters.Contains('budgetStartDate') | Should -BeFalse
+    }
+
     It 'stops after the guard when it fails' {
         Set-HappyAzMock
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith {

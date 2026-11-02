@@ -138,7 +138,7 @@ function Invoke-DemoSemanticModelRefresh {
             }
         }
         catch {
-            # A network error that lasted through the retries (Invoke-DemoTransientRetry) says so, with its innermost cause.
+            # A network error that stopped the refresh (Invoke-DemoTransientRetry) says so, with its innermost cause.
             if (Test-DemoNetworkFailure -Exception $_.Exception) {
                 $evidence['networkError'] = $true
             }

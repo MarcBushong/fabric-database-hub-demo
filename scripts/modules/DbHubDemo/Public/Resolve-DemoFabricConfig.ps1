@@ -254,7 +254,13 @@ function Resolve-DemoFabricConfig {
                         $state['CapacityId'] = $capacity.CapacityId
                         $assignment = Wait-DemoFabricCapacityAssignment -WorkspaceId $state['WorkspaceId'] -Token $Token -TimeoutSeconds ([System.Math]::Min($TimeoutSeconds, 300))
                         $evidence = [ordered]@{ workspaceId = $state['WorkspaceId']; workspaceName = $setting.WorkspaceName; capacityId = $capacity.CapacityId; capacityName = $setting.CapacityName; capacityAssignmentProgress = $assignment.Progress; source = 'created' }
-                        if ($assignment.Progress -eq 'Failed') {
+                        if ([bool](Get-DemoMemberValue -InputObject $assignment -Name 'NetworkError')) {
+                            # A network error stopped the wait (review of c7c86ec): a rerun finds the workspace by name and goes on.
+                            $state['CapacityId'] = ''
+                            $evidence['networkError'] = $true
+                            & $add 'FABRIC.RESOLVE.WORKSPACE' 'Fail' ('The Fabric workspace "{0}" was created, but whether it''s on the capacity "{1}" yet couldn''t be read: {2}' -f $setting.WorkspaceName, $setting.CapacityName, $assignment.Error) $evidence ('Run the script again, or ./scripts/deploy.ps1, which resumes where it stopped: either finds the workspace by name. {0}' -f (Get-DemoNetworkErrorNote)) $doc['GetWorkspace']
+                        }
+                        elseif ($assignment.Progress -eq 'Failed') {
                             # The lakehouse step reads the workspace again and reports that it has no capacity.
                             $state['CapacityId'] = ''
                             & $add 'FABRIC.RESOLVE.WORKSPACE' 'Manual action required' ('The Fabric workspace "{0}" was created, but its assignment to the capacity "{1}" failed.' -f $setting.WorkspaceName, $setting.CapacityName) $evidence 'A workspace administrator assigns an F or Trial capacity in Workspace settings > License info, then run the script again.' $doc['GetWorkspace']
@@ -301,7 +307,12 @@ function Resolve-DemoFabricConfig {
             if ($assigned.StatusCode -in 200, 202) {
                 $assignment = Wait-DemoFabricCapacityAssignment -WorkspaceId $state['WorkspaceId'] -Token $Token -TimeoutSeconds ([System.Math]::Min($TimeoutSeconds, 300))
                 $evidence['capacityAssignmentProgress'] = $assignment.Progress
-                if ($assignment.Progress -eq 'Completed') {
+                if ([bool](Get-DemoMemberValue -InputObject $assignment -Name 'NetworkError')) {
+                    # A network error stopped the wait (review of c7c86ec): a rerun reads the workspace again and goes on.
+                    $evidence['networkError'] = $true
+                    & $add 'FABRIC.RESOLVE.CAPACITY' 'Fail' ('The workspace "{0}" was assigned to the capacity "{1}", but whether the assignment finished couldn''t be read: {2}' -f $state['WorkspaceName'], $setting.CapacityName, $assignment.Error) $evidence ('Run the script again, or ./scripts/deploy.ps1, which resumes where it stopped: either reads the workspace again. {0}' -f (Get-DemoNetworkErrorNote)) $doc['AssignToCapacity']
+                }
+                elseif ($assignment.Progress -eq 'Completed') {
                     $state['CapacityId'] = $capacity.CapacityId
                     & $add 'FABRIC.RESOLVE.CAPACITY' 'Pass' ('Assigned the workspace "{0}" to the capacity "{1}" ({2}).' -f $state['WorkspaceName'], $setting.CapacityName, $capacity.Sku) $evidence '' $doc['AssignToCapacity']
                 }

@@ -1298,8 +1298,8 @@ function Invoke-DemoDeploymentTrack {
         }
         catch {
             if (Test-DemoNetworkFailure -Exception $_.Exception) {
-                # A network error that lasted through the retries (Invoke-DemoTransientRetry): a rerun resumes here.
-                & $note ('DEPLOY.TRACK.{0}' -f $Track.ToUpperInvariant()) $(if ($Track -eq 'Fabric') { 'fabric' } else { $Track }) 'Fail' ('Track {0} stopped at {1}: {2}' -f $Track, $name, (Get-DemoExceptionText -Exception $_.Exception)) ('Run ./scripts/deploy.ps1 again: the track continues at {0} (a network error lasted through the retries).' -f $name) ([ordered]@{ networkError = $true })
+                # A network error stopped the step (Invoke-DemoTransientRetry): a rerun resumes here.
+                & $note ('DEPLOY.TRACK.{0}' -f $Track.ToUpperInvariant()) $(if ($Track -eq 'Fabric') { 'fabric' } else { $Track }) 'Fail' ('Track {0} stopped at {1}: {2}' -f $Track, $name, (Get-DemoExceptionText -Exception $_.Exception)) ('Run ./scripts/deploy.ps1 again: the track continues at {0}. {1}' -f $name, (Get-DemoNetworkErrorNote)) ([ordered]@{ networkError = $true })
             }
             else {
                 & $note ('DEPLOY.TRACK.{0}' -f $Track.ToUpperInvariant()) $(if ($Track -eq 'Fabric') { 'fabric' } else { $Track }) 'Fail' ('Track {0} stopped at {1}: {2}' -f $Track, $name, (Get-DemoExceptionText -Exception $_.Exception)) ('Fix the cause, then run deploy.ps1 -Resume: the track continues at {0}.' -f $name)

@@ -654,6 +654,12 @@ function Get-DemoSqlVmMonitoringState {
     Reads what T1 performance monitoring depends on, read-only: the SqlIaasExtension with its instance view,
     the VM's identity and power state, the Microsoft.Sql and Microsoft.AzureArcData registrations, and T1's
     SQL Server instance resources from unified inventory. Internal.
+
+    .DESCRIPTION
+    A read that fails is told apart from one that finds nothing (review of c7c86ec): ReadErrors lists, redacted, each
+    read of the extension, the VM, or a registration that failed with anything but not found (Test-DemoAzNotFound), and
+    ConvertTo-DemoSqlVmMonitoringResult then says Azure couldn't be read, instead of reporting a missing SqlIaasExtension
+    or identity.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -668,8 +674,23 @@ function Get-DemoSqlVmMonitoringState {
     $sqlVm = $setting.SqlVm
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = 'rg-{0}-{1}' -f $Config['prefix'], $Config['environment']
-    $extension = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'extension', 'show', '--resource-group', $resourceGroupName, '--vm-name', $VmName, '--name', [string]$sqlVm['extensionInstanceName'], '--instance-view') -AsJson -AllowFailure
-    $vm = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'show', '--resource-group', $resourceGroupName, '--name', $VmName) -AsJson -AllowFailure
+    $readErrors = [System.Collections.Generic.List[string]]::new()
+    $readJson = {
+        param([string] $What, [string[]] $Arguments)
+        $call = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList $Arguments -AllowFailure
+        if ($call.ExitCode -ne 0) {
+            if (-not (Test-DemoAzNotFound -Text ([string]$call.StdErr))) {
+                $readErrors.Add(('{0}: {1}' -f $What, ((Get-DemoDeploymentErrorText -Text ([string]$call.StdErr) -MaxLength 300) -replace '\s+', ' ')))
+            }
+            return $null
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$call.StdOut)) {
+            return $null
+        }
+        return ([string]$call.StdOut | ConvertFrom-Json -Depth 64)
+    }
+    $extension = & $readJson ('the SqlIaasExtension on {0}' -f $VmName) @('vm', 'extension', 'show', '--resource-group', $resourceGroupName, '--vm-name', $VmName, '--name', [string]$sqlVm['extensionInstanceName'], '--instance-view', '--output', 'json')
+    $vm = & $readJson $VmName @('vm', 'show', '--resource-group', $resourceGroupName, '--name', $VmName, '--output', 'json')
     # A deallocated VM's extension instance view is empty: no version and no plugin status (Phase 14 live finding).
     $powerState = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
     # Learn lists "full management mode" among the prerequisites, while the SQL VM API now detects the mode
@@ -684,6 +705,9 @@ function Get-DemoSqlVmMonitoringState {
     foreach ($namespace in 'Microsoft.Sql', 'Microsoft.AzureArcData') {
         $provider = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('provider', 'show', '--namespace', $namespace, '--query', 'registrationState', '--output', 'tsv') -AllowFailure
         $providers[$namespace] = if ($provider.ExitCode -eq 0) { ([string]$provider.StdOut).Trim() } else { 'Unknown' }
+        if ($provider.ExitCode -ne 0 -and -not (Test-DemoAzNotFound -Text ([string]$provider.StdErr))) {
+            $readErrors.Add(('the {0} registration: {1}' -f $namespace, ((Get-DemoDeploymentErrorText -Text ([string]$provider.StdErr) -MaxLength 300) -replace '\s+', ' ')))
+        }
     }
     $inventory = @()
     try {
@@ -704,6 +728,7 @@ function Get-DemoSqlVmMonitoringState {
         SqlManagement      = $sqlManagement
         Providers          = $providers
         InventoryInstances = $inventory
+        ReadErrors         = $readErrors.ToArray()
     }
 }
 
@@ -713,7 +738,9 @@ function ConvertTo-DemoSqlVmMonitoringResult {
     T1.SQLVM.MONITORING from a monitoring state (Get-DemoSqlVmMonitoringState). Internal.
 
     .DESCRIPTION
-    Fail: the extension is missing, not Succeeded, or older than 2.0.229.0; the VM has no system-assigned
+    Fail: Azure couldn't be read (State.ReadErrors: a read of the extension, the VM, or a registration that failed with
+    anything but not found; the next deploy.ps1 resumes the step); the extension is missing, not Succeeded, or older than
+    2.0.229.0; the VM has no system-assigned
     identity; Microsoft.AzureArcData isn't registered; the feature flag isn't set; or MetricsUploadStatus
     contains an HTTP error (the documented troubleshooting symptom for a blocked endpoint or identity).
     Warning: the flag is set but the plugin doesn't report Running and OK yet (allow 3 to 15 minutes; NotRunning
@@ -774,6 +801,14 @@ function ConvertTo-DemoSqlVmMonitoringResult {
         New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $docUrl
     }
 
+    # A read that failed isn't a missing extension, identity, or registration (review of c7c86ec): an az call that failed
+    # with anything but not found had been read as "nothing there".
+    $readErrorValue = Get-DemoMemberValue -InputObject $State -Name 'ReadErrors'
+    $readErrors = @(@($readErrorValue) | Where-Object { $_ })
+    if ($readErrors.Count -gt 0) {
+        $evidence['readErrors'] = $readErrors
+        return (& $new 'Fail' ('Azure couldn''t be read for {0}''s monitoring: {1}' -f $State.VmName, ($readErrors -join '; ')) 'Run ./scripts/deploy.ps1 again: it resumes at T1''s Monitoring step (or run ./scripts/configure-monitoring.ps1 again).')
+    }
     if ($null -eq $properties) {
         return (& $new 'Fail' ('{0} has no SqlIaasExtension, so performance monitoring can''t run.' -f $State.VmName) 'Check the SQL virtual machine registration (sqlvm01.bicep), then run configure-monitoring.ps1 again.')
     }

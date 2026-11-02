@@ -64,7 +64,8 @@ function Invoke-DemoHubFabricGet {
     https://api.fabric.microsoft.com/v1, retries a transient failure (Invoke-DemoTransientRetry: a network error, and HTTP
     408, 429, 502, 503, and 504), and returns StatusCode, Headers, and the parsed Body without throwing on HTTP errors. A
     network error that lasts, or a refused URI, throws; this adapter returns that as StatusCode 0 with the redacted
-    message and its innermost cause. Returns StatusCode, Body, and Error (empty on 2xx).
+    message and its innermost cause. Returns StatusCode, Body, Error (empty on 2xx), and NetworkError (no answer came
+    back after the attempts, so a caller that polls can stop instead of paying them again; review of c7c86ec).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -81,7 +82,7 @@ function Invoke-DemoHubFabricGet {
         $response = Invoke-DemoFabricRequest -Method Get -Uri $Uri -Token $Token
     }
     catch {
-        return [pscustomobject]@{ StatusCode = 0; Body = $null; Error = ('No response: {0}' -f (Get-DemoExceptionText -Exception $_.Exception)) }
+        return [pscustomobject]@{ StatusCode = 0; Body = $null; Error = ('No response: {0}' -f (Get-DemoExceptionText -Exception $_.Exception)); NetworkError = (Test-DemoNetworkFailure -Exception $_.Exception) }
     }
     $code = [int]$response.StatusCode
     $errorText = ''
@@ -89,7 +90,7 @@ function Invoke-DemoHubFabricGet {
         $detail = Get-DemoHubErrorText -Content $response.Body
         $errorText = if ($detail) { 'HTTP {0}: {1}' -f $code, $detail } else { 'HTTP {0}' -f $code }
     }
-    [pscustomobject]@{ StatusCode = $code; Body = $response.Body; Error = $errorText }
+    [pscustomobject]@{ StatusCode = $code; Body = $response.Body; Error = $errorText; NetworkError = $false }
 }
 
 function Read-DemoHubFabricList {

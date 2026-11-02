@@ -196,7 +196,7 @@ Describe 'One transient-retry policy for the REST helpers (Phase 28 live finding
         $result.status | Should -Be 'Fail'
         $result.message | Should -Match 'stopped: A network error reached api\.fabric\.microsoft\.com on each of 4 attempts: The SSL connection could not be established: Authentication failed'
         $result.evidence.networkError | Should -BeTrue
-        $result.remediation | Should -Be 'Run the script again: a network error lasted through the retries, and the import is idempotent.'
+        $result.remediation | Should -Be 'Run the script again: the import is idempotent. A network error stopped it (requests that are safe to repeat were retried).'
         (InModuleScope DbHubDemo -Parameters @{ Result = $result } { Test-DemoNetworkResult -Result $Result }) | Should -BeTrue
     }
 }
@@ -245,15 +245,21 @@ throw $failure
         $records[0].status | Should -Be 'Fail'
         $records[0].message | Should -Be 'network-error.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts: The SSL connection could not be established: Received an unexpected EOF or 0 bytes from the transport stream.'
         $records[0].evidence.networkError | Should -BeTrue
-        $records[0].remediation | Should -Be 'Run ./scripts/deploy.ps1 again: it resumes where it stopped (a network error lasted through the retries).'
+        $records[0].remediation | Should -Be 'Run ./scripts/deploy.ps1 again: it resumes where it stopped. A network error stopped it (requests that are safe to repeat were retried).'
     }
 
-    It 'says to run deploy.ps1 again, which resumes, when a network error lasted, and keeps each other failure''s own fix' {
+    It 'says to run deploy.ps1 again, which resumes, when a network error stopped a step, and keeps each other failure''s own fix' {
         $network = New-DemoResult -CheckId 'DEPLOY.POWERBI' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts: The SSL connection could not be established.' -Remediation 'Run ./scripts/configure-powerbi.ps1 yourself to see its output.'
         $outcome = InModuleScope DbHubDemo -Parameters @{ Results = @($network); Config = $script:config } { Get-DemoDeploymentOutcome -Result $Results -Config $Config -Command './scripts/deploy.ps1' }
         $outcome.Done | Should -BeFalse
-        $outcome.Next | Should -Be 'Run ./scripts/deploy.ps1 again: a network error lasted through the retries, and it resumes where it stopped.'
+        $outcome.Next | Should -Be 'Run ./scripts/deploy.ps1 again: it resumes where it stopped. A network error stopped it (requests that are safe to repeat were retried).'
         $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+
+        # Review of c7c86ec: a request that starts something was sent once, so "lasted through the retries" wasn't true.
+        $once = New-DemoResult -CheckId 'DEPLOY.POWERBI' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The refresh stopped: A network error reached api.powerbi.com, and the request wasn''t sent again, because the server may have processed it: The operation was canceled.' -Remediation 'Run the script again; the refresh is idempotent.'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Results = @($once); Config = $script:config } { Get-DemoDeploymentOutcome -Result $Results -Config $Config -Command './scripts/deploy.ps1' }
+        $outcome.Next | Should -Be 'Run ./scripts/deploy.ps1 again: it resumes where it stopped. A network error stopped it (requests that are safe to repeat were retried).'
+        $outcome.Next | Should -Not -Match 'lasted through'
 
         $other = New-DemoResult -CheckId 'DEPLOY.POWERBI' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'configure-powerbi.ps1 stopped: the capacity is paused' -Remediation 'Run ./scripts/configure-powerbi.ps1 yourself to see its output.'
         $outcome = InModuleScope DbHubDemo -Parameters @{ Results = @($other); Config = $script:config } { Get-DemoDeploymentOutcome -Result $Results -Config $Config -Command './scripts/deploy.ps1' }
@@ -265,5 +271,84 @@ throw $failure
             Should -Be 'The history report step failed: configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts. The other tracks continue; the run ends NOT DONE, and ./scripts/deploy.ps1 resumes it.'
         InModuleScope DbHubDemo { (Get-DemoProgressStepLabel -Id 'T1.Monitoring'), (Get-DemoProgressStepLabel -Id 'T3.Setup'), (Get-DemoProgressStepLabel -Id 'T2.GuidedStop'), (Get-DemoProgressStepLabel -Id 'T2.Monitoring') } |
             Should -Be @('monitoring', 'T3 setup from T1', 'guided stop', 'PAYG and monitoring')
+    }
+}
+
+Describe 'A lasting outage costs one request''s retries, not one per item or poll (review of c7c86ec)' {
+    BeforeAll {
+        # An instant DNS failure on every request, as the reviewer reproduced it.
+        function New-DnsFailure([string] $HostName) {
+            [System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::NameResolutionError, ('No such host is known. ({0}:443)' -f $HostName), [System.Net.Sockets.SocketException]::new([int][System.Net.Sockets.SocketError]::HostNotFound), $null)
+        }
+        function Set-OutageMock {
+            $script:sent = [System.Collections.Generic.List[string]]::new()
+            $script:warned = [System.Collections.Generic.List[string]]::new()
+            Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ($PesterBoundParameters['Level'] -eq 'Warning') { $script:warned.Add([string]$PesterBoundParameters['Message']) } }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith {
+                $script:sent.Add(('{0} {1}' -f $PesterBoundParameters['Method'], $PesterBoundParameters['Uri']))
+                throw (New-DnsFailure -HostName ([uri][string]$PesterBoundParameters['Uri']).Host)
+            }
+        }
+        $script:policyConfig = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
+        $script:policyConfig['subscriptionId'] = $script:subscriptionId
+        $script:policyConfig['tenantId'] = '66666666-7777-8888-9999-000000000000'
+        $script:policyConfig['networkMode'] = 'auto'
+    }
+
+    It 'says a request a network error stopped is one, in Invoke-DemoRestRequest''s answer' {
+        Set-OutageMock
+        $read = 'https://management.azure.com/providers/Microsoft.Authorization/policyDefinitions/demo-0?api-version=2023-04-01'
+        $call = InModuleScope DbHubDemo -Parameters @{ Token = $script:token; Uri = $read; Subscription = $script:subscriptionId } { Invoke-DemoRestRequest -SubscriptionId $Subscription -Method GET -Uri $Uri -Token $Token }
+        $call.ExitCode | Should -Be 1
+        $call.StatusCode | Should -Be 0
+        $call.NetworkError | Should -BeTrue
+        $script:sent.Count | Should -Be 4
+    }
+
+    It 'stops waiting for a workspace''s capacity assignment at the first read a network error stopped' {
+        # Before: each poll paid its own 4 attempts, 244 requests where the wait had made 61.
+        Set-OutageMock
+        $wait = InModuleScope DbHubDemo -Parameters @{ Token = $script:token; Workspace = $script:workspaceId } { Wait-DemoFabricCapacityAssignment -WorkspaceId $Workspace -Token $Token -TimeoutSeconds 300 }
+        $wait.NetworkError | Should -BeTrue
+        $wait.Progress | Should -Be 'Unknown'
+        $wait.Error | Should -Match '^No response: A network error reached api\.fabric\.microsoft\.com on each of 4 attempts: No such host is known'
+        $script:sent.Count | Should -Be 4
+    }
+
+    It 'counts the capacity wait in elapsed time, the reads included' {
+        $script:sent = [System.Collections.Generic.List[string]]::new()
+        $script:now = [datetime]::new(2026, 11, 2, 15, 0, 0, [System.DateTimeKind]::Utc)
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:now = $script:now.AddSeconds([int]$PesterBoundParameters['Seconds']) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+        # Each read answers after 60 seconds of HTTP 503 and its retries, then InProgress.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -MockWith {
+            $script:sent.Add([string]$Uri)
+            $script:now = $script:now.AddSeconds(60)
+            [pscustomobject]@{ StatusCode = 200; Headers = @{}; Body = [pscustomobject]@{ id = $script:workspaceId; capacityAssignmentProgress = 'InProgress' } }
+        }
+        $start = $script:now
+        $wait = InModuleScope DbHubDemo -Parameters @{ Token = $script:token; Workspace = $script:workspaceId } { Wait-DemoFabricCapacityAssignment -WorkspaceId $Workspace -Token $Token -TimeoutSeconds 120 -PollSeconds 5 }
+        $wait.Progress | Should -Be 'InProgress'
+        $script:sent.Count | Should -BeLessOrEqual 3 -Because 'before, the wait counted only its own 5-second sleeps and read 25 times'
+        ($script:now - $start).TotalSeconds | Should -BeLessOrEqual 190
+    }
+
+    It 'stops reading policy definitions after the first one a network error stopped, and counts the rest as unreadable, with one Warning' {
+        # Before: 20 unreadable definitions took 80 requests and about 17 minutes.
+        Set-OutageMock
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoAccessToken -MockWith { [pscustomobject]@{ Token = $script:token; Error = '' } }
+        $script:assignmentList = ConvertTo-Json -Depth 10 -InputObject @{ value = @(foreach ($index in 1..20) {
+                    @{ name = ('demo-{0}' -f $index); properties = @{ displayName = ('Demo policy {0}' -f $index); scope = ('/subscriptions/{0}' -f $script:subscriptionId); enforcementMode = 'Default'; policyDefinitionId = ('/providers/Microsoft.Authorization/policyDefinitions/demo-{0}' -f $index) } }
+                }) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:assignmentList; StdErr = '' } }
+        $policy = InModuleScope DbHubDemo -Parameters @{ Config = $script:policyConfig } { Get-DemoPolicyConstraint -Config $Config }
+        $script:sent.Count | Should -Be 4
+        $inventory = $policy.Results | Where-Object { $_.checkId -eq 'PREFLIGHT.POLICY.INVENTORY' }
+        $inventory.status | Should -Be 'Warning'
+        $inventory.message | Should -Match 'definition demo-1 \(built-in\) in assignment "Demo policy 1" \(A network error reached management\.azure\.com on each of 4 attempts: No such host is known'
+        $inventory.message | Should -Match '19 more definition\(s\) and set\(s\), not read after the network error'
+        @($script:warned | Where-Object { $_ -match '^Policy inventory: a network error lasted through the attempts to read a definition, so no more are read' }).Count | Should -Be 1
+        ($policy.Results | Where-Object { $_.checkId -eq 'PREFLIGHT.POLICY.SQLPUBLIC' }).evidence.effectiveNetworkMode | Should -Be 'private' -Because 'networkMode auto resolves to private when the inventory isn''t complete'
     }
 }

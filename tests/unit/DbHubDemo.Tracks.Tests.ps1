@@ -526,7 +526,7 @@ Describe 'Invoke-DemoDeploymentTrack' {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ($PesterBoundParameters['Level'] -eq 'Warning') { $script:warned.Add([string]$PesterBoundParameters['Message']) } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith {
-            New-DemoResult -CheckId 'DEPLOY.POWERBI' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts: The SSL connection could not be established.' -Evidence ([ordered]@{ networkError = $true }) -Remediation 'Run ./scripts/deploy.ps1 again: it resumes where it stopped (a network error lasted through the retries).'
+            New-DemoResult -CheckId 'DEPLOY.POWERBI' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts: The SSL connection could not be established.' -Evidence ([ordered]@{ networkError = $true }) -Remediation 'Run ./scripts/deploy.ps1 again: it resumes where it stopped. A network error stopped it (requests that are safe to repeat were retried).'
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { New-TestResult 'DEPLOY.FABRIC.APP' 'Not selected' }
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
@@ -551,7 +551,7 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $track = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.TRACK.T1' }
         $track.message | Should -Be 'Track T1 stopped at Monitoring: A network error reached management.azure.com on each of 4 attempts: The SSL connection could not be established.'
         $track.evidence.networkError | Should -BeTrue
-        $track.remediation | Should -Be 'Run ./scripts/deploy.ps1 again: the track continues at Monitoring (a network error lasted through the retries).'
+        $track.remediation | Should -Be 'Run ./scripts/deploy.ps1 again: the track continues at Monitoring. A network error stopped it (requests that are safe to repeat were retried).'
         @($script:warned).Count | Should -Be 1
         $script:warned[0] | Should -Match '^The monitoring step failed: Track T1 stopped at Monitoring: A network error reached'
     }

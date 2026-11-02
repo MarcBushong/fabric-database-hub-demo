@@ -28,9 +28,10 @@ function Invoke-DemoPreflight {
       conflicts. Unless -SkipPolicyInventory is set.
     - T3 free offer: whether the Azure SQL Database free offer is available (Get-DemoT3FreeOfferStatus,
       read-only). When it isn't, T3 falls back to regular serverless with a Warning.
-    - Policy what-if: a subscription what-if of infra/main.bicep with the effective network mode and the
-      free-offer result (no resources change). VMs that already exist keep osProfile out; a VM that would
-      be created gets a throwaway in-memory password for the what-if only.
+    - Policy what-if: a subscription what-if of infra/main.bicep with the effective network mode, the
+      free-offer result, and the existing budget's start date, as the deployment sends them (no resources change).
+      VMs that already exist keep osProfile out; a VM that would be created gets a throwaway in-memory password
+      for the what-if only.
     - Cost: live-price estimate against the ceilings, with the subscription's Defender for Cloud plans
       (az security pricing list, read-only), the effective network mode, and the free-offer result. The
       monthly ceiling is hard: a light-use month above it is Fail.
@@ -482,7 +483,14 @@ function Invoke-DemoPreflight {
         $parametersPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('dbhub-preflight-{0}.json' -f [guid]::NewGuid())
         $whatIf = $null
         try {
-            Get-DemoDeploymentParameter -Config $Config -NetworkMode $effectiveNetworkMode -ExistingVmName $existingVms -T1SecurityType $t1Security.SecurityType -T3UseFreeLimit $t3UseFreeLimit -T3AdminGroupDisplayName $groupDisplayName | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $parametersPath -Encoding utf8NoBOM
+            # The same budget start date the deployment sends: the budget's own, which Azure never changes (Phase 28 live
+            # finding, 2026-11-02).
+            $whatIfParameters = @{ Config = $Config; NetworkMode = $effectiveNetworkMode; ExistingVmName = $existingVms; T1SecurityType = $t1Security.SecurityType; T3UseFreeLimit = $t3UseFreeLimit; T3AdminGroupDisplayName = $groupDisplayName }
+            $budgetStart = Get-DemoBudgetStartDate -Config $Config
+            if ($budgetStart) {
+                $whatIfParameters['BudgetStartDate'] = $budgetStart
+            }
+            Get-DemoDeploymentParameter @whatIfParameters | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $parametersPath -Encoding utf8NoBOM
             $template = Join-Path -Path $script:RepoRoot -ChildPath 'infra/main.bicep'
             $arguments = [System.Collections.Generic.List[string]]::new([string[]]@('deployment', 'sub', 'what-if', '--location', $location, '--name', ('preflight-{0}-{1}' -f $Config['prefix'], $Config['environment']), '--template-file', $template, '--parameters', "@$parametersPath"))
             if ($existingVms.Count -lt 2) {

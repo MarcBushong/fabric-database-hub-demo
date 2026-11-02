@@ -8,7 +8,8 @@
 # - HttpRequestError (.NET 8, PowerShell 7.4): https://learn.microsoft.com/dotnet/api/system.net.http.httprequesterror
 # - HttpClient timeouts: https://learn.microsoft.com/dotnet/api/system.net.http.httpclient.timeout
 
-# The tag on the exception Invoke-DemoTransientRetry throws once a network error lasted through its attempts.
+# The tag on the exception Invoke-DemoTransientRetry throws once a network error stopped a request: after its attempts, or
+# after one, for a request that isn't sent again.
 $script:DemoNetworkErrorKey = 'DbHubDemo.NetworkError'
 
 function Get-DemoExceptionText {
@@ -140,11 +141,29 @@ function Test-DemoUnsentRequest {
     return $false
 }
 
+function Get-DemoNetworkErrorNote {
+    <#
+    .SYNOPSIS
+    The sentence a remediation ends with when a network error stopped a step. Pure. Internal.
+
+    .DESCRIPTION
+    True whether the request went again (a read, or a request that never reached the service) or, as a request that
+    starts or adds something and may have reached it, was sent once (Invoke-DemoTransientRetry -NotIdempotent): "lasted
+    through the retries" wasn't (review of c7c86ec).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    return 'A network error stopped it (requests that are safe to repeat were retried).'
+}
+
 function Test-DemoNetworkResult {
     <#
     .SYNOPSIS
-    True when an ADR 0012 result says a network error lasted through Invoke-DemoTransientRetry's attempts: its evidence
-    has networkError, or its message carries the network failure's text. A rerun is then the fix. Pure. Internal.
+    True when an ADR 0012 result says a network error stopped it after Invoke-DemoTransientRetry's attempts (one, for a
+    request that isn't sent again): its evidence has networkError, or its message carries the network failure's text. A
+    rerun is then the fix. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
