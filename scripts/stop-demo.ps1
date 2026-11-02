@@ -82,6 +82,9 @@ $ErrorActionPreference = 'Stop'
 if (-not (Get-Module -Name 'DbHubDemo')) {
     Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
 }
+# Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
+$ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
+$OutputPath = Resolve-DemoUserPath -Path $OutputPath
 
 $config = Get-DemoConfig -Path $ConfigPath
 $results = @(Stop-DemoEnvironment -Config $config -ParkT2:$ParkT2 -RemoveBastionOnly:$RemoveBastionOnly -IfExpired:$IfExpired -RemoveT3:$RemoveT3 -SaveHistory:$SaveHistory -SaveHistoryWindowMinutes $SaveHistoryWindowMinutes -WhatIf:([bool]$WhatIfPreference) -Confirm:$false)

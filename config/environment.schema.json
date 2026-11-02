@@ -136,10 +136,9 @@
       "default": true
     },
     "t4SkuName": {
-      "description": "T4's compute size: Standard_B1ms, the smallest Burstable size (default); Standard_B2s (2 vCores, 4 GiB), the documented fallback when Azure refuses B1ms in the region with SkuNotAvailable; or Standard_D2ds_v5 (General Purpose, 2 vCores, 8 GiB), the documented option the owner chose on 2026-10-26 after West US 3 refused both Burstable sizes. The tier follows the size. It's never the default and never set automatically: deploy.ps1 and preflight report a Fail that names the next option, and nothing changes the size on its own. B2s lists at about four times B1ms's hourly price and D2ds_v5 at about ten times; estimate-cost.ps1 prices the size you set, including the 7-day automatic restart's worst case (Phase 24, ADR 0019).",
+      "description": "T4's compute size. Leave it unset for the default, Standard_B1ms, the smallest Burstable size: deploy.ps1 then falls back on its own when Azure refuses it with SkuNotAvailable, to Standard_B2s (2 vCores, 4 GiB; the same Burstable class), and when that's refused too, finishes without T4 (DONE says so); what it used is recorded in the resource group's DbHubT4Sku tag for later runs (Phase 28, ADR 0019). Set it to choose the size yourself: Standard_B1ms, Standard_B2s, or Standard_D2ds_v5 (General Purpose, 2 vCores, 8 GiB), the documented option the owner chose on 2026-10-26 after West US 3 refused both Burstable sizes. A size you set never changes on its own, and a General Purpose size is never chosen for you. The tier follows the size. B2s lists at about four times B1ms's hourly price and D2ds_v5 at about ten times; estimate-cost.ps1 prices the size, including the 7-day automatic restart's worst case (Phase 24, ADR 0019).",
       "type": "string",
-      "enum": ["Standard_B1ms", "Standard_B2s", "Standard_D2ds_v5"],
-      "default": "Standard_B1ms"
+      "enum": ["Standard_B1ms", "Standard_B2s", "Standard_D2ds_v5"]
     },
     "t4AvailabilityZone": {
       "description": "Availability zone T4 is created in: empty for no preference (default), or 1, 2, or 3 (a zone the region's PostgreSQL capabilities list). It applies only when T4 is created; a server keeps its zone (Phase 24, ADR 0019).",

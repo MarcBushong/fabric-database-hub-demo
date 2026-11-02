@@ -38,8 +38,10 @@ function Get-DemoArmResource {
     Reads one Azure Resource Manager URL (GET) with a token for the configured subscription's tenant.
 
     .DESCRIPTION
-    Internal and read-only. Never throws: returns Ok, Value (case-insensitive hashtables), and Error, a
-    short reason such as the ARM error code, so callers can say what they couldn't read.
+    Internal and read-only. Never throws: returns Ok, Value (case-insensitive hashtables), Error, a
+    short reason such as the ARM error code, so callers can say what they couldn't read, and NetworkError (no
+    answer came back after Invoke-DemoRestRequest's attempts; Error then names the host and the cause), so a
+    caller that reads many URLs can stop sending (review of c7c86ec).
     A URL under the configured subscription goes through 'az rest' (Invoke-DemoAz). Any other Resource
     Manager URL, such as a built-in or management group policy definition, goes through
     Invoke-DemoRestRequest with a token verified for the configured tenant: for those URLs 'az rest' would
@@ -65,17 +67,20 @@ function Get-DemoArmResource {
         }
     }
     catch {
-        return [pscustomobject]@{ Ok = $false; Value = $null; Error = (Protect-DemoText -Text $_.Exception.Message) }
+        return [pscustomobject]@{ Ok = $false; Value = $null; Error = (Protect-DemoText -Text $_.Exception.Message); NetworkError = $false }
     }
 
     if ($result.ExitCode -ne 0) {
         $stderr = [string]$result.StdErr
+        if ([bool](Get-DemoMemberValue -InputObject $result -Name 'NetworkError')) {
+            return [pscustomobject]@{ Ok = $false; Value = $null; Error = (Get-DemoDeploymentErrorText -Text $stderr -MaxLength 300); NetworkError = $true }
+        }
         $code = [regex]::Match($stderr, '"code"\s*:\s*"([^"]+)"')
         if (-not $code.Success) {
             $code = [regex]::Match($stderr, '\(([A-Za-z][A-Za-z0-9]+)\)')
         }
         $reason = if ($code.Success) { $code.Groups[1].Value } else { 'exit code {0}' -f $result.ExitCode }
-        return [pscustomobject]@{ Ok = $false; Value = $null; Error = $reason }
+        return [pscustomobject]@{ Ok = $false; Value = $null; Error = $reason; NetworkError = $false }
     }
 
     try {
@@ -85,9 +90,9 @@ function Get-DemoArmResource {
         }
     }
     catch {
-        return [pscustomobject]@{ Ok = $false; Value = $null; Error = 'the response was not valid JSON' }
+        return [pscustomobject]@{ Ok = $false; Value = $null; Error = 'the response was not valid JSON'; NetworkError = $false }
     }
-    [pscustomobject]@{ Ok = $true; Value = $value; Error = '' }
+    [pscustomobject]@{ Ok = $true; Value = $value; Error = ''; NetworkError = $false }
 }
 
 function Get-DemoPolicyParameterTable {

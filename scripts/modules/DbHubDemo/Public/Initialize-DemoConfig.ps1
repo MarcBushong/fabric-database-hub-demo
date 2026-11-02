@@ -24,8 +24,9 @@ function Initialize-DemoConfig {
        <prefix>-<environment>-sql-admins), and whether you own it. With -CreateAdminGroup, a missing group is created
        with you as its owner (Microsoft Graph Create group and Add owners, the calls behind 'az ad group create' and
        'az ad group owner add'). A tenant that forbids it is Manual action required with the Entra steps.
-    8. T2's SQL Server install mode: PaygWizard (the default: Hub Performance on T2, after a one-time setup wizard of
-       about an hour per guest build) or Developer (no wizard; T2 in Hub's Estate only). It asks unless
+    8. T2's SQL Server install mode: PaygWizard (the default: Hub Performance on T2; once per guest build, deploy.ps1
+       stops for about 10 minutes of pre-filled SQL Server setup through Bastion, the guided stop) or Developer (no
+       stop; T2 in Hub's Estate only). It asks unless
        -T2SqlInstallMode or -NonInteractive.
     9. The file (INIT.CONFIG): the example configuration with these values, validated against
        config/environment.schema.json, then written (not with -WhatIf). fabric.manageCapacity stays false unless
@@ -174,7 +175,8 @@ function Initialize-DemoConfig {
     $results = [System.Collections.Generic.List[object]]::new()
     $nextSteps = [System.Collections.Generic.List[string]]::new()
     $zeroGuid = '00000000-0000-0000-0000-000000000000'
-    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    # Relative to PowerShell's current location, not the process's working directory (review fix 8).
+    $fullPath = Resolve-DemoUserPath -Path $Path
     $dryRun = [bool]$WhatIfPreference
     $interactive = -not $NonInteractive -and (Test-DemoInteractiveSession)
     $docs = @{
@@ -518,8 +520,8 @@ function Initialize-DemoConfig {
         $mode = 'PaygWizard'
         if ($interactive) {
             $options = @(
-                'PaygWizard (default): Database Hub shows T2''s performance. Once per guest build, you run the SQL Server setup wizard through Bastion (about an hour).'
-                'Developer: no wizard, unattended. T2 shows in Database Hub''s Estate only, not Performance; T1, T3, and T4 still show performance.'
+                'PaygWizard (default): Database Hub shows T2''s performance and the agent''s findings. Once per guest build, deploy.ps1 stops for about 10 minutes: through Bastion you choose pay-as-you-go and Standard in a pre-filled SQL Server setup.'
+                'Developer: no stop, unattended. T2 shows in Database Hub''s Estate only, with no T2 performance data or agent findings; T1, T3, and T4 still show performance.'
             )
             $mode = @('PaygWizard', 'Developer')[(Read-DemoChoice -Title 'How should T2 (the Arc-enabled SQL Server) install SQL Server?' -Option $options -Default 0)]
         }
@@ -620,9 +622,11 @@ function Initialize-DemoConfig {
         $nextSteps.Add(('Fix what''s listed under Manual action required above ({0}), then run init.ps1 -Force again.' -f (($open | ForEach-Object { $_.checkId }) -join ', ')))
     }
     $nextSteps.Add(('./scripts/preflight.ps1{0}   # checks P1-P6, quota, policies, and the cost; registers missing providers' -f $configArgument))
-    $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5-2 hours; keep this machine awake' -f $configArgument))
     if ($mode -eq 'PaygWizard') {
-        $nextSteps.Add(('When status.ps1 says the T2 host waits for the setup wizard (DEPLOY.T2.BACKGROUND), follow its steps, then: ./scripts/deploy.ps1 -FromStage T2{0}' -f $configArgument))
+        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 2 to 3 hours and keeps this PC awake; about 60 to 90 minutes in, it asks you for about 10 minutes (the guided stop), then finishes by itself' -f $configArgument))
+    }
+    else {
+        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 to 2.5 hours and keeps this PC awake; nothing needs you' -f $configArgument))
     }
     $nextSteps.Add(('./scripts/configure-fabric-app.ps1 -SignIn{0}   # optional, the Insights app: one browser sign-in, then it deploys' -f $configArgument))
     $nextSteps.Add(('Each session: ./scripts/start-demo.ps1{0}, then ./scripts/stop-demo.ps1 -SaveHistory{0}' -f $configArgument))

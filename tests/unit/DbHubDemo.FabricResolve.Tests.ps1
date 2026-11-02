@@ -212,6 +212,68 @@ Describe 'Resolve-DemoFabricConfig' {
         @($requests | Where-Object { $_.Method -ne 'Get' }).Uri | Should -Be @("$api/workspaces", "$api/workspaces/$workspaceId/lakehouses")
     }
 
+    It 'fails the created workspace''s step with networkError only when no read comes back in the capacity wait''s whole window (reviews of c7c86ec and 76d10b2)' {
+        # 76d10b2 failed it after one read's attempts, about 50 seconds, so a short outage failed the Fabric step.
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @() }) }
+            @{ Method = 'Get'; Match = $capacitiesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($activeCapacity) }) }
+            @{ Method = 'Post'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 201 -Body @{ id = $workspaceId; displayName = 'Database Hub Demo'; type = 'Workspace' }) }
+        )
+        $script:workspaceReads = 0
+        $script:start = [datetime]::new(2026, 11, 2, 15, 0, 0, [System.DateTimeKind]::Utc)
+        $script:now = $script:start
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $true } -MockWith { $script:now = $script:now.AddSeconds([int]$PesterBoundParameters['Seconds']) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -ParameterFilter { $Method -eq 'Get' -and [string]$Uri -match $workspaceUri } -MockWith {
+            $script:workspaceReads++
+            throw ([System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::NameResolutionError, 'No such host is known. (api.fabric.microsoft.com:443)', $null, $null))
+        }
+        $resolution = Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token -Create -SkipLakehouse -Confirm:$false
+        $record = Get-Record $resolution 'FABRIC.RESOLVE.WORKSPACE'
+        $record.status | Should -Be 'Fail'
+        $record.message | Should -Match '^The Fabric workspace "Database Hub Demo" was created, but whether it''s on the capacity "demo-capacity" yet couldn''t be read: No response: A network error reached api\.fabric\.microsoft\.com on each of 4 attempts'
+        $record.evidence.networkError | Should -BeTrue
+        $record.remediation | Should -Be 'Run the script again, or ./scripts/deploy.ps1, which resumes where it stopped: either finds the workspace by name. A network error stopped it (requests that are safe to repeat were retried).'
+        $script:workspaceReads | Should -Be 24 -Because 'six reads of 4 attempts in the 300-second window'
+        ($script:now - $script:start).TotalSeconds | Should -BeGreaterOrEqual 300
+        ($script:now - $script:start).TotalSeconds | Should -BeLessOrEqual 350
+        (InModuleScope DbHubDemo -Parameters @{ Result = $record } { Test-DemoNetworkResult -Result $Result }) | Should -BeTrue
+    }
+
+    It 'rides out a short outage after assigning a capacity, and keeps the old Pass and Warning (review of 76d10b2)' {
+        # 76d10b2 made a 70-second outage a Fail, where the wait had read on and passed.
+        $script:start = [datetime]::new(2026, 11, 2, 15, 0, 0, [System.DateTimeKind]::Utc)
+        $script:now = $script:start
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+        foreach ($case in @(
+                @{ Outage = @(0, 70); After = 'Completed'; Status = 'Pass'; Message = '^Assigned the workspace "Database Hub Demo" to the capacity "demo-capacity" \(F4\)\.$' }
+                @{ Outage = @(1, 100000); After = 'Completed'; Status = 'Warning'; Message = '^The workspace "Database Hub Demo" is still being assigned to the capacity "demo-capacity"\.$' }
+            )) {
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $workspaceId; displayName = 'Database Hub Demo'; type = 'Workspace' }) }) }
+                @{ Method = 'Get'; Match = $capacitiesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($activeCapacity) }) }
+                @{ Method = 'Post'; Match = $assignUri; Responses = @(New-FabricResponse -Status 202 -Body $null) }
+            )
+            Mock -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $true } -MockWith { $script:now = $script:now.AddSeconds([int]$PesterBoundParameters['Seconds']) }
+            $script:start = $script:now
+            $script:outage = $case.Outage
+            $script:after = $case.After
+            Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -ParameterFilter { $Method -eq 'Get' -and [string]$Uri -match $workspaceUri } -MockWith {
+                $at = ($script:now - $script:start).TotalSeconds
+                if ($at -ge $script:outage[0] -and $at -lt $script:outage[1]) {
+                    throw ([System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::NameResolutionError, 'No such host is known. (api.fabric.microsoft.com:443)', $null, $null))
+                }
+                $progress = if ($at -lt $script:outage[0]) { 'InProgress' } else { $script:after }
+                New-FabricResponse -Status 200 -Body @{ id = $workspaceId; capacityId = $capacityId; capacityAssignmentProgress = $progress }
+            }
+            $resolution = Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token -Create -SkipLakehouse -Confirm:$false
+            $record = Get-Record $resolution 'FABRIC.RESOLVE.CAPACITY'
+            $record.status | Should -Be $case.Status
+            $record.message | Should -Match $case.Message
+            $record.evidence.Contains('networkError') | Should -BeFalse
+        }
+    }
+
     It 'follows a lakehouse''s long-running creation and reads the new lakehouse back by name' {
         Set-FabricMock -Routes @(
             @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($demoWorkspace) }) }
@@ -271,6 +333,29 @@ Describe 'Resolve-DemoFabricConfig' {
         (Get-Record $denied 'FABRIC.RESOLVE.WORKSPACE').remediation | Should -Match 'Create workspaces'
         $taken = Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token -Create -Confirm:$false
         (Get-Record $taken 'FABRIC.RESOLVE.WORKSPACE').remediation | Should -Match 'already exists, and you can''t access it'
+    }
+
+    It 'finds by name the workspace its own create made, when the create sent again after a lost answer finds the name taken (Phase 28 live finding)' {
+        # The first create reached Fabric, but its answer was lost (HTTP 502); Invoke-DemoTransientRetry sent it again.
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $workspacesUri; Responses = @(
+                    New-FabricResponse -Status 200 -Body @{ value = @() }
+                    New-FabricResponse -Status 200 -Body @{ value = @($demoWorkspace) }
+                ) }
+            @{ Method = 'Get'; Match = $capacitiesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($activeCapacity) }) }
+            @{ Method = 'Post'; Match = $workspacesUri; Responses = @(
+                    New-FabricResponse -Status 502 -Body $null
+                    New-FabricResponse -Status 409 -Body @{ errorCode = 'WorkspaceNameAlreadyExists'; message = 'The name is in use.' }
+                ) }
+        )
+        $resolution = Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token -Create -SkipLakehouse -Confirm:$false
+        $record = Get-Record $resolution 'FABRIC.RESOLVE.WORKSPACE'
+        $record.status | Should -Be 'Pass'
+        $record.message | Should -Match '^Found the Fabric workspace "Database Hub Demo" by name: its create said it already exists'
+        $record.evidence.source | Should -Be 'name'
+        $resolution.WorkspaceId | Should -Be $workspaceId
+        @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -match $workspacesUri }).Count | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 5 }
     }
 
     It 'is a Fail for an unexpected error' {

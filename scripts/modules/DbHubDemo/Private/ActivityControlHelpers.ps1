@@ -1375,7 +1375,8 @@ function Set-DemoActivityControlFabric {
             & $add 'CONTROL.FABRIC.FOLDER' 'Pass' ('The folder "{0}" exists in the workspace.' -f $Name.FabricFolder) ([ordered]@{ folder = $Name.FabricFolder }) '' $folderDoc
         }
         elseif ($folders.StatusCode -eq 200 -and $PSCmdlet.ShouldProcess(('workspace {0}' -f $sharedId), ('Create the folder "{0}"' -f $Name.FabricFolder))) {
-            $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces/{1}/folders' -f $base, $sharedId) -Body ([ordered]@{ displayName = $Name.FabricFolder }) -Token $Token
+            # Creates here aren't looked up again by name, so each is sent again only when it never reached the service.
+            $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces/{1}/folders' -f $base, $sharedId) -Body ([ordered]@{ displayName = $Name.FabricFolder }) -Token $Token -NotIdempotent
             if ($created.StatusCode -in 200, 201) {
                 $folderId = [string](Get-DemoMemberValue -InputObject $created.Body -Name 'id')
                 & $add 'CONTROL.FABRIC.FOLDER' 'Pass' ('The folder "{0}" was created in the workspace (Folders - Create Folder, a documented preview API).' -f $Name.FabricFolder) ([ordered]@{ folder = $Name.FabricFolder }) '' $folderDoc
@@ -1406,7 +1407,7 @@ function Set-DemoActivityControlFabric {
             return $results.ToArray()
         }
         else {
-            $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces' -f $base) -Body ([ordered]@{ displayName = $Name.FabricWorkspace; description = 'On-demand activity control for the Database Hub demo (ADR 0020): the control notebook and its managed private endpoint to the control vault.'; capacityId = $capacityId }) -Token $Token
+            $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces' -f $base) -Body ([ordered]@{ displayName = $Name.FabricWorkspace; description = 'On-demand activity control for the Database Hub demo (ADR 0020): the control notebook and its managed private endpoint to the control vault.'; capacityId = $capacityId }) -Token $Token -NotIdempotent
             if ($created.StatusCode -notin 200, 201) {
                 & $add 'CONTROL.FABRIC.WORKSPACE' 'Fail' ('The workspace "{0}" couldn''t be created: {1}' -f $Name.FabricWorkspace, (Get-DemoFabricErrorText -Response $created)) @{} 'Creating a workspace needs the Fabric tenant setting that allows it and a role on the capacity; then run setup-activity-control.ps1 again.' $workspaceDoc
                 return $results.ToArray()
@@ -1433,7 +1434,7 @@ function Set-DemoActivityControlFabric {
         $endpoints = Get-DemoActivityControlFabricList -Uri ('{0}/workspaces/{1}/managedPrivateEndpoints' -f $base, $targetWorkspace) -Token $Token
         $endpoint = @($endpoints.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') -eq $Name.PrivateEndpoint }) | Select-Object -First 1
         if ($null -eq $endpoint -and $PSCmdlet.ShouldProcess($Name.FabricWorkspace, ('Create the managed private endpoint {0} to {1}' -f $Name.PrivateEndpoint, $Name.KeyVault))) {
-            $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces/{1}/managedPrivateEndpoints' -f $base, $targetWorkspace) -Body ([ordered]@{ name = $Name.PrivateEndpoint; targetPrivateLinkResourceId = $Name.KeyVaultId; targetSubresourceType = 'vault'; requestMessage = $request }) -Token $Token
+            $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces/{1}/managedPrivateEndpoints' -f $base, $targetWorkspace) -Body ([ordered]@{ name = $Name.PrivateEndpoint; targetPrivateLinkResourceId = $Name.KeyVaultId; targetSubresourceType = 'vault'; requestMessage = $request }) -Token $Token -NotIdempotent
             if ($created.StatusCode -notin 200, 201, 202) {
                 & $add 'CONTROL.FABRIC.ENDPOINT' 'Fail' ('The managed private endpoint couldn''t be created: {0}' -f (Get-DemoFabricErrorText -Response $created)) @{} 'Creating it needs the Admin role in the control workspace; then run setup-activity-control.ps1 again.' $endpointDoc
                 return $results.ToArray()

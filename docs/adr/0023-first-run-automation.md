@@ -1,6 +1,6 @@
 # ADR 0023: First-run automation
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-10-29 for Phase 28: `deploy.ps1` runs the first run itself)
 - **Date:** 2026-10-27
 - **Decision source:** User-directed (2026-10-26: "automate as much as possible for other folks using the repo"; 2026-10-27: a colleague in another tenant tests the seamless first run), with the coordinator's decisions on the approved plan
 - **Related:** [ADR 0008](0008-identity-rbac-abac.md), [ADR 0009](0009-secrets-handling.md), [ADR 0011](0011-control-surface-priority.md), [ADR 0012](0012-validation-model.md), [ADR 0014](0014-notebook-role-and-capacity.md), [deployment](../deployment.md#first-run-initps1), [prerequisites](../prerequisites.md)
@@ -57,6 +57,10 @@
 - **Static (2026-10-27):** `tests/unit/DbHubDemo.FirstRun.Tests.ps1`, in the static validation.
 - **Live, read-only (2026-10-27):** `init.ps1 -WhatIf -CreateAdminGroup` (50 s) and `init.ps1` into a temporary Git-ignored path (44 s) against the live subscription: every `INIT.*` check **Pass**, and the file passed `Get-DemoConfig`. They found two defects, fixed the same day: under `-WhatIf` the guard didn't keep its context, so the reads after it had no token; and List Capacities also returned a Premium Per User capacity (`PP3`). The Trial capacity's SKU read live as `FTL64`.
 - **Pending, the coordinator's live check:** `init.ps1` with a new workspace name, then the Fabric track creates the workspace and lakehouse; `-CreateAdminGroup` only with `-WhatIf`. `fabric.manageCapacity` and `-SaveHistory` stay unproven live until a capacity that's the tester's alone is available: the owner's capacity is shared and is never touched.
+
+## Amendment: the first run from `deploy.ps1` (Phase 28, 2026-10-29)
+
+The owner wants one command after `az login` ([ADR 0018](0018-fast-redeploy-parallel-tracks-golden-snapshot.md#amendments-2026-10-29-phase-28-one-command-one-guided-stop)). So `deploy.ps1` with no configuration file runs the same first run itself (`Initialize-DemoFirstRun`): `Initialize-DemoConfig` with `-CreateAdminGroup`, the same prompts, and `-NonInteractive` where nobody can answer (CI, redirected input, an assistant), so an ambiguous choice is **Manual action required** there, as in `init.ps1`. When the file is written and no `INIT.*` result is **Fail** or **Manual action required**, the deployment goes on with it; otherwise the run ends **NOT DONE**, before anything is created, with the first open item's fix and the command to run next. `-WhatIf` writes nothing. Every rule above stands: the one pre-guard read, no sign-in, no change to the Azure CLI context, and `init.ps1` keeps working on its own. Unit-tested in `tests/unit/DbHubDemo.OneCommand.Tests.ps1` and `tests/unit/Repo.LifecycleScripts.Tests.ps1`.
 
 ## Sources
 

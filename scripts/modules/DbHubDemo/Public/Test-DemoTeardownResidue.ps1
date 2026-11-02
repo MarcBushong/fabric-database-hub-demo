@@ -17,7 +17,7 @@ function Test-DemoTeardownResidue {
       identities in the manifest (an assignment elsewhere would be left behind as "Identity not found").
     - TEARDOWN.RESIDUAL.IDENTITIES: the manifest's identities are gone from Microsoft Entra, and none of them
       is still a member of the P6 group.
-    - TEARDOWN.RESIDUAL.DEPLOYMENTS: no subscription-scope deployment dbhub-<environment>-*.
+    - TEARDOWN.RESIDUAL.DEPLOYMENTS: no subscription-scope deployment <prefix>-<environment>-*.
     - TEARDOWN.RESIDUAL.BUDGET: the budget at the group's scope is gone.
     - TEARDOWN.RESIDUAL.REFERENCES: no resource outside the group still names it (a Warning: such a
       resource, for example one Azure Policy created, may be shared).
@@ -112,7 +112,7 @@ function Test-DemoTeardownResidue {
         GoldenGroupName   = (Get-DemoGoldenResourceGroupName -Config $Config)
         Environment       = [string]$Config['environment']
         DeploymentId      = $deploymentId
-        DeploymentPrefix  = ('dbhub-{0}-' -f $Config['environment'])
+        DeploymentPrefix  = ((Get-DemoMainDeploymentName -Config $Config) -replace 'main$', '')
         BudgetUrl         = ('https://management.azure.com/subscriptions/{0}/resourceGroups/{1}/providers/Microsoft.Consumption/budgets/budget-{2}-{3}?api-version={4}' -f $subscriptionId, $resourceGroupName, $Config['prefix'], $Config['environment'], (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Consumption/budgets'))
         PrincipalIds      = $principalIds
         GroupObjectId     = $(if ($groupObjectId -match $guid) { $groupObjectId } else { '' })

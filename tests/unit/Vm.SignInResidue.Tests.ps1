@@ -44,6 +44,22 @@ BeforeAll {
     }
 
     $script:noEvents = { param($Name, $XPath) $null = $Name, $XPath }
+
+    # Windows automatic sign-in (Phase 28) isn't readable here (no LSA on this test machine, or no administrator), and
+    # the sweep fails closed on what it can't read: every test reads a machine without it unless it passes its own
+    # -AutoLogonProvider. The sweep's own autologon tests are at the end of its Describe block.
+    $script:noAutoLogon = { param($Mode) $null = $Mode; @{ Enabled = 0; Secret = 0; PlainValue = 0; UserName = 0 } }
+    $script:sweep = ${function:Invoke-DemoSignInSweep}
+    function Invoke-DemoSignInSweep {
+        $arguments = @{}
+        for ($i = 0; $i -lt $args.Count; $i += 2) {
+            $arguments[([string]$args[$i]).TrimStart('-').TrimEnd(':')] = $args[$i + 1]
+        }
+        if (-not $arguments.ContainsKey('AutoLogonProvider')) {
+            $arguments['AutoLogonProvider'] = $script:noAutoLogon
+        }
+        & $script:sweep @arguments
+    }
 }
 
 Describe 'Invoke-DemoSignInSweep' {
@@ -343,6 +359,44 @@ Describe 'Invoke-DemoSignInSweep' {
         $result.pass | Should -BeTrue
         $result.found.browserCaches | Should -Be 0
         (Invoke-DemoSignInSweep -IncludeBrowserCache $true -Folder $machine -EventLogReader $script:noEvents).pass | Should -BeFalse
+    }
+
+    It 'fails closed on automatic sign-in left armed: AutoAdminLogon, the LSA secret, or the Winlogon values (Phase 28)' {
+        $machine = New-TestMachine
+        foreach ($leftover in @(@{ Enabled = 1; Secret = 0; PlainValue = 0; UserName = 0 }, @{ Enabled = 0; Secret = 1; PlainValue = 0; UserName = 0 }, @{ Enabled = 0; Secret = 0; PlainValue = 1; UserName = 0 })) {
+            $script:autoState = $leftover
+            $result = Invoke-DemoSignInSweep -Folder $machine -EventLogReader $script:noEvents -AutoLogonProvider { param($Mode) $null = $Mode; $script:autoState }
+            $result.pass | Should -BeFalse -Because ('the leftover {0} blocks a golden capture' -f (($leftover.GetEnumerator() | Where-Object { $_.Value } | ForEach-Object { $_.Key }) -join ','))
+        }
+        # DefaultUserName counts only where the setup wizard signs in (IncludeBrowserCache): elsewhere Windows writes it as
+        # the last console user.
+        $userOnly = { param($Mode) $null = $Mode; @{ Enabled = 0; Secret = 0; PlainValue = 0; UserName = 1 } }
+        (Invoke-DemoSignInSweep -Folder $machine -EventLogReader $script:noEvents -AutoLogonProvider $userOnly).pass | Should -BeTrue
+        (Invoke-DemoSignInSweep -IncludeBrowserCache $true -Folder $machine -EventLogReader $script:noEvents -AutoLogonProvider $userOnly).pass | Should -BeFalse
+    }
+
+    It 'fails closed when automatic sign-in can''t be read, and Clean turns it off and removes the secret and the values' {
+        $machine = New-TestMachine
+        (Invoke-DemoSignInSweep -Folder $machine -EventLogReader $script:noEvents -AutoLogonProvider { param($Mode) $null = $Mode; throw 'access denied' }).pass | Should -BeFalse
+        $script:modes = [System.Collections.Generic.List[string]]::new()
+        $script:armed = $true
+        $provider = {
+            param($Mode)
+            $script:modes.Add($Mode)
+            if ($Mode -eq 'Clear') {
+                $script:armed = $false
+            }
+            $on = [int]$script:armed
+            @{ Enabled = $on; Secret = $on; PlainValue = 0; UserName = $on }
+        }
+        $result = Invoke-DemoSignInSweep -Clean $true -IncludeBrowserCache $true -Folder $machine -EventLogReader $script:noEvents -EventLogClearer { param($Name) $null = $Name } -AutoLogonProvider $provider
+        $result.pass | Should -BeTrue
+        $script:modes | Should -Contain 'Clear'
+        $summary = ConvertTo-DemoSignInSummary -Sweep $result
+        $summary.actions.autologon | Should -Be 1
+        $summary.actions.logonName | Should -Be 1
+        $summary.found.autologon | Should -BeGreaterThan 0
+        $summary.remaining.autologon | Should -Be 0
     }
 }
 

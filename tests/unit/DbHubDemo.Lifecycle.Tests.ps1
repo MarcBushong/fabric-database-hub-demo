@@ -22,7 +22,7 @@ BeforeAll {
         $state = [ordered]@{
             Exists = $true; Stage = ''; StageUtc = ''; BundleSha256 = ''; BundleChunkCount = 0; RunnerSha256 = ''; RunnerChunkCount = 0
             BundleSentTo = @(); RunnerSentTo = @(); NetworkMode = 'private'; T3UseFreeLimit = $false; T3AdminGroupName = 'DbHub T3 Admins'
-            BastionExpiresUtc = ''; HostPasswordUtc = ''; Tags = @{ deploymentId = 'abc123' }
+            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; Tags = @{ deploymentId = 'abc123' }
         }
         foreach ($key in $Values.Keys) {
             $state[$key] = $Values[$key]
@@ -137,6 +137,10 @@ Describe 'Invoke-DemoTemplateDeployment' {
             if ($ArgumentList[0] -eq 'vm' -and $ArgumentList[1] -eq 'show') {
                 return (New-AzResult -StdOut $script:hostComputerName)
             }
+            # A failed create's operations, read for its cause; these tests' failures have none to show.
+            if ($ArgumentList[0] -eq 'deployment' -and $ArgumentList[1] -eq 'operation') {
+                return (New-AzResult -StdOut '[]')
+            }
             $file = [string]$ArgumentList[[array]::IndexOf($ArgumentList, '--parameters') + 1]
             $content = Get-Content -LiteralPath $file.Substring(1) -Raw | ConvertFrom-Json -AsHashtable
             $script:deployCalls.Add([pscustomobject]@{ Arguments = @($ArgumentList); Parameters = $content })
@@ -236,6 +240,8 @@ Describe 'Invoke-DemoTemplateDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -Times 1 -Exactly -ParameterFilter { $T4Exists }
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -Times 0 -Exactly
 
+        # A size the configuration sets never changes on its own (Phase 28): a refusal stays a Fail with the fallback named.
+        $withT4['t4SkuName'] = 'Standard_B1ms'
         $script:t4State = 'NotFound'
         $script:templateFails = $true
         $script:t4Failure = [pscustomobject]@{ Sku = 'Standard_B1ms'; Zone = ''; TimeUtc = '2026-10-26T14:11:42Z' }
@@ -247,7 +253,432 @@ Describe 'Invoke-DemoTemplateDeployment' {
         $sku.status | Should -Be 'Fail'
         $sku.message | Should -Match 'Standard_B1ms with no zone preference'
         $sku.remediation | Should -Match 'Set t4SkuName to Standard_B2s, the documented fallback'
-        $sku.remediation | Should -Match 'Nothing changes the size on its own'
+        $sku.remediation | Should -Match 'A size you set is never changed on its own'
+    }
+
+    It 'falls back on its own from a refused Standard_B1ms to Standard_B2s, then to no T4, and records it, when the configuration doesn''t set the size (Phase 28)' {
+        $withT4 = New-TestConfig -WithT4
+        $withT4.Contains('t4SkuName') | Should -BeFalse -Because 'the schema has no default for it'
+        $script:sizes = [System.Collections.Generic.List[string]]::new()
+        $script:recordedSku = [System.Collections.Generic.List[string]]::new()
+        $script:failures = [System.Collections.Generic.Queue[object]]::new()
+        $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_B1ms'; Zone = ''; TimeUtc = '2026-10-26T14:11:42Z' })
+        $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_B2s'; Zone = ''; TimeUtc = '2026-10-26T14:31:42Z' })
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -MockWith { if ($script:failures.Count -gt 0) { $script:failures.Dequeue() } else { $null } }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recordedSku.Add([string]$Value['T4Sku']) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { $null }
+        # The template fails while T4 is in it (SkuNotAvailable) and succeeds without it.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:sizes.Add($(if ($Config['t4Enabled']) { if ($Config.Contains('t4SkuName')) { [string]$Config['t4SkuName'] } else { 'default' } } else { 'none' }))
+            $script:templateFails = [bool]$Config['t4Enabled']
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
+        $deployment.Succeeded | Should -BeTrue
+        $script:sizes | Should -Be @('default', 'Standard_B2s', 'none')
+        $script:recordedSku | Should -Be @('Standard_B2s', 'None')
+        $deployment.T4Enabled | Should -BeFalse
+        $fallbacks = @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' })
+        @($fallbacks.status) | Should -Be @('Warning', 'Warning')
+        $fallbacks[0].message | Should -Match 'tries Standard_B2s, the same Burstable class'
+        $fallbacks[1].message | Should -Match 't4Enabled stays as you configured it'
+        $fallbacks[1].remediation | Should -Match '"t4SkuName": "Standard_D2ds_v5"'
+        $fallbacks[1].remediation | Should -Match 'dated example'
+        # The template keeps the choice in the resource group's tags too.
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
+        ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Pass'
+    }
+
+    It 'starts the fallback one size on when preflight already ruled the default out, and never for a size the configuration sets (Phase 28)' {
+        $withT4 = New-TestConfig -WithT4
+        $script:sizes = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            $script:sizes.Add($(if ($Config['t4Enabled']) { if ($Config.Contains('t4SkuName')) { [string]$Config['t4SkuName'] } else { 'default' } } else { 'none' }))
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit } } }
+        }
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'Standard_B2s'
+        $script:sizes | Should -Be @('Standard_B2s')
+        ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).status | Should -Be 'Warning'
+        $deployment.T4SkuName | Should -Be 'Standard_B2s'
+
+        $script:sizes.Clear()
+        $withT4['t4SkuName'] = 'Standard_D2ds_v5'
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'None'
+        $script:sizes | Should -Be @('Standard_D2ds_v5')
+        @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).Count | Should -Be 0
+    }
+
+    It 'clears a recorded "no T4" once a size is deployed, and when the configuration sets t4SkuName (review finding 5)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'abc123'; owner = 'your-alias'; DbHubT4Sku = 'None' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
+            @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
+        }
+        $withT4 = New-TestConfig -WithT4
+        $withT4['t4SkuName'] = 'Standard_D2ds_v5'
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
+        $deployment.Succeeded | Should -BeTrue
+        $deployment.T4Enabled | Should -BeTrue
+        # The template carries the group's tags, so the stale record goes in them.
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be ''
+
+        # A T4 left on in a configuration without a size (a sequential run reads no record) clears it once it's deployed.
+        $script:deployCalls.Clear()
+        Invoke-DemoTemplateDeployment -Config (New-TestConfig -WithT4) -NetworkMode private -T3UseFreeLimit $false | Out-Null
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be ''
+
+        # With T4 off, the record stays.
+        $script:deployCalls.Clear()
+        Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false | Out-Null
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
+    }
+}
+
+Describe 'The budget''s start date and a failed template''s cause (Phase 28 live finding, 2026-11-02)' {
+    BeforeAll {
+        $config = New-TestConfig
+        $script:sub = '11111111-2222-3333-4444-555555555555'
+        $script:createError = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","target":"/subscriptions/' + $script:sub + '/providers/Microsoft.Resources/deployments/dbhub-demo-main","message":"At least one resource deployment operation failed. Please list deployment operations for details. Please see https://aka.ms/arm-deployment-operations for usage details."}}'
+        $script:budgetError = 'Start date of budgets cannot be updated. Please delete and create a new budget.'
+
+        # One deployment operation as 'az deployment operation ... list' prints it.
+        function New-TestOperation([string] $Type, [string] $Name, [string] $State = 'Failed', [object] $StatusMessage = $null, [string] $Group = 'rg-dbhub-demo', [string] $StatusCode = 'BadRequest') {
+            $id = if ($Type -eq 'Microsoft.Resources/resourceGroups') { '/subscriptions/{0}/resourceGroups/{1}' -f $script:sub, $Name } elseif ($Group) { '/subscriptions/{0}/resourceGroups/{1}/providers/{2}/{3}' -f $script:sub, $Group, $Type, $Name } else { '/subscriptions/{0}/providers/{1}/{2}' -f $script:sub, $Type, $Name }
+            $properties = [ordered]@{ provisioningOperation = 'Create'; provisioningState = $State; statusCode = $(if ($State -eq 'Failed') { $StatusCode } else { 'OK' }); targetResource = [ordered]@{ id = $id; resourceType = $Type; resourceName = $Name }; timestamp = '2026-11-02T14:03:11.123456+00:00' }
+            if ($null -ne $StatusMessage) {
+                $properties['statusMessage'] = $StatusMessage
+            }
+            [ordered]@{ id = '{0}/operations/0F1E2D3C4B5A6978' -f $id; operationId = '0F1E2D3C4B5A6978'; properties = $properties }
+        }
+        function New-TestDeploymentFailed([string] $Target) {
+            [ordered]@{ status = 'Failed'; error = [ordered]@{ code = 'DeploymentFailed'; target = $Target; message = 'At least one resource deployment operation failed. Please list deployment operations for details. Please see https://aka.ms/arm-deployment-operations for usage details.'; details = @([ordered]@{ code = 'ResourceDeploymentFailure'; target = $Target; message = 'The resource write operation failed to complete successfully, because it reached terminal provisioning state ''Failed''.' }) } }
+        }
+        function ConvertTo-TestOperationJson([object[]] $Operation) {
+            ConvertTo-Json -InputObject @($Operation) -Depth 30
+        }
+        # The live finding's chain: the subscription deployment, its resource group deployment, the budget module, the budget.
+        function Set-TestBudgetChain {
+            $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(
+                (New-TestOperation -Type 'Microsoft.Resources/resourceGroups' -Name 'rg-dbhub-demo' -State 'Succeeded')
+                (New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'demo-abc123' -StatusCode 'Conflict' -StatusMessage (New-TestDeploymentFailed ('/subscriptions/{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/demo-abc123' -f $script:sub)))
+            )
+            $script:operations['rg-dbhub-demo/demo-abc123'] = ConvertTo-TestOperationJson @(
+                (New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'network' -State 'Succeeded')
+                (New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'budget' -StatusCode 'Conflict' -StatusMessage ([ordered]@{ status = 'Failed'; error = [ordered]@{ code = 'DeploymentFailed'; message = 'At least one resource deployment operation failed.'; details = @([ordered]@{ code = 'BadRequest'; message = ('{"error":{"code":"400","message":"' + $script:budgetError + '"}}') }) } }))
+            )
+            $script:operations['rg-dbhub-demo/budget'] = ConvertTo-TestOperationJson @(
+                (New-TestOperation -Type 'Microsoft.Consumption/budgets' -Name 'budget-dbhub-demo' -StatusMessage ([ordered]@{ error = [ordered]@{ code = '400'; message = $script:budgetError } }))
+            )
+        }
+        # What az prints for the budget: the whole resource as JSON, or, with --query and --output, only the start date,
+        # as the API wrote it (az applies the query itself, so the test does the same for the one query the module sends).
+        function Get-TestBudgetResponse([string[]] $Arguments) {
+            if ($script:budgetRead -eq 'Missing') {
+                return (New-AzResult -ExitCode 1 -StdErr 'ERROR: Not Found({"error":{"code":"NotFound","message":"Budget budget-dbhub-demo was not found."}})')
+            }
+            if ($script:budgetRead -eq 'Denied') {
+                return (New-AzResult -ExitCode 1 -StdErr ('ERROR: Forbidden({{"error":{{"code":"AuthorizationFailed","message":"The client was refused; correlation {0}."}}}})' -f $script:fakeSecret))
+            }
+            $queryAt = [array]::IndexOf($Arguments, '--query')
+            if ($queryAt -ge 0) {
+                $Arguments[$queryAt + 1] | Should -Be 'properties.timePeriod.startDate'
+                if ($Arguments[[array]::IndexOf($Arguments, '--output') + 1] -eq 'tsv') {
+                    return (New-AzResult -StdOut $script:budgetStart)
+                }
+                return (New-AzResult -StdOut ('"{0}"' -f $script:budgetStart))
+            }
+            $body = [ordered]@{ id = '/subscriptions/{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.Consumption/budgets/budget-dbhub-demo' -f $script:sub; name = 'budget-dbhub-demo'; type = 'Microsoft.Consumption/budgets'; properties = [ordered]@{ category = 'Cost'; amount = 250; timeGrain = 'Monthly'; timePeriod = [ordered]@{ startDate = $script:budgetStart; endDate = '2036-09-30T00:00:00Z' } } }
+            return (New-AzResult -StdOut (ConvertTo-Json -InputObject $body -Depth 10))
+        }
+    }
+
+    BeforeEach {
+        $script:azLog = [System.Collections.Generic.List[string]]::new()
+        $script:creates = [System.Collections.Generic.List[object]]::new()
+        $script:operations = @{}
+        $script:budgetRead = 'Found'
+        $script:budgetStart = '2026-10-01T00:00:00Z'
+        $script:createFails = { $false }
+        $script:createStdErr = $script:createError
+        $script:groupExists = $true
+        $script:pgDeployment = $null
+        $script:fakeSecret = -join @('Fk', 'q7', 'Lm', '29', 'Pz', 'Wd')
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { $script:groupExists }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'abc123'; owner = 'your-alias' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoExistingVmName -MockWith { @('sqlvm01', 'archost01') }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT1SecurityType -MockWith { [pscustomobject]@{ SecurityType = 'TrustedLaunch' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmDiskDrift -MockWith { @() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Exists = $false; State = 'NotFound' } }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { $null }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            $joined = $ArgumentList -join ' '
+            $script:azLog.Add($joined)
+            if ($joined -match '^rest --method get --url https://management\.azure\.com/subscriptions/[^/]+/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Consumption/budgets/budget-dbhub-demo\?api-version=') {
+                return (Get-TestBudgetResponse -Arguments $ArgumentList)
+            }
+            if ($joined -like 'vm show *') {
+                return (New-AzResult -StdOut "archost01`n")
+            }
+            if ($joined -like 'deployment sub create *') {
+                $file = [string]$ArgumentList[[array]::IndexOf($ArgumentList, '--parameters') + 1]
+                $parameters = Get-Content -LiteralPath $file.Substring(1) -Raw | ConvertFrom-Json -AsHashtable
+                $script:creates.Add($parameters)
+                if (& $script:createFails $parameters) {
+                    return (New-AzResult -ExitCode 1 -StdErr $script:createStdErr)
+                }
+                return (New-AzResult -StdOut '{"properties":{"provisioningState":"Succeeded","duration":"PT4M","outputs":{"resourceGroupName":{"value":"rg-dbhub-demo"}}}}')
+            }
+            if ($joined -match '^deployment operation (sub|group) list (?:--resource-group (\S+) )?--name (\S+)') {
+                $key = if ($Matches[1] -eq 'sub') { 'sub/' + $Matches[3] } else { $Matches[2] + '/' + $Matches[3] }
+                if ($script:operations.ContainsKey($key)) {
+                    return (New-AzResult -StdOut $script:operations[$key])
+                }
+                return (New-AzResult -ExitCode 3 -StdErr ('ERROR: (DeploymentNotFound) Deployment ''{0}'' could not be found.' -f $Matches[3]))
+            }
+            if ($joined -like 'deployment group show --resource-group rg-dbhub-demo --name pgflex01 *' -and $null -ne $script:pgDeployment) {
+                return (New-AzResult -StdOut $script:pgDeployment)
+            }
+            return (New-AzResult -ExitCode 3 -StdErr 'ERROR: (ResourceNotFound) Not faked in this test.')
+        }
+    }
+
+    AfterEach {
+        Clear-DemoSecret
+    }
+
+    Context 'Get-DemoBudgetStartDate' {
+        It 'reads the start date as the API wrote it and returns it as yyyy-MM-dd in UTC, whatever the culture and time zone' {
+            $savedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+            $savedZone = $env:TZ
+            try {
+                # A Buddhist-calendar culture writes another year with the same format string, so only the invariant culture
+                # gives 2026; on Linux, TZ moves the machine's zone west of UTC, where the local date of 2026-10-01T00:00Z is
+                # still September.
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('th-TH')
+                if (-not $IsWindows) {
+                    $env:TZ = 'America/Los_Angeles'
+                    [System.TimeZoneInfo]::ClearCachedData()
+                }
+                InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be '2026-10-01'
+            }
+            finally {
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture
+                $env:TZ = $savedZone
+                [System.TimeZoneInfo]::ClearCachedData()
+            }
+            $script:azLog[0] | Should -Match ('^rest --method get --url https://management\.azure\.com/subscriptions/{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Consumption/budgets/budget-dbhub-demo\?api-version=\S+ --query properties\.timePeriod\.startDate --output tsv --subscription {0}$' -f [regex]::Escape($script:sub))
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'Warning' }
+
+            # An offset that isn't UTC still names the day in UTC.
+            $script:budgetStart = '2026-10-01T02:00:00+02:00'
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be '2026-10-01'
+        }
+
+        It 'returns nothing, and says nothing, when there''s no budget yet (HTTP 404)' {
+            $script:budgetRead = 'Missing'
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be ''
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly
+        }
+
+        It 'logs one redacted Warning and returns nothing when the budget can''t be read, or its date isn''t the first of a month' {
+            Register-DemoSecret -Value $script:fakeSecret
+            $script:budgetRead = 'Denied'
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be ''
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'The start date of the budget budget-dbhub-demo couldn''t be read \(ERROR: Forbidden.*AuthorizationFailed.*\[REDACTED\].*\), so the template sends the first day of this month\. In a later month than the budget''s own, Azure refuses that change' -and $Message -notmatch $script:fakeSecret -and $Message -notmatch '[\r\n]' }
+
+            $script:budgetRead = 'Found'
+            $script:budgetStart = '2026-10-15T00:00:00Z'
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoBudgetStartDate -Config $Config } | Should -Be ''
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'Azure returned "2026-10-15T00:00:00Z", not the first day of a month' }
+        }
+    }
+
+    Context 'Invoke-DemoTemplateDeployment' {
+        It 'sends the budget''s own start date to the template in a later month than the budget''s' {
+            # The template's default is the first day of the current month, which Azure refuses for this budget.
+            '2026-10-01' | Should -BeLessThan ([System.DateTime]::UtcNow.ToString('yyyy-MM-01', [System.Globalization.CultureInfo]::InvariantCulture))
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $deployment.Succeeded | Should -BeTrue
+            $script:creates.Count | Should -Be 1
+            $script:creates[0].parameters.budgetStartDate.value | Should -Be '2026-10-01'
+        }
+
+        It 'reads the budget even when the resource group is gone, because a budget at its scope outlives it' {
+            $script:groupExists = $false
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoExistingVmName -MockWith { @() }
+            Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false | Out-Null
+            $script:creates[0].parameters.budgetStartDate.value | Should -Be '2026-10-01'
+
+            # A new environment has no budget, so the template's default applies.
+            $script:creates.Clear()
+            $script:budgetRead = 'Missing'
+            Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false | Out-Null
+            $script:creates[0].parameters.Contains('budgetStartDate') | Should -BeFalse
+        }
+
+        It 'names the innermost error of a failed deployment''s nested operations in DEPLOY.TEMPLATE, with a remediation for the budget' {
+            Set-TestBudgetChain
+            $script:createFails = { $true }
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $deployment.Succeeded | Should -BeFalse
+            $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+            $template.status | Should -Be 'Fail'
+            $template.message | Should -Be ('The template create failed: Microsoft.Consumption/budgets budget-dbhub-demo: 400: {0}' -f $script:budgetError)
+            $template.evidence.deploymentName | Should -Be 'dbhub-demo-main'
+            $template.evidence.failedOperations.Count | Should -Be 1
+            $template.evidence.failedOperations[0].resourceType | Should -Be 'Microsoft.Consumption/budgets'
+            $template.evidence.failedOperations[0].code | Should -Be '400'
+            $template.evidence.deploymentError | Should -Match 'DeploymentFailed'
+            $template.remediation | Should -Match 'Delete the budget budget-dbhub-demo at the scope of the resource group rg-dbhub-demo \(Azure portal: Cost Management > Budgets'
+            $template.remediation | Should -Match 'Budgets - Delete\), then run \./scripts/deploy\.ps1 again: it creates the budget anew, starting the first day of this month\.'
+            $template.docUrl | Should -Be 'https://learn.microsoft.com/rest/api/consumption/budgets/delete'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation *' }) | Should -Be @(
+                ('deployment operation sub list --name dbhub-demo-main --output json --subscription {0}' -f $script:sub)
+                ('deployment operation group list --resource-group rg-dbhub-demo --name demo-abc123 --output json --subscription {0}' -f $script:sub)
+                ('deployment operation group list --resource-group rg-dbhub-demo --name budget --output json --subscription {0}' -f $script:sub)
+            )
+        }
+
+        It 'bounds the depth, the number of errors, and each message, and redacts secrets' {
+            Register-DemoSecret -Value $script:fakeSecret
+            $script:createFails = { $true }
+            # Six nested deployments in a row: only four levels are read, and the fourth's own error is used.
+            $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'level2' -StatusMessage (New-TestDeploymentFailed 'level2'))
+            foreach ($level in 2..5) {
+                $script:operations[('rg-dbhub-demo/level{0}' -f $level)] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name ('level{0}' -f ($level + 1)) -StatusMessage ([ordered]@{ status = 'Failed'; error = [ordered]@{ code = 'DeploymentFailed'; message = 'At least one resource deployment operation failed.'; details = @([ordered]@{ code = ('InnerOfLevel{0}' -f ($level + 1)); message = 'Level {0} failed.' -f ($level + 1) }) } }))
+            }
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+            $template.message | Should -Be 'The template create failed: Microsoft.Resources/deployments level5: InnerOfLevel5: Level 5 failed.'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation *' }).Count | Should -Be 4
+            @($script:azLog | Where-Object { $_ -like '*--name level5 *' }).Count | Should -Be 0
+
+            # Eight failed resources with long messages: five errors, each at most 300 characters, the secret redacted.
+            $script:azLog.Clear()
+            $long = ('{0} ' -f $script:fakeSecret) + ('word ' * 500)
+            $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'demo-abc123' -StatusMessage (New-TestDeploymentFailed 'demo-abc123'))
+            $script:operations['rg-dbhub-demo/demo-abc123'] = ConvertTo-TestOperationJson @(foreach ($index in 1..8) { New-TestOperation -Type 'Microsoft.Network/networkSecurityGroups' -Name ('nsg-{0}' -f $index) -StatusMessage ([ordered]@{ error = [ordered]@{ code = 'InvalidRequest'; message = "Line one $index`r`n$long" } }) })
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+            $template.evidence.failedOperations.Count | Should -Be 5
+            foreach ($item in $template.evidence.failedOperations) {
+                $item.message.Length | Should -BeLessOrEqual 300
+                $item.message | Should -Match '^Line one \d \[REDACTED\] word word'
+                $item.message | Should -Match '\.\.\.$'
+            }
+            $template.message.Length | Should -BeLessOrEqual ('The template create failed: '.Length + 1200)
+            $template.message | Should -Not -Match $script:fakeSecret
+            $template.message | Should -Not -Match '[\r\n]'
+            $template.message | Should -Match '^The template create failed: Microsoft\.Network/networkSecurityGroups nsg-1: InvalidRequest: Line one 1 '
+            $template.remediation | Should -Match 'Fix the cause in the message, then run deploy\.ps1 -Resume\.'
+            $template.docUrl | Should -Be 'https://learn.microsoft.com/azure/azure-resource-manager/troubleshooting/find-error-code'
+        }
+
+        It 'falls back to the Azure CLI''s error when the operations can''t be read, and reads none for an error that isn''t DeploymentFailed' {
+            $script:createFails = { $true }
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+            $template.message | Should -Be ('The template create failed: {0}' -f $script:createError)
+            $template.remediation | Should -Be 'Fix the cause in the message, then run deploy.ps1 -Resume. A 409 Conflict while a policy installs an extension clears within minutes.'
+            $template.docUrl | Should -Be 'https://learn.microsoft.com/cli/azure/deployment/sub#az-deployment-sub-create'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation sub list *' }).Count | Should -Be 1
+
+            # A validation error names its cause itself, and the record with this name can still be an earlier run's.
+            $script:azLog.Clear()
+            Set-TestBudgetChain
+            $script:createStdErr = 'ERROR: {"code":"InvalidTemplateDeployment","message":"The template deployment ''dbhub-demo-main'' is not valid according to the validation procedure."}'
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).message | Should -Match '^The template create failed: ERROR: \{"code":"InvalidTemplateDeployment"'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation *' }).Count | Should -Be 0
+
+            # An older Azure CLI's error text that still names the budget gets the budget's remediation too.
+            $script:createStdErr = $script:createError + ' {"code":"400","message":"' + $script:budgetError + '"}'
+            $script:operations.Clear()
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).remediation | Should -Match 'Delete the budget budget-dbhub-demo'
+        }
+
+        It 'shows no subscription ID, tenant ID, object ID, or account in what GitHub Actions writes' {
+            $savedActions = $env:GITHUB_ACTIONS
+            $savedSummary = $env:GITHUB_STEP_SUMMARY
+            try {
+                $env:GITHUB_ACTIONS = 'true'
+                $env:GITHUB_STEP_SUMMARY = Join-Path -Path $TestDrive -ChildPath 'summary.md'
+                InModuleScope DbHubDemo { $script:DemoLogMasks.Clear() }
+                $null = Register-DemoLogMask -Value 'operator@contoso.example' 6>&1
+                $script:createFails = { $true }
+                $denied = 'The client ''operator@contoso.example'' with object id ''aaaaaaaa-1111-2222-3333-444444444444'' does not have authorization to perform action ''Microsoft.Consumption/budgets/write'' over scope ''/subscriptions/{0}/resourceGroups/rg-dbhub-demo/providers/Microsoft.Consumption/budgets/budget-dbhub-demo'' in tenant ''66666666-7777-8888-9999-000000000000''.' -f $script:sub
+                $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'demo-abc123' -StatusMessage (New-TestDeploymentFailed 'demo-abc123'))
+                $script:operations['rg-dbhub-demo/demo-abc123'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Consumption/budgets' -Name 'budget-dbhub-demo' -StatusCode 'Forbidden' -StatusMessage ([ordered]@{ error = [ordered]@{ code = 'AuthorizationFailed'; message = $denied } }))
+                $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
+                $template = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }
+                $template.message | Should -Match '^The template create failed: Microsoft\.Consumption/budgets budget-dbhub-demo: AuthorizationFailed: The client '
+                $path = Join-Path -Path $TestDrive -ChildPath 'out/deploy.jsonl'
+                Export-DemoResult -Result @($template) -Path $path
+                $written = @((Get-Content -LiteralPath $path -Raw), (Get-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Raw), (InModuleScope DbHubDemo -Parameters @{ Text = $template.message } { Protect-DemoLogText -Text $Text }))
+                foreach ($text in $written) {
+                    $text | Should -Not -Match '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+                    $text | Should -Not -Match 'operator@contoso\.example'
+                    $text | Should -Match 'AuthorizationFailed'
+                }
+            }
+            finally {
+                $env:GITHUB_ACTIONS = $savedActions
+                $env:GITHUB_STEP_SUMMARY = $savedSummary
+                InModuleScope DbHubDemo { $script:DemoLogMasks.Clear() }
+            }
+        }
+
+        It 'still falls back from a rejected free offer without reading the operations, also inside DeploymentFailed' {
+            $script:createFails = { param($Parameters) [bool]$Parameters.parameters.t3UseFreeLimit.value }
+            foreach ($stdErr in @(
+                    'ERROR: (ProvisioningDisabled) The free offer is not available in region westus3 for this subscription.'
+                    ($script:createError.TrimEnd('}') + ',"details":[{"code":"ProvisioningDisabled","message":"Cannot update paid database to free database."}]}}')
+                )) {
+                $script:creates.Clear()
+                $script:azLog.Clear()
+                $script:createStdErr = $stdErr
+                Set-TestBudgetChain
+                $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $true
+                $deployment.Succeeded | Should -BeTrue
+                $deployment.T3UseFreeLimit | Should -BeFalse
+                $script:creates.Count | Should -Be 2
+                ($deployment.Results | Where-Object { $_.checkId -eq 'T3.FREEOFFER' }).status | Should -Be 'Warning'
+                ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Pass'
+                @($script:azLog | Where-Object { $_ -like 'deployment operation *' }).Count | Should -Be 0
+            }
+        }
+
+        It 'still falls back from a refused Burstable size through T4''s own reads, and keeps DEPLOY.T4.SKU beside the cause for a size the configuration sets' {
+            $withT4 = New-TestConfig -WithT4
+            # Azure refuses T4 while it's in the template; T4's own check reads pgflex01's deployment and operations.
+            $script:createFails = { param($Parameters) [bool]$Parameters.parameters.t4Enabled.value -and [string]$Parameters.parameters.t4SkuName.value -eq 'Standard_B1ms' }
+            $script:pgDeployment = ConvertTo-Json -Depth 20 -InputObject ([ordered]@{ name = 'pgflex01'; properties = [ordered]@{ provisioningState = 'Failed'; timestamp = '2026-11-02T14:03:11.123456+00:00'; parameters = [ordered]@{ sizing = [ordered]@{ value = [ordered]@{ skuName = 'Standard_B1ms'; tier = 'Burstable' } }; availabilityZone = [ordered]@{ value = '' } }; error = [ordered]@{ code = 'DeploymentFailed'; details = @([ordered]@{ code = 'ResourceDeploymentFailure' }) } } })
+            $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'demo-abc123' -StatusMessage (New-TestDeploymentFailed 'demo-abc123'))
+            $script:operations['rg-dbhub-demo/demo-abc123'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'pgflex01' -StatusMessage (New-TestDeploymentFailed 'pgflex01'))
+            $script:operations['rg-dbhub-demo/pgflex01'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.DBforPostgreSQL/flexibleServers' -Name 'pgflex01-abc123' -StatusMessage ([ordered]@{ status = 'Failed'; error = [ordered]@{ code = 'SkuNotAvailable'; message = 'Specified SKU is not supported in this region. Please choose a different SKU.' } }))
+            $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
+            $deployment.Succeeded | Should -BeTrue
+            $deployment.T4SkuName | Should -Be 'Standard_B2s'
+            @($script:creates | ForEach-Object { [string]$_.parameters.t4SkuName.value }) | Should -Be @('Standard_B1ms', 'Standard_B2s')
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).status | Should -Be 'Warning'
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Pass'
+            @($script:azLog | Where-Object { $_ -like 'deployment operation group list --resource-group rg-dbhub-demo --name pgflex01 *' }).Count | Should -Be 1
+            @($script:azLog | Where-Object { $_ -like 'deployment operation sub list *' }).Count | Should -Be 0
+
+            # A size the configuration sets doesn't fall back: DEPLOY.TEMPLATE names the refusal, and DEPLOY.T4.SKU still says what to do.
+            $script:creates.Clear()
+            $script:azLog.Clear()
+            $withT4['t4SkuName'] = 'Standard_B1ms'
+            $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
+            $deployment.Succeeded | Should -BeFalse
+            $script:creates.Count | Should -Be 1
+            ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).message | Should -Be 'The template create failed: Microsoft.DBforPostgreSQL/flexibleServers pgflex01-abc123: SkuNotAvailable: Specified SKU is not supported in this region. Please choose a different SKU.'
+            $sku = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }
+            $sku.status | Should -Be 'Fail'
+            $sku.remediation | Should -Match 'Set t4SkuName to Standard_B2s, the documented fallback'
+        }
     }
 }
 
@@ -309,6 +740,186 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith { $script:order.Add('Telemetry:' + ($Target -join ',')); New-TestResult 'HUB.TELEMETRY.T1' 'Pass' 'hub' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmAssociatedService -MockWith { $script:order.Add('Inventory:' + $ListedStatus); New-TestResult 'T1.SQLVM.ASSOCIATEDSERVICES' 'Pass' 't1' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { $script:order.Add('RunnerStatus'); [pscustomobject]@{ Status = 'Pass'; Result = (New-TestResult 'WORKLOAD.T1.COMMAND' 'Pass' 'workload' 'T1') } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith { $script:order.Add('DoneGate'); New-TestResult 'HUB.ESTATE.T1' 'Pass' 'hub' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:order.Add('PowerBI'); New-TestResult 'FABRIC.REPORT' 'Pass' 'fabric' 'fabric' }
+        # Phase 28 live finding: what's stopped starts before the first stage that needs it; here both VMs run.
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
+    }
+
+    It 'starts deallocated VMs while preflight runs, and runs them before the first stage that needs them; running ones are only read (Phase 28 live finding)' {
+        Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $true }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Running:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenSourceRelease -MockWith { $script:order.Add('SourceRelease') }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:order.Add('T1Monitoring'); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/running' }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $script:order[0..3] | Should -Be @('Request:sqlvm01', 'Preflight', 'Running:sqlvm01', 'Template') -Because 'it boots while preflight runs, and runs before the template'
+        $script:order | Should -Not -Contain 'Request:archost01'
+        $script:order | Should -Not -Contain 'Running:archost01'
+        $script:order | Should -Not -Contain 'T1Monitoring' -Because 'the Monitoring stage runs in this run'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).status | Should -Be 'Pass'
+
+        # A resume at T2: both start before it, with the golden source's guest and T1's monitoring plugin, which no
+        # Monitoring stage of this run checks.
+        $script:order.Clear()
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        $script:state = New-TestState @{ Stage = 'Monitoring'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+        Invoke-DemoDeployment -Config $config -Resume | Out-Null
+        $script:order[0..6] | Should -Be @('Request:sqlvm01', 'Request:archost01', 'Running:sqlvm01', 'Running:archost01', 'SourceRelease', 'T1Monitoring', 'Arc')
+    }
+
+    It 'checks T1''s monitoring plugin on a run without a Monitoring stage, whether or not a VM was stopped, before the first stage that needs the VMs (Phase 28 live finding, 2026-10-30)' {
+        # Live: start-demo.ps1 found the plugin running at 07:47; by 09:12 it was NotRunning, and a resumed run whose
+        # Monitoring stage had finished earlier never noticed.
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:order.Add(('T1Monitoring:{0}:{1}' -f $CheckId, $Occasion)); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        $script:state = New-TestState @{ Stage = 'Monitoring'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+        $results = @(Invoke-DemoDeployment -Config $config -Resume)
+        $script:order[0..1] | Should -Be @('T1Monitoring:DEPLOY.T1.MONITORING:the deployment', 'Arc')
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' }).status | Should -Be 'Pass'
+
+        # A run with its own Monitoring stage leaves it to that stage.
+        $script:order.Clear()
+        $script:state = New-TestState
+        Invoke-DemoDeployment -Config $config | Out-Null
+        @($script:order | Where-Object { $_ -like 'T1Monitoring*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'checks T1''s plugin once, and T1''s telemetry again, before its validation fails for missing T1 data, then runs DONE''s checks (Phase 28 live finding, 2026-10-30)' {
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:order.Add('T1Monitoring'); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        $script:telemetryPolls = 0
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith {
+            $script:telemetryPolls++
+            $script:order.Add('Telemetry:' + ($Target -join ','))
+            foreach ($t in $Target) {
+                if ($t -eq 'T1' -and $script:telemetryPolls -eq 1) {
+                    New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'No performance telemetry from T1 (sqlvm01) in the last 60 minutes.' -Evidence ([ordered]@{ resourceId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01'; rows = 0 })
+                }
+                else {
+                    New-TestResult ('TELEMETRY.{0}' -f $t) 'Pass' 'hub' $t
+                }
+            }
+        }
+        $script:state = New-TestState @{ Stage = 'Fabric' }
+        $results = @(Invoke-DemoDeployment -Config $config -Resume)
+        $validation = $script:order.IndexOf('Telemetry:T1,T2,T3')
+        $validation | Should -BeGreaterOrEqual 0
+        $script:order[($validation + 1)..($validation + 3)] | Should -Be @('T1Monitoring', 'Telemetry:T1', 'Inventory:Fail')
+        $script:order | Should -Contain 'DoneGate' -Because 'nothing failed once T1''s data came'
+        @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' }).status | Should -Be @('Pass')
+    }
+
+    It 'says what it started keeps running when preflight then fails, and deploys nothing (Phase 28 live finding)' {
+        Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $true }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Running:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/stopped' }
+        $script:preflightStatus = 'Fail'
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $script:order | Should -Be @('Request:sqlvm01', 'Request:archost01', 'Preflight')
+        $warning = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $warning.status | Should -Be 'Warning'
+        $warning.message | Should -Match 'This run started sqlvm01 and archost01 while preflight ran; it keeps running until \./scripts/stop-demo\.ps1'
+    }
+
+    It 'imports the Real-Time Dashboard and the history model and report in the Fabric stage, as the parallel Fabric track does (review follow-up)' {
+        # FABRIC.ITEMS.REQUIRED needs them, and a new workspace has neither.
+        $results = Invoke-DemoDeployment -Config $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['ImportDashboard'] }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -Times 1 -Exactly
+        $script:order[$script:order.IndexOf('Fabric') + 1] | Should -Be 'PowerBI'
+        ($results | Where-Object { $_.checkId -eq 'FABRIC.REPORT' }).status | Should -Be 'Pass'
+
+        # A Power BI Fail stops the run at the Fabric stage, as a Fabric Fail does.
+        $script:order.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:order.Add('PowerBI'); New-TestResult 'FABRIC.REPORT' 'Fail' 'fabric' 'fabric' }
+        $failed = Invoke-DemoDeployment -Config $config
+        ($failed | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.FABRIC' }).status | Should -Be 'Fail'
+        $script:order | Should -Not -Contain 'DoneGate'
+    }
+
+    It 'can end DONE on a new workspace, because its Fabric stage creates what FABRIC.ITEMS.REQUIRED looks for (review follow-up)' {
+        # Before, every stage passed on a new workspace and the run still ended NOT DONE with exit code 1.
+        $names = InModuleScope DbHubDemo { Get-DemoFabricAppSetting }
+        $script:workspace = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $script:required = @([string]$names['dashboardName'], [string]$names['semanticModelName'], [string]$names['reportName'])
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith {
+            $script:order.Add('Fabric')
+            if ([bool]$PesterBoundParameters['ImportDashboard']) {
+                $null = $script:workspace.Add($script:required[0])
+            }
+            New-TestResult 'HUB.CHECKLIST' 'Pass' 'hub' 'fabric'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith {
+            $script:order.Add('PowerBI')
+            $null = $script:workspace.Add($script:required[1])
+            $null = $script:workspace.Add($script:required[2])
+            New-TestResult 'FABRIC.REPORT' 'Pass' 'fabric' 'fabric'
+        }
+        # DONE's read-only checks: every target shows in Database Hub, and the Fabric items pass only when they're in the workspace.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith {
+            $missing = @($script:required | Where-Object { -not $script:workspace.Contains($_) })
+            foreach ($id in @($Requirement | Where-Object { $_ -ne 'FABRIC.ITEMS.REQUIRED' })) {
+                New-TestResult $id 'Pass' 'hub' 'subscription'
+            }
+            New-TestResult 'FABRIC.ITEMS.REQUIRED' $(if ($missing.Count -eq 0) { 'Pass' } else { 'Fail' }) 'fabric' 'fabric'
+        }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $results; State = $script:state; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Sequential }
+        ($results | Where-Object { $_.checkId -eq 'FABRIC.ITEMS.REQUIRED' }).status | Should -Be 'Pass'
+        $outcome.Kind | Should -Be 'Done' -Because ('Missing: {0}; reason: {1}' -f (@($outcome.Missing) -join ', '), $outcome.Reason)
+        $outcome.ExitCode | Should -Be 0
+    }
+
+    It 'records that the T2 host''s loader started a bootstrap generation, and clears it once T2 is done (review follow-up)' {
+        # The watchdog never restarts the host while that generation may still build its guest (Get-DemoHostRestartBlocker).
+        Invoke-DemoDeployment -Config $config | Out-Null
+        $marks = @($script:recorded | Where-Object { $_.Contains('T2BuildUtc') } | ForEach-Object { if ($_['T2BuildUtc']) { 'set' } else { 'clear' } })
+        $marks | Should -Be @('set', 'clear')
+        $script:state.T2BuildUtc | Should -BeNullOrEmpty
+
+        # T2 left open (the wizard step waits): the generation stays on record.
+        $script:recorded.Clear()
+        $script:arcStatus = 'Manual action required'
+        Invoke-DemoDeployment -Config $config | Out-Null
+        @($script:recorded | Where-Object { $_.Contains('T2BuildUtc') } | ForEach-Object { if ($_['T2BuildUtc']) { 'set' } else { 'clear' } }) | Should -Be @('set')
+    }
+
+    It 'cleans up in the T2 stage what an earlier guided stop left open, and isn''t DONE while it stays open (Phase 28 review)' {
+        # After a Ctrl+C at a parallel run's guided stop, setup can finish anyway; a -Sequential rerun left Bastion up and
+        # the handed-over host password valid, and could end DONE.
+        $script:state = New-TestState @{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '2026-10-29T16:00:00Z' }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith {
+            $script:order.Add('Cleanup')
+            $script:state.HostPasswordUtc = ''
+            $script:state.GuidedStopUtc = ''
+            @()
+        }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $script:order[$script:order.IndexOf('Arc') + 1] | Should -Be 'Cleanup'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).status | Should -Be 'Pass'
+
+        # A cleanup that couldn't rotate the password: the run says so, names stop-demo.ps1, and isn't DONE.
+        $script:order.Clear()
+        $script:state = New-TestState @{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '' }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:order.Add('Cleanup'); @() }
+        $open = @(Invoke-DemoDeployment -Config $config)
+        ($open | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).status | Should -Be 'Manual action required'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $open; State = $script:state; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Sequential }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.NextCommand | Should -Be './scripts/stop-demo.ps1 -RemoveBastionOnly'
+    }
+
+    It 'runs DONE''s read-only checks after the validation, as the parallel path does, so a sequential run can end DONE (review finding 4)' {
+        $results = Invoke-DemoDeployment -Config $config
+        $script:order[-1] | Should -Be 'DoneGate'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -Times 1 -Exactly -ParameterFilter { $Requirement -contains 'HUB.ESTATE.T1' -and $Requirement -contains 'T2.ARC.SQLINSTANCE' -and $Requirement -contains 'FABRIC.ITEMS.REQUIRED' -and $Requirement -notcontains 'HUB.ESTATE.T4' }
+        ($results | Where-Object { $_.checkId -eq 'HUB.ESTATE.T1' }).status | Should -Be 'Pass'
+
+        # Not while a stage is open (T2 in PaygWizard mode, which -Sequential doesn't guide): that run isn't done anyway.
+        $script:order.Clear()
+        $script:arcStatus = 'Manual action required'
+        Invoke-DemoDeployment -Config $config | Out-Null
+        $script:order | Should -Not -Contain 'DoneGate'
     }
 
     It 'runs every stage in the live-proven order' {
@@ -316,7 +927,7 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Be @(
             'Preflight', 'Template', 'Bundle', 'SendBundle:sqlvm01', 'SendBundle:archost01', 'Publish', 'SendRunner:sqlvm01', 'SendRunner:archost01',
             'Template+Bundle', 'Loader:sqlvm01', 'Loader:archost01', 'T1Ready', 'Group', 'T3Setup', 'EnableT3', 'TestT3',
-            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus'
+            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate'
         )
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         $script:state.Stage | Should -Be 'Validation'
@@ -373,6 +984,46 @@ Describe 'Invoke-DemoDeployment' {
         Invoke-DemoDeployment -Config $config -StopAfter Infrastructure | Out-Null
         $script:order | Should -Be @('Preflight', 'Template')
         $script:state.Stage | Should -Be 'Infrastructure'
+    }
+
+    It 'resets the parallel tracks'' records once its preflight passed, so a later plain deploy.ps1 never resumes past a step this run does again (Phase 28 live finding, 2026-10-30)' {
+        # -Sequential records only its stages; a parallel run's records from before it could let a later parallel resume skip
+        # a step that this run did again and that failed.
+        $script:state = New-TestState @{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith {
+            $script:recorded.Add(@{} + $Value)
+            if ($Value.Contains('TrackT1')) {
+                $script:order.Add('ResetTracks')
+            }
+            foreach ($key in $Value.Keys) {
+                $script:state.$key = $Value[$key]
+            }
+        }
+        Invoke-DemoDeployment -Config $config -StopAfter Infrastructure | Out-Null
+        $script:order | Should -Be @('Preflight', 'ResetTracks', 'Template')
+        $script:state.TrackT1 | Should -Be ''
+        $script:state.TrackT2 | Should -Be ''
+        $script:state.TrackFabric | Should -Be '' -Because 'a run that starts over trusts nothing recorded before it'
+
+        # A preflight Fail resets nothing.
+        $script:order.Clear()
+        $script:state = New-TestState @{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+        $script:preflightStatus = 'Fail'
+        Invoke-DemoDeployment -Config $config | Out-Null
+        $script:order | Should -Be @('Preflight')
+        $script:state.TrackFabric | Should -Be 'Fabric'
+
+        # -Resume lowers only the records of the steps it does again.
+        $script:order.Clear()
+        $script:recorded.Clear()
+        $script:preflightStatus = 'Pass'
+        $script:state = New-TestState @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+        Invoke-DemoDeployment -Config $config -Resume | Out-Null
+        $script:order[0..1] | Should -Be @('ResetTracks', 'Arc')
+        $reset = @($script:recorded | Where-Object { $_.ContainsKey('TrackT1') })[0]
+        $reset['TrackT1'] | Should -Be 'Monitoring'
+        $reset['TrackT2'] | Should -Be 'Bootstraps'
+        $reset['TrackFabric'] | Should -Be ''
     }
 
     It 'deploys the opt-in Key Vault after the template, and a vault Fail is reported without stopping the run' {
@@ -867,6 +1518,10 @@ Describe 'Start-DemoEnvironment' {
         $script:t3Exists = $false
         Start-DemoEnvironment -Config $config -ActivityProfile 'off' -Confirm:$false | Out-Null
         $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Template:abab:cdcd', 'Group', 'T3Setup', 'EnableT3', 'Gate', 'Monitoring:20', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off')
+        # A plugin the redeployment leaves NotRunning gets the agent's restart at once, as after a start (the owner's
+        # decision, 2026-10-30), never the whole wait.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['NotRunningGraceMinutes'] -eq 0 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('NotRunningGraceMinutes') } -Because 'the check after the start restarts at once, its default'
     }
 
     It 'rotates a one-time password left from an earlier session, retries T2 while its guest boots, and warms up with -WaitForWarmUp' {
@@ -1162,6 +1817,18 @@ Describe 'Get-DemoEnvironmentStatus with the runner''s own profile get output' {
         }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadAction -Times 2 -Exactly -ParameterFilter { $Action -eq 'Runner' -and $Request['arguments'][0] -eq 'profile' -and $Request['arguments'][1] -eq 'get' }
     }
+
+    It 'reports T2''s profile as Not selected, not a Warning, before T2 is set up (Phase 28 live finding)' {
+        # Before SQL Server setup, the guest has no demo module, so its Import-Module fails.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadAction -ParameterFilter { $Request['target'] -eq 'T2' } -MockWith {
+            @{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = 'Fail'; message = 'The control action failed: The specified module ''C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1'' was not loaded because no valid module file was found in any module directory.'; evidence = @{} }
+        }
+        $results = Get-DemoEnvironmentStatus -Config $config -Detail
+        $t2 = $results | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T2' }
+        $t2.status | Should -Be 'Not selected'
+        $t2.message | Should -Match 'T2 isn''t set up yet'
+        ($results | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T1' }).status | Should -Be 'Pass'
+    }
 }
 Describe 'Remove-DemoEnvironment' {
     BeforeAll {
@@ -1294,6 +1961,9 @@ Describe 'Invoke-DemoControl' {
         $script:calls.Count | Should -Be 0
         $script:t2Message = 'The workload runner is not installed in the guest yet.'
         (Invoke-DemoControl -Config $config -Target T2 -Scenario baseline -Confirm:$false | Where-Object { $_.checkId -eq 'CONTROL.T2' }).status | Should -Be 'Warning'
+        # Before T2's setup, the guest has no demo module yet (Phase 28 live finding): a Warning too, not a Fail.
+        $script:t2Message = 'The control action failed: The specified module ''C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1'' was not loaded because no valid module file was found in any module directory.'
+        (Invoke-DemoControl -Config $config -Target T2 -Scenario baseline -Confirm:$false | Where-Object { $_.checkId -eq 'CONTROL.T2' }).status | Should -Be 'Warning'
     }
 }
 
@@ -1380,6 +2050,98 @@ Describe 'Write-DemoResultReport' {
         $text | Should -Match '### Manual action required'
         $text | Should -Match '\*\*T2\.PAYGWIZARD:\*\* Open Bastion and run the wizard\.'
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'T2.PAYGWIZARD: Open Bastion' }
+    }
+
+    It 'logs Warnings that share a remediation, 3 or more, as one line, keeps each Fail on its own line, and leaves the table and the job summary complete (Phase 28 live run)' {
+        # Live, 2026-10-30: about 58 blank-measure Warnings with the same remediation came right before the DONE banner.
+        $summary = Join-Path -Path $TestDrive -ChildPath 'grouped.md'
+        $previous = $env:GITHUB_STEP_SUMMARY
+        $env:GITHUB_STEP_SUMMARY = $summary
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $blank = 'Expected before a scenario runs. Run one, then check the model again.'
+        $results = @(
+            foreach ($measure in 'TELEMETRY.AVG_CPU', 'TELEMETRY.MAX_WAIT', 'INCIDENT.COUNT') {
+                New-DemoResult -CheckId ('FABRIC.SEMANTICMODEL.MEASURE.{0}' -f $measure) -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The measure is blank.' -Remediation $blank
+            }
+            New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.ROWS' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'No rows.' -Remediation $blank
+            New-DemoResult -CheckId 'HUB.ESTATE.T1' -Area 'hub' -Target 'T1' -Status 'Warning' -Message 'Not in Estate yet.' -Remediation 'Wait about 10 minutes.'
+            New-DemoResult -CheckId 'HUB.ESTATE.T2' -Area 'hub' -Target 'T2' -Status 'Warning' -Message 'Not in Estate yet.' -Remediation 'Wait about 10 minutes.'
+            New-DemoResult -CheckId 'TELEMETRY.T1' -Area 'hub' -Target 'T1' -Status 'Pass' -Message 'Telemetry arrives.'
+        )
+        try {
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+            $table = @(Write-DemoResultReport -Result $results -Title 'deploy.ps1' 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+        }
+        finally {
+            $env:GITHUB_STEP_SUMMARY = $previous
+        }
+        $script:logged | Should -Be @(
+            ('3 checks (FABRIC.SEMANTICMODEL.MEASURE.*, e.g. FABRIC.SEMANTICMODEL.MEASURE.TELEMETRY.AVG_CPU, FABRIC.SEMANTICMODEL.MEASURE.TELEMETRY.MAX_WAIT): {0}' -f $blank)
+            ('FABRIC.SEMANTICMODEL.ROWS: {0}' -f $blank)
+            'HUB.ESTATE.T1: Wait about 10 minutes.'
+            'HUB.ESTATE.T2: Wait about 10 minutes.'
+        )
+        $text = Get-Content -LiteralPath $summary -Raw
+        foreach ($item in $results) {
+            $table | Should -Match ([regex]::Escape($item.checkId))
+            $text | Should -Match ([regex]::Escape(('| {0} | {1} |' -f $item.checkId, $item.status)))
+        }
+    }
+
+    It 'says, after a run that ended DONE, that none of its Manual action required items keeps it from DONE (Phase 28 live run)' {
+        # Live, 2026-10-30: "2 item(s) need you" came right before a DONE banner whose summary said nothing else needed the person.
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $results = @(
+            New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The app is deployed.' -Remediation 'Open the app once in the browser.'
+            New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status 'Manual action required' -Message 'Nothing else needs you for DONE.'
+        )
+        $previous = $env:GITHUB_STEP_SUMMARY
+        $env:GITHUB_STEP_SUMMARY = ''
+        try {
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+            Write-DemoResultReport -Result $results -Title 'deploy.ps1' -OutcomeDone 6>$null
+            $script:logged | Should -Be @('2 item(s) are Manual action required; none of them keeps this run from DONE:', '  FABRIC.APP.BROWSER: Open the app once in the browser.', '  DEPLOY.SUMMARY: Nothing else needs you for DONE.')
+            $script:logged.Clear()
+            Write-DemoResultReport -Result $results -Title 'deploy.ps1' 6>$null
+            $script:logged[0] | Should -Be '2 item(s) need you (Manual action required):'
+        }
+        finally {
+            $env:GITHUB_STEP_SUMMARY = $previous
+        }
+    }
+
+    It 'logs a check''s remediation once when two sources report the same check and remediation, and keeps the table and the job summary complete (Phase 28 live run)' {
+        # Live, 2026-10-30: PREFLIGHT.FABRIC.VIEWERLICENSE's remediation came twice, from preflight and from the Fabric track.
+        $summary = Join-Path -Path $TestDrive -ChildPath 'deduplicated.md'
+        $previous = $env:GITHUB_STEP_SUMMARY
+        $env:GITHUB_STEP_SUMMARY = $summary
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $licence = 'For viewers of the report or the app: assign Pro or PPU licenses (P11).'
+        $results = @(
+            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.VIEWERLICENSE' -Area 'preflight' -Target 'fabric' -Status 'Warning' -Message 'The capacity is F2.' -Remediation $licence
+            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.VIEWERLICENSE' -Area 'preflight' -Target 'fabric' -Status 'Warning' -Message 'The capacity is F2.' -Remediation $licence
+            New-DemoResult -CheckId 'HUB.ESTATE.T1' -Area 'hub' -Target 'T1' -Status 'Warning' -Message 'Not in Estate yet.' -Remediation 'Wait about 10 minutes.'
+            New-DemoResult -CheckId 'HUB.ESTATE.T1' -Area 'hub' -Target 'T1' -Status 'Fail' -Message 'Not in Estate.' -Remediation 'Wait about 10 minutes.'
+            New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The app is deployed.' -Remediation 'Open the app once in the browser.'
+            New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The app is deployed.' -Remediation 'Open the app once in the browser.'
+        )
+        try {
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+            $table = @(Write-DemoResultReport -Result $results -Title 'deploy.ps1' 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+        }
+        finally {
+            $env:GITHUB_STEP_SUMMARY = $previous
+        }
+        $script:logged | Should -Be @(
+            ('PREFLIGHT.FABRIC.VIEWERLICENSE: {0}' -f $licence)
+            'HUB.ESTATE.T1: Wait about 10 minutes.'
+            '1 item(s) need you (Manual action required):'
+            '  FABRIC.APP.BROWSER: Open the app once in the browser.'
+        )
+        ([regex]::Matches($table, 'PREFLIGHT\.FABRIC\.VIEWERLICENSE')).Count | Should -Be 2 -Because 'the table keeps every result'
+        $text = Get-Content -LiteralPath $summary -Raw
+        ([regex]::Matches($text, '\| PREFLIGHT\.FABRIC\.VIEWERLICENSE \| Warning \|')).Count | Should -Be 2
+        ([regex]::Matches($text, '\*\*FABRIC\.APP\.BROWSER:\*\*')).Count | Should -Be 2 -Because 'the job summary is unchanged'
     }
 }
 
@@ -1505,6 +2267,133 @@ Describe 'Invoke-DemoVmPowerAction' {
     }
 }
 
+Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts what was stopped (Phase 28 live finding)' {
+    BeforeAll {
+        $config = New-TestConfig
+    }
+
+    BeforeEach {
+        # Live, 2026-10-30: a rerun after the nightly auto-shutdown found the VMs deallocated, and its first Run Command failed.
+        $script:calls = [System.Collections.Generic.List[string]]::new()
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
+        $script:page = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
+        Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:calls.Add('request ' + $VmName); $true }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith {
+            $script:calls.Add(('running {0} requested={1}' -f $VmName, [bool]$PesterBoundParameters['StartRequested']))
+            New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) $(if ($VmName -eq $script:noStart) { 'Warning' } else { 'Pass' }) 'infra' 'T1'
+        }
+        $script:noStart = ''
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenSourceRelease -MockWith { $script:calls.Add('source release'); New-TestResult 'T2.GOLDEN.SOURCE' 'Pass' 't2' 'T2' }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:calls.Add('t1 monitoring'); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:page.Add(('{0}|{1}|{2}|{3}' -f (@($PesterBoundParameters['Id']) -join ','), $PesterBoundParameters['State'], $PesterBoundParameters['Status'], $PesterBoundParameters['Message'])) }
+    }
+
+    It 'leaves running VMs and a Ready T4 alone, read-only, and says nothing needed starting' {
+        $withT4 = New-TestConfig -WithT4
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { $script:calls.Add('t4 ' + $PesterBoundParameters['WaitMinutes']); New-DemoResult -CheckId 'DEPLOY.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'T4 was already running (Ready).' -Evidence ([ordered]@{ stateBefore = 'Ready'; stateAfter = 'Ready' }) }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $request.Needed | Should -BeFalse
+        $script:calls | Should -Be @('t4 0') -Because 'Invoke-DemoT4PowerAction only reads a T4 that''s Ready'
+        $script:page | Should -Be @('StartVms|Skipped||Not needed: nothing was stopped.')
+        @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request }) | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -Times 0 -Exactly
+    }
+
+    It 'asks a deallocated VM to start without waiting, waits for one that''s still stopping, and says so on the status page' {
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocating' }
+        $script:billing = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Add-DemoProgressStartedVm -MockWith { $script:billing.Add((@($PesterBoundParameters['Name']) -join ',')) }
+        # Invoke-DemoVmPowerAction issues the start for the one that was still stopping once it has settled.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith {
+            $script:calls.Add(('running {0} requested={1}' -f $VmName, [bool]$PesterBoundParameters['StartRequested']))
+            $issued = if ([bool]$PesterBoundParameters['StartRequested']) { '' } else { 'start' }
+            New-DemoResult -CheckId ('START.VM_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T1' -Status 'Pass' -Message ('{0} is running.' -f $VmName) -Evidence ([ordered]@{ issued = $issued })
+        }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $request.Needed | Should -BeTrue
+        $request.Requested | Should -Be @('sqlvm01') -Because 'only what this run asked to start bills because of it'
+        $script:billing | Should -Be @('sqlvm01') -Because 'the ending names what this run started, even after Ctrl+C (Phase 28)'
+        $script:calls | Should -Be @('request sqlvm01') -Because 'a VM that''s still deallocating is only waited for'
+        $script:page[0] | Should -Be 'StartVms|Running||Starting sqlvm01 (deallocated) and archost01 (deallocating), which were stopped; no action needed from you.'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request -ProgressPath 'progress.json' })
+        $script:calls | Should -Contain 'running sqlvm01 requested=True'
+        $script:calls | Should -Contain 'running archost01 requested=False'
+        $script:calls | Should -Contain 'source release' -Because 'a golden snapshot''s source host gets its guest back, as start-demo.ps1 does'
+        $script:calls | Should -Not -Contain 't1 monitoring' -Because 'T1''s Monitoring step runs in this run'
+        $done = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $done.status | Should -Be 'Pass'
+        $done.message | Should -Match 'Started sqlvm01 and archost01, which had been stopped'
+        $script:page[-1] | Should -Match '^StartVms\|\|Pass\|Started sqlvm01 and archost01'
+        $script:billing[-1] | Should -Be 'sqlvm01,archost01' -Because 'the one that was still stopping was started too'
+        @($done.evidence.started) | Should -Be @('sqlvm01', 'archost01')
+    }
+
+    It 'records as billing because of this run only the VMs it issued a start for, not one that was already starting (Phase 28 review)' {
+        # Reviewer, 2026-10-30: the record named every VM that wasn't running, including one something else was starting.
+        $script:power = @{ sqlvm01 = 'PowerState/starting'; archost01 = 'PowerState/deallocated' }
+        $script:billing = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Add-DemoProgressStartedVm -MockWith { $script:billing.Add((@($PesterBoundParameters['Name']) -join ',')) }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $request.Requested | Should -Be @('archost01')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request -ProgressPath 'progress.json' })
+        $script:calls | Should -Contain 'running sqlvm01 requested=False' -Because 'a VM that''s starting is only waited for'
+        $script:billing[-1] | Should -Be 'archost01'
+        @(($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).evidence.started) | Should -Be @('archost01')
+    }
+
+    It 'starts a stopped T4 and waits for it, and leaves T1''s monitoring plugin to the caller''s check on every run (Phase 28 live finding)' {
+        $withT4 = New-TestConfig -WithT4
+        $script:power = @{ sqlvm01 = 'PowerState/stopped'; archost01 = 'PowerState/running' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith {
+            $script:calls.Add(('t4 {0} requested={1}' -f $PesterBoundParameters['WaitMinutes'], [bool]$PesterBoundParameters['Requested']))
+            $after = if ([int]$PesterBoundParameters['WaitMinutes'] -gt 0) { 'Ready' } else { 'Starting' }
+            New-DemoResult -CheckId 'DEPLOY.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 is {0}.' -f $after) -Evidence ([ordered]@{ stateBefore = 'Stopped'; stateAfter = $after })
+        }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
+        $request.Names | Should -Be @('sqlvm01 (stopped)', 'T4 (stopped)')
+        $request.Requested | Should -Be @('sqlvm01', 'T4')
+        $script:page[0] | Should -Be 'StartVms|Running||Starting sqlvm01 and T4, which were stopped; no action needed from you.'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        # The plugin can stop hours after a start, so deploy.ps1 checks it on every run, not only after it started sqlvm01.
+        $script:calls | Should -Be @('request sqlvm01', 't4 0 requested=False', 'running sqlvm01 requested=True', 't4 15 requested=True')
+        $results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' } | Should -BeNullOrEmpty
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).message | Should -Match 'T4 is Ready'
+    }
+
+    It 'says in plain words which VMs start because they were stopped, and that nothing is needed from the person (Phase 28 live run)' {
+        # Live, 2026-10-30: "Starting the VMs that were stopped: no action needed (sqlvm01 (deallocated), archost01
+        # (deallocated))" read as if nothing were needed for those VMs.
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $script:page[0] | Should -Be 'StartVms|Running||Starting sqlvm01 and archost01, which were stopped (deallocated); no action needed from you.'
+        $script:page.Clear()
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/stopped' }
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
+        $script:page[0] | Should -Be 'StartVms|Running||Starting archost01, which was stopped; no action needed from you.'
+    }
+
+    It 'fails with the next action when a VM still doesn''t run, so nothing needs it' {
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/deallocated' }
+        $script:noStart = 'archost01'
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        $failed = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match 'archost01 isn''t running'
+        $failed.remediation | Should -Match ([regex]::Escape('./scripts/start-demo.ps1'))
+        $script:calls | Should -Not -Contain 'source release' -Because 'the host isn''t running'
+    }
+
+    It 'starts nothing in a what-if' {
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -WhatIf }
+        $request.Needed | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Request-DemoVmStart -Times 0 -Exactly
+    }
+}
+
 Describe 'Set-DemoTargetProfile' {
     BeforeAll {
         $config = New-TestConfig
@@ -1553,6 +2442,30 @@ Describe 'Set-DemoTargetProfile' {
 
         $script:message = 'The workload runner is not installed in the guest yet.'
         (& (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName off -CheckPrefix STOP } $config).status | Should -Be 'Not selected'
+    }
+
+    It 'reports T2 as Not selected, not set up yet, when stop-demo.ps1 runs before its setup and the guest has no demo module (Phase 28 live finding)' {
+        # Live: stop-demo.ps1 at the guided stop gave STOP.PROFILE_T2 a Warning with the guest's Import-Module error.
+        $script:attempts = 0
+        $script:failFirst = 9
+        $script:message = 'The control action failed: The specified module ''C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1'' was not loaded because no valid module file was found in any module directory.'
+        $stop = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName off -CheckPrefix STOP } $config
+        $stop.status | Should -Be 'Not selected'
+        $stop.message | Should -Match 'T2 isn''t set up yet'
+        $stop.message | Should -Match 'no activity runs there to turn off'
+        # What the guest says since this fix, before it imports anything.
+        $script:message = 'The control action failed: T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
+        (& (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName baseline -CheckPrefix START } $config).status | Should -Be 'Not selected'
+        $vmScript = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoWorkloadControl.ps1') -Raw
+        $vmScript | Should -Match ([regex]::Escape('if (-not (Test-Path -LiteralPath $modulePath)) {'))
+        $thrown = [regex]::Match($vmScript, "throw '(T2 isn''t set up yet(?:[^']|'')*)'").Groups[1].Value -replace "''", "'"
+        $thrown | Should -Not -BeNullOrEmpty
+        & (Get-Module -Name DbHubDemo) { param($t) Test-DemoT2NotSetUpText -Text $t } ('The control action failed: ' + $thrown) | Should -BeTrue
+        # Any other T2 problem stays a Warning, and so does any other target's.
+        $script:message = 'The control action failed: The module manifest DbHubDemo.Vm.psd1 could not be processed.'
+        (& (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName off -CheckPrefix STOP } $config).status | Should -Be 'Warning'
+        $script:message = 'The specified module was not loaded because no valid module file was found in any module directory.'
+        (& (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T1 -ProfileName off -CheckPrefix STOP } $config).status | Should -Be 'Warning'
     }
 }
 
@@ -1672,6 +2585,9 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
             $plugin = switch ($PluginState) {
                 'Empty' { '' }
                 'Running' { 'DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"};' }
+                # The documented troubleshooting symptom of a blocked endpoint or identity (enable-performance-monitoring-sql-vm).
+                'RunningHttp403' { 'DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"HTTP 403 Forbidden"};' }
+                'RunningNoUpload' { 'DatabaseMonitorArcPlugin: {"State":"Running"};' }
                 default { 'DatabaseMonitorArcPlugin: {"State":"' + $PluginState + '"};' }
             }
             [pscustomobject]@{
@@ -1711,15 +2627,38 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
     }
 
+    It 'passes a running plugin only with uploads OK, and hands back uploads that fail with their cause and fix, without a restart (Phase 28 review)' {
+        # Reviewer, 2026-10-30: the early Pass checked only State Running, so a plugin that started by itself with its uploads
+        # already failing passed here, and the deployment step lost the real cause.
+        $script:pluginStates.Enqueue('RunningHttp403')
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' } $config
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be 'sqlvm01''s monitoring plugin is running, but its uploads fail (HTTP 403 Forbidden); a restart of the SQL IaaS Agent doesn''t fix that.'
+        $result.remediation | Should -Match '^Check sqlvm01''s system-assigned identity and outbound HTTPS to telemetry\.[a-z0-9]+\.arcdataservices\.com:443, then run \./scripts/configure-monitoring\.ps1\.$'
+        $result.evidence.restarted | Should -BeFalse
+        $result.evidence.after | Should -Match 'HTTP 403 Forbidden'
+
+        $script:pluginStates.Clear()
+        $script:pluginStates.Enqueue('RunningNoUpload')
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c } $config
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be 'sqlvm01''s monitoring plugin is running, but its uploads aren''t OK yet (upload status '''').'
+        $result.remediation | Should -Match 'configure-monitoring\.ps1 -WaitMinutes 15'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly -Because 'a restart of the agent doesn''t fix uploads'
+    }
+
     It 'reports as the deployment''s check when deploy.ps1 calls it after its wait (Phase 25d)' {
         # Live, 2026-10-27: after the deployment's template run the plugin stayed NotRunning; the restart brought it back.
         foreach ($state in 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($state)
         }
-        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' } $config
+        # The Monitoring step has already given the plugin its grace (Invoke-DemoSqlVmMonitoringWait), so it passes 0.
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -NotRunningGraceMinutes 0 } $config
         $result.checkId | Should -Be 'DEPLOY.T1.MONITORING'
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'wasn''t running after the deployment \(DatabaseMonitorArcPlugin: \{"State":"NotRunning"\}\); the SQL IaaS Agent service was restarted'
+        $script:readsAtRestart | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly -ParameterFilter { $Seconds -eq 60 }
     }
 
     It 'waits for the agent''s first plugin status after boot, and leaves a plugin that comes up Running alone' {
@@ -1745,12 +2684,15 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'wasn''t running after the start \(DatabaseMonitorArcPlugin: \{"State":"NotRunning"\}\); the SQL IaaS Agent service was restarted'
         $result.evidence.restarted | Should -BeTrue
+        $result.evidence.gracePolls | Should -Be 0
         $result.evidence.after | Should -Match '"State":"Running","MetricsUploadStatus":"OK"'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $VmName -eq 'sqlvm01' -and $Script -match "Restart-Service -Name 'SQLIaaSExtension' -Force" }
     }
 
-    It 'restarts the SQL IaaS Agent when the plugin stayed NotRunning after the start, and waits for Running and OK' {
-        # Live, 2026-10-22: NotRunning for more than 90 minutes after a deallocation and start; Running a minute after the restart.
+    It 'restarts the SQL IaaS Agent at once when the plugin stayed NotRunning after the start, with no grace by default, and waits for Running and OK' {
+        # Live, 2026-10-22: NotRunning for more than 90 minutes after a deallocation and start; Running a minute after the
+        # restart. start-demo.ps1 and deploy.ps1's check beside the tracks keep this immediate restart (the owner's decision,
+        # 2026-10-30: presenters run start-demo.ps1 before each session).
         foreach ($state in 'NotRunning', 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($state)
         }
@@ -1758,7 +2700,65 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         $script:readsAtRestart | Should -Be 1
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'restarted'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly -ParameterFilter { $Seconds -eq 60 }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $VmName -eq 'sqlvm01' -and $Script -match "Restart-Service -Name 'SQLIaaSExtension' -Force" }
+
+        # With a grace, the restart comes after it: the first read, then three more a minute apart.
+        $script:pluginStates.Clear()
+        $script:reads = 0
+        foreach ($state in 'NotRunning', 'NotRunning', 'NotRunning', 'NotRunning', 'Running') {
+            $script:pluginStates.Enqueue($state)
+        }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -PollSeconds 1 -NotRunningGraceMinutes 3 } $config
+        $script:readsAtRestart | Should -Be 4
+        $result.evidence.gracePolls | Should -Be 3
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 3 -Exactly -ParameterFilter { $Seconds -eq 60 }
+    }
+
+    It 'counts the grace in elapsed time, the reads included, and never sleeps past its end (Phase 28 live finding)' {
+        # Live, 2026-10-30: each read takes 15 to 20 seconds, so a wait counted in reads ran 25 minutes instead of 20.
+        $script:pluginStates.Enqueue('NotRunning')
+        $script:now = [datetime]::new(2026, 10, 30, 13, 30, 0, [System.DateTimeKind]::Utc)
+        $script:sleeps = [System.Collections.Generic.List[int]]::new()
+        $script:restartAt = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:sleeps.Add([int]$Seconds); $script:now = $script:now.AddSeconds($Seconds) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm extension show ' } -MockWith {
+            $script:reads++
+            $script:now = $script:now.AddSeconds(20)
+            New-TestSqlIaasExtension -PluginState $(if ($null -ne $script:restartAt) { 'Running' } else { 'NotRunning' })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $script:readsAtRestart = $script:reads
+            $script:restartAt = $script:now
+            [pscustomobject]@{ Succeeded = $true; Output = 'SQLIaaSExtension is Running.' }
+        }
+        $start = $script:now
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -NotRunningGraceMinutes 3 } $config
+        $result.status | Should -Be 'Pass'
+        @($script:sleeps)[0..2] | Should -Be @(60, 60, 20) -Because 'the last sleep ends with the 3-minute grace'
+        $script:readsAtRestart | Should -Be 4
+        ($script:restartAt - $start).TotalSeconds | Should -Be 220 -Because 'the first read (20 s), then the grace of 180 s, and the read that ends it'
+    }
+
+    It 'says on the console and the status page, with a grace, that it waits for a NotRunning plugin, and leaves one that starts by itself alone (Phase 28 live finding)' {
+        foreach ($state in 'NotRunning', 'NotRunning', 'Running') {
+            $script:pluginStates.Enqueue($state)
+        }
+        $script:page = [System.Collections.Generic.List[string]]::new()
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:page.Add(('{0}|{1}|{2}' -f (@($PesterBoundParameters['Id']) -join ','), [bool]$PesterBoundParameters['AzureSide'], $PesterBoundParameters['Message'])) }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -NotRunningGraceMinutes 3 -ProgressPath 'progress.json' } $config
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'is running \(upload status ''OK''\), reported \d+ seconds after the check began'
+        $result.evidence.gracePolls | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
+        $script:page | Should -Be @(
+            'T1.Monitoring|True|T1''s monitoring plugin reports NotRunning; the deployment restarts it if it doesn''t start by itself within 3 minutes; no action needed.'
+            'T1.Monitoring|True|T1''s monitoring plugin reports NotRunning (1 min so far); the deployment restarts it if it doesn''t start by itself within 2 minutes; no action needed.'
+        )
+        $script:logged | Should -Be @('T1''s monitoring plugin reports NotRunning; the deployment restarts it if it doesn''t start by itself within 3 minutes; no action needed.') -Because 'a console line on the first read, then every few minutes'
     }
 
     It 'restarts the SQL IaaS Agent when the plugin still has no status after the bounded wait' {
@@ -1789,5 +2789,296 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         $result.status | Should -Be 'Not selected'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'says on the status page, as it restarts the agent, that T1''s monitoring plugin is restarting with no action needed (Phase 28 live finding)' {
+        foreach ($state in 'NotRunning', 'Running') {
+            $script:pluginStates.Enqueue($state)
+        }
+        $script:page = [System.Collections.Generic.List[string]]::new()
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:page.Add(('{0}|{1}|{2}|{3}|{4}' -f (@($PesterBoundParameters['Id']) -join ','), $PesterBoundParameters['State'], $PesterBoundParameters['Status'], [bool]$PesterBoundParameters['AzureSide'], $PesterBoundParameters['Message'])) }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -CheckId 'DEPLOY.T1.MONITORING' -Occasion 'the deployment' -NotRunningGraceMinutes 0 -ProgressPath 'progress.json' } $config
+        $result.status | Should -Be 'Pass'
+        $script:page | Should -Be @('T1.Monitoring|Running||True|Restarting T1''s monitoring plugin, which stopped after a restart; no action needed.')
+        $script:readsAtRestart | Should -Be 1 -Because 'the message comes just before the restart'
+        $script:logged[0] | Should -Be 'sqlvm01''s monitoring plugin reports DatabaseMonitorArcPlugin: {"State":"NotRunning"}; restarting the SQL IaaS Agent service so it starts again; no action needed.'
+        $script:logged[1] | Should -Be 'The SQL IaaS Agent service on sqlvm01 restarted; waiting up to 5 minutes for its monitoring plugin to report Running and OK; no action needed.'
+
+        # The check deploy.ps1 runs on every run: the step shows it, and a failure is a Warning, never an exception.
+        $script:page.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { throw 'The VM isn''t running (deallocated or stopped).' }
+        $check = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoT1MonitoringCheck -Config $c -ProgressPath 'progress.json' } $config
+        $check.checkId | Should -Be 'DEPLOY.T1.MONITORING'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Match 'T1''s monitoring plugin couldn''t be checked: The VM isn''t running'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('NotRunningGraceMinutes') } -Because 'the check beside the tracks restarts at once, Restore''s default (the owner''s decision, 2026-10-30)'
+        $script:page[0] | Should -Be 'T1.Monitoring|Running||True|Checking T1''s monitoring plugin, which can stop after a restart: no action needed.'
+        $script:page[-1] | Should -Match '^T1\.Monitoring\|\|Warning\|False\|T1''s monitoring plugin couldn''t be checked'
+    }
+}
+
+Describe 'Invoke-DemoSqlVmMonitoringWait: a deployment step''s T1 monitoring (Phase 28 live finding, 2026-10-30)' {
+    BeforeAll {
+        $config = New-TestConfig
+        $script:waitRemediation = 'Run configure-monitoring.ps1 -WaitMinutes 15, or check again later.'
+        function New-StuckMonitoring {
+            New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message 'The DatabaseWatcheronAzureVM flag is set on sqlvm01, but DatabaseMonitorArcPlugin doesn''t report Running and OK yet (state ''NotRunning'', upload '''').' -Remediation $script:waitRemediation -Evidence ([ordered]@{ provisioningState = 'Succeeded'; featureFlagEnabled = $true; pluginState = 'NotRunning'; powerState = 'PowerState/running'; pending = $true; stoppedForRestart = $true })
+        }
+    }
+
+    BeforeEach {
+        # Live, b18a028's rerun from deallocated VMs: the step waited 25 minutes on a NotRunning plugin, the restart brought it
+        # back in 17 seconds, and the console still printed the wait's "Run configure-monitoring.ps1 -WaitMinutes 15".
+        $script:calls = [System.Collections.Generic.List[string]]::new()
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $script:restoreStatus = 'Pass'
+        $script:restoreRestarted = $true
+        $script:reread = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add(('wait {0} grace {1}' -f $PesterBoundParameters['WaitMinutes'], $PesterBoundParameters['NotRunningGraceMinutes'])); New-StuckMonitoring }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith {
+            $script:calls.Add(('restore {0} grace {1}' -f $PesterBoundParameters['CheckId'], $PesterBoundParameters['NotRunningGraceMinutes']))
+            $message = if (-not $script:restoreRestarted) { 'sqlvm01''s monitoring plugin is running (upload status ''OK''), reported 200 seconds after the check began.' } else { 'sqlvm01''s monitoring plugin wasn''t running after the deployment; the SQL IaaS Agent service was restarted, and it''s Running with uploads OK after 17 seconds.' }
+            New-DemoResult -CheckId $PesterBoundParameters['CheckId'] -Area 't1' -Target 'T1' -Status $script:restoreStatus -Message $message -Remediation $(if ($script:restoreStatus -eq 'Pass') { '' } else { './scripts/configure-monitoring.ps1 -WaitMinutes 15 checks it again.' }) -Evidence ([ordered]@{ restarted = $script:restoreRestarted })
+        }
+        # T1.SQLVM.MONITORING read right after, as ConvertTo-DemoSqlVmMonitoringResult and Test-DemoSqlVmMonitoring report it.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -MockWith {
+            $script:calls.Add('reread')
+            switch ($script:reread) {
+                'Pass' {
+                    New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'sqlvm01 reports DatabaseMonitorArcPlugin Running with MetricsUploadStatus OK.' -Evidence ([ordered]@{ pluginState = 'Running'; metricsUploadStatus = 'OK'; pending = $false })
+                }
+                'Fail' {
+                    New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.' -Remediation 'Check the VM''s system-assigned identity and outbound HTTPS to telemetry.<location>.arcdataservices.com:443.' -Evidence ([ordered]@{ pluginState = 'Running'; metricsUploadStatus = 'HTTP 403 Forbidden'; pending = $false })
+                }
+                'Pending' {
+                    New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message 'The DatabaseWatcheronAzureVM flag is set on sqlvm01, but DatabaseMonitorArcPlugin doesn''t report Running and OK yet (state ''Running'', upload '''').' -Remediation $script:waitRemediation -Evidence ([ordered]@{ pluginState = 'Running'; metricsUploadStatus = ''; pending = $true })
+                }
+                default {
+                    throw 'The operation timed out.'
+                }
+            }
+        }
+    }
+
+    It 'restarts a plugin still NotRunning after the short grace, then reports T1.SQLVM.MONITORING as it is then, so the console doesn''t tell the person to act' {
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -ProgressPath 'progress.json' } $config)
+        $script:calls | Should -Be @('wait 20 grace 3', 'restore DEPLOY.T1.MONITORING grace 0', 'reread') -Because 'the flag was set before this run, and the restart waits no second grace'
+        @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING', 'DEPLOY.T1.MONITORING')
+        $results[0].status | Should -Be 'Pass'
+        $results[0].remediation | Should -BeNullOrEmpty
+        $results[0].message | Should -Match 'The plugin had reported NotRunning; the SQL IaaS Agent service was restarted \(DEPLOY\.T1\.MONITORING\)\.$'
+        $results[0].evidence.restartCheckId | Should -Be 'DEPLOY.T1.MONITORING'
+        $results[0].evidence.restarted | Should -BeTrue
+        $results[0].evidence.pluginStateBefore | Should -Be 'NotRunning'
+
+        $previous = $env:GITHUB_STEP_SUMMARY
+        $env:GITHUB_STEP_SUMMARY = ''
+        try {
+            Write-DemoResultReport -Result $results -Title 'deploy.ps1' 6>$null
+        }
+        finally {
+            $env:GITHUB_STEP_SUMMARY = $previous
+        }
+        @($script:logged | Where-Object { $_ -like 'T1.SQLVM.MONITORING*' }) | Should -BeNullOrEmpty
+
+        # When this run merged the flag (T1's Bootstraps step), the plugin gets the longer grace first.
+        $script:calls.Clear()
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -JustMerged } $config
+        $script:calls[0] | Should -Be 'wait 20 grace 5'
+
+        # start-demo.ps1, after it recreates T3, restarts a NotRunning plugin at once (the owner's decision, 2026-10-30).
+        $script:calls.Clear()
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -RestartAtOnce -CheckId 'START.T1.MONITORING' } $config
+        @($script:calls)[0..1] | Should -Be @('wait 20 grace 0', 'restore START.T1.MONITORING grace 0')
+    }
+
+    It 'marks the wait''s Warning superseded, without a remediation and without claiming uploads OK, when a read right after the restart is still a wait' {
+        # Phase 28 review (2026-10-30): "superseded" only for a read that's still a wait, with what that read shows.
+        $script:reread = 'Pending'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -CheckId 'START.T1.MONITORING' } $config)
+        @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING', 'START.T1.MONITORING')
+        $results[0].status | Should -Be 'Warning'
+        $results[0].remediation | Should -BeNullOrEmpty
+        $results[0].message | Should -Match 'Superseded: the SQL IaaS Agent service was restarted \(START\.T1\.MONITORING\); a read right after shows state ''Running'', upload ''''\.$'
+        $results[0].message | Should -Not -Match 'uploads OK'
+        $results[0].evidence.superseded | Should -BeTrue
+        $results[0].evidence.restarted | Should -BeTrue
+    }
+
+    It 'returns a Fail read right after a restart that passed unchanged, with its own cause and fix and the restart in its evidence (Phase 28 review)' {
+        # Reviewer, 2026-10-30, reproduced: the Fail went to the else branch, which returned the wait's Warning, superseded,
+        # without a remediation, and with "...restarted, and the plugin reported Running with uploads OK".
+        $script:reread = 'Fail'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING', 'DEPLOY.T1.MONITORING')
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.'
+        $results[0].remediation | Should -Be 'Check the VM''s system-assigned identity and outbound HTTPS to telemetry.<location>.arcdataservices.com:443.'
+        $results[0].evidence.metricsUploadStatus | Should -Be 'HTTP 403 Forbidden'
+        $results[0].evidence.restartCheckId | Should -Be 'DEPLOY.T1.MONITORING'
+        $results[0].evidence.restarted | Should -BeTrue
+        $results[0].evidence.pluginStateBefore | Should -Be 'NotRunning'
+        $results[0].evidence.Contains('superseded') | Should -BeFalse
+    }
+
+    It 'returns a Fail read unchanged when the plugin started without a restart, and when the restart didn''t help (Phase 28 review)' {
+        # The reviewer's second variant: Restore found the plugin Running (no restart), and the read right after is a Fail.
+        $script:reread = 'Fail'
+        $script:restoreRestarted = $false
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'Monitoring runs on sqlvm01, but uploads fail: HTTP 403 Forbidden.'
+        $results[0].remediation | Should -Match 'system-assigned identity'
+        $results[0].evidence.restarted | Should -BeFalse
+        $results[0].message | Should -Not -Match 'Superseded|uploads OK'
+
+        $script:restoreRestarted = $true
+        $script:restoreStatus = 'Warning'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[1].status | Should -Be 'Warning'
+
+        # A read that throws is a Fail too, as Test-DemoSqlVmMonitoring reports one, never a superseded Warning.
+        $script:restoreStatus = 'Pass'
+        $script:reread = 'Throw'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'Azure couldn''t be read: The operation timed out.'
+        $results[0].evidence.restarted | Should -BeTrue
+    }
+
+    It 'names a restart in a Pass read only when there was one' {
+        $script:restoreRestarted = $false
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Pass'
+        $results[0].message | Should -Match 'The plugin had reported NotRunning; then it started without a restart \(DEPLOY\.T1\.MONITORING\)\.$'
+        $results[0].evidence.restarted | Should -BeFalse
+    }
+
+    It 'leaves the wait''s Warning and its remediation when the restart didn''t bring the plugin back, and restarts nothing that isn''t stuck' {
+        $script:restoreStatus = 'Warning'
+        $script:reread = 'Pending'
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].remediation | Should -Be $script:waitRemediation
+        $results[0].message | Should -Not -Match 'Superseded'
+        $results[1].status | Should -Be 'Warning'
+        $script:calls | Should -Contain 'reread' -Because 'a read right after can show a Fail with its own cause'
+
+        $script:calls.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add('wait'); New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'Running and OK.' -Evidence ([ordered]@{ pluginState = 'Running' }) }
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c } $config)
+        @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING')
+        $script:calls | Should -Be @('wait')
+    }
+}
+
+Describe 'T1''s monitoring when Azure can''t be read (review of c7c86ec)' {
+    BeforeAll {
+        $config = New-TestConfig
+        # What the Azure CLI writes when it can't reach Azure Resource Manager (fake host lookup failure).
+        $script:unreachable = 'ERROR: HTTPSConnectionPool(host=''management.azure.com'', port=443): Max retries exceeded with url: /subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo (Caused by NameResolutionError("Failed to resolve ''management.azure.com''"))'
+        $script:extensionJson = ConvertTo-Json -Depth 10 -InputObject ([ordered]@{
+                name              = 'SqlIaasExtension'
+                provisioningState = 'Succeeded'
+                settings          = [ordered]@{ FeatureFlags = @([ordered]@{ Name = 'DatabaseWatcheronAzureVM'; Enable = $true }) }
+                instanceView      = [ordered]@{ typeHandlerVersion = '2.0.240.0'; statuses = @([ordered]@{ code = 'ProvisioningState/succeeded'; message = 'SQL Server IaaS Agent: Healthy;DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"};' }) }
+            })
+    }
+
+    BeforeEach {
+        $script:failing = ''
+        $script:sqlRegistration = 'Registered'
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSqlVmInventoryInstance -MockWith { [pscustomobject]@{ properties = [pscustomobject]@{ edition = 'Standard' } } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            $joined = $ArgumentList -join ' '
+            $part = if ($joined -like 'vm extension show *') { 'extension' } elseif ($joined -like 'vm show *') { 'vm' } elseif ($joined -like 'provider show --namespace Microsoft.Sql *') { 'sql' } elseif ($joined -like 'provider show --namespace Microsoft.AzureArcData *') { 'arcdata' } else { 'other' }
+            if ($part -eq $script:failing) {
+                return (New-AzResult -ExitCode 1 -StdErr $script:unreachable)
+            }
+            if ($part -eq 'extension' -and $script:failing -eq 'missing') {
+                return (New-AzResult -ExitCode 3 -StdErr "ERROR: (ResourceNotFound) The Resource 'Microsoft.Compute/virtualMachines/sqlvm01/extensions/SqlIaasExtension' under resource group 'rg-dbhub-demo' was not found.")
+            }
+            if ($part -eq 'sql' -and $script:sqlRegistration -eq 'GatewayTimeout') {
+                return (New-AzResult -ExitCode 1 -StdErr "ERROR: (GatewayTimeout) The gateway did not receive a response from 'Microsoft.Resources' within the specified time period.")
+            }
+            switch ($part) {
+                'extension' { return (New-AzResult -StdOut $script:extensionJson) }
+                'vm' { return (New-AzResult -StdOut '{"name":"sqlvm01","identity":{"type":"SystemAssigned"}}') }
+                'sql' { return (New-AzResult -StdOut $script:sqlRegistration) }
+                'arcdata' { return (New-AzResult -StdOut 'Registered') }
+            }
+            if ($joined -like 'vm get-instance-view *') {
+                return (New-AzResult -StdOut '{"instanceView":{"statuses":[{"code":"PowerState/running"}]}}')
+            }
+            return (New-AzResult -StdOut '{"sqlManagement":"Full"}')
+        }
+    }
+
+    It 'says Azure couldn''t be read, with the redacted error, instead of a missing extension, identity, or registration' {
+        foreach ($case in @(
+                @{ Failing = 'extension'; What = 'the SqlIaasExtension on sqlvm01'; Not = 'has no SqlIaasExtension' }
+                @{ Failing = 'vm'; What = 'sqlvm01'; Not = 'system-assigned managed identity' }
+                @{ Failing = 'arcdata'; What = 'the Microsoft\.AzureArcData registration'; Not = 'not Registered' }
+            )) {
+            $script:failing = $case.Failing
+            $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }
+            $result.status | Should -Be 'Fail' -Because $case.Failing
+            $result.message | Should -Match ('^Azure couldn''t be read for sqlvm01''s monitoring: {0}: ERROR: HTTPSConnectionPool' -f $case.What)
+            $result.message | Should -Not -Match $case.Not
+            $result.remediation | Should -Be 'Run ./scripts/deploy.ps1 again: it resumes at T1''s Monitoring step (or run ./scripts/configure-monitoring.ps1 again).'
+            @($result.evidence.readErrors).Count | Should -BeGreaterThan 0
+        }
+
+        # Not found is still what it was: the extension is missing.
+        $script:failing = 'missing'
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }).message | Should -Be 'sqlvm01 has no SqlIaasExtension, so performance monitoring can''t run.'
+        $script:failing = ''
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }).status | Should -Be 'Pass'
+    }
+
+    It 'returns that Fail after the agent''s restart (R584), with the restart in its evidence, so the step stops on the real cause' {
+        $script:failing = 'extension'
+        $stuck = New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message 'The DatabaseWatcheronAzureVM flag is set on sqlvm01, but DatabaseMonitorArcPlugin doesn''t report Running and OK yet (state ''NotRunning'', upload '''').' -Evidence ([ordered]@{ pluginState = 'NotRunning'; pending = $true })
+        $restore = New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'Restarted.' -Evidence ([ordered]@{ restarted = $true })
+        $after = InModuleScope DbHubDemo -Parameters @{ Config = $config; Monitoring = $stuck; Restore = $restore } { Get-DemoSqlVmMonitoringAfterRestart -Config $Config -Monitoring $Monitoring -Restore $Restore }
+        $after.status | Should -Be 'Fail'
+        $after.message | Should -Match '^Azure couldn''t be read for sqlvm01''s monitoring: the SqlIaasExtension on sqlvm01: ERROR: HTTPSConnectionPool'
+        $after.message | Should -Not -Match 'has no SqlIaasExtension'
+        $after.remediation | Should -Match 'Run \./scripts/deploy\.ps1 again: it resumes at T1''s Monitoring step'
+        $after.evidence.restarted | Should -BeTrue
+        $after.evidence.restartCheckId | Should -Be 'DEPLOY.T1.MONITORING'
+    }
+
+    It 'keeps a Microsoft.Sql registration that couldn''t be read the Warning an unregistered one gets, not a Fail (review of 76d10b2)' {
+        # 76d10b2 made a GatewayTimeout on this read a Fail that stopped T1's Monitoring step and blocked DONE.
+        $sqlWarning = 'T1 uploads telemetry, but Microsoft.Sql isn''t Registered; Database Hub needs it.'
+        foreach ($case in @(
+                @{ Registration = 'GatewayTimeout'; Failing = ''; State = 'Unknown' }
+                @{ Registration = 'Registered'; Failing = 'sql'; State = 'Unknown' }
+                @{ Registration = 'NotRegistered'; Failing = ''; State = 'NotRegistered' }
+            )) {
+            $script:sqlRegistration = $case.Registration
+            $script:failing = $case.Failing
+            $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }
+            $result.status | Should -Be 'Warning' -Because ('{0} {1}' -f $case.Registration, $case.Failing)
+            $result.message | Should -Be $sqlWarning
+            $result.evidence.providers['Microsoft.Sql'] | Should -Be $case.State
+            $result.evidence.Contains('readErrors') | Should -BeFalse
+        }
+
+        # A failed extension or VM read is still "couldn't be read", and names only what failed.
+        $script:sqlRegistration = 'GatewayTimeout'
+        foreach ($failing in 'extension', 'vm') {
+            $script:failing = $failing
+            $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoSqlVmMonitoring -Config $Config }
+            $result.status | Should -Be 'Fail'
+            $result.message | Should -Match '^Azure couldn''t be read for sqlvm01''s monitoring: '
+            $result.message | Should -Not -Match 'Microsoft\.Sql|GatewayTimeout'
+            @($result.evidence.readErrors).Count | Should -Be 1
+        }
     }
 }

@@ -229,16 +229,39 @@ function Resolve-DemoFabricConfig {
                         $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces' -f $base) -Body $body -Token $Token
                     }
                     catch {
-                        $created = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Protect-DemoText -Text $_.Exception.Message) } }
+                        $created = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Get-DemoExceptionText -Exception $_.Exception) } }
                     }
                     $newId = [string](Get-DemoMemberValue -InputObject $created.Body -Name 'id')
-                    if ($created.StatusCode -in 200, 201 -and $newId) {
+                    $code = [string](Get-DemoMemberValue -InputObject $created.Body -Name 'errorCode')
+                    $taken = $created.StatusCode -eq 409 -or $code -match '(?i)AlreadyInUse|AlreadyExists|NameConflict'
+                    $takenMatch = $null
+                    if ($taken) {
+                        # A create sent again after a network error can find the workspace its first attempt made (Phase
+                        # 28 live finding, 2026-10-30): it's then resolved by name, as one found at the start is.
+                        $again = Read-DemoHubFabricList -Uri ('{0}/workspaces' -f $base) -Token $Token -MaxPages $MaxPages
+                        $againShared = @($again.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'type') -ine 'Personal' })
+                        $takenMatch = @(Select-DemoFabricNamed -Items $againShared -Name $setting.WorkspaceName)
+                    }
+                    if ($taken -and @($takenMatch).Count -eq 1) {
+                        $workspace = @($takenMatch)[0]
+                        $state['WorkspaceId'] = ([string](Get-DemoMemberValue -InputObject $workspace -Name 'id')).ToLowerInvariant()
+                        $state['WorkspaceName'] = [string](Get-DemoMemberValue -InputObject $workspace -Name 'displayName')
+                        & $add 'FABRIC.RESOLVE.WORKSPACE' 'Pass' ('Found the Fabric workspace "{0}" by name: its create said it already exists (a request sent again after a network error finds what the first one made).' -f $state['WorkspaceName']) ([ordered]@{ workspaceId = $state['WorkspaceId']; workspaceName = $state['WorkspaceName']; capacityId = [string](Get-DemoMemberValue -InputObject $workspace -Name 'capacityId'); source = 'name' }) '' $doc['ListWorkspaces']
+                    }
+                    elseif ($created.StatusCode -in 200, 201 -and $newId) {
                         $state['WorkspaceId'] = $newId.ToLowerInvariant()
                         $state['WorkspaceCreated'] = $true
                         $state['CapacityId'] = $capacity.CapacityId
                         $assignment = Wait-DemoFabricCapacityAssignment -WorkspaceId $state['WorkspaceId'] -Token $Token -TimeoutSeconds ([System.Math]::Min($TimeoutSeconds, 300))
                         $evidence = [ordered]@{ workspaceId = $state['WorkspaceId']; workspaceName = $setting.WorkspaceName; capacityId = $capacity.CapacityId; capacityName = $setting.CapacityName; capacityAssignmentProgress = $assignment.Progress; source = 'created' }
-                        if ($assignment.Progress -eq 'Failed') {
+                        if ([bool](Get-DemoMemberValue -InputObject $assignment -Name 'NetworkError')) {
+                            # No read came back in the whole wait, and a network error stopped the last one (reviews of c7c86ec
+                            # and 76d10b2): a rerun finds the workspace by name and goes on.
+                            $state['CapacityId'] = ''
+                            $evidence['networkError'] = $true
+                            & $add 'FABRIC.RESOLVE.WORKSPACE' 'Fail' ('The Fabric workspace "{0}" was created, but whether it''s on the capacity "{1}" yet couldn''t be read: {2}' -f $setting.WorkspaceName, $setting.CapacityName, $assignment.Error) $evidence ('Run the script again, or ./scripts/deploy.ps1, which resumes where it stopped: either finds the workspace by name. {0}' -f (Get-DemoNetworkErrorNote)) $doc['GetWorkspace']
+                        }
+                        elseif ($assignment.Progress -eq 'Failed') {
                             # The lakehouse step reads the workspace again and reports that it has no capacity.
                             $state['CapacityId'] = ''
                             & $add 'FABRIC.RESOLVE.WORKSPACE' 'Manual action required' ('The Fabric workspace "{0}" was created, but its assignment to the capacity "{1}" failed.' -f $setting.WorkspaceName, $setting.CapacityName) $evidence 'A workspace administrator assigns an F or Trial capacity in Workspace settings > License info, then run the script again.' $doc['GetWorkspace']
@@ -279,13 +302,19 @@ function Resolve-DemoFabricConfig {
                 $assigned = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces/{1}/assignToCapacity' -f $base, $state['WorkspaceId']) -Body ([ordered]@{ capacityId = $capacity.CapacityId }) -Token $Token
             }
             catch {
-                $assigned = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Protect-DemoText -Text $_.Exception.Message) } }
+                $assigned = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Get-DemoExceptionText -Exception $_.Exception) } }
             }
             $evidence = [ordered]@{ workspaceId = $state['WorkspaceId']; capacityId = $capacity.CapacityId; capacityName = $setting.CapacityName }
             if ($assigned.StatusCode -in 200, 202) {
                 $assignment = Wait-DemoFabricCapacityAssignment -WorkspaceId $state['WorkspaceId'] -Token $Token -TimeoutSeconds ([System.Math]::Min($TimeoutSeconds, 300))
                 $evidence['capacityAssignmentProgress'] = $assignment.Progress
-                if ($assignment.Progress -eq 'Completed') {
+                if ([bool](Get-DemoMemberValue -InputObject $assignment -Name 'NetworkError')) {
+                    # No read came back in the whole wait, and a network error stopped the last one (reviews of c7c86ec and
+                    # 76d10b2): a rerun reads the workspace again and goes on.
+                    $evidence['networkError'] = $true
+                    & $add 'FABRIC.RESOLVE.CAPACITY' 'Fail' ('The workspace "{0}" was assigned to the capacity "{1}", but whether the assignment finished couldn''t be read: {2}' -f $state['WorkspaceName'], $setting.CapacityName, $assignment.Error) $evidence ('Run the script again, or ./scripts/deploy.ps1, which resumes where it stopped: either reads the workspace again. {0}' -f (Get-DemoNetworkErrorNote)) $doc['AssignToCapacity']
+                }
+                elseif ($assignment.Progress -eq 'Completed') {
                     $state['CapacityId'] = $capacity.CapacityId
                     & $add 'FABRIC.RESOLVE.CAPACITY' 'Pass' ('Assigned the workspace "{0}" to the capacity "{1}" ({2}).' -f $state['WorkspaceName'], $setting.CapacityName, $capacity.Sku) $evidence '' $doc['AssignToCapacity']
                 }
@@ -371,7 +400,7 @@ function Resolve-DemoFabricConfig {
                         $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces/{1}/lakehouses' -f $base, $state['WorkspaceId']) -Body $body -Token $Token
                     }
                     catch {
-                        $created = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Protect-DemoText -Text $_.Exception.Message) } }
+                        $created = [pscustomobject]@{ StatusCode = 0; Headers = @{}; Body = [pscustomobject]@{ message = (Get-DemoExceptionText -Exception $_.Exception) } }
                     }
                     $code = [string](Get-DemoMemberValue -InputObject $created.Body -Name 'errorCode')
                     $failure = ''

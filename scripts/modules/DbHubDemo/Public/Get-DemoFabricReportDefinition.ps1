@@ -39,7 +39,7 @@ function Get-DemoFabricReportDefinition {
         [string] $DisplayName = 'RPT_DatabaseHub_History'
     )
 
-    $root = [System.IO.Path]::GetFullPath($Path)
+    $root = Resolve-DemoUserPath -Path $Path
     foreach ($required in 'definition.pbir', 'definition/report.json', 'definition/version.json', 'definition/pages/pages.json') {
         if (-not (Test-Path -LiteralPath (Join-Path -Path $root -ChildPath $required) -PathType Leaf)) {
             throw "Not a PBIR report folder ($required is missing): $root"

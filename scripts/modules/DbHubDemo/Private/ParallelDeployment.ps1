@@ -40,6 +40,9 @@ function Start-DemoDeploymentTrackJob {
     $contextXml = [System.Management.Automation.PSSerializer]::Serialize($Context, 20)
     $job = {
         param([string] $ModulePath, [string] $ConfigXml, [string] $TrackName, [string] $ContextXml, [string[]] $Steps, [int] $Delay)
+        # This process's ID and start time first, so deploy.ps1 can end it at once when it's stopped, and never a process
+        # that gets the same ID later (Stop-DemoRunJob).
+        'DBHUB-PID {0} {1}' -f $PID, $(try { [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks } catch { 0 })
         $ErrorActionPreference = 'Stop'
         $env:DBHUB_LOG_TRACK = $TrackName
         if ($Delay -gt 0) {
@@ -52,6 +55,14 @@ function Start-DemoDeploymentTrackJob {
         }
         $configValue = [System.Management.Automation.PSSerializer]::Deserialize($ConfigXml)
         $contextValue = [System.Management.Automation.PSSerializer]::Deserialize($ContextXml)
+        # The run's cancel marker, which tells this process's finally blocks to skip slow Azure cleanups when deploy.ps1
+        # stops it (Test-DemoRunCancelled), and its private files under the handoff directory, which deploy.ps1 deletes
+        # even when it has to end this process (Initialize-DemoPrivateDirectory). Phase 28 live finding.
+        $handoffPath = [string]$contextValue['HandoffPath']
+        if ($handoffPath) {
+            $env:DBHUB_CANCEL_FILE = Join-Path -Path $handoffPath -ChildPath 'cancel.xml'
+            $env:DBHUB_PRIVATE_ROOT = Join-Path -Path $handoffPath -ChildPath 'private'
+        }
         try {
             $guard = Assert-DemoAzContext -SubscriptionId ([string]$configValue['subscriptionId']) -TenantId ([string]$configValue['tenantId']) -Account ([string]$configValue['azureAccount'])
             Write-DemoLog -Message ('Subscription guard in this process: {0}.' -f $guard.status)
@@ -97,6 +108,9 @@ function Start-DemoArtifactBuildJob {
     $modulePath = Join-Path -Path $script:RepoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1'
     $build = {
         param([string] $BuildModulePath, [bool] $NoRunner, [string] $Directory)
+        # This process's ID and start time first, so deploy.ps1 can end it at once when it's stopped, and never a process
+        # that gets the same ID later (Stop-DemoRunJob).
+        'DBHUB-PID {0} {1}' -f $PID, $(try { [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks } catch { 0 })
         $ErrorActionPreference = 'Stop'
         $env:DBHUB_LOG_TRACK = 'Build'
         $value = [pscustomobject]@{ Bundle = $null; Runner = $null; Error = '' }
@@ -128,11 +142,134 @@ function Start-DemoArtifactBuildJob {
     return (Start-Job -Name 'dbhub-build-artifacts' -ScriptBlock $build -ArgumentList $modulePath, ([bool]$SkipRunner), $HandoffPath)
 }
 
+function Start-DemoPolicyInventoryJob {
+    <#
+    .SYNOPSIS
+    Runs preflight's policy inventory (Get-DemoPolicyConstraint) in its own PowerShell process, with its own subscription
+    guard, while the template and the tracks run (Phase 28, brief goal 5). Internal.
+
+    .DESCRIPTION
+    Only with networkMode private, where the inventory resolves nothing the template needs; the what-if check in
+    preflight still catches a policy that denies part of the deployment. Not with public (review finding 7): a Modify
+    policy that turns SQL public access off isn't a denial, so preflight's own check must stop that run first. The job
+    writes each PREFLIGHT.POLICY.* result as one DBHUB-RESULT line, as a track does (Receive-DemoDeploymentTrackOutput
+    reads them), and a failed read as the PREFLIGHT.POLICY.INVENTORY Warning, as preflight does.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([System.Management.Automation.Job])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateRange(0, 720)]
+        [int] $CacheHours = 0
+    )
+
+    if (-not $PSCmdlet.ShouldProcess('policy inventory', 'Read the policy inventory in its own process')) {
+        return
+    }
+    $modulePath = Join-Path -Path $script:RepoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1'
+    $configXml = [System.Management.Automation.PSSerializer]::Serialize($Config, 20)
+    $inventory = {
+        param([string] $InventoryModulePath, [string] $InventoryConfigXml, [int] $Hours)
+        # This process's ID and start time first, so deploy.ps1 can end it at once when it's stopped, and never a process
+        # that gets the same ID later (Stop-DemoRunJob).
+        'DBHUB-PID {0} {1}' -f $PID, $(try { [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks } catch { 0 })
+        $ErrorActionPreference = 'Stop'
+        $env:DBHUB_LOG_TRACK = 'Policy'
+        Import-Module -Name $InventoryModulePath -Force
+        $configValue = [System.Management.Automation.PSSerializer]::Deserialize($InventoryConfigXml)
+        $module = Get-Module -Name 'DbHubDemo'
+        $items = & $module {
+            param($PolicyConfig, $PolicyHours)
+            try {
+                $null = Assert-DemoAzContext -SubscriptionId ([string]$PolicyConfig['subscriptionId']) -TenantId ([string]$PolicyConfig['tenantId']) -Account ([string]$PolicyConfig['azureAccount'])
+                @((Get-DemoPolicyConstraint -Config $PolicyConfig -CacheHours $PolicyHours).Results)
+            }
+            catch {
+                New-DemoResult -CheckId 'PREFLIGHT.POLICY.INVENTORY' -Area 'preflight' -Target 'subscription' -Status 'Warning' -Message ('The policy inventory, which ran alongside the deployment, failed ({0}). The what-if check found no policy denials before anything was created.' -f (Protect-DemoText -Text $_.Exception.Message).TrimEnd('.'))
+            }
+        } $configValue $Hours
+        foreach ($item in @($items)) {
+            'DBHUB-RESULT {0}' -f ([System.Management.Automation.PSSerializer]::Serialize($item, 20) -replace '\r?\n', '')
+        }
+    }
+    return (Start-Job -Name 'dbhub-policy-inventory' -ScriptBlock $inventory -ArgumentList $modulePath, $configXml, $CacheHours)
+}
+
+function Start-DemoT1MonitoringJob {
+    <#
+    .SYNOPSIS
+    Checks T1's monitoring plugin in its own PowerShell process, with its own subscription guard, while the tracks run, on
+    a deploy.ps1 run that has no T1 Monitoring step of its own (Invoke-DemoT1MonitoringCheck; Phase 28 live finding,
+    2026-10-30). Internal.
+
+    .DESCRIPTION
+    Live: the plugin was NotRunning again less than 90 minutes after start-demo.ps1 found it Running, and the resumed run,
+    whose T1 track had finished in an earlier run, ended NOT DONE on TELEMETRY.T1. A plugin that isn't running gets the
+    SQL IaaS Agent service restarted, which takes minutes, so it runs beside the tracks and this process stays free to
+    prompt the person at the guided stop. The job writes DEPLOY.T1.MONITORING as one DBHUB-RESULT line, as a track does
+    (Receive-DemoDeploymentTrackOutput reads it), and updates the status page's T1 Monitoring step itself. -HandoffPath
+    gives it the run's cancel marker and private directory, as the tracks have.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([System.Management.Automation.Job])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateSet('the start', 'the deployment')]
+        [string] $Occasion = 'the deployment',
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [AllowEmptyString()]
+        [string] $HandoffPath = ''
+    )
+
+    if (-not $PSCmdlet.ShouldProcess('sqlvm01', 'Check T1''s monitoring plugin in its own process')) {
+        return
+    }
+    $modulePath = Join-Path -Path $script:RepoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1'
+    $configXml = [System.Management.Automation.PSSerializer]::Serialize($Config, 20)
+    $check = {
+        param([string] $CheckModulePath, [string] $CheckConfigXml, [string] $CheckOccasion, [string] $Progress, [string] $Handoff)
+        # This process's ID and start time first, so deploy.ps1 can end it at once when it's stopped, and never a process
+        # that gets the same ID later (Stop-DemoRunJob).
+        'DBHUB-PID {0} {1}' -f $PID, $(try { [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks } catch { 0 })
+        $ErrorActionPreference = 'Stop'
+        $env:DBHUB_LOG_TRACK = 'T1'
+        if ($Handoff) {
+            $env:DBHUB_CANCEL_FILE = Join-Path -Path $Handoff -ChildPath 'cancel.xml'
+            $env:DBHUB_PRIVATE_ROOT = Join-Path -Path $Handoff -ChildPath 'private'
+        }
+        Import-Module -Name $CheckModulePath -Force
+        $configValue = [System.Management.Automation.PSSerializer]::Deserialize($CheckConfigXml)
+        $module = Get-Module -Name 'DbHubDemo'
+        $item = & $module {
+            param($MonitoringConfig, $MonitoringOccasion, $MonitoringProgress)
+            try {
+                $null = Assert-DemoAzContext -SubscriptionId ([string]$MonitoringConfig['subscriptionId']) -TenantId ([string]$MonitoringConfig['tenantId']) -Account ([string]$MonitoringConfig['azureAccount'])
+                Invoke-DemoT1MonitoringCheck -Config $MonitoringConfig -Occasion $MonitoringOccasion -ProgressPath $MonitoringProgress
+            }
+            catch {
+                New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message ('T1''s monitoring plugin wasn''t checked: the subscription guard failed in its process ({0}).' -f (Protect-DemoText -Text $_.Exception.Message).TrimEnd('.')) -Remediation './scripts/start-demo.ps1 checks it, and restarts the SQL IaaS Agent service when the plugin isn''t running.'
+            }
+        } $configValue $CheckOccasion $Progress
+        foreach ($one in @($item)) {
+            'DBHUB-RESULT {0}' -f ([System.Management.Automation.PSSerializer]::Serialize($one, 20) -replace '\r?\n', '')
+        }
+    }
+    return (Start-Job -Name 'dbhub-t1-monitoring' -ScriptBlock $check -ArgumentList $modulePath, $configXml, $Occasion, $ProgressPath, $HandoffPath)
+}
+
 function Receive-DemoDeploymentTrackOutput {
     <#
     .SYNOPSIS
-    Reads what a track job wrote since the last read: its results and its summary (deserialized), and its log
-    lines, which go to the console as they arrive. Returns Results and Summary. Internal.
+    Reads what a track job wrote since the last read: its results and its summary (deserialized), its process ID and
+    start time (DBHUB-PID, kept for Stop-DemoRunJob), and its log lines, which go to the console as they arrive. Returns
+    Results and Summary. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -153,6 +290,12 @@ function Receive-DemoDeploymentTrackOutput {
         elseif ($line.StartsWith('DBHUB-SUMMARY ', [System.StringComparison]::Ordinal)) {
             $summary = [System.Management.Automation.PSSerializer]::Deserialize($line.Substring(14))
         }
+        elseif ($line -match '^DBHUB-PID (\d{1,10})(?: (\d{1,19}))?$') {
+            # The job's process and its start time, for Stop-DemoRunJob (Phase 28 live finding and its review).
+            $key = $Job.InstanceId.ToString()
+            $script:DemoJobProcessId[$key] = [int]$Matches[1]
+            $script:DemoJobProcessStart[$key] = if ($Matches[2]) { [long]$Matches[2] } else { [long]0 }
+        }
     }
     foreach ($problem in @($jobErrors)) {
         Write-DemoLog -Level Warning -Message ('{0}: {1}' -f $Job.Name, (Protect-DemoText -Text ([string]$problem)))
@@ -171,6 +314,12 @@ function Invoke-DemoParallelDeployment {
     Invoke-DemoDeployment -Parallel calls it. Internal.
 
     .DESCRIPTION
+    0. On an existing environment, what's stopped (the nightly auto-shutdown, stop-demo.ps1, a stop) starts while
+       preflight runs (Request-DemoStoppedStart: the VMs, and T4 when it's deployed), and runs before the tracks start or
+       the template deploys (Wait-DemoStoppedStart, DEPLOY.VMSTART; Phase 28 live finding). Running VMs are only read.
+       Then, on a run that ends with the validation and has no T1 Monitoring step of its own, T1's monitoring plugin is
+       checked, and restarted when it isn't running, beside the tracks (Start-DemoT1MonitoringJob, DEPLOY.T1.MONITORING;
+       Phase 28 live finding, 2026-10-30).
     1. The subscription guard; then the bootstrap bundle and the workload runner start building in their own
        process (Start-DemoArtifactBuildJob), which hands them over through a private handoff directory.
        Preflight (Invoke-DemoPreflight) and the T2 source (Resolve-DemoT2Source, PREFLIGHT.T2.SOURCE). Any
@@ -187,8 +336,19 @@ function Invoke-DemoParallelDeployment {
     4. Validation: Database Hub's estate for the targets that finished, the runner's status on T1, and, after
        the Fabric track, the Hub checklist with the T3 gate and the Real-Time Dashboard's tile check.
     5. DEPLOY.TIMING (per track and per step, each target's ready time, and the total) and DEPLOY.SUMMARY.
-       The clock stops when T1, T2, and T3 telemetry passed, Database Hub lists the estate, T2 runs Standard
-       with PAYG and monitoring, and Fabric is imported (ADR 0018, section 1).
+       The clock stops when every track finished and DONE's requirements passed (Get-DemoDoneRequirement; ADR 0018,
+       section 1, as amended by Phase 28): Database Hub's estate for T1 to T4, T1, T2, and T3 telemetry, T4's
+       metrics, T2 at Standard with PAYG and monitoring, T1's inventory, and the required Fabric items. T4's are left
+       out when T4 is off; Developer mode leaves out T2's telemetry, PAYG, and monitoring. A target whose telemetry
+       didn't come gets its monitoring checked, and its telemetry once more, before the run is judged
+       (Invoke-DemoTelemetryCheck, in the tracks' telemetry steps and in DONE's checks; Phase 28 live finding).
+
+    Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
+    does; -ProgressPath is the status page's model, which each stage and track updates; with networkMode private the
+    policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
+    its results replace preflight's placeholders at the end; preflight's T4 startSku starts the Burstable fallback;
+    and this process prompts the person at the guided stop when the T2 track process reports it Ready in the progress
+    model; without one (-NoStatusPage), the T2 track process prompts the person itself.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([object[]])]
@@ -217,7 +377,7 @@ function Invoke-DemoParallelDeployment {
 
         [int] $T1WaitMinutes = 45,
 
-        [int] $T2WaitMinutes = 120,
+        [int] $T2WaitMinutes = 180,
 
         [int] $MonitoringWaitMinutes = 20,
 
@@ -236,7 +396,13 @@ function Invoke-DemoParallelDeployment {
         [ValidateRange(10, 600)]
         [int] $TrackTimeoutMinutes = 240,
 
-        [switch] $InProcess
+        [switch] $InProcess,
+
+        [switch] $AutoResume,
+
+        [string] $ProgressPath = '',
+
+        [string] $PagePath = ''
     )
 
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -248,6 +414,10 @@ function Invoke-DemoParallelDeployment {
     $stageResult = {
         param([string] $Name, [string] $Status, [string] $Message, [string] $Remediation = '')
         $results.Add((New-DemoResult -CheckId ('DEPLOY.STAGE.{0}' -f $Name.ToUpperInvariant()) -Area 'infra' -Target 'subscription' -Status $Status -Message $Message -Remediation $Remediation))
+        # The status page's Preflight and Infrastructure steps (Phase 28).
+        if ($Name -in 'Preflight', 'Infrastructure') {
+            Set-DemoProgressStep -Path $ProgressPath -Id $Name -Status $Status -Message $Message
+        }
     }
     $phase = [ordered]@{}
     $mark = { param([string] $Name, [System.Diagnostics.Stopwatch] $Watch) $phase[$Name] = [int]$Watch.Elapsed.TotalSeconds }
@@ -257,15 +427,29 @@ function Invoke-DemoParallelDeployment {
     }
     catch {
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing ran. Sign in yourself and select nothing else: the scripts pass --subscription on every call.'))
+        Set-DemoProgressStep -Path $ProgressPath -Id 'Preflight' -State 'Failed' -Status 'Fail' -Message $_.Exception.Message
         return $results.ToArray()
     }
     $mark.Invoke('Guard', $clock)
 
     $state = Get-DemoDeploymentState -Config $Config
+    # Phase 28 (brief item 2): a plain deploy.ps1 continues an unfinished deployment from the resource group's tags.
+    if ($AutoResume -and -not $Resume -and -not $FromStage -and -not $whatIf -and [string]$state.Stage -and [string]$state.Stage -ne 'Validation') {
+        $Resume = [switch]::new($true)
+        Write-DemoLog -Message ('An unfinished deployment is on record (its last finished stage is {0}), so this run continues it, as deploy.ps1 -Resume does. To start over from preflight instead: ./scripts/deploy.ps1 -FromStage Preflight.' -f $state.Stage)
+    }
+    # T4's size as an earlier run's Burstable fallback settled it, unless the configuration sets one (Phase 28).
+    $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state
     $skipT4 = -not (Test-DemoT4Enabled -Config $Config)
     $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4
     if ($whatIf) {
         $plan = Resolve-DemoTrackPlan -StopAfter 'Infrastructure'
+    }
+    Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume
+    # The tracks run for as long as the T2 wait, the guided stop (at least 45 minutes for the person, plus about 20 to
+    # prepare), and what follows it can take (Phase 28).
+    if ($WaitForT2) {
+        $TrackTimeoutMinutes = [System.Math]::Min(600, [System.Math]::Max($TrackTimeoutMinutes, $T2WaitMinutes + 65 + 30 + $ArcWaitMinutes + 30 + $TelemetryWaitMinutes + 15))
     }
     $context = @{
         NetworkMode           = $state.NetworkMode
@@ -284,6 +468,11 @@ function Invoke-DemoParallelDeployment {
         WaitForT2             = [bool]$WaitForT2
         ImportNotebooks       = [bool]$ImportNotebooks
         ImportDashboard       = $true
+        # Phase 28: the status page's model, and who prompts the person at the guided stop: this process, which owns
+        # the console, the clipboard, and the browser, when the tracks run in their own processes and the model exists.
+        ProgressPath          = $ProgressPath
+        PagePath              = $PagePath
+        PromptInParent        = $false
     }
     $ensureContext = {
         if (-not $context.NetworkMode) {
@@ -314,6 +503,140 @@ function Invoke-DemoParallelDeployment {
     $jobs = [ordered]@{}
     $summaries = [ordered]@{}
     $trackResults = [ordered]@{}
+    # Phase 28 (brief goal 5): with networkMode private, the policy inventory resolves nothing the template needs, so it
+    # runs in its own process alongside the template and the tracks, and its results replace preflight's placeholders at
+    # the end. With auto it stays in preflight, as before, and with public too (review finding 7): a Modify policy that
+    # turns SQL public access off isn't a denial the what-if sees, so PREFLIGHT.POLICY.SQLPUBLIC must stop the run first.
+    $deferPolicy = $useJobs -and [bool]$plan.Preflight -and -not $SkipPolicyInventory -and [string]$Config['networkMode'] -eq 'private'
+    $policyJob = $null
+    $policy = @{ Collected = $false; Applied = $false; Items = @() }
+    $t4StartSku = ''
+    # T1's monitoring plugin, checked on a run that ends with the validation and has no T1 Monitoring step of its own
+    # (Phase 28 live finding, 2026-10-30), in its own process while the tracks run (Start-DemoT1MonitoringJob).
+    $checkT1Monitoring = -not $whatIf -and [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists') -and [bool]$plan.Validation -and 'Monitoring' -notin @($plan.Tracks['T1'])
+    $monitorCheck = @{ Job = $null; Collected = $false }
+    # Reads that check once its process has finished; with -WaitMinutes, waits for it, then gives up with a Warning.
+    $collectMonitoring = {
+        param([int] $WaitMinutes = 0)
+        $job = $monitorCheck.Job
+        if ($null -eq $job -or $monitorCheck.Collected) {
+            return
+        }
+        if ($WaitMinutes -gt 0) {
+            # In one-second steps, as the wait for the tracks: a Ctrl+C that PowerShell didn't act on ends it within a second.
+            $until = [DateTime]::UtcNow.AddMinutes($WaitMinutes)
+            while ($job.State -in 'NotStarted', 'Running' -and [DateTime]::UtcNow -lt $until) {
+                if (Test-DemoRunCancelled) {
+                    throw [System.OperationCanceledException]::new('deploy.ps1 was stopped (Ctrl+C) before T1''s monitoring check finished.')
+                }
+                $null = Wait-Job -Job $job -Timeout 1
+            }
+        }
+        if ($job.State -in 'NotStarted', 'Running') {
+            if ($WaitMinutes -gt 0) {
+                $monitorCheck.Collected = $true
+                $null = Stop-DemoRunJob -Job @($job)
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message ('The check of T1''s monitoring plugin didn''t finish within {0} minutes, so it was stopped.' -f $WaitMinutes) -Remediation './scripts/start-demo.ps1 checks it, and restarts the SQL IaaS Agent service when the plugin isn''t running.'))
+            }
+            return
+        }
+        $monitorCheck.Collected = $true
+        $read = Receive-DemoDeploymentTrackOutput -Job $job
+        if (@($read.Results).Count -eq 0) {
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T1.MONITORING' -Area 't1' -Target 'T1' -Status 'Warning' -Message ('The check of T1''s monitoring plugin ended without a result (job state {0}).' -f $job.State) -Remediation './scripts/start-demo.ps1 checks it, and restarts the SQL IaaS Agent service when the plugin isn''t running.'))
+            return
+        }
+        & $addAll @($read.Results)
+    }
+    # Reads the deferred policy inventory once it has finished; with -WaitMinutes, waits for it, then gives up with a Warning.
+    $collectPolicy = {
+        param([int] $WaitMinutes = 0)
+        if ($null -eq $policyJob -or $policy.Collected) {
+            return
+        }
+        if ($WaitMinutes -gt 0 -and $policyJob.State -in 'NotStarted', 'Running') {
+            $null = Wait-Job -Job $policyJob -Timeout ($WaitMinutes * 60)
+        }
+        if ($policyJob.State -in 'NotStarted', 'Running') {
+            if ($WaitMinutes -gt 0) {
+                Stop-Job -Job $policyJob -ErrorAction SilentlyContinue
+                $policy.Items = @(New-DemoResult -CheckId 'PREFLIGHT.POLICY.INVENTORY' -Area 'preflight' -Target 'subscription' -Status 'Warning' -Message 'The policy inventory, which ran alongside the deployment, didn''t finish in time. The what-if check found no policy denials before anything was created.' -Remediation 'Run ./scripts/preflight.ps1 to read it (its cache makes the next deploy.ps1 faster).')
+                $policy.Collected = $true
+            }
+            return
+        }
+        $read = Receive-DemoDeploymentTrackOutput -Job $policyJob
+        $policy.Items = @($read.Results)
+        $policy.Collected = $true
+        foreach ($item in @($policy.Items | Where-Object { [string]$_.status -in 'Fail', 'Warning', 'Manual action required' })) {
+            Write-DemoLog -Level Warning -Message ('Policy inventory: {0} {1}: {2}' -f $item.checkId, $item.status, $item.message)
+        }
+    }
+    # The deferred inventory's results replace preflight's placeholders (PREFLIGHT.POLICY.INVENTORY and SQLPUBLIC).
+    $applyPolicy = {
+        param([int] $WaitMinutes = 5)
+        & $collectPolicy $WaitMinutes
+        if (-not $policy.Collected -or $policy.Applied) {
+            return
+        }
+        $policy.Applied = $true
+        $kept = @($results | Where-Object { -not ([string]$_.checkId -in 'PREFLIGHT.POLICY.INVENTORY', 'PREFLIGHT.POLICY.SQLPUBLIC' -and [bool](Get-DemoMemberValue -InputObject $_.evidence -Name 'deferred')) })
+        $results.Clear()
+        & $addAll $kept
+        & $addAll @($policy.Items)
+    }
+    # The guided stop's prompt, in this process (Phase 28): the T2 track process turns the model's guidedStop Ready, and
+    # this process, which has the console, the clipboard, and the browser, hands over the credential and prompts the
+    # person, then reminds them every 5 minutes until the host's setup check passes or the time limit passes.
+    $guided = @{ Prompted = $false; NextReminder = [DateTime]::MinValue; Closed = $false }
+    $guidedTick = {
+        if (-not $ProgressPath -or $guided.Closed) {
+            return
+        }
+        $model = Read-DemoProgress -Path $ProgressPath
+        if ($null -eq $model) {
+            return
+        }
+        $stop = $model['guidedStop']
+        $stopState = [string]$stop['state']
+        if ($stopState -eq 'Ready' -and [long]$stop['deadlineAt'] -gt 0) {
+            $deadline = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$stop['deadlineAt']).UtcDateTime
+            if (-not $guided.Prompted) {
+                $guided.Prompted = $true
+                try {
+                    $credential = Invoke-DemoGuidedStopCredential -Config $Config -ExpiresUtc $deadline
+                }
+                catch {
+                    Write-DemoLog -Level Warning -Message ('The host credential for the guided stop couldn''t be prepared: {0}' -f $_.Exception.Message)
+                    $credential = [pscustomobject]@{ Mode = 'unknown'; UserName = ''; Text = ''; Results = @() }
+                    try {
+                        # The person may reset the password in the portal now; the state makes sure it's rotated afterward.
+                        Set-DemoDeploymentState -Config $Config -Value @{ HostPasswordSet = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
+                    }
+                    catch {
+                        Write-DemoLog -Level Warning -Message ('The handover wasn''t recorded, so if you reset archost01''s password in the portal, reset it again afterward to a random value you don''t keep: {0}' -f $_.Exception.Message)
+                    }
+                }
+                & $addAll @($credential.Results)
+                Set-DemoProgressValue -Path $ProgressPath -Section 'guidedStop' -Value @{ credential = $credential.Mode; credentialText = $credential.Text; hostUser = $credential.UserName }
+                Show-DemoGuidedStopPrompt -Url ([string]$stop['url']) -DeadlineUtc $deadline -HostVm ([string]$stop['hostVm']) -HostUser $credential.UserName -SignInWay $credential.Mode -SignInText $credential.Text -PagePath $PagePath -SignInFallback:([bool]$stop['signInFallback'])
+                $guided.NextReminder = [DateTime]::UtcNow.AddMinutes(5)
+            }
+            elseif ([DateTime]::UtcNow -ge $guided.NextReminder) {
+                Show-DemoGuidedStopReminder -DeadlineUtc $deadline -PagePath $PagePath -Status ([string]$stop['message']) -HostVm ([string]$stop['hostVm'])
+                $guided.NextReminder = [DateTime]::UtcNow.AddMinutes(5)
+            }
+        }
+        elseif ($guided.Prompted -and $stopState -in 'Done', 'TimedOut', 'Failed') {
+            $guided.Closed = $true
+            $closing = switch ($stopState) {
+                'Done' { 'The guided stop is done: SQL Server setup passed the host''s check. Nothing else needs you; deploy.ps1 finishes T2 on its own.' }
+                'TimedOut' { 'The guided stop''s time limit passed. deploy.ps1 finishes the rest; run ./scripts/deploy.ps1 again when you have about 15 minutes, and it guides you through the step again.' }
+                default { 'The guided stop couldn''t go on; the summary at the end says why and what to run.' }
+            }
+            Write-DemoLog -Message $closing
+        }
+    }
     # Reads what each track process wrote since the last read.
     $collect = {
         foreach ($track in $jobs.Keys) {
@@ -331,6 +654,14 @@ function Invoke-DemoParallelDeployment {
         param([datetime] $Deadline)
         while ($true) {
             & $collect
+            try {
+                & $guidedTick
+                & $collectPolicy 0
+                & $collectMonitoring 0
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('The guided stop''s prompt, the policy inventory, or T1''s monitoring check couldn''t be read this time: {0}' -f $_.Exception.Message)
+            }
             if ($null -ne $buildJob -and $buildJob.State -notin 'NotStarted', 'Running' -and -not (Test-Path -LiteralPath (Join-Path -Path $handoff -ChildPath 'artifacts.xml'))) {
                 # A build process that died without a word: the tracks get its error instead of waiting.
                 Write-DemoTrackHandoff -Path $handoff -Name 'artifacts' -Value ([pscustomobject]@{ Bundle = $null; Runner = $null; Error = ('the build process ended ({0}) without a result' -f $buildJob.State) }) -Confirm:$false
@@ -340,14 +671,26 @@ function Invoke-DemoParallelDeployment {
                 break
             }
             if ([DateTime]::UtcNow -ge $Deadline) {
-                foreach ($job in $running) {
-                    Stop-Job -Job $job -ErrorAction SilentlyContinue
+                # Their slow Azure cleanups are skipped, so they stop within seconds (Phase 28 live finding).
+                try {
+                    Write-DemoTrackHandoff -Path $handoff -Name 'cancel' -Value ([pscustomobject]@{ Reason = 'deadline'; Utc = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) }) -Confirm:$false
                 }
+                catch {
+                    Write-DemoLog -Level Debug -Message ('The cancel marker wasn''t written: {0}' -f $_.Exception.Message)
+                }
+                $null = Stop-DemoRunJob -Job $running
                 $runningNames = @($running | ForEach-Object { $_.Name }) -join ', '
                 $results.Add((New-DemoResult -CheckId 'DEPLOY.TRACKS' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('{0} track(s) were still running after {1} minutes and were stopped: {2}.' -f $running.Count, $TrackTimeoutMinutes, $runningNames) -Remediation 'Run deploy.ps1 -Resume: each track continues after its last finished step.'))
                 break
             }
-            Start-Sleep -Seconds 10
+            # Ten seconds, in one-second steps: a Ctrl+C that PowerShell didn't act on ends the wait within a second
+            # (Enable-DemoRunCancelWatch; Phase 28 live finding).
+            for ($second = 0; $second -lt 10; $second++) {
+                if (Test-DemoRunCancelled) {
+                    throw [System.OperationCanceledException]::new('deploy.ps1 was stopped (Ctrl+C) before the tracks finished.')
+                }
+                Start-Sleep -Seconds 1
+            }
         }
         & $collect
         foreach ($track in @($jobs.Keys)) {
@@ -355,22 +698,41 @@ function Invoke-DemoParallelDeployment {
                 $trackResults[$track].Add((New-DemoResult -CheckId ('DEPLOY.TRACK.{0}' -f $track.ToUpperInvariant()) -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('Track {0}''s process ended without a summary (job state {1}).' -f $track, $jobs[$track].State) -Remediation 'Run deploy.ps1 -Resume: the track continues after its last finished step.'))
                 $summaries[$track] = [pscustomobject]@{ Track = $track; Status = 'Fail'; Steps = @(); Timing = @{}; ReadyUtc = @{} }
             }
-            Remove-Job -Job $jobs[$track] -Force -ErrorAction SilentlyContinue
+            # A job whose process had to be ended still reads Running for about a minute; Remove-Job would wait for it.
+            if ($jobs[$track].State -notin 'NotStarted', 'Running', 'Stopping') {
+                Remove-Job -Job $jobs[$track] -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
     try {
         if ($useJobs) {
             $handoff = Initialize-DemoPrivateDirectory -Prefix 'dbhub-tracks'
+            # The track processes' private files go here (DBHUB_PRIVATE_ROOT), so they go with the handoff directory even
+            # when a stop has to end a process (Phase 28 live finding). It inherits the handoff directory's protection.
+            $null = [System.IO.Directory]::CreateDirectory((Join-Path -Path $handoff -ChildPath 'private'))
             if ($needsArtifacts) {
                 $buildJob = Start-DemoArtifactBuildJob -HandoffPath $handoff -SkipRunner:$SkipRunner -Confirm:$false
             }
         }
 
+        # 0. Phase 28 live finding (2026-10-30): a rerun after the nightly auto-shutdown, stop-demo.ps1, or a stop found
+        # the VMs deallocated, and its first Run Command failed. What's stopped is asked to start now, so it boots while
+        # preflight runs; running VMs are only read. Nothing on a first deployment, a what-if, or a run that needs no VM.
+        $stoppedStart = $null
+        $needsVms = -not $whatIf -and [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists') -and ([bool]$plan.Infrastructure -or @($order).Count -gt 0 -or [bool]$plan.Validation)
+        if ($needsVms) {
+            $stoppedStart = Request-DemoStoppedStart -Config $Config -SkipT4:$skipT4 -ProgressPath $ProgressPath -Confirm:$false
+        }
+        else {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -State 'Skipped' -Message $(if ([bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')) { 'Not part of this run.' } else { 'Not needed: nothing is deployed yet.' })
+        }
+
         # 1. Preflight and the T2 source.
         if ($plan.Preflight) {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
-            $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf)
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Preflight' -State 'Running' -Message 'Checking access, quotas, sizes, Fabric, and policies before anything is created.'
+            $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf -DeferPolicyInventory:$deferPolicy)
             & $addAll $preflight
             $source = Resolve-DemoT2Source -Config $Config
             $results.Add($source.Result)
@@ -378,6 +740,12 @@ function Invoke-DemoParallelDeployment {
             $context.T2SnapshotId = $source.SnapshotId
             if ((& $hasStatus $preflight 'Fail') -or $source.Result.status -eq 'Fail') {
                 & $stageResult 'Preflight' 'Fail' 'Preflight has at least one Fail, so nothing was deployed.' 'Fix each Fail above (its remediation says how), then run deploy.ps1 again.'
+                if ($null -ne $stoppedStart -and @($stoppedStart.Requested).Count -gt 0) {
+                    # What this run asked to start keeps running, and billing (ADR 0016), until a stop.
+                    $message = 'This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')
+                    $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Evidence ([ordered]@{ vms = @($stoppedStart.Requested); started = @($stoppedStart.Requested); notRunning = @(); afterPreflightFail = $true }) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
+                    Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status 'Warning' -Message $message
+                }
                 return $results.ToArray()
             }
             $pick = { param([string] $CheckId, [string] $Key) $item = $preflight | Where-Object { $_.checkId -eq $CheckId } | Select-Object -First 1; Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name $Key }
@@ -393,9 +761,50 @@ function Invoke-DemoParallelDeployment {
             if ($group) {
                 $context.T3AdminGroupName = $group
             }
+            # Where T4's Burstable fallback starts when preflight already ruled out the default (Phase 28).
+            $startSkus = @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY') { [string](& $pick $checkId 'startSku') })
+            $t4StartSku = if ($startSkus -contains 'None') { 'None' } elseif ($startSkus -contains 'Standard_B2s') { 'Standard_B2s' } else { '' }
+            if ($deferPolicy) {
+                Write-DemoLog -Message ('networkMode is {0}, so the policy inventory runs alongside the deployment instead of before it; its results come at the end.' -f [string]$Config['networkMode'])
+                $policyJob = Start-DemoPolicyInventoryJob -Config $Config -CacheHours $PolicyCacheHours -Confirm:$false
+            }
             & $ensureContext
             $mark.Invoke('Preflight', $watch)
-            & $stageResult 'Preflight' 'Pass' ('Preflight passed (network mode {0}, T3 free offer {1}, T2 source {2}).' -f $context.NetworkMode, $context.T3UseFreeLimit, $context.T2Source)
+            & $stageResult 'Preflight' 'Pass' (Get-DemoPreflightPassText -NetworkMode ([string]$context.NetworkMode) -T3UseFreeLimit ([bool]$context.T3UseFreeLimit) -T2Source ([string]$context.T2Source))
+        }
+        if (-not $whatIf) {
+            & $ensureContext
+            Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -T2Source ([string]$context.T2Source)
+            # The tracks' records describe this run before any track writes, and before the template reads the group's tags
+            # (Phase 28 live finding, 2026-10-30: a fresh run's failed Fabric step kept an earlier run's record, and the next
+            # plain deploy.ps1 resumed past it). A run that starts over clears them all; any other run lowers those of the
+            # tracks it runs from an earlier step. T2's early Restore writes only after the template's resource group update.
+            $reset = Get-DemoTrackRecordReset -Plan $plan -State $state -FreshStart:(-not $Resume -and (-not $FromStage -or $FromStage -eq 'Preflight'))
+            if ($reset.Count -gt 0) {
+                try {
+                    Set-DemoDeploymentState -Config $Config -Value $reset -Confirm:$false
+                    # The validation's $trackFinished reads a track this run doesn't start from $state.
+                    foreach ($key in $reset.Keys) {
+                        if ($null -ne $state.PSObject.Properties[$key]) {
+                            $state.$key = $reset[$key]
+                        }
+                    }
+                    Write-DemoLog -Message ('The track records an earlier run left were reset ({0}), so a later resume can''t skip a step this run doesn''t finish.' -f ((@($reset.Keys | Sort-Object) | ForEach-Object { $_ -replace '^Track', '' }) -join ', '))
+                }
+                catch {
+                    Write-DemoLog -Level Warning -Message ('The track records an earlier run left couldn''t be reset, so a later resume could skip a step this run doesn''t finish: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+                }
+            }
+        }
+
+        # The VMs that were stopped run before anything needs them: the tracks' Run Commands, and the template's
+        # extensions. A VM that doesn't start stops the run here, with the next action (DEPLOY.VMSTART).
+        if ($null -ne $stoppedStart) {
+            $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -ProgressPath $ProgressPath)
+            & $addAll $started
+            if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
+                return $results.ToArray()
+            }
         }
 
         # 2. The track processes, a few seconds apart, so their guards run while the template deploys.
@@ -403,6 +812,10 @@ function Invoke-DemoParallelDeployment {
             & $ensureContext
             $context['HandoffPath'] = $handoff
             $context['HandoffTimeoutMinutes'] = $TrackTimeoutMinutes
+            # This process prompts the person at the guided stop ($guidedTick) when the T2 track process can tell it, through
+            # the progress model, that the stop is ready; without a model (-NoStatusPage, or a page that couldn't be set
+            # up) the T2 track process prompts the person itself, and its console lines reach this console.
+            $context['PromptInParent'] = [bool]$ProgressPath
             # A golden T2 starts its Restore once the template has deployed archost01 in this run; a deployment
             # record older than two minutes before now belongs to an earlier run.
             $context['EarlyT2'] = [bool]$plan.Infrastructure -and [string]$context.T2Source -eq 'golden'
@@ -416,11 +829,27 @@ function Invoke-DemoParallelDeployment {
             }
         }
 
+        # Phase 28 live finding (2026-10-30): T1's monitoring plugin can stop after a restart, hours after start-demo.ps1
+        # found it running, and a run whose T1 track has no Monitoring step (it finished in an earlier run) didn't notice
+        # until DONE's telemetry check failed. Once the VMs run, it's checked on every run that ends with the validation:
+        # beside the tracks in its own process, so the guided stop's prompt never waits for it, or here without one.
+        if ($checkT1Monitoring) {
+            $occasion = if ($null -ne $stoppedStart -and $stoppedStart.Vms.Contains('sqlvm01')) { 'the start' } else { 'the deployment' }
+            if ($useJobs) {
+                $monitorCheck.Job = Start-DemoT1MonitoringJob -Config $Config -Occasion $occasion -ProgressPath $ProgressPath -HandoffPath $handoff -Confirm:$false
+            }
+            else {
+                $results.Add((Invoke-DemoT1MonitoringCheck -Config $Config -Occasion $occasion -ProgressPath $ProgressPath))
+            }
+        }
+
         # 3. Infrastructure.
         $loaderSettings = $null
         if ($plan.Infrastructure) {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
             & $ensureContext
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Running' -Message 'Deploying the template (about 7 to 9 minutes).'
+            $firstDeployment = -not $whatIf -and -not [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')
             $deployArguments = @{
                 Config                  = $Config
                 Action                  = $(if ($whatIf) { 'WhatIf' } else { 'Create' })
@@ -431,9 +860,13 @@ function Invoke-DemoParallelDeployment {
             if ($context.T2Source -eq 'golden' -and $context.T2SnapshotId) {
                 $deployArguments['T2OsDiskSourceId'] = $context.T2SnapshotId
             }
-            if (-not $whatIf -and -not $skipT4) {
+            if ($t4StartSku) {
+                $deployArguments['T4StartSku'] = $t4StartSku
+            }
+            if (-not $whatIf -and -not $skipT4 -and @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.START' -and [string]$_.status -eq 'Pass' }).Count -eq 0) {
                 # A stopped flexible server rejects every other management operation, including the template's
-                # update, so a stopped T4 starts first (Phase 24, ADR 0019). Not selected when T4 doesn't exist yet.
+                # update, so a stopped T4 starts first (Phase 24, ADR 0019), unless this run already started it. Not
+                # selected when T4 doesn't exist yet.
                 $t4Start = Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 20 -CheckPrefix DEPLOY
                 if ($t4Start.status -ne 'Not selected') {
                     $results.Add($t4Start)
@@ -459,6 +892,29 @@ function Invoke-DemoParallelDeployment {
             }
             $context.T3UseFreeLimit = [bool]$deployment.T3UseFreeLimit
             $loaderSettings = $deployment.Outputs['loaderSettings']
+            # What T4 got (Phase 28's Burstable fallback can change its size or leave it out): the tracks use it.
+            $deployedT4 = Get-DemoMemberValue -InputObject $deployment -Name 'T4Enabled'
+            if ($null -ne $deployedT4) {
+                $deployedSku = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T4SkuName')
+                if ([bool]$deployedT4 -ne (Test-DemoT4Enabled -Config $Config) -or ([bool]$deployedT4 -and $deployedSku -and $deployedSku -ne (Get-DemoT4SkuName -Config $Config))) {
+                    $copy = [ordered]@{}
+                    foreach ($key in $Config.Keys) {
+                        $copy[$key] = $Config[$key]
+                    }
+                    $copy['t4Enabled'] = [bool]$deployedT4
+                    if ([bool]$deployedT4 -and $deployedSku) {
+                        $copy['t4SkuName'] = $deployedSku
+                    }
+                    $Config = $copy
+                    $skipT4 = -not [bool]$deployedT4
+                }
+            }
+            if ($firstDeployment) {
+                # What the template created runs and bills from now on, even when the run stops: the ending names it when
+                # the run isn't DONE. Only after the template succeeded, and T4 only when it was deployed (Phase 28 review:
+                # a failed template, or the Burstable fallback ending without T4, named what didn't exist).
+                Add-DemoProgressStartedVm -Path $ProgressPath -Name (@('sqlvm01', (Get-DemoHostVmName -Config $Config)) + @(if (-not $skipT4) { 'T4' }))
+            }
             try {
                 Set-DemoDeploymentState -Config $Config -Value @{ Stage = 'Infrastructure'; NetworkMode = $context.NetworkMode; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T3AdminGroupName = [string]$context.T3AdminGroupName; T2Source = $(if ($context.T2Source -eq 'golden') { 'golden' } elseif ($context.T2Source -like 'existing-*') { $context.T2Source -replace '^existing-', '' } else { 'build' }) } -Confirm:$false
             }
@@ -474,6 +930,7 @@ function Invoke-DemoParallelDeployment {
             & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
         }
         if ($StopAfter -in 'Preflight', 'Infrastructure') {
+            & $applyPolicy 15
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
             return $results.ToArray()
         }
@@ -481,12 +938,12 @@ function Invoke-DemoParallelDeployment {
 
         # The loader settings come from the template; a run that skipped it reads the last deployment's outputs.
         if ($null -eq $loaderSettings -and $needsArtifacts) {
-            $outputs = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('deployment', 'sub', 'show', '--name', ('dbhub-{0}-main' -f $Config['environment']), '--query', 'properties.outputs.loaderSettings.value', '--output', 'json') -AsJson -AllowFailure
+            $outputs = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('deployment', 'sub', 'show', '--name', (Get-DemoMainDeploymentName -Config $Config), '--query', 'properties.outputs.loaderSettings.value', '--output', 'json') -AsJson -AllowFailure
             $loaderSettings = $outputs
         }
         $context['LoaderSettings'] = $loaderSettings
         if ($useJobs) {
-            Write-DemoTrackHandoff -Path $handoff -Name 'infrastructure' -Value ([pscustomobject]@{ Succeeded = $true; LoaderSettings = $loaderSettings; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; Message = '' }) -Confirm:$false
+            Write-DemoTrackHandoff -Path $handoff -Name 'infrastructure' -Value ([pscustomobject]@{ Succeeded = $true; LoaderSettings = $loaderSettings; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $Config); T4SkuName = $(if (Test-DemoT4Enabled -Config $Config) { Get-DemoT4SkuName -Config $Config } else { '' }); Message = '' }) -Confirm:$false
         }
         elseif ($needsArtifacts) {
             try {
@@ -516,12 +973,29 @@ function Invoke-DemoParallelDeployment {
                 $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f $buildError) -Remediation 'Run New-DemoBootstrapBundle and Publish-DemoWorkloadRunner yourself to see the error (the runner needs the .NET SDK, or use -SkipRunner).'))
             }
         }
+        # The deferred policy inventory has had the whole run; it gets up to 5 more minutes.
+        & $applyPolicy 5
+        # T1's monitoring check matters to DONE's telemetry checks, which run once every track finished: it gets up to 20
+        # more minutes then (a restart that doesn't take is about 16 at most), and none when a track didn't pass.
+        & $collectMonitoring $(if (@($summaries.Values | Where-Object { [string]$_.Status -ne 'Pass' }).Count -eq 0) { 20 } else { 0 })
     }
     finally {
-        # Cancelled or finished: no track process outlives deploy.ps1, and the handoff directory goes.
-        foreach ($job in @(@($jobs.Values) + @($buildJob) | Where-Object { $null -ne $_ })) {
-            Stop-Job -Job $job -ErrorAction SilentlyContinue
-            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        # Finished, failed, or stopped (Ctrl+C): no job process outlives deploy.ps1, within seconds, and the handoff
+        # directory goes, with the tracks' private files in it. A job still running gets the cancel marker first, so its
+        # slow Azure cleanups (Run Command deletes, the guided stop's Bastion removal and password rotation) are left to
+        # the next deploy.ps1 or stop-demo.ps1 instead of holding the stop for minutes (Phase 28 live finding).
+        $runJobs = @(@($jobs.Values) + @($buildJob) + @($policyJob) + @($monitorCheck.Job) | Where-Object { $null -ne $_ })
+        if ($handoff -and @($runJobs | Where-Object { $_.State -in 'NotStarted', 'Running', 'Stopping' }).Count -gt 0) {
+            try {
+                Write-DemoTrackHandoff -Path $handoff -Name 'cancel' -Value ([pscustomobject]@{ Reason = 'stopped'; Utc = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) }) -Confirm:$false
+            }
+            catch {
+                Write-DemoLog -Level Debug -Message ('The cancel marker wasn''t written: {0}' -f $_.Exception.Message)
+            }
+        }
+        $ended = @(Stop-DemoRunJob -Job $runJobs)
+        if ($ended.Count -gt 0) {
+            Write-DemoLog -Level Warning -Message ('Stopped: {0} ended at once; the next ./scripts/deploy.ps1 continues their work.' -f ($ended -join ', '))
         }
         if ($handoff) {
             Remove-DemoPrivateDirectory -Path $handoff -Confirm:$false | Out-Null
@@ -545,8 +1019,22 @@ function Invoke-DemoParallelDeployment {
     $t2Done = $summaries.Contains('T2') -and [string]$summaries['T2'].Status -eq 'Pass'
     $fabricDone = $summaries.Contains('Fabric') -and [string]$summaries['Fabric'].Status -eq 'Pass'
     $t4Done = $summaries.Contains('T4') -and [string]$summaries['T4'].Status -eq 'Pass'
+    # A track this run didn't start counts as finished when an earlier run finished it (the state's Track* tags).
+    $trackFinished = {
+        param([string] $Track, [string] $LastStep)
+        if ($summaries.Contains($Track)) {
+            return ([string]$summaries[$Track].Status -eq 'Pass')
+        }
+        return ([string](Get-DemoMemberValue -InputObject $state -Name ('Track{0}' -f $Track)) -eq $LastStep)
+    }
+    $allTracksDone = (& $trackFinished 'T1' 'Telemetry') -and (& $trackFinished 'T2' 'Telemetry') -and ($skipT4 -or (& $trackFinished 'T4' 'Telemetry')) -and ($SkipFabric -or (& $trackFinished 'Fabric' 'Fabric'))
+    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:$skipT4 -SkipFabric:$SkipFabric
+    $validationStart = $results.Count
     if ($plan.Validation) {
-        $estateTargets = @(@(if ($t1Done) { 'T1', 'T3' }) + @(if ($t2Done) { 'T2' }) + @(if ($t4Done) { 'T4' }))
+        Set-DemoProgressStep -Path $ProgressPath -Id 'Validation' -State 'Running' -Message 'Checking Database Hub''s estate, telemetry, and metrics, and the Fabric items.'
+        # T4's estate only when it's deployed: the Burstable fallback can leave it out of this run (Phase 28).
+        $estateTargets = @(@(if ($t1Done) { 'T1', 'T3' }) + @(if ($t2Done) { 'T2' }) + @(if ($t4Done -and -not $skipT4) { 'T4' }))
         if ($estateTargets.Count -gt 0) {
             & $addAll @(Test-DemoHubEstate -Config $Config -Target $estateTargets)
         }
@@ -577,18 +1065,29 @@ function Invoke-DemoParallelDeployment {
             }
             & $addAll @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -CheckDashboardData -T3PerformanceMonitoringCheck $propertyCheck)
         }
+        # DONE (Phase 28, brief item 16): once every track this configuration has is finished, with no Fail, each DONE
+        # requirement this run's results don't show passing is checked now, read-only, so a resumed run judges every
+        # target and not only the ones it worked on. A target whose telemetry didn't come gets its monitoring checked,
+        # and its telemetry once more, before the run is judged (Invoke-DemoTelemetryCheck; Phase 28 live finding).
+        if ($allTracksDone -and -not (& $hasStatus $results.ToArray() 'Fail')) {
+            & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
+        }
         try {
-            Set-DemoDeploymentState -Config $Config -Value @{ Stage = $(if ($t1Done -and $t2Done -and ($fabricDone -or $SkipFabric)) { 'Validation' } elseif ($t1Done) { 'Monitoring' } else { 'Infrastructure' }) } -Confirm:$false
+            Set-DemoDeploymentState -Config $Config -Value @{ Stage = $(if ($allTracksDone) { 'Validation' } elseif ($t1Done) { 'Monitoring' } else { 'Infrastructure' }) } -Confirm:$false
         }
         catch {
             Write-DemoLog -Level Warning -Message ('The validation ran, but the stage wasn''t recorded: {0}' -f $_.Exception.Message)
         }
+        # What only a person can confirm, and the optional parts, don't make this step look blocked (Phase 28 live finding);
+        # the Hub tenant setting by its latest read (Phase 28 review).
+        $runSoFar = $results.ToArray()
+        $validationStatus = Get-DemoWorstStatus -Status @($results | Select-Object -Skip $validationStart | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_ -Context $runSoFar) -and -not (Test-DemoOptionalResult -Result $_) } | ForEach-Object { [string]$_.status })
+        Set-DemoProgressStep -Path $ProgressPath -Id 'Validation' -Status $(if ($validationStatus) { $validationStatus } else { 'Pass' }) -Message $(if ($allTracksDone) { 'Database Hub''s estate, telemetry, and metrics checked for every target.' } else { 'Checked what finished; the rest waits for the unfinished tracks.' })
     }
     $mark.Invoke('Validation', $validationWatch)
 
     # 6. Timing and the summary.
     $all = $results.ToArray()
-    $passed = { param([string] $CheckId) @($all | Where-Object { [string]$_.checkId -eq $CheckId -and [string]$_.status -eq 'Pass' }).Count -gt 0 }
     $ready = [ordered]@{}
     foreach ($summary in $summaries.Values) {
         $readyValue = Get-DemoMemberValue -InputObject $summary -Name 'ReadyUtc'
@@ -598,22 +1097,22 @@ function Invoke-DemoParallelDeployment {
             }
         }
     }
-    $clockStopped = (& $passed 'TELEMETRY.T1') -and (& $passed 'TELEMETRY.T2') -and (& $passed 'TELEMETRY.T3') -and (& $passed 'HUB.ESTATE.T1') -and (& $passed 'HUB.ESTATE.T2') -and (& $passed 'HUB.ESTATE.T3') -and (& $passed 'T2.ARC.SQLINSTANCE') -and (& $passed 'T2.ARC.MONITORING') -and (& $passed 'T1.SQLVM.ASSOCIATEDSERVICES') -and ($fabricDone -or $SkipFabric)
+    # The clock stops when DONE's requirements pass (ADR 0018, section 1, as amended by Phase 28: T4 included).
+    $clockStopped = $allTracksDone -and (Test-DemoDoneEvidence -Result $all -Requirement $requirement).Complete
     $trackTiming = [ordered]@{}
     foreach ($track in $summaries.Keys) {
         $trackTiming[$track] = [ordered]@{ status = [string]$summaries[$track].Status; steps = $summaries[$track].Timing; startedUtc = [string](Get-DemoMemberValue -InputObject $summaries[$track] -Name 'StartedUtc'); firstStepUtc = [string](Get-DemoMemberValue -InputObject $summaries[$track] -Name 'FirstStepUtc'); endedUtc = [string](Get-DemoMemberValue -InputObject $summaries[$track] -Name 'EndedUtc'); early = @(Get-DemoMemberValue -InputObject $summaries[$track] -Name 'Early') }
     }
     $minutes = [math]::Round($clock.Elapsed.TotalMinutes, 1)
     $timing = [ordered]@{ startUtc = $startUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); endUtc = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); minutes = $minutes; phases = $phase; tracks = $trackTiming; targetReadyUtc = $ready; t2Source = $context.T2Source; clockStopped = $clockStopped; withinThirtyMinutes = ($clockStopped -and $minutes -le 30) }
-    $timingMessage = if ($clockStopped) { 'Everything is deployed and populated in {0} minutes (T1, T2, and T3 telemetry, the estate, T2 PAYG with monitoring, T1''s inventory with only the engine, and Fabric).' -f $minutes } else { 'The run took {0} minutes; not every end-to-end condition passed yet, so the clock didn''t stop (see DEPLOY.SUMMARY).' -f $minutes }
+    $timingMessage = if ($clockStopped) { 'Everything is deployed and populated in {0} minutes: Database Hub''s estate for every target, {1}{2}, T1''s inventory with only the engine{3}.' -f $minutes, $(if ($skipT4) { 'T1, T2, and T3 telemetry' } else { 'T1, T2, and T3 telemetry, T4''s metrics' }), $(if ($installMode -eq 'Developer') { '' } else { ', T2''s PAYG and monitoring' }), $(if ($SkipFabric) { '' } else { ', and the required Fabric items' }) } else { 'The run took {0} minutes; not every DONE requirement passed yet, so the clock didn''t stop (see DEPLOY.SUMMARY).' -f $minutes }
     $results.Add((New-DemoResult -CheckId 'DEPLOY.TIMING' -Area 'infra' -Target 'subscription' -Status $(if ($clockStopped) { 'Pass' } else { 'Warning' }) -Message $timingMessage -Evidence $timing))
 
     $all = $results.ToArray()
-    $manual = @($all | Where-Object { $_.status -eq 'Manual action required' })
-    $failed = @($all | Where-Object { $_.status -eq 'Fail' })
-    $steps = @($manual | ForEach-Object { '{0}: {1}' -f $_.checkId, $(if ($_.remediation) { $_.remediation } else { $_.message }) })
-    $summaryStatus = if ($failed.Count -gt 0) { 'Fail' } elseif ($manual.Count -gt 0) { 'Manual action required' } else { 'Pass' }
-    $summaryMessage = if ($manual.Count -gt 0) { ('{0} item(s) need you: {1}' -f $manual.Count, ($steps -join ' | ')) } elseif ($failed.Count -gt 0) { ('{0} check(s) failed.' -f $failed.Count) } else { 'Every track and the validation finished.' }
-    $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $summaryStatus -Message $summaryMessage -Evidence ([ordered]@{ manual = $steps; failed = @($failed | ForEach-Object { $_.checkId }); minutes = $minutes })))
+    # Phase 28 live finding (2026-10-30): what only a person can confirm is listed once each, apart from what needs you.
+    $summary = Get-DemoDeploySummary -Result $all -FinishedText 'Every track and the validation finished.'
+    $summaryEvidence = $summary.Evidence
+    $summaryEvidence['minutes'] = $minutes
+    $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $summary.Status -Message $summary.Message -Evidence $summaryEvidence))
     return $results.ToArray()
 }

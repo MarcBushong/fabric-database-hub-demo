@@ -11,7 +11,10 @@ function Invoke-DemoPowerBIRequest {
 
     .DESCRIPTION
     Refuses any URI outside https://api.powerbi.com/v1.0/myorg, so the token can't be sent anywhere else. HTTP errors
-    don't throw: the caller reads StatusCode. HTTP 429 is retried after Retry-After (at most 60 seconds, 4 attempts).
+    don't throw: the caller reads StatusCode. A transient failure is retried (Invoke-DemoTransientRetry: a network
+    error, and HTTP 408, 429, 502, 503, and 504, up to 4 attempts, after Retry-After when there is one); with
+    -NotIdempotent (a request that starts something, such as a refresh), only a request that never reached the server,
+    and HTTP 429. A network error that lasts throws, with its innermost cause (Phase 28 live finding, 2026-10-30).
     https://learn.microsoft.com/rest/api/power-bi/
     #>
     [CmdletBinding()]
@@ -27,7 +30,9 @@ function Invoke-DemoPowerBIRequest {
         [Parameter(Mandatory)]
         [securestring] $Token,
 
-        [System.Collections.IDictionary] $Body
+        [System.Collections.IDictionary] $Body,
+
+        [switch] $NotIdempotent
     )
 
     if (-not $Uri.StartsWith($script:PowerBIApiBaseUri + '/', [System.StringComparison]::Ordinal)) {
@@ -47,17 +52,8 @@ function Invoke-DemoPowerBIRequest {
         $request['ContentType'] = 'application/json; charset=utf-8'
     }
 
-    $attempt = 0
-    while ($true) {
-        $attempt++
-        $response = Invoke-WebRequest @request
-        $statusCode = [int]$response.StatusCode
-        if ($statusCode -eq 429 -and $attempt -lt 4) {
-            Start-Sleep -Seconds (Get-DemoFabricRetryDelay -Headers $response.Headers -Default 10)
-            continue
-        }
-        break
-    }
+    $response = Invoke-DemoTransientRetry -Send { param([hashtable] $Call) Invoke-WebRequest @Call } -State $request -Target ([uri]$Uri).Host -NotIdempotent:$NotIdempotent
+    $statusCode = [int]$response.StatusCode
 
     $content = [string]$response.Content
     $parsed = $null

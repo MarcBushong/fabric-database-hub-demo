@@ -40,6 +40,55 @@ function Get-DemoGuestCredential {
     return (New-Object -TypeName 'System.Management.Automation.PSCredential' -ArgumentList $UserName, $secure)
 }
 
+function Update-DemoGuestSecret {
+    <#
+    .SYNOPSIS
+    Rotates the guest administrator's password the way the golden rotation does (vm/bootstrap/Invoke-DemoGoldenGuest.ps1,
+    RotateGuestPassword): the new random value is stored with DPAPI as pending first, then set in the guest over
+    PowerShell Direct with the current credential, proven with a new session, and only then promoted; if it can't sign
+    in, the old one is set back. It's never logged or returned (ADR 0009).
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $SecretPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [string] $UserName = 'Administrator'
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Name, 'Rotate the guest administrator password')) {
+        return
+    }
+    $pendingPath = $SecretPath + '.pending'
+    $old = Get-DemoGuestCredential -SecretPath $SecretPath -UserName $UserName
+    $session = New-PSSession -VMName $Name -Credential $old -ErrorAction Stop
+    try {
+        $value = Build-DemoVmPassword -Length 24
+        Protect-DemoVmSecret -Value $value -Path $pendingPath
+        $value = $null
+        $new = Get-DemoGuestCredential -SecretPath $pendingPath -UserName $UserName
+        $setSecret = {
+            param($Account, $Secret)
+            Set-LocalUser -Name $Account -Password $Secret
+        }
+        Invoke-Command -Session $session -ScriptBlock $setSecret -ArgumentList $UserName, $new.Password -ErrorAction Stop
+        if (Test-DemoGuestOnline -Name $Name -Credential $new) {
+            Move-Item -LiteralPath $pendingPath -Destination $SecretPath -Force
+            Write-DemoVmLog -Message 'Rotated the guest administrator password; the new one is stored on the host with DPAPI.'
+            return
+        }
+        Invoke-Command -Session $session -ScriptBlock $setSecret -ArgumentList $UserName, $old.Password -ErrorAction Stop
+        Remove-Item -LiteralPath $pendingPath -Force -ErrorAction SilentlyContinue
+        throw 'The new guest password could not sign in, so the old one was set back.'
+    }
+    finally {
+        Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-DemoGuestVm {
     [CmdletBinding()]
     [OutputType([bool])]

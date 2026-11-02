@@ -43,7 +43,7 @@ Option 1 by default; option 2 as an opt-in enhancement when `assignRoles=true`.
 - **`PaygWizard` mode (default):** before the manual setup-wizard step (ADR 0003, ADR 0006). This refines plan §9.2 for this one mode.
   - **Validated live (2026-10-21):** with the machine already Connected, the wizard's Azure Extension page locks the subscription, resource group, and region to the existing Arc connection. It still needs an Azure sign-in, because the extension can't be unticked with pay-as-you-go: Next without a sign-in fails with "requires all input values for AZURESERVICEPRINCIPAL".
   - The operator selects **Use Azure Login** and signs in with their own account; the demo never hands out a service principal secret.
-  - The sign-in window needs the WebView2 runtime, which the `GuestWebView2` host step installs in the guest beforehand.
+  - The sign-in window is an Internet Explorer-based control (live finding, 2026-10-30): the host turns IE Enhanced Security Configuration off for administrators in the guest before setup opens and back on after, and the `GuestWebView2` host step still installs the WebView2 runtime beforehand ([ADR 0009](0009-secrets-handling.md#setups-azure-sign-in-ie-enhanced-security-configuration-live-finding-2026-10-30)).
 
 ### Idempotency and duplicates
 

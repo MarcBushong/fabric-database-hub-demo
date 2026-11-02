@@ -79,6 +79,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force
+# Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
+$ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
+$OutputPath = Resolve-DemoUserPath -Path $OutputPath
 
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     Write-DemoLog -Level Warning -Message "No configuration at $ConfigPath; using config/demo.config.example.json."

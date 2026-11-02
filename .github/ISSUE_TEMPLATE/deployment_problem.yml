@@ -10,6 +10,11 @@ body:
         (for example `azuresql01-<suffix>`), resource IDs, and your account. Never paste a token, a password, or a
         webhook URL. [Troubleshooting](https://github.com/MarcBushong/fabric-database-hub-demo/blob/main/docs/troubleshooting.md)
         covers the common results first.
+
+        **The quickest way to share what happened:** run `./scripts/collect-diagnostics.ps1`. It zips your results,
+        deploy.ps1's console log, and its status page's model from `out/`, redacted again (IDs, the servers' suffix, email
+        addresses, and your home folder masked), and writes the zip only when a secret scan finds nothing. Look through it,
+        then attach it below. Paste the **DONE** or **NOT DONE** banner deploy.ps1 ended with too.
   - type: dropdown
     id: script
     attributes:
@@ -33,6 +38,17 @@ body:
       description: For example `./scripts/deploy.ps1 -FromStage T2`, with any ID replaced.
     validations:
       required: true
+  - type: textarea
+    id: banner
+    attributes:
+      label: How deploy.ps1 ended
+      description: The DONE or NOT DONE banner at the end of deploy.ps1's output (its Why, Next, and Run lines), with any ID replaced. Skip it for other scripts.
+      render: text
+  - type: textarea
+    id: bundle
+    attributes:
+      label: The diagnostics bundle
+      description: Drag the zip ./scripts/collect-diagnostics.ps1 wrote (out/diagnostics-<time>.zip) here, after you looked through it. Never attach your configuration file.
   - type: textarea
     id: results
     attributes:

@@ -122,6 +122,8 @@ function Get-DemoSignInDataSummary {
         if ((& $count $remaining 'caches') -gt 0) { $left.Add(('{0} browser sign-in cache(s)' -f (& $count $remaining 'caches'))) }
         if ((& $count $remaining 'archives') -gt 0) { $left.Add(('{0} archive(s) in setup''s log folders that couldn''t be checked' -f (& $count $remaining 'archives'))) }
         if ((& $count $remaining 'unverified') -gt 0) { $left.Add(('{0} file(s) that couldn''t be read' -f (& $count $remaining 'unverified'))) }
+        if ((& $count $remaining 'autologon') -gt 0) { $left.Add('Windows automatic sign-in left armed (AutoAdminLogon, the LSA DefaultPassword secret, or the Winlogon DefaultPassword value)') }
+        if ((& $count $remaining 'logonName') -gt 0) { $left.Add('the Winlogon DefaultUserName value') }
     }
     $appTokens = 0
     $security = 0
@@ -161,8 +163,8 @@ function Get-DemoSignInDataResult {
       file or in the PowerShell and Application logs (fail closed);
     - Manual action required when a token-shaped value is in the Security log, which nothing clears on its own:
       the remediation gives the exact command;
-    - Warning when the cleanup cleared an event log (endpoint protection may report that), or only an
-      application's or a managed identity's token was found;
+    - Warning when the cleanup turned off Windows automatic sign-in that was left armed (Phase 28), cleared an event log
+      (endpoint protection may report that), or only an application's or a managed identity's token was found;
     - Pass otherwise.
     Evidence holds counts and locations only. Internal.
     #>
@@ -230,6 +232,11 @@ function Get-DemoSignInDataResult {
         $message = 'The Security log holds token-shaped value(s) ({0}). Nothing clears that log on its own, because clearing it erases the audit trail and endpoint protection may report it.' -f $where
         $command = './scripts/check-sign-in-data.ps1 -VmName {0} -Clean -ClearSecurityLog' -f $VmName
         return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Manual action required' -Message $message -Evidence $evidence -Remediation ('After you review it, clear it with: {0} (or, on the VM in an elevated prompt: wevtutil clear-log Security), then check again.' -f $command) -DocUrl 'https://learn.microsoft.com/windows-server/administration/windows-commands/wevtutil')
+    }
+    $autoLogon = @($parts | Where-Object { [int](Get-DemoMemberValue -InputObject $_.Actions -Name 'autologon') -gt 0 })
+    if ($autoLogon.Count -gt 0) {
+        $message = 'Windows automatic sign-in was left armed on {0}, and the cleanup turned it off and deleted its LSA secret and Winlogon values; no sign-in data is left on {1}.' -f (($autoLogon | ForEach-Object { $_.Label }) -join ' and '), $names
+        return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'The PaygWizard guided stop''s own cleanup hadn''t finished. Nothing more to do; if it happens again, read docs/troubleshooting.md (the guided stop).' -DocUrl 'https://learn.microsoft.com/windows/win32/secauthn/protecting-the-automatic-logon-password')
     }
     $cleared = @($parts | ForEach-Object { foreach ($log in @($_.Cleared)) { '{0} on {1}' -f $log, $_.Label } })
     if ($cleared.Count -gt 0) {

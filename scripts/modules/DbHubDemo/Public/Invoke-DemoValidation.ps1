@@ -58,7 +58,7 @@ function Invoke-DemoValidation {
     the Teardown area can match resources by it.
 
     .PARAMETER FabricAdmin
-    The caller is a Fabric administrator, so P4 is read through the Fabric admin API.
+    Accepted for compatibility: since Phase 28, P4 is read through the Fabric admin API on every run.
 
     .PARAMETER SkipPolicyInventory
     Skip preflight's policy inventory, which reads every policy definition that applies to the subscription.

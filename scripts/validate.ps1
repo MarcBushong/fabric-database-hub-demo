@@ -52,7 +52,7 @@ The environment's deploymentId. Read from the resource group's tag when omitted;
 to -Area Teardown so resources tagged with it are found.
 
 .PARAMETER FabricAdmin
-You're a Fabric administrator, so the Hub tenant setting (P4) is read through the Fabric admin API.
+Accepted for compatibility: since Phase 28 the Hub tenant setting (P4) is read through the Fabric admin API on every run.
 
 .PARAMETER SkipPolicyInventory
 Skip the Preflight area's policy inventory, which can take a few minutes in tenants with large policy sets.
@@ -103,6 +103,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force
+# Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
+$ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
+$OutputPath = Resolve-DemoUserPath -Path $OutputPath
+$ScanPath = @(Resolve-DemoUserPath -Path $ScanPath)
 
 $config = Get-DemoConfig -Path $ConfigPath
 $parameters = @{

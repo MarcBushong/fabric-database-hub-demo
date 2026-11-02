@@ -59,8 +59,8 @@ function Sync-DemoFabricAppStage {
     )
 
     $docUrl = 'https://learn.microsoft.com/fabric/apps/project-structure'
-    $source = [System.IO.Path]::GetFullPath($SourcePath)
-    $stage = [System.IO.Path]::GetFullPath($StagePath)
+    $source = Resolve-DemoUserPath -Path $SourcePath
+    $stage = Resolve-DemoUserPath -Path $StagePath
     $results = [System.Collections.Generic.List[object]]::new()
     if (-not (Test-Path -LiteralPath (Join-Path -Path $source -ChildPath 'rayfin/rayfin.yml') -PathType Leaf)) {
         $results.Add((New-DemoResult -CheckId 'FABRIC.APP.STAGE' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} isn''t a Fabric Apps project: rayfin/rayfin.yml is missing.' -f $SourcePath) -DocUrl $docUrl))

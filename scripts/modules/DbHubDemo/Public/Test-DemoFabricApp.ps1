@@ -64,7 +64,7 @@ function Test-DemoFabricApp {
     $connector = [string]$settings['connectorName']
     $connectorDoc = 'https://learn.microsoft.com/fabric/apps/connectors'
     $results = [System.Collections.Generic.List[object]]::new()
-    $stage = [System.IO.Path]::GetFullPath($StagePath)
+    $stage = Resolve-DemoUserPath -Path $StagePath
     $queryFolder = 'rayfin/.temp/dbhub-queries'
     $callTimeout = $TimeoutSeconds
     if (-not $HostingUrl -or -not $ItemUrl) {

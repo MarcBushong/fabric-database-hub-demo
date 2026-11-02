@@ -194,16 +194,238 @@ Describe 'Lifecycle scripts' {
 
     BeforeEach {
         # Mocks run inside the scripts, where $script: is the script's own scope, so they share this table.
-        $capture = @{ exported = $null; clipboard = [System.Collections.Generic.List[string]]::new(); sent = '' }
+        $capture = @{ exported = $null; clipboard = [System.Collections.Generic.List[string]]::new(); sent = ''; ci = $false; kind = 'Done'; exit = 0 }
         Mock -CommandName Write-DemoResultReport -MockWith { }
+        # deploy.ps1's run experience (Phase 28) has its own tests (DbHubDemo.OneCommand.Tests.ps1); here it only has to be
+        # called, with no keep-awake, status page, browser, or transcript on the test machine.
+        Mock -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $false; Ci = $capture['ci']; Interactive = $true; Codespaces = $false; Windows = $true } }
+        Mock -CommandName Start-Transcript -MockWith { }
+        Mock -CommandName Stop-Transcript -MockWith { }
+        Mock -CommandName Start-DemoDeploymentRun -MockWith { [pscustomobject]@{ ProgressPath = 'progress.json'; PagePath = 'page.html'; Writer = $null; KeepAwake = $true; StartedUtc = [DateTime]::UtcNow; Command = './scripts/deploy.ps1'; Environment = $null; InstallMode = 'PaygWizard'; WaitForT2 = [bool]$WaitForT2 } }
+        Mock -CommandName Complete-DemoDeploymentRun -MockWith { [pscustomobject]@{ Kind = $capture['kind']; ExitCode = $capture['exit']; Minutes = 1; Reason = ''; Next = ''; NextCommand = './scripts/deploy.ps1'; Optional = @(); Notes = @(); Resume = '' } }
+        Mock -CommandName Exit-DemoKeepAwake -MockWith { $true }
+        Mock -CommandName Write-DemoDeploymentOutcome -MockWith { }
+        # Stop-DemoEnvironment's rotation and start-demo.ps1's handover record never reach Azure here.
+        Mock -CommandName Set-DemoDeploymentState -MockWith { $capture['state'] = $Value }
     }
 
     It 'deploy.ps1 passes its switches and stages through, and drops an empty stage' {
         Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -Resume -FromStage '' -StopAfter Activity -SkipFabric -OutputPath $outputPath
         $LASTEXITCODE | Should -Be 0
-        Should -Invoke -CommandName Invoke-DemoDeployment -Times 1 -Exactly -ParameterFilter { $Resume -and $SkipFabric -and $StopAfter -eq 'Activity' -and -not $PSBoundParameters.ContainsKey('FromStage') }
+        Should -Invoke -CommandName Invoke-DemoDeployment -Times 1 -Exactly -ParameterFilter { $Resume -and $SkipFabric -and $StopAfter -eq 'Activity' -and -not $PSBoundParameters.ContainsKey('FromStage') -and -not $AutoResume -and $ProgressPath -eq 'progress.json' }
         Test-Path -LiteralPath $outputPath | Should -BeTrue
+    }
+
+    Context 'Phase 28: one command, one guided stop' {
+        It 'waits for T2 by default, not in CI unless -WaitForT2, and never with -NoWaitForT2' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { $capture['wait'].Add([bool]$WaitForT2); New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            $capture['wait'] = [System.Collections.Generic.List[bool]]::new()
+            $deploy = Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1'
+            & $deploy -ConfigPath $configPath -OutputPath $outputPath
+            & $deploy -ConfigPath $configPath -OutputPath $outputPath -NoWaitForT2
+            $capture['ci'] = $true
+            & $deploy -ConfigPath $configPath -OutputPath $outputPath
+            & $deploy -ConfigPath $configPath -OutputPath $outputPath -WaitForT2
+            $capture['wait'] | Should -Be @($true, $false, $false, $true)
+            Should -Invoke -CommandName Start-DemoDeploymentRun -Times 4 -Exactly
+        }
+
+        It 'tells the result report whether the run ended DONE, so its Manual action required heading doesn''t contradict DONE (Phase 28 live run)' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            $deploy = Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1'
+            & $deploy -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Write-DemoResultReport -Times 1 -Exactly -ParameterFilter { $Title -eq 'deploy.ps1' -and $OutcomeDone }
+            $capture['kind'] = 'NotDone'
+            $capture['exit'] = 2
+            & $deploy -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 2
+            Should -Invoke -CommandName Write-DemoResultReport -Times 1 -Exactly -ParameterFilter { $Title -eq 'deploy.ps1' -and -not $OutcomeDone }
+        }
+
+        It 'continues an unfinished deployment without a flag, keeps the PC awake until the end, and exits nonzero when it isn''t done' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            $capture['kind'] = 'NotDone'
+            $capture['exit'] = 2
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 2
+            Should -Invoke -CommandName Invoke-DemoDeployment -Times 1 -Exactly -ParameterFilter { $AutoResume -and -not $Resume -and $Parallel }
+            Should -Invoke -CommandName Exit-DemoKeepAwake -Times 1 -Exactly
+            Should -Invoke -CommandName Write-DemoDeploymentOutcome -Times 1 -Exactly -ParameterFilter { $Outcome.Kind -eq 'NotDone' }
+            Should -Invoke -CommandName Start-Transcript -Times 1 -Exactly
+            Should -Invoke -CommandName Stop-Transcript -Times 1 -Exactly
+        }
+
+        It 'still ends with one banner, and releases the PC, when the deployment throws' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { throw 'the network went away' }
+            $capture['kind'] = 'NotDone'
+            $capture['exit'] = 1
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 1
+            Should -Invoke -CommandName Complete-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { @($Result | Where-Object { $_.checkId -eq 'DEPLOY.RUN' -and $_.status -eq 'Fail' }).Count -eq 1 }
+            Should -Invoke -CommandName Exit-DemoKeepAwake -Times 1 -Exactly
+        }
+
+        It 'ends Stopped, not done, without a Fail, and lets the PC sleep again when the wait for the tracks notices Ctrl+C (Phase 28 live finding)' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { throw [System.OperationCanceledException]::new('deploy.ps1 was stopped (Ctrl+C) before the tracks finished.') }
+            $capture['kind'] = 'NotDone'
+            $capture['exit'] = 2
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 2
+            Should -Invoke -CommandName Complete-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['Stopped'] -and @($Result | Where-Object { $_.checkId -eq 'DEPLOY.RUN' }).Count -eq 0 }
+            Should -Invoke -CommandName Exit-DemoKeepAwake -Times 1 -Exactly
+        }
+
+        It 'ends with one banner, Stopped, not done, and releases the PC within seconds when a stop (as Ctrl+C makes one) interrupts it (Phase 28 live finding)' {
+            # A real pipeline stop, the one PowerShell makes for Ctrl+C, in a runspace of its own with stand-ins for the
+            # deployment's commands; before the fix, the ending didn't know the run was stopped.
+            $log = Join-Path -Path $TestDrive -ChildPath ('stop-' + [guid]::NewGuid().ToString('N') + '.log')
+            $runner = [powershell]::Create()
+            $null = $runner.AddScript({
+                    param([string] $ModulePath, [string] $Deploy, [string] $ConfigFile, [string] $OutputFile, [string] $LogFile)
+                    Import-Module -Name $ModulePath
+                    # Stand-ins for the deployment's commands. Simple functions: the parameters they don't name land in $args.
+                    . ([scriptblock]::Create(("function global:Write-StopTestLog([string] `$Text) {{ [System.IO.File]::AppendAllText('{0}', `$Text + [System.Environment]::NewLine) }}" -f ($LogFile -replace "'", "''"))))
+                    function global:Get-DemoRunEnvironment { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+                    function global:Start-Transcript { }
+                    function global:Stop-Transcript { }
+                    function global:Initialize-DemoFirstRun { [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = ''; NextSteps = @(); Outcome = $null } }
+                    function global:Start-DemoDeploymentRun { [pscustomobject]@{ ProgressPath = ''; PagePath = ''; Writer = $null; KeepAwake = $true; StartedUtc = [DateTime]::UtcNow; Command = './scripts/deploy.ps1'; Environment = $null; InstallMode = 'PaygWizard'; WaitForT2 = $true } }
+                    function global:Invoke-DemoDeployment { Write-StopTestLog 'deploying'; Start-Sleep -Seconds 60; Write-StopTestLog 'not stopped' }
+                    function global:Complete-DemoDeploymentRun {
+                        param([switch] $Stopped)
+                        Write-StopTestLog ('complete stopped={0}' -f [bool]$Stopped)
+                        [pscustomobject]@{ Kind = 'NotDone'; ExitCode = 2; Minutes = 1; Reason = 'stopped'; Next = 'continue'; NextCommand = './scripts/deploy.ps1'; Optional = @(); Notes = @(); Resume = '' }
+                    }
+                    function global:Exit-DemoKeepAwake { Write-StopTestLog 'awake released'; $true }
+                    function global:Write-DemoDeploymentOutcome { param($Outcome) Write-StopTestLog ('banner {0}' -f $Outcome.Kind) }
+                    & $Deploy -ConfigPath $ConfigFile -OutputPath $OutputFile
+                }).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1')).AddArgument($configPath).AddArgument($outputPath).AddArgument($log)
+            $null = $runner.BeginInvoke()
+            try {
+                $watch = [System.Diagnostics.Stopwatch]::StartNew()
+                while (-not ((Test-Path -LiteralPath $log) -and (Get-Content -LiteralPath $log) -contains 'deploying') -and $watch.Elapsed.TotalSeconds -lt 90) {
+                    Start-Sleep -Milliseconds 200
+                }
+                $watch.Restart()
+                $runner.Stop()
+                $watch.Elapsed.TotalSeconds | Should -BeLessThan 10
+                $lines = @(Get-Content -LiteralPath $log)
+                $lines | Should -Not -Contain 'not stopped'
+                $lines | Should -Contain 'complete stopped=True'
+                $lines | Should -Contain 'awake released'
+                $lines | Should -Contain 'banner NotDone'
+            }
+            finally {
+                $runner.Dispose()
+            }
+        }
+
+        It 'lets the PC sleep again when it''s stopped while the run''s experience starts (Phase 28 live finding)' {
+            Mock -CommandName Start-DemoDeploymentRun -MockWith { throw 'stopped while the run started' }
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            { & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $outputPath } | Should -Throw -ExpectedMessage 'stopped while the run started'
+            Should -Invoke -CommandName Invoke-DemoDeployment -Times 0 -Exactly
+            Should -Invoke -CommandName Exit-DemoKeepAwake -Times 1 -Exactly
+            Should -Invoke -CommandName Stop-Transcript -Times 1 -Exactly
+        }
+
+        It 'keeps GitHub Actions'' exit codes and inputs as before' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'DEPLOY.T2.BACKGROUND' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'building' }
+            Mock -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $true; Ci = $true; Interactive = $false; Codespaces = $false; Windows = $false } }
+            $capture['kind'] = 'NotDone'
+            $capture['exit'] = 2
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Invoke-DemoDeployment -Times 1 -Exactly -ParameterFilter { -not $AutoResume -and -not $WaitForT2 }
+            Should -Invoke -CommandName Start-Transcript -Times 0 -Exactly
+        }
+
+        It 'judges a -Sequential run as one, so it can end DONE (review finding 4)' {
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $outputPath -Sequential
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Invoke-DemoDeployment -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('Parallel') }
+            Should -Invoke -CommandName Complete-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['Sequential'] }
+        }
+
+        It 'resolves relative paths against PowerShell''s location, not the process''s working directory (review fix 8)' {
+            # .NET resolves relative paths against [Environment]::CurrentDirectory, which Push-Location doesn't change.
+            $location = Join-Path -Path $TestDrive -ChildPath ('location-' + [guid]::NewGuid().ToString('N'))
+            $elsewhere = Join-Path -Path $TestDrive -ChildPath ('process-' + [guid]::NewGuid().ToString('N'))
+            $null = New-Item -ItemType Directory -Path (Join-Path -Path $location -ChildPath 'config'), $elsewhere -Force
+            Copy-Item -LiteralPath $configPath -Destination (Join-Path -Path $location -ChildPath 'config/proof.local.json')
+            Mock -CommandName Initialize-DemoFirstRun -MockWith { $capture['firstRun'] = $ConfigPath; [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = $ConfigPath; NextSteps = @(); Outcome = $null } }
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            Mock -CommandName Show-DemoDeploymentProgress -MockWith { $capture['watched'] = $Path; 'Done' }
+            Mock -CommandName Initialize-DemoConfig -MockWith { $capture['initPath'] = $Path; [pscustomobject]@{ Written = $true; Results = @(); NextSteps = @() } }
+            $saved = [System.Environment]::CurrentDirectory
+            Push-Location -LiteralPath $location
+            try {
+                [System.Environment]::CurrentDirectory = $elsewhere
+                & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath './config/proof.local.json' -OutputPath './out/deploy.jsonl'
+                & (Join-Path -Path $repoRoot -ChildPath 'scripts/status.ps1') -ConfigPath './config/proof.local.json' -OutputPath './out/status.jsonl' -Watch
+                & (Join-Path -Path $repoRoot -ChildPath 'scripts/init.ps1') -ConfigPath './config/new.local.json' -OutputPath './out/init.jsonl' -NonInteractive
+            }
+            finally {
+                [System.Environment]::CurrentDirectory = $saved
+                Pop-Location
+            }
+            $out = Join-Path -Path $location -ChildPath 'out'
+            Test-Path -LiteralPath (Join-Path -Path $out -ChildPath 'deploy.jsonl') -PathType Leaf | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path -Path $elsewhere -ChildPath 'out') | Should -BeFalse
+            $capture['firstRun'] | Should -Be ([System.IO.Path]::Combine($location, 'config', 'proof.local.json'))
+            Should -Invoke -CommandName Start-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { $OutputDirectory -eq $out -and $ConfigPath -eq ([System.IO.Path]::Combine($location, 'config', 'proof.local.json')) }
+            $capture['watched'] | Should -Be ([System.IO.Path]::Combine($location, 'out', 'deploy-progress.json'))
+            $capture['initPath'] | Should -Be ([System.IO.Path]::Combine($location, 'config', 'new.local.json'))
+        }
+
+        It 'writes the configuration first when there''s none, then deploys; and stops NOT DONE with the fix when it can''t' {
+            $fresh = Join-Path -Path $TestDrive -ChildPath ('fresh-' + [guid]::NewGuid().ToString('N') + '.local.json')
+            $capture['template'] = Get-Content -LiteralPath $configPath -Raw
+            Mock -CommandName Initialize-DemoFirstRun -MockWith {
+                Set-Content -LiteralPath $ConfigPath -Value $capture['template']
+                [pscustomobject]@{ Ran = $true; Ready = $true; Results = @(New-DemoResult -CheckId 'INIT.CONFIG' -Area 'preflight' -Target 'repo' -Status 'Pass' -Message 'written'); Path = $ConfigPath; NextSteps = @(); Outcome = $null }
+            }
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $fresh -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Invoke-DemoDeployment -Times 1 -Exactly
+
+            $missing = Join-Path -Path $TestDrive -ChildPath ('missing-' + [guid]::NewGuid().ToString('N') + '.local.json')
+            Mock -CommandName Initialize-DemoFirstRun -MockWith {
+                [pscustomobject]@{ Ran = $true; Ready = $false; Results = @(New-DemoResult -CheckId 'INIT.P6.GROUP' -Area 'preflight' -Target 'tenant' -Status 'Manual action required' -Message 'The group can''t be created.'); Path = $ConfigPath; NextSteps = @(); Outcome = [pscustomobject]@{ Kind = 'NotDone'; Reason = 'INIT.P6.GROUP'; Next = 'Ask an administrator.'; NextCommand = './scripts/deploy.ps1'; ExitCode = 2; Resume = ''; Optional = @(); Notes = @() } }
+            }
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $missing -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 2
+            Should -Invoke -CommandName Invoke-DemoDeployment -Times 1 -Exactly -Because 'only the first run deployed'
+            Should -Invoke -CommandName Write-DemoDeploymentOutcome -ParameterFilter { $Outcome.Reason -eq 'INIT.P6.GROUP' }
+        }
+
+        It 'status.ps1 -Watch shows the live model, and reads Azure only without one' {
+            Mock -CommandName Get-DemoEnvironmentStatus -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            Mock -CommandName Show-DemoDeploymentProgress -MockWith { $capture['view'] }
+            $capture['view'] = 'Done'
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/status.ps1') -ConfigPath $configPath -Watch -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Show-DemoDeploymentProgress -Times 1 -Exactly -ParameterFilter { $Watch -and $Path -match 'deploy-progress\.json$' }
+            Should -Invoke -CommandName Get-DemoEnvironmentStatus -Times 0 -Exactly
+            $capture['view'] = 'Stopped'
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/status.ps1') -ConfigPath $configPath -Watch -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 2
+            $capture['view'] = 'None'
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/status.ps1') -ConfigPath $configPath -Watch -OutputPath $outputPath
+            Should -Invoke -CommandName Get-DemoEnvironmentStatus -Times 1 -Exactly
+        }
+
+        It 'collect-diagnostics.ps1 masks the configuration''s owner and account too' {
+            Mock -CommandName Export-DemoDiagnosticBundle -MockWith { $capture['mask'] = @($Mask); New-DemoResult -CheckId 'DIAG.BUNDLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'written' }
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/collect-diagnostics.ps1') -ConfigPath $configPath -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 0
+            $capture['mask'] | Should -Contain 'your-alias'
+            $capture['mask'] | Should -Contain 'you@example.com'
+        }
     }
 
     It 'stop-demo.ps1 passes -RemoveT3, -ParkT2, and the Bastion-only cleanup through' {
@@ -223,16 +445,40 @@ Describe 'Lifecycle scripts' {
         Should -Invoke -CommandName Start-DemoEnvironment -Times 1 -Exactly -ParameterFilter { $SkipCostCheck }
 
         Mock -CommandName Set-Clipboard -MockWith { throw 'no clipboard here' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoClipboard -MockWith { $false }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -ConfigPath $configPath -Interactive -ResetAdminPassword -OutputPath $outputPath
         ($capture['exported'] | Where-Object { $_.checkId -eq 'START.HOSTPASSWORD' }).status | Should -Be 'Manual action required'
         ($capture['exported'] | Where-Object { $_.checkId -eq 'START.HOSTPASSWORD' }).remediation | Should -Match 'Reset password'
         Should -Invoke -CommandName Set-DemoVmLocalPassword -Times 0 -Exactly
+        # Phase 28: the handover is recorded, so stop-demo.ps1 rotates a password the person set in the portal.
+        $capture['state']['HostPasswordSet'] | Should -Not -BeNullOrEmpty
+    }
+
+    It 'start-demo.ps1 sets no password where Set-Clipboard only pretends to work (GitHub Codespaces; review finding 3)' {
+        Mock -CommandName Start-DemoEnvironment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        Mock -CommandName Set-DemoVmLocalPassword -MockWith { New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'set' -Evidence @{ userName = 'demoadmin' } }
+        Mock -CommandName Export-DemoResult -MockWith { $capture['exported'] = $Result }
+        # PowerShell 7's Set-Clipboard on Linux without xclip or a display keeps the text in its own process and doesn't fail.
+        Mock -CommandName Set-Clipboard -MockWith { $capture['clipboard'].Add([string]$Value) }
+        Mock -ModuleName DbHubDemo -CommandName Set-Clipboard -MockWith { }
+        $saved = $env:CODESPACES
+        try {
+            $env:CODESPACES = 'true'
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -ConfigPath $configPath -Interactive -ResetAdminPassword -OutputPath $outputPath
+        }
+        finally {
+            $env:CODESPACES = $saved
+        }
+        Should -Invoke -CommandName Set-DemoVmLocalPassword -Times 0 -Exactly
+        ($capture['exported'] | Where-Object { $_.checkId -eq 'START.HOSTPASSWORD' }).status | Should -Be 'Manual action required'
+        $capture['clipboard'].Count | Should -Be 0
     }
 
     It 'start-demo.ps1 puts the one-time password on the clipboard only, never in the results' {
         Mock -CommandName Start-DemoEnvironment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
         Mock -CommandName Export-DemoResult -MockWith { $capture['exported'] = $Result }
         Mock -CommandName Set-Clipboard -MockWith { $capture['clipboard'].Add([string]$Value) }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoClipboard -MockWith { $true }
         Mock -CommandName Set-DemoVmLocalPassword -MockWith {
             $capture['sent'] = [System.Net.NetworkCredential]::new('', $Password).Password
             New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'set' -Evidence @{ userName = 'demoadmin' }
@@ -336,5 +582,48 @@ Describe 'Lifecycle scripts' {
         Mock -CommandName Get-DemoEnvironmentStatus -MockWith { New-DemoResult -CheckId 'STATUS.T3' -Area 't3' -Target 'T3' -Status 'Fail' -Message 'broken' }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/status.ps1') -ConfigPath $configPath -OutputPath $outputPath
         $LASTEXITCODE | Should -Be 1
+    }
+}
+
+Describe 'Paths the scripts are given (review fix 8)' {
+    It 'every script resolves each *Path parameter against PowerShell''s location before it uses it' {
+        # .NET file APIs resolve a relative path against [Environment]::CurrentDirectory, which Set-Location doesn't change.
+        $offenders = foreach ($file in Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts') -Filter '*.ps1' -File) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            $text = Get-Content -LiteralPath $file.FullName -Raw
+            foreach ($parameter in @($ast.ParamBlock.Parameters)) {
+                $name = $parameter.Name.VariablePath.UserPath
+                if ($name -like '*Path' -and $text -notmatch ('(?m)^\${0} = (@\()?Resolve-DemoUserPath -Path \${0}\b' -f $name)) {
+                    '{0}: -{1}' -f $file.Name, $name
+                }
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
+
+    It 'Resolve-DemoUserPath resolves against the location, keeps an empty path empty, and refuses a path outside the file system' {
+        $location = Join-Path -Path $TestDrive -ChildPath ('resolve-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $location -Force
+        $saved = [System.Environment]::CurrentDirectory
+        Push-Location -LiteralPath $location
+        try {
+            [System.Environment]::CurrentDirectory = [System.IO.Path]::GetTempPath()
+            Resolve-DemoUserPath -Path './config/../config/x.json' | Should -Be ([System.IO.Path]::Combine($location, 'config', 'x.json'))
+            @(Resolve-DemoUserPath -Path 'a.json', '') | Should -Be @(([System.IO.Path]::Combine($location, 'a.json')), '')
+            Resolve-DemoUserPath -Path $location | Should -Be $location
+        }
+        finally {
+            [System.Environment]::CurrentDirectory = $saved
+            Pop-Location
+        }
+        if ($IsWindows) {
+            Push-Location -LiteralPath 'HKCU:\'
+            try {
+                { Resolve-DemoUserPath -Path './x.json' } | Should -Throw "*isn't a file-system path*"
+            }
+            finally {
+                Pop-Location
+            }
+        }
     }
 }

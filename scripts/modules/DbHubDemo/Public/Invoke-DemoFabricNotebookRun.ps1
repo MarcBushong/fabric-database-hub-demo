@@ -37,7 +37,7 @@ function Invoke-DemoFabricNotebookRun {
     A Fabric REST API token you already have, as a SecureString.
 
     .PARAMETER TimeoutMinutes
-    How long to wait for the job.
+    How long to wait for the job, in elapsed time, the reads included.
 
     .PARAMETER PollSeconds
     Seconds between reads of the job instance.
@@ -112,7 +112,8 @@ function Invoke-DemoFabricNotebookRun {
     $submitUri = '{0}/workspaces/{1}/items/{2}/jobs/instances?jobType=RunNotebook' -f $script:FabricApiBaseUri, $workspaceId, $itemId
     # IDs are named in the log, never shown.
     Write-DemoLog -Message ('Running {0} on demand ({1}).' -f $Name, (($parameters.Keys | ForEach-Object { if ($_ -like '*_ID') { '{0}=(resolved)' -f $_ } else { '{0}={1}' -f $_, $parameters[$_].value } }) -join ', '))
-    $submit = Invoke-DemoFabricRequest -Method 'Post' -Uri $submitUri -Token $Token -Body $body
+    # A second submit would start a second run, so it's sent again only when it never reached the service.
+    $submit = Invoke-DemoFabricRequest -Method 'Post' -Uri $submitUri -Token $Token -Body $body -NotIdempotent
     if ($submit.StatusCode -ne 202) {
         return (& $result 'Fail' ('{0} wasn''t started: HTTP {1}, {2}' -f $Name, $submit.StatusCode, (Get-DemoFabricErrorText -Response $submit)) @{} 'Check that the workspace''s capacity is running (the scripts never resume it), then run the notebook again.')
     }
@@ -125,8 +126,15 @@ function Invoke-DemoFabricNotebookRun {
     $status = 'NotStarted'
     $state = $null
     $maxPolls = [int][System.Math]::Ceiling($TimeoutMinutes * 60.0 / $PollSeconds)
+    # Elapsed time bounds the polls too, the reads included: a read that keeps getting a transient status (HTTP 429 or
+    # 5xx) pays its attempts and backoff on every poll (review of c7c86ec). A network error that lasts throws.
+    $deadline = (Get-DemoUtcNow).AddMinutes($TimeoutMinutes)
     for ($poll = 1; $poll -le $maxPolls; $poll++) {
-        Start-Sleep -Seconds $PollSeconds
+        $remaining = ($deadline - (Get-DemoUtcNow)).TotalSeconds
+        if ($remaining -le 0) {
+            break
+        }
+        Start-Sleep -Seconds ([int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, [System.Math]::Ceiling($remaining))))
         $read = Invoke-DemoFabricRequest -Method 'Get' -Uri $location -Token $Token
         if ($read.StatusCode -ne 200) {
             continue

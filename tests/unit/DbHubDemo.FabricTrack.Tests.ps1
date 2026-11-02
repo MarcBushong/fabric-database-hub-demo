@@ -105,6 +105,56 @@ Describe 'Invoke-DemoPowerBIStage and Invoke-DemoFabricAppStage' {
             Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricScriptStep -Times 0 -Exactly
         }
     }
+
+    It 'passes the workspace the Fabric step resolved, and never reports the optional app as a Fail (Phase 28 live finding)' {
+        # Live: the app's own lookup of the workspace, right after the Fabric step created it, failed; the app was
+        # skipped with a Fail, and nothing said why.
+        $workspaceId = '44444444-4444-4444-4444-444444444444'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricScriptStep -MockWith {
+            $script:stepArgument = Get-Variable -Name 'Argument' -ValueOnly -ErrorAction SilentlyContinue
+            # As configure-fabric-app.ps1 writes them: JSON records.
+            @(
+                [ordered]@{ checkId = 'FABRIC.APP.SOURCE'; status = 'Pass'; message = 'fabric/app is ready.'; remediation = ''; evidence = $null }
+                [ordered]@{ checkId = 'FABRIC.RESOLVE.WORKSPACE'; status = 'Fail'; message = 'Your Fabric workspaces couldn''t be listed: HTTP 429: Too many requests.'; remediation = 'Check your Fabric access (sign in again with ''az login --tenant <tenantId>'' if the session expired), then run the script again.'; evidence = [ordered]@{ statusCode = 429 } }
+                [ordered]@{ checkId = 'FABRIC.APP.DEPLOY'; status = 'Not selected'; message = 'The Fabric workspace isn''t resolved, so nothing was deployed.'; remediation = ''; evidence = $null }
+            ) | ForEach-Object { $_ | ConvertTo-Json -Compress | ConvertFrom-Json }
+        }
+        $records = @(& (Get-Module -Name DbHubDemo) { param($c, $w) Invoke-DemoFabricAppStage -Config $c -WorkspaceId $w } $config $workspaceId)
+        $script:stepArgument['WorkspaceId'] | Should -Be $workspaceId
+        @($records | Where-Object { $_.status -eq 'Fail' }).Count | Should -Be 0
+        $listed = $records | Where-Object { $_.checkId -eq 'FABRIC.RESOLVE.WORKSPACE' }
+        $listed.status | Should -Be 'Manual action required'
+        $listed.evidence.reportedStatus | Should -Be 'Fail'
+        $listed.evidence.statusCode | Should -Be 429
+        $listed.message | Should -Match '^Optional Insights app: Your Fabric workspaces couldn''t be listed'
+        foreach ($record in $records) {
+            $record.evidence.optional | Should -Be 'insightsApp' -Because $record.checkId
+            (& (Get-Module -Name DbHubDemo) { param($r) Test-DemoOptionalResult -Result $r } $record) | Should -BeTrue -Because ('{0} never blocks DONE' -f $record.checkId)
+        }
+        $summary = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoInsightsAppSummary -Result $r } $records
+        $summary.State | Should -Be 'Skipped'
+        $summary.Status | Should -Be 'Manual action required'
+        $summary.Reason | Should -Match ([regex]::Escape('It wasn''t added: FABRIC.RESOLVE.WORKSPACE: Your Fabric workspaces couldn''t be listed: HTTP 429'))
+        $summary.HowTo | Should -Match 'Check your Fabric access'
+        $summary.HowTo | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
+
+        # Without a resolved workspace, the script looks it up itself, as before.
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoFabricAppStage -Config $c -WorkspaceId '' } $config
+        $script:stepArgument.Contains('WorkspaceId') | Should -BeFalse
+    }
+
+    It 'finds the workspace configure-fabric.ps1 resolved: found, created, or the override, and not a failed one' {
+        $resolved = {
+            param([string] $Status, [string] $Id)
+            New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status $Status -Message 'x' -Evidence ([ordered]@{ workspaceId = $Id })
+        }
+        $module = Get-Module -Name DbHubDemo
+        & $module { param($r) Get-DemoResolvedWorkspaceId -Result $r } @((& $resolved 'Pass' '44444444-4444-4444-4444-44444444ABCD')) | Should -Be '44444444-4444-4444-4444-44444444abcd'
+        & $module { param($r) Get-DemoResolvedWorkspaceId -Result $r } @((& $resolved 'Not selected' '55555555-5555-5555-5555-555555555555')) | Should -Be '55555555-5555-5555-5555-555555555555'
+        & $module { param($r) Get-DemoResolvedWorkspaceId -Result $r } @((& $resolved 'Fail' '66666666-6666-6666-6666-666666666666')) | Should -Be ''
+        & $module { param($r) Get-DemoResolvedWorkspaceId -Result $r } @((& $resolved 'Pass' '00000000-0000-0000-0000-000000000000')) | Should -Be ''
+        & $module { param($r) Get-DemoResolvedWorkspaceId -Result $r } @() | Should -Be ''
+    }
 }
 
 Describe 'Invoke-DemoFabricNotebookRun' {
@@ -173,5 +223,23 @@ Describe 'Invoke-DemoFabricNotebookRun' {
         $result = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -TimeoutMinutes 1 -PollSeconds 1
         $result.status | Should -Be 'Warning'
         $result.message | Should -Match 'still InProgress'
+    }
+
+    It 'counts -TimeoutMinutes in elapsed time, the reads included, when every read pays its retries (review of c7c86ec)' {
+        # Each read answers HTTP 503 after its attempts and backoff, about 50 seconds; before, the polls were counted, not the time.
+        $script:reads = 0
+        $script:now = [datetime]::new(2026, 11, 2, 15, 0, 0, [System.DateTimeKind]::Utc)
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:now = $script:now.AddSeconds([int]$PesterBoundParameters['Seconds']) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -ParameterFilter { $Method -eq 'Get' } -MockWith {
+            $script:reads++
+            $script:now = $script:now.AddSeconds(50)
+            [pscustomobject]@{ StatusCode = 503; Headers = @{}; Body = $null }
+        }
+        $start = $script:now
+        $result = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -TimeoutMinutes 2 -PollSeconds 15
+        $result.status | Should -Be 'Warning'
+        $script:reads | Should -BeLessOrEqual 3 -Because 'eight polls of 65 seconds each would take more than 8 minutes'
+        ($script:now - $start).TotalMinutes | Should -BeLessOrEqual 3
     }
 }

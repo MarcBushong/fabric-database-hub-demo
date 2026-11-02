@@ -172,7 +172,7 @@ function Invoke-DemoValidationInfrastructure {
         $step = [string](Get-DemoMemberValue -InputObject $health -Name 'currentStep')
         $healthMessage = [string](Get-DemoMemberValue -InputObject $health -Name 'message')
         $healthEvidence = [ordered]@{}
-        foreach ($name in 'role', 'state', 'status', 'currentStep', 'generation', 'updatedUtc', 'installMode', 'arcOnboarded', 'guestState', 'sqlEdition') {
+        foreach ($name in 'role', 'state', 'status', 'currentStep', 'generation', 'updatedUtc', 'installMode', 'arcOnboarded', 'guestState', 'sqlEdition', 'guidedArmed', 'guidedRequest', 'guidedLast') {
             $healthEvidence[$name] = Get-DemoMemberValue -InputObject $health -Name $name
         }
         $stepText = if ($step) { ' (step {0})' -f $step } else { '' }
