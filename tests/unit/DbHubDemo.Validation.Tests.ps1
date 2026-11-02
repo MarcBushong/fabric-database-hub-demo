@@ -661,19 +661,20 @@ Describe 'Teardown area (read-only residual check)' {
         }
     }
 
-    It 'renders the residual query with every placeholder, and matches nothing on an unknown deploymentId' {
+    It 'renders the residual query with every placeholder, matches nothing on an unknown deploymentId, and never matches by the solution and environment tags (Phase 28 follow-up)' {
         $query = InModuleScope -ModuleName DbHubDemo {
             Format-DemoKqlTemplate -Name 'ResourceGraph.Residual' -Parameters @{
                 SubscriptionId = ConvertTo-DemoKqlLiteral -Value '11111111-2222-3333-4444-555555555555' -Type String
                 ResourceGroup  = ConvertTo-DemoKqlLiteral -Value 'rg-dbhub-demo' -Type String
                 ControlGroup   = ConvertTo-DemoKqlLiteral -Value 'rg-dbhub-control' -Type String
-                Environment    = ConvertTo-DemoKqlLiteral -Value 'demo' -Type String
                 DeploymentId   = ConvertTo-DemoKqlLiteral -Value '' -Type String
             }
         }
         $query | Should -Match "isnotempty\(''\)"
         $query | Should -Match 'resourcecontainers'
         $query | Should -Not -Match '\{\{'
+        # Another prefix's environment of the same name carries the same solution and environment tags (live, 2026-11-02).
+        $query | Should -Not -Match "tags\['(solution|environment)'\]|tags\.(solution|environment)"
     }
 
     It 'passes a deployed environment with nothing outside its group, and warns about what destroy wouldn''t delete' {
@@ -702,9 +703,15 @@ Describe 'Teardown area (read-only residual check)' {
         $context = New-TestContext
         (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationTeardown -Context $X })).status | Should -Be 'Fail'
         $script:graphRows = @([pscustomobject]@{ id = 'c'; name = 'rg-dbhub-control'; type = 'microsoft.resources/subscriptions/resourcegroups'; resourceGroup = 'rg-dbhub-control' })
+        # Without the deploymentId (the group that recorded it is gone), resources outside the group can't be looked for.
+        $unknown = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationTeardown -Context $X })
+        $unknown.status | Should -Be 'Warning'
+        $unknown.remediation | Should -Match '-DeploymentId <id>'
+        $context.DeploymentId = 'abc123'
         $clean = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationTeardown -Context $X })
         $clean.status | Should -Be 'Pass'
         $clean.message | Should -Match 'zero residual resources'
+        $clean.message | Should -Match 'deploymentId abc123'
     }
 }
 

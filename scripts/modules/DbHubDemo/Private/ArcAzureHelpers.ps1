@@ -83,8 +83,69 @@ function Get-DemoArcHostIdentity {
     return (& $notFound ('{0} isn''t attached to {1} (deploy.ps1 creates it only with assignRoles = true)' -f $name, $Target.HostVmName))
 }
 
+function ConvertFrom-DemoJsonStringMap {
+    <#
+    .SYNOPSIS
+    The members of a JSON object as name -> the text Azure returned, read with System.Text.Json; an empty hashtable
+    when the JSON (or its -Property) isn't an object. Internal.
+
+    .DESCRIPTION
+    PowerShell 7's ConvertFrom-Json turns an ISO 8601 string into a [datetime] (a value with an offset into local time),
+    and its [string] is "MM/dd/yyyy HH:mm:ss", so a value read that way and written back changes. This reads each
+    string as it is; null is '', and any other value is its raw JSON text.
+    https://learn.microsoft.com/dotnet/api/system.text.json.jsondocument
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Json,
+
+        [string] $Property = ''
+    )
+
+    $map = @{}
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        return $map
+    }
+    $document = [System.Text.Json.JsonDocument]::Parse($Json)
+    try {
+        $element = $document.RootElement
+        if ($Property) {
+            $member = [System.Text.Json.JsonElement]::new()
+            if ($element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object -or -not $element.TryGetProperty($Property, [ref]$member)) {
+                return $map
+            }
+            $element = $member
+        }
+        if ($element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+            return $map
+        }
+        foreach ($item in $element.EnumerateObject()) {
+            $kind = $item.Value.ValueKind
+            $map[$item.Name] = if ($kind -eq [System.Text.Json.JsonValueKind]::String) { $item.Value.GetString() } elseif ($kind -eq [System.Text.Json.JsonValueKind]::Null) { '' } else { $item.Value.GetRawText() }
+        }
+    }
+    finally {
+        $document.Dispose()
+    }
+    return $map
+}
+
 function Get-DemoResourceGroupTag {
-    # The demo resource group's tags as a hashtable; empty when the group can't be read. Internal.
+    <#
+    .SYNOPSIS
+    The demo resource group's tags as a hashtable of the values exactly as Azure holds them; empty when the group can't
+    be read. Internal.
+
+    .DESCRIPTION
+    Read as text (ConvertFrom-DemoJsonStringMap), never through ConvertFrom-Json: a redeploy's template writes these
+    tags back (existingResourceGroupTags), and an ISO 8601 date in any of them, a person's own included, came back as
+    "MM/dd/yyyy HH:mm:ss" (Phase 28 follow-up). Tags written that way before the fix stay readable: the readers parse
+    both forms with the invariant culture, as UTC.
+    https://learn.microsoft.com/cli/azure/group#az-group-show
+    #>
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
@@ -95,18 +156,10 @@ function Get-DemoResourceGroupTag {
         [string] $ResourceGroupName
     )
 
-    $group = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('group', 'show', '--name', $ResourceGroupName) -AsJson -AllowFailure
+    $group = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('group', 'show', '--name', $ResourceGroupName, '--output', 'json') -AllowFailure
     $tags = @{}
-    $source = Get-DemoMemberValue -InputObject $group -Name 'tags'
-    if ($source -is [System.Collections.IDictionary]) {
-        foreach ($key in $source.Keys) {
-            $tags[[string]$key] = [string]$source[$key]
-        }
-    }
-    elseif ($null -ne $source) {
-        foreach ($property in $source.PSObject.Properties) {
-            $tags[$property.Name] = [string]$property.Value
-        }
+    if ($group.ExitCode -eq 0) {
+        $tags = ConvertFrom-DemoJsonStringMap -Json ([string]$group.StdOut) -Property 'tags'
     }
     # In GitHub Actions only: the deployment's random suffix names T3 and T4, so it's masked in the job log (ADR 0022).
     if ($tags.ContainsKey('deploymentId')) {

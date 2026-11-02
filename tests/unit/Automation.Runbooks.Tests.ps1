@@ -47,6 +47,9 @@ BeforeAll {
         $script:plugin = 'Running'
         $script:runCommandStatus = 201
         $script:t4ActionStatus = 202
+        # Run Commands listed on a VM, by VM name; without an entry, the earlier run's DbHubControl-<vm>-20261026000000
+        # and someone else's DbHubDemo-Other, without instance views.
+        $script:runCommands = @{}
     }
 
     function Invoke-TestAzure([string] $Method, [string] $Path, [object] $Body) {
@@ -77,7 +80,12 @@ BeforeAll {
             '/extensions/SqlIaasExtension' {
                 return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ instanceView = @{ statuses = @(@{ message = ('DatabaseMonitorArcPlugin: {{"State":"{0}","MetricsUploadStatus":"OK"}}' -f $script:plugin) }) } } } -Depth 6))
             }
-            '/virtualMachines/(\w+)/runCommands$' { return (New-Response 200 ('{{"value":[{{"name":"DbHubControl-{0}-20261026000000"}},{{"name":"DbHubDemo-Other"}}]}}' -f $Matches[1])) }
+            '/virtualMachines/(\w+)/runCommands(\?\$expand=instanceView)?$' {
+                if ($script:runCommands.ContainsKey($Matches[1])) {
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($script:runCommands[$Matches[1]]) } -Depth 8))
+                }
+                return (New-Response 200 ('{{"value":[{{"name":"DbHubControl-{0}-20261026000000"}},{{"name":"DbHubDemo-Other"}}]}}' -f $Matches[1]))
+            }
             '/runCommands/' {
                 if ($Method -eq 'PUT') { return (New-Response $script:runCommandStatus '{}') }
                 return (New-Response 202)
@@ -396,6 +404,55 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         @($result.dispatched) | Should -Be @('T1', 'T3')
         $result.message | Should -Match 'T2 \(archost01 isn''t running\)'
         @($script:calls | Where-Object { $_.Path -match '/start$' }) | Should -BeNullOrEmpty
+    }
+
+    It 'deletes the control''s finished Run Commands on a running VM the run doesn''t use, and keeps one that still runs (Phase 28 follow-up)' {
+        # Live, 2026-11-02: a run's Run Command stayed on a VM that later runs didn't use; a VM takes 25 managed ones.
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'running' }
+        $script:runCommands['archost01'] = @(
+            @{ name = 'DbHubControl-archost01-20261026000000'; properties = @{ instanceView = @{ executionState = 'Succeeded' } } }
+            @{ name = 'DbHubControl-archost01-reset-20261027145500'; properties = @{ instanceView = @{ executionState = 'Running' } } }
+            @{ name = 'DbHubControl-archost01-20261027120000'; properties = @{ provisioningState = 'Succeeded' } }
+            @{ name = 'DbHubDemo-Bootstrap'; properties = @{ instanceView = @{ executionState = 'Succeeded' } } }
+        )
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        @($script:calls | Where-Object { $_.Method -eq 'GET' -and $_.Path -match '/archost01/runCommands\?\$expand=instanceView$' }).Count | Should -Be 1
+        $deleted = @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/archost01/runCommands/' } | ForEach-Object { $_.Path -replace '^.*/runCommands/', '' })
+        # The finished one, and one whose instance view is gone but whose time is more than an hour old; never one that
+        # still runs, or anything that isn't the control's.
+        $deleted | Should -Be @('DbHubControl-archost01-20261026000000', 'DbHubControl-archost01-20261027120000')
+        # The VM it dispatched to gets its own cleanup, as before.
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/sqlvm01/runCommands/DbHubControl-sqlvm01-20261026000000$' }).Count | Should -Be 1
+    }
+
+    It 'a reset cleans the other running VM''s finished Run Commands too, and touches no VM that isn''t running' {
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'reset'; targets = @('T2') }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/sqlvm01/runCommands/DbHubControl-sqlvm01-20261026000000$' }).Count | Should -Be 1
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match 'DbHubDemo-Other' }) | Should -BeNullOrEmpty
+        $script:calls.Clear()
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'running' }
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'reset'; targets = @('T2') }) -Context (New-TestContext)
+        @($script:calls | Where-Object { $_.Path -match '/sqlvm01/runCommands' }) | Should -BeNullOrEmpty
+    }
+
+    It 'sends a Run Command with only its script, no parameters or protected parameters, and nothing secret in it' {
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'blocking-chain'; intensity = 7 }, @{ target = 'T2'; scenario = 'baseline' }); durationMinutes = 20; requestedBy = 'notebook' }) -Context (New-TestContext)
+        $puts = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-' })
+        $puts.Count | Should -Be 2
+        foreach ($put in $puts) {
+            @($put.Body.Keys | Sort-Object) | Should -Be @('location', 'properties')
+            @($put.Body.properties.Keys | Sort-Object) | Should -Be @('asyncExecution', 'source', 'timeoutInSeconds', 'treatFailureAsDeploymentFailure')
+            @($put.Body.properties.source.Keys) | Should -Be @('script')
+            (Find-DemoSecretLeak -Text $put.Body.properties.source.script -Source $put.Path).Findings | Should -BeNullOrEmpty
+        }
+        # The identity's role allows exactly what the cleanup and the dispatch do on Run Commands (ADR 0020).
+        $actions = InModuleScope -ModuleName DbHubDemo { $script:ActivityControlRoleActions }
+        foreach ($action in 'read', 'write', 'delete') {
+            $actions | Should -Contain ('Microsoft.Compute/virtualMachines/runCommands/{0}' -f $action)
+        }
     }
 }
 

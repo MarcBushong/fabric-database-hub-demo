@@ -43,7 +43,9 @@ function Remove-DemoEnvironment {
     ConfirmImpact is High: destroy.ps1 asks unless -Force. Returns DESTROY.EXPIRY (with -IfExpired),
     DESTROY.GOLDEN.GUARD, DESTROY.ARC.SQLINSTANCES, DESTROY.ARC.MACHINES, DESTROY.RESOURCEGROUP,
     DESTROY.KEYVAULT (with the Key Vault opt-in), DESTROY.DEPLOYMENT, DESTROY.BUDGET, DESTROY.GOLDEN, the
-    TEARDOWN.RESIDUAL.* checks, and DESTROY.RESIDUAL.
+    TEARDOWN.RESIDUAL.* checks, and DESTROY.RESIDUAL. With -ResidueOnly it deletes nothing and asks nothing: it runs
+    the residual check again with the manifest an earlier destroy wrote (DESTROY.MANIFEST, the TEARDOWN.RESIDUAL.*
+    checks, and DESTROY.RESIDUAL).
 
     Sources (checked 2026-10-21): https://learn.microsoft.com/cli/azure/group#az-group-delete,
     https://learn.microsoft.com/rest/api/hybridcompute/machines/delete,
@@ -80,11 +82,20 @@ function Remove-DemoEnvironment {
     .PARAMETER WithoutGolden
     Accept losing a PaygWizard install when no boot-verified golden snapshot keeps it.
 
+    .PARAMETER ResidueOnly
+    Delete nothing: run only the residual check again, with the manifest at -ManifestPath that an earlier destroy
+    wrote, and sum it up in DESTROY.RESIDUAL. The manifest isn't changed, nothing is asked, and -WhatIf isn't needed.
+    No manifest there runs the check without one (DESTROY.MANIFEST Warning); one that can't be read, or that belongs
+    to another resource group, runs nothing (DESTROY.MANIFEST Fail).
+
     .PARAMETER NowUtc
     For tests: the current time.
 
     .EXAMPLE
     Remove-DemoEnvironment -Config $config -Confirm:$false
+
+    .EXAMPLE
+    Remove-DemoEnvironment -Config $config -ResidueOnly -ManifestPath ./out/destroy-manifest-demo.json
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     [OutputType([object[]])]
@@ -108,6 +119,8 @@ function Remove-DemoEnvironment {
 
         [switch] $WithoutGolden,
 
+        [switch] $ResidueOnly,
+
         [datetime] $NowUtc = [DateTime]::UtcNow
     )
 
@@ -122,6 +135,40 @@ function Remove-DemoEnvironment {
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
     $docUrl = 'https://learn.microsoft.com/cli/azure/group#az-group-delete'
+
+    # Read-only: the residual check again, with the manifest an earlier destroy recorded (Phase 28 follow-up).
+    if ($ResidueOnly) {
+        $read = Read-DemoTeardownManifest -Path $ManifestPath -ResourceGroupName $resourceGroupName
+        $manifestDoc = 'https://learn.microsoft.com/azure/governance/resource-graph/overview'
+        if ($read.Error) {
+            $results.Add((New-DemoResult -CheckId 'DESTROY.MANIFEST' -Area 'teardown' -Target 'subscription' -Status 'Fail' -Message ('Nothing was checked: {0}' -f $read.Error) -Remediation 'Pass the manifest that destroy.ps1 wrote for this environment (out/destroy-manifest-<environment>.json) with -ManifestPath, and the same configuration with -ConfigPath.' -DocUrl $manifestDoc))
+            return $results.ToArray()
+        }
+        if ($read.Found) {
+            # Assigned first: Get-DemoMemberValue returns an array as one object, which @() wouldn't unroll.
+            $recordedPrincipals = Get-DemoMemberValue -InputObject $read.Manifest -Name 'Principals'
+            $recordedId = [string](Get-DemoMemberValue -InputObject $read.Manifest -Name 'DeploymentId')
+            $recordedUtc = Get-DemoMemberValue -InputObject $read.Manifest -Name 'RecordedUtc'
+            $recordedText = if ($recordedUtc -is [datetime]) { $recordedUtc.ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'", [System.Globalization.CultureInfo]::InvariantCulture) } else { [string]$recordedUtc }
+            $results.Add((New-DemoResult -CheckId 'DESTROY.MANIFEST' -Area 'teardown' -Target 'subscription' -Status 'Pass' -Message ('The residual check reads the manifest {0}, recorded {1} for {2} (deploymentId {3}, {4} identit(ies)). Nothing is deleted.' -f $ManifestPath, $recordedText, $resourceGroupName, $(if ($recordedId) { $recordedId } else { 'unknown' }), @(@($recordedPrincipals) | Where-Object { $null -ne $_ }).Count) -DocUrl $manifestDoc))
+        }
+        else {
+            $results.Add((New-DemoResult -CheckId 'DESTROY.MANIFEST' -Area 'teardown' -Target 'subscription' -Status 'Warning' -Message ('There''s no manifest at {0}, so the residual check runs without the deploymentId and the identities: it looks for {1} by name only. Nothing is deleted.' -f $(if ($ManifestPath) { $ManifestPath } else { '(no path)' }), $resourceGroupName) -Remediation 'Pass the manifest that destroy.ps1 wrote before it deleted anything (out/destroy-manifest-<environment>.json) with -ManifestPath.' -DocUrl $manifestDoc))
+        }
+        try {
+            $residue = @(Test-DemoTeardownResidue -Config $Config -Manifest $read.Manifest -WaitMinutes $ResidueWaitMinutes)
+        }
+        catch {
+            $results.Add((New-DemoResult -CheckId 'DESTROY.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status 'Warning' -Message ('The residual check couldn''t run: {0}' -f (Protect-DemoText -Text $_.Exception.Message).Trim()) -Remediation 'Run it again later; it deletes nothing.' -DocUrl $manifestDoc))
+            return $results.ToArray()
+        }
+        foreach ($item in $residue) {
+            $results.Add($item)
+        }
+        $results.Add((New-DemoResidueSummary -Residue $residue -ResourceGroupName $resourceGroupName -Manifest $read.Manifest))
+        return $results.ToArray()
+    }
+
     $groupExists = Test-DemoResourceGroupExist -Config $Config
     if ($IfExpired) {
         if (-not $groupExists) {
@@ -355,20 +402,12 @@ function Remove-DemoEnvironment {
         $residue = @(Test-DemoTeardownResidue -Config $Config -Manifest $manifest -WaitMinutes $ResidueWaitMinutes)
     }
     catch {
-        $results.Add((New-DemoResult -CheckId 'DESTROY.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status 'Warning' -Message ('The deletes finished, but the residual check couldn''t run: {0}' -f (Protect-DemoText -Text $_.Exception.Message).Trim()) -Remediation ('Run the check again later, read-only: ./tests/teardown/Invoke-TeardownTest.ps1 -ConfigPath <configuration>. It reads the manifest {0}.' -f $(if ($ManifestPath) { $ManifestPath } else { 'that destroy.ps1 wrote' })) -DocUrl 'https://learn.microsoft.com/azure/governance/resource-graph/overview'))
+        $results.Add((New-DemoResult -CheckId 'DESTROY.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status 'Warning' -Message ('The deletes finished, but the residual check couldn''t run: {0}' -f (Protect-DemoText -Text $_.Exception.Message).Trim()) -Remediation ('Run the check again later, read-only: ./scripts/destroy.ps1 -ResidueOnly -ManifestPath {0}. It deletes nothing.' -f $(if ($ManifestPath) { $ManifestPath } else { '<the manifest destroy.ps1 wrote>' })) -DocUrl 'https://learn.microsoft.com/azure/governance/resource-graph/overview'))
         return $results.ToArray()
     }
     foreach ($item in $residue) {
         $results.Add($item)
     }
-    $failed = @($residue | Where-Object { $_.status -eq 'Fail' } | ForEach-Object { $_.checkId })
-    $warned = @($residue | Where-Object { $_.status -eq 'Warning' } | ForEach-Object { $_.checkId })
-    $summary = if ($failed.Count) { 'Fail' } elseif ($warned.Count) { 'Warning' } else { 'Pass' }
-    $message = switch ($summary) {
-        'Pass' { 'Nothing of {0} is left: no resource, Arc resource, role assignment, identity, deployment record, or budget.' -f $resourceGroupName }
-        'Warning' { 'No check found anything of {0} left, but read the warnings: {1}.' -f $resourceGroupName, ($warned -join ', ') }
-        default { 'Something of {0} is left: {1}.' -f $resourceGroupName, ($failed -join ', ') }
-    }
-    $results.Add((New-DemoResult -CheckId 'DESTROY.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status $summary -Message $message -Evidence ([ordered]@{ failed = $failed; warnings = $warned; deploymentId = [string](Get-DemoMemberValue -InputObject $manifest -Name 'DeploymentId') }) -Remediation $(if ($summary -eq 'Fail') { 'Read the TEARDOWN.RESIDUAL results above; run destroy.ps1 again, or delete what''s named there.' } else { '' }) -DocUrl 'https://learn.microsoft.com/azure/governance/resource-graph/overview'))
+    $results.Add((New-DemoResidueSummary -Residue $residue -ResourceGroupName $resourceGroupName -Manifest $manifest))
     return $results.ToArray()
 }

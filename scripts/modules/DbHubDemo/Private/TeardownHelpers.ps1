@@ -114,11 +114,23 @@ function Get-DemoResidueSnapshot {
 
     .DESCRIPTION
     Returns GroupExists, BudgetExists, and lists of what's left: Tagged, GroupResources, Arc,
-    RoleAssignments, Principals, Members, Deployments, and with -Extended also References and Records.
-    Errors maps each check that couldn't be read to its redacted error, so the caller never reports it as
+    RoleAssignments, OrphanedAssignments, Principals, Members, Deployments, and with -Extended also References and
+    Records. Errors maps each check that couldn't be read to its redacted error, so the caller never reports it as
     clean. Everything is scoped to the configured subscription: Resource Graph through its request body, the
     budget through a URL that names the subscription, and every other command through Invoke-DemoAz. It
     never passes --ids or a {subscriptionId} placeholder.
+
+    Only this environment is matched (Phase 28 follow-up, live 2026-11-02): its resource group by its exact name
+    rg-<prefix>-<environment>, and its resources by the manifest's deploymentId tag, which the template derives from
+    the subscription, the prefix, and the environment. Never the solution and environment tags alone, which another
+    prefix's environment of the same name carries too, and never a resource's name alone (arcsql01 and sqlvm01 are the
+    same in every environment).
+
+    Role assignments: one at or under the group is residue (RoleAssignments), and so is one for a manifest identity
+    in another of the demo's resource groups (rg-<prefix>-control, rg-<prefix>-golden). One for a manifest identity
+    anywhere else is OrphanedAssignments: the demo gives its managed identities role assignments only at or under its
+    group (with assignRoles: the Arc onboarding identity's Azure Connected Machine Onboarding on the group), so
+    something else made it, such as a tenant policy with a DeployIfNotExists effect.
 
     Resource Graph and Microsoft Graph go through Invoke-DemoRestRequest with tokens that Get-DemoAccessToken
     verified for the configured tenant and caller, never 'az rest' or 'az ad', which would use the Azure CLI's
@@ -140,35 +152,39 @@ function Get-DemoResidueSnapshot {
     $subscriptionId = [string]$Setting.SubscriptionId
     $group = [string]$Setting.ResourceGroupName
     $control = [string]$Setting.ControlGroupName
-    $environment = [string]$Setting.Environment
+    $golden = [string](Get-DemoMemberValue -InputObject $Setting -Name 'GoldenGroupName')
     # Only names the configuration schema allows go into query text.
     foreach ($name in @($group, $control)) {
         if ($name -notmatch '^[A-Za-z0-9._()-]{1,90}$') {
             throw ('The resource group name ''{0}'' can''t be used in a Resource Graph query.' -f $name)
         }
     }
-    if ($environment -notmatch '^[a-z][a-z0-9]{1,7}$') {
-        throw ('The environment name ''{0}'' can''t be used in a Resource Graph query.' -f $environment)
-    }
     $groupId = ([string]$Setting.ResourceGroupId).ToLowerInvariant()
     $groupPath = '/resourcegroups/{0}' -f $group.ToLowerInvariant()
+    # The demo's other resource groups, which outlive the environment (ADR 0002, ADR 0018).
+    $demoGroupIds = @(foreach ($name in @($control, $golden)) {
+            if ($name -match '^[A-Za-z0-9._()-]{1,90}$') {
+                ('/subscriptions/{0}/resourcegroups/{1}' -f $subscriptionId, $name).ToLowerInvariant()
+            }
+        })
     $errors = [ordered]@{}
     # Checks that a canary showed can't be verified with this sign-in: waiting won't change them.
     $unverifiable = [System.Collections.Generic.List[string]]::new()
     $snapshot = [ordered]@{
-        GroupExists     = $false
-        BudgetExists    = $false
-        Tagged          = @()
-        GroupResources  = @()
-        Arc             = @()
-        RoleAssignments = @()
-        Principals      = @()
-        Members         = @()
-        Deployments     = @()
-        References      = @()
-        Records         = @()
-        Errors          = $errors
-        Unverifiable    = @()
+        GroupExists         = $false
+        BudgetExists        = $false
+        Tagged              = @()
+        GroupResources      = @()
+        Arc                 = @()
+        RoleAssignments     = @()
+        OrphanedAssignments = @()
+        Principals          = @()
+        Members             = @()
+        Deployments         = @()
+        References          = @()
+        Records             = @()
+        Errors              = $errors
+        Unverifiable        = @()
     }
     $reach = Get-DemoResourceGraphReach -SubscriptionId $subscriptionId
     $readGraph = {
@@ -211,37 +227,53 @@ function Get-DemoResidueSnapshot {
         $snapshot.GroupExists = ([string]$exists.StdOut).Trim() -eq 'true'
     }
 
-    # The environment's tags: every template resource and the Arc machine (onboarding copies the group's tags)
-    # carry solution, environment, and deploymentId. The GitHub identity's group is kept by design (ADR 0002).
+    # The environment's tags: every template resource and the Arc machine (onboarding copies the group's tags) carry
+    # its deploymentId, which is unique to the subscription, the prefix, and the environment. The solution and
+    # environment tags aren't: another prefix's environment of the same name has them too (live, 2026-11-02). Without
+    # the deploymentId, only the resource group itself, by its exact name, is looked for. The GitHub identity's group
+    # is kept by design (ADR 0002).
     $deploymentId = [string]$Setting.DeploymentId
     if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
         $deploymentId = ''
     }
-    $tagMatch = "(tostring(tags.solution) =~ 'fabric-database-hub-demo' and tostring(tags.environment) =~ '{0}')" -f $environment
-    if ($deploymentId) {
-        $tagMatch = "(tostring(tags.deploymentId) == '{0}' or {1})" -f $deploymentId, $tagMatch
-    }
-    $snapshot.Tagged = & $graph 'Tagged' ("resources | where {0} | where resourceGroup !~ '{1}' | project id | union (resourcecontainers | where {0} | where name !~ '{1}' | project id)" -f $tagMatch, $control)
+    $tagMatch = if ($deploymentId) { "tostring(tags.deploymentId) == '{0}'" -f $deploymentId } else { '' }
+    $containers = "resourcecontainers | where type =~ 'microsoft.resources/subscriptions/resourcegroups' | where name =~ '{0}'{1} | where name !~ '{2}' | project id" -f $group, $(if ($tagMatch) { ' or ' + $tagMatch } else { '' }), $control
+    $taggedQuery = if ($tagMatch) { "resources | where {0} | where resourceGroup !~ '{1}' | project id | union ({2})" -f $tagMatch, $control, $containers } else { $containers }
+    $snapshot.Tagged = & $graph 'Tagged' $taggedQuery
     $snapshot.GroupResources = & $graph 'GroupResources' ("resources | where resourceGroup =~ '{0}' | project id" -f $group)
 
-    # Arc resources of this environment wherever they are: in the group, carrying its tags, or hosted by one of
+    # Arc resources of this environment wherever they are: in the group, carrying its deploymentId, or hosted by one of
     # its machines or VMs (unified inventory lists T1's instances under the Compute VM).
     $arcTypes = "'microsoft.hybridcompute/machines', 'microsoft.hybridcompute/machines/extensions', 'microsoft.hybridcompute/machines/licenseprofiles', 'microsoft.hybridcompute/machines/runcommands', 'microsoft.azurearcdata/sqlserverinstances', 'microsoft.azurearcdata/sqlserverinstances/databases', 'microsoft.azurearcdata/sqlserverinstances/availabilitygroups'"
-    $arcScope = "resourceGroup =~ '{0}' or tolower(tostring(properties.containerResourceId)) contains '{1}/' or {2}" -f $group, $groupPath, $tagMatch
+    $arcScope = "resourceGroup =~ '{0}' or tolower(tostring(properties.containerResourceId)) contains '{1}/'{2}" -f $group, $groupPath, $(if ($tagMatch) { ' or ' + $tagMatch } else { '' })
     $snapshot.Arc = & $graph 'Arc' ("resources | where type in~ ({0}) | where {1} | project id" -f $arcTypes, $arcScope)
 
     $principalIds = @($Setting.PrincipalIds | Where-Object { $_ -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' })
     $principalClause = if ($principalIds.Count) { " or principalId in ({0})" -f (($principalIds | ForEach-Object { "'{0}'" -f $_ }) -join ', ') } else { '' }
-    $assignmentQuery = "authorizationresources | where type =~ 'microsoft.authorization/roleassignments' | extend assignmentScope = tolower(tostring(properties.scope)), principalId = tolower(tostring(properties.principalId)) | where assignmentScope startswith '{0}'{1} | project id, assignmentScope, principalId" -f $groupId, $principalClause
+    $assignmentQuery = "authorizationresources | where type =~ 'microsoft.authorization/roleassignments' | extend assignmentScope = tolower(tostring(properties.scope)), principalId = tolower(tostring(properties.principalId)), roleDefinitionId = tolower(tostring(properties.roleDefinitionId)) | where assignmentScope startswith '{0}'{1} | project id, assignmentScope, principalId, roleDefinitionId" -f $groupId, $principalClause
     $read = & $readGraph 'RoleAssignments' $assignmentQuery
     if ($null -ne $read) {
-        $snapshot.RoleAssignments = @(foreach ($row in @($read.Rows)) {
-                $scope = [string](Get-DemoMemberValue -InputObject $row -Name 'assignmentScope')
-                $principal = [string](Get-DemoMemberValue -InputObject $row -Name 'principalId')
-                if ($scope -eq $groupId -or $scope.StartsWith($groupId + '/', [System.StringComparison]::Ordinal) -or $principal -in $principalIds) {
-                    [string](Get-DemoMemberValue -InputObject $row -Name 'id')
+        $under = { param([string] $Scope, [string] $Parent) $Scope -eq $Parent -or $Scope.StartsWith($Parent + '/', [System.StringComparison]::Ordinal) }
+        $left = [System.Collections.Generic.List[string]]::new()
+        $orphaned = [System.Collections.Generic.List[object]]::new()
+        foreach ($row in @($read.Rows)) {
+            $scope = [string](Get-DemoMemberValue -InputObject $row -Name 'assignmentScope')
+            $principal = [string](Get-DemoMemberValue -InputObject $row -Name 'principalId')
+            $id = [string](Get-DemoMemberValue -InputObject $row -Name 'id')
+            if (& $under $scope $groupId) {
+                $left.Add($id)
+            }
+            elseif ($principal -in $principalIds) {
+                if (@($demoGroupIds | Where-Object { & $under $scope $_ }).Count -gt 0) {
+                    $left.Add($id)
                 }
-            })
+                else {
+                    $orphaned.Add([pscustomobject]@{ Id = $id; Scope = $scope; PrincipalId = $principal; RoleDefinitionId = [string](Get-DemoMemberValue -InputObject $row -Name 'roleDefinitionId') })
+                }
+            }
+        }
+        $snapshot.RoleAssignments = $left.ToArray()
+        $snapshot.OrphanedAssignments = $orphaned.ToArray()
     }
 
     $list = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('deployment', 'sub', 'list', '--query', '[].name', '--output', 'json') -AllowFailure
@@ -329,7 +361,6 @@ function Get-DemoResidueSnapshot {
     if ($Extended) {
         # A resource elsewhere that names the group: a resource ID under it, or the group's own ID (a JSON
         # string ends with a quote). The golden group's snapshots name their source group by design (ADR 0018).
-        $golden = [string](Get-DemoMemberValue -InputObject $Setting -Name 'GoldenGroupName')
         $goldenFilter = if ($golden) { " | where resourceGroup !~ '{0}'" -f $golden } else { '' }
         $snapshot.References = & $graph 'References' ("resources | where resourceGroup !~ '{0}'{2} | extend propertiesText = tostring(properties) | where propertiesText contains '{1}/' or propertiesText contains '{1}""' | project id" -f $group, $groupPath, $goldenFilter)
         # Records the platform keeps about the deleted resources: Defender for Cloud assessments, Azure Policy
@@ -341,4 +372,358 @@ function Get-DemoResidueSnapshot {
     }
     $snapshot.Unverifiable = $unverifiable.ToArray()
     return [pscustomobject]$snapshot
+}
+
+function New-DemoResidueConfirmation {
+    <#
+    .SYNOPSIS
+    The state of one residual check's Azure Resource Manager reads (Confirm-DemoResidueResource): how many are left, each
+    resource ID's outcome, and the API versions found. Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [ValidateRange(0, 100)]
+        [int] $MaxReads = 25
+    )
+
+    $comparer = [System.StringComparer]::OrdinalIgnoreCase
+    return @{
+        MaxReads    = $MaxReads
+        Reads       = 0
+        Outcome     = [System.Collections.Generic.Dictionary[string, string]]::new($comparer)
+        Detail      = [System.Collections.Generic.Dictionary[string, string]]::new($comparer)
+        ApiVersions = [System.Collections.Generic.Dictionary[string, string]]::new($comparer)
+        Namespaces  = [System.Collections.Generic.HashSet[string]]::new($comparer)
+        Pinned      = $null
+    }
+}
+
+function ConvertFrom-DemoArmResourceId {
+    <#
+    .SYNOPSIS
+    The provider namespace and resource type of an Azure Resource Manager ID, from its last /providers/ segment (for
+    example Microsoft.AzureArcData and sqlServerInstances/databases); Microsoft.Resources and resourceGroups for a
+    resource group's ID. $null for anything else. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyString()]
+        [string] $Id
+    )
+
+    if ($Id -match '^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[^/]+$') {
+        return [pscustomobject]@{ Namespace = 'Microsoft.Resources'; Type = 'resourceGroups' }
+    }
+    $index = $Id.LastIndexOf('/providers/', [System.StringComparison]::OrdinalIgnoreCase)
+    if ($Id -notmatch '^/subscriptions/[0-9a-fA-F-]{36}/' -or $index -lt 0) {
+        return $null
+    }
+    # The namespace, then type and name pairs.
+    $parts = $Id.Substring($index + '/providers/'.Length).Split('/')
+    if ($parts.Count -lt 3 -or ($parts.Count - 1) % 2 -ne 0 -or @($parts | Where-Object { -not $_ }).Count -gt 0) {
+        return $null
+    }
+    $types = for ($i = 1; $i -lt $parts.Count; $i += 2) { $parts[$i] }
+    return [pscustomobject]@{ Namespace = $parts[0]; Type = (@($types) -join '/') }
+}
+
+function Get-DemoResidueApiVersion {
+    <#
+    .SYNOPSIS
+    An API version for a resource type: the one config/versions.json pins, or else the newest stable one its resource
+    provider lists (Providers - Get, one read per namespace, counted against the check's reads); '' when none is known.
+    Internal.
+    https://learn.microsoft.com/rest/api/resources/providers/get
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $Namespace,
+
+        [Parameter(Mandatory)]
+        [string] $Type,
+
+        [Parameter(Mandatory)]
+        [hashtable] $State
+    )
+
+    if ($null -eq $State.Pinned) {
+        $State.Pinned = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $versions = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
+        foreach ($key in @($versions['apiVersions'].Keys)) {
+            if ($key -ne 'note') {
+                $State.Pinned[[string]$key] = [string]$versions['apiVersions'][$key]
+            }
+        }
+    }
+    $key = '{0}/{1}' -f $Namespace, $Type
+    if ($State.Pinned.ContainsKey($key)) {
+        return $State.Pinned[$key]
+    }
+    if ($State.ApiVersions.ContainsKey($key)) {
+        return $State.ApiVersions[$key]
+    }
+    if ($Namespace -notmatch '^[A-Za-z0-9.]{1,100}$' -or $State.Namespaces.Contains($Namespace) -or $State.Reads -ge $State.MaxReads) {
+        return ''
+    }
+    $null = $State.Namespaces.Add($Namespace)
+    $State.Reads++
+    try {
+        $read = Invoke-DemoRestRequest -SubscriptionId $SubscriptionId -Method 'GET' -Uri ('https://management.azure.com/subscriptions/{0}/providers/{1}?api-version={2}' -f $SubscriptionId, $Namespace, (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Resources/providers'))
+    }
+    catch {
+        return ''
+    }
+    if ($read.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$read.StdOut)) {
+        return ''
+    }
+    $provider = [string]$read.StdOut | ConvertFrom-Json -Depth 16
+    # Assigned first: Get-DemoMemberValue returns an array as one object, which @() wouldn't unroll.
+    $resourceTypes = Get-DemoMemberValue -InputObject $provider -Name 'resourceTypes'
+    foreach ($entry in @($resourceTypes)) {
+        $name = [string](Get-DemoMemberValue -InputObject $entry -Name 'resourceType')
+        $listed = Get-DemoMemberValue -InputObject $entry -Name 'apiVersions'
+        $all = @(@($listed) | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^\d{4}-\d{2}-\d{2}(-preview)?$' } | Sort-Object -Descending)
+        $stable = @($all | Where-Object { $_ -notlike '*-preview' })
+        $chosen = if ($stable.Count) { $stable[0] } elseif ($all.Count) { $all[0] } else { '' }
+        if ($name -and $chosen) {
+            $State.ApiVersions[('{0}/{1}' -f $Namespace, $name)] = $chosen
+        }
+    }
+    if ($State.ApiVersions.ContainsKey($key)) {
+        return $State.ApiVersions[$key]
+    }
+    return ''
+}
+
+function Confirm-DemoResidueResource {
+    <#
+    .SYNOPSIS
+    Asks Azure Resource Manager whether resources that Azure Resource Graph still lists exist, with a bounded number of
+    reads for the whole check. Read-only. Internal.
+
+    .DESCRIPTION
+    Resource Graph's index lags behind deletes: on 2026-11-02 it listed ten databases of a deleted Arc SQL Server
+    instance in their deleted resource group for more than 30 minutes, and in Phase 20 for about 16. So a row counts
+    as residue only when Resource Manager returns the resource (Resources - Get By Id, through Invoke-DemoRestRequest).
+    HTTP 404 with ResourceNotFound, ResourceGroupNotFound, or ParentResourceNotFound means it's gone, and the row is a
+    stale index record. Anything else (another error, an unknown API version, or no reads left) leaves it
+    Unconfirmed. Each outcome goes into -State (New-DemoResidueConfirmation): an ID found gone is never read again,
+    and with -NewOnly an ID read before isn't read again either. With -AssumePresent (the group still exists, so the
+    destroy isn't done), the IDs are Present without a read. Never writes anything.
+    - https://learn.microsoft.com/rest/api/resources/resources/get-by-id
+    - https://learn.microsoft.com/azure/azure-resource-manager/troubleshooting/error-not-found
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [string[]] $Id = @(),
+
+        [Parameter(Mandatory)]
+        [hashtable] $State,
+
+        [switch] $AssumePresent,
+
+        [switch] $NewOnly
+    )
+
+    $goneCodes = @('ResourceNotFound', 'ResourceGroupNotFound', 'ParentResourceNotFound')
+    $limit = 'not read: the check reads at most {0} resources from Azure Resource Manager' -f $State.MaxReads
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $set = { param([string] $Key, [string] $Outcome, [string] $Detail) $State.Outcome[$Key] = $Outcome; $State.Detail[$Key] = $Detail }
+    foreach ($item in @($Id | Where-Object { $_ })) {
+        $resourceId = [string]$item
+        if (-not $seen.Add($resourceId)) {
+            continue
+        }
+        $previous = if ($State.Outcome.ContainsKey($resourceId)) { $State.Outcome[$resourceId] } else { '' }
+        if ($previous -eq 'Gone' -or ($NewOnly -and $previous)) {
+            continue
+        }
+        if ($AssumePresent) {
+            & $set $resourceId 'Present' 'its resource group still exists'
+            continue
+        }
+        if ($State.Reads -ge $State.MaxReads) {
+            if (-not $previous) {
+                & $set $resourceId 'Unconfirmed' $limit
+            }
+            continue
+        }
+        $type = ConvertFrom-DemoArmResourceId -Id $resourceId
+        if ($null -eq $type) {
+            & $set $resourceId 'Unconfirmed' 'not an Azure Resource Manager ID'
+            continue
+        }
+        $version = Get-DemoResidueApiVersion -SubscriptionId $SubscriptionId -Namespace $type.Namespace -Type $type.Type -State $State
+        if (-not $version) {
+            & $set $resourceId 'Unconfirmed' $(if ($State.Reads -ge $State.MaxReads) { $limit } else { 'no API version is known for {0}/{1}' -f $type.Namespace, $type.Type })
+            continue
+        }
+        if ($State.Reads -ge $State.MaxReads) {
+            & $set $resourceId 'Unconfirmed' $limit
+            continue
+        }
+        $State.Reads++
+        $path = ($resourceId.Split('/') | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+        try {
+            $read = Invoke-DemoRestRequest -SubscriptionId $SubscriptionId -Method 'GET' -Uri ('https://management.azure.com{0}?api-version={1}' -f $path, $version)
+        }
+        catch {
+            & $set $resourceId 'Unconfirmed' ('the read failed: {0}' -f (Protect-DemoText -Text $_.Exception.Message).Trim())
+            continue
+        }
+        if ($read.ExitCode -eq 0) {
+            & $set $resourceId 'Present' 'Azure Resource Manager returned it'
+            continue
+        }
+        $code = [regex]::Match([string]$read.StdErr, '"code"\s*:\s*"([A-Za-z]+)"').Groups[1].Value
+        if ([int](Get-DemoMemberValue -InputObject $read -Name 'StatusCode') -eq 404 -and $code -in $goneCodes) {
+            & $set $resourceId 'Gone' $code
+            continue
+        }
+        $text = (Protect-DemoText -Text ([string]$read.StdErr)).Trim()
+        if ($text.Length -gt 200) {
+            $text = $text.Substring(0, 200) + '...'
+        }
+        & $set $resourceId 'Unconfirmed' ('Azure Resource Manager answered {0}' -f $(if ($text) { $text } else { 'with an error' }))
+    }
+}
+
+function Split-DemoResidueResource {
+    <#
+    .SYNOPSIS
+    Sorts resource IDs by what Confirm-DemoResidueResource found: Present (Resource Manager returned it), Gone (a stale
+    Resource Graph record), and Unconfirmed (not read, or not answered), with Reasons for the unconfirmed ones. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [string[]] $Id = @(),
+
+        [Parameter(Mandatory)]
+        [hashtable] $State
+    )
+
+    $present = [System.Collections.Generic.List[string]]::new()
+    $gone = [System.Collections.Generic.List[string]]::new()
+    $unconfirmed = [System.Collections.Generic.List[string]]::new()
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in @($Id | Where-Object { $_ })) {
+        $resourceId = [string]$item
+        if (-not $seen.Add($resourceId)) {
+            continue
+        }
+        $outcome = if ($State.Outcome.ContainsKey($resourceId)) { $State.Outcome[$resourceId] } else { '' }
+        if ($outcome -eq 'Present') {
+            $present.Add($resourceId)
+        }
+        elseif ($outcome -eq 'Gone') {
+            $gone.Add($resourceId)
+        }
+        else {
+            $unconfirmed.Add($resourceId)
+            $reason = if ($outcome -and $State.Detail.ContainsKey($resourceId)) { $State.Detail[$resourceId] } else { 'not read' }
+            if (-not $reasons.Contains($reason)) {
+                $reasons.Add($reason)
+            }
+        }
+    }
+    return [pscustomobject]@{ Present = $present.ToArray(); Gone = $gone.ToArray(); Unconfirmed = $unconfirmed.ToArray(); Reasons = $reasons.ToArray() }
+}
+
+function Get-DemoResidueTypeCount {
+    # 'type: count' for each resource type among resource IDs, for the records evidence. Internal.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [string[]] $Id = @()
+    )
+
+    $counts = [ordered]@{}
+    foreach ($item in @($Id | Where-Object { $_ })) {
+        $type = ConvertFrom-DemoArmResourceId -Id ([string]$item)
+        $name = if ($null -eq $type) { 'unknown' } else { ('{0}/{1}' -f $type.Namespace, $type.Type).ToLowerInvariant() }
+        $counts[$name] = 1 + [int]$counts[$name]
+    }
+    return @($counts.Keys | ForEach-Object { '{0}: {1}' -f $_, $counts[$_] })
+}
+
+function Read-DemoTeardownManifest {
+    <#
+    .SYNOPSIS
+    Reads the manifest destroy.ps1 wrote (names and IDs only) for a read-only rerun of the residual check, and checks
+    that it belongs to this configuration's resource group. Returns Found, Manifest, and Error. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyString()]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroupName
+    )
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{ Found = $false; Manifest = $null; Error = '' }
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 10
+    }
+    catch {
+        return [pscustomobject]@{ Found = $true; Manifest = $null; Error = ('{0} isn''t a readable manifest: {1}' -f $Path, (Protect-DemoText -Text $_.Exception.Message).Trim()) }
+    }
+    $recordedGroup = [string](Get-DemoMemberValue -InputObject $manifest -Name 'ResourceGroupName')
+    if ($recordedGroup -ne $ResourceGroupName) {
+        return [pscustomobject]@{ Found = $true; Manifest = $null; Error = ('{0} is the manifest of {1}, not of {2}, this configuration''s resource group.' -f $Path, $(if ($recordedGroup) { $recordedGroup } else { 'no resource group' }), $ResourceGroupName) }
+    }
+    return [pscustomobject]@{ Found = $true; Manifest = $manifest; Error = '' }
+}
+
+function New-DemoResidueSummary {
+    <#
+    .SYNOPSIS
+    DESTROY.RESIDUAL: the TEARDOWN.RESIDUAL.* results in one line. Pass only when every check is clean, Fail when one
+    found something left, Warning when nothing was found but something couldn't be verified. Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Residue = @(),
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroupName,
+
+        [AllowNull()]
+        [object] $Manifest
+    )
+
+    $failed = @($Residue | Where-Object { $_.status -eq 'Fail' } | ForEach-Object { $_.checkId })
+    $warned = @($Residue | Where-Object { $_.status -eq 'Warning' } | ForEach-Object { $_.checkId })
+    $summary = if ($failed.Count) { 'Fail' } elseif ($warned.Count) { 'Warning' } else { 'Pass' }
+    $message = switch ($summary) {
+        'Pass' { 'Nothing of {0} is left: no resource, Arc resource, role assignment, identity, deployment record, or budget.' -f $ResourceGroupName }
+        'Warning' { 'No check found anything of {0} left, but read the warnings: {1}.' -f $ResourceGroupName, ($warned -join ', ') }
+        default { 'Something of {0} is left: {1}.' -f $ResourceGroupName, ($failed -join ', ') }
+    }
+    return (New-DemoResult -CheckId 'DESTROY.RESIDUAL' -Area 'teardown' -Target 'subscription' -Status $summary -Message $message -Evidence ([ordered]@{ failed = $failed; warnings = $warned; deploymentId = [string](Get-DemoMemberValue -InputObject $Manifest -Name 'DeploymentId') }) -Remediation $(if ($summary -eq 'Fail') { 'Read the TEARDOWN.RESIDUAL results above; run destroy.ps1 again, or delete what''s named there.' } else { '' }) -DocUrl 'https://learn.microsoft.com/azure/governance/resource-graph/overview')
 }

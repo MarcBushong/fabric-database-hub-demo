@@ -14,6 +14,10 @@ function Get-DemoEnvironmentStatus {
     - STATUS.T2.AUTOSIGNIN (Phase 28, Get-DemoGuidedSignInStatus), only when there's something to say: Pass while the
       guest's one-time automatic sign-in waits for a guided stop; a Warning when it's armed with no guided stop
       waiting or its last cleanup didn't finish (archost01's next pass removes the leftovers; status stays read-only).
+    - STATUS.DISKS: each VM's disks against the profile. STATUS.RUNCOMMANDS (Phase 28 follow-up,
+      Get-DemoRunCommandStatus): managed Run Commands the demo left on its VMs, the on-demand control's DbHubControl-*
+      and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap, as a Warning with the commands
+      that delete them; Pass when there's none. Read-only.
     - STATUS.T3: whether T3 exists and its status (Online, Paused); Not selected after stop-demo.ps1 -RemoveT3.
     - STATUS.T4 (Phase 24, ADR 0019): T4's state; while it runs, its live Azure Monitor metrics from the last
       15 minutes (CPU, memory, connections, CPU credits, and the enhanced metrics: sessions by state and by
@@ -172,6 +176,9 @@ function Get-DemoEnvironmentStatus {
     # VM's disks to Standard HDD; deploy.ps1 keeps the current type, and this says so (a read of each VM).
     if ($found.Count -gt 0) {
         $results.Add((New-DemoDiskDriftResult -CheckId 'STATUS.DISKS' -Drift @(Get-DemoVmDiskDrift -Config $Config -VmName $found.ToArray()) -VmName $found.ToArray()))
+        # Managed Run Commands the demo left on its VMs (Phase 28 follow-up): the on-demand control's, and the scripts'
+        # beyond the bootstrap loader. Read-only; Azure allows 25 per VM.
+        $results.Add((Get-DemoRunCommandStatus -Config $Config -VmName $found.ToArray() -Running $running))
     }
 
     $t3 = Get-DemoT3State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
