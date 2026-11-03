@@ -317,8 +317,9 @@ function Invoke-DemoValidationT4 {
     <#
     .SYNOPSIS
     The T4 area (Phase 24, ADR 0019): Test-DemoT4 -IncludeMetrics, read-only, with the size T4's fallback recorded in the
-    group's DbHubT4Sku tag (Phase 28 follow-up), or, when the fallback left T4 out, one Not selected that says why. A
-    stopped T4 is a Warning (it sends no metrics), never a Fail. Internal.
+    group's DbHubT4Sku tag (Phase 28 follow-up), or, when the fallback left T4 out, one Not selected that says why; but a
+    server that exists although the record says T4 is off (None or Refused) is a T4.SERVER Warning that it bills (review
+    of 64c28b2; New-DemoT4RecordedOffResult). A stopped T4 is a Warning (it sends no metrics), never a Fail. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -336,6 +337,11 @@ function Invoke-DemoValidationT4 {
     $record = [pscustomobject]@{ T4Sku = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Context -Name 'Tags') -Name (Get-DemoDeploymentStateTagName)['T4Sku']) }
     $parameters['Config'] = Resolve-DemoEffectiveConfig -Config $Context.Config -State $record
     if ((Test-DemoT4Enabled -Config $Context.Config) -and -not (Test-DemoT4Enabled -Config $parameters['Config'])) {
+        # A server bills whatever the record says (review of 64c28b2), so one that exists is a Warning, never hidden.
+        $current = Get-DemoT4State -Config $Context.Config -DeploymentId ([string]$Context.DeploymentId)
+        if ([bool](Get-DemoMemberValue -InputObject $current -Name 'Exists') -and [string]$record.T4Sku -cin 'None', 'Refused') {
+            return @(New-DemoT4RecordedOffResult -CheckId 'T4.SERVER' -Server $current -Recorded ([string]$record.T4Sku))
+        }
         return @(New-DemoResult -CheckId 'T4.SERVER' -Area 't4' -Target 'T4' -Status 'Not selected' -Message (Get-DemoT4OffReason -Config $Context.Config -State $record))
     }
     @(Test-DemoT4 @parameters)
