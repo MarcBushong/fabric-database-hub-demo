@@ -9,9 +9,10 @@ function Complete-DemoDeploymentRun {
     given. While T4 runs on the General Purpose fallback (DbHubT4Sku Standard_D2ds_v5), its hourly list price comes from
     this run's DEPLOY.T4.SKU, or from the Azure Retail Prices API now, for the note DONE and NOT DONE add (Phase 28
     follow-up). The note says T4 was created only with evidence that its server exists: this run's results, the T4
-    track's record, or else a Servers - Get (review of 20e855c). Returns the outcome: Kind (Done, NotDone, or WhatIf),
-    Done, Reason, Next, NextCommand, Optional, Unfinished, ExitCode, Resume, and Minutes. Never throws: a run that can't
-    be judged is NOT DONE.
+    track's record, or else a Servers - Get (review of 20e855c), which also decides when this run's template failed or
+    T4.SERVER failed, since neither means the server is missing (review of 64c28b2). Returns the outcome: Kind (Done,
+    NotDone, or WhatIf), Done, Reason, Next, NextCommand, Optional, Unfinished, ExitCode, Resume, and Minutes. Never
+    throws: a run that can't be judged is NOT DONE.
 
     .PARAMETER Run
     What Start-DemoDeploymentRun returned.
@@ -100,7 +101,8 @@ function Complete-DemoDeploymentRun {
         $startedVms = @(Get-DemoStartedVm -Result @($Result) -Model $model)
         # T4 on the General Purpose fallback is said with its hourly list price (Phase 28 follow-up): this run's, or read
         # from the Azure Retail Prices API now. It says "created" only with evidence that the server exists (review of
-        # 20e855c): this run's results or the T4 track's record, or else a Servers - Get.
+        # 20e855c): this run's results or the T4 track's record, or else a Servers - Get, which also decides after a failed
+        # template or a T4.SERVER Fail: neither means the server is missing (review of 64c28b2).
         $t4Hourly = $null
         $t4Created = $null
         $t4Why = ''

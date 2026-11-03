@@ -782,11 +782,12 @@ function Test-DemoT4FallbackSize {
 function Get-DemoT4ServerEvidence {
     <#
     Whether this run's results, or the T4 track's record, show T4's server (review of 20e855c): $true for a T4.SERVER Pass
-    or Warning (it exists; Fail means missing), a HUB.ESTATE.T4 or METRICS.T4 Pass, a DEPLOY.TEMPLATE Pass with T4 in the
-    template, or a T4 track that finished a step (DbHubTrackT4: its Server step fails without a server); $false for a
-    T4.SERVER Fail, or for this run's fallback creating T4 (DEPLOY.T4.SKU next Standard_D2ds_v5, which runs only for a
-    server that doesn't exist yet) with a DEPLOY.TEMPLATE Fail; $null when nothing says (a Servers - Get decides then).
-    Pure. Internal.
+    or Warning (it exists), a HUB.ESTATE.T4 or METRICS.T4 Pass, a DEPLOY.TEMPLATE Pass with T4 in the template, or a T4
+    track that finished a step (DbHubTrackT4: its Server step fails without a server); otherwise $null, and a Servers - Get
+    decides. Never $false (review of 64c28b2): a T4.SERVER Fail means a missing server or a read that failed
+    (Test-DemoT4), and this run's fallback creating T4 (DEPLOY.T4.SKU next Standard_D2ds_v5) with a DEPLOY.TEMPLATE Fail
+    can still have created it, because T4's server depends only on the network (infra/modules/demo.bicep), so another
+    resource's failure doesn't stop it. Either one also outweighs the T4 track's record, which can be older. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -811,7 +812,7 @@ function Get-DemoT4ServerEvidence {
     $creating = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'next') -ceq 'Standard_D2ds_v5' }).Count -gt 0
     $templateFailed = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.TEMPLATE' -and [string]$_.status -eq 'Fail' }).Count -gt 0
     if (($creating -and $templateFailed) -or @($all | Where-Object { [string]$_.checkId -eq 'T4.SERVER' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
-        return $false
+        return $null
     }
     if ([string](Get-DemoMemberValue -InputObject $State -Name 'TrackT4')) {
         return $true
@@ -859,8 +860,9 @@ function Get-DemoT4FallbackNote {
     General Purpose Standard_D2ds_v5 (Phase 28 follow-up; Test-DemoT4FallbackSize), with the hourly list price the caller
     read from the Azure Retail Prices API, never a number written here (ADR 0016). It says "created" only with evidence
     that the server exists (review of 20e855c): -Created $true (Get-DemoT4ServerEvidence, or a Servers - Get) gives
-    Format-DemoT4FallbackCreatedText and the 7-day restart; $false says the size was chosen but the server isn't created
-    yet, and why (-Why); $null says it couldn't be confirmed. '' when it doesn't apply. Pure. Internal.
+    Format-DemoT4FallbackCreatedText and the 7-day restart; $false (a Servers - Get found no server) says the size was
+    chosen but the server isn't created yet, and why (-Why); $null says it couldn't be confirmed. '' when it doesn't apply.
+    Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -899,6 +901,50 @@ function Get-DemoT4FallbackNote {
         return ('T4 isn''t created yet: the fallback chose General Purpose Standard_D2ds_v5 because Burstable sizes were refused here, {0}, but {1}. The next ./scripts/deploy.ps1 that deploys the template creates it, after checking its price against the ceilings again.' -f $hourly, $because)
     }
     return ('The fallback chose General Purpose Standard_D2ds_v5 for T4 because Burstable sizes were refused here, {0}; whether the server exists couldn''t be confirmed just now, and ./scripts/status.ps1 shows it.' -f $hourly)
+}
+
+function New-DemoT4RecordedOffResult {
+    <#
+    The Warning that status.ps1 (STATUS.T4) and validate.ps1 (T4.SERVER) give for a T4 server that exists although the
+    resource group's record says T4 is off, DbHubT4Sku None or Refused (review of 64c28b2): a run before that review could
+    record None for a server that a template attempt which failed for another resource had created, and a server bills
+    whatever the record says. The next deploy.ps1 keeps it, at its own size, and clears a None record
+    (Invoke-DemoTemplateDeployment keeps an existing server's size), while Refused leaves it out of the demo until
+    t4SkuName sets its size; stop-demo.ps1 stops it whatever the record says. -Server is Get-DemoT4State's answer for the
+    server that exists. The record itself isn't changed (status.ps1 and validate.ps1 are read-only). Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('STATUS.T4', 'T4.SERVER')]
+        [string] $CheckId,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $Server,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('None', 'Refused')]
+        [string] $Recorded
+    )
+
+    $serverName = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Server -Name 'Names') -Name 'ServerName')
+    $state = [string](Get-DemoMemberValue -InputObject $Server -Name 'State')
+    $sku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $Server -Name 'Server')
+    $size = ''
+    if ($sku) {
+        $size = ', {0} {1}' -f $(if ((Get-DemoT4SkuSpec -SkuName $sku).Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' }), $sku
+    }
+    $message = 'T4 ({0}) exists and bills, although the resource group''s record says T4 is off (DbHubT4Sku {1}): it''s {2}{3}.' -f $serverName, $Recorded, $(if ($state) { $state } else { 'Unknown' }), $size
+    $keep = if ($Recorded -ceq 'None') {
+        'The next ./scripts/deploy.ps1 keeps it at its own size and clears the record.'
+    }
+    else {
+        'The next ./scripts/deploy.ps1 keeps it as it is, but leaves it out of the demo while the record says Refused; set t4SkuName to its size{0} to bring it back.' -f $(if ($sku) { ', ' + $sku + ',' } else { '' })
+    }
+    $remediation = '{0} Meanwhile ./scripts/stop-demo.ps1 stops it with the rest of the demo, and ./scripts/destroy.ps1 removes everything.' -f $keep
+    return (New-DemoResult -CheckId $CheckId -Area 't4' -Target 'T4' -Status 'Warning' -Message $message -Evidence ([ordered]@{ server = $serverName; state = $state; skuName = $sku; recorded = $Recorded }) -Remediation $remediation -DocUrl ([string](Get-DemoPostgresSetting)['docUrls']['stopServer']))
 }
 
 function Format-DemoT4RestartText {

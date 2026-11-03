@@ -30,7 +30,8 @@ function Invoke-DemoTemplateDeployment {
        Azure Retail Prices API now, and the demo's worst-case month, T4 running every hour because Azure starts a
        stopped server again after 7 days, with its storage and Defender plans, against monthlyCeilingUsd, and a session
        against sessionCeilingUsd), which runs right before every General Purpose creation on the fallback's behalf, and
-       again after Azure refuses the T3 free offer, because it counted the offer's allowance (review of 20e855c);
+       again after Azure refuses the T3 free offer, because it counted the offer's allowance (review of 20e855c), unless
+       that attempt had already created the server (below);
        over either ceiling, or without a price, T4 is left out (DbHubT4Sku None, checked again on the next run that
        deploys the template); and a refused Standard_D2ds_v5 deploys again without T4 (Refused). Each step is a
        DEPLOY.T4.SKU Warning, and a General Purpose T4 also gets a console line and T4Note ("T4 created as General
@@ -42,7 +43,11 @@ function Invoke-DemoTemplateDeployment {
        the configured size), so a redeploy never resizes it, and a record that doesn't match it is cleared, never set to
        its size, so a record always means the fallback chose it. A record no longer holds once the configuration sets
        t4SkuName (review finding 5). The VMs that exist are read again before each attempt, so a VM a failed attempt
-       created never gets an osProfile again.
+       created never gets an osProfile again. While the fallback is choosing, T4 is read again after each failed attempt
+       that sent it (review of 64c28b2): its server depends only on the network, so an attempt that failed for another
+       resource (the T3 free offer, a budget) can still have created it, and a server that exists is treated as existing
+       from then on: it keeps its own size and record, isn't priced again, even after the T3 free offer's rejection (it
+       exists and bills), is never recorded None or Refused, and is never moved to another size, which would resize it.
     7. Phase 28 live finding (2026-11-02): a deployment that failed while it ran (DeploymentFailed) and isn't retried
        above gets DEPLOY.TEMPLATE's Fail with the innermost errors of its failed operations, nested deployments
        included (Get-DemoDeploymentFailure, New-DemoTemplateFailureResult), for example "Microsoft.Consumption/budgets
@@ -65,6 +70,8 @@ function Invoke-DemoTemplateDeployment {
     - T4's compute tiers and capacity errors (2026-11-02): https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute,
       https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors
     - A stopped server starts again after 7 days (2026-11-02): https://learn.microsoft.com/azure/postgresql/overview
+    - T4's server, read again after a failed attempt (Get-DemoT4State, through 'az rest'; as the review of 20e855c cites
+      it): https://learn.microsoft.com/rest/api/postgresql/servers/get
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -219,14 +226,20 @@ function Invoke-DemoTemplateDeployment {
     # redeploy never sends Standard_B1ms to a server created as Standard_D2ds_v5, whatever the record says (Phase 28
     # follow-up). A record that doesn't match the server that exists no longer holds, and is cleared rather than set to the
     # server's size: only the fallback writes a size, so a record always means the fallback chose it (review of 20e855c).
-    if ($t4Exists -and -not $t4Explicit -and $t4ServerSku) {
-        if ($t4ServerSku -cne (Get-DemoT4SkuName -Config $effective)) {
-            $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Pass' -Message ('T4 exists as {0} ({1}), so this deployment keeps that size: an existing server is never resized unless t4SkuName says so.' -f $t4ServerSku, (Get-DemoT4SkuSpec -SkuName $t4ServerSku).Tier) -Evidence ([ordered]@{ serverSku = $t4ServerSku; configuredSku = (Get-DemoT4SkuName -Config $effective) }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute'))
-            $effective = Copy-DemoT4Config -Config $effective -Source server -SkuName $t4ServerSku
+    # The same goes for a server that a failed attempt of this run created (below).
+    $keepServer = {
+        param([System.Collections.IDictionary] $Wanted, [string] $ServerSku)
+        if ($ServerSku -cne (Get-DemoT4SkuName -Config $Wanted)) {
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Pass' -Message ('T4 exists as {0} ({1}), so this deployment keeps that size: an existing server is never resized unless t4SkuName says so.' -f $ServerSku, (Get-DemoT4SkuSpec -SkuName $ServerSku).Tier) -Evidence ([ordered]@{ serverSku = $ServerSku; configuredSku = (Get-DemoT4SkuName -Config $Wanted) }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute'))
+            $Wanted = Copy-DemoT4Config -Config $Wanted -Source server -SkuName $ServerSku
         }
-        if ($Action -eq 'Create' -and [string]$tags[$t4TagName] -and [string]$tags[$t4TagName] -cne $t4ServerSku) {
+        if ($Action -eq 'Create' -and [string]$tags[$t4TagName] -and [string]$tags[$t4TagName] -cne $ServerSku) {
             $tags[$t4TagName] = ''
         }
+        return $Wanted
+    }
+    if ($t4Exists -and -not $t4Explicit -and $t4ServerSku) {
+        $effective = & $keepServer $effective $t4ServerSku
     }
 
     $useFreeLimit = $T3UseFreeLimit
@@ -424,6 +437,33 @@ function Invoke-DemoTemplateDeployment {
             # The template creates the resource group before anything else, so a later record goes into its tags too.
             $groupSeen = $true
         }
+        # T4's server depends only on the network (infra/modules/demo.bicep), so an attempt that failed for another resource
+        # (the T3 free offer, a budget) can still have created it, as it can the VMs. While the fallback is choosing, T4 is
+        # read again after every failed attempt that sent it, and a server that exists is treated as existing from then on:
+        # it keeps its own size and the record that goes with it, isn't priced again (it exists and bills), is never recorded
+        # as left out (None) or refused (Refused), and is never moved to another size, which would resize it (review of
+        # 64c28b2). A server that can't be read is taken as missing, as before.
+        if ($ladder -and (Test-DemoT4Enabled -Config $effective)) {
+            $t4Now = $null
+            try {
+                $t4Now = Get-DemoT4State -Config $effective -DeploymentId ([string]$tags['deploymentId'])
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('T4''s server couldn''t be read after the failed attempt, so the fallback goes on as if it doesn''t exist: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+            }
+            if ([bool](Get-DemoMemberValue -InputObject $t4Now -Name 'Exists')) {
+                $t4Exists = $true
+                $ladder = $false
+                $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4Now -Name 'Server')
+                if ($t4ServerSku) {
+                    $effective = & $keepServer $effective $t4ServerSku
+                }
+                Write-DemoLog -Level Warning -Message ('T4''s server exists after this failed attempt (it depends only on the network, so another resource''s failure doesn''t stop it): it''s kept at {0}, and the fallback stops here, so it isn''t priced again, left out, or moved to another size.' -f $(if ($t4ServerSku) { $t4ServerSku } else { 'its own size' }))
+            }
+            elseif ($null -ne $t4Now -and [string](Get-DemoMemberValue -InputObject $t4Now -Name 'State') -ne 'NotFound') {
+                Write-DemoLog -Level Warning -Message ('T4''s server couldn''t be read after the failed attempt, so the fallback goes on as if it doesn''t exist: {0}' -f (Protect-DemoText -Text ([string](Get-DemoMemberValue -InputObject $t4Now -Name 'Error'))))
+            }
+        }
         $verdict = Resolve-DemoT3FreeOfferError -ErrorText ([string]$run.StdErr)
         if (-not $freeOfferTried -and $useFreeLimit -and $verdict.IsFreeOfferError) {
             Write-DemoLog -Level Warning -Message 'Azure rejected the T3 free offer; deploying again with regular General Purpose serverless.'
@@ -431,13 +471,18 @@ function Invoke-DemoTemplateDeployment {
             $useFreeLimit = $false
             $freeOfferTried = $true
             # The General Purpose fallback's cost check counted the free offer's allowance, so it runs again without it before
-            # the next attempt, and its new result replaces the old one (review of 20e855c).
-            if ($gpChecked -and (Test-DemoT4Enabled -Config $effective) -and (Get-DemoT4SkuName -Config $effective) -ceq 'Standard_D2ds_v5') {
+            # the next attempt, and its new result replaces the old one (review of 20e855c); unless the rejected attempt had
+            # already created the server, which then exists and bills, so it isn't priced again (review of 64c28b2).
+            if ($ladder -and $gpChecked -and (Test-DemoT4Enabled -Config $effective) -and (Get-DemoT4SkuName -Config $effective) -ceq 'Standard_D2ds_v5') {
                 $gpChecked = $false
                 if ($null -ne $gpResult) {
                     [void]$results.Remove($gpResult)
                     $gpResult = $null
                 }
+            }
+            elseif ($t4Exists -and $null -ne $gpResult) {
+                $gpResult.message += ' Azure then rejected the T3 free offer, whose allowance this check counted, but that attempt had already created T4''s server, so it isn''t priced again: it exists and bills.'
+                $gpResult.evidence['freeOfferCounted'] = $true
             }
             continue
         }
@@ -446,9 +491,10 @@ function Invoke-DemoTemplateDeployment {
             $t4Failure = Get-DemoT4CreateFailure -Config $effective
         }
         # The fallback (Phase 28 and its follow-up, ADR 0019): only Azure's SkuNotAvailable for the size this attempt sent,
-        # which the configuration doesn't set, moves it on: Standard_B1ms to Standard_B2s, Standard_B2s to General Purpose
-        # Standard_D2ds_v5 (after its cost check, at the top of the next attempt), and Standard_D2ds_v5 to no T4. A quota, a
-        # policy denial, or a transient error fails the template as before. What it chose is recorded for later runs.
+        # which the configuration doesn't set, moves it on, and only while T4's server doesn't exist (read above):
+        # Standard_B1ms to Standard_B2s, Standard_B2s to General Purpose Standard_D2ds_v5 (after its cost check, at the top
+        # of the next attempt), and Standard_D2ds_v5 to no T4. A quota, a policy denial, or a transient error fails the
+        # template as before. What it chose is recorded for later runs.
         $current = Get-DemoT4SkuName -Config $effective
         if ($ladder -and $null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current -and $current -notin $t4Refused) {
             $t4Refused.Add($current)

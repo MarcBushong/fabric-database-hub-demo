@@ -1939,6 +1939,32 @@ Describe 'Get-DemoEnvironmentStatus' {
         $t4.status | Should -Be 'Not selected'
         $t4.message | Should -Be 'T4 (pgflex01-abc123) doesn''t exist; deploy.ps1 creates it as General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the Burstable sizes here, after checking its price against the ceilings again.'
     }
+
+    It 'warns in STATUS.T4 about a T4 server that exists and bills although the record says <Record> (review of 64c28b2)' -ForEach @(
+        @{ Record = 'None'; Keep = 'The next \./scripts/deploy\.ps1 keeps it at its own size and clears the record\.' }
+        @{ Record = 'Refused'; Keep = 'The next \./scripts/deploy\.ps1 keeps it as it is, but leaves it out of the demo while the record says Refused; set t4SkuName to its size, Standard_D2ds_v5, to bring it back\.' }
+    ) {
+        # 64c28b2 could record None for a server that a template attempt which failed for another resource had created.
+        $script:t4Names = [pscustomobject]@{ ServerName = 'pgflex01-abc123'; ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' }
+        $script:t4Record = $Record
+        $script:t4Server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { New-TestState @{ Stage = 'Validation'; RunnerSha256 = $script:runnerSha; RunnerSentTo = @('sqlvm01', 'archost01'); T4Sku = $script:t4Record; Tags = @{ deploymentId = 'abc123'; expiresOn = '2026-12-31' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = $script:t4Names; Exists = ($null -ne $script:t4Server); State = $(if ($null -ne $script:t4Server) { 'Ready' } else { 'NotFound' }); Server = $script:t4Server; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4MetricSnapshot -MockWith { throw 'status.ps1 reads no metrics for a T4 that the record says is off' }
+        $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.status | Should -Be 'Warning'
+        $t4.message | Should -Be ('T4 (pgflex01-abc123) exists and bills, although the resource group''s record says T4 is off (DbHubT4Sku {0}): it''s Ready, General Purpose Standard_D2ds_v5.' -f $Record)
+        $t4.remediation | Should -Match ('^{0} Meanwhile \./scripts/stop-demo\.ps1 stops it with the rest of the demo, and \./scripts/destroy\.ps1 removes everything\.$' -f $Keep)
+        $t4.evidence.recorded | Should -Be $Record
+        $t4.evidence.state | Should -Be 'Ready'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4State -Times 1 -Exactly -ParameterFilter { $DeploymentId -eq 'abc123' }
+
+        # Without a server, T4 is off as the record says, and STATUS.T4 says why, as before.
+        $script:t4Server = $null
+        $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.status | Should -Be 'Not selected'
+        $t4.message | Should -Match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both Burstable sizes'
+    }
 }
 
 Describe 'Get-DemoEnvironmentStatus with the runner''s own profile get output' {
