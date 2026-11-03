@@ -755,3 +755,15 @@ Decided differently:
 - **This changes one point of the review of 20e855c:** a run whose template failed while the fallback was creating T4 now makes one Servers - Get in its ending, which it skipped before.
 
 **Risks.** R601 (updated: what to watch when the first fallback run's template fails for another resource) and R602 (new).
+
+### Phase 28 follow-up: the README's blank sign-in with no dialog
+
+2026-11-03. A tester's setup showed a blank **Use Azure Login** window in the guest with no Internet Explorer dialog to select **Add...** in. The README covered only the dialog; `docs/troubleshooting.md` already had this case.
+
+**Work summary.** The README's guided stop (step 4) and "What you must do, and when" now say what to do when the window stays blank and no dialog comes. IE Enhanced Security Configuration was still on when setup started, and a change made while setup is open doesn't reach it. So: cancel setup, set it to **Off** for **Administrators** in **Server Manager** > **Local Server**, start setup again, and redo the **Edition** and **Azure Extension for SQL Server** pages. They also say that the dialog can open behind setup's window, and that "Requires all input values for AZURESERVICEPRINCIPAL" only means the sign-in hasn't happened. No code changed.
+
+**Changed files.** `README.md`, `CHANGELOG.md`, and this report.
+
+**Validation.** `./tests/Invoke-StaticValidation.ps1 -Check Markdown`: **Pass**. The Pester files that read the README, the CHANGELOG, or this report (`Agent.PromptPack`, `DbHubDemo.Bundle`, `DbHubDemo.OneCommand`, `Repo.Conventions`, `Repo.NeutralWording`, and `Docs.Walkthrough`), with strict mode: **Pass** (722 passed, 0 failed).
+
+**Risks.** None new.
