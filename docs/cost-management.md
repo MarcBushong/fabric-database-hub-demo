@@ -14,6 +14,41 @@ From `estimate-cost.ps1` on 2026-10-21 (Phase 16's run): public list prices from
 
 Even with that worst case added, a light-use month stays well below the ceiling. Earlier dated estimates are in the ADR 0016 addenda: [2026-10-20, after Phase 6](adr/0016-cost-profiles.md#phase-6-note-lowest-cost-without-data-disks-and-the-estimates-after-the-merge-2026-10-20), [2026-10-20, with Defender and private mode](adr/0016-cost-profiles.md#phase-5-addendum-microsoft-defender-for-cloud-and-private-mode-2026-10-20), and [2026-10-19](adr/0016-cost-profiles.md#phase-5-addendum-live-estimates-and-the-premium-ssd-v2-evaluation-2026-10-19).
 
+## Dated example: business hours, and two optional upgrades (2026-11-03)
+
+A dated example, not a proposal: no default changes ([ADR 0016](adr/0016-cost-profiles.md)). List prices in USD for West US 3, from the [Azure Retail Prices API](https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices) on 2026-11-03. Run the estimate yourself for current figures.
+
+**The assumption: the demo runs 9 to 5 on weekdays,** 8 hours a day on 22 weekdays, so **176 hours a month**, and it's stopped the rest of the time (the VMs deallocated, T4 stopped, T3 paused).
+
+**The base: $436.98 a month.** That's `./scripts/estimate-cost.ps1 -LightUseHoursPerMonth 176` on the `lowest-cost` profile in private mode, with the subscription's Defender for Cloud plans, T4 on `Standard_D2ds_v5`, and T3 as regular serverless, without the free offer: $2.02 an hour while it runs, times 176 hours, plus $81.23 a month that bills whether it runs or not.
+
+| Component | A month at 176 hours |
+|---|---|
+| T1: the `Standard_D2s_v5` VM, plus the SQL Server Standard license | About $33 + $70 |
+| T2: the `Standard_E2s_v5` host, plus Arc SQL Standard pay-as-you-go (the 4-core minimum) | About $38 + $70 |
+| T3: serverless at its 1-vCore maximum while it's awake (the worst case) | About $92 |
+| T4: `Standard_D2ds_v5` compute | About $31 |
+| Defender for Cloud: its hourly and its monthly plans | About $60 |
+| Fixed costs without Defender: the OS disks, T3's and T4's storage, the T2 golden snapshot, the private endpoint, the private DNS zones, and the activity control's Key Vault | About $41 |
+| **Total** | **$436.98** |
+
+**Two optional upgrades, on top of the base at 176 hours:**
+
+- **PostgreSQL autonomous tuning (T4):** it runs "on any currently supported compute SKU with at least 4 vCores", on any tier, and analyzes "the workload tracked by query store" ([autonomous tuning](https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning), updated 2026-07-16). The [Query Store page](https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store) (updated 2026-07-16) says "Don't enable query store on the Burstable pricing tier". So the practical minimum is `Standard_D4ds_v5`: $0.356 an hour against $0.178 for `Standard_D2ds_v5`, **+$31.33 a month**. `Standard_B4ms` is $0.272 an hour, but it's Burstable, so it isn't recommended.
+- **SQL Server Enterprise (T1 and T2):** automatic tuning, which includes plan correction, is Enterprise-only in SQL Server 2022 ([editions](https://learn.microsoft.com/sql/sql-server/editions-and-components-of-sql-server-2022), updated 2026-10-19).
+  - T1: the "SQL Server Enterprise / 1-4 vCPU VM License" meter is $1.50 an hour, against $0.40 for Standard.
+  - T2: Arc's "Ent edition - PAYG" is $0.375 a core-hour, against $0.100, times the 4-core minimum: $1.50 an hour against $0.40.
+  - Together, **+$387.20 a month**. It would also need T1's Enterprise Marketplace image and Enterprise in T2's guest setup; the demo installs Standard on both.
+- **Both upgrades:** about **$855.51 a month**.
+
+**Above the hard ceiling, even without the upgrades.** The **$250** monthly ceiling assumes idle plus light use, 10 running hours a month (`config/profiles.json`). A business-hours schedule needs `monthlyCeilingUsd` raised to about **$450**, or about **$875** with both upgrades, and the budget with it (`deploy.ps1 -FromStage Infrastructure`). Otherwise:
+
+- the monthly check fails when it counts those hours (`estimate-cost.ps1 -LightUseHoursPerMonth 176` reports `PREFLIGHT.COST.MONTHLY` as a **Fail**); preflight's own run counts the 10-hour light-use month;
+- the budget's alerts fire at 50%, 80%, and 100% of the ceiling;
+- once the month's actual cost reaches the ceiling, `start-demo.ps1` stops starting the demo (`START.COST.ACTUAL` **Fail**) until the next month, unless you raise the ceiling or pass `-SkipCostCheck`.
+
+**Neither upgrade adds a Database Hub visual:** PostgreSQL's tuning recommendations show in the Azure portal, and SQL Server's plan correction in its DMVs (`sys.dm_db_tuning_recommendations`) and SSMS.
+
 ## The T2 golden snapshot (Phase 20)
 
 The fast redeploy keeps one incremental snapshot of the T2 host's OS disk in `rg-<prefix>-golden` ([ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)); there's no storage account. It bills every month it exists, whether the demo runs or not, until `destroy.ps1 -IncludeGolden` deletes it.
