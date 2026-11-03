@@ -556,7 +556,7 @@ function New-DemoTemplateFailureResult {
 }
 
 function ConvertTo-DemoDeploymentOutput {
-    # The template outputs as name -> value. Internal.
+    # The template outputs as name -> value; empty for a deployment without outputs. Internal.
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
@@ -569,7 +569,8 @@ function ConvertTo-DemoDeploymentOutput {
     if ($null -eq $source) {
         return $outputs
     }
-    $properties = if ($source -is [System.Collections.IDictionary]) { $source.Keys } else { $source.PSObject.Properties.Name }
+    # Each name on its own: under strict mode, .Name on an empty property collection (outputs: {}) throws.
+    $properties = if ($source -is [System.Collections.IDictionary]) { @($source.Keys) } else { @($source.PSObject.Properties | ForEach-Object { $_.Name }) }
     foreach ($name in $properties) {
         $outputs[[string]$name] = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $source -Name $name) -Name 'value'
     }

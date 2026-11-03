@@ -42,7 +42,10 @@ function Start-DemoEnvironment {
     5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, baseline by default)
        on T1, T3, T4, and T2 until the next auto-shutdown (START.PROFILE_*). The VMs don't set it at boot unless
        activityProfileOnBoot is true, so this is what starts the demo's activity. T2's guest needs a few
-       minutes after the host starts, so its profile is retried.
+       minutes after the host starts, so its profile is retried. Then the on-demand activity control's finished
+       Run Commands (DbHubControl-*) on the VMs that run are deleted without waiting (START.CONTROL.RUNCOMMANDS,
+       Phase 28 follow-up; Remove-DemoControlRunCommand): the control's stop path never touches Run Command (ADR
+       0020), so a VM keeps the last run's until then. A delete that fails is a Warning the next start retries.
     6. -WarmUpMinutes: the activity keeps running in the background, and START.WARMUP says when to check the
        telemetry (ADR 0018). With -WaitForWarmUp it waits that long, then checks that telemetry arrives for
        each started target (Test-DemoHubTelemetry), so Hub charts have history when the presenter joins.
@@ -319,6 +322,16 @@ function Start-DemoEnvironment {
         # (live, 2026-10-22: T1's first attempt found no server), so both retry.
         $attempts = if ($target -in 'T1', 'T2') { 3 } else { 1 }
         $results.Add((Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $profileName -CheckPrefix 'START' -SkipReason $skip -RequestedBy 'start-demo' -Attempts $attempts -RetrySeconds $T2ProfileRetrySeconds))
+    }
+
+    # The on-demand control's finished Run Commands on the VMs that run (ADR 0020: its stop path leaves the last run's),
+    # once this start's own Run Commands are done; a delete that fails is a Warning the next start retries.
+    $runningVms = @(@('sqlvm01', $hostVm) | Where-Object { $running[$_] })
+    if ($runningVms.Count -gt 0) {
+        $cleanup = Remove-DemoControlRunCommand -Config $Config -VmName $runningVms -Confirm:$false
+        if ($null -ne $cleanup) {
+            $results.Add($cleanup)
+        }
     }
 
     if ($WarmUpMinutes -gt 0 -and -not $WaitForWarmUp) {

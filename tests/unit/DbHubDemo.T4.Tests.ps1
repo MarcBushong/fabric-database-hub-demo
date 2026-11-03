@@ -61,7 +61,11 @@ BeforeAll {
             }
             $script:azCalls.Add($text)
             if ($text -like 'group show*') {
-                return [pscustomobject]@{ tags = [pscustomobject]@{ deploymentId = 'abc123' } }
+                # Get-DemoResourceGroupTag reads the Azure CLI's text (Phase 28 follow-up); -AsJson callers get it parsed.
+                if ($AsJson) {
+                    return [pscustomobject]@{ tags = [pscustomobject]@{ deploymentId = 'abc123' } }
+                }
+                return (New-AzResult -Json @{ tags = @{ deploymentId = 'abc123' } })
             }
             if ($text -match '--method post --url \S+/(start|stop)\?') {
                 $script:t4.State = if ($Matches[1] -eq 'start') { 'Ready' } else { 'Stopped' }

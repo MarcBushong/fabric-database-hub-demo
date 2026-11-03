@@ -100,6 +100,100 @@ Describe 'Deployment state in the resource group''s tags' {
         & (Get-Module -Name DbHubDemo) { Test-DemoDeploymentStageReached -Recorded 'Monitoring' -Stage 'T2' } | Should -BeFalse
         & (Get-Module -Name DbHubDemo) { Test-DemoDeploymentStageReached -Recorded '' -Stage 'T3' } | Should -BeFalse
     }
+
+    Context 'tag values as Azure holds them (Phase 28 follow-up)' {
+        BeforeEach {
+            # ISO 8601 dates, with Z and with an offset, in the demo's tags and in a person's own; a date-only expiry.
+            $script:groupTags = [ordered]@{
+                deploymentId        = 'abc123'
+                DbHubDeployStage    = 'T3'
+                DbHubDeployStageUtc = '2026-11-02T14:05:09Z'
+                DbHubGuidedStopUtc  = '2026-11-02T15:00:00Z'
+                expiresOn           = '2026-12-31'
+                reviewedOn          = '2026-10-31T09:30:00+02:00'
+                createdAt           = '2026-10-30T08:00:00.1234567Z'
+                note                = 'kept by hand'
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+                $script:azCalls.Add(@($ArgumentList))
+                if ($ArgumentList[0] -eq 'group' -and $ArgumentList[1] -eq 'exists') {
+                    return (New-AzResult -StdOut 'true')
+                }
+                if ($ArgumentList[0] -eq 'group' -and $ArgumentList[1] -eq 'show') {
+                    # As the Azure CLI prints it: the dates are JSON strings.
+                    return (New-AzResult -StdOut ([ordered]@{ id = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo'; name = 'rg-dbhub-demo'; tags = $script:groupTags } | ConvertTo-Json))
+                }
+                return (New-AzResult -StdOut '{}')
+            }
+        }
+
+        It 'reads every tag''s text unchanged, whatever the culture and time zone, so a redeploy writes it back as it was' {
+            $savedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+            $savedZone = $env:TZ
+            try {
+                # A culture that writes the day first, and on Linux a zone west of UTC, where a [datetime] read from an ISO
+                # string with an offset becomes local time.
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('de-DE')
+                if (-not $IsWindows) {
+                    $env:TZ = 'America/Los_Angeles'
+                    [System.TimeZoneInfo]::ClearCachedData()
+                }
+                $tags = InModuleScope DbHubDemo { Get-DemoResourceGroupTag -SubscriptionId '11111111-2222-3333-4444-555555555555' -ResourceGroupName 'rg-dbhub-demo' }
+                foreach ($key in $script:groupTags.Keys) {
+                    $tags[$key] | Should -BeExactly $script:groupTags[$key] -Because $key
+                    $tags[$key] | Should -BeOfType [string]
+                }
+                $state = Get-DemoDeploymentState -Config $config
+                $state.StageUtc | Should -BeExactly '2026-11-02T14:05:09Z'
+                $state.GuidedStopUtc | Should -BeExactly '2026-11-02T15:00:00Z'
+                # What the template gets back for the group (existingResourceGroupTags) is the same text.
+                $document = Get-DemoDeploymentParameter -Config $config -ExistingResourceGroupTags $tags -NetworkMode public -T3UseFreeLimit $false
+                $sent = $document['parameters']['existingResourceGroupTags']['value']
+                $json = $document | ConvertTo-Json -Depth 30
+                foreach ($key in $script:groupTags.Keys) {
+                    $sent[$key] | Should -BeExactly $script:groupTags[$key] -Because $key
+                    $json | Should -Match ([regex]::Escape(('"{0}": "{1}"' -f $key, $script:groupTags[$key]))) -Because $key
+                }
+            }
+            finally {
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture
+                $env:TZ = $savedZone
+                [System.TimeZoneInfo]::ClearCachedData()
+            }
+        }
+
+        It 'reads both forms of a date tag, ISO and the "MM/dd/yyyy HH:mm:ss" that earlier redeploys wrote, as the same UTC time' {
+            $savedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+            try {
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('de-DE')
+                $iso = InModuleScope DbHubDemo { ConvertTo-DemoRunCommandUtc -Value '2026-11-02T15:00:00Z' }
+                $rewritten = InModuleScope DbHubDemo { ConvertTo-DemoRunCommandUtc -Value '11/02/2026 15:00:00' }
+                $iso | Should -Be ([datetime]::new(2026, 11, 2, 15, 0, 0, [System.DateTimeKind]::Utc))
+                $rewritten | Should -Be $iso
+                # The watchdog reads the guided stop's time either way (Get-DemoHostRestartBlocker).
+                foreach ($value in '2099-11-02T15:00:00Z', '11/02/2099 15:00:00') {
+                    $script:groupTags['DbHubGuidedStopUtc'] = $value
+                    InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoHostRestartBlocker -Config $Config } | Should -Match 'guided stop' -Because $value
+                }
+            }
+            finally {
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture
+            }
+        }
+    }
+}
+
+Describe 'ConvertTo-DemoDeploymentOutput (Phase 28 follow-up)' {
+    It 'returns no outputs for a deployment whose outputs object is empty, under strict mode' {
+        Set-StrictMode -Version Latest
+        $deployment = '{"properties":{"provisioningState":"Succeeded","outputs":{}}}' | ConvertFrom-Json -Depth 64
+        $outputs = InModuleScope DbHubDemo -Parameters @{ Deployment = $deployment } { ConvertTo-DemoDeploymentOutput -Deployment $Deployment }
+        $outputs | Should -BeOfType [hashtable]
+        $outputs.Count | Should -Be 0
+        $named = '{"properties":{"outputs":{"deploymentId":{"type":"String","value":"abc123"}}}}' | ConvertFrom-Json -Depth 64
+        (InModuleScope DbHubDemo -Parameters @{ Deployment = $named } { ConvertTo-DemoDeploymentOutput -Deployment $Deployment })['deploymentId'] | Should -Be 'abc123'
+        (InModuleScope DbHubDemo { ConvertTo-DemoDeploymentOutput -Deployment $null }).Count | Should -Be 0
+    }
 }
 
 Describe 'Invoke-DemoTemplateDeployment' {
@@ -1441,6 +1535,10 @@ Describe 'Start-DemoEnvironment' {
         }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith { $script:order.Add('Telemetry:' + ($Target -join ',')); New-TestResult 'HUB.TELEMETRY.T1' 'Pass' 'hub' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName New-DemoBastion -MockWith { $script:order.Add('Bastion'); New-TestResult 'START.BASTION' 'Pass' 'infra' 'T2' }
+        # The on-demand control's Run Command cleanup (Phase 28 follow-up) has its own tests below; here it records when it ran.
+        $script:cleanup = $null
+        $script:cleanupAt = -1
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoControlRunCommand -MockWith { $script:cleanupAt = $script:order.Count; $script:cleanup }
         $script:autoStopThrows = $false
         $script:stopJobWaited = $false
         Mock -ModuleName DbHubDemo -CommandName Clear-DemoActivityControlAutoStop -MockWith {
@@ -1465,6 +1563,23 @@ Describe 'Start-DemoEnvironment' {
     It 'checks the cost, starts the VMs, resumes T3, and sets the configured profile everywhere' {
         Start-DemoEnvironment -Config $config -Confirm:$false | Out-Null
         $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'WarmT3', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline')
+    }
+
+    It 'deletes the on-demand control''s finished Run Commands on the VMs that run, after the profiles, and carries on with its Warning (Phase 28 follow-up)' {
+        $script:cleanup = New-TestResult 'START.CONTROL.RUNCOMMANDS' 'Warning' 'workload'
+        $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoControlRunCommand -Times 1 -Exactly -ParameterFilter { (@($VmName) -join ',') -eq 'sqlvm01,archost01' }
+        $script:cleanupAt | Should -Be $script:order.Count -Because 'it runs once this start''s own Run Commands, the profiles, are done'
+        ($results | Where-Object { $_.checkId -eq 'START.CONTROL.RUNCOMMANDS' }).status | Should -Be 'Warning'
+        Get-DemoExitCode -Result $results | Should -Be 0
+
+        # A VM that didn't start isn't cleaned (a deallocated VM can't remove one); with none running, nothing is called.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Start:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) $(if ($VmName -eq 'archost01') { 'Fail' } else { 'Pass' }) 'infra' 'T1' }
+        $null = Start-DemoEnvironment -Config $config -Confirm:$false
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoControlRunCommand -Times 1 -Exactly -ParameterFilter { (@($VmName) -join ',') -eq 'sqlvm01' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Start:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) 'Fail' 'infra' 'T1' }
+        $null = Start-DemoEnvironment -Config $config -Confirm:$false
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoControlRunCommand -Times 2 -Exactly
     }
 
     It 'tells the power check which VMs this start requested, so a VM it started isn''t "already running" (Phase 25d)' {
@@ -1634,6 +1749,8 @@ Describe 'Get-DemoEnvironmentStatus' {
         $script:golden = @()
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { throw 'no Run Command while the VMs are deallocated' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmDiskDrift -MockWith { @() }
+        # STATUS.RUNCOMMANDS (Phase 28 follow-up) has its own tests below; here it records what it was asked.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRunCommandStatus -MockWith { New-TestResult 'STATUS.RUNCOMMANDS' 'Pass' 'infra' }
         # STATUS.FABRIC (Phase 26a) has its own tests (DbHubDemo.FabricResolve.Tests.ps1); here it sends nothing.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricStatus -MockWith { New-TestResult 'STATUS.FABRIC' 'Pass' 'fabric' 'fabric' }
     }
@@ -1684,13 +1801,15 @@ Describe 'Get-DemoEnvironmentStatus' {
 
     It 'covers the plan''s status items, read-only, and every result follows the schema' {
         $results = Get-DemoEnvironmentStatus -Config $config
-        foreach ($id in 'STATUS.DEPLOYMENT', 'STATUS.VM_SQLVM01', 'STATUS.VM_ARCHOST01', 'STATUS.T3', 'T1.SQLVM.ASSOCIATEDSERVICES', 'T2.ARC.CONNECTED', 'STATUS.BASTION', 'STATUS.COST', 'STATUS.SHUTDOWN') {
+        foreach ($id in 'STATUS.DEPLOYMENT', 'STATUS.VM_SQLVM01', 'STATUS.VM_ARCHOST01', 'STATUS.T3', 'T1.SQLVM.ASSOCIATEDSERVICES', 'T2.ARC.CONNECTED', 'STATUS.BASTION', 'STATUS.COST', 'STATUS.SHUTDOWN', 'STATUS.RUNCOMMANDS') {
             @($results | Where-Object { $_.checkId -eq $id }).Count | Should -Be 1 -Because $id
         }
         ($results | Where-Object { $_.checkId -eq 'STATUS.VM_SQLVM01' }).area | Should -Be 't1'
         ($results | Where-Object { $_.checkId -eq 'STATUS.T3' }).message | Should -Match 'Paused'
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -Times 0 -Exactly -Because 'T1 is deallocated'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -Times 0 -Exactly
+        # The leftover Run Commands of both VMs it found, each with its power state (Phase 28 follow-up).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRunCommandStatus -Times 1 -Exactly -ParameterFilter { (@($VmName) -join ',') -eq 'sqlvm01,archost01' -and $Running['sqlvm01'] -eq $false -and $Running['archost01'] -eq $false }
     }
 
     It 'reads the active profile on T1 and T3 while sqlvm01 runs, from T1 only' {
@@ -1843,6 +1962,8 @@ Describe 'Get-DemoEnvironmentStatus with the runner''s own profile get output' {
         $script:golden = @()
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { 'PowerState/running' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ status = 'Pass'; state = 'Ready'; message = 'ok' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmDiskDrift -MockWith { @() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRunCommandStatus -MockWith { New-TestResult 'STATUS.RUNCOMMANDS' 'Pass' 'infra' }
         # Only the Run Command transport is faked: Invoke-DemoWorkloadCommand parses the runner's output itself.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadAction -MockWith {
             # 'profile get --json' as the runner writes it (Cli/CommandLine.cs): one JSON object, not an array, with a
@@ -1888,6 +2009,175 @@ Describe 'Get-DemoEnvironmentStatus with the runner''s own profile get output' {
         $t2.status | Should -Be 'Not selected'
         $t2.message | Should -Match 'T2 isn''t set up yet'
         ($results | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T1' }).status | Should -Be 'Pass'
+    }
+}
+
+Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps1''s report (Phase 28 follow-up)' {
+    BeforeAll {
+        $config = New-TestConfig
+        function New-RunCommand([string] $Name, [string] $Execution = 'Succeeded', [string] $Provisioning = 'Succeeded') {
+            @{ name = $Name; properties = @{ provisioningState = $Provisioning; instanceView = @{ executionState = $Execution } } }
+        }
+    }
+
+    BeforeEach {
+        $script:azLog = [System.Collections.Generic.List[string]]::new()
+        $script:listed = @{ sqlvm01 = @(); archost01 = @() }
+        $script:listFails = @{}
+        $script:deleteAnswers = @{}
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            $joined = $ArgumentList -join ' '
+            $script:azLog.Add($joined)
+            if ($joined -match '^rest --method get --url https://management\.azure\.com/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Compute/virtualMachines/(\w+)/runCommands\?api-version=[\d-]+&\$expand=instanceView ') {
+                if ($script:listFails[$Matches[1]]) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to read the Run Commands.')
+                }
+                return (New-AzResult -StdOut (@{ value = @($script:listed[$Matches[1]]) } | ConvertTo-Json -Depth 8))
+            }
+            if ($joined -match '^rest --method delete --url https://management\.azure\.com/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Compute/virtualMachines/\w+/runCommands/([A-Za-z0-9-]+)\?api-version=[\d-]+ ') {
+                if ($script:deleteAnswers.ContainsKey($Matches[1])) {
+                    return $script:deleteAnswers[$Matches[1]]
+                }
+                return (New-AzResult)
+            }
+            return (New-AzResult -ExitCode 3 -StdErr ('ERROR: not faked in this test: {0}' -f $joined))
+        }
+    }
+
+    It 'start-demo.ps1 deletes the control''s finished Run Commands on the VMs that run, without waiting, and nothing else' {
+        # Live, 2026-11-02: the 2026-10-27 run's DbHubControl-sqlvm01-<timestamp> was still on sqlvm01; a VM takes 25.
+        $script:listed['sqlvm01'] = @(
+            New-RunCommand 'DbHubControl-sqlvm01-20261027153000'
+            New-RunCommand 'DbHubControl-monitoring-20261027153000' 'Failed'
+            New-RunCommand 'DbHubControl-sqlvm01-20261102120000' 'Running'
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand 'DbHubDemo-HealthRead' 'Running'
+            New-RunCommand 'DbHubDemo-Workload'
+            New-RunCommand 'OtherTeam-Patch'
+        )
+        $script:listed['archost01'] = @(New-RunCommand 'DbHubControl-archost01-20261027153000' 'TimedOut')
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01', 'archost01') -Confirm:$false }
+        $result.checkId | Should -Be 'START.CONTROL.RUNCOMMANDS'
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match '^Deleted 3 finished Run Command\(s\) the on-demand control left on the VMs: sqlvm01/DbHubControl-sqlvm01-20261027153000, sqlvm01/DbHubControl-monitoring-20261027153000, archost01/DbHubControl-archost01-20261027153000\.'
+        $deletes = @($script:azLog | Where-Object { $_ -match '^rest --method delete' })
+        $deletes.Count | Should -Be 3
+        $deletes | ForEach-Object { $_ | Should -Match '/runCommands/DbHubControl-(sqlvm01|monitoring|archost01)-20261027153000\?api-version=2025-11-01 --subscription 11111111-2222-3333-4444-555555555555$' }
+        # It never waits for a delete: no read of a single Run Command after it.
+        @($script:azLog | Where-Object { $_ -match '/runCommands/[A-Za-z0-9-]+\?' -and $_ -match '^rest --method get' }) | Should -BeNullOrEmpty
+    }
+
+    It 'start-demo.ps1''s cleanup is a Warning the next start retries, never a Fail, when a VM can''t remove one or can''t be listed' {
+        $script:listed['sqlvm01'] = @(New-RunCommand 'DbHubControl-sqlvm01-20261027153000')
+        $script:listed['archost01'] = @(New-RunCommand 'DbHubControl-archost01-20261027153000')
+        $script:deleteAnswers['DbHubControl-archost01-20261027153000'] = New-AzResult -ExitCode 1 -StdErr 'ERROR: (OperationNotAllowed) Cannot modify extensions in the VM when the VM is not running.'
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01', 'archost01') -Confirm:$false }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'archost01/DbHubControl-archost01-20261027153000: the VM isn''t running'
+        $result.message | Should -Match 'Deleted: sqlvm01/DbHubControl-sqlvm01-20261027153000\.'
+        $result.remediation | Should -Match 'The next start-demo\.ps1 tries again'
+        $result.remediation | Should -Match ([regex]::Escape('az vm run-command delete --resource-group rg-dbhub-demo --vm-name archost01 --name DbHubControl-archost01-20261027153000 --subscription 11111111-2222-3333-4444-555555555555 --yes'))
+        Get-DemoExitCode -Result @($result) | Should -Be 0
+
+        $script:listFails['sqlvm01'] = $true
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01') -Confirm:$false }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'sqlvm01: the Run Commands couldn''t be listed \(ERROR: \(AuthorizationFailed\)'
+    }
+
+    It 'start-demo.ps1''s cleanup says nothing with the control off and nothing to delete, and a Pass with it on' {
+        $script:listed['sqlvm01'] = @(New-RunCommand 'DbHubDemo-Bootstrap')
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01') -Confirm:$false } | Should -BeNullOrEmpty
+        $controlConfig = New-TestConfig
+        $controlConfig['control']['enabled'] = $true
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $controlConfig } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01') -Confirm:$false }
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'No finished Run Command of the on-demand control is left on sqlvm01'
+        @($script:azLog | Where-Object { $_ -match '^rest --method delete' }) | Should -BeNullOrEmpty
+    }
+
+    It 'status.ps1 reports what''s left on the VMs as a Warning with the commands that delete them, and deletes nothing' {
+        $script:listed['sqlvm01'] = @(
+            New-RunCommand 'DbHubControl-sqlvm01-20261027153000'
+            New-RunCommand 'DbHubControl-sqlvm01-20261102120000' 'Running'
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand 'DbHubDemo-HealthRead' 'Running'
+            New-RunCommand 'DbHubDemo-Workload' 'Failed'
+            New-RunCommand 'DbHubDemo-Chunk-0123456789ab-001' 'Succeeded' 'Deleting'
+            New-RunCommand 'OtherTeam-Patch'
+        )
+        # A deallocated VM runs nothing, so a "Running" there is a stale instance view, and it counts.
+        $script:listed['archost01'] = @(New-RunCommand 'DbHubControl-archost01-20261027153000' 'Running')
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01', 'archost01') -Running @{ sqlvm01 = $true; archost01 = $false } }
+        $result.checkId | Should -Be 'STATUS.RUNCOMMANDS'
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be '3 managed Run Command(s) are left on the demo VMs: sqlvm01/DbHubControl-sqlvm01-20261027153000, sqlvm01/DbHubDemo-Workload, archost01/DbHubControl-archost01-20261027153000.'
+        $result.remediation | Should -Match 'start-demo\.ps1 deletes the on-demand control''s finished ones \(DbHubControl-\*\) once the VMs run'
+        $result.remediation | Should -Match 'the next run of the step that made a DbHubDemo-\* one deletes it first'
+        $result.remediation | Should -Match ([regex]::Escape('az vm run-command delete --resource-group rg-dbhub-demo --vm-name sqlvm01 --name DbHubControl-sqlvm01-20261027153000 --subscription 11111111-2222-3333-4444-555555555555 --yes'))
+        $result.remediation | Should -Match 'Azure allows 25 managed Run Commands per VM'
+        @($result.evidence.deleteCommands).Count | Should -Be 3
+        @($script:azLog | Where-Object { $_ -notmatch '^rest --method get ' }) | Should -BeNullOrEmpty -Because 'status.ps1 only reads'
+    }
+
+    It 'status.ps1 passes with only the bootstrap loader left, and warns when it can''t list a VM''s Run Commands' {
+        $script:listed['sqlvm01'] = @(New-RunCommand 'DbHubDemo-Bootstrap')
+        $script:listed['archost01'] = @(New-RunCommand 'DbHubDemo-Bootstrap')
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01', 'archost01') -Running @{ sqlvm01 = $false; archost01 = $false } }
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'No leftover Run Command on sqlvm01 and archost01'
+        $script:listFails['archost01'] = $true
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01', 'archost01') -Running @{} }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'couldn''t all be listed: archost01: ERROR: \(AuthorizationFailed\)'
+    }
+
+    It 'a control Run Command is finished when its state is terminal, or empty or Unknown an hour after the time in its name: <Name> <State>' -ForEach @(
+        @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'Succeeded'; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'Canceled'; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-20261102120000'; State = 'TimedOut'; Finished = $true }
+        @{ Name = 'DbHubControl-monitoring-20261102120000'; State = 'Failed'; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-20261102105959'; State = ''; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-reset-20261102105959'; State = 'Unknown'; Finished = $true }
+        @{ Name = 'DbHubControl-sqlvm01-20261102113000'; State = ''; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-20261102113000'; State = 'Unknown'; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-20261101090000'; State = 'Running'; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-20261101090000'; State = 'Pending'; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-manual'; State = 'Unknown'; Finished = $false }
+        @{ Name = 'DbHubControl-sqlvm01-20261399999999'; State = ''; Finished = $false }
+    ) {
+        $now = [DateTime]::new(2026, 11, 2, 12, 0, 0, [DateTimeKind]::Utc)
+        InModuleScope DbHubDemo -Parameters @{ Name = $Name; State = $State; Now = $now } { Test-DemoRunCommandFinished -Name $Name -ExecutionState $State -NowUtc $Now } | Should -Be $Finished
+    }
+
+    It 'start-demo.ps1 never deletes a control Run Command an overlapping run has just created, and status.ps1 doesn''t count it on a running VM (review of 7fb941e)' {
+        # Right after it's created, a Run Command's execution state is empty or Unknown until the VM agent picks it up.
+        $now = [DateTime]::UtcNow
+        $at = { param([double] $MinutesAgo) $now.AddMinutes(-$MinutesAgo).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+        $new = 'DbHubControl-sqlvm01-{0}' -f (& $at 1)
+        $script:listed['sqlvm01'] = @(
+            New-RunCommand $new ''
+            New-RunCommand ('DbHubControl-monitoring-{0}' -f (& $at 2)) 'Unknown'
+            @{ name = ('DbHubControl-sqlvm01-reset-{0}' -f (& $at 3)); properties = @{ provisioningState = 'Succeeded' } }
+            New-RunCommand 'DbHubControl-sqlvm01-manual' 'Unknown'
+            New-RunCommand ('DbHubControl-sqlvm01-{0}' -f (& $at 90)) 'Unknown'
+            New-RunCommand ('DbHubControl-sqlvm01-reset-{0}' -f (& $at 120)) ''
+            New-RunCommand ('DbHubControl-monitoring-{0}' -f (& $at 5)) 'Canceled'
+        )
+        $finished = @(('DbHubControl-sqlvm01-{0}' -f (& $at 90)), ('DbHubControl-sqlvm01-reset-{0}' -f (& $at 120)), ('DbHubControl-monitoring-{0}' -f (& $at 5)))
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01') -Confirm:$false }
+        $result.status | Should -Be 'Pass'
+        $deleted = @($script:azLog | Where-Object { $_ -match '^rest --method delete' } | ForEach-Object { [regex]::Match($_, '/runCommands/([A-Za-z0-9-]+)\?').Groups[1].Value })
+        $deleted | Should -Be $finished
+        @($result.evidence.deleted) | Should -Be @($finished | ForEach-Object { 'sqlvm01/' + $_ })
+
+        $status = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01') -Running @{ sqlvm01 = $true } }
+        @($status.evidence.leftover) | Should -Be @($finished | ForEach-Object { 'sqlvm01/' + $_ })
+        @($status.evidence.deleteCommands) | Should -Not -Match ([regex]::Escape($new))
+        # A deallocated VM runs nothing, so there every one counts.
+        $status = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01') -Running @{ sqlvm01 = $false } }
+        @($status.evidence.leftover).Count | Should -Be 7
     }
 }
 Describe 'Remove-DemoEnvironment' {
