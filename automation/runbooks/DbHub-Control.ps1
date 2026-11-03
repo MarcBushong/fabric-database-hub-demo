@@ -11,9 +11,13 @@ identity id-<prefix>-automation, whose only role is DbHub Demo Activity Operator
 at the control account (A2).
 
 - run: refuses while another run is active; caps each activity's minutes at its scenario's maximum and before the
-  VMs' next auto-shutdown; creates the one-time auto-stop schedule before anything starts; starts the VMs (and T4)
-  when they're stopped; and sets each target's activity profile through one asynchronous managed Run Command per VM.
-  It doesn't wait for the Run Commands, and each profile ends on its own at the run's end.
+  VMs' next auto-shutdown; creates the one-time auto-stop schedule (and, for a run that uses sqlvm01, the monitoring
+  re-checks that start DbHub-Monitor) before anything starts; starts the VMs (and T4) when they're stopped; and sets
+  each target's activity profile through an asynchronous managed Run Command on each VM as soon as it runs (T4's once
+  it's Ready, without holding back T1 to T3). The VM-side control waits for each target to accept connections, and
+  releases or starts T2's guest when it's off, before it sets the profile. Once sqlvm01 runs, the job looks after T1's
+  monitoring plugin and restarts its agent when the plugin doesn't run. It doesn't wait for the Run Commands, and each
+  profile ends on its own at the run's end.
 - stop (Stop now): removes the auto-stop, deallocates both VMs, and stops T4, through Azure Resource Manager only.
 - reset: the runner's reset on the targets whose VM runs.
 

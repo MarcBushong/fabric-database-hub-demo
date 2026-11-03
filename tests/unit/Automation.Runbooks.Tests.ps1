@@ -35,21 +35,39 @@ BeforeAll {
         return [pscustomobject]@{ StatusCode = $Status; Body = $body; Error = $(if ($Status -ge 400) { 'HTTP {0}' -f $Status } else { '' }) }
     }
 
-    # A small Azure: the VMs' power states, T3, T4, the auto-stop schedule, and the control account's jobs.
+    # A small Azure: the VMs' power states, T3, T4, the auto-stop and monitoring re-check schedules and their links,
+    # the control account's jobs, T1's monitoring plugin, and a clock that Start-Sleep moves.
     function Reset-TestAzure {
         $script:calls = [System.Collections.Generic.List[object]]::new()
+        $script:clock = [datetime]::new(2026, 10, 27, 15, 0, 0, [System.DateTimeKind]::Utc)
         $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        # Minutes from a VM's start until it runs, by VM name; without an entry, it runs at once.
+        $script:vmStartMinutes = @{}
+        $script:vmRunningAt = @{}
         $script:t4 = ''
         $script:t3 = 200
         $script:group = 200
         $script:jobs = @()
         $script:autostop = ''
+        $script:rechecks = @{}
+        $script:links = [System.Collections.Generic.List[object]]::new()
+        # T1's plugin state, or a script block that returns it for the clock; '' means the agent reports no plugin
+        # status yet.
         $script:plugin = 'Running'
+        $script:flag = $true
+        $script:restartedAt = $null
         $script:runCommandStatus = 201
         $script:t4ActionStatus = 202
         # Run Commands listed on a VM, by VM name; without an entry, the earlier run's DbHubControl-<vm>-20261026000000
         # and someone else's DbHubDemo-Other, without instance views.
         $script:runCommands = @{}
+    }
+
+    function Get-TestVmState([string] $Name) {
+        if ($script:vm[$Name] -eq 'starting' -and $script:vmRunningAt.ContainsKey($Name) -and $script:clock -ge $script:vmRunningAt[$Name]) {
+            $script:vm[$Name] = 'running'
+        }
+        return $script:vm[$Name]
     }
 
     function Invoke-TestAzure([string] $Method, [string] $Path, [object] $Body) {
@@ -69,16 +87,55 @@ BeforeAll {
                 if ($Method -eq 'PUT') { $script:autostop = [string]$Body.properties.startTime; return (New-Response 201 '{}') }
                 if ($Method -eq 'DELETE') { $script:autostop = ''; return (New-Response 200) }
             }
-            '/jobSchedules$' { return (New-Response 200 '{"value":[]}') }
-            '/jobSchedules/' { return (New-Response 201 '{}') }
+            '/schedules/(dbhub-monitor-\d+)$' {
+                $name = $Matches[1]
+                if ($Method -eq 'PUT') { $script:rechecks[$name] = [string]$Body.properties.startTime; return (New-Response 201 '{}') }
+                if ($Method -eq 'DELETE') {
+                    if (-not $script:rechecks.ContainsKey($name)) { return (New-Response 404) }
+                    $script:rechecks.Remove($name); return (New-Response 200)
+                }
+                if ($script:rechecks.ContainsKey($name)) { return (New-Response 200 '{}') }
+                return (New-Response 404)
+            }
+            '/jobSchedules$' {
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($script:links | ForEach-Object { @{ properties = @{ jobScheduleId = $_.Id; schedule = @{ name = $_.Schedule }; runbook = @{ name = $_.Runbook } } } }) } -Depth 8))
+            }
+            '/jobSchedules/([0-9a-f-]{36})$' {
+                $id = $Matches[1]
+                if ($Method -eq 'PUT') {
+                    $script:links.Add([pscustomobject]@{ Id = $id; Schedule = [string]$Body.properties.schedule.name; Runbook = [string]$Body.properties.runbook.name; Parameters = $Body.properties.parameters })
+                    return (New-Response 201 '{}')
+                }
+                if ($Method -eq 'DELETE') {
+                    $script:links = [System.Collections.Generic.List[object]]@($script:links | Where-Object Id -NE $id)
+                    return (New-Response 200)
+                }
+                return (New-Response 404)
+            }
             '/virtualMachines/(\w+)/instanceView$' {
                 $name = $Matches[1]
-                return (New-Response 200 (ConvertTo-Json -InputObject @{ statuses = @(@{ code = 'ProvisioningState/succeeded' }, @{ code = ('PowerState/{0}' -f $script:vm[$name]) }) } -Depth 4))
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ statuses = @(@{ code = 'ProvisioningState/succeeded' }, @{ code = ('PowerState/{0}' -f (Get-TestVmState $name)) }) } -Depth 4))
             }
-            '/virtualMachines/(\w+)/start$' { $script:vm[$Matches[1]] = 'running'; return (New-Response 202) }
+            '/virtualMachines/(\w+)/start$' {
+                $name = $Matches[1]
+                if ($script:vmStartMinutes.ContainsKey($name)) {
+                    $script:vm[$name] = 'starting'
+                    $script:vmRunningAt[$name] = $script:clock.AddMinutes($script:vmStartMinutes[$name])
+                }
+                else {
+                    $script:vm[$name] = 'running'
+                }
+                return (New-Response 202)
+            }
             '/virtualMachines/(\w+)/deallocate$' { $script:vm[$Matches[1]] = 'deallocating'; return (New-Response 202) }
             '/extensions/SqlIaasExtension' {
-                return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ instanceView = @{ statuses = @(@{ message = ('DatabaseMonitorArcPlugin: {{"State":"{0}","MetricsUploadStatus":"OK"}}' -f $script:plugin) }) } } } -Depth 6))
+                $state = if ($script:plugin -is [scriptblock]) { & $script:plugin } else { [string]$script:plugin }
+                $statuses = @(@{ code = 'ProvisioningState/succeeded'; message = 'SQL Server IaaS Agent is running.' })
+                if ($state) {
+                    $statuses += @{ message = ('DatabaseMonitorArcPlugin: {{"State":"{0}","MetricsUploadStatus":"OK"}}' -f $state) }
+                }
+                $flags = @(@{ Name = 'DatabaseWatcheronAzureVM'; Enable = $script:flag })
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ settings = @{ FeatureFlags = $flags }; instanceView = @{ statuses = $statuses } } } -Depth 8))
             }
             '/virtualMachines/(\w+)/runCommands(\?\$expand=instanceView)?$' {
                 if ($script:runCommands.ContainsKey($Matches[1])) {
@@ -87,7 +144,10 @@ BeforeAll {
                 return (New-Response 200 ('{{"value":[{{"name":"DbHubControl-{0}-20261026000000"}},{{"name":"DbHubDemo-Other"}}]}}' -f $Matches[1]))
             }
             '/runCommands/' {
-                if ($Method -eq 'PUT') { return (New-Response $script:runCommandStatus '{}') }
+                if ($Method -eq 'PUT') {
+                    if ($Path -match '/runCommands/DbHubControl-monitoring-' -and $script:runCommandStatus -in 200, 201) { $script:restartedAt = $script:clock }
+                    return (New-Response $script:runCommandStatus '{}')
+                }
                 return (New-Response 202)
             }
             '/servers/azuresql01-abc123/databases/ContosoCare$' { return (New-Response $script:t3 '{}') }
@@ -221,11 +281,13 @@ Describe 'DbHub-Control run planning (Get-DbHubRunPlan)' {
 }
 
 Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' {
+    # Start-Sleep moves the fake clock (Get-DbHubUtcNow), so the run's waits take no real time.
     BeforeEach {
         Reset-TestAzure
-        Mock Start-Sleep { }
+        Mock Get-DbHubUtcNow { return $script:clock }
+        Mock Start-Sleep { $script:clock = $script:clock.AddSeconds($Seconds) }
         Mock Invoke-DbHubArm {
-            $script:calls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body })
+            $script:calls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body; At = $script:clock })
             return (Invoke-TestAzure -Method $Method -Path $Path -Body $Body)
         }
     }
@@ -293,15 +355,161 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         $t1 = $requests | Where-Object target -EQ 'T1'
         $t1.arguments | Should -Be @('profile', 'set', '--name', 'incident:blocking-chain', '--duration', '30m', '--not-after', '{{NEXT_SHUTDOWN}}', '--concurrency', '2', '--intensity', '7', '--requested-by', 'notebook/aaaaaaaa')
         ($requests | Where-Object target -EQ 'T3').arguments | Should -Be @('profile', 'set', '--name', 'baseline', '--duration', '45m', '--not-after', '{{NEXT_SHUTDOWN}}', '--requested-by', 'notebook/aaaaaaaa')
-        $single = InModuleScope -ModuleName DbHubDemo -Parameters @{ Request = [ordered]@{ target = 'T1'; arguments = @($t1.arguments); timeoutSeconds = 600 } } { Get-DemoWorkloadControlScript -Action Runner -Request $Request }
+        $single = InModuleScope -ModuleName DbHubDemo -Parameters @{ Request = [ordered]@{ target = 'T1'; arguments = @($t1.arguments); timeoutSeconds = 300; readySeconds = 600 } } { Get-DemoWorkloadControlScript -Action Runner -Request $Request }
         $sqlvmScript.Contains($single) | Should -BeTrue
     }
 
     It 'restarts T1''s monitoring plugin when it isn''t running, as start-demo.ps1 does' {
         $script:plugin = 'NotRunning'
-        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
         $restart = $script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' }
         $restart.Body.properties.source.script | Should -Match "Restart-Service -Name 'SQLIaaSExtension'"
+        # It reads the plugin again after the restart, for at most monitoring.verifyMinutes.
+        $result.monitoring | Should -Be 'StillNotRunning'
+        $result.message | Should -Match 'still didn''t run after its restart'
+        ($script:clock - $restart.At).TotalMinutes | Should -BeGreaterOrEqual 5
+        ($script:clock - $restart.At).TotalMinutes | Should -BeLessThan 6
+    }
+
+    It 'waits for the plugin''s first status, and leaves a plugin that then runs alone (live, 2026-11-03)' {
+        # Right after a start the agent reports no plugin status yet; a restart then left the plugin NotRunning for
+        # hours (2026-10-26), and reading it once and moving on sent no restart at all (2026-11-03).
+        $script:pluginAt = $script:clock.AddMinutes(3)
+        $script:plugin = { if ($script:clock -lt $script:pluginAt) { '' } else { 'Running' } }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        $result.monitoring | Should -Be 'Running'
+        $result.message | Should -Match 'monitoring plugin runs'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Method -eq 'GET' -and $_.Path -match '/extensions/SqlIaasExtension' }).Count | Should -BeGreaterThan 1
+    }
+
+    It 'restarts the plugin''s agent when the plugin reports no status for 5 minutes, then sees it run' {
+        $start = $script:clock
+        $script:plugin = { if ($null -ne $script:restartedAt -and $script:clock -ge $script:restartedAt.AddMinutes(2)) { 'Running' } else { '' } }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Restarted'
+        $result.message | Should -Match 'was restarted and runs'
+        $restart = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-20261027150000$' })
+        $restart.Count | Should -Be 1
+        ($restart[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 5
+        ($restart[0].At - $start).TotalMinutes | Should -BeLessThan 6
+        # The activity went out first: the plugin never holds back a dispatch.
+        (@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-sqlvm01-' })[0].At) | Should -Be $start
+    }
+
+    It 'leaves the plugin alone when performance monitoring isn''t turned on' {
+        $script:flag = $false
+        $script:plugin = 'NotRunning'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'NotSelected'
+        @($script:calls | Where-Object { $_.Path -match '/runCommands/DbHubControl-monitoring-' }) | Should -BeNullOrEmpty
+    }
+
+    It 'neither reads the plugin nor schedules re-checks for a run that doesn''t use sqlvm01' {
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T2'; scenario = 'baseline' }); durationMinutes = 120 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        $result.monitoring | Should -BeNullOrEmpty
+        @($result.rechecks) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Path -match '/extensions/|/schedules/dbhub-monitor-' -and $_.Method -ne 'DELETE' }) | Should -BeNullOrEmpty
+    }
+
+    It 'checks the plugin again every 30 minutes of a long run, and Stop now takes the re-checks away' {
+        # Live, 2026-10-30: the plugin stopped again within 90 minutes after a start; a run lasts up to 120.
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 120 }) -Context (New-TestContext)
+        @($result.rechecks) | Should -Be @('dbhub-monitor-1', 'dbhub-monitor-2', 'dbhub-monitor-3')
+        $script:rechecks['dbhub-monitor-1'] | Should -Be '2026-10-27T15:30:00Z'
+        $script:rechecks['dbhub-monitor-3'] | Should -Be '2026-10-27T16:30:00Z'
+        $monitors = @($script:links | Where-Object Runbook -EQ 'DbHub-Monitor')
+        $monitors.Count | Should -Be 3
+        foreach ($link in $monitors) {
+            $link.Parameters | Should -BeNullOrEmpty
+        }
+        # A short run gets none: its end comes before the first re-check.
+        $script:autostop = ''
+        $short = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        @($short.rechecks) | Should -BeNullOrEmpty
+        $script:rechecks.Count | Should -Be 0 -Because 'the next run removes the last run''s re-checks with its auto-stop'
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 120 }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 15, 40, 0, [System.DateTimeKind]::Utc)))
+        $script:rechecks.Count | Should -Be 3
+        $stop = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop' }) -Context (New-TestContext)
+        $stop.status | Should -Be 'Stopped'
+        $script:rechecks.Count | Should -Be 0
+        @($script:links) | Should -BeNullOrEmpty
+    }
+
+    It 'dispatches each VM as soon as it runs: T1 and T3 don''t wait for T2''s host (live, 2026-11-03)' {
+        $start = $script:clock
+        $script:vmStartMinutes = @{ archost01 = 6 }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }, @{ target = 'T2'; scenario = 'baseline' }, @{ target = 'T3'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        @($result.dispatched).Count | Should -Be 3
+        $sqlvm = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/sqlvm01/runCommands/DbHubControl-sqlvm01-' })
+        $archost = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/archost01/runCommands/DbHubControl-archost01-' })
+        $sqlvm[0].At | Should -Be $start
+        ($archost[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 6
+        ($archost[0].At - $start).TotalMinutes | Should -BeLessThan 7
+    }
+
+    It 'skips the activities of a VM that isn''t running after 15 minutes, and still sends the others' {
+        $script:vmStartMinutes = @{ archost01 = 30 }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }, @{ target = 'T2'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        @($result.dispatched) | Should -Be @('T1: baseline for 20 minutes')
+        ($result.skipped -join '; ') | Should -Match 'T2 \(archost01 isn''t running yet\)'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/archost01/runCommands/' }) | Should -BeNullOrEmpty
+    }
+
+    It 'sends T4''s activity on its own once T4 is Ready, without holding back T1 and T3 (live, 2026-11-03)' {
+        $start = $script:clock
+        $script:t4 = 'Stopped'
+        $script:t4ReadyAt = $start.AddMinutes(8)
+        Mock Get-DbHubT4 { return [pscustomobject]@{ Name = 'pgflex01-abc123'; State = $(if ($script:t4 -eq 'Starting' -and $script:clock -ge $script:t4ReadyAt) { 'Ready' } else { $script:t4 }) } }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'cpu-pressure' }, @{ target = 'T3'; scenario = 'baseline' }, @{ target = 'T4'; scenario = 'idle-in-transaction' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        @($result.dispatched).Count | Should -Be 3
+        @($result.skipped) | Should -BeNullOrEmpty
+        $decode = { param($Call) @([regex]::Matches($Call.Body.properties.source.script, "-RequestBase64 '([A-Za-z0-9+/=]+)'") | ForEach-Object { ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_.Groups[1].Value)) | ConvertFrom-Json).target }) }
+        $first = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-sqlvm01-20261027150000$' })
+        $late = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-sqlvm01-t4-20261027150000$' })
+        $first[0].At | Should -Be $start
+        & $decode $first[0] | Should -Be @('T1', 'T3')
+        & $decode $late[0] | Should -Be @('T4')
+        ($late[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 8
+        ($late[0].At - $start).TotalMinutes | Should -BeLessThan 9
+        # The late dispatch keeps the run's first Run Command: only the earlier run's are deleted.
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/runCommands/DbHubControl-sqlvm01-(t4-)?20261027150000$' }) | Should -BeNullOrEmpty
+    }
+
+    It 'skips T4 when it isn''t Ready after 20 minutes, while T1 went out at once' {
+        $start = $script:clock
+        $script:t4 = 'Stopped'
+        Mock Get-DbHubT4 { return [pscustomobject]@{ Name = 'pgflex01-abc123'; State = $script:t4 } }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }, @{ target = 'T4'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        @($result.dispatched) | Should -Be @('T1: baseline for 20 minutes')
+        ($result.skipped -join '; ') | Should -Match 'T4 \(pgflex01-abc123 isn''t Ready yet\)'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-sqlvm01-' })[0].At | Should -Be $start
+        @($script:calls | Where-Object { $_.Path -match '-t4-' }) | Should -BeNullOrEmpty
+        ($script:clock - $start).TotalMinutes | Should -BeGreaterOrEqual 20
+        ($script:clock - $start).TotalMinutes | Should -BeLessThan 21
+    }
+
+    It 'sends each request its readiness bound, and gives each Run Command the time its waits can take' {
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'blocking-chain' }, @{ target = 'T2'; scenario = 'baseline' }, @{ target = 'T3'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $decode = { param($Call) @([regex]::Matches($Call.Body.properties.source.script, "-RequestBase64 '([A-Za-z0-9+/=]+)'") | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_.Groups[1].Value)) | ConvertFrom-Json }) }
+        $archost = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/archost01/runCommands/DbHubControl-archost01-' })[0]
+        $t2 = & $decode $archost
+        $t2.target | Should -Be 'T2'
+        $t2.readySeconds | Should -Be 1200
+        $t2.timeoutSeconds | Should -Be 300
+        # 5 minutes, plus T2's readiness bound and runner timeout, plus the 12-minute heartbeat wait in front of it.
+        $archost.Body.properties.timeoutInSeconds | Should -Be (300 + 1200 + 300 + 720)
+        $sqlvm = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/sqlvm01/runCommands/DbHubControl-sqlvm01-' })[0]
+        @(& $decode $sqlvm | ForEach-Object readySeconds) | Should -Be @(600, 600)
+        $sqlvm.Body.properties.timeoutInSeconds | Should -Be (300 + 2 * (600 + 300))
+        # Clear-DbHubOldRunCommand counts a Run Command as finished an hour after the time in its name.
+        Get-DbHubRunCommandTimeout -Request @(1..9 | ForEach-Object { @{ target = 'T2'; readySeconds = 1200; timeoutSeconds = 300 } }) | Should -Be 3000
     }
 
     It 'skips T3 when it isn''t deployed and still runs the rest' {
@@ -456,6 +664,63 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
     }
 }
 
+Describe 'DbHub-Monitor (Invoke-DbHubMonitor) against a mocked Azure Resource Manager' {
+    BeforeEach {
+        Reset-TestAzure
+        Mock Get-DbHubUtcNow { return $script:clock }
+        Mock Start-Sleep { $script:clock = $script:clock.AddSeconds($Seconds) }
+        Mock Invoke-DbHubArm {
+            $script:calls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body; At = $script:clock })
+            return (Invoke-TestAzure -Method $Method -Path $Path -Body $Body)
+        }
+    }
+
+    It 'does nothing <Case>' -ForEach @(
+        @{ Case = 'once the run has ended (no auto-stop is pending)'; Setup = { $script:vm['sqlvm01'] = 'running' } }
+        @{ Case = 'when the run''s auto-stop time has passed'; Setup = { $script:vm['sqlvm01'] = 'running'; $script:autostop = '2026-10-27T15:05:00Z' } }
+        @{ Case = 'while sqlvm01 doesn''t run'; Setup = { $script:autostop = '2026-10-27T16:40:00Z' } }
+    ) {
+        $script:plugin = 'NotRunning'
+        & $Setup
+        $result = Invoke-DbHubMonitor -Context (New-TestContext)
+        $result.status | Should -Be 'Skipped'
+        @($script:calls | Where-Object { $_.Method -ne 'GET' -or $_.Path -match '/extensions/' }) | Should -BeNullOrEmpty
+    }
+
+    It 'restarts the plugin''s agent during a run when the plugin has stopped, and starts or stops nothing' {
+        $script:vm['sqlvm01'] = 'running'
+        $script:autostop = '2026-10-27T16:40:00Z'
+        $script:plugin = { if ($null -ne $script:restartedAt) { 'Running' } else { 'NotRunning' } }
+        $result = Invoke-DbHubMonitor -Context (New-TestContext)
+        $result.status | Should -Be 'Checked'
+        $result.monitoring | Should -Be 'Restarted'
+        $writes = @($script:calls | Where-Object Method -NE 'GET')
+        $writes.Count | Should -Be 1
+        $writes[0].Path | Should -Match '/sqlvm01/runCommands/DbHubControl-monitoring-20261027150000$'
+        $writes[0].Body.properties.source.script | Should -Match "Restart-Service -Name 'SQLIaaSExtension'"
+    }
+
+    It 'leaves a running plugin alone' {
+        $script:vm['sqlvm01'] = 'running'
+        $script:autostop = '2026-10-27T16:40:00Z'
+        $result = Invoke-DbHubMonitor -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Running'
+        @($script:calls | Where-Object Method -NE 'GET') | Should -BeNullOrEmpty
+    }
+
+    It 'reports a plugin that still doesn''t run after the restart, within its bound' {
+        $script:vm['sqlvm01'] = 'running'
+        $script:autostop = '2026-10-27T16:40:00Z'
+        $script:plugin = 'NotRunning'
+        $start = $script:clock
+        $result = Invoke-DbHubMonitor -Context (New-TestContext)
+        $result.status | Should -Be 'Partial'
+        $result.monitoring | Should -Be 'StillNotRunning'
+        $result.message | Should -Match 'start-demo\.ps1'
+        ($script:clock - $start).TotalMinutes | Should -BeLessThan 11
+    }
+}
+
 Describe 'Invoke-DbHubArm''s requests' {
     BeforeEach {
         $script:sent = $null
@@ -486,7 +751,7 @@ Describe 'Invoke-DbHubArm''s requests' {
 }
 
 Describe 'The published runbooks' {
-    It '<_> is self-contained: settings and the shared code in place of its markers, ASCII, and it parses' -ForEach @('DbHub-Control', 'DbHub-Stop') {
+    It '<_> is self-contained: settings and the shared code in place of its markers, ASCII, and it parses' -ForEach @('DbHub-Control', 'DbHub-Stop', 'DbHub-Monitor') {
         $content = InModuleScope -ModuleName DbHubDemo -Parameters @{ Name = $_; Json = $script:settingsJson } { Get-DemoActivityControlRunbookContent -Name $Name -Setting ($Json | ConvertFrom-Json -AsHashtable) }
         $content | Should -Not -Match '__DBHUB_SETTINGS__'
         $content | Should -Not -Match '# __DBHUB_COMMON__'
