@@ -21,8 +21,11 @@ function Get-DemoEnvironmentStatus {
     - STATUS.T3: whether T3 exists and its status (Online, Paused); Not selected after stop-demo.ps1 -RemoveT3.
     - STATUS.T4 (Phase 24, ADR 0019): T4's state; while it runs, its live Azure Monitor metrics from the last
       15 minutes (CPU, memory, connections, CPU credits, and the enhanced metrics: sessions by state and by
-      wait event type, the oldest transaction, deadlocks); while it's stopped, when it starts on its own (seven
-      days after the stop in the activity log; a Warning within a day). STATUS.PROFILE_T4 is its activity
+      wait event type, the oldest transaction, deadlocks); while it's stopped, when Azure starts it again on its own (seven
+      days after the stop in the activity log; a Warning within a day), what it then bills at its own size (the Retail
+      Prices API), and whether the on-demand control's daily safety stop stops it again or nothing does (Phase 28
+      follow-up); a General Purpose T4 says so, and when the fallback chose it, with its hourly list price.
+      STATUS.PROFILE_T4 is its activity
       profile, and with -Detail STATUS.T4.LIVE is T1's runner's live view of T4 (connections against
       max_connections, sessions by state, blockers, the oldest transaction, deadlocks).
     - T1.SQLVM.ASSOCIATEDSERVICES (Phase 7, read-only): the SQL Server instances unified inventory lists for
@@ -194,40 +197,61 @@ function Get-DemoEnvironmentStatus {
         $results.Add((New-DemoResult -CheckId 'STATUS.T3' -Area 't3' -Target 'T3' -Status 'Not selected' -Message ('T3 ({0}) doesn''t exist; start-demo.ps1 recreates it under the same names.' -f $t3.ServerName)))
     }
 
-    # T4 (Phase 24, ADR 0019): its state, its live Azure Monitor metrics with the enhanced ones while it runs,
-    # and when a stopped server starts on its own.
+    # T4 (Phase 24, ADR 0019): its state, its live Azure Monitor metrics with the enhanced ones while it runs, and when a
+    # stopped server starts on its own. Its size is the server's own, or the one the fallback recorded (Phase 28 follow-up):
+    # a General Purpose T4 says so with its hourly list price, and a stopped one says when Azure starts it again (the stop
+    # time plus 7 days), what it then bills, and whether anything here stops it again (Format-DemoT4RestartText).
     $t4 = $null
     $t4Ready = $false
-    if (-not (Test-DemoT4Enabled -Config $Config)) {
-        $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Not selected' -Message 'T4 is off in this configuration (t4Enabled is false).'))
+    $t4Config = Resolve-DemoEffectiveConfig -Config $Config -State $state
+    if (-not (Test-DemoT4Enabled -Config $t4Config)) {
+        $t4Why = if (Test-DemoT4Enabled -Config $Config) { Get-DemoT4OffReason -Config $Config -State $state } else { 'T4 is off in this configuration (t4Enabled is false).' }
+        $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Not selected' -Message $t4Why))
     }
     else {
-        $t4 = Get-DemoT4State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $t4 = Get-DemoT4State -Config $t4Config -DeploymentId ([string]$state.Tags['deploymentId'])
         $t4Docs = (Get-DemoPostgresSetting)['docUrls']
+        $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4 -Name 'Server')
+        $t4Sku = if ($t4ServerSku) { $t4ServerSku } else { Get-DemoT4SkuName -Config $t4Config }
+        $t4GeneralPurpose = (Get-DemoT4SkuSpec -SkuName $t4Sku).Tier -eq 'GeneralPurpose'
+        $t4Origin = if (Test-DemoT4FallbackSize -Config $Config -State $state) { ', which the fallback chose because Azure refused the Burstable sizes here' } else { '' }
         if (-not $t4.Exists) {
-            $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Not selected' -Message ('T4 ({0}) doesn''t exist; deploy.ps1 creates it.' -f $t4.Names.ServerName)))
+            # A size the fallback chose but didn't create yet is said as that, never as created (review of 20e855c).
+            $chosen = if ($t4Origin) { ' as General Purpose {0}{1}, after checking its price against the ceilings again' -f $t4Sku, $t4Origin } else { '' }
+            $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Not selected' -Message ('T4 ({0}) doesn''t exist; deploy.ps1 creates it{1}.' -f $t4.Names.ServerName, $chosen)))
         }
         elseif ($t4.State -eq 'Ready') {
             $t4Ready = $true
             $snapshot = Get-DemoT4MetricSnapshot -Config $Config -ServerId $t4.Names.ServerId -Minutes 15
-            $evidence = [ordered]@{ state = $t4.State; latestUtc = $snapshot.LatestUtc; latest = $snapshot.Latest; sessionsByState = $snapshot.ByState; sessionsByWaitEventType = $snapshot.ByWaitEventType }
-            $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Pass' -Message ('{0} is running: {1} (Azure Monitor, last 15 minutes; Database Hub''s PostgreSQL dashboard charts the same metrics).' -f $t4.Names.ServerName, (Format-DemoT4MetricText -Snapshot $snapshot)) -Evidence $evidence -DocUrl ([string]$t4Docs['hubMonitor'])))
+            $evidence = [ordered]@{ state = $t4.State; latestUtc = $snapshot.LatestUtc; latest = $snapshot.Latest; sessionsByState = $snapshot.ByState; sessionsByWaitEventType = $snapshot.ByWaitEventType; skuName = $t4Sku }
+            $message = '{0} is running: {1} (Azure Monitor, last 15 minutes; Database Hub''s PostgreSQL dashboard charts the same metrics).' -f $t4.Names.ServerName, (Format-DemoT4MetricText -Snapshot $snapshot)
+            if ($t4GeneralPurpose) {
+                # What it bills while it runs, priced at run time (ADR 0016).
+                $hourly = Get-DemoT4HourlyPrice -Config $t4Config -SkuName $t4Sku
+                $evidence['hourlyUsd'] = $hourly
+                $message += ' It''s General Purpose {0}{1}: {2} while it runs.' -f $t4Sku, $t4Origin, $(if ($null -ne $hourly) { [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, 'about {0:N3} USD an hour (list price)', [double]$hourly) } else { 'its hourly list price couldn''t be read just now' })
+            }
+            $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Pass' -Message $message -Evidence $evidence -DocUrl ([string]$t4Docs['hubMonitor'])))
         }
         elseif ($t4.State -eq 'Stopped') {
             $days = [int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays']
             $stopped = Get-DemoT4StoppedUtc -Config $Config -ServerId $t4.Names.ServerId -NowUtc $NowUtc
+            # What the restart bills, priced at run time (ADR 0016), and whether the on-demand control's daily safety stop
+            # stops it again: its schedule, not only control.enabled (review of 20e855c).
+            $hourly = Get-DemoT4HourlyPrice -Config $t4Config -SkuName $t4Sku
+            $safety = Get-DemoT4SafetyStopState -Config $Config
+            $safetyStop = $safety.State -eq 'Scheduled'
+            $size = if ($t4GeneralPurpose) { ' It''s General Purpose {0}{1}.' -f $t4Sku, $t4Origin } else { '' }
             if ($null -ne $stopped) {
                 $restart = $stopped.AddDays($days)
                 $hoursLeft = ($restart - [DateTime]::SpecifyKind($NowUtc, [System.DateTimeKind]::Utc)).TotalHours
                 $soon = $hoursLeft -lt 24
-                # What the restart bills, priced at run time (ADR 0016); a scheduled daily stop of T4 caps it once it's live.
-                $hourly = Get-DemoT4HourlyPrice -Config $Config
-                $billing = if ($null -ne $hourly) { ' It then bills compute at about {0:N2} USD an hour ({1}, list price) until it''s stopped, unless a scheduled daily stop of T4 stops it first.' -f $hourly, (Get-DemoT4SkuName -Config $Config) } else { ' It then bills compute at its size until it''s stopped, unless a scheduled daily stop of T4 stops it first.' }
-                $message = ('{0} is stopped since {1:yyyy-MM-dd HH:mm} UTC; it starts on its own at {2:yyyy-MM-dd HH:mm} UTC unless it''s stopped again before then.' -f $t4.Names.ServerName, $stopped, $restart) + $billing
-                $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status $(if ($soon) { 'Warning' } else { 'Pass' }) -Message $message -Evidence ([ordered]@{ state = $t4.State; stoppedUtc = $stopped.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); autoStartUtc = $restart.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); hourlyUsd = $hourly; skuName = (Get-DemoT4SkuName -Config $Config) }) -Remediation $(if ($soon) { 'Run stop-demo.ps1 again after it starts, or start-demo.ps1 for a session; the 7-day restart bills compute until the next stop.' } else { '' }) -DocUrl ([string]$t4Docs['stopServer'])))
+                $message = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0} is stopped since {1:yyyy-MM-dd HH:mm} UTC. ', $t4.Names.ServerName, $stopped.ToUniversalTime()) + (Format-DemoT4RestartText -RestartUtc $restart -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State) + $size
+                $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status $(if ($soon) { 'Warning' } else { 'Pass' }) -Message $message -Evidence ([ordered]@{ state = $t4.State; stoppedUtc = $stopped.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); autoStartUtc = $restart.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); hourlyUsd = $hourly; skuName = $t4Sku; dailySafetyStop = $safetyStop; safetyStop = $safety.State }) -Remediation $(if ($soon) { 'Run stop-demo.ps1 again after it starts, or start-demo.ps1 for a session; the 7-day restart bills compute until the next stop.' } else { '' }) -DocUrl ([string]$t4Docs['stopServer'])))
             }
             else {
-                $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Pass' -Message ('{0} is stopped; it starts on its own {1} days after it was stopped (the stop isn''t in the last 8 days of the activity log).' -f $t4.Names.ServerName, $days) -Evidence ([ordered]@{ state = $t4.State }) -DocUrl ([string]$t4Docs['stopServer'])))
+                $message = ('{0} is stopped; the stop isn''t in the last 8 days of the activity log. ' -f $t4.Names.ServerName) + (Format-DemoT4RestartText -RestartUtc $null -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State) + $size
+                $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Pass' -Message $message -Evidence ([ordered]@{ state = $t4.State; hourlyUsd = $hourly; skuName = $t4Sku; dailySafetyStop = $safetyStop; safetyStop = $safety.State }) -DocUrl ([string]$t4Docs['stopServer'])))
             }
         }
         else {

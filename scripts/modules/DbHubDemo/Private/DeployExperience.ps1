@@ -591,26 +591,54 @@ function Get-DemoBillingNote {
 }
 
 function Get-DemoT4OffReason {
-    # Why T4 isn't deployed, or '' when it is (brief item 16): t4Enabled false in the configuration, or the Burstable
-    # fallback (Phase 28) found no size Azure accepts. Decided from the effective configuration, as the deployment
-    # decides (Resolve-DemoEffectiveConfig), so a t4SkuName the configuration sets wins over a recorded "no T4" (review
-    # finding 5). Pure. Internal.
+    <#
+    Why T4 isn't deployed, or '' when it is (brief item 16): t4Enabled false in the configuration, or T4's fallback (Phase
+    28 and its follow-up) left it out. Azure refused both Burstable sizes, and the General Purpose fallback,
+    Standard_D2ds_v5, was left out by its cost check or isn't deployed yet (DbHubT4Sku None: with this run's reason and
+    fix from -Result's DEPLOY.T4.SKU or PREFLIGHT.T4.FALLBACK when it has one), or Azure refused it too (Refused). Decided
+    from the effective configuration, as the deployment decides (Resolve-DemoEffectiveConfig), so a t4SkuName the
+    configuration sets wins over a recorded "no T4" (review finding 5). Pure. Internal.
+    #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [System.Collections.IDictionary] $Config = @{},
 
         [AllowNull()]
-        [object] $State
+        [object] $State,
+
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
     )
 
-    if (-not (Test-DemoT4Enabled -Config $Config)) {
+    $resolved = $Config.Contains('t4SkuSource') -and -not [string]::IsNullOrWhiteSpace([string]$Config['t4SkuSource'])
+    if (-not (Test-DemoT4Enabled -Config $Config) -and -not $resolved) {
         return 'T4 (Azure Database for PostgreSQL) isn''t deployed: t4Enabled is false in your configuration.'
     }
-    if (-not (Test-DemoT4Enabled -Config (Resolve-DemoEffectiveConfig -Config $Config -State $State))) {
-        return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both Burstable sizes, Standard_B1ms and Standard_B2s, in {0} (SkuNotAvailable). To add it, set t4SkuName to Standard_D2ds_v5 (General Purpose; DEPLOY.T4.SKU gives its price), then run ./scripts/deploy.ps1.' -f [string]$Config['location'])
+    if (Test-DemoT4Enabled -Config (Resolve-DemoEffectiveConfig -Config $Config -State $State)) {
+        return ''
     }
-    return ''
+    $location = [string]$Config['location']
+    if ([string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') -ceq 'Refused') {
+        return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both Burstable sizes, Standard_B1ms and Standard_B2s, and the General Purpose fallback, Standard_D2ds_v5, in {0} (SkuNotAvailable), so nothing is tried again on its own. To add it, ask for access with a Region access request (Learn: Resolve capacity errors), then set t4SkuName and run ./scripts/deploy.ps1.' -f $location)
+    }
+    # The fallback's cost check left it out (Phase 28 follow-up): this run's own reason, with the numbers, when it has one.
+    $skipped = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -in 'DEPLOY.T4.SKU', 'PREFLIGHT.T4.FALLBACK' -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'skipReason') -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'startSku') -ceq 'None' }) | Select-Object -Last 1
+    if ($null -ne $skipped) {
+        $evidence = Get-DemoMemberValue -InputObject $skipped -Name 'evidence'
+        $cost = [pscustomobject]@{
+            SkipReason          = [string](Get-DemoMemberValue -InputObject $evidence -Name 'skipReason')
+            HourlyUsd           = Get-DemoMemberValue -InputObject $evidence -Name 'hourlyUsd'
+            MonthlyWorstCaseUsd = Get-DemoMemberValue -InputObject $evidence -Name 'monthlyWorstCaseUsd'
+            MonthlyCeilingUsd   = Get-DemoMemberValue -InputObject $evidence -Name 'monthlyCeilingUsd'
+            SessionUsd          = Get-DemoMemberValue -InputObject $evidence -Name 'sessionUsd'
+            SessionCeilingUsd   = Get-DemoMemberValue -InputObject $evidence -Name 'sessionCeilingUsd'
+            PriceError          = ''
+        }
+        $skip = Get-DemoT4SkipReason -Cost $cost
+        return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both Burstable sizes, Standard_B1ms and Standard_B2s, in {0} (SkuNotAvailable), and the General Purpose fallback, Standard_D2ds_v5, wasn''t created: {1}. {2}' -f $location, $skip.Because, $skip.Remediation)
+    }
+    return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both Burstable sizes, Standard_B1ms and Standard_B2s, in {0} (SkuNotAvailable), and the General Purpose fallback, Standard_D2ds_v5, isn''t deployed. deploy.ps1 checks it, price and ceilings first, whenever it deploys the template: run ./scripts/deploy.ps1 -FromStage Preflight.' -f $location)
 }
 
 function Get-DemoDoneRequirement {
@@ -979,7 +1007,9 @@ function Get-DemoDeploymentOutcome {
     <#
     .SYNOPSIS
     The one ending of a deploy.ps1 run (brief item 1): Kind Done, NotDone, or WhatIf, with Reason, Next (the single next
-    action), NextCommand (the exact command), Notes (what DONE states plainly: T4 off and why, Developer mode's T2),
+    action), NextCommand (the exact command), Notes (what DONE states plainly: T4 off and why, T4 on the General Purpose
+    fallback with its hourly price from -T4HourlyUsd, "created" only when -T4Created or this run's evidence shows the
+    server, Developer mode's T2),
     Optional (items that never block DONE), Unfinished (tracks that didn't finish), Missing (DONE requirements without a
     Pass), and ExitCode: 0 when DONE, 1 when NOT DONE with a Fail, 2 when NOT DONE otherwise; -WhatIfRun is 0 unless a
     check failed. Pure. Internal.
@@ -1032,7 +1062,20 @@ function Get-DemoDeploymentOutcome {
         # What this run started or created (Get-DemoStartedVm): a NOT DONE or stopped run names it, since it bills until
         # a stop (Phase 28).
         [AllowEmptyCollection()]
-        [string[]] $StartedVm = @()
+        [string[]] $StartedVm = @(),
+
+        # T4's hourly list price on the General Purpose fallback (Phase 28 follow-up), from the Azure Retail Prices API;
+        # the caller reads it, so this stays pure.
+        [AllowNull()]
+        [object] $T4HourlyUsd = $null,
+
+        # Whether T4's server exists (review of 20e855c): $true or $false from the caller's Servers - Get; $null takes
+        # this run's results and the T4 track's record (Get-DemoT4ServerEvidence). The fallback note says "created" only
+        # when it's $true, and -T4Why says why it isn't.
+        [AllowNull()]
+        [object] $T4Created = $null,
+
+        [string] $T4Why = ''
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
@@ -1045,10 +1088,17 @@ function Get-DemoDeploymentOutcome {
     $confirm = @(Get-DemoConfirmItem -Result $all)
     $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
     $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
-    $t4Off = Get-DemoT4OffReason -Config $Config -State $State
+    $t4Off = Get-DemoT4OffReason -Config $Config -State $State -Result $all
     $notes = [System.Collections.Generic.List[string]]::new()
     if ($t4Off) {
         $notes.Add($t4Off)
+    }
+    # Said loudly (Phase 28 follow-up): T4 runs on the General Purpose fallback, with its price; "created" only with
+    # evidence that the server exists (review of 20e855c).
+    $t4Created = if ($null -ne $T4Created) { [bool]$T4Created } else { Get-DemoT4ServerEvidence -Result $all -State $State }
+    $t4Fallback = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd $T4HourlyUsd -Created $t4Created -Why $T4Why
+    if ($t4Fallback) {
+        $notes.Add($t4Fallback)
     }
     if ($installMode -eq 'Developer') {
         $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. ProductKey or PaygWizard mode gives them.')

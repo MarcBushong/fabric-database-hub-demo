@@ -350,7 +350,7 @@ Describe 'Invoke-DemoTemplateDeployment' {
         $sku.remediation | Should -Match 'A size you set is never changed on its own'
     }
 
-    It 'falls back on its own from a refused Standard_B1ms to Standard_B2s, then to no T4, and records it, when the configuration doesn''t set the size (Phase 28)' {
+    It 'falls back on its own from a refused Standard_B1ms to Standard_B2s, then to General Purpose after its cost check, and records it, when the configuration doesn''t set the size (Phase 28 and its follow-up)' {
         $withT4 = New-TestConfig -WithT4
         $withT4.Contains('t4SkuName') | Should -BeFalse -Because 'the schema has no default for it'
         $script:sizes = [System.Collections.Generic.List[string]]::new()
@@ -360,8 +360,9 @@ Describe 'Invoke-DemoTemplateDeployment' {
         $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_B2s'; Zone = ''; TimeUtc = '2026-10-26T14:31:42Z' })
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -MockWith { if ($script:failures.Count -gt 0) { $script:failures.Dequeue() } else { $null } }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recordedSku.Add([string]$Value['T4Sku']) }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { $null }
-        # The template fails while T4 is in it (SkuNotAvailable) and succeeds without it.
+        # The cost check has its own tests (DbHubDemo.T4Fallback.Tests.ps1); here its worst case is over the monthly ceiling.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -MockWith { [pscustomobject]@{ Allowed = $false; SkipReason = 'MonthlyCeiling'; SkuName = 'Standard_D2ds_v5'; HourlyUsd = 0.5; T4MonthlyWorstCaseUsd = 400.0; MonthlyWorstCaseUsd = 600.0; SessionUsd = 9.0; MonthlyCeilingUsd = 250.0; SessionCeilingUsd = 15.0; DefenderIncluded = $true; Unpriced = @(); Location = 'westus3'; PriceError = '' } }
+        # The template fails while a Burstable T4 is in it (SkuNotAvailable) and succeeds without it.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
             $script:sizes.Add($(if ($Config['t4Enabled']) { if ($Config.Contains('t4SkuName')) { [string]$Config['t4SkuName'] } else { 'default' } } else { 'none' }))
             $script:templateFails = [bool]$Config['t4Enabled']
@@ -369,15 +370,16 @@ Describe 'Invoke-DemoTemplateDeployment' {
         }
         $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
         $deployment.Succeeded | Should -BeTrue
-        $script:sizes | Should -Be @('default', 'Standard_B2s', 'none')
+        $script:sizes | Should -Be @('default', 'Standard_B2s', 'none') -Because 'the cost check left the General Purpose size out before anything was sent'
         $script:recordedSku | Should -Be @('Standard_B2s', 'None')
         $deployment.T4Enabled | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly
         $fallbacks = @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' })
         @($fallbacks.status) | Should -Be @('Warning', 'Warning')
         $fallbacks[0].message | Should -Match 'tries Standard_B2s, the same Burstable class'
         $fallbacks[1].message | Should -Match 't4Enabled stays as you configured it'
-        $fallbacks[1].remediation | Should -Match '"t4SkuName": "Standard_D2ds_v5"'
-        $fallbacks[1].remediation | Should -Match 'dated example'
+        $fallbacks[1].remediation | Should -Match 'raise monthlyCeilingUsd to at least 600'
+        $deployment.T4Note | Should -Match 'T4 isn''t deployed'
         # The template keeps the choice in the resource group's tags too.
         $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
         ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Pass'
@@ -402,7 +404,7 @@ Describe 'Invoke-DemoTemplateDeployment' {
         @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).Count | Should -Be 0
     }
 
-    It 'clears a recorded "no T4" once a size is deployed, and when the configuration sets t4SkuName (review finding 5)' {
+    It 'clears a recorded "no T4" when the configuration sets t4SkuName, and keeps it for a configuration that isn''t resolved (review finding 5; Phase 28 follow-up)' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'abc123'; owner = 'your-alias'; DbHubT4Sku = 'None' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
             @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
@@ -415,10 +417,13 @@ Describe 'Invoke-DemoTemplateDeployment' {
         # The template carries the group's tags, so the stale record goes in them.
         $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be ''
 
-        # A T4 left on in a configuration without a size (a sequential run reads no record) clears it once it's deployed.
+        # Phase 28 follow-up: a configuration without a size that isn't resolved yet, as start-demo.ps1's T3 recreation
+        # passes it, follows the record: "no T4" stays, and nothing is created. Only deploy.ps1, which resolves it with
+        # -TemplateRuns, checks the General Purpose fallback again (DbHubDemo.T4Fallback.Tests.ps1).
         $script:deployCalls.Clear()
-        Invoke-DemoTemplateDeployment -Config (New-TestConfig -WithT4) -NetworkMode private -T3UseFreeLimit $false | Out-Null
-        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be ''
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -WithT4) -NetworkMode private -T3UseFreeLimit $false
+        $deployment.T4Enabled | Should -BeFalse
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
 
         # With T4 off, the record stays.
         $script:deployCalls.Clear()
@@ -1859,7 +1864,7 @@ Describe 'Get-DemoEnvironmentStatus' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4MetricSnapshot -Times 1 -Exactly -ParameterFilter { $Minutes -eq 15 }
     }
 
-    It 'says when a stopped T4 starts on its own, and warns within a day of it (Phase 24)' {
+    It 'says when a stopped T4 starts on its own, what it then bills, and warns within a day of it (Phase 24; Phase 28 follow-up)' {
         $script:t4Names = [pscustomobject]@{ ServerName = 'pgflex01-abc123'; ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = $script:t4Names; Exists = $true; State = 'Stopped'; Server = $null; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4StoppedUtc -MockWith { [datetime]::new(2026, 10, 20, 23, 0, 0, [System.DateTimeKind]::Utc) }
@@ -1868,16 +1873,71 @@ Describe 'Get-DemoEnvironmentStatus' {
         $results = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc))
         $t4 = $results | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Pass'
-        $t4.message | Should -BeLike 'pgflex01-abc123 is stopped since 2026-10-20 23:00 UTC; it starts on its own at 2026-10-27 23:00 UTC unless it''s stopped again before then.*'
-        $t4.message | Should -Match 'It then bills compute at about 0\.18 USD an hour \(Standard_B1ms, list price\) until it''s stopped, unless a scheduled daily stop of T4 stops it first\.'
+        $t4.message | Should -BeLike 'pgflex01-abc123 is stopped since 2026-10-20 23:00 UTC. Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, *'
+        $t4.message | Should -Match 'it then bills compute at about 0\.178 USD an hour \(Standard_B1ms, list price\) until it''s stopped again: nothing here stops it on its own'
         ([datetime]$t4.evidence.autoStartUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm', [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be '2026-10-27T23:00'
         $t4.evidence.hourlyUsd | Should -Be 0.178
+        $t4.evidence.dailySafetyStop | Should -BeFalse
 
         $results = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) -NowUtc ([datetime]::new(2026, 10, 27, 5, 0, 0, [System.DateTimeKind]::Utc))
         $t4 = $results | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Warning'
         $t4.remediation | Should -Match 'stop-demo\.ps1'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4MetricSnapshot -Times 0 -Exactly
+    }
+
+    It 'says a General Purpose T4 that the fallback chose, with its price, and when the daily safety stop stops a restarted one (Phase 28 follow-up)' {
+        $script:t4Names = [pscustomobject]@{ ServerName = 'pgflex01-abc123'; ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' }
+        $script:t4State = 'Stopped'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { New-TestState @{ Stage = 'Validation'; RunnerSha256 = $script:runnerSha; RunnerSentTo = @('sqlvm01', 'archost01'); T4Sku = 'Standard_D2ds_v5'; Tags = @{ deploymentId = 'abc123'; expiresOn = '2026-12-31' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = $script:t4Names; Exists = $true; State = $script:t4State; Server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4StoppedUtc -MockWith { [datetime]::new(2026, 10, 20, 23, 0, 0, [System.DateTimeKind]::Utc) }
+        # An obviously fake price, as the Retail Prices API would give it at run time.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { 0.5 }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlStatus -MockWith { New-TestResult 'STATUS.CONTROL' 'Pass' 'infra' 'subscription' }
+        # The daily safety stop's schedule, read as CONTROL.SAFETYSTOP reads it (review of 20e855c).
+        $script:safetyState = 'Scheduled'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:safetyState; NextRunUtc = $null } }
+        $config = New-TestConfig -WithT4
+        $config['control']['enabled'] = $true
+        $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.message | Should -Match 'Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the on-demand control''s daily safety stop stops it again, within a day\.'
+        $t4.message | Should -Match 'It''s General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the Burstable sizes here\.$'
+        $t4.evidence.dailySafetyStop | Should -BeTrue
+        $t4.evidence.safetyStop | Should -Be 'Scheduled'
+        $t4.evidence.skuName | Should -Be 'Standard_D2ds_v5'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -ParameterFilter { $SkuName -eq 'Standard_D2ds_v5' }
+
+        # The control is on, but its daily safety stop couldn't be scheduled: nothing here stops a restarted T4.
+        $script:safetyState = 'NotScheduled'
+        $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.message | Should -Match 'Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until it''s stopped again: the on-demand control''s daily safety stop isn''t scheduled'
+        $t4.message | Should -Not -Match 'stops it again, within a day'
+        $t4.evidence.dailySafetyStop | Should -BeFalse
+        $t4.evidence.safetyStop | Should -Be 'NotScheduled'
+
+        # Running: its size, and what it bills while it runs.
+        $script:t4State = 'Ready'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4MetricSnapshot -MockWith { [pscustomobject]@{ Succeeded = $true; Error = ''; Minutes = 15; LatestUtc = '2026-10-23T20:00:00.0000000Z'; Latest = [ordered]@{ cpu_percent = 12 }; ByState = [ordered]@{}; ByWaitEventType = [ordered]@{} } }
+        $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.status | Should -Be 'Pass'
+        $t4.message | Should -Match 'It''s General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the Burstable sizes here: about 0\.500 USD an hour \(list price\) while it runs\.'
+        $t4.evidence.hourlyUsd | Should -Be 0.5
+
+        # A Standard_D2ds_v5 server that a configuration set, after t4SkuName is removed: no record (only the fallback writes
+        # one), so no refusal is claimed (review of 20e855c).
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { New-TestState @{ Stage = 'Validation'; RunnerSha256 = $script:runnerSha; RunnerSentTo = @('sqlvm01', 'archost01'); T4Sku = ''; Tags = @{ deploymentId = 'abc123'; expiresOn = '2026-12-31' } } }
+        $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.message | Should -Match 'It''s General Purpose Standard_D2ds_v5: about 0\.500 USD an hour \(list price\) while it runs\.'
+        $t4.message | Should -Not -Match 'fallback|refused'
+
+        # The fallback chose Standard_D2ds_v5, but the server doesn't exist (its creation failed for another reason): never
+        # "created" (review of 20e855c).
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { New-TestState @{ Stage = 'Validation'; RunnerSha256 = $script:runnerSha; RunnerSentTo = @('sqlvm01', 'archost01'); T4Sku = 'Standard_D2ds_v5'; Tags = @{ deploymentId = 'abc123'; expiresOn = '2026-12-31' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = $script:t4Names; Exists = $false; State = 'NotFound'; Server = $null; Error = '' } }
+        $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.status | Should -Be 'Not selected'
+        $t4.message | Should -Be 'T4 (pgflex01-abc123) doesn''t exist; deploy.ps1 creates it as General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the Burstable sizes here, after checking its price against the ceilings again.'
     }
 }
 

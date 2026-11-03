@@ -346,7 +346,9 @@ function Invoke-DemoParallelDeployment {
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
     does; -ProgressPath is the status page's model, which each stage and track updates; with networkMode private the
     policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
-    its results replace preflight's placeholders at the end; preflight's T4 startSku starts the Burstable fallback;
+    its results replace preflight's placeholders at the end; preflight's T4 startSku says where T4's fallback starts
+    (Standard_B2s, General Purpose Standard_D2ds_v5 after its cost check, or no T4; Phase 28 follow-up), and a "no T4"
+    record gets that fallback again when this run deploys the template;
     and this process prompts the person at the guided stop when the T2 track process reports it Ready in the progress
     model; without one (-NoStatusPage), the T2 track process prompts the person itself.
     #>
@@ -438,8 +440,11 @@ function Invoke-DemoParallelDeployment {
         $Resume = [switch]::new($true)
         Write-DemoLog -Message ('An unfinished deployment is on record (its last finished stage is {0}), so this run continues it, as deploy.ps1 -Resume does. To start over from preflight instead: ./scripts/deploy.ps1 -FromStage Preflight.' -f $state.Stage)
     }
-    # T4's size as an earlier run's Burstable fallback settled it, unless the configuration sets one (Phase 28).
-    $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state
+    # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28): a "no T4" record
+    # (None) gets the General Purpose fallback, and its cost check, again when this run deploys the template (Phase 28
+    # follow-up).
+    $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric).Infrastructure
+    $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:$templateRuns
     $skipT4 = -not (Test-DemoT4Enabled -Config $Config)
     $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4
     if ($whatIf) {
@@ -761,9 +766,9 @@ function Invoke-DemoParallelDeployment {
             if ($group) {
                 $context.T3AdminGroupName = $group
             }
-            # Where T4's Burstable fallback starts when preflight already ruled out the default (Phase 28).
-            $startSkus = @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY') { [string](& $pick $checkId 'startSku') })
-            $t4StartSku = if ($startSkus -contains 'None') { 'None' } elseif ($startSkus -contains 'Standard_B2s') { 'Standard_B2s' } else { '' }
+            # Where T4's fallback starts when preflight already ruled sizes out, or its cost check left T4 out (Phase 28 and
+            # its follow-up): the furthest step any of its checks found.
+            $t4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') })
             if ($deferPolicy) {
                 Write-DemoLog -Message ('networkMode is {0}, so the policy inventory runs alongside the deployment instead of before it; its results come at the end.' -f [string]$Config['networkMode'])
                 $policyJob = Start-DemoPolicyInventoryJob -Config $Config -CacheHours $PolicyCacheHours -Confirm:$false
@@ -892,20 +897,12 @@ function Invoke-DemoParallelDeployment {
             }
             $context.T3UseFreeLimit = [bool]$deployment.T3UseFreeLimit
             $loaderSettings = $deployment.Outputs['loaderSettings']
-            # What T4 got (Phase 28's Burstable fallback can change its size or leave it out): the tracks use it.
+            # What T4 got (the fallback can change its size or leave it out): the tracks use it.
             $deployedT4 = Get-DemoMemberValue -InputObject $deployment -Name 'T4Enabled'
             if ($null -ne $deployedT4) {
                 $deployedSku = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T4SkuName')
                 if ([bool]$deployedT4 -ne (Test-DemoT4Enabled -Config $Config) -or ([bool]$deployedT4 -and $deployedSku -and $deployedSku -ne (Get-DemoT4SkuName -Config $Config))) {
-                    $copy = [ordered]@{}
-                    foreach ($key in $Config.Keys) {
-                        $copy[$key] = $Config[$key]
-                    }
-                    $copy['t4Enabled'] = [bool]$deployedT4
-                    if ([bool]$deployedT4 -and $deployedSku) {
-                        $copy['t4SkuName'] = $deployedSku
-                    }
-                    $Config = $copy
+                    $Config = if ([bool]$deployedT4 -and $deployedSku) { Copy-DemoT4Config -Config $Config -Source deployed -SkuName $deployedSku } else { Copy-DemoT4Config -Config $Config -Source deployed -Off }
                     $skipT4 = -not [bool]$deployedT4
                 }
             }
@@ -922,7 +919,13 @@ function Invoke-DemoParallelDeployment {
                 Write-DemoLog -Level Warning -Message ('The infrastructure is deployed, but its state wasn''t recorded: {0}' -f $_.Exception.Message)
             }
             $mark.Invoke('Infrastructure', $watch)
-            & $stageResult 'Infrastructure' 'Pass' ('The infrastructure is deployed (archost01''s disk: {0}).' -f $(if ($deployArguments.Contains('T2OsDiskSourceId')) { 'restored from ' + ($context.T2SnapshotId -replace '^.*/', '') } else { 'as before' }))
+            # The status page and the run's results say what T4's fallback did (Phase 28 follow-up).
+            $infrastructureText = 'The infrastructure is deployed (archost01''s disk: {0}).' -f $(if ($deployArguments.Contains('T2OsDiskSourceId')) { 'restored from ' + ($context.T2SnapshotId -replace '^.*/', '') } else { 'as before' })
+            $t4NoteValue = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T4Note')
+            if ($t4NoteValue) {
+                $infrastructureText += ' ' + $t4NoteValue
+            }
+            & $stageResult 'Infrastructure' 'Pass' $infrastructureText
             if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                 & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
             }

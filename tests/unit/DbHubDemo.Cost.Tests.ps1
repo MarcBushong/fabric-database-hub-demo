@@ -184,6 +184,61 @@ Describe 'Get-DemoCostEstimate' {
         ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Fail'
     }
 
+    It 'prices T4''s General Purpose fallback for its cost check: every hour of a month, with storage, DNS, and the Defender plans, against both ceilings (Phase 28 follow-up)' {
+        $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'OpenSourceRelationalDatabases'; pricingTier = 'Standard'; subPlan = $null })
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDefenderPlan -MockWith { $plans }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @() }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $config = New-TestConfig -Override @{ t4Enabled = $true }
+        $cost = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4GeneralPurposeCost -Config $Config -NetworkMode public -T3UseFreeLimit $false }
+        $cost.SkuName | Should -Be 'Standard_D2ds_v5'
+        $cost.HourlyUsd | Should -Be 0.18 -Because '2 vCores at the fixture''s hourly vCore meter, not the reservation'
+        # T4 alone, every hour: storage 3.20 + DNS 0.50 + Defender for open-source relational databases 15.00 + CSPM
+        # 0.012 x 730 (27.46 fixed), plus 730 hours of compute.
+        $cost.T4MonthlyWorstCaseUsd | Should -Be ([System.Math]::Round(27.46 + 0.18 * 730, 2))
+        $cost.DefenderIncluded | Should -BeTrue
+        @($cost.Unpriced) | Should -BeNullOrEmpty
+        # The demo's month with it is what PREFLIGHT.COST.MONTHLY checks: the light-use month plus the restart's worst case.
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }) -NetworkMode public -DefenderPlans $plans -T3UseFreeLimit $false
+        $cost.MonthlyWorstCaseUsd | Should -Be ([System.Math]::Round($estimate.LightUseMonthly + $estimate.T4AutoRestartWorstCaseMonthly, 2))
+        $cost.SessionUsd | Should -Be $estimate.SessionCost
+        $cost.Allowed | Should -Be ($cost.MonthlyWorstCaseUsd -le 250 -and $cost.SessionUsd -le 15)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -ParameterFilter { [uri]::UnescapeDataString($Uri) -match "productName eq 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'" }
+
+        # Defender for Cloud plans that can't be read are named, never guessed.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDefenderPlan -MockWith { throw 'AuthorizationFailed' }
+        $unread = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4GeneralPurposeCost -Config $Config -NetworkMode public -T3UseFreeLimit $false }
+        $unread.DefenderIncluded | Should -BeFalse
+        @($unread.Unpriced) | Should -Contain 'Microsoft Defender for Cloud (the subscription''s plans weren''t read)'
+    }
+
+    It 'reads each price once for estimates that share a price cache, as preflight''s General Purpose check does (Phase 28 follow-up)' {
+        $script:priceUris = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -MockWith {
+            $script:priceUris.Add($Uri)
+            $filter = [uri]::UnescapeDataString(($Uri -split '\$filter=')[1])
+            $items = @()
+            foreach ($fragment in $priceFixtures.Keys) {
+                if ($filter.Contains($fragment)) {
+                    $items = @($priceFixtures[$fragment] | ForEach-Object { [pscustomobject]$_ })
+                    break
+                }
+            }
+            [pscustomobject]@{ Items = $items; NextPageLink = $null }
+        }
+        $cache = @{}
+        Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -NetworkMode public -PriceCache $cache | Out-Null
+        $first = $script:priceUris.Count
+        $generalPurpose = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }) -NetworkMode public -PriceCache $cache
+        @($script:priceUris | Select-Object -Skip $first).Count | Should -Be 1 -Because 'only T4''s General Purpose compute is new'
+        [uri]::UnescapeDataString($script:priceUris[-1]) | Should -Match 'General Purpose Ddsv5 Series Compute'
+        ($generalPurpose.Components | Where-Object Name -EQ 'T4 compute (Standard_D2ds_v5)').UnitPrice | Should -Be 0.09
+        # Without a shared cache, each estimate reads its own prices, as before.
+        $script:priceUris.Clear()
+        Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }) -NetworkMode public | Out-Null
+        $script:priceUris.Count | Should -Be $first
+    }
+
     It 'prices the lowest-cost profile from retail prices' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         # Running: T1 0.20 + SQL 0.40 + host 0.30 + Arc 0.10 x 4 cores (the per-OSE minimum for the 2-vCPU guest)

@@ -316,8 +316,9 @@ function Invoke-DemoValidationT3 {
 function Invoke-DemoValidationT4 {
     <#
     .SYNOPSIS
-    The T4 area (Phase 24, ADR 0019): Test-DemoT4 -IncludeMetrics, read-only. A stopped T4 is a Warning (it
-    sends no metrics), never a Fail. Internal.
+    The T4 area (Phase 24, ADR 0019): Test-DemoT4 -IncludeMetrics, read-only, with the size T4's fallback recorded in the
+    group's DbHubT4Sku tag (Phase 28 follow-up), or, when the fallback left T4 out, one Not selected that says why. A
+    stopped T4 is a Warning (it sends no metrics), never a Fail. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -329,6 +330,13 @@ function Invoke-DemoValidationT4 {
     $parameters = @{ Config = $Context.Config; IncludeMetrics = $true }
     if ($Context.DeploymentId) {
         $parameters['DeploymentId'] = $Context.DeploymentId
+    }
+    # T4 at the size its fallback recorded (Phase 28 follow-up), so T4.CONFIG compares the server with that size; a T4 the
+    # fallback left out says why.
+    $record = [pscustomobject]@{ T4Sku = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Context -Name 'Tags') -Name (Get-DemoDeploymentStateTagName)['T4Sku']) }
+    $parameters['Config'] = Resolve-DemoEffectiveConfig -Config $Context.Config -State $record
+    if ((Test-DemoT4Enabled -Config $Context.Config) -and -not (Test-DemoT4Enabled -Config $parameters['Config'])) {
+        return @(New-DemoResult -CheckId 'T4.SERVER' -Area 't4' -Target 'T4' -Status 'Not selected' -Message (Get-DemoT4OffReason -Config $Context.Config -State $record))
     }
     @(Test-DemoT4 @parameters)
 }
