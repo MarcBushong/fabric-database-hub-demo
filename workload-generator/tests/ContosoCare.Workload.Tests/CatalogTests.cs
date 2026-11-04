@@ -127,6 +127,75 @@ public sealed partial class CatalogTests
     }
 
     [Fact]
+    public void TheShowcasesSlotsFitTheirScenariosAndTargets()
+    {
+        var profile = ActivityProfilesDefinition.Default.Profiles["showcase"];
+
+        Assert.Equal(ProfileDefinition.AnchorProfileStart, profile.Anchor);
+        Assert.Equal(30, profile.CycleMinutes);
+        Assert.Equal(90, profile.DefaultDurationMinutes);
+        Assert.Equal(120, profile.MaxDurationMinutes);
+        Assert.True(profile.Baseline);
+        foreach (var slot in profile.Incidents)
+        {
+            var scenario = ScenarioCatalog.Default.Get(slot.Scenario);
+            var target = Enum.Parse<DemoTarget>(slot.Target);
+            Assert.True(scenario.AppliesTo(target), $"{slot.Scenario} doesn't run on {slot.Target}.");
+            Assert.True(slot.DurationMinutes * 60 <= scenario.Duration.MaxSeconds, $"{slot.Target} {slot.Scenario} runs past its scenario's maximum.");
+            Assert.True(slot.StartMinute + slot.DurationMinutes <= profile.CycleMinutes, $"{slot.Target} {slot.Scenario} runs past its cycle.");
+            Assert.NotNull(slot.Concurrency);
+            Assert.NotNull(slot.Intensity);
+            Assert.InRange(slot.Concurrency.Value, scenario.Concurrency.Min, scenario.Concurrency.Max);
+            Assert.InRange(slot.Intensity.Value, scenario.Intensity.Min, scenario.Intensity.Max);
+            Assert.True(slot.Tier is null || slot.Target == "T4", "Only T4's slots are tier-specific.");
+            ScenarioCatalog.ResolveParameters(scenario, target, slot.Parameters);
+        }
+    }
+
+    [Fact]
+    public void TheShowcaseRunsAtMostTwoIncidentsAtOncePerTargetAndNeverOneScenarioTwice()
+    {
+        // ADR 0010's bounds with demo.usp_run_begin's limits: four Running runs per database (50109) and one per scenario
+        // (50108). Two incidents and the baseline leave room for a run that's still ending.
+        var profile = ActivityProfilesDefinition.Default.Profiles["showcase"];
+        var cycles = profile.MaxDurationMinutes / profile.CycleMinutes;
+
+        foreach (var tier in new[] { "Burstable", "GeneralPurpose" })
+        {
+            for (var cycle = 1; cycle <= cycles; cycle++)
+            {
+                foreach (var group in profile.Incidents.Where(s => s.RunsInCycle(cycle) && s.RunsOnTier(tier)).GroupBy(s => s.Target, StringComparer.Ordinal))
+                {
+                    for (var minute = 0; minute < profile.CycleMinutes; minute++)
+                    {
+                        var active = group.Where(s => s.StartMinute <= minute && minute < s.StartMinute + s.DurationMinutes).ToList();
+                        Assert.True(active.Count <= 2, $"{group.Key}, cycle {cycle}, {tier}: {active.Count} incidents at minute {minute}.");
+                        Assert.Equal(active.Count, active.Select(s => s.Scenario).Distinct(StringComparer.Ordinal).Count());
+                    }
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void EveryShowcaseTargetHasIncidentsInEveryCycle()
+    {
+        var profile = ActivityProfilesDefinition.Default.Profiles["showcase"];
+
+        foreach (var target in new[] { "T1", "T2", "T3", "T4" })
+        {
+            for (var cycle = 1; cycle <= profile.MaxDurationMinutes / profile.CycleMinutes; cycle++)
+            {
+                foreach (var tier in new[] { "Burstable", "GeneralPurpose" })
+                {
+                    var slots = profile.Incidents.Where(s => s.Target == target && s.RunsInCycle(cycle) && s.RunsOnTier(tier)).ToList();
+                    Assert.True(slots.Count >= 3, $"{target} has {slots.Count} incidents in cycle {cycle} ({tier}).");
+                }
+            }
+        }
+    }
+
+    [Fact]
     public void TheSqlCatalogMirrorsTheScenarioMaximums()
     {
         var sql = File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql"));

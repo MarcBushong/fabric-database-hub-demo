@@ -40,6 +40,9 @@ internal sealed record HostLanesDocument
 
     public string? RunnerVersion { get; init; }
 
+    /// <summary>The host process's priority when 'profile run' raised it (HostPriority, the showcase); null when it didn't.</summary>
+    public string? ProcessPriority { get; init; }
+
     public List<HostLaneRecord>? Lanes { get; init; }
 }
 

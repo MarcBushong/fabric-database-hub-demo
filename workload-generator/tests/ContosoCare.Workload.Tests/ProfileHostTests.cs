@@ -355,7 +355,7 @@ public sealed class ProfileHostTests
             }
         }
 
-        public Task SetAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, CancellationToken cancellationToken) =>
+        public Task<ProfileSetResult> SetAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, ProfileRequestStamp? stamp, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         private static async Task<ProfileState> HangAsync(CancellationToken cancellationToken)

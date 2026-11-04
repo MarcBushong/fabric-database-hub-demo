@@ -171,6 +171,7 @@ internal static partial class CommandLine
         command.Options.Add(profileFile);
         command.Options.Add(requestedBy);
         command.Options.Add(json);
+        var stampOptions = new RequestStampOptions(command);
         command.SetAction(async (parseResult, cancellationToken) =>
         {
             using var log = GlobalOptions.CreateLog(parseResult);
@@ -185,6 +186,12 @@ internal static partial class CommandLine
 
                 var who = parseResult.GetValue(requestedBy)!;
                 var scope = parseResult.GetValue(all) ? "all" : parseResult.GetValue(runId) is not null ? "run" : "scenario";
+                var stamp = stampOptions.StampOf(parseResult);
+                if (stamp is not null && scope != "all")
+                {
+                    throw new ScenarioRequestException("--if-newer and --request-id go with --all, which sets the activity profile.");
+                }
+
                 var scenarioId = parseResult.GetValue(scenario);
                 if (scenarioId is not null)
                 {
@@ -197,9 +204,24 @@ internal static partial class CommandLine
                     throw new ScenarioRequestException("--run-id must be a run ID such as 20261020173000-t1-a1b2c3.");
                 }
 
-                if (scope == "all" && targetValue is DemoTarget.T3 or DemoTarget.T4)
+                // A stamped stop sets the profile off first, and only when no newer request is stored; when one is, it
+                // stops nothing, so a late stop never ends a newer request's runs (ADR 0020, newest wins).
+                var profileOff = false;
+                if (stamp is not null)
                 {
-                    await new FileProfileStore(parseResult.GetValue(profileFile) ?? FileProfileStore.DefaultPathFor(targetValue)).SetAsync("off", who, null, null, cancellationToken).ConfigureAwait(false);
+                    var store = Store(targetValue, () => target.Resolve(parseResult), parseResult.GetValue(profileFile), log);
+                    var set = await store.SetAsync("off", who, null, null, stamp, cancellationToken).ConfigureAwait(false);
+                    if (!set.Applied)
+                    {
+                        WriteChecks(parseResult, targetValue, "stop", [NotApplied(targetValue, set, stamp, "stop")], parseResult.GetValue(json));
+                        return ExitCodes.Success;
+                    }
+
+                    profileOff = true;
+                }
+                else if (scope == "all" && targetValue is DemoTarget.T3 or DemoTarget.T4)
+                {
+                    await new FileProfileStore(parseResult.GetValue(profileFile) ?? FileProfileStore.DefaultPathFor(targetValue)).SetAsync("off", who, null, null, null, cancellationToken).ConfigureAwait(false);
                 }
 
                 int cancelled;
@@ -212,7 +234,7 @@ internal static partial class CommandLine
                 {
                     var opener = new SqlConnectionOpener(target.Resolve(parseResult), log);
                     await using var connection = await opener.OpenAsync(SessionNames.ForControl("stop"), cancellationToken).ConfigureAwait(false);
-                    cancelled = await new DemoDatabase(connection).StopAsync(scope, id, scenarioId, who, setProfileOff: scope == "all", cancellationToken).ConfigureAwait(false);
+                    cancelled = await new DemoDatabase(connection).StopAsync(scope, id, scenarioId, who, setProfileOff: scope == "all" && !profileOff, cancellationToken).ConfigureAwait(false);
                 }
 
                 log.Info("stop.requested", "Stop requested.", ("target", targetValue), ("scope", scope), ("runsCancelled", cancelled));
@@ -241,6 +263,7 @@ internal static partial class CommandLine
             command.Options.Add(option);
         }
 
+        var stampOptions = new RequestStampOptions(command);
         command.SetAction(async (parseResult, cancellationToken) =>
         {
             using var log = GlobalOptions.CreateLog(parseResult);
@@ -250,15 +273,37 @@ internal static partial class CommandLine
                 var who = parseResult.GetValue(requestedBy)!;
                 var seconds = Math.Clamp(parseResult.GetValue(wait), 0, 300);
                 var checks = new List<CheckRecord>();
-                if (targetValue is DemoTarget.T3 or DemoTarget.T4 && !parseResult.GetValue(keepProfile))
+                var keep = parseResult.GetValue(keepProfile);
+                var stamp = stampOptions.StampOf(parseResult);
+                if (stamp is not null)
                 {
-                    await new FileProfileStore(parseResult.GetValue(profileFile) ?? FileProfileStore.DefaultPathFor(targetValue)).SetAsync("off", who, null, null, cancellationToken).ConfigureAwait(false);
+                    if (keep)
+                    {
+                        throw new ScenarioRequestException("--if-newer and --request-id stamp the profile that reset sets to off; drop --keep-profile.");
+                    }
+
+                    // A stamped reset sets the profile off first, and only when no newer request is stored; when one is,
+                    // it resets nothing (ADR 0020, newest wins).
+                    var store = Store(targetValue, () => target.Resolve(parseResult), parseResult.GetValue(profileFile), log);
+                    var set = await store.SetAsync("off", who, null, null, stamp, cancellationToken).ConfigureAwait(false);
+                    if (!set.Applied)
+                    {
+                        WriteChecks(parseResult, targetValue, "reset", [NotApplied(targetValue, set, stamp, "reset")], parseResult.GetValue(json));
+                        return ExitCodes.Success;
+                    }
+
+                    checks.Add(new CheckRecord("profile-off", "Pass", string.Create(CultureInfo.InvariantCulture, $"The {targetValue} activity profile is off (request {stamp.RequestId}).")));
+                    keep = true;
+                }
+                else if (targetValue is DemoTarget.T3 or DemoTarget.T4 && !keep)
+                {
+                    await new FileProfileStore(parseResult.GetValue(profileFile) ?? FileProfileStore.DefaultPathFor(targetValue)).SetAsync("off", who, null, null, null, cancellationToken).ConfigureAwait(false);
                     checks.Add(new CheckRecord("profile-file-off", "Pass", targetValue == DemoTarget.T3
                         ? "The T3 activity profile file is set to off, so the runner stops connecting and T3 can auto-pause."
                         : "The T4 activity profile file is set to off, so the runner stops connecting to T4."));
                 }
 
-                var options = new ResetOptions(who, seconds, !parseResult.GetValue(noKill), parseResult.GetValue(keepProfile), parseResult.GetValue(undo), parseResult.GetValue(reseed));
+                var options = new ResetOptions(who, seconds, !parseResult.GetValue(noKill), keep, parseResult.GetValue(undo), parseResult.GetValue(reseed));
                 if (targetValue == DemoTarget.T4)
                 {
                     checks.AddRange(await new PgScenarioRunner(new PgConnectionOpener(target.ResolvePostgres(parseResult), log), log, TimeProvider.System).ResetAsync(options, cancellationToken).ConfigureAwait(false));
@@ -368,7 +413,7 @@ internal static partial class CommandLine
 
     private static Command ProfileCommand()
     {
-        var command = new Command("profile", "Get, set, or host the activity profile: off, baseline, business-day, or incident:<scenario>.");
+        var command = new Command("profile", "Get, set, or host the activity profile: off, baseline, business-day, showcase, or incident:<scenario>.");
 
         var get = new Command("get", "Show the target's activity profile, and with --json its profile host lane.");
         var getTarget = new TargetOptions(get);
@@ -400,6 +445,8 @@ internal static partial class CommandLine
                         ["setBy"] = state.SetBy,
                         ["expiresAt"] = state.ExpiresAt is { } at ? DemoDatabase.Format(at) : null,
                         ["parameters"] = state.Parameters is null ? null : JsonNode.Parse(ProfileParametersJson.Serialize(state.Parameters)),
+                        ["requestedAt"] = state.RequestedAt is { } requested ? DemoDatabase.Format(requested) : null,
+                        ["requestId"] = state.RequestId,
                         ["description"] = description,
                         ["host"] = host.ToNode(),
                     }.ToJsonString(OutputOptions));
@@ -415,15 +462,18 @@ internal static partial class CommandLine
 
         var set = new Command("set", "Set the target's activity profile. A running 'profile run' host picks it up within its poll interval.");
         var setTarget = new TargetOptions(set);
-        var name = new Option<string>("--name", "-n") { Description = "off, baseline, business-day, or incident:<scenario>.", Required = true };
+        var name = new Option<string>("--name", "-n") { Description = "off, baseline, business-day, showcase, or incident:<scenario>.", Required = true };
         var setRun = new RunOptions(set);
         var withBaseline = new Option<bool?>("--with-baseline") { Description = "incident:<scenario> only: run the baseline next to the incident (default true)." };
+        var tier = new Option<string?>("--tier") { Description = "T4's compute tier, Burstable or GeneralPurpose, which picks the profile's tier-specific slots (showcase, business-day). Without it, only Burstable slots run." };
         var setFile = ProfileFile();
         var setJson = Json();
         set.Options.Add(name);
         set.Options.Add(withBaseline);
+        set.Options.Add(tier);
         set.Options.Add(setFile);
         set.Options.Add(setJson);
+        var setStamp = new RequestStampOptions(set);
         set.SetAction(async (parseResult, cancellationToken) =>
         {
             using var log = GlobalOptions.CreateLog(parseResult);
@@ -435,9 +485,24 @@ internal static partial class CommandLine
                 var request = setRun.ToRequest(parseResult, profileName.ScenarioId ?? "healthy-baseline", targetValue);
                 if (profileName.Kind != ProfileKind.Incident && (request.Parameters.Count > 0 || request.Concurrency is not null || request.Intensity is not null))
                 {
-                    throw new ScenarioRequestException("--param, --concurrency, and --intensity apply to incident:<scenario> only; baseline and business-day take theirs from scenarios/activity-profiles.json.");
+                    throw new ScenarioRequestException("--param, --concurrency, and --intensity apply to incident:<scenario> only; baseline, business-day, and showcase take theirs from scenarios/activity-profiles.json.");
                 }
 
+                var tierValue = parseResult.GetValue(tier);
+                if (tierValue is not null)
+                {
+                    if (!profileName.HasSchedule)
+                    {
+                        throw new ScenarioRequestException("--tier applies to showcase and business-day, whose slots can be tier-specific.");
+                    }
+
+                    if (tierValue is not (ProfileParameters.TierBurstable or ProfileParameters.TierGeneralPurpose))
+                    {
+                        throw new ScenarioRequestException("--tier must be Burstable or GeneralPurpose (T4's sku.tier).");
+                    }
+                }
+
+                var stamp = setStamp.StampOf(parseResult);
                 if (profileName.Kind == ProfileKind.Incident)
                 {
                     // Validates the incident's options now, so a bad value fails here instead of in the host.
@@ -453,6 +518,7 @@ internal static partial class CommandLine
                     ResetBefore = request.ResetBefore ? true : null,
                     AutoCleanup = request.AutoCleanup ? null : false,
                     WithBaseline = parseResult.GetValue(withBaseline),
+                    Tier = tierValue,
                 };
                 var expiresAt = profileName.Kind == ProfileKind.Off
                     ? (DateTimeOffset?)null
@@ -463,9 +529,16 @@ internal static partial class CommandLine
                 }
 
                 var store = Store(targetValue, () => setTarget.Resolve(parseResult), parseResult.GetValue(setFile), log);
-                await store.SetAsync(profileName.Value, request.RequestedBy, expiresAt, parameters, cancellationToken).ConfigureAwait(false);
-                log.Info("profile.set", "Activity profile set.", ("target", targetValue), ("profile", profileName.Value), ("expiresAt", expiresAt), ("store", store.Description));
-                var check = new CheckRecord("profile-set", "Pass", string.Create(CultureInfo.InvariantCulture, $"{targetValue} profile set to {profileName.Value}{(expiresAt is { } e ? " until " + DemoDatabase.Format(e) : string.Empty)}. A running 'profile run' host applies it within {ActivityProfilesDefinition.Default.PollSeconds} s."));
+                var result = await store.SetAsync(profileName.Value, request.RequestedBy, expiresAt, parameters, stamp, cancellationToken).ConfigureAwait(false);
+                if (!result.Applied)
+                {
+                    log.Info("profile.not-applied", "A newer request is already set; this one changed nothing.", ("target", targetValue), ("profile", profileName.Value), ("requestId", stamp?.RequestId), ("newerRequestId", result.NewerRequestId));
+                    WriteChecks(parseResult, targetValue, "profile", [NotApplied(targetValue, result, stamp!, "profile set")], parseResult.GetValue(setJson));
+                    return ExitCodes.Success;
+                }
+
+                log.Info("profile.set", "Activity profile set.", ("target", targetValue), ("profile", profileName.Value), ("expiresAt", expiresAt), ("store", store.Description), ("requestId", stamp?.RequestId));
+                var check = new CheckRecord("profile-set", "Pass", string.Create(CultureInfo.InvariantCulture, $"{targetValue} profile set to {profileName.Value}{(expiresAt is { } e ? " until " + DemoDatabase.Format(e) : string.Empty)}{(stamp is null ? string.Empty : " (request " + stamp.RequestId + ")")}. A running 'profile run' host applies it within {ActivityProfilesDefinition.Default.PollSeconds} s."));
                 WriteChecks(parseResult, targetValue, "profile", [check], parseResult.GetValue(setJson));
                 return ExitCodes.Success;
             }).ConfigureAwait(false);
@@ -531,7 +604,7 @@ internal static partial class CommandLine
                     targets.Add(new ProfileTarget(DemoTarget.T4, new PgScenarioRunner(new PgConnectionOpener(t4, log), log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))));
                 }
 
-                var options = ProfileHostOptions.From(ActivityProfilesDefinition.Default, parseResult.GetValue(hostStateFile) ?? HostLanesFile.DefaultPath);
+                var options = ProfileHostOptions.From(ActivityProfilesDefinition.Default, parseResult.GetValue(hostStateFile) ?? HostLanesFile.DefaultPath) with { RaisePriority = true };
                 await new ProfileHost(ActivityProfilesDefinition.Default, ScenarioCatalog.Default, log, TimeProvider.System, options).RunAsync(targets, limit, cancellationToken).ConfigureAwait(false);
                 return ExitCodes.Success;
             }).ConfigureAwait(false);
@@ -879,6 +952,10 @@ internal static partial class CommandLine
 
     private static Option<string> RequestedBy() => new("--requested-by") { Description = "Who asked, recorded with the request (a name, never a secret).", DefaultValueFactory = _ => DefaultRequester() };
 
+    /// <summary>A stamped request that changed nothing because a newer one is already set: a Pass, because newest wins (ADR 0020).</summary>
+    private static CheckRecord NotApplied(DemoTarget target, ProfileSetResult result, ProfileRequestStamp stamp, string what) =>
+        new("not-applied", "Pass", string.Create(CultureInfo.InvariantCulture, $"Not applied: a newer request ({result.NewerRequestId ?? "unknown"}) is already set on {target}, so this {what} (request {stamp.RequestId}) changed nothing."));
+
     internal static string DefaultRequester() => Environment.UserName + "@" + Environment.MachineName;
 
     /// <summary>Options shared by every command: logging format, log file, verbosity.</summary>
@@ -983,6 +1060,42 @@ internal static partial class CommandLine
                 NotAfter = ParseNotAfter(parseResult.GetValue(notAfter)),
                 RequestedBy = parseResult.GetValue(requestedBy) ?? DefaultRequester(),
             };
+        }
+    }
+
+    /// <summary>
+    /// --if-newer and --request-id: a control request's stamp. A stamped profile set (and stop --all or reset, which set
+    /// the profile off) applies only when no newer request is stored, so a request that arrives late never replaces a
+    /// newer one (the showcase's supersede guard, ADR 0020).
+    /// </summary>
+    private sealed class RequestStampOptions
+    {
+        private readonly Option<string?> ifNewer = new("--if-newer") { Description = "Apply only when no newer control request is stored: this request's time, ISO 8601 with an offset (milliseconds count). Needs --request-id." };
+        private readonly Option<string?> requestId = new("--request-id") { Description = "This control request's ID, for example the Automation job's, stored with the profile; with --if-newer, a tie on the time goes to the larger ID." };
+
+        public RequestStampOptions(Command command)
+        {
+            command.Options.Add(ifNewer);
+            command.Options.Add(requestId);
+        }
+
+        public ProfileRequestStamp? StampOf(ParseResult parseResult)
+        {
+            var at = parseResult.GetValue(ifNewer);
+            var id = parseResult.GetValue(requestId);
+            if (at is null && id is null)
+            {
+                return null;
+            }
+
+            if (at is null || id is null)
+            {
+                throw new ScenarioRequestException("--if-newer and --request-id go together.");
+            }
+
+            return DurationText.TryParseInstant(at, out var instant)
+                ? new ProfileRequestStamp(instant, id)
+                : throw new ScenarioRequestException("--if-newer must be an ISO 8601 time with an offset, for example 2026-11-03T18:00:00.123Z.");
         }
     }
 }

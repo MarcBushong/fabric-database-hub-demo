@@ -44,6 +44,13 @@ GO
 IF COL_LENGTH(N'demo.activity_profile', N'parameters') IS NULL
     ALTER TABLE demo.activity_profile ADD parameters nvarchar(2000) NULL;
 GO
+-- The stamp of the newest control request stored with the profile (the showcase's supersede guard, ADR 0020).
+IF COL_LENGTH(N'demo.activity_profile', N'requested_at') IS NULL
+    ALTER TABLE demo.activity_profile ADD requested_at datetime2(3) NULL;
+GO
+IF COL_LENGTH(N'demo.activity_profile', N'request_id') IS NULL
+    ALTER TABLE demo.activity_profile ADD request_id varchar(64) NULL;
+GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ix_scenario_runs_status' AND object_id = OBJECT_ID(N'demo.scenario_runs'))
     CREATE INDEX ix_scenario_runs_status ON demo.scenario_runs (status, started_at);
 GO
@@ -505,34 +512,81 @@ GO
 
 -- Activity profile (T1 and T2; T3's profile lives in a file on T1 so polling never wakes the serverless database) --
 
+-- @requested_at and @request_id stamp a control request (the showcase's supersede guard, ADR 0020): a stamped set writes
+-- only when no newer request is stored, so an older request that arrives late never replaces a newer one. A tie on the
+-- time goes to the larger request ID (binary order), and the same request again changes nothing. An unstamped set
+-- (deploy, the runner's command line, a VM's own) always writes and keeps the stored stamp.
 CREATE OR ALTER PROCEDURE demo.usp_profile_set
     @profile_name varchar(64),
     @set_by nvarchar(128),
     @expires_at datetime2(3) = NULL,
-    @parameters nvarchar(2000) = NULL
+    @parameters nvarchar(2000) = NULL,
+    @requested_at datetime2(3) = NULL,
+    @request_id varchar(64) = NULL,
+    @applied bit = NULL OUTPUT,
+    @newer_request_id varchar(64) = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
     DECLARE @message nvarchar(2048);
+    DECLARE @exists bit = 0, @stored_at datetime2(3), @stored_id varchar(64);
 
     IF @profile_name IS NULL
-       OR (@profile_name NOT IN ('off', 'baseline', 'business-day')
+       OR (@profile_name NOT IN ('off', 'baseline', 'business-day', 'showcase')
            AND NOT (@profile_name LIKE 'incident:%'
                     AND EXISTS (SELECT 1 FROM demo.fn_scenario_catalog() WHERE CONCAT('incident:', scenario_id) = @profile_name)))
     BEGIN
-        SET @message = CONCAT(N'Unknown activity profile ''', @profile_name, N'''. Use off, baseline, business-day, or incident:<scenario>.');
+        SET @message = CONCAT(N'Unknown activity profile ''', @profile_name, N'''. Use off, baseline, business-day, showcase, or incident:<scenario>.');
         THROW 50117, @message, 1;
     END;
 
-    IF EXISTS (SELECT 1 FROM demo.activity_profile WHERE profile_slot = 1)
+    IF (@requested_at IS NULL AND @request_id IS NOT NULL) OR (@requested_at IS NOT NULL AND ISNULL(@request_id, '') = '')
+        THROW 50118, N'A request stamp needs both @requested_at and @request_id.', 1;
+
+    SET @applied = 0;
+    SET @newer_request_id = NULL;
+
+    BEGIN TRANSACTION;
+
+    -- The row is read under an update lock until the write, so two stamped sets can't both pass the compare.
+    SELECT @exists = 1, @stored_at = requested_at, @stored_id = request_id
+    FROM demo.activity_profile WITH (UPDLOCK, HOLDLOCK)
+    WHERE profile_slot = 1;
+
+    IF @requested_at IS NOT NULL AND @stored_at IS NOT NULL
+    BEGIN
+        IF @stored_at > @requested_at
+           OR (@stored_at = @requested_at AND @stored_id COLLATE Latin1_General_BIN2 > @request_id COLLATE Latin1_General_BIN2)
+        BEGIN
+            SET @newer_request_id = @stored_id;
+            COMMIT TRANSACTION;
+            RETURN;
+        END;
+
+        IF @stored_at = @requested_at AND @stored_id COLLATE Latin1_General_BIN2 = @request_id COLLATE Latin1_General_BIN2
+        BEGIN
+            -- The same request again (a retried Run Command): the profile it set stays as it is, its cycle included.
+            SET @applied = 1;
+            COMMIT TRANSACTION;
+            RETURN;
+        END;
+    END;
+
+    IF @exists = 1
         UPDATE demo.activity_profile
         SET profile_name = @profile_name, set_at = SYSUTCDATETIME(), set_by = ISNULL(@set_by, N'unknown'),
-            expires_at = @expires_at, parameters = @parameters
+            expires_at = @expires_at, parameters = @parameters,
+            requested_at = CASE WHEN @requested_at IS NULL THEN requested_at ELSE @requested_at END,
+            request_id = CASE WHEN @requested_at IS NULL THEN request_id ELSE @request_id END
         WHERE profile_slot = 1;
     ELSE
-        INSERT INTO demo.activity_profile (profile_slot, profile_name, set_at, set_by, expires_at, parameters)
-        VALUES (1, @profile_name, SYSUTCDATETIME(), ISNULL(@set_by, N'unknown'), @expires_at, @parameters);
+        INSERT INTO demo.activity_profile (profile_slot, profile_name, set_at, set_by, expires_at, parameters, requested_at, request_id)
+        VALUES (1, @profile_name, SYSUTCDATETIME(), ISNULL(@set_by, N'unknown'), @expires_at, @parameters, @requested_at, @request_id);
+
+    SET @applied = 1;
+    COMMIT TRANSACTION;
 END;
 GO
 
@@ -547,7 +601,9 @@ BEGIN
         set_by,
         expires_at,
         parameters,
-        is_active = CAST(CASE WHEN profile_name <> 'off' AND (expires_at IS NULL OR expires_at > SYSUTCDATETIME()) THEN 1 ELSE 0 END AS bit)
+        is_active = CAST(CASE WHEN profile_name <> 'off' AND (expires_at IS NULL OR expires_at > SYSUTCDATETIME()) THEN 1 ELSE 0 END AS bit),
+        requested_at,
+        request_id
     FROM demo.activity_profile
     WHERE profile_slot = 1;
 END;

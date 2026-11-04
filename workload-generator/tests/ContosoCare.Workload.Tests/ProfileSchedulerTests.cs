@@ -189,6 +189,7 @@ public sealed class ProfileSchedulerTests
     [InlineData("off", "Off")]
     [InlineData("baseline", "Baseline")]
     [InlineData("business-day", "BusinessDay")]
+    [InlineData("showcase", "Showcase")]
     [InlineData("incident:io-pressure", "Incident")]
     public void ProfileNamesParse(string text, string kind)
     {
@@ -199,9 +200,125 @@ public sealed class ProfileSchedulerTests
     [InlineData("incident:")]
     [InlineData("incident:no-such")]
     [InlineData("Baseline")]
+    [InlineData("Showcase")]
     [InlineData(null)]
     public void BadProfileNamesAreRefused(string? text)
     {
         Assert.Throws<ScenarioRequestException>(() => ProfileName.Parse(text, Catalog));
+    }
+
+    [Fact]
+    public void TheShowcaseRunsNinetyMinutesByDefaultAndTwoHoursAtMost()
+    {
+        var name = ProfileName.Parse("showcase", Catalog);
+
+        Assert.Equal(SetAt.AddMinutes(90), ProfileScheduler.ComputeExpiry(name, new ProfileParameters(), SetAt, null, Definitions, Catalog));
+        Assert.Equal(SetAt.AddMinutes(120), ProfileScheduler.ComputeExpiry(name, new ProfileParameters { DurationSeconds = 4 * 3600 }, SetAt, null, Definitions, Catalog));
+        var notAfter = SetAt.AddMinutes(50);
+        Assert.Equal(notAfter - RunLimits.ShutdownMargin, ProfileScheduler.ComputeExpiry(name, null, SetAt, notAfter, Definitions, Catalog));
+    }
+
+    [Fact]
+    public void TheShowcasesCyclesStartWhenTheTargetsProfileIsSet()
+    {
+        // Each target runs its own clock: its first slots start at the moment its profile was set, not at a UTC boundary.
+        var state = State("showcase", SetAt.AddMinutes(90));
+
+        var activities = ProfileScheduler.Plan(state, DemoTarget.T1, SetAt.AddMinutes(3), Definitions, Catalog, null);
+
+        Assert.Contains(activities, a => a.IsBaseline);
+        var blocking = Assert.Single(activities, a => a.ScenarioId == "blocking-chain");
+        Assert.Equal(SetAt, blocking.Start);
+        Assert.Equal(SetAt.AddMinutes(10), blocking.End);
+        Assert.Equal("4", blocking.Parameters["depth"]);
+        var flush = Assert.Single(activities, a => a.ScenarioId == "log-flush-waits");
+        Assert.Equal(SetAt.AddMinutes(2), flush.Start);
+
+        // Cycle 2 repeats the slots 30 minutes later.
+        var later = ProfileScheduler.Plan(state, DemoTarget.T1, SetAt.AddMinutes(33), Definitions, Catalog, null);
+        Assert.Equal(SetAt.AddMinutes(30), Assert.Single(later, a => a.ScenarioId == "blocking-chain").Start);
+    }
+
+    [Theory]
+    [InlineData("T2", 23, "parallel-scans")]
+    [InlineData("T2", 53, "tempdb-contention")]
+    [InlineData("T2", 83, "parallel-scans")]
+    [InlineData("T3", 14, "locking-blocking")]
+    [InlineData("T3", 44, "deadlock-storm")]
+    [InlineData("T4", 11, "idle-in-transaction")]
+    [InlineData("T4", 41, "locking-blocking")]
+    public void TheShowcaseAlternatesSomeSlotsBetweenOddAndEvenCycles(string target, int minute, string scenario)
+    {
+        var state = State("showcase", SetAt.AddMinutes(120));
+
+        var activities = ProfileScheduler.Plan(state, Enum.Parse<DemoTarget>(target), SetAt.AddMinutes(minute), Definitions, Catalog, null);
+
+        Assert.Contains(activities, a => a.ScenarioId == scenario);
+    }
+
+    [Theory]
+    [InlineData(16, "slow-consumer")]
+    [InlineData(46, "missing-index")]
+    [InlineData(76, "plan-regression")]
+    [InlineData(106, "missing-index")]
+    public void TheShowcaseRunsAListedCycleOnly(int minute, string scenario)
+    {
+        var state = State("showcase", SetAt.AddMinutes(120));
+
+        var incidents = ProfileScheduler.Plan(state, DemoTarget.T3, SetAt.AddMinutes(minute), Definitions, Catalog, null).Where(a => !a.IsBaseline).ToList();
+
+        Assert.Contains(incidents, a => a.ScenarioId == scenario);
+        Assert.True(incidents.Count <= 2, "at most two incidents at once on a target");
+        Assert.DoesNotContain(incidents, a => a.ScenarioId == (scenario == "slow-consumer" ? "plan-regression" : "slow-consumer"));
+    }
+
+    [Theory]
+    [InlineData("GeneralPurpose", 9, 20)]
+    [InlineData("Burstable", 9, 14)]
+    [InlineData(null, 9, 14)]
+    [InlineData("MemoryOptimized", 9, 14)]
+    public void TheShowcasePicksT4sCpuSlotByTier(string? tier, int minute, int endMinute)
+    {
+        var state = State("showcase", SetAt.AddMinutes(90), new ProfileParameters { Tier = tier });
+
+        var cpu = Assert.Single(ProfileScheduler.Plan(state, DemoTarget.T4, SetAt.AddMinutes(minute), Definitions, Catalog, null), a => a.ScenarioId == "cpu-pressure");
+
+        Assert.Equal(SetAt.AddMinutes(8), cpu.Start);
+        Assert.Equal(SetAt.AddMinutes(endMinute), cpu.End);
+    }
+
+    [Fact]
+    public void BurstableT4RestsItsCpuInEvenCycles()
+    {
+        var burstable = State("showcase", SetAt.AddMinutes(90), new ProfileParameters { Tier = "Burstable" });
+        var generalPurpose = State("showcase", SetAt.AddMinutes(90), new ProfileParameters { Tier = "GeneralPurpose" });
+
+        Assert.DoesNotContain(ProfileScheduler.Plan(burstable, DemoTarget.T4, SetAt.AddMinutes(39), Definitions, Catalog, null), a => a.ScenarioId == "cpu-pressure");
+        Assert.Contains(ProfileScheduler.Plan(generalPurpose, DemoTarget.T4, SetAt.AddMinutes(39), Definitions, Catalog, null), a => a.ScenarioId == "cpu-pressure");
+    }
+
+    [Theory]
+    [InlineData(null, 1, true)]
+    [InlineData("all", 2, true)]
+    [InlineData("odd", 3, true)]
+    [InlineData("odd", 4, false)]
+    [InlineData("even", 2, true)]
+    [InlineData("3", 3, true)]
+    [InlineData("3", 1, false)]
+    [InlineData("1,3", 3, true)]
+    [InlineData("1,3", 2, false)]
+    public void SlotsRunInTheirCycles(string? cycles, long cycle, bool runs)
+    {
+        Assert.Equal(runs, new IncidentSlot { Target = "T1", Scenario = "cpu-pressure", StartMinute = 0, DurationMinutes = 5, Cycles = cycles }.RunsInCycle(cycle));
+    }
+
+    [Fact]
+    public void BusinessDayStillCountsItsCyclesFromUtcMidnight()
+    {
+        // A profile set at 15:02 still runs business-day's incidents at fixed minutes past the hour.
+        var activities = ProfileScheduler.Plan(State("business-day"), DemoTarget.T2, new DateTimeOffset(2026, 10, 20, 16, 6, 0, TimeSpan.Zero), Definitions, Catalog, null);
+
+        var incident = Assert.Single(activities, a => !a.IsBaseline);
+        Assert.Equal(new DateTimeOffset(2026, 10, 20, 16, 5, 0, TimeSpan.Zero), incident.Start);
     }
 }
