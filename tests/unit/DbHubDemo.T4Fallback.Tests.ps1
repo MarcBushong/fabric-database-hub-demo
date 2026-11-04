@@ -111,9 +111,14 @@ BeforeAll {
             }
         }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recorded.Add([string]$Value['T4Sku']) }
-        # The sizes priced since the harness was set up (Should -Invoke counts a whole It's calls).
+        # The sizes priced since the harness was set up (Should -Invoke counts a whole It's calls). The 2-vCore fallback calls
+        # without -SkuName, as it always has, and Pester sets no variable for a parameter that isn't bound, which strict mode
+        # refuses to read (CI on 413990f), so the size comes from $PesterBoundParameters, with the function's own default.
         $script:pricedSizes = [System.Collections.Generic.List[string]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -MockWith { $script:pricedSizes.Add([string]$SkuName); $script:cost }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -MockWith {
+            $script:pricedSizes.Add($(if ($PesterBoundParameters.ContainsKey('SkuName')) { [string]$PesterBoundParameters['SkuName'] } else { 'Standard_D2ds_v5' }))
+            $script:cost
+        }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
             $script:currentSize = if (-not $Config['t4Enabled']) { 'none' } elseif ($Config.Contains('t4SkuName') -and $Config['t4SkuName']) { [string]$Config['t4SkuName'] } else { 'Standard_D4ds_v5' }
             $script:sizes.Add($script:currentSize)
@@ -980,7 +985,8 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         $deployment.Succeeded | Should -BeTrue
         @($script:sizes) | Should -Be @('Standard_D2ds_v5') -Because 'the server keeps its size'
         $deployment.T4SkuName | Should -Be 'Standard_D2ds_v5'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $SkuName -eq 'Standard_D4ds_v5' -and $NetworkMode -eq 'private' -and $T3UseFreeLimit -eq $false }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['SkuName'] -eq 'Standard_D4ds_v5' -and $NetworkMode -eq 'private' -and $T3UseFreeLimit -eq $false }
+        @($script:pricedSizes) | Should -Be @('Standard_D4ds_v5') -Because 'only the move is priced: the server exists, so no fallback runs'
         $size = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE')
         $size.Count | Should -Be 1
         $size[0].status | Should -Be 'Warning'
@@ -1011,7 +1017,7 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         $script:cost = New-TestCost -MonthlyWorstCaseUsd 137.55 -SkuName 'Standard_D4ds_v5' -RestartAssumption 'SafetyStop'
         $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -ScaleT4
         @($script:sizes) | Should -Be @('Standard_D4ds_v5')
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $SkuName -eq 'Standard_D4ds_v5' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['SkuName'] -eq 'Standard_D4ds_v5' }
         $size = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE'
         $size.evidence.outcome | Should -Be 'Scale'
         $size.message | Should -Match 'Its cost check passed: about 0\.500 USD an hour while it runs .* counted as about a day per restart because the daily T4 safety stop is in place'
@@ -1032,7 +1038,7 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         $deployment.Succeeded | Should -BeTrue
         @($script:sizes) | Should -Be @('Standard_D2ds_v5') -Because 'over the ceiling, the server keeps its size'
         $deployment.T4SkuName | Should -Be 'Standard_D2ds_v5'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $SkuName -eq 'Standard_D4ds_v5' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['SkuName'] -eq 'Standard_D4ds_v5' }
         $size = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE'
         $size.evidence.outcome | Should -Be 'Ceiling'
         $size.evidence.explicit | Should -BeTrue
