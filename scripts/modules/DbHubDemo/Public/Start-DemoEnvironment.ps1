@@ -18,7 +18,10 @@ function Start-DemoEnvironment {
        Run Commands there wait for it, at most until its 10-minute bound; one not set by then is a START.INTERIM_<target>
        Warning with the commands (Wait-DemoActivityInterim, re-review of PR 16). The
        bootstraps resume on their own. A golden snapshot's source host gets its air-gapped guest back
-       (T2.GOLDEN.SOURCE, Invoke-DemoGoldenSourceRelease). T1's monitoring plugin, which can stay NotRunning
+       (T2.GOLDEN.SOURCE, Invoke-DemoGoldenSourceRelease) as soon as it runs, before its interim baseline; when the
+       release leaves the guest off (a capture in progress there, or a release that failed), START.INTERIM_T2 is Not
+       selected and nothing waits for it, and a T2 guest the relay holds for a golden capture, or one that isn't running,
+       ends the VM's retries at once (review of PR 17, 2026-11-04). T1's monitoring plugin, which can stay NotRunning
        after a deallocation (live, 2026-10-22), gets the SQL IaaS Agent service restarted
        (START.T1.MONITORING, Restore-DemoSqlVmMonitoringPlugin): first it waits up to 5 minutes for the agent to
        report the plugin's status, because a restart right after boot, before that, left it NotRunning (live,
@@ -98,7 +101,9 @@ function Start-DemoEnvironment {
     Seconds between profile attempts while T2's guest boots, and while T1's SQL Server starts (both VMs boot
     at once). T1's and T2's three attempts share one readiness budget of twice this (4 minutes by default): the VM
     side waits for its target within it, so a target that stays down costs about that once, plus the Run Commands'
-    own time, and never a wait per attempt (Set-DemoTargetProfile).
+    own time, and never a wait per attempt (Set-DemoTargetProfile). A target whose interim baseline this start waited
+    for and that stayed down through it gets one attempt without a wait, so that wait and this budget don't add up
+    (review of PR 17, 2026-11-04).
 
     .PARAMETER SkipT4
     Leave T4, the PostgreSQL flexible server, stopped.
@@ -240,13 +245,33 @@ function Start-DemoEnvironment {
     foreach ($vm in 'sqlvm01', $hostVm) {
         $startResult = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:$startRequested[$vm]
         $results.Add($startResult)
+        if ([string]$startResult.status -ne 'Pass') {
+            continue
+        }
+        # A golden snapshot's source host has an air-gapped guest until the first start after the capture: it's released as
+        # soon as the host runs, before its interim baseline, which would otherwise wait up to 10 minutes for a guest that
+        # stays off. When the release leaves it off (a capture in progress there, or a release that failed), the interim
+        # is Not selected and nothing waits for it (review of PR 16 and PR 17, 2026-11-04).
+        $held = $null
+        if ($vm -eq $hostVm) {
+            $sourceRelease = Invoke-DemoGoldenSourceRelease -Config $Config
+            if ($null -ne $sourceRelease) {
+                $results.Add($sourceRelease)
+                $held = Get-DemoGoldenHeldInterimResult -ActivityProfile $activity -Release $sourceRelease -CheckPrefix 'START'
+            }
+        }
+        if ($vm -in $quieted) {
+            continue
+        }
         # A VM this start booted resumes the profile stored there about 2 minutes after the boot (business-day lasts 8 hours
         # from its switch, or until 2 minutes before the next auto-shutdown, so it can outlive a stop), so it gets the
         # interim baseline as soon as it runs, before this start's own Run Commands there (review of PR 16, 2026-11-04).
-        if ([string]$startResult.status -eq 'Pass' -and $vm -notin $quieted) {
-            foreach ($sentItem in @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName $vm -Target $quietTargets -RequestedBy 'start-demo' -Started -PassThru)) {
-                $interimSent.Add($sentItem)
-            }
+        if ($null -ne $held) {
+            $results.Add($held)
+            continue
+        }
+        foreach ($sentItem in @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName $vm -Target $quietTargets -RequestedBy 'start-demo' -Started -PassThru)) {
+            $interimSent.Add($sentItem)
         }
     }
     # Its SQL Server, or T2's guest, can still be starting, so the VM retries the interim baseline, and this start's own
@@ -257,14 +282,6 @@ function Start-DemoEnvironment {
     $running = @{}
     foreach ($vm in 'sqlvm01', $hostVm) {
         $running[$vm] = @($results | Where-Object { $_.checkId -eq ('START.VM_{0}' -f $vm.ToUpperInvariant()) -and $_.status -eq 'Pass' }).Count -gt 0
-    }
-
-    # A golden snapshot's source host has an air-gapped guest until the first start after the capture.
-    if ($running[$hostVm]) {
-        $sourceRelease = Invoke-DemoGoldenSourceRelease -Config $Config
-        if ($null -ne $sourceRelease) {
-            $results.Add($sourceRelease)
-        }
     }
 
     # After a deallocation, T1's monitoring plugin can stay NotRunning, so T1 sends no performance telemetry
@@ -349,6 +366,14 @@ function Start-DemoEnvironment {
 
     $t3Enabled = $t3Ready -and ((Test-DemoDeploymentStageReached -Recorded $state.Stage -Stage 'T3') -or @($results | Where-Object { $_.checkId -like 'WORKLOAD.T3*' -and $_.status -in 'Pass', 'Warning' }).Count -gt 0)
     $profileTargets = @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @('T2')
+    # A target whose interim baseline this start waited for has had that wait's readiness bound already: its VM tried it
+    # every 15 seconds for up to 10 minutes. One that never answered then (TimedOut, or Failed after several attempts) gets
+    # one more attempt below without another wait, so the two waits don't add up (review of PR 17, 2026-11-04).
+    $stayedDown = @($results | Where-Object { [string]$_.checkId -match '^START\.INTERIM_T[12]$' -and [string]$_.status -eq 'Warning' } | Where-Object {
+            $interimEvidence = Get-DemoMemberValue -InputObject $_ -Name 'evidence'
+            $interimOutcome = [string](Get-DemoMemberValue -InputObject $interimEvidence -Name 'outcome')
+            $interimOutcome -eq 'TimedOut' -or ($interimOutcome -eq 'Failed' -and [int](Get-DemoMemberValue -InputObject $interimEvidence -Name 'attempts') -gt 1)
+        } | ForEach-Object { ([string]$_.checkId).Substring(([string]$_.checkId).Length - 2) })
     foreach ($target in $profileTargets) {
         $skip = ''
         if (-not $state.RunnerSha256) {
@@ -380,10 +405,11 @@ function Start-DemoEnvironment {
         }
         # T2's guest boots after its host, and T1's SQL Server can still be starting because both VMs boot at once
         # (live, 2026-10-22: T1's first attempt found no server), so both retry, within one readiness budget that the
-        # VM side waits in (2 x T2ProfileRetrySeconds; review, 2026-11-04: a wait per attempt took 34 to 64 minutes).
+        # VM side waits in (2 x T2ProfileRetrySeconds; review, 2026-11-04: a wait per attempt took 34 to 64 minutes),
+        # except one that already stayed down through its interim's wait (above).
         # A profile with incidents is set as its interim, baseline, and switched below once this start's own Run
         # Commands are done (2026-11-03).
-        $attempts = if ($target -in 'T1', 'T2') { 3 } else { 1 }
+        $attempts = if ($target -in 'T1', 'T2' -and $target -notin $stayedDown) { 3 } else { 1 }
         $set = Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $activity.Interim -CheckPrefix 'START' -SkipReason $skip -RequestedBy 'start-demo' -Attempts $attempts -RetrySeconds $T2ProfileRetrySeconds -SwitchTo $switchTo
         $results.Add($set)
         if ($switchTo -and [string]$set.status -in 'Pass', 'Warning') {

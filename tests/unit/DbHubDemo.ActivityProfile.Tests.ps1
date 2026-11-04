@@ -63,6 +63,36 @@ else {
         return $bundle
     }
 
+    function New-GuestBundle([object[]] $Line) {
+        # A stand-in for archost01's bundle whose control script answers T2's attempt n with -Line[n - 1], and the last one
+        # after that, as T2's relay would; attempts.txt counts the attempts.
+        $bundle = Join-Path -Path $TestDrive -ChildPath ('guest-' + [guid]::NewGuid().ToString('N'))
+        $folder = Join-Path -Path $bundle -ChildPath 'vm/bootstrap'
+        $null = New-Item -ItemType Directory -Path $folder -Force
+        Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath 'lines.json') -Value (ConvertTo-Json -InputObject @($Line) -Depth 6)
+        Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath 'Invoke-DemoWorkloadControl.ps1') -Value @'
+param($Action, $RequestBase64)
+$file = Join-Path -Path $PSScriptRoot -ChildPath 'attempts.txt'
+$attempt = 1
+if (Test-Path -LiteralPath $file) { $attempt = [int](Get-Content -LiteralPath $file) + 1 }
+Set-Content -LiteralPath $file -Value $attempt
+$lines = @(Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath 'lines.json') -Raw | ConvertFrom-Json)
+$line = $lines[[System.Math]::Min($attempt, $lines.Count) - 1]
+[Console]::Out.WriteLine('DBHUBDEMO-WORKLOAD ' + ($line | ConvertTo-Json -Depth 6 -Compress))
+'@
+        Set-Content -LiteralPath (Join-Path -Path $bundle -ChildPath 'settings.json') -Value (@{ bundlePath = $bundle } | ConvertTo-Json)
+        return $bundle
+    }
+
+    function New-RelayLine([string] $Status, [string] $Message, [string] $Golden = '') {
+        # T2's relay result line (Write-DemoControlResult); the golden reason is what Invoke-DemoControlGuestReady records.
+        $evidence = [ordered]@{ target = 'T2'; guest = 'arcsql01'; seconds = 1 }
+        if ($Golden) {
+            $evidence['golden'] = $Golden
+        }
+        [ordered]@{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = $Status; message = $Message; evidence = $evidence }
+    }
+
     function Invoke-RetryScript([string] $Script, [string] $Bundle, [string[]] $Target) {
         # Runs a generated profile script against the stand-in bundle instead of C:\ProgramData\DbHubDemo, and returns each
         # target's result line.
@@ -230,6 +260,55 @@ Describe 'The activity profiles'' Run Command (DbHubDemo-Profile)' {
         @(Get-Content -LiteralPath (Join-Path -Path $bundle -ChildPath 'vm/bootstrap/order.txt')) | Should -Be @('T1', 'T1', 'T3')
     }
 
+    It 'sends readySeconds 0 with every target, so the VM side never waits on top of the script''s own retries (review of PR 17)' {
+        # PR 17's relay waits up to 10 minutes (20 for T2) for a target unless the request says otherwise, which would
+        # have multiplied the interim baseline's 10-minute bound.
+        $scripts = InModuleScope DbHubDemo {
+            Get-DemoProfileRunCommandScript -Target 'T1', 'T3', 'T4', 'T2' -ProfileName 'baseline' -RequestedBy 'start-demo' -NotAfterUtc ([datetime]::UtcNow.AddMinutes(10)) -RetrySeconds 15 -RunnerTimeoutSeconds 120
+            Get-DemoProfileRunCommandScript -Target 'T1', 'T2' -ProfileName 'business-day' -RequestedBy 'start-demo' -NotAfterUtc ([datetime]::UtcNow.AddMinutes(30))
+            Get-DemoProfileRunCommandScript -Target 'T2' -ProfileName 'off' -RequestedBy 'stop-demo' -NotAfterUtc ([datetime]::UtcNow.AddMinutes(10))
+        }
+        $requests = @(foreach ($script in $scripts) { [regex]::Matches($script, "-RequestBase64 '([A-Za-z0-9+/=]+)'") | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_.Groups[1].Value)) | ConvertFrom-Json -AsHashtable } })
+        $requests.Count | Should -Be 7
+        foreach ($request in $requests) {
+            $request.ContainsKey('readySeconds') | Should -BeTrue
+            $request['readySeconds'] | Should -Be 0
+        }
+    }
+
+    It 'stops trying T2 at once when its relay holds the guest for a golden capture, or finds it not running, and keeps the reason (review of PR 17)' {
+        # Reviewer: on the first start after a capture, the interim tried an air-gapped guest every 15 seconds for 10
+        # minutes, held sqlvm01's steps with it, and ended in a Warning.
+        Mock -CommandName Start-Sleep -MockWith { }
+        $script = InModuleScope DbHubDemo { Get-DemoProfileRunCommandScript -Target 'T2' -ProfileName 'baseline' -RequestedBy 'start-demo' -NotAfterUtc ([datetime]::UtcNow.AddMinutes(10)) -RetrySeconds 15 -RunnerTimeoutSeconds 120 }
+
+        # A guest that's still booting is tried again, as before.
+        $booting = New-RelayLine 'Fail' 'runner profile set --target T2: arcsql01 didn''t run with a heartbeat within 60 seconds (Running, heartbeat NoContact).' 'Source'
+        $passed = New-RelayLine 'Pass' 'runner profile set --target T2: Pass (1 check(s) passed).' 'Released'
+        $lines = Invoke-RetryScript -Script $script -Bundle (New-GuestBundle -Line @($booting, $passed)) -Target 'T2'
+        $lines['T2']['status'] | Should -Be 'Pass'
+        $lines['T2']['evidence']['attempts'] | Should -Be 2
+        $lines['T2']['evidence']['golden'] | Should -Be 'Released'
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 15 }
+
+        # The relay's refusal while a capture runs is long; the line keeps its end, and the reason in its evidence.
+        $refusal = 'runner profile set --target T2: A golden capture is in progress on ARCHOST01 (snapshot snap-dbhub-t2-golden-1, since 2026-11-04T15:00:00Z), so arcsql01 stays as the capture left it: off and air-gapped. The capture returns its source to service when it ends (GOLDEN.CAPTURE.SOURCE); start T2 again after that. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again, which ends the marker and releases the source first, or ./scripts/start-demo.ps1 once that capture''s snapshot exists; from 2026-11-04T21:00:00Z this marker no longer holds a start back.'
+        foreach ($golden in 'CaptureInProgress', 'CaptureMarkerUnreadable', 'CopyNotReset') {
+            $lines = Invoke-RetryScript -Script $script -Bundle (New-GuestBundle -Line @((New-RelayLine 'Fail' $refusal $golden), $passed)) -Target 'T2'
+            $lines['T2']['status'] | Should -Be 'Fail'
+            $lines['T2']['evidence']['attempts'] | Should -Be 1 -Because ('{0} lasts until the capture ends or deploy.ps1 resets the copy' -f $golden)
+            $lines['T2']['evidence']['golden'] | Should -Be $golden
+        }
+        $lines['T2']['message'] | Should -BeLike '...*this marker no longer holds a start back.'
+        $lines['T2']['message'] | Should -Not -Match 'golden capture is in progress' -Because 'the line keeps only the end of the message, so the reason travels in the evidence'
+
+        # A guest PowerShell Direct finds not running (a host whose relay predates PR 17's start of the guest).
+        $off = New-RelayLine 'Fail' 'The control action failed: The virtual machine arcsql01 is not in running state.'
+        $lines = Invoke-RetryScript -Script $script -Bundle (New-GuestBundle -Line @($off, $passed)) -Target 'T2'
+        $lines['T2']['evidence']['attempts'] | Should -Be 1
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -Because 'only the booting guest was tried again'
+    }
+
     It 'matches the result lines to their targets by the target they name, else in order from the end' {
         $named = @((ConvertTo-ProfileLine 'T3' 'Pass' 'T3 set'), 'noise', (ConvertTo-ProfileLine 'T1' 'Fail' 'T1 failed')) -join "`n"
         $lines = InModuleScope DbHubDemo -Parameters @{ Output = $named } { ConvertFrom-DemoProfileRunCommandOutput -Output $Output -Target 'T1', 'T3', 'T4' }
@@ -310,6 +389,30 @@ Describe 'Send-DemoProfileRunCommand: one managed Run Command per VM, both VMs a
         ($records | Where-Object Target -EQ 'T2').Detail | Should -Match 'archost01 isn''t running'
     }
 
+    It 'tells T2''s guest held by a golden capture, or not running, from a failure by the relay''s reason: GuestOff <Golden> (review of PR 17)' -ForEach @(
+        @{ Golden = 'CaptureInProgress'; Message = '...ARCHOST01; from 2026-11-04T21:00:00Z this marker no longer holds a start back.'; Outcome = 'GuestOff'; Detail = 'a golden capture is in progress on archost01: it turned T2''s activity off first, and the guest stays off and air-gapped until the capture returns it to service (GOLDEN.CAPTURE.SOURCE)' }
+        @{ Golden = 'CaptureMarkerUnreadable'; Message = '...or ./scripts/start-demo.ps1 once that capture''s snapshot exists.'; Outcome = 'GuestOff'; Detail = 'archost01 has a golden capture marker that can''t be read, so its guest is left as the capture left it (T2.GUEST.STATE says what to do)' }
+        @{ Golden = 'CopyNotReset'; Message = '...its T2 track resets the copy while the guest is still air-gapped, then releases it. Never reconnect it by hand.'; Outcome = 'GuestOff'; Detail = 'archost01 runs a copy restored from a golden snapshot whose Arc identity wasn''t reset, so its guest isn''t started or used until ./scripts/deploy.ps1 resets it (T2.GUEST.STATE)' }
+        @{ Golden = ''; Message = 'The control action failed: The virtual machine arcsql01 is not in running state.'; Outcome = 'GuestOff'; Detail = 'T2''s guest on archost01 isn''t running, so no activity runs there' }
+        @{ Golden = 'Source'; Message = 'runner profile set --target T2: arcsql01 didn''t run with a heartbeat within 60 seconds (Running, heartbeat NoContact).'; Outcome = 'Failed'; Detail = 'runner profile set --target T2: arcsql01 didn''t run with a heartbeat within 60 seconds (Running, heartbeat NoContact).' }
+        @{ Golden = 'VmIdUnknown'; Message = '...Start T2 again in a few minutes; if it keeps failing, run ./scripts/deploy.ps1, which resets a restored copy.'; Outcome = 'Failed'; Detail = '...Start T2 again in a few minutes; if it keeps failing, run ./scripts/deploy.ps1, which resets a restored copy.' }
+    ) {
+        $evidence = [ordered]@{ target = 'T2'; exitCode = $null; attempts = 1 }
+        if ($Golden) {
+            $evidence['golden'] = $Golden
+        }
+        $script:outputs['archost01'] = 'DBHUBDEMO-WORKLOAD ' + ([ordered]@{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = 'Fail'; message = $Message; evidence = $evidence } | ConvertTo-Json -Depth 4 -Compress)
+        $records = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Send-DemoProfileRunCommand -Config $Config -Target 'T2' -ProfileName 'baseline' -RequestedBy 'start-demo' -WaitSeconds 60 -PollSeconds 1 })
+        $records[0].Outcome | Should -Be $Outcome
+        $records[0].Detail | Should -Be $Detail
+    }
+
+    It 'never reads a golden reason on any target but T2' {
+        $script:outputs['sqlvm01'] = 'DBHUBDEMO-WORKLOAD ' + ([ordered]@{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = 'Fail'; message = 'The runner said no.'; evidence = [ordered]@{ target = 'T1'; golden = 'CaptureInProgress' } } | ConvertTo-Json -Depth 4 -Compress)
+        $records = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Send-DemoProfileRunCommand -Config $Config -Target 'T1' -ProfileName 'baseline' -RequestedBy 'start-demo' -WaitSeconds 60 -PollSeconds 1 })
+        $records[0].Outcome | Should -Be 'Failed'
+    }
+
     It 'retries a busy VM (409) within the wait, and only sends with -WaitSeconds 0' {
         $script:putAnswers.Enqueue([pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (Conflict) Another operation is in progress.' })
         $script:outputs['sqlvm01'] = ConvertTo-ProfileLine 'T1' 'Pass' 'set'
@@ -363,6 +466,14 @@ Describe 'The switch from the interim baseline (Invoke-DemoActivitySwitch, Send-
         if ($Status -eq 'Warning') {
             $results[0].remediation | Should -Match ([regex]::Escape('./scripts/demo-control.ps1 -Target T3 -Scenario business-day -Duration 240'))
         }
+    }
+
+    It 'reports T2''s guest held by a golden capture, or not running, as Not selected with the reason (GuestOff, review of PR 17)' {
+        $script:outcomes['T2'] = 'GuestOff'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoActivitySwitch -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -Target 'T2' -CheckPrefix 'START' -RequestedBy 'start-demo' })
+        $results[0].checkId | Should -Be 'START.INCIDENTS_T2'
+        $results[0].status | Should -Be 'Not selected'
+        $results[0].message | Should -Be 'T2: not switched to business-day: the runner said no'
     }
 
     It 'sends nothing for a profile without incidents, or without targets' {
@@ -598,6 +709,46 @@ Describe 'The interim baseline on a VM the run started (re-review of PR 16, 2026
         @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -ActivityProfile 'baseline') } { Wait-DemoActivityInterim -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -Record @([pscustomobject]@{ Target = 'T1'; VmName = 'sqlvm01'; Outcome = 'Sent'; Detail = ''; Data = $null; Seconds = 0 }) -CheckPrefix 'START' }) | Should -BeNullOrEmpty
         @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Wait-DemoActivityInterim -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -Record @() -CheckPrefix 'START' }) | Should -BeNullOrEmpty
     }
+
+    It 'reports T2''s guest held by a golden capture, or not running, as Not selected with the reason, never a Warning (review of PR 17)' {
+        $data = [pscustomobject]@{ Url = 'https://management.azure.com/x/DbHubDemo-Profile?api-version=1'; NotBefore = [DateTime]::UtcNow.AddMinutes(-1); SentUtc = [DateTime]::UtcNow; ExpiresUtc = [DateTime]::UtcNow.AddMinutes(10) }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoProfileRunCommand -MockWith {
+            foreach ($item in $Record) {
+                [pscustomobject]@{ Target = $item.Target; VmName = $item.VmName; Outcome = 'GuestOff'; Detail = 'a golden capture is in progress on archost01: it turned T2''s activity off first, and the guest stays off and air-gapped until the capture returns it to service (GOLDEN.CAPTURE.SOURCE)'; Data = $null; Seconds = 9 }
+            }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Data = $data } { Wait-DemoActivityInterim -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -Record @([pscustomobject]@{ Target = 'T2'; VmName = 'archost01'; Outcome = 'Sent'; Detail = 'sent'; Data = $Data; Seconds = 0 }) -CheckPrefix 'START' })
+        $results.Count | Should -Be 1
+        $results[0].checkId | Should -Be 'START.INTERIM_T2'
+        $results[0].status | Should -Be 'Not selected'
+        $results[0].message | Should -Be 'T2: no interim baseline to set on archost01: a golden capture is in progress on archost01: it turned T2''s activity off first, and the guest stays off and air-gapped until the capture returns it to service (GOLDEN.CAPTURE.SOURCE)'
+        $results[0].evidence['outcome'] | Should -Be 'GuestOff'
+    }
+
+    It 'skips T2''s interim, Not selected, when the golden source''s release left the guest off, and only then (review of PR 17)' {
+        $activity = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoActivityProfile -Config $Config }
+        $skip = {
+            param($Release, [string] $Prefix = 'START', $UsedProfile = $activity)
+            InModuleScope DbHubDemo -Parameters @{ Activity = $UsedProfile; Release = $Release; Prefix = $Prefix } { Get-DemoGoldenHeldInterimResult -ActivityProfile $Activity -Release $Release -CheckPrefix $Prefix }
+        }
+        $held = New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'archost01 is the source of snap-1, and its guest stays air-gapped: a golden capture is in progress on this host.' -Evidence ([ordered]@{ snapshots = @('snap-1'); captureInProgress = $true })
+        $result = & $skip $held
+        $result.checkId | Should -Be 'START.INTERIM_T2'
+        $result.status | Should -Be 'Not selected'
+        $result.message | Should -Be 'T2: no interim baseline to set on archost01, and none to wait for: a golden capture is in progress on archost01: it turned T2''s activity off first, and the guest stays off and air-gapped until the capture returns it to service (GOLDEN.CAPTURE.SOURCE).'
+        $result.evidence['release'] | Should -Be 'Warning'
+
+        $failed = New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status 'Fail' -Message 'archost01 is a golden snapshot''s source, and its guest couldn''t be reconnected: the Run Command failed.' -Evidence ([ordered]@{ snapshots = @('snap-1') })
+        $result = & $skip $failed 'DEPLOY'
+        $result.checkId | Should -Be 'DEPLOY.INTERIM_T2'
+        $result.message | Should -Be 'T2: no interim baseline to set on archost01, and none to wait for: the golden source''s release failed (T2.GOLDEN.SOURCE says why), so its guest is still off and air-gapped.'
+
+        # A released guest gets its interim: a Pass, or a Warning that only couldn't tag the snapshot.
+        & $skip (New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'reconnected' -Evidence ([ordered]@{ snapshots = @('snap-1') })) | Should -BeNullOrEmpty
+        & $skip (New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'reconnected; the release wasn''t recorded on snap-1' -Evidence ([ordered]@{ snapshots = @('snap-1') })) | Should -BeNullOrEmpty
+        & $skip $null | Should -BeNullOrEmpty
+        & $skip $held 'START' (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -ActivityProfile 'baseline') } { Get-DemoActivityProfile -Config $Config }) | Should -BeNullOrEmpty -Because 'a profile without incidents has no interim'
+    }
 }
 
 Describe 'Complete-DemoDeploymentRun sends a switch the run didn''t get to (Ctrl+C, an error)' {
@@ -658,6 +809,14 @@ Describe 'stop-demo.ps1''s bounded steps (2026-11-03)' {
         $result.checkId | Should -Be 'STOP.PROFILE_T1'
         $result.status | Should -Be $Status
         $result.message | Should -Match $Pattern
+    }
+
+    It 'reports T2''s guest that isn''t running as Not selected: nothing to turn off there (GuestOff, review of PR 17)' {
+        $record = New-ProfileRecord 'T2' 'GuestOff' 'T2''s guest on archost01 isn''t running, so no activity runs there'
+        $result = InModuleScope DbHubDemo -Parameters @{ Record = $record } { ConvertTo-DemoStopProfileResult -Record $Record -WaitSeconds 180 }
+        $result.checkId | Should -Be 'STOP.PROFILE_T2'
+        $result.status | Should -Be 'Not selected'
+        $result.message | Should -Be 'T2: nothing to turn off: T2''s guest on archost01 isn''t running, so no activity runs there. The profile stored in the guest ends at the auto-shutdown it was set for, and start-demo.ps1 sets its own when the guest runs again.'
     }
 
     It 'bounds the guest''s clean shutdown, and a time-out is a Warning: the host''s deallocation shuts the guest down' {

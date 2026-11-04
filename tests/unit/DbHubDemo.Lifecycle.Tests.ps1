@@ -875,12 +875,13 @@ Describe 'Invoke-DemoDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).status | Should -Be 'Pass'
 
         # A resume at T2: both start before it, with the golden source's guest and T1's monitoring plugin, which no
-        # Monitoring stage of this run checks.
+        # Monitoring stage of this run checks. The source's release comes as soon as archost01 runs, before its interim
+        # baseline (review of PR 17).
         $script:order.Clear()
         $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
         $script:state = New-TestState @{ Stage = 'Monitoring'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
         Invoke-DemoDeployment -Config $config -Resume | Out-Null
-        $script:order[0..9] | Should -Be @('Request:sqlvm01', 'Request:archost01', 'Running:sqlvm01', 'Switch:T1,T3=baseline', 'Running:archost01', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'SourceRelease', 'T1Monitoring', 'Arc')
+        $script:order[0..9] | Should -Be @('Request:sqlvm01', 'Request:archost01', 'Running:sqlvm01', 'Switch:T1,T3=baseline', 'Running:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'T1Monitoring', 'Arc')
     }
 
     It 'checks T1''s monitoring plugin on a run without a Monitoring stage, whether or not a VM was stopped, before the first stage that needs the VMs (Phase 28 live finding, 2026-10-30)' {
@@ -1513,6 +1514,16 @@ Describe 'Stop-DemoEnvironment' {
         ($results | Where-Object { $_.checkId -eq 'STOP.PROFILE_T3' }).status | Should -Be 'Pass'
     }
 
+    It 'reports T2''s guest that isn''t running as Not selected, with the others before the deallocation: nothing to turn off there (review of PR 17)' {
+        $script:offOutcome = @{ T2 = 'GuestOff' }
+        $results = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
+        $t2 = $results | Where-Object { $_.checkId -eq 'STOP.PROFILE_T2' }
+        $t2.status | Should -Be 'Not selected'
+        $t2.message | Should -Match '^T2: nothing to turn off: the runner said no\. The profile stored in the guest'
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        [array]::IndexOf($ids, 'STOP.PROFILE_T2') | Should -BeLessThan ([array]::IndexOf($ids, 'STOP.VM_ARCHOST01'))
+    }
+
     It 'parks only T2 with -ParkT2, and deletes T3 only with -RemoveT3' {
         Stop-DemoEnvironment -Config $config -ParkT2 -Confirm:$false | Out-Null
         $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Profile:T2=off', 'Guest', 'Deallocate:archost01')
@@ -1687,7 +1698,7 @@ Describe 'Start-DemoEnvironment' {
         $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
         # A VM this start booted gets the interim baseline as soon as it runs, and its own Run Commands wait for it (review of
         # PR 16, and its re-review).
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Switch:T1,T3=baseline', 'Start:archost01', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'SourceRelease', 'T1Monitoring', 'WarmT3', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T2=business-day')
+        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Switch:T1,T3=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'T1Monitoring', 'WarmT3', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T2=business-day')
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 1 -Exactly -ParameterFilter { $ProfileName -eq 'business-day' -and $WaitSeconds -eq 180 -and $RequestedBy -eq 'start-demo' }
         foreach ($target in 'T1', 'T3', 'T2') {
             $switch = $results | Where-Object { $_.checkId -eq ('START.INCIDENTS_{0}' -f $target) }
@@ -1762,8 +1773,10 @@ Describe 'Start-DemoEnvironment' {
         # boot, while the start's own Run Commands (the monitoring restore, T3's warm-up, the profiles) still run.
         Start-DemoEnvironment -Config $config -Confirm:$false | Out-Null
         $script:order.IndexOf('Switch:T1,T3=baseline') | Should -Be ($script:order.IndexOf('Start:sqlvm01') + 1)
-        $script:order.IndexOf('Switch:T2=baseline') | Should -Be ($script:order.IndexOf('Start:archost01') + 1)
-        $script:order.IndexOf('Interim:T1,T3,T2') | Should -BeLessThan $script:order.IndexOf('SourceRelease') -Because 'the first Run Command on archost01 waits for its interim'
+        # The golden source's release comes first on archost01 (review of PR 17): it runs Run Commands only on a guest the
+        # capture left off, where no incident runs, and the interim must never wait for such a guest.
+        $script:order.IndexOf('SourceRelease') | Should -Be ($script:order.IndexOf('Start:archost01') + 1)
+        $script:order.IndexOf('Switch:T2=baseline') | Should -Be ($script:order.IndexOf('SourceRelease') + 1)
         $script:order.IndexOf('Interim:T1,T3,T2') | Should -BeLessThan $script:order.IndexOf('T1Monitoring') -Because 'the first Run Command on sqlvm01 waits for its interim'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 2 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and $WaitSeconds -eq 0 -and $ExpiresMinutes -eq 10 -and $RequestedBy -eq 'start-demo' -and $RetrySeconds -eq 15 -and $RunnerTimeoutSeconds -eq 120 }
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -eq 'sqlvm01 started, so T1 and T3 get the interim baseline before this run''s own Run Commands there: its profile host resumes the profile stored there about 2 minutes after the boot. The VM tries every 15 seconds until it''s set, for at most 10 minutes, while its SQL Server starts; business-day comes back at the end.' }
@@ -1800,7 +1813,7 @@ Describe 'Start-DemoEnvironment' {
             $script:refuse = @()
         }
         Start-DemoEnvironment -Config $config -SkipT3 -Confirm:$false | Out-Null
-        @($script:order[0..8]) | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Switch:T2=baseline', 'Start:sqlvm01', 'Switch:T1=baseline', 'Start:archost01', 'Switch:T2=baseline', 'Interim:T1,T2')
+        @($script:order[0..9]) | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Switch:T2=baseline', 'Start:sqlvm01', 'Switch:T1=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T2')
         $script:order[-1] | Should -Be 'Switch:T1,T2=business-day'
 
         # A VM that doesn't run gets nothing: a Run Command can't reach it.
@@ -1884,6 +1897,52 @@ Describe 'Start-DemoEnvironment' {
         $script:order.IndexOf('SourceRelease') | Should -BeLessThan $script:order.IndexOf('Profile:T2=baseline')
     }
 
+    It 'releases a golden source as soon as archost01 runs, before its interim baseline, and sends none to a guest the release left off (review of PR 17)' {
+        # Reviewer: the first start after a capture sent T2's interim, and waited for it, before the release: the guest was
+        # off and air-gapped, so it was tried for 10 minutes, held sqlvm01's steps, and ended in a misleading Warning.
+        $script:sourceRelease = New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'archost01 is the source of snap-1, and its guest stays air-gapped: a golden capture is in progress on this host.' -Evidence ([ordered]@{ snapshots = @('snap-1'); captureInProgress = $true })
+        $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        $script:order.IndexOf('SourceRelease') | Should -Be ($script:order.IndexOf('Start:archost01') + 1)
+        $script:order | Should -Not -Contain 'Switch:T2=baseline'
+        $script:order | Should -Contain 'Interim:T1,T3' -Because 'only sqlvm01''s interim is waited for'
+        $skipped = $results | Where-Object { $_.checkId -eq 'START.INTERIM_T2' }
+        $skipped.status | Should -Be 'Not selected'
+        $skipped.message | Should -Match '^T2: no interim baseline to set on archost01, and none to wait for: a golden capture is in progress on archost01'
+        Get-DemoExitCode -Result $results | Should -Be 0
+
+        # A release that failed leaves the guest off as well.
+        $script:order.Clear()
+        $script:sourceRelease = New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status 'Fail' -Message 'archost01 is a golden snapshot''s source, and its guest couldn''t be reconnected: the Run Command failed.'
+        $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        $script:order | Should -Not -Contain 'Switch:T2=baseline'
+        ($results | Where-Object { $_.checkId -eq 'START.INTERIM_T2' }).message | Should -Match 'the golden source''s release failed'
+
+        # A released guest gets its interim right after the release.
+        $script:order.Clear()
+        $script:sourceRelease = New-TestResult 'T2.GOLDEN.SOURCE' 'Pass' 't2' 'T2'
+        $null = Start-DemoEnvironment -Config $config -Confirm:$false
+        $script:order.IndexOf('Switch:T2=baseline') | Should -Be ($script:order.IndexOf('SourceRelease') + 1)
+    }
+
+    It 'tries T1 and T2 once more, without another wait, when they stayed down through their interim''s wait (review of PR 17)' {
+        # Each had its VM's 10-minute bound already; a second budget of 4 minutes each would only add to it.
+        $script:interimOutcome = 'TimedOut'
+        $script:t1Failures = 1
+        $script:t2Failures = 1
+        $results = @(Start-DemoEnvironment -Config $config -T2ProfileRetrySeconds 1 -Confirm:$false)
+        @($script:order | Where-Object { $_ -eq 'Profile:T1=baseline' }).Count | Should -Be 1
+        @($script:order | Where-Object { $_ -eq 'Profile:T2=baseline' }).Count | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -Times 2 -Exactly -ParameterFilter { $Target -in 'T1', 'T2' -and $ReadySeconds -eq 0 }
+        ($results | Where-Object { $_.checkId -eq 'START.PROFILE_T1' }).status | Should -Be 'Warning'
+
+        # The same after the VM's own retries failed until the bound (the line's attempts).
+        $script:order.Clear()
+        $script:interimOutcome = 'Failed'
+        $script:t1Failures = 1
+        $null = Start-DemoEnvironment -Config $config -T2ProfileRetrySeconds 1 -Confirm:$false
+        @($script:order | Where-Object { $_ -eq 'Profile:T1=baseline' }).Count | Should -Be 1
+    }
+
     It 'stops before anything starts when the cost guardrail fails' {
         $script:costStatus = 'Fail'
         $results = Start-DemoEnvironment -Config $config -Confirm:$false
@@ -1958,7 +2017,7 @@ Describe 'Start-DemoEnvironment' {
             New-DemoResult -CheckId 'START.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 is {0}.' -f $after) -Evidence @{ stateBefore = 'Stopped'; stateAfter = $after }
         }
         $results = Start-DemoEnvironment -Config (New-TestConfig -WithT4) -Confirm:$false
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'T4:Start:0', 'Start:sqlvm01', 'Switch:T1,T3,T4=baseline', 'Start:archost01', 'Switch:T2=baseline', 'Interim:T1,T3,T4,T2', 'SourceRelease', 'T1Monitoring', 'WarmT3', 'T4:Start:15', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T4=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T4,T2=business-day')
+        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'T4:Start:0', 'Start:sqlvm01', 'Switch:T1,T3,T4=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T4,T2', 'T1Monitoring', 'WarmT3', 'T4:Start:15', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T4=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T4,T2=business-day')
         ($results | Where-Object { $_.checkId -eq 'START.T4.START' }).status | Should -Be 'Pass'
         # The confirming call knows this run requested the start, so it doesn't say "was already running" (Phase 25d).
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -Times 1 -Exactly -ParameterFilter { $WaitMinutes -gt 0 -and $Requested }
@@ -3074,7 +3133,7 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $activity = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoActivityProfile -Config $Config }
         $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request; Activity = $activity } { Wait-DemoStoppedStart -Config $Config -Request $Request -ActivityProfile $Activity })
-        $script:calls | Should -Be @('request sqlvm01', 'request archost01', 'running sqlvm01 requested=True', 'quiet sqlvm01 started=True by=deploy', 'running archost01 requested=True', 'quiet archost01 started=True by=deploy', 'interim wait T1,T2 DEPLOY', 'source release') -Because 'the golden source''s release is the first Run Command on archost01'
+        $script:calls | Should -Be @('request sqlvm01', 'request archost01', 'running sqlvm01 requested=True', 'quiet sqlvm01 started=True by=deploy', 'running archost01 requested=True', 'source release', 'quiet archost01 started=True by=deploy', 'interim wait T1,T2 DEPLOY') -Because 'the golden source''s release comes as soon as archost01 runs, before its interim baseline, which must never wait for a guest the capture left off (review of PR 17)'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.INTERIM_T1' }).status | Should -Be 'Pass'
 
         # A VM that didn't start gets none.
@@ -3088,6 +3147,27 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $script:noStart = ''
         $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
         @($script:calls | Where-Object { $_ -like 'quiet*' -or $_ -like 'interim*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'sends archost01 no interim baseline, and waits for none, when the golden source''s release leaves its guest off (review of PR 17)' {
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenSourceRelease -MockWith { $script:calls.Add('source release'); New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'archost01 is the source of snap-1, and its guest stays air-gapped: a golden capture is in progress on this host.' -Evidence ([ordered]@{ snapshots = @('snap-1'); captureInProgress = $true }) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityQuiet -MockWith {
+            $script:calls.Add(('quiet {0}' -f (@($VmName) -join ',')))
+            [pscustomobject]@{ Target = 'T1'; VmName = 'sqlvm01'; Outcome = 'Sent'; Detail = 'sent'; Data = $null; Seconds = 0 }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoActivityInterim -MockWith {
+            $script:calls.Add(('interim wait {0}' -f (@($Record | ForEach-Object { $_.Target }) -join ',')))
+            New-DemoResult -CheckId 'DEPLOY.INTERIM_T1' -Area 'workload' -Target 'T1' -Status 'Pass' -Message 'set'
+        }
+        $activity = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoActivityProfile -Config $Config }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request; Activity = $activity } { Wait-DemoStoppedStart -Config $Config -Request $Request -ActivityProfile $Activity })
+        $script:calls | Should -Be @('request sqlvm01', 'request archost01', 'running sqlvm01 requested=True', 'quiet sqlvm01', 'running archost01 requested=True', 'source release', 'interim wait T1')
+        $skipped = $results | Where-Object { $_.checkId -eq 'DEPLOY.INTERIM_T2' }
+        $skipped.status | Should -Be 'Not selected'
+        $skipped.message | Should -Match '^T2: no interim baseline to set on archost01, and none to wait for: a golden capture is in progress on archost01'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).status | Should -Be 'Pass'
     }
 
     It 'starts nothing in a what-if' {
@@ -3209,6 +3289,33 @@ Describe 'Set-DemoTargetProfile' {
         $null = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T1 -ProfileName baseline -CheckPrefix START -Attempts 3 -RetrySeconds 120 } $config
         @($script:ready) | Should -Be @(240, 20)
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 120 }
+    }
+
+    It 'doesn''t try T2 again while its relay holds the guest for a golden capture, and tries any other failure again (review of PR 17)' {
+        $script:golden = 'CaptureInProgress'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $script:attempts++
+            [pscustomobject]@{ Status = 'Fail'; ExitCode = 1; Records = @(); Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Fail' -Message 'runner profile set --target T2: A golden capture is in progress on ARCHOST01 (snapshot snap-1), so arcsql01 stays as the capture left it: off and air-gapped.' -Evidence @{ target = $Target; guest = 'arcsql01'; golden = $script:golden; readySeconds = 0 }) }
+        }
+        foreach ($golden in 'CaptureInProgress', 'CaptureMarkerUnreadable', 'CopyNotReset') {
+            $script:attempts = 0
+            $script:golden = $golden
+            $held = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName baseline -CheckPrefix START -Attempts 3 -RetrySeconds 120 } $config
+            $held.status | Should -Be 'Warning'
+            $held.message | Should -Match 'golden capture is in progress'
+            $script:attempts | Should -Be 1 -Because ('{0} lasts until the capture ends or deploy.ps1 resets the copy' -f $golden)
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+
+        # A guest that's still booting, for one, is tried again within the budget; so is any target's failure but T2's.
+        $script:attempts = 0
+        $script:golden = 'Source'
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName baseline -CheckPrefix START -Attempts 3 -RetrySeconds 1 } $config
+        $script:attempts | Should -Be 3
+        $script:attempts = 0
+        $script:golden = 'CaptureInProgress'
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T1 -ProfileName baseline -CheckPrefix START -Attempts 3 -RetrySeconds 1 } $config
+        $script:attempts | Should -Be 3
     }
 
     It 'reports a T2 guest without SQL Server as Not selected, with the relay''s own words (Phase 28)' {
