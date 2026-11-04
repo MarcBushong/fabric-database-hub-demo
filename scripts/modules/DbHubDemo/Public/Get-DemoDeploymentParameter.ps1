@@ -229,7 +229,9 @@ function Get-DemoDeploymentParameter {
         t3AdminGroupObjectId      = [string]$Config['t3AdminGroupObjectId']
         t3AutoPauseMinutes        = [int]$Config['t3AutoPauseMinutes']
         t3UseFreeLimit            = $t3UseFreeLimitValue
-        activityProfile           = if ($Config['activityProfile']) { [string]$Config['activityProfile'] } else { 'baseline' }
+        # The profile the VMs set by themselves (after a runner install, and at a boot with activityProfileOnBoot): never one
+        # with incidents, so none slows a run's own Run Commands; the run switches to it afterward (2026-11-03, ADR 0010).
+        activityProfile           = (Get-DemoActivityProfile -Config $Config).Interim
         activityProfileOnBoot     = ($Config.Contains('activityProfileOnBoot') -and [bool]$Config['activityProfileOnBoot'])
         t4Enabled                 = (Test-DemoT4Enabled -Config $Config)
         t4SkuName                 = (Get-DemoT4SkuName -Config $Config)

@@ -11,8 +11,13 @@ function Stop-DemoEnvironment {
       and with the Key Vault opt-in disables the vault's copy (Disable-DemoHostPasswordSecret, STOP.KEYVAULT);
       once Bastion is gone, clears the record of a guided stop whose cleanup didn't finish (GuidedStopUtc, as after a
       Ctrl+C at the guided stop), so deploy.ps1's DONE no longer waits for it (Phase 28 review);
-      sets every target's activity profile to off, so nothing restarts on the next boot (R183); stops the
-      guest arcsql01 cleanly over PowerShell Direct; then deallocates the T2 VM and sqlvm01. T3 isn't
+      sets every target's activity profile to off, so nothing restarts on the next boot (R183): one managed Run Command
+      per VM, both VMs at once, waited for at most -ProfileOffWaitSeconds (about 3 minutes), because an incident in
+      progress can keep a VM's Run Commands waiting for minutes; one that doesn't finish in time is a Warning, reported
+      after the deallocation, that says the VM was deallocated anyway, which stops the incident with it (2026-11-03);
+      stops the guest arcsql01 cleanly over PowerShell Direct, as before, within the same bound (a guest stop that
+      doesn't finish in time is a Warning: the host's deallocation shuts the guest down through its automatic stop
+      action, ShutDown); then deallocates the T2 VM and sqlvm01. T3 isn't
       touched: with its profile off (the T3 profile is a file on T1, so this doesn't wake it), serverless
       auto-pause stops its compute t3AutoPauseMinutes after the last session. T4, the PostgreSQL flexible
       server (Phase 24, ADR 0019), gets its profile off and is stopped (STOP.T4.STOP; Servers - Stop). A
@@ -56,6 +61,10 @@ function Stop-DemoEnvironment {
     .PARAMETER SaveHistoryWindowMinutes
     How far back the saved history goes (default 720 minutes; the notebook uses 5-minute bins up to 12 hours).
 
+    .PARAMETER ProfileOffWaitSeconds
+    How long the profiles' off waits for both VMs together before the stop goes on anyway, and how long the guest's clean
+    shutdown may take (default 180).
+
     .EXAMPLE
     Stop-DemoEnvironment -Config $config -RemoveT3
     #>
@@ -76,7 +85,10 @@ function Stop-DemoEnvironment {
         [switch] $SaveHistory,
 
         [ValidateRange(15, 10080)]
-        [int] $SaveHistoryWindowMinutes = 720
+        [int] $SaveHistoryWindowMinutes = 720,
+
+        [ValidateRange(30, 900)]
+        [int] $ProfileOffWaitSeconds = 180
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -150,6 +162,7 @@ function Stop-DemoEnvironment {
         $t4Missing = [string](Get-DemoT4State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])).State -eq 'NotFound'
     }
     $profileTargets = if ($ParkT2) { @('T2') } else { @('T1', 'T3') + @(if ($t4On) { 'T4' }) + @('T2') }
+    $offTargets = [System.Collections.Generic.List[string]]::new()
     foreach ($item in $profileTargets) {
         $vm = if ($item -eq 'T2') { $hostVm } else { 'sqlvm01' }
         $skip = ''
@@ -165,16 +178,43 @@ function Stop-DemoEnvironment {
         elseif ($power[$vm] -ne 'PowerState/running') {
             $skip = '{0} isn''t running, so no activity runs there. A profile ends at the auto-shutdown it was set for, and nothing sets it again at boot unless activityProfileOnBoot is true.' -f $vm
         }
-        $results.Add((Set-DemoTargetProfile -Config $Config -Target $item -ProfileName 'off' -CheckPrefix 'STOP' -SkipReason $skip -RequestedBy 'stop-demo'))
+        if ($skip) {
+            $results.Add((Set-DemoTargetProfile -Config $Config -Target $item -ProfileName 'off' -CheckPrefix 'STOP' -SkipReason $skip -RequestedBy 'stop-demo'))
+        }
+        else {
+            $offTargets.Add($item)
+        }
+    }
+    # The profiles go off in one managed Run Command per VM, both VMs at once, and the wait is bounded (about 3 minutes):
+    # an incident in progress can keep a VM's Run Commands waiting for minutes (2026-10-23), and deallocating the VM stops
+    # it anyway, so the stop never waits for it (2026-11-03). A profile that isn't off yet is reported after the
+    # deallocation, which is what stops its activity then.
+    $notOff = [System.Collections.Generic.List[object]]::new()
+    if ($offTargets.Count -gt 0) {
+        foreach ($record in @(Send-DemoProfileRunCommand -Config $Config -Target $offTargets.ToArray() -ProfileName 'off' -RequestedBy 'stop-demo' -WaitSeconds $ProfileOffWaitSeconds -ExpiresMinutes 10)) {
+            if ([string]$record.Outcome -in 'Set', 'NotSetUp') {
+                $results.Add((ConvertTo-DemoStopProfileResult -Record $record -WaitSeconds $ProfileOffWaitSeconds))
+            }
+            else {
+                $notOff.Add($record)
+            }
+        }
     }
 
     if ($hostVm -eq 'archost01' -and $power[$hostVm] -eq 'PowerState/running') {
-        # A clean guest shutdown before the host deallocates; the guest's stop action would also shut it down.
-        $results.Add((Stop-DemoGuestVm -Config $Config -Confirm:$false))
+        # A clean guest shutdown before the host deallocates, as before, within the same bound; the guest's automatic stop
+        # action (ShutDown) shuts it down when the host deallocates otherwise.
+        $results.Add((Stop-DemoGuestVm -Config $Config -TimeoutSeconds $ProfileOffWaitSeconds -Confirm:$false))
     }
     $vms = if ($ParkT2) { @($hostVm) } else { @($hostVm, 'sqlvm01') }
+    $deallocated = @{}
     foreach ($vm in $vms) {
-        $results.Add((Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Deallocate))
+        $stopped = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Deallocate
+        $results.Add($stopped)
+        $deallocated[$vm] = [string]$stopped.status -eq 'Pass'
+    }
+    foreach ($record in $notOff) {
+        $results.Add((ConvertTo-DemoStopProfileResult -Record $record -WaitSeconds $ProfileOffWaitSeconds -DeallocationFailed:(-not [bool]$deallocated[[string]$record.VmName])))
     }
     if (-not $ParkT2 -and $t4On -and -not $t4Missing) {
         # After the VMs, so T1's runner has ended T4's sessions; the stop finishes in the background.

@@ -488,7 +488,8 @@ function Save-DemoFabricHistory {
             StillRunning = $StillRunning
         }
     }
-    $manualRun = 'In Fabric, open NB_DatabaseHub_LiveActivity in the demo''s workspace and select Run all (with the defaults it writes only the lakehouse''s history tables).'
+    # CONFIRM is True by default since 2026-11-03 (no dry-run defaults), so a run by hand that only saves sets it to False.
+    $manualRun = 'In Fabric, open NB_DatabaseHub_LiveActivity in the demo''s workspace, set CONFIRM = False in its parameters cell (it''s True by default, so Run all would also send its activity request to the stopped VMs), and select Run all: it then writes only the lakehouse''s history tables.'
     try {
         $token = Get-DemoFabricToken -SubscriptionId ([string]$Config['subscriptionId'])
     }

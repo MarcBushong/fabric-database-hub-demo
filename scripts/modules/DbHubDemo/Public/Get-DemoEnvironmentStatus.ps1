@@ -16,7 +16,8 @@ function Get-DemoEnvironmentStatus {
       waiting or its last cleanup didn't finish (archost01's next pass removes the leftovers; status stays read-only).
     - STATUS.DISKS: each VM's disks against the profile. STATUS.RUNCOMMANDS (Phase 28 follow-up,
       Get-DemoRunCommandStatus): managed Run Commands the demo left on its VMs, the on-demand control's DbHubControl-*
-      and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap, as a Warning with the commands
+      and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap and the activity profiles'
+      DbHubDemo-Profile (both stay by design), as a Warning with the commands
       that delete them; Pass when there's none. Read-only.
     - STATUS.T3: whether T3 exists and its status (Online, Paused); Not selected after stop-demo.ps1 -RemoveT3.
     - STATUS.T4 (Phase 24, ADR 0019): T4's state; while it runs, its live Azure Monitor metrics from the last
@@ -34,7 +35,9 @@ function Get-DemoEnvironmentStatus {
       T1, Pass with the engine only and a Warning while associated services are still listed; and T1.SQLVM.MONITORING while sqlvm01
       runs (an extension that's Updating after a redeployment is a Warning).
     - STATUS.PROFILE_T1 and STATUS.PROFILE_T3 (sqlvm01 running): the active activity profile and its end,
-      read with 'profile get' (a Run Command each; the T3 profile is a file on T1, so T3 isn't woken).
+      read with 'profile get' (a Run Command each; the T3 profile is a file on T1, so T3 isn't woken), with what it does
+      and how to choose the other (Get-DemoProfileStatusNote, 2026-11-03): business-day's incidents for that target and
+      the quieter baseline, or, for baseline, business-day; a baseline that a run hasn't switched yet says so.
       STATUS.PROFILE_T2 with -Detail. Each takes on the Warning or Fail of the profile host lane that serves the
       target (Phase 25b, from host-lanes.json): a stalled, restarting, or failing lane, or an active profile that
       nothing runs.
@@ -279,6 +282,7 @@ function Get-DemoEnvironmentStatus {
 
     if ($running['sqlvm01'] -and $state.RunnerSha256) {
         # The active profile (plan section 9.6). The T3 profile is a file on T1, so reading it doesn't wake T3.
+        $configuredActivity = Get-DemoActivityProfile -Config $Config
         $profileTargets = @('T1') + @(if ($t3.Exists) { 'T3' }) + @(if ($null -ne $t4 -and $t4.Exists) { 'T4' })
         if ($Detail -and $hostVm -eq 'archost01' -and $running[$hostVm] -and 'archost01' -in $state.RunnerSentTo) {
             $profileTargets += 'T2'
@@ -344,6 +348,9 @@ function Get-DemoEnvironmentStatus {
                     $remediation = 'The host replaces a stalled or failed lane by itself within about 5 minutes; run status.ps1 again. If it stays, run validate.ps1 -Area Workload for WORKLOAD.{0}.HOST, or stop-demo.ps1 and then start-demo.ps1, which restart the VM and its DbHubDemo-Workload task.' -f $target
                 }
             }
+            # What the active profile does, and how to choose the other (2026-11-03): business-day's incidents fill the
+            # Performance page, and a baseline that a run hasn't switched yet says so.
+            $message += Get-DemoProfileStatusNote -Target $target -ActiveName $name -ActivityProfile $configuredActivity
             $results.Add((New-DemoResult -CheckId ('STATUS.PROFILE_{0}' -f $target) -Area 'workload' -Target $target -Status $profileStatus -Message $message -Evidence $profileEvidence -Remediation $remediation))
         }
         if ($Detail -and $t4Ready) {

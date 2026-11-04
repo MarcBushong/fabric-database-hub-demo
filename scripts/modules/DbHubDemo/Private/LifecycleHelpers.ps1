@@ -129,8 +129,9 @@ function Request-DemoStoppedStart {
     deploy.ps1 on an existing environment (Phase 28 live finding, 2026-10-30): asks Azure to start the demo VMs that are
     deallocated or stopped, and T4 when it's deployed and stopped, without waiting, so they boot while preflight runs.
     Returns what Wait-DemoStoppedStart waits for: Needed, Vms (each VM that wasn't running, with its power state and
-    whether a start was requested), T4 (the start request's result, or $null), Names (for the status page), and Requested
-    (what this run asked to start). Internal.
+    whether a start was requested), T4 (the start request's result, or $null), Names (for the status page), Requested
+    (what this run asked to start), and Running (the VMs that were already running, which can serve an earlier run's
+    activity profile; Invoke-DemoActivityQuiet, 2026-11-03). Internal.
 
     .DESCRIPTION
     The nightly auto-shutdown, stop-demo.ps1, or a Ctrl+C followed by a stop leaves the VMs deallocated, and every Run
@@ -155,13 +156,14 @@ function Request-DemoStoppedStart {
         [string] $ProgressPath = ''
     )
 
-    $request = [pscustomobject]@{ Needed = $false; Vms = [ordered]@{}; T4 = $null; Names = @(); Requested = @() }
+    $request = [pscustomobject]@{ Needed = $false; Vms = [ordered]@{}; T4 = $null; Names = @(); Requested = @(); Running = @() }
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
     $power = [ordered]@{}
     foreach ($vm in 'sqlvm01', (Get-DemoHostVmName -Config $Config)) {
         $power[$vm] = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $vm
     }
+    $request.Running = @($power.Keys | Where-Object { $power[$_] -eq 'PowerState/running' })
     $stopped = @($power.Keys | Where-Object { $power[$_] -and $power[$_] -ne 'PowerState/running' })
     $t4On = -not $SkipT4 -and (Test-DemoT4Enabled -Config $Config)
     if (($stopped.Count -gt 0 -or $t4On) -and -not $PSCmdlet.ShouldProcess($resourceGroupName, 'Start the demo VMs, and T4, that are stopped')) {
@@ -215,7 +217,12 @@ function Wait-DemoStoppedStart {
     the results with DEPLOY.VMSTART: Pass when every VM runs, Fail when one doesn't, because every Run Command on it would
     fail, so the caller stops there. Updates the status page's StartVms step. Nothing when nothing was stopped. T1's
     monitoring plugin, which can stop after a restart, is the caller's next check (Invoke-DemoT1MonitoringCheck), on
-    every run without a T1 Monitoring step, whether or not this run started sqlvm01. Internal.
+    every run without a T1 Monitoring step, whether or not this run started sqlvm01. With -ActivityProfile (one with
+    incidents), each VM that now runs gets its targets' interim baseline as soon as it does (Invoke-DemoActivityQuiet
+    -Started): its profile host resumes the profile stored there about 2 minutes after the boot (review of PR 16,
+    2026-11-04). The VM retries it while its SQL Server, or T2's guest, starts, and this waits for it before the run's
+    first Run Command there, at most until its 10-minute bound, with DEPLOY.INTERIM_<target> (Wait-DemoActivityInterim,
+    re-review of PR 16). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -230,7 +237,10 @@ function Wait-DemoStoppedStart {
         [string] $ProgressPath = '',
 
         [ValidateRange(1, 60)]
-        [int] $T4WaitMinutes = 15
+        [int] $T4WaitMinutes = 15,
+
+        [AllowNull()]
+        [pscustomobject] $ActivityProfile = $null
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -242,15 +252,29 @@ function Wait-DemoStoppedStart {
     # What this run itself started: its own request (Request-DemoVmStart), or the start Invoke-DemoVmPowerAction issued
     # once a VM that was still stopping had settled; never one that was already starting (Phase 28 review).
     $issued = [System.Collections.Generic.List[string]]::new()
+    $interimSent = [System.Collections.Generic.List[object]]::new()
     foreach ($vm in @($Request.Vms.Keys)) {
         $item = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:([bool]$Request.Vms[$vm].Requested)
         $results.Add($item)
         if ([string]$item.status -ne 'Pass') {
             $notRunning.Add($vm)
         }
+        elseif ($null -ne $ActivityProfile) {
+            foreach ($sentItem in @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $ActivityProfile -VmName $vm -RequestedBy 'deploy' -Started -PassThru)) {
+                $interimSent.Add($sentItem)
+            }
+        }
         $itemEvidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
         if ([bool]$Request.Vms[$vm].Requested -or [string](Get-DemoMemberValue -InputObject $itemEvidence -Name 'issued') -eq 'start') {
             $issued.Add($vm)
+        }
+    }
+    # The interim baseline on each VM this run started is retried there while its SQL Server, or T2's guest, starts, and
+    # the run's first Run Command there (the golden source's release below, then the tracks') waits for it, at most until
+    # its 10-minute bound (re-review of PR 16, 2026-11-04).
+    if ($null -ne $ActivityProfile -and $interimSent.Count -gt 0) {
+        foreach ($interim in @(Wait-DemoActivityInterim -Config $Config -ActivityProfile $ActivityProfile -Record $interimSent.ToArray() -CheckPrefix 'DEPLOY')) {
+            $results.Add($interim)
         }
     }
     # The T2 guest starts with its host (its automatic start action), except on a golden snapshot's source host,
@@ -438,19 +462,28 @@ function Stop-DemoGuestVm {
     <#
     .SYNOPSIS
     Shuts the T2 guest down cleanly before the host deallocates (Invoke-DemoWorkloadControl.ps1 -Action
-    StopGuest on archost01), as STOP.GUEST. Internal.
+    StopGuest on archost01), as STOP.GUEST. -TimeoutSeconds bounds the wait (stop-demo.ps1, 2026-11-03): an incident in
+    the guest can keep archost01's Run Commands waiting, and the host's deallocation shuts the guest down anyway, through
+    its automatic stop action (ShutDown), so a time-out is a Warning. Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Config
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateRange(0, 3600)]
+        [int] $TimeoutSeconds = 0
     )
 
     if (-not $PSCmdlet.ShouldProcess('arcsql01', 'Shut the T2 guest down')) {
         return (New-DemoResult -CheckId 'STOP.GUEST' -Area 'infra' -Target 'T2' -Status 'Not selected' -Message 'What if: the guest wasn''t stopped.')
     }
-    $data = Invoke-DemoWorkloadAction -Config $Config -VmName 'archost01' -Action 'StopGuest'
+    $data = Invoke-DemoWorkloadAction -Config $Config -VmName 'archost01' -Action 'StopGuest' -TimeoutSeconds $TimeoutSeconds
+    $evidence = if ($data['evidence'] -is [System.Collections.IDictionary]) { $data['evidence'] } else { @{} }
+    if ($evidence.Contains('timedOut') -and [bool]$evidence['timedOut']) {
+        return (New-DemoResult -CheckId 'STOP.GUEST' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('The guest''s clean shutdown didn''t finish within {0} seconds (archost01 is busy, for example with an incident in the guest), so the stop went on: archost01 is deallocated anyway, and its automatic stop action (ShutDown) shuts the guest down.' -f $TimeoutSeconds) -Evidence $evidence -Remediation 'Nothing to do: the guest starts with the host next time.')
+    }
     $status = [string]$data['status']
     if ($status -notin 'Pass', 'Fail', 'Warning', 'Manual action required', 'Not supported', 'Not selected') {
         $status = 'Warning'
@@ -459,7 +492,6 @@ function Stop-DemoGuestVm {
     if (-not $message) {
         $message = 'The guest stop returned no message.'
     }
-    $evidence = if ($data['evidence'] -is [System.Collections.IDictionary]) { $data['evidence'] } else { @{} }
     $remediation = if ($status -in 'Fail', 'Warning') { 'The host''s automatic stop action (ShutDown) still stops the guest when the host deallocates.' } else { '' }
     return (New-DemoResult -CheckId 'STOP.GUEST' -Area 'infra' -Target 'T2' -Status $status -Message $message -Evidence $evidence -Remediation $remediation)
 }
@@ -497,7 +529,8 @@ function Set-DemoTargetProfile {
     demo-control.yml or start-demo.ps1 -ActivityProfile sets it again; a T2 guest that isn't set up yet (no demo module or
     workload runner before SQL Server setup; Test-DemoT2NotSetUpText) is Not selected. -Attempts retries a target that
     isn't reachable yet, such as a T2 guest that's still
-    booting.
+    booting. -SwitchTo names the profile with incidents that the run sets once its own Run Commands on the VM are done
+    (2026-11-03, Invoke-DemoActivitySwitch): the message says so, and the evidence records it.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Callers confirm once for the whole start or stop; Invoke-DemoWorkloadCommand is called with -Confirm:$false.')]
     [CmdletBinding()]
@@ -528,11 +561,20 @@ function Set-DemoTargetProfile {
         [int] $Attempts = 1,
 
         [ValidateRange(0, 600)]
-        [int] $RetrySeconds = 120
+        [int] $RetrySeconds = 120,
+
+        [AllowEmptyString()]
+        [ValidatePattern('^((business-day|incident:[a-z0-9][a-z0-9-]{0,47}))?$')]
+        [string] $SwitchTo = ''
     )
 
     $checkId = '{0}.PROFILE_{1}' -f $CheckPrefix, $Target
     $docUrl = 'https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-overview#auto-pause'
+    $switchNote = ''
+    if ($SwitchTo) {
+        $vmName = if ($Target -eq 'T2') { Get-DemoHostVmName -Config $Config } else { 'sqlvm01' }
+        $switchNote = ' This run switches it to {0} once its own Run Commands on {1} are done, so no incident slows them.' -f $SwitchTo, $vmName
+    }
     if ($SkipReason) {
         return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status 'Not selected' -Message ('{0}: the activity profile wasn''t set to {1}. {2}' -f $Target, $ProfileName, $SkipReason))
     }
@@ -558,12 +600,15 @@ function Set-DemoTargetProfile {
         Start-Sleep -Seconds $RetrySeconds
     }
     $evidence = [ordered]@{ profile = $ProfileName; requestedBy = $RequestedBy }
+    if ($SwitchTo) {
+        $evidence['switchTo'] = $SwitchTo
+    }
     if ($null -ne $run -and $run.Status -in 'Pass', 'Warning') {
         $message = if ($ProfileName -eq 'off') {
             '{0}: the activity profile is off. Nothing sets it again at boot unless activityProfileOnBoot is true.' -f $Target
         }
         else {
-            '{0}: the activity profile is {1} until two minutes before the next auto-shutdown.' -f $Target, $ProfileName
+            '{0}: the activity profile is {1} until two minutes before the next auto-shutdown.{2}' -f $Target, $ProfileName, $switchNote
         }
         if ($Target -eq 'T3' -and $ProfileName -ne 'off') {
             $message += ' While it runs, T3''s serverless database stays awake and bills compute (ADR 0016).'
@@ -585,6 +630,51 @@ function Set-DemoTargetProfile {
     return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status 'Warning' -Message ('{0}: the activity profile couldn''t be set to {1}: {2}' -f $Target, $ProfileName, $detail) -Remediation $remediation -Evidence $evidence)
 }
 
+function ConvertTo-DemoStopProfileResult {
+    <#
+    .SYNOPSIS
+    stop-demo.ps1's STOP.PROFILE_<target> from one Send-DemoProfileRunCommand record (2026-11-03): Pass when the profile
+    is off; Not selected when the target has no runner yet; a Warning when it didn't finish within -WaitSeconds or
+    failed, which says that the VM was deallocated anyway, which stops the activity, an incident in progress included.
+    stop-demo.ps1 makes that Warning after the deallocation; -DeallocationFailed says that it failed too
+    (STOP.VM_<vm>), so the activity goes on until the auto-shutdown. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Record,
+
+        [ValidateRange(1, 3600)]
+        [int] $WaitSeconds = 180,
+
+        [switch] $DeallocationFailed
+    )
+
+    $target = [string]$Record.Target
+    $vm = [string]$Record.VmName
+    $checkId = 'STOP.PROFILE_{0}' -f $target
+    $docUrl = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
+    $evidence = [ordered]@{ profile = 'off'; requestedBy = 'stop-demo'; vm = $vm; outcome = [string]$Record.Outcome; seconds = $Record.Seconds; runCommand = 'DbHubDemo-Profile'; deallocated = (-not $DeallocationFailed) }
+    $stored = 'The stored profile ends at the auto-shutdown it was set for; start-demo.ps1 sets its own, but a VM started before then without it resumes the stored one, unless the off still runs first.'
+    $why = if ([string]$Record.Outcome -eq 'TimedOut') { 'turning the activity profile off didn''t finish within {0} seconds ({1} is busy, for example with an incident in progress)' -f $WaitSeconds, $vm } else { 'the activity profile couldn''t be set to off: {0}' -f [string]$Record.Detail }
+    switch ([string]$Record.Outcome) {
+        'Set' {
+            return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Pass' -Message ('{0}: the activity profile is off. Nothing sets it again at boot unless activityProfileOnBoot is true.' -f $target) -Evidence $evidence -DocUrl $docUrl)
+        }
+        'NotSetUp' {
+            $message = if ($target -eq 'T2') { 'T2 isn''t set up yet: the guest gets its demo module and workload runner after SQL Server setup, so no activity runs there to turn off.' } else { '{0}: T1 doesn''t drive {0} yet, so no activity runs there to turn off: {1}' -f $target, [string]$Record.Detail }
+            return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Not selected' -Message $message -Evidence $evidence -DocUrl $docUrl)
+        }
+        default {
+            if ($DeallocationFailed) {
+                return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Warning' -Message ('{0}: {1}, and {2} wasn''t deallocated either (STOP.VM_{3}), so its activity goes on until the auto-shutdown it was set for.' -f $target, $why, $vm, $vm.ToUpperInvariant()) -Evidence $evidence -Remediation 'Run ./scripts/stop-demo.ps1 again; the VM''s nightly auto-shutdown stops it otherwise.' -DocUrl $docUrl)
+            }
+            return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Warning' -Message ('{0}: {1}, so {2} was deallocated anyway (STOP.VM_{3}), which stops the incident with it. {4}' -f $target, $why, $vm, $vm.ToUpperInvariant(), $stored) -Evidence $evidence -Remediation 'Nothing to do now. If the VM is started outside start-demo.ps1 before the auto-shutdown, turn the activity off with ./scripts/demo-control.ps1 -Target all -Scenario off.' -DocUrl $docUrl)
+        }
+    }
+}
+
 function Test-DemoStartCost {
     <#
     .SYNOPSIS
@@ -594,7 +684,8 @@ function Test-DemoStartCost {
     .DESCRIPTION
     - PREFLIGHT.COST.SESSION and PREFLIGHT.COST.MONTHLY from Get-DemoCostEstimate (Azure Retail Prices API at
       run time, with the subscription's Defender for Cloud plans when they can be read): the same checks
-      preflight runs before deploy.ps1. The monthly one is a hard ceiling (Fail).
+      preflight runs before deploy.ps1, with the run's activity profile (-ActivityProfile, else the configuration's, else
+      business-day, whose T3 incidents count; 2026-11-03). The monthly one is a hard ceiling (Fail).
     - START.COST.ACTUAL: the resource group's month-to-date actual cost (Cost Management, which lags by up to
       a day) plus one estimated session. Fail when the month already reached monthlyCeilingUsd, Warning when
       this session would cross it, Warning when the cost can't be read or isn't in USD.
@@ -610,12 +701,16 @@ function Test-DemoStartCost {
         [string] $NetworkMode,
 
         [AllowNull()]
-        [object] $T3UseFreeLimit
+        [object] $T3UseFreeLimit,
+
+        [AllowEmptyString()]
+        [string] $ActivityProfile = ''
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
     $docUrl = 'https://learn.microsoft.com/rest/api/cost-management/query/usage'
-    $costParameters = @{ Config = $Config; NetworkMode = $NetworkMode }
+    # The run's activity profile, so business-day's T3 incidents are counted (2026-11-03).
+    $costParameters = @{ Config = $Config; NetworkMode = $NetworkMode; ActivityProfile = $ActivityProfile }
     if ($null -ne $T3UseFreeLimit) {
         $costParameters['T3UseFreeLimit'] = [bool]$T3UseFreeLimit
     }

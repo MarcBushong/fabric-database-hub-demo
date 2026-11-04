@@ -94,6 +94,24 @@ Describe 'Invoke-DemoPreflight' {
         $script:pgOperationsJson = '[]'
     }
 
+    It 'says once that a configuration without activityProfile uses the new default, business-day, before the cost checks that count it (2026-11-03)' {
+        Set-HappyAzMock
+        $unset = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $unset[$key] = $config[$key] }
+        $unset.Remove('activityProfile')
+        $results = @(Invoke-DemoPreflight -Config $unset -SkipWhatIf -SkipPolicyInventory)
+        $notice = @($results | Where-Object checkId -EQ 'PREFLIGHT.ACTIVITYPROFILE')
+        $notice.Count | Should -Be 1
+        $notice[0].status | Should -Be 'Pass'
+        $notice[0].message | Should -Match '^activityProfile isn''t set, so this run uses the new default, business-day \(incidents every hour\); set it to baseline for the quieter demo\.'
+        [array]::IndexOf(@($results | ForEach-Object { [string]$_.checkId }), 'PREFLIGHT.ACTIVITYPROFILE') | Should -BeLessThan ([array]::IndexOf(@($results | ForEach-Object { [string]$_.checkId }), 'PREFLIGHT.COST.SESSION'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'activityProfile isn''t set*' } -Times 1 -Exactly
+        $unset.Contains('activityProfile') | Should -BeFalse -Because 'preflight never writes the configuration'
+
+        # A configuration that names its profile gets no notice.
+        @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -EQ 'PREFLIGHT.ACTIVITYPROFILE').Count | Should -Be 0
+    }
+
     It 'fails T4 on a size Azure refused for the same zone, warns for one more try in another zone, and says nothing without a refusal (Phase 24)' {
         Set-HappyAzMock
         # Live, 2026-10-26: the capability list included Standard_B1ms, and Azure still refused it with SkuNotAvailable;

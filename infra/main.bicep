@@ -199,7 +199,7 @@ param workloadRunnerSha256 string = ''
 @maxValue(999)
 param workloadRunnerChunkCount int = 0
 
-@description('Activity profile that deploy.ps1 and start-demo.ps1 set until the next auto-shutdown: off, baseline, business-day, or incident:<scenario> (ADR 0010). While T3 has an active profile, the runner keeps its serverless database awake (ADR 0016).')
+@description('Activity profile the VMs set by themselves after a runner install, and at every boot with activityProfileOnBoot: off, baseline, business-day, or incident:<scenario> (ADR 0010). deploy.ps1 passes baseline in place of a profile with incidents, business-day included, and sets that profile once its own Run Commands on a VM are done. While T3 has an active profile, the runner keeps its serverless database awake (ADR 0016).')
 @minLength(3)
 @maxLength(57)
 param activityProfile string = 'baseline'

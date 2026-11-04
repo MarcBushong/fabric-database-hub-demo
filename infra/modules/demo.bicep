@@ -118,7 +118,7 @@ param workloadRunnerSha256 string
 @description('Number of chunks Send-DemoWorkloadRunner delivered to each VM; required with workloadRunnerSha256.')
 param workloadRunnerChunkCount int
 
-@description('Activity profile that deploy.ps1 and start-demo.ps1 set (ADR 0010).')
+@description('Activity profile the VMs set by themselves: baseline in place of a profile with incidents, which deploy.ps1 sets once its own Run Commands are done (ADR 0010).')
 param activityProfile string
 
 @description('Whether the VMs also set activityProfile at every boot (ADR 0016, R183).')

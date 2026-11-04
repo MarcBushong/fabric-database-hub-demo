@@ -28,7 +28,9 @@ function Invoke-DemoDeployment {
     5a. T4 (Phase 24, ADR 0019): Test-DemoT4, Enable-DemoT4Workload (T1 sets the PostgreSQL flexible server
        up through the P6 group), and METRICS.T4. A stopped T4 is started before the template, which a stopped
        server would reject. A T4 failure is reported without stopping the run.
-    6. Activity: the configured activityProfile on T1 and T3 until the next auto-shutdown (Set-DemoTargetProfile).
+    6. Activity: the configured activityProfile on T1 and T3 until the next auto-shutdown (Set-DemoTargetProfile),
+       business-day by default since 2026-11-03, set as baseline until the run's switch at its end (after DONE's checks,
+       also when a stage stops it at a Fail; DEPLOY.INCIDENTS_*), so no incident slows the run's own Run Commands.
        The VMs set it again at boot only when activityProfileOnBoot is true (ADR 0016, R183).
     7. Monitoring: Enable-DemoSqlVmMonitoring for T1 after the template deployments, waiting while a
        redeployment keeps the SQL IaaS extension Updating for about 10 minutes (Phase 13 live finding), as
@@ -250,6 +252,29 @@ function Invoke-DemoDeployment {
         $startIndex = [array]::IndexOf($stages, 'Validation')
         Write-DemoLog -Message 'Every stage finished earlier; running the validation again.'
     }
+    # The run's activity profile (2026-11-03, ADR 0010): the Activity and T2 stages set its interim, baseline in place of a
+    # profile with incidents, and the run switches the VMs it noted once its own Run Commands are done, also when it stops
+    # at a Fail; Complete-DemoDeploymentRun sends the switch when the run ends before that. A run without preflight says
+    # the default here.
+    $activity = Get-DemoActivityProfile -Config $Config
+    $switchTo = if ($activity.HasIncidents) { $activity.Name } else { '' }
+    Clear-DemoActivitySwitch
+    if ($startIndex -gt 0 -and -not $whatIf) {
+        $notice = New-DemoActivityProfileNotice -ActivityProfile $activity -CheckPrefix 'DEPLOY'
+        if ($null -ne $notice) {
+            $results.Add($notice)
+        }
+    }
+    $switchActivity = {
+        if (-not $whatIf -and $activity.HasIncidents) {
+            & $addAll @(Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile $activity -Result $results.ToArray() -CheckPrefix 'DEPLOY' -RequestedBy 'deploy')
+        }
+    }
+    # A run that stops at a Fail switches the VMs it noted too, then returns what it has.
+    $finishEarly = {
+        & $switchActivity
+        $results.ToArray()
+    }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28 and its follow-up): a
     # "no T4" record gets the General Purpose fallback, and its cost check, again when this run deploys the template.
     # DONE's T4 reason reads the configuration as the file has it.
@@ -342,15 +367,29 @@ function Invoke-DemoDeployment {
                 }
             }
             if ($null -ne $stoppedStart) {
-                $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart)
+                $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -ActivityProfile $activity)
                 & $addAll $started
                 if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
+                # A VM that was already running may still serve an earlier run's incidents: its targets get the interim
+                # baseline before this run's Run Commands reach it, and the switch at the end brings the profile back.
+                # One this run started got it as soon as it ran (Wait-DemoStoppedStart; review of PR 16, 2026-11-04).
+                $alreadyRunning = Get-DemoMemberValue -InputObject $stoppedStart -Name 'Running'
+                Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @($alreadyRunning) -RequestedBy 'deploy'
             }
             if ($checkT1Monitoring) {
                 $occasion = if ($null -ne $stoppedStart -and $stoppedStart.Vms.Contains('sqlvm01')) { 'the start' } else { 'the deployment' }
                 $results.Add((Invoke-DemoT1MonitoringCheck -Config $Config -Occasion $occasion))
+            }
+        }
+        # A stage that can leave a VM on the interim baseline: the loaders can install the runner, which then sets it, and
+        # T3, T4, Activity, and T2 set it. The run switches that VM at its end (2026-11-03).
+        if ($switchTo -and -not $whatIf) {
+            switch ($stage) {
+                'Bootstraps' { foreach ($vm in $runnerVms) { Register-DemoActivitySwitch -VmName $vm } }
+                { $_ -in 'T3', 'T4', 'Activity' } { Register-DemoActivitySwitch -VmName 'sqlvm01' }
+                'T2' { if ($hostVm -eq 'archost01') { Register-DemoActivitySwitch -VmName 'archost01' } }
             }
         }
         switch ($stage) {
@@ -363,7 +402,7 @@ function Invoke-DemoDeployment {
                         # What this run asked to start keeps running, and billing (ADR 0016), until a stop.
                         $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('This run started {0} while preflight ran; it keeps running until ./scripts/stop-demo.ps1 or the nightly auto-shutdown.' -f (@($stoppedStart.Requested) -join ' and ')) -Evidence ([ordered]@{ vms = @($stoppedStart.Requested); started = @($stoppedStart.Requested); notRunning = @(); afterPreflightFail = $true }) -Remediation 'Fix the preflight Fail, then run ./scripts/deploy.ps1 again; or run ./scripts/stop-demo.ps1 to stop the VMs now.'))
                     }
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 $pick = { param([string] $CheckId, [string] $Key) $item = $preflight | Where-Object { $_.checkId -eq $CheckId } | Select-Object -First 1; Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name $Key }
                 $mode = [string](& $pick 'PREFLIGHT.POLICY.SQLPUBLIC' 'effectiveNetworkMode')
@@ -416,11 +455,11 @@ function Invoke-DemoDeployment {
                 & $addAll $deployment.Results
                 if ($whatIf) {
                     & $stageResult 'Infrastructure' 'Not selected' 'What if: the template''s what-if ran; nothing was deployed, and later stages were skipped.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 if (-not $deployment.Succeeded) {
                     & $stageResult 'Infrastructure' 'Fail' 'The template deployment failed, so the later stages didn''t run.' 'Fix the cause in DEPLOY.TEMPLATE, then run deploy.ps1 -Resume.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 $context.T3UseFreeLimit = [bool]$deployment.T3UseFreeLimit
                 # What T4 got (the fallback can change its size or leave it out): the later stages, the Bootstraps stage's
@@ -494,7 +533,7 @@ function Invoke-DemoDeployment {
                 $current = Get-DemoDeploymentState -Config $Config
                 if (-not $current.BundleSha256 -or @($vmNames | Where-Object { $_ -notin $current.BundleSentTo }).Count -gt 0) {
                     & $stageResult 'Bootstraps' 'Fail' 'The bootstrap bundle hasn''t reached every VM, so the loaders can''t run.' 'Run deploy.ps1 -FromStage Artifacts.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 $deployArguments = @{
                     Config                  = $Config
@@ -512,7 +551,7 @@ function Invoke-DemoDeployment {
                 & $addAll $deployment.Results
                 if (-not $deployment.Succeeded) {
                     & $stageResult 'Bootstraps' 'Fail' 'The deployment that adds the loaders failed.' 'Fix the cause in DEPLOY.TEMPLATE, then run deploy.ps1 -Resume.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 if (-not $whatIf -and $hostVm -eq 'archost01') {
                     # The host's loader starts a bootstrap generation that builds its guest; until T2 is done, deploy.ps1's
@@ -528,7 +567,7 @@ function Invoke-DemoDeployment {
                 & $addAll $loaders
                 if (& $hasStatus $loaders 'Fail') {
                     & $stageResult 'Bootstraps' 'Fail' 'A bootstrap loader failed.' 'Read its INFRA.BOOTSTRAP.LOADER_* message, fix the cause, then run deploy.ps1 -FromStage Artifacts.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 $wait = Wait-DemoVmHealthState -Config $Config -VmName 'sqlvm01' -State @('Ready', 'Failed', 'ManualActionRequired') -MaxPolls ([int][System.Math]::Ceiling($T1WaitMinutes / 5)) -PollSeconds 300
                 $t1State = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'state')
@@ -539,12 +578,12 @@ function Invoke-DemoDeployment {
                 elseif ($t1State -eq 'Failed') {
                     $results.Add((New-DemoResult -CheckId 'DEPLOY.T1.READY' -Area 't1' -Target 'T1' -Status 'Fail' -Message ('T1''s bootstrap failed: {0}' -f $t1Message) -Remediation 'Read C:\ProgramData\DbHubDemo\logs on sqlvm01 (Get-DemoVmHealth -View Full), fix the cause, then run deploy.ps1 -FromStage Artifacts to start a new bootstrap generation.'))
                     & $stageResult 'Bootstraps' 'Fail' 'T1''s bootstrap failed.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 else {
                     $results.Add((New-DemoResult -CheckId 'DEPLOY.T1.READY' -Area 't1' -Target 'T1' -Status 'Warning' -Message ('T1 isn''t Ready after {0} minutes (state {1}: {2}).' -f $T1WaitMinutes, $t1State, $t1Message) -Remediation 'Run deploy.ps1 -Resume later; the bootstrap keeps converging on its own.'))
                     & $stageResult 'Bootstraps' 'Warning' 'The loaders ran, but T1 isn''t Ready yet, so the run stopped here.' 'Run deploy.ps1 -Resume later.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 & $recordStage 'Bootstraps'
                 & $stageResult 'Bootstraps' 'Pass' ('The loaders ran on {0}, and T1 is Ready.' -f ($vmNames -join ' and '))
@@ -559,7 +598,7 @@ function Invoke-DemoDeployment {
                 if ($group.status -in 'Fail', 'Manual action required') {
                     & $stageResult 'T3' $group.status 'T1 couldn''t join the T3 administrators group (P6), so T3 wasn''t configured.' $group.remediation
                     if ($group.status -eq 'Fail') {
-                        return $results.ToArray()
+                        return (& $finishEarly)
                     }
                     $context.OpenStage = 'T3'
                     continue
@@ -569,7 +608,7 @@ function Invoke-DemoDeployment {
                 $results.Add($setup.Result)
                 if ($setup.Status -eq 'Fail') {
                     & $stageResult 'T3' 'Fail' 'The T3 setup from T1 failed.' 'Read the T3 setup result, fix the cause, then run deploy.ps1 -FromStage T3.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 $current = Get-DemoDeploymentState -Config $Config
                 if ($current.RunnerSha256) {
@@ -581,7 +620,7 @@ function Invoke-DemoDeployment {
                 & $addAll $checks
                 if (& $hasStatus ($t3Results.ToArray() + $checks) 'Fail') {
                     & $stageResult 'T3' 'Fail' 'A T3 step or check failed.' 'Read the T3 and WORKLOAD.T3 results, fix the cause, then run deploy.ps1 -FromStage T3.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 & $recordStage 'T3'
                 & $stageResult 'T3' 'Pass' 'T3 is configured from T1 and checked.'
@@ -614,20 +653,21 @@ function Invoke-DemoDeployment {
             }
             'Activity' {
                 # The VMs don't set the profile at boot unless activityProfileOnBoot is true (R183), so the
-                # deployment sets it explicitly; it ends before the next auto-shutdown.
+                # deployment sets it explicitly; it ends before the next auto-shutdown. A profile with incidents starts as
+                # its interim, baseline, until the run's switch (2026-11-03).
                 $current = Get-DemoDeploymentState -Config $Config
-                $profileName = if ($Config['activityProfile']) { [string]$Config['activityProfile'] } else { 'baseline' }
+                $profileName = $activity.Interim
                 $skip = if ($current.RunnerSha256) { '' } else { 'No workload runner was deployed (-SkipRunner).' }
-                $activity = @(foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' })) {
-                        Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy'
+                $activityResults = @(foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' })) {
+                        Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo
                     })
-                & $addAll $activity
+                & $addAll $activityResults
                 & $recordStage 'Activity'
-                if (& $hasStatus $activity 'Warning') {
+                if (& $hasStatus $activityResults 'Warning') {
                     & $stageResult 'Activity' 'Warning' ('The activity profile {0} couldn''t be set everywhere; the deployment continues.' -f $profileName) 'Set it with demo-control.yml or ./scripts/start-demo.ps1 -ActivityProfile <name>.'
                 }
                 else {
-                    & $stageResult 'Activity' 'Pass' ('T1 and T3 run the {0} activity profile until the next auto-shutdown; a VM that starts later sets it again only when activityProfileOnBoot is true.' -f $profileName)
+                    & $stageResult 'Activity' 'Pass' ('T1 and T3 run the {0} activity profile until the next auto-shutdown{1}; a VM that starts later sets it again only when activityProfileOnBoot is true.' -f $profileName, $(if ($switchTo) { ', and this run switches them to {0} at its end' -f $switchTo } else { '' }))
                 }
             }
             'Monitoring' {
@@ -641,7 +681,7 @@ function Invoke-DemoDeployment {
                 $monitoring = $monitoringResults[0]
                 if ($monitoring.status -eq 'Fail') {
                     & $stageResult 'Monitoring' 'Fail' 'T1 performance monitoring couldn''t be turned on.' $monitoring.remediation
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 & $recordStage 'Monitoring'
                 & $stageResult 'Monitoring' 'Pass' ('T1 performance monitoring: {0}.' -f $monitoringResults[-1].status)
@@ -676,7 +716,7 @@ function Invoke-DemoDeployment {
                 & $addAll @(Clear-DemoGuidedStopLeftover -Config $Config)
                 if (& $hasStatus $arc 'Fail') {
                     & $stageResult 'T2' 'Fail' 'T2''s Arc onboarding or configuration failed.' 'Read the T2.* results, fix the cause, then run deploy.ps1 -FromStage T2.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 if (& $hasStatus $arc 'Manual action required') {
                     & $stageResult 'T2' 'Manual action required' 'T2 waits for a manual step (see the T2 results for the exact steps); the later stages still run.' 'Do the step, then run deploy.ps1 -Resume: it continues with T2.'
@@ -692,9 +732,8 @@ function Invoke-DemoDeployment {
                 # (T2.ARC.MONITORING), as configure-monitoring.ps1 -Target T2 would.
                 $context.T2Complete = $true
                 $current = Get-DemoDeploymentState -Config $Config
-                $profileName = if ($Config['activityProfile']) { [string]$Config['activityProfile'] } else { 'baseline' }
                 $t2Skip = if (-not $current.RunnerSha256 -or 'archost01' -notin $current.RunnerSentTo) { 'T2 has no workload runner (-SkipRunner, or it wasn''t sent to archost01).' } else { '' }
-                $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $t2Skip -RequestedBy 'deploy'))
+                $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $activity.Interim -CheckPrefix 'DEPLOY' -SkipReason $t2Skip -RequestedBy 'deploy' -SwitchTo $switchTo))
                 # The guest build is done, so the bootstrap generation's record goes (Get-DemoHostRestartBlocker).
                 & $recordStage 'T2' @{ T2BuildUtc = '' }
                 & $stageResult 'T2' 'Pass' 'T2 is onboarded to Azure Arc, configured, and monitored.'
@@ -712,13 +751,13 @@ function Invoke-DemoDeployment {
                 & $addAll $fabric
                 if (& $hasStatus $fabric 'Fail') {
                     & $stageResult 'Fabric' 'Fail' 'A Fabric or Database Hub check failed.' 'Read the HUB.* and FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $ConfigPath)
                 & $addAll $powerBI
                 if (& $hasStatus $powerBI 'Fail') {
                     & $stageResult 'Fabric' 'Fail' 'The history semantic model or report failed.' 'Read the FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
-                    return $results.ToArray()
+                    return (& $finishEarly)
                 }
                 & $recordStage 'Fabric'
                 & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }))
@@ -755,6 +794,9 @@ function Invoke-DemoDeployment {
         $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool](Get-DemoT4OffReason -Config $userConfig -State $current)) -SkipFabric:$SkipFabric
         & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
     }
+
+    # The switch (2026-11-03): DONE's checks have read what they need, so this run's own Run Commands are done.
+    & $switchActivity
 
     $all = $results.ToArray()
     # Phase 28 live finding (2026-10-30): what only a person can confirm is listed once each, apart from what needs you.

@@ -147,13 +147,13 @@
       "default": ""
     },
     "activityProfile": {
-      "description": "Activity profile that deploy.ps1 and start-demo.ps1 set on the targets, until the next auto-shutdown: off, baseline (default; the steady Contoso Care mix), business-day (the baseline plus scheduled, bounded incidents), or incident:<scenario> (ADR 0010). demo-control.yml, start-demo.ps1 -ActivityProfile, and the live-activity notebook change it while the VMs run, and stop-demo.ps1 sets it to off. While T3 has an active profile, the runner keeps its serverless database from auto-pausing, which bills compute (ADR 0016).",
+      "description": "Activity profile that deploy.ps1 and start-demo.ps1 set on the targets, until the next auto-shutdown: off, baseline (the steady Contoso Care mix), business-day (default since 2026-11-03: the baseline plus bounded incidents at fixed minutes past each UTC hour, so Database Hub's Performance page has problems to show), or incident:<scenario> (ADR 0010). A profile with incidents starts as baseline, and the run switches to it once its own Run Commands on a VM are done; the VMs set baseline in its place by themselves (after a runner install, and at a boot with activityProfileOnBoot). demo-control.yml, start-demo.ps1 -ActivityProfile, and the live-activity notebook change it while the VMs run, and stop-demo.ps1 sets it to off. While T3 has an active profile, the runner keeps its serverless database from auto-pausing, which bills compute (ADR 0016).",
       "type": "string",
       "pattern": "^(off|baseline|business-day|incident:[a-z0-9][a-z0-9-]{0,47})$",
-      "default": "baseline"
+      "default": "business-day"
     },
     "activityProfileOnBoot": {
-      "description": "Whether the VMs also set activityProfile at every boot (a manual start, a scheduled start, a restart). False (default): a VM that starts serves only the profile someone set, so T3 can auto-pause unless a demo needs it (ADR 0016, R183).",
+      "description": "Whether the VMs also set activityProfile at every boot (a manual start, a scheduled start, a restart); a profile with incidents, business-day included, is set as its baseline, which deploy.ps1, start-demo.ps1, or demo-control.yml then switch. False (default): a VM that starts serves only the profile someone set, so T3 can auto-pause unless a demo needs it (ADR 0016, R183).",
       "type": "boolean",
       "default": false
     },

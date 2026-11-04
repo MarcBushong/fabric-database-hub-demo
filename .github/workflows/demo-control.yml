@@ -25,7 +25,7 @@ on:
         description: baseline, business-day, off, or incident:<scenario>
         type: string
         required: true
-        default: baseline
+        default: business-day
       duration:
         description: Minutes, 1-240 (everything also stops at auto-shutdown)
         type: string

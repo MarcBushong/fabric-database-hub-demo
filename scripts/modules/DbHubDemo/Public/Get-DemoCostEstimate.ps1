@@ -61,6 +61,16 @@ function Get-DemoCostEstimate {
     demo, and then T4's General Purpose fallback, with the same prices (Phase 28 follow-up). Without it, each estimate
     reads its own prices.
 
+    .PARAMETER ActivityProfile
+    The activity profile the run uses (start-demo.ps1 -ActivityProfile); empty uses the configuration's, or the default,
+    business-day (Get-DemoActivityProfile). business-day's T3 incidents (resource-governance and log-rate-pressure, 10 of
+    every 60 minutes in scenarios/activity-profiles.json) drive T3 to its maximum vCores, so its running hour is priced at
+    the maximum for those minutes and at t3ActiveShareOfMaxVcores for the rest. Serverless bills each second the larger
+    of the CPU and the memory used (3 GB a vCore), never above the maximum vCores
+    (https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-overview), so the shipped share, 1.0, already
+    covers them: the increment is then 0, and the messages say so (2026-11-03, ADR 0016). The VMs and a provisioned T4
+    bill the same whatever the load.
+
     .EXAMPLE
     Get-DemoCostEstimate -Config (Get-DemoConfig -Path ./config/demo.config.json)
 
@@ -99,7 +109,11 @@ function Get-DemoCostEstimate {
         [AllowEmptyCollection()]
         [object[]] $GoldenSnapshots = @(),
 
-        [hashtable] $PriceCache
+        [hashtable] $PriceCache,
+
+        [AllowEmptyString()]
+        [ValidatePattern('^((off|baseline|business-day|incident:[a-z0-9][a-z0-9-]{0,47}))?$')]
+        [string] $ActivityProfile = ''
     )
 
     $catalog = Get-DemoProfile
@@ -209,7 +223,13 @@ function Get-DemoCostEstimate {
         Add-Component 'T2 Arc SQL Standard PAYG' 'running' $arcItem $cores 'core-hour'
     }
 
-    $t3Vcores = [double]$sizing.t3.maxVcores * [double]$assumptions.t3ActiveShareOfMaxVcores
+    $t3Share = [double]$assumptions.t3ActiveShareOfMaxVcores
+    $t3Vcores = [double]$sizing.t3.maxVcores * $t3Share
+    # business-day (the default since 2026-11-03): T3's incidents run at its maximum vCores for their minutes of each hour,
+    # read from scenarios/activity-profiles.json; the rest of the hour stays at the assumed share. 0 with the shipped share.
+    $activity = Get-DemoActivityProfile -Config $Config -Requested $ActivityProfile
+    $t3IncidentShare = if ($activity.Name -ceq 'business-day') { Get-DemoT3IncidentShare } else { 0.0 }
+    $t3IncrementVcores = [double]$sizing.t3.maxVcores * [System.Math]::Max(0.0, 1.0 - $t3Share) * $t3IncidentShare
     # Azure SQL Database free offer: each database gets 100,000 vCore-seconds of compute and 32 GB of data a
     # month (https://learn.microsoft.com/azure/azure-sql/database/free-offer, checked 2026-10-20). With
     # 'continue using database for additional charges', usage above that bills at serverless rates.
@@ -225,6 +245,9 @@ function Get-DemoCostEstimate {
     $t3VcoreItem = $t3Items | Where-Object { $_.meterName -eq 'vCore' } | Select-Object -First 1
     # The session stays at list price (an upper bound); the light-use month subtracts the free allowance.
     Add-Component 'T3 compute (serverless)' 'running' $t3VcoreItem $t3Vcores 'vCore-hour'
+    if ($t3IncrementVcores -gt 0) {
+        Add-Component ('T3 compute, business-day incidents ({0:N0} of every 60 minutes at the maximum vCores)' -f ($t3IncidentShare * 60)) 'running' $t3VcoreItem $t3IncrementVcores 'vCore-hour'
+    }
 
     # Interactive access (per session)
     $bastionItems = Get-CachedPrice "serviceName eq 'Azure Bastion' and armRegionName eq '$location' and skuName eq 'Basic' and priceType eq 'Consumption'"
@@ -413,9 +436,13 @@ function Get-DemoCostEstimate {
     $idleMonthly = [System.Math]::Round($idle, 2)
     $t3FreeCredit = 0.0
     if ($t3UsesFreeOffer -and $t3VcoreItem) {
-        $t3FreeCredit = [System.Math]::Min($t3Vcores * $LightUseHoursPerMonth, 100000.0 / 3600.0) * [double]$t3VcoreItem.retailPrice
+        $t3FreeCredit = [System.Math]::Min(($t3Vcores + $t3IncrementVcores) * $LightUseHoursPerMonth, 100000.0 / 3600.0) * [double]$t3VcoreItem.retailPrice
     }
     $t3FreeCreditMonthly = [System.Math]::Round($t3FreeCredit, 2)
+    # business-day's T3 increment, before the free allowance (which it uses faster), for the messages and the evidence.
+    $t3IncrementPrice = if ($t3VcoreItem) { [double]$t3VcoreItem.retailPrice } else { 0.0 }
+    $t3IncrementSession = [System.Math]::Round($t3IncrementVcores * $DemoHours * $t3IncrementPrice, 2)
+    $t3IncrementMonthly = [System.Math]::Round($t3IncrementVcores * $LightUseHoursPerMonth * $t3IncrementPrice, 2)
     $sessionCost = [System.Math]::Round($running * $DemoHours + $bastion * $BastionHours, 2)
     $lightUseMonthly = [System.Math]::Round($idle + $running * $LightUseHoursPerMonth + $bastion * $BastionHours - $t3FreeCredit, 2)
     $defenderSession = [System.Math]::Round($defenderRunning * $DemoHours, 2)
@@ -441,6 +468,13 @@ function Get-DemoCostEstimate {
         t3FreeOfferUnchecked = $t3FreeOfferUnchecked
         t3FreeOfferCredit    = $t3FreeCreditMonthly
         t4Enabled            = [bool]$t4On
+        activityProfile      = $activity.Name
+        activityProfileSource = $activity.Source
+        t3IncidentShare      = [System.Math]::Round($t3IncidentShare, 4)
+        t3ActiveShareOfMax   = $t3Share
+        t3BusinessDayVcoreHoursPerHour = [System.Math]::Round($t3IncrementVcores, 4)
+        t3BusinessDaySession = $t3IncrementSession
+        t3BusinessDayMonthly = $t3IncrementMonthly
     }
     if ($t4On) {
         $evidence['t4FixedMonthly'] = $t4FixedMonthly
@@ -479,8 +513,21 @@ function Get-DemoCostEstimate {
         elseif ($t3FreeOfferUnchecked) {
             $monthlyMessage += ' The Azure SQL Database free offer wasn''t checked, so T3 is priced as regular serverless; preflight checks it.'
         }
+        # business-day's T3 incidents (2026-11-03): counted in both checks, with what they add.
+        $sessionActivity = ''
+        if ($activity.Name -ceq 'business-day') {
+            $incidentMinutes = [int][System.Math]::Round($t3IncidentShare * 60)
+            if ($t3IncrementVcores -gt 0) {
+                $activityText = ' With activityProfile business-day, T3''s incidents run at its maximum vCores {0} of every 60 minutes, which adds {1:N2} USD to a session and {2:N2} USD to the light-use month before the free allowance.' -f $incidentMinutes, $t3IncrementSession, $t3IncrementMonthly
+            }
+            else {
+                $activityText = ' With activityProfile business-day, T3''s incidents run at its maximum vCores {0} of every 60 minutes; the estimate already prices T3 at its maximum for every running hour, so they add nothing.' -f $incidentMinutes
+            }
+            $monthlyMessage += $activityText
+            $sessionActivity = $activityText
+        }
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.SESSION' -Area 'preflight' -Target 'subscription' -Status $sessionStatus `
-                    -Message ('{0}: a {1}-hour demo session is estimated at {2:N2} USD{3} against a ceiling of {4:N2} USD.' -f $ProfileName, $DemoHours, $sessionCost, $sessionDefender, $sessionCeiling) `
+                    -Message ('{0}: a {1}-hour demo session is estimated at {2:N2} USD{3} against a ceiling of {4:N2} USD.{5}' -f $ProfileName, $DemoHours, $sessionCost, $sessionDefender, $sessionCeiling, $sessionActivity) `
                     -Evidence $evidence -Remediation 'Shorten the session, choose a smaller profile, or opt in to Spot (ADR 0016).' -DocUrl $retailPricesDoc))
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status $monthlyStatus `
                     -Message $monthlyMessage -Evidence $evidence -Remediation 'Pick a cheaper profile or options (lowest-cost, Spot, or parking T2 between demos), or raise monthlyCeilingUsd in the configuration (ADR 0016).' -DocUrl $retailPricesDoc))
@@ -547,6 +594,9 @@ function Get-DemoCostEstimate {
         T3FreeOffer                    = [bool]$t3UsesFreeOffer
         T3FreeOfferUnchecked           = $t3FreeOfferUnchecked
         T3FreeOfferCreditMonthly       = $t3FreeCreditMonthly
+        ActivityProfile                = $activity.Name
+        T3BusinessDaySession           = $t3IncrementSession
+        T3BusinessDayMonthly           = $t3IncrementMonthly
         Components                     = $components.ToArray()
         MissingPrices                  = $missing.ToArray()
         Results                        = $results.ToArray()

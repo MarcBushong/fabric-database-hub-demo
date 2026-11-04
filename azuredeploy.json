@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "11848242780012714981"
+      "templateHash": "10759024018932669250"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -374,7 +374,7 @@
       "minLength": 3,
       "maxLength": 57,
       "metadata": {
-        "description": "Activity profile that deploy.ps1 and start-demo.ps1 set until the next auto-shutdown: off, baseline, business-day, or incident:<scenario> (ADR 0010). While T3 has an active profile, the runner keeps its serverless database awake (ADR 0016)."
+        "description": "Activity profile the VMs set by themselves after a runner install, and at every boot with activityProfileOnBoot: off, baseline, business-day, or incident:<scenario> (ADR 0010). deploy.ps1 passes baseline in place of a profile with incidents, business-day included, and sets that profile once its own Run Commands on a VM are done. While T3 has an active profile, the runner keeps its serverless database awake (ADR 0016)."
       }
     },
     "activityProfileOnBoot": {
@@ -637,7 +637,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "6573729177947380292"
+              "templateHash": "18388658520621337888"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -878,7 +878,7 @@
             "activityProfile": {
               "type": "string",
               "metadata": {
-                "description": "Activity profile that deploy.ps1 and start-demo.ps1 set (ADR 0010)."
+                "description": "Activity profile the VMs set by themselves: baseline in place of a profile with incidents, which deploy.ps1 sets once its own Run Commands are done (ADR 0010)."
               }
             },
             "activityProfileOnBoot": {

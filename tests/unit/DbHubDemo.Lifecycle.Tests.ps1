@@ -841,6 +841,21 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { $script:order.Add('RunnerStatus'); [pscustomobject]@{ Status = 'Pass'; Result = (New-TestResult 'WORKLOAD.T1.COMMAND' 'Pass' 'workload' 'T1') } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith { $script:order.Add('DoneGate'); New-TestResult 'HUB.ESTATE.T1' 'Pass' 'hub' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:order.Add('PowerBI'); New-TestResult 'FABRIC.REPORT' 'Pass' 'fabric' 'fabric' }
+        # The switch from the interim baseline to a profile with incidents, after DONE's reads (2026-11-03).
+        $script:switchOutcome = 'Set'
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            $script:order.Add(('Switch:{0}={1}' -f (@($Target) -join ','), $ProfileName))
+            foreach ($item in $Target) {
+                [pscustomobject]@{ Target = $item; VmName = $(if ($item -eq 'T2') { 'archost01' } else { 'sqlvm01' }); Outcome = $(if ([int]$PesterBoundParameters['WaitSeconds'] -eq 0) { 'Sent' } else { $script:switchOutcome }); Detail = 'the runner said no'; Data = $null; Seconds = 3 }
+            }
+        }
+        # The wait for the interim baseline on a VM this run started (re-review of PR 16, 2026-11-04).
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoProfileRunCommand -MockWith {
+            $script:order.Add(('Interim:{0}' -f (@($Record | ForEach-Object { $_.Target }) -join ',')))
+            foreach ($item in $Record) {
+                [pscustomobject]@{ Target = $item.Target; VmName = $item.VmName; Outcome = $(if ($item.Outcome -eq 'Sent') { 'Set' } else { $item.Outcome }); Detail = 'set'; Data = $null; Seconds = 30 }
+            }
+        }
         # Phase 28 live finding: what's stopped starts before the first stage that needs it; here both VMs run.
         $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
@@ -853,7 +868,7 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:order.Add('T1Monitoring'); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
         $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/running' }
         $results = @(Invoke-DemoDeployment -Config $config)
-        $script:order[0..3] | Should -Be @('Request:sqlvm01', 'Preflight', 'Running:sqlvm01', 'Template') -Because 'it boots while preflight runs, and runs before the template'
+        $script:order[0..6] | Should -Be @('Request:sqlvm01', 'Preflight', 'Running:sqlvm01', 'Switch:T1,T3=baseline', 'Interim:T1,T3', 'Switch:T2=baseline', 'Template') -Because 'it boots while preflight runs, and runs before the template; sqlvm01, which this run started, gets the interim baseline as soon as it runs and the run waits for it (review of PR 16, and its re-review), and archost01, which already ran, gets it next (2026-11-03)'
         $script:order | Should -Not -Contain 'Request:archost01'
         $script:order | Should -Not -Contain 'Running:archost01'
         $script:order | Should -Not -Contain 'T1Monitoring' -Because 'the Monitoring stage runs in this run'
@@ -865,7 +880,7 @@ Describe 'Invoke-DemoDeployment' {
         $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
         $script:state = New-TestState @{ Stage = 'Monitoring'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
         Invoke-DemoDeployment -Config $config -Resume | Out-Null
-        $script:order[0..6] | Should -Be @('Request:sqlvm01', 'Request:archost01', 'Running:sqlvm01', 'Running:archost01', 'SourceRelease', 'T1Monitoring', 'Arc')
+        $script:order[0..9] | Should -Be @('Request:sqlvm01', 'Request:archost01', 'Running:sqlvm01', 'Switch:T1,T3=baseline', 'Running:archost01', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'SourceRelease', 'T1Monitoring', 'Arc')
     }
 
     It 'checks T1''s monitoring plugin on a run without a Monitoring stage, whether or not a VM was stopped, before the first stage that needs the VMs (Phase 28 live finding, 2026-10-30)' {
@@ -874,7 +889,7 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { $script:order.Add(('T1Monitoring:{0}:{1}' -f $CheckId, $Occasion)); New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
         $script:state = New-TestState @{ Stage = 'Monitoring'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
         $results = @(Invoke-DemoDeployment -Config $config -Resume)
-        $script:order[0..1] | Should -Be @('T1Monitoring:DEPLOY.T1.MONITORING:the deployment', 'Arc')
+        $script:order[0..2] | Should -Be @('Switch:T1,T3,T2=baseline', 'T1Monitoring:DEPLOY.T1.MONITORING:the deployment', 'Arc') -Because 'VMs that already run get the interim baseline before this run''s Run Commands (2026-11-03)'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.T1.MONITORING' }).status | Should -Be 'Pass'
 
         # A run with its own Monitoring stage leaves it to that stage.
@@ -1010,7 +1025,7 @@ Describe 'Invoke-DemoDeployment' {
 
     It 'runs DONE''s read-only checks after the validation, as the parallel path does, so a sequential run can end DONE (review finding 4)' {
         $results = Invoke-DemoDeployment -Config $config
-        $script:order[-1] | Should -Be 'DoneGate'
+        $script:order[-2..-1] | Should -Be @('DoneGate', 'Switch:T1,T3,T2=business-day') -Because 'the switch to business-day comes after DONE''s reads (2026-11-03)'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -Times 1 -Exactly -ParameterFilter { $Requirement -contains 'HUB.ESTATE.T1' -and $Requirement -contains 'T2.ARC.SQLINSTANCE' -and $Requirement -contains 'FABRIC.ITEMS.REQUIRED' -and $Requirement -notcontains 'HUB.ESTATE.T4' }
         ($results | Where-Object { $_.checkId -eq 'HUB.ESTATE.T1' }).status | Should -Be 'Pass'
 
@@ -1024,9 +1039,9 @@ Describe 'Invoke-DemoDeployment' {
     It 'runs every stage in the live-proven order' {
         $results = Invoke-DemoDeployment -Config $config
         $script:order | Should -Be @(
-            'Preflight', 'Template', 'Bundle', 'SendBundle:sqlvm01', 'SendBundle:archost01', 'Publish', 'SendRunner:sqlvm01', 'SendRunner:archost01',
+            'Preflight', 'Switch:T1,T3,T2=baseline', 'Template', 'Bundle', 'SendBundle:sqlvm01', 'SendBundle:archost01', 'Publish', 'SendRunner:sqlvm01', 'SendRunner:archost01',
             'Template+Bundle', 'Loader:sqlvm01', 'Loader:archost01', 'T1Ready', 'Group', 'T3Setup', 'EnableT3', 'TestT3',
-            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate'
+            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate', 'Switch:T1,T3,T2=business-day'
         )
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         $script:state.Stage | Should -Be 'Validation'
@@ -1035,6 +1050,60 @@ Describe 'Invoke-DemoDeployment' {
         $script:state.RunnerSha256 | Should -Be $script:runnerSha
         @($results | ForEach-Object { $_.checkId } | Where-Object { $_ -like 'DEPLOY.STAGE.*' }).Count | Should -Be 11
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.T4' }).status | Should -Be 'Not selected' -Because 'T4 is off in this test configuration'
+    }
+
+    It 'sets the interim baseline in its stages and switches to business-day after DONE''s reads, for a configuration without activityProfile too (-Sequential, 2026-11-03)' {
+        $unset = New-TestConfig
+        $unset.Remove('activityProfile')
+        $results = @(Invoke-DemoDeployment -Config $unset)
+        @($script:order | Where-Object { $_ -like 'Profile:*' }) | Should -Be @('Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline')
+        $script:order[-2..-1] | Should -Be @('DoneGate', 'Switch:T1,T3,T2=business-day')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoTargetProfile -Times 3 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and $SwitchTo -eq 'business-day' }
+        foreach ($target in 'T1', 'T3', 'T2') {
+            ($results | Where-Object { $_.checkId -eq ('DEPLOY.INCIDENTS_{0}' -f $target) }).status | Should -Be 'Pass'
+        }
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        [array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        $unset.Contains('activityProfile') | Should -BeFalse -Because 'the run never writes the configuration'
+
+        # A resumed run that skips preflight says once that it uses the default (DEPLOY.ACTIVITYPROFILE).
+        $script:order.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        $script:state = New-TestState @{ Stage = 'Monitoring'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+        $resumed = @(Invoke-DemoDeployment -Config $unset -Resume)
+        $notice = @($resumed | Where-Object { $_.checkId -eq 'DEPLOY.ACTIVITYPROFILE' })
+        $notice.Count | Should -Be 1
+        $notice[0].message | Should -Match 'uses the new default, business-day \(incidents every hour\); set it to baseline for the quieter demo'
+        $script:order[0] | Should -Be 'Switch:T1,T3,T2=baseline' -Because 'both VMs already ran'
+        $script:order[-1] | Should -Be 'Switch:T1,T3,T2=business-day'
+    }
+
+    It 'keeps an explicit baseline: no switch (-Sequential)' {
+        $quiet = New-TestConfig
+        $quiet['activityProfile'] = 'baseline'
+        $results = @(Invoke-DemoDeployment -Config $quiet)
+        $script:order[-1] | Should -Be 'DoneGate'
+        @($script:order | Where-Object { $_ -like 'Switch:*' }) | Should -BeNullOrEmpty
+        @($results | Where-Object { $_.checkId -like 'DEPLOY.INCIDENTS_*' -or $_.checkId -eq 'DEPLOY.ACTIVITYPROFILE' }) | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoTargetProfile -Times 3 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and -not $SwitchTo }
+    }
+
+    It 'still switches when it stops at a Fail after the profiles were set, so no VM stays on the interim baseline (-Sequential)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:order.Add('PowerBI'); New-TestResult 'FABRIC.REPORT' 'Fail' 'fabric' 'fabric' }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.FABRIC' }).status | Should -Be 'Fail'
+        $script:order | Should -Not -Contain 'DoneGate'
+        $script:order[-1] | Should -Be 'Switch:T1,T3,T2=business-day'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.INCIDENTS_T2' }).status | Should -Be 'Pass'
+    }
+
+    It 'reports a switch that doesn''t finish in time as a Warning, never a Fail (-Sequential)' {
+        $script:switchOutcome = 'TimedOut'
+        $results = @(Invoke-DemoDeployment -Config $config)
+        foreach ($target in 'T1', 'T3', 'T2') {
+            ($results | Where-Object { $_.checkId -eq ('DEPLOY.INCIDENTS_{0}' -f $target) }).status | Should -Be 'Warning'
+        }
+        @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
     }
 
     It 'stops at a preflight Fail before anything is deployed' {
@@ -1048,7 +1117,7 @@ Describe 'Invoke-DemoDeployment' {
     It 'resumes after the recorded stage, with the bundle and runner it recorded' {
         $script:state = New-TestState @{ Stage = 'Monitoring'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
         Invoke-DemoDeployment -Config $config -Resume | Out-Null
-        $script:order[0] | Should -Be 'Arc'
+        $script:order[0..1] | Should -Be @('Switch:T1,T3,T2=baseline', 'Arc')
         $script:order | Should -Not -Contain 'Preflight'
         $script:order | Should -Not -Contain 'Bundle'
     }
@@ -1081,7 +1150,7 @@ Describe 'Invoke-DemoDeployment' {
 
     It 'stops after the given stage' {
         Invoke-DemoDeployment -Config $config -StopAfter Infrastructure | Out-Null
-        $script:order | Should -Be @('Preflight', 'Template')
+        $script:order | Should -Be @('Preflight', 'Switch:T1,T3,T2=baseline', 'Template', 'Switch:T1,T3,T2=business-day') -Because 'VMs that already run get the interim baseline first, and the profile back at the end (2026-11-03)'
         $script:state.Stage | Should -Be 'Infrastructure'
     }
 
@@ -1099,7 +1168,7 @@ Describe 'Invoke-DemoDeployment' {
             }
         }
         Invoke-DemoDeployment -Config $config -StopAfter Infrastructure | Out-Null
-        $script:order | Should -Be @('Preflight', 'ResetTracks', 'Template')
+        $script:order | Should -Be @('Preflight', 'ResetTracks', 'Switch:T1,T3,T2=baseline', 'Template', 'Switch:T1,T3,T2=business-day')
         $script:state.TrackT1 | Should -Be ''
         $script:state.TrackT2 | Should -Be ''
         $script:state.TrackFabric | Should -Be '' -Because 'a run that starts over trusts nothing recorded before it'
@@ -1118,7 +1187,7 @@ Describe 'Invoke-DemoDeployment' {
         $script:preflightStatus = 'Pass'
         $script:state = New-TestState @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
         Invoke-DemoDeployment -Config $config -Resume | Out-Null
-        $script:order[0..1] | Should -Be @('ResetTracks', 'Arc')
+        $script:order[0..2] | Should -Be @('ResetTracks', 'Switch:T1,T3,T2=baseline', 'Arc')
         $reset = @($script:recorded | Where-Object { $_.ContainsKey('TrackT1') })[0]
         $reset['TrackT1'] | Should -Be 'Monitoring'
         $reset['TrackT2'] | Should -Be 'Bootstraps'
@@ -1131,8 +1200,8 @@ Describe 'Invoke-DemoDeployment' {
         $vaultConfig['keyVault']['enabled'] = $true
         Mock -ModuleName DbHubDemo -CommandName Initialize-DemoKeyVault -MockWith { $script:order.Add('KeyVault'); New-TestResult 'INFRA.KEYVAULT' 'Fail' }
         $results = Invoke-DemoDeployment -Config $vaultConfig
-        $script:order[0..2] | Should -Be @('Preflight', 'Template', 'KeyVault')
-        $script:order[-1] | Should -Be 'RunnerStatus'
+        $script:order[0..3] | Should -Be @('Preflight', 'Switch:T1,T3,T2=baseline', 'Template', 'KeyVault')
+        $script:order[-2..-1] | Should -Be @('RunnerStatus', 'Switch:T1,T3,T2=business-day') -Because 'a run that isn''t DONE switches from the interim baseline too (2026-11-03)'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Fail'
         $script:state.Stage | Should -Be 'Validation'
 
@@ -1394,6 +1463,17 @@ Describe 'Stop-DemoEnvironment' {
             $script:order.Add(('Profile:{0}={1}' -f $Target, $ArgumentList[3]))
             [pscustomobject]@{ Status = 'Pass'; ExitCode = 0; Records = @(); Result = (New-TestResult ('WORKLOAD.{0}.COMMAND' -f $Target) 'Pass' 'workload' $Target) }
         }
+        # The profiles go off in one managed Run Command per VM, waited for at most -WaitSeconds (2026-11-03).
+        $script:offOutcome = @{}
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            foreach ($item in $Target) {
+                $script:order.Add(('Profile:{0}={1}' -f $item, $ProfileName))
+            }
+            foreach ($item in $Target) {
+                $outcome = if ($script:offOutcome.ContainsKey($item)) { $script:offOutcome[$item] } else { 'Set' }
+                [pscustomobject]@{ Target = $item; VmName = $(if ($item -eq 'T2') { 'archost01' } else { 'sqlvm01' }); Outcome = $outcome; Detail = 'the runner said no'; Data = $null; Seconds = [int]$PesterBoundParameters['WaitSeconds'] }
+            }
+        }
         Mock -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -MockWith { $script:order.Add('Guest'); New-TestResult 'STOP.GUEST' 'Pass' 'infra' 'T2' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Deallocate:' + $VmName); New-TestResult ('STOP.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoT3 -MockWith { $script:order.Add('RemoveT3'); New-TestResult 'T3.REMOVE' 'Pass' 't3' 'T3' }
@@ -1404,6 +1484,33 @@ Describe 'Stop-DemoEnvironment' {
         $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off', 'Guest', 'Deallocate:archost01', 'Deallocate:sqlvm01')
         ($results | Where-Object { $_.checkId -eq 'STOP.PROFILE_T3' }).message | Should -Match 'off'
         Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoT3 -Times 0 -Exactly
+    }
+
+    It 'turns the profiles off in one bounded wait for both VMs, then stops the guest and deallocates anyway (2026-11-03)' {
+        $script:offOutcome = @{ T1 = 'TimedOut'; T3 = 'TimedOut'; T2 = 'TimedOut' }
+        $results = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
+        $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off', 'Guest', 'Deallocate:archost01', 'Deallocate:sqlvm01')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 1 -Exactly -ParameterFilter { $ProfileName -eq 'off' -and $WaitSeconds -eq 180 -and (@($Target) -join ',') -eq 'T1,T3,T2' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 180 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -Times 0 -Exactly
+        foreach ($target in 'T1', 'T3', 'T2') {
+            $off = $results | Where-Object { $_.checkId -eq ('STOP.PROFILE_{0}' -f $target) }
+            $off.status | Should -Be 'Warning'
+            $off.message | Should -Match 'didn''t finish within 180 seconds'
+            $off.message | Should -Match 'was deallocated anyway \(STOP\.VM_(SQLVM01|ARCHOST01)\), which stops the incident with it'
+        }
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        [array]::IndexOf($ids, 'STOP.PROFILE_T1') | Should -BeGreaterThan ([array]::IndexOf($ids, 'STOP.VM_SQLVM01')) -Because 'the Warning says the VM was deallocated, so it comes after the deallocation'
+    }
+
+    It 'says so when a VM that didn''t turn its profile off wasn''t deallocated either' {
+        $script:offOutcome = @{ T1 = 'TimedOut' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Deallocate:' + $VmName); New-TestResult ('STOP.VM_{0}' -f $VmName.ToUpperInvariant()) $(if ($VmName -eq 'sqlvm01') { 'Fail' } else { 'Pass' }) 'infra' 'T1' }
+        $results = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
+        $t1 = $results | Where-Object { $_.checkId -eq 'STOP.PROFILE_T1' }
+        $t1.status | Should -Be 'Warning'
+        $t1.message | Should -Match 'wasn''t deallocated either'
+        ($results | Where-Object { $_.checkId -eq 'STOP.PROFILE_T3' }).status | Should -Be 'Pass'
     }
 
     It 'parks only T2 with -ParkT2, and deletes T3 only with -RemoveT3' {
@@ -1535,6 +1642,22 @@ Describe 'Start-DemoEnvironment' {
         }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith { $script:order.Add('Telemetry:' + ($Target -join ',')); New-TestResult 'HUB.TELEMETRY.T1' 'Pass' 'hub' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName New-DemoBastion -MockWith { $script:order.Add('Bastion'); New-TestResult 'START.BASTION' 'Pass' 'infra' 'T2' }
+        # The switch from the interim baseline to a profile with incidents (2026-11-03): one managed Run Command per VM.
+        $script:switchOutcome = 'Set'
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            $script:order.Add(('Switch:{0}={1}' -f (@($Target) -join ','), $ProfileName))
+            foreach ($item in $Target) {
+                [pscustomobject]@{ Target = $item; VmName = $(if ($item -eq 'T2') { 'archost01' } else { 'sqlvm01' }); Outcome = $(if ([int]$PesterBoundParameters['WaitSeconds'] -eq 0) { 'Sent' } else { $script:switchOutcome }); Detail = 'the runner said no'; Data = $null; Seconds = 4 }
+            }
+        }
+        # The wait for the interim baseline on a VM this start booted (re-review of PR 16, 2026-11-04).
+        $script:interimOutcome = 'Set'
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoProfileRunCommand -MockWith {
+            $script:order.Add(('Interim:{0}' -f (@($Record | ForEach-Object { $_.Target }) -join ',')))
+            foreach ($item in $Record) {
+                [pscustomobject]@{ Target = $item.Target; VmName = $item.VmName; Outcome = $(if ($item.Outcome -eq 'Sent') { $script:interimOutcome } else { $item.Outcome }); Detail = 'sqlvm01 didn''t finish it within 750 seconds'; Data = [ordered]@{ evidence = [ordered]@{ attempts = 3 } }; Seconds = 41 }
+            }
+        }
         # The on-demand control's Run Command cleanup (Phase 28 follow-up) has its own tests below; here it records when it ran.
         $script:cleanup = $null
         $script:cleanupAt = -1
@@ -1560,16 +1683,150 @@ Describe 'Start-DemoEnvironment' {
         }
     }
 
-    It 'checks the cost, starts the VMs, resumes T3, and sets the configured profile everywhere' {
+    It 'checks the cost, starts the VMs, resumes T3, and sets the configured profile everywhere: baseline first, then business-day once its own Run Commands are done (2026-11-03)' {
+        $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        # A VM this start booted gets the interim baseline as soon as it runs, and its own Run Commands wait for it (review of
+        # PR 16, and its re-review).
+        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Switch:T1,T3=baseline', 'Start:archost01', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'SourceRelease', 'T1Monitoring', 'WarmT3', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T2=business-day')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 1 -Exactly -ParameterFilter { $ProfileName -eq 'business-day' -and $WaitSeconds -eq 180 -and $RequestedBy -eq 'start-demo' }
+        foreach ($target in 'T1', 'T3', 'T2') {
+            $switch = $results | Where-Object { $_.checkId -eq ('START.INCIDENTS_{0}' -f $target) }
+            $switch.status | Should -Be 'Pass'
+            $switch.message | Should -Match 'They started only once this run''s own Run Commands on (sqlvm01|archost01) were done, so none slowed them'
+        }
+        ($results | Where-Object { $_.checkId -eq 'START.INCIDENTS_T2' }).message | Should -Match ':05 \(cpu-pressure, 8 minutes\), :20 \(missing-index, 8 minutes\), :35 \(io-pressure, 8 minutes\), and :50 \(inefficient-query, 6 minutes\) past each UTC hour'
+        ($results | Where-Object { $_.checkId -eq 'START.PROFILE_T1' }).message | Should -Match 'business-day'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoStartCost -Times 1 -Exactly -ParameterFilter { $ActivityProfile -eq 'business-day' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'Activity: business-day:*set activityProfile to baseline for a quiet demo*' } -Times 1 -Exactly
+    }
+
+    It 'uses business-day for a configuration without activityProfile, says so once, and checks the cost with it (2026-11-03)' {
+        $unset = New-TestConfig
+        $unset.Remove('activityProfile')
+        $results = @(Start-DemoEnvironment -Config $unset -Confirm:$false)
+        $notice = @($results | Where-Object { $_.checkId -eq 'START.ACTIVITYPROFILE' })
+        $notice.Count | Should -Be 1
+        $notice[0].status | Should -Be 'Pass'
+        $notice[0].message | Should -Match ([regex]::Escape('activityProfile isn''t set, so this run uses the new default, business-day (incidents every hour); set it to baseline for the quieter demo.'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'activityProfile isn''t set, so this run uses the new default, business-day*' } -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoStartCost -Times 1 -Exactly -ParameterFilter { $ActivityProfile -eq 'business-day' }
+        $script:order | Should -Contain 'Switch:T1,T3,T2=business-day'
+        ($results | Where-Object { $_.checkId -eq 'START.INCIDENTS_T1' }).message | Should -Match 'business-day is the default because activityProfile isn''t set; set it to baseline for the quieter demo'
+        $unset.Contains('activityProfile') | Should -BeFalse -Because 'the run never writes the configuration'
+
+        # The notice comes with -SkipCostCheck too.
+        $skipped = @(Start-DemoEnvironment -Config $unset -SkipCostCheck -Confirm:$false)
+        @($skipped | Where-Object { $_.checkId -eq 'START.ACTIVITYPROFILE' }).Count | Should -Be 1
+    }
+
+    It 'keeps an explicit baseline, from the configuration or -ActivityProfile: no switch, no notice' {
+        $quiet = New-TestConfig
+        $quiet['activityProfile'] = 'baseline'
+        $results = @(Start-DemoEnvironment -Config $quiet -Confirm:$false)
+        $script:order | Should -Contain 'Profile:T2=baseline'
+        @($script:order | Where-Object { $_ -like 'Switch:*' }) | Should -BeNullOrEmpty
+        @($results | Where-Object { $_.checkId -like 'START.ACTIVITYPROFILE' -or $_.checkId -like 'START.INCIDENTS_*' }) | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoStartCost -Times 1 -Exactly -ParameterFilter { $ActivityProfile -eq 'baseline' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'Activity: baseline:*problem panels stay empty*set activityProfile to business-day*' } -Times 1 -Exactly
+
+        $script:order.Clear()
+        Start-DemoEnvironment -Config $config -ActivityProfile 'baseline' -Confirm:$false | Out-Null
+        @($script:order | Where-Object { $_ -like 'Switch:*' }) | Should -BeNullOrEmpty
+        $script:order | Should -Contain 'Profile:T1=baseline'
+    }
+
+    It 'leaves a VM the caller still sends Run Commands to on the interim baseline for the caller to switch (-HoldActivitySwitchVm)' {
+        Start-DemoEnvironment -Config $config -HoldActivitySwitchVm 'archost01' -Confirm:$false | Out-Null
+        $script:order[-1] | Should -Be 'Switch:T1,T3=business-day'
+        InModuleScope DbHubDemo { @(Get-DemoActivitySwitchVm) } | Should -Be @('archost01')
+        InModuleScope DbHubDemo { Clear-DemoActivitySwitch }
+    }
+
+    It 'sets the interim baseline first on a VM that already ran, before its own Run Commands there, and switches it back at the end (2026-11-03)' {
+        # An earlier start, or a deploy.ps1 that ended NOT DONE, can have left business-day's incidents running.
+        Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $false }
+        Start-DemoEnvironment -Config $config -SkipT3 -Confirm:$false | Out-Null
+        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Switch:T1,T2=baseline', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Profile:T1=baseline', 'Profile:T2=baseline', 'Switch:T1,T2=business-day') -Because '-SkipT3 leaves T3 alone, quiet included'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 1 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and $WaitSeconds -eq 0 -and $ExpiresMinutes -eq 10 }
+
+        # An explicit baseline has no incidents to quiet.
+        $script:order.Clear()
+        $quiet = New-TestConfig
+        $quiet['activityProfile'] = 'baseline'
+        Start-DemoEnvironment -Config $quiet -SkipT3 -Confirm:$false | Out-Null
+        @($script:order | Where-Object { $_ -like 'Switch:*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'sets the interim baseline on a VM this start booted as soon as it runs, before its own Run Commands there, and says why (review of PR 16)' {
+        # Reviewer: a stored business-day can outlive a stop, and the profile host resumes it about 2 minutes after the
+        # boot, while the start's own Run Commands (the monitoring restore, T3's warm-up, the profiles) still run.
         Start-DemoEnvironment -Config $config -Confirm:$false | Out-Null
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'WarmT3', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline')
+        $script:order.IndexOf('Switch:T1,T3=baseline') | Should -Be ($script:order.IndexOf('Start:sqlvm01') + 1)
+        $script:order.IndexOf('Switch:T2=baseline') | Should -Be ($script:order.IndexOf('Start:archost01') + 1)
+        $script:order.IndexOf('Interim:T1,T3,T2') | Should -BeLessThan $script:order.IndexOf('SourceRelease') -Because 'the first Run Command on archost01 waits for its interim'
+        $script:order.IndexOf('Interim:T1,T3,T2') | Should -BeLessThan $script:order.IndexOf('T1Monitoring') -Because 'the first Run Command on sqlvm01 waits for its interim'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 2 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and $WaitSeconds -eq 0 -and $ExpiresMinutes -eq 10 -and $RequestedBy -eq 'start-demo' -and $RetrySeconds -eq 15 -and $RunnerTimeoutSeconds -eq 120 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -eq 'sqlvm01 started, so T1 and T3 get the interim baseline before this run''s own Run Commands there: its profile host resumes the profile stored there about 2 minutes after the boot. The VM tries every 15 seconds until it''s set, for at most 10 minutes, while its SQL Server starts; business-day comes back at the end.' }
+    }
+
+    It 'waits for the interim baseline on a VM it booted before its own Run Commands there, and reports one not set in time as a Warning with the commands (re-review of PR 16)' {
+        $script:interimOutcome = 'TimedOut'
+        $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        $script:order.IndexOf('Interim:T1,T3,T2') | Should -BeLessThan $script:order.IndexOf('T1Monitoring')
+        $late = $results | Where-Object { $_.checkId -eq 'START.INTERIM_T1' }
+        $late.status | Should -Be 'Warning'
+        $late.message | Should -Match '^T1: the interim baseline on sqlvm01, which this run started, wasn''t set within \d+ seconds\. This run''s own Run Commands there went on'
+        $late.remediation | Should -Be './scripts/validate.ps1 -Area Workload -Target T1 says whether T1''s runner answers now. If this run''s switch to business-day (START.INCIDENTS_T1) didn''t pass, set it once it does: ./scripts/demo-control.ps1 -Target T1 -Scenario business-day -Duration 240.'
+        Get-DemoExitCode -Result $results | Should -Be 0 -Because 'a start goes on, with the Warning'
+
+        $script:order.Clear()
+        $script:interimOutcome = 'Set'
+        $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        @($results | Where-Object { $_.checkId -like 'START.INTERIM_*' } | ForEach-Object { '{0}={1}' -f $_.checkId, $_.status }) | Should -Be @('START.INTERIM_T1=Pass', 'START.INTERIM_T3=Pass', 'START.INTERIM_T2=Pass')
+        ($results | Where-Object { $_.checkId -eq 'START.INTERIM_T1' }).message | Should -Be 'T1: the interim baseline is set on sqlvm01, which this run started, in 41 seconds and 3 attempt(s), before this run''s own Run Commands there; business-day comes back at the end.'
+    }
+
+    It 'sets the interim baseline once a VM that was still stopping runs, and none on a VM that didn''t start (review of PR 16)' {
+        # archost01 was still deallocating: this start didn't request its start, and the first interim request found it
+        # not running; the power check started it once it had settled.
+        Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $VmName -eq 'sqlvm01' }
+        $script:refuse = @('T2')
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            $script:order.Add(('Switch:{0}={1}' -f (@($Target) -join ','), $ProfileName))
+            foreach ($item in $Target) {
+                $outcome = if ([int]$PesterBoundParameters['WaitSeconds'] -ne 0) { 'Set' } elseif ($item -in $script:refuse) { 'NotSent' } else { 'Sent' }
+                [pscustomobject]@{ Target = $item; VmName = $(if ($item -eq 'T2') { 'archost01' } else { 'sqlvm01' }); Outcome = $outcome; Detail = 'archost01 isn''t running'; Data = $null; Seconds = 1 }
+            }
+            $script:refuse = @()
+        }
+        Start-DemoEnvironment -Config $config -SkipT3 -Confirm:$false | Out-Null
+        @($script:order[0..8]) | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Switch:T2=baseline', 'Start:sqlvm01', 'Switch:T1=baseline', 'Start:archost01', 'Switch:T2=baseline', 'Interim:T1,T2')
+        $script:order[-1] | Should -Be 'Switch:T1,T2=business-day'
+
+        # A VM that doesn't run gets nothing: a Run Command can't reach it.
+        $script:order.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Start:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) $(if ($VmName -eq 'archost01') { 'Fail' } else { 'Pass' }) 'infra' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $true }
+        Start-DemoEnvironment -Config $config -SkipT3 -Confirm:$false | Out-Null
+        $script:order[$script:order.IndexOf('Start:archost01') + 1] | Should -Not -Be 'Switch:T2=baseline'
+        @($script:order | Where-Object { $_ -eq 'Switch:T2=baseline' }) | Should -BeNullOrEmpty
+    }
+
+    It 'reports a switch that doesn''t finish in time as a Warning with the command, never a Fail' {
+        $script:switchOutcome = 'TimedOut'
+        $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        $late = $results | Where-Object { $_.checkId -eq 'START.INCIDENTS_T1' }
+        $late.status | Should -Be 'Warning'
+        $late.message | Should -Match 'didn''t finish within 180 seconds'
+        $late.remediation | Should -Match ([regex]::Escape('./scripts/demo-control.ps1 -Target T1 -Scenario business-day -Duration 240'))
+        Get-DemoExitCode -Result $results | Should -Be 0
     }
 
     It 'deletes the on-demand control''s finished Run Commands on the VMs that run, after the profiles, and carries on with its Warning (Phase 28 follow-up)' {
         $script:cleanup = New-TestResult 'START.CONTROL.RUNCOMMANDS' 'Warning' 'workload'
         $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
         Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoControlRunCommand -Times 1 -Exactly -ParameterFilter { (@($VmName) -join ',') -eq 'sqlvm01,archost01' }
-        $script:cleanupAt | Should -Be $script:order.Count -Because 'it runs once this start''s own Run Commands, the profiles, are done'
+        $script:cleanupAt | Should -Be $script:order.IndexOf('Switch:T1,T3,T2=business-day') -Because 'it runs once this start''s own Run Commands, the profiles, are done, and the switch to business-day comes after it'
         ($results | Where-Object { $_.checkId -eq 'START.CONTROL.RUNCOMMANDS' }).status | Should -Be 'Warning'
         Get-DemoExitCode -Result $results | Should -Be 0
 
@@ -1701,7 +1958,7 @@ Describe 'Start-DemoEnvironment' {
             New-DemoResult -CheckId 'START.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 is {0}.' -f $after) -Evidence @{ stateBefore = 'Stopped'; stateAfter = $after }
         }
         $results = Start-DemoEnvironment -Config (New-TestConfig -WithT4) -Confirm:$false
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'T4:Start:0', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'WarmT3', 'T4:Start:15', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T4=baseline', 'Profile:T2=baseline')
+        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'T4:Start:0', 'Start:sqlvm01', 'Switch:T1,T3,T4=baseline', 'Start:archost01', 'Switch:T2=baseline', 'Interim:T1,T3,T4,T2', 'SourceRelease', 'T1Monitoring', 'WarmT3', 'T4:Start:15', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T4=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T4,T2=business-day')
         ($results | Where-Object { $_.checkId -eq 'START.T4.START' }).status | Should -Be 'Pass'
         # The confirming call knows this run requested the start, so it doesn't say "was already running" (Phase 25d).
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -Times 1 -Exactly -ParameterFilter { $WaitMinutes -gt 0 -and $Requested }
@@ -1842,6 +2099,32 @@ Describe 'Get-DemoEnvironmentStatus' {
         $t3 = $results | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T3' }
         $t3.status | Should -Be 'Pass'
         $t3.message | Should -Not -Match 'Profile host'
+    }
+
+    It 'says what the active profile does and how to choose the other: business-day''s incidents, a baseline a run hasn''t switched yet, or a configured baseline (2026-11-03)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { 'PowerState/running' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ status = 'Pass'; state = 'Ready'; message = 'ok' } }
+        $script:active = 'business-day'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $record = [pscustomobject]@{ target = $Target; name = $script:active; description = ('{0} (active until 2026-11-03T23:58:00Z; set by start-demo at 2026-11-03T15:00:00Z)' -f $script:active); expiresAt = '2026-11-03T23:58:00Z'; setBy = 'start-demo'; setAt = '2026-11-03T15:00:00Z' }
+            [pscustomobject]@{ Status = 'Pass'; ExitCode = 0; Records = @($record); Result = (New-TestResult ('WORKLOAD.{0}.COMMAND' -f $Target) 'Pass' 'workload' $Target) }
+        }
+        $results = Get-DemoEnvironmentStatus -Config $config
+        $t1 = $results | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T1' }
+        $t1.status | Should -Be 'Pass'
+        $t1.message | Should -Match ([regex]::Escape('Bounded incidents run at :10 (locking-blocking, 8 minutes) and :40 (locking-blocking, 6 minutes) past each UTC hour; Database Hub''s Performance page shows each a few minutes after it starts. For a quiet demo, set activityProfile to baseline.'))
+        ($results | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T3' }).message | Should -Match ([regex]::Escape(':15 (resource-governance, 5 minutes) and :45 (log-rate-pressure, 5 minutes)'))
+
+        # The interim baseline of a configuration that asks for business-day: a run switches it, and how to now.
+        $script:active = 'baseline'
+        $t1 = Get-DemoEnvironmentStatus -Config $config | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T1' }
+        $t1.message | Should -Match ([regex]::Escape('The configuration asks for business-day: deploy.ps1 and start-demo.ps1 switch to it once their own Run Commands are done; to switch now: ./scripts/demo-control.ps1 -Target T1 -Scenario business-day -Duration 240.'))
+
+        # A configured baseline: the problem panels stay empty, and how to choose business-day.
+        $quiet = New-TestConfig
+        $quiet['activityProfile'] = 'baseline'
+        $t1 = Get-DemoEnvironmentStatus -Config $quiet | Where-Object { $_.checkId -eq 'STATUS.PROFILE_T1' }
+        $t1.message | Should -Match ([regex]::Escape('No incidents run, so the Performance page''s problem panels stay empty; business-day, the default, adds bounded incidents every hour (set activityProfile to business-day).'))
     }
 
     It 'shows a running T4''s Azure Monitor metrics with the enhanced ones in STATUS.T4 (Phase 24)' {
@@ -2147,12 +2430,12 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         @($script:azLog | Where-Object { $_ -notmatch '^rest --method get ' }) | Should -BeNullOrEmpty -Because 'status.ps1 only reads'
     }
 
-    It 'status.ps1 passes with only the bootstrap loader left, and warns when it can''t list a VM''s Run Commands' {
-        $script:listed['sqlvm01'] = @(New-RunCommand 'DbHubDemo-Bootstrap')
-        $script:listed['archost01'] = @(New-RunCommand 'DbHubDemo-Bootstrap')
+    It 'status.ps1 passes with only the bootstrap loader and the activity profiles'' Run Command left, and warns when it can''t list a VM''s Run Commands' {
+        $script:listed['sqlvm01'] = @((New-RunCommand 'DbHubDemo-Bootstrap'), (New-RunCommand 'DbHubDemo-Profile' 'Running'))
+        $script:listed['archost01'] = @((New-RunCommand 'DbHubDemo-Bootstrap'), (New-RunCommand 'DbHubDemo-Profile' 'TimedOut'))
         $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01', 'archost01') -Running @{ sqlvm01 = $false; archost01 = $false } }
-        $result.status | Should -Be 'Pass'
-        $result.message | Should -Match 'No leftover Run Command on sqlvm01 and archost01'
+        $result.status | Should -Be 'Pass' -Because 'each profile change replaces DbHubDemo-Profile, and its script does nothing once it has expired (2026-11-03)'
+        $result.message | Should -Match 'No leftover Run Command on sqlvm01 and archost01; the bootstrap loader DbHubDemo-Bootstrap and the activity profiles'' DbHubDemo-Profile stay by design\.'
         $script:listFails['archost01'] = $true
         $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01', 'archost01') -Running @{} }
         $result.status | Should -Be 'Warning'
@@ -2671,6 +2954,7 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { $script:calls.Add('t4 ' + $PesterBoundParameters['WaitMinutes']); New-DemoResult -CheckId 'DEPLOY.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'T4 was already running (Ready).' -Evidence ([ordered]@{ stateBefore = 'Ready'; stateAfter = 'Ready' }) }
         $request = InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Request-DemoStoppedStart -Config $Config -ProgressPath 'progress.json' -Confirm:$false }
         $request.Needed | Should -BeFalse
+        @($request.Running) | Should -Be @('sqlvm01', 'archost01') -Because 'a VM that already runs gets the interim baseline before the run''s Run Commands (2026-11-03)'
         $script:calls | Should -Be @('t4 0') -Because 'Invoke-DemoT4PowerAction only reads a T4 that''s Ready'
         $script:page | Should -Be @('StartVms|Skipped||Not needed: nothing was stopped.')
         @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request }) | Should -BeNullOrEmpty
@@ -2760,6 +3044,37 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $failed.message | Should -Match 'archost01 isn''t running'
         $failed.remediation | Should -Match ([regex]::Escape('./scripts/start-demo.ps1'))
         $script:calls | Should -Not -Contain 'source release' -Because 'the host isn''t running'
+    }
+
+    It 'sets the interim baseline on each VM it started as soon as that VM runs, and waits for it before the run''s first Run Command there, and none on a VM that didn''t start (review of PR 16, and its re-review)' {
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityQuiet -MockWith {
+            $script:calls.Add(('quiet {0} started={1} by={2}' -f (@($VmName) -join ','), [bool]$Started, $RequestedBy))
+            foreach ($vm in $VmName) {
+                [pscustomobject]@{ Target = $(if ($vm -eq 'archost01') { 'T2' } else { 'T1' }); VmName = $vm; Outcome = 'Sent'; Detail = 'sent'; Data = $null; Seconds = 0 }
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoActivityInterim -MockWith {
+            $script:calls.Add(('interim wait {0} {1}' -f (@($Record | ForEach-Object { $_.Target }) -join ','), $CheckPrefix))
+            New-DemoResult -CheckId 'DEPLOY.INTERIM_T1' -Area 'workload' -Target 'T1' -Status 'Pass' -Message 'set'
+        }
+        $activity = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoActivityProfile -Config $Config }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request; Activity = $activity } { Wait-DemoStoppedStart -Config $Config -Request $Request -ActivityProfile $Activity })
+        $script:calls | Should -Be @('request sqlvm01', 'request archost01', 'running sqlvm01 requested=True', 'quiet sqlvm01 started=True by=deploy', 'running archost01 requested=True', 'quiet archost01 started=True by=deploy', 'interim wait T1,T2 DEPLOY', 'source release') -Because 'the golden source''s release is the first Run Command on archost01'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.INTERIM_T1' }).status | Should -Be 'Pass'
+
+        # A VM that didn't start gets none.
+        $script:calls.Clear()
+        $script:noStart = 'archost01'
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request; Activity = $activity } { Wait-DemoStoppedStart -Config $Config -Request $Request -ActivityProfile $Activity })
+        $script:calls | Should -Be @('running sqlvm01 requested=True', 'quiet sqlvm01 started=True by=deploy', 'running archost01 requested=True', 'interim wait T1 DEPLOY')
+
+        # Without -ActivityProfile, nothing is sent or waited for, as before.
+        $script:calls.Clear()
+        $script:noStart = ''
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        @($script:calls | Where-Object { $_ -like 'quiet*' -or $_ -like 'interim*' }) | Should -BeNullOrEmpty
     }
 
     It 'starts nothing in a what-if' {

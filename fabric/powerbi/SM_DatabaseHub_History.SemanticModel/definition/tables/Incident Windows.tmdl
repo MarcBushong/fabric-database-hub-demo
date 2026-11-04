@@ -313,7 +313,7 @@ table 'Incident Windows'
             SWITCH (
                 TRUE (),
                 [Has Telemetry Bins] = 0,
-                    "Run NB_DatabaseHub_LiveActivity (Run all is safe). It saves telemetry snapshots and incident windows to LH_DatabaseHub, and this page reads them. The live views stay in Database Hub and the Real-Time Dashboard.",
+                    "Run NB_DatabaseHub_LiveActivity (Run all also sends its activity request; set CONFIRM = False to only capture). It saves telemetry snapshots and incident windows to LH_DatabaseHub, and this page reads them. The live views stay in Database Hub and the Real-Time Dashboard.",
                 [Has Incident] = 0,
                     "No incident window is in the lakehouse yet. Start one, for example ./scripts/demo-control.ps1 -Target T1 -Scenario incident:locking-blocking -Duration 15, wait 15 minutes for the telemetry, then run NB_DatabaseHub_LiveActivity. Until then, this chart shows the latest healthy baseline.",
                 "What happened: " & [Focus Signal Label] & " on " & [Focus Target Key]

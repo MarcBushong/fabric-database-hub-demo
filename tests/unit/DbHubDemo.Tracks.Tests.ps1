@@ -930,6 +930,17 @@ Describe 'Invoke-DemoParallelDeployment' {
         # Phase 28 live finding: what's stopped starts before anything needs it; here both VMs run unless a test says not.
         $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
+        # The activity profiles' Run Command (2026-11-03): the interim baseline on VMs that already run, and the switch.
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            $wait = [int]$PesterBoundParameters['WaitSeconds']
+            $script:calls.Add(('switch {0}={1} wait={2}' -f (@($Target) -join ','), $ProfileName, $wait))
+            foreach ($item in $Target) { [pscustomobject]@{ Target = $item; VmName = $(if ($item -eq 'T2') { 'archost01' } else { 'sqlvm01' }); Outcome = $(if ($wait -eq 0) { 'Sent' } else { 'Set' }); Detail = ''; Data = $null; Seconds = 9 } }
+        }
+        # The wait for the interim baseline on a VM this run started (re-review of PR 16, 2026-11-04).
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoProfileRunCommand -MockWith {
+            $script:calls.Add(('interim {0}' -f (@($Record | ForEach-Object { $_.Target }) -join ',')))
+            foreach ($item in $Record) { [pscustomobject]@{ Target = $item.Target; VmName = $item.VmName; Outcome = 'Set'; Detail = ''; Data = $null; Seconds = 30 } }
+        }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -948,6 +959,66 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         @($script:calls | Where-Object { $_ -match '^state .*Stage' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'switches what the tracks left on the interim baseline to business-day only after DONE''s reads, and keeps an explicit baseline (2026-11-03)' {
+        # The tracks set baseline first and note the VMs; this process switches them once its own Run Commands are done.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
+            $vm = switch ($Track) { 'T1' { 'sqlvm01' } 'T2' { 'archost01' } default { '' } }
+            if ($vm) {
+                & (Get-Module -Name 'DbHubDemo') { param($Name) Register-DemoActivitySwitch -VmName $Name } $vm
+            }
+            $ready = switch ($Track) { 'T1' { [ordered]@{ T1 = '2026-10-22T15:00:00Z'; T3 = '2026-10-22T15:01:00Z' } } 'T2' { [ordered]@{ T2 = '2026-10-22T15:10:00Z' } } default { [ordered]@{} } }
+            $trackResults = switch ($Track) {
+                'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3'), (New-TestResult 'DEPLOY.PROFILE_T1'), (New-TestResult 'DEPLOY.PROFILE_T3')) }
+                'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2'), (New-TestResult 'DEPLOY.PROFILE_T2')) }
+                default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') }
+            }
+            [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = $ready; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            $wait = [int]$PesterBoundParameters['WaitSeconds']
+            $script:calls.Add(('switch {0}={1} wait={2}' -f (@($Target) -join ','), $ProfileName, $wait))
+            foreach ($item in $Target) { [pscustomobject]@{ Target = $item; VmName = $(if ($item -eq 'T2') { 'archost01' } else { 'sqlvm01' }); Outcome = $(if ($wait -eq 0) { 'Sent' } else { 'Set' }); Detail = ''; Data = $null; Seconds = 9 } }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $calls = @($script:calls)
+        # Both VMs already ran, so they got the interim baseline before the tracks' Run Commands, without waiting.
+        $quiet = [array]::IndexOf($calls, 'switch T1,T3,T2=baseline wait=0')
+        $quiet | Should -BeGreaterOrEqual 0
+        $quiet | Should -BeLessThan ([array]::IndexOf($calls, 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'))
+        $switch = [array]::IndexOf($calls, 'switch T1,T3,T2=business-day wait=180')
+        $switch | Should -BeGreaterThan ([array]::IndexOf($calls, 'fabric items')) -Because 'DONE''s reads come first'
+        [array]::IndexOf($calls, 'fabric items') | Should -BeGreaterOrEqual 0
+        @($calls | Where-Object { $_ -like 'switch *' }).Count | Should -Be 2
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        foreach ($target in 'T1', 'T3', 'T2') {
+            ($results | Where-Object { $_.checkId -eq ('DEPLOY.INCIDENTS_{0}' -f $target) }).status | Should -Be 'Pass'
+        }
+        [array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.TIMING'))
+        [array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+
+        # An explicit baseline is what the tracks set, so there's nothing to switch.
+        $script:calls.Clear()
+        $quiet = New-TestConfig
+        $quiet['activityProfile'] = 'baseline'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $quiet } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        @($script:calls | Where-Object { $_ -like 'switch *' }) | Should -BeNullOrEmpty
+        @($results | Where-Object { $_.checkId -like 'DEPLOY.INCIDENTS_*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'says once that a resumed run without preflight uses the default, business-day, for a configuration without activityProfile (2026-11-03)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Bootstraps'; $state }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        $unset = New-TestConfig
+        $unset.Remove('activityProfile')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $unset } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+        $script:calls | Should -Not -Contain 'preflight'
+        $notice = @($results | Where-Object { $_.checkId -eq 'DEPLOY.ACTIVITYPROFILE' })
+        $notice.Count | Should -Be 1
+        $notice[0].message | Should -Match '^activityProfile isn''t set, so this run uses the new default, business-day \(incidents every hour\); set it to baseline for the quieter demo\.'
     }
 
     It 'reads T3''s extended property from T1 for the gate when the run has no T3.PROPERTY (a resumed run)' {
@@ -1288,6 +1359,13 @@ Describe 'Invoke-DemoParallelDeployment' {
             @($calls | Where-Object { $_ -like 'running archost01*' }) | Should -BeNullOrEmpty -Because 'a running VM is only read'
             $calls | Should -Not -Contain 'source release' -Because 'archost01 wasn''t started'
             $calls | Should -Not -Contain 't1 monitoring' -Because 'T1''s own Monitoring step runs in this run'
+            # sqlvm01, which this run started, gets the interim baseline as soon as it runs, and the run waits for it; then
+            # archost01, which already ran: all before the template and the tracks (review of PR 16, and its re-review).
+            $calls.IndexOf('switch T1,T3=baseline wait=0') | Should -Be ($calls.IndexOf('running sqlvm01 requested=True') + 1)
+            $calls.IndexOf('interim T1,T3') | Should -Be ($calls.IndexOf('switch T1,T3=baseline wait=0') + 1)
+            $calls.IndexOf('switch T2=baseline wait=0') | Should -Be ($calls.IndexOf('interim T1,T3') + 1)
+            $calls.IndexOf('switch T2=baseline wait=0') | Should -BeLessThan $calls.IndexOf('template disk=golden')
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.INTERIM_T1' }).status | Should -Be 'Pass'
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).status | Should -Be 'Pass'
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         }

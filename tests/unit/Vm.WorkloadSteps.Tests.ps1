@@ -485,6 +485,44 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         function ConvertTo-Request([hashtable] $Request) {
             [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($Request | ConvertTo-Json -Depth 5 -Compress)))
         }
+
+        function New-RunnerStatus([int] $Runs, [string] $Target = 'T1') {
+            # The runner's 'status --json' as it writes it, indented: the profile near the top, one node per run (each with
+            # its own "profile" string), and the host node last (CommandLine.cs). 2 runs make 2,128 characters, 5 make 3,584,
+            # with the line breaks the runner writes on the Windows VMs (System.Text.Json's indented output uses
+            # Environment.NewLine).
+            $scenarios = 'cpu-pressure', 'missing-index', 'io-pressure', 'inefficient-query', 'healthy-baseline'
+            $runNodes = foreach ($index in 1..$Runs) {
+                $scenario = $scenarios[($index - 1) % $scenarios.Count]
+                $start = [datetime]::new(2026, 11, 3, 13, 5, 0, [System.DateTimeKind]::Utc).AddMinutes(15 * ($index - 1))
+                [ordered]@{
+                    runId              = ('{0:yyyyMMddTHHmmss}-{1}' -f $start, $scenario)
+                    scenario           = $scenario
+                    target             = $Target
+                    status             = $(if ($index -eq $Runs) { 'Running' } else { 'Completed' })
+                    startedAt          = $start.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+                    deadlineAt         = $start.AddMinutes(8).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+                    stoppedAt          = $(if ($index -eq $Runs) { $null } else { $start.AddMinutes(8).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') })
+                    maxDurationSeconds = 600
+                    concurrency        = 8
+                    intensity          = 5
+                    profile            = 'business-day'
+                    requestedBy        = 'profile-host'
+                    outcome            = $(if ($index -eq $Runs) { $null } else { 'Completed' })
+                }
+            }
+            $document = [ordered]@{
+                target         = $Target
+                profile        = [ordered]@{ name = 'business-day'; setAt = '2026-11-03T13:01:12.000Z'; setBy = 'deploy'; expiresAt = '2099-11-03T21:01:12.000Z'; description = 'business-day: incidents at :05, :20, :35, and :50 past each UTC hour.' }
+                runs           = @($runNodes)
+                stopRequests   = @()
+                demoSessions   = @()
+                dataHeadroomMb = 1834
+                logHeadroomMb  = 912
+                host           = [ordered]@{ status = 'Fail'; message = ('The {0} lane keeps failing: the host restarted it 3 times in the last hour.' -f $Target); file = 'C:\ProgramData\DbHubDemo\host-lanes.json'; processId = 4312; hostStartedAt = '2026-11-03T12:58:40.000Z'; heartbeatAt = '2026-11-03T14:06:58.000Z'; heartbeatAgeSeconds = 2; processAlive = $true; stoppedAt = $null; stopReason = $null; lane = [ordered]@{ state = 'Serving'; generation = 4; restarts = 3; restartsLastHour = 3; lastRestartReason = 'no poll finished for 301 s'; lastPollAt = '2026-11-03T14:06:50.000Z'; lastPollAgeSeconds = 10; operation = 'polling'; consecutiveFailures = 0; lastError = $null; runningRuns = 1 } }
+            }
+            return (($document | ConvertTo-Json -Depth 8) -replace '\r?\n', "`r`n")
+        }
     }
 
     BeforeEach {
@@ -559,6 +597,31 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter {
             ($ArgumentList -join ' ') -eq 'status --json --target T4 --server pgflex01-abc123.postgres.database.azure.com --user contosocare_runner'
         }
+    }
+
+    It 'Runner keeps the active profile''s name and expiry from the whole status, which the kept tail of one with <Runs> runs (<Size> characters) leaves out (re-review of PR 16)' -ForEach @(
+        @{ Runs = 2; Size = 2128 }
+        @{ Runs = 5; Size = 3584 }
+    ) {
+        $root = New-ControlRoot
+        $script:status = New-RunnerStatus -Runs $Runs
+        $script:status.Length | Should -Be $Size
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5') }) -StateRoot $root
+        $script:lines[0].Length | Should -BeLessThan 3500 -Because 'the line fits the 4,096 bytes a Run Command keeps'
+        $script:lines[0] | Should -Match ([regex]::Escape('"profile":{"name":"business-day","expiresAt":"2099-11-03T21:01:12.000Z"}'))
+        $result = Get-ControlResult
+        $result.evidence.stdout | Should -Not -Match '"description"' -Because 'the kept tail leaves the status''s own profile out'
+        $result.evidence.stdout | Should -Match '"host"'
+        $result.evidence.profile.name | Should -Be 'business-day'
+    }
+
+    It 'Runner adds no profile for output that has none' {
+        $root = New-ControlRoot
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '[{"checkId":"WORKLOAD.T1.PROFILE.SET","status":"Pass","message":"ok"}]'; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('profile', 'set', '--name', 'baseline', '--json') }) -StateRoot $root
+        $script:lines[0] | Should -Not -Match '"profile":\{'
+        (Get-ControlResult).status | Should -Be 'Pass'
     }
 
     It 'EnableT4: sets T4 up as the P6 group''s role, records the marker, sets the profile, and restarts the host' {

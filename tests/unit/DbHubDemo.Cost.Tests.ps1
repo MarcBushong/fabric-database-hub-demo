@@ -254,6 +254,59 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.Components.Name | Should -Not -Match 'cache|data disk'
     }
 
+    It 'counts business-day''s T3 incidents, which the shipped share already prices at T3''s maximum, so both ceilings hold as before (2026-11-03)' {
+        $unset = New-TestConfig
+        $unset.Remove('activityProfile')
+        $default = Get-DemoCostEstimate -Config $unset -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $quiet = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ activityProfile = 'baseline' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $default.ActivityProfile | Should -Be 'business-day'
+        $quiet.ActivityProfile | Should -Be 'baseline'
+        # T3 at its maximum, 1 vCore x 0.50, for every running hour already (t3ActiveShareOfMaxVcores 1.0): nothing to add.
+        $default.T3BusinessDaySession | Should -Be 0
+        $default.T3BusinessDayMonthly | Should -Be 0
+        $default.SessionCost | Should -Be $quiet.SessionCost
+        $default.LightUseMonthly | Should -Be $quiet.LightUseMonthly
+        @($default.Components | Where-Object Name -Match 'business-day') | Should -BeNullOrEmpty
+        $session = $default.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION'
+        $session.status | Should -Be 'Pass'
+        $session.message | Should -Match 'With activityProfile business-day, T3''s incidents run at its maximum vCores 10 of every 60 minutes; the estimate already prices T3 at its maximum for every running hour, so they add nothing\.'
+        $monthly = $default.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.status | Should -Be 'Pass'
+        $monthly.message | Should -Match 'they add nothing'
+        $session.evidence.activityProfile | Should -Be 'business-day'
+        $session.evidence.activityProfileSource | Should -Be 'default'
+        $session.evidence.t3IncidentShare | Should -Be 0.1667
+        ($quiet.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Not -Match 'business-day'
+    }
+
+    It 'adds the T3 increment from the retail price when the assumed share is below the maximum, and -ActivityProfile picks the profile (2026-11-03)' {
+        $catalog = Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath '../../config/profiles.json') -Raw | ConvertFrom-Json -AsHashtable
+        $catalog['assumptions']['t3ActiveShareOfMaxVcores'] = 0.5
+        $script:halfShare = $catalog
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoProfile -MockWith { $script:halfShare }
+        $businessDay = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $baseline = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -ActivityProfile 'baseline'
+        # 1 vCore x (1 - 0.5) x 10/60 of each hour at the fixture's 0.50 per vCore-hour: about 0.0417 an hour.
+        $increment = $businessDay.Components | Where-Object Name -EQ 'T3 compute, business-day incidents (10 of every 60 minutes at the maximum vCores)'
+        $increment.UnitPrice | Should -Be 0.5
+        [System.Math]::Round([double]$increment.Quantity, 4) | Should -Be 0.0833
+        $businessDay.T3BusinessDaySession | Should -Be 0.21 -Because '0.0833 x 5 hours x 0.50'
+        $businessDay.T3BusinessDayMonthly | Should -Be 0.42 -Because '0.0833 x 10 hours x 0.50'
+        [System.Math]::Round($businessDay.SessionCost - $baseline.SessionCost, 2) | Should -Be 0.21
+        [System.Math]::Round($businessDay.LightUseMonthly - $baseline.LightUseMonthly, 2) | Should -Be 0.42
+        @($baseline.Components | Where-Object Name -Match 'business-day') | Should -BeNullOrEmpty
+        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Match 'adds 0\.21 USD to a session and 0\.42 USD to the light-use month before the free allowance'
+        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').status | Should -Be 'Pass'
+        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -ParameterFilter { [uri]::UnescapeDataString($Uri) -match 'Serverless - Compute Gen5' }
+
+        # The free offer's allowance covers the increment too, and is used faster.
+        $free = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $true
+        $freeBaseline = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $true -ActivityProfile 'baseline'
+        $free.T3FreeOfferCreditMonthly | Should -BeGreaterThan $freeBaseline.T3FreeOfferCreditMonthly
+        $free.LightUseMonthly | Should -Be $freeBaseline.LightUseMonthly -Because 'at light use the allowance covers T3 either way'
+    }
+
     It 'prices T2 golden snapshots per GB-month on their provisioned size, as Standard HDD when incremental (ADR 0018)' {
         $snapshot = [pscustomobject]@{ Name = 'snap-dbhub-t2golden-202610221306'; Sku = 'Standard_LRS'; SizeGiB = 128; UsedGiB = 37; Incremental = $true }
         $without = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public

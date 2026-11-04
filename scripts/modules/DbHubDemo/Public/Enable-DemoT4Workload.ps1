@@ -12,7 +12,8 @@ function Enable-DemoT4Workload {
        scenario functions, and grants the runner's role what the scenarios need in contosocare;
     2. records C:\ProgramData\DbHubDemo\t4-workload.json, which tells the WorkloadRunner step and
        Start-DemoWorkload.ps1 that T1's identity reaches T4;
-    3. sets T4's activity profile (activityProfile, baseline by default) until the next auto-shutdown; and
+    3. sets T4's activity profile (the one the VMs set by themselves: activityProfile, with baseline in place of a
+       profile with incidents, business-day included, which the run switches to at its end) until the next auto-shutdown; and
     4. restarts DbHubDemo-Workload, whose host then drives T4 too.
     No token, password, or connection string leaves this machine or reaches T1: T1's runner asks its own
     identity for a token. The group's name comes from T4's administrator record (the name PostgreSQL knows it
