@@ -67,7 +67,13 @@ BeforeAll {
                 }
                 return (New-AzResult -Json @{ tags = @{ deploymentId = 'abc123' } })
             }
-            if ($text -match '--method post --url \S+/(start|stop)\?') {
+            if ($text -match '--method post --url \S+/(start|stop|restart)\?') {
+                if ($Matches[1] -eq 'restart') {
+                    $script:t4.Restarts++
+                    $script:t4.MaxPending = $false
+                    $script:events.Add('restart')
+                    return (New-AzResult -Json '')
+                }
                 $script:t4.State = if ($Matches[1] -eq 'start') { 'Ready' } else { 'Stopped' }
                 return (New-AzResult -Json '')
             }
@@ -104,6 +110,12 @@ BeforeAll {
             if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/configurations/metrics\.collector_database_activity\?') {
                 return (New-AzResult -Json @{ properties = @{ value = $script:t4.Enhanced } })
             }
+            if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/configurations/max_connections\?') {
+                if (-not $script:t4.MaxConnections) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'A fake read error.')
+                }
+                return (New-AzResult -Json @{ name = 'max_connections'; properties = @{ value = $script:t4.MaxConnections; isConfigPendingRestart = $script:t4.MaxPending; isDynamicConfig = $false; source = 'user-override'; allowedValues = '25-5000' } })
+            }
             if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123\?') {
                 if (-not $script:t4.Exists) {
                     return (New-AzResult -ExitCode 1 -StdErr '(ResourceNotFound) The Resource was not found.')
@@ -115,7 +127,8 @@ BeforeAll {
     }
 
     function Reset-T4State {
-        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_B1ms' }
+        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_D4ds_v5'; MaxConnections = '50'; MaxPending = $false; Restarts = 0 }
+        $script:events = [System.Collections.Generic.List[string]]::new()
     }
 }
 
@@ -154,7 +167,7 @@ Describe 'Test-DemoT4' {
 
     It 'passes a Ready, Entra-only, privately integrated server with its database, administrator, and enhanced metrics' {
         $results = @(Test-DemoT4 -Config (New-TestConfig) -IncludeMetrics)
-        ($results | ForEach-Object { $_.checkId }) | Should -Be @('T4.SERVER', 'T4.CONFIG', 'T4.ENTRAONLY', 'T4.NETWORK', 'T4.ADMIN', 'T4.DATABASE', 'T4.ENHANCEDMETRICS', 'METRICS.T4')
+        ($results | ForEach-Object { $_.checkId }) | Should -Be @('T4.SERVER', 'T4.CONFIG', 'T4.ENTRAONLY', 'T4.NETWORK', 'T4.ADMIN', 'T4.DATABASE', 'T4.ENHANCEDMETRICS', 'T4.MAXCONNECTIONS', 'METRICS.T4')
         $results | ForEach-Object { $_.status | Should -Be 'Pass' -Because $_.checkId }
         ($results | Where-Object checkId -EQ 'T4.ADMIN').evidence.principalName | Should -Be 'DbHub T3 admins'
         $metrics = $results | Where-Object checkId -EQ 'METRICS.T4'
@@ -209,9 +222,79 @@ Describe 'Test-DemoT4' {
         $config = New-TestConfig
         $config['t4SkuName'] = 'Standard_B2s'
         $check = Test-DemoT4 -Config $config | Where-Object checkId -EQ 'T4.CONFIG'
-        $check.status | Should -Be 'Warning' -Because 'the server runs Standard_B1ms'
+        $check.status | Should -Be 'Warning' -Because 'the server runs Standard_D4ds_v5, the default'
         $check.message | Should -Match 'on Standard_B2s'
         $check.evidence.wantedSku | Should -Be 'Standard_B2s'
+    }
+
+    It 'checks max_connections against config/versions.json: <Name> (2026-11-03)' -ForEach @(
+        @{ Name = 'in effect'; Value = '50'; Pending = $false; Status = 'Pass'; Pattern = '^max_connections is 50 and in effect' }
+        @{ Name = 'waiting for a restart'; Value = '50'; Pending = $true; Status = 'Warning'; Pattern = 'waits for a restart' }
+        @{ Name = 'a size''s own default'; Value = '859'; Pending = $false; Status = 'Warning'; Pattern = '^max_connections is 859, not 50' }
+        @{ Name = 'a read that failed'; Value = ''; Pending = $false; Status = 'Warning'; Pattern = 'couldn''t be read: A fake read error' }
+    ) {
+        $script:t4.MaxConnections = $Value
+        $script:t4.MaxPending = $Pending
+        $check = Test-DemoT4 -Config (New-TestConfig) | Where-Object checkId -EQ 'T4.MAXCONNECTIONS'
+        $check.status | Should -Be $Status
+        $check.message | Should -Match $Pattern
+        $check.evidence.wanted | Should -Be '50'
+        @($script:azCalls | Where-Object { $_ -match '--method (post|put|patch|delete)' }).Count | Should -Be 0 -Because 'the check only reads; deploy.ps1 restarts'
+    }
+}
+
+Describe 'max_connections on every T4 size (ADR 0019, 2026-11-03)' {
+    BeforeEach {
+        Reset-T4State
+        Initialize-T4AzMock
+    }
+
+    It 'sets it in the template from config/versions.json, within the documented range, after the other parameters' {
+        $postgres = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable)['postgresql']
+        $postgres['maxConnections'] | Should -Be 50 -Because 'Standard_B1ms''s own default, below connection-surge''s cap of 60'
+        $postgres['docUrls']['serverParameters'] | Should -Match '/azure/postgresql/server-parameters/param-connections-authentication-connection-settings$'
+        $server = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/pgflex01.bicep') -Raw
+        $server | Should -Match "@minValue\(25\)\s+@maxValue\(5000\)\s+param maxConnections int = 50"
+        $server | Should -Match "(?s)resource maxConnectionsSetting 'Microsoft\.DBforPostgreSQL/flexibleServers/configurations@2025-08-01' = \{\s+parent: server\s+name: 'max_connections'\s+properties: \{\s+value: string\(maxConnections\)\s+source: 'user-override'\s+\}\s+dependsOn: \[\s+idleInTransactionTimeout\s+\]"
+        (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw) | Should -Match 'maxConnections: postgres\.maxConnections'
+        $scenario = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scenarios/connection-surge/scenario.json') -Raw | ConvertFrom-Json -AsHashtable
+        $scenario['parameters']['maxConnections']['default'] | Should -BeGreaterThan ($postgres['maxConnections'] - 15) -Because 'a wave fills every slot the runner can have before the cap stops it'
+    }
+
+    It 'leaves a T4 alone when nothing waits for a restart, and when the value can''t be read' {
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PendingRestart -Config $Config } | Should -BeNullOrEmpty
+        $script:t4.MaxConnections = ''
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PendingRestart -Config $Config } | Should -BeNullOrEmpty
+        $script:t4.Restarts | Should -Be 0
+        $config = New-TestConfig
+        $config['t4Enabled'] = $false
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoT4PendingRestart -Config $Config } | Should -BeNullOrEmpty
+    }
+
+    It 'restarts a Ready T4 whose max_connections waits, with the documented operation, and waits until the value is in effect' {
+        $script:t4.MaxPending = $true
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PendingRestart -Config $Config }
+        $result.checkId | Should -Be 'DEPLOY.T4.RESTART'
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match '^T4 \(pgflex01-abc123\) restarted in \d+ s, so max_connections 50 is in effect'
+        $script:t4.Restarts | Should -Be 1
+        @($script:azCalls | Where-Object { $_ -match '--method post --url https://management\.azure\.com/subscriptions/\S+/flexibleServers/pgflex01-abc123/restart\?api-version=\d{4}-\d\d-\d\d$' }).Count | Should -Be 1
+    }
+
+    It 'doesn''t restart a T4 that isn''t Ready, and says when a restart doesn''t apply the value' {
+        $script:t4.MaxPending = $true
+        $script:t4.State = 'Stopped'
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PendingRestart -Config $Config }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'is Stopped, so it wasn''t restarted'
+        $script:t4.Restarts | Should -Be 0
+        # A restart that Azure accepts but that leaves the value waiting until the wait ends.
+        $script:t4.State = 'Ready'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ParameterState -MockWith { [pscustomobject]@{ Found = $true; Value = '50'; PendingRestart = $true; Source = 'user-override'; Error = '' } }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PendingRestart -Config $Config -WaitMinutes 1 -PollSeconds 1 }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'still waits for the restart'
+        $result.remediation | Should -Match 'validate\.ps1 -Area T4'
     }
 }
 
@@ -227,21 +310,37 @@ Describe 'T4 sizes (Phase 24)' {
         $gp.VCores | Should -Be 2
         $gp.Product | Should -Match 'General Purpose Ddsv5 Series Compute'
         $gp.PerVCore | Should -BeTrue
+        $d4 = InModuleScope DbHubDemo { Get-DemoT4SkuSpec -SkuName 'Standard_D4ds_v5' }
+        $d4.VCores | Should -Be 4
+        $d4.Product | Should -Match 'General Purpose Ddsv5 Series Compute'
+        $amd = InModuleScope DbHubDemo { Get-DemoT4SkuSpec -SkuName 'Standard_D4ads_v5' }
+        $amd.Tier | Should -Be 'GeneralPurpose'
+        $amd.VCores | Should -Be 4
+        $amd.Product | Should -Match 'General Purpose Dadsv5 Series Compute'
+        $amd.PerVCore | Should -BeTrue
         { InModuleScope DbHubDemo { Get-DemoT4SkuSpec -SkuName 'Standard_E2ds_v5' } } | Should -Throw '*documented T4 size*'
     }
 
-    It 'offers D2ds_v5 only as a setting: the schema and the template allow it, B1ms stays the default, and the template derives the tier from the size' {
+    It 'offers the documented sizes: the schema and the template allow them, Standard_D4ds_v5 is the default (2026-11-04), and the template derives the tier from the size' {
         $schema = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/environment.schema.json') -Raw | ConvertFrom-Json -AsHashtable
-        $schema.properties['t4SkuName'].enum | Should -Be @('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5')
+        $schema.properties['t4SkuName'].enum | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'Standard_B1ms', 'Standard_B2s')
         # Phase 28: the schema has no default, so an unset size is told apart from one you set (only an unset one falls
-        # back on its own); the profile's size, Standard_B1ms, is what an unset one deploys.
+        # back on its own); the profile's size, Standard_D4ds_v5 since 2026-11-04, is what an unset one deploys. The same
+        # goes for t4AutonomousTuning: unset means on, with a Warning instead of a Fail on a size that can't run it.
         $schema.properties['t4SkuName'].Contains('default') | Should -BeFalse
         (New-TestConfig).Contains('t4SkuName') | Should -BeFalse
         $template = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'azuredeploy.json') -Raw | ConvertFrom-Json -AsHashtable
-        $template.parameters['t4SkuName'].allowedValues | Should -Contain 'Standard_D2ds_v5'
-        $template.parameters['t4SkuName'].defaultValue | Should -Be 'Standard_B1ms'
+        $schema.properties['t4AutonomousTuning'].Contains('default') | Should -BeFalse
+        $template.parameters['t4SkuName'].allowedValues | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'Standard_B1ms', 'Standard_B2s')
+        $template.parameters['t4SkuName'].defaultValue | Should -Be 'Standard_D4ds_v5'
+        $template.parameters['t4AutonomousTuning'].defaultValue | Should -BeFalse -Because 'deploy.ps1 decides, from the switch and the size'
         (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw) | Should -Match "tier: startsWith\(t4SkuName, 'Standard_B'\) \? 'Burstable' : 'GeneralPurpose'"
-        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuName -Config $Config } | Should -Be 'Standard_B1ms'
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuName -Config $Config } | Should -Be 'Standard_D4ds_v5'
+        foreach ($profileName in 'lowest-cost', 'demo-day', 'enhanced-performance') {
+            $config = New-TestConfig
+            $config['profile'] = $profileName
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4DefaultSkuName -Config $Config } | Should -Be 'Standard_D4ds_v5'
+        }
     }
 
     It 'prices T4''s hour at the configured size from the Retail Prices API, or returns nothing when it can''t' {
@@ -282,7 +381,9 @@ Describe 'Invoke-DemoT4PowerAction' {
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'was already running'
         @($script:azCalls | Where-Object { $_ -match '--method post' }).Count | Should -Be 0
-        # An obviously fake price: the stop says what a restarted T4 bills at its own size (Phase 28 follow-up).
+        # An obviously fake price: the stop says what a restarted T4 bills at its own size (Phase 28 follow-up), here a
+        # Burstable server a configuration chose to keep the month cheap.
+        $script:t4.Sku = 'Standard_B1ms'
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { @([pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server Burstable BS Series Compute'; skuName = 'B1MS'; meterName = 'B1MS'; retailPrice = 0.25; unitOfMeasure = '1 Hour' }) }
         $stop = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 5 -CheckPrefix STOP }
         $stop.status | Should -Be 'Pass'
@@ -428,6 +529,22 @@ Describe 'T4 in the deployment tracks' {
         $enable.status | Should -Be 'Fail'
         $enable.remediation | Should -Match 'FromStage T4'
     }
+
+    It 'restarts a T4 whose max_connections waits right before T1 sets it up, and only in T1''s T4 step (2026-11-03)' {
+        $script:t4.MaxPending = $true
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ RunnerSha256 = ('b' * 64); RunnerSentTo = @('sqlvm01') } }
+        Mock -ModuleName DbHubDemo -CommandName Add-DemoT1ToT3AdminGroup -MockWith { New-DemoResult -CheckId 'T3.GROUP' -Area 't3' -Target 'T3' -Status 'Pass' -Message 'member' -Evidence @{ principalId = '88888888-8888-8888-8888-888888888888' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT1PrincipalId -MockWith { '88888888-8888-8888-8888-888888888888' }
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoT4Workload -MockWith { $script:events.Add('enable'); New-DemoResult -CheckId 'WORKLOAD.T4.ENABLE' -Area 'workload' -Target 'T4' -Status 'Pass' -Message 'set up' }
+        # The T4 track's Server step only reports it, so it can run beside T1's T4 step without restarting T4 under it.
+        $server = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T4' -Context @{ NoState = $true; TelemetryWaitMinutes = 0 } -Step @('Server') }
+        ($server.Results | Where-Object checkId -EQ 'T4.MAXCONNECTIONS').status | Should -Be 'Warning'
+        $script:t4.Restarts | Should -Be 0
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context @{ NoState = $true } -Step @('T4') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:events) | Should -Be @('restart', 'enable')
+        ($outcome.Results | Where-Object checkId -EQ 'DEPLOY.T4.RESTART').status | Should -Be 'Pass'
+    }
 }
 
 Describe 'Get-DemoT4StoppedUtc' {
@@ -450,5 +567,184 @@ Describe 'Get-DemoT4StoppedUtc' {
         $stopped.ToUniversalTime() | Should -Be ([datetime]::new(2026, 10, 26, 19, 6, 38, [System.DateTimeKind]::Utc))
         $script:activityCalls.Count | Should -Be 1
         $script:activityCalls[0] | Should -Match '--start-time 2026-10-18T19:10:00Z --end-time 2026-10-26T19:15:00Z --max-events 1000 '
+    }
+}
+
+Describe 'Get-DemoT4RestartCoverage (2026-11-04)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        # The control's names, as Get-DemoActivityControlName returns them for the example configuration; no request is real.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlName -MockWith {
+            [pscustomobject]@{ SubscriptionId = '11111111-2222-3333-4444-555555555555'; Identity = 'id-dbhub-automation'; RoleName = 'DbHub Demo Activity Operator'; DemoResourceGroup = 'rg-dbhub-demo'; DemoResourceGroupId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo'; AutomationAccount = 'aa-dbhub-control'; AutomationAccountId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-control/providers/Microsoft.Automation/automationAccounts/aa-dbhub-control'; StopRunbook = 'DbHub-Stop'; SafetyStopSchedule = 'dbhub-t4-safety-stop' }
+        }
+        $script:control = $true
+        $script:schedule = 'Scheduled'
+        $script:roleId = 'dddddddd-0000-0000-0000-000000000009'
+        $script:a1 = [pscustomobject]@{ Exists = $true; Missing = $false; Error = '' }
+        $script:jobs = [pscustomobject]@{ Ok = $true; Missing = $false; Error = ''; Value = @{ value = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlSetting -MockWith { [pscustomobject]@{ Enabled = $script:control } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:schedule; NextRunUtc = $null } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlRoleId -MockWith { $script:roleId }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlPrincipalId -MockWith { 'dddddddd-0000-0000-0000-000000000004' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoActivityControlAssignment -MockWith { $script:a1 }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith { $script:jobs }
+        function New-StopJob([string] $Status, [string] $Created) {
+            @{ properties = @{ jobId = ('job-' + $Status); status = $Status; creationTime = $Created; runbook = @{ name = 'DbHub-Stop' } } }
+        }
+        $script:coverage = { InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4RestartCoverage -Config $Config -ConfigPath './config/demo.config.json' } }
+    }
+
+    It 'counts when the schedule is in place, A1 is assigned, and the last DbHub-Stop job didn''t fail' {
+        $script:jobs.Value = @{ value = @((New-StopJob -Status 'Failed' -Created '2026-11-01T19:15:00Z'), (New-StopJob -Status 'Completed' -Created '2026-11-03T19:15:00Z'), (New-StopJob -Status 'Running' -Created '2026-11-04T19:15:00Z')) }
+        $coverage = & $script:coverage
+        $coverage.Counts | Should -BeTrue -Because 'the newest job that ended completed; a running one hasn''t ended'
+        $coverage.Missing | Should -Be ''
+        $coverage.Reason | Should -Be 'the daily T4 safety stop is scheduled, A1 is assigned, and the last DbHub-Stop job didn''t fail'
+        $coverage.Evidence.lastStopJob | Should -Be 'Completed'
+        $script:jobs.Value = @{ value = @() }
+        (& $script:coverage).Counts | Should -BeTrue -Because 'a control whose stop never ran has no failed job'
+    }
+
+    It 'doesn''t count, and names the missing piece and its exact fix: <Case>' -ForEach @(
+        @{ Case = 'the control isn''t set up'; Setup = { $script:control = $false }; Missing = 'Control'; Reason = 'control\.enabled is false'; Fix = 'Set control\.enabled to true and run \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json; an Owner then runs \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json -GrantRole once' }
+        @{ Case = 'the schedule isn''t in place'; Setup = { $script:schedule = 'NotScheduled' }; Missing = 'Schedule'; Reason = 'missing, disabled, or not linked to DbHub-Stop'; Fix = '^Run \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json, which schedules it again\.$' }
+        @{ Case = 'the schedule couldn''t be read'; Setup = { $script:schedule = 'Unknown' }; Missing = 'Schedule'; Reason = 'couldn''t be read, so it''s taken as missing'; Fix = 'schedules it again' }
+        @{ Case = 'the custom role doesn''t exist'; Setup = { $script:roleId = '' }; Missing = 'A1'; Reason = 'isn''t assigned: without it DbHub-Stop can''t stop T4'; Fix = '-GrantRole, or set assignRoles to true and run \./scripts/deploy\.ps1, which grants A1 again after the template\.$' }
+        @{ Case = 'A1 isn''t assigned'; Setup = { $script:a1 = [pscustomobject]@{ Exists = $false; Missing = $false; Error = '' } }; Missing = 'A1'; Reason = 'id-dbhub-automation''s "DbHub Demo Activity Operator" role on rg-dbhub-demo, isn''t assigned'; Fix = '^An Owner runs \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json -GrantRole, or set assignRoles to true' }
+        @{ Case = 'A1 couldn''t be read'; Setup = { $script:a1 = [pscustomobject]@{ Exists = $false; Missing = $false; Error = 'HTTP 503' } }; Missing = 'A1'; Reason = 'couldn''t be read, so it''s taken as missing'; Fix = '-GrantRole' }
+        @{ Case = 'the last DbHub-Stop job failed'; Setup = { $script:jobs.Value = @{ value = @((New-StopJob -Status 'Completed' -Created '2026-11-01T19:15:00Z'), (New-StopJob -Status 'Failed' -Created '2026-11-03T19:15:00Z')) } }; Missing = 'StopJob'; Reason = 'the last DbHub-Stop job \(created 2026-11-03 19:15 UTC\) ended Failed'; Fix = '^Open the job in aa-dbhub-control \(Process Automation > Jobs\) to see why; when A1 is the cause, an Owner runs' }
+        @{ Case = 'the last DbHub-Stop job was stopped'; Setup = { $script:jobs.Value = @{ value = @(New-StopJob -Status 'Stopped' -Created '2026-11-03T19:15:00Z') } }; Missing = 'StopJob'; Reason = 'ended Stopped'; Fix = 'Process Automation > Jobs' }
+        @{ Case = 'the jobs couldn''t be read'; Setup = { $script:jobs = [pscustomobject]@{ Ok = $false; Missing = $false; Error = 'HTTP 429'; Value = $null } }; Missing = 'StopJob'; Reason = 'couldn''t be read \(HTTP 429\), so it''s taken as failed'; Fix = '^Open aa-dbhub-control > Jobs in the Azure portal' }
+        @{ Case = 'a read throws'; Setup = { Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { throw 'The connection was reset.' } }; Missing = 'Schedule'; Reason = 'couldn''t be checked \(The connection was reset\.\), so it''s taken as missing'; Fix = 'then run this again' }
+    ) {
+        & $Setup
+        $coverage = & $script:coverage
+        $coverage.Counts | Should -BeFalse
+        $coverage.Missing | Should -Be $Missing
+        $coverage.Reason | Should -Match $Reason
+        $coverage.Fix | Should -Match $Fix
+        $coverage.Evidence.counts | Should -BeFalse
+        $coverage.Evidence.missing | Should -Be $Missing
+    }
+
+    It 'reports which worst case the monthly ceiling counts: a Pass with it, a Warning with the fix without it, Not selected without T4' {
+        $config = New-TestConfig
+        $counted = & $script:coverage
+        $pass = InModuleScope DbHubDemo -Parameters @{ Config = $config; Coverage = $counted } { New-DemoT4RestartCoverageResult -Config $Config -Coverage $Coverage -CheckPrefix 'START' }
+        $pass.checkId | Should -Be 'START.COST.T4RESTART'
+        $pass.status | Should -Be 'Pass'
+        $pass.message | Should -Match 'so the monthly ceiling counts each restart as about a day, until the next safety stop\.$'
+        $script:a1 = [pscustomobject]@{ Exists = $false; Missing = $false; Error = '' }
+        $missing = & $script:coverage
+        $warning = InModuleScope DbHubDemo -Parameters @{ Config = $config; Coverage = $missing } { New-DemoT4RestartCoverageResult -Config $Config -Coverage $Coverage }
+        $warning.checkId | Should -Be 'PREFLIGHT.COST.T4RESTART'
+        $warning.status | Should -Be 'Warning'
+        $warning.message | Should -Match 'so the monthly ceiling counts it running for the rest of the month\.$'
+        $warning.remediation | Should -Match '^An Owner runs .* -GrantRole, or set assignRoles to true .* With it in place, each restart counts as about a day\.$'
+        $unchecked = InModuleScope DbHubDemo -Parameters @{ Config = $config } { New-DemoT4RestartCoverageResult -Config $Config -Coverage $null }
+        $unchecked.status | Should -Be 'Warning'
+        $unchecked.message | Should -Match 'whether the daily T4 safety stop is in place wasn''t checked'
+        $config['t4Enabled'] = $false
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { New-DemoT4RestartCoverageResult -Config $Config -Coverage $null }).status | Should -Be 'Not selected'
+    }
+}
+
+Describe 'Get-DemoT4RestartWorstCase (2026-11-04)' {
+    It 'counts the rest of the month without the safety stop, and about a day per restart with it: <Case>' -ForEach @(
+        @{ Case = 'no safety stop'; Month = 730; Light = 10; Capped = $false; Hours = 720; Restarts = 0 }
+        @{ Case = 'the safety stop, a 730-hour month'; Month = 730; Light = 10; Capped = $true; Hours = 96; Restarts = 4 }
+        @{ Case = 'the safety stop, a 720-hour month'; Month = 720; Light = 10; Capped = $true; Hours = 96; Restarts = 4 }
+        @{ Case = 'the safety stop, never more than the rest of the month'; Month = 730; Light = 700; Capped = $true; Hours = 30; Restarts = 4 }
+        @{ Case = 'no safety stop, light use past the month'; Month = 730; Light = 744; Capped = $false; Hours = 0; Restarts = 0 }
+    ) {
+        $result = InModuleScope DbHubDemo -Parameters @{ Month = $Month; Light = $Light; Capped = $Capped } { Get-DemoT4RestartWorstCase -HoursPerMonth $Month -LightUseHoursPerMonth $Light -Capped $Capped }
+        $result.Hours | Should -Be $Hours
+        $result.Restarts | Should -Be $Restarts
+    }
+}
+
+Describe 'T4 autonomous tuning (2026-11-04)' {
+    It 'is <Status> with t4AutonomousTuning <Switch> at <Sku>' -ForEach @(
+        @{ Switch = 'unset'; Sku = ''; Status = 'Pass'; Enabled = $true; Pattern = 'gets autonomous tuning at Standard_D4ds_v5 \(General Purpose, 4 vCores\)' }
+        @{ Switch = 'unset'; Sku = 'Standard_D4ads_v5'; Status = 'Pass'; Enabled = $true; Pattern = 'Standard_D4ads_v5' }
+        @{ Switch = 'true'; Sku = 'Standard_D4ds_v5'; Status = 'Pass'; Enabled = $true; Pattern = 'Intelligent Performance > Autonomous tuning' }
+        @{ Switch = 'unset'; Sku = 'Standard_B1ms'; Status = 'Warning'; Enabled = $false; Pattern = 'off for T4 at Standard_B1ms \(Burstable, 1 vCore\): it needs a General Purpose or Memory Optimized size with at least 4 vCores' }
+        @{ Switch = 'unset'; Sku = 'Standard_D2ds_v5'; Status = 'Warning'; Enabled = $false; Pattern = 'Standard_D2ds_v5 \(General Purpose, 2 vCores\)' }
+        @{ Switch = 'true'; Sku = 'Standard_B1ms'; Status = 'Fail'; Enabled = $false; Pattern = '^t4AutonomousTuning is true, but T4''s size Standard_B1ms' }
+        @{ Switch = 'true'; Sku = 'Standard_D2ds_v5'; Status = 'Fail'; Enabled = $false; Pattern = 'Standard_D2ds_v5 \(General Purpose, 2 vCores\) can''t run autonomous tuning' }
+        @{ Switch = 'false'; Sku = ''; Status = 'Not selected'; Enabled = $false; Pattern = 'left as they are' }
+        @{ Switch = 'false'; Sku = 'Standard_B1ms'; Status = 'Not selected'; Enabled = $false; Pattern = 't4AutonomousTuning is false' }
+    ) {
+        $config = New-TestConfig
+        if ($Switch -ne 'unset') {
+            $config['t4AutonomousTuning'] = $Switch -eq 'true'
+        }
+        if ($Sku) {
+            $config['t4SkuName'] = $Sku
+        }
+        $tuning = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4Tuning -Config $Config }
+        $tuning.Status | Should -Be $Status
+        $tuning.Enabled | Should -Be $Enabled
+        $tuning.Message | Should -Match $Pattern
+        if ($Status -eq 'Fail') {
+            $tuning.Remediation | Should -Match 'Set t4SkuName to Standard_D4ds_v5 \(or remove it: that''s the default\) or Standard_D4ads_v5; or set t4AutonomousTuning to false'
+        }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT }
+        $result.checkId | Should -Be 'PREFLIGHT.T4.TUNING'
+        $result.status | Should -Be $Status
+        $result.evidence.enabled | Should -Be $Enabled
+        # The template gets it only where it runs.
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoDeploymentParameter -Config $Config -NetworkMode private -T3UseFreeLimit $false }).parameters['t4AutonomousTuning'].value | Should -Be $Enabled
+    }
+
+    It 'judges the size it''s given, the fallback''s step, and is Not selected while T4 is off' {
+        $config = New-TestConfig
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4Tuning -Config $Config -SkuName 'Standard_D2ds_v5' }).Status | Should -Be 'Warning'
+        $config['t4Enabled'] = $false
+        $off = InModuleScope DbHubDemo -Parameters @{ Config = $config } { New-DemoT4TuningResult -Config $Config -CheckPrefix DEPLOY }
+        $off.checkId | Should -Be 'DEPLOY.T4.TUNING'
+        $off.status | Should -Be 'Not selected'
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoDeploymentParameter -Config $Config -NetworkMode private -T3UseFreeLimit $false }).parameters['t4AutonomousTuning'].value | Should -BeFalse
+    }
+
+    It 'sets Query Store and index tuning in the template, the interval before the mode, only when it''s on, and Query Store off on Burstable' {
+        $postgres = InModuleScope DbHubDemo { Get-DemoPostgresSetting }
+        $postgres['autonomousTuning']['minVCores'] | Should -Be 4
+        $postgres['autonomousTuning']['queryCaptureMode'] | Should -Be 'top'
+        $postgres['autonomousTuning']['parametersCaptureMode'] | Should -Be 'capture_first_sample'
+        $postgres['autonomousTuning']['analysisIntervalMinutes'] | Should -Be 60
+        $postgres['autonomousTuning']['mode'] | Should -Be 'report'
+        $bicep = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/pgflex01.bicep') -Raw
+        $order = @('max_connections', 'pg_qs.query_capture_mode', 'pg_qs.parameters_capture_mode', 'index_tuning.analysis_interval', 'index_tuning.mode') | ForEach-Object { $bicep.IndexOf("name: '$_'") }
+        $order | Should -Not -Contain -1
+        @($order | Sort-Object) | Should -Be $order -Because 'each depends on the one before, so the interval is in effect when the mode turns tuning on'
+        $bicep | Should -Match "resource queryCaptureMode '[^']+' = if \(autonomousTuning \|\| sizing\.tier == 'Burstable'\)"
+        $bicep | Should -Match "value: autonomousTuning \? string\(tuning\.queryCaptureMode\) : 'none'"
+        foreach ($name in 'parametersCaptureMode', 'tuningInterval', 'tuningMode') {
+            $bicep | Should -Match ("resource {0} '[^']+' = if \(autonomousTuning\)" -f $name)
+        }
+        (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw) | Should -Match 'tuning: postgres\.autonomousTuning'
+    }
+
+    It 'reads the zones the region lists for a General Purpose size, and nothing when it can''t' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            New-AzResult -Json @(@{ name = 'westus3'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5'; supportedZones = @('9') }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D2ds_v5'; supportedZones = @('1') }, @{ name = 'Standard_D4ds_v5'; supportedZones = @('3', '1', '2') }) }) })
+        } -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus --location westus3' }
+        @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuZone -Config $Config -SkuName 'Standard_D4ds_v5' }) | Should -Be @('1', '2', '3')
+        @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuZone -Config $Config -SkuName 'Standard_D4ads_v5' }).Count | Should -Be 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { New-AzResult -ExitCode 1 -StdErr 'boom' } -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' }
+        @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuZone -Config $Config -SkuName 'Standard_D4ds_v5' }).Count | Should -Be 0
+    }
+
+    It 'says an existing T4 moves to the default once, and why it keeps its size otherwise: <Outcome>' -ForEach @(
+        @{ Outcome = 'Scale'; Pattern = 'T4 exists as Standard_B1ms \(Burstable\), and your configuration doesn''t set t4SkuName, so deploy\.ps1 scales it to the default, General Purpose Standard_D4ds_v5 with 4 vCores and autonomous tuning \(since 2026-11-04\), which restarts it' }
+        @{ Outcome = 'Waiting'; Pattern = 'T4 exists as Standard_B1ms \(Burstable\) and is Stopped, not Ready, so this deployment keeps its size' }
+        @{ Outcome = 'Refused'; Pattern = 'Azure refused to scale T4 to Standard_D4ds_v5 \(SkuNotAvailable, at 2026-11-04T10:00:00Z\), so T4 keeps Standard_B1ms \(Burstable\)' }
+    ) {
+        $result = InModuleScope DbHubDemo -Parameters @{ Outcome = $Outcome } { New-DemoT4SizeResult -CheckPrefix PREFLIGHT -ServerSku 'Standard_B1ms' -SkuName 'Standard_D4ds_v5' -Outcome $Outcome -State 'Stopped' -Failure ([pscustomobject]@{ Sku = 'Standard_D4ds_v5'; Zone = ''; TimeUtc = '2026-11-04T10:00:00Z' }) }
+        $result.checkId | Should -Be 'PREFLIGHT.T4.SIZE'
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match $Pattern
+        $result.remediation | Should -Match 't4SkuName'
     }
 }

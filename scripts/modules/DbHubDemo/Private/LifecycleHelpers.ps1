@@ -779,6 +779,9 @@ function Test-DemoStartCost {
       run time, with the subscription's Defender for Cloud plans when they can be read): the same checks
       preflight runs before deploy.ps1, with the run's activity profile (-ActivityProfile, else the configuration's, else
       business-day, whose T3 incidents count; 2026-11-03). The monthly one is a hard ceiling (Fail).
+    - START.COST.T4RESTART: which worst case the monthly check counts for T4's 7-day automatic restart, about a day per
+      restart where the daily T4 safety stop is fully in place, otherwise the rest of the month, with a Warning that names
+      what's missing (Get-DemoT4RestartCoverage; 2026-11-04, ADR 0016).
     - START.COST.ACTUAL: the resource group's month-to-date actual cost (Cost Management, which lags by up to
       a day) plus one estimated session. Fail when the month already reached monthlyCeilingUsd, Warning when
       this session would cross it, Warning when the cost can't be read or isn't in USD.
@@ -819,6 +822,11 @@ function Test-DemoStartCost {
     catch {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots couldn''t be listed, so the estimate leaves them out: {0}' -f $_.Exception.Message)
     }
+    # T4's 7-day automatic restart: about a day per restart only where the daily T4 safety stop is fully in place (2026-11-04).
+    $t4On = Test-DemoT4Enabled -Config $Config
+    if ($t4On) {
+        $costParameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
+    }
     $sessionCost = 0.0
     try {
         $estimate = Get-DemoCostEstimate @costParameters
@@ -830,6 +838,7 @@ function Test-DemoStartCost {
     catch {
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.SESSION' -Area 'preflight' -Target 'subscription' -Status 'Warning' -Message ('The cost estimate couldn''t be computed: {0}' -f $_.Exception.Message) -Remediation 'Run ./scripts/estimate-cost.ps1 to see why; the ceilings weren''t checked.'))
     }
+    $results.Add((New-DemoT4RestartCoverageResult -Config $Config -Coverage $(if ($t4On) { $costParameters['T4RestartCoverage'] } else { $null }) -CheckPrefix 'START'))
 
     $ceiling = [double]$Config['monthlyCeilingUsd']
     $actual = $null

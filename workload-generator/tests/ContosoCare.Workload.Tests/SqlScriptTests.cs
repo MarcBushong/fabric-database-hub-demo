@@ -187,6 +187,27 @@ public sealed class SqlScriptTests
     }
 
     [Fact]
+    public void TheProfileSetIsACompareAndSetThatAllowsTheShowcase()
+    {
+        // The showcase's supersede guard (ADR 0020): a stamped set writes only when no newer request is stored, read and
+        // written under one update lock; an unstamped set keeps the stamp.
+        var sql = File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql"));
+        var procedure = sql[sql.IndexOf("CREATE OR ALTER PROCEDURE demo.usp_profile_set", StringComparison.Ordinal)..];
+        procedure = procedure[..procedure.IndexOf("\nGO", StringComparison.Ordinal)];
+
+        Assert.Contains("'off', 'baseline', 'business-day', 'showcase'", procedure, StringComparison.Ordinal);
+        Assert.Contains("WITH (UPDLOCK, HOLDLOCK)", procedure, StringComparison.Ordinal);
+        Assert.Contains("IF @stored_at > @requested_at", procedure, StringComparison.Ordinal);
+        Assert.Contains("@stored_id COLLATE Latin1_General_BIN2 > @request_id COLLATE Latin1_General_BIN2", procedure, StringComparison.Ordinal);
+        Assert.Contains("requested_at = CASE WHEN @requested_at IS NULL THEN requested_at ELSE @requested_at END", procedure, StringComparison.Ordinal);
+        Assert.Contains("THROW 50118", procedure, StringComparison.Ordinal);
+        Assert.Contains("IF COL_LENGTH(N'demo.activity_profile', N'requested_at') IS NULL", sql, StringComparison.Ordinal);
+        Assert.Contains("IF COL_LENGTH(N'demo.activity_profile', N'request_id') IS NULL", sql, StringComparison.Ordinal);
+        var get = sql[sql.IndexOf("CREATE OR ALTER PROCEDURE demo.usp_profile_get", StringComparison.Ordinal)..];
+        Assert.Matches(@"is_active = [^\n]+,\s+requested_at,\s+request_id\s", get[..get.IndexOf("\nGO", StringComparison.Ordinal)]);
+    }
+
+    [Fact]
     public void BatchesSplitOnGoLines()
     {
         var batches = Sql.SqlScripts.SplitBatches("SELECT 1;\nGO\n\nSELECT 'GO';\n  go  -- comment\nSELECT 2;\nGO\n");

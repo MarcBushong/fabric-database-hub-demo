@@ -488,6 +488,11 @@ Describe 'The runbooks'' settings' {
         $setting['scenarios'].Contains('healthy-baseline') | Should -BeFalse
         $folders = @(Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scenarios') -Directory | Where-Object Name -NE 'healthy-baseline' | ForEach-Object Name)
         @($setting['scenarios'].Keys | Sort-Object) | Should -Be @($folders | Sort-Object)
+        # Run all's showcase (2026-11-04): its bounds from scenarios/activity-profiles.json.
+        @($setting['profiles'].Keys) | Should -Be @('showcase')
+        $setting['profiles']['showcase']['maxMinutes'] | Should -Be 120
+        $setting['profiles']['showcase']['defaultMinutes'] | Should -Be 90
+        @($setting['profiles']['showcase']['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4')
         $setting['minDurationMinutes'] | Should -Be 5
         $setting['maxDurationMinutes'] | Should -Be 120
         $setting['maxBodyBytes'] | Should -Be 4096
@@ -503,7 +508,8 @@ Describe 'The runbooks'' settings' {
         $setting['monitorRecheckMinutes'] | Should -Be 30
         $setting['monitoring']['featureFlag'] | Should -Be 'DatabaseWatcheronAzureVM'
         $setting['monitoring']['statusPlugin'] | Should -Be 'DatabaseMonitorArcPlugin'
-        $setting['monitoring']['settleMinutes'] | Should -Be 5
+        # 8 since 2026-11-04 (5 before): the look waits for a status reported after sqlvm01's start, not the one from before the stop.
+        $setting['monitoring']['settleMinutes'] | Should -Be 8
         $setting['monitoring']['verifyMinutes'] | Should -Be 5
         foreach ($type in $setting['apiVersions'].Keys) {
             $setting['apiVersions'][$type] | Should -Match '^\d{4}-\d{2}-\d{2}(-preview)?$' -Because $type

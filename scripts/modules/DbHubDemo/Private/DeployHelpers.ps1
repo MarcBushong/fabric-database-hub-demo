@@ -85,10 +85,11 @@ function Get-DemoDeploymentStateTagName {
         FabricCapacityResumed    = 'DbHubFabricCapacityResumed'
         FabricCapacityResumedUtc = 'DbHubFabricCapacityResumedUtc'
         # Phase 28: until when the PaygWizard guided stop's request on the T2 host is valid (empty when there's none), and the
-        # size T4's fallback settled on for later runs: Standard_B2s, Standard_D2ds_v5 (General Purpose, after its cost
-        # check), None (left out; the General Purpose step is checked again), or Refused (Phase 28 follow-up).
+        # size T4's fallback settled on for later runs (since T4's 4-vCore default, 2026-11-04, under a new name, so Phase 28's
+        # DbHubT4Sku isn't read): Standard_D4ads_v5, Standard_D2ds_v5 (after its cost check), the size an existing server kept
+        # when Azure refused to scale it to the default, None (left out; the 2-vCore step is checked again), or Refused.
         GuidedStopUtc            = 'DbHubGuidedStopUtc'
-        T4Sku                    = 'DbHubT4Sku'
+        T4Sku                    = 'DbHubT4Size'
         # Phase 28 review follow-up: when the T2 host's loader started a bootstrap generation that nobody has seen finish (empty
         # when none runs), so deploy.ps1's watchdog never restarts the host during its guest build (Get-DemoHostRestartBlocker).
         T2BuildUtc               = 'DbHubT2BuildUtc'

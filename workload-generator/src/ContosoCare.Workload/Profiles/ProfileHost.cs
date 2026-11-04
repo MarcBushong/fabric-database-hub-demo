@@ -14,7 +14,12 @@ internal interface IProfileStore
 
     Task<ProfileState> GetAsync(CancellationToken cancellationToken);
 
-    Task SetAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, CancellationToken cancellationToken);
+    /// <summary>
+    /// Sets the profile. With a <paramref name="stamp"/>, only when no newer control request is stored (compare-and-set,
+    /// the showcase's supersede guard); the same request again changes nothing. Without one, it always writes and keeps
+    /// the stored stamp.
+    /// </summary>
+    Task<ProfileSetResult> SetAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, ProfileRequestStamp? stamp, CancellationToken cancellationToken);
 }
 
 /// <summary>T1 and T2: demo.activity_profile in the local ContosoCare database.</summary>
@@ -28,20 +33,26 @@ internal sealed class SqlProfileStore(SqlConnectionOpener opener) : IProfileStor
         return await new DemoDatabase(connection).GetProfileAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task SetAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, CancellationToken cancellationToken)
+    public async Task<ProfileSetResult> SetAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, ProfileRequestStamp? stamp, CancellationToken cancellationToken)
     {
         await using var connection = await opener.OpenAsync(SessionNames.ForControl("profile"), cancellationToken).ConfigureAwait(false);
-        await new DemoDatabase(connection).SetProfileAsync(profileName, setBy, expiresAt, parameters, cancellationToken).ConfigureAwait(false);
+        return await new DemoDatabase(connection).SetProfileAsync(profileName, setBy, expiresAt, parameters, stamp, cancellationToken).ConfigureAwait(false);
     }
 }
 
 /// <summary>
 /// T3 and T4: a JSON file on T1 (ADR 0010, ADR 0019), so polling the profile never connects to a remote database: T3's
 /// serverless database can auto-pause and a stopped T4 isn't retried while the profile is off. Writes go to a
-/// temporary file that replaces the old one.
+/// temporary file that replaces the old one, under an exclusive lock file, so two writers can't both pass the
+/// compare-and-set of stamped requests.
 /// </summary>
-internal sealed class FileProfileStore(string path) : IProfileStore
+internal sealed class FileProfileStore(string path, TimeSpan? lockTimeout = null) : IProfileStore
 {
+    /// <summary>How long a writer waits for another writer's lock on the profile file before it gives up.</summary>
+    internal static readonly TimeSpan DefaultLockTimeout = TimeSpan.FromSeconds(10);
+
+    private readonly TimeSpan lockWait = lockTimeout ?? DefaultLockTimeout;
+
     /// <summary>T3's profile file (the default for every command that takes --profile-file).</summary>
     public static string DefaultPath => DefaultPathFor(DemoTarget.T3);
 
@@ -52,6 +63,8 @@ internal sealed class FileProfileStore(string path) : IProfileStore
         target == DemoTarget.T4 ? "activity-t4.json" : "activity.json");
 
     public string FilePath => path;
+
+    public string LockPath => path + ".lock";
 
     public string Description => "profile file " + path;
 
@@ -65,10 +78,10 @@ internal sealed class FileProfileStore(string path) : IProfileStore
         var json = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
         var content = JsonSerializer.Deserialize(json, CatalogJsonContext.Default.ProfileFileContent)
             ?? throw new InvalidOperationException($"The profile file {path} is empty.");
-        return new ProfileState(content.Profile, content.SetAt, content.SetBy, content.ExpiresAt, content.Parameters);
+        return new ProfileState(content.Profile, content.SetAt, content.SetBy, content.ExpiresAt, content.Parameters) { RequestedAt = content.RequestedAt, RequestId = content.RequestId };
     }
 
-    public async Task SetAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, CancellationToken cancellationToken)
+    public async Task<ProfileSetResult> SetAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, ProfileRequestStamp? stamp, CancellationToken cancellationToken)
     {
         var directory = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path));
         if (!string.IsNullOrEmpty(directory))
@@ -76,10 +89,68 @@ internal sealed class FileProfileStore(string path) : IProfileStore
             Directory.CreateDirectory(directory);
         }
 
-        var content = new ProfileFileContent { Profile = profileName, SetAt = DateTimeOffset.UtcNow, SetBy = setBy, ExpiresAt = expiresAt, Parameters = parameters };
+        await using var gate = await LockAsync(cancellationToken).ConfigureAwait(false);
+        var current = await ReadCurrentAsync(cancellationToken).ConfigureAwait(false);
+        var requestedAt = current?.RequestedAt;
+        var requestId = current?.RequestId;
+        if (stamp is not null)
+        {
+            var order = stamp.CompareTo(requestedAt, requestId);
+            if (order < 0)
+            {
+                return new ProfileSetResult(false, requestId);
+            }
+
+            if (order == 0 && current is not null)
+            {
+                // The same request again (a retried Run Command): the profile it set stays as it is, its cycle included.
+                return ProfileSetResult.Written;
+            }
+
+            requestedAt = stamp.RequestedAt;
+            requestId = stamp.RequestId;
+        }
+
+        var content = new ProfileFileContent { Profile = profileName, SetAt = DateTimeOffset.UtcNow, SetBy = setBy, ExpiresAt = expiresAt, Parameters = parameters, RequestedAt = requestedAt, RequestId = requestId };
         var temporary = path + ".tmp";
         await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(content, CatalogJsonContext.Default.ProfileFileContent), cancellationToken).ConfigureAwait(false);
         File.Move(temporary, path, overwrite: true);
+        return ProfileSetResult.Written;
+    }
+
+    /// <summary>The stored content, or null when there's no file or it can't be read as one (a writer replaces it then).</summary>
+    private async Task<ProfileFileContent?> ReadCurrentAsync(CancellationToken cancellationToken)
+    {
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize(await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false), CatalogJsonContext.Default.ProfileFileContent);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Opens the lock file exclusively, retrying while another writer holds it, for the lock timeout at most.</summary>
+    private async Task<FileStream> LockAsync(CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow + lockWait;
+        while (true)
+        {
+            try
+            {
+                return new FileStream(LockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1, FileOptions.None);
+            }
+            catch (Exception ex) when ((ex is IOException or UnauthorizedAccessException) && DateTimeOffset.UtcNow < deadline)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(50), cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 }
 
@@ -158,6 +229,9 @@ internal sealed record ProfileHostOptions
     /// <summary>host-lanes.json, or null to write none.</summary>
     public string? StateFilePath { get; init; }
 
+    /// <summary>Raise the process to above-normal priority on Windows (HostPriority; 'profile run' only, never in tests).</summary>
+    public bool RaisePriority { get; init; }
+
     public static ProfileHostOptions From(ActivityProfilesDefinition definitions, string? stateFilePath) => new()
     {
         Poll = TimeSpan.FromSeconds(definitions.PollSeconds),
@@ -189,9 +263,15 @@ internal sealed class ProfileHost(
     private readonly ProfileHostOptions options = options ?? ProfileHostOptions.From(definitions, null);
     private readonly Func<ProfileTarget, ILaneWork> workFactory = workFactory ?? (t => new ExecutorLaneWork(t.Executor));
     private int stateWriteFailures;
+    private string? processPriority;
 
     public async Task RunAsync(IReadOnlyList<ProfileTarget> targets, DateTimeOffset? notAfter, CancellationToken cancellationToken)
     {
+        if (options.RaisePriority)
+        {
+            processPriority = HostPriority.RaiseCurrent(log)?.ToString();
+        }
+
         var hostStarted = time.GetUtcNow();
         var (processId, processStarted) = CurrentProcess();
         log.Info(
@@ -811,6 +891,7 @@ internal sealed class ProfileHost(
             StoppedAt = stoppedAt,
             StopReason = stopReason,
             RunnerVersion = Program.GetVersion(),
+            ProcessPriority = processPriority,
             Lanes = records,
         };
         try
@@ -873,7 +954,7 @@ internal sealed class ProfileHost(
     {
         var end = ProfileScheduler.EffectiveEnd(state, definitions, catalog, null);
         var active = state.Name != "off" && now < end;
-        return string.Create(CultureInfo.InvariantCulture, $"{state.Name} ({(active ? "active until " + end.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture) : "inactive")}; set by {state.SetBy} at {state.SetAt.UtcDateTime:yyyy-MM-ddTHH:mm:ssZ})");
+        return string.Create(CultureInfo.InvariantCulture, $"{state.Name} ({(active ? "active until " + end.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture) : "inactive")}; set by {state.SetBy} at {state.SetAt.UtcDateTime:yyyy-MM-ddTHH:mm:ssZ}{(state.RequestId is { } request ? "; request " + request : string.Empty)})");
     }
 
     /// <summary>True when the profile wants activity now: it isn't off and hasn't ended.</summary>

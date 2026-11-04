@@ -277,7 +277,7 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $fallback = New-TestConfig -WithT4
         $after = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = (New-FinishedState -T4Sku 'None'); Config = $fallback } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $after.Kind | Should -Be 'Done'
-        ($after.Notes -join ' ') | Should -Match 'Azure refused both Burstable sizes'
+        ($after.Notes -join ' ') | Should -Match 'Azure refused both 4-vCore sizes'
         ($after.Notes -join ' ') | Should -Match 'Standard_D2ds_v5'
         $after.Reason | Should -Match 'T1, T2, and T3 in Estate'
     }
@@ -290,7 +290,7 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $outcome.Kind | Should -Be 'NotDone' -Because 'a T4 that''s on must show in Database Hub'
         $outcome.Missing | Should -Contain 'HUB.ESTATE.T4'
         $outcome.Missing | Should -Contain 'METRICS.T4'
-        ($outcome.Notes -join ' ') | Should -Not -Match 'Azure refused both Burstable sizes'
+        ($outcome.Notes -join ' ') | Should -Not -Match 'Azure refused both 4-vCore sizes'
 
         # t4Enabled false in the file is the reason, whatever an earlier fallback recorded.
         (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4OffReason -Config $Config -State ([pscustomobject]@{ T4Sku = 'None' }) }) | Should -Match 't4Enabled is false in your configuration'
@@ -439,7 +439,7 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
         $lines | Should -Contain '- Couldn''t check the Fabric tenant setting "Users can access the Database hub (preview)" (needs a Fabric administrator; HTTP 403): please confirm it''s enabled.'
         $text | Should -Match '- The optional Insights app is deployed; confirm it once in the browser\.'
         $text | Should -Not -Match 'is disabled|not enabled|System\.String\[\]'
-        @($lines | Where-Object { $_ -match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both Burstable sizes' }).Count | Should -Be 1 -Because 'the T4 note is its own line'
+        @($lines | Where-Object { $_ -match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both 4-vCore sizes' }).Count | Should -Be 1 -Because 'the T4 note is its own line'
     }
 
     It 'is NOT DONE, with the true wording, only when the Hub setting was read and is disabled, and never asks to confirm a setting it read' {
@@ -810,7 +810,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $outcome.ExitCode | Should -Be 0
         $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
         $model['run']['state'] | Should -Be 'Done'
-        $model['run']['reason'] | Should -Match 'Azure refused both Burstable sizes'
+        $model['run']['reason'] | Should -Match 'Azure refused both 4-vCore sizes'
         $model['run']['reason'] | Should -Not -Match 'System\.String\[\]|tenant setting'
         @($model['confirm']).Count | Should -Be 1
         $model['confirm'][0] | Should -Be 'Couldn''t check the Fabric tenant setting "Users can access the Database hub (preview)" (needs a Fabric administrator; HTTP 403): please confirm it''s enabled.'
@@ -833,7 +833,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $result -State (New-FinishedState -WithT4 -T4Sku 'None')
         $outcome.Kind | Should -Be 'NotDone'
         $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
-        $model['run']['reason'] | Should -Match '^TELEMETRY\.T1: No performance telemetry from T1 \(sqlvm01\) in the last 60 minutes\. T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both Burstable sizes'
+        $model['run']['reason'] | Should -Match '^TELEMETRY\.T1: No performance telemetry from T1 \(sqlvm01\) in the last 60 minutes\. T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both 4-vCore sizes'
         $model['run']['reason'] | Should -Not -Match 'System\.String\[\]'
         Get-Content -LiteralPath $run.PagePath -Raw | Should -Not -Match 'System\.String\[\]'
 

@@ -36,7 +36,7 @@
       "maxLength": 100
     },
     "scenario": {
-      "description": "A folder under scenarios/ (resource-governance and log-rate-pressure since Phase 11, and the eight wait-family scenarios since Phase 25b; the cpu-pressure and inefficient-query scenarios also produce resource-governance pressure on T3), any (cross-incident wrap-up), or setup (session setup).",
+      "description": "A folder under scenarios/ (resource-governance and log-rate-pressure since Phase 11, the eight wait-family scenarios since Phase 25b, and plan-regression since the showcase; the cpu-pressure and inefficient-query scenarios also produce resource-governance pressure on T3), any (cross-incident wrap-up), or setup (session setup).",
       "enum": [
         "setup",
         "healthy-baseline",
@@ -55,6 +55,7 @@
         "log-flush-waits",
         "slow-consumer",
         "capacity-max",
+        "plan-regression",
         "any"
       ]
     },

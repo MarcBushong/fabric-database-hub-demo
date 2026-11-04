@@ -6,7 +6,7 @@ function Complete-DemoDeploymentRun {
 
     .DESCRIPTION
     The outcome reads the resource group's state after the run (each track's last finished step), unless -State is
-    given. While T4 runs on the General Purpose fallback (DbHubT4Sku Standard_D2ds_v5), its hourly list price comes from
+    given. While T4 runs at a fallback size (DbHubT4Size Standard_D4ads_v5 or Standard_D2ds_v5), its hourly list price comes from
     this run's DEPLOY.T4.SKU, or from the Azure Retail Prices API now, for the note DONE and NOT DONE add (Phase 28
     follow-up). The note says T4 was created only with evidence that its server exists: this run's results, the T4
     track's record, or else a Servers - Get (review of 20e855c), which also decides when this run's template failed or
@@ -114,7 +114,7 @@ function Complete-DemoDeploymentRun {
     }
     try {
         $startedVms = @(Get-DemoStartedVm -Result @($Result) -Model $model)
-        # T4 on the General Purpose fallback is said with its hourly list price (Phase 28 follow-up): this run's, or read
+        # T4 at a fallback size is said with its hourly list price (ADR 0019): this run's, or read
         # from the Azure Retail Prices API now. It says "created" only with evidence that the server exists (review of
         # 20e855c): this run's results or the T4 track's record, or else a Servers - Get, which also decides after a failed
         # template or a T4.SERVER Fail: neither means the server is missing (review of 64c28b2).
@@ -123,7 +123,7 @@ function Complete-DemoDeploymentRun {
         $t4Why = ''
         if (-not $wasStopped -and -not $WhatIfRun -and (Test-DemoT4FallbackSize -Config $Config -State $judgedState)) {
             $priced = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and $null -ne (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'hourlyUsd') }) | Select-Object -Last 1
-            $t4Hourly = if ($null -ne $priced) { [double](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $priced -Name 'evidence') -Name 'hourlyUsd') } else { Get-DemoT4HourlyPrice -Config $Config -SkuName 'Standard_D2ds_v5' }
+            $t4Hourly = if ($null -ne $priced) { [double](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $priced -Name 'evidence') -Name 'hourlyUsd') } else { Get-DemoT4HourlyPrice -Config $Config -SkuName ([string](Get-DemoMemberValue -InputObject $judgedState -Name 'T4Sku')) }
             $t4Created = Get-DemoT4ServerEvidence -Result @($Result) -State $judgedState
             if ($null -eq $t4Created) {
                 try {

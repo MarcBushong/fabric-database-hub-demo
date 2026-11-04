@@ -1563,3 +1563,134 @@ BEGIN
         scans = @scans, updates = @updates, stop_requested = demo.fn_run_stop_requested(@run_id);
 END;
 GO
+
+-- Plan regression (the showcase; Azure SQL Database only) ----------------------------------------------------------
+
+-- A front-desk visit summary for a few patients by ID range. Its plan follows the first range it's compiled for: a
+-- few patients seek ix_appointments_patient and look their rows up (plan A); every patient scans care.appointments
+-- (plan B), which then serves the narrow ranges far more slowly. Query Store sees one query with two plans: the
+-- parameter-sensitive regression that automatic tuning's FORCE_LAST_GOOD_PLAN corrects. The range predicate keeps
+-- it out of parameter-sensitive plan optimization, which handles equality predicates only.
+CREATE OR ALTER PROCEDURE demo.usp_visit_summary_lookup
+    @first_patient int,
+    @last_patient int,
+    @visits int = NULL OUTPUT,
+    @minutes int = NULL OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT @visits = COUNT(*), @minutes = SUM(a.duration_minutes)
+    FROM care.appointments AS a
+    WHERE a.patient_id BETWEEN @first_patient AND @last_patient
+      AND a.status <> 'Cancelled';
+END;
+GO
+
+-- Workers run the visit summary for one to three patients at a time. For the first @good_percent of the run it's
+-- compiled for such a range (plan A). Then worker 1 marks it for recompilation (sp_recompile) and runs it once for
+-- every patient, so the cached plan scans (plan B); the other workers stay out of those few seconds, and every worker
+-- goes on with narrow ranges on plan B. With FORCE_LAST_GOOD_PLAN on (Azure SQL Database's default), automatic tuning
+-- forces plan A once the estimated CPU gain is over 10 seconds (sys.dm_db_tuning_recommendations). At its start,
+-- worker 1 unforces a plan an earlier run left forced, so the regression can happen again. Only
+-- demo.usp_visit_summary_lookup's own queries are touched, and only by reading. Azure SQL Database only: SQL Server
+-- 2022 Standard (T1, T2) has no automatic tuning, and the runner there can't recompile or unforce.
+CREATE OR ALTER PROCEDURE demo.usp_scenario_plan_regression
+    @run_id varchar(64),
+    @worker int = 1,
+    @intensity tinyint = 6,
+    @good_percent int = 35
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @deadline datetime2(3);
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'plan-regression', @deadline_at = @deadline OUTPUT;
+
+    IF CAST(SERVERPROPERTY('EngineEdition') AS int) <> 5
+        THROW 50168, N'plan-regression runs on Azure SQL Database (T3) only: SQL Server 2022 Standard has no automatic tuning.', 1;
+    IF @good_percent IS NULL OR @good_percent NOT BETWEEN 10 AND 80
+        THROW 50169, N'@good_percent must be between 10 and 80.', 1;
+
+    DECLARE @started datetime2(3), @switch_at datetime2(3), @quiet_until datetime2(3);
+    DECLARE @patients int, @first int, @last int, @visits int, @minutes int, @r bigint;
+    DECLARE @good bigint = 0, @regressed bigint = 0, @switched bit = 0, @unforced int = 0;
+    DECLARE @pause datetime = demo.fn_pause(@intensity, 400, 0);
+    DECLARE @stopped bit = 0, @next_check datetime2(3) = SYSUTCDATETIME();
+    DECLARE @lookup int = OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P');
+    DECLARE @forced TABLE (n int IDENTITY(1, 1) PRIMARY KEY, query_id bigint NOT NULL, plan_id bigint NOT NULL);
+    DECLARE @remaining int = 0, @query_id bigint, @plan_id bigint;
+
+    SELECT @started = started_at FROM demo.scenario_runs WHERE run_id = @run_id;
+    SET @switch_at = DATEADD(millisecond, CAST(DATEDIFF_BIG(millisecond, @started, @deadline) * @good_percent / 100 AS int), @started);
+    SET @quiet_until = DATEADD(second, 5, @switch_at);
+
+    SELECT @patients = MAX(patient_id) FROM care.patients;
+    IF @patients IS NULL
+        THROW 50140, N'ContosoCare isn''t seeded. Run demo.usp_seed_contosocare first.', 1;
+
+    IF @worker = 1
+    BEGIN
+        -- A clean start: a plan that automatic tuning forced in an earlier run is unforced, and the lookup compiles again.
+        INSERT INTO @forced (query_id, plan_id)
+        SELECT p.query_id, p.plan_id
+        FROM sys.query_store_plan AS p
+        INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+        WHERE q.object_id = @lookup AND p.is_forced_plan = 1;
+        SET @remaining = @@ROWCOUNT;
+        WHILE @remaining > 0
+        BEGIN
+            SELECT @query_id = query_id, @plan_id = plan_id FROM @forced WHERE n = @remaining;
+            EXEC sys.sp_query_store_unforce_plan @query_id = @query_id, @plan_id = @plan_id;
+            SET @unforced += 1;
+            SET @remaining -= 1;
+        END;
+        EXEC sys.sp_recompile @objname = N'demo.usp_visit_summary_lookup';
+    END;
+
+    WHILE @stopped = 0 AND SYSUTCDATETIME() < @deadline
+    BEGIN
+        IF @switched = 0 AND SYSUTCDATETIME() >= @switch_at
+        BEGIN
+            SET @switched = 1;
+            IF @worker = 1
+            BEGIN
+                -- The regression: the next compilation sees every patient, so the cached plan scans.
+                EXEC sys.sp_recompile @objname = N'demo.usp_visit_summary_lookup';
+                EXEC demo.usp_visit_summary_lookup @first_patient = 1, @last_patient = @patients, @visits = @visits OUTPUT, @minutes = @minutes OUTPUT;
+            END;
+        END;
+
+        -- The other workers stay out of the switch's few seconds, so the lookup compiles for every patient.
+        IF @worker > 1 AND SYSUTCDATETIME() >= @switch_at AND SYSUTCDATETIME() < @quiet_until
+            WAITFOR DELAY '00:00:01';
+        ELSE
+        BEGIN
+            SET @r = ABS(CAST(CHECKSUM(NEWID()) AS bigint));
+            SET @first = 1 + CAST(@r % @patients AS int);
+            SET @last = @first + CAST(@r % 3 AS int);
+            EXEC demo.usp_visit_summary_lookup @first_patient = @first, @last_patient = @last, @visits = @visits OUTPUT, @minutes = @minutes OUTPUT;
+            IF @switched = 1
+                SET @regressed += 1;
+            ELSE
+                SET @good += 1;
+        END;
+
+        IF SYSUTCDATETIME() >= @next_check
+        BEGIN
+            SET @stopped = demo.fn_run_should_stop(@run_id);
+            SET @next_check = DATEADD(millisecond, 1000, SYSUTCDATETIME());
+        END;
+        IF @stopped = 0 AND SYSUTCDATETIME() < @deadline
+            WAITFOR DELAY @pause;
+    END;
+
+    SELECT worker = @worker, good_lookups = @good, regressed_lookups = @regressed, unforced_plans = @unforced,
+        forced_now = CAST(CASE WHEN EXISTS (
+            SELECT 1 FROM sys.query_store_plan AS p INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+            WHERE q.object_id = @lookup AND p.is_forced_plan = 1) THEN 1 ELSE 0 END AS bit),
+        force_last_good_plan = (SELECT TOP (1) actual_state_desc FROM sys.database_automatic_tuning_options WHERE name = N'FORCE_LAST_GOOD_PLAN'),
+        stop_requested = demo.fn_run_stop_requested(@run_id);
+END;
+GO

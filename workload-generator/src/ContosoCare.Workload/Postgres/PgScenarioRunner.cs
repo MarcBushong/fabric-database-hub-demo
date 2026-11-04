@@ -300,7 +300,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     // Scenario orchestrations ----------------------------------------------------------------------------------------------
 
-    /// <summary>healthy-baseline and cpu-pressure: N sessions call the step back to back, pausing by intensity.</summary>
+    /// <summary>healthy-baseline, cpu-pressure, and missing-index: N sessions call the step back to back, pausing by intensity.</summary>
     private async Task<IReadOnlyList<WorkerOutcome>> RunWorkersAsync(RunContext context)
     {
         var plan = context.Plan;
@@ -308,9 +308,11 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         for (var worker = 1; worker <= plan.Concurrency; worker++)
         {
             var index = worker;
+            var turn = 0;
             tasks.Add(plan.Scenario.Id switch
             {
                 "cpu-pressure" => StepLoopAsync(context, "worker", index, (c, t) => CpuStepAsync(c, context, index, plan.Parameters["variant"].Text ?? "problem", t), Pause(plan.Intensity, 2000, 0), TimeSpan.Zero),
+                "missing-index" => StepLoopAsync(context, "worker", index, (c, t) => MissingIndexStepAsync(c, context, index, turn++, time.GetUtcNow(), t), Pause(plan.Intensity, 1000, 20), TimeSpan.Zero),
                 _ => StepLoopAsync(context, "worker", index, (c, t) => BaselineStepAsync(c, context, index, t), Pause(plan.Intensity, 2000, 100), TimeSpan.Zero),
             });
         }
@@ -407,8 +409,10 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     /// <summary>
     /// connection-surge: opens connections a few at a time until only headroom slots stay free below max_connections,
-    /// holds them (pinging now and then), tries overshoot more that the server refuses (SQLSTATE 53300: Failed
-    /// Connections in Database Hub), then releases them all and pauses. Repeats until the deadline.
+    /// then fills that headroom for a few seconds at most and tries overshoot more, which the server refuses (SQLSTATE
+    /// 53300: Failed connections in Database Hub), and frees the headroom again (SurgeBurst, 2026-11-03). Holds the rest
+    /// (pinging now and then), releases them all, and pauses. Repeats until the deadline. Refusals are capped per minute
+    /// and per run (SurgeBounds), and a sign-in failure ends the surge, so it never repeats a failed sign-in.
     /// </summary>
     private async Task<IReadOnlyList<WorkerOutcome>> RunConnectionSurgeAsync(RunContext context, PgDemoDatabase database)
     {
@@ -426,15 +430,37 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         var refused = 0;
         var failedOther = 0;
         long pings = 0;
+        long longestBurstMs = 0;
+        var bounds = new SurgeBounds(time);
+        var capped = false;
         var held = new List<NpgsqlConnection>();
         try
         {
             while (!context.Stop.IsCancellationRequested && time.GetUtcNow() < context.Deadline - TimeSpan.FromSeconds(5))
             {
+                // A wave starts only while one more refusal is allowed: its ramp can meet the limit too, when other sessions
+                // opened connections meanwhile. Otherwise it waits for the minute, or for the run's end once its cap is used.
+                if (bounds.Allowance(1) == 0)
+                {
+                    var next = bounds.NextAllowedAt();
+                    if (!capped)
+                    {
+                        capped = true;
+                        context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "surge-capped", null, string.Create(CultureInfo.InvariantCulture, $"{bounds.RefusedInRun} attempt(s) refused so far, the cap ({SurgeBounds.MaxRefusedPerMinute} in any minute, {SurgeBounds.MaxRefusedPerRun} a run); {(next is null ? "no more waves in this run" : "the next wave waits for the minute")}.")));
+                    }
+
+                    await WaitUntilAsync(next is { } at ? Earlier(at, context.Deadline) : context.Deadline, context).ConfigureAwait(false);
+                    continue;
+                }
+
+                capped = false;
                 var (max, reserved, open) = await database.GetConnectionLimitsAsync(context.Abort).ConfigureAwait(false);
-                var target = Math.Min(ceiling, Math.Max(0, max - reserved - headroom - open));
+                var room = Math.Max(0, max - reserved - headroom - open);
+                var target = Math.Min(ceiling, room);
+                // The cap stops this wave before the server's limit, so nothing can be past it.
+                var limited = ceiling < room;
                 waves++;
-                context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "surge-started", null, string.Create(CultureInfo.InvariantCulture, $"Wave {waves}: {open} client connection(s) open, max_connections {max}, {reserved} reserved; opening {target}, leaving {headroom} free, then {overshoot} past the limit.")));
+                context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "surge-started", null, string.Create(CultureInfo.InvariantCulture, $"Wave {waves}: {open} client connection(s) open, max_connections {max}, {reserved} reserved; opening {target}, leaving {headroom} free{(limited ? $"; maxConnections ({ceiling}) stops it before the limit, so nothing is past it" : $", then up to {overshoot} past the limit")}.")));
 
                 while (held.Count < target && !context.Stop.IsCancellationRequested && time.GetUtcNow() < context.Deadline - TimeSpan.FromSeconds(5))
                 {
@@ -448,6 +474,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                         catch (PostgresException ex) when (ex.SqlState == TooManyConnectionsState)
                         {
                             refused++;
+                            bounds.RecordRefused();
                             target = held.Count;
                             break;
                         }
@@ -457,22 +484,27 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                     await WaitUntilAsync(time.GetUtcNow() + TimeSpan.FromSeconds(1), context).ConfigureAwait(false);
                 }
 
-                var attempts = 0;
-                for (var i = 0; i < overshoot && !context.Stop.IsCancellationRequested; i++)
+                // Past the limit: the headroom is filled for SurgeBounds.MaxBurst at most, the next attempts are refused, and
+                // the headroom is free again for the hold, so reset and the other T4 lanes (whose opens retry 53300) get in.
+                var allowance = limited ? 0 : bounds.Allowance(overshoot);
+                if (allowance > 0 && !context.Stop.IsCancellationRequested && time.GetUtcNow() + SurgeBounds.MaxBurst < context.Deadline - TimeSpan.FromSeconds(5))
                 {
-                    attempts++;
-                    try
+                    var burst = await SurgeBurst.RunAsync(
+                        token => opener.OpenAsync(context.ApplicationName, token, Limits(context), retry: false),
+                        bounds,
+                        allowance,
+                        headroom + allowance + SurgeBurst.Slack,
+                        SurgeBounds.MaxBurst,
+                        time,
+                        context.Abort).ConfigureAwait(false);
+                    refused += burst.Refused;
+                    failedOther += burst.Failed;
+                    peak = Math.Max(peak, held.Count + burst.Opened);
+                    longestBurstMs = Math.Max(longestBurstMs, (long)burst.HeldFor.TotalMilliseconds);
+                    context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "surge-overshoot", null, string.Create(CultureInfo.InvariantCulture, $"Wave {waves}: filled {burst.Opened} free slot(s) for {burst.HeldFor.TotalSeconds:0.0} s; {burst.Refused} attempt(s) past the limit refused (too many connections); the headroom is free again.{(burst.Error is null ? string.Empty : " Stopped early: " + burst.Error)}")));
+                    if (burst.SignInFailed)
                     {
-                        // Past the limit on purpose; if a slot happened to be free, this one is kept and released with the rest.
-                        held.Add(await opener.OpenAsync(context.ApplicationName, context.Abort, Limits(context), retry: false).ConfigureAwait(false));
-                    }
-                    catch (PostgresException ex) when (ex.SqlState == TooManyConnectionsState)
-                    {
-                        refused++;
-                    }
-                    catch (NpgsqlException)
-                    {
-                        failedOther++;
+                        return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings, longestBurstMs), "A sign-in failed during the surge, so it stopped and doesn't try again: " + burst.Error, false)];
                     }
                 }
 
@@ -514,15 +546,15 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                 await WaitUntilAsync(resumeAt, context).ConfigureAwait(false);
             }
 
-            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings), null, false)];
+            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings, longestBurstMs), null, false)];
         }
         catch (Exception ex) when (IsCancellation(ex, context))
         {
-            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings), null, true)];
+            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings, longestBurstMs), null, true)];
         }
         catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException)
         {
-            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings), PgConnectionOpener.Describe(ex), false)];
+            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings, longestBurstMs), PgConnectionOpener.Describe(ex), false)];
         }
         finally
         {
@@ -842,6 +874,39 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
     private static Task<IReadOnlyDictionary<string, object?>> CpuStepAsync(NpgsqlConnection connection, RunContext context, int worker, string variant, CancellationToken cancellationToken) =>
         QueryRowAsync(connection, "SELECT executions, pairs_compared, overlap_pairs, elapsed_ms FROM demo.usp_scenario_cpu_pressure(@run_id, @worker, @variant);", cancellationToken, ("run_id", context.RunId), ("worker", worker), ("variant", variant));
 
+    /// <summary>
+    /// missing-index on T4 (2026-11-04): the SQL Server targets' two lookups, claims aging by payer since a date and visits
+    /// by reason code at a facility. The step function only checks that the run still runs (so a stop ends the loop, as
+    /// in every step); the lookup goes as the runner's own top-level parameterized statement, so Query Store
+    /// (pg_qs.query_capture_mode top) captures it and autonomous tuning can recommend its index. Neither payer_code nor
+    /// reason_code has an index (database/postgresql/010-schema.sql). Read-only; the turn alternates the lookups and
+    /// varies their values.
+    /// </summary>
+    private static async Task<IReadOnlyDictionary<string, object?>> MissingIndexStepAsync(NpgsqlConnection connection, RunContext context, int worker, int turn, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await QueryRowAsync(connection, "SELECT checked FROM demo.usp_scenario_missing_index(@run_id);", cancellationToken, ("run_id", context.RunId)).ConfigureAwait(false);
+        var (sql, parameters) = MissingIndexLookup(worker, turn, now);
+        return await QueryRowAsync(connection, sql, cancellationToken, parameters).ConfigureAwait(false);
+    }
+
+    /// <summary>The lookup a missing-index turn sends on T4, and its parameters. Pure.</summary>
+    internal static (string Sql, (string Name, object Value)[] Parameters) MissingIndexLookup(int worker, int turn, DateTimeOffset now)
+    {
+        if (turn % 2 == 0)
+        {
+            return (
+                "SELECT count(*)::bigint AS rows_found FROM care.claims WHERE payer_code = @payer AND submitted_on >= @since;",
+                [("payer", MissingIndexPayers[((turn / 2) + worker) % MissingIndexPayers.Length]), ("since", DateOnly.FromDateTime(now.UtcDateTime.AddDays(-30)))]);
+        }
+
+        return (
+            "SELECT count(*)::bigint AS rows_found FROM care.appointments WHERE reason_code = @reason AND facility_id = @facility;",
+            [("reason", string.Create(CultureInfo.InvariantCulture, $"R{((turn * 7) + worker) % 50:000}")), ("facility", 1 + ((turn + worker) % 20))]);
+    }
+
+    /// <summary>The payers database/postgresql/020-seed.sql gives claims.</summary>
+    private static readonly string[] MissingIndexPayers = ["CONTOSO-HMO", "FABRIKAM-PPO", "NORTHWIND-MED", "SELF-PAY", "TAILSPIN-INS"];
+
     /// <summary>Runs a step in a transaction that's always rolled back (locking contenders, writers, the active holder).</summary>
     private static async Task<IReadOnlyDictionary<string, object?>> InRolledBackTransactionAsync(NpgsqlConnection connection, string sql, CancellationToken cancellationToken, params (string Name, object Value)[] parameters)
     {
@@ -1085,13 +1150,14 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         ["held_ms"] = heldMs,
     };
 
-    private static Dictionary<string, object?> SurgeMetrics(int waves, int peak, int refused, int failedOther, long pings) => new(StringComparer.Ordinal)
+    private static Dictionary<string, object?> SurgeMetrics(int waves, int peak, int refused, int failedOther, long pings, long longestBurstMs) => new(StringComparer.Ordinal)
     {
         ["waves"] = waves,
         ["longest_connections_held"] = peak,
         ["connections_refused"] = refused,
         ["connections_failed_other"] = failedOther,
         ["pings"] = pings,
+        ["longest_burst_ms"] = longestBurstMs,
     };
 
     private static DateTimeOffset Earlier(DateTimeOffset a, DateTimeOffset b) => a <= b ? a : b;

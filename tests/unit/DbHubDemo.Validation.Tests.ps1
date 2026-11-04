@@ -723,7 +723,8 @@ Describe 'Cost area' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI call expected' }
         $script:schedule = @{ properties = @{ status = 'Enabled'; dailyRecurrence = @{ time = '1900' }; timeZoneId = 'Pacific Standard Time' } }
         $script:costResponse = Get-TestAzResponse
-        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '250.0'; timeGrain = 'Monthly' })
+        # The budget at monthlyCeilingUsd's default, 375 since 2026-11-04 (ADR 0016).
+        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '375.0'; timeGrain = 'Monthly' })
         $script:costResponse['^resource show --resource-group rg-dbhub-demo --name shutdown-computevm-.* --resource-type Microsoft\.DevTestLab/schedules'] = Get-TestAzOk $script:schedule
         $script:costResponse['^resource list .*bastionHosts'] = Get-TestAzOk @()
         $script:costResponse['^network public-ip list'] = Get-TestAzOk @()

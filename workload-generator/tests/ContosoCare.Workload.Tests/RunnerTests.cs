@@ -125,7 +125,7 @@ public sealed class RunnerTests
 
             var expires = new DateTimeOffset(2026, 10, 21, 2, 0, 0, TimeSpan.Zero);
             var parameters = new ProfileParameters { DurationSeconds = 300, Parameters = new Dictionary<string, string> { ["maxLogMb"] = "512" } };
-            await store.SetAsync("incident:log-rate-pressure", "tester", expires, parameters, TestContext.Current.CancellationToken);
+            await store.SetAsync("incident:log-rate-pressure", "tester", expires, parameters, null, TestContext.Current.CancellationToken);
             var state = await store.GetAsync(TestContext.Current.CancellationToken);
 
             Assert.Equal("incident:log-rate-pressure", state.Name);

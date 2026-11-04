@@ -318,13 +318,38 @@ function Get-DemoActivityControlCatalog {
     return $catalog
 }
 
+function Get-DemoActivityControlProfile {
+    <#
+    .SYNOPSIS
+    The activity profiles the control runs as a whole (2026-11-04: showcase, Run all's default), from
+    scenarios/activity-profiles.json: each one's maximum and default minutes and the targets it has incidents for. off
+    isn't one: the runbook takes it as its own word, which turns a target's activity off. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param()
+
+    $definitions = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'scenarios/activity-profiles.json') -Raw | ConvertFrom-Json -AsHashtable
+    $profiles = [ordered]@{}
+    foreach ($name in @('showcase')) {
+        $definition = $definitions['profiles'][$name]
+        $profiles[$name] = [ordered]@{
+            maxMinutes     = [int]$definition['maxDurationMinutes']
+            defaultMinutes = [int]$definition['defaultDurationMinutes']
+            targets        = @($definition['incidents'] | ForEach-Object { [string]$_['target'] } | Sort-Object -Unique)
+        }
+    }
+    return $profiles
+}
+
 function Get-DemoActivityControlRunbookSetting {
     <#
     .SYNOPSIS
     The settings baked into the three runbooks: names, the demo's schedule, the bounds, the allow-lists from the scenario
-    catalog, how long the VM-side control waits for each target (readySeconds), how T1's monitoring plugin is looked
-    after, the pinned API versions, and the VM-side workload-control template. Nothing in it is secret; it holds the
-    subscription ID and the identity's client ID, which live in Azure only. Internal.
+    catalog and the activity profiles the control runs as a whole (showcase), how long the VM-side control waits for
+    each target (readySeconds), how T1's monitoring plugin is looked after, the pinned API versions, and the VM-side
+    workload-control template. Nothing in it is secret; it holds the subscription ID and the identity's client ID, which
+    live in Azure only. Internal.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -385,8 +410,9 @@ function Get-DemoActivityControlRunbookSetting {
         maxBodyBytes           = 4096
         targets                = $targets
         scenarios              = $catalog
+        profiles               = Get-DemoActivityControlProfile
         readySeconds           = [ordered]@{ T1 = 600; T2 = 1200; T3 = 600; T4 = 600 }
-        monitoring             = [ordered]@{ extensionInstanceName = [string]$sqlVm['extensionInstanceName']; statusPlugin = [string]$sqlVm['statusPlugin']; featureFlag = [string]$sqlVm['featureFlag']; serviceName = 'SQLIaaSExtension'; settleMinutes = 5; verifyMinutes = 5 }
+        monitoring             = [ordered]@{ extensionInstanceName = [string]$sqlVm['extensionInstanceName']; statusPlugin = [string]$sqlVm['statusPlugin']; featureFlag = [string]$sqlVm['featureFlag']; serviceName = 'SQLIaaSExtension'; settleMinutes = 8; verifyMinutes = 5 }
         apiVersions            = $apiVersions
         controlScriptTemplate  = (Get-DemoWorkloadControlTemplate).Replace('__ACTION__', 'Runner')
     }
@@ -1281,7 +1307,7 @@ function Get-DemoActivityControlNotebook {
 
     $path = Join-Path -Path $script:RepoRoot -ChildPath 'fabric/control/NB_DatabaseHub_Control.ipynb'
     $notebook = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
-    $catalog = [ordered]@{ targets = @($Setting['targets'].Keys); scenarios = $Setting['scenarios']; minDurationMinutes = $Setting['minDurationMinutes']; maxDurationMinutes = $Setting['maxDurationMinutes'] }
+    $catalog = [ordered]@{ targets = @($Setting['targets'].Keys); scenarios = $Setting['scenarios']; profiles = $Setting['profiles']; minDurationMinutes = $Setting['minDurationMinutes']; maxDurationMinutes = $Setting['maxDurationMinutes'] }
     $values = [ordered]@{
         KEY_VAULT_URL       = $Name.KeyVaultUri
         WEBHOOK_SECRET_NAME = $Name.Secret

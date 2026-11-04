@@ -166,15 +166,21 @@ internal sealed class DemoDatabase(SqlConnection connection)
         }
 
         var parameters = reader.IsDBNull(4) ? null : ProfileParametersJson.Parse(reader.GetString(4));
+        // requested_at and request_id (the showcase's request stamp) follow is_active; a database set up before them has none.
+        var stamped = reader.FieldCount > 7 && !reader.IsDBNull(6);
         return new ProfileState(
             reader.GetString(0),
             AsUtc(reader.GetDateTime(1)),
             reader.GetString(2),
             reader.IsDBNull(3) ? null : AsUtc(reader.GetDateTime(3)),
-            parameters);
+            parameters)
+        {
+            RequestedAt = stamped ? AsUtc(reader.GetDateTime(6)) : null,
+            RequestId = stamped && !reader.IsDBNull(7) ? reader.GetString(7) : null,
+        };
     }
 
-    public async Task SetProfileAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, CancellationToken cancellationToken)
+    public async Task<ProfileSetResult> SetProfileAsync(string profileName, string setBy, DateTimeOffset? expiresAt, ProfileParameters? parameters, ProfileRequestStamp? stamp, CancellationToken cancellationToken)
     {
         await using var command = Procedure("demo.usp_profile_set");
         Add(command, "@profile_name", SqlDbType.VarChar, profileName, 64);
@@ -182,7 +188,23 @@ internal sealed class DemoDatabase(SqlConnection connection)
         var expires = Add(command, "@expires_at", SqlDbType.DateTime2, expiresAt is { } at ? at.UtcDateTime : (object)DBNull.Value);
         expires.Scale = 3;
         Add(command, "@parameters", SqlDbType.NVarChar, parameters is null ? DBNull.Value : (object)Truncate(ProfileParametersJson.Serialize(parameters), 2000), 2000);
+        SqlParameter? applied = null;
+        SqlParameter? newer = null;
+        if (stamp is not null)
+        {
+            // Compare-and-set in demo.usp_profile_set: written only when no newer request is stored.
+            var requested = Add(command, "@requested_at", SqlDbType.DateTime2, stamp.RequestedAt.UtcDateTime);
+            requested.Scale = 3;
+            Add(command, "@request_id", SqlDbType.VarChar, stamp.RequestId, ProfileRequestStamp.MaximumIdLength);
+            applied = Output(command, "@applied", SqlDbType.Bit);
+            newer = Output(command, "@newer_request_id", SqlDbType.VarChar);
+            newer.Size = ProfileRequestStamp.MaximumIdLength;
+        }
+
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        return applied is null || applied.Value is not bool written || written
+            ? ProfileSetResult.Written
+            : new ProfileSetResult(false, newer?.Value as string);
     }
 
     public async Task<IReadOnlyList<RunRecord>> GetRunsAsync(int count, bool runningOnly, CancellationToken cancellationToken)

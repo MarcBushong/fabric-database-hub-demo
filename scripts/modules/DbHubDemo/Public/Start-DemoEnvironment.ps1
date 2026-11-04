@@ -23,9 +23,11 @@ function Start-DemoEnvironment {
        selected and nothing waits for it, and a T2 guest the relay holds for a golden capture, or one that isn't running,
        ends the VM's retries at once (review of PR 17, 2026-11-04). T1's monitoring plugin, which can stay NotRunning
        after a deallocation (live, 2026-10-22), gets the SQL IaaS Agent service restarted
-       (START.T1.MONITORING, Restore-DemoSqlVmMonitoringPlugin): first it waits up to 5 minutes for the agent to
-       report the plugin's status, because a restart right after boot, before that, left it NotRunning (live,
-       2026-10-26), then restarts the service only when the plugin isn't Running, and checks for Running and OK.
+       (START.T1.MONITORING, Restore-DemoSqlVmMonitoringPlugin): first it waits up to 8 minutes for the agent to
+       report a fresh status, one reported after the VM's latest start (live, 2026-11-04: right after a cold start the
+       instance view still said Running and OK from before the stop), because a restart right after boot, before the agent
+       reports, left it NotRunning (live, 2026-10-26); then it restarts the service once when the fresh status isn't
+       Running, or when no fresh status comes, and checks for Running and OK.
        A one-time host password left from an earlier session that couldn't be rotated is rotated now, unless
        -Interactive; with the Key Vault opt-in, the vault's copy is disabled too (START.KEYVAULT.CLEANUP).
        Before the VMs start, with the on-demand activity control (control.enabled, ADR 0020), a pending auto-stop

@@ -241,6 +241,10 @@ Latency, in minutes: for the in-Hub agent, from the scenario's `started_at` in `
 | slow-consumer.skills | Manual action required | Manual action required | Manual action required | | | |
 | capacity-max.in-hub | Manual action required | Manual action required | Manual action required | | | |
 | capacity-max.skills | Manual action required | Manual action required | Manual action required | | | |
+| plan-regression.in-hub | Not supported | Not supported | Manual action required | | | T3 only: T1 and T2 have no automatic tuning |
+| plan-regression.skills | Not supported | Not supported | Manual action required | | | T3 only: T1 and T2 have no automatic tuning |
+| showcase.in-hub | Manual action required | Manual action required | Manual action required | | | |
+| showcase.skills | Manual action required | Manual action required | Manual action required | | | |
 | incident-wrap-up.in-hub | Manual action required | Manual action required | Manual action required | | | |
 | incident-wrap-up.skills | Manual action required | Manual action required | Manual action required | | | |
 

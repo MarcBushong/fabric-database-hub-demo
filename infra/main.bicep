@@ -60,9 +60,9 @@ param autoShutdownTimeZone string = 'Pacific Standard Time'
 @maxLength(10)
 param expiresOn string = ''
 
-@description('Monthly budget amount in USD: the hard monthly ceiling (ADR 0016, C2).')
+@description('Monthly budget amount in USD: the hard monthly ceiling, 375 by default since 2026-11-04 (user-directed, for the 4-core T4; ADR 0016, C2).')
 @minValue(1)
-param monthlyCeilingUsd int = 250
+param monthlyCeilingUsd int = 375
 
 @description('First day of the budget period (yyyy-MM-01). deploy.ps1 passes the existing value on re-runs.')
 @minLength(10)
@@ -225,16 +225,21 @@ param t3AutoPauseMinutes int = 0
 @description('T3 uses the Azure SQL Database free offer with "continue using database for additional charges" (ADR 0016, C7). Preflight decides; deploy.ps1 redeploys T3 without it if Azure rejects the offer.')
 param t3UseFreeLimit bool = true
 
-@description('Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId>: Burstable Standard_B1ms, Entra-only with the P6 group as administrator, virtual network integration in snet-pg (Phase 24, ADR 0019).')
+@description('Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId>: General Purpose Standard_D4ds_v5 by default (since 2026-11-04), Entra-only with the P6 group as administrator, virtual network integration in snet-pg (Phase 24, ADR 0019).')
 param t4Enabled bool = true
 
-@description('T4\'s compute size: Standard_B1ms, the smallest Burstable size (default); Standard_B2s, the fallback when Azure answers SkuNotAvailable for B1ms in the region; or Standard_D2ds_v5, General Purpose (2 vCores, 8 GiB), the fallback when Azure refuses both Burstable sizes and its cost check passes. The tier follows the size, and storage, backups, and high availability are the same on both tiers (Phase 24, Phase 28 and its follow-up, ADR 0019). deploy.ps1 never resizes an existing server on its own.')
+@description('T4\'s compute size: Standard_D4ds_v5, General Purpose with 4 vCores and 16 GiB (default since 2026-11-04, user-directed, for autonomous tuning); Standard_D4ads_v5 (4 vCores) and Standard_D2ds_v5 (2 vCores, autonomous tuning off), the fallback when Azure answers SkuNotAvailable, the second only after its cost check; or Standard_B1ms or Standard_B2s, Burstable, which a configuration sets to keep the month cheap (autonomous tuning off). The tier follows the size, and storage, backups, and high availability are the same on both tiers (ADR 0019). deploy.ps1 moves an existing server whose size the configuration doesn\'t set to the default once, which restarts it.')
 @allowed([
+  'Standard_D4ds_v5'
+  'Standard_D4ads_v5'
+  'Standard_D2ds_v5'
   'Standard_B1ms'
   'Standard_B2s'
-  'Standard_D2ds_v5'
 ])
-param t4SkuName string = 'Standard_B1ms'
+param t4SkuName string = 'Standard_D4ds_v5'
+
+@description('T4\'s autonomous tuning (2026-11-04, user-directed; ADR 0019): Query Store capturing the top queries and index tuning in REPORT mode every 60 minutes, set only on a size that runs it (General Purpose or Memory Optimized with at least 4 vCores). deploy.ps1 decides from t4AutonomousTuning and the size (Get-DemoT4Tuning). When false, those parameters are left as they are, except that Query Store is turned off on a Burstable size.')
+param t4AutonomousTuning bool = false
 
 @description('T4\'s availability zone when it is created: empty for no preference, or 1, 2, or 3. A server keeps its zone, so deploy.ps1 passes it only while T4 doesn\'t exist (Phase 24, ADR 0019).')
 @allowed([
@@ -317,6 +322,7 @@ module demo 'modules/demo.bicep' = {
     t3UseFreeLimit: t3UseFreeLimit
     t4Enabled: t4Enabled
     t4SkuName: t4SkuName
+    t4AutonomousTuning: t4AutonomousTuning
     t4AvailabilityZone: t4AvailabilityZone
     diskSkuOverrides: diskSkuOverrides
   }

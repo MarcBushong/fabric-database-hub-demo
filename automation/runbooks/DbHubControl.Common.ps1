@@ -363,9 +363,11 @@ function Test-DbHubControlRequest {
     The request body is a JSON object of at most maxBodyBytes (4,096) bytes, and nothing else:
     - {"action": "run", "activities": [{"target": "T1", "scenario": "blocking-chain", "intensity": 5, "concurrency": 4}],
       "durationMinutes": 20}: one activity per target, because a target's activity profile holds one incident at a
-      time. scenario is "baseline" or a catalog scenario that the target can run; intensity (1-10) and concurrency
-      (1 to the scenario's maximum, incidents only) are optional; durationMinutes is minDurationMinutes to
-      maxDurationMinutes.
+      time. scenario is "baseline", a catalog scenario that the target can run, a profile from the settings' profiles
+      (showcase, 2026-11-04: its own rotation of incidents, from scenarios/activity-profiles.json), or "off", which turns
+      the target's activity off (a run needs at least one activity that isn't off); intensity (1-10) and concurrency
+      (1 to the scenario's maximum, incidents only) are optional, and a profile or off takes neither; durationMinutes
+      is minDurationMinutes to maxDurationMinutes.
     - {"action": "stop"}: Stop now.
     - {"action": "reset", "targets": ["T1"]}: the runner's reset; without targets, every target whose VM runs.
     - "requestedBy" is optional on any action: 1-64 letters, digits, or . _ @ / - (a name, never a secret).
@@ -456,6 +458,8 @@ function Test-DbHubControlRequest {
     }
     $normalized = @()
     $seen = @()
+    $profiles = Get-DbHubMember -InputObject $Settings -Name 'profiles'
+    $profileNames = @(Get-DbHubPropertyName -InputObject $profiles)
     foreach ($activity in $activities.Items) {
         if ($null -eq $activity -or $activity -is [string] -or $activity -is [System.ValueType] -or $activity -is [System.Array]) {
             return (Get-DbHubRefusal -Reason 'Each activity must be an object with target and scenario.')
@@ -475,10 +479,17 @@ function Test-DbHubControlRequest {
         $seen += $target
         $scenario = Get-DbHubMember -InputObject $activity -Name 'scenario'
         if (-not ($scenario -is [string])) {
-            return (Get-DbHubRefusal -Reason 'Each activity needs a scenario: baseline or a scenario from the catalog.')
+            return (Get-DbHubRefusal -Reason 'Each activity needs a scenario: baseline, off, a profile, or a scenario from the catalog.')
         }
         $maximumConcurrency = 0
-        if ($scenario -cne 'baseline') {
+        $isProfile = $scenario -ceq 'off' -or $scenario -cin $profileNames
+        if ($isProfile -and $scenario -cne 'off') {
+            $definition = Get-DbHubMember -InputObject $profiles -Name $scenario
+            if ($target -cnotin @($definition.targets)) {
+                return (Get-DbHubRefusal -Reason ('{0} doesn''t run on {1}.' -f $scenario, $target))
+            }
+        }
+        elseif (-not $isProfile -and $scenario -cne 'baseline') {
             $definition = Get-DbHubMember -InputObject $Settings.scenarios -Name $scenario
             if ($null -eq $definition) {
                 return (Get-DbHubRefusal -Reason ('''{0}'' isn''t a scenario in the catalog.' -f ($scenario -replace '[^A-Za-z0-9_-]', '?')))
@@ -489,10 +500,13 @@ function Test-DbHubControlRequest {
             $maximumConcurrency = [int]$definition.maxConcurrency
         }
         $intensity = Get-DbHubMember -InputObject $activity -Name 'intensity'
+        $concurrency = Get-DbHubMember -InputObject $activity -Name 'concurrency'
+        if ($isProfile -and ($null -ne $intensity -or $null -ne $concurrency)) {
+            return (Get-DbHubRefusal -Reason ('intensity and concurrency don''t apply to {0}: a profile takes its own from the catalog.' -f $scenario))
+        }
         if ($null -ne $intensity -and -not (Test-DbHubInteger -Value $intensity -Minimum 1 -Maximum 10)) {
             return (Get-DbHubRefusal -Reason 'intensity must be a whole number from 1 to 10.')
         }
-        $concurrency = Get-DbHubMember -InputObject $activity -Name 'concurrency'
         if ($null -ne $concurrency -and ($maximumConcurrency -lt 1 -or -not (Test-DbHubInteger -Value $concurrency -Minimum 1 -Maximum $maximumConcurrency))) {
             return (Get-DbHubRefusal -Reason ('concurrency applies to incidents only, from 1 to the scenario''s maximum ({0}).' -f $maximumConcurrency))
         }
@@ -505,6 +519,9 @@ function Test-DbHubControlRequest {
             $normalizedConcurrency = [int]$concurrency
         }
         $normalized += [pscustomobject]@{ Target = $target; Scenario = $scenario; Intensity = $normalizedIntensity; Concurrency = $normalizedConcurrency }
+    }
+    if (@($normalized | Where-Object { $_.Scenario -cne 'off' }).Count -eq 0) {
+        return (Get-DbHubRefusal -Reason 'A run needs at least one activity that isn''t off; Stop now stops everything.')
     }
     return [pscustomobject]@{ Valid = $true; Reason = ''; Action = 'run'; Activities = $normalized; DurationMinutes = [int]$duration; Targets = @($seen); RequestedBy = $requestedBy }
 }
@@ -542,9 +559,10 @@ function Get-DbHubRunPlan {
     <#
     .SYNOPSIS
     How long each activity runs: the requested minutes, capped at its scenario's maximum (maxDurationMinutes for the
-    baseline) and so that it ends before the VMs' next auto-shutdown minus shutdownMarginMinutes. Returns Valid,
-    Reason, Activities (with Minutes), RunEndUtc, AutoStopUtc (the run's end plus autoStopBufferMinutes), and
-    ShutdownUtc.
+    baseline, the profile's maxMinutes for a profile such as showcase) and so that it ends before the VMs' next
+    auto-shutdown minus shutdownMarginMinutes; off takes no minutes and doesn't count toward the run's end. Returns
+    Valid, Reason, Activities (with Minutes, and Tier, VCores, and NotAfterUtc for the dispatch to fill), RunEndUtc,
+    AutoStopUtc (the run's end plus autoStopBufferMinutes), and ShutdownUtc.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -563,20 +581,35 @@ function Get-DbHubRunPlan {
     if ($available -lt [int]$Settings.minDurationMinutes) {
         return [pscustomobject]@{ Valid = $false; Reason = ('The VMs'' auto-shutdown is at {0:yyyy-MM-dd HH:mm} UTC, too soon for a run of at least {1} minutes.' -f $shutdown, [int]$Settings.minDurationMinutes); Activities = @(); RunEndUtc = $NowUtc; AutoStopUtc = $NowUtc; ShutdownUtc = $shutdown }
     }
+    $profiles = Get-DbHubMember -InputObject $Settings -Name 'profiles'
     $planned = @()
     $longest = 0
     foreach ($activity in @($Request.Activities)) {
         $cap = [int]$Settings.maxDurationMinutes
-        if ($activity.Scenario -cne 'baseline') {
+        $profileDefinition = Get-DbHubMember -InputObject $profiles -Name ([string]$activity.Scenario)
+        if ($activity.Scenario -ceq 'off') {
+            $cap = 0
+        }
+        elseif ($null -ne $profileDefinition) {
+            $cap = [int](Get-DbHubMember -InputObject $profileDefinition -Name 'maxMinutes')
+        }
+        elseif ($activity.Scenario -cne 'baseline') {
             $cap = [int](Get-DbHubMember -InputObject $Settings.scenarios -Name $activity.Scenario).maxMinutes
         }
         $minutes = [System.Math]::Min([System.Math]::Min([int]$Request.DurationMinutes, $cap), $available)
         if ($minutes -gt $longest) {
             $longest = $minutes
         }
-        $planned += [pscustomobject]@{ Target = $activity.Target; Scenario = $activity.Scenario; Intensity = $activity.Intensity; Concurrency = $activity.Concurrency; Minutes = $minutes }
+        $planned += [pscustomobject]@{ Target = $activity.Target; Scenario = $activity.Scenario; Intensity = $activity.Intensity; Concurrency = $activity.Concurrency; Minutes = $minutes; Tier = ''; VCores = 0; NotAfterUtc = $null }
     }
     $end = $NowUtc.AddMinutes($longest)
+    foreach ($item in $planned) {
+        # A profile ends with the run (the runner stops 2 minutes before --not-after), even when its target's dispatch
+        # waited for the target to start.
+        if ($null -ne (Get-DbHubMember -InputObject $profiles -Name ([string]$item.Scenario))) {
+            $item.NotAfterUtc = $end.AddMinutes(2)
+        }
+    }
     return [pscustomobject]@{ Valid = $true; Reason = ''; Activities = $planned; RunEndUtc = $end; AutoStopUtc = $end.AddMinutes([int]$Settings.autoStopBufferMinutes); ShutdownUtc = $shutdown }
 }
 
@@ -599,12 +632,19 @@ function Get-DbHubDemoPath {
 }
 
 function ConvertTo-DbHubUtc {
-    # Parses an ISO 8601 time from Azure; $null when it doesn't parse.
+    # Parses an ISO 8601 time from Azure; $null when it doesn't parse. A DateTime (a JSON parser's) is taken as UTC when it
+    # has no kind.
     param(
         [AllowNull()]
         [object] $Value
     )
 
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [System.DateTimeKind]::Unspecified) {
+            return [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc)
+        }
+        return $Value.ToUniversalTime()
+    }
     $parsed = [DateTimeOffset]::MinValue
     if ($null -ne $Value -and [DateTimeOffset]::TryParse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
         return $parsed.UtcDateTime
@@ -827,7 +867,8 @@ function Register-DbHubMonitorRecheck {
     $settings = $Context.Settings
     $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Automation/automationAccounts'
     $account = Get-DbHubAccountPath -Settings $settings
-    # Never sooner than 30 minutes: the run's own job looks after the plugin for up to 25 (Start-DbHubActivityRun).
+    # Never sooner than 30 minutes: the run's own job looks after the plugin for up to 28 (Start-DbHubActivityRun: sqlvm01 runs
+    # within 15, then up to 8 to settle and 5 to verify a restart).
     $interval = [System.Math]::Max(30, [int]$settings.monitorRecheckMinutes)
     $created = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $names = @(Get-DbHubMonitorScheduleName -Settings $settings)
@@ -892,6 +933,35 @@ function Get-DbHubVmState {
         }
     }
     return 'Unknown'
+}
+
+function Get-DbHubVmStartUtc {
+    <#
+    .SYNOPSIS
+    A running VM's latest start, as its instance view gives it: the time of its provisioning status, which a start sets
+    when it completes ("the time of the status"); $null when it can't be read or has no time. Later VM operations can move
+    it later, never earlier, so a plugin status reported after it is from this boot.
+    https://learn.microsoft.com/rest/api/compute/virtual-machines/instance-view (InstanceViewStatus, checked 2026-11-04)
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VmName
+    )
+
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Compute/virtualMachines'
+    $view = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/instanceView' -f (Get-DbHubDemoPath -Settings $Context.Settings), $VmName) -ApiVersion $version
+    if ($view.StatusCode -ne 200) {
+        return $null
+    }
+    foreach ($status in @(Get-DbHubMember -InputObject $view.Body -Name 'statuses')) {
+        if ([string](Get-DbHubMember -InputObject $status -Name 'code') -like 'ProvisioningState/*') {
+            return (ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $status -Name 'time'))
+        }
+    }
+    return $null
 }
 
 function Invoke-DbHubVmAction {
@@ -968,8 +1038,9 @@ function Get-DbHubT3State {
 }
 
 function Get-DbHubT4 {
-    # T4, the PostgreSQL flexible server <t4ServerPrefix><deploymentId> (Phase 24): Name and State (Ready, Stopped,
-    # Starting, Stopping, Updating, ...), or State Missing or Unknown.
+    # T4, the PostgreSQL flexible server <t4ServerPrefix><deploymentId> (Phase 24): Name, State (Ready, Stopped,
+    # Starting, Stopping, Updating, ...), or State Missing or Unknown, and its size: Tier (sku.tier) and SkuName
+    # (sku.name), which the showcase's T4 slots use (2026-11-04).
     param(
         [Parameter(Mandatory = $true)]
         [object] $Context,
@@ -980,18 +1051,37 @@ function Get-DbHubT4 {
 
     $deploymentId = [string](Get-DbHubMember -InputObject $Tags -Name 'deploymentId')
     if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
-        return [pscustomobject]@{ Name = ''; State = 'Unknown' }
+        return [pscustomobject]@{ Name = ''; State = 'Unknown'; Tier = ''; SkuName = '' }
     }
     $name = '{0}{1}' -f $Context.Settings.t4ServerPrefix, $deploymentId
     $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
     $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $name) -ApiVersion $version
     if ($read.StatusCode -eq 404) {
-        return [pscustomobject]@{ Name = $name; State = 'Missing' }
+        return [pscustomobject]@{ Name = $name; State = 'Missing'; Tier = ''; SkuName = '' }
     }
     if ($read.StatusCode -ne 200) {
-        return [pscustomobject]@{ Name = $name; State = 'Unknown' }
+        return [pscustomobject]@{ Name = $name; State = 'Unknown'; Tier = ''; SkuName = '' }
     }
-    return [pscustomobject]@{ Name = $name; State = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'state') }
+    $sku = Get-DbHubMember -InputObject $read.Body -Name 'sku'
+    return [pscustomobject]@{ Name = $name; State = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'state'); Tier = [string](Get-DbHubMember -InputObject $sku -Name 'tier'); SkuName = [string](Get-DbHubMember -InputObject $sku -Name 'name') }
+}
+
+function Get-DbHubT4VCore {
+    # T4's vCores from its size's name (Standard_B1ms 1, Standard_B2s 2, Standard_D2ds_v5 2, Standard_D4ds_v5 and
+    # Standard_D4ads_v5 4: the number after the series letter, as Learn's compute sizes name them), or 0 when the name
+    # doesn't say. https://learn.microsoft.com/azure/postgresql/compute-storage/concepts-compute
+    param(
+        [AllowNull()]
+        [string] $SkuName
+    )
+
+    if ([string]$SkuName -cmatch '^Standard_[A-Z]+(\d{1,2})[a-z_0-9]*$') {
+        $vcores = [int]$Matches[1]
+        if ($vcores -ge 1 -and $vcores -le 64) {
+            return $vcores
+        }
+    }
+    return 0
 }
 
 function Invoke-DbHubT4Action {
@@ -1069,13 +1159,22 @@ function Send-DbHubDispatch {
         if ($null -eq $ready) {
             $ready = 600
         }
+        if ([string](Get-DbHubMember -InputObject $item -Name 'Scenario') -ceq 'off') {
+            # The VM-side control never waits for a target before it turns it off (Test-DemoControlActivityCommand).
+            $ready = 0
+        }
         $requests += [ordered]@{ target = $item.Target; arguments = @(Get-DbHubRunnerArgument -Activity $item -RequestedBy $RequestedBy); timeoutSeconds = 300; readySeconds = [int]$ready }
     }
     return (Send-DbHubRunCommand -Context $Context -VmName $VmName -Name $Name -Script (Get-DbHubWorkloadScript -Settings $settings -Request $requests) -TimeoutSeconds (Get-DbHubRunCommandTimeout -Request $requests))
 }
 
 function Get-DbHubRunnerArgument {
-    # The runner arguments for one planned activity, built from validated values only, or for a reset.
+    <#
+    The runner arguments for one planned activity, built from validated values only, or for a reset. off turns the
+    target's activity off; a profile (showcase) runs for its minutes and ends with the run (--not-after: the run's end
+    plus the 2 minutes the runner keeps before it), and T4's gets its tier and vCores (--tier, --vcores), which pick and
+    scale its slots; the baseline and an incident end by the VMs' next auto-shutdown at the latest.
+    #>
     param(
         [AllowNull()]
         [object] $Activity,
@@ -1088,6 +1187,25 @@ function Get-DbHubRunnerArgument {
 
     if ($Reset) {
         return @('reset', '--requested-by', $RequestedBy)
+    }
+    if ($Activity.Scenario -ceq 'off') {
+        return @('profile', 'set', '--name', 'off', '--requested-by', $RequestedBy)
+    }
+    $notAfter = Get-DbHubMember -InputObject $Activity -Name 'NotAfterUtc'
+    if ($null -ne $notAfter) {
+        $arguments = @('profile', 'set', '--name', [string]$Activity.Scenario, '--duration', ('{0}m' -f [int]$Activity.Minutes), '--not-after', ([datetime]$notAfter).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'+00:00'", [System.Globalization.CultureInfo]::InvariantCulture))
+        if ([string]$Activity.Target -ceq 'T4') {
+            $tier = [string](Get-DbHubMember -InputObject $Activity -Name 'Tier')
+            if ($tier) {
+                $arguments += @('--tier', $tier)
+            }
+            $vcores = [int](Get-DbHubMember -InputObject $Activity -Name 'VCores')
+            if ($vcores -gt 0) {
+                $arguments += @('--vcores', [string]$vcores)
+            }
+        }
+        $arguments += @('--requested-by', $RequestedBy)
+        return $arguments
     }
     $name = 'baseline'
     if ($Activity.Scenario -cne 'baseline') {
@@ -1285,13 +1403,68 @@ function Clear-DbHubFinishedRunCommand {
     }
 }
 
+function Get-DbHubPluginReportedUtc {
+    <#
+    .SYNOPSIS
+    When the SQL IaaS Agent's main service last reported: the latest ExtensionServiceHealthReport.MainServiceLastReportedTime
+    in the extension's status messages (its ComponentStatus/Resource Provider Plugin substatus; live, 2026-11-04); $null
+    when there's none. Right after a start, the instance view still holds the status from before the stop (live,
+    2026-11-04: Running and OK a minute after boot, NotRunning 12 minutes later), and this time tells the two apart.
+    #>
+    param(
+        [AllowEmptyCollection()]
+        [string[]] $Message = @()
+    )
+
+    $latest = $null
+    foreach ($text in @($Message)) {
+        foreach ($match in [regex]::Matches([string]$text, 'MainServiceLastReportedTime\W{1,8}(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)')) {
+            $time = ConvertTo-DbHubUtc -Value $match.Groups[1].Value
+            if ($null -ne $time -and ($null -eq $latest -or $time -gt $latest)) {
+                $latest = $time
+            }
+        }
+    }
+    return $latest
+}
+
+function Test-DbHubPluginFresh {
+    <#
+    .SYNOPSIS
+    Whether a plugin status (Get-DbHubMonitoringPlugin) was reported after SinceUtc, sqlvm01's start: its ReportedUtc is
+    later. Without SinceUtc there's nothing to compare, so it's fresh. Without a ReportedUtc (an agent that doesn't report
+    the time), it's fresh only once the start is more than 30 minutes old, so a cold start still gets its restart and a VM
+    that has run a while isn't restarted on every look.
+    #>
+    param(
+        [AllowNull()]
+        [object] $Plugin,
+
+        [AllowNull()]
+        [object] $SinceUtc,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $NowUtc
+    )
+
+    if ($null -eq $SinceUtc) {
+        return $true
+    }
+    $reported = Get-DbHubMember -InputObject $Plugin -Name 'ReportedUtc'
+    if ($null -ne $reported) {
+        return ([datetime]$reported -gt [datetime]$SinceUtc)
+    }
+    return (($NowUtc - [datetime]$SinceUtc).TotalMinutes -gt 30)
+}
+
 function Get-DbHubMonitoringPlugin {
     <#
     .SYNOPSIS
     T1's Database Hub monitoring plugin, as the SQL IaaS Agent extension's instance view reports it and as
     start-demo.ps1 reads it (Restore-DemoSqlVmMonitoringPlugin): Read (the extension could be read), FlagSet (its
     settings hold the monitoring feature flag), Found and State (the plugin's line, for example
-    DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"}), Upload, and Message.
+    DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"}), Upload, Message, and ReportedUtc (when the
+    agent's main service last reported, Get-DbHubPluginReportedUtc; $null when it doesn't say).
     https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm
     #>
     param(
@@ -1300,7 +1473,7 @@ function Get-DbHubMonitoringPlugin {
     )
 
     $settings = $Context.Settings
-    $result = [pscustomobject]@{ Read = $false; FlagSet = $false; Found = $false; State = ''; Upload = ''; Message = '' }
+    $result = [pscustomobject]@{ Read = $false; FlagSet = $false; Found = $false; State = ''; Upload = ''; Message = ''; ReportedUtc = $null }
     $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines'
     $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/extensions/{2}?$expand=instanceView' -f (Get-DbHubDemoPath -Settings $settings), $settings.sqlVmName, $settings.monitoring.extensionInstanceName) -ApiVersion $version
     if ($read.StatusCode -ne 200) {
@@ -1316,25 +1489,30 @@ function Get-DbHubMonitoringPlugin {
         }
     }
     $view = Get-DbHubMember -InputObject $properties -Name 'instanceView'
-    $pattern = [regex]::Escape([string]$settings.monitoring.statusPlugin) + '\s*:\s*(\{[^{}]*\})'
+    $messages = New-Object -TypeName 'System.Collections.Generic.List[string]'
     foreach ($listName in 'statuses', 'substatuses') {
         foreach ($status in @(Get-DbHubMember -InputObject $view -Name $listName)) {
-            $match = [regex]::Match([string](Get-DbHubMember -InputObject $status -Name 'message'), $pattern)
-            if (-not $match.Success) {
-                continue
-            }
-            $result.Message = $match.Value
-            try {
-                $json = $match.Groups[1].Value | ConvertFrom-Json
-                $result.Found = $true
-                $result.State = [string](Get-DbHubMember -InputObject $json -Name 'State')
-                $result.Upload = [string](Get-DbHubMember -InputObject $json -Name 'MetricsUploadStatus')
-            }
-            catch {
-                $result.Found = $false
-            }
-            return $result
+            $messages.Add([string](Get-DbHubMember -InputObject $status -Name 'message'))
         }
+    }
+    $result.ReportedUtc = Get-DbHubPluginReportedUtc -Message $messages.ToArray()
+    $pattern = [regex]::Escape([string]$settings.monitoring.statusPlugin) + '\s*:\s*(\{[^{}]*\})'
+    foreach ($message in $messages) {
+        $match = [regex]::Match($message, $pattern)
+        if (-not $match.Success) {
+            continue
+        }
+        $result.Message = $match.Value
+        try {
+            $json = $match.Groups[1].Value | ConvertFrom-Json
+            $result.Found = $true
+            $result.State = [string](Get-DbHubMember -InputObject $json -Name 'State')
+            $result.Upload = [string](Get-DbHubMember -InputObject $json -Name 'MetricsUploadStatus')
+        }
+        catch {
+            $result.Found = $false
+        }
+        break
     }
     return $result
 }
@@ -1361,8 +1539,15 @@ function Send-DbHubMonitoringRestart {
 }
 
 function Initialize-DbHubMonitorState {
-    # The state of one look after T1's monitoring plugin (Step-DbHubMonitor).
-    return [pscustomobject]@{ Phase = 'Settle'; Done = $false; Outcome = ''; FirstUtc = $null; RestartUtc = $null; Before = ''; After = ''; Restarted = $false }
+    # The state of one look after T1's monitoring plugin (Step-DbHubMonitor). StartUtc is when this run's start of sqlvm01
+    # was accepted; without it (the run didn't start it, or a DbHub-Monitor re-check), the first step reads the VM's
+    # latest start from its instance view (Get-DbHubVmStartUtc).
+    param(
+        [AllowNull()]
+        [object] $StartUtc = $null
+    )
+
+    return [pscustomobject]@{ Phase = 'Settle'; Done = $false; Outcome = ''; FirstUtc = $null; RestartUtc = $null; Before = ''; After = ''; Restarted = $false; StartUtc = $StartUtc; StartKnown = ($null -ne $StartUtc) }
 }
 
 function Step-DbHubMonitor {
@@ -1372,11 +1557,16 @@ function Step-DbHubMonitor {
     it. Live, 2026-10-26: about a minute after boot the extension reported no plugin status, and a restart then left
     the plugin NotRunning for hours; once the agent had reported, the restart brought it to Running and OK. Live,
     2026-11-03: the control read the plugin right after the start, found no status, sent no restart, and T1 sent no
-    telemetry. So:
-    - no status yet: wait, up to monitoring.settleMinutes after the first read;
-    - Running: left alone (Outcome Running), uploads that aren't OK included, because a restart doesn't fix uploads;
-    - any other state, or still no status after the wait: the SQL IaaS Agent's service is restarted, then read until
-      it's Running with uploads OK (Restarted) or monitoring.verifyMinutes pass (StillNotRunning).
+    telemetry. Live, 2026-11-04: 47 seconds after the run's start the instance view still held the status from before
+    the stop, Running and OK, so no restart went out; 12 minutes later it said NotRunning, and T1 had sent nothing. So a
+    status counts only when it's fresh: reported (MainServiceLastReportedTime) after sqlvm01's start in this run, or after
+    the VM's latest start in its instance view when the run didn't start it (Test-DbHubPluginFresh). Then:
+    - no fresh status yet: wait, up to monitoring.settleMinutes (8) after the first read;
+    - fresh and Running: left alone (Outcome Running), uploads that aren't OK included, because a restart doesn't fix
+      uploads;
+    - fresh in any other state, or still no fresh status after the wait: the SQL IaaS Agent's service is restarted once,
+      then read until it's Running with uploads OK in a status reported after the restart (Restarted) or
+      monitoring.verifyMinutes pass (StillNotRunning).
     Other outcomes: NotSelected (the monitoring flag isn't set), Unread (the extension couldn't be read for the whole
     time), RestartRefused (Azure didn't accept the Run Command). Done says the look is over.
     #>
@@ -1398,12 +1588,23 @@ function Step-DbHubMonitor {
     if ($null -eq $State.FirstUtc) {
         $State.FirstUtc = $now
     }
+    if (-not $State.StartKnown) {
+        $State.StartUtc = Get-DbHubVmStartUtc -Context $Context -VmName ([string]$Context.Settings.sqlVmName)
+        $State.StartKnown = $true
+    }
     $plugin = Get-DbHubMonitoringPlugin -Context $Context
     $finish = {
         param([string] $Outcome, [string] $Text)
         $State.Done = $true
         $State.Outcome = $Outcome
         Write-DbHubLog -Context $Context -Message ('T1''s monitoring plugin: {0}' -f $Text)
+    }
+    $timeText = {
+        param([AllowNull()] [object] $Time)
+        if ($null -eq $Time) {
+            return 'an unknown time'
+        }
+        return ([datetime]$Time).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     }
     if (-not $plugin.Read) {
         $bound = $State.FirstUtc.AddMinutes($settle + $verify)
@@ -1428,15 +1629,25 @@ function Step-DbHubMonitor {
     }
     if ($State.Phase -eq 'Settle') {
         $reported = $plugin.Found -and $plugin.State
-        if ($reported -and $plugin.State -eq 'Running') {
+        $fresh = $reported -and (Test-DbHubPluginFresh -Plugin $plugin -SinceUtc $State.StartUtc -NowUtc $now)
+        if ($fresh -and $plugin.State -eq 'Running') {
             $State.Before = $plugin.Message
-            & $finish 'Running' ('running ({0}).' -f $plugin.Message)
+            & $finish 'Running' ('running ({0}, reported at {1}).' -f $plugin.Message, (& $timeText $plugin.ReportedUtc))
             return
         }
-        if (-not $reported -and $now -lt $State.FirstUtc.AddMinutes($settle)) {
+        if (-not $fresh -and $now -lt $State.FirstUtc.AddMinutes($settle)) {
             return
         }
-        $State.Before = if ($reported) { $plugin.Message } else { 'no plugin status after {0} minutes' -f $settle }
+        if ($fresh) {
+            $State.Before = $plugin.Message
+        }
+        elseif ($reported) {
+            # Live, 2026-11-04: the status from before the stop said Running and OK, and the plugin was NotRunning.
+            $State.Before = 'no fresh plugin status since {0}''s start at {1} (waited {2} minutes); the last one, reported at {3}, said {4}' -f $Context.Settings.sqlVmName, (& $timeText $State.StartUtc), $settle, (& $timeText $plugin.ReportedUtc), $plugin.Message
+        }
+        else {
+            $State.Before = 'no plugin status after {0} minutes' -f $settle
+        }
         if (-not (Send-DbHubMonitoringRestart -Context $Context -Stamp $Stamp)) {
             & $finish 'RestartRefused' ('{0}; the SQL IaaS Agent service''s restart wasn''t accepted.' -f $State.Before)
             return
@@ -1447,7 +1658,9 @@ function Step-DbHubMonitor {
         Write-DbHubLog -Context $Context -Message ('T1''s monitoring plugin: {0}; the SQL IaaS Agent service is restarted.' -f $State.Before)
         return
     }
-    if ($plugin.State -eq 'Running' -and $plugin.Upload -eq 'OK') {
+    # After the restart, only a status reported since then counts; an agent that doesn't report the time is taken at its word.
+    $afterRestart = $null -eq $plugin.ReportedUtc -or $plugin.ReportedUtc -gt $State.RestartUtc
+    if ($plugin.State -eq 'Running' -and $plugin.Upload -eq 'OK' -and $afterRestart) {
         $State.After = $plugin.Message
         & $finish 'Restarted' ('running with uploads OK after the restart ({0}).' -f $plugin.Message)
         return
@@ -1564,8 +1777,13 @@ function Start-DbHubActivityRun {
     at most T4WaitMinutes after the start, or with sqlvm01's when T4 is already Ready then (live, 2026-11-03: the run
     waited up to 15 minutes for T4 before it dispatched anything). The VM-side control waits for each target to accept
     connections before it sets the profile (readySeconds). Meanwhile T1's monitoring plugin is looked after once sqlvm01
-    runs (Step-DbHubMonitor): left alone when it runs, restarted when it reports another state or no status after
-    monitoring.settleMinutes. The job ends when every VM, T4, and the plugin are done, or at their bounds.
+    runs (Step-DbHubMonitor): left alone when a status reported since this run's start of sqlvm01 says it runs, and
+    restarted once when a fresh status says another state, or when no fresh status comes within monitoring.settleMinutes
+    (live, 2026-11-04: right after a cold start the status from before the stop said Running). The job ends when every VM,
+    T4, and the plugin are done, or at their bounds.
+    An off never starts anything (review of PR 20, 2026-11-04): a VM whose only activities are off is left as it is and
+    gets them only when it already runs, T4's off goes out with sqlvm01's activities (T4's profile is a file on T1)
+    without reading, starting, or waiting for T4, and a run whose only dispatched activities are off stops what it started.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -1608,13 +1826,26 @@ function Start-DbHubActivityRun {
         $activities = @($activities | Where-Object { $_.Target -ne 'T3' })
     }
     $t4 = $null
-    if (@($activities | Where-Object { $_.Target -eq 'T4' }).Count -gt 0) {
+    # T4's off is a file on T1 (its profile), so only an activity that isn't off reads T4, starts it, or waits for it
+    # (review of PR 20, 2026-11-04).
+    if (@($activities | Where-Object { $_.Target -eq 'T4' -and $_.Scenario -cne 'off' }).Count -gt 0) {
         $t4 = Get-DbHubT4 -Context $Context -Tags $Tags
         # Missing, Unknown, or a state it can't be started from now, such as Stopping right after a stop.
         if ($t4.State -notin 'Ready', 'Starting', 'Updating', 'Stopped') {
             $skipped.Add(('T4 ({0})' -f $t4.State.ToLowerInvariant()))
             $activities = @($activities | Where-Object { $_.Target -ne 'T4' })
             $t4 = $null
+        }
+        else {
+            # The showcase's T4 slots follow its size (2026-11-04): its tier picks the tier-specific slots, and its vCores
+            # scale the CPU-bound ones (the runner's --tier and --vcores).
+            foreach ($activity in @($activities | Where-Object { $_.Target -eq 'T4' })) {
+                $t4Tier = [string](Get-DbHubMember -InputObject $t4 -Name 'Tier')
+                if ($t4Tier -cin 'Burstable', 'GeneralPurpose') {
+                    $activity.Tier = $t4Tier
+                }
+                $activity.VCores = Get-DbHubT4VCore -SkuName ([string](Get-DbHubMember -InputObject $t4 -Name 'SkuName'))
+            }
         }
     }
     $byVm = [ordered]@{}
@@ -1625,10 +1856,24 @@ function Start-DbHubActivityRun {
         }
         $byVm[$vm] += $activity
     }
+    # Whether a VM has an activity that isn't off: only such a VM is started, and T1's plugin is looked after only then.
+    $hasActivity = {
+        param([string] $VmName)
+        return (@($byVm[$VmName] | Where-Object { $_.Scenario -cne 'off' }).Count -gt 0)
+    }
     foreach ($vm in @($byVm.Keys)) {
-        if ((Get-DbHubVmState -Context $Context -VmName $vm) -eq 'Missing') {
+        $vmState = Get-DbHubVmState -Context $Context -VmName $vm
+        if ($vmState -eq 'Missing') {
             foreach ($activity in $byVm[$vm]) {
                 $skipped.Add(('{0} ({1} doesn''t exist)' -f $activity.Target, $vm))
+            }
+            $byVm.Remove($vm)
+        }
+        elseif (-not (& $hasActivity $vm) -and $vmState -ne 'running') {
+            # An off never starts anything (review of PR 20): on a VM that doesn't run, nothing runs to turn off. Its stored
+            # profile ends at its own end, and a boot's leftover-run cleanup ends what a stopped run left.
+            foreach ($activity in $byVm[$vm]) {
+                $skipped.Add(('{0} (off not sent: {1} is {2}, so nothing runs there)' -f $activity.Target, $vm, $vmState))
             }
             $byVm.Remove($vm)
         }
@@ -1638,11 +1883,13 @@ function Start-DbHubActivityRun {
         # T4's activity goes out on sqlvm01, so without it T4 isn't started.
         $t4 = $null
     }
-    if (@($byVm.Keys).Count -eq 0) {
+    if (@($byVm.Keys | Where-Object { & $hasActivity $_ }).Count -eq 0) {
+        # Off alone isn't a run: Stop now stops everything (Test-DbHubControlRequest refuses a request of off only).
         $result.message = 'Nothing to run: ' + ($skipped -join '; ')
         $result.skipped = $skipped.ToArray()
         return [pscustomobject]$result
     }
+    $sqlActive = $byVm.Contains($sqlVm) -and (& $hasActivity $sqlVm)
 
     $stop = Register-DbHubAutoStop -Context $Context -AutoStopUtc $plan.AutoStopUtc
     if (-not $stop.Created) {
@@ -1652,13 +1899,18 @@ function Start-DbHubActivityRun {
     $result.runEndUtc = $plan.RunEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     $result.autoStopUtc = $stop.StartUtc
     Write-DbHubLog -Context $Context -Message ('Auto-stop set for {0}; the run ends by {1}.' -f $stop.StartUtc, $result.runEndUtc)
-    if ($byVm.Contains($sqlVm)) {
+    if ($sqlActive) {
         $result.rechecks = @(Register-DbHubMonitorRecheck -Context $Context -StartUtc $Context.NowUtc -RunEndUtc $plan.RunEndUtc)
     }
 
+    # When this run's start of sqlvm01 was accepted: T1's monitoring plugin counts only a status reported after it.
+    $sqlStartedUtc = $null
     foreach ($vm in @($byVm.Keys)) {
-        if ((Get-DbHubVmState -Context $Context -VmName $vm) -ne 'running') {
-            $null = Invoke-DbHubVmAction -Context $Context -VmName $vm -Action start
+        if ((& $hasActivity $vm) -and (Get-DbHubVmState -Context $Context -VmName $vm) -ne 'running') {
+            $accepted = Invoke-DbHubVmAction -Context $Context -VmName $vm -Action start
+            if ($accepted -and $vm -eq $sqlVm) {
+                $sqlStartedUtc = Get-DbHubUtcNow
+            }
         }
     }
     if ($null -ne $t4 -and $t4.State -eq 'Stopped' -and -not (Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action start)) {
@@ -1675,28 +1927,38 @@ function Start-DbHubActivityRun {
     $stamp = $Context.NowUtc.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
     $who = Get-DbHubRequester -Context $Context -RequestedBy $Request.RequestedBy
     $dispatched = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    # The dispatched activities that aren't off (a reference the dispatch block counts in): without one, the run stops what
+    # it started.
+    $sent = @{ Activities = 0 }
     # This run's Run Commands, which no cleanup of its own deletes.
     $runNames = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $runNames.Add(('{0}monitoring-{1}' -f $settings.runCommandPrefix, $stamp))
     $plans = [ordered]@{}
     foreach ($vm in @($byVm.Keys)) {
-        $plans[$vm] = [pscustomobject]@{ Activities = @($byVm[$vm] | Where-Object { $_.Target -ne 'T4' }); Done = $false; Running = $false }
+        # T4's off goes out with sqlvm01's activities, without waiting for T4: its profile is a file on T1.
+        $plans[$vm] = [pscustomobject]@{ Activities = @($byVm[$vm] | Where-Object { $_.Target -ne 'T4' -or $_.Scenario -ceq 'off' }); Done = $false; Running = $false }
     }
     $t4Activity = $null
     if ($null -ne $t4 -and $plans.Contains($sqlVm)) {
-        $t4Activity = @($byVm[$sqlVm] | Where-Object { $_.Target -eq 'T4' }) | Select-Object -First 1
+        $t4Activity = @($byVm[$sqlVm] | Where-Object { $_.Target -eq 'T4' -and $_.Scenario -cne 'off' }) | Select-Object -First 1
     }
     $t4Pending = $null -ne $t4Activity
     $monitor = $null
-    if ($plans.Contains($sqlVm)) {
-        $monitor = Initialize-DbHubMonitorState
+    if ($sqlActive) {
+        $monitor = Initialize-DbHubMonitorState -StartUtc $sqlStartedUtc
     }
     $dispatch = {
         param([string] $VmName, [object[]] $Chosen, [string] $Name)
         $runNames.Add($Name)
         if (Send-DbHubDispatch -Context $Context -VmName $VmName -Activity $Chosen -Name $Name -RequestedBy $who) {
             foreach ($item in $Chosen) {
-                $dispatched.Add(('{0}: {1} for {2} minutes' -f $item.Target, $item.Scenario, $item.Minutes))
+                if ($item.Scenario -ceq 'off') {
+                    $dispatched.Add(('{0}: off' -f $item.Target))
+                }
+                else {
+                    $dispatched.Add(('{0}: {1} for {2} minutes' -f $item.Target, $item.Scenario, $item.Minutes))
+                    $sent.Activities++
+                }
             }
         }
         else {
@@ -1792,10 +2054,10 @@ function Start-DbHubActivityRun {
     }
     $result.dispatched = $dispatched.ToArray()
     $result.skipped = $skipped.ToArray()
-    if ($dispatched.Count -eq 0) {
+    if ($sent.Activities -eq 0) {
         $stopped = Stop-DbHubDemo -Context $Context -Tags $Tags
         $result.status = 'Failed'
-        $result.message = 'Nothing could be dispatched ({0}), so everything was stopped again: {1}.' -f ($skipped -join '; '), ((@($stopped.Done) + @($stopped.Failed)) -join ', ')
+        $result.message = 'No activity could be dispatched ({0}), so everything was stopped again: {1}.' -f ($skipped -join '; '), ((@($stopped.Done) + @($stopped.Failed)) -join ', ')
         return [pscustomobject]$result
     }
     $result.status = 'Dispatched'
@@ -1995,8 +2257,9 @@ function Invoke-DbHubMonitor {
     .SYNOPSIS
     DbHub-Monitor's entry point, which a run's monitoring re-checks start (Register-DbHubMonitorRecheck): while the run
     lasts (its auto-stop is pending) and sqlvm01 runs, it looks after T1's monitoring plugin as the run's start did
-    (Step-DbHubMonitor): left alone when it runs, its agent's service restarted when it reports another state or no
-    status. It never starts or stops a VM or T4, and does nothing once the run has ended.
+    (Step-DbHubMonitor): left alone when a status reported since the VM's latest start says it runs, its agent's service
+    restarted once when a fresh status says another state or no fresh status comes. It never starts or stops a VM or T4,
+    and does nothing once the run has ended.
     #>
     param(
         [Parameter(Mandatory = $true)]

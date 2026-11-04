@@ -166,15 +166,33 @@
     "statusPlugin": "DatabaseMonitorArcPlugin"
   },
   "postgresql": {
-    "note": "T4 (Phase 24, ADR 0019): Azure Database for PostgreSQL flexible server, Burstable Standard_B1ms (config/profiles.json t4). majorVersion is a generally available major version (version policy and supported versions on Learn, checked 2026-10-23: 11 to 18, with 18 GA; West US 3's capabilities list 11 to 18). The server and its child resources use the apiVersions entries above: 2025-08-01 is the newest version Bicep 0.47.16 has types for (2026-10-01 is published but has no Bicep types yet). The runner's PostgreSQL provider, Npgsql, is pinned in workload-generator/Directory.Packages.props, and the optional local test server in workloadRunner.localTestPostgresImage.",
+    "note": "T4 (Phase 24, ADR 0019): Azure Database for PostgreSQL flexible server, General Purpose Standard_D4ds_v5 by default since 2026-11-04 (config/profiles.json t4; user-directed, for autonomous tuning, which needs at least 4 vCores; it was Burstable Standard_B1ms). majorVersion is a generally available major version (version policy and supported versions on Learn, checked 2026-10-23: 11 to 18, with 18 GA; West US 3's capabilities list 11 to 18). The server and its child resources use the apiVersions entries above: 2025-08-01 is the newest version Bicep 0.47.16 has types for (2026-10-01 is published but has no Bicep types yet). The runner's PostgreSQL provider, Npgsql, is pinned in workload-generator/Directory.Packages.props, and the optional local test server in workloadRunner.localTestPostgresImage.",
     "majorVersion": "18",
     "serverNamePrefix": "pgflex01",
     "databaseName": "contosocare",
     "runnerRole": "contosocare_runner",
     "tokenResource": "https://ossrdbms-aad.database.windows.net",
     "enhancedMetricsParameter": "metrics.collector_database_activity",
+    "maxConnections": 50,
+    "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_D4ds_v5 and Standard_D4ads_v5 (default 1,718), Standard_D2ds_v5 (859), and Standard_B2s (429) refuse the surge's overshoot too, and Database Hub's Failed connections fill on every size. Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
     "autoStartAfterStoppedDays": 7,
     "capabilitiesApiVersion": "2025-08-01",
+    "autonomousTuning": {
+      "note": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): set by the template only when Get-DemoT4Tuning allows it, on a General Purpose or Memory Optimized size with at least minVCores vCores ('supported on any currently supported compute SKU with at least 4 vCores'; Query Store, which it needs, shouldn't run on Burstable). Query Store captures the top queries, with the first sample of each parameterized query's parameters (the runner's queries are parameterized), and index tuning runs in report mode every 60 minutes, its minimum, because T4 runs only during demos; the interval is set before the mode, because the first session is scheduled from the interval in effect when tuning is turned on. All four parameters are dynamic (no restart; checked 2026-11-04). The recommendations show in the Azure portal (the server's Intelligent Performance > Autonomous tuning) and through az postgres flexible-server autonomous-tuning, not in Database Hub.",
+      "minVCores": 4,
+      "queryCaptureMode": "top",
+      "parametersCaptureMode": "capture_first_sample",
+      "analysisIntervalMinutes": 60,
+      "mode": "report",
+      "docUrls": {
+        "autonomousTuning": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning",
+        "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
+        "queryStoreParameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-query-store",
+        "tuningParameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-autonomous-tuning",
+        "cli": "https://learn.microsoft.com/cli/azure/postgres/flexible-server/autonomous-tuning",
+        "scaling": "https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources"
+      }
+    },
     "metrics": {
       "note": "Azure Monitor metrics T4 shows (Database Hub's PostgreSQL dashboard uses the first six; the enhanced metrics need metricsParameter on). Read by status.ps1 and validate.ps1 with az monitor metrics list.",
       "hub": [ "cpu_percent", "memory_percent", "storage_percent", "iops", "active_connections", "connections_failed" ],
@@ -189,7 +207,10 @@
       "monitoring": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-monitoring",
       "stopServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server",
       "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
-      "versionPolicy": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-version-policy"
+      "versionPolicy": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-version-policy",
+      "serverParameters": "https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings",
+      "limits": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits",
+      "restartServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-restart-server"
     },
     "verifiedOn": "2026-10-23"
   },

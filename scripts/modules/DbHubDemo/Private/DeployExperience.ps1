@@ -593,8 +593,8 @@ function Get-DemoBillingNote {
 function Get-DemoT4OffReason {
     <#
     Why T4 isn't deployed, or '' when it is (brief item 16): t4Enabled false in the configuration, or T4's fallback (Phase
-    28 and its follow-up) left it out. Azure refused both Burstable sizes, and the General Purpose fallback,
-    Standard_D2ds_v5, was left out by its cost check or isn't deployed yet (DbHubT4Sku None: with this run's reason and
+    28 and its follow-up, ADR 0019) left it out. Azure refused both 4-vCore sizes, and the 2-vCore fallback,
+    Standard_D2ds_v5, was left out by its cost check or isn't deployed yet (DbHubT4Size None: with this run's reason and
     fix from -Result's DEPLOY.T4.SKU or PREFLIGHT.T4.FALLBACK when it has one), or Azure refused it too (Refused). Decided
     from the effective configuration, as the deployment decides (Resolve-DemoEffectiveConfig), so a t4SkuName the
     configuration sets wins over a recorded "no T4" (review finding 5). Pure. Internal.
@@ -620,7 +620,7 @@ function Get-DemoT4OffReason {
     }
     $location = [string]$Config['location']
     if ([string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') -ceq 'Refused') {
-        return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both Burstable sizes, Standard_B1ms and Standard_B2s, and the General Purpose fallback, Standard_D2ds_v5, in {0} (SkuNotAvailable), so nothing is tried again on its own. To add it, ask for access with a Region access request (Learn: Resolve capacity errors), then set t4SkuName and run ./scripts/deploy.ps1.' -f $location)
+        return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both 4-vCore sizes, Standard_D4ds_v5 and Standard_D4ads_v5, in {0} (SkuNotAvailable), and then the 2-vCore fallback, Standard_D2ds_v5, or t4AutonomousTuning true ruled that out, so nothing is tried again on its own. To add it, ask for access with a Region access request (Learn: Resolve capacity errors), then set t4SkuName and run ./scripts/deploy.ps1.' -f $location)
     }
     # The fallback's cost check left it out (Phase 28 follow-up): this run's own reason, with the numbers, when it has one.
     $skipped = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -in 'DEPLOY.T4.SKU', 'PREFLIGHT.T4.FALLBACK' -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'skipReason') -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'startSku') -ceq 'None' }) | Select-Object -Last 1
@@ -636,9 +636,9 @@ function Get-DemoT4OffReason {
             PriceError          = ''
         }
         $skip = Get-DemoT4SkipReason -Cost $cost
-        return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both Burstable sizes, Standard_B1ms and Standard_B2s, in {0} (SkuNotAvailable), and the General Purpose fallback, Standard_D2ds_v5, wasn''t created: {1}. {2}' -f $location, $skip.Because, $skip.Remediation)
+        return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both 4-vCore sizes, Standard_D4ds_v5 and Standard_D4ads_v5, in {0} (SkuNotAvailable), and the 2-vCore fallback, Standard_D2ds_v5, wasn''t created: {1}. {2}' -f $location, $skip.Because, $skip.Remediation)
     }
-    return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both Burstable sizes, Standard_B1ms and Standard_B2s, in {0} (SkuNotAvailable), and the General Purpose fallback, Standard_D2ds_v5, isn''t deployed. deploy.ps1 checks it, price and ceilings first, whenever it deploys the template: run ./scripts/deploy.ps1 -FromStage Preflight.' -f $location)
+    return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both 4-vCore sizes, Standard_D4ds_v5 and Standard_D4ads_v5, in {0} (SkuNotAvailable), and the 2-vCore fallback, Standard_D2ds_v5, isn''t deployed. deploy.ps1 checks it, price and ceilings first, whenever it deploys the template: run ./scripts/deploy.ps1 -FromStage Preflight.' -f $location)
 }
 
 function Get-DemoDoneRequirement {
@@ -1064,7 +1064,7 @@ function Get-DemoDeploymentOutcome {
         [AllowEmptyCollection()]
         [string[]] $StartedVm = @(),
 
-        # T4's hourly list price on the General Purpose fallback (Phase 28 follow-up), from the Azure Retail Prices API;
+        # T4's hourly list price at a fallback size (ADR 0019), from the Azure Retail Prices API;
         # the caller reads it, so this stays pure.
         [AllowNull()]
         [object] $T4HourlyUsd = $null,
@@ -1093,7 +1093,7 @@ function Get-DemoDeploymentOutcome {
     if ($t4Off) {
         $notes.Add($t4Off)
     }
-    # Said loudly (Phase 28 follow-up): T4 runs on the General Purpose fallback, with its price; "created" only with
+    # Said loudly (ADR 0019): T4 runs at a fallback size, with whether autonomous tuning is on and its price; "created" only with
     # evidence that the server exists (review of 20e855c).
     $t4Created = if ($null -ne $T4Created) { [bool]$T4Created } else { Get-DemoT4ServerEvidence -Result $all -State $State }
     $t4Fallback = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd $T4HourlyUsd -Created $t4Created -Why $T4Why
