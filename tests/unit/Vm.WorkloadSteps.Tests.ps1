@@ -905,7 +905,9 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             Mock -CommandName Set-VM -MockWith { $script:guest.AutomaticStartAction = $AutomaticStartAction }
             Mock -CommandName Start-VM -MockWith { $script:guest.State = 'Running'; $script:guest.Heartbeat = 'OkApplicationsHealthy' }
             Mock -CommandName Get-VMNetworkAdapter -MockWith { $script:adapters }
-            Mock -CommandName Connect-VMNetworkAdapter -MockWith { $VMNetworkAdapter.SwitchName = $SwitchName }
+            # The golden script's own Connect-GoldenAdapter, which the relay reuses: on a host with the Hyper-V module (the
+            # Windows runners) Pester mocks the real Connect-VMNetworkAdapter, whose -VMNetworkAdapter takes only a real adapter.
+            Mock -CommandName Connect-GoldenAdapter -MockWith { foreach ($adapter in $script:adapters) { if (-not [string]$adapter.SwitchName) { $adapter.SwitchName = $SwitchName } } }
             Mock -CommandName Get-GoldenImdsVmId -MockWith { if ($script:imds) { $script:imds } else { throw 'The Instance Metadata Service did not answer.' } }
             Mock -CommandName Wait-GoldenGuest -MockWith { [pscustomobject]@{ Credential = $script:guestCredential; Seconds = 20 } }
             # The host bootstrap's lock, which a capture's Prepare holds too.
@@ -952,7 +954,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             $result.evidence.golden | Should -Be 'Source'
             $result.evidence.released | Should -Be 'Source'
             $result.evidence.sqlService | Should -Be 'Running'
-            Should -Invoke -CommandName Connect-VMNetworkAdapter -Times 1 -Exactly -ParameterFilter { $SwitchName -eq 'DbHubDemoNat' }
+            Should -Invoke -CommandName Connect-GoldenAdapter -Times 1 -Exactly -ParameterFilter { $SwitchName -eq 'DbHubDemoNat' }
             Should -Invoke -CommandName Set-VM -Times 1 -Exactly -ParameterFilter { $AutomaticStartAction -eq 'Start' -and $AutomaticStartDelay -eq 0 }
             Should -Invoke -CommandName Start-VM -Times 1 -Exactly
             $capture = Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json
@@ -970,7 +972,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             $result.status | Should -Be 'Fail'
             $result.evidence.golden | Should -Be 'CopyNotReset'
             $result.message | Should -Match 'deploy\.ps1'
-            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-VMNetworkAdapter', 'Invoke-DemoControlGuestCommand') {
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Invoke-DemoControlGuestCommand') {
                 Should -Invoke -CommandName $command -Times 0 -Exactly
             }
             (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
@@ -995,7 +997,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             $result.evidence.golden | Should -Be 'ResetCopy'
             $result.evidence.released | Should -Be 'Copy'
             Should -Invoke -CommandName Wait-GoldenGuest -Times 1 -Exactly
-            Should -Invoke -CommandName Connect-VMNetworkAdapter -Times 1 -Exactly
+            Should -Invoke -CommandName Connect-GoldenAdapter -Times 1 -Exactly
         }
 
         It 'reads the host''s VM ID for a released record, and then only waits for the running guest of the source' {
@@ -1007,7 +1009,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             $result.status | Should -Be 'Pass'
             $result.evidence.golden | Should -Be 'Released'
             Should -Invoke -CommandName Get-GoldenImdsVmId -Times 1 -Exactly
-            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-VMNetworkAdapter', 'Enter-GoldenLock') {
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Enter-GoldenLock') {
                 Should -Invoke -CommandName $command -Times 0 -Exactly
             }
             # A copy whose reset is recorded is taken at its word: no VM ID is read.
@@ -1030,7 +1032,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             $result.evidence.golden | Should -Be 'CopyNotReset'
             $result.message | Should -Match 'record says released, but its Arc identity was never reset'
             $result.message | Should -Match 'deploy\.ps1'
-            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-VMNetworkAdapter', 'Invoke-DemoControlGuestCommand', 'Wait-GoldenGuest') {
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Invoke-DemoControlGuestCommand', 'Wait-GoldenGuest') {
                 Should -Invoke -CommandName $command -Times 0 -Exactly
             }
             # The same record on a host whose VM ID can't be read is refused too.
@@ -1051,7 +1053,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             $result.message | Should -Match 'A golden capture is in progress .*snapshot snap-dbhub-t2golden-202611032130, since 2026-11-03T21:29:26Z'
             $result.message | Should -Match 'capture-t2-golden\.ps1'
             $result.message | Should -Match 'from 2026-11-04T03:29:26Z'
-            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-VMNetworkAdapter', 'Enter-GoldenLock', 'Invoke-DemoControlGuestCommand') {
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Enter-GoldenLock', 'Invoke-DemoControlGuestCommand') {
                 Should -Invoke -CommandName $command -Times 0 -Exactly
             }
             (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
@@ -1073,7 +1075,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             $result.evidence.golden | Should -Be 'CaptureInProgress'
             Should -Invoke -CommandName Enter-GoldenLock -Times 1 -Exactly
             $script:lockReleased | Should -BeTrue
-            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-VMNetworkAdapter') {
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter') {
                 Should -Invoke -CommandName $command -Times 0 -Exactly
             }
             (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
@@ -1117,7 +1119,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
                 $result.message | Should -Match 'capture marker on .* can''t be read, and only a capture writes it'
                 $result.message | Should -Match 'capture-t2-golden\.ps1 again'
             }
-            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-VMNetworkAdapter', 'Enter-GoldenLock', 'Invoke-DemoControlGuestCommand') {
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Enter-GoldenLock', 'Invoke-DemoControlGuestCommand') {
                 Should -Invoke -CommandName $command -Times 0 -Exactly
             }
         }
@@ -1148,7 +1150,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             $result.evidence.startActionBefore | Should -Be 'StartIfRunning'
             Should -Invoke -CommandName Set-VM -Times 1 -Exactly -ParameterFilter { $AutomaticStartAction -eq 'Start' }
             Should -Invoke -CommandName Start-VM -Times 1 -Exactly
-            Should -Invoke -CommandName Connect-VMNetworkAdapter -Times 0 -Exactly
+            Should -Invoke -CommandName Connect-GoldenAdapter -Times 0 -Exactly
         }
 
         It 'waits while SQL Server in the guest refuses connections, then sets the profile' {
