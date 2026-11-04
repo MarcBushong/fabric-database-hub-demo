@@ -217,7 +217,10 @@ function Wait-DemoStoppedStart {
     the results with DEPLOY.VMSTART: Pass when every VM runs, Fail when one doesn't, because every Run Command on it would
     fail, so the caller stops there. Updates the status page's StartVms step. Nothing when nothing was stopped. T1's
     monitoring plugin, which can stop after a restart, is the caller's next check (Invoke-DemoT1MonitoringCheck), on
-    every run without a T1 Monitoring step, whether or not this run started sqlvm01. Internal.
+    every run without a T1 Monitoring step, whether or not this run started sqlvm01. With -ActivityProfile (one with
+    incidents), each VM that now runs gets its targets' interim baseline as soon as it does, before the run's Run Commands
+    there, sent without waiting (Invoke-DemoActivityQuiet -Started): its profile host resumes the profile stored there
+    about 2 minutes after the boot (review of PR 16, 2026-11-04). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -232,7 +235,10 @@ function Wait-DemoStoppedStart {
         [string] $ProgressPath = '',
 
         [ValidateRange(1, 60)]
-        [int] $T4WaitMinutes = 15
+        [int] $T4WaitMinutes = 15,
+
+        [AllowNull()]
+        [pscustomobject] $ActivityProfile = $null
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -249,6 +255,9 @@ function Wait-DemoStoppedStart {
         $results.Add($item)
         if ([string]$item.status -ne 'Pass') {
             $notRunning.Add($vm)
+        }
+        elseif ($null -ne $ActivityProfile) {
+            Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $ActivityProfile -VmName $vm -RequestedBy 'deploy' -Started
         }
         $itemEvidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
         if ([bool]$Request.Vms[$vm].Requested -or [string](Get-DemoMemberValue -InputObject $itemEvidence -Name 'issued') -eq 'start') {

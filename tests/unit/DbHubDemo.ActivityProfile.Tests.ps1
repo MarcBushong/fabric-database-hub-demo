@@ -335,6 +335,91 @@ Describe 'The switch from the interim baseline (Invoke-DemoActivitySwitch, Send-
     }
 }
 
+Describe 'A stop (Ctrl+C) in the middle of a send (review of PR 16, 2026-11-04)' {
+    BeforeEach {
+        $script:puts = [System.Collections.Generic.List[string]]::new()
+        $script:stopAt = ''
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $url = [string]$ArgumentList[[array]::IndexOf($ArgumentList, '--url') + 1]
+            if ($script:stopAt -and $url -match ('/virtualMachines/{0}/' -f $script:stopAt)) {
+                # What Ctrl+C does to the command that runs: every catch block is skipped, and finally blocks still run.
+                throw [System.Management.Automation.PipelineStoppedException]::new()
+            }
+            $script:puts.Add($url)
+            [pscustomobject]@{ ExitCode = 0; StdOut = '{}'; StdErr = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRunCommandState -MockWith { [pscustomobject]@{ Found = $true; NotFound = $false; ProvisioningState = 'Succeeded'; ExecutionState = 'Succeeded'; ExitCode = 0; StartTime = [DateTime]::UtcNow; Output = ''; Error = '' } }
+        InModuleScope DbHubDemo { Clear-DemoActivitySwitch }
+
+        function Invoke-StoppablePipeline([string] $Script, [System.Collections.IDictionary] $Config) {
+            # Runs -Script in a pipeline of this runspace, which a stop ends alone, as Ctrl+C ends a script's.
+            $shell = [powershell]::Create([System.Management.Automation.RunspaceMode]::CurrentRunspace)
+            try {
+                $null = $shell.AddScript($Script).AddArgument($Config)
+                $null = $shell.Invoke()
+                return [string]$shell.InvocationStateInfo.State
+            }
+            finally {
+                $shell.Dispose()
+            }
+        }
+    }
+
+    AfterEach {
+        InModuleScope DbHubDemo { Clear-DemoActivitySwitch }
+    }
+
+    It 'forgets a VM only once Azure accepted its switch, so the fallback sends the rest and says so' {
+        # Reviewer: the switch forgot both VMs before any request was in, so after a stop the fallback found nothing.
+        $config = New-TestConfig
+        InModuleScope DbHubDemo { Register-DemoActivitySwitch -VmName 'sqlvm01'; Register-DemoActivitySwitch -VmName 'archost01' }
+        $script:stopAt = 'archost01'
+        $state = Invoke-StoppablePipeline -Config $config -Script 'param($Config) & (Get-Module -Name DbHubDemo) { param($C) Send-DemoPendingActivitySwitch -Config $C -ActivityProfile (Get-DemoActivityProfile -Config $C) -CheckPrefix START -RequestedBy start-demo -WaitSeconds 60 } $Config'
+        $state | Should -Be 'Stopped'
+        @($script:puts | Where-Object { $_ -match '/virtualMachines/sqlvm01/' }) | Should -HaveCount 1
+        InModuleScope DbHubDemo { @(Get-DemoActivitySwitchVm) } | Should -Be @('archost01') -Because 'sqlvm01''s request was in, and archost01''s wasn''t'
+
+        # start-demo.ps1's finally, or Complete-DemoDeploymentRun, sends what's left without waiting, and says so.
+        $script:stopAt = ''
+        $script:puts.Clear()
+        $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -CheckPrefix START -RequestedBy start-demo -NoWait }
+        @($script:puts) | Should -HaveCount 1
+        $script:puts[0] | Should -Match '/virtualMachines/archost01/runCommands/DbHubDemo-Profile\?'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -eq 'The run stopped before its end, so business-day was sent to archost01 without waiting: T2 switches from the interim baseline when the VM runs it.' }
+        InModuleScope DbHubDemo { @(Get-DemoActivitySwitchVm) } | Should -BeNullOrEmpty
+    }
+
+    It 'forgets every VM once a switch returns, whatever each outcome, so a run that ended sends nothing again' {
+        $config = New-TestConfig
+        InModuleScope DbHubDemo { Register-DemoActivitySwitch -VmName 'sqlvm01'; Register-DemoActivitySwitch -VmName 'archost01' }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -CheckPrefix START -RequestedBy start-demo -WaitSeconds 60 })
+        @($results | ForEach-Object { $_.checkId }) | Should -Be @('START.INCIDENTS_T1', 'START.INCIDENTS_T3', 'START.INCIDENTS_T2')
+        InModuleScope DbHubDemo { @(Get-DemoActivitySwitchVm) } | Should -BeNullOrEmpty
+    }
+
+    It 'notes each VM before its interim request goes out, so a stop during the send leaves both to the fallback' {
+        # Reviewer: the interim send noted the VMs only once the whole send had returned.
+        $config = New-TestConfig
+        $script:stopAt = 'sqlvm01'
+        $state = Invoke-StoppablePipeline -Config $config -Script 'param($Config) & (Get-Module -Name DbHubDemo) { param($C) Invoke-DemoActivityQuiet -Config $C -ActivityProfile (Get-DemoActivityProfile -Config $C) -VmName sqlvm01, archost01 -RequestedBy deploy } $Config'
+        $state | Should -Be 'Stopped'
+        $script:puts | Should -BeNullOrEmpty
+        InModuleScope DbHubDemo { @(Get-DemoActivitySwitchVm) } | Should -Be @('archost01', 'sqlvm01')
+    }
+
+    It 'keeps a VM noted when Azure refused its interim request but something else had noted it already' {
+        # activityProfileOnBoot, or a stage of the run, can have noted the VM first: its switch must still come.
+        $config = New-TestConfig
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "ERROR: (OperationNotAllowed) Operation 'Run Command' is not allowed on VM since the VM is deallocated." } }
+        InModuleScope DbHubDemo { Register-DemoActivitySwitch -VmName 'archost01' }
+        $reached = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoActivityQuiet -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -VmName 'sqlvm01', 'archost01' -RequestedBy 'deploy' -PassThru })
+        $reached | Should -BeNullOrEmpty
+        InModuleScope DbHubDemo { @(Get-DemoActivitySwitchVm) } | Should -Be @('archost01') -Because 'sqlvm01 was noted only for this send, which Azure refused'
+    }
+}
+
 Describe 'Complete-DemoDeploymentRun sends a switch the run didn''t get to (Ctrl+C, an error)' {
     BeforeEach {
         $script:out = Join-Path -Path $TestDrive -ChildPath ('out-' + [guid]::NewGuid().ToString('N'))

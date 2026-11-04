@@ -539,6 +539,8 @@ function Send-DemoProfileRunCommand {
       or T4 that T1 doesn't drive yet), Failed (the runner or the Run Command failed; Detail says why), TimedOut (no
       result within -WaitSeconds: the Run Command goes on, until its expiry), NotSent (Azure didn't accept it, for
       example on a VM that isn't running), or, with -WaitSeconds 0, Sent (accepted, not waited for).
+    - -OnSent runs with the VM's name as soon as Azure accepts that VM's request, before the next VM's, so a caller can
+      forget a VM only once its request is in, even when a stop (Ctrl+C) ends this midway (review of PR 16, 2026-11-04).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject[]])]
@@ -565,7 +567,10 @@ function Send-DemoProfileRunCommand {
         [int] $PollSeconds = 10,
 
         [ValidateRange(5, 120)]
-        [int] $ExpiresMinutes = 30
+        [int] $ExpiresMinutes = 30,
+
+        [AllowNull()]
+        [scriptblock] $OnSent = $null
     )
 
     $subscriptionId = [string]$Config['subscriptionId']
@@ -616,6 +621,9 @@ function Send-DemoProfileRunCommand {
             }
             if ($put.ExitCode -eq 0) {
                 $sent[$vm] = $url
+                if ($null -ne $OnSent) {
+                    $null = & $OnSent $vm
+                }
                 continue
             }
             $why = if (Test-DemoAzVmNotRunning -Text ([string]$put.StdErr)) { '{0} isn''t running' -f $vm } else { Get-DemoDeploymentErrorText -Text ([string]$put.StdErr) -MaxLength 300 }
@@ -703,6 +711,7 @@ function Invoke-DemoActivitySwitch {
     - -NoWait, for a run that's stopped (Ctrl+C) or failed: the Run Commands are only sent, in a few seconds, so no VM
       stays on the interim baseline; one console line says so, and nothing is returned, because nothing reads the
       results then. Sending them doesn't stop the run: a failure is logged.
+    - -OnSent goes to Send-DemoProfileRunCommand: it runs for each VM once Azure accepts that VM's request.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -727,7 +736,10 @@ function Invoke-DemoActivitySwitch {
         [ValidateRange(1, 1800)]
         [int] $WaitSeconds = 180,
 
-        [switch] $NoWait
+        [switch] $NoWait,
+
+        [AllowNull()]
+        [scriptblock] $OnSent = $null
     )
 
     $targets = @($Target | Where-Object { $_ } | Select-Object -Unique)
@@ -741,7 +753,7 @@ function Invoke-DemoActivitySwitch {
     $verb = if ($targets.Count -eq 1) { 'switches' } else { 'switch' }
     if ($NoWait) {
         try {
-            $sent = @(Send-DemoProfileRunCommand -Config $Config -Target $targets -ProfileName $name -RequestedBy $RequestedBy -WaitSeconds 0)
+            $sent = @(Send-DemoProfileRunCommand -Config $Config -Target $targets -ProfileName $name -RequestedBy $RequestedBy -WaitSeconds 0 -OnSent $OnSent)
             $failed = @($sent | Where-Object { $_.Outcome -ne 'Sent' })
             if ($failed.Count -eq 0) {
                 Write-DemoLog -Level Warning -Message ('The run stopped before its end, so {0} was sent to {1} without waiting: {2} {3} from the interim baseline when the VM runs it.' -f $name, $vmText, (Join-DemoActivityList -Item $targets), $verb)
@@ -759,7 +771,7 @@ function Invoke-DemoActivitySwitch {
     Write-DemoLog -Message ('This run''s own Run Commands on {0} are done, so {1} {2} from the interim baseline to {3} now.' -f $vmText, (Join-DemoActivityList -Item $targets), $verb, $name)
     $records = @()
     try {
-        $records = @(Send-DemoProfileRunCommand -Config $Config -Target $targets -ProfileName $name -RequestedBy $RequestedBy -WaitSeconds $WaitSeconds)
+        $records = @(Send-DemoProfileRunCommand -Config $Config -Target $targets -ProfileName $name -RequestedBy $RequestedBy -WaitSeconds $WaitSeconds -OnSent $OnSent)
     }
     catch {
         $problem = Protect-DemoText -Text $_.Exception.Message
@@ -811,6 +823,9 @@ function Send-DemoPendingActivitySwitch {
     - start-demo.ps1: at the warm-up's start, once its own Run Commands are done; a VM whose Run Commands the script still
       sends (-Interactive -ResetAdminPassword sets the host password afterward) is switched by the script after them; and
       with -NoWait when the start ends before its switch.
+    A VM is forgotten once Azure accepts its request, and the rest once the switch returns: a stop (Ctrl+C) that ends the
+    switch midway skips every catch block, so a VM forgotten before its request was in would leave the fallback (-NoWait)
+    nothing to send and nothing to say (review of PR 16, 2026-11-04).
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -846,24 +861,33 @@ function Send-DemoPendingActivitySwitch {
     if ($vms.Count -eq 0) {
         return @()
     }
-    foreach ($vm in $vms) {
-        $null = $script:DemoActivitySwitchVm.Remove($vm)
-    }
     $targets = @(Get-DemoActivitySwitchTarget -Config $Config -VmName $vms -Result $Result -CheckPrefix $CheckPrefix)
-    return @(Invoke-DemoActivitySwitch -Config $Config -ActivityProfile $ActivityProfile -Target $targets -CheckPrefix $CheckPrefix -RequestedBy $RequestedBy -WaitSeconds $WaitSeconds -NoWait:$NoWait)
+    $forget = { param([string] $Vm) $null = $script:DemoActivitySwitchVm.Remove($Vm) }
+    $switched = @(Invoke-DemoActivitySwitch -Config $Config -ActivityProfile $ActivityProfile -Target $targets -CheckPrefix $CheckPrefix -RequestedBy $RequestedBy -WaitSeconds $WaitSeconds -NoWait:$NoWait -OnSent $forget)
+    # The switch returned, so each VM's outcome is reported (or logged); only a stop leaves a VM here.
+    foreach ($vm in $vms) {
+        & $forget $vm
+    }
+    return $switched
 }
 
 function Invoke-DemoActivityQuiet {
     <#
     .SYNOPSIS
-    A run that finds a VM already running sets the interim baseline on that VM's targets first, before its own Run
-    Commands there (2026-11-03, ADR 0010): an earlier start, or a deploy.ps1 that ended NOT DONE, can have left business-day's
-    incidents running, and Run Commands on a busy VM took minutes (2026-10-23). One managed Run Command per VM, sent
-    without waiting, which does nothing after 10 minutes; each VM it reached is noted, so the run's switch at its end, or
-    the one a stop or a failure sends, brings the profile back. Nothing for a profile without incidents. Never throws.
-    Internal.
+    A run sets the interim baseline on a VM's targets before its own Run Commands there (2026-11-03, ADR 0010): on a VM
+    that's already running, where an earlier start, or a deploy.ps1 that ended NOT DONE, can have left business-day's
+    incidents running; and (-Started) on a VM the run started, as soon as it runs, because its profile host resumes the
+    profile stored there about 2 minutes after the boot, while the run's own Run Commands go on (review of PR 16,
+    2026-11-04). Run Commands on a busy VM took minutes (2026-10-23). Internal.
+
+    .DESCRIPTION
+    One managed Run Command per VM, sent without waiting, which does nothing after 10 minutes. Each VM is noted before its
+    request goes out, so a stop (Ctrl+C) during the send still leaves it to the run's switch at its end, or to the one a
+    stop or a failure sends, which brings the profile back; a VM Azure refused, which nothing else had noted, is forgotten
+    again. -PassThru returns the VMs it reached. Nothing for a profile without incidents. Never throws, apart from a stop.
     #>
     [CmdletBinding()]
+    [OutputType([string[]])]
     param(
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
@@ -880,7 +904,11 @@ function Invoke-DemoActivityQuiet {
 
         [Parameter(Mandatory)]
         [ValidatePattern('^[A-Za-z0-9._@/-]{1,64}$')]
-        [string] $RequestedBy
+        [string] $RequestedBy,
+
+        [switch] $Started,
+
+        [switch] $PassThru
     )
 
     $vms = @($VmName | Where-Object { $_ -in 'sqlvm01', 'archost01' } | Select-Object -Unique)
@@ -892,19 +920,39 @@ function Invoke-DemoActivityQuiet {
     if ($targets.Count -eq 0) {
         return
     }
+    $hostVm = Get-DemoHostVmName -Config $Config
+    $sending = @($targets | ForEach-Object { if ($_ -eq 'T2') { $hostVm } else { 'sqlvm01' } } | Select-Object -Unique | Where-Object { $_ -in $vms })
+    $known = @(Get-DemoActivitySwitchVm)
+    foreach ($vm in $sending) {
+        Register-DemoActivitySwitch -VmName $vm
+    }
+    $reachedVms = @()
     try {
         $sent = @(Send-DemoProfileRunCommand -Config $Config -Target $targets -ProfileName $ActivityProfile.Interim -RequestedBy $RequestedBy -WaitSeconds 0 -ExpiresMinutes 10)
         $reached = @($sent | Where-Object { $_.Outcome -eq 'Sent' })
         $reachedVms = @($reached | ForEach-Object { [string]$_.VmName } | Select-Object -Unique)
-        foreach ($vm in $reachedVms) {
-            Register-DemoActivitySwitch -VmName $vm
+        foreach ($vm in $sending) {
+            if ($vm -notin $reachedVms -and $vm -notin $known) {
+                $null = $script:DemoActivitySwitchVm.Remove($vm)
+            }
         }
         if ($reachedVms.Count -gt 0) {
-            Write-DemoLog -Message ('{0} {1} already running, so {2} get the interim {3} first, without waiting: no incident slows this run''s own Run Commands there, and {4} comes back at the end.' -f (Join-DemoActivityList -Item $reachedVms), $(if ($reachedVms.Count -eq 1) { 'was' } else { 'were' }), (Join-DemoActivityList -Item @($reached | ForEach-Object { [string]$_.Target })), $ActivityProfile.Interim, $ActivityProfile.Name)
+            $vmText = Join-DemoActivityList -Item $reachedVms
+            $targetText = Join-DemoActivityList -Item @($reached | ForEach-Object { [string]$_.Target })
+            $message = if ($Started) {
+                '{0} started, so {1} get the interim {2} now that {4}, without waiting: its profile host resumes the profile stored there about 2 minutes after the boot, and no incident slows this run''s own Run Commands there; {3} comes back at the end.' -f $vmText, $targetText, $ActivityProfile.Interim, $ActivityProfile.Name, $(if ($reachedVms.Count -eq 1) { 'it runs' } else { 'they run' })
+            }
+            else {
+                '{0} {1} already running, so {2} get the interim {3} first, without waiting: no incident slows this run''s own Run Commands there, and {4} comes back at the end.' -f $vmText, $(if ($reachedVms.Count -eq 1) { 'was' } else { 'were' }), $targetText, $ActivityProfile.Interim, $ActivityProfile.Name
+            }
+            Write-DemoLog -Message $message
         }
     }
     catch {
-        Write-DemoLog -Level Debug -Message ('The interim baseline wasn''t sent to the VMs that run: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        Write-DemoLog -Level Debug -Message ('The interim baseline wasn''t sent to {0}: {1}' -f (Join-DemoActivityList -Item $sending), (Protect-DemoText -Text $_.Exception.Message))
+    }
+    if ($PassThru) {
+        return $reachedVms
     }
 }
 

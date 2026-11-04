@@ -10,7 +10,10 @@ function Start-DemoEnvironment {
     2. The cost guardrail (Test-DemoStartCost): the live estimate against sessionCeilingUsd and
        monthlyCeilingUsd, and the month-to-date actual cost plus one session against monthlyCeilingUsd. A Fail
        stops here, before anything starts; -SkipCostCheck skips it.
-    3. Requests both VM starts at once, then waits until sqlvm01 and the T2 VM run (START.VM_*; ADR 0018). The
+    3. Requests both VM starts at once, then waits until sqlvm01 and the T2 VM run (START.VM_*; ADR 0018). With a
+       profile with incidents, a VM that was already running gets the interim baseline before the starts are waited for,
+       and a VM this start booted gets it as soon as it runs (review of PR 16, 2026-11-04): its profile host resumes the
+       profile stored there about 2 minutes after the boot. Both are sent without waiting (Invoke-DemoActivityQuiet). The
        bootstraps resume on their own. A golden snapshot's source host gets its air-gapped guest back
        (T2.GOLDEN.SOURCE, Invoke-DemoGoldenSourceRelease). T1's monitoring plugin, which can stay NotRunning
        after a deallocation (live, 2026-10-22), gets the SQL IaaS Agent service restarted
@@ -227,9 +230,16 @@ function Start-DemoEnvironment {
     # A VM that was already running may still serve an earlier run's incidents: the targets this start sets get the
     # interim baseline before its own Run Commands reach that VM, and its switch brings the profile back (2026-11-03).
     $quietTargets = @('T1') + @(if (-not $SkipT3) { 'T3' }) + @(if ($t4On) { 'T4' }) + @('T2')
-    Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @(@('sqlvm01', $hostVm) | Where-Object { -not $startRequested[$_] }) -Target $quietTargets -RequestedBy 'start-demo'
+    $quieted = @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @(@('sqlvm01', $hostVm) | Where-Object { -not $startRequested[$_] }) -Target $quietTargets -RequestedBy 'start-demo' -PassThru)
     foreach ($vm in 'sqlvm01', $hostVm) {
-        $results.Add((Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:$startRequested[$vm]))
+        $startResult = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:$startRequested[$vm]
+        $results.Add($startResult)
+        # A VM this start booted resumes the profile stored there about 2 minutes after the boot (business-day lasts 8 hours
+        # from its switch, or until 2 minutes before the next auto-shutdown, so it can outlive a stop), so it gets the
+        # interim baseline as soon as it runs, before this start's own Run Commands there (review of PR 16, 2026-11-04).
+        if ([string]$startResult.status -eq 'Pass' -and $vm -notin $quieted) {
+            Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName $vm -Target $quietTargets -RequestedBy 'start-demo' -Started
+        }
     }
     $running = @{}
     foreach ($vm in 'sqlvm01', $hostVm) {

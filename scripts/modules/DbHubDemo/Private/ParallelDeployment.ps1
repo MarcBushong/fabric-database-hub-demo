@@ -822,13 +822,14 @@ function Invoke-DemoParallelDeployment {
         # The VMs that were stopped run before anything needs them: the tracks' Run Commands, and the template's
         # extensions. A VM that doesn't start stops the run here, with the next action (DEPLOY.VMSTART).
         if ($null -ne $stoppedStart) {
-            $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -ProgressPath $ProgressPath)
+            $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -ProgressPath $ProgressPath -ActivityProfile $activity)
             & $addAll $started
             if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
                 return $results.ToArray()
             }
             # A VM that was already running may still serve an earlier run's incidents: its targets get the interim
             # baseline before the tracks' Run Commands reach it, and the switch below brings the profile back (2026-11-03).
+            # One this run started got it as soon as it ran (Wait-DemoStoppedStart; review of PR 16, 2026-11-04).
             $alreadyRunning = Get-DemoMemberValue -InputObject $stoppedStart -Name 'Running'
             Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @($alreadyRunning) -RequestedBy 'deploy'
         }

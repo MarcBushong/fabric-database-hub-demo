@@ -367,13 +367,14 @@ function Invoke-DemoDeployment {
                 }
             }
             if ($null -ne $stoppedStart) {
-                $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart)
+                $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -ActivityProfile $activity)
                 & $addAll $started
                 if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
                     return (& $finishEarly)
                 }
                 # A VM that was already running may still serve an earlier run's incidents: its targets get the interim
                 # baseline before this run's Run Commands reach it, and the switch at the end brings the profile back.
+                # One this run started got it as soon as it ran (Wait-DemoStoppedStart; review of PR 16, 2026-11-04).
                 $alreadyRunning = Get-DemoMemberValue -InputObject $stoppedStart -Name 'Running'
                 Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @($alreadyRunning) -RequestedBy 'deploy'
             }
