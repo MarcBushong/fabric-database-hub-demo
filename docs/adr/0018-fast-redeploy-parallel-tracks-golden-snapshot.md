@@ -277,6 +277,16 @@ Static only: unit tests for the first run from `deploy.ps1`, the wait by default
 3. **The test isolates its copy by itself** (section 6): a network security group that denies all outbound traffic before the first boot, the proof from inside the guest that no Arc endpoint answers, and the reset before the deny rule goes; with `-Onboard`, the copy is onboarded fresh in the test group under its own resource ID.
 4. **Only `GOLDEN.TEST.SOURCE` assumed a quiet source,** as a second signal; it's adapted above. The code comment "so the copy and the source never run connected at once" (`Invoke-DemoGoldenSourceRelease`) described that signal, not a control.
 
+**Review fix (2026-11-04): nothing releases the source while its capture runs.** Between Prepare and the snapshot, the source's record says unreleased and names this host, which is exactly what the Fabric relay releases: a T2 start in that window (it waited for the bootstrap lock that Prepare held, then got it before the capture's next poll) reconnected the guest and started it, so the snapshot kept a guest that wasn't air-gapped, and every copy would boot connected with the captured identity. Now:
+
+| Rule | How |
+|---|---|
+| Prepare marks the capture as in progress before it touches the guest | `C:\ProgramData\DbHubDemo\golden\capture-in-progress.json` (the snapshot name, the time, and this host's Azure VM ID). Only the capture's own Release removes it (`EndCapture`): its first step, which also ends an interrupted capture's marker, and its return of the source (`GOLDEN.CAPTURE.SOURCE`) |
+| The relay leaves the guest alone while the marker counts | It counts for 6 hours (longer than Prepare, the compaction, the snapshot, and its disk check take together) and only on the host it names; a copy carries the source's marker in the snapshot, where it means nothing. The relay changes the guest (Release, automatic start, `Start-VM`) only under the bootstrap's lock, which Prepare holds too, and on what it reads again under it ([ADR 0020](0020-on-demand-activity-control.md#amendments-2026-11-03-every-start-brings-every-target-back)) |
+| A released record counts only on its source or a reset copy | A copy whose record says released without `resetUtc` may hold the captured identity, so the relay refuses it, and `T2.GUEST.STATE` fails it with `deploy.ps1`, which resets a restored copy |
+| The capture doesn't start during an on-demand run | `GOLDEN.CAPTURE.CONTROL` (before anything changes): a `DbHub-Control` or `DbHub-Stop` job queued or running, or a pending auto-stop, means nothing is captured, because a run starts `archost01` and its auto-stop deallocates it |
+| `status.ps1` says so | `T2.GUEST.STATE` is a **Warning** while a capture is in progress, and says when the marker stops counting, instead of pointing to a Fabric start |
+
 ## Sources (checked 2026-11-03)
 
 - Azure Arc agent status (heartbeat every 5 minutes; Disconnected within 15 to 30 minutes): <https://learn.microsoft.com/azure/azure-arc/servers/overview#agent-status>
