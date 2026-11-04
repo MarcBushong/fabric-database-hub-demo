@@ -58,7 +58,7 @@ function Get-DemoCostEstimate {
 
     .PARAMETER PriceCache
     A hashtable that several estimates in one run share, so each Retail Prices query runs once: preflight prices the
-    demo, and then T4's General Purpose fallback, with the same prices (Phase 28 follow-up). Without it, each estimate
+    demo, and then T4's 2-vCore fallback, with the same prices (ADR 0019). Without it, each estimate
     reads its own prices.
 
     .PARAMETER ActivityProfile
@@ -308,7 +308,7 @@ function Get-DemoCostEstimate {
     $t3BillableGB = if ($t3UsesFreeOffer) { [System.Math]::Max(0.0, [double]$sizing.t3.maxSizeGB - 32.0) } else { [double]$sizing.t3.maxSizeGB }
     Add-Component 'T3 storage' 'idle' ($t3StorageItems | Where-Object { $_.meterName -eq 'General Purpose Data Stored' } | Select-Object -First 1) $t3BillableGB 'GB-month'
 
-    # T4 (Phase 24, ADR 0019): the Burstable flexible server's compute while the demo runs, and its storage and
+    # T4 (Phase 24, ADR 0019): the flexible server's compute while the demo runs, and its storage and
     # private DNS zone (virtual network integration in both network modes) all month, stopped or not. Its
     # backups stay within the free allowance (backup storage up to the provisioned size). A stopped server
     # starts on its own after seven days, so the worst case adds the rest of the month's compute.
@@ -317,8 +317,9 @@ function Get-DemoCostEstimate {
     $t4WorstCase = $null
     $t4Restart = $null
     if ($t4On -and $null -ne $sizing.t4) {
-        # The size actually deployed: the t4SkuName setting (B1ms, the B2s fallback, or the General Purpose D2ds_v5
-        # option, priced per vCore-hour; Phase 24).
+        # The size actually deployed: the t4SkuName setting or the default (General Purpose Standard_D4ds_v5 since
+        # 2026-11-04), the fallback's D4ads_v5 or D2ds_v5 (General Purpose, priced per vCore-hour), or a Burstable size
+        # (one meter per server-hour; ADR 0019).
         $t4SkuName = Get-DemoT4SkuName -Config $Config
         $t4Spec = Get-DemoT4SkuSpec -SkuName $t4SkuName
         $t4ComputeItems = Get-CachedPrice "serviceName eq 'Azure Database for PostgreSQL' and armRegionName eq '$location' and productName eq '$($t4Spec.Product)' and priceType eq 'Consumption'"

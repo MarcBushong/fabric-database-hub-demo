@@ -127,7 +127,7 @@ BeforeAll {
     }
 
     function Reset-T4State {
-        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_B1ms'; MaxConnections = '50'; MaxPending = $false; Restarts = 0 }
+        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_D4ds_v5'; MaxConnections = '50'; MaxPending = $false; Restarts = 0 }
         $script:events = [System.Collections.Generic.List[string]]::new()
     }
 }
@@ -222,7 +222,7 @@ Describe 'Test-DemoT4' {
         $config = New-TestConfig
         $config['t4SkuName'] = 'Standard_B2s'
         $check = Test-DemoT4 -Config $config | Where-Object checkId -EQ 'T4.CONFIG'
-        $check.status | Should -Be 'Warning' -Because 'the server runs Standard_B1ms'
+        $check.status | Should -Be 'Warning' -Because 'the server runs Standard_D4ds_v5, the default'
         $check.message | Should -Match 'on Standard_B2s'
         $check.evidence.wantedSku | Should -Be 'Standard_B2s'
     }
@@ -310,21 +310,37 @@ Describe 'T4 sizes (Phase 24)' {
         $gp.VCores | Should -Be 2
         $gp.Product | Should -Match 'General Purpose Ddsv5 Series Compute'
         $gp.PerVCore | Should -BeTrue
+        $d4 = InModuleScope DbHubDemo { Get-DemoT4SkuSpec -SkuName 'Standard_D4ds_v5' }
+        $d4.VCores | Should -Be 4
+        $d4.Product | Should -Match 'General Purpose Ddsv5 Series Compute'
+        $amd = InModuleScope DbHubDemo { Get-DemoT4SkuSpec -SkuName 'Standard_D4ads_v5' }
+        $amd.Tier | Should -Be 'GeneralPurpose'
+        $amd.VCores | Should -Be 4
+        $amd.Product | Should -Match 'General Purpose Dadsv5 Series Compute'
+        $amd.PerVCore | Should -BeTrue
         { InModuleScope DbHubDemo { Get-DemoT4SkuSpec -SkuName 'Standard_E2ds_v5' } } | Should -Throw '*documented T4 size*'
     }
 
-    It 'offers D2ds_v5 only as a setting: the schema and the template allow it, B1ms stays the default, and the template derives the tier from the size' {
+    It 'offers the documented sizes: the schema and the template allow them, Standard_D4ds_v5 is the default (2026-11-04), and the template derives the tier from the size' {
         $schema = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/environment.schema.json') -Raw | ConvertFrom-Json -AsHashtable
-        $schema.properties['t4SkuName'].enum | Should -Be @('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5')
+        $schema.properties['t4SkuName'].enum | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'Standard_B1ms', 'Standard_B2s')
         # Phase 28: the schema has no default, so an unset size is told apart from one you set (only an unset one falls
-        # back on its own); the profile's size, Standard_B1ms, is what an unset one deploys.
+        # back on its own); the profile's size, Standard_D4ds_v5 since 2026-11-04, is what an unset one deploys. The same
+        # goes for t4AutonomousTuning: unset means on, with a Warning instead of a Fail on a size that can't run it.
         $schema.properties['t4SkuName'].Contains('default') | Should -BeFalse
         (New-TestConfig).Contains('t4SkuName') | Should -BeFalse
         $template = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'azuredeploy.json') -Raw | ConvertFrom-Json -AsHashtable
-        $template.parameters['t4SkuName'].allowedValues | Should -Contain 'Standard_D2ds_v5'
-        $template.parameters['t4SkuName'].defaultValue | Should -Be 'Standard_B1ms'
+        $schema.properties['t4AutonomousTuning'].Contains('default') | Should -BeFalse
+        $template.parameters['t4SkuName'].allowedValues | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'Standard_B1ms', 'Standard_B2s')
+        $template.parameters['t4SkuName'].defaultValue | Should -Be 'Standard_D4ds_v5'
+        $template.parameters['t4AutonomousTuning'].defaultValue | Should -BeFalse -Because 'deploy.ps1 decides, from the switch and the size'
         (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw) | Should -Match "tier: startsWith\(t4SkuName, 'Standard_B'\) \? 'Burstable' : 'GeneralPurpose'"
-        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuName -Config $Config } | Should -Be 'Standard_B1ms'
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuName -Config $Config } | Should -Be 'Standard_D4ds_v5'
+        foreach ($profileName in 'lowest-cost', 'demo-day', 'enhanced-performance') {
+            $config = New-TestConfig
+            $config['profile'] = $profileName
+            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4DefaultSkuName -Config $Config } | Should -Be 'Standard_D4ds_v5'
+        }
     }
 
     It 'prices T4''s hour at the configured size from the Retail Prices API, or returns nothing when it can''t' {
@@ -365,7 +381,9 @@ Describe 'Invoke-DemoT4PowerAction' {
         $result.status | Should -Be 'Pass'
         $result.message | Should -Match 'was already running'
         @($script:azCalls | Where-Object { $_ -match '--method post' }).Count | Should -Be 0
-        # An obviously fake price: the stop says what a restarted T4 bills at its own size (Phase 28 follow-up).
+        # An obviously fake price: the stop says what a restarted T4 bills at its own size (Phase 28 follow-up), here a
+        # Burstable server a configuration chose to keep the month cheap.
+        $script:t4.Sku = 'Standard_B1ms'
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { @([pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server Burstable BS Series Compute'; skuName = 'B1MS'; meterName = 'B1MS'; retailPrice = 0.25; unitOfMeasure = '1 Hour' }) }
         $stop = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 5 -CheckPrefix STOP }
         $stop.status | Should -Be 'Pass'
@@ -642,5 +660,91 @@ Describe 'Get-DemoT4RestartWorstCase (2026-11-04)' {
         $result = InModuleScope DbHubDemo -Parameters @{ Month = $Month; Light = $Light; Capped = $Capped } { Get-DemoT4RestartWorstCase -HoursPerMonth $Month -LightUseHoursPerMonth $Light -Capped $Capped }
         $result.Hours | Should -Be $Hours
         $result.Restarts | Should -Be $Restarts
+    }
+}
+
+Describe 'T4 autonomous tuning (2026-11-04)' {
+    It 'is <Status> with t4AutonomousTuning <Switch> at <Sku>' -ForEach @(
+        @{ Switch = 'unset'; Sku = ''; Status = 'Pass'; Enabled = $true; Pattern = 'gets autonomous tuning at Standard_D4ds_v5 \(General Purpose, 4 vCores\)' }
+        @{ Switch = 'unset'; Sku = 'Standard_D4ads_v5'; Status = 'Pass'; Enabled = $true; Pattern = 'Standard_D4ads_v5' }
+        @{ Switch = 'true'; Sku = 'Standard_D4ds_v5'; Status = 'Pass'; Enabled = $true; Pattern = 'Intelligent Performance > Autonomous tuning' }
+        @{ Switch = 'unset'; Sku = 'Standard_B1ms'; Status = 'Warning'; Enabled = $false; Pattern = 'off for T4 at Standard_B1ms \(Burstable, 1 vCore\): it needs a General Purpose or Memory Optimized size with at least 4 vCores' }
+        @{ Switch = 'unset'; Sku = 'Standard_D2ds_v5'; Status = 'Warning'; Enabled = $false; Pattern = 'Standard_D2ds_v5 \(General Purpose, 2 vCores\)' }
+        @{ Switch = 'true'; Sku = 'Standard_B1ms'; Status = 'Fail'; Enabled = $false; Pattern = '^t4AutonomousTuning is true, but T4''s size Standard_B1ms' }
+        @{ Switch = 'true'; Sku = 'Standard_D2ds_v5'; Status = 'Fail'; Enabled = $false; Pattern = 'Standard_D2ds_v5 \(General Purpose, 2 vCores\) can''t run autonomous tuning' }
+        @{ Switch = 'false'; Sku = ''; Status = 'Not selected'; Enabled = $false; Pattern = 'left as they are' }
+        @{ Switch = 'false'; Sku = 'Standard_B1ms'; Status = 'Not selected'; Enabled = $false; Pattern = 't4AutonomousTuning is false' }
+    ) {
+        $config = New-TestConfig
+        if ($Switch -ne 'unset') {
+            $config['t4AutonomousTuning'] = $Switch -eq 'true'
+        }
+        if ($Sku) {
+            $config['t4SkuName'] = $Sku
+        }
+        $tuning = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4Tuning -Config $Config }
+        $tuning.Status | Should -Be $Status
+        $tuning.Enabled | Should -Be $Enabled
+        $tuning.Message | Should -Match $Pattern
+        if ($Status -eq 'Fail') {
+            $tuning.Remediation | Should -Match 'Set t4SkuName to Standard_D4ds_v5 \(or remove it: that''s the default\) or Standard_D4ads_v5; or set t4AutonomousTuning to false'
+        }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT }
+        $result.checkId | Should -Be 'PREFLIGHT.T4.TUNING'
+        $result.status | Should -Be $Status
+        $result.evidence.enabled | Should -Be $Enabled
+        # The template gets it only where it runs.
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoDeploymentParameter -Config $Config -NetworkMode private -T3UseFreeLimit $false }).parameters['t4AutonomousTuning'].value | Should -Be $Enabled
+    }
+
+    It 'judges the size it''s given, the fallback''s step, and is Not selected while T4 is off' {
+        $config = New-TestConfig
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4Tuning -Config $Config -SkuName 'Standard_D2ds_v5' }).Status | Should -Be 'Warning'
+        $config['t4Enabled'] = $false
+        $off = InModuleScope DbHubDemo -Parameters @{ Config = $config } { New-DemoT4TuningResult -Config $Config -CheckPrefix DEPLOY }
+        $off.checkId | Should -Be 'DEPLOY.T4.TUNING'
+        $off.status | Should -Be 'Not selected'
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoDeploymentParameter -Config $Config -NetworkMode private -T3UseFreeLimit $false }).parameters['t4AutonomousTuning'].value | Should -BeFalse
+    }
+
+    It 'sets Query Store and index tuning in the template, the interval before the mode, only when it''s on, and Query Store off on Burstable' {
+        $postgres = InModuleScope DbHubDemo { Get-DemoPostgresSetting }
+        $postgres['autonomousTuning']['minVCores'] | Should -Be 4
+        $postgres['autonomousTuning']['queryCaptureMode'] | Should -Be 'top'
+        $postgres['autonomousTuning']['parametersCaptureMode'] | Should -Be 'capture_first_sample'
+        $postgres['autonomousTuning']['analysisIntervalMinutes'] | Should -Be 60
+        $postgres['autonomousTuning']['mode'] | Should -Be 'report'
+        $bicep = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/pgflex01.bicep') -Raw
+        $order = @('max_connections', 'pg_qs.query_capture_mode', 'pg_qs.parameters_capture_mode', 'index_tuning.analysis_interval', 'index_tuning.mode') | ForEach-Object { $bicep.IndexOf("name: '$_'") }
+        $order | Should -Not -Contain -1
+        @($order | Sort-Object) | Should -Be $order -Because 'each depends on the one before, so the interval is in effect when the mode turns tuning on'
+        $bicep | Should -Match "resource queryCaptureMode '[^']+' = if \(autonomousTuning \|\| sizing\.tier == 'Burstable'\)"
+        $bicep | Should -Match "value: autonomousTuning \? string\(tuning\.queryCaptureMode\) : 'none'"
+        foreach ($name in 'parametersCaptureMode', 'tuningInterval', 'tuningMode') {
+            $bicep | Should -Match ("resource {0} '[^']+' = if \(autonomousTuning\)" -f $name)
+        }
+        (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw) | Should -Match 'tuning: postgres\.autonomousTuning'
+    }
+
+    It 'reads the zones the region lists for a General Purpose size, and nothing when it can''t' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            New-AzResult -Json @(@{ name = 'westus3'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5'; supportedZones = @('9') }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D2ds_v5'; supportedZones = @('1') }, @{ name = 'Standard_D4ds_v5'; supportedZones = @('3', '1', '2') }) }) })
+        } -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus --location westus3' }
+        @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuZone -Config $Config -SkuName 'Standard_D4ds_v5' }) | Should -Be @('1', '2', '3')
+        @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuZone -Config $Config -SkuName 'Standard_D4ads_v5' }).Count | Should -Be 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { New-AzResult -ExitCode 1 -StdErr 'boom' } -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' }
+        @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4SkuZone -Config $Config -SkuName 'Standard_D4ds_v5' }).Count | Should -Be 0
+    }
+
+    It 'says an existing T4 moves to the default once, and why it keeps its size otherwise: <Outcome>' -ForEach @(
+        @{ Outcome = 'Scale'; Pattern = 'T4 exists as Standard_B1ms \(Burstable\), and your configuration doesn''t set t4SkuName, so deploy\.ps1 scales it to the default, General Purpose Standard_D4ds_v5 with 4 vCores and autonomous tuning \(since 2026-11-04\), which restarts it' }
+        @{ Outcome = 'Waiting'; Pattern = 'T4 exists as Standard_B1ms \(Burstable\) and is Stopped, not Ready, so this deployment keeps its size' }
+        @{ Outcome = 'Refused'; Pattern = 'Azure refused to scale T4 to Standard_D4ds_v5 \(SkuNotAvailable, at 2026-11-04T10:00:00Z\), so T4 keeps Standard_B1ms \(Burstable\)' }
+    ) {
+        $result = InModuleScope DbHubDemo -Parameters @{ Outcome = $Outcome } { New-DemoT4SizeResult -CheckPrefix PREFLIGHT -ServerSku 'Standard_B1ms' -SkuName 'Standard_D4ds_v5' -Outcome $Outcome -State 'Stopped' -Failure ([pscustomobject]@{ Sku = 'Standard_D4ds_v5'; Zone = ''; TimeUtc = '2026-11-04T10:00:00Z' }) }
+        $result.checkId | Should -Be 'PREFLIGHT.T4.SIZE'
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match $Pattern
+        $result.remediation | Should -Match 't4SkuName'
     }
 }

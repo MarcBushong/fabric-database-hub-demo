@@ -139,13 +139,18 @@ param t3UseFreeLimit bool
 @description('Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId> (Phase 24, ADR 0019). Its administrator is the same P6 group as T3.')
 param t4Enabled bool = true
 
-@description('T4\'s compute size: Standard_B1ms (default), Standard_B2s (the Burstable fallback), or Standard_D2ds_v5 (the General Purpose fallback); the tier follows the size (Phase 24, Phase 28 and its follow-up, ADR 0019).')
+@description('T4\'s compute size: Standard_D4ds_v5 (default since 2026-11-04, for autonomous tuning), Standard_D4ads_v5 or Standard_D2ds_v5 (the fallback), or Standard_B1ms or Standard_B2s (Burstable, set to keep the month cheap); the tier follows the size (ADR 0019).')
 @allowed([
+  'Standard_D4ds_v5'
+  'Standard_D4ads_v5'
+  'Standard_D2ds_v5'
   'Standard_B1ms'
   'Standard_B2s'
-  'Standard_D2ds_v5'
 ])
-param t4SkuName string = 'Standard_B1ms'
+param t4SkuName string = 'Standard_D4ds_v5'
+
+@description('T4\'s autonomous tuning (Query Store and index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019).')
+param t4AutonomousTuning bool = false
 
 @description('T4\'s availability zone at creation: empty for no preference, or 1, 2, or 3.')
 @allowed([
@@ -392,8 +397,8 @@ module pgflex01 'pgflex01.bicep' = if (t4Enabled) {
     serverName: t4ServerName
     databaseName: postgres.databaseName
     postgresVersion: postgres.majorVersion
-    // The tier follows the size (Phase 24): Standard_B sizes are Burstable, D2ds_v5, the fallback's General Purpose
-    // size, is General Purpose (https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute). The
+    // The tier follows the size (Phase 24): Standard_B sizes are Burstable, and the D sizes (the default D4ds_v5, the
+    // fallback's D4ads_v5 and D2ds_v5) are General Purpose (https://learn.microsoft.com/azure/postgresql/compute-storage/concepts-compute). The
     // rest of the sizing is valid on both tiers (checked for the Phase 28 follow-up): 32 GiB of Premium SSD at P4 without
     // auto-grow, 7-day backups without geo-redundancy, and high availability off, which Burstable doesn't support anyway;
     // no IOPS setting, because Premium SSD's IOPS come from its tier.
@@ -408,6 +413,8 @@ module pgflex01 'pgflex01.bicep' = if (t4Enabled) {
     adminGroupObjectId: t3AdminGroupObjectId
     adminGroupDisplayName: t3AdminGroupDisplayName
     maxConnections: postgres.maxConnections
+    autonomousTuning: t4AutonomousTuning
+    tuning: postgres.autonomousTuning
   }
 }
 

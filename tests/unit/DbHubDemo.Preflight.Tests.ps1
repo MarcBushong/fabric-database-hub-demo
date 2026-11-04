@@ -116,22 +116,22 @@ Describe 'Invoke-DemoPreflight' {
         Set-HappyAzMock
         # Live, 2026-10-26: the capability list included Standard_B1ms, and Azure still refused it with SkuNotAvailable;
         # the code is in the server's deployment operation, not in the deployment's own error.
-        $refused = { param([string] $Sku, [string] $Zone) ConvertTo-Json -Depth 20 -InputObject @{ name = 'pgflex01'; properties = @{ provisioningState = 'Failed'; timestamp = '2026-10-26T14:11:42Z'; parameters = @{ sizing = @{ value = @{ skuName = $Sku; tier = 'Burstable' } }; availabilityZone = @{ value = $Zone } }; error = @{ code = 'DeploymentFailed'; details = @(@{ code = 'ResourceDeploymentFailure'; details = $null }) } } } }
+        $refused = { param([string] $Sku, [string] $Zone) ConvertTo-Json -Depth 20 -InputObject @{ name = 'pgflex01'; properties = @{ provisioningState = 'Failed'; timestamp = '2026-10-26T14:11:42Z'; parameters = @{ sizing = @{ value = @{ skuName = $Sku; tier = $(if ($Sku -like 'Standard_B*') { 'Burstable' } else { 'GeneralPurpose' }) } }; availabilityZone = @{ value = $Zone } }; error = @{ code = 'DeploymentFailed'; details = @(@{ code = 'ResourceDeploymentFailure'; details = $null }) } } } }
         $script:pgOperationsJson = ConvertTo-Json -Depth 20 -InputObject @(@{ properties = @{ provisioningState = 'Failed'; targetResource = @{ resourceType = 'Microsoft.DBforPostgreSQL/flexibleServers' }; statusMessage = @{ status = 'Failed'; error = @{ code = 'SkuNotAvailable'; message = 'Specified SKU is not supported in this region. Please choose a different SKU.' } } } })
-        $script:pgDeploymentJson = & $refused 'Standard_B1ms' ''
+        $script:pgDeploymentJson = & $refused 'Standard_D4ds_v5' ''
         # Phase 28: the default size falls back on its own, so a refusal on record starts the run one size on (a Warning).
         $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
         $check.status | Should -Be 'Warning'
-        $check.message | Should -Match 'starts with Standard_B2s, the same Burstable class'
-        $check.evidence.startSku | Should -Be 'Standard_B2s'
+        $check.message | Should -Match 'starts with Standard_D4ads_v5, General Purpose with 4 vCores too'
+        $check.evidence.startSku | Should -Be 'Standard_D4ads_v5'
 
         # A size the configuration sets never changes on its own: that refusal is still a Fail.
         $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
-        $pinned['t4SkuName'] = 'Standard_B1ms'
+        $pinned['t4SkuName'] = 'Standard_D4ds_v5'
         $check = Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
         $check.status | Should -Be 'Fail'
-        $check.remediation | Should -Match 'Set t4SkuName to Standard_B2s, the documented fallback'
+        $check.remediation | Should -Match 'Set t4SkuName to Standard_D4ads_v5 \(General Purpose, 4 vCores on AMD processors'
 
         $zoned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $zoned[$key] = $config[$key] }
@@ -140,29 +140,29 @@ Describe 'Invoke-DemoPreflight' {
         $check.status | Should -Be 'Warning'
         $check.message | Should -Match 'once more in zone 2'
 
-        $zoned['t4SkuName'] = 'Standard_B2s'
+        $zoned['t4SkuName'] = 'Standard_D4ads_v5'
         @(Invoke-DemoPreflight -Config $zoned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU').Count | Should -Be 0 -Because 'the refusal was for another size'
 
-        # Live, 2026-10-26: West US 3 refused the fallback too; the remediation then names no further size.
-        $script:pgDeploymentJson = & $refused 'Standard_B2s' ''
+        # A refusal of the fallback's 4-vCore size: the remediation names the default and the 2-vCore size.
+        $script:pgDeploymentJson = & $refused 'Standard_D4ads_v5' ''
         $check = Invoke-DemoPreflight -Config $zoned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
         $check.status | Should -Be 'Warning' -Because 'this configuration pins zone 2, and the refusal had no zone'
-        $check.remediation | Should -Match 'already the documented Burstable fallback'
+        $check.remediation | Should -Match 'Set t4SkuName to Standard_D4ds_v5 \(or remove it'
         $check.remediation | Should -Match 'Region access request'
-        $check.remediation | Should -Match 'Standard_D2ds_v5, the documented General Purpose option'
-        $check.remediation | Should -Not -Match 'Set t4SkuName to Standard_B2s'
+        $check.remediation | Should -Match 'Standard_D2ds_v5 \(2 vCores; autonomous tuning turns off'
+        $check.remediation | Should -Not -Match 'Set t4SkuName to Standard_D4ads_v5'
 
         $script:pgDeploymentJson = '{"name":"pgflex01","properties":{"provisioningState":"Succeeded"}}'
         @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU').Count | Should -Be 0
     }
 
-    It 'checks that the region offers T4''s Burstable size and PostgreSQL version, from the Location Based Capabilities API (Phase 24)' {
+    It 'checks that the region offers T4''s size and PostgreSQL version, from the Location Based Capabilities API (Phase 24)' {
         Set-HappyAzMock
-        $capabilities = { param([string[]] $Versions) ConvertTo-Json -Depth 10 -InputObject @{ value = @(@{ supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @($Versions | ForEach-Object { @{ name = $_ } }) }) } }
+        $capabilities = { param([string[]] $Versions) ConvertTo-Json -Depth 10 -InputObject @{ value = @(@{ supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5' }, @{ name = 'Standard_D4ads_v5' }, @{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @($Versions | ForEach-Object { @{ name = $_ } }) }) } }
         $script:pgCapabilitiesJson = & $capabilities @('17', '18')
         $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
         $check.status | Should -Be 'Pass'
-        $check.message | Should -Match 'Standard_B1ms and PostgreSQL 18'
+        $check.message | Should -Match 'GeneralPurpose Standard_D4ds_v5 and PostgreSQL 18'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^rest --method get --url https://management\.azure\.com/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft\.DBforPostgreSQL/locations/westus3/capabilities\?api-version=' }
 
         $script:pgCapabilitiesJson = & $capabilities @('16', '17')
@@ -190,31 +190,42 @@ Describe 'Invoke-DemoPreflight' {
         (Invoke-DemoPreflight -Config $off -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').status | Should -Be 'Not selected'
     }
 
-    It 'reads T4''s sizes with az postgres flexible-server list-skus first, and starts the Burstable fallback early when the default isn''t listed (Phase 28)' {
+    It 'reads T4''s sizes with az postgres flexible-server list-skus first, and starts the fallback early when the default isn''t listed (Phase 28; 2026-11-04)' {
         Set-HappyAzMock
-        $script:listSkus = { param([string[]] $Burstable) ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @($Burstable | ForEach-Object { @{ name = $_ } }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '17' }, @{ name = '18' }) }) }
-        $script:listSkusJson = & $script:listSkus @('Standard_B1ms', 'Standard_B2s')
+        $script:listSkus = { param([string[]] $GeneralPurpose) ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @($GeneralPurpose | ForEach-Object { @{ name = $_ } }) }); supportedServerVersions = @(@{ name = '17' }, @{ name = '18' }) }) }
+        $script:listSkusJson = & $script:listSkus @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:listSkusJson; StdErr = '' } }
         $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
         $check.status | Should -Be 'Pass'
         $check.evidence.source | Should -Be 'az postgres flexible-server list-skus'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match 'locations/westus3/capabilities' }
 
-        $script:listSkusJson = & $script:listSkus @('Standard_B2s')
+        $script:listSkusJson = & $script:listSkus @('Standard_D4ads_v5', 'Standard_D2ds_v5')
         $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
         $check.status | Should -Be 'Warning'
-        $check.evidence.startSku | Should -Be 'Standard_B2s'
-        $check.message | Should -Match 'starts with Standard_B2s'
+        $check.evidence.startSku | Should -Be 'Standard_D4ads_v5'
+        $check.message | Should -Match 'starts with Standard_D4ads_v5'
 
-        $script:listSkusJson = & $script:listSkus @()
-        $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $script:listSkusJson = & $script:listSkus @('Standard_D2ds_v5')
+        $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
+        $check = $results | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
         $check.status | Should -Be 'Warning'
-        # Phase 28 follow-up: neither Burstable size listed, so the General Purpose fallback is next, after its cost check.
+        # Neither 4-vCore size listed, so the 2-vCore fallback is next, after its cost check, with autonomous tuning off.
         $check.evidence.startSku | Should -Be 'Standard_D2ds_v5'
-        $check.message | Should -Match 'General Purpose fallback, Standard_D2ds_v5, once its cost check passes'
+        $check.message | Should -Match '2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off, once its cost check passes'
+        $tuning = $results | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING'
+        $tuning.status | Should -Be 'Warning'
+        $tuning.message | Should -Match 'Standard_D2ds_v5 \(General Purpose, 2 vCores\).*deploy\.ps1''s fallback uses Standard_D2ds_v5'
+        # With t4AutonomousTuning true, that's a Fail: the fallback stops after the 4-vCore sizes.
+        $strict = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $strict[$key] = $config[$key] }
+        $strict['t4AutonomousTuning'] = $true
+        $tuning = Invoke-DemoPreflight -Config $strict -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING'
+        $tuning.status | Should -Be 'Fail'
+        $tuning.remediation | Should -Match 'set t4AutonomousTuning to false'
 
         # None of the fallback's sizes listed: no T4, and DONE says why.
-        $script:listSkusJson = ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @() }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5' }) }); supportedServerVersions = @(@{ name = '18' }) })
+        $script:listSkusJson = & $script:listSkus @('Standard_D8ds_v5')
         $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
         $check.status | Should -Be 'Warning'
         $check.evidence.startSku | Should -Be 'None'
@@ -223,9 +234,39 @@ Describe 'Invoke-DemoPreflight' {
         # A size the configuration sets that the region doesn't list is a Fail before anything is created.
         $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
-        $pinned['t4SkuName'] = 'Standard_B1ms'
-        $script:listSkusJson = & $script:listSkus @('Standard_B2s')
+        $pinned['t4SkuName'] = 'Standard_D4ds_v5'
+        $script:listSkusJson = & $script:listSkus @('Standard_D4ads_v5')
         (Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').status | Should -Be 'Fail'
+    }
+
+    It 'says once that an existing T4 that no record keeps moves to the default, prices it at the default, and checks the region offers it (2026-11-04)' {
+        Set-HappyAzMock
+        $script:listSkus = { param([string[]] $GeneralPurpose) ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @($GeneralPurpose | ForEach-Object { @{ name = $_ } }) }); supportedServerVersions = @(@{ name = '18' }) }) }
+        $script:listSkusJson = & $script:listSkus @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:listSkusJson; StdErr = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Exists = $true; State = 'Ready'; Server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_B1ms'; tier = 'Burstable' } } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith { [pscustomobject]@{ LightUseMonthly = 10.0; SessionCost = 1.0; T4AutoRestartWorstCaseMonthly = 1.0; T4FixedMonthly = 1.0; DefenderIncluded = $true; MissingPrices = @(); Components = @(); Results = @() } }
+        $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
+        $size = $results | Where-Object checkId -eq 'PREFLIGHT.T4.SIZE'
+        $size.status | Should -Be 'Warning'
+        $size.message | Should -Match 'T4 exists as Standard_B1ms \(Burstable\), and your configuration doesn''t set t4SkuName, so deploy\.ps1 scales it to the default'
+        $size.remediation | Should -Match 'set t4SkuName to Standard_B1ms'
+        $capability = $results | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $capability.status | Should -Be 'Pass'
+        $capability.message | Should -Match 'offers the default it moves to, GeneralPurpose Standard_D4ds_v5'
+        ($results | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING').status | Should -Be 'Pass'
+        # Priced at the default it moves to, not the server's own size.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { -not $Config.Contains('t4SkuSource') -and -not $Config.Contains('t4SkuName') }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 0 -Exactly -ParameterFilter { [string]$Config['t4SkuName'] -eq 'Standard_B1ms' }
+
+        # A configuration that sets its size gets no notice: that size is what it keeps.
+        $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
+        $pinned['t4SkuName'] = 'Standard_B1ms'
+        $results = Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory
+        @($results | Where-Object checkId -eq 'PREFLIGHT.T4.SIZE').Count | Should -Be 0
+        ($results | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING').status | Should -Be 'Warning'
+        ($results | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING').message | Should -Match 't4SkuName sets Standard_B1ms\.$'
     }
 
     It 'prices T4''s General Purpose fallback before anything is created, with its full-month worst case against both ceilings (Phase 28 follow-up)' {
@@ -237,8 +278,8 @@ Describe 'Invoke-DemoPreflight' {
         $config = $copy
         # Fake estimates in Get-DemoCostEstimate's shape, with T4's compute at the size priced; obviously fake prices.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith {
-            $sku = if ($Config['t4Enabled'] -eq $false) { '' } elseif ($Config['t4SkuName']) { [string]$Config['t4SkuName'] } else { 'Standard_B1ms' }
-            $vcores = if ($sku -eq 'Standard_D2ds_v5') { 2 } else { 1 }
+            $sku = if ($Config['t4Enabled'] -eq $false) { '' } elseif ($Config['t4SkuName']) { [string]$Config['t4SkuName'] } else { 'Standard_D4ds_v5' }
+            $vcores = if ($sku -eq 'Standard_D2ds_v5') { 2 } elseif ($sku -like 'Standard_D4*') { 4 } else { 1 }
             $unit = if ($sku -eq 'Standard_D2ds_v5') { 0.1 } else { 0.01 }
             [pscustomobject]@{
                 LightUseMonthly               = $script:lightUse
@@ -251,11 +292,11 @@ Describe 'Invoke-DemoPreflight' {
                 Results                       = @(New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message ('Priced with T4 at {0}.' -f $(if ($sku) { $sku } else { 'nothing' })))
             }
         }
-        $script:listSkus = { param([string[]] $Burstable) ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @($Burstable | ForEach-Object { @{ name = $_ } }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '18' }) }) }
-        $script:listSkusJson = & $script:listSkus @('Standard_B1ms', 'Standard_B2s')
+        $script:listSkus = { param([string[]] $GeneralPurpose) ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @($GeneralPurpose | ForEach-Object { @{ name = $_ } }) }); supportedServerVersions = @(@{ name = '18' }) }) }
+        $script:listSkusJson = & $script:listSkus @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:listSkusJson; StdErr = '' } }
 
-        # A Burstable start: the General Purpose step is priced ahead, since Azure can still refuse a listed size. Within
+        # A 4-vCore start: the 2-vCore step is priced ahead, since Azure can still refuse a listed size. Within
         # both ceilings: 60 + 0.2 x 690 = 198 USD for the month, 9 for a session.
         $script:lightUse = 60.0
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
@@ -270,8 +311,9 @@ Describe 'Invoke-DemoPreflight' {
         $fallback.evidence.startSku | Should -Be ''
         $fallback.evidence.hourlyUsd | Should -Be 0.2
         $fallback.evidence.monthlyWorstCaseUsd | Should -Be 198.0
-        $fallback.message | Should -Match 'deploy\.ps1 creates T4 as General Purpose Standard_D2ds_v5: about 0\.200 USD an hour'
-        ($results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Be 'Priced with T4 at Standard_B1ms.'
+        $fallback.message | Should -Match 'deploy\.ps1 creates T4 as General Purpose Standard_D2ds_v5, with autonomous tuning off \(it needs 4 vCores\): about 0\.200 USD an hour'
+        ($results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Be 'Priced with T4 at Standard_D4ds_v5.'
+        ($results | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING').status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $Config['t4SkuName'] -eq 'Standard_D2ds_v5' -and $null -ne $PriceCache }
 
         # Over monthlyCeilingUsd (150 + 138 = 288 USD): a Warning that T4 would be left out, and how to allow it.
@@ -280,11 +322,11 @@ Describe 'Invoke-DemoPreflight' {
         $fallback.status | Should -Be 'Warning'
         $fallback.evidence.skipReason | Should -Be 'MonthlyCeiling'
         $fallback.message | Should -Match 'would leave T4 out instead: its worst case, every hour of a month'
-        $fallback.remediation | Should -Match '^Nothing to do unless Azure refuses both Burstable sizes\. To have the fallback create T4 then, raise monthlyCeilingUsd to at least 288'
+        $fallback.remediation | Should -Match '^Nothing to do unless Azure refuses both 4-vCore sizes\. To have the fallback create T4 then, raise monthlyCeilingUsd to at least 288'
 
-        # The region lists neither Burstable size: the run starts at General Purpose, so the run's own estimate prices it,
+        # The region lists neither 4-vCore size: the run starts at the 2-vCore size, so the run's own estimate prices it,
         # and over a ceiling T4 is left out (startSku None) and the ceilings are checked without it, not failed.
-        $script:listSkusJson = & $script:listSkus @()
+        $script:listSkusJson = & $script:listSkus @('Standard_D2ds_v5')
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
         $fallback = $results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
         $fallback.status | Should -Be 'Warning'
@@ -302,7 +344,7 @@ Describe 'Invoke-DemoPreflight' {
         $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
         $pinned['t4SkuName'] = 'Standard_B1ms'
-        $script:listSkusJson = & $script:listSkus @('Standard_B1ms', 'Standard_B2s')
+        $script:listSkusJson = & $script:listSkus @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
         (Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK').status | Should -Be 'Not selected'
         $pinned.Remove('t4SkuName')
         $pinned['t4Enabled'] = $false
@@ -310,15 +352,15 @@ Describe 'Invoke-DemoPreflight' {
     }
 
     It 'keeps the run''s own cost checks, a monthly-ceiling Fail included, when the fallback''s extra estimate fails: <Case> (review of 20e855c)' -ForEach @(
-        @{ Case = 'a Burstable start, the General Purpose estimate refused (HTTP 429)'; Burstable = @('Standard_B1ms', 'Standard_B2s'); Throws = 'fallback'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; Match = 'deploy\.ps1 prices its General Purpose fallback, Standard_D2ds_v5, right before it would create it; right now, its price couldn''t be read from the Azure Retail Prices API \(HTTP 429' }
-        @{ Case = 'a General Purpose start over a ceiling, the estimate without T4 refused (HTTP 429)'; Burstable = @(); Throws = 'off'; StartSku = 'None'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; Match = 'The ceilings without T4 couldn''t be checked \(HTTP 429.*\), so PREFLIGHT\.COST\.\* still price T4 at Standard_D2ds_v5' }
-        @{ Case = 'the fallback''s check itself throws'; Burstable = @('Standard_B1ms', 'Standard_B2s'); Throws = 'check'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; Match = '^T4''s General Purpose fallback couldn''t be priced in preflight: HTTP 429' }
+        @{ Case = 'a 4-vCore start, the 2-vCore estimate refused (HTTP 429)'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'fallback'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; Match = 'deploy\.ps1 prices its 2-vCore fallback, Standard_D2ds_v5, right before it would create it; right now, its price couldn''t be read from the Azure Retail Prices API \(HTTP 429' }
+        @{ Case = 'a 2-vCore start over a ceiling, the estimate without T4 refused (HTTP 429)'; GeneralPurpose = @('Standard_D2ds_v5'); Throws = 'off'; StartSku = 'None'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; Match = 'The ceilings without T4 couldn''t be checked \(HTTP 429.*\), so PREFLIGHT\.COST\.\* still price T4 at Standard_D2ds_v5' }
+        @{ Case = 'the fallback''s check itself throws'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'check'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; Match = '^T4''s 2-vCore fallback couldn''t be priced in preflight: HTTP 429' }
     ) {
         Set-HappyAzMock
         # The run's own estimate is over monthlyCeilingUsd, a Fail; obviously fake prices.
         $script:throws = $Throws
         Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith {
-            $sku = if ($Config['t4Enabled'] -eq $false) { '' } elseif ($Config['t4SkuName']) { [string]$Config['t4SkuName'] } else { 'Standard_B1ms' }
+            $sku = if ($Config['t4Enabled'] -eq $false) { '' } elseif ($Config['t4SkuName']) { [string]$Config['t4SkuName'] } else { 'Standard_D4ds_v5' }
             if (($script:throws -eq 'off' -and -not $sku) -or ($script:throws -eq 'fallback' -and $sku -eq 'Standard_D2ds_v5')) {
                 throw 'HTTP 429: Too Many Requests (after 3 retries).'
             }
@@ -337,7 +379,7 @@ Describe 'Invoke-DemoPreflight' {
         if ($Throws -eq 'check') {
             Mock -ModuleName DbHubDemo -CommandName Get-DemoT4FallbackPreflight -MockWith { throw 'HTTP 429: Too Many Requests (after 3 retries).' }
         }
-        $script:listSkusJson = ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @($Burstable | ForEach-Object { @{ name = $_ } }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '18' }) })
+        $script:listSkusJson = ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @($GeneralPurpose | ForEach-Object { @{ name = $_ } }) }); supportedServerVersions = @(@{ name = '18' }) })
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:listSkusJson; StdErr = '' } }
 
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
@@ -882,7 +924,8 @@ Describe 'Get-DemoDeploymentParameter' {
 
     It 'passes T4''s size, and its zone only for a server that doesn''t exist yet (Phase 24)' {
         $document = Get-DemoDeploymentParameter -Config $config -T3UseFreeLimit $true -NetworkMode public
-        $document.parameters.t4SkuName.value | Should -Be 'Standard_B1ms' -Because 'the smallest Burstable size is the default'
+        $document.parameters.t4SkuName.value | Should -Be 'Standard_D4ds_v5' -Because 'General Purpose with 4 vCores is the default since 2026-11-04'
+        $document.parameters.t4AutonomousTuning.value | Should -BeTrue
         $document.parameters.t4AvailabilityZone.value | Should -Be ''
         $copy = @{}
         foreach ($key in $config.Keys) { $copy[$key] = $config[$key] }

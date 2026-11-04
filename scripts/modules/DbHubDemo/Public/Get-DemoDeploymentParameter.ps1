@@ -235,6 +235,8 @@ function Get-DemoDeploymentParameter {
         activityProfileOnBoot     = ($Config.Contains('activityProfileOnBoot') -and [bool]$Config['activityProfileOnBoot'])
         t4Enabled                 = (Test-DemoT4Enabled -Config $Config)
         t4SkuName                 = (Get-DemoT4SkuName -Config $Config)
+        # Query Store and index tuning in REPORT mode, only on a size that runs them (2026-11-04, Get-DemoT4Tuning).
+        t4AutonomousTuning        = ((Test-DemoT4Enabled -Config $Config) -and (Get-DemoT4Tuning -Config $Config).Enabled)
         # A server keeps the zone it was created in, so the zone goes only to a T4 that doesn't exist yet.
         t4AvailabilityZone        = $(if ($T4Exists) { '' } else { Get-DemoT4AvailabilityZone -Config $Config })
     }

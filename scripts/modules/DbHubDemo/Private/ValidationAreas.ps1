@@ -338,7 +338,7 @@ function Invoke-DemoValidationT4 {
     <#
     .SYNOPSIS
     The T4 area (Phase 24, ADR 0019): Test-DemoT4 -IncludeMetrics, read-only, with the size T4's fallback recorded in the
-    group's DbHubT4Sku tag (Phase 28 follow-up), or, when the fallback left T4 out, one Not selected that says why; but a
+    group's DbHubT4Size tag (ADR 0019), or, when the fallback left T4 out, one Not selected that says why; but a
     server that exists although the record says T4 is off (None or Refused) is a T4.SERVER Warning that it bills (review
     of 64c28b2; New-DemoT4RecordedOffResult). A stopped T4 is a Warning (it sends no metrics), never a Fail. Internal.
     #>

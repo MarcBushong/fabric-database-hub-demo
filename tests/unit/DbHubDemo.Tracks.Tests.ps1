@@ -1256,7 +1256,7 @@ Describe 'Invoke-DemoParallelDeployment' {
             New-DemoResult -CheckId 'PREFLIGHT.T4.CAPABILITY' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message 'westus3 lists neither Burstable size.' -Evidence @{ startSku = 'Standard_D2ds_v5' }
             New-DemoResult -CheckId 'PREFLIGHT.T4.FALLBACK' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message 'The fallback fits both ceilings.' -Evidence @{ startSku = 'Standard_D2ds_v5' }
         }
-        $script:note = 'T4 created as General Purpose Standard_D2ds_v5 because Burstable sizes were refused here; about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API).'
+        $script:note = 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API).'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
             $script:calls.Add(('template start={0}' -f (Get-Variable -Name 'T4StartSku' -ValueOnly -ErrorAction SilentlyContinue)))
             [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $true; T4SkuName = 'Standard_D2ds_v5'; T4Note = $script:note }

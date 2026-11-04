@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "15749944926969352364"
+      "templateHash": "7688273784718142831"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -421,19 +421,28 @@
       "type": "bool",
       "defaultValue": true,
       "metadata": {
-        "description": "Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId>: Burstable Standard_B1ms, Entra-only with the P6 group as administrator, virtual network integration in snet-pg (Phase 24, ADR 0019)."
+        "description": "Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId>: General Purpose Standard_D4ds_v5 by default (since 2026-11-04), Entra-only with the P6 group as administrator, virtual network integration in snet-pg (Phase 24, ADR 0019)."
       }
     },
     "t4SkuName": {
       "type": "string",
-      "defaultValue": "Standard_B1ms",
+      "defaultValue": "Standard_D4ds_v5",
       "allowedValues": [
+        "Standard_D4ds_v5",
+        "Standard_D4ads_v5",
+        "Standard_D2ds_v5",
         "Standard_B1ms",
-        "Standard_B2s",
-        "Standard_D2ds_v5"
+        "Standard_B2s"
       ],
       "metadata": {
-        "description": "T4's compute size: Standard_B1ms, the smallest Burstable size (default); Standard_B2s, the fallback when Azure answers SkuNotAvailable for B1ms in the region; or Standard_D2ds_v5, General Purpose (2 vCores, 8 GiB), the fallback when Azure refuses both Burstable sizes and its cost check passes. The tier follows the size, and storage, backups, and high availability are the same on both tiers (Phase 24, Phase 28 and its follow-up, ADR 0019). deploy.ps1 never resizes an existing server on its own."
+        "description": "T4's compute size: Standard_D4ds_v5, General Purpose with 4 vCores and 16 GiB (default since 2026-11-04, user-directed, for autonomous tuning); Standard_D4ads_v5 (4 vCores) and Standard_D2ds_v5 (2 vCores, autonomous tuning off), the fallback when Azure answers SkuNotAvailable, the second only after its cost check; or Standard_B1ms or Standard_B2s, Burstable, which a configuration sets to keep the month cheap (autonomous tuning off). The tier follows the size, and storage, backups, and high availability are the same on both tiers (ADR 0019). deploy.ps1 moves an existing server whose size the configuration doesn't set to the default once, which restarts it."
+      }
+    },
+    "t4AutonomousTuning": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): Query Store capturing the top queries and index tuning in REPORT mode every 60 minutes, set only on a size that runs it (General Purpose or Memory Optimized with at least 4 vCores). deploy.ps1 decides from t4AutonomousTuning and the size (Get-DemoT4Tuning). When false, those parameters are left as they are, except that Query Store is turned off on a Burstable size."
       }
     },
     "t4AvailabilityZone": {
@@ -622,6 +631,9 @@
           "t4SkuName": {
             "value": "[parameters('t4SkuName')]"
           },
+          "t4AutonomousTuning": {
+            "value": "[parameters('t4AutonomousTuning')]"
+          },
           "t4AvailabilityZone": {
             "value": "[parameters('t4AvailabilityZone')]"
           },
@@ -637,7 +649,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "12464494181789340950"
+              "templateHash": "11306737593386690606"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -920,14 +932,23 @@
             },
             "t4SkuName": {
               "type": "string",
-              "defaultValue": "Standard_B1ms",
+              "defaultValue": "Standard_D4ds_v5",
               "allowedValues": [
+                "Standard_D4ds_v5",
+                "Standard_D4ads_v5",
+                "Standard_D2ds_v5",
                 "Standard_B1ms",
-                "Standard_B2s",
-                "Standard_D2ds_v5"
+                "Standard_B2s"
               ],
               "metadata": {
-                "description": "T4's compute size: Standard_B1ms (default), Standard_B2s (the Burstable fallback), or Standard_D2ds_v5 (the General Purpose fallback); the tier follows the size (Phase 24, Phase 28 and its follow-up, ADR 0019)."
+                "description": "T4's compute size: Standard_D4ds_v5 (default since 2026-11-04, for autonomous tuning), Standard_D4ads_v5 or Standard_D2ds_v5 (the fallback), or Standard_B1ms or Standard_B2s (Burstable, set to keep the month cheap); the tier follows the size (ADR 0019)."
+              }
+            },
+            "t4AutonomousTuning": {
+              "type": "bool",
+              "defaultValue": false,
+              "metadata": {
+                "description": "T4's autonomous tuning (Query Store and index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019)."
               }
             },
             "t4AvailabilityZone": {
@@ -980,9 +1001,9 @@
                   "autoPauseMinutes": 15
                 },
                 "t4": {
-                  "skuName": "Standard_B1ms",
-                  "tier": "Burstable",
-                  "vcores": 1,
+                  "skuName": "Standard_D4ds_v5",
+                  "tier": "GeneralPurpose",
+                  "vcores": 4,
                   "storageSizeGB": 32,
                   "storageTier": "P4",
                   "backupRetentionDays": 7
@@ -1020,9 +1041,9 @@
                   "autoPauseMinutes": 60
                 },
                 "t4": {
-                  "skuName": "Standard_B1ms",
-                  "tier": "Burstable",
-                  "vcores": 1,
+                  "skuName": "Standard_D4ds_v5",
+                  "tier": "GeneralPurpose",
+                  "vcores": 4,
                   "storageSizeGB": 32,
                   "storageTier": "P4",
                   "backupRetentionDays": 7
@@ -1060,9 +1081,9 @@
                   "autoPauseMinutes": 60
                 },
                 "t4": {
-                  "skuName": "Standard_B1ms",
-                  "tier": "Burstable",
-                  "vcores": 1,
+                  "skuName": "Standard_D4ds_v5",
+                  "tier": "GeneralPurpose",
+                  "vcores": 4,
                   "storageSizeGB": 32,
                   "storageTier": "P4",
                   "backupRetentionDays": 7
@@ -1116,7 +1137,7 @@
               }
             },
             "$fxv#3": {
-              "note": "T4 (Phase 24, ADR 0019): Azure Database for PostgreSQL flexible server, Burstable Standard_B1ms (config/profiles.json t4). majorVersion is a generally available major version (version policy and supported versions on Learn, checked 2026-10-23: 11 to 18, with 18 GA; West US 3's capabilities list 11 to 18). The server and its child resources use the apiVersions entries above: 2025-08-01 is the newest version Bicep 0.47.16 has types for (2026-10-01 is published but has no Bicep types yet). The runner's PostgreSQL provider, Npgsql, is pinned in workload-generator/Directory.Packages.props, and the optional local test server in workloadRunner.localTestPostgresImage.",
+              "note": "T4 (Phase 24, ADR 0019): Azure Database for PostgreSQL flexible server, General Purpose Standard_D4ds_v5 by default since 2026-11-04 (config/profiles.json t4; user-directed, for autonomous tuning, which needs at least 4 vCores; it was Burstable Standard_B1ms). majorVersion is a generally available major version (version policy and supported versions on Learn, checked 2026-10-23: 11 to 18, with 18 GA; West US 3's capabilities list 11 to 18). The server and its child resources use the apiVersions entries above: 2025-08-01 is the newest version Bicep 0.47.16 has types for (2026-10-01 is published but has no Bicep types yet). The runner's PostgreSQL provider, Npgsql, is pinned in workload-generator/Directory.Packages.props, and the optional local test server in workloadRunner.localTestPostgresImage.",
               "majorVersion": "18",
               "serverNamePrefix": "pgflex01",
               "databaseName": "contosocare",
@@ -1124,9 +1145,25 @@
               "tokenResource": "https://ossrdbms-aad.database.windows.net",
               "enhancedMetricsParameter": "metrics.collector_database_activity",
               "maxConnections": 50,
-              "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_B2s (default 429) and Standard_D2ds_v5 (default 859) refuse the surge's overshoot too, and Database Hub's Failed connections fill on every size. Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
+              "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_D4ds_v5 and Standard_D4ads_v5 (default 1,718), Standard_D2ds_v5 (859), and Standard_B2s (429) refuse the surge's overshoot too, and Database Hub's Failed connections fill on every size. Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
               "autoStartAfterStoppedDays": 7,
               "capabilitiesApiVersion": "2025-08-01",
+              "autonomousTuning": {
+                "note": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): set by the template only when Get-DemoT4Tuning allows it, on a General Purpose or Memory Optimized size with at least minVCores vCores ('supported on any currently supported compute SKU with at least 4 vCores'; Query Store, which it needs, shouldn't run on Burstable). Query Store captures the top queries, with the first sample of each parameterized query's parameters (the runner's queries are parameterized), and index tuning runs in report mode every 60 minutes, its minimum, because T4 runs only during demos; the interval is set before the mode, because the first session is scheduled from the interval in effect when tuning is turned on. All four parameters are dynamic (no restart; checked 2026-11-04). The recommendations show in the Azure portal (the server's Intelligent Performance > Autonomous tuning) and through az postgres flexible-server autonomous-tuning, not in Database Hub.",
+                "minVCores": 4,
+                "queryCaptureMode": "top",
+                "parametersCaptureMode": "capture_first_sample",
+                "analysisIntervalMinutes": 60,
+                "mode": "report",
+                "docUrls": {
+                  "autonomousTuning": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning",
+                  "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
+                  "queryStoreParameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-query-store",
+                  "tuningParameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-autonomous-tuning",
+                  "cli": "https://learn.microsoft.com/cli/azure/postgres/flexible-server/autonomous-tuning",
+                  "scaling": "https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources"
+                }
+              },
               "metrics": {
                 "note": "Azure Monitor metrics T4 shows (Database Hub's PostgreSQL dashboard uses the first six; the enhanced metrics need metricsParameter on). Read by status.ps1 and validate.ps1 with az monitor metrics list.",
                 "hub": [
@@ -9683,6 +9720,12 @@
                   },
                   "maxConnections": {
                     "value": "[variables('postgres').maxConnections]"
+                  },
+                  "autonomousTuning": {
+                    "value": "[parameters('t4AutonomousTuning')]"
+                  },
+                  "tuning": {
+                    "value": "[variables('postgres').autonomousTuning]"
                   }
                 },
                 "template": {
@@ -9692,7 +9735,7 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "10192647775240632981"
+                      "templateHash": "17417311977485402231"
                     },
                     "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, the free enhanced metrics turned on, and max_connections at 50 on every size."
                   },
@@ -9802,6 +9845,25 @@
                       "metadata": {
                         "description": "max_connections on every size, from config/versions.json (postgresql.maxConnections): Standard_B1ms's own default of 50, so connection-surge reaches the limit, and Database Hub's Failed connections fill, on the larger sizes too (ADR 0019, 2026-11-03). A static parameter: the value takes effect at the next restart, which deploy.ps1 does when one is pending."
                       }
+                    },
+                    "autonomousTuning": {
+                      "type": "bool",
+                      "defaultValue": false,
+                      "metadata": {
+                        "description": "Autonomous tuning (2026-11-04, ADR 0019): Query Store and index tuning in REPORT mode, only on a size that runs them (4 vCores or more, not Burstable); deploy.ps1 decides (Get-DemoT4Tuning). When false, these parameters are left as they are, except that Query Store is turned off on a Burstable size."
+                      }
+                    },
+                    "tuning": {
+                      "type": "object",
+                      "defaultValue": {
+                        "queryCaptureMode": "top",
+                        "parametersCaptureMode": "capture_first_sample",
+                        "analysisIntervalMinutes": 60,
+                        "mode": "report"
+                      },
+                      "metadata": {
+                        "description": "The autonomous tuning values from config/versions.json (postgresql.autonomousTuning): queryCaptureMode, parametersCaptureMode, analysisIntervalMinutes, and mode."
+                      }
                     }
                   },
                   "resources": [
@@ -9907,6 +9969,62 @@
                       "dependsOn": [
                         "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'idle_in_transaction_session_timeout')]",
                         "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
+                      ]
+                    },
+                    {
+                      "condition": "[or(parameters('autonomousTuning'), equals(parameters('sizing').tier, 'Burstable'))]",
+                      "type": "Microsoft.DBforPostgreSQL/flexibleServers/configurations",
+                      "apiVersion": "2025-08-01",
+                      "name": "[format('{0}/{1}', parameters('serverName'), 'pg_qs.query_capture_mode')]",
+                      "properties": {
+                        "value": "[if(parameters('autonomousTuning'), string(parameters('tuning').queryCaptureMode), 'none')]",
+                        "source": "user-override"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'max_connections')]",
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
+                      ]
+                    },
+                    {
+                      "condition": "[parameters('autonomousTuning')]",
+                      "type": "Microsoft.DBforPostgreSQL/flexibleServers/configurations",
+                      "apiVersion": "2025-08-01",
+                      "name": "[format('{0}/{1}', parameters('serverName'), 'pg_qs.parameters_capture_mode')]",
+                      "properties": {
+                        "value": "[string(parameters('tuning').parametersCaptureMode)]",
+                        "source": "user-override"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'pg_qs.query_capture_mode')]",
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
+                      ]
+                    },
+                    {
+                      "condition": "[parameters('autonomousTuning')]",
+                      "type": "Microsoft.DBforPostgreSQL/flexibleServers/configurations",
+                      "apiVersion": "2025-08-01",
+                      "name": "[format('{0}/{1}', parameters('serverName'), 'index_tuning.analysis_interval')]",
+                      "properties": {
+                        "value": "[string(parameters('tuning').analysisIntervalMinutes)]",
+                        "source": "user-override"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'pg_qs.parameters_capture_mode')]",
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
+                      ]
+                    },
+                    {
+                      "condition": "[parameters('autonomousTuning')]",
+                      "type": "Microsoft.DBforPostgreSQL/flexibleServers/configurations",
+                      "apiVersion": "2025-08-01",
+                      "name": "[format('{0}/{1}', parameters('serverName'), 'index_tuning.mode')]",
+                      "properties": {
+                        "value": "[string(parameters('tuning').mode)]",
+                        "source": "user-override"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]",
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'index_tuning.analysis_interval')]"
                       ]
                     }
                   ],

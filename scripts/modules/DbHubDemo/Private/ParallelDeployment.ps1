@@ -353,7 +353,7 @@ function Invoke-DemoParallelDeployment {
     does; -ProgressPath is the status page's model, which each stage and track updates; with networkMode private the
     policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
     its results replace preflight's placeholders at the end; preflight's T4 startSku says where T4's fallback starts
-    (Standard_B2s, General Purpose Standard_D2ds_v5 after its cost check, or no T4; Phase 28 follow-up), and a "no T4"
+    (Standard_D4ads_v5, Standard_D2ds_v5 after its cost check, or no T4; ADR 0019), and a "no T4"
     record gets that fallback again when this run deploys the template;
     and this process prompts the person at the guided stop when the T2 track process reports it Ready in the progress
     model; without one (-NoStatusPage), the T2 track process prompts the person itself.
@@ -447,7 +447,7 @@ function Invoke-DemoParallelDeployment {
         Write-DemoLog -Message ('An unfinished deployment is on record (its last finished stage is {0}), so this run continues it, as deploy.ps1 -Resume does. To start over from preflight instead: ./scripts/deploy.ps1 -FromStage Preflight.' -f $state.Stage)
     }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28): a "no T4" record
-    # (None) gets the General Purpose fallback, and its cost check, again when this run deploys the template (Phase 28
+    # (None) gets the 2-vCore fallback, and its cost check, again when this run deploys the template (Phase 28
     # follow-up).
     $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric).Infrastructure
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:$templateRuns
@@ -883,6 +883,8 @@ function Invoke-DemoParallelDeployment {
                 NetworkMode             = $context.NetworkMode
                 T3UseFreeLimit          = [bool]$context.T3UseFreeLimit
                 T3AdminGroupDisplayName = [string]$context.T3AdminGroupName
+                # An existing T4 whose size the configuration doesn't set moves to the default (2026-11-04, ADR 0019).
+                ScaleT4                 = $true
             }
             if ($context.T2Source -eq 'golden' -and $context.T2SnapshotId) {
                 $deployArguments['T2OsDiskSourceId'] = $context.T2SnapshotId

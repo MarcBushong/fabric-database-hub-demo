@@ -346,18 +346,21 @@ Describe 'Invoke-DemoTemplateDeployment' {
         $sku = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }
         $sku.status | Should -Be 'Fail'
         $sku.message | Should -Match 'Standard_B1ms with no zone preference'
-        $sku.remediation | Should -Match 'Set t4SkuName to Standard_B2s, the documented fallback'
+        $sku.remediation | Should -Match 'Set t4SkuName to Standard_B2s, the other Burstable size'
         $sku.remediation | Should -Match 'A size you set is never changed on its own'
     }
 
-    It 'falls back on its own from a refused Standard_B1ms to Standard_B2s, then to General Purpose after its cost check, and records it, when the configuration doesn''t set the size (Phase 28 and its follow-up)' {
+    It 'falls back on its own from a refused Standard_D4ds_v5 to another zone, Standard_D4ads_v5, then Standard_D2ds_v5 after its cost check, and records it, when the configuration doesn''t set the size (2026-11-04)' {
         $withT4 = New-TestConfig -WithT4
         $withT4.Contains('t4SkuName') | Should -BeFalse -Because 'the schema has no default for it'
         $script:sizes = [System.Collections.Generic.List[string]]::new()
+        $script:zones = [System.Collections.Generic.List[string]]::new()
         $script:recordedSku = [System.Collections.Generic.List[string]]::new()
         $script:failures = [System.Collections.Generic.Queue[object]]::new()
-        $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_B1ms'; Zone = ''; TimeUtc = '2026-10-26T14:11:42Z' })
-        $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_B2s'; Zone = ''; TimeUtc = '2026-10-26T14:31:42Z' })
+        $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_D4ds_v5'; Zone = ''; TimeUtc = '2026-11-04T14:11:42Z' })
+        $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_D4ds_v5'; Zone = '2'; TimeUtc = '2026-11-04T14:21:42Z' })
+        $script:failures.Enqueue([pscustomobject]@{ Sku = 'Standard_D4ads_v5'; Zone = ''; TimeUtc = '2026-11-04T14:31:42Z' })
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SkuZone -MockWith { @('2', '3') }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -MockWith { if ($script:failures.Count -gt 0) { $script:failures.Dequeue() } else { $null } }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recordedSku.Add([string]$Value['T4Sku']) }
         # The cost check has its own tests (DbHubDemo.T4Fallback.Tests.ps1); here its worst case is over the monthly ceiling.
@@ -365,23 +368,27 @@ Describe 'Invoke-DemoTemplateDeployment' {
         # The template fails while a Burstable T4 is in it (SkuNotAvailable) and succeeds without it.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
             $script:sizes.Add($(if ($Config['t4Enabled']) { if ($Config.Contains('t4SkuName')) { [string]$Config['t4SkuName'] } else { 'default' } } else { 'none' }))
+            $script:zones.Add([string]$Config['t4AvailabilityZone'])
             $script:templateFails = [bool]$Config['t4Enabled']
             @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
         }
         $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
         $deployment.Succeeded | Should -BeTrue
-        $script:sizes | Should -Be @('default', 'Standard_B2s', 'none') -Because 'the cost check left the General Purpose size out before anything was sent'
-        $script:recordedSku | Should -Be @('Standard_B2s', 'None')
+        $script:sizes | Should -Be @('default', 'Standard_D4ds_v5', 'Standard_D4ads_v5', 'none') -Because 'the cost check left the 2-vCore size out before anything was sent'
+        @($script:zones | Select-Object -First 3) | Should -Be @('', '2', '') -Because 'the retry goes to another zone the region lists, and the next size to the configured zone'
+        $script:recordedSku | Should -Be @('Standard_D4ads_v5', 'None')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4SkuZone -Times 1 -Exactly
         $deployment.T4Enabled | Should -BeFalse
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly
         $fallbacks = @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' })
-        @($fallbacks.status) | Should -Be @('Warning', 'Warning')
-        $fallbacks[0].message | Should -Match 'tries Standard_B2s, the same Burstable class'
-        $fallbacks[1].message | Should -Match 't4Enabled stays as you configured it'
-        $fallbacks[1].remediation | Should -Match 'raise monthlyCeilingUsd to at least 600'
+        @($fallbacks.status) | Should -Be @('Warning', 'Warning', 'Warning')
+        $fallbacks[0].message | Should -Match 'tries it once more in zone 2'
+        $fallbacks[1].message | Should -Match 'tries Standard_D4ads_v5, General Purpose with 4 vCores'
+        $fallbacks[2].message | Should -Match 't4Enabled stays as you configured it'
+        $fallbacks[2].remediation | Should -Match 'raise monthlyCeilingUsd to at least 600'
         $deployment.T4Note | Should -Match 'T4 isn''t deployed'
         # The template keeps the choice in the resource group's tags too.
-        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Size'] | Should -Be 'None'
         ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Pass'
     }
 
@@ -392,10 +399,10 @@ Describe 'Invoke-DemoTemplateDeployment' {
             $script:sizes.Add($(if ($Config['t4Enabled']) { if ($Config.Contains('t4SkuName')) { [string]$Config['t4SkuName'] } else { 'default' } } else { 'none' }))
             @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit } } }
         }
-        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'Standard_B2s'
-        $script:sizes | Should -Be @('Standard_B2s')
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'Standard_D4ads_v5'
+        $script:sizes | Should -Be @('Standard_D4ads_v5')
         ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).status | Should -Be 'Warning'
-        $deployment.T4SkuName | Should -Be 'Standard_B2s'
+        $deployment.T4SkuName | Should -Be 'Standard_D4ads_v5'
 
         $script:sizes.Clear()
         $withT4['t4SkuName'] = 'Standard_D2ds_v5'
@@ -405,7 +412,7 @@ Describe 'Invoke-DemoTemplateDeployment' {
     }
 
     It 'clears a recorded "no T4" when the configuration sets t4SkuName, and keeps it for a configuration that isn''t resolved (review finding 5; Phase 28 follow-up)' {
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'abc123'; owner = 'your-alias'; DbHubT4Sku = 'None' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'abc123'; owner = 'your-alias'; DbHubT4Size = 'None' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
             @{ '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion = '1.0.0.0'; parameters = @{ t3UseFreeLimit = @{ value = $T3UseFreeLimit }; budgetTags = @{ value = $ExistingResourceGroupTags } } }
         }
@@ -415,7 +422,7 @@ Describe 'Invoke-DemoTemplateDeployment' {
         $deployment.Succeeded | Should -BeTrue
         $deployment.T4Enabled | Should -BeTrue
         # The template carries the group's tags, so the stale record goes in them.
-        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be ''
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Size'] | Should -Be ''
 
         # Phase 28 follow-up: a configuration without a size that isn't resolved yet, as start-demo.ps1's T3 recreation
         # passes it, follows the record: "no T4" stays, and nothing is created. Only deploy.ps1, which resolves it with
@@ -423,12 +430,12 @@ Describe 'Invoke-DemoTemplateDeployment' {
         $script:deployCalls.Clear()
         $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -WithT4) -NetworkMode private -T3UseFreeLimit $false
         $deployment.T4Enabled | Should -BeFalse
-        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Size'] | Should -Be 'None'
 
         # With T4 off, the record stays.
         $script:deployCalls.Clear()
         Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false | Out-Null
-        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Sku'] | Should -Be 'None'
+        $script:deployCalls[-1].Parameters.parameters.budgetTags.value['DbHubT4Size'] | Should -Be 'None'
     }
 }
 
@@ -752,15 +759,16 @@ Describe 'The budget''s start date and a failed template''s cause (Phase 28 live
         It 'still falls back from a refused Burstable size through T4''s own reads, and keeps DEPLOY.T4.SKU beside the cause for a size the configuration sets' {
             $withT4 = New-TestConfig -WithT4
             # Azure refuses T4 while it's in the template; T4's own check reads pgflex01's deployment and operations.
-            $script:createFails = { param($Parameters) [bool]$Parameters.parameters.t4Enabled.value -and [string]$Parameters.parameters.t4SkuName.value -eq 'Standard_B1ms' }
-            $script:pgDeployment = ConvertTo-Json -Depth 20 -InputObject ([ordered]@{ name = 'pgflex01'; properties = [ordered]@{ provisioningState = 'Failed'; timestamp = '2026-11-02T14:03:11.123456+00:00'; parameters = [ordered]@{ sizing = [ordered]@{ value = [ordered]@{ skuName = 'Standard_B1ms'; tier = 'Burstable' } }; availabilityZone = [ordered]@{ value = '' } }; error = [ordered]@{ code = 'DeploymentFailed'; details = @([ordered]@{ code = 'ResourceDeploymentFailure' }) } } })
+            $script:createFails = { param($Parameters) [bool]$Parameters.parameters.t4Enabled.value -and [string]$Parameters.parameters.t4SkuName.value -eq 'Standard_D4ds_v5' }
+            $script:pgDeployment = ConvertTo-Json -Depth 20 -InputObject ([ordered]@{ name = 'pgflex01'; properties = [ordered]@{ provisioningState = 'Failed'; timestamp = '2026-11-02T14:03:11.123456+00:00'; parameters = [ordered]@{ sizing = [ordered]@{ value = [ordered]@{ skuName = 'Standard_D4ds_v5'; tier = 'GeneralPurpose' } }; availabilityZone = [ordered]@{ value = '' } }; error = [ordered]@{ code = 'DeploymentFailed'; details = @([ordered]@{ code = 'ResourceDeploymentFailure' }) } } })
             $script:operations['sub/dbhub-demo-main'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'demo-abc123' -StatusMessage (New-TestDeploymentFailed 'demo-abc123'))
             $script:operations['rg-dbhub-demo/demo-abc123'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.Resources/deployments' -Name 'pgflex01' -StatusMessage (New-TestDeploymentFailed 'pgflex01'))
             $script:operations['rg-dbhub-demo/pgflex01'] = ConvertTo-TestOperationJson @(New-TestOperation -Type 'Microsoft.DBforPostgreSQL/flexibleServers' -Name 'pgflex01-abc123' -StatusMessage ([ordered]@{ status = 'Failed'; error = [ordered]@{ code = 'SkuNotAvailable'; message = 'Specified SKU is not supported in this region. Please choose a different SKU.' } }))
             $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
             $deployment.Succeeded | Should -BeTrue
-            $deployment.T4SkuName | Should -Be 'Standard_B2s'
-            @($script:creates | ForEach-Object { [string]$_.parameters.t4SkuName.value }) | Should -Be @('Standard_B1ms', 'Standard_B2s')
+            $deployment.T4SkuName | Should -Be 'Standard_D4ads_v5'
+            @($script:creates | ForEach-Object { [string]$_.parameters.t4SkuName.value }) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
+            @($script:azLog | Where-Object { $_ -like 'postgres flexible-server list-skus --location westus3 *' }).Count | Should -Be 1 -Because 'the retry in another zone needs a zone the region lists, which couldn''t be read here'
             ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).status | Should -Be 'Warning'
             ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).status | Should -Be 'Pass'
             @($script:azLog | Where-Object { $_ -like 'deployment operation group list --resource-group rg-dbhub-demo --name pgflex01 *' }).Count | Should -Be 1
@@ -769,14 +777,14 @@ Describe 'The budget''s start date and a failed template''s cause (Phase 28 live
             # A size the configuration sets doesn't fall back: DEPLOY.TEMPLATE names the refusal, and DEPLOY.T4.SKU still says what to do.
             $script:creates.Clear()
             $script:azLog.Clear()
-            $withT4['t4SkuName'] = 'Standard_B1ms'
+            $withT4['t4SkuName'] = 'Standard_D4ds_v5'
             $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false
             $deployment.Succeeded | Should -BeFalse
             $script:creates.Count | Should -Be 1
             ($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.TEMPLATE' }).message | Should -Be 'The template create failed: Microsoft.DBforPostgreSQL/flexibleServers pgflex01-abc123: SkuNotAvailable: Specified SKU is not supported in this region. Please choose a different SKU.'
             $sku = $deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }
             $sku.status | Should -Be 'Fail'
-            $sku.remediation | Should -Match 'Set t4SkuName to Standard_B2s, the documented fallback'
+            $sku.remediation | Should -Match 'Set t4SkuName to Standard_D4ads_v5 \(General Purpose, 4 vCores on AMD processors'
         }
     }
 }
@@ -2229,7 +2237,7 @@ Describe 'Get-DemoEnvironmentStatus' {
         $t4 = $results | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Pass'
         $t4.message | Should -BeLike 'pgflex01-abc123 is stopped since 2026-10-20 23:00 UTC. Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, *'
-        $t4.message | Should -Match 'it then bills compute at about 0\.178 USD an hour \(Standard_B1ms, list price\) until it''s stopped again: nothing here stops it on its own'
+        $t4.message | Should -Match 'it then bills compute at about 0\.178 USD an hour \(Standard_D4ds_v5, list price\) until it''s stopped again: nothing here stops it on its own'
         ([datetime]$t4.evidence.autoStartUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm', [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be '2026-10-27T23:00'
         $t4.evidence.hourlyUsd | Should -Be 0.178
         $t4.evidence.dailySafetyStop | Should -BeFalse
@@ -2257,7 +2265,7 @@ Describe 'Get-DemoEnvironmentStatus' {
         $config['control']['enabled'] = $true
         $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.message | Should -Match 'Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the on-demand control''s daily safety stop stops it again, within a day\.'
-        $t4.message | Should -Match 'It''s General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the Burstable sizes here\.$'
+        $t4.message | Should -Match 'It''s General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off\.$'
         $t4.evidence.dailySafetyStop | Should -BeTrue
         $t4.evidence.safetyStop | Should -Be 'Scheduled'
         $t4.evidence.skuName | Should -Be 'Standard_D2ds_v5'
@@ -2276,7 +2284,7 @@ Describe 'Get-DemoEnvironmentStatus' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4MetricSnapshot -MockWith { [pscustomobject]@{ Succeeded = $true; Error = ''; Minutes = 15; LatestUtc = '2026-10-23T20:00:00.0000000Z'; Latest = [ordered]@{ cpu_percent = 12 }; ByState = [ordered]@{}; ByWaitEventType = [ordered]@{} } }
         $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Pass'
-        $t4.message | Should -Match 'It''s General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the Burstable sizes here: about 0\.500 USD an hour \(list price\) while it runs\.'
+        $t4.message | Should -Match 'It''s General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off: about 0\.500 USD an hour \(list price\) while it runs\.'
         $t4.evidence.hourlyUsd | Should -Be 0.5
 
         # A Standard_D2ds_v5 server that a configuration set, after t4SkuName is removed: no record (only the fallback writes
@@ -2292,7 +2300,7 @@ Describe 'Get-DemoEnvironmentStatus' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = $script:t4Names; Exists = $false; State = 'NotFound'; Server = $null; Error = '' } }
         $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Not selected'
-        $t4.message | Should -Be 'T4 (pgflex01-abc123) doesn''t exist; deploy.ps1 creates it as General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the Burstable sizes here, after checking its price against the ceilings again.'
+        $t4.message | Should -Be 'T4 (pgflex01-abc123) doesn''t exist; deploy.ps1 creates it as General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off, after checking its price against the ceilings again.'
     }
 
     It 'warns in STATUS.T4 about a T4 server that exists and bills although the record says <Record> (review of 64c28b2)' -ForEach @(
@@ -2308,7 +2316,7 @@ Describe 'Get-DemoEnvironmentStatus' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4MetricSnapshot -MockWith { throw 'status.ps1 reads no metrics for a T4 that the record says is off' }
         $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Warning'
-        $t4.message | Should -Be ('T4 (pgflex01-abc123) exists and bills, although the resource group''s record says T4 is off (DbHubT4Sku {0}): it''s Ready, General Purpose Standard_D2ds_v5.' -f $Record)
+        $t4.message | Should -Be ('T4 (pgflex01-abc123) exists and bills, although the resource group''s record says T4 is off (DbHubT4Size {0}): it''s Ready, General Purpose Standard_D2ds_v5.' -f $Record)
         $t4.remediation | Should -Match ('^{0} Meanwhile \./scripts/stop-demo\.ps1 stops it with the rest of the demo, and \./scripts/destroy\.ps1 removes everything\.$' -f $Keep)
         $t4.evidence.recorded | Should -Be $Record
         $t4.evidence.state | Should -Be 'Ready'
@@ -2318,7 +2326,7 @@ Describe 'Get-DemoEnvironmentStatus' {
         $script:t4Server = $null
         $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Not selected'
-        $t4.message | Should -Match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both Burstable sizes'
+        $t4.message | Should -Match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both 4-vCore sizes'
     }
 }
 

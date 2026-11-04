@@ -276,7 +276,7 @@ function Invoke-DemoDeployment {
         $results.ToArray()
     }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28 and its follow-up): a
-    # "no T4" record gets the General Purpose fallback, and its cost check, again when this run deploys the template.
+    # "no T4" record gets the 2-vCore fallback, and its cost check, again when this run deploys the template.
     # DONE's T4 reason reads the configuration as the file has it.
     $userConfig = $Config
     $infrastructureIndex = [array]::IndexOf($stages, 'Infrastructure')
@@ -430,6 +430,8 @@ function Invoke-DemoDeployment {
                     NetworkMode             = $context.NetworkMode
                     T3UseFreeLimit          = [bool]$context.T3UseFreeLimit
                     T3AdminGroupDisplayName = [string]$context.T3AdminGroupName
+                    # An existing T4 whose size the configuration doesn't set moves to the default (2026-11-04, ADR 0019).
+                    ScaleT4                 = $true
                 }
                 if ($context.T4StartSku) {
                     $deployArguments['T4StartSku'] = $context.T4StartSku
@@ -542,6 +544,7 @@ function Invoke-DemoDeployment {
                     T3AdminGroupDisplayName = [string]$context.T3AdminGroupName
                     BootstrapBundleSha256   = $current.BundleSha256
                     BootstrapChunkCount     = $current.BundleChunkCount
+                    ScaleT4                 = $true
                 }
                 if ($current.RunnerSha256 -and @($runnerVms | Where-Object { $_ -notin $current.RunnerSentTo }).Count -eq 0) {
                     $deployArguments['WorkloadRunnerSha256'] = $current.RunnerSha256

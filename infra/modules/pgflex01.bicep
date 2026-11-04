@@ -60,6 +60,17 @@ param idleInTransactionTimeoutMs int = 900000
 @maxValue(5000)
 param maxConnections int = 50
 
+@description('Autonomous tuning (2026-11-04, ADR 0019): Query Store and index tuning in REPORT mode, only on a size that runs them (4 vCores or more, not Burstable); deploy.ps1 decides (Get-DemoT4Tuning). When false, these parameters are left as they are, except that Query Store is turned off on a Burstable size.')
+param autonomousTuning bool = false
+
+@description('The autonomous tuning values from config/versions.json (postgresql.autonomousTuning): queryCaptureMode, parametersCaptureMode, analysisIntervalMinutes, and mode.')
+param tuning object = {
+  queryCaptureMode: 'top'
+  parametersCaptureMode: 'capture_first_sample'
+  analysisIntervalMinutes: 60
+  mode: 'report'
+}
+
 // The private DNS zone that virtual network integration needs, linked to the demo VNet so T1 resolves the
 // server's name to its private address (https://learn.microsoft.com/azure/postgresql/network/concepts-networking-private).
 resource privateDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
@@ -190,6 +201,66 @@ resource maxConnectionsSetting 'Microsoft.DBforPostgreSQL/flexibleServers/config
   }
   dependsOn: [
     idleInTransactionTimeout
+  ]
+}
+
+// Autonomous tuning (2026-11-04, user-directed; ADR 0019), on T4's 4-vCore default: it "is supported on any currently
+// supported compute SKU with at least 4 vCores", and needs Query Store capturing queries (top or all); the runner's
+// queries are parameterized, so parameters_capture_mode is capture_first_sample. index_tuning.analysis_interval goes
+// before index_tuning.mode: the first session is scheduled from the interval in effect when tuning is turned on, and 60
+// minutes is its minimum, because T4 runs only during demos. All four are dynamic (no restart). Without autonomous
+// tuning they're left as they are, except on Burstable: "Don't enable query store on the Burstable pricing tier as it
+// causes performance problems", so a server moved to a Burstable size (t4SkuName, to keep the month cheap) gets Query
+// Store off, where the 4-vCore default had turned it on.
+// (https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning,
+// https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store,
+// https://learn.microsoft.com/azure/postgresql/parameters/parameters-query-store,
+// https://learn.microsoft.com/azure/postgresql/parameters/parameters-autonomous-tuning)
+resource queryCaptureMode 'Microsoft.DBforPostgreSQL/flexibleServers/configurations@2025-08-01' = if (autonomousTuning || sizing.tier == 'Burstable') {
+  parent: server
+  name: 'pg_qs.query_capture_mode'
+  properties: {
+    value: autonomousTuning ? string(tuning.queryCaptureMode) : 'none'
+    source: 'user-override'
+  }
+  dependsOn: [
+    maxConnectionsSetting
+  ]
+}
+
+resource parametersCaptureMode 'Microsoft.DBforPostgreSQL/flexibleServers/configurations@2025-08-01' = if (autonomousTuning) {
+  parent: server
+  name: 'pg_qs.parameters_capture_mode'
+  properties: {
+    value: string(tuning.parametersCaptureMode)
+    source: 'user-override'
+  }
+  dependsOn: [
+    queryCaptureMode
+  ]
+}
+
+resource tuningInterval 'Microsoft.DBforPostgreSQL/flexibleServers/configurations@2025-08-01' = if (autonomousTuning) {
+  parent: server
+  name: 'index_tuning.analysis_interval'
+  properties: {
+    value: string(tuning.analysisIntervalMinutes)
+    source: 'user-override'
+  }
+  dependsOn: [
+    parametersCaptureMode
+  ]
+}
+
+resource tuningMode 'Microsoft.DBforPostgreSQL/flexibleServers/configurations@2025-08-01' = if (autonomousTuning) {
+  parent: server
+  name: 'index_tuning.mode'
+  properties: {
+    value: string(tuning.mode)
+    source: 'user-override'
+  }
+  dependsOn: [
+    tuningInterval
   ]
 }
 

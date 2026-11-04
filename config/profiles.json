@@ -13,7 +13,7 @@
       "t2Host": { "size": "Standard_E2s_v5", "vcpus": 2, "family": "standardESv5Family", "osDisk": "E10", "dataDisk": "None" },
       "t2Guest": { "vcpus": 2, "memoryGiB": 8, "vhdxGB": 64 },
       "t3": { "minVcores": 0.5, "maxVcores": 1, "maxSizeGB": 32, "autoPauseMinutes": 15 },
-      "t4": { "skuName": "Standard_B1ms", "tier": "Burstable", "vcores": 1, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
+      "t4": { "skuName": "Standard_D4ds_v5", "tier": "GeneralPurpose", "vcores": 4, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
       "database": { "seedScale": 1 }
     },
     "demo-day": {
@@ -21,7 +21,7 @@
       "t2Host": { "size": "Standard_D4as_v5", "vcpus": 4, "family": "standardDASv5Family", "osDisk": "E10", "dataDisk": "E10", "zonalDataDisk": "PremiumV2" },
       "t2Guest": { "vcpus": 2, "memoryGiB": 8, "vhdxGB": 64 },
       "t3": { "minVcores": 0.5, "maxVcores": 2, "maxSizeGB": 32, "autoPauseMinutes": 60 },
-      "t4": { "skuName": "Standard_B1ms", "tier": "Burstable", "vcores": 1, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
+      "t4": { "skuName": "Standard_D4ds_v5", "tier": "GeneralPurpose", "vcores": 4, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
       "database": { "seedScale": 2 }
     },
     "enhanced-performance": {
@@ -29,7 +29,7 @@
       "t2Host": { "size": "Standard_D8as_v5", "vcpus": 8, "family": "standardDASv5Family", "osDisk": "P10", "dataDisk": "P10", "zonalDataDisk": "PremiumV2" },
       "t2Guest": { "vcpus": 4, "memoryGiB": 16, "vhdxGB": 64 },
       "t3": { "minVcores": 0.5, "maxVcores": 4, "maxSizeGB": 32, "autoPauseMinutes": 60 },
-      "t4": { "skuName": "Standard_B1ms", "tier": "Burstable", "vcores": 1, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
+      "t4": { "skuName": "Standard_D4ds_v5", "tier": "GeneralPurpose", "vcores": 4, "storageSizeGB": 32, "storageTier": "P4", "backupRetentionDays": 7 },
       "database": { "seedScale": 4 }
     }
   },

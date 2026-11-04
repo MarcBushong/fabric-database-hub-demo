@@ -3,6 +3,13 @@
 # https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
 $script:T4StopJobEndedStatuses = @('Completed', 'Failed', 'Stopped', 'Suspended')
 
+# T4's documented sizes (ADR 0019): the default, General Purpose Standard_D4ds_v5 (4 vCores, since 2026-11-04, for
+# autonomous tuning; user-directed), the fallback's Standard_D4ads_v5 (4 vCores) and Standard_D2ds_v5 (2 vCores), and the
+# Burstable sizes a configuration can set to stay cheap. The fallback's order is the first three.
+# https://learn.microsoft.com/azure/postgresql/compute-storage/concepts-compute (checked 2026-11-04)
+$script:T4Sizes = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'Standard_B1ms', 'Standard_B2s')
+$script:T4FallbackSizes = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
+
 function Test-DemoT4Enabled {
     # True unless the configuration turns T4 off (t4Enabled false; Phase 24, ADR 0019). Internal.
     [CmdletBinding()]
@@ -27,11 +34,11 @@ function Get-DemoPostgresSetting {
 
 function Get-DemoT4SkuName {
     <#
-    T4's compute size: the t4SkuName setting, or the profile's size (Standard_B1ms) when it isn't set. When the
-    configuration doesn't set it, deploy.ps1's fallback moves on when Azure refuses a size with SkuNotAvailable: from B1ms
-    to Standard_B2s (Phase 28), then to General Purpose Standard_D2ds_v5 once its cost check passes (Phase 28 follow-up,
-    ADR 0019), and records it; Resolve-DemoEffectiveConfig puts the recorded size here. A size the configuration sets
-    never changes. Internal.
+    T4's compute size: the t4SkuName setting, or the profile's size (General Purpose Standard_D4ds_v5 since 2026-11-04)
+    when it isn't set. When the configuration doesn't set it, deploy.ps1's fallback moves on when Azure refuses a size
+    with SkuNotAvailable: Standard_D4ds_v5 once more in another zone the region lists, then Standard_D4ads_v5 (4 vCores),
+    then Standard_D2ds_v5 (2 vCores, autonomous tuning off) once its cost check passes (ADR 0019), and records it;
+    Resolve-DemoEffectiveConfig puts the recorded size here. A size the configuration sets never changes. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -43,6 +50,19 @@ function Get-DemoT4SkuName {
     if ($Config.Contains('t4SkuName') -and $Config['t4SkuName']) {
         return [string]$Config['t4SkuName']
     }
+    return (Get-DemoT4DefaultSkuName -Config $Config)
+}
+
+function Get-DemoT4DefaultSkuName {
+    # The profile's T4 size, what a configuration without t4SkuName gets: General Purpose Standard_D4ds_v5 since
+    # 2026-11-04 (user-directed, for autonomous tuning; ADR 0016 and ADR 0019). Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
     $catalog = Get-DemoProfile
     $profileName = if ($Config['profile']) { [string]$Config['profile'] } else { 'lowest-cost' }
     return [string]$catalog.profiles[$profileName].t4.skuName
@@ -68,9 +88,10 @@ function Test-DemoT4SkuExplicit {
 function Copy-DemoT4Config {
     <#
     A copy of the configuration with T4's size set (and T4 on), or with T4 off (-Off), marked with where that came from in
-    t4SkuSource (Phase 28 follow-up): record (the resource group's DbHubT4Sku tag), fallback (the General Purpose
-    fallback, whose cost check is still to come), server (an existing server's own size), or deployed (what this run's
-    template deployed). So it's never taken for a size the file sets (Test-DemoT4SkuExplicit). Pure. Internal.
+    t4SkuSource (Phase 28 follow-up): record (the resource group's DbHubT4Size tag), fallback (the fallback's next size,
+    whose cost check may still be to come), server (an existing server's own size), or deployed (what this run's
+    template deployed). So it's never taken for a size the file sets (Test-DemoT4SkuExplicit). -Zone sets the zone a new
+    server is created in (the fallback's retry in another zone; '' is no preference). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -84,7 +105,10 @@ function Copy-DemoT4Config {
 
         [string] $SkuName = '',
 
-        [switch] $Off
+        [switch] $Off,
+
+        [ValidateSet('', '1', '2', '3')]
+        [string] $Zone = ''
     )
 
     $copy = [ordered]@{}
@@ -97,6 +121,9 @@ function Copy-DemoT4Config {
     elseif ($SkuName) {
         $copy['t4Enabled'] = $true
         $copy['t4SkuName'] = $SkuName
+    }
+    if ($PSBoundParameters.ContainsKey('Zone')) {
+        $copy['t4AvailabilityZone'] = [string]$Zone
     }
     $copy['t4SkuSource'] = $Source
     return $copy
@@ -113,7 +140,7 @@ function Get-DemoT4ServerSku {
     )
 
     $name = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Server -Name 'sku') -Name 'name')
-    if ($name -cin 'Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5') {
+    if ($name -cin $script:T4Sizes) {
         return $name
     }
     return ''
@@ -122,9 +149,9 @@ function Get-DemoT4ServerSku {
 function Get-DemoT4SkuSpec {
     <#
     A documented T4 size's tier, vCores, and Retail Prices meter. The tier follows the size, as in
-    infra/modules/demo.bicep: Standard_B sizes are Burstable (one meter per server-hour), and Standard_D<n>ds_v5 is
-    General Purpose (a vCore-hour meter times its vCores). Internal.
-    Source: https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute
+    infra/modules/demo.bicep: Standard_B sizes are Burstable (one meter per server-hour), and Standard_D<n>ds_v5 and
+    Standard_D<n>ads_v5 are General Purpose (a vCore-hour meter of their series times their vCores). Internal.
+    Source: https://learn.microsoft.com/azure/postgresql/compute-storage/concepts-compute (checked 2026-11-04)
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -139,7 +166,167 @@ function Get-DemoT4SkuSpec {
     if ($SkuName -match '^Standard_D(\d+)ds_v5$') {
         return [pscustomobject]@{ SkuName = $SkuName; Tier = 'GeneralPurpose'; VCores = [int]$Matches[1]; Product = 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'; Meter = 'vCore'; PerVCore = $true }
     }
-    throw ('{0} isn''t a documented T4 size (Standard_B1ms, Standard_B2s, or Standard_D2ds_v5).' -f $SkuName)
+    if ($SkuName -match '^Standard_D(\d+)ads_v5$') {
+        return [pscustomobject]@{ SkuName = $SkuName; Tier = 'GeneralPurpose'; VCores = [int]$Matches[1]; Product = 'Azure Database for PostgreSQL Flexible Server General Purpose Dadsv5 Series Compute'; Meter = 'vCore'; PerVCore = $true }
+    }
+    throw ('{0} isn''t a documented T4 size ({1}).' -f $SkuName, ($script:T4Sizes -join ', '))
+}
+
+function Get-DemoT4Tuning {
+    <#
+    .SYNOPSIS
+    Whether T4 gets autonomous tuning (2026-11-04, user-directed; ADR 0019): Query Store and index tuning in REPORT mode,
+    which the template sets only when Enabled. Returns Enabled, Status, Message, Remediation, SkuName, Tier, VCores, and
+    Switch (t4AutonomousTuning as the file sets it, or $null). Pure. Internal.
+
+    .DESCRIPTION
+    Autonomous tuning works on "any currently supported compute SKU with at least 4 vCores", and the Query Store it needs
+    shouldn't run on Burstable ("Don't enable query store on the Burstable pricing tier as it causes performance
+    problems"), so the size must be General Purpose or Memory Optimized with at least 4 vCores
+    (config/versions.json postgresql.autonomousTuning.minVCores). t4AutonomousTuning, unset meaning on:
+    - unset or true, with a size that fits: Enabled, Pass.
+    - unset, with a size that doesn't (a t4SkuName you set, or the fallback's Standard_D2ds_v5): off, Warning, with why.
+    - true, with a size that doesn't: off, Fail, with the exact fix (preflight stops the run).
+    - false: off, Not selected; the template leaves the parameters as they are.
+    -SkuName is the size to judge (the fallback's step); by default, the configuration's.
+    Sources (checked 2026-11-04): https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning (updated
+    2026-07-16), https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $SkuName = ''
+    )
+
+    $switchValue = if ($Config.Contains('t4AutonomousTuning') -and $null -ne $Config['t4AutonomousTuning']) { [bool]$Config['t4AutonomousTuning'] } else { $null }
+    $size = if ($SkuName) { $SkuName } else { Get-DemoT4SkuName -Config $Config }
+    $spec = Get-DemoT4SkuSpec -SkuName $size
+    $minVCores = [int](Get-DemoPostgresSetting)['autonomousTuning']['minVCores']
+    $fits = $spec.Tier -ne 'Burstable' -and $spec.VCores -ge $minVCores
+    $tierText = if ($spec.Tier -eq 'GeneralPurpose') { 'General Purpose' } else { $spec.Tier }
+    $sized = '{0} ({1}, {2} vCore{3})' -f $size, $tierText, $spec.VCores, $(if ($spec.VCores -eq 1) { '' } else { 's' })
+    $result = [ordered]@{ Enabled = $false; Status = 'Not selected'; Message = ''; Remediation = ''; SkuName = $size; Tier = $spec.Tier; VCores = $spec.VCores; Switch = $switchValue }
+    $needs = 'it needs a General Purpose or Memory Optimized size with at least {0} vCores, because it runs only on {0} vCores or more and Query Store shouldn''t run on Burstable' -f $minVCores
+    if ($switchValue -eq $false) {
+        $result.Message = 't4AutonomousTuning is false, so T4 gets no autonomous tuning; its Query Store and index-tuning parameters are left as they are.'
+    }
+    elseif ($fits) {
+        $result.Enabled = $true
+        $result.Status = 'Pass'
+        $result.Message = 'T4 gets autonomous tuning at {0}: Query Store captures the top queries, and index tuning runs in REPORT mode every 60 minutes, so its index and table recommendations show in the Azure portal (the server''s Intelligent Performance > Autonomous tuning), not in Database Hub.' -f $sized
+    }
+    elseif ($switchValue -eq $true) {
+        $result.Status = 'Fail'
+        $result.Message = 't4AutonomousTuning is true, but T4''s size {0} can''t run autonomous tuning: {1}.' -f $sized, $needs
+        $result.Remediation = 'Set t4SkuName to Standard_D4ds_v5 (or remove it: that''s the default) or Standard_D4ads_v5; or set t4AutonomousTuning to false (or remove it, which turns tuning off on this size with a Warning).'
+    }
+    else {
+        $result.Status = 'Warning'
+        $result.Message = 'Autonomous tuning is off for T4 at {0}: {1}. Database Hub''s PostgreSQL visuals don''t need it.' -f $sized, $needs
+        $result.Remediation = 'Nothing to do for the demo. To have it, remove t4SkuName (the default is Standard_D4ds_v5) or set it to Standard_D4ds_v5 or Standard_D4ads_v5; to say you don''t want it, set t4AutonomousTuning to false.'
+    }
+    return [pscustomobject]$result
+}
+
+function New-DemoT4TuningResult {
+    # <Prefix>.T4.TUNING from Get-DemoT4Tuning (2026-11-04, ADR 0019), or Not selected when T4 is off. -Why adds why T4
+    # has this size (the fallback's step). Internal.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $SkuName = '',
+
+        [string] $Why = '',
+
+        [ValidateSet('PREFLIGHT', 'DEPLOY')]
+        [string] $CheckPrefix = 'PREFLIGHT'
+    )
+
+    $checkId = '{0}.T4.TUNING' -f $CheckPrefix
+    $area = if ($CheckPrefix -eq 'PREFLIGHT') { 'preflight' } else { 't4' }
+    $docUrl = [string](Get-DemoPostgresSetting)['autonomousTuning']['docUrls']['autonomousTuning']
+    if (-not (Test-DemoT4Enabled -Config $Config)) {
+        return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Not selected' -Message 'T4 is off in this configuration, so autonomous tuning doesn''t apply.' -DocUrl $docUrl)
+    }
+    $tuning = Get-DemoT4Tuning -Config $Config -SkuName $SkuName
+    $message = if ($Why) { '{0} {1}' -f $tuning.Message, $Why } else { $tuning.Message }
+    $evidence = [ordered]@{ enabled = $tuning.Enabled; skuName = $tuning.SkuName; tier = $tuning.Tier; vCores = $tuning.VCores; switch = $tuning.Switch }
+    $parameters = @{ CheckId = $checkId; Area = $area; Target = 'T4'; Status = $tuning.Status; Message = $message; Evidence = $evidence; DocUrl = $docUrl }
+    if ($tuning.Remediation) {
+        $parameters['Remediation'] = $tuning.Remediation
+    }
+    return (New-DemoResult @parameters)
+}
+
+function New-DemoT4SizeResult {
+    <#
+    <Prefix>.T4.SIZE (2026-11-04, ADR 0019): the notice that an existing T4 whose size the configuration doesn't set moves
+    to the default, General Purpose Standard_D4ds_v5 with autonomous tuning, at this deploy, or why it keeps its size.
+    It's said while the move is pending, so once it's done, it isn't said again. -Outcome:
+    - Scale: it scales now. A Warning: the server restarts ("When you change the number of vCores or the compute tier, the
+      server restarts", typically a minute or less), and it bills more while it runs.
+    - Waiting: T4 isn't Ready (deploy.ps1 starts a stopped T4 before the template), so it keeps its size this time.
+    - Refused: Azure refused the scale (-Failure, SkuNotAvailable), so it keeps its size, which the resource group records
+      (DbHubT4Size), and later runs keep it.
+    Internal.
+    Source (checked 2026-11-04; updated 2026-07-16): https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('PREFLIGHT', 'DEPLOY')]
+        [string] $CheckPrefix,
+
+        [Parameter(Mandatory)]
+        [string] $ServerSku,
+
+        [Parameter(Mandatory)]
+        [string] $SkuName,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Scale', 'Waiting', 'Refused')]
+        [string] $Outcome,
+
+        [string] $State = '',
+
+        [AllowNull()]
+        [pscustomobject] $Failure
+    )
+
+    $checkId = '{0}.T4.SIZE' -f $CheckPrefix
+    $area = if ($CheckPrefix -eq 'PREFLIGHT') { 'preflight' } else { 't4' }
+    $docUrl = 'https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources'
+    $from = '{0} ({1})' -f $ServerSku, $(if ((Get-DemoT4SkuSpec -SkuName $ServerSku).Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' })
+    $evidence = [ordered]@{ serverSku = $ServerSku; skuName = $SkuName; outcome = $Outcome }
+    $keep = 'To keep T4 at {0}, set t4SkuName to {0} in your configuration (autonomous tuning then stays off on a size under 4 vCores); a size you set is never changed.' -f $ServerSku
+    switch ($Outcome) {
+        'Scale' {
+            $who = if ($CheckPrefix -eq 'PREFLIGHT') { 'deploy.ps1 scales it' } else { 'this deployment scales it' }
+            $message = 'T4 exists as {0}, and your configuration doesn''t set t4SkuName, so {1} to the default, General Purpose {2} with 4 vCores and autonomous tuning (since 2026-11-04), which restarts it, usually for a minute or less. The cost checks price it at {2}.' -f $from, $who, $SkuName
+            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('Nothing to do. {0}' -f $keep) -DocUrl $docUrl)
+        }
+        'Waiting' {
+            $evidence['state'] = $State
+            $message = 'T4 exists as {0} and is {1}, not Ready, so this deployment keeps its size; the default, {2} with autonomous tuning, comes with the next ./scripts/deploy.ps1 while T4 runs.' -f $from, $(if ($State) { $State } else { 'in an unknown state' }), $SkuName
+            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('Run ./scripts/deploy.ps1 again once T4 is Ready (./scripts/start-demo.ps1 starts it). {0}' -f $keep) -DocUrl $docUrl)
+        }
+        default {
+            if ($null -ne $Failure) {
+                $evidence['refusedUtc'] = $Failure.TimeUtc
+            }
+            $message = 'Azure refused to scale T4 to {0} (SkuNotAvailable{1}), so T4 keeps {2}, and later runs keep it too (the resource group''s DbHubT4Size records it); autonomous tuning stays off on a size under 4 vCores.' -f $SkuName, $(if ($null -ne $Failure) { ', at ' + $Failure.TimeUtc } else { '' }), $from
+            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('To try the default again, set t4SkuName to {0} (a size you set has no fallback: a refusal is then a Fail), or ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors).' -f $SkuName) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors')
+        }
+    }
 }
 
 function Select-DemoT4ComputePrice {
@@ -195,21 +382,23 @@ function Get-DemoT4HourlyPrice {
 function ConvertTo-DemoT4FallbackCost {
     <#
     .SYNOPSIS
-    The verdict on T4's General Purpose fallback from the demo's estimate with T4 at Standard_D2ds_v5 (Phase 28
-    follow-up, ADR 0019): Allowed only when its compute was priced, the worst-case month is within monthlyCeilingUsd, and
-    a session is within sessionCeilingUsd. Pure. Internal.
+    The verdict on T4's 2-vCore fallback, General Purpose Standard_D2ds_v5 (ADR 0019; the last size the fallback tries
+    since T4's 4-vCore default, 2026-11-04), from the demo's estimate with T4 at that size: Allowed only when its compute
+    was priced, the worst-case month is within monthlyCeilingUsd, and a session is within sessionCeilingUsd. Pure.
+    Internal.
 
     .DESCRIPTION
-    The worst case is every hour of a month running, because Azure starts a stopped flexible server again on its own after
-    seven days ("The server remains stopped for seven days unless you restart it sooner",
-    https://learn.microsoft.com/azure/postgresql/overview; https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server).
-    So it's the estimate's light-use month plus its T4 restart worst case (Get-DemoCostEstimate: the rest of the month's
-    compute at that size), with T4's storage, its private DNS zone, and, where the subscription's plans are on Standard
-    (what a tenant policy enforces, PREFLIGHT.POLICY.DEFENDER), Defender CSPM and Defender for open-source relational
-    databases. Unpriced names what the Retail Prices API had no price for, which the totals leave out, and Defender for
-    Cloud when its plans weren't read. Returns Allowed, SkipReason (MonthlyCeiling, SessionCeiling, Price, or ''),
-    SkuName, HourlyUsd, T4MonthlyWorstCaseUsd (T4 alone, the whole month), MonthlyWorstCaseUsd (the demo's month with it),
-    SessionUsd, MonthlyCeilingUsd, SessionCeilingUsd, DefenderIncluded, Unpriced, Location, and PriceError.
+    The worst case counts Azure starting a stopped flexible server again on its own after seven days ("The server remains
+    stopped for seven days unless you restart it sooner", https://learn.microsoft.com/azure/postgresql/overview;
+    https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server): the estimate's light-use month plus
+    its T4 restart worst case (Get-DemoCostEstimate: about a day per restart where the daily T4 safety stop is fully in
+    place, otherwise the rest of the month's compute at that size), with T4's storage, its private DNS zone, and, where
+    the subscription's plans are on Standard (what a tenant policy enforces, PREFLIGHT.POLICY.DEFENDER), Defender CSPM
+    and Defender for open-source relational databases. Unpriced names what the Retail Prices API had no price for, which
+    the totals leave out, and Defender for Cloud when its plans weren't read. Returns Allowed, SkipReason
+    (MonthlyCeiling, SessionCeiling, Price, or ''), SkuName, HourlyUsd, T4MonthlyWorstCaseUsd (T4 alone),
+    MonthlyWorstCaseUsd (the demo's month with it), SessionUsd, MonthlyCeilingUsd, SessionCeilingUsd, DefenderIncluded,
+    Unpriced, Location, PriceError, and RestartAssumption (SafetyStop, RestOfMonth, or '').
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -269,14 +458,15 @@ function ConvertTo-DemoT4FallbackCost {
         Unpriced              = $unpriced.ToArray()
         Location              = [string]$Config['location']
         PriceError            = $PriceError
+        RestartAssumption     = [string](Get-DemoMemberValue -InputObject $Estimate -Name 'T4RestartAssumption')
     }
 }
 
 function Get-DemoT4GeneralPurposeCost {
     <#
     .SYNOPSIS
-    The cost check right before T4's General Purpose fallback creates Standard_D2ds_v5 (Phase 28 follow-up, ADR 0019): the
-    demo's estimate with T4 at that size, priced from the Azure Retail Prices API now (Get-DemoCostEstimate, with the
+    The cost check right before T4's fallback creates Standard_D2ds_v5, its 2-vCore size (ADR 0019): the demo's
+    estimate with T4 at that size, priced from the Azure Retail Prices API now (Get-DemoCostEstimate, with the
     subscription's Defender for Cloud plans and the T2 golden snapshots, both read-only), and its verdict
     (ConvertTo-DemoT4FallbackCost). Never throws: an estimate that can't be made is a verdict that doesn't allow it
     (Price). Internal.
@@ -304,13 +494,13 @@ function Get-DemoT4GeneralPurposeCost {
         $parameters['DefenderPlans'] = @(Get-DemoDefenderPlan -SubscriptionId ([string]$Config['subscriptionId']))
     }
     catch {
-        Write-DemoLog -Level Warning -Message ('The Defender for Cloud plans couldn''t be read, so the General Purpose fallback''s estimate leaves them out: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        Write-DemoLog -Level Warning -Message ('The Defender for Cloud plans couldn''t be read, so the 2-vCore fallback''s estimate leaves them out: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
     try {
         $parameters['GoldenSnapshots'] = @(Get-DemoT2GoldenSnapshot -Config $Config)
     }
     catch {
-        Write-DemoLog -Level Warning -Message ('The T2 golden snapshots couldn''t be listed, so the General Purpose fallback''s estimate leaves them out: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        Write-DemoLog -Level Warning -Message ('The T2 golden snapshots couldn''t be listed, so the 2-vCore fallback''s estimate leaves them out: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
     # The daily T4 safety stop caps the restart worst case when it's fully in place (2026-11-04); never throws.
     $parameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
@@ -319,7 +509,7 @@ function Get-DemoT4GeneralPurposeCost {
     }
     catch {
         $problem = Protect-DemoText -Text $_.Exception.Message
-        Write-DemoLog -Level Warning -Message ('T4''s General Purpose fallback couldn''t be priced: {0}' -f $problem)
+        Write-DemoLog -Level Warning -Message ('T4''s 2-vCore fallback couldn''t be priced: {0}' -f $problem)
         return (ConvertTo-DemoT4FallbackCost -Estimate $null -Config $priced -PriceError $problem)
     }
 }
@@ -335,7 +525,8 @@ function Format-DemoT4FallbackCostText {
     )
 
     $culture = [System.Globalization.CultureInfo]::InvariantCulture
-    $text = [string]::Format($culture, 'about {0:N3} USD an hour while it runs (list price in {1}, Azure Retail Prices API, read now); its worst case, every hour of a month because Azure starts a stopped server again on its own after 7 days, is {2:N2} USD a month for T4 with its storage and Defender plans, and {3:N2} USD for the demo''s month against monthlyCeilingUsd ({4:N2} USD); a session is {5:N2} USD against sessionCeilingUsd ({6:N2} USD)', [object[]]@([double]$Cost.HourlyUsd, $Cost.Location, [double]$Cost.T4MonthlyWorstCaseUsd, [double]$Cost.MonthlyWorstCaseUsd, [double]$Cost.MonthlyCeilingUsd, [double]$Cost.SessionUsd, [double]$Cost.SessionCeilingUsd))
+    $worst = if ([string](Get-DemoMemberValue -InputObject $Cost -Name 'RestartAssumption') -eq 'SafetyStop') { 'its worst case, Azure starting a stopped server again on its own after 7 days, counted as about a day per restart because the daily T4 safety stop is in place,' } else { 'its worst case, every hour of a month because Azure starts a stopped server again on its own after 7 days,' }
+    $text = [string]::Format($culture, 'about {0:N3} USD an hour while it runs (list price in {1}, Azure Retail Prices API, read now); {7} is {2:N2} USD a month for T4 with its storage and Defender plans, and {3:N2} USD for the demo''s month against monthlyCeilingUsd ({4:N2} USD); a session is {5:N2} USD against sessionCeilingUsd ({6:N2} USD)', [object[]]@([double]$Cost.HourlyUsd, $Cost.Location, [double]$Cost.T4MonthlyWorstCaseUsd, [double]$Cost.MonthlyWorstCaseUsd, [double]$Cost.MonthlyCeilingUsd, [double]$Cost.SessionUsd, [double]$Cost.SessionCeilingUsd, $worst))
     if (@($Cost.Unpriced).Count -gt 0) {
         $text += '. Not priced, so left out of these totals: {0}' -f (@($Cost.Unpriced) -join '; ')
     }
@@ -344,7 +535,7 @@ function Format-DemoT4FallbackCostText {
 
 function Select-DemoT4StartSku {
     # Where T4's fallback starts, from what preflight's checks found (their startSku evidence): the furthest step wins, in
-    # the fallback's order: '' (the default size), Standard_B2s, Standard_D2ds_v5, None, Refused (Phase 28 follow-up). Pure.
+    # the fallback's order: '' (the default size), Standard_D4ads_v5, Standard_D2ds_v5, None, Refused (ADR 0019). Pure.
     # Internal.
     [CmdletBinding()]
     [OutputType([string])]
@@ -354,7 +545,7 @@ function Select-DemoT4StartSku {
         [string[]] $Sku = @()
     )
 
-    $order = @('', 'Standard_B2s', 'Standard_D2ds_v5', 'None', 'Refused')
+    $order = @('', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'None', 'Refused')
     $best = 0
     foreach ($item in @($Sku)) {
         $rank = [array]::IndexOf($order, [string]$item)
@@ -380,6 +571,57 @@ function Get-DemoT4AvailabilityZone {
     return ''
 }
 
+function Get-DemoT4SkuZone {
+    <#
+    The availability zones the region's PostgreSQL flexible server capabilities list for a General Purpose -SkuName
+    (supportedServerEditions[].supportedServerSkus[].supportedZones, through 'az postgres flexible-server list-skus'),
+    for the fallback's one retry in another zone (2026-11-04, ADR 0019). An empty list when it can't be read. Never
+    throws. A read. Internal.
+    https://learn.microsoft.com/cli/azure/postgres/flexible-server#az-postgres-flexible-server-list-skus
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [string] $SkuName
+    )
+
+    try {
+        $read = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('postgres', 'flexible-server', 'list-skus', '--location', [string]$Config['location'], '--output', 'json') -AllowFailure
+        if ($read.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$read.StdOut)) {
+            return @()
+        }
+        $items = @([string]$read.StdOut | ConvertFrom-Json -Depth 64)
+        if ($items.Count -eq 1 -and $null -ne (Get-DemoMemberValue -InputObject $items[0] -Name 'value')) {
+            # Get-DemoMemberList returns its list as one object: assign it before going through it.
+            $listed = Get-DemoMemberList -InputObject $items[0] -Name 'value'
+            $items = @($listed)
+        }
+        foreach ($item in $items) {
+            $editions = Get-DemoMemberList -InputObject $item -Name 'supportedServerEditions'
+            foreach ($edition in $editions) {
+                if ([string](Get-DemoMemberValue -InputObject $edition -Name 'name') -ne 'GeneralPurpose') {
+                    continue
+                }
+                $skus = Get-DemoMemberList -InputObject $edition -Name 'supportedServerSkus'
+                foreach ($sku in $skus) {
+                    if ([string](Get-DemoMemberValue -InputObject $sku -Name 'name') -ceq $SkuName) {
+                        $zones = Get-DemoMemberList -InputObject $sku -Name 'supportedZones'
+                        return [string[]]@($zones | ForEach-Object { [string]$_ } | Where-Object { $_ -in '1', '2', '3' } | Sort-Object -Unique)
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The zones the region lists for {0} couldn''t be read: {1}' -f $SkuName, (Protect-DemoText -Text $_.Exception.Message))
+    }
+    return @()
+}
+
 function Get-DemoT4CreateFailure {
     <#
     .SYNOPSIS
@@ -390,9 +632,10 @@ function Get-DemoT4CreateFailure {
     Azure answers SkuNotAvailable ("Specified SKU is not supported in this region") when a size isn't offered
     in the region or is temporarily unavailable there, even when the Location Based Capabilities API lists it
     (live, 2026-10-26). Learn's remedy is another size. When the configuration doesn't set t4SkuName, deploy.ps1's
-    fallback moves on by itself (Phase 28 and its follow-up): Standard_B2s, then General Purpose Standard_D2ds_v5 after
-    its cost check; only this code moves it on, and no other failure (a quota, a policy denial, a transient error) does.
-    Deploy and preflight use this to report it and to move the fallback on.
+    fallback moves on by itself (ADR 0019): Standard_D4ds_v5 once more in another zone the region lists, then
+    Standard_D4ads_v5, then Standard_D2ds_v5 (autonomous tuning off) after its cost check; only this code moves it on,
+    and no other failure (a quota, a policy denial, a transient error) does. Deploy and preflight use this to report it
+    and to move the fallback on.
     Sources: https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors,
     https://learn.microsoft.com/cli/azure/deployment/group#az-deployment-group-show,
     https://learn.microsoft.com/cli/azure/deployment/operation/group#az-deployment-operation-group-list
@@ -463,16 +706,29 @@ function New-DemoT4SkuFailureResult {
     )
 
     $where = if ($Failure.Zone) { 'zone {0}' -f $Failure.Zone } else { 'no zone preference' }
-    $evidence = [ordered]@{ refusedSku = $Failure.Sku; refusedZone = $Failure.Zone; refusedUtc = $Failure.TimeUtc; fallbackSku = 'Standard_B2s' }
-    $remediation = 'Set t4SkuName to Standard_B2s, the documented fallback (2 vCores, 4 GiB; about four times the hourly list price of B1ms, which estimate-cost.ps1 prices at run time), and run deploy.ps1 again; or keep the size and try once more with t4AvailabilityZone set to another zone the region lists; or remove t4SkuName, and deploy.ps1''s fallback tries Standard_B2s, then General Purpose Standard_D2ds_v5 after its cost check, by itself. A size you set is never changed on its own.'
-    if ($Failure.Sku -eq 'Standard_B2s') {
-        # Live, 2026-10-26: West US 3 refused the fallback too; the owner then chose the General Purpose option.
-        $evidence['fallbackSku'] = 'Standard_D2ds_v5'
-        $remediation = 'Standard_B2s is already the documented Burstable fallback. Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), try once more with t4AvailabilityZone set to a zone the region lists, set t4SkuName to Standard_D2ds_v5, the documented General Purpose option (2 vCores, 8 GiB; a much higher hourly price and 7-day restart worst case, which estimate-cost.ps1 prices at run time), remove t4SkuName so deploy.ps1''s fallback moves to it by itself after its cost check, or set t4Enabled to false until Azure accepts the size. A size you set is never changed on its own.'
-    }
-    elseif ($Failure.Sku -match '^Standard_D') {
-        $evidence['fallbackSku'] = ''
-        $remediation = 'The demo documents no further size. Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), and set t4Enabled to false until Azure accepts a size. A size you set is never changed on its own.'
+    $evidence = [ordered]@{ refusedSku = $Failure.Sku; refusedZone = $Failure.Zone; refusedUtc = $Failure.TimeUtc; fallbackSku = '' }
+    $access = 'ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors)'
+    switch -CaseSensitive ([string]$Failure.Sku) {
+        'Standard_D4ds_v5' {
+            $evidence['fallbackSku'] = 'Standard_D4ads_v5'
+            $remediation = 'Set t4SkuName to Standard_D4ads_v5 (General Purpose, 4 vCores on AMD processors, at the same price per vCore, so autonomous tuning stays on) and run deploy.ps1 again; or keep the size and try once more with t4AvailabilityZone set to another zone the region lists; or remove t4SkuName, and deploy.ps1''s fallback tries another zone, Standard_D4ads_v5, then Standard_D2ds_v5 (2 vCores, autonomous tuning off) after its cost check, by itself. A size you set is never changed on its own.'
+        }
+        'Standard_D4ads_v5' {
+            $evidence['fallbackSku'] = 'Standard_D2ds_v5'
+            $remediation = ('Set t4SkuName to Standard_D4ds_v5 (or remove it: that''s the default, and the fallback then tries both 4-vCore sizes and Standard_D2ds_v5 by itself), set it to Standard_D2ds_v5 (2 vCores; autonomous tuning turns off, and a lower hourly price, which estimate-cost.ps1 prices at run time), {0}, or set t4Enabled to false until Azure accepts a size. A size you set is never changed on its own.' -f $access)
+        }
+        'Standard_D2ds_v5' {
+            $remediation = ('Remove t4SkuName (the default, Standard_D4ds_v5, comes with the fallback), {0}, or set t4Enabled to false until Azure accepts a size. A size you set is never changed on its own.' -f $access)
+        }
+        'Standard_B1ms' {
+            $evidence['fallbackSku'] = 'Standard_B2s'
+            $remediation = 'Set t4SkuName to Standard_B2s, the other Burstable size (2 vCores, 4 GiB; about four times the hourly list price of B1ms, which estimate-cost.ps1 prices at run time), and run deploy.ps1 again; or keep the size and try once more with t4AvailabilityZone set to another zone the region lists; or remove t4SkuName for the default, Standard_D4ds_v5, with its fallback. A size you set is never changed on its own.'
+        }
+        default {
+            # Standard_B2s, the last Burstable size; live, 2026-10-26: West US 3 refused it too.
+            $evidence['fallbackSku'] = 'Standard_D4ds_v5'
+            $remediation = ('Remove t4SkuName for the default, Standard_D4ds_v5 (General Purpose, 4 vCores, with autonomous tuning; a much higher hourly price, which estimate-cost.ps1 prices at run time), whose fallback moves on by itself; try once more with t4AvailabilityZone set to a zone the region lists; {0}; or set t4Enabled to false until Azure accepts the size. A size you set is never changed on its own.' -f $access)
+        }
     }
     $docUrl = 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'
     if ($Status -eq 'Warning') {
@@ -486,20 +742,23 @@ function New-DemoT4SkuFailureResult {
 function New-DemoT4FallbackResult {
     <#
     .SYNOPSIS
-    DEPLOY.T4.SKU (or a preflight check) for T4's fallback when the configuration doesn't set t4SkuName (Phase 28 and its
-    follow-up, ADR 0019): a Warning that says what this run does about a size Azure refused with SkuNotAvailable.
-    Internal.
+    DEPLOY.T4.SKU (or a preflight check) for T4's fallback when the configuration doesn't set t4SkuName (ADR 0019): a
+    Warning that says what this run does about a size Azure refused with SkuNotAvailable. Internal.
 
     .DESCRIPTION
-    -Next:
-    - Standard_B2s: Azure refused Standard_B1ms; this run tries Standard_B2s, the same Burstable class.
-    - Standard_D2ds_v5: Azure refused both Burstable sizes, and -Cost (ConvertTo-DemoT4FallbackCost) allows the General
-      Purpose fallback: this run creates T4 as Standard_D2ds_v5, with its hourly list price and its worst case from the
-      Azure Retail Prices API, read now.
-    - None: Azure refused both Burstable sizes, and -Cost doesn't allow the General Purpose fallback (its worst case would
-      exceed monthlyCeilingUsd, a session would exceed sessionCeilingUsd, or its price couldn't be read), so this run
-      finishes without T4; the next run that deploys the template checks the fallback again.
-    - Refused: Azure refused Standard_D2ds_v5 too, so this run finishes without T4, and nothing is tried again on its own.
+    The fallback since T4's 4-vCore default (2026-11-04, user-directed):
+    - Zone: Azure refused Standard_D4ds_v5; this run tries it once more in -Zone, another zone the region's capabilities
+      list for it.
+    - Standard_D4ads_v5: Azure refused Standard_D4ds_v5 (in another zone too, when one was tried); this run tries
+      Standard_D4ads_v5, General Purpose with 4 vCores on AMD processors, so autonomous tuning stays on.
+    - Standard_D2ds_v5: Azure refused both 4-vCore sizes, and -Cost (ConvertTo-DemoT4FallbackCost) allows the 2-vCore
+      fallback: this run creates T4 as Standard_D2ds_v5, with autonomous tuning off (it needs 4 vCores), and its hourly
+      list price and worst case from the Azure Retail Prices API, read now.
+    - None: Azure refused both 4-vCore sizes, and -Cost doesn't allow the 2-vCore fallback (its worst case would exceed
+      monthlyCeilingUsd, a session would exceed sessionCeilingUsd, or its price couldn't be read), so this run finishes
+      without T4; the next run that deploys the template checks the fallback again.
+    - Refused: Azure refused Standard_D2ds_v5 too, or, with -TuningRequired (t4AutonomousTuning true), the 4-vCore sizes,
+      which leave no size that runs autonomous tuning; this run finishes without T4, and nothing is tried again on its own.
     -Refused is the refusal that moved the fallback on (Get-DemoT4CreateFailure), or $null when preflight or an earlier
     run's record started it there. No price is written here (ADR 0016).
     #>
@@ -511,11 +770,16 @@ function New-DemoT4FallbackResult {
         [pscustomobject] $Refused,
 
         [Parameter(Mandatory)]
-        [ValidateSet('Standard_B2s', 'Standard_D2ds_v5', 'None', 'Refused')]
+        [ValidateSet('Zone', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'None', 'Refused')]
         [string] $Next,
 
         [AllowNull()]
         [pscustomobject] $Cost,
+
+        [ValidateSet('', '1', '2', '3')]
+        [string] $Zone = '',
+
+        [switch] $TuningRequired,
 
         [ValidateSet('DEPLOY.T4.SKU', 'PREFLIGHT.T4.FALLBACK')]
         [string] $CheckId = 'DEPLOY.T4.SKU'
@@ -524,26 +788,40 @@ function New-DemoT4FallbackResult {
     $docUrl = 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'
     $area = if ($CheckId -like 'PREFLIGHT.*') { 'preflight' } else { 't4' }
     $where = ''
-    $evidence = [ordered]@{ next = $Next; startSku = $Next }
+    $evidence = [ordered]@{ next = $Next; startSku = $(if ($Next -eq 'Zone') { '' } else { $Next }) }
+    $refusal = 'SkuNotAvailable, on record or found by preflight'
     if ($null -ne $Refused) {
         $where = if ($Refused.Zone) { 'zone {0}' -f $Refused.Zone } else { 'no zone preference' }
+        $refusal = '{0}, at {1}; SkuNotAvailable' -f $where, $Refused.TimeUtc
         $evidence['refusedSku'] = $Refused.Sku
         $evidence['refusedZone'] = $Refused.Zone
         $evidence['refusedUtc'] = $Refused.TimeUtc
     }
-    if ($Next -eq 'Standard_B2s') {
-        $message = 'Azure refused T4''s size {0} with {1} at {2} (SkuNotAvailable). This run tries Standard_B2s, the same Burstable class (2 vCores, 4 GiB; about four times the hourly list price of B1ms, which estimate-cost.ps1 prices at run time), and later runs keep it.' -f $Refused.Sku, $where, $Refused.TimeUtc
-        return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName in your configuration: a size you set is never changed.' -DocUrl $docUrl)
+    $keep = 'Nothing to do. To choose T4''s size yourself, set t4SkuName in your configuration: a size you set is never changed.'
+    if ($Next -eq 'Zone') {
+        $evidence['retryZone'] = $Zone
+        $message = 'Azure refused T4''s size Standard_D4ds_v5 ({0}). This run tries it once more in zone {1}, which the region''s capabilities list for it; if Azure refuses that too, it moves on to Standard_D4ads_v5.' -f $refusal, $Zone
+        return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $keep -DocUrl $docUrl)
+    }
+    if ($Next -eq 'Standard_D4ads_v5') {
+        $message = 'Azure refused T4''s default size, Standard_D4ds_v5 ({0}). This run tries Standard_D4ads_v5, General Purpose with 4 vCores on AMD processors at the same price per vCore (estimate-cost.ps1 prices it at run time), so autonomous tuning stays on, and later runs keep it.' -f $refusal
+        return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $keep -DocUrl $docUrl)
     }
     if ($Next -eq 'Refused') {
-        $what = if ($null -ne $Refused) { ' ({0}, at {1}; SkuNotAvailable)' -f $where, $Refused.TimeUtc } else { ' (SkuNotAvailable, on record)' }
-        $message = 'Azure refused T4''s General Purpose fallback, Standard_D2ds_v5{0}, after both Burstable sizes, so this run finishes without T4, and later runs don''t try again on their own: t4Enabled stays as you configured it, but the server isn''t created.' -f $what
-        $remediation = 'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), then set t4SkuName to the size you get access to and run ./scripts/deploy.ps1. Or set t4Enabled to false to leave T4 out on purpose.'
+        if ($TuningRequired) {
+            $evidence['tuningRequired'] = $true
+            $message = 'Azure refused T4''s 4-vCore sizes, Standard_D4ds_v5 and Standard_D4ads_v5 ({0}), and t4AutonomousTuning is true, which rules out the 2-vCore fallback (Standard_D2ds_v5 can''t run autonomous tuning), so this run finishes without T4, and later runs don''t try again on their own: t4Enabled stays as you configured it, but the server isn''t created.' -f $refusal
+            $remediation = 'Remove t4AutonomousTuning (or set it to false) and set t4SkuName to Standard_D2ds_v5 to have T4 without autonomous tuning; or ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), then set t4SkuName to the 4-vCore size you get access to and run ./scripts/deploy.ps1. Or set t4Enabled to false to leave T4 out on purpose.'
+        }
+        else {
+            $message = 'Azure refused T4''s last fallback size, Standard_D2ds_v5 ({0}), after both 4-vCore sizes, so this run finishes without T4, and later runs don''t try again on their own: t4Enabled stays as you configured it, but the server isn''t created.' -f $refusal
+            $remediation = 'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), then set t4SkuName to the size you get access to and run ./scripts/deploy.ps1. Or set t4Enabled to false to leave T4 out on purpose.'
+        }
         return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl $docUrl)
     }
 
-    # Standard_D2ds_v5 or None: the General Purpose fallback, as its cost check decided.
-    $why = if ($null -ne $Refused) { 'Azure refused both of T4''s Burstable sizes, Standard_B1ms and then Standard_B2s ({0}, at {1}; SkuNotAvailable)' -f $where, $Refused.TimeUtc } else { 'Azure refuses T4''s Burstable sizes, Standard_B1ms and Standard_B2s, here (SkuNotAvailable, on record or found by preflight)' }
+    # Standard_D2ds_v5 or None: the 2-vCore fallback, as its cost check decided.
+    $why = if ($null -ne $Refused) { 'Azure refused both of T4''s 4-vCore sizes, Standard_D4ds_v5 and then Standard_D4ads_v5 ({0})' -f $refusal } else { 'Azure refuses T4''s 4-vCore sizes, Standard_D4ds_v5 and Standard_D4ads_v5, here ({0})' -f $refusal }
     $evidence['fallbackSku'] = 'Standard_D2ds_v5'
     $evidence['fallbackTier'] = 'GeneralPurpose'
     if ($null -ne $Cost) {
@@ -553,14 +831,14 @@ function New-DemoT4FallbackResult {
         $evidence['unpriced'] = @($Cost.Unpriced)
     }
     if ($Next -eq 'Standard_D2ds_v5') {
-        $message = '{0}, so this run creates T4 as General Purpose Standard_D2ds_v5 (2 vCores, 8 GiB): {1}. Later runs keep this size, and an existing server is never resized.' -f $why, (Format-DemoT4FallbackCostText -Cost $Cost)
-        $remediation = 'Nothing to do. ./scripts/stop-demo.ps1 stops T4 between sessions and says when Azure starts it again on its own. To choose T4''s size yourself, set t4SkuName (a size you set is never changed), or set t4Enabled to false to leave T4 out.'
+        $message = '{0}, so this run creates T4 as General Purpose Standard_D2ds_v5 (2 vCores, 8 GiB), with autonomous tuning off, because it needs at least 4 vCores: {1}. Later runs keep this size.' -f $why, (Format-DemoT4FallbackCostText -Cost $Cost)
+        $remediation = 'Nothing to do: Database Hub''s PostgreSQL visuals don''t need autonomous tuning. ./scripts/stop-demo.ps1 stops T4 between sessions and says when Azure starts it again on its own. To choose T4''s size yourself, set t4SkuName (a size you set is never changed), or set t4Enabled to false to leave T4 out.'
         return (New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server')
     }
     $skipReason = if ($null -ne $Cost) { [string]$Cost.SkipReason } else { 'Price' }
     $evidence['skipReason'] = $skipReason
     $skip = Get-DemoT4SkipReason -Cost $Cost
-    $message = '{0}, and the General Purpose fallback, Standard_D2ds_v5, isn''t created: {1}. This run finishes without T4: t4Enabled stays as you configured it, and the next run that deploys the template checks the fallback again, price and ceilings first.' -f $why, $skip.Because
+    $message = '{0}, and the 2-vCore fallback, Standard_D2ds_v5, isn''t created: {1}. This run finishes without T4: t4Enabled stays as you configured it, and the next run that deploys the template checks the fallback again, price and ceilings first.' -f $why, $skip.Because
     if ($null -ne $Cost -and @($Cost.Unpriced).Count -gt 0) {
         $message += ' Not priced, so left out of these totals: {0}.' -f (@($Cost.Unpriced) -join '; ')
     }
@@ -568,9 +846,9 @@ function New-DemoT4FallbackResult {
 }
 
 function Get-DemoT4SkipReason {
-    # Why the General Purpose fallback's cost check (ConvertTo-DemoT4FallbackCost) leaves T4 out, and what would add it:
-    # Because (a clause) and Remediation, invariant culture (Phase 28 follow-up). -Ahead words the remediation for
-    # preflight, before Azure has refused anything. Pure. Internal.
+    # Why the 2-vCore fallback's cost check (ConvertTo-DemoT4FallbackCost) leaves T4 out, and what would add it: Because
+    # (a clause) and Remediation, invariant culture (ADR 0019). -Ahead words the remediation for preflight, before Azure
+    # has refused anything. Pure. Internal.
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -582,11 +860,12 @@ function Get-DemoT4SkipReason {
 
     $culture = [System.Globalization.CultureInfo]::InvariantCulture
     $reason = if ($null -ne $Cost) { [string]$Cost.SkipReason } else { 'Price' }
-    $then = if ($Ahead) { 'Nothing to do unless Azure refuses both Burstable sizes. To have the fallback create T4 then, ' } else { 'To add T4, ' }
+    $then = if ($Ahead) { 'Nothing to do unless Azure refuses both 4-vCore sizes. To have the fallback create T4 then, ' } else { 'To add T4, ' }
     $again = if ($Ahead) { '' } else { ', then run ./scripts/deploy.ps1, which checks the fallback again' }
+    $worst = if ($null -ne $Cost -and [string](Get-DemoMemberValue -InputObject $Cost -Name 'RestartAssumption') -eq 'SafetyStop') { 'its worst case (Azure starts a stopped server again on its own after 7 days, about a day each time while the daily T4 safety stop is in place)' } else { 'its worst case, every hour of a month (Azure starts a stopped server again on its own after 7 days)' }
     switch ($reason) {
         'MonthlyCeiling' {
-            $because = [string]::Format($culture, 'its worst case, every hour of a month (Azure starts a stopped server again on its own after 7 days) at about {0:N3} USD an hour, with its storage and Defender plans, brings the demo''s month to {1:N2} USD, over monthlyCeilingUsd ({2:N2} USD)', [double]$Cost.HourlyUsd, [double]$Cost.MonthlyWorstCaseUsd, [double]$Cost.MonthlyCeilingUsd)
+            $because = [string]::Format($culture, '{3} at about {0:N3} USD an hour, with its storage and Defender plans, brings the demo''s month to {1:N2} USD, over monthlyCeilingUsd ({2:N2} USD)', [double]$Cost.HourlyUsd, [double]$Cost.MonthlyWorstCaseUsd, [double]$Cost.MonthlyCeilingUsd, $worst)
             $remediation = [string]::Format($culture, '{0}raise monthlyCeilingUsd to at least {1:N0} in your configuration (the budget follows it){2}; or set t4Enabled to false to leave T4 out on purpose.', $then, [System.Math]::Ceiling([double]$Cost.MonthlyWorstCaseUsd), $again)
         }
         'SessionCeiling' {
@@ -605,22 +884,24 @@ function Get-DemoT4SkipReason {
 function Get-DemoT4FallbackPreflight {
     <#
     .SYNOPSIS
-    PREFLIGHT.T4.FALLBACK (Phase 28 follow-up, ADR 0019): the General Purpose fallback's cost check in preflight, and where
-    deploy.ps1's fallback starts (its evidence's startSku). Returns Result and CostResults (the cost checks to report
-    instead of the estimate's own, or $null). Internal.
+    PREFLIGHT.T4.FALLBACK (ADR 0019): the 2-vCore fallback's cost check in preflight, and where deploy.ps1's fallback
+    starts (its evidence's startSku). Returns Result and CostResults (the cost checks to report instead of the
+    estimate's own, or $null). Internal.
 
     .DESCRIPTION
-    - -Start Standard_D2ds_v5 (the Burstable sizes are ruled out, or an earlier run's record): -Estimate already prices T4
+    - -Start Standard_D2ds_v5 (the 4-vCore sizes are ruled out, or an earlier run's record): -Estimate already prices T4
       at that size, so its verdict (ConvertTo-DemoT4FallbackCost) decides. Within both ceilings, the start stays, with a
       Warning that gives the price and the worst case; otherwise the start is None, with a Warning that says why, and the
       ceilings are checked again without T4 (CostResults), which this run leaves out.
-    - A T4 that doesn't exist yet and a size the configuration doesn't set, starting at a Burstable size: Azure can still
-      refuse it at creation although the region lists it (live, West US 3), so the General Purpose step is priced now too,
-      with the same parameters and price cache (only its compute price is read again): a Pass within both ceilings,
-      otherwise a Warning that T4 would be left out. deploy.ps1 prices it again right before it would create it.
-    - Otherwise Not selected: T4 exists (its size is kept), the configuration sets t4SkuName (no fallback), or the start is
+    - A T4 that doesn't exist yet and a size the configuration doesn't set, starting at a 4-vCore size: Azure can still
+      refuse it at creation although the region lists it (live, West US 3, 2026-10-26, for Standard_B1ms), so the 2-vCore
+      step is priced now too, with the same parameters and price cache (only its compute price is read again): a Pass
+      within both ceilings, otherwise a Warning that T4 would be left out. deploy.ps1 prices it again right before it
+      would create it.
+    - Otherwise Not selected: T4 exists (deploy.ps1 keeps it, or scales it to the default), the configuration sets
+      t4SkuName (no fallback), t4AutonomousTuning is true (the fallback stops after the 4-vCore sizes), or the start is
       None or Refused (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU says why).
-    Its own estimates never throw (review of 20e855c): the Burstable start's that fails is a Warning with skipReason Price,
+    Its own estimates never throw (review of 20e855c): the 4-vCore start's that fails is a Warning with skipReason Price,
     and when the estimate without T4 fails, CostResults stays $null, so the run's own cost checks, a monthly-ceiling Fail
     included, are what preflight reports.
     #>
@@ -675,12 +956,15 @@ function Get-DemoT4FallbackPreflight {
         return (& $notSelected ('t4SkuName is set to {0}, so there''s no fallback: a size you set is never changed.' -f (Get-DemoT4SkuName -Config $Config)))
     }
     if ($Exists) {
-        return (& $notSelected ('T4 exists{0}, so the fallback doesn''t apply: deploy.ps1 keeps its size.' -f $(if ($ServerSku) { ' as ' + $ServerSku } else { '' })))
+        return (& $notSelected ('T4 exists{0}, so the fallback doesn''t apply: deploy.ps1 keeps its size, or scales it to the default (PREFLIGHT.T4.SIZE says when).' -f $(if ($ServerSku) { ' as ' + $ServerSku } else { '' })))
     }
     if ($Start -in 'None', 'Refused') {
-        return (& $notSelected 'This run leaves T4 out (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU says why), so the General Purpose fallback isn''t priced.')
+        return (& $notSelected 'This run leaves T4 out (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU says why), so the 2-vCore fallback isn''t priced.')
     }
-    # A Burstable start: the General Purpose step, priced now for the record.
+    if ((Get-DemoT4Tuning -Config $Config).Switch -eq $true) {
+        return (& $notSelected 't4AutonomousTuning is true, so the fallback stops after the 4-vCore sizes (Standard_D4ds_v5, Standard_D4ads_v5): the 2-vCore size can''t run autonomous tuning, so it isn''t priced.')
+    }
+    # A 4-vCore start: the 2-vCore step, priced now for the record.
     $priced = @{} + $CostParameters
     $priced['Config'] = Copy-DemoT4Config -Config $Config -Source fallback -SkuName 'Standard_D2ds_v5'
     try {
@@ -688,7 +972,7 @@ function Get-DemoT4FallbackPreflight {
     }
     catch {
         $problem = Protect-DemoText -Text $_.Exception.Message
-        Write-DemoLog -Level Warning -Message ('T4''s General Purpose fallback couldn''t be priced ahead: {0}' -f $problem)
+        Write-DemoLog -Level Warning -Message ('T4''s 2-vCore fallback couldn''t be priced ahead: {0}' -f $problem)
         $cost = ConvertTo-DemoT4FallbackCost -Estimate $null -Config $priced['Config'] -PriceError $problem
     }
     $evidence = [ordered]@{ startSku = $Start; fallbackSku = 'Standard_D2ds_v5'; fallbackTier = 'GeneralPurpose' }
@@ -696,17 +980,17 @@ function Get-DemoT4FallbackPreflight {
         $evidence[$name.Substring(0, 1).ToLowerInvariant() + $name.Substring(1)] = $cost.$name
     }
     $evidence['unpriced'] = @($cost.Unpriced)
-    $premise = 'If Azure refuses T4''s Burstable sizes when it creates it (SkuNotAvailable; West US 3 did, although it lists them)'
+    $premise = 'If Azure refuses T4''s 4-vCore sizes when it creates it (SkuNotAvailable; West US 3 refused Standard_B1ms on 2026-10-26 although it listed it)'
     if ($cost.Allowed) {
-        $message = '{0}, deploy.ps1 creates T4 as General Purpose Standard_D2ds_v5: {1}. That''s within both ceilings; deploy.ps1 prices it again right before it would create it.' -f $premise, (Format-DemoT4FallbackCostText -Cost $cost)
+        $message = '{0}, deploy.ps1 creates T4 as General Purpose Standard_D2ds_v5, with autonomous tuning off (it needs 4 vCores): {1}. That''s within both ceilings; deploy.ps1 prices it again right before it would create it.' -f $premise, (Format-DemoT4FallbackCostText -Cost $cost)
         return [pscustomobject]@{ Result = (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Pass' -Message $message -Evidence $evidence -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server'); CostResults = $null }
     }
     $skip = Get-DemoT4SkipReason -Cost $cost -Ahead
     $message = if ($skip.Reason -eq 'Price') {
-        '{0}, deploy.ps1 prices its General Purpose fallback, Standard_D2ds_v5, right before it would create it; right now, {1}.' -f $premise, $skip.Because
+        '{0}, deploy.ps1 prices its 2-vCore fallback, Standard_D2ds_v5, right before it would create it; right now, {1}.' -f $premise, $skip.Because
     }
     else {
-        '{0}, deploy.ps1''s General Purpose fallback, Standard_D2ds_v5, would leave T4 out instead: {1}.' -f $premise, $skip.Because
+        '{0}, deploy.ps1''s 2-vCore fallback, Standard_D2ds_v5, would leave T4 out instead: {1}.' -f $premise, $skip.Because
     }
     if (@($cost.Unpriced).Count -gt 0) {
         $message += ' Not priced, so left out of these totals: {0}.' -f (@($cost.Unpriced) -join '; ')
@@ -717,21 +1001,21 @@ function Get-DemoT4FallbackPreflight {
 function Resolve-DemoEffectiveConfig {
     <#
     .SYNOPSIS
-    The configuration with what earlier runs settled that the file doesn't say: T4's size from the fallback (Phase 28 and
-    its follow-up, ADR 0019), recorded in the resource group's DbHubT4Sku tag. A t4SkuName the file sets, or t4Enabled
-    false, always wins. Returns the configuration itself when nothing applies or it's already resolved (it carries
-    t4SkuSource), otherwise a copy (Copy-DemoT4Config). Pure. Internal.
+    The configuration with what earlier runs settled that the file doesn't say: T4's size from the fallback (ADR 0019),
+    recorded in the resource group's DbHubT4Size tag. A t4SkuName the file sets, or t4Enabled false, always wins. Returns
+    the configuration itself when nothing applies or it's already resolved (it carries t4SkuSource), otherwise a copy
+    (Copy-DemoT4Config). Pure. Internal.
 
     .DESCRIPTION
-    The record:
-    - Standard_B2s: Azure refused Standard_B1ms, and T4 uses Standard_B2s.
-    - Standard_D2ds_v5: Azure refused both Burstable sizes, the cost check passed, and T4 uses General Purpose
-      Standard_D2ds_v5. A redeploy keeps it, and never tries Standard_B1ms again.
-    - None: Azure refused both Burstable sizes, and T4 isn't deployed: the General Purpose fallback's cost check left it
-      out (over a ceiling, or no price), or the record is from before the fallback went on to General Purpose. With
-      -TemplateRuns (this run deploys the template), T4 is planned at Standard_D2ds_v5 again, and its cost check runs
-      before anything is created; the Burstable sizes aren't tried again. Without it, T4 is off.
-    - Refused: Azure refused Standard_D2ds_v5 too, so T4 is off, and nothing is tried again on its own.
+    The record (since T4's 4-vCore default, 2026-11-04; the Phase 28 tag, DbHubT4Sku, is no longer read, so a server its
+    fallback created moves to the default at the next deploy):
+    - A documented size (Standard_D4ads_v5, Standard_D2ds_v5, or the size an existing server kept when Azure refused to
+      scale it to the default): T4 uses it, and a redeploy keeps it.
+    - None: Azure refused both 4-vCore sizes, and T4 isn't deployed: the 2-vCore fallback's cost check left it out (over
+      a ceiling, or no price). With -TemplateRuns (this run deploys the template), T4 is planned at Standard_D2ds_v5
+      again, and its cost check runs before anything is created; the 4-vCore sizes aren't tried again. Without it, T4 is
+      off.
+    - Refused: Azure refused the fallback's last size too, so T4 is off, and nothing is tried again on its own.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.IDictionary])]
@@ -752,13 +1036,10 @@ function Resolve-DemoEffectiveConfig {
     if (-not $recorded -or (Test-DemoT4SkuExplicit -Config $Config) -or -not (Test-DemoT4Enabled -Config $Config)) {
         return $Config
     }
+    if ($recorded -cin $script:T4Sizes) {
+        return (Copy-DemoT4Config -Config $Config -Source record -SkuName $recorded)
+    }
     switch -CaseSensitive ($recorded) {
-        'Standard_B2s' {
-            return (Copy-DemoT4Config -Config $Config -Source record -SkuName 'Standard_B2s')
-        }
-        'Standard_D2ds_v5' {
-            return (Copy-DemoT4Config -Config $Config -Source record -SkuName 'Standard_D2ds_v5')
-        }
         'None' {
             if ($TemplateRuns) {
                 return (Copy-DemoT4Config -Config $Config -Source fallback -SkuName 'Standard_D2ds_v5')
@@ -773,9 +1054,10 @@ function Resolve-DemoEffectiveConfig {
 }
 
 function Test-DemoT4FallbackSize {
-    # True when the fallback chose General Purpose for T4 (DbHubT4Sku Standard_D2ds_v5: only the fallback writes a size,
-    # review of 20e855c) and the configuration neither sets t4SkuName nor turns T4 off (Phase 28 follow-up). It says
-    # nothing about whether the server exists (Get-DemoT4ServerEvidence). Pure. Internal.
+    # True when the fallback chose a size other than the default for T4 (DbHubT4Size Standard_D4ads_v5 or
+    # Standard_D2ds_v5: only the fallback writes a size, review of 20e855c) and the configuration neither sets t4SkuName
+    # nor turns T4 off (ADR 0019). It says nothing about whether the server exists (Get-DemoT4ServerEvidence). Pure.
+    # Internal.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -788,7 +1070,7 @@ function Test-DemoT4FallbackSize {
     if (-not (Test-DemoT4Enabled -Config $Config) -or (Test-DemoT4SkuExplicit -Config $Config)) {
         return $false
     }
-    return ([string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') -ceq 'Standard_D2ds_v5')
+    return ([string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') -cin 'Standard_D4ads_v5', 'Standard_D2ds_v5')
 }
 
 function Get-DemoT4ServerEvidence {
@@ -821,7 +1103,7 @@ function Get-DemoT4ServerEvidence {
     if ($seen.Count -gt 0) {
         return $true
     }
-    $creating = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'next') -ceq 'Standard_D2ds_v5' }).Count -gt 0
+    $creating = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'next') -cin 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'Zone' }).Count -gt 0
     $templateFailed = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.TEMPLATE' -and [string]$_.status -eq 'Fail' }).Count -gt 0
     if (($creating -and $templateFailed) -or @($all | Where-Object { [string]$_.checkId -eq 'T4.SERVER' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
         return $null
@@ -833,19 +1115,30 @@ function Get-DemoT4ServerEvidence {
 }
 
 function Format-DemoT4FallbackCreatedText {
-    # "T4 created as General Purpose Standard_D2ds_v5 because Burstable sizes were refused here; about <price> USD an hour
-    # while running": the console line, the status page, and DONE say it the same way (Phase 28 follow-up). -HourlyUsd
-    # comes from the Azure Retail Prices API; without it, the line says the price couldn't be read. Pure. Internal.
+    # "T4 created as General Purpose <size> because Azure refused <what> here, with autonomous tuning on (or off); about
+    # <price> USD an hour while running": the console line, the status page, and DONE say it the same way (ADR 0019).
+    # -HourlyUsd comes from the Azure Retail Prices API; without it, the line says the price couldn't be read. -Tuning is
+    # whether this size gets autonomous tuning (Get-DemoT4Tuning). Pure. Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [AllowNull()]
         [object] $HourlyUsd,
 
-        [string] $Location = ''
+        [string] $Location = '',
+
+        [ValidateSet('Standard_D4ads_v5', 'Standard_D2ds_v5')]
+        [string] $SkuName = 'Standard_D2ds_v5',
+
+        [bool] $Tuning = $false
     )
 
-    return ('T4 created as General Purpose Standard_D2ds_v5 because Burstable sizes were refused here; {0}.' -f (Format-DemoT4HourlyText -HourlyUsd $HourlyUsd -Location $Location))
+    $hourly = Format-DemoT4HourlyText -HourlyUsd $HourlyUsd -Location $Location
+    if ($SkuName -eq 'Standard_D4ads_v5') {
+        $tuningText = if ($Tuning) { 'with autonomous tuning on' } else { 'with autonomous tuning off (t4AutonomousTuning is false)' }
+        return ('T4 created as General Purpose Standard_D4ads_v5 (4 vCores) because Azure refused Standard_D4ds_v5 here, {0}; {1}.' -f $tuningText, $hourly)
+    }
+    return ('T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); {0}.' -f $hourly)
 }
 
 function Format-DemoT4HourlyText {
@@ -869,12 +1162,12 @@ function Format-DemoT4HourlyText {
 function Get-DemoT4FallbackNote {
     <#
     The line deploy.ps1's ending (DONE and NOT DONE, on the console and the status page) adds while T4's fallback has chosen
-    General Purpose Standard_D2ds_v5 (Phase 28 follow-up; Test-DemoT4FallbackSize), with the hourly list price the caller
-    read from the Azure Retail Prices API, never a number written here (ADR 0016). It says "created" only with evidence
-    that the server exists (review of 20e855c): -Created $true (Get-DemoT4ServerEvidence, or a Servers - Get) gives
-    Format-DemoT4FallbackCreatedText and the 7-day restart; $false (a Servers - Get found no server) says the size was
-    chosen but the server isn't created yet, and why (-Why); $null says it couldn't be confirmed. '' when it doesn't apply.
-    Pure. Internal.
+    a size other than the default, Standard_D4ads_v5 or Standard_D2ds_v5 (ADR 0019; Test-DemoT4FallbackSize), with the
+    size, whether autonomous tuning is on, and the hourly list price the caller read from the Azure Retail Prices API,
+    never a number written here (ADR 0016). It says "created" only with evidence that the server exists (review of
+    20e855c): -Created $true (Get-DemoT4ServerEvidence, or a Servers - Get) gives Format-DemoT4FallbackCreatedText and the
+    7-day restart; $false (a Servers - Get found no server) says the size was chosen but the server isn't created yet,
+    and why (-Why); $null says it couldn't be confirmed. '' when it doesn't apply. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -897,6 +1190,8 @@ function Get-DemoT4FallbackNote {
         return ''
     }
     $location = [string]$Config['location']
+    $sku = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku')
+    $tuning = (Get-DemoT4Tuning -Config $Config -SkuName $sku).Enabled
     if ($Created -is [bool] -and $Created) {
         # Whether the daily safety stop is scheduled isn't read here, so it's said as a condition (status.ps1 reads it).
         $restart = if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
@@ -905,20 +1200,21 @@ function Get-DemoT4FallbackNote {
         else {
             'Azure starts a stopped T4 again on its own after 7 days, and nothing here stops it again (no daily safety stop is set up), so ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show that date.'
         }
-        return ('{0} {1}' -f (Format-DemoT4FallbackCreatedText -HourlyUsd $HourlyUsd -Location $location), $restart)
+        return ('{0} {1}' -f (Format-DemoT4FallbackCreatedText -HourlyUsd $HourlyUsd -Location $location -SkuName $sku -Tuning $tuning), $restart)
     }
     $hourly = Format-DemoT4HourlyText -HourlyUsd $HourlyUsd -Location $location
+    $origin = if ($sku -ceq 'Standard_D4ads_v5') { 'because Azure refused Standard_D4ds_v5 here' } else { 'because Azure refused the 4-vCore sizes here, so autonomous tuning is off' }
     if ($Created -is [bool]) {
         $because = if ($Why) { $Why } else { 'no server exists yet: no deployment has created it' }
-        return ('T4 isn''t created yet: the fallback chose General Purpose Standard_D2ds_v5 because Burstable sizes were refused here, {0}, but {1}. The next ./scripts/deploy.ps1 that deploys the template creates it, after checking its price against the ceilings again.' -f $hourly, $because)
+        return ('T4 isn''t created yet: the fallback chose General Purpose {0} {1}, {2}, but {3}. The next ./scripts/deploy.ps1 that deploys the template creates it, after checking its price against the ceilings again.' -f $sku, $origin, $hourly, $because)
     }
-    return ('The fallback chose General Purpose Standard_D2ds_v5 for T4 because Burstable sizes were refused here, {0}; whether the server exists couldn''t be confirmed just now, and ./scripts/status.ps1 shows it.' -f $hourly)
+    return ('The fallback chose General Purpose {0} for T4 {1}, {2}; whether the server exists couldn''t be confirmed just now, and ./scripts/status.ps1 shows it.' -f $sku, $origin, $hourly)
 }
 
 function New-DemoT4RecordedOffResult {
     <#
     The Warning that status.ps1 (STATUS.T4) and validate.ps1 (T4.SERVER) give for a T4 server that exists although the
-    resource group's record says T4 is off, DbHubT4Sku None or Refused (review of 64c28b2): a run before that review could
+    resource group's record says T4 is off, DbHubT4Size None or Refused (review of 64c28b2): a run before that review could
     record None for a server that a template attempt which failed for another resource had created, and a server bills
     whatever the record says. The next deploy.ps1 keeps it, at its own size, and clears a None record
     (Invoke-DemoTemplateDeployment keeps an existing server's size), while Refused leaves it out of the demo until
@@ -948,7 +1244,7 @@ function New-DemoT4RecordedOffResult {
     if ($sku) {
         $size = ', {0} {1}' -f $(if ((Get-DemoT4SkuSpec -SkuName $sku).Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' }), $sku
     }
-    $message = 'T4 ({0}) exists and bills, although the resource group''s record says T4 is off (DbHubT4Sku {1}): it''s {2}{3}.' -f $serverName, $Recorded, $(if ($state) { $state } else { 'Unknown' }), $size
+    $message = 'T4 ({0}) exists and bills, although the resource group''s record says T4 is off (DbHubT4Size {1}): it''s {2}{3}.' -f $serverName, $Recorded, $(if ($state) { $state } else { 'Unknown' }), $size
     $keep = if ($Recorded -ceq 'None') {
         'The next ./scripts/deploy.ps1 keeps it at its own size and clears the record.'
     }

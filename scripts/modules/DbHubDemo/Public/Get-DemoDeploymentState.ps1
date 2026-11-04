@@ -14,7 +14,8 @@ function Get-DemoDeploymentState {
     with fabric.manageCapacity, as "<resource group>/<name>", Phase 26b), GuidedStopUtc (until when the PaygWizard guided
     stop's request is valid; while it's still set after that, the guided stop's cleanup didn't finish and its Bastion
     may be up, so DONE waits: Get-DemoGuidedStopLeftover, Phase 28 review) and T4Sku (the size T4's fallback settled
-    on: Standard_B2s, Standard_D2ds_v5, None, or Refused; Phase 28 and its follow-up, Resolve-DemoEffectiveConfig),
+    on, in the DbHubT4Size tag: Standard_D4ads_v5, Standard_D2ds_v5, a size an existing server kept, None, or Refused;
+    ADR 0019, Resolve-DemoEffectiveConfig),
     T2BuildUtc (when the T2 host's loader started a bootstrap generation that nobody has seen finish; empty when none
     runs; Phase 28 review follow-up), and Tags (every tag on the group). Read-only.
 
