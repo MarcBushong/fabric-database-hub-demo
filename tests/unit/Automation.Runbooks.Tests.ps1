@@ -45,6 +45,9 @@ BeforeAll {
         $script:vmStartMinutes = @{}
         $script:vmRunningAt = @{}
         $script:t4 = ''
+        # T4's size in its Servers - Get answer (sku.name and sku.tier); without one, the answer has no sku.
+        $script:t4Sku = ''
+        $script:t4Tier = ''
         $script:t3 = 200
         $script:group = 200
         $script:jobs = @()
@@ -154,6 +157,9 @@ BeforeAll {
             '/servers/azuresql01-abc123/databases/ContosoCare$' { return (New-Response $script:t3 '{}') }
             '/flexibleServers/pgflex01-abc123$' {
                 if (-not $script:t4) { return (New-Response 404) }
+                if ($script:t4Sku) {
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ sku = @{ name = $script:t4Sku; tier = $script:t4Tier }; properties = @{ state = $script:t4 } }))
+                }
                 return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ state = $script:t4 } }))
             }
             '/flexibleServers/pgflex01-abc123/(start|stop)$' {
@@ -173,6 +179,8 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         @{ Name = 'a reset of two targets'; Body = @{ action = 'reset'; targets = @('T1', 'T3') } }
         @{ Name = 'a reset of one target'; Body = @{ action = 'reset'; targets = @('T2') } }
         @{ Name = 'a reset of every target'; Body = @{ action = 'reset' } }
+        @{ Name = 'the showcase on every target'; Body = @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'showcase' }, @{ target = 'T3'; scenario = 'showcase' }, @{ target = 'T4'; scenario = 'showcase' }); durationMinutes = 90 } }
+        @{ Name = 'the showcase with a target off'; Body = @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }); durationMinutes = 120 } }
     ) {
         $request = Test-DbHubControlRequest -WebhookData (New-Webhook $Body) -Settings $script:settings
         $request.Reason | Should -BeNullOrEmpty
@@ -222,6 +230,11 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         @{ Name = 'a reset of one target twice'; Raw = '{"action":"reset","targets":["T1","T1"]}'; Match = 'distinct' }
         @{ Name = 'a reset whose targets aren''t a list'; Raw = '{"action":"reset","targets":"T1"}'; Match = 'targets must be a list' }
         @{ Name = 'activities that aren''t a list'; Raw = '{"action":"run","activities":{"target":"T1","scenario":"baseline"},"durationMinutes":20}'; Match = 'activities must be' }
+        @{ Name = 'an intensity for the showcase'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"showcase","intensity":5}],"durationMinutes":90}'; Match = 'don''t apply to showcase' }
+        @{ Name = 'a concurrency for off'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"showcase"},{"target":"T2","scenario":"off","concurrency":2}],"durationMinutes":90}'; Match = 'don''t apply to off' }
+        @{ Name = 'a run of off only'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"off"},{"target":"T4","scenario":"off"}],"durationMinutes":20}'; Match = 'at least one activity that isn''t off' }
+        @{ Name = 'the showcase in another case'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"Showcase"}],"durationMinutes":20}'; Match = 'isn''t a scenario' }
+        @{ Name = 'business-day, which the control doesn''t run'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"business-day"}],"durationMinutes":20}'; Match = 'isn''t a scenario' }
     ) {
         $data = if ($null -eq $Raw) { $null } else { New-Webhook $Raw }
         $request = Test-DbHubControlRequest -WebhookData $data -Settings $script:settings
@@ -240,6 +253,13 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         $script:settings.scenarios.'blocking-chain'.maxMinutes | Should -Be 30
         $script:settings.scenarios.'capacity-max'.maxMinutes | Should -Be 20
         $script:settings.scenarios.'blocking-chain'.maxConcurrency | Should -Be 4
+    }
+
+    It 'allows the showcase profile, from scenarios/activity-profiles.json: 90 minutes by default, 120 at most, on T1 to T4' {
+        @($script:settings.profiles.PSObject.Properties.Name) | Should -Be @('showcase')
+        $script:settings.profiles.showcase.defaultMinutes | Should -Be 90
+        $script:settings.profiles.showcase.maxMinutes | Should -Be 120
+        @($script:settings.profiles.showcase.targets) | Should -Be @('T1', 'T2', 'T3', 'T4')
     }
 }
 
@@ -269,6 +289,38 @@ Describe 'DbHub-Control run planning (Get-DbHubRunPlan)' {
         $plan = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc ([datetime]::new(2026, 10, 27, 22, 55, 0, [System.DateTimeKind]::Utc))
         $plan.Valid | Should -BeFalse
         $plan.Reason | Should -Match 'auto-shutdown'
+    }
+
+    It 'gives the showcase its minutes up to its 120, off none, and ends the showcase with the run' {
+        $request = Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }, @{ target = 'T3'; scenario = 'capacity-max' }); durationMinutes = 90 }) -Settings $script:settings
+        $now = [datetime]::new(2026, 10, 27, 14, 0, 0, [System.DateTimeKind]::Utc)
+        $plan = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc $now
+        $plan.Valid | Should -BeTrue
+        $showcase = @($plan.Activities | Where-Object Target -EQ 'T1')[0]
+        $showcase.Minutes | Should -Be 90
+        $showcase.NotAfterUtc | Should -Be $now.AddMinutes(92)
+        @($plan.Activities | Where-Object Target -EQ 'T2')[0].Minutes | Should -Be 0
+        @($plan.Activities | Where-Object Target -EQ 'T2')[0].NotAfterUtc | Should -BeNullOrEmpty
+        @($plan.Activities | Where-Object Target -EQ 'T3')[0].Minutes | Should -Be 20
+        @($plan.Activities | Where-Object Target -EQ 'T3')[0].NotAfterUtc | Should -BeNullOrEmpty
+        $plan.RunEndUtc | Should -Be $now.AddMinutes(90)
+        # Near the auto-shutdown, the showcase ends with the shortened run.
+        $late = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc ([datetime]::new(2026, 10, 27, 22, 30, 0, [System.DateTimeKind]::Utc))
+        @($late.Activities | Where-Object Target -EQ 'T1')[0].Minutes | Should -Be 28
+        @($late.Activities | Where-Object Target -EQ 'T1')[0].NotAfterUtc | Should -Be ([datetime]::new(2026, 10, 27, 23, 0, 0, [System.DateTimeKind]::Utc))
+    }
+
+    It 'reads T4''s vCores from its size''s name: <Sku> is <VCores>' -ForEach @(
+        @{ Sku = 'Standard_B1ms'; VCores = 1 }
+        @{ Sku = 'Standard_B2s'; VCores = 2 }
+        @{ Sku = 'Standard_D2ds_v5'; VCores = 2 }
+        @{ Sku = 'Standard_D4ds_v5'; VCores = 4 }
+        @{ Sku = 'Standard_D4ads_v5'; VCores = 4 }
+        @{ Sku = 'Standard_E16ds_v5'; VCores = 16 }
+        @{ Sku = ''; VCores = 0 }
+        @{ Sku = 'GP_Gen5_2'; VCores = 0 }
+    ) {
+        Get-DbHubT4VCore -SkuName $Sku | Should -Be $VCores
     }
 
     It 'computes the next auto-shutdown as the module does, across daylight saving time' -ForEach @(
@@ -358,6 +410,34 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         ($requests | Where-Object target -EQ 'T3').arguments | Should -Be @('profile', 'set', '--name', 'baseline', '--duration', '45m', '--not-after', '{{NEXT_SHUTDOWN}}', '--requested-by', 'notebook/aaaaaaaa')
         $single = InModuleScope -ModuleName DbHubDemo -Parameters @{ Request = [ordered]@{ target = 'T1'; arguments = @($t1.arguments); timeoutSeconds = 300; readySeconds = 600 } } { Get-DemoWorkloadControlScript -Action Runner -Request $Request }
         $sqlvmScript.Contains($single) | Should -BeTrue
+    }
+
+    It 'sends the showcase with the run''s end as --not-after, T4''s with its tier and vCores, and off as off' {
+        $script:t4 = 'Ready'
+        $script:t4Sku = 'Standard_D4ds_v5'
+        $script:t4Tier = 'GeneralPurpose'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }, @{ target = 'T3'; scenario = 'showcase' }, @{ target = 'T4'; scenario = 'showcase' }); durationMinutes = 90 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        @($result.dispatched) | Should -Be @('T1: showcase for 90 minutes', 'T3: showcase for 90 minutes', 'T4: showcase for 90 minutes', 'T2: off')
+        $decode = { param($Pattern) @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match $Pattern } | ForEach-Object { [regex]::Matches($_.Body.properties.source.script, "-RequestBase64 '([A-Za-z0-9+/=]+)'") | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_.Groups[1].Value)) } }) }
+        # Read as JSON text: PowerShell 7's ConvertFrom-Json would turn the time into a DateTime; the VM side (Windows
+        # PowerShell 5.1) keeps it a string.
+        $arguments = { param([string] $Json) ([regex]::Match($Json, '"arguments":\[([^\]]*)\]').Groups[1].Value) }
+        $sqlvm = & $decode '/sqlvm01/runCommands/DbHubControl-sqlvm01-'
+        # 15:00 UTC plus 90 minutes is the run's end; the runner stops 2 minutes before --not-after.
+        & $arguments @($sqlvm | Where-Object { $_ -match '"target":"T1"' })[0] | Should -BeExactly '"profile","set","--name","showcase","--duration","90m","--not-after","2026-10-27T16:32:00+00:00","--requested-by","notebook/aaaaaaaa"'
+        & $arguments @($sqlvm | Where-Object { $_ -match '"target":"T3"' })[0] | Should -BeExactly '"profile","set","--name","showcase","--duration","90m","--not-after","2026-10-27T16:32:00+00:00","--requested-by","notebook/aaaaaaaa"'
+        & $arguments @($sqlvm | Where-Object { $_ -match '"target":"T4"' })[0] | Should -BeExactly '"profile","set","--name","showcase","--duration","90m","--not-after","2026-10-27T16:32:00+00:00","--tier","GeneralPurpose","--vcores","4","--requested-by","notebook/aaaaaaaa"'
+        & $arguments @(& $decode '/archost01/runCommands/DbHubControl-archost01-' | Where-Object { $_ -match '"target":"T2"' })[0] | Should -BeExactly '"profile","set","--name","off","--requested-by","notebook/aaaaaaaa"'
+        $script:autostop | Should -Be '2026-10-27T16:40:00Z'
+    }
+
+    It 'sends T4''s showcase without a tier or vCores when its size can''t be read' {
+        $script:t4 = 'Ready'
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T4'; scenario = 'showcase' }); durationMinutes = 30 }) -Context (New-TestContext)
+        $source = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/sqlvm01/runCommands/DbHubControl-sqlvm01-' })[0].Body.properties.source.script
+        $request = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([regex]::Match($source, "-RequestBase64 '([A-Za-z0-9+/=]+)'").Groups[1].Value))
+        [regex]::Match($request, '"arguments":\[([^\]]*)\]').Groups[1].Value | Should -BeExactly '"profile","set","--name","showcase","--duration","30m","--not-after","2026-10-27T15:32:00+00:00","--requested-by","notebook/aaaaaaaa"'
     }
 
     It 'restarts T1''s monitoring plugin when it isn''t running, as start-demo.ps1 does' {

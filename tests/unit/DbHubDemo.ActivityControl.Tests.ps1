@@ -488,6 +488,11 @@ Describe 'The runbooks'' settings' {
         $setting['scenarios'].Contains('healthy-baseline') | Should -BeFalse
         $folders = @(Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scenarios') -Directory | Where-Object Name -NE 'healthy-baseline' | ForEach-Object Name)
         @($setting['scenarios'].Keys | Sort-Object) | Should -Be @($folders | Sort-Object)
+        # Run all's showcase (2026-11-04): its bounds from scenarios/activity-profiles.json.
+        @($setting['profiles'].Keys) | Should -Be @('showcase')
+        $setting['profiles']['showcase']['maxMinutes'] | Should -Be 120
+        $setting['profiles']['showcase']['defaultMinutes'] | Should -Be 90
+        @($setting['profiles']['showcase']['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4')
         $setting['minDurationMinutes'] | Should -Be 5
         $setting['maxDurationMinutes'] | Should -Be 120
         $setting['maxBodyBytes'] | Should -Be 4096

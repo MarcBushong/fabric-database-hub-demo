@@ -363,9 +363,11 @@ function Test-DbHubControlRequest {
     The request body is a JSON object of at most maxBodyBytes (4,096) bytes, and nothing else:
     - {"action": "run", "activities": [{"target": "T1", "scenario": "blocking-chain", "intensity": 5, "concurrency": 4}],
       "durationMinutes": 20}: one activity per target, because a target's activity profile holds one incident at a
-      time. scenario is "baseline" or a catalog scenario that the target can run; intensity (1-10) and concurrency
-      (1 to the scenario's maximum, incidents only) are optional; durationMinutes is minDurationMinutes to
-      maxDurationMinutes.
+      time. scenario is "baseline", a catalog scenario that the target can run, a profile from the settings' profiles
+      (showcase, 2026-11-04: its own rotation of incidents, from scenarios/activity-profiles.json), or "off", which turns
+      the target's activity off (a run needs at least one activity that isn't off); intensity (1-10) and concurrency
+      (1 to the scenario's maximum, incidents only) are optional, and a profile or off takes neither; durationMinutes
+      is minDurationMinutes to maxDurationMinutes.
     - {"action": "stop"}: Stop now.
     - {"action": "reset", "targets": ["T1"]}: the runner's reset; without targets, every target whose VM runs.
     - "requestedBy" is optional on any action: 1-64 letters, digits, or . _ @ / - (a name, never a secret).
@@ -456,6 +458,8 @@ function Test-DbHubControlRequest {
     }
     $normalized = @()
     $seen = @()
+    $profiles = Get-DbHubMember -InputObject $Settings -Name 'profiles'
+    $profileNames = @(Get-DbHubPropertyName -InputObject $profiles)
     foreach ($activity in $activities.Items) {
         if ($null -eq $activity -or $activity -is [string] -or $activity -is [System.ValueType] -or $activity -is [System.Array]) {
             return (Get-DbHubRefusal -Reason 'Each activity must be an object with target and scenario.')
@@ -475,10 +479,17 @@ function Test-DbHubControlRequest {
         $seen += $target
         $scenario = Get-DbHubMember -InputObject $activity -Name 'scenario'
         if (-not ($scenario -is [string])) {
-            return (Get-DbHubRefusal -Reason 'Each activity needs a scenario: baseline or a scenario from the catalog.')
+            return (Get-DbHubRefusal -Reason 'Each activity needs a scenario: baseline, off, a profile, or a scenario from the catalog.')
         }
         $maximumConcurrency = 0
-        if ($scenario -cne 'baseline') {
+        $isProfile = $scenario -ceq 'off' -or $scenario -cin $profileNames
+        if ($isProfile -and $scenario -cne 'off') {
+            $definition = Get-DbHubMember -InputObject $profiles -Name $scenario
+            if ($target -cnotin @($definition.targets)) {
+                return (Get-DbHubRefusal -Reason ('{0} doesn''t run on {1}.' -f $scenario, $target))
+            }
+        }
+        elseif (-not $isProfile -and $scenario -cne 'baseline') {
             $definition = Get-DbHubMember -InputObject $Settings.scenarios -Name $scenario
             if ($null -eq $definition) {
                 return (Get-DbHubRefusal -Reason ('''{0}'' isn''t a scenario in the catalog.' -f ($scenario -replace '[^A-Za-z0-9_-]', '?')))
@@ -489,10 +500,13 @@ function Test-DbHubControlRequest {
             $maximumConcurrency = [int]$definition.maxConcurrency
         }
         $intensity = Get-DbHubMember -InputObject $activity -Name 'intensity'
+        $concurrency = Get-DbHubMember -InputObject $activity -Name 'concurrency'
+        if ($isProfile -and ($null -ne $intensity -or $null -ne $concurrency)) {
+            return (Get-DbHubRefusal -Reason ('intensity and concurrency don''t apply to {0}: a profile takes its own from the catalog.' -f $scenario))
+        }
         if ($null -ne $intensity -and -not (Test-DbHubInteger -Value $intensity -Minimum 1 -Maximum 10)) {
             return (Get-DbHubRefusal -Reason 'intensity must be a whole number from 1 to 10.')
         }
-        $concurrency = Get-DbHubMember -InputObject $activity -Name 'concurrency'
         if ($null -ne $concurrency -and ($maximumConcurrency -lt 1 -or -not (Test-DbHubInteger -Value $concurrency -Minimum 1 -Maximum $maximumConcurrency))) {
             return (Get-DbHubRefusal -Reason ('concurrency applies to incidents only, from 1 to the scenario''s maximum ({0}).' -f $maximumConcurrency))
         }
@@ -505,6 +519,9 @@ function Test-DbHubControlRequest {
             $normalizedConcurrency = [int]$concurrency
         }
         $normalized += [pscustomobject]@{ Target = $target; Scenario = $scenario; Intensity = $normalizedIntensity; Concurrency = $normalizedConcurrency }
+    }
+    if (@($normalized | Where-Object { $_.Scenario -cne 'off' }).Count -eq 0) {
+        return (Get-DbHubRefusal -Reason 'A run needs at least one activity that isn''t off; Stop now stops everything.')
     }
     return [pscustomobject]@{ Valid = $true; Reason = ''; Action = 'run'; Activities = $normalized; DurationMinutes = [int]$duration; Targets = @($seen); RequestedBy = $requestedBy }
 }
@@ -542,9 +559,10 @@ function Get-DbHubRunPlan {
     <#
     .SYNOPSIS
     How long each activity runs: the requested minutes, capped at its scenario's maximum (maxDurationMinutes for the
-    baseline) and so that it ends before the VMs' next auto-shutdown minus shutdownMarginMinutes. Returns Valid,
-    Reason, Activities (with Minutes), RunEndUtc, AutoStopUtc (the run's end plus autoStopBufferMinutes), and
-    ShutdownUtc.
+    baseline, the profile's maxMinutes for a profile such as showcase) and so that it ends before the VMs' next
+    auto-shutdown minus shutdownMarginMinutes; off takes no minutes and doesn't count toward the run's end. Returns
+    Valid, Reason, Activities (with Minutes, and Tier, VCores, and NotAfterUtc for the dispatch to fill), RunEndUtc,
+    AutoStopUtc (the run's end plus autoStopBufferMinutes), and ShutdownUtc.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -563,20 +581,35 @@ function Get-DbHubRunPlan {
     if ($available -lt [int]$Settings.minDurationMinutes) {
         return [pscustomobject]@{ Valid = $false; Reason = ('The VMs'' auto-shutdown is at {0:yyyy-MM-dd HH:mm} UTC, too soon for a run of at least {1} minutes.' -f $shutdown, [int]$Settings.minDurationMinutes); Activities = @(); RunEndUtc = $NowUtc; AutoStopUtc = $NowUtc; ShutdownUtc = $shutdown }
     }
+    $profiles = Get-DbHubMember -InputObject $Settings -Name 'profiles'
     $planned = @()
     $longest = 0
     foreach ($activity in @($Request.Activities)) {
         $cap = [int]$Settings.maxDurationMinutes
-        if ($activity.Scenario -cne 'baseline') {
+        $profileDefinition = Get-DbHubMember -InputObject $profiles -Name ([string]$activity.Scenario)
+        if ($activity.Scenario -ceq 'off') {
+            $cap = 0
+        }
+        elseif ($null -ne $profileDefinition) {
+            $cap = [int](Get-DbHubMember -InputObject $profileDefinition -Name 'maxMinutes')
+        }
+        elseif ($activity.Scenario -cne 'baseline') {
             $cap = [int](Get-DbHubMember -InputObject $Settings.scenarios -Name $activity.Scenario).maxMinutes
         }
         $minutes = [System.Math]::Min([System.Math]::Min([int]$Request.DurationMinutes, $cap), $available)
         if ($minutes -gt $longest) {
             $longest = $minutes
         }
-        $planned += [pscustomobject]@{ Target = $activity.Target; Scenario = $activity.Scenario; Intensity = $activity.Intensity; Concurrency = $activity.Concurrency; Minutes = $minutes }
+        $planned += [pscustomobject]@{ Target = $activity.Target; Scenario = $activity.Scenario; Intensity = $activity.Intensity; Concurrency = $activity.Concurrency; Minutes = $minutes; Tier = ''; VCores = 0; NotAfterUtc = $null }
     }
     $end = $NowUtc.AddMinutes($longest)
+    foreach ($item in $planned) {
+        # A profile ends with the run (the runner stops 2 minutes before --not-after), even when its target's dispatch
+        # waited for the target to start.
+        if ($null -ne (Get-DbHubMember -InputObject $profiles -Name ([string]$item.Scenario))) {
+            $item.NotAfterUtc = $end.AddMinutes(2)
+        }
+    }
     return [pscustomobject]@{ Valid = $true; Reason = ''; Activities = $planned; RunEndUtc = $end; AutoStopUtc = $end.AddMinutes([int]$Settings.autoStopBufferMinutes); ShutdownUtc = $shutdown }
 }
 
@@ -968,8 +1001,9 @@ function Get-DbHubT3State {
 }
 
 function Get-DbHubT4 {
-    # T4, the PostgreSQL flexible server <t4ServerPrefix><deploymentId> (Phase 24): Name and State (Ready, Stopped,
-    # Starting, Stopping, Updating, ...), or State Missing or Unknown.
+    # T4, the PostgreSQL flexible server <t4ServerPrefix><deploymentId> (Phase 24): Name, State (Ready, Stopped,
+    # Starting, Stopping, Updating, ...), or State Missing or Unknown, and its size: Tier (sku.tier) and SkuName
+    # (sku.name), which the showcase's T4 slots use (2026-11-04).
     param(
         [Parameter(Mandatory = $true)]
         [object] $Context,
@@ -980,18 +1014,37 @@ function Get-DbHubT4 {
 
     $deploymentId = [string](Get-DbHubMember -InputObject $Tags -Name 'deploymentId')
     if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
-        return [pscustomobject]@{ Name = ''; State = 'Unknown' }
+        return [pscustomobject]@{ Name = ''; State = 'Unknown'; Tier = ''; SkuName = '' }
     }
     $name = '{0}{1}' -f $Context.Settings.t4ServerPrefix, $deploymentId
     $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
     $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $name) -ApiVersion $version
     if ($read.StatusCode -eq 404) {
-        return [pscustomobject]@{ Name = $name; State = 'Missing' }
+        return [pscustomobject]@{ Name = $name; State = 'Missing'; Tier = ''; SkuName = '' }
     }
     if ($read.StatusCode -ne 200) {
-        return [pscustomobject]@{ Name = $name; State = 'Unknown' }
+        return [pscustomobject]@{ Name = $name; State = 'Unknown'; Tier = ''; SkuName = '' }
     }
-    return [pscustomobject]@{ Name = $name; State = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'state') }
+    $sku = Get-DbHubMember -InputObject $read.Body -Name 'sku'
+    return [pscustomobject]@{ Name = $name; State = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'state'); Tier = [string](Get-DbHubMember -InputObject $sku -Name 'tier'); SkuName = [string](Get-DbHubMember -InputObject $sku -Name 'name') }
+}
+
+function Get-DbHubT4VCore {
+    # T4's vCores from its size's name (Standard_B1ms 1, Standard_B2s 2, Standard_D2ds_v5 2, Standard_D4ds_v5 and
+    # Standard_D4ads_v5 4: the number after the series letter, as Learn's compute sizes name them), or 0 when the name
+    # doesn't say. https://learn.microsoft.com/azure/postgresql/compute-storage/concepts-compute
+    param(
+        [AllowNull()]
+        [string] $SkuName
+    )
+
+    if ([string]$SkuName -cmatch '^Standard_[A-Z]+(\d{1,2})[a-z_0-9]*$') {
+        $vcores = [int]$Matches[1]
+        if ($vcores -ge 1 -and $vcores -le 64) {
+            return $vcores
+        }
+    }
+    return 0
 }
 
 function Invoke-DbHubT4Action {
@@ -1075,7 +1128,12 @@ function Send-DbHubDispatch {
 }
 
 function Get-DbHubRunnerArgument {
-    # The runner arguments for one planned activity, built from validated values only, or for a reset.
+    <#
+    The runner arguments for one planned activity, built from validated values only, or for a reset. off turns the
+    target's activity off; a profile (showcase) runs for its minutes and ends with the run (--not-after: the run's end
+    plus the 2 minutes the runner keeps before it), and T4's gets its tier and vCores (--tier, --vcores), which pick and
+    scale its slots; the baseline and an incident end by the VMs' next auto-shutdown at the latest.
+    #>
     param(
         [AllowNull()]
         [object] $Activity,
@@ -1088,6 +1146,25 @@ function Get-DbHubRunnerArgument {
 
     if ($Reset) {
         return @('reset', '--requested-by', $RequestedBy)
+    }
+    if ($Activity.Scenario -ceq 'off') {
+        return @('profile', 'set', '--name', 'off', '--requested-by', $RequestedBy)
+    }
+    $notAfter = Get-DbHubMember -InputObject $Activity -Name 'NotAfterUtc'
+    if ($null -ne $notAfter) {
+        $arguments = @('profile', 'set', '--name', [string]$Activity.Scenario, '--duration', ('{0}m' -f [int]$Activity.Minutes), '--not-after', ([datetime]$notAfter).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'+00:00'", [System.Globalization.CultureInfo]::InvariantCulture))
+        if ([string]$Activity.Target -ceq 'T4') {
+            $tier = [string](Get-DbHubMember -InputObject $Activity -Name 'Tier')
+            if ($tier) {
+                $arguments += @('--tier', $tier)
+            }
+            $vcores = [int](Get-DbHubMember -InputObject $Activity -Name 'VCores')
+            if ($vcores -gt 0) {
+                $arguments += @('--vcores', [string]$vcores)
+            }
+        }
+        $arguments += @('--requested-by', $RequestedBy)
+        return $arguments
     }
     $name = 'baseline'
     if ($Activity.Scenario -cne 'baseline') {
@@ -1616,6 +1693,17 @@ function Start-DbHubActivityRun {
             $activities = @($activities | Where-Object { $_.Target -ne 'T4' })
             $t4 = $null
         }
+        else {
+            # The showcase's T4 slots follow its size (2026-11-04): its tier picks the tier-specific slots, and its vCores
+            # scale the CPU-bound ones (the runner's --tier and --vcores).
+            foreach ($activity in @($activities | Where-Object { $_.Target -eq 'T4' })) {
+                $t4Tier = [string](Get-DbHubMember -InputObject $t4 -Name 'Tier')
+                if ($t4Tier -cin 'Burstable', 'GeneralPurpose') {
+                    $activity.Tier = $t4Tier
+                }
+                $activity.VCores = Get-DbHubT4VCore -SkuName ([string](Get-DbHubMember -InputObject $t4 -Name 'SkuName'))
+            }
+        }
     }
     $byVm = [ordered]@{}
     foreach ($activity in $activities) {
@@ -1696,7 +1784,12 @@ function Start-DbHubActivityRun {
         $runNames.Add($Name)
         if (Send-DbHubDispatch -Context $Context -VmName $VmName -Activity $Chosen -Name $Name -RequestedBy $who) {
             foreach ($item in $Chosen) {
-                $dispatched.Add(('{0}: {1} for {2} minutes' -f $item.Target, $item.Scenario, $item.Minutes))
+                if ($item.Scenario -ceq 'off') {
+                    $dispatched.Add(('{0}: off' -f $item.Target))
+                }
+                else {
+                    $dispatched.Add(('{0}: {1} for {2} minutes' -f $item.Target, $item.Scenario, $item.Minutes))
+                }
             }
         }
         else {
