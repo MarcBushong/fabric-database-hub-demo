@@ -231,8 +231,11 @@ public sealed class SqlScriptTests
         Assert.Equal(names, Names(created.Groups[1].Value));
         Assert.Equal(names, Names(widened.Groups[1].Value));
 
-        // The migration replaces only a check that lacks the showcase, so a second run changes nothing.
-        Assert.Contains("AND definition NOT LIKE N'%''showcase''%'", control, StringComparison.Ordinal);
+        // The migration replaces a check that lacks any of the names, so a second run changes nothing and a name added
+        // later reaches a database that already ran it (the review of PR 29).
+        var guard = Regex.Match(control, @"AND \(definition NOT LIKE N'%''[a-z-]+''%'(?:\s+OR definition NOT LIKE N'%''[a-z-]+''%')*\)");
+        Assert.True(guard.Success, "The migration's guard checks the definition for each name.");
+        Assert.Equal(names, Names(guard.Value));
 
         using var profiles = JsonDocument.Parse(File.ReadAllText(RepositoryPaths.Combine("scenarios", "activity-profiles.json")));
         var sent = profiles.RootElement.GetProperty("profiles").EnumerateObject().Select(p => p.Name).Where(name => name != "incident").Append("off");

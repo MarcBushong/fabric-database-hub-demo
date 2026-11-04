@@ -1055,3 +1055,35 @@ The integration:
 - The fix itself reaches the owner's environment through `deploy.ps1 -FromStage Artifacts` after the merge, followed by Run all.
 
 **Risks.** R661 (new).
+
+### The showcase hotfix, follow-up: the migration's guard and the update's order
+
+2026-11-04. The review of PR 29 found no bugs and two Low findings, filed as [#31](https://github.com/MarcBushong/fabric-database-hub-demo/issues/31) and [#30](https://github.com/MarcBushong/fabric-database-hub-demo/issues/30) and fixed here. This entry also records PR 29's live rollout.
+
+**Work summary.**
+
+1. **#31:** the migration's guard looked only for `'showcase'`. A profile name added later would skip every database that had already run the migration, and `profile set` would fail with 547 again. The guard now runs when the definition lacks any allowed name. The test derives the guard's names and compares them with the check's and the procedure's.
+2. **#30:** troubleshooting's entry for the 547 put the update before Stop now. The run's pending auto-stop, which `deploy.ps1` doesn't cancel, could deallocate the VMs in the middle of the update. The entry now gives the order the live rollout used: `stop-demo.ps1`, which waits until the VMs are deallocated (or Stop now, then a wait until they are, because Stop now returns before they stop; the review of this pull request), then the update, which starts the stopped VMs and T4, then Run all.
+
+**Changed files.**
+
+- `database/common/110-demo-control.sql`
+- `workload-generator/tests/ContosoCare.Workload.Tests/SqlScriptTests.cs`
+- `CHANGELOG.md`, `docs/troubleshooting.md`, and this report
+
+**Validation.**
+
+- **Static:** `dotnet test --filter FullyQualifiedName~SqlScriptTests`: **Pass** (26). A mutation that removed `showcase` from the guard failed the test (expected `baseline`, `business-day`, `off`, and `showcase`; actual without `showcase`), and the restored file passed. markdownlint on the changed files: **Pass**.
+- **Live, the new guard,** on the owner's T1 after PR 29's rollout, in one transaction that was rolled back:
+  - with every name present, the batch changed nothing;
+  - after the check was replaced by one without `off` (a case the old guard missed, because `showcase` was there), the batch added it back;
+  - after the rollback, the check and T1's active `showcase` profile were as before.
+- **Live rollout of PR 29** on the owner's environment (2026-11-04), in this order:
+  - `stop-demo.ps1` (all **Pass**): it removed the pending auto-stop, set every profile off, deallocated both VMs, and stopped T4.
+  - `deploy.ps1 -FromStage Artifacts`: **DONE** in 41 minutes. It started `sqlvm01`, `archost01`, and T4, and installed the new runner on both VMs.
+    - Afterward, T1's check read `([profile_name]='showcase' OR [profile_name]='business-day' OR [profile_name]='baseline' OR [profile_name]='off' OR [profile_name] like 'incident:%')`.
+    - A policy-installed `MDE.Windows` update held `archost01`'s Run Commands for about 25 minutes (R49). `T2.ARC.ONBOARDING` was a **Warning** (the guest didn't answer while it was blocked; Arc stayed Connected), and the run waited it out.
+  - **Run all** from `NB_DatabaseHub_Control`, with its defaults, through the Job Scheduler API: `DbHub-Control` dispatched the showcase to all four targets for 90 minutes, and T1's plugin status was fresh.
+    - Each VM's Run Command set the showcase: T1, T3, and T4 on `sqlvm01`, and T2 on `archost01` (it accepted connections after 6 seconds). Each was **Pass**: "profile set to showcase until" the run's end.
+
+**Risks.** None new; R661 stays **Open** ([#28](https://github.com/MarcBushong/fabric-database-hub-demo/issues/28)).
