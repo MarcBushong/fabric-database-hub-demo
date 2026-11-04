@@ -61,6 +61,8 @@ Replace these before you send a prompt. Nothing else in a prompt needs editing.
 | [capacity-max.skills](capacity-max.skills.md) | capacity-max | skills | T1, T2, T3 | T1 | target with the most pressure; correlate; baseline compared with incident; evidence |
 | [plan-regression.in-hub](plan-regression.in-hub.md) | plan-regression (T3) | in-Hub agent | T1, T2, T3 | T3 | target with the most pressure; correlate; inefficient queries |
 | [plan-regression.skills](plan-regression.skills.md) | plan-regression (T3) | skills | T1, T2, T3 | T3 | target with the most pressure; inefficient queries; evidence |
+| [showcase.in-hub](showcase.in-hub.md) | any (the showcase) | in-Hub agent | T1, T2, T3 | | estate health summary; target with the most pressure; correlate; baseline compared with incident |
+| [showcase.skills](showcase.skills.md) | any (the showcase) | skills | T1, T2, T3 | | estate health summary; target with the most pressure; correlate; baseline compared with incident |
 | [incident-wrap-up.in-hub](incident-wrap-up.in-hub.md) | any | in-Hub agent | T1, T2, T3 | | customer root cause; evidence; baseline compared with incident; safest next action; approvals; what to verify; incident summary |
 | [incident-wrap-up.skills](incident-wrap-up.skills.md) | any | skills | T1, T2, T3 | | customer root cause; evidence; baseline compared with incident; safest next action; approvals; what to verify; incident summary |
 
