@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.SqlServer.TransactSql.ScriptDom;
 using Xunit;
 
@@ -205,6 +207,36 @@ public sealed class SqlScriptTests
         Assert.Contains("IF COL_LENGTH(N'demo.activity_profile', N'request_id') IS NULL", sql, StringComparison.Ordinal);
         var get = sql[sql.IndexOf("CREATE OR ALTER PROCEDURE demo.usp_profile_get", StringComparison.Ordinal)..];
         Assert.Matches(@"is_active = [^\n]+,\s+requested_at,\s+request_id\s", get[..get.IndexOf("\nGO", StringComparison.Ordinal)]);
+    }
+
+    [Fact]
+    public void TheProfileCheckAllowsEveryProfileTheSetAccepts()
+    {
+        // The table's check must allow every name the procedure accepts, both in a new database (010-schema.sql) and in
+        // one from before the showcase (110's migration): the live check of 2026-11-04 found the showcase refused with
+        // error 547 on T1 and T2, where only the procedure had it. The profiles file holds what the control sends.
+        static string[] Names(string list) => [.. Regex.Matches(list, "'([a-z-]+)'").Select(m => m.Groups[1].Value).Order(StringComparer.Ordinal)];
+
+        var schema = File.ReadAllText(RepositoryPaths.Combine("database", "common", "010-schema.sql"));
+        var control = File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql"));
+        var created = Regex.Match(schema, @"CONSTRAINT ck_activity_profile_name CHECK \(profile_name IN \(([^)]*)\) OR profile_name LIKE 'incident:%'\)");
+        var widened = Regex.Match(control, @"ADD CONSTRAINT ck_activity_profile_name\s+CHECK \(profile_name IN \(([^)]*)\) OR profile_name LIKE 'incident:%'\)");
+        var accepted = Regex.Match(control, @"@profile_name NOT IN \(([^)]*)\)");
+        Assert.True(created.Success, "010-schema.sql creates ck_activity_profile_name with a list of names.");
+        Assert.True(widened.Success, "110-demo-control.sql widens ck_activity_profile_name with a list of names.");
+        Assert.True(accepted.Success, "demo.usp_profile_set checks the name against a list.");
+
+        var names = Names(accepted.Groups[1].Value);
+        Assert.Contains("showcase", names);
+        Assert.Equal(names, Names(created.Groups[1].Value));
+        Assert.Equal(names, Names(widened.Groups[1].Value));
+
+        // The migration replaces only a check that lacks the showcase, so a second run changes nothing.
+        Assert.Contains("AND definition NOT LIKE N'%''showcase''%'", control, StringComparison.Ordinal);
+
+        using var profiles = JsonDocument.Parse(File.ReadAllText(RepositoryPaths.Combine("scenarios", "activity-profiles.json")));
+        var sent = profiles.RootElement.GetProperty("profiles").EnumerateObject().Select(p => p.Name).Where(name => name != "incident").Append("off");
+        Assert.All(sent, name => Assert.Contains(name, names));
     }
 
     [Fact]

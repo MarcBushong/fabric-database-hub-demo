@@ -51,6 +51,28 @@ GO
 IF COL_LENGTH(N'demo.activity_profile', N'request_id') IS NULL
     ALTER TABLE demo.activity_profile ADD request_id varchar(64) NULL;
 GO
+-- 010-schema.sql created the profile-name check before the showcase existed, and creates a table only when it's
+-- missing, so a database from before the showcase gets the check widened here; without it, setting the showcase on
+-- T1 or T2 fails with error 547 (the live check of 2026-11-04). The same check as 010-schema.sql's, in one transaction.
+IF EXISTS (SELECT 1 FROM sys.check_constraints
+           WHERE name = N'ck_activity_profile_name'
+             AND parent_object_id = OBJECT_ID(N'demo.activity_profile')
+             AND definition NOT LIKE N'%''showcase''%')
+BEGIN
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        ALTER TABLE demo.activity_profile DROP CONSTRAINT ck_activity_profile_name;
+        ALTER TABLE demo.activity_profile WITH CHECK ADD CONSTRAINT ck_activity_profile_name
+            CHECK (profile_name IN ('off', 'baseline', 'business-day', 'showcase') OR profile_name LIKE 'incident:%');
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH;
+END;
+GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'ix_scenario_runs_status' AND object_id = OBJECT_ID(N'demo.scenario_runs'))
     CREATE INDEX ix_scenario_runs_status ON demo.scenario_runs (status, started_at);
 GO

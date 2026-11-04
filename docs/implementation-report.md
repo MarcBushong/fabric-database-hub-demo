@@ -297,6 +297,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R658 | The 30-minute `DbHub-Monitor` re-checks are scheduled only while at least 5 minutes of the run remain, so a run under about 35 minutes gets none | **Accepted:** the run's own job looks after the plugin first; the 90-minute showcase gets two; the README and the notebook's guide say so (the showcase, PR-A) |
 | R659 | The notebook's new defaults reach the workspace only when `setup-activity-control.ps1` runs without `-SkipFabric`, which needs the Fabric capacity running | **Open:** the rollout step after the merge (the showcase, PR-A) |
 | R660 | An `off` for a VM that doesn't run isn't sent (the review of PR 20), so that target's stored profile stays as it was | **Accepted:** nothing runs on a stopped VM; a stored profile ends at its own end (a run's at the run's end plus 2 minutes, `business-day`'s after its window), `stop-demo.ps1` sets every profile off, and the profile host's leftover-run cleanup ends what a stopped run left at the next boot (the showcase, PR-A) |
+| R661 | A control run says Dispatched once Azure accepts each VM's Run Command, so a profile set that then fails (the 547 of 2026-11-04 on T1 and T2) shows only in that Run Command's result, and the target keeps its earlier profile | **Open:** [#28](https://github.com/MarcBushong/fabric-database-hub-demo/issues/28); troubleshooting names the symptom and its fix, and the showcase hotfix removes the 547 itself |
 
 ## Phase log
 
@@ -1021,3 +1022,36 @@ The integration:
 - **M2, the documented update command scaled T4 with no ceiling check:** `-FromStage Infrastructure` skips preflight, and the template step scaled an existing T4 without `t4SkuName` to `Standard_D4ds_v5` (the reviewer's case: `monthlyCeilingUsd` 250, no `t4SkuName`, no control, so light use plus the restart worst case is $312.21, a **Fail**, scaled anyway). Now the template step prices a move to a larger size (`Test-DemoT4SizeIncrease`) with the 2-vCore fallback's estimate at that size (`Get-DemoT4GeneralPurposeCost -SkuName`, with the safety stop's `T4RestartCoverage`); over either ceiling, or without a price, T4 keeps its size and `DEPLOY.T4.SIZE` (outcome `Ceiling`) names the ceiling to raise, and nothing is recorded, so the next run checks again. With `-ScaleT4`, an explicit `t4SkuName` changed to a larger size on an existing server is priced the same way, then scaled or kept; a smaller size can only lower the cost and isn't priced. Tests: over the ceiling keeps the size (the month, a session, and no price), under it scales and says the check passed, a move between the two 4-vCore sizes isn't priced, and the explicit change is priced, then kept or scaled.
 
 **Risks.** R649 to R660 (new); R641, R646, and R651 updated.
+
+### The showcase hotfix: T1 and T2's profile-name check
+
+2026-11-04. The live check of PR 20 on the owner's environment found Run all's showcase refused on T1 and T2. `runner profile set` failed with error 547, "The UPDATE statement conflicted with the CHECK constraint 'ck_activity_profile_name'", while T3 and T4 took the showcase. PR 20 added `showcase` to `demo.usp_profile_set`'s list, but not to the table's check. `010-schema.sql` has created that check since the first release with `off`, `baseline`, `business-day`, and `incident:%` only. T3's and T4's profiles are files on T1, so they never reach the table, and CI has no SQL Server, so no test ran the procedure. The control's job still said Dispatched for all four targets; that's issue [#28](https://github.com/MarcBushong/fabric-database-hub-demo/issues/28) (R661).
+
+**Work summary.**
+
+1. `database/common/010-schema.sql` creates the check with `showcase`.
+2. `database/common/110-demo-control.sql` widens the check in a database created before the showcase. When `sys.check_constraints` holds a definition without `'showcase'`, it drops the check and adds it again, with the same names as `010-schema.sql`, in one transaction, so a second run changes nothing. The runner embeds the script, so its hash changes. `deploy.ps1 -FromStage Artifacts` (or the fuller update) installs the new runner, and its `setup` applies the script on T1, T3, and T2.
+3. Test: `TheProfileCheckAllowsEveryProfileTheSetAccepts` (the runner's SQL tests). The check in `010-schema.sql`, the check that `110-demo-control.sql` adds, and the procedure's list must hold the same names, including `showcase`. Every profile in `scenarios/activity-profiles.json`, plus `off`, must be among them.
+4. Docs: the troubleshooting entry for the 547 (its symptom, how to read the Run Command's result, and the update that fixes it), the database README, and the CHANGELOG.
+
+**Changed files.**
+
+- `database/common/010-schema.sql`, `110-demo-control.sql`, and `README.md`
+- `workload-generator/tests/ContosoCare.Workload.Tests/SqlScriptTests.cs`
+- `CHANGELOG.md`, `docs/troubleshooting.md`, and this report
+
+**Validation.**
+
+- **Static (2026-11-04, `CI` set):**
+  - `./tests/Invoke-StaticValidation.ps1 -Check DotNet,Markdown -CI`: .NET **Pass** (518 tests: 501 passed, 17 skipped without a test server); markdownlint **Pass** (0 issues in 133 files).
+  - Pester 5.9.1 on `Repo.Conventions`, `Docs.Walkthrough`, `DbHubDemo.Workload`, `Vm.Workload`, and `DbHubDemo.Bundle`: **Pass** (282 passed).
+  - CI runs the full suite.
+- **Live, on the owner's T1 (SQL Server 2022 Standard),** in one transaction that was rolled back:
+  - before the migration, the check had no `showcase`;
+  - after the migration, it had `showcase`;
+  - after a second run, it was unchanged;
+  - an update to `showcase` changed 1 row, and an update to an unknown name was refused with 547;
+  - after the rollback, the check and the profile were as before.
+- The fix itself reaches the owner's environment through `deploy.ps1 -FromStage Artifacts` after the merge, followed by Run all.
+
+**Risks.** R661 (new).
