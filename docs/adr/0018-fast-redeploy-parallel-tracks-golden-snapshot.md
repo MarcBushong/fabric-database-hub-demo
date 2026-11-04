@@ -287,6 +287,7 @@ Static only: unit tests for the first run from `deploy.ps1`, the wait by default
 | A released record counts only on its source or a reset copy | A copy whose record says released without `resetUtc` may hold the captured identity, so the relay refuses it, and `T2.GUEST.STATE` fails it with `deploy.ps1`, which resets a restored copy |
 | The capture doesn't start during an on-demand run | `GOLDEN.CAPTURE.CONTROL` (before anything changes): a `DbHub-Control` or `DbHub-Stop` job queued or running, or a pending auto-stop, means nothing is captured, because a run starts `archost01` and its auto-stop deallocates it |
 | `status.ps1` says so | `T2.GUEST.STATE` is a **Warning** while a capture is in progress, and says when the marker stops counting, instead of pointing to a Fabric start |
+| A start never waits for a guest the capture holds | `start-demo.ps1` and `deploy.ps1` run the source's release as soon as `archost01` runs, before its interim `baseline` (PR 16), so a marker whose snapshot exists ends first; when the release leaves the guest off (a capture in progress, or a release that failed), `START.`/`DEPLOY.INTERIM_T2` is **Not selected** and nothing is sent or waited for there. The interim's retries stop at once, **Not selected**, when the relay holds the guest (a capture in progress, a marker that can't be read, a copy not reset) or finds it not running, because nothing runs there to quiet; `START.PROFILE_T2` isn't tried again for such a hold (review of PR 17, 2026-11-04) |
 
 ## Sources (checked 2026-11-03)
 
