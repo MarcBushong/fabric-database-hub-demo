@@ -1048,3 +1048,75 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
         }
     }
 }
+
+Describe 'The health read''s live view of the T2 guest (T2.GUEST.STATE, 2026-11-03)' {
+    BeforeAll {
+        $healthScript = Join-Path -Path $repoRoot -ChildPath 'vm/health/Get-DemoHealth.ps1'
+        # The health read dot-sources the installed golden script for the host's role; it's loaded here first so that
+        # Pester can mock its IMDS read.
+        . (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoGoldenGuest.ps1')
+        # Plain variables, not $script: ones: the mocks run under the health read's own script scope.
+        $hostVmId = 'aaaaaaaa-0000-0000-0000-000000000001'
+
+        function New-HealthRoot([object] $Capture) {
+            $root = Join-Path -Path $TestDrive -ChildPath ('health-' + [guid]::NewGuid().ToString('N'))
+            $null = New-Item -ItemType Directory -Path (Join-Path -Path $root -ChildPath 'golden') -Force
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), '{"schemaVersion":1,"role":"ArcHost","state":"Ready","status":"Pass","message":"Ready.","steps":[]}')
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'settings.json'), (ConvertTo-Json -InputObject @{ bundlePath = $repoRoot }))
+            if ($null -ne $Capture) {
+                [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture.json'), (ConvertTo-Json -InputObject $Capture))
+            }
+            return $root
+        }
+    }
+
+    BeforeEach {
+        $testGuest = @{ State = 'Off'; Heartbeat = ''; AutomaticStartAction = 'Nothing' }
+        $testSwitch = ''
+        Mock -CommandName Get-VM -MockWith { if ($Name -eq 'arcsql01') { [pscustomobject]@{ Name = 'arcsql01'; State = $testGuest.State; Heartbeat = $testGuest.Heartbeat; AutomaticStartAction = $testGuest.AutomaticStartAction } } }
+        Mock -CommandName Get-VMNetworkAdapter -MockWith { @([pscustomobject]@{ Name = 'Network Adapter'; SwitchName = $testSwitch }) }
+        Mock -CommandName Get-GoldenImdsVmId -MockWith { $hostVmId }
+    }
+
+    It 'reports a source a golden capture left air-gapped, with its role and no ID, in both views' {
+        $root = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = $hostVmId; released = $false })
+        $text = & $healthScript -Root $root -View Summary
+        $guest = ($text | ConvertFrom-Json).t2Guest
+        $guest.present | Should -BeTrue
+        $guest.state | Should -Be 'Off'
+        $guest.startAction | Should -Be 'Nothing'
+        $guest.adapters | Should -Be 1
+        $guest.connected | Should -Be 0
+        $guest.golden.released | Should -BeFalse
+        $guest.golden.role | Should -Be 'Source'
+        $text | Should -Not -Match 'aaaaaaaa-0000'
+        ((& $healthScript -Root $root -View Full) | ConvertFrom-Json).t2Guest.golden.role | Should -Be 'Source'
+    }
+
+    It 'tells a copy from the source, and reads no Azure VM ID once the record is released' {
+        $copy = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = 'bbbbbbbb-0000-0000-0000-000000000002'; released = $false; resetUtc = '2026-10-29T10:00:00Z' })
+        $guest = ((& $healthScript -Root $copy -View Summary) | ConvertFrom-Json).t2Guest
+        $guest.golden.role | Should -Be 'Copy'
+        $guest.golden.reset | Should -BeTrue
+        $testGuest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start' }
+        $testSwitch = 'DbHubDemoNat'
+        $released = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = $hostVmId; released = $true; releasedUtc = '2026-11-03T22:37:00Z' })
+        $guest = ((& $healthScript -Root $released -View Summary) | ConvertFrom-Json).t2Guest
+        $guest.golden.released | Should -BeTrue
+        $guest.golden.role | Should -BeNullOrEmpty
+        $guest.connected | Should -Be 1
+        Should -Invoke -CommandName Get-GoldenImdsVmId -Times 1 -Exactly
+    }
+
+    It 'reports a guest that doesn''t exist, and nothing at all on a VM without Hyper-V' {
+        Mock -CommandName Get-VM -MockWith { }
+        $root = New-HealthRoot
+        $guest = ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest
+        $guest.present | Should -BeFalse
+        $guest.PSObject.Properties['golden'] | Should -BeNullOrEmpty
+        Mock -CommandName Get-Command -ParameterFilter { $Name -eq 'Get-VM' } -MockWith { }
+        $summary = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $summary.PSObject.Properties['t2Guest'] | Should -BeNullOrEmpty
+        $summary.state | Should -Be 'Ready'
+    }
+}

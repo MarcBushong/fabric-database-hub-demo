@@ -316,13 +316,28 @@ Describe 'Stopped VMs are expected (validation areas)' {
         }
         $context = New-TestContext -Target T1, T2
         $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X; Invoke-DemoValidationT2 -Context $X })
-        foreach ($id in 'INFRA.HEALTH.SQLVM01', 'INFRA.HEALTH.ARCHOST01', 'T2.GUEST.ISOLATION') {
+        foreach ($id in 'INFRA.HEALTH.SQLVM01', 'INFRA.HEALTH.ARCHOST01', 'T2.GUEST.STATE', 'T2.GUEST.ISOLATION') {
             $result = $results | Where-Object { $_.checkId -eq $id }
             $result.status | Should -Be 'Warning' -Because $id
             $result.message | Should -Match 'tried twice, a minute apart' -Because $id
             $result.message | Should -Not -Match 'MDE\.Windows' -Because $id
         }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $RunCommandName -eq 'DbHubDemo-ValidateProbe' }
+    }
+
+    It 'reports T2.GUEST.STATE from the health read the Infrastructure area made, while archost01 runs (live, 2026-11-03)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcCheck -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Pass'; message = 'Ready.'; currentStep = ''; guestState = 'Running'; t2Guest = [pscustomobject]@{ present = $true; state = 'Off'; heartbeat = ''; startAction = 'Nothing'; adapters = 1; connected = 0; golden = [pscustomobject]@{ released = $false; reset = $false; role = 'Source' } } }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith { throw 'The guest isn''t running.' }
+        $context = New-TestContext -Target T2
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X; Invoke-DemoValidationT2 -Context $X })
+        $guest = $results | Where-Object { $_.checkId -eq 'T2.GUEST.STATE' }
+        $guest.status | Should -Be 'Fail'
+        $guest.message | Should -Match 'air-gapped by a golden capture'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 1 -Exactly -ParameterFilter { $VmName -eq 'archost01' }
     }
 
     It 'reads T1''s associated services from unified inventory while sqlvm01 is deallocated: a Warning while SSAS or SSIS are listed, a Pass with only the engine' {

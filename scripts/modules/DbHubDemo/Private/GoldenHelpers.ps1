@@ -715,3 +715,104 @@ function Restore-DemoGoldenCaptureSource {
     }
     return (& $new $outcome.Status ($outcome.Message + $hostText) $outcome.Remediation)
 }
+
+function Get-DemoT2GuestStateResult {
+    <#
+    .SYNOPSIS
+    T2.GUEST.STATE for status.ps1 and validate.ps1 while archost01 runs (2026-11-03): whether the nested guest can be in
+    Database Hub, from the host's live read (the t2Guest part of Get-DemoVmHealth). $null when there's nothing to
+    read (no Hyper-V host, as in the evaluation-only mode). Internal and pure.
+
+    .DESCRIPTION
+    Live, 2026-11-03: a golden capture had left the source's guest air-gapped (off, automatic start Nothing, adapter
+    disconnected) for six days, and nothing said so. Statuses (ADR 0012):
+    - Fail when T2 can't be in Database Hub while its host runs: a golden capture record that isn't released (the
+      source: start-demo.ps1 or a Fabric start releases it; a copy: deploy.ps1 resets it, and it's never connected by
+      hand while it may hold the captured identity), the guest off, or its adapter not connected to the NAT switch.
+    - Warning when it works now but won't after the next start (an automatic start action other than Start), or its
+      heartbeat isn't OK yet (it may still be booting), or the host couldn't be read.
+    - Not selected while the host's build hasn't created the guest yet; Pass otherwise.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Health
+    )
+
+    $guest = Get-DemoMemberValue -InputObject $Health -Name 't2Guest'
+    if ($null -eq $guest -or (Get-DemoHostVmName -Config $Config) -ne 'archost01') {
+        return $null
+    }
+    $guestName = [string](Import-PowerShellDataFile -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/dsc/guest.psd1')).Name
+    $switchName = [string](Import-PowerShellDataFile -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/dsc/host.psd1')).SwitchName
+    $docUrl = 'https://learn.microsoft.com/powershell/module/hyper-v/connect-vmnetworkadapter'
+    $golden = Get-DemoMemberValue -InputObject $guest -Name 'golden'
+    $evidence = [ordered]@{
+        guest       = $guestName
+        present     = [bool](Get-DemoMemberValue -InputObject $guest -Name 'present')
+        state       = [string](Get-DemoMemberValue -InputObject $guest -Name 'state')
+        heartbeat   = [string](Get-DemoMemberValue -InputObject $guest -Name 'heartbeat')
+        startAction = [string](Get-DemoMemberValue -InputObject $guest -Name 'startAction')
+        adapters    = [int](Get-DemoMemberValue -InputObject $guest -Name 'adapters')
+        connected   = [int](Get-DemoMemberValue -InputObject $guest -Name 'connected')
+        golden      = $(if ($null -ne $golden) { [ordered]@{ released = [bool](Get-DemoMemberValue -InputObject $golden -Name 'released'); reset = [bool](Get-DemoMemberValue -InputObject $golden -Name 'reset'); role = [string](Get-DemoMemberValue -InputObject $golden -Name 'role') } } else { $null })
+    }
+    $new = { param([string] $Status, [string] $Message, [string] $Remediation = '') New-DemoResult -CheckId 'T2.GUEST.STATE' -Area 't2' -Target 'T2' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $docUrl }
+    $readError = [string](Get-DemoMemberValue -InputObject $guest -Name 'error')
+    if ($readError) {
+        return (& $new 'Warning' ('archost01 couldn''t read its guest {0}: {1}' -f $guestName, (Protect-DemoText -Text $readError)) 'Run status.ps1 again in a few minutes.')
+    }
+    $seen = '{0}, automatic start {1}, {2} of {3} adapter(s) connected' -f $(if ($evidence['state']) { $evidence['state'] } else { 'in no state' }), $(if ($evidence['startAction']) { $evidence['startAction'] } else { 'unknown' }), $evidence['connected'], $evidence['adapters']
+    if (-not $evidence['present']) {
+        $hostState = [string](Get-DemoMemberValue -InputObject $Health -Name 'state')
+        if ($hostState -eq 'Ready') {
+            return (& $new 'Fail' ('archost01 is Ready, but its guest {0} doesn''t exist, so T2 can''t be in Database Hub.' -f $guestName) 'Run ./scripts/deploy.ps1 -Resume: archost01''s bootstrap creates the guest again.')
+        }
+        return (& $new 'Not selected' ('The guest {0} doesn''t exist yet: archost01''s bootstrap is {1}{2}.' -f $guestName, $(if ($hostState) { $hostState } else { 'starting' }), $(if ([string](Get-DemoMemberValue -InputObject $Health -Name 'currentStep')) { ' at {0}' -f (Get-DemoMemberValue -InputObject $Health -Name 'currentStep') } else { '' })))
+    }
+    $fabricStart = 'a start of T2 from the Fabric control (NB_DatabaseHub_Control)'
+    if ($null -ne $golden -and -not $evidence['golden']['released']) {
+        switch ($evidence['golden']['role']) {
+            'Source' {
+                return (& $new 'Fail' ('{0} is still air-gapped by a golden capture ({1}): T2 is missing from Database Hub until its source is released.' -f $guestName, $seen) ('Run ./scripts/start-demo.ps1, or {0}: either releases the source (T2.GOLDEN.SOURCE), which only reconnects the guest and restores its automatic start, because its Arc identity is its own.' -f $fabricStart))
+            }
+            'Copy' {
+                if ($evidence['golden']['reset']) {
+                    return (& $new 'Fail' ('{0} is a copy restored from a golden snapshot whose Arc identity was reset, but it isn''t released yet ({1}).' -f $guestName, $seen) ('Run ./scripts/deploy.ps1 (its T2 track releases it and onboards it), or {0}.' -f $fabricStart))
+                }
+                return (& $new 'Fail' ('{0} is a copy restored from a golden snapshot that hasn''t been reset yet ({1}); it may still hold the captured Arc identity, so it must stay air-gapped.' -f $guestName, $seen) 'Run ./scripts/deploy.ps1: its T2 track resets the copy while it''s air-gapped, then connects and onboards it. Don''t connect it by hand.')
+            }
+            default {
+                return (& $new 'Fail' ('{0} carries a golden capture record that isn''t released, and archost01''s Azure VM ID couldn''t be read, so it can''t tell a source from a copy ({1}).' -f $guestName, $seen) 'Run ./scripts/deploy.ps1: its T2 track decides and releases or resets it. Don''t connect the guest by hand.')
+            }
+        }
+    }
+    $connect = 'az vm run-command invoke --subscription {0} --resource-group {1} --name archost01 --command-id RunPowerShellScript --scripts ''Connect-VMNetworkAdapter -VMName {2} -SwitchName {3}; Set-VM -Name {2} -AutomaticStartAction Start -AutomaticStartDelay 0; Start-VM -Name {2}''' -f [string]$Config['subscriptionId'], (Get-DemoResourceGroupName -Config $Config), $guestName, $switchName
+    $problems = [System.Collections.Generic.List[string]]::new()
+    if ($evidence['adapters'] -eq 0 -or $evidence['connected'] -lt $evidence['adapters']) {
+        $problems.Add(('its network adapter isn''t connected to {0}, so it can''t reach Azure' -f $switchName))
+    }
+    if ($evidence['state'] -ne 'Running') {
+        $problems.Add(('it''s {0}' -f $(if ($evidence['state']) { $evidence['state'] } else { 'in no state' })))
+    }
+    if ($problems.Count -gt 0) {
+        $fix = if ($evidence['connected'] -lt $evidence['adapters'] -or $evidence['adapters'] -eq 0) { 'Connect, set, and start it on archost01: {0}' -f $connect } else { 'Use {0}, which starts an off guest and sets its automatic start, or run on archost01: {1}' -f $fabricStart, $connect }
+        return (& $new 'Fail' ('{0} can''t be in Database Hub while archost01 runs: {1} ({2}).' -f $guestName, ($problems -join '; '), $seen) $fix)
+    }
+    $notes = [System.Collections.Generic.List[string]]::new()
+    if ($evidence['startAction'] -ne 'Start') {
+        $notes.Add(('it doesn''t start with the host (automatic start action {0}), so the next start finds it off' -f $(if ($evidence['startAction']) { $evidence['startAction'] } else { 'unknown' })))
+    }
+    if ($evidence['heartbeat'] -notlike 'Ok*') {
+        $notes.Add(('its heartbeat is {0}; it may still be booting' -f $(if ($evidence['heartbeat']) { $evidence['heartbeat'] } else { 'not reported' })))
+    }
+    if ($notes.Count -gt 0) {
+        $fix = if ($evidence['startAction'] -ne 'Start') { 'Set it on archost01 (deploy.ps1 -Resume does too): {0}' -f $connect } else { 'Run status.ps1 again in a few minutes.' }
+        return (& $new 'Warning' ('{0} runs, but {1}.' -f $guestName, ($notes -join '; ')) $fix)
+    }
+    return (& $new 'Pass' ('{0} runs with its heartbeat OK, starts with the host, and its adapter is connected to {1}.' -f $guestName, $switchName))
+}

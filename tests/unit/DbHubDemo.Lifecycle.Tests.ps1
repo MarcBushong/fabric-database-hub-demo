@@ -2082,6 +2082,19 @@ Describe 'Get-DemoEnvironmentStatus' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -Times 1 -Exactly
     }
 
+    It 'flags T2''s guest that a golden capture left air-gapped while archost01 runs, from the same health read (live, 2026-11-03)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'archost01') { 'PowerState/running' } else { 'PowerState/deallocated' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            [pscustomobject]@{ status = 'Pass'; state = 'Ready'; message = 'ok'; t2Guest = [pscustomobject]@{ present = $true; state = 'Off'; heartbeat = ''; startAction = 'Nothing'; adapters = 1; connected = 0; golden = [pscustomobject]@{ released = $false; reset = $false; role = 'Source' } } }
+        }
+        $results = Get-DemoEnvironmentStatus -Config $config
+        $guest = $results | Where-Object { $_.checkId -eq 'T2.GUEST.STATE' }
+        $guest.status | Should -Be 'Fail'
+        $guest.message | Should -Match 'still air-gapped by a golden capture \(Off, automatic start Nothing, 0 of 1 adapter\(s\) connected\)'
+        $guest.remediation | Should -Match 'start-demo\.ps1'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 1 -Exactly -ParameterFilter { $VmName -eq 'archost01' }
+    }
+
     It 'reads profile get''s JSON object and takes on a stalled host lane''s status' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { 'PowerState/running' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ status = 'Pass'; state = 'Ready'; message = 'ok' } }

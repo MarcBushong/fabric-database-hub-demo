@@ -956,6 +956,61 @@ Describe 'Restore-DemoGoldenCaptureSource' {
     }
 }
 
+Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
+    BeforeAll {
+        $config = New-TestConfig
+        function Get-GuestState([object] $Guest, [string] $HostState = 'Ready') {
+            $health = [pscustomobject]@{ status = 'Pass'; state = $HostState; currentStep = 'Watchdog'; t2Guest = $Guest }
+            & (Get-Module -Name DbHubDemo) { param($c, $h) Get-DemoT2GuestStateResult -Config $c -Health $h } $config $health
+        }
+        function New-Guest([string] $State = 'Running', [string] $Heartbeat = 'OkApplicationsHealthy', [string] $StartAction = 'Start', [int] $Adapters = 1, [int] $Connected = 1, [object] $Golden = $null) {
+            $guest = [ordered]@{ present = $true; state = $State; heartbeat = $Heartbeat; startAction = $StartAction; adapters = $Adapters; connected = $Connected }
+            if ($null -ne $Golden) {
+                $guest['golden'] = $Golden
+            }
+            [pscustomobject]$guest
+        }
+    }
+
+    It 'is <Status> when <Case>' -ForEach @(
+        @{ Case = 'the guest runs as designed'; Guest = { New-Guest }; Status = 'Pass'; Match = 'runs with its heartbeat OK, starts with the host, and its adapter is connected to DbHubDemoNat'; Fix = '' }
+        @{ Case = 'the capture left the source air-gapped'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Source' }) }; Status = 'Fail'; Match = 'still air-gapped by a golden capture'; Fix = 'start-demo\.ps1, or a start of T2 from the Fabric control' }
+        @{ Case = 'a restored copy isn''t reset'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Copy' }) }; Status = 'Fail'; Match = 'must stay air-gapped'; Fix = 'deploy\.ps1: its T2 track resets the copy.*Don''t connect it by hand' }
+        @{ Case = 'a reset copy isn''t released'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $true; role = 'Copy' }) }; Status = 'Fail'; Match = 'was reset, but it isn''t released yet'; Fix = 'deploy\.ps1' }
+        @{ Case = 'the host''s role can''t be read'; Guest = { New-Guest -State 'Off' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Unknown' }) }; Status = 'Fail'; Match = 'can''t tell a source from a copy'; Fix = 'Don''t connect the guest by hand' }
+        @{ Case = 'the guest is off without a capture'; Guest = { New-Guest -State 'Off' -Heartbeat '' }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'Fabric control.*Start-VM -Name arcsql01' }
+        @{ Case = 'its adapter is disconnected'; Guest = { New-Guest -Connected 0 }; Status = 'Fail'; Match = 'isn''t connected to DbHubDemoNat'; Fix = "--name archost01 --command-id RunPowerShellScript --scripts 'Connect-VMNetworkAdapter -VMName arcsql01 -SwitchName DbHubDemoNat" }
+        @{ Case = 'a released capture''s guest is off'; Guest = { New-Guest -State 'Off' -Heartbeat '' -Golden ([pscustomobject]@{ released = $true; reset = $false; role = '' }) }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'Start-VM' }
+        @{ Case = 'it won''t start with the host'; Guest = { New-Guest -StartAction 'StartIfRunning' }; Status = 'Warning'; Match = 'doesn''t start with the host \(automatic start action StartIfRunning\)'; Fix = 'AutomaticStartAction Start' }
+        @{ Case = 'its heartbeat isn''t OK yet'; Guest = { New-Guest -Heartbeat 'NoContact' }; Status = 'Warning'; Match = 'heartbeat is NoContact'; Fix = 'again in a few minutes' }
+        @{ Case = 'the host couldn''t read it'; Guest = { [pscustomobject]@{ present = $false; error = 'Access is denied.' } }; Status = 'Warning'; Match = 'couldn''t read its guest'; Fix = 'again' }
+    ) {
+        $result = Get-GuestState (& $Guest)
+        $result.checkId | Should -Be 'T2.GUEST.STATE'
+        $result.status | Should -Be $Status
+        $result.message | Should -Match $Match
+        if ($Fix) {
+            $result.remediation | Should -Match $Fix
+        }
+        if ($Status -ne 'Pass') {
+            $result.remediation | Should -Not -BeNullOrEmpty
+        }
+    }
+
+    It 'never offers to connect a copy that may hold the captured identity' {
+        $result = Get-GuestState (New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Copy' }))
+        $result.remediation | Should -Not -Match 'Connect-VMNetworkAdapter|run-command'
+    }
+
+    It 'waits for a guest the build hasn''t created yet, fails one a Ready host lost, and says nothing without a Hyper-V read' {
+        (Get-GuestState ([pscustomobject]@{ present = $false }) -HostState 'Running').status | Should -Be 'Not selected'
+        $lost = Get-GuestState ([pscustomobject]@{ present = $false }) -HostState 'Ready'
+        $lost.status | Should -Be 'Fail'
+        $lost.remediation | Should -Match 'deploy\.ps1 -Resume'
+        & (Get-Module -Name DbHubDemo) { param($c) Get-DemoT2GuestStateResult -Config $c -Health ([pscustomobject]@{ status = 'Pass'; state = 'Ready' }) } $config | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Request-DemoVmStart' {
     BeforeEach {
         $config = New-TestConfig

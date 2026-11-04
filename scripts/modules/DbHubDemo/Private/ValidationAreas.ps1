@@ -226,9 +226,10 @@ function Invoke-DemoValidationT1 {
 function Invoke-DemoValidationT2 {
     <#
     .SYNOPSIS
-    The T2 area: the Arc checks (Get-DemoArcCheck) and, while the host runs, T2.GUEST.ISOLATION from the
-    read-only onboarding probe: the guest can't reach IMDS or the wire server, and resolves names through the
-    host (ADR 0004). Internal.
+    The T2 area: the Arc checks (Get-DemoArcCheck) and, while the host runs, T2.GUEST.STATE (the guest as the host
+    sees it now: air-gapped by a golden capture, off, or cut off from its switch; Get-DemoT2GuestStateResult) and
+    T2.GUEST.ISOLATION from the read-only onboarding probe: the guest can't reach IMDS or the wire server, and
+    resolves names through the host (ADR 0004). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -248,6 +249,14 @@ function Invoke-DemoValidationT2 {
     if (-not $state.Running) {
         $results.Add((New-DemoValidationStoppedResult -CheckId 'T2.GUEST.ISOLATION' -Area 't2' -Target 'T2' -VmState $state -Context $Context -Checks 'the guest isolation probe (ADR 0004)' -EvaluationOnly:$arc.EvaluationOnly))
         return $results.ToArray()
+    }
+    if (-not $arc.EvaluationOnly) {
+        # The guest as the host sees it now (2026-11-03), from the health read the Infrastructure area shares.
+        $read = Get-DemoValidationHealth -Context $Context -VmName $arc.HostVmName
+        $guestState = if ($null -ne $read.Health) { Get-DemoT2GuestStateResult -Config $Context.Config -Health $read.Health } else { New-DemoResult -CheckId 'T2.GUEST.STATE' -Area 't2' -Target 'T2' -Status 'Warning' -Message ('The guest''s state couldn''t be read on {0}: {1} {2}' -f $arc.HostVmName, $read.Error, (Get-DemoValidationRunCommandNote -ErrorText $read.Error)) -Remediation 'Run validate.ps1 -Area T2 again in about 10 minutes.' -DocUrl 'https://learn.microsoft.com/powershell/module/hyper-v/get-vm' }
+        if ($null -ne $guestState) {
+            $results.Add($guestState)
+        }
     }
     $probe = $null
     $probeError = ''

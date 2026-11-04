@@ -169,8 +169,11 @@ function Get-DemoArcState {
         $extension = Get-DemoArcArmResource -SubscriptionId $target.SubscriptionId -Url $target.ExtensionUrl
     }
     $powerState = ''
+    $hostSince = $null
     if ($IncludeHostPowerState) {
-        $powerState = Get-DemoVmPowerState -SubscriptionId $target.SubscriptionId -ResourceGroupName $target.ResourceGroupName -VmName $target.HostVmName
+        $power = Get-DemoVmPowerInfo -SubscriptionId $target.SubscriptionId -ResourceGroupName $target.ResourceGroupName -VmName $target.HostVmName
+        $powerState = $power.PowerState
+        $hostSince = $power.SinceUtc
     }
     [pscustomobject]@{
         Target          = $target
@@ -180,11 +183,23 @@ function Get-DemoArcState {
         HostedInstances = $hosted
         Extension       = $extension
         HostPowerState  = $powerState
+        HostSinceUtc    = $hostSince
     }
 }
 
 function Test-DemoArcConnected {
-    # T2.ARC.CONNECTED: the Arc machine exists and reports Connected. Internal; see Get-DemoArcCheck.
+    <#
+    .SYNOPSIS
+    T2.ARC.CONNECTED: the Arc machine exists and reports Connected. Internal; see Get-DemoArcCheck.
+
+    .DESCRIPTION
+    Disconnected is a Warning while the host is stopped, and for 10 minutes after the later of the machine's last
+    status change and the host's start (its provisioning status's time): the agent heartbeats every 5 minutes, and
+    a guest that just started needs a few minutes to boot. After that, a running host whose machine is still
+    Disconnected is a Fail (live, 2026-11-03: Disconnected for days while a golden capture's air gap kept the guest
+    off its network); T2.GUEST.STATE says why.
+    Source: https://learn.microsoft.com/azure/azure-arc/servers/overview#agent-status (checked 2026-11-03).
+    #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -202,6 +217,10 @@ function Test-DemoArcConnected {
     $properties = Get-DemoMemberValue -InputObject $State.Machine -Name 'properties'
     $status = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
     $changed = ConvertTo-DemoUtcDate -Value (Get-DemoMemberValue -InputObject $properties -Name 'lastStatusChange')
+    $hostSince = $null
+    if ($State.PSObject.Properties['HostSinceUtc']) {
+        $hostSince = ConvertTo-DemoUtcDate -Value $State.HostSinceUtc
+    }
     $evidence = [ordered]@{
         status            = $status
         lastStatusChange  = if ($changed) { $changed.ToString('o') } else { '' }
@@ -209,17 +228,21 @@ function Test-DemoArcConnected {
         provisioningState = [string](Get-DemoMemberValue -InputObject $properties -Name 'provisioningState')
         vmId              = [string](Get-DemoMemberValue -InputObject $properties -Name 'vmId')
         hostPowerState    = $State.HostPowerState
+        hostSinceUtc      = if ($hostSince) { $hostSince.ToString('o') } else { '' }
     }
     if ($status -eq 'Connected') {
         return (New-DemoArcResult -CheckId 'T2.ARC.CONNECTED' -Target $target -Status 'Pass' -Message ('The Arc machine {0} is Connected.' -f $target.MachineName) -Evidence $evidence -DocUrl $docUrl)
     }
     if ($status -eq 'Disconnected') {
         $hostRunning = $State.HostPowerState -eq 'PowerState/running'
-        $minutes = if ($changed) { ($Now - $changed).TotalMinutes } else { [double]::MaxValue }
-        if (-not $hostRunning -or $minutes -lt 30) {
+        $from = @($changed, $hostSince) | Where-Object { $null -ne $_ } | Sort-Object -Descending | Select-Object -First 1
+        $minutes = if ($null -ne $from) { ($Now - $from).TotalMinutes } else { [double]::MaxValue }
+        $evidence['minutesDisconnectedWhileRunning'] = if ($hostRunning -and $null -ne $from) { [int]$minutes } else { $null }
+        if (-not $hostRunning -or $minutes -lt 10) {
             return (New-DemoArcResult -CheckId 'T2.ARC.CONNECTED' -Target $target -Status 'Warning' -Message ('The Arc machine {0} is Disconnected while {1} is {2}; it reconnects within minutes of the host starting.' -f $target.MachineName, $target.HostVmName, $(if ($State.HostPowerState) { $State.HostPowerState } else { 'in an unknown state' })) -Evidence $evidence -Remediation 'Start the demo (./scripts/start-demo.ps1), wait a few minutes, and validate again.' -DocUrl $docUrl)
         }
-        return (New-DemoArcResult -CheckId 'T2.ARC.CONNECTED' -Target $target -Status 'Fail' -Message ('The Arc machine {0} has been Disconnected for {1:N0} minutes although {2} is running.' -f $target.MachineName, $minutes, $target.HostVmName) -Evidence $evidence -Remediation 'Check the guest is running and can reach the Arc endpoints (azcmagent check in the guest), then run configure-arc.ps1 -Force.' -DocUrl $target.Setting.DocUrls['show'])
+        $running = if ($null -ne $hostSince) { ', and {0} has been running for {1:N0} minutes' -f $target.HostVmName, ($Now - $hostSince).TotalMinutes } else { (' although {0} is running' -f $target.HostVmName) }
+        return (New-DemoArcResult -CheckId 'T2.ARC.CONNECTED' -Target $target -Status 'Fail' -Message ('The Arc machine {0} has been Disconnected for {1:N0} minutes{2}, so Database Hub has no T2.' -f $target.MachineName, ($Now - $(if ($null -ne $changed) { $changed } else { $from })).TotalMinutes, $running) -Evidence $evidence -Remediation 'Read T2.GUEST.STATE (./scripts/status.ps1): a guest that''s off, air-gapped by a golden capture, or cut off from its NAT switch can''t reach Azure, and it says how to fix that. Otherwise check the guest reaches the Arc endpoints (azcmagent check in the guest); run configure-arc.ps1 -Force only when the agent itself is broken.' -DocUrl $target.Setting.DocUrls['show'])
     }
     return (New-DemoArcResult -CheckId 'T2.ARC.CONNECTED' -Target $target -Status 'Fail' -Message ('The Arc machine {0} reports status ''{1}''.' -f $target.MachineName, $status) -Evidence $evidence -Remediation 'Run azcmagent show in the guest; to rebuild the connection run configure-arc.ps1 -Force, which removes a stale machine first.' -DocUrl $docUrl)
 }
