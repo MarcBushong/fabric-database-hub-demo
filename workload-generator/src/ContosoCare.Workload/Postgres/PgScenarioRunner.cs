@@ -407,8 +407,10 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     /// <summary>
     /// connection-surge: opens connections a few at a time until only headroom slots stay free below max_connections,
-    /// holds them (pinging now and then), tries overshoot more that the server refuses (SQLSTATE 53300: Failed
-    /// Connections in Database Hub), then releases them all and pauses. Repeats until the deadline.
+    /// then fills that headroom for a few seconds at most and tries overshoot more, which the server refuses (SQLSTATE
+    /// 53300: Failed connections in Database Hub), and frees the headroom again (SurgeBurst, 2026-11-03). Holds the rest
+    /// (pinging now and then), releases them all, and pauses. Repeats until the deadline. Refusals are capped per minute
+    /// and per run (SurgeBounds), and a sign-in failure ends the surge, so it never repeats a failed sign-in.
     /// </summary>
     private async Task<IReadOnlyList<WorkerOutcome>> RunConnectionSurgeAsync(RunContext context, PgDemoDatabase database)
     {
@@ -426,15 +428,37 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         var refused = 0;
         var failedOther = 0;
         long pings = 0;
+        long longestBurstMs = 0;
+        var bounds = new SurgeBounds(time);
+        var capped = false;
         var held = new List<NpgsqlConnection>();
         try
         {
             while (!context.Stop.IsCancellationRequested && time.GetUtcNow() < context.Deadline - TimeSpan.FromSeconds(5))
             {
+                // A wave starts only while one more refusal is allowed: its ramp can meet the limit too, when other sessions
+                // opened connections meanwhile. Otherwise it waits for the minute, or for the run's end once its cap is used.
+                if (bounds.Allowance(1) == 0)
+                {
+                    var next = bounds.NextAllowedAt();
+                    if (!capped)
+                    {
+                        capped = true;
+                        context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "surge-capped", null, string.Create(CultureInfo.InvariantCulture, $"{bounds.RefusedInRun} attempt(s) refused so far, the cap ({SurgeBounds.MaxRefusedPerMinute} in any minute, {SurgeBounds.MaxRefusedPerRun} a run); {(next is null ? "no more waves in this run" : "the next wave waits for the minute")}.")));
+                    }
+
+                    await WaitUntilAsync(next is { } at ? Earlier(at, context.Deadline) : context.Deadline, context).ConfigureAwait(false);
+                    continue;
+                }
+
+                capped = false;
                 var (max, reserved, open) = await database.GetConnectionLimitsAsync(context.Abort).ConfigureAwait(false);
-                var target = Math.Min(ceiling, Math.Max(0, max - reserved - headroom - open));
+                var room = Math.Max(0, max - reserved - headroom - open);
+                var target = Math.Min(ceiling, room);
+                // The cap stops this wave before the server's limit, so nothing can be past it.
+                var limited = ceiling < room;
                 waves++;
-                context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "surge-started", null, string.Create(CultureInfo.InvariantCulture, $"Wave {waves}: {open} client connection(s) open, max_connections {max}, {reserved} reserved; opening {target}, leaving {headroom} free, then {overshoot} past the limit.")));
+                context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "surge-started", null, string.Create(CultureInfo.InvariantCulture, $"Wave {waves}: {open} client connection(s) open, max_connections {max}, {reserved} reserved; opening {target}, leaving {headroom} free{(limited ? $"; maxConnections ({ceiling}) stops it before the limit, so nothing is past it" : $", then up to {overshoot} past the limit")}.")));
 
                 while (held.Count < target && !context.Stop.IsCancellationRequested && time.GetUtcNow() < context.Deadline - TimeSpan.FromSeconds(5))
                 {
@@ -448,6 +472,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                         catch (PostgresException ex) when (ex.SqlState == TooManyConnectionsState)
                         {
                             refused++;
+                            bounds.RecordRefused();
                             target = held.Count;
                             break;
                         }
@@ -457,22 +482,27 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                     await WaitUntilAsync(time.GetUtcNow() + TimeSpan.FromSeconds(1), context).ConfigureAwait(false);
                 }
 
-                var attempts = 0;
-                for (var i = 0; i < overshoot && !context.Stop.IsCancellationRequested; i++)
+                // Past the limit: the headroom is filled for SurgeBounds.MaxBurst at most, the next attempts are refused, and
+                // the headroom is free again for the hold, so reset and the other T4 lanes (whose opens retry 53300) get in.
+                var allowance = limited ? 0 : bounds.Allowance(overshoot);
+                if (allowance > 0 && !context.Stop.IsCancellationRequested && time.GetUtcNow() + SurgeBounds.MaxBurst < context.Deadline - TimeSpan.FromSeconds(5))
                 {
-                    attempts++;
-                    try
+                    var burst = await SurgeBurst.RunAsync(
+                        token => opener.OpenAsync(context.ApplicationName, token, Limits(context), retry: false),
+                        bounds,
+                        allowance,
+                        headroom + allowance + SurgeBurst.Slack,
+                        SurgeBounds.MaxBurst,
+                        time,
+                        context.Abort).ConfigureAwait(false);
+                    refused += burst.Refused;
+                    failedOther += burst.Failed;
+                    peak = Math.Max(peak, held.Count + burst.Opened);
+                    longestBurstMs = Math.Max(longestBurstMs, (long)burst.HeldFor.TotalMilliseconds);
+                    context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "surge-overshoot", null, string.Create(CultureInfo.InvariantCulture, $"Wave {waves}: filled {burst.Opened} free slot(s) for {burst.HeldFor.TotalSeconds:0.0} s; {burst.Refused} attempt(s) past the limit refused (too many connections); the headroom is free again.{(burst.Error is null ? string.Empty : " Stopped early: " + burst.Error)}")));
+                    if (burst.SignInFailed)
                     {
-                        // Past the limit on purpose; if a slot happened to be free, this one is kept and released with the rest.
-                        held.Add(await opener.OpenAsync(context.ApplicationName, context.Abort, Limits(context), retry: false).ConfigureAwait(false));
-                    }
-                    catch (PostgresException ex) when (ex.SqlState == TooManyConnectionsState)
-                    {
-                        refused++;
-                    }
-                    catch (NpgsqlException)
-                    {
-                        failedOther++;
+                        return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings, longestBurstMs), "A sign-in failed during the surge, so it stopped and doesn't try again: " + burst.Error, false)];
                     }
                 }
 
@@ -514,15 +544,15 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                 await WaitUntilAsync(resumeAt, context).ConfigureAwait(false);
             }
 
-            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings), null, false)];
+            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings, longestBurstMs), null, false)];
         }
         catch (Exception ex) when (IsCancellation(ex, context))
         {
-            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings), null, true)];
+            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings, longestBurstMs), null, true)];
         }
         catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException)
         {
-            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings), PgConnectionOpener.Describe(ex), false)];
+            return [new WorkerOutcome("surge", 1, null, SurgeMetrics(waves, peak, refused, failedOther, pings, longestBurstMs), PgConnectionOpener.Describe(ex), false)];
         }
         finally
         {
@@ -1085,13 +1115,14 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         ["held_ms"] = heldMs,
     };
 
-    private static Dictionary<string, object?> SurgeMetrics(int waves, int peak, int refused, int failedOther, long pings) => new(StringComparer.Ordinal)
+    private static Dictionary<string, object?> SurgeMetrics(int waves, int peak, int refused, int failedOther, long pings, long longestBurstMs) => new(StringComparer.Ordinal)
     {
         ["waves"] = waves,
         ["longest_connections_held"] = peak,
         ["connections_refused"] = refused,
         ["connections_failed_other"] = failedOther,
         ["pings"] = pings,
+        ["longest_burst_ms"] = longestBurstMs,
     };
 
     private static DateTimeOffset Earlier(DateTimeOffset a, DateTimeOffset b) => a <= b ? a : b;
