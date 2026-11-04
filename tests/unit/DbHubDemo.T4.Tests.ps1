@@ -551,3 +551,96 @@ Describe 'Get-DemoT4StoppedUtc' {
         $script:activityCalls[0] | Should -Match '--start-time 2026-10-18T19:10:00Z --end-time 2026-10-26T19:15:00Z --max-events 1000 '
     }
 }
+
+Describe 'Get-DemoT4RestartCoverage (2026-11-04)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        # The control's names, as Get-DemoActivityControlName returns them for the example configuration; no request is real.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlName -MockWith {
+            [pscustomobject]@{ SubscriptionId = '11111111-2222-3333-4444-555555555555'; Identity = 'id-dbhub-automation'; RoleName = 'DbHub Demo Activity Operator'; DemoResourceGroup = 'rg-dbhub-demo'; DemoResourceGroupId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo'; AutomationAccount = 'aa-dbhub-control'; AutomationAccountId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-control/providers/Microsoft.Automation/automationAccounts/aa-dbhub-control'; StopRunbook = 'DbHub-Stop'; SafetyStopSchedule = 'dbhub-t4-safety-stop' }
+        }
+        $script:control = $true
+        $script:schedule = 'Scheduled'
+        $script:roleId = 'dddddddd-0000-0000-0000-000000000009'
+        $script:a1 = [pscustomobject]@{ Exists = $true; Missing = $false; Error = '' }
+        $script:jobs = [pscustomobject]@{ Ok = $true; Missing = $false; Error = ''; Value = @{ value = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlSetting -MockWith { [pscustomobject]@{ Enabled = $script:control } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:schedule; NextRunUtc = $null } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlRoleId -MockWith { $script:roleId }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlPrincipalId -MockWith { 'dddddddd-0000-0000-0000-000000000004' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoActivityControlAssignment -MockWith { $script:a1 }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith { $script:jobs }
+        function New-StopJob([string] $Status, [string] $Created) {
+            @{ properties = @{ jobId = ('job-' + $Status); status = $Status; creationTime = $Created; runbook = @{ name = 'DbHub-Stop' } } }
+        }
+        $script:coverage = { InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4RestartCoverage -Config $Config -ConfigPath './config/demo.config.json' } }
+    }
+
+    It 'counts when the schedule is in place, A1 is assigned, and the last DbHub-Stop job didn''t fail' {
+        $script:jobs.Value = @{ value = @((New-StopJob -Status 'Failed' -Created '2026-11-01T19:15:00Z'), (New-StopJob -Status 'Completed' -Created '2026-11-03T19:15:00Z'), (New-StopJob -Status 'Running' -Created '2026-11-04T19:15:00Z')) }
+        $coverage = & $script:coverage
+        $coverage.Counts | Should -BeTrue -Because 'the newest job that ended completed; a running one hasn''t ended'
+        $coverage.Missing | Should -Be ''
+        $coverage.Reason | Should -Be 'the daily T4 safety stop is scheduled, A1 is assigned, and the last DbHub-Stop job didn''t fail'
+        $coverage.Evidence.lastStopJob | Should -Be 'Completed'
+        $script:jobs.Value = @{ value = @() }
+        (& $script:coverage).Counts | Should -BeTrue -Because 'a control whose stop never ran has no failed job'
+    }
+
+    It 'doesn''t count, and names the missing piece and its exact fix: <Case>' -ForEach @(
+        @{ Case = 'the control isn''t set up'; Setup = { $script:control = $false }; Missing = 'Control'; Reason = 'control\.enabled is false'; Fix = 'Set control\.enabled to true and run \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json; an Owner then runs \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json -GrantRole once' }
+        @{ Case = 'the schedule isn''t in place'; Setup = { $script:schedule = 'NotScheduled' }; Missing = 'Schedule'; Reason = 'missing, disabled, or not linked to DbHub-Stop'; Fix = '^Run \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json, which schedules it again\.$' }
+        @{ Case = 'the schedule couldn''t be read'; Setup = { $script:schedule = 'Unknown' }; Missing = 'Schedule'; Reason = 'couldn''t be read, so it''s taken as missing'; Fix = 'schedules it again' }
+        @{ Case = 'the custom role doesn''t exist'; Setup = { $script:roleId = '' }; Missing = 'A1'; Reason = 'isn''t assigned: without it DbHub-Stop can''t stop T4'; Fix = '-GrantRole, or set assignRoles to true and run \./scripts/deploy\.ps1, which grants A1 again after the template\.$' }
+        @{ Case = 'A1 isn''t assigned'; Setup = { $script:a1 = [pscustomobject]@{ Exists = $false; Missing = $false; Error = '' } }; Missing = 'A1'; Reason = 'id-dbhub-automation''s "DbHub Demo Activity Operator" role on rg-dbhub-demo, isn''t assigned'; Fix = '^An Owner runs \./scripts/setup-activity-control\.ps1 -ConfigPath \./config/demo\.config\.json -GrantRole, or set assignRoles to true' }
+        @{ Case = 'A1 couldn''t be read'; Setup = { $script:a1 = [pscustomobject]@{ Exists = $false; Missing = $false; Error = 'HTTP 503' } }; Missing = 'A1'; Reason = 'couldn''t be read, so it''s taken as missing'; Fix = '-GrantRole' }
+        @{ Case = 'the last DbHub-Stop job failed'; Setup = { $script:jobs.Value = @{ value = @((New-StopJob -Status 'Completed' -Created '2026-11-01T19:15:00Z'), (New-StopJob -Status 'Failed' -Created '2026-11-03T19:15:00Z')) } }; Missing = 'StopJob'; Reason = 'the last DbHub-Stop job \(created 2026-11-03 19:15 UTC\) ended Failed'; Fix = '^Open the job in aa-dbhub-control \(Process Automation > Jobs\) to see why; when A1 is the cause, an Owner runs' }
+        @{ Case = 'the last DbHub-Stop job was stopped'; Setup = { $script:jobs.Value = @{ value = @(New-StopJob -Status 'Stopped' -Created '2026-11-03T19:15:00Z') } }; Missing = 'StopJob'; Reason = 'ended Stopped'; Fix = 'Process Automation > Jobs' }
+        @{ Case = 'the jobs couldn''t be read'; Setup = { $script:jobs = [pscustomobject]@{ Ok = $false; Missing = $false; Error = 'HTTP 429'; Value = $null } }; Missing = 'StopJob'; Reason = 'couldn''t be read \(HTTP 429\), so it''s taken as failed'; Fix = '^Open aa-dbhub-control > Jobs in the Azure portal' }
+        @{ Case = 'a read throws'; Setup = { Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { throw 'The connection was reset.' } }; Missing = 'Schedule'; Reason = 'couldn''t be checked \(The connection was reset\.\), so it''s taken as missing'; Fix = 'then run this again' }
+    ) {
+        & $Setup
+        $coverage = & $script:coverage
+        $coverage.Counts | Should -BeFalse
+        $coverage.Missing | Should -Be $Missing
+        $coverage.Reason | Should -Match $Reason
+        $coverage.Fix | Should -Match $Fix
+        $coverage.Evidence.counts | Should -BeFalse
+        $coverage.Evidence.missing | Should -Be $Missing
+    }
+
+    It 'reports which worst case the monthly ceiling counts: a Pass with it, a Warning with the fix without it, Not selected without T4' {
+        $config = New-TestConfig
+        $counted = & $script:coverage
+        $pass = InModuleScope DbHubDemo -Parameters @{ Config = $config; Coverage = $counted } { New-DemoT4RestartCoverageResult -Config $Config -Coverage $Coverage -CheckPrefix 'START' }
+        $pass.checkId | Should -Be 'START.COST.T4RESTART'
+        $pass.status | Should -Be 'Pass'
+        $pass.message | Should -Match 'so the monthly ceiling counts each restart as about a day, until the next safety stop\.$'
+        $script:a1 = [pscustomobject]@{ Exists = $false; Missing = $false; Error = '' }
+        $missing = & $script:coverage
+        $warning = InModuleScope DbHubDemo -Parameters @{ Config = $config; Coverage = $missing } { New-DemoT4RestartCoverageResult -Config $Config -Coverage $Coverage }
+        $warning.checkId | Should -Be 'PREFLIGHT.COST.T4RESTART'
+        $warning.status | Should -Be 'Warning'
+        $warning.message | Should -Match 'so the monthly ceiling counts it running for the rest of the month\.$'
+        $warning.remediation | Should -Match '^An Owner runs .* -GrantRole, or set assignRoles to true .* With it in place, each restart counts as about a day\.$'
+        $unchecked = InModuleScope DbHubDemo -Parameters @{ Config = $config } { New-DemoT4RestartCoverageResult -Config $Config -Coverage $null }
+        $unchecked.status | Should -Be 'Warning'
+        $unchecked.message | Should -Match 'whether the daily T4 safety stop is in place wasn''t checked'
+        $config['t4Enabled'] = $false
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { New-DemoT4RestartCoverageResult -Config $Config -Coverage $null }).status | Should -Be 'Not selected'
+    }
+}
+
+Describe 'Get-DemoT4RestartWorstCase (2026-11-04)' {
+    It 'counts the rest of the month without the safety stop, and about a day per restart with it: <Case>' -ForEach @(
+        @{ Case = 'no safety stop'; Month = 730; Light = 10; Capped = $false; Hours = 720; Restarts = 0 }
+        @{ Case = 'the safety stop, a 730-hour month'; Month = 730; Light = 10; Capped = $true; Hours = 96; Restarts = 4 }
+        @{ Case = 'the safety stop, a 720-hour month'; Month = 720; Light = 10; Capped = $true; Hours = 96; Restarts = 4 }
+        @{ Case = 'the safety stop, never more than the rest of the month'; Month = 730; Light = 700; Capped = $true; Hours = 30; Restarts = 4 }
+        @{ Case = 'no safety stop, light use past the month'; Month = 730; Light = 744; Capped = $false; Hours = 0; Restarts = 0 }
+    ) {
+        $result = InModuleScope DbHubDemo -Parameters @{ Month = $Month; Light = $Light; Capped = $Capped } { Get-DemoT4RestartWorstCase -HoursPerMonth $Month -LightUseHoursPerMonth $Light -Capped $Capped }
+        $result.Hours | Should -Be $Hours
+        $result.Restarts | Should -Be $Restarts
+    }
+}

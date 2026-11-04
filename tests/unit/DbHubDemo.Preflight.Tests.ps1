@@ -230,6 +230,11 @@ Describe 'Invoke-DemoPreflight' {
 
     It 'prices T4''s General Purpose fallback before anything is created, with its full-month worst case against both ceilings (Phase 28 follow-up)' {
         Set-HappyAzMock
+        # Its numbers are set against a 250 USD ceiling, kept here (the default is 375 since 2026-11-04).
+        $copy = [ordered]@{}
+        foreach ($key in $config.Keys) { $copy[$key] = $config[$key] }
+        $copy['monthlyCeilingUsd'] = 250
+        $config = $copy
         # Fake estimates in Get-DemoCostEstimate's shape, with T4's compute at the size priced; obviously fake prices.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith {
             $sku = if ($Config['t4Enabled'] -eq $false) { '' } elseif ($Config['t4SkuName']) { [string]$Config['t4SkuName'] } else { 'Standard_B1ms' }
@@ -254,6 +259,12 @@ Describe 'Invoke-DemoPreflight' {
         # both ceilings: 60 + 0.2 x 690 = 198 USD for the month, 9 for a session.
         $script:lightUse = 60.0
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
+        # T4's restart (2026-11-04): the example configuration has no on-demand control, so the rest of the month counts.
+        $restart = $results | Where-Object checkId -eq 'PREFLIGHT.COST.T4RESTART'
+        $restart.status | Should -Be 'Warning'
+        $restart.message | Should -Match 'control\.enabled is false'
+        $restart.remediation | Should -Match 'setup-activity-control\.ps1'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $null -ne $T4RestartCoverage -and $T4RestartCoverage.Missing -eq 'Control' }
         $fallback = $results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
         $fallback.status | Should -Be 'Pass'
         $fallback.evidence.startSku | Should -Be ''

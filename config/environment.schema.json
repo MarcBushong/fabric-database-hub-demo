@@ -176,10 +176,10 @@
       "default": "demo"
     },
     "monthlyCeilingUsd": {
-      "description": "Hard monthly ceiling for idle plus light use: preflight and estimate-cost.ps1 fail when the estimate is above it. Also the Azure budget amount (ADR 0016).",
+      "description": "Hard monthly ceiling for idle plus light use: preflight, start-demo.ps1, and estimate-cost.ps1 fail when the estimate is above it. Its worst case includes T4's 7-day automatic restart: about a day per restart where the on-demand control's daily T4 safety stop is fully in place, otherwise the rest of the month. 375 by default since 2026-11-04 (user-directed, for the 4-core T4 with autonomous tuning; it was 250). Also the Azure budget amount, with alerts at 50, 80, and 100 percent; deploy.ps1 -FromStage Infrastructure updates the budget. To keep the month cheaper, set t4SkuName to Standard_B1ms (autonomous tuning then turns off), set t4Enabled to false, or set a lower value here (ADR 0016).",
       "type": "number",
       "exclusiveMinimum": 0,
-      "default": 250
+      "default": 375
     },
     "sessionCeilingUsd": {
       "description": "Ceiling for one demo-day session.",

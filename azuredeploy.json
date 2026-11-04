@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "11912047813101372109"
+      "templateHash": "15749944926969352364"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -117,10 +117,10 @@
     },
     "monthlyCeilingUsd": {
       "type": "int",
-      "defaultValue": 250,
+      "defaultValue": 375,
       "minValue": 1,
       "metadata": {
-        "description": "Monthly budget amount in USD: the hard monthly ceiling (ADR 0016, C2)."
+        "description": "Monthly budget amount in USD: the hard monthly ceiling, 375 by default since 2026-11-04 (user-directed, for the 4-core T4; ADR 0016, C2)."
       }
     },
     "budgetStartDate": {

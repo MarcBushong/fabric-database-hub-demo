@@ -1,3 +1,8 @@
+# The DbHub-Stop job statuses that mean a job ended (2026-11-04): Completed, or one that didn't finish its work. The safety
+# stop's coverage (Get-DemoT4RestartCoverage) reads the last one.
+# https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
+$script:T4StopJobEndedStatuses = @('Completed', 'Failed', 'Stopped', 'Suspended')
+
 function Test-DemoT4Enabled {
     # True unless the configuration turns T4 off (t4Enabled false; Phase 24, ADR 0019). Internal.
     [CmdletBinding()]
@@ -232,7 +237,12 @@ function ConvertTo-DemoT4FallbackCost {
     $sessionCeiling = [double]$Config['sessionCeilingUsd']
     $monthlyWorst = [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthly') + [double](Get-DemoMemberValue -InputObject $Estimate -Name 'T4AutoRestartWorstCaseMonthly'), 2)
     $session = [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'SessionCost'), 2)
-    $t4Worst = if ($null -ne $hourly) { [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'T4FixedMonthly') + $hourly * $hoursPerMonth, 2) } else { $null }
+    # T4 alone: its fixed costs and its compute for the light-use hours plus the restart worst case the estimate counted
+    # (T4RestartHours: the rest of the month, or about a day per restart where the daily T4 safety stop is in place;
+    # 2026-11-04). An estimate without it counts every hour of the month.
+    $restartHours = Get-DemoMemberValue -InputObject $Estimate -Name 'T4RestartHours'
+    $t4Hours = if ($null -ne $restartHours) { [System.Math]::Min($hoursPerMonth, [double](Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseHoursPerMonth') + [double]$restartHours) } else { $hoursPerMonth }
+    $t4Worst = if ($null -ne $hourly) { [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'T4FixedMonthly') + $hourly * $t4Hours, 2) } else { $null }
     $defenderIncluded = [bool](Get-DemoMemberValue -InputObject $Estimate -Name 'DefenderIncluded')
     $missing = Get-DemoMemberValue -InputObject $Estimate -Name 'MissingPrices'
     $unpriced = [System.Collections.Generic.List[string]]::new()
@@ -302,6 +312,8 @@ function Get-DemoT4GeneralPurposeCost {
     catch {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots couldn''t be listed, so the General Purpose fallback''s estimate leaves them out: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
+    # The daily T4 safety stop caps the restart worst case when it's fully in place (2026-11-04); never throws.
+    $parameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
     try {
         return (ConvertTo-DemoT4FallbackCost -Estimate (Get-DemoCostEstimate @parameters) -Config $priced)
     }
@@ -986,6 +998,195 @@ function Format-DemoT4RestartText {
         default { ' until it''s stopped again: nothing here stops it on its own (the on-demand control''s daily safety stop isn''t set up), so run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.' }
     }
     return ('Azure starts it again on its own {0}{1}{2}' -f $when, $bills, $after)
+}
+
+function Get-DemoT4LastStopJob {
+    <#
+    .SYNOPSIS
+    The control's last DbHub-Stop job that ended (the per-run auto-stop or the daily T4 safety stop), from Job - List By
+    Automation Account (https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account), the newest by its
+    creation time. Returns Ok, Error, Found, Id, Status, and CreatedUtc; a control Automation account that doesn't exist has
+    none (Found false). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Name
+    )
+
+    $jobs = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/jobs' -f $Name.AutomationAccountId) -Query ([ordered]@{ '$filter' = ("properties/runbook/name eq '{0}'" -f $Name.StopRunbook); 'api-version' = '2024-10-23' })
+    if (-not $jobs.Ok) {
+        if ($jobs.Missing) {
+            return [pscustomobject]@{ Ok = $true; Error = ''; Found = $false; Id = ''; Status = ''; CreatedUtc = $null }
+        }
+        return [pscustomobject]@{ Ok = $false; Error = $jobs.Error; Found = $false; Id = ''; Status = ''; CreatedUtc = $null }
+    }
+    $last = $null
+    foreach ($job in @(Get-DemoActivityControlList -InputObject $jobs.Value -Name 'value')) {
+        $properties = Get-DemoMemberValue -InputObject $job -Name 'properties'
+        $status = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
+        $runbook = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'runbook') -Name 'name')
+        if ($runbook -ne $Name.StopRunbook -or $status -notin $script:T4StopJobEndedStatuses) {
+            continue
+        }
+        $created = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'creationTime')
+        if ($null -eq $last -or ($null -ne $created -and ($null -eq $last.CreatedUtc -or $created -gt $last.CreatedUtc))) {
+            $last = [pscustomobject]@{ Ok = $true; Error = ''; Found = $true; Id = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobId'); Status = $status; CreatedUtc = $created }
+        }
+    }
+    if ($null -eq $last) {
+        return [pscustomobject]@{ Ok = $true; Error = ''; Found = $false; Id = ''; Status = ''; CreatedUtc = $null }
+    }
+    return $last
+}
+
+function Get-DemoT4RestartCoverage {
+    <#
+    .SYNOPSIS
+    Whether the on-demand control's daily T4 safety stop caps T4's 7-day automatic restart in the cost estimate's worst case
+    (the owner's decision, 2026-11-04, ADR 0016). Returns Counts, Missing (Control, Schedule, A1, StopJob, or ''), Reason,
+    Fix, and Evidence. Never throws. Internal.
+
+    .DESCRIPTION
+    Azure starts a stopped flexible server again on its own after 7 days, and it then runs until something stops it. The
+    safety stop counts, so each restart counts as about a day, only when all three hold:
+    - the schedule dbhub-t4-safety-stop exists, is enabled, and is linked to DbHub-Stop (Get-DemoT4SafetyStopState);
+    - A1, the control identity's custom role on the demo's resource group, is assigned: DbHub-Stop can't stop T4 without
+      it, and destroy deletes it with the group, so only assignRoles or -GrantRole grants it again;
+    - the last DbHub-Stop job that ended didn't fail (Failed, Stopped, or Suspended).
+    Anything else, a read that fails included (fail safe), means the worst case counts the rest of the month, and Missing,
+    Reason, and Fix say what's missing and the exact command that fixes it.
+    - Schedules: https://learn.microsoft.com/rest/api/automation/schedule/get
+    - Role assignments: https://learn.microsoft.com/rest/api/authorization/role-assignments/list-for-scope
+    - Jobs: https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = ''
+    )
+
+    $grant = Get-DemoActivityControlCommand -ConfigPath $ConfigPath
+    $setup = $grant -replace ' -GrantRole$', ''
+    $missing = {
+        param([string] $Piece, [string] $Reason, [string] $Fix, [System.Collections.IDictionary] $Evidence)
+        $Evidence['counts'] = $false
+        $Evidence['missing'] = $Piece
+        [pscustomobject]@{ Counts = $false; Missing = $Piece; Reason = $Reason; Fix = $Fix; Evidence = $Evidence }
+    }
+    $evidence = [ordered]@{}
+    try {
+        if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
+            $evidence['control'] = 'off'
+            return (& $missing 'Control' 'the on-demand activity control isn''t set up (control.enabled is false), so nothing here stops T4 after Azure starts it again' ('Set control.enabled to true and run {0}; an Owner then runs {1} once (ADR 0020).' -f $setup, $grant) $evidence)
+        }
+        $state = [string](Get-DemoT4SafetyStopState -Config $Config).State
+        $evidence['schedule'] = $state
+        if ($state -ne 'Scheduled') {
+            $what = if ($state -eq 'Unknown') { 'couldn''t be read, so it''s taken as missing' } else { 'isn''t in place (the schedule dbhub-t4-safety-stop is missing, disabled, or not linked to DbHub-Stop)' }
+            return (& $missing 'Schedule' ('the daily T4 safety stop {0}' -f $what) ('Run {0}, which schedules it again.' -f $setup) $evidence)
+        }
+        $name = Get-DemoActivityControlName -Config $Config
+        $roleId = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId
+        $principalId = if ($roleId) { Get-DemoActivityControlPrincipalId -Name $name } else { '' }
+        $a1 = if ($roleId -and $principalId) { Test-DemoActivityControlAssignment -SubscriptionId $name.SubscriptionId -Scope $name.DemoResourceGroupId -PrincipalId $principalId -RoleId $roleId } else { $null }
+        $evidence['a1'] = if ($null -ne $a1 -and $a1.Exists) { 'assigned' } elseif ($null -ne $a1 -and $a1.Error -and -not $a1.Missing) { 'unread' } else { 'missing' }
+        if ($evidence['a1'] -ne 'assigned') {
+            $what = if ($evidence['a1'] -eq 'unread') { 'couldn''t be read, so it''s taken as missing' } else { 'isn''t assigned' }
+            $reason = 'A1, {0}''s "{1}" role on {2}, {3}: without it DbHub-Stop can''t stop T4, and destroy deletes it with the group' -f $name.Identity, $name.RoleName, $name.DemoResourceGroup, $what
+            return (& $missing 'A1' $reason ('An Owner runs {0}, or set assignRoles to true and run ./scripts/deploy.ps1, which grants A1 again after the template.' -f $grant) $evidence)
+        }
+        $job = Get-DemoT4LastStopJob -Name $name
+        if (-not $job.Ok) {
+            $evidence['lastStopJob'] = 'unread'
+            return (& $missing 'StopJob' ('the last DbHub-Stop job couldn''t be read ({0}), so it''s taken as failed' -f $job.Error) ('Open {0} > Jobs in the Azure portal to check DbHub-Stop''s last run, then run {1}.' -f $name.AutomationAccount, $setup) $evidence)
+        }
+        $evidence['lastStopJob'] = if ($job.Found) { $job.Status } else { 'none' }
+        if ($job.Found -and $job.Status -ne 'Completed') {
+            $when = if ($null -ne $job.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$job.CreatedUtc) } else { '' }
+            $reason = 'the last DbHub-Stop job{0} ended {1}, so the safety stop may not stop T4' -f $when, $job.Status
+            return (& $missing 'StopJob' $reason ('Open the job in {0} (Process Automation > Jobs) to see why; when A1 is the cause, an Owner runs {1}. Then run {2}.' -f $name.AutomationAccount, $grant, $setup) $evidence)
+        }
+        $evidence['counts'] = $true
+        $evidence['missing'] = ''
+        return [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the daily T4 safety stop is scheduled, A1 is assigned, and the last DbHub-Stop job didn''t fail'; Fix = ''; Evidence = $evidence }
+    }
+    catch {
+        $problem = Protect-DemoText -Text $_.Exception.Message
+        Write-DemoLog -Level Warning -Message ('Whether the daily T4 safety stop is in place couldn''t be read, so the cost estimate counts T4''s restart for the rest of the month: {0}' -f $problem)
+        $evidence['error'] = $problem
+        return (& $missing 'Schedule' ('the daily T4 safety stop couldn''t be checked ({0}), so it''s taken as missing' -f $problem) ('Run {0}, then run this again.' -f $setup) $evidence)
+    }
+}
+
+function Get-DemoT4RestartWorstCase {
+    <#
+    The hours of T4 compute the estimate's worst case adds for its 7-day automatic restart (2026-11-04, ADR 0016). Without
+    the safety stop (-Capped false), the rest of the month after the light-use hours. With it, each restart runs until the
+    next daily safety stop, about 24 hours, and a restart comes at most every 8 days (7 stopped, then up to 1 running): at
+    most floor(HoursPerMonth / 192) + 1 restarts a month, 4 for a 730-hour month, so 96 hours, never more than the rest
+    of the month. Returns Hours and Restarts (0 without the cap). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [double] $HoursPerMonth,
+
+        [Parameter(Mandatory)]
+        [double] $LightUseHoursPerMonth,
+
+        [Parameter(Mandatory)]
+        [bool] $Capped,
+
+        [ValidateRange(1, 30)]
+        [int] $StoppedDays = 7
+    )
+
+    $rest = [System.Math]::Max(0.0, $HoursPerMonth - $LightUseHoursPerMonth)
+    if (-not $Capped) {
+        return [pscustomobject]@{ Hours = $rest; Restarts = 0 }
+    }
+    $restarts = [int][System.Math]::Floor($HoursPerMonth / (($StoppedDays + 1) * 24.0)) + 1
+    return [pscustomobject]@{ Hours = [System.Math]::Min($rest, $restarts * 24.0); Restarts = $restarts }
+}
+
+function New-DemoT4RestartCoverageResult {
+    <#
+    <Prefix>.COST.T4RESTART (2026-11-04, ADR 0016): which worst case the monthly ceiling counts for T4's 7-day automatic
+    restart, and why. Pass when the daily T4 safety stop caps it (about a day per restart); a Warning that names what's
+    missing, and the exact fix, when it counts the rest of the month; Not selected when T4 is off. Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Coverage,
+
+        [ValidateSet('PREFLIGHT', 'START')]
+        [string] $CheckPrefix = 'PREFLIGHT'
+    )
+
+    $checkId = '{0}.COST.T4RESTART' -f $CheckPrefix
+    $doc = [string](Get-DemoPostgresSetting)['docUrls']['stopServer']
+    if (-not (Test-DemoT4Enabled -Config $Config)) {
+        return (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Not selected' -Message 'T4 is off in this configuration (t4Enabled is false), so its automatic restart costs nothing.' -DocUrl $doc)
+    }
+    if ($null -ne $Coverage -and $Coverage.Counts) {
+        return (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Pass' -Message ('Azure starts a stopped T4 again on its own after 7 days, and {0}, so the monthly ceiling counts each restart as about a day, until the next safety stop.' -f $Coverage.Reason) -Evidence $Coverage.Evidence -DocUrl $doc)
+    }
+    $reason = if ($null -ne $Coverage) { $Coverage.Reason } else { 'whether the daily T4 safety stop is in place wasn''t checked' }
+    $fix = if ($null -ne $Coverage -and $Coverage.Fix) { $Coverage.Fix } else { 'Run ./scripts/setup-activity-control.ps1 to set up the daily T4 safety stop (ADR 0020).' }
+    $evidence = if ($null -ne $Coverage) { $Coverage.Evidence } else { [ordered]@{ counts = $false; missing = 'NotChecked' } }
+    return (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure starts a stopped T4 again on its own after 7 days, and {0}, so the monthly ceiling counts it running for the rest of the month.' -f $reason) -Evidence $evidence -Remediation ('{0} With it in place, each restart counts as about a day.' -f $fix) -DocUrl $doc)
 }
 
 function Get-DemoT4Name {

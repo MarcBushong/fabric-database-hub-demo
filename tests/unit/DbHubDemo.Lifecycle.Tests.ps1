@@ -3355,7 +3355,7 @@ Describe 'Test-DemoStartCost' {
     ) {
         $script:actual = [pscustomobject]@{ Amount = $Amount; Currency = $Currency }
         $results = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode private -T3UseFreeLimit $false } $config
-        @($results.checkId) | Should -Be @('PREFLIGHT.COST.SESSION', 'PREFLIGHT.COST.MONTHLY', 'START.COST.ACTUAL')
+        @($results.checkId) | Should -Be @('PREFLIGHT.COST.SESSION', 'PREFLIGHT.COST.MONTHLY', 'START.COST.T4RESTART', 'START.COST.ACTUAL')
         ($results | Where-Object { $_.checkId -eq 'START.COST.ACTUAL' }).status | Should -Be $Expected
     }
 

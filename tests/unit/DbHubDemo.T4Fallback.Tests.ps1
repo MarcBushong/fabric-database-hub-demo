@@ -296,6 +296,8 @@ Describe 'Guardrail 1: only SkuNotAvailable for both Burstable sizes moves T4 to
 Describe 'Guardrail 2: priced from the Retail Prices API before anything is created, and left out over a ceiling' {
     It 'allows the fallback only with a compute price, the worst-case month within monthlyCeilingUsd, and a session within sessionCeilingUsd' {
         $verdict = { param($Estimate, $Config) InModuleScope DbHubDemo -Parameters @{ Estimate = $Estimate; Config = $Config } { ConvertTo-DemoT4FallbackCost -Estimate $Estimate -Config $Config } }
+        # Its numbers are set against a 250 USD ceiling (the default is 375 since 2026-11-04).
+        function New-TestConfig { $c = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json'); $c['monthlyCeilingUsd'] = 250; $c }
         $within = & $verdict (New-TestEstimate) (New-TestConfig)
         $within.Allowed | Should -BeTrue
         $within.SkipReason | Should -Be ''

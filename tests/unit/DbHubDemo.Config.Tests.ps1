@@ -39,7 +39,7 @@ Describe 'Get-DemoConfig' {
         $config.networkMode | Should -Be 'auto'
         $config.t2Mode | Should -Be 'Nested'
         $config.t2SqlInstallMode | Should -Be 'PaygWizard'
-        $config.monthlyCeilingUsd | Should -Be 250
+        $config.monthlyCeilingUsd | Should -Be 375 -Because 'the default since 2026-11-04 (user-directed, for the 4-core T4)'
         $config.sessionCeilingUsd | Should -Be 15
         $config.assignRoles | Should -BeFalse
         $config.bastionMaxHours | Should -Be 4
