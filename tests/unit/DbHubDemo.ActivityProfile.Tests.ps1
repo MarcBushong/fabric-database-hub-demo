@@ -489,20 +489,34 @@ Describe 'stop-demo.ps1''s bounded steps (2026-11-03)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActionRunCommand -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 180 -and $VmName -eq 'archost01' }
     }
 
-    It 'stops retrying a busy VM at the bound, and keeps today''s retries without one' {
+    It 'stops retrying a busy VM at the bound with a time-out, not the last 409, and keeps today''s retries without one' {
         $script:azCalls = [System.Collections.Generic.List[object]]::new()
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { $script:azCalls.Add($PesterBoundParameters['TimeoutSeconds']); [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (Conflict) Another operation is in progress.' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoConflictDelay -MockWith { 40 }
         $run = InModuleScope DbHubDemo { Invoke-DemoActionRunCommand -SubscriptionId '11111111-2222-3333-4444-555555555555' -ResourceGroupName 'rg-dbhub-demo' -VmName 'archost01' -Script 'Write-Output 1' -TimeoutSeconds 30 }
-        $run.ExitCode | Should -Be 1
+        $run.ExitCode | Should -Be -1 -Because 'the bound ran out, as when the CLI itself is stopped at it (review of PR 16)'
+        $run.StdErr | Should -Be 'The Run Command on archost01 did not finish within 30 seconds: the VM stayed busy (409 Conflict, another operation in progress) until the bound. ERROR: (Conflict) Another operation is in progress.'
         $script:azCalls.Count | Should -Be 1 -Because 'the next try would start after the bound'
         [int]$script:azCalls[0] | Should -BeGreaterThan 0
         [int]$script:azCalls[0] | Should -BeLessOrEqual 30
 
         $script:azCalls.Clear()
-        $null = InModuleScope DbHubDemo { Invoke-DemoActionRunCommand -SubscriptionId '11111111-2222-3333-4444-555555555555' -ResourceGroupName 'rg-dbhub-demo' -VmName 'archost01' -Script 'Write-Output 1' }
+        $unbounded = InModuleScope DbHubDemo { Invoke-DemoActionRunCommand -SubscriptionId '11111111-2222-3333-4444-555555555555' -ResourceGroupName 'rg-dbhub-demo' -VmName 'archost01' -Script 'Write-Output 1' }
         $script:azCalls.Count | Should -Be 10
         @($script:azCalls | Where-Object { $null -ne $_ }) | Should -BeNullOrEmpty -Because 'no bound means no -TimeoutSeconds, as before'
+        $unbounded.ExitCode | Should -Be 1 -Because 'without a bound, the last 409 stays what it is'
+    }
+
+    It 'reports a guest stop that a busy archost01 held past its bound as a Warning, so stop-demo.ps1 exits 0 (review of PR 16)' {
+        # Reviewer: on 409s until the bound, STOP.GUEST was a Fail and stop-demo.ps1 exited 1, though the deallocation went on.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (Conflict) Run command extension execution is in progress. Please wait for completion before invoking a run command.' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoConflictDelay -MockWith { 40 }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Stop-DemoGuestVm -Config $Config -TimeoutSeconds 30 -Confirm:$false }
+        $result.checkId | Should -Be 'STOP.GUEST'
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^The guest''s clean shutdown didn''t finish within 30 seconds \(archost01 is busy'
+        $result.evidence['timedOut'] | Should -BeTrue
+        Get-DemoExitCode -Result @($result) | Should -Be 0
     }
 }
 

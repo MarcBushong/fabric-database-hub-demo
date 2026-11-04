@@ -120,7 +120,8 @@ function Invoke-DemoActionRunCommand {
     message. Action Run Command runs one script at a time per VM and returns only the last 4,096 bytes of
     output (https://learn.microsoft.com/azure/virtual-machines/windows/run-command). -TimeoutSeconds bounds the whole
     call, retries included (stop-demo.ps1's guest stop, 2026-11-03): the Azure CLI is stopped then, and the result's
-    ExitCode is -1 (Invoke-DemoAz); the Run Command itself goes on in Azure.
+    ExitCode is -1 (Invoke-DemoAz); the Run Command itself goes on in Azure. A bound that runs out between retries of a
+    busy VM is the same time-out, ExitCode -1, not the last 409 (review of PR 16, 2026-11-04).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -168,6 +169,9 @@ function Invoke-DemoActionRunCommand {
             }
             $delay = Get-DemoConflictDelay -Attempt $attempt
             if ([DateTime]::UtcNow.AddSeconds($delay + 1) -ge $deadline) {
+                # The bound ran out while the VM stayed busy: a time-out, as when the CLI itself is stopped at the bound
+                # (ExitCode -1), not the last 409, so a bounded caller reports it as one (review of PR 16, 2026-11-04).
+                $run = [pscustomobject]@{ ExitCode = -1; StdOut = ''; StdErr = ('The Run Command on {0} did not finish within {1} seconds: the VM stayed busy (409 Conflict, another operation in progress) until the bound. {2}' -f $VmName, $TimeoutSeconds, ([string]$run.StdErr).Trim()) }
                 break
             }
             Write-DemoLog -Level Warning -Message ('A Run Command or an extension that a policy installs or updates (for example MDE.Windows) is busy on {0}; retrying in {1} seconds ({2} of {3}).' -f $VmName, $delay, $attempt, ($Attempts - 1))
