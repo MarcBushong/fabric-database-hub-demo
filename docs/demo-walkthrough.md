@@ -77,7 +77,7 @@ The coordinator's decision (2026-10-20, [ADR 0016](adr/0016-cost-profiles.md)):
 
 ### Know the cost before you start
 
-- **Ceilings** ([ADR 0016](adr/0016-cost-profiles.md)): at most **$15 per demo-day session** (`sessionCeilingUsd`; above it is a **Warning**), and at most **$250 for a light-use month** (`monthlyCeilingUsd`, a hard ceiling; above it is a **Fail**). The Azure budget on the resource group alerts at 50%, 80%, and 100% of the monthly ceiling.
+- **Ceilings** ([ADR 0016](adr/0016-cost-profiles.md)): at most **$15 per demo-day session** (`sessionCeilingUsd`; above it is a **Warning**), and at most **$375 for a light-use month** (`monthlyCeilingUsd`, a hard ceiling since 2026-11-04, $250 before; above it is a **Fail**). The month counts T4's 7-day automatic restart: about a day per restart when the on-demand control's daily T4 safety stop is in place, the rest of the month otherwise ([cost management](cost-management.md#dated-example-the-4-vcore-t4-default-and-the-375-ceiling-2026-11-04)). The Azure budget on the resource group alerts at 50%, 80%, and 100% of the monthly ceiling.
 - **Estimate on the day:** `./scripts/estimate-cost.ps1 -NetworkMode private`, or `public`, whichever mode preflight resolved. When the subscription guard passes, it includes the subscription's Microsoft Defender for Cloud plans and the T3 free offer. It prices everything from the [Azure Retail Prices API](https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices) when you run it, so this script quotes no prices.
 - **The start checks it too:** `start-demo.ps1` runs the cost guardrail before it starts anything: the live estimate against both ceilings (`PREFLIGHT.COST.SESSION` and `PREFLIGHT.COST.MONTHLY`), and this month's actual cost plus one session against `monthlyCeilingUsd` (`START.COST.ACTUAL`). A **Fail** stops the start. `-SkipCostCheck` starts anyway (`START.COST` **Not selected**), so use it only right after a check.
 - **What a session adds:** VM hours, the SQL Server licenses that bill while the VMs run (T1's image license, and Arc pay-as-you-go per core-hour for T2), T3 compute while an activity profile keeps it awake, Defender plans on running VMs, and Bastion with its public IP for every hour it exists. The shared Fabric capacity isn't in the estimate: it's outside the demo's resource group, and it bills while it runs, at the owner's choice.
@@ -631,7 +631,7 @@ Invoke-DemoWorkloadCommand -Config $config -Target T2 -ArgumentList 'status', '-
 
 ### Missing index
 
-- **Runs on:** T2 by default, T1, and T3. On T3, Azure SQL Database can also raise its own index recommendation after enough executions.
+- **Runs on:** T2 by default, T1, T3, and T4 (since 2026-11-04). On T3, Azure SQL Database can also raise its own index recommendation after enough executions. On T4, the same two lookups feed autonomous tuning ([below](#t4-autonomous-tuning-in-the-azure-portal)); `remediation.sql` and `-UndoRemediation` are for T1 to T3.
 - **Bounds:** 10 minutes by default, 30 at most; 2 sessions.
 - **Start:** `incident:missing-index`.
 - **Stop:** `profile set --name baseline`, or `stop --scenario missing-index`.
@@ -762,6 +762,23 @@ Invoke-DemoWorkloadCommand -Config $config -Target T2 -ArgumentList 'status', '-
 - **Prompts:** [plan-regression.in-hub](../fabric/agent/prompts/plan-regression.in-hub.md) 1 to 3; fallback [plan-regression.skills](../fabric/agent/prompts/plan-regression.skills.md).
 - **Reset:** a forced plan stays after the run, so it can be shown. The next run, or `reset`, unforces it, for the lookup's queries only (`forced-plan-unforced`).
 
+### T4 autonomous tuning in the Azure portal
+
+- **Runs on:** T4 with 4 or more vCores and `t4AutonomousTuning` on: the default, General Purpose `Standard_D4ds_v5`, since 2026-11-04. It runs "on any currently supported compute SKU with at least 4 vCores" ([autonomous tuning](https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning), updated 2026-07-16, checked 2026-11-04). `Standard_B1ms`, `Standard_B2s`, and `Standard_D2ds_v5` turn it off: "Don't enable query store on the Burstable pricing tier as it causes performance problems" ([Query Store](https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store)).
+- **What feeds it:** the showcase's T4 `missing-index` slot (minutes 20-29 of each 30-minute cycle, General Purpose only), or `incident:missing-index` on T4: two selective, parameterized lookups on `care.claims` and `care.appointments` columns without an index, sent by the runner as top-level statements, so Query Store captures them (`pg_qs.query_capture_mode` `TOP`, `pg_qs.parameters_capture_mode` `capture_first_sample`).
+- **When:** a tuning session runs every `index_tuning.analysis_interval` minutes while T4 runs: 60 here, the minimum (the default is 720). So the first recommendation comes at least about 60 minutes after the lookups start: near the end of a 90-minute showcase, or the next day if T4 ran the lookups the day before. Not proven live.
+- **Show it (Database Hub, then the Azure portal):** Database Hub's PostgreSQL view shows metrics only ([monitor PostgreSQL](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql)), so go from Database Hub **Estate** → T4 (`pgflex01-<deploymentId>`) → **Open in…** (the Azure portal) → the server's **Intelligent Performance** > **Autonomous tuning**: its index recommendations for those tables, and table recommendations, with what each would change.
+- **From a shell:** the documented command group [`az postgres flexible-server autonomous-tuning`](https://learn.microsoft.com/cli/azure/postgres/flexible-server/autonomous-tuning) (checked 2026-11-04):
+
+  ```powershell
+  az postgres flexible-server autonomous-tuning show --resource-group <rg> --server-name pgflex01-<deploymentId>
+  az postgres flexible-server autonomous-tuning list-index-recommendations --resource-group <rg> --server-name pgflex01-<deploymentId> --recommendation-type CreateIndex
+  az postgres flexible-server autonomous-tuning list-table-recommendations --resource-group <rg> --server-name pgflex01-<deploymentId>
+  ```
+
+- **The human-approved action:** nothing applies a recommendation: `index_tuning.mode` is `REPORT`. A person may review one and create the index in `contosocare`; nothing in the repo creates or drops T4 indexes, so to show "before" again, drop that index yourself.
+- **Cost:** the 4-vCore size bills about $0.356 an hour while T4 runs, against $0.017 for `Standard_B1ms` (a dated example: West US 3, list prices, 2026-11-03; [cost management](cost-management.md#dated-example-the-4-vcore-t4-default-and-the-375-ceiling-2026-11-04)).
+
 ## Recovery playbook
 
 When something isn't visible, say so plainly, keep the story moving on another target or surface, and fix it after the session. Never present missing data as healthy: "missing telemetry isn't zero utilization or proof that a server is healthy" ([Monitor databases in Database Hub](https://learn.microsoft.com/fabric/database/hub/monitor)).
@@ -808,7 +825,7 @@ When something isn't visible, say so plainly, keep the story moving on another t
    - With the schedules on (`DBHUB_SCHEDULES_ENABLED`), `schedule-stop.yml` runs the same stop every night, at 01:00 UTC unless you edit its cron for your time zone.
 3. **Confirm Bastion is gone.** It's the easiest thing to forget, because the nightly auto-shutdown doesn't touch it. `./scripts/stop-demo.ps1 -RemoveBastionOnly` removes only Bastion and its public IP, and rotates the host password.
 4. **Check the state and the cost:** `./scripts/status.ps1` reports the power states (`STATUS.VM_*`), Bastion and its public IP (`STATUS.BASTION`, a **Warning** while either exists), T3's state, the next auto-shutdown, and month-to-date spend from the [Cost Management query API](https://learn.microsoft.com/rest/api/cost-management/query/usage) against `monthlyCeilingUsd` (`STATUS.COST`). [Cost analysis](https://learn.microsoft.com/azure/cost-management-billing/costs/quick-acm-cost-analysis) in the Azure portal, scoped to the demo resource group, breaks the same spend down by resource.
-   - The month must stay below $250, the hard ceiling; the budget alerts at 50%, 80%, and 100%.
+   - The month must stay below `monthlyCeilingUsd`, $375 by default since 2026-11-04, the hard ceiling; the budget alerts at 50%, 80%, and 100%.
    - If month-to-date spend grew by more than the session estimate, something ran longer than planned: usually Bastion, an evening start that ran until the next day's shutdown, or a T3 profile left on.
 5. **Record what happened:** the date, the targets the agent covered, the latency, and any action it offered, in the [live coverage record](../fabric/agent/README.md#live-coverage-record); the beat timings; and every *verify in rehearsal* item you settled. When the shared capacity is running, run the live-activity notebook's **Persist** cell if you want the session's telemetry beyond its 7-day retention.
 6. **The wizard's dashboard** (30-minute version): keep it for the next session, or delete it from the workspace yourself. It's a manual step: nothing in the repo created it, so nothing removes it. `RTD_DatabaseHub_LiveView` stays in the workspace between sessions. `destroy.ps1` doesn't touch Fabric items, so it removes neither dashboard, nor the notebooks.
