@@ -752,6 +752,16 @@ Invoke-DemoWorkloadCommand -Config $config -Target T2 -ArgumentList 'status', '-
 - **Prompts:** [capacity-max.in-hub](../fabric/agent/prompts/capacity-max.in-hub.md) 1 to 3; fallback [capacity-max.skills](../fabric/agent/prompts/capacity-max.skills.md).
 - **Reset:** auto-cleanup and `reset` empty `demo.io_scratch` once no `io-pressure` or `capacity-max` run uses it; the space stays allocated for the next run.
 
+### Plan regression
+
+- **Runs on:** T3 only. SQL Server 2022 Standard on T1 and T2 has no automatic tuning ([editions](https://learn.microsoft.com/sql/sql-server/editions-and-components-of-sql-server-2022)), so the procedure refuses to run there. The showcase runs it on T3 in its third cycle.
+- **Bounds:** 10 minutes by default, 20 at most; 2 sessions (4 at most); `goodPercent` 35 (10 to 80), the share of the run on the fast plan. The lookups only read; the run recompiles and unforces only `demo.usp_visit_summary_lookup`'s plans.
+- **Start:** `incident:plan-regression` on T3 with `--duration 15m`.
+- **Stop:** `profile set --name baseline`, or `stop --scenario plan-regression`.
+- **Show:** in Database Hub, CPU stepping up at the switch to the slow plan and back down once automatic tuning forces the fast one; the plans themselves aren't in the telemetry. In T3: `sys.dm_db_tuning_recommendations` (a `FORCE_LAST_GOOD_PLAN` recommendation, Verifying, then Success), the database's **Automatic tuning** page in the Azure portal, and Query Store's **Regressed Queries** and **Queries With Forced Plans** in SSMS ([automatic tuning](https://learn.microsoft.com/azure/azure-sql/database/automatic-tuning-overview)). Whether the plan is forced within one run isn't proven live yet ([limitations](limitations.md)).
+- **Prompts:** [plan-regression.in-hub](../fabric/agent/prompts/plan-regression.in-hub.md) 1 to 3; fallback [plan-regression.skills](../fabric/agent/prompts/plan-regression.skills.md).
+- **Reset:** a forced plan stays after the run, so it can be shown. The next run, or `reset`, unforces it, for the lookup's queries only (`forced-plan-unforced`).
+
 ## Recovery playbook
 
 When something isn't visible, say so plainly, keep the story moving on another target or surface, and fix it after the session. Never present missing data as healthy: "missing telemetry isn't zero utilization or proof that a server is healthy" ([Monitor databases in Database Hub](https://learn.microsoft.com/fabric/database/hub/monitor)).

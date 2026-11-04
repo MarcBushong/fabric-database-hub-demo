@@ -40,7 +40,7 @@
       ]
     },
     "showcase": {
-      "description": "Run all in the control notebook: the baseline plus a 30-minute rotation of bounded incidents on every target, at most two at a time per target, staggered across targets, so every Database Hub visual fills within one session. T1: blocking, log flushes, deadlocks, and CPU. T2: CPU, memory grants, IO, and parallelism or tempdb. T3: the CPU cap, blocking or deadlocks, network, a missing index, or a plan regression, and log rate. T4: a connection surge, CPU (shorter on Burstable), idle-in-transaction or locking, and IO. Each target's cycle starts when its profile is set; some slots run in odd or even cycles, or in one cycle only.",
+      "description": "Run all in the control notebook: the baseline plus a 30-minute rotation of bounded incidents on every target, at most two at a time per target, staggered across targets, to fill the Database Hub visuals that can fill within one session (README: What fills each Database Hub visual, and when). T1: blocking, log flushes, deadlocks, and CPU. T2: CPU, memory grants, IO, and parallelism or tempdb. T3: the CPU cap, blocking or deadlocks, network, a missing index, or a plan regression, and log rate. T4: a connection surge, CPU (shorter on Burstable), idle-in-transaction or locking, and IO. Each target's cycle starts when its profile is set; some slots run in odd or even cycles, or in one cycle only.",
       "defaultDurationMinutes": 90,
       "maxDurationMinutes": 120,
       "baseline": true,

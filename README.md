@@ -413,6 +413,130 @@ So `setup-activity-control.ps1` adapts to your tenant (`control.vaultNetworkMode
 
 `public` and `private` force a path. `public` in a tenant whose policy would make the vault private is refused before anything is created: the script names the policy and never adds its exclusion tag, because opting out of a network control is your governance team's decision. `destroy.ps1` keeps the control; `setup-activity-control.ps1 -Remove` deletes it ([cleanup](docs/cleanup.md#the-on-demand-activity-control)).
 
+## What fills each Database Hub visual, and when
+
+**Run all** in the Fabric notebook `NB_DatabaseHub_Control` starts the **showcase** on all four targets for 90 minutes (120 at most):
+
+- the steady Contoso Care baseline, plus a 30-minute rotation of bounded incidents, at most two at a time per target ([`activity-profiles.json`](scenarios/activity-profiles.json));
+- it repeats every 30 minutes, and each target's clock starts when its activity starts;
+- it ends by itself, and the run's auto-stop deallocates the VMs and stops T4 10 minutes later.
+
+A new Run all replaces an active run, and its cycles start again from minute 0.
+
+**When data arrives:** the first data reaches Database Hub about **10-15 minutes after Run all** when the VMs already run, and **15-35 minutes** from a cold start (the VMs, T2's guest, T4). That's the notebook, the runbook, the start, and Database Hub's own lag: "Most performance data is available within 3 to 5 minutes ... Some inventory-based data can take up to 15 minutes" ([enable performance monitoring](https://learn.microsoft.com/fabric/database/hub/add-sql)). After that, each visual follows its slot by 3-15 minutes, as the tables say. "No data" means neither healthy nor down ([FAQ](https://learn.microsoft.com/fabric/database/hub/faq)). So start Run all about 30 minutes before the audience.
+
+**Labels:** the Learn pages were checked on 2026-11-03. *Observed 2026-11-03* means seen in the Database Hub UI on that date and not documented on Learn. Database Hub is a preview, so labels, thresholds, and timings can change.
+
+### Microsoft SQL: T1 (`sqlvm01`), T2 (`arcsql01`), and T3 (`ContosoCare` on `azuresql01-<deploymentId>`)
+
+| Visual (where) | Threshold or condition | Filled by (minute of each 30-minute cycle) | Populates (after its slot starts) | Stays empty when |
+|---|---|---|---|---|
+| **Estate**: the three resources, issue chips, suggestion chips | Reader on the subscription, `Microsoft.Sql` registered, T1's SQL IaaS Agent extension, T2 through Azure Arc ([monitor SQL](https://learn.microsoft.com/fabric/database/hub/monitor-sql)) | The deployment, not activity | Already there | No Reader, the provider unregistered, T2's guest off or Arc disconnected |
+| **Security** issues and suggestions (Overview, Estate) | Database Hub's assessment list: Microsoft Entra authentication, TLS 1.2, public network access, private endpoint (issues); auditing, customer-managed keys, Microsoft Entra enforced, ledger (suggestions) ([monitor SQL](https://learn.microsoft.com/fabric/database/hub/monitor-sql)) | Configuration, not activity | On the assessment's own schedule (not documented); a newly created T3 can show them late | A control is already met. Activity never fills these |
+| **Performance > Microsoft SQL**: CPU, memory, storage, IO | Telemetry samples: CPU every 10 seconds (15 on Azure SQL Database), counters every minute ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)) | Every slot, the baseline too | 3-5 minutes, up to 15 | A VM deallocated, T3 paused, T1's monitoring plugin not running, T2's guest off |
+| **High CPU** (the chart "High CPU resources over time") | **Over 80%** (*observed 2026-11-03*). Learn uses 80% as the default of the **High CPU utilization** alert template, "greater than 80 for 10 minutes" ([alerts](https://learn.microsoft.com/fabric/database/hub/sql-activator-alerts)). On T3, CPU is "a percentage of the service tier limit" ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)) | T3 `resource-governance` 1-13; T2 `cpu-pressure` 2-14; T1 `cpu-pressure` 22-29 | 3-15 minutes, plus the panel's own window (not documented) | **T1 and T2 may not appear:** on 2026-10-23 the telemetry's `AvgCPUPercent` was 0 for both while SQL Server's own CPU was at 97-99% (*observed*). The panel's source isn't documented |
+| **CPU spikes** | Against a **48-hour baseline** (*observed 2026-11-03*) | The same CPU slots, judged against the previous 48 hours | When the target sent telemetry in the previous 48 hours: see [the baseline run](#the-baseline-run-why-it-matters-and-when-it-doesnt) | Likely when the target sent no telemetry in the previous 48 hours (the computation isn't documented). Telemetry is kept "up to 7 days" ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)) |
+| **Databases limited by service tier** | T3 at its service tier's limits (*observed 2026-11-03*); Azure SQL Database only | T3 `resource-governance` 1-13 (the CPU cap); `log-rate-pressure` 25-30 (the log rate governor) | 3-15 minutes | T1 and T2 (no service tier); T3 paused |
+| **Recent signal changes** | Not documented ([monitor databases](https://learn.microsoft.com/fabric/database/hub/monitor)) | Every slot's start and end | 3-15 minutes | A run of the baseline alone |
+| **Waits** (Database Hub's built-in Real-Time Dashboard, **Create SQL monitors from template**, the telemetry endpoint) | Wait categories ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)) | **CPU**: T1 22-29, T2 2-14, T3 1-13. **Lock**: T1 0-21, T3 13-25. **Tran Log IO**: T1 2-10. **Log Rate Governor**: T3 25-30. **Memory**: T2 10-18. **Parallelism**: T2 22-29 (cycles 1 and 3). **Buffer Latch**: T2 22-29 (cycle 2). **Network IO**: T3 15-25 (cycle 1) | 3-15 minutes | **Parallelism on T3:** 1 vCore runs serial plans. **Buffer IO:** only briefly after a cold start, because the scratch sets fit in memory (*observed 2026-10-27*) |
+| **Blocking** (`Processes blocked`) | Above 0 means a session was blocked ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry), sample query 8) | T1 `blocking-chain` 0-10; T3 `locking-blocking` 13-23 (cycles 1 and 3) | 3-15 minutes | The chain's depth and head blocker aren't in the telemetry: use the agent skills or `sys.dm_exec_requests` |
+| **Deadlocks** (`Number of Deadlocks/sec`); the **Deadlock spike** alert template | Template: "greater than 1 for 10 minutes", Azure SQL Database only ([alerts](https://learn.microsoft.com/fabric/database/hub/sql-activator-alerts)) | T1 `deadlock-storm` 11-21; T3 `deadlock-storm` 13-25 (cycle 2) | 3-15 minutes; the alert template only after its 10-minute condition and the rule's query interval. T3's slot is in cycle 2, about 43 minutes into the run | Alerts need a rule you create, and a capacity ([walkthrough](docs/demo-walkthrough.md)) |
+| **Log** (`WRITELOG`, `Log Flushes/sec`) | Counters every minute | T1 `log-flush-waits` 2-10; T3 `log-rate-pressure` 25-30 | 3-15 minutes | `Log Flushes/sec` is SQL Server only |
+| **Memory grants** (`Granted Workspace Memory (KB)`, Memory waits) | Counters | T2 `memory-grant-pressure` 10-18 | 3-15 minutes | The memory chart stays high anyway: the buffer pool "is usually the largest, which is healthy" (sample query 7) |
+| **Storage growth** | `SqlServerDatabaseStorageUtilization` every minute | T2 `io-pressure` 18-26 (2 GB, the first cycle only) | 1-15 minutes | Later cycles reuse the space |
+| **CPU of one regressed query** | T3's plan regression and its correction show as CPU only | T3 `plan-regression` 15-25 (cycle 3, about 75 minutes into the run) | 3-15 minutes | The plans are in Query Store and the DMVs, not in Database Hub (below) |
+| **Query-level** (top queries, plans) | Not in Database Hub: "Telemetry describes resources, not individual queries" ([telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)) | Query Store is on in `ContosoCare` (15-minute intervals): SSMS, VS Code, or T3's Query Performance Insight | One Query Store interval | Never in Database Hub |
+| **Database Agent and Copilot** | Coverage, prerequisites, and timing aren't documented ([overview](https://learn.microsoft.com/fabric/database/hub/overview), [FAQ](https://learn.microsoft.com/fabric/database/hub/faq)) | The prompts in [`showcase.in-hub.md`](fabric/agent/prompts/showcase.in-hub.md) | On demand | A target the agent doesn't cover: use the fallback in the [agent guide](fabric/agent/README.md) |
+
+### PostgreSQL: T4 (`pgflex01-<deploymentId>`)
+
+Database Hub shows T4's Azure Monitor metrics only: "Query Store-backed top queries, query plans, wait-event analysis, and log search aren't part of the Database Hub" ([monitor PostgreSQL](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql)). Run all starts a stopped T4; a server that's starting "can have incomplete data".
+
+| Visual (Performance > PostgreSQL) | Metric and its meaning ([monitor PostgreSQL](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql)) | Filled by (minute of each cycle) | Populates (after its slot starts, T4 running) | Stays empty when |
+|---|---|---|---|---|
+| **Estate** | The flexible server, not its databases | The deployment | Already there | No Reader |
+| **CPU** | `cpu_percent` | `cpu-pressure` 8-20 on General Purpose; 8-14 in cycles 1 and 3 on Burstable | A few minutes ("some Azure Monitor metrics arrive in batches") | **Burstable:** "When credits are exhausted, the VM is restricted to baseline CPU" ([compute](https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute)), so the showcase rations it |
+| **Connections** | `active_connections`, "connections across all states, including idle" | `connection-surge` 0-8, up to the limit; `idle-in-transaction` or `locking-blocking` 10-20 | A few minutes | T4 stopped or starting |
+| **Failed connections** | `connections_failed`, "failed attempts" | `connection-surge` 0-8: at the limit it holds the free slots for 5 seconds at most while a few attempts are refused, at most 5 a minute and 30 a run ([connection-surge](scenarios/connection-surge/README.md)) | A few minutes, on every size: the template sets `max_connections` to 50 | The new limit still waits for T4's restart (`T4.MAXCONNECTIONS` is a **Warning**): on an environment deployed before it, run `./scripts/deploy.ps1 -FromStage Infrastructure` once ([update an existing environment](docs/deployment.md#update-an-existing-environment)). Not proven live yet ([limitations](docs/limitations.md#targets-and-licensing)) |
+| **Disk activity** | `iops`, "not a saturation percentage" | `io-pressure` 20-29 | A few minutes | |
+| **Storage** | `storage_percent` | `io-pressure` adds up to 1 GiB once, about 3% of 32 GiB | A few minutes, the first cycle | Later cycles reuse the space |
+| **Memory** | `memory_percent` | No slot of its own | Whatever the load shows | |
+| **Read replica lag** | `physical_replication_delay_in_seconds` | Nothing: T4 has no read replica | Never | Always |
+| **Security** | Microsoft Entra authentication enabled (issue); customer-managed keys, Microsoft Entra enforced, public network access disabled (suggestions) | Configuration | On the assessment's schedule | A control already met |
+| **Alerts** | Activator alerting over these PostgreSQL metrics "isn't currently supported" ([FAQ](https://learn.microsoft.com/fabric/database/hub/faq)) | Nothing | Never | Always |
+
+### Recommendations and optimizations
+
+| Recommendation | Where it shows | What triggers it | How long it takes | Within one session? |
+|---|---|---|---|---|
+| T3 **automatic plan correction** | `sys.dm_db_tuning_recommendations`, the database's **Automatic tuning** page in the Azure portal, and Query Store in SSMS (not Database Hub) | `plan-regression` in the showcase's third cycle (minutes 15-25, about 75 minutes into the run): a plan regression with an estimated CPU gain over 10 seconds ([automatic tuning](https://learn.microsoft.com/sql/relational-databases/automatic-tuning/automatic-tuning)). `FORCE_LAST_GOOD_PLAN` is on by Azure default ([overview](https://learn.microsoft.com/azure/azure-sql/database/automatic-tuning-overview)) | Detection and forcing aren't timed on Learn; the check of the forced plan takes "30 minutes to 72 hours" | **Likely, in a run of 90 minutes or more** (not proven live yet): the recommendation and the forced plan; its verification can come later |
+| T3 **create index** | Azure portal, **Performance recommendation** | Repeated queries that would gain from an index (T3's `missing-index` slots, cycle 2) | "At least for a day" of monitoring; consistent patterns ([apply recommendations](https://learn.microsoft.com/azure/azure-sql/database/database-advisor-find-recommendations-portal)) | **No:** run the demo on more than one day |
+| T3 **parameterize queries**, **drop index** | Azure portal | Recompiling ad hoc queries; indexes unused for more than 90 days ([advisor](https://learn.microsoft.com/azure/azure-sql/database/database-advisor-implement-performance-recommendations)) | Days; 90 days | **No** |
+| T1 and T2 automatic tuning | n/a | n/a | n/a | **Never:** SQL Server 2022 Standard doesn't include automatic tuning ([editions](https://learn.microsoft.com/sql/sql-server/editions-and-components-of-sql-server-2022)); Enterprise is a dated example in [cost management](docs/cost-management.md#dated-example-business-hours-and-two-optional-upgrades-2026-11-03) |
+| T1-T3 missing-index suggestions in the engine | SSMS, the agent skills (not Database Hub) | Every `missing-index` run | Immediate | Yes, outside Database Hub |
+| Database Hub **performance** issues and suggestions | Overview, Estate, **Issue Details** | Not documented; findings "can come from agents, alerts, resource metadata, or telemetry" ([monitor databases](https://learn.microsoft.com/fabric/database/hub/monitor)) | Not documented | Probably, for CPU findings (not documented) |
+| Database Hub **optimization** suggestions | Overview, Estate | "Supported storage, compute, and memory signals" ([monitor databases](https://learn.microsoft.com/fabric/database/hub/monitor)), such as low use | Not documented | **Not while the showcase runs:** they need quiet targets |
+| T4 **Azure Advisor** | Azure portal | Daily; history-based recommendations "only appear after a server operates with the same configuration for seven days"; long-running transactions over 24 hours ([PostgreSQL Advisor](https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-azure-advisor-recommendations)) | 1-7 days | **No** |
+| T4 **autonomous tuning** (indexes, `ANALYZE`, `VACUUM`) | Azure portal | The Query Store workload | Every 12 hours by default | **Never here:** it "isn't supported on servers with less than 4 vCores" ([autonomous tuning](https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning)), and Query Store shouldn't run on Burstable ([Query Store](https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store)) |
+| **Database Agent** recommendations | Database Hub | Your prompt, from what the showcase created | Not documented | On demand |
+
+## The baseline run: why it matters, and when it doesn't
+
+**What it runs.** The `baseline` activity profile runs the `healthy-baseline` scenario as back-to-back 30-minute runs ([`activity-profiles.json`](scenarios/activity-profiles.json)): the steady Contoso Care mix of front-desk, billing, and scheduling lookups and small updates that stay within the seeded values.
+
+| Target | Sessions | Intensity | What it does there |
+|---|---|---|---|
+| T1 `sqlvm01`, T2 `arcsql01` | 2 | 3 | Low, flat CPU; steady `Batch Requests/sec` and `Transactions/sec`; `Processes blocked` at 0 |
+| T3 `ContosoCare` | 1 | 2 | The same, lighter. It also keeps the serverless database awake, which bills vCore-seconds, inside the free monthly allowance first when T3 has the free offer |
+| T4 `contosocare` | 1 | 2 | The same lookups, a work-item update, and an audit row; low CPU and connections |
+
+- **It's the quiet default:** `activityProfile` is `baseline` unless you change it.
+- **Under the incidents:** `business-day` and the showcase run it beneath their incidents.
+- **On its own:** in the control notebook, `"scenario": "baseline"` for a target runs it alone, for up to 120 minutes; `./scripts/start-demo.ps1 -ActivityProfile baseline` runs it until `./scripts/stop-demo.ps1` or the nightly auto-shutdown.
+
+**The baselines Database Hub and Azure compute themselves, and the history each one needs:**
+
+| Visual or recommendation | History it needs | Source |
+|---|---|---|
+| **CPU spikes** | A **48-hour baseline** | Database Hub's panel (*observed 2026-11-03*; not on Learn) |
+| Everything in the telemetry | Kept "up to 7 days" | [Telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry) |
+| Alert templates (CPU, log, deadlocks) | A condition that holds "for 10 minutes" | [Alerts](https://learn.microsoft.com/fabric/database/hub/sql-activator-alerts) |
+| Azure SQL Database recommendations (T3) | "At least for a day" of monitoring, with consistent patterns | [Apply recommendations](https://learn.microsoft.com/azure/azure-sql/database/database-advisor-find-recommendations-portal) |
+| Automatic tuning's check of a change (T3) | "From 30 minutes to 72 hours" | [Automatic tuning](https://learn.microsoft.com/azure/azure-sql/database/automatic-tuning-overview) |
+| Drop-index recommendations (T3) | Indexes unused for more than 90 days | [Advisor](https://learn.microsoft.com/azure/azure-sql/database/database-advisor-implement-performance-recommendations) |
+| PostgreSQL Azure Advisor (T4) | Daily; history-based ones after 7 days on the same configuration | [PostgreSQL Advisor](https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-azure-advisor-recommendations) |
+| Query Store comparisons (T1-T3, in SSMS) | A "before" interval of 15 minutes or more (the demo's interval) | This repo's `030-configure.sql` for each target, such as [T3's](database/azuresql/030-configure.sql) |
+| Optimization suggestions (low use) | Quiet periods, from "supported storage, compute, and memory signals" | [Monitor databases](https://learn.microsoft.com/fabric/database/hub/monitor) |
+
+**Why it matters:**
+
+- **CPU spikes stays empty without history.** A target that sent no telemetry in the previous 48 hours has nothing to spike against. Demo VMs are deallocated most of the time, so that's the usual state.
+- **Recommendations need days, not minutes.** Azure SQL Database's advisor needs at least a day of the same pattern, and PostgreSQL's Advisor up to a week. A single session never produces them; T3's automatic plan correction is the one exception ([above](#recommendations-and-optimizations)).
+- **Incidents stand out against normal load.** **Recent signal changes**, a before-and-after chart, and an agent's "is this sustained or a spike?" all compare the incident with what came before. Without a baseline, the first minutes of an incident are also the first minutes of data.
+- **T3 stays awake.** Without activity, the serverless database pauses after its auto-pause delay (`t3AutoPauseMinutes`, 15 by default), and its charts show gaps. "No data" means neither healthy nor down ([FAQ](https://learn.microsoft.com/fabric/database/hub/faq)).
+
+**Why it doesn't:**
+
+- **Most visuals fill on absolute thresholds within one session:** High CPU (over 80%, *observed 2026-11-03*), waits by category, blocking, deadlocks, log, databases limited by service tier, and T4's CPU, connections, failed connections, IOPS, and storage.
+- **The showcase brings its own baseline:** it runs the baseline under its incidents, so Run all 30 minutes before the audience is enough for a full demo of those visuals.
+
+**How long to run it** (costs are dated examples: West US 3 list prices from the Azure Retail Prices API, 2026-11-03):
+
+| You want | Do this | Cost |
+|---|---|---|
+| A demo of the absolute-threshold visuals | **Run all** (the showcase) 30 minutes before the audience | One 90-minute session bills about 2 hours: about **$2.45-$4.04** |
+| **CPU spikes** too | The day before, within 48 hours, run `baseline` on all four targets for 60 minutes (the control notebook with each target's `"scenario": "baseline"` and `DURATION_MINUTES = 60`, or `start-demo.ps1 -ActivityProfile baseline` and `stop-demo.ps1` an hour later), then Run all on the day. 60 minutes gives each target about an hour of normal samples; the panel's minimum isn't documented. Prefer `baseline` to `business-day` here: hourly incidents raise the baseline that the next day's spikes are compared with (an inference, since the computation isn't documented) | About 1.4 billed hours more: about **$1.71-$2.83** |
+| T3's own index recommendation | Run the showcase, or `business-day`, on two or more days; then open the database's **Performance recommendation** page in the Azure portal (viewing it resumes a paused T3) | One session a day |
+| PostgreSQL Advisor's history-based recommendations | Seven days on one configuration. Not practical for this demo | n/a |
+
+**Against the ceilings** ([ADR 0016](docs/adr/0016-cost-profiles.md)):
+
+- **A session** should stay under `sessionCeilingUsd`, **$15** (above it is a **Warning**). A day-before baseline plus a showcase is about $4.16-$6.87.
+- **The month** must stay under `monthlyCeilingUsd`, **$250**, a hard ceiling (above it, preflight's monthly check is a **Fail**). In the dated example, the demo bills about $81 a month whether it runs or not, and about $2.02 an hour while it runs (the worst case: T4 on `Standard_D2ds_v5`, T3 without the free offer, Defender for Cloud; [cost management](docs/cost-management.md#dated-example-business-hours-and-two-optional-upgrades-2026-11-03)). So $250 covers about 83 running hours a month: about 40 showcases, or about 24 with a day-before baseline each. The budget's alerts fire at 50%, 80%, and 100% of the ceiling.
+- Run `./scripts/estimate-cost.ps1` for today's prices.
+
+**What you lose by skipping it:** CPU spikes; Azure's own recommendations; a clean "before" picture in the Performance charts and in Query Store; an agent that can tell the incident from normal load; and, for the first minutes of a cold start, T3's charts, while it resumes.
+
 ## Cost
 
 - **Ceilings:** a hard **$250 a month** for idle plus light use (preflight fails above it) and **$15 per demo-day session** (a Warning). Every default is the cheapest working option, and the deployment adds a budget with alerts.

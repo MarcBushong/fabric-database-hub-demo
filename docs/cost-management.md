@@ -49,6 +49,26 @@ A dated example, not a proposal: no default changes ([ADR 0016](adr/0016-cost-pr
 
 **Neither upgrade adds a Database Hub visual:** PostgreSQL's tuning recommendations show in the Azure portal, and SQL Server's plan correction in its DMVs (`sys.dm_db_tuning_recommendations`) and SSMS.
 
+## Dated example: one showcase session (2026-11-03)
+
+**Run all** in the control notebook runs the showcase on all four targets, 90 minutes by default and 120 at most ([what fills each Database Hub visual](../README.md#what-fills-each-database-hub-visual-and-when)). List prices in USD for West US 3, from the Azure Retail Prices API on 2026-11-03: examples, not quotes, and no default depends on them ([ADR 0016](adr/0016-cost-profiles.md)).
+
+**Billed time:** a 90-minute run bills about **2 hours**. The VMs start a few minutes after the request, the run lasts 90 minutes, and the run's auto-stop comes 10 minutes after its end, then the VMs deallocate and T4 stops. T3 bills while it's awake, from its first connection to `t3AutoPauseMinutes` (15) after its last session.
+
+| Case | Per running hour | 90-minute showcase (2 hours) | 120-minute showcase (2.5 hours) | Against $15 a session |
+|---|---|---|---|---|
+| Worst: T4 on `Standard_D2ds_v5`, T3 at list price, the Defender for Cloud plans of the test subscription (Servers P2, SQL servers on machines, CSPM) | $2.02 | **$4.04** | $5.05 | **Pass** |
+| T4 on `Standard_D2ds_v5`, T3 within the free offer's allowance, the same Defender plans | $1.50 | $3.00 | $3.75 | **Pass** |
+| T4 on `Standard_B1ms`, T3 at list price, the same Defender plans | $1.86 | $3.72 | $4.65 | **Pass** |
+| Lowest: T4 on `Standard_B1ms`, T3 within the free allowance, no Defender plans | $1.22 | **$2.45** | $3.06 | **Pass** |
+
+- **T3:** at most about 1.8 hours awake at no more than 1 vCore, so at most about 6,500 vCore-seconds a session, 6.5% of the [free offer](https://learn.microsoft.com/azure/azure-sql/database/free-offer)'s 100,000 a month: about 15 sessions fit in it when nothing else wakes T3. Past the allowance, T3 bills at list price and stays available (`BillOverUsage`).
+- **Azure Automation:** a run's `DbHub-Control` job takes 2 to 20 minutes with its waits, and `DbHub-Stop` 1 to 3, inside the first 500 job minutes a month, which are included: about 25 to 50 sessions a month. Past them, about $0.04 a session.
+- **Three back-to-back 120-minute runs:** about 6.5 billed hours, $13.13 at worst, still under $15.
+- **A day-before baseline** of 60 minutes, for Database Hub's **CPU spikes** ([the baseline run](../README.md#the-baseline-run-why-it-matters-and-when-it-doesnt)): about 1.4 billed hours, $1.71 to $2.83.
+- **The month:** with T4 on `Standard_D2ds_v5`, the demo bills about $81 a month whether it runs or not ([above](#dated-example-business-hours-and-two-optional-upgrades-2026-11-03)), so the **$250** hard ceiling covers about 83 running hours at the worst rate: about 40 showcases a month, or about 24 with a day-before baseline each.
+- **Outside the ceilings:** the control notebook and its live view use the Fabric capacity's units ([below](#microsoft-fabric-capacity)); Database Hub itself needs no capacity, except for alert rules.
+
 ## The T2 golden snapshot (Phase 20)
 
 The fast redeploy keeps one incremental snapshot of the T2 host's OS disk in `rg-<prefix>-golden` ([ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)); there's no storage account. It bills every month it exists, whether the demo runs or not, until `destroy.ps1 -IncludeGolden` deletes it.

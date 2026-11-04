@@ -302,6 +302,20 @@ T4, the PostgreSQL flexible server `pgflex01-<deploymentId>` ([ADR 0019](adr/001
 - **The T4 track** (its own process, like T1, T2, and Fabric): `Server` runs `Test-DemoT4` (`T4.SERVER`, `T4.CONFIG`, `T4.ENTRAONLY`, `T4.NETWORK`, `T4.ADMIN`, `T4.DATABASE`, `T4.ENHANCEDMETRICS`); `Telemetry` waits for its Azure Monitor metrics (`METRICS.T4`). The validation adds `HUB.ESTATE.T4`.
 - **T1's track** gets a `T4` step after `T3`: `Enable-DemoT4Workload` (`WORKLOAD.T4.ENABLE`) has T1's managed identity, a member of the P6 group, sign in as the group's role, create the runner's role, apply and seed the schema, and add T4 to the activity host. A T4 failure is reported (and in `DEPLOY.SUMMARY`) but doesn't stop T1's track; `deploy.ps1 -FromStage T4` runs the T4 work again. The Activity step sets T4's profile with T1's and T3's.
 - **The stage** `T4` sits between `T3` and `Activity` for `-FromStage`, `-StopAfter`, and `-Sequential`; `-Resume` continues the T4 track after `DbHubTrackT4`.
+- **`max_connections` is 50 on every size** (2026-11-03, [ADR 0019](adr/0019-t4-postgresql-flexible-server.md#2026-11-03-max_connections-at-50-on-every-size-and-connection-surge-past-the-limit-the-showcase)), so `connection-surge` can fill Database Hub's **Failed connections**. It's a static parameter: a template that changes it leaves it waiting for a restart ([server parameters](https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings)). T1's `T4` step, and the `T4` stage of `-Sequential`, restart T4 when one waits ([Servers - Restart](https://learn.microsoft.com/rest/api/postgresql/servers/restart), which restarts the engine, not the compute), wait up to 10 minutes for it to be Ready, and report `DEPLOY.T4.RESTART`; the restart ends T4's open sessions, and the runner's connections retry. A deployment that changes nothing never restarts T4. The T4 track's `Server` step only reports: `T4.MAXCONNECTIONS` is a **Warning** while the value waits.
+
+### Update an existing environment
+
+A change to the template, the workload runner, or its T-SQL reaches an environment that's already deployed only through a run that deploys them again. `./scripts/deploy.ps1 -Resume` after a run that ended **DONE** doesn't: it continues after the last stage that finished, the validation, so it only validates again.
+
+| Command | What it applies |
+|---|---|
+| `./scripts/deploy.ps1 -FromStage Infrastructure` | Everything after preflight, which it skips: **the template**, with T4's `max_connections` (waiting for a restart when it changed) and the budget at `monthlyCeilingUsd`; **the artifacts**, a new bootstrap bundle and workload runner when their hashes changed (the runner carries `scenarios/`, with the activity profiles and the scenario catalog, and the T-SQL in `database/common`); **the loaders**, where T1's runner step installs the new runner and runs its `setup` on T1, T3, and T4, and T2's on T2, which applies `110-demo-control.sql` and `120-scenario-procedures.sql`; T1's `T3` step, which sets T3 up again; **T1's `T4` step**, which restarts T4 when `max_connections` waits for it, then sets T4 up again; then the activity profiles, T1's monitoring, T2's Arc configuration, Fabric, and the validation, with `T4.MAXCONNECTIONS` |
+| `./scripts/deploy.ps1` after a run that ended **DONE** | The same, after preflight: a run after **DONE** starts over, with preflight's cost checks against both ceilings |
+| `./scripts/deploy.ps1 -FromStage Artifacts` | The runner and its T-SQL, without the template: T4's limit and the budget stay as they are |
+| `./scripts/deploy.ps1 -Resume` | After **DONE**, the validation only. After a run that didn't finish, it continues where that run stopped |
+
+Raising `monthlyCeilingUsd` needs the template too, because the budget's amount comes from it ([cost management](cost-management.md#dated-example-business-hours-and-two-optional-upgrades-2026-11-03)).
 
 ## Day to day
 
