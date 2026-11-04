@@ -431,6 +431,8 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         $script:t4 = 'Ready'
         $script:t4Sku = 'Standard_D4ds_v5'
         $script:t4Tier = 'GeneralPurpose'
+        # An off goes only to a VM that already runs (review of PR 20).
+        $script:vm['archost01'] = 'running'
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }, @{ target = 'T3'; scenario = 'showcase' }, @{ target = 'T4'; scenario = 'showcase' }); durationMinutes = 90 }) -Context (New-TestContext)
         $result.status | Should -Be 'Dispatched'
         @($result.dispatched) | Should -Be @('T1: showcase for 90 minutes', 'T3: showcase for 90 minutes', 'T4: showcase for 90 minutes', 'T2: off')
@@ -444,7 +446,67 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         & $arguments @($sqlvm | Where-Object { $_ -match '"target":"T3"' })[0] | Should -BeExactly '"profile","set","--name","showcase","--duration","90m","--not-after","2026-10-27T16:32:00+00:00","--requested-by","notebook/aaaaaaaa"'
         & $arguments @($sqlvm | Where-Object { $_ -match '"target":"T4"' })[0] | Should -BeExactly '"profile","set","--name","showcase","--duration","90m","--not-after","2026-10-27T16:32:00+00:00","--tier","GeneralPurpose","--vcores","4","--requested-by","notebook/aaaaaaaa"'
         & $arguments @(& $decode '/archost01/runCommands/DbHubControl-archost01-' | Where-Object { $_ -match '"target":"T2"' })[0] | Should -BeExactly '"profile","set","--name","off","--requested-by","notebook/aaaaaaaa"'
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/archost01/start$' }) | Should -BeNullOrEmpty
         $script:autostop | Should -Be '2026-10-27T16:40:00Z'
+    }
+
+    It 'never starts a VM or T4 for an off: a T2 off on a stopped host and a T4 off on a stopped server issue no start and no wait (review of PR 20)' {
+        # The reviewer's request: T1 and T3 showcase, T2 off, T4 off, with everything stopped. Before, it booted archost01
+        # and started the 4-vCore T4, waited up to 15 and 20 minutes, and sent off; both billed until the auto-stop.
+        $script:t4 = 'Stopped'
+        $script:t4Sku = 'Standard_D4ds_v5'
+        $script:t4Tier = 'GeneralPurpose'
+        $start = $script:clock
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }, @{ target = 'T3'; scenario = 'showcase' }, @{ target = 'T4'; scenario = 'off' }); durationMinutes = 90 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        $posts = @($script:calls | Where-Object Method -EQ 'POST' | ForEach-Object { $_.Path })
+        @($posts | Where-Object { $_ -match '/sqlvm01/start$' }).Count | Should -Be 1
+        @($posts | Where-Object { $_ -match '/archost01/start$|/flexibleServers/[^/]+/start$' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/' }) | Should -BeNullOrEmpty -Because 'T4''s off neither reads, starts, nor waits for T4'
+        $script:vm['archost01'] | Should -Be 'deallocated'
+        $script:t4 | Should -Be 'Stopped'
+        @($result.dispatched) | Should -Be @('T1: showcase for 90 minutes', 'T3: showcase for 90 minutes', 'T4: off')
+        @($result.skipped) | Should -Be @('T2 (off not sent: archost01 is deallocated, so nothing runs there)')
+        # T4's off goes in sqlvm01's own Run Command, which doesn't wait for it, and the job ends once T1's plugin is
+        # settled, 20 seconds in, not 20 minutes later.
+        $commands = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/sqlvm01/runCommands/DbHubControl-sqlvm01-' })
+        $commands.Count | Should -Be 1
+        $requests = @([regex]::Matches($commands[0].Body.properties.source.script, "-RequestBase64 '([A-Za-z0-9+/=]+)'") | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_.Groups[1].Value)) })
+        $t4Request = @($requests | Where-Object { $_ -match '"target":"T4"' })[0]
+        [regex]::Match($t4Request, '"arguments":\[([^\]]*)\]').Groups[1].Value | Should -BeExactly '"profile","set","--name","off","--requested-by","notebook/aaaaaaaa"'
+        $t4Request | Should -Match '"readySeconds":0[,}]'
+        @($script:calls | Where-Object { $_.Path -match '/runCommands/DbHubControl-sqlvm01-t4-' }) | Should -BeNullOrEmpty
+        ($script:clock - $start).TotalMinutes | Should -BeLessThan 2
+    }
+
+    It 'sends an off to a VM that already runs without starting it, skips one that doesn''t run, and leaves T1''s plugin alone when T1 is off' {
+        $script:vm['sqlvm01'] = 'running'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'off' }, @{ target = 'T2'; scenario = 'showcase' }, @{ target = 'T3'; scenario = 'off' }, @{ target = 'T4'; scenario = 'off' }); durationMinutes = 60 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        $posts = @($script:calls | Where-Object Method -EQ 'POST' | ForEach-Object { $_.Path })
+        @($posts | Where-Object { $_ -match '/archost01/start$' }).Count | Should -Be 1
+        @($posts | Where-Object { $_ -match '/sqlvm01/start$|/flexibleServers/' }) | Should -BeNullOrEmpty
+        @($result.dispatched) | Should -Be @('T1: off', 'T3: off', 'T4: off', 'T2: showcase for 60 minutes')
+        $result.monitoring | Should -BeNullOrEmpty
+        @($result.rechecks) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Path -match '/extensions/|/flexibleServers/' }) | Should -BeNullOrEmpty
+
+        # The same offs on a stopped sqlvm01 aren't sent, and nothing starts it.
+        Reset-TestAzure
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'off' }, @{ target = 'T2'; scenario = 'showcase' }, @{ target = 'T4'; scenario = 'off' }); durationMinutes = 30 }) -Context (New-TestContext)
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/sqlvm01/start$' }) | Should -BeNullOrEmpty
+        @($result.skipped) | Should -Be @('T1 (off not sent: sqlvm01 is deallocated, so nothing runs there)', 'T4 (off not sent: sqlvm01 is deallocated, so nothing runs there)')
+        @($result.dispatched) | Should -Be @('T2: showcase for 30 minutes')
+    }
+
+    It 'stops what it started when the only activities it could dispatch are off' {
+        $script:vm['archost01'] = 'running'
+        $script:vmStartMinutes['sqlvm01'] = 60
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }); durationMinutes = 30 }) -Context (New-TestContext)
+        @($result.dispatched) | Should -Be @('T2: off')
+        $result.status | Should -Be 'Failed'
+        $result.message | Should -Match '^No activity could be dispatched \(T1 \(sqlvm01 isn''t running yet\)\), so everything was stopped again'
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate$' }).Count | Should -Be 2
     }
 
     It 'sends T4''s showcase without a tier or vCores when its size can''t be read' {

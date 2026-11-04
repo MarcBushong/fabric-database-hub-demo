@@ -1159,6 +1159,10 @@ function Send-DbHubDispatch {
         if ($null -eq $ready) {
             $ready = 600
         }
+        if ([string](Get-DbHubMember -InputObject $item -Name 'Scenario') -ceq 'off') {
+            # The VM-side control never waits for a target before it turns it off (Test-DemoControlActivityCommand).
+            $ready = 0
+        }
         $requests += [ordered]@{ target = $item.Target; arguments = @(Get-DbHubRunnerArgument -Activity $item -RequestedBy $RequestedBy); timeoutSeconds = 300; readySeconds = [int]$ready }
     }
     return (Send-DbHubRunCommand -Context $Context -VmName $VmName -Name $Name -Script (Get-DbHubWorkloadScript -Settings $settings -Request $requests) -TimeoutSeconds (Get-DbHubRunCommandTimeout -Request $requests))
@@ -1777,6 +1781,9 @@ function Start-DbHubActivityRun {
     restarted once when a fresh status says another state, or when no fresh status comes within monitoring.settleMinutes
     (live, 2026-11-04: right after a cold start the status from before the stop said Running). The job ends when every VM,
     T4, and the plugin are done, or at their bounds.
+    An off never starts anything (review of PR 20, 2026-11-04): a VM whose only activities are off is left as it is and
+    gets them only when it already runs, T4's off goes out with sqlvm01's activities (T4's profile is a file on T1)
+    without reading, starting, or waiting for T4, and a run whose only dispatched activities are off stops what it started.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -1819,7 +1826,9 @@ function Start-DbHubActivityRun {
         $activities = @($activities | Where-Object { $_.Target -ne 'T3' })
     }
     $t4 = $null
-    if (@($activities | Where-Object { $_.Target -eq 'T4' }).Count -gt 0) {
+    # T4's off is a file on T1 (its profile), so only an activity that isn't off reads T4, starts it, or waits for it
+    # (review of PR 20, 2026-11-04).
+    if (@($activities | Where-Object { $_.Target -eq 'T4' -and $_.Scenario -cne 'off' }).Count -gt 0) {
         $t4 = Get-DbHubT4 -Context $Context -Tags $Tags
         # Missing, Unknown, or a state it can't be started from now, such as Stopping right after a stop.
         if ($t4.State -notin 'Ready', 'Starting', 'Updating', 'Stopped') {
@@ -1847,10 +1856,24 @@ function Start-DbHubActivityRun {
         }
         $byVm[$vm] += $activity
     }
+    # Whether a VM has an activity that isn't off: only such a VM is started, and T1's plugin is looked after only then.
+    $hasActivity = {
+        param([string] $VmName)
+        return (@($byVm[$VmName] | Where-Object { $_.Scenario -cne 'off' }).Count -gt 0)
+    }
     foreach ($vm in @($byVm.Keys)) {
-        if ((Get-DbHubVmState -Context $Context -VmName $vm) -eq 'Missing') {
+        $vmState = Get-DbHubVmState -Context $Context -VmName $vm
+        if ($vmState -eq 'Missing') {
             foreach ($activity in $byVm[$vm]) {
                 $skipped.Add(('{0} ({1} doesn''t exist)' -f $activity.Target, $vm))
+            }
+            $byVm.Remove($vm)
+        }
+        elseif (-not (& $hasActivity $vm) -and $vmState -ne 'running') {
+            # An off never starts anything (review of PR 20): on a VM that doesn't run, nothing runs to turn off. Its stored
+            # profile ends at its own end, and a boot's leftover-run cleanup ends what a stopped run left.
+            foreach ($activity in $byVm[$vm]) {
+                $skipped.Add(('{0} (off not sent: {1} is {2}, so nothing runs there)' -f $activity.Target, $vm, $vmState))
             }
             $byVm.Remove($vm)
         }
@@ -1860,11 +1883,13 @@ function Start-DbHubActivityRun {
         # T4's activity goes out on sqlvm01, so without it T4 isn't started.
         $t4 = $null
     }
-    if (@($byVm.Keys).Count -eq 0) {
+    if (@($byVm.Keys | Where-Object { & $hasActivity $_ }).Count -eq 0) {
+        # Off alone isn't a run: Stop now stops everything (Test-DbHubControlRequest refuses a request of off only).
         $result.message = 'Nothing to run: ' + ($skipped -join '; ')
         $result.skipped = $skipped.ToArray()
         return [pscustomobject]$result
     }
+    $sqlActive = $byVm.Contains($sqlVm) -and (& $hasActivity $sqlVm)
 
     $stop = Register-DbHubAutoStop -Context $Context -AutoStopUtc $plan.AutoStopUtc
     if (-not $stop.Created) {
@@ -1874,14 +1899,14 @@ function Start-DbHubActivityRun {
     $result.runEndUtc = $plan.RunEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     $result.autoStopUtc = $stop.StartUtc
     Write-DbHubLog -Context $Context -Message ('Auto-stop set for {0}; the run ends by {1}.' -f $stop.StartUtc, $result.runEndUtc)
-    if ($byVm.Contains($sqlVm)) {
+    if ($sqlActive) {
         $result.rechecks = @(Register-DbHubMonitorRecheck -Context $Context -StartUtc $Context.NowUtc -RunEndUtc $plan.RunEndUtc)
     }
 
     # When this run's start of sqlvm01 was accepted: T1's monitoring plugin counts only a status reported after it.
     $sqlStartedUtc = $null
     foreach ($vm in @($byVm.Keys)) {
-        if ((Get-DbHubVmState -Context $Context -VmName $vm) -ne 'running') {
+        if ((& $hasActivity $vm) -and (Get-DbHubVmState -Context $Context -VmName $vm) -ne 'running') {
             $accepted = Invoke-DbHubVmAction -Context $Context -VmName $vm -Action start
             if ($accepted -and $vm -eq $sqlVm) {
                 $sqlStartedUtc = Get-DbHubUtcNow
@@ -1902,20 +1927,24 @@ function Start-DbHubActivityRun {
     $stamp = $Context.NowUtc.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
     $who = Get-DbHubRequester -Context $Context -RequestedBy $Request.RequestedBy
     $dispatched = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    # The dispatched activities that aren't off (a reference the dispatch block counts in): without one, the run stops what
+    # it started.
+    $sent = @{ Activities = 0 }
     # This run's Run Commands, which no cleanup of its own deletes.
     $runNames = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $runNames.Add(('{0}monitoring-{1}' -f $settings.runCommandPrefix, $stamp))
     $plans = [ordered]@{}
     foreach ($vm in @($byVm.Keys)) {
-        $plans[$vm] = [pscustomobject]@{ Activities = @($byVm[$vm] | Where-Object { $_.Target -ne 'T4' }); Done = $false; Running = $false }
+        # T4's off goes out with sqlvm01's activities, without waiting for T4: its profile is a file on T1.
+        $plans[$vm] = [pscustomobject]@{ Activities = @($byVm[$vm] | Where-Object { $_.Target -ne 'T4' -or $_.Scenario -ceq 'off' }); Done = $false; Running = $false }
     }
     $t4Activity = $null
     if ($null -ne $t4 -and $plans.Contains($sqlVm)) {
-        $t4Activity = @($byVm[$sqlVm] | Where-Object { $_.Target -eq 'T4' }) | Select-Object -First 1
+        $t4Activity = @($byVm[$sqlVm] | Where-Object { $_.Target -eq 'T4' -and $_.Scenario -cne 'off' }) | Select-Object -First 1
     }
     $t4Pending = $null -ne $t4Activity
     $monitor = $null
-    if ($plans.Contains($sqlVm)) {
+    if ($sqlActive) {
         $monitor = Initialize-DbHubMonitorState -StartUtc $sqlStartedUtc
     }
     $dispatch = {
@@ -1928,6 +1957,7 @@ function Start-DbHubActivityRun {
                 }
                 else {
                     $dispatched.Add(('{0}: {1} for {2} minutes' -f $item.Target, $item.Scenario, $item.Minutes))
+                    $sent.Activities++
                 }
             }
         }
@@ -2024,10 +2054,10 @@ function Start-DbHubActivityRun {
     }
     $result.dispatched = $dispatched.ToArray()
     $result.skipped = $skipped.ToArray()
-    if ($dispatched.Count -eq 0) {
+    if ($sent.Activities -eq 0) {
         $stopped = Stop-DbHubDemo -Context $Context -Tags $Tags
         $result.status = 'Failed'
-        $result.message = 'Nothing could be dispatched ({0}), so everything was stopped again: {1}.' -f ($skipped -join '; '), ((@($stopped.Done) + @($stopped.Failed)) -join ', ')
+        $result.message = 'No activity could be dispatched ({0}), so everything was stopped again: {1}.' -f ($skipped -join '; '), ((@($stopped.Done) + @($stopped.Failed)) -join ', ')
         return [pscustomobject]$result
     }
     $result.status = 'Dispatched'
