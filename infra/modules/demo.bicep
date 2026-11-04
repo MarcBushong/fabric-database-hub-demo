@@ -407,6 +407,7 @@ module pgflex01 'pgflex01.bicep' = if (t4Enabled) {
     privateDnsZoneName: '${prefix}-${environment}.private.postgres.database.azure.com'
     adminGroupObjectId: t3AdminGroupObjectId
     adminGroupDisplayName: t3AdminGroupDisplayName
+    maxConnections: postgres.maxConnections
   }
 }
 

@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "10759024018932669250"
+      "templateHash": "11912047813101372109"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -637,7 +637,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "18388658520621337888"
+              "templateHash": "12464494181789340950"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -1123,6 +1123,8 @@
               "runnerRole": "contosocare_runner",
               "tokenResource": "https://ossrdbms-aad.database.windows.net",
               "enhancedMetricsParameter": "metrics.collector_database_activity",
+              "maxConnections": 50,
+              "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_B2s (default 429) and Standard_D2ds_v5 (default 859) refuse the surge's overshoot too, and Database Hub's Failed connections fill on every size. Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
               "autoStartAfterStoppedDays": 7,
               "capabilitiesApiVersion": "2025-08-01",
               "metrics": {
@@ -1158,7 +1160,10 @@
                 "monitoring": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-monitoring",
                 "stopServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server",
                 "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
-                "versionPolicy": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-version-policy"
+                "versionPolicy": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-version-policy",
+                "serverParameters": "https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings",
+                "limits": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits",
+                "restartServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-restart-server"
               },
               "verifiedOn": "2026-10-23"
             },
@@ -9675,6 +9680,9 @@
                   },
                   "adminGroupDisplayName": {
                     "value": "[parameters('t3AdminGroupDisplayName')]"
+                  },
+                  "maxConnections": {
+                    "value": "[variables('postgres').maxConnections]"
                   }
                 },
                 "template": {
@@ -9684,9 +9692,9 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "4168938847978769215"
+                      "templateHash": "10192647775240632981"
                     },
-                    "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, and the free enhanced metrics turned on."
+                    "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, the free enhanced metrics turned on, and max_connections at 50 on every size."
                   },
                   "parameters": {
                     "location": {
@@ -9785,6 +9793,15 @@
                       "metadata": {
                         "description": "Server-wide idle_in_transaction_session_timeout in milliseconds: the backstop that ends any session left idle in a transaction (ADR 0010). The runner sets a shorter value on its own sessions."
                       }
+                    },
+                    "maxConnections": {
+                      "type": "int",
+                      "defaultValue": 50,
+                      "minValue": 25,
+                      "maxValue": 5000,
+                      "metadata": {
+                        "description": "max_connections on every size, from config/versions.json (postgresql.maxConnections): Standard_B1ms's own default of 50, so connection-surge reaches the limit, and Database Hub's Failed connections fill, on the larger sizes too (ADR 0019, 2026-11-03). A static parameter: the value takes effect at the next restart, which deploy.ps1 does when one is pending."
+                      }
                     }
                   },
                   "resources": [
@@ -9876,6 +9893,19 @@
                       },
                       "dependsOn": [
                         "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'metrics.collector_database_activity')]",
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.DBforPostgreSQL/flexibleServers/configurations",
+                      "apiVersion": "2025-08-01",
+                      "name": "[format('{0}/{1}', parameters('serverName'), 'max_connections')]",
+                      "properties": {
+                        "value": "[string(parameters('maxConnections'))]",
+                        "source": "user-override"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'idle_in_transaction_session_timeout')]",
                         "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
                       ]
                     }

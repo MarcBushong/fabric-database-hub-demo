@@ -638,6 +638,12 @@ function Invoke-DemoDeployment {
                 $current = Get-DemoDeploymentState -Config $Config
                 $t4Enable = $null
                 if (-not (& $hasStatus $t4Checks 'Fail') -and $current.RunnerSha256) {
+                    # A max_connections value the template set waits for a restart (a static parameter); T4 restarts right
+                    # before T1 connects (ADR 0019, 2026-11-03).
+                    $t4Restart = Invoke-DemoT4PendingRestart -Config $Config
+                    if ($null -ne $t4Restart) {
+                        $results.Add($t4Restart)
+                    }
                     $t4Enable = Enable-DemoT4Workload -Config $Config -Confirm:$false
                     $results.Add($t4Enable)
                 }

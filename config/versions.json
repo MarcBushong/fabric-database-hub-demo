@@ -173,6 +173,8 @@
     "runnerRole": "contosocare_runner",
     "tokenResource": "https://ossrdbms-aad.database.windows.net",
     "enhancedMetricsParameter": "metrics.collector_database_activity",
+    "maxConnections": 50,
+    "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_B2s (default 429) and Standard_D2ds_v5 (default 859) refuse the surge's overshoot too, and Database Hub's Failed connections fill on every size. Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
     "autoStartAfterStoppedDays": 7,
     "capabilitiesApiVersion": "2025-08-01",
     "metrics": {
@@ -189,7 +191,10 @@
       "monitoring": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-monitoring",
       "stopServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server",
       "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
-      "versionPolicy": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-version-policy"
+      "versionPolicy": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-version-policy",
+      "serverParameters": "https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings",
+      "limits": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits",
+      "restartServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-restart-server"
     },
     "verifiedOn": "2026-10-23"
   },

@@ -1249,6 +1249,125 @@ function Invoke-DemoT4PowerAction {
     return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4 ({0}) is {1}, not {2}, after {3} minute(s).{4}' -f $names.ServerName, $current.State, $wanted, $WaitMinutes, $autoStart) -Evidence $evidence -Remediation 'Check it again with status.ps1 in a few minutes; a Burstable server that has used up its CPU credits can take longer to stop or start.' -DocUrl $docUrl)
 }
 
+function Get-DemoT4ParameterState {
+    <#
+    .SYNOPSIS
+    One of T4's server parameters (Configurations - Get): Found, Value, PendingRestart, Source, and Error. Internal.
+
+    .DESCRIPTION
+    PendingRestart is isConfigPendingRestart: a static parameter's new value waits for a server restart before it takes
+    effect. A read: it works while the server is stopped.
+    Source (checked 2026-11-03): https://learn.microsoft.com/rest/api/postgresql/configurations/get
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [string] $ServerId,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z0-9._]+$')]
+        [string] $Name
+    )
+
+    $read = Get-DemoT4Resource -Config $Config -ServerId $ServerId -Child ('configurations/{0}' -f $Name)
+    $properties = Get-DemoMemberValue -InputObject $read.Value -Name 'properties'
+    return [pscustomobject]@{
+        Found          = [bool]$read.Found
+        Value          = [string](Get-DemoMemberValue -InputObject $properties -Name 'value')
+        PendingRestart = ([string](Get-DemoMemberValue -InputObject $properties -Name 'isConfigPendingRestart') -eq 'True')
+        Source         = [string](Get-DemoMemberValue -InputObject $properties -Name 'source')
+        Error          = [string]$read.Error
+    }
+}
+
+function Invoke-DemoT4PendingRestart {
+    <#
+    .SYNOPSIS
+    Restarts T4 when max_connections, which the template sets, waits for a restart, so the new limit is in effect before T1
+    sets T4 up and the runner connects (ADR 0019, 2026-11-03). Returns DEPLOY.T4.RESTART, or nothing when nothing waits.
+    Internal.
+
+    .DESCRIPTION
+    max_connections is a static parameter: after the template changes it, isConfigPendingRestart is true until the server
+    restarts. Then, when T4 is Ready, this sends Servers - Restart, which restarts the PostgreSQL engine, not the compute,
+    and waits up to -WaitMinutes until T4 is Ready with nothing pending. The restart ends T4's open sessions; the runner's
+    connections retry, and Enable-DemoT4Workload, which follows, restarts the activity host anyway. A deployment that
+    changed nothing never restarts T4. A T4 that isn't Ready isn't restarted (Warning): the value takes effect at its next
+    restart.
+    Sources (checked 2026-11-03):
+    - https://learn.microsoft.com/rest/api/postgresql/configurations/get
+    - https://learn.microsoft.com/rest/api/postgresql/servers/restart
+    - https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-restart-server
+    - https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'deploy.ps1 confirms once for the whole deployment.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $DeploymentId = '',
+
+        [ValidateRange(1, 30)]
+        [int] $WaitMinutes = 10,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 15
+    )
+
+    $checkId = 'DEPLOY.T4.RESTART'
+    $postgres = Get-DemoPostgresSetting
+    $docUrl = [string]$postgres['docUrls']['restartServer']
+    $names = Get-DemoT4Name -Config $Config -DeploymentId $DeploymentId
+    if (-not $names.Enabled -or -not $names.ServerId) {
+        return
+    }
+    $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
+    if (-not $current.Exists) {
+        return
+    }
+    $setting = Get-DemoT4ParameterState -Config $Config -ServerId $names.ServerId -Name 'max_connections'
+    if (-not $setting.Found -or -not $setting.PendingRestart) {
+        # Nothing waits, or the read failed: T4.MAXCONNECTIONS (Test-DemoT4) reports the value either way.
+        return
+    }
+    $evidence = [ordered]@{ server = $names.ServerName; parameter = 'max_connections'; value = $setting.Value; stateBefore = $current.State }
+    if ($current.State -ne 'Ready') {
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('max_connections {0} waits for a restart, but T4 ({1}) is {2}, so it wasn''t restarted; the value takes effect at its next restart.' -f $setting.Value, $names.ServerName, $current.State) -Evidence $evidence -Remediation 'Once T4 is Ready, run ./scripts/deploy.ps1 -FromStage T4, or restart it yourself (az postgres flexible-server restart).' -DocUrl $docUrl)
+    }
+
+    Write-DemoLog -Message ('T4 ({0}) restarts so max_connections {1}, a static parameter the template set, takes effect.' -f $names.ServerName, $setting.Value)
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $url = 'https://management.azure.com{0}/restart?api-version={1}' -f $names.ServerId, (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.DBforPostgreSQL/flexibleServers')
+    $post = Invoke-DemoAzWithConflictRetry -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('rest', '--method', 'post', '--url', $url) -Label ('T4 {0}: restart' -f $names.ServerName) -MaxConflictRetries 4
+    if ($post.ExitCode -ne 0) {
+        $evidence['error'] = Protect-DemoText -Text ([string]$post.StdErr).Trim()
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4 ({0}) couldn''t be restarted, so max_connections {1} waits for its next restart: {2}' -f $names.ServerName, $setting.Value, $evidence['error']) -Evidence $evidence -Remediation 'Run ./scripts/deploy.ps1 -FromStage T4 again in a few minutes, or restart T4 yourself (az postgres flexible-server restart).' -DocUrl $docUrl)
+    }
+    # Servers - Restart answers 202 before the state changes, so the wait is for the value in effect, not just Ready.
+    $deadline = [DateTime]::UtcNow.AddMinutes($WaitMinutes)
+    do {
+        Start-Sleep -Seconds $PollSeconds
+        $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
+        $done = $false
+        if ($current.State -eq 'Ready') {
+            $setting = Get-DemoT4ParameterState -Config $Config -ServerId $names.ServerId -Name 'max_connections'
+            $done = $setting.Found -and -not $setting.PendingRestart
+        }
+    } until ($done -or [DateTime]::UtcNow -ge $deadline)
+    $evidence['stateAfter'] = $current.State
+    $evidence['seconds'] = [int]$clock.Elapsed.TotalSeconds
+    if ($done) {
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 ({0}) restarted in {1} s, so max_connections {2} is in effect (only the PostgreSQL engine restarted, not its compute).' -f $names.ServerName, $evidence['seconds'], $setting.Value) -Evidence $evidence -DocUrl $docUrl)
+    }
+    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4 ({0}) was asked to restart, but after {1} minute(s) it''s {2} and max_connections still waits for the restart.' -f $names.ServerName, $WaitMinutes, $current.State) -Evidence $evidence -Remediation 'Check it in a few minutes with ./scripts/validate.ps1 -Area T4 (T4.MAXCONNECTIONS); if it still waits, run ./scripts/deploy.ps1 -FromStage T4.' -DocUrl $docUrl)
+}
+
 function Get-DemoT4MetricSnapshot {
     <#
     .SYNOPSIS

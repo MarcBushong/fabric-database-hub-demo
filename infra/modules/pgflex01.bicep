@@ -1,4 +1,4 @@
-metadata description = 'T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, and the free enhanced metrics turned on.'
+metadata description = 'T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, the free enhanced metrics turned on, and max_connections at 50 on every size.'
 
 @description('Azure region.')
 param location string
@@ -54,6 +54,11 @@ param adminGroupDisplayName string
 @minValue(60000)
 @maxValue(3600000)
 param idleInTransactionTimeoutMs int = 900000
+
+@description('max_connections on every size, from config/versions.json (postgresql.maxConnections): Standard_B1ms\'s own default of 50, so connection-surge reaches the limit, and Database Hub\'s Failed connections fill, on the larger sizes too (ADR 0019, 2026-11-03). A static parameter: the value takes effect at the next restart, which deploy.ps1 does when one is pending.')
+@minValue(25)
+@maxValue(5000)
+param maxConnections int = 50
 
 // The private DNS zone that virtual network integration needs, linked to the demo VNet so T1 resolves the
 // server's name to its private address (https://learn.microsoft.com/azure/postgresql/network/concepts-networking-private).
@@ -167,6 +172,24 @@ resource idleInTransactionTimeout 'Microsoft.DBforPostgreSQL/flexibleServers/con
   }
   dependsOn: [
     enhancedMetrics
+  ]
+}
+
+// A static parameter (allowed values 25-5000): the new value waits for a restart (isConfigPendingRestart), which
+// deploy.ps1 does before T1 sets T4 up. 50 is Standard_B1ms's default; Standard_B2s and Standard_D2ds_v5 default to 429
+// and 859, above connection-surge's cap, so lowering it makes them refuse the surge's overshoot too. 15 slots stay
+// reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner.
+// (https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings,
+// https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits)
+resource maxConnectionsSetting 'Microsoft.DBforPostgreSQL/flexibleServers/configurations@2025-08-01' = {
+  parent: server
+  name: 'max_connections'
+  properties: {
+    value: string(maxConnections)
+    source: 'user-override'
+  }
+  dependsOn: [
+    idleInTransactionTimeout
   ]
 }
 

@@ -1010,6 +1010,12 @@ function Invoke-DemoDeploymentTrack {
                         & $note 'WORKLOAD.T4.ENABLE' 'T4' 'Manual action required' 'T1 isn''t in the P6 group yet, so it can''t sign in to T4 as the group''s role.' 'Add T1 to the group (Add-DemoT1ToT3AdminGroup describes how), then run deploy.ps1 -FromStage T4.'
                         break
                     }
+                    # A max_connections value the template set waits for a restart (a static parameter). T4 restarts here,
+                    # right before T1 connects, and nowhere else in the run, so no setup runs into it (ADR 0019, 2026-11-03).
+                    $restart = Invoke-DemoT4PendingRestart -Config $Config
+                    if ($null -ne $restart) {
+                        $results.Add($restart)
+                    }
                     $enable = Enable-DemoT4Workload -Config $Config -PrincipalId ([string](Get-DemoMemberValue -InputObject $group -Name 'evidence').principalId) -Confirm:$false
                     if ($enable.status -in 'Fail', 'Manual action required' -and -not $enable.remediation) {
                         $enable.remediation = 'Fix the cause, then run deploy.ps1 -FromStage T4.'
