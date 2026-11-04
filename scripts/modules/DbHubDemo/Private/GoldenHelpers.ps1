@@ -420,7 +420,8 @@ function Invoke-DemoGoldenSourceRelease {
     reconnects; the Arc identity is still its own), and the snapshot is tagged dbhubSourceReleasedUtc, so
     later starts skip it. start-demo.ps1, deploy.ps1 (existing host), and the capture call it; a Fabric start of T2
     releases the source on the host itself (Invoke-DemoWorkloadControl.ps1), where it can't tag the snapshot, so a
-    later call here releases again, which is harmless, and records it.
+    later call here releases again, which is harmless, and records it. -EndCapture is for the capture's own return
+    of its source only: its Release removes the capture marker that Prepare wrote (2026-11-04).
 
     Sources (checked 2026-10-22): https://learn.microsoft.com/cli/azure/vm#az-vm-show,
     https://learn.microsoft.com/cli/azure/tag#az-tag-update
@@ -432,7 +433,9 @@ function Invoke-DemoGoldenSourceRelease {
         [System.Collections.IDictionary] $Config,
 
         [ValidateRange(60, 7200)]
-        [int] $TimeoutSeconds = 1800
+        [int] $TimeoutSeconds = 1800,
+
+        [switch] $EndCapture
     )
 
     if ((Get-DemoHostVmName -Config $Config) -ne 'archost01') {
@@ -451,7 +454,8 @@ function Invoke-DemoGoldenSourceRelease {
     }
     $docUrl = 'https://learn.microsoft.com/virtualization/hyper-v-on-windows/user-guide/powershell-direct'
     Write-DemoLog -Message ('archost01 is the source of {0}; reconnecting its air-gapped guest.' -f (($sources | ForEach-Object { $_.Name }) -join ', '))
-    $release = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -TimeoutSeconds $TimeoutSeconds
+    $parameter = if ($EndCapture) { @{ EndCapture = 'true' } } else { @{} }
+    $release = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -Parameter $parameter -TimeoutSeconds $TimeoutSeconds
     $evidence = [ordered]@{
         snapshots = @($sources | ForEach-Object { $_.Name })
         seconds   = $release.Seconds
@@ -564,7 +568,8 @@ function Restore-DemoGoldenCaptureSource {
        also tags dbhubSourceReleasedUtc, so later starts skip it); otherwise, when the capture stopped before its
        snapshot, vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Release. Either way the host's own Azure VM ID
        decides its role, so only a source is released this way: its guest's adapter is reconnected, its automatic
-       start set to Start, and the guest started.
+       start set to Start, and the guest started. Both pass EndCapture, so the Release first removes the capture
+       marker that Prepare wrote: the capture is over, and T2's control relay may act on the guest again.
     3. arcsql01 Connected, through Azure Resource Manager, at most -ArcWaitMinutes. A machine that misses its
        heartbeats turns Disconnected within 15 to 30 minutes, so Connected right after the air gap may be left over
        from before it. Connected counts once its lastStatusChange is later than the air gap (it reconnected), or 30
@@ -618,7 +623,7 @@ function Restore-DemoGoldenCaptureSource {
     $pollEvery = $PollSeconds
     $releaseAndVerify = {
         $airGapped = $true
-        $released = Invoke-DemoGoldenSourceRelease -Config $Config
+        $released = Invoke-DemoGoldenSourceRelease -Config $Config -EndCapture
         if ($null -ne $released) {
             $evidence['release'] = 'T2.GOLDEN.SOURCE'
             $evidence['releaseStatus'] = [string]$released.status
@@ -627,7 +632,7 @@ function Restore-DemoGoldenCaptureSource {
             }
         }
         else {
-            $guest = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -TimeoutSeconds 1800
+            $guest = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -Parameter @{ EndCapture = 'true' } -TimeoutSeconds 1800
             $evidence['release'] = 'Release'
             $evidence['releaseStatus'] = if ($guest.Succeeded) { 'Pass' } else { 'Fail' }
             $evidence['role'] = [string](Get-DemoMemberValue -InputObject $guest.Data -Name 'role')
@@ -731,9 +736,12 @@ function Get-DemoT2GuestStateResult {
     - Fail when T2 can't be in Database Hub while its host runs: a golden capture record that isn't released (the
       source: a Fabric start of T2 releases it, and so do start-demo.ps1 once a snapshot names the host and the next
       capture; a copy: deploy.ps1 resets it, and it's never connected by hand while it may hold the captured
-      identity), the guest off, or its adapter not connected to the NAT switch.
-    - Warning when it works now but won't after the next start (an automatic start action other than Start), or its
-      heartbeat isn't OK yet (it may still be booting), or the host couldn't be read.
+      identity), a copy whose record says released without a reset (2026-11-04: it may hold the captured identity),
+      the guest off, or its adapter not connected to the NAT switch.
+    - Warning while a golden capture is in progress on this host (the marker Prepare writes, for 6 hours at most):
+      the guest is off and air-gapped on purpose, and a Fabric start of T2 is refused until the capture ends (review,
+      2026-11-04). Also when it works now but won't after the next start (an automatic start action other than
+      Start), or its heartbeat isn't OK yet (it may still be booting), or the host couldn't be read or tell its role.
     - Not selected while the host's build hasn't created the guest yet; Pass otherwise.
     #>
     [CmdletBinding()]
@@ -769,6 +777,20 @@ function Get-DemoT2GuestStateResult {
     if ($readError) {
         return (& $new 'Warning' ('archost01 couldn''t read its guest {0}: {1}' -f $guestName, (Protect-DemoText -Text $readError)) 'Run status.ps1 again in a few minutes.')
     }
+    $capture = Get-DemoMemberValue -InputObject $guest -Name 'capture'
+    $captureState = [string](Get-DemoMemberValue -InputObject $capture -Name 'state')
+    if ($captureState -in 'Active', 'Unknown') {
+        # The health read's JSON may turn its ISO times into dates: one format for both.
+        $time = {
+            param([object] $Value)
+            $moment = ConvertTo-DemoUtcDateTime -Value $Value
+            if ($null -eq $moment) { return [string]$Value }
+            return $moment.ToString("yyyy-MM-dd HH:mm 'UTC'", [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        $evidence['capture'] = [ordered]@{ state = $captureState; snapshotName = [string](Get-DemoMemberValue -InputObject $capture -Name 'snapshotName'); sinceUtc = (& $time (Get-DemoMemberValue -InputObject $capture -Name 'sinceUtc')); untilUtc = (& $time (Get-DemoMemberValue -InputObject $capture -Name 'untilUtc')) }
+        $where = if ($captureState -eq 'Active') { 'on archost01' } else { 'on archost01 (its marker is recent, and archost01''s Azure VM ID couldn''t be read to confirm it''s the host the marker names)' }
+        return (& $new 'Warning' ('A golden capture is in progress {0}: snapshot {1}, since {2}. {3} stays off and air-gapped until the capture returns its source to service (GOLDEN.CAPTURE.SOURCE), and a start of T2 from the Fabric control is refused meanwhile.' -f $where, $evidence['capture']['snapshotName'], $evidence['capture']['sinceUtc'], $guestName) ('Let ./scripts/capture-t2-golden.ps1 finish. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again: it releases the source before anything else. From {0} the marker no longer holds a Fabric start back, and that start releases the source too.' -f $evidence['capture']['untilUtc']))
+    }
     $seen = '{0}, automatic start {1}, {2} of {3} adapter(s) connected' -f $(if ($evidence['state']) { $evidence['state'] } else { 'in no state' }), $(if ($evidence['startAction']) { $evidence['startAction'] } else { 'unknown' }), $evidence['connected'], $evidence['adapters']
     if (-not $evidence['present']) {
         $hostState = [string](Get-DemoMemberValue -InputObject $Health -Name 'state')
@@ -791,6 +813,17 @@ function Get-DemoT2GuestStateResult {
             }
             default {
                 return (& $new 'Fail' ('{0} carries a golden capture record that isn''t released, and archost01''s Azure VM ID couldn''t be read, so it can''t tell a source from a copy ({1}).' -f $guestName, $seen) 'Run ./scripts/deploy.ps1: its T2 track decides and releases or resets it. Don''t connect the guest by hand.')
+            }
+        }
+    }
+    if ($null -ne $golden -and $evidence['golden']['released'] -and -not $evidence['golden']['reset']) {
+        # Only the capture's source may carry a released record without a reset (review, 2026-11-04).
+        switch ($evidence['golden']['role']) {
+            'Copy' {
+                return (& $new 'Fail' ('{0} runs on a copy restored from a golden snapshot whose record says released, but its Arc identity was never reset, so it may hold the captured identity ({1}); the Fabric control won''t use it.' -f $guestName, $seen) 'Run ./scripts/deploy.ps1: its T2 track resets the restored copy. Don''t start or connect the guest by hand.')
+            }
+            'Unknown' {
+                return (& $new 'Warning' ('archost01''s Azure VM ID couldn''t be read, so its released golden record can''t be told from a copy''s that was never reset ({0}); the Fabric control leaves {1} alone until it can.' -f $seen, $guestName) 'Run status.ps1 again in a few minutes; if it persists, run ./scripts/deploy.ps1.')
             }
         }
     }
@@ -818,4 +851,63 @@ function Get-DemoT2GuestStateResult {
         return (& $new 'Warning' ('{0} runs, but {1}.' -f $guestName, ($notes -join '; ')) $fix)
     }
     return (& $new 'Pass' ('{0} runs with its heartbeat OK, starts with the host, and its adapter is connected to {1}.' -f $guestName, $switchName))
+}
+
+function Get-DemoGoldenCaptureControlResult {
+    <#
+    .SYNOPSIS
+    GOLDEN.CAPTURE.CONTROL: capture-t2-golden.ps1 runs only while no on-demand run is active (review, 2026-11-04). A run
+    from the Fabric control starts archost01 and dispatches T2, and its auto-stop deallocates archost01, which would cut
+    into the capture or its return of the source. Internal.
+    https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
+    https://learn.microsoft.com/rest/api/automation/schedule/get
+
+    .DESCRIPTION
+    - Not selected when the control is off (control.enabled false).
+    - Fail, and nothing is captured, while a DbHub-Control or DbHub-Stop job is queued or running, while the auto-stop
+      dbhub-autostop is pending (its time hasn't come), or when either can't be read.
+    - Pass otherwise, also when the control's Automation account doesn't exist.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $docUrl = 'https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account'
+    $new = { param([string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}, [string] $Remediation = '') New-DemoResult -CheckId 'GOLDEN.CAPTURE.CONTROL' -Area 't2' -Target 'T2' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $docUrl }
+    if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
+        return (& $new 'Not selected' 'The on-demand activity control is off (control.enabled is false), so no run from Fabric can start or stop archost01 during the capture.')
+    }
+    $name = Get-DemoActivityControlName -Config $Config
+    $wait = 'Nothing was captured. Wait until the run has ended, or end it now (Stop now in {0}, or ./scripts/stop-demo.ps1), then run capture-t2-golden.ps1 again.' -f $name.Notebook
+    $evidence = [ordered]@{ jobs = @(); autoStopUtc = '' }
+    foreach ($runbook in $name.ControlRunbook, $name.StopRunbook) {
+        $jobs = Get-DemoActivityControlActiveJob -Name $name -Runbook $runbook
+        if (-not $jobs.Ok) {
+            return (& $new 'Fail' ('The on-demand control''s {0} jobs couldn''t be read ({1}), so a run may be active. Nothing was captured.' -f $runbook, $jobs.Error) $evidence 'Run capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).')
+        }
+        foreach ($job in @($jobs.Jobs)) {
+            $evidence['jobs'] += ('{0} {1} {2}' -f $runbook, $job.Id, $job.Status)
+        }
+    }
+    if (@($evidence['jobs']).Count -gt 0) {
+        return (& $new 'Fail' ('An on-demand run is starting or stopping now ({0}): it starts or deallocates archost01, which would cut into the capture.' -f (@($evidence['jobs']) -join '; ')) $evidence $wait)
+    }
+    $version = '2024-10-23'
+    $schedule = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $name.AutomationAccountId, $name.AutoStopSchedule) -ApiVersion $version)
+    if (-not $schedule.Ok -and -not $schedule.Missing) {
+        return (& $new 'Fail' ('The on-demand auto-stop {0} couldn''t be read ({1}), so a run may be active. Nothing was captured.' -f $name.AutoStopSchedule, $schedule.Error) $evidence 'Run capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).')
+    }
+    if ($schedule.Ok) {
+        $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties') -Name 'startTime')
+        if ($null -ne $stopUtc -and $stopUtc -gt $NowUtc.ToUniversalTime()) {
+            $evidence['autoStopUtc'] = $stopUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+            return (& $new 'Fail' ('An on-demand run is active until {0:yyyy-MM-dd HH:mm} UTC: its auto-stop ({1}) deallocates archost01 then, which would cut into the capture, and its start of T2 waits for the capture.' -f $stopUtc, $name.AutoStopSchedule) $evidence $wait)
+        }
+    }
+    return (& $new 'Pass' ('No on-demand run is active: no {0} or {1} job is queued or running, and no auto-stop is pending.' -f $name.ControlRunbook, $name.StopRunbook) $evidence)
 }

@@ -31,6 +31,12 @@ function Invoke-DemoWorkloadCommand {
     .PARAMETER TimeoutSeconds
     How long the runner may take (30 to 5400). A 'run' command waits for its scenario to end.
 
+    .PARAMETER ReadySeconds
+    How long the VM side waits for the target to accept connections before an activity command ('profile set' other
+    than off, or 'run'; 0 to 1800). The default 0 doesn't wait, so a module caller's time stays bounded by its own
+    retries (Set-DemoTargetProfile spends one budget across its attempts); the Fabric control's runbooks send their
+    own (ADR 0020).
+
     .EXAMPLE
     Invoke-DemoWorkloadCommand -Config $config -Target T1 -ArgumentList 'status', '--json'
 
@@ -52,7 +58,10 @@ function Invoke-DemoWorkloadCommand {
         [string[]] $ArgumentList,
 
         [ValidateRange(30, 5400)]
-        [int] $TimeoutSeconds = 1800
+        [int] $TimeoutSeconds = 1800,
+
+        [ValidateRange(0, 1800)]
+        [int] $ReadySeconds = 0
     )
 
     foreach ($argument in $ArgumentList) {
@@ -68,7 +77,7 @@ function Invoke-DemoWorkloadCommand {
     if (-not $PSCmdlet.ShouldProcess(('{0} through {1}' -f $Target, $vmName), ('Run ContosoCare.Workload {0}' -f $command))) {
         return
     }
-    $data = Invoke-DemoWorkloadAction -Config $Config -VmName $vmName -Action 'Runner' -Request @{ target = $Target; arguments = @($ArgumentList); timeoutSeconds = $TimeoutSeconds }
+    $data = Invoke-DemoWorkloadAction -Config $Config -VmName $vmName -Action 'Runner' -Request @{ target = $Target; arguments = @($ArgumentList); timeoutSeconds = $TimeoutSeconds; readySeconds = $ReadySeconds }
     $evidence = @{}
     if ($data['evidence'] -is [System.Collections.IDictionary]) {
         foreach ($key in $data['evidence'].Keys) {

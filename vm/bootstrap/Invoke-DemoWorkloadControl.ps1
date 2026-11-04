@@ -452,9 +452,10 @@ function Test-DemoControlTransientFailure {
       connections and failed with SQL error 2. On T2 also a PowerShell Direct session that a guest's start ended.
     - T3, Azure SQL Database serverless: SqlClient's list and Azure SQL Database's transient faults (615, 926, 4060,
       4221, 40197, 40501, 40613, 49918, 49919, 49920), 40613 above all while a paused database resumes.
-    - T4, the PostgreSQL flexible server: a connection that can't be opened while the server starts, SQLSTATE class 08
-      (connection exception), 57P01, 57P02, 57P03 (shutdown, crash shutdown, cannot connect now) and 53300 (too many
-      connections), or Npgsql's failure to connect (a refused or timed-out socket).
+    - T4, the PostgreSQL flexible server: a connection that can't be opened while the server starts: the connection
+      exceptions 08000, 08001, 08003, 08004, 08006, and 08007 (not 08P01, a protocol violation, which doesn't pass by
+      itself), 57P03 (cannot connect now) and 53300 (too many connections), or Npgsql's failure to connect (a refused
+      or timed-out socket).
     - Any target: the managed identity endpoint not answering yet right after a boot, and a warmup that ran out of time.
     Anything else means the target answered.
     Sources (checked 2026-11-03):
@@ -488,7 +489,7 @@ function Test-DemoControlTransientFailure {
         return $true
     }
     if ($Target -eq 'T4') {
-        if ($value -match '(?i)PostgreSQL error (08[0-9A-Z]{3}|57P0[123]|53300)\b') {
+        if ($value -match '(?i)PostgreSQL error (08000|08001|08003|08004|08006|08007|57P03|53300)\b') {
             return $true
         }
         return [bool]($value -match '(?i)failed to connect|exception while connecting|actively refused|connection refused|no connection could be made|timeout during|timed out|database system is starting up')
@@ -632,14 +633,21 @@ function Get-DemoControlGoldenDecision {
     <#
     .SYNOPSIS
     What T2's relay does with a golden snapshot's capture record before activity starts (ADR 0018, sections 4 and 5).
-    Returns Action (None, Release, or Refuse) and Reason (NoCapture, Released, Source, ResetCopy, CopyNotReset, or
-    VmIdUnknown). Pure.
+    Returns Action (None, Release, Refuse, or Wait) and Reason (NoCapture, Released, Source, ResetCopy, CopyNotReset,
+    VmIdUnknown, or CaptureInProgress). Pure.
 
     .DESCRIPTION
-    - No record, or one that's released: nothing to do.
-    - The host's Azure VM ID is the record's sourceAzureVmId: the capture's source, which the capture may have left
-      air-gapped. The golden script's own Release releases it: on the source it only reconnects the guest's adapter and
-      restores its automatic start, because the Arc identity is still its own.
+    - A capture in progress on this host (CaptureProgress Active, from the marker Prepare writes): nothing is touched
+      until the capture's own Release ends it (review, 2026-11-04: a start between Prepare and the snapshot undid the
+      air gap the snapshot keeps). A recent marker on a host whose VM ID couldn't be read: refused the same way as an
+      unknown VM ID.
+    - No record: nothing to do.
+    - A released record: nothing to do only on the capture's source (the host's Azure VM ID is the record's
+      sourceAzureVmId) or on a copy whose reset is recorded (resetUtc). A copy whose record says released without a
+      reset (for example a snapshot taken after its source was released by mistake) may hold the captured identity,
+      so it's refused like a copy that wasn't reset; so is a host whose VM ID couldn't be read.
+    - The capture's source, unreleased: the golden script's own Release releases it: on the source it only reconnects
+      the guest's adapter and restores its automatic start, because the Arc identity is still its own.
     - A copy whose Arc identity was reset (resetUtc): the same Release, which skips the reset it already did.
     - A copy that wasn't reset may still hold the captured identity, so it's never started here: deploy.ps1 resets it
       while it's air-gapped. Nor is a host whose VM ID couldn't be read, because it can't be told from such a copy.
@@ -651,9 +659,18 @@ function Get-DemoControlGoldenDecision {
         [object] $Capture,
 
         [AllowEmptyString()]
-        [string] $AzureVmId = ''
+        [string] $AzureVmId = '',
+
+        [ValidateSet('None', 'Active', 'Unknown')]
+        [string] $CaptureProgress = 'None'
     )
 
+    if ($CaptureProgress -eq 'Active') {
+        return [pscustomobject]@{ Action = 'Wait'; Reason = 'CaptureInProgress' }
+    }
+    if ($CaptureProgress -eq 'Unknown') {
+        return [pscustomobject]@{ Action = 'Refuse'; Reason = 'VmIdUnknown' }
+    }
     if ($null -eq $Capture) {
         return [pscustomobject]@{ Action = 'None'; Reason = 'NoCapture' }
     }
@@ -665,20 +682,100 @@ function Get-DemoControlGoldenDecision {
         }
         return [string]$property.Value
     }
+    $source = & $read 'sourceAzureVmId'
+    $isSource = [bool]($AzureVmId -and $source -and [string]::Equals($source, $AzureVmId, [System.StringComparison]::OrdinalIgnoreCase))
+    $reset = [bool](& $read 'resetUtc')
     if ((& $read 'released') -eq 'True') {
-        return [pscustomobject]@{ Action = 'None'; Reason = 'Released' }
+        if ($reset -or $isSource) {
+            return [pscustomobject]@{ Action = 'None'; Reason = 'Released' }
+        }
+        if (-not $AzureVmId) {
+            return [pscustomobject]@{ Action = 'Refuse'; Reason = 'VmIdUnknown' }
+        }
+        return [pscustomobject]@{ Action = 'Refuse'; Reason = 'CopyNotReset' }
     }
     if (-not $AzureVmId) {
         return [pscustomobject]@{ Action = 'Refuse'; Reason = 'VmIdUnknown' }
     }
-    $source = & $read 'sourceAzureVmId'
-    if ($source -and [string]::Equals($source, $AzureVmId, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if ($isSource) {
         return [pscustomobject]@{ Action = 'Release'; Reason = 'Source' }
     }
-    if (& $read 'resetUtc') {
+    if ($reset) {
         return [pscustomobject]@{ Action = 'Release'; Reason = 'ResetCopy' }
     }
     return [pscustomobject]@{ Action = 'Refuse'; Reason = 'CopyNotReset' }
+}
+
+function Get-DemoControlGoldenState {
+    <#
+    .SYNOPSIS
+    T2's golden state, read fresh from the host: the capture record, the capture marker (Get-GoldenCaptureProgress),
+    this host's Azure VM ID when either needs it (IMDS; a released copy's record with its reset recorded doesn't), and
+    the relay's decision. Uses the golden script's functions, so the caller dot-sources it first. Returns Capture,
+    Progress, and Decision.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot
+    )
+
+    $capture = Read-GoldenJson -Path ([System.IO.Path]::Combine($StateRoot, 'golden', 'capture.json'))
+    $marker = Read-GoldenJson -Path (Get-GoldenCaptureMarkerPath -Root $StateRoot)
+    $vmId = ''
+    $settled = $null -ne $capture -and (Get-DemoControlGoldenDecision -Capture $capture).Reason -eq 'Released'
+    if ($null -ne $marker -or ($null -ne $capture -and -not $settled)) {
+        try {
+            $vmId = Get-GoldenImdsVmId
+        }
+        catch {
+            $vmId = ''
+        }
+    }
+    $progress = Get-GoldenCaptureProgress -Marker $marker -AzureVmId $vmId -NowUtc (Get-DemoControlUtcNow)
+    return [pscustomobject]@{
+        Capture  = $capture
+        Progress = $progress
+        Decision = (Get-DemoControlGoldenDecision -Capture $capture -AzureVmId $vmId -CaptureProgress $progress.State)
+    }
+}
+
+function Get-DemoControlGoldenRefusal {
+    # The relay's message when its golden decision leaves the guest alone (Refuse or Wait); empty otherwise. Pure.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $State,
+
+        [Parameter(Mandatory = $true)]
+        [string] $GuestName
+    )
+
+    $snapshot = ''
+    $released = $false
+    if ($null -ne $State.Capture) {
+        if ($State.Capture.PSObject.Properties['snapshotName']) {
+            $snapshot = [string]$State.Capture.snapshotName
+        }
+        $released = $State.Capture.PSObject.Properties['released'] -and [string]$State.Capture.released -eq 'True'
+    }
+    switch ($State.Decision.Reason) {
+        'CaptureInProgress' {
+            return ('A golden capture is in progress on {0} (snapshot {1}, since {2}), so {3} stays as the capture left it: off and air-gapped. The capture returns its source to service when it ends (GOLDEN.CAPTURE.SOURCE); start T2 again after that. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again, which releases the source first; from {4} this marker no longer holds a start back.' -f $env:COMPUTERNAME, $State.Progress.SnapshotName, $State.Progress.SinceUtc, $GuestName, $State.Progress.UntilUtc)
+        }
+        'CopyNotReset' {
+            if ($released) {
+                return ('{0} runs a copy restored from the golden snapshot {1} whose record says released, but its Arc identity was never reset, so it may hold the captured identity; its guest isn''t started or used here. Run ./scripts/deploy.ps1: its T2 track resets the copy. Never reconnect it by hand.' -f $env:COMPUTERNAME, $snapshot)
+            }
+            return ('{0} runs a copy restored from the golden snapshot {1}, and its Arc identity hasn''t been reset yet, so its guest stays off and air-gapped. Run ./scripts/deploy.ps1: its T2 track resets the copy while the guest is still air-gapped, then releases it. Never reconnect it by hand.' -f $env:COMPUTERNAME, $snapshot)
+        }
+        'VmIdUnknown' {
+            return ('This host''s Azure VM ID couldn''t be read (Instance Metadata Service), so it can''t be told from a copy restored from a golden snapshot{0} that may hold the captured Arc identity, and {1} is left as it is. Start T2 again in a few minutes; if it keeps failing, run ./scripts/deploy.ps1, which resets a restored copy.' -f $(if ($snapshot) { ' ({0})' -f $snapshot } else { '' }), $GuestName)
+        }
+    }
+    return ''
 }
 
 function Invoke-DemoControlGuestCommand {
@@ -736,6 +833,10 @@ function Invoke-DemoControlGuestReady {
     written here (the host has no rights on rg-<prefix>-golden): start-demo.ps1 or deploy.ps1 writes it later, and
     their Release finds the source released and only confirms it. A guest that's off without a capture record gets
     the automatic start action Start, its designed state (GuestVm.ps1), and starts.
+    Review, 2026-11-04: a start between a capture's Prepare and its snapshot released the source, so the snapshot kept a
+    guest that wasn't air-gapped. Now nothing changes the guest while a capture is in progress on this host (the marker
+    Prepare writes; Get-GoldenCaptureProgress), a released record counts only on the source or a reset copy, and the
+    release and the start run under the host bootstrap's lock (which Prepare holds too), on what's read again under it.
     Sources: https://learn.microsoft.com/powershell/module/hyper-v/get-vm, https://learn.microsoft.com/powershell/module/hyper-v/set-vm,
     https://learn.microsoft.com/powershell/module/hyper-v/start-vm,
     https://learn.microsoft.com/virtualization/hyper-v-on-windows/user-guide/powershell-direct (checked 2026-11-03).
@@ -771,36 +872,60 @@ function Invoke-DemoControlGuestReady {
 
     # The golden script's functions, from this bundle; dot-sourcing runs nothing.
     . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'bootstrap', 'Invoke-DemoGoldenGuest.ps1')) -GuestName $GuestName -Root $StateRoot
-    $script:Options = @{ Root = $StateRoot; SnapshotName = ''; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true }
-    $capture = Read-GoldenJson -Path ([System.IO.Path]::Combine($StateRoot, 'golden', 'capture.json'))
-    $decision = Get-DemoControlGoldenDecision -Capture $capture
-    if ($decision.Reason -eq 'VmIdUnknown') {
-        # A record whose air gap isn't released: is this host its source, or a copy?
-        $vmId = ''
-        try {
-            $vmId = Get-GoldenImdsVmId
-        }
-        catch {
-            $vmId = ''
-        }
-        $decision = Get-DemoControlGoldenDecision -Capture $capture -AzureVmId $vmId
+    $script:Options = @{ Root = $StateRoot; SnapshotName = ''; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+    $golden = Get-DemoControlGoldenState -StateRoot $StateRoot
+    $evidence['golden'] = $golden.Decision.Reason
+    $refusal = Get-DemoControlGoldenRefusal -State $golden -GuestName $GuestName
+    if ($refusal) {
+        return (& $fail $refusal)
     }
-    $evidence['golden'] = $decision.Reason
-    if ($decision.Action -eq 'Refuse') {
-        if ($decision.Reason -eq 'CopyNotReset') {
-            return (& $fail ('{0} runs a copy restored from the golden snapshot {1}, and its Arc identity hasn''t been reset yet, so its guest stays off and air-gapped. Run ./scripts/deploy.ps1: its T2 track resets the copy while the guest is still air-gapped, then releases it. Never reconnect it by hand.' -f $env:COMPUTERNAME, [string]$capture.snapshotName))
-        }
-        return (& $fail ('The capture record names a golden snapshot ({0}) whose air gap isn''t released, and this host''s Azure VM ID couldn''t be read, so it can''t tell the snapshot''s source from a copy and leaves the guest off. Run ./scripts/start-demo.ps1 (it releases a capture''s source), or ./scripts/deploy.ps1 for a restored copy.' -f [string]$capture.snapshotName))
-    }
-    if ($decision.Action -eq 'Release') {
+
+    $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+    if ($golden.Decision.Action -eq 'Release' -or ($vm -and [string]$vm.State -in 'Off', 'Saved')) {
+        # Anything that changes the guest runs under the host bootstrap's lock, which a capture's Prepare holds too, and
+        # on what's read again under it: a capture may have prepared the guest while this waited (review, 2026-11-04).
         $lock = $null
         try {
-            $lock = Enter-GoldenLock -TimeoutSeconds ([System.Math]::Min(300, (& $left)))
-            $release = Invoke-GoldenRelease -Setting (Get-GoldenHostSetting)
-            $evidence['released'] = [string]$release['role']
-        }
-        catch {
-            return (& $fail ('The air gap that a golden capture left on {0} couldn''t be released: {1} Run ./scripts/start-demo.ps1, which releases it too.' -f $GuestName, [string]$_.Exception.Message))
+            try {
+                $lock = Enter-GoldenLock -TimeoutSeconds ([System.Math]::Min(300, (& $left)))
+            }
+            catch {
+                return (& $fail ('{0} wasn''t changed: {1} Start T2 again in a few minutes.' -f $GuestName, [string]$_.Exception.Message))
+            }
+            $golden = Get-DemoControlGoldenState -StateRoot $StateRoot
+            $evidence['golden'] = $golden.Decision.Reason
+            $refusal = Get-DemoControlGoldenRefusal -State $golden -GuestName $GuestName
+            if ($refusal) {
+                return (& $fail $refusal)
+            }
+            if ($golden.Decision.Action -eq 'Release') {
+                try {
+                    $release = Invoke-GoldenRelease -Setting (Get-GoldenHostSetting)
+                    $evidence['released'] = [string]$release['role']
+                }
+                catch {
+                    return (& $fail ('The air gap that a golden capture left on {0} couldn''t be released: {1} Run ./scripts/start-demo.ps1, which releases it too.' -f $GuestName, [string]$_.Exception.Message))
+                }
+            }
+            $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+            if ($vm -and [string]$vm.State -in 'Off', 'Saved') {
+                $evidence['stateBefore'] = [string]$vm.State
+                if ([string]$vm.AutomaticStartAction -ne 'Start') {
+                    $evidence['startActionBefore'] = [string]$vm.AutomaticStartAction
+                    Set-VM -Name $GuestName -AutomaticStartAction Start -AutomaticStartDelay 0
+                }
+                try {
+                    Start-VM -Name $GuestName -ErrorAction Stop
+                }
+                catch {
+                    # Hyper-V's own automatic start may have started it a moment earlier.
+                    $now = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+                    if (-not $now -or [string]$now.State -notin 'Running', 'Starting') {
+                        return (& $fail ('{0} is {1} and couldn''t be started: {2}' -f $GuestName, [string]$vm.State, [string]$_.Exception.Message))
+                    }
+                }
+                $evidence['started'] = $true
+            }
         }
         finally {
             if ($null -ne $lock) {
@@ -813,23 +938,8 @@ function Invoke-DemoControlGuestReady {
     if (-not $vm) {
         return (& $fail ('T2 isn''t set up yet: the host hasn''t created its guest {0}.' -f $GuestName))
     }
-    $evidence['stateBefore'] = [string]$vm.State
-    if ([string]$vm.State -in 'Off', 'Saved') {
-        if ([string]$vm.AutomaticStartAction -ne 'Start') {
-            $evidence['startActionBefore'] = [string]$vm.AutomaticStartAction
-            Set-VM -Name $GuestName -AutomaticStartAction Start -AutomaticStartDelay 0
-        }
-        try {
-            Start-VM -Name $GuestName -ErrorAction Stop
-        }
-        catch {
-            # Hyper-V's own automatic start may have started it a moment earlier.
-            $now = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
-            if (-not $now -or [string]$now.State -notin 'Running', 'Starting') {
-                return (& $fail ('{0} is {1} and couldn''t be started: {2}' -f $GuestName, [string]$vm.State, [string]$_.Exception.Message))
-            }
-        }
-        $evidence['started'] = $true
+    if (-not $evidence.Contains('stateBefore')) {
+        $evidence['stateBefore'] = [string]$vm.State
     }
 
     # Running, with a heartbeat from its integration services.
@@ -861,6 +971,11 @@ function Invoke-DemoControlGuestReady {
     }
     $evidence['sqlService'] = [string]$sql.status
     $evidence['sqlStartedHere'] = [bool]$sql.startedByScript
+    if ([string]$sql.status -eq 'Missing') {
+        # Before the setup wizard's step (PaygWizard) the guest has no SQL Server, so no demo module or runner either:
+        # the caller reports that as Not selected, never a Warning (Phase 28; Test-DemoT2NotSetUpText).
+        return (& $fail ('T2 isn''t set up yet: SQL Server isn''t installed in {0} yet (the setup wizard''s step installs it), so the workload runner is not installed in the guest yet.' -f $GuestName))
+    }
     if ([string]$sql.status -ne 'Running') {
         return (& $fail ('SQL Server''s service in {0} is {1} after {2} seconds.' -f $GuestName, [string]$sql.status, [int]$sql.seconds))
     }

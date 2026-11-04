@@ -96,7 +96,9 @@ function Start-DemoEnvironment {
 
     .PARAMETER T2ProfileRetrySeconds
     Seconds between profile attempts while T2's guest boots, and while T1's SQL Server starts (both VMs boot
-    at once).
+    at once). T1's and T2's three attempts share one readiness budget of twice this (4 minutes by default): the VM
+    side waits for its target within it, so a target that stays down costs about that once, plus the Run Commands'
+    own time, and never a wait per attempt (Set-DemoTargetProfile).
 
     .PARAMETER SkipT4
     Leave T4, the PostgreSQL flexible server, stopped.
@@ -377,8 +379,10 @@ function Start-DemoEnvironment {
             $skip = ('{0} isn''t running.' -f $hostVm)
         }
         # T2's guest boots after its host, and T1's SQL Server can still be starting because both VMs boot at once
-        # (live, 2026-10-22: T1's first attempt found no server), so both retry. A profile with incidents is set as its
-        # interim, baseline, and switched below once this start's own Run Commands are done (2026-11-03).
+        # (live, 2026-10-22: T1's first attempt found no server), so both retry, within one readiness budget that the
+        # VM side waits in (2 x T2ProfileRetrySeconds; review, 2026-11-04: a wait per attempt took 34 to 64 minutes).
+        # A profile with incidents is set as its interim, baseline, and switched below once this start's own Run
+        # Commands are done (2026-11-03).
         $attempts = if ($target -in 'T1', 'T2') { 3 } else { 1 }
         $set = Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $activity.Interim -CheckPrefix 'START' -SkipReason $skip -RequestedBy 'start-demo' -Attempts $attempts -RetrySeconds $T2ProfileRetrySeconds -SwitchTo $switchTo
         $results.Add($set)

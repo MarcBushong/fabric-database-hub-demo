@@ -8,6 +8,9 @@ function New-DemoT2GoldenSnapshot {
     1. The subscription guard. The nested T2 mode with PaygWizard, and a host without data disks (the guest
        lives on the OS disk); anything else is Not supported.
     2. Policy: the read-only inventory must not deny snapshots or disks (unless -SkipPolicyInventory).
+       Then no on-demand run may be active (GOLDEN.CAPTURE.CONTROL, Get-DemoGoldenCaptureControlResult): no
+       DbHub-Control or DbHub-Stop job queued or running, and no pending auto-stop, because a run starts and
+       deallocates archost01; otherwise nothing changes (review, 2026-11-04).
     3. Starts archost01 when it's deallocated, and releases an air gap that an interrupted capture left (the
        host's Azure VM ID matches the capture record, so only the guest's network and start action return).
     4. Inspects the host and guest (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Inspect, read-only) and
@@ -21,7 +24,9 @@ function New-DemoT2GoldenSnapshot {
        With -WipeFreeSpace (ADR 0009, Phase 26d), vm/bootstrap/Invoke-DemoDiskWipe.ps1 -WipeAction GuestFill then
        checks that the host's C: has at least -MinHostFreeGB free, runs the TRIM pass in the guest, overwrites the
        guest's free space with zeros, deletes that file, and trims again (GOLDEN.CAPTURE.WIPE).
-    6. Prepare: removes the sign-in data that setup leaves on the VM again and checks that none remains, turns IE
+    6. Prepare: writes the capture marker first (T2's control relay leaves the guest alone while it's there; the
+       capture's own Release removes it, at step 3 and in step 9), removes the sign-in data that setup leaves on the
+       VM again and checks that none remains, turns IE
        ESC on, writes the capture record, applies the air gap (the guest's automatic start action Nothing, its
        network adapter disconnected), and shuts the guest down cleanly. With -WipeFreeSpace, HostCompact then
        compacts the guest's VHDX (Optimize-VHD -Mode Full, mounted read-only), overwrites the host's free space
@@ -174,6 +179,13 @@ function New-DemoT2GoldenSnapshot {
         return $results.ToArray()
     }
 
+    # 2b. No on-demand run: it would start or deallocate archost01 during the capture (review, 2026-11-04).
+    $control = Get-DemoGoldenCaptureControlResult -Config $Config
+    $results.Add($control)
+    if ($control.status -eq 'Fail') {
+        return $results.ToArray()
+    }
+
     # 3. The host running, with a guest an interrupted capture left air-gapped released. The power state it was
     # found in is what GOLDEN.CAPTURE.SOURCE returns it to.
     $foundPower = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName 'archost01'
@@ -182,7 +194,8 @@ function New-DemoT2GoldenSnapshot {
     if ($power.status -ne 'Pass') {
         return $results.ToArray()
     }
-    $release = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -TimeoutSeconds 1800
+    # EndCapture: this capture's own Release, so it also removes the marker an interrupted capture left.
+    $release = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -Parameter @{ EndCapture = 'true' } -TimeoutSeconds 1800
     if (-not $release.Succeeded) {
         & $add 'GOLDEN.CAPTURE.RELEASE' 'Fail' ('The guest couldn''t be made ready: {0}' -f $release.Error) @{} 'Read the Run Command error, fix the cause, and run capture-t2-golden.ps1 again.'
         return $results.ToArray()

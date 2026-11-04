@@ -1828,12 +1828,44 @@ function Remove-DemoActivityControlFabric {
     return (New-DemoResult -CheckId 'CONTROL.REMOVE.FABRIC' -Area 'fabric' -Target 'fabric' -Status $status -Message ('Fabric: {0}.{1}' -f $(if ($done.Count) { ($done -join ', ') + ' removed' } else { 'nothing to remove' }), $(if ($failed.Count) { ' Failed: ' + ($failed -join '; ') } else { '' })) -Remediation $(if ($failed.Count) { 'Delete what''s left in Fabric yourself (it needs the Admin role in the control workspace).' } else { '' }) -DocUrl $doc)
 }
 
+function Get-DemoActivityControlActiveJob {
+    <#
+    .SYNOPSIS
+    One control runbook's jobs that are queued or running, from Job - List By Automation Account
+    (https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account). A control Automation account or
+    group that doesn't exist has none. Returns Ok, Error, and Jobs (Id and Status). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Name,
+
+        [Parameter(Mandatory)]
+        [string] $Runbook
+    )
+
+    $jobs = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/jobs' -f $Name.AutomationAccountId) -Query ([ordered]@{ '$filter' = ("properties/runbook/name eq '{0}'" -f $Runbook); 'api-version' = '2024-10-23' })
+    if (-not $jobs.Ok -and -not $jobs.Missing) {
+        return [pscustomobject]@{ Ok = $false; Error = $jobs.Error; Jobs = @() }
+    }
+    $active = [System.Collections.Generic.List[object]]::new()
+    foreach ($job in @(Get-DemoActivityControlList -InputObject $jobs.Value -Name 'value')) {
+        $properties = Get-DemoMemberValue -InputObject $job -Name 'properties'
+        $status = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
+        $name = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'runbook') -Name 'name')
+        if ($name -eq $Runbook -and $status -in $script:ActivityControlActiveJobStatuses) {
+            $active.Add([pscustomobject]@{ Id = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobId'); Status = $status })
+        }
+    }
+    return [pscustomobject]@{ Ok = $true; Error = ''; Jobs = $active.ToArray() }
+}
+
 function Get-DemoActivityControlActiveStopJob {
     <#
     .SYNOPSIS
-    The control's DbHub-Stop jobs that are queued or running, from Job - List By Automation Account
-    (https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account). A control Automation account or
-    group that doesn't exist has none. Returns Ok, Error, and Jobs (Id and Status). Internal.
+    The control's DbHub-Stop jobs that are queued or running (Get-DemoActivityControlActiveJob). Returns Ok, Error, and
+    Jobs (Id and Status). Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1842,20 +1874,7 @@ function Get-DemoActivityControlActiveStopJob {
         [object] $Name
     )
 
-    $jobs = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/jobs' -f $Name.AutomationAccountId) -Query ([ordered]@{ '$filter' = ("properties/runbook/name eq '{0}'" -f $Name.StopRunbook); 'api-version' = '2024-10-23' })
-    if (-not $jobs.Ok -and -not $jobs.Missing) {
-        return [pscustomobject]@{ Ok = $false; Error = $jobs.Error; Jobs = @() }
-    }
-    $active = [System.Collections.Generic.List[object]]::new()
-    foreach ($job in @(Get-DemoActivityControlList -InputObject $jobs.Value -Name 'value')) {
-        $properties = Get-DemoMemberValue -InputObject $job -Name 'properties'
-        $status = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
-        $runbook = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'runbook') -Name 'name')
-        if ($runbook -eq $Name.StopRunbook -and $status -in $script:ActivityControlActiveJobStatuses) {
-            $active.Add([pscustomobject]@{ Id = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobId'); Status = $status })
-        }
-    }
-    return [pscustomobject]@{ Ok = $true; Error = ''; Jobs = $active.ToArray() }
+    return (Get-DemoActivityControlActiveJob -Name $Name -Runbook $Name.StopRunbook)
 }
 
 function Wait-DemoActivityControlStopJob {

@@ -78,3 +78,99 @@ Describe 'Get-GoldenResetDecision' {
         $decision.Reason | Should -Be 'NoCapturedIdentity'
     }
 }
+
+Describe 'The capture marker (review, 2026-11-04)' {
+    BeforeAll {
+        $script:now = [datetime]::new(2026, 11, 4, 2, 0, 0, [System.DateTimeKind]::Utc)
+        function New-Marker([datetime] $StartedUtc, [string] $Source = 'source-vm') {
+            [pscustomobject]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611040100'; startedUtc = $StartedUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"); sourceAzureVmId = $Source }
+        }
+        # Hyper-V's cmdlets exist only on a Hyper-V host; elsewhere these stand-ins let Pester mock them.
+        $stubs = @{
+            'Get-VM'   = 'param([string] $Name)'
+            'Stop-VM'  = 'param([string] $Name, [switch] $Force, [switch] $AsJob)'
+            'Set-VM'   = 'param([string] $Name, [string] $AutomaticStartAction, [int] $AutomaticStartDelay)'
+            'Start-VM' = 'param([string] $Name)'
+        }
+        $script:addedStubs = @()
+        foreach ($name in $stubs.Keys) {
+            if (-not (Get-Command -Name $name -ErrorAction SilentlyContinue)) {
+                New-Item -Path ('function:global:' + $name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stubs[$name])) | Out-Null
+                $script:addedStubs += $name
+            }
+        }
+    }
+
+    AfterAll {
+        foreach ($name in $script:addedStubs) {
+            Remove-Item -Path ('function:global:' + $name) -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'counts a marker for 6 hours, and only on the host it names' {
+        $active = Get-GoldenCaptureProgress -Marker (New-Marker -StartedUtc $script:now.AddMinutes(-59)) -AzureVmId 'SOURCE-VM' -NowUtc $script:now
+        $active.State | Should -Be 'Active'
+        $active.SnapshotName | Should -Be 'snap-dbhub-t2golden-202611040100'
+        $active.SinceUtc | Should -Be '2026-11-04T01:01:00Z'
+        $active.UntilUtc | Should -Be '2026-11-04T07:01:00Z'
+        (Get-GoldenCaptureProgress -Marker (New-Marker -StartedUtc $script:now.AddMinutes(-359)) -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'Active'
+        (Get-GoldenCaptureProgress -Marker (New-Marker -StartedUtc $script:now.AddHours(-6)) -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'None'
+        (Get-GoldenCaptureProgress -Marker (New-Marker -StartedUtc $script:now.AddMinutes(-5)) -AzureVmId 'copy-vm' -NowUtc $script:now).State | Should -Be 'None'
+        (Get-GoldenCaptureProgress -Marker (New-Marker -StartedUtc $script:now.AddMinutes(-5)) -AzureVmId '' -NowUtc $script:now).State | Should -Be 'Unknown'
+        (Get-GoldenCaptureProgress -Marker $null -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'None'
+        (Get-GoldenCaptureProgress -Marker ([pscustomobject]@{ startedUtc = 'not a time'; sourceAzureVmId = 'source-vm' }) -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'None'
+    }
+
+    Context 'Prepare and Release' {
+        BeforeEach {
+            $script:root = Join-Path -Path $TestDrive -ChildPath ('golden-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path (Join-Path -Path $script:root -ChildPath 'golden') -Force | Out-Null
+            $script:markerPath = Join-Path -Path $script:root -ChildPath 'golden\capture-in-progress.json'
+            $script:guestState = 'Running'
+            $script:markerAtAirGap = $false
+            Mock -CommandName Get-GoldenHostFact -MockWith { @{ guestState = 'Running'; azureVmId = 'source-vm'; guestHyperVId = 'hyper-v-id' } }
+            Mock -CommandName Wait-GoldenGuest -MockWith { [pscustomobject]@{ Credential = $script:credential; Seconds = 5 } }
+            Mock -CommandName Invoke-Command -MockWith {
+                [pscustomobject]@{ signInCaches = @(); setupLogFilesWithToken = 0; ieEsc = 'On'; sqlEdition = 'Standard Edition (64-bit)'; agentJson = '{"status":"Connected","resourceName":"arcsql01","resourceGroup":"rg-dbhub-demo"}'; evaluationExpiresUtc = '2027-04-19T13:46:22Z'; cachesRemoved = 0; logFilesRedacted = 0 }
+            }
+            Mock -CommandName Set-VM -MockWith { if ($AutomaticStartAction -eq 'Nothing') { $script:markerAtAirGap = Test-Path -LiteralPath $script:markerPath } }
+            Mock -CommandName Disconnect-GoldenAdapter -MockWith { }
+            Mock -CommandName Connect-GoldenAdapter -MockWith { }
+            Mock -CommandName Get-GoldenAdapterState -MockWith { [ordered]@{ count = 1; connected = 0 } }
+            Mock -CommandName Stop-VM -MockWith { $script:guestState = 'Off' }
+            Mock -CommandName Start-VM -MockWith { $script:guestState = 'Running' }
+            Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = $script:guestState; AutomaticStartAction = 'Nothing' } }
+            Mock -CommandName Get-GoldenImdsVmId -MockWith { 'source-vm' }
+            Mock -CommandName Start-Sleep -MockWith { }
+        }
+
+        It 'Prepare writes the marker before the air gap, naming this host, the snapshot, and the time' {
+            $script:Options = @{ Root = $script:root; SnapshotName = 'snap-dbhub-t2golden-202611040100'; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+            $result = Invoke-GoldenPrepare -Setting @{ AdministratorName = 'Administrator' }
+            $result['succeeded'] | Should -BeTrue
+            $script:markerAtAirGap | Should -BeTrue
+            $marker = Get-Content -LiteralPath $script:markerPath -Raw | ConvertFrom-Json
+            $marker.snapshotName | Should -Be 'snap-dbhub-t2golden-202611040100'
+            $marker.sourceAzureVmId | Should -Be 'source-vm'
+            $result['captureSinceUtc'] | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+            (Get-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
+        }
+
+        It 'only the capture''s own Release (EndCapture) removes the marker; any other Release leaves it' {
+            $record = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611040100'; sourceAzureVmId = 'source-vm'; released = $false }
+            Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Value ($record | ConvertTo-Json)
+            Set-Content -LiteralPath $script:markerPath -Value '{"snapshotName":"snap-dbhub-t2golden-202611040100","startedUtc":"2026-11-04T01:00:00Z","sourceAzureVmId":"source-vm"}'
+            $script:guestState = 'Off'
+            $script:Options = @{ Root = $script:root; SnapshotName = ''; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+            $other = Invoke-GoldenRelease -Setting @{ SwitchName = 'DbHubDemoNat'; AdministratorName = 'Administrator'; ArcMarkerFile = 'arc-onboarded.json' }
+            $other['succeeded'] | Should -BeTrue
+            $other.Contains('captureEnded') | Should -BeFalse
+            Test-Path -LiteralPath $script:markerPath | Should -BeTrue
+            $script:Options['EndCapture'] = $true
+            $own = Invoke-GoldenRelease -Setting @{ SwitchName = 'DbHubDemoNat'; AdministratorName = 'Administrator'; ArcMarkerFile = 'arc-onboarded.json' }
+            $own['captureEnded'] | Should -BeTrue
+            Test-Path -LiteralPath $script:markerPath | Should -BeFalse
+            (Get-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeTrue
+        }
+    }
+}

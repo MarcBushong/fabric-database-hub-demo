@@ -61,38 +61,63 @@ function Get-DemoHealthGuestFact {
             $facts['adapters'] = $adapters.Count
             $facts['connected'] = @($adapters | Where-Object { [string]$_.SwitchName }).Count
         }
-        $capturePath = [System.IO.Path]::Combine($StateRoot, 'golden', 'capture.json')
+        $goldenFolder = [System.IO.Path]::Combine($StateRoot, 'golden')
+        $capturePath = [System.IO.Path]::Combine($goldenFolder, 'capture.json')
+        $markerPath = [System.IO.Path]::Combine($goldenFolder, 'capture-in-progress.json')
+        $capture = $null
+        $marker = $null
         if (Test-Path -LiteralPath $capturePath -PathType Leaf) {
             $capture = [System.IO.File]::ReadAllText($capturePath) | ConvertFrom-Json
+        }
+        if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+            $marker = [System.IO.File]::ReadAllText($markerPath) | ConvertFrom-Json
+        }
+        $golden = $null
+        if ($null -ne $capture) {
             $read = { param([string] $Name) $property = $capture.PSObject.Properties[$Name]; if ($property -and $null -ne $property.Value) { [string]$property.Value } else { '' } }
             $golden = [ordered]@{ released = ((& $read 'released') -eq 'True'); reset = [bool](& $read 'resetUtc'); role = '' }
-            if (-not $golden['released']) {
-                # The role as the golden Release decides it: the host's Azure VM ID (IMDS) against the record's source.
+        }
+        # The host's role as the golden Release and T2's relay decide it, from its Azure VM ID (IMDS): needed for a record
+        # that isn't released, for one that says released without a reset (only the source's may; review, 2026-11-04),
+        # and for a capture marker, which counts only on the host it names.
+        if ($null -ne $marker -or ($null -ne $golden -and -not ($golden['released'] -and $golden['reset']))) {
+            if ($null -ne $golden) {
                 $golden['role'] = 'Unknown'
-                $settingsPath = Join-Path -Path $StateRoot -ChildPath 'settings.json'
-                $bundle = ''
-                if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
-                    $property = ([System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json).PSObject.Properties['bundlePath']
-                    if ($property -and $property.Value) {
-                        $bundle = [string]$property.Value
-                    }
+            }
+            $settingsPath = Join-Path -Path $StateRoot -ChildPath 'settings.json'
+            $bundle = ''
+            if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
+                $property = ([System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json).PSObject.Properties['bundlePath']
+                if ($property -and $property.Value) {
+                    $bundle = [string]$property.Value
                 }
-                $goldenScript = if ($bundle) { [System.IO.Path]::Combine($bundle, 'vm', 'bootstrap', 'Invoke-DemoGoldenGuest.ps1') } else { '' }
-                if ($goldenScript -and (Test-Path -LiteralPath $goldenScript -PathType Leaf)) {
-                    . $goldenScript -GuestName $Guest -Root $StateRoot
+            }
+            $goldenScript = if ($bundle) { [System.IO.Path]::Combine($bundle, 'vm', 'bootstrap', 'Invoke-DemoGoldenGuest.ps1') } else { '' }
+            if ($goldenScript -and (Test-Path -LiteralPath $goldenScript -PathType Leaf)) {
+                . $goldenScript -GuestName $Guest -Root $StateRoot
+                $azureVmId = ''
+                try {
+                    $azureVmId = Get-GoldenImdsVmId
+                }
+                catch {
                     $azureVmId = ''
-                    try {
-                        $azureVmId = Get-GoldenImdsVmId
-                    }
-                    catch {
-                        $azureVmId = ''
-                    }
+                }
+                if ($null -ne $golden) {
                     $source = & $read 'sourceAzureVmId'
                     if ($azureVmId -and $source) {
                         $golden['role'] = if ([string]::Equals($azureVmId, $source, [System.StringComparison]::OrdinalIgnoreCase)) { 'Source' } else { 'Copy' }
                     }
                 }
+                # An installed bundle from before 2026-11-04 has no marker reader; its relay doesn't read markers either.
+                if ($null -ne $marker -and (Get-Command -Name 'Get-GoldenCaptureProgress' -ErrorAction SilentlyContinue)) {
+                    $progress = Get-GoldenCaptureProgress -Marker $marker -AzureVmId $azureVmId -NowUtc ([DateTime]::UtcNow)
+                    if ($progress.State -ne 'None') {
+                        $facts['capture'] = [ordered]@{ state = $progress.State; snapshotName = $progress.SnapshotName; sinceUtc = $progress.SinceUtc; untilUtc = $progress.UntilUtc }
+                    }
+                }
             }
+        }
+        if ($null -ne $golden) {
             $facts['golden'] = $golden
         }
     }

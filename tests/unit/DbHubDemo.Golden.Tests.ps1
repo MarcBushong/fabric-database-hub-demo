@@ -217,6 +217,8 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $script:snapshotFails = ''
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSignInDataAction -MockWith { $script:calls.Add(('sweep {0} {1} {2}' -f $Action, $Scope, [bool]$PesterBoundParameters['ClearSecurityLog'])); New-TestSweepOutcome -Pass $script:sweepPass -Security $script:sweepSecurity }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @() }
+        $script:controlStatus = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenCaptureControlResult -MockWith { $script:calls.Add('control'); New-TestResult 'GOLDEN.CAPTURE.CONTROL' $script:controlStatus }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
             $script:calls.Add('guest ' + $Action)
             switch ($Action) {
@@ -430,6 +432,23 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $null = New-DemoT2GoldenSnapshot -Config $config -Confirm:$false
         $null = New-DemoT2GoldenSnapshot -Config $config -WhatIf
         @($script:calls | Where-Object { $_ -match '^restore' }) | Should -BeNullOrEmpty
+    }
+
+    It 'captures nothing, and touches nothing, while an on-demand run is active; -WhatIf doesn''t read the control (review, 2026-11-04)' {
+        $script:controlStatus = 'Fail'
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
+        ($results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.CONTROL').status | Should -Be 'Fail'
+        $results[-1].checkId | Should -Be 'GOLDEN.CAPTURE.CONTROL'
+        @($script:calls | Where-Object { $_ -match '^(power|guest|profile|password|restore)' }) | Should -BeNullOrEmpty
+        $script:calls.Clear()
+        $null = New-DemoT2GoldenSnapshot -Config $config -WhatIf
+        $script:calls | Should -Not -Contain 'control'
+    }
+
+    It 'ends an interrupted capture''s marker with its own first Release, and checks the control before it starts the host' {
+        $null = New-DemoT2GoldenSnapshot -Config $config -Confirm:$false
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 1 -Exactly -ParameterFilter { $Action -eq 'Release' -and [string]$Parameter['EndCapture'] -eq 'true' }
+        [array]::IndexOf([string[]]$script:calls.ToArray(), 'control') | Should -BeLessThan ([array]::IndexOf([string[]]$script:calls.ToArray(), 'power Start'))
     }
 }
 
@@ -801,6 +820,11 @@ Describe 'Invoke-DemoGoldenSourceRelease' {
         $result.status | Should -Be 'Pass'
         $script:calls | Should -Contain 'Release'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match '^tag update --resource-id /subscriptions/.*/snapshots/snap-dbhub-t2golden-202610221306 --operation Merge --tags dbhubSourceReleasedUtc=' }
+        # Only the capture's own return of its source ends its marker (review, 2026-11-04).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 0 -Exactly -ParameterFilter { $Parameter.Contains('EndCapture') }
+        $script:released = $null
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoGoldenSourceRelease -Config $c -EndCapture } $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 1 -Exactly -ParameterFilter { [string]$Parameter['EndCapture'] -eq 'true' }
     }
 
     It 'does nothing on a host that isn''t a capture source, or once the release is recorded' {
@@ -874,6 +898,8 @@ Describe 'Restore-DemoGoldenCaptureSource' {
         $result.message | Should -Match 'deallocated again, as the capture found it'
         @($script:calls | Where-Object { $_ -ne 'arc' }) | Should -Be @('power Start', 'source release', 'guest stop', 'power Deallocate')
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 0 -Exactly
+        # The capture's own Release ends its marker (review, 2026-11-04).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenSourceRelease -Times 1 -Exactly -ParameterFilter { $EndCapture }
     }
 
     It 'doesn''t take a Connected status left over from before the air gap for a reconnection' {
@@ -911,7 +937,7 @@ Describe 'Restore-DemoGoldenCaptureSource' {
         $result.evidence['release'] | Should -Be 'Release'
         $result.evidence['arcProof'] | Should -Be 'never disconnected'
         @($script:calls | Where-Object { $_ -eq 'arc' }).Count | Should -Be 1
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 1 -Exactly -ParameterFilter { $Action -eq 'Release' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 1 -Exactly -ParameterFilter { $Action -eq 'Release' -and [string]$Parameter['EndCapture'] -eq 'true' }
     }
 
     It 'fails when the guest can''t be released, and still deallocates the host it started' {
@@ -984,6 +1010,11 @@ Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
         @{ Case = 'it won''t start with the host'; Guest = { New-Guest -StartAction 'StartIfRunning' }; Status = 'Warning'; Match = 'doesn''t start with the host \(automatic start action StartIfRunning\)'; Fix = 'AutomaticStartAction Start' }
         @{ Case = 'its heartbeat isn''t OK yet'; Guest = { New-Guest -Heartbeat 'NoContact' }; Status = 'Warning'; Match = 'heartbeat is NoContact'; Fix = 'again in a few minutes' }
         @{ Case = 'the host couldn''t read it'; Guest = { [pscustomobject]@{ present = $false; error = 'Access is denied.' } }; Status = 'Warning'; Match = 'couldn''t read its guest'; Fix = 'again' }
+        @{ Case = 'a capture is in progress on this host'; Guest = { $g = New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Source' }); $g | Add-Member -NotePropertyName capture -NotePropertyValue ([pscustomobject]@{ state = 'Active'; snapshotName = 'snap-dbhub-t2golden-202611040100'; sinceUtc = [datetime]::new(2026, 11, 4, 1, 0, 0, [System.DateTimeKind]::Utc); untilUtc = '2026-11-04T07:00:00Z' }) -PassThru }; Status = 'Warning'; Match = 'A golden capture is in progress on archost01: snapshot snap-dbhub-t2golden-202611040100, since 2026-11-04 01:00 UTC'; Fix = '^Let \./scripts/capture-t2-golden\.ps1 finish.*From 2026-11-04 07:00 UTC' }
+        @{ Case = 'a recent marker can''t be matched to this host'; Guest = { $g = New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0; $g | Add-Member -NotePropertyName capture -NotePropertyValue ([pscustomobject]@{ state = 'Unknown'; snapshotName = 'snap-dbhub-t2golden-202611040100'; sinceUtc = '2026-11-04T01:00:00Z'; untilUtc = '2026-11-04T07:00:00Z' }) -PassThru }; Status = 'Warning'; Match = 'Azure VM ID couldn''t be read to confirm'; Fix = 'capture-t2-golden\.ps1' }
+        @{ Case = 'a copy''s record says released without a reset'; Guest = { New-Guest -Golden ([pscustomobject]@{ released = $true; reset = $false; role = 'Copy' }) }; Status = 'Fail'; Match = 'record says released, but its Arc identity was never reset'; Fix = 'deploy\.ps1: its T2 track resets the restored copy' }
+        @{ Case = 'a released record''s host can''t tell its role'; Guest = { New-Guest -Golden ([pscustomobject]@{ released = $true; reset = $false; role = 'Unknown' }) }; Status = 'Warning'; Match = 'can''t be told from a copy''s'; Fix = 'deploy\.ps1' }
+        @{ Case = 'the source''s record is released'; Guest = { New-Guest -Golden ([pscustomobject]@{ released = $true; reset = $false; role = 'Source' }) }; Status = 'Pass'; Match = 'runs with its heartbeat OK'; Fix = '' }
     ) {
         $result = Get-GuestState (& $Guest)
         $result.checkId | Should -Be 'T2.GUEST.STATE'
@@ -1054,5 +1085,81 @@ Describe 'Get-DemoT2GoldenStatus' {
         (& $status @(& $script:make 100) $config).status | Should -Be 'Pass'
         $config['expiresOn'] = '2027-12-31'
         (& $status @(& $script:make 100) $config).message | Should -Match 'before the environment''s expiresOn'
+    }
+}
+
+Describe 'Get-DemoGoldenCaptureControlResult (GOLDEN.CAPTURE.CONTROL, review of 2026-11-04)' {
+    BeforeEach {
+        $config = New-TestConfig
+        $config['control'] = @{ enabled = $true }
+        $script:now = [datetime]::new(2026, 11, 4, 2, 0, 0, [System.DateTimeKind]::Utc)
+        $script:jobs = @{ 'DbHub-Control' = @(); 'DbHub-Stop' = @() }
+        $script:jobsFail = ''
+        $script:autoStop = ''
+        $script:autoStopFail = $false
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            if ($Url -match '/jobs$') {
+                $runbook = ([string]$Query['$filter'] -replace "^properties/runbook/name eq '([^']+)'$", '$1')
+                if ($script:jobsFail -eq $runbook) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'Forbidden' } }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = [pscustomobject]@{ value = @($script:jobs[$runbook] | ForEach-Object { [pscustomobject]@{ properties = [pscustomobject]@{ jobId = $_[0]; status = $_[1]; runbook = [pscustomobject]@{ name = $runbook } } } }) }; Error = '' }
+            }
+            if ($Url -match '/schedules/dbhub-autostop\?') {
+                if ($script:autoStopFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'Timeout' } }
+                if (-not $script:autoStop) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = [pscustomobject]@{ properties = [pscustomobject]@{ startTime = $script:autoStop } }; Error = '' }
+            }
+            throw ('unexpected: {0}' -f $Url)
+        }
+        function Get-ControlCheck {
+            & (Get-Module -Name DbHubDemo) { param($c, $n) Get-DemoGoldenCaptureControlResult -Config $c -NowUtc $n } $config $script:now
+        }
+    }
+
+    It 'passes with no job queued or running and no pending auto-stop, also after an auto-stop''s time' {
+        $result = Get-ControlCheck
+        $result.checkId | Should -Be 'GOLDEN.CAPTURE.CONTROL'
+        $result.status | Should -Be 'Pass'
+        $script:autoStop = '2026-11-04T01:30:00Z'
+        (Get-ControlCheck).status | Should -Be 'Pass'
+        $script:jobs['DbHub-Control'] = @(, @('aaaaaaaa-0000-0000-0000-00000000000a', 'Completed'))
+        (Get-ControlCheck).status | Should -Be 'Pass'
+    }
+
+    It 'fails while a DbHub-Control or DbHub-Stop job is queued or running' -ForEach @(
+        @{ Runbook = 'DbHub-Control'; Status = 'Running' }
+        @{ Runbook = 'DbHub-Control'; Status = 'New' }
+        @{ Runbook = 'DbHub-Stop'; Status = 'Activating' }
+    ) {
+        $script:jobs[$Runbook] = @(, @('bbbbbbbb-0000-0000-0000-00000000000b', $Status))
+        $result = Get-ControlCheck
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match ('{0} bbbbbbbb-0000-0000-0000-00000000000b {1}' -f $Runbook, $Status)
+        $result.remediation | Should -Match 'Nothing was captured.*Stop now in NB_DatabaseHub_Control, or \./scripts/stop-demo\.ps1'
+    }
+
+    It 'fails while an auto-stop is pending, with its time' {
+        $script:autoStop = '2026-11-04T03:10:00Z'
+        $result = Get-ControlCheck
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'active until 2026-11-04 03:10 UTC'
+        ([datetime]$result.evidence['autoStopUtc']).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm") | Should -Be '2026-11-04T03:10'
+    }
+
+    It 'fails when the jobs or the auto-stop can''t be read, because a run may be active' {
+        $script:jobsFail = 'DbHub-Stop'
+        $jobs = Get-ControlCheck
+        $jobs.status | Should -Be 'Fail'
+        $jobs.message | Should -Match 'DbHub-Stop jobs couldn''t be read \(Forbidden\)'
+        $script:jobsFail = ''
+        $script:autoStopFail = $true
+        $schedule = Get-ControlCheck
+        $schedule.status | Should -Be 'Fail'
+        $schedule.message | Should -Match 'dbhub-autostop couldn''t be read \(Timeout\)'
+    }
+
+    It 'is Not selected, and reads nothing, when the control is off' {
+        $config['control'] = @{ enabled = $false }
+        (Get-ControlCheck).status | Should -Be 'Not selected'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -Times 0 -Exactly
     }
 }

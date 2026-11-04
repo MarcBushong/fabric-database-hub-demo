@@ -18,7 +18,10 @@ Actions:
   SQL Server's edition, version, and update level, the Arc agent's identity, sign-in data that setup leaves
   on the VM (token-shaped values and the sign-in caches), and IE Enhanced Security Configuration. The full
   sign-in data sweep (Invoke-DemoSignInResidue.ps1, ADR 0009) runs before Prepare.
-- Prepare: the capture's guest-side steps. Removes the sign-in data that setup leaves on the VM again and
+- Prepare: the capture's guest-side steps. First writes the capture marker
+  C:\ProgramData\DbHubDemo\golden\capture-in-progress.json (the snapshot name, the time, and this host's Azure VM
+  ID): while it's there and recent, T2's control relay leaves the guest alone (Get-GoldenCaptureProgress). Then
+  removes the sign-in data that setup leaves on the VM again and
   checks that none remains, turns IE ESC back on when it's off, writes the capture record
   C:\ProgramData\DbHubDemo\golden\capture.json (the snapshot name, this host's Azure VM ID, and the guest's
   Arc identity), applies the air gap (the guest's automatic start action becomes Nothing, and its network
@@ -35,6 +38,8 @@ Actions:
   Arc marker so the host waits for onboarding like a fresh build, waits for SQL Server's delayed automatic
   start (starting it after 8 minutes if it's still stopped), checks that it runs Standard edition, and
   rotates the guest's password; then reconnects the adapter and restores the automatic start.
+  With EndCapture (only the capture's own Release: its first step, and its return of the source), the capture
+  marker is removed first, because the capture is over.
   With ProveIsolation, the adapter is connected before the reset, and the reset runs only after
   'azcmagent check' and direct TCP tests show that no Arc endpoint answers (the boot test's network
   security group denies all outbound traffic). With KeepIsolated, the adapter stays disconnected.
@@ -70,6 +75,9 @@ The Azure region for 'azcmagent check' (Release with ProveIsolation).
 
 .PARAMETER SkipRotation
 'true' to skip the guest password rotation in Release.
+
+.PARAMETER EndCapture
+'true' for the capture's own Release only (capture-t2-golden.ps1): it removes the capture marker that Prepare wrote.
 #>
 [CmdletBinding()]
 param(
@@ -79,6 +87,7 @@ param(
     [string] $ProveIsolation = 'false',
     [string] $KeepIsolated = 'false',
     [string] $SkipRotation = 'false',
+    [string] $EndCapture = 'false',
     [string] $GuestName = 'arcsql01',
     [string] $Root = 'C:\ProgramData\DbHubDemo'
 )
@@ -173,6 +182,68 @@ function Write-GoldenJson {
     $temporary = $Path + '.tmp'
     [System.IO.File]::WriteAllText($temporary, (ConvertTo-Json -InputObject $Value -Depth 6), (New-Object -TypeName 'System.Text.UTF8Encoding' -ArgumentList $false))
     Move-Item -LiteralPath $temporary -Destination $Path -Force
+}
+
+# How long a capture marker counts after Prepare wrote it: longer than a capture can take from Prepare to its
+# return of the source (Prepare 40 minutes, HostCompact up to 2 hours, then the snapshot, its disk check, and the
+# host's start), so only a capture that was interrupted (Ctrl+C) leaves one that stops counting by itself.
+$script:GoldenCaptureMarkerHours = 6
+
+function Get-GoldenCaptureMarkerPath {
+    param([Parameter(Mandatory = $true)] [string] $Root)
+    return [System.IO.Path]::Combine($Root, 'golden', 'capture-in-progress.json')
+}
+
+function Get-GoldenCaptureProgress {
+    <#
+    .SYNOPSIS
+    Whether a golden capture is in progress on this host (review of 2026-11-04): Prepare writes the capture marker
+    and only the capture's own Release (EndCapture) removes it, so T2's control relay never undoes the air gap between
+    Prepare and the snapshot. The marker counts for GoldenCaptureMarkerHours after it was written, and only on the host
+    it names: a copy restored from the snapshot carries it too, and there it means nothing. Returns State (None,
+    Active, or Unknown when this host's Azure VM ID couldn't be read), SnapshotName, SinceUtc, and UntilUtc. Pure.
+    #>
+    param(
+        [AllowNull()]
+        [object] $Marker,
+
+        [AllowEmptyString()]
+        [string] $AzureVmId = '',
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $NowUtc
+    )
+
+    $none = New-Object -TypeName 'psobject' -Property @{ State = 'None'; SnapshotName = ''; SinceUtc = ''; UntilUtc = '' }
+    if ($null -eq $Marker) {
+        return $none
+    }
+    $read = {
+        param([string] $Name)
+        $property = $Marker.PSObject.Properties[$Name]
+        if ($null -eq $property -or $null -eq $property.Value) {
+            return ''
+        }
+        return [string]$property.Value
+    }
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    $since = [datetime]::MinValue
+    if (-not [datetime]::TryParse((& $read 'startedUtc'), [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$since)) {
+        return $none
+    }
+    $now = if ($NowUtc.Kind -eq [System.DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($NowUtc, [System.DateTimeKind]::Utc) } else { $NowUtc.ToUniversalTime() }
+    $until = $since.AddHours($script:GoldenCaptureMarkerHours)
+    if ($now -ge $until) {
+        return $none
+    }
+    $state = 'Active'
+    if (-not $AzureVmId) {
+        $state = 'Unknown'
+    }
+    elseif (-not [string]::Equals((& $read 'sourceAzureVmId'), $AzureVmId, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $none
+    }
+    return (New-Object -TypeName 'psobject' -Property @{ State = $state; SnapshotName = (& $read 'snapshotName'); SinceUtc = $since.ToString('yyyy-MM-ddTHH:mm:ssZ'); UntilUtc = $until.ToString('yyyy-MM-ddTHH:mm:ssZ') })
 }
 
 function Get-GoldenSecretPath {
@@ -745,6 +816,16 @@ function Invoke-GoldenPrepare {
     if (-not $hostFacts['azureVmId']) {
         throw 'The host''s Azure VM ID could not be read from IMDS, so the capture record would be incomplete.'
     }
+    # From here until the capture's own Release (EndCapture), T2's control relay leaves the guest alone, even when it
+    # gets this lock between Prepare and the snapshot (review, 2026-11-04).
+    $marker = [ordered]@{
+        schemaVersion   = 1
+        snapshotName    = $script:Options.SnapshotName
+        startedUtc      = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        sourceAzureVmId = $hostFacts['azureVmId']
+    }
+    Write-GoldenJson -Path (Get-GoldenCaptureMarkerPath -Root $script:Options.Root) -Value $marker
+    $result['captureSinceUtc'] = $marker['startedUtc']
     $credential = (Wait-GoldenGuest -UserName $Setting['AdministratorName'] -TimeoutSeconds 300).Credential
     $before = Invoke-Command -VMName $GuestName -Credential $credential -ScriptBlock $script:GuestInspectBlock -ArgumentList $script:JwtPattern -ErrorAction Stop
     $clean = Invoke-Command -VMName $GuestName -Credential $credential -ScriptBlock $script:GuestCleanBlock -ArgumentList $script:JwtPattern, @($before.signInCaches) -ErrorAction Stop
@@ -834,6 +915,12 @@ function Invoke-GoldenPasswordRotation {
 function Invoke-GoldenRelease {
     param([hashtable] $Setting)
     $result = [ordered]@{ action = 'Release'; succeeded = $false }
+    if ($script:Options['EndCapture']) {
+        # The capture's own Release: the capture is over, so T2's control relay may act on the guest again.
+        $markerPath = Get-GoldenCaptureMarkerPath -Root $script:Options.Root
+        $result['captureEnded'] = Test-Path -LiteralPath $markerPath -PathType Leaf
+        Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    }
     $capturePath = [System.IO.Path]::Combine($script:Options.Root, 'golden', 'capture.json')
     $capture = Read-GoldenJson -Path $capturePath
     $vm = Get-VM -Name $GuestName -ErrorAction Stop
@@ -953,6 +1040,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             ProveIsolation = ($ProveIsolation -eq 'true')
             KeepIsolated   = ($KeepIsolated -eq 'true')
             SkipRotation   = ($SkipRotation -eq 'true')
+            EndCapture     = ($EndCapture -eq 'true')
         }
         $setting = Get-GoldenHostSetting
         $lock = $null

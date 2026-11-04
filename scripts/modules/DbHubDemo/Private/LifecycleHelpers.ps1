@@ -530,7 +530,12 @@ function Set-DemoTargetProfile {
     workload runner before SQL Server setup; Test-DemoT2NotSetUpText) is Not selected. -Attempts retries a target that
     isn't reachable yet, such as a T2 guest that's still
     booting. -SwitchTo names the profile with incidents that the run sets once its own Run Commands on the VM are done
-    (2026-11-03, Invoke-DemoActivitySwitch): the message says so, and the evidence records it.
+    (2026-11-03, Invoke-DemoActivitySwitch): the message says so, and the evidence records it. Since 2026-11-04 the
+    attempts share one readiness budget, the time the retries allowed before: (Attempts - 1) x RetrySeconds, 4 minutes
+    for start-demo.ps1's T1 and T2 and none for one attempt. Each attempt asks the VM side to wait for its target
+    (readySeconds) for what's left of it, and what the VM side waited counts against it, so a target that stays down
+    costs the budget once, not once per attempt, and a target that answers stops the wait. A host whose bundle predates
+    readySeconds fails at once, as before, and its retries wait RetrySeconds.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Callers confirm once for the whole start or stop; Invoke-DemoWorkloadCommand is called with -Confirm:$false.')]
     [CmdletBinding()]
@@ -584,9 +589,10 @@ function Set-DemoTargetProfile {
     }
     $run = $null
     $detail = ''
+    $left = [System.Math]::Max(0, ($Attempts - 1) * $RetrySeconds)
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            $run = Invoke-DemoWorkloadCommand -Config $Config -Target $Target -ArgumentList $arguments -TimeoutSeconds 300 -Confirm:$false
+            $run = Invoke-DemoWorkloadCommand -Config $Config -Target $Target -ArgumentList $arguments -TimeoutSeconds 300 -ReadySeconds ([System.Math]::Min(1800, $left)) -Confirm:$false
             $detail = [string]$run.Result.message
         }
         catch {
@@ -596,8 +602,20 @@ function Set-DemoTargetProfile {
         if (($null -ne $run -and $run.Status -in 'Pass', 'Warning') -or $attempt -eq $Attempts) {
             break
         }
-        Write-DemoLog -Level Warning -Message ('{0}: the activity profile couldn''t be set yet ({1}); retrying in {2} seconds ({3} of {4}).' -f $Target, $detail, $RetrySeconds, $attempt, $Attempts)
-        Start-Sleep -Seconds $RetrySeconds
+        # What the VM side waited for the target counts against the budget; once it has waited all of it, the target
+        # stayed down, and another attempt would only wait again.
+        $waited = 0
+        if ($null -ne $run) {
+            $waited = [int](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $run.Result -Name 'evidence') -Name 'readySeconds')
+        }
+        $left = [System.Math]::Max(0, $left - $waited)
+        if ($waited -gt 0 -and $left -le 0) {
+            break
+        }
+        $pause = [System.Math]::Min($RetrySeconds, $left)
+        Write-DemoLog -Level Warning -Message ('{0}: the activity profile couldn''t be set yet ({1}); retrying in {2} seconds ({3} of {4}).' -f $Target, $detail, $pause, $attempt, $Attempts)
+        Start-Sleep -Seconds $pause
+        $left -= $pause
     }
     $evidence = [ordered]@{ profile = $ProfileName; requestedBy = $RequestedBy }
     if ($SwitchTo) {

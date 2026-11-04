@@ -3171,6 +3171,56 @@ Describe 'Set-DemoTargetProfile' {
         $script:message = 'The specified module was not loaded because no valid module file was found in any module directory.'
         (& (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T1 -ProfileName off -CheckPrefix STOP } $config).status | Should -Be 'Warning'
     }
+
+    It 'spends one readiness budget across its attempts: a target that stays down costs it once (review, 2026-11-04)' {
+        # The VM side waits up to readySeconds for its target before 'profile set'; start-demo.ps1's 3 attempts used to
+        # wait 10 (T1) or 20 (T2) minutes each, 34 to 64 minutes in all, before the Warning.
+        $script:ready = [System.Collections.Generic.List[int]]::new()
+        $script:waits = $true
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $script:ready.Add($ReadySeconds)
+            $evidence = if ($script:waits) { @{ ready = 'TimedOut'; readySeconds = $ReadySeconds } } else { @{} }
+            [pscustomobject]@{ Status = 'Fail'; ExitCode = 1; Records = @(); Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Fail' -Message 'T1 didn''t accept connections within 240 seconds' -Evidence $evidence) }
+        }
+        $down = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T1 -ProfileName baseline -CheckPrefix START -Attempts 3 -RetrySeconds 120 } $config
+        $down.status | Should -Be 'Warning'
+        @($script:ready) | Should -Be @(240)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+
+        # A host whose bundle predates readySeconds fails at once: the retries and their pauses are as before.
+        $script:ready.Clear()
+        $script:waits = $false
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName baseline -CheckPrefix START -Attempts 3 -RetrySeconds 120 } $config
+        @($script:ready) | Should -Be @(240, 120, 0)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 2 -Exactly -ParameterFilter { $Seconds -eq 120 }
+
+        # One attempt (deploy.ps1, stop-demo.ps1, the capture) never waits.
+        $script:ready.Clear()
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T1 -ProfileName baseline -CheckPrefix DEPLOY } $config
+        @($script:ready) | Should -Be @(0)
+    }
+
+    It 'counts what the VM side waited before a failure that isn''t readiness, and stays within the budget' {
+        $script:ready = [System.Collections.Generic.List[int]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $script:ready.Add($ReadySeconds)
+            [pscustomobject]@{ Status = 'Fail'; ExitCode = 1; Records = @(); Result = (New-DemoResult -CheckId 'WORKLOAD.T1.COMMAND' -Area 'workload' -Target 'T1' -Status 'Fail' -Message 'runner exited with code 1' -Evidence @{ ready = 'Ready'; readySeconds = 100 }) }
+        }
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T1 -ProfileName baseline -CheckPrefix START -Attempts 3 -RetrySeconds 120 } $config
+        @($script:ready) | Should -Be @(240, 20)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 120 }
+    }
+
+    It 'reports a T2 guest without SQL Server as Not selected, with the relay''s own words (Phase 28)' {
+        $script:failFirst = 9
+        $vmScript = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoWorkloadControl.ps1') -Raw
+        $said = [regex]::Match($vmScript, "\('(T2 isn''t set up yet: SQL Server isn''t installed in \{0\} yet(?:[^']|'')*)' -f \`$GuestName\)").Groups[1].Value -replace "''", "'"
+        $said | Should -Not -BeNullOrEmpty
+        $script:message = 'runner profile set --name baseline --target T2: ' + ($said -replace '\{0\}', 'arcsql01')
+        $missing = & (Get-Module -Name DbHubDemo) { param($c) Set-DemoTargetProfile -Config $c -Target T2 -ProfileName baseline -CheckPrefix START } $config
+        $missing.status | Should -Be 'Not selected'
+        $missing.message | Should -Match 'T2 isn''t set up yet'
+    }
 }
 
 Describe 'Test-DemoStartCost' {
