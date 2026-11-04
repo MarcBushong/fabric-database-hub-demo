@@ -1063,7 +1063,7 @@ The integration:
 **Work summary.**
 
 1. **#31:** the migration's guard looked only for `'showcase'`. A profile name added later would skip every database that had already run the migration, and `profile set` would fail with 547 again. The guard now runs when the definition lacks any allowed name. The test derives the guard's names and compares them with the check's and the procedure's.
-2. **#30:** troubleshooting's entry for the 547 put the update before Stop now. The run's pending auto-stop, which `deploy.ps1` doesn't cancel, could deallocate the VMs in the middle of the update. The entry now gives the order the live rollout used: Stop now (or wait for the auto-stop), then the update, which starts the stopped VMs and T4, then Run all.
+2. **#30:** troubleshooting's entry for the 547 put the update before Stop now. The run's pending auto-stop, which `deploy.ps1` doesn't cancel, could deallocate the VMs in the middle of the update. The entry now gives the order the live rollout used: `stop-demo.ps1`, which waits until the VMs are deallocated (or Stop now, then a wait until they are, because Stop now returns before they stop; the review of this pull request), then the update, which starts the stopped VMs and T4, then Run all.
 
 **Changed files.**
 
