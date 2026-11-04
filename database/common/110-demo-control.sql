@@ -53,11 +53,15 @@ IF COL_LENGTH(N'demo.activity_profile', N'request_id') IS NULL
 GO
 -- 010-schema.sql created the profile-name check before the showcase existed, and creates a table only when it's
 -- missing, so a database from before the showcase gets the check widened here; without it, setting the showcase on
--- T1 or T2 fails with error 547 (the live check of 2026-11-04). The same check as 010-schema.sql's, in one transaction.
+-- T1 or T2 fails with error 547 (the live check of 2026-11-04). The guard looks for every allowed name, so a name
+-- added later widens a check that already has the showcase too. The same check as 010-schema.sql's, in one transaction.
 IF EXISTS (SELECT 1 FROM sys.check_constraints
            WHERE name = N'ck_activity_profile_name'
              AND parent_object_id = OBJECT_ID(N'demo.activity_profile')
-             AND definition NOT LIKE N'%''showcase''%')
+             AND (definition NOT LIKE N'%''off''%'
+                  OR definition NOT LIKE N'%''baseline''%'
+                  OR definition NOT LIKE N'%''business-day''%'
+                  OR definition NOT LIKE N'%''showcase''%'))
 BEGIN
     BEGIN TRY
         BEGIN TRANSACTION;
