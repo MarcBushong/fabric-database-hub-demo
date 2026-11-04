@@ -280,6 +280,7 @@ Sources for this amendment (checked 2026-11-03):
 - Run Command overview (at most 25 managed Run Commands; an action Run Command's 90-minute limit): <https://learn.microsoft.com/azure/virtual-machines/run-command-overview>
 - Monitor a Microsoft SQL database in Database Hub (the Performance page; the problem panels' names aren't on it): <https://learn.microsoft.com/fabric/database/hub/monitor-sql>
 - Serverless compute tier (billed per second for the vCores and memory used, between the minimum and the maximum): <https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-overview>
+
 ## The showcase: anchors, cycles, tiers, request stamps, the host's priority, and plan-regression (2026-11-03)
 
 - **Decision source:** the owner's request of 2026-11-03, that **Run all** in the control notebook run (no dry run) and fill every Database Hub visual, and the coordinator's stage 2 decisions on the approved design: 90 minutes by default and 120 at most (D2), `plan-regression` on T3 (D4), and a newer request superseding an older one (D5; the runbook's side is in [ADR 0020](0020-on-demand-activity-control.md)).

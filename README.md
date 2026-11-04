@@ -490,7 +490,7 @@ Database Hub shows T4's Azure Monitor metrics only: "Query Store-backed top quer
 | T3 `ContosoCare` | 1 | 2 | The same, lighter. It also keeps the serverless database awake, which bills vCore-seconds, inside the free monthly allowance first when T3 has the free offer |
 | T4 `contosocare` | 1 | 2 | The same lookups, a work-item update, and an audit row; low CPU and connections |
 
-- **It's the quiet default:** `activityProfile` is `baseline` unless you change it.
+- **The quiet profile:** set `"activityProfile": "baseline"` for a demo without incidents; the default since 2026-11-03 is `business-day`, which runs the baseline under bounded incidents every hour.
 - **Under the incidents:** `business-day` and the showcase run it beneath their incidents.
 - **On its own:** in the control notebook, `"scenario": "baseline"` for a target runs it alone, for up to 120 minutes; `./scripts/start-demo.ps1 -ActivityProfile baseline` runs it until `./scripts/stop-demo.ps1` or the nightly auto-shutdown.
 
