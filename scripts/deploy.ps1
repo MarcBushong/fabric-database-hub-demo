@@ -55,7 +55,9 @@ summary). It has no guided stop.
   minutes past each UTC hour, which fill Database Hub's Performance page; set activityProfile to baseline for the
   quieter demo. The run sets baseline first and switches to a profile with incidents once its own Run Commands on each
   VM are done, after DONE's checks (DEPLOY.INCIDENTS_*), so no incident slows them; when it ends before that (Ctrl+C,
-  an error), the switch is sent without waiting. A configuration that doesn't set activityProfile gets one notice.
+  an error), the switch is sent without waiting. A VM the run starts gets baseline as soon as its SQL Server, or T2's
+  guest, answers, and the run's own Run Commands there wait for it, at most about 12.5 minutes (DEPLOY.INTERIM_*). A
+  configuration that doesn't set activityProfile gets one notice.
 
 - Every step is idempotent. The last step each track finished is recorded in the resource group's tags, so
   a later run continues from there on any machine, and GitHub Actions (deploy.yml) runs the same tracks.

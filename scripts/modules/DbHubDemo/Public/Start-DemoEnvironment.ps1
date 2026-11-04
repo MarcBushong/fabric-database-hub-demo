@@ -13,7 +13,10 @@ function Start-DemoEnvironment {
     3. Requests both VM starts at once, then waits until sqlvm01 and the T2 VM run (START.VM_*; ADR 0018). With a
        profile with incidents, a VM that was already running gets the interim baseline before the starts are waited for,
        and a VM this start booted gets it as soon as it runs (review of PR 16, 2026-11-04): its profile host resumes the
-       profile stored there about 2 minutes after the boot. Both are sent without waiting (Invoke-DemoActivityQuiet). The
+       profile stored there about 2 minutes after the boot. The first is sent without waiting (Invoke-DemoActivityQuiet).
+       The second is retried on the VM every 15 seconds while its SQL Server, or T2's guest, starts, and this start's own
+       Run Commands there wait for it, at most until its 10-minute bound; one not set by then is a START.INTERIM_<target>
+       Warning with the commands (Wait-DemoActivityInterim, re-review of PR 16). The
        bootstraps resume on their own. A golden snapshot's source host gets its air-gapped guest back
        (T2.GOLDEN.SOURCE, Invoke-DemoGoldenSourceRelease). T1's monitoring plugin, which can stay NotRunning
        after a deallocation (live, 2026-10-22), gets the SQL IaaS Agent service restarted
@@ -230,7 +233,8 @@ function Start-DemoEnvironment {
     # A VM that was already running may still serve an earlier run's incidents: the targets this start sets get the
     # interim baseline before its own Run Commands reach that VM, and its switch brings the profile back (2026-11-03).
     $quietTargets = @('T1') + @(if (-not $SkipT3) { 'T3' }) + @(if ($t4On) { 'T4' }) + @('T2')
-    $quieted = @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @(@('sqlvm01', $hostVm) | Where-Object { -not $startRequested[$_] }) -Target $quietTargets -RequestedBy 'start-demo' -PassThru)
+    $quieted = @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @(@('sqlvm01', $hostVm) | Where-Object { -not $startRequested[$_] }) -Target $quietTargets -RequestedBy 'start-demo' -PassThru | Where-Object { $_.Outcome -eq 'Sent' } | ForEach-Object { [string]$_.VmName } | Select-Object -Unique)
+    $interimSent = [System.Collections.Generic.List[object]]::new()
     foreach ($vm in 'sqlvm01', $hostVm) {
         $startResult = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:$startRequested[$vm]
         $results.Add($startResult)
@@ -238,8 +242,15 @@ function Start-DemoEnvironment {
         # from its switch, or until 2 minutes before the next auto-shutdown, so it can outlive a stop), so it gets the
         # interim baseline as soon as it runs, before this start's own Run Commands there (review of PR 16, 2026-11-04).
         if ([string]$startResult.status -eq 'Pass' -and $vm -notin $quieted) {
-            Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName $vm -Target $quietTargets -RequestedBy 'start-demo' -Started
+            foreach ($sentItem in @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName $vm -Target $quietTargets -RequestedBy 'start-demo' -Started -PassThru)) {
+                $interimSent.Add($sentItem)
+            }
         }
+    }
+    # Its SQL Server, or T2's guest, can still be starting, so the VM retries the interim baseline, and this start's own
+    # Run Commands there wait for it, at most until its 10-minute bound (re-review of PR 16, 2026-11-04).
+    foreach ($item in @(Wait-DemoActivityInterim -Config $Config -ActivityProfile $activity -Record $interimSent.ToArray() -CheckPrefix 'START')) {
+        $results.Add($item)
     }
     $running = @{}
     foreach ($vm in 'sqlvm01', $hostVm) {

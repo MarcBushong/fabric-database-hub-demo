@@ -218,9 +218,11 @@ function Wait-DemoStoppedStart {
     fail, so the caller stops there. Updates the status page's StartVms step. Nothing when nothing was stopped. T1's
     monitoring plugin, which can stop after a restart, is the caller's next check (Invoke-DemoT1MonitoringCheck), on
     every run without a T1 Monitoring step, whether or not this run started sqlvm01. With -ActivityProfile (one with
-    incidents), each VM that now runs gets its targets' interim baseline as soon as it does, before the run's Run Commands
-    there, sent without waiting (Invoke-DemoActivityQuiet -Started): its profile host resumes the profile stored there
-    about 2 minutes after the boot (review of PR 16, 2026-11-04). Internal.
+    incidents), each VM that now runs gets its targets' interim baseline as soon as it does (Invoke-DemoActivityQuiet
+    -Started): its profile host resumes the profile stored there about 2 minutes after the boot (review of PR 16,
+    2026-11-04). The VM retries it while its SQL Server, or T2's guest, starts, and this waits for it before the run's
+    first Run Command there, at most until its 10-minute bound, with DEPLOY.INTERIM_<target> (Wait-DemoActivityInterim,
+    re-review of PR 16). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -250,6 +252,7 @@ function Wait-DemoStoppedStart {
     # What this run itself started: its own request (Request-DemoVmStart), or the start Invoke-DemoVmPowerAction issued
     # once a VM that was still stopping had settled; never one that was already starting (Phase 28 review).
     $issued = [System.Collections.Generic.List[string]]::new()
+    $interimSent = [System.Collections.Generic.List[object]]::new()
     foreach ($vm in @($Request.Vms.Keys)) {
         $item = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:([bool]$Request.Vms[$vm].Requested)
         $results.Add($item)
@@ -257,11 +260,21 @@ function Wait-DemoStoppedStart {
             $notRunning.Add($vm)
         }
         elseif ($null -ne $ActivityProfile) {
-            Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $ActivityProfile -VmName $vm -RequestedBy 'deploy' -Started
+            foreach ($sentItem in @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $ActivityProfile -VmName $vm -RequestedBy 'deploy' -Started -PassThru)) {
+                $interimSent.Add($sentItem)
+            }
         }
         $itemEvidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
         if ([bool]$Request.Vms[$vm].Requested -or [string](Get-DemoMemberValue -InputObject $itemEvidence -Name 'issued') -eq 'start') {
             $issued.Add($vm)
+        }
+    }
+    # The interim baseline on each VM this run started is retried there while its SQL Server, or T2's guest, starts, and
+    # the run's first Run Command there (the golden source's release below, then the tracks') waits for it, at most until
+    # its 10-minute bound (re-review of PR 16, 2026-11-04).
+    if ($null -ne $ActivityProfile -and $interimSent.Count -gt 0) {
+        foreach ($interim in @(Wait-DemoActivityInterim -Config $Config -ActivityProfile $ActivityProfile -Record $interimSent.ToArray() -CheckPrefix 'DEPLOY')) {
+            $results.Add($interim)
         }
     }
     # The T2 guest starts with its host (its automatic start action), except on a golden snapshot's source host,

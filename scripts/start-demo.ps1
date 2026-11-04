@@ -21,10 +21,11 @@ sections 9.4, 9.6).
   at fixed minutes past each UTC hour, which fill Database Hub's Performance page; set activityProfile to baseline for
   the quieter demo. A profile with incidents is set as baseline first and switched once this start's own Run Commands
   are done, at the warm-up's start (START.INCIDENTS_*), so no incident slows them; with -Interactive
-  -ResetAdminPassword, archost01's switch comes after the host password. A start that ends before its switch (Ctrl+C,
-  an error) sends it without waiting. A configuration that doesn't set activityProfile gets one notice. The VMs don't
-  set a profile at boot unless activityProfileOnBoot is true, so a VM that starts some other way doesn't keep T3 awake
-  (ADR 0016).
+  -ResetAdminPassword, archost01's switch comes after the host password. A VM this start boots gets baseline as soon as
+  its SQL Server, or T2's guest, answers, and this start's own Run Commands there wait for it, at most about 12.5
+  minutes (START.INTERIM_*). A start that ends before its switch (Ctrl+C, an error) sends it without waiting. A
+  configuration that doesn't set activityProfile gets one notice. The VMs don't set a profile at boot unless
+  activityProfileOnBoot is true, so a VM that starts some other way doesn't keep T3 awake (ADR 0016).
 - -WarmUpMinutes: the activity keeps running in the background and the script returns once the profiles are
   set (ADR 0018); START.WARMUP says when to check the telemetry. -WaitForWarmUp waits that long and checks
   that telemetry arrives (the scheduled warm-up workflows use 30).

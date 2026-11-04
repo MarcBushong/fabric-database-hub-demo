@@ -936,6 +936,11 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:calls.Add(('switch {0}={1} wait={2}' -f (@($Target) -join ','), $ProfileName, $wait))
             foreach ($item in $Target) { [pscustomobject]@{ Target = $item; VmName = $(if ($item -eq 'T2') { 'archost01' } else { 'sqlvm01' }); Outcome = $(if ($wait -eq 0) { 'Sent' } else { 'Set' }); Detail = ''; Data = $null; Seconds = 9 } }
         }
+        # The wait for the interim baseline on a VM this run started (re-review of PR 16, 2026-11-04).
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoProfileRunCommand -MockWith {
+            $script:calls.Add(('interim {0}' -f (@($Record | ForEach-Object { $_.Target }) -join ',')))
+            foreach ($item in $Record) { [pscustomobject]@{ Target = $item.Target; VmName = $item.VmName; Outcome = 'Set'; Detail = ''; Data = $null; Seconds = 30 } }
+        }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -1354,11 +1359,13 @@ Describe 'Invoke-DemoParallelDeployment' {
             @($calls | Where-Object { $_ -like 'running archost01*' }) | Should -BeNullOrEmpty -Because 'a running VM is only read'
             $calls | Should -Not -Contain 'source release' -Because 'archost01 wasn''t started'
             $calls | Should -Not -Contain 't1 monitoring' -Because 'T1''s own Monitoring step runs in this run'
-            # sqlvm01, which this run started, gets the interim baseline as soon as it runs, and archost01, which already
-            # ran, next: both before the template and the tracks (review of PR 16, 2026-11-04).
+            # sqlvm01, which this run started, gets the interim baseline as soon as it runs, and the run waits for it; then
+            # archost01, which already ran: all before the template and the tracks (review of PR 16, and its re-review).
             $calls.IndexOf('switch T1,T3=baseline wait=0') | Should -Be ($calls.IndexOf('running sqlvm01 requested=True') + 1)
-            $calls.IndexOf('switch T2=baseline wait=0') | Should -Be ($calls.IndexOf('switch T1,T3=baseline wait=0') + 1)
+            $calls.IndexOf('interim T1,T3') | Should -Be ($calls.IndexOf('switch T1,T3=baseline wait=0') + 1)
+            $calls.IndexOf('switch T2=baseline wait=0') | Should -Be ($calls.IndexOf('interim T1,T3') + 1)
             $calls.IndexOf('switch T2=baseline wait=0') | Should -BeLessThan $calls.IndexOf('template disk=golden')
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.INTERIM_T1' }).status | Should -Be 'Pass'
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).status | Should -Be 'Pass'
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         }

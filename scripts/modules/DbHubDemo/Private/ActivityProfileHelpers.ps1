@@ -375,7 +375,13 @@ function Get-DemoProfileRunCommandScript {
     in order, with the target in its evidence: the template's own line is captured and cut to its status, the end of its
     message, and the runner's exit code, so the lines of up to four targets fit in the 4 KB of output the instance view
     keeps. After -NotAfterUtc the script changes nothing and prints an expired line per target, so one that a
-    deallocation held back never changes a profile when the VM starts again. Windows PowerShell 5.1. Pure. Internal.
+    deallocation held back never changes a profile when the VM starts again. With -RetrySeconds, each target's request is
+    tried again that many seconds apart until the runner sets it, until it says the target isn't set up, or until
+    -NotAfterUtc (review of PR 16, 2026-11-04): on a VM that has just booted, T1's and T2's profiles live in a SQL Server
+    that's still starting, and T2's behind a guest that boots after its host, and the runner retries only transient
+    errors. T3's and T4's profiles are files on T1 (CommandLine.cs, Store), so with -RetrySeconds they're set first,
+    before T1's retries, and only the last target is ever tried again. Each line's evidence has the attempts. Windows
+    PowerShell 5.1. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -396,7 +402,10 @@ function Get-DemoProfileRunCommandScript {
         [datetime] $NotAfterUtc,
 
         [ValidateRange(30, 1800)]
-        [int] $RunnerTimeoutSeconds = 300
+        [int] $RunnerTimeoutSeconds = 300,
+
+        [ValidateRange(0, 120)]
+        [int] $RetrySeconds = 0
     )
 
     $notAfter = $NotAfterUtc.ToUniversalTime()
@@ -421,12 +430,17 @@ function Get-DemoProfileRunCommandScript {
     }
     $lines.Add('}')
     $lines.Add('else {')
-    foreach ($item in $Target) {
+    $order = if ($RetrySeconds -gt 0) { @($Target | Where-Object { $_ -in 'T3', 'T4' }) + @($Target | Where-Object { $_ -in 'T1', 'T2' }) } else { $Target }
+    foreach ($item in $order) {
         $arguments = @('profile', 'set', '--name', $ProfileName, '--requested-by', $RequestedBy)
         if ($ProfileName -ne 'off') {
             $arguments += @('--not-after', '{{NEXT_SHUTDOWN}}')
         }
-        # The template's line, captured and cut short, so every target's line survives the instance view's 4 KB.
+        # The template's line, captured and cut short, so every target's line survives the instance view's 4 KB; with
+        # -RetrySeconds, tried again until the runner sets it, says the target isn't set up, or the expiry comes.
+        $lines.Add('$dbhubAttempts = 0')
+        $lines.Add('while ($true) {')
+        $lines.Add('$dbhubAttempts++')
         $lines.Add('$dbhubOut = [Console]::Out')
         $lines.Add('$dbhubWriter = New-Object -TypeName System.IO.StringWriter')
         $lines.Add('[Console]::SetOut($dbhubWriter)')
@@ -443,13 +457,26 @@ function Get-DemoProfileRunCommandScript {
         $lines.Add('        try { $dbhubResult = $dbhubText.Substring($dbhubAt + 19) | ConvertFrom-Json } catch { $dbhubResult = $null }')
         $lines.Add('    }')
         $lines.Add('}')
-        $lines.Add(('$dbhubShort = @{{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = ''Fail''; message = ''{0}: the runner printed no result line.''; evidence = @{{ target = ''{0}'' }} }}' -f $item))
+        if ($RetrySeconds -gt 0) {
+            $lines.Add('$dbhubState = [string]::Empty')
+            $lines.Add('$dbhubSaid = [string]::Empty')
+            $lines.Add('if ($null -ne $dbhubResult) { $dbhubState = [string]$dbhubResult.status; $dbhubSaid = [string]$dbhubResult.message }')
+            $lines.Add('if ($dbhubState -eq ''Pass'' -or $dbhubState -eq ''Warning'') { break }')
+            $lines.Add('if ($dbhubSaid -match ''(?i)not installed|no workload runner|isn.t set up yet|no valid module file|has no T3 server|has no T4 server'') { break }')
+            $lines.Add(('if ([System.DateTime]::UtcNow.AddSeconds({0}) -ge $dbhubNotAfter) {{ break }}' -f $RetrySeconds))
+            $lines.Add(('Start-Sleep -Seconds {0}' -f $RetrySeconds))
+        }
+        else {
+            $lines.Add('break')
+        }
+        $lines.Add('}')
+        $lines.Add(('$dbhubShort = @{{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = ''Fail''; message = ''{0}: the runner printed no result line.''; evidence = @{{ target = ''{0}''; attempts = $dbhubAttempts }} }}' -f $item))
         $lines.Add('if ($null -ne $dbhubResult) {')
         $lines.Add('    $dbhubMessage = [string]$dbhubResult.message')
         $lines.Add('    if ($dbhubMessage.Length -gt 300) { $dbhubMessage = ''...'' + $dbhubMessage.Substring($dbhubMessage.Length - 300) }')
         $lines.Add('    $dbhubExit = $null')
         $lines.Add('    if ($null -ne $dbhubResult.evidence) { $dbhubExit = $dbhubResult.evidence.exitCode }')
-        $lines.Add(('    $dbhubShort = @{{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = [string]$dbhubResult.status; message = $dbhubMessage; evidence = @{{ target = ''{0}''; exitCode = $dbhubExit }} }}' -f $item))
+        $lines.Add(('    $dbhubShort = @{{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = [string]$dbhubResult.status; message = $dbhubMessage; evidence = @{{ target = ''{0}''; exitCode = $dbhubExit; attempts = $dbhubAttempts }} }}' -f $item))
         $lines.Add('}')
         $lines.Add('[Console]::Out.WriteLine(''DBHUBDEMO-WORKLOAD '' + (ConvertTo-Json -InputObject $dbhubShort -Depth 4 -Compress))')
     }
@@ -532,13 +559,15 @@ function Send-DemoProfileRunCommand {
       script carries its own expiry, so they never pile up (25 per VM at most,
       https://learn.microsoft.com/azure/virtual-machines/run-command-overview) and none is left to delete;
       status.ps1 counts it as the scripts' own, like the bootstrap loader. Once its expiry (-ExpiresMinutes) passes, the
-      script changes nothing (Get-DemoProfileRunCommandScript).
+      script changes nothing (Get-DemoProfileRunCommandScript), and -RetrySeconds has the VM try each target again until
+      then.
     - A state from an earlier request under the same name doesn't count: only an execution that started after this
       request's PUT, less a minute for the clocks.
     - Outcome: Set (the runner set the profile), NotSetUp (the target has no runner yet: T2 before SQL Server setup, or T3
       or T4 that T1 doesn't drive yet), Failed (the runner or the Run Command failed; Detail says why), TimedOut (no
       result within -WaitSeconds: the Run Command goes on, until its expiry), NotSent (Azure didn't accept it, for
-      example on a VM that isn't running), or, with -WaitSeconds 0, Sent (accepted, not waited for).
+      example on a VM that isn't running), or, with -WaitSeconds 0, Sent (accepted, not waited for; its Data has what
+      Wait-DemoProfileRunCommand needs to wait for it later).
     - -OnSent runs with the VM's name as soon as Azure accepts that VM's request, before the next VM's, so a caller can
       forget a VM only once its request is in, even when a stop (Ctrl+C) ends this midway (review of PR 16, 2026-11-04).
     #>
@@ -569,6 +598,12 @@ function Send-DemoProfileRunCommand {
         [ValidateRange(5, 120)]
         [int] $ExpiresMinutes = 30,
 
+        [ValidateRange(0, 120)]
+        [int] $RetrySeconds = 0,
+
+        [ValidateRange(30, 1800)]
+        [int] $RunnerTimeoutSeconds = 300,
+
         [AllowNull()]
         [scriptblock] $OnSent = $null
     )
@@ -577,9 +612,10 @@ function Send-DemoProfileRunCommand {
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
     $hostVm = Get-DemoHostVmName -Config $Config
     $apiVersion = Get-DemoRunCommandApiVersion
-    $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    $notBefore = [DateTime]::UtcNow.AddMinutes(-1)
-    $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+    $sentUtc = [DateTime]::UtcNow
+    $notBefore = $sentUtc.AddMinutes(-1)
+    $expiresUtc = $sentUtc.AddMinutes($ExpiresMinutes)
+    $deadline = $sentUtc.AddSeconds($WaitSeconds)
     $groups = [ordered]@{}
     foreach ($item in $Target) {
         $vm = if ($item -eq 'T2') { $hostVm } else { 'sqlvm01' }
@@ -593,13 +629,13 @@ function Send-DemoProfileRunCommand {
     $records = @{}
     $record = {
         param([string] $Item, [string] $Vm, [string] $Outcome, [string] $Detail, [object] $Data = $null)
-        $records[$Item] = [pscustomobject]@{ Target = $Item; VmName = $Vm; Outcome = $Outcome; Detail = $Detail; Data = $Data; Seconds = [int]$clock.Elapsed.TotalSeconds }
+        $records[$Item] = [pscustomobject]@{ Target = $Item; VmName = $Vm; Outcome = $Outcome; Detail = $Detail; Data = $Data; Seconds = [int]([DateTime]::UtcNow - $sentUtc).TotalSeconds }
     }
     $sent = [ordered]@{}
     $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-profile'
     try {
         foreach ($vm in @($groups.Keys)) {
-            $script = Get-DemoProfileRunCommandScript -Target @($groups[$vm]) -ProfileName $ProfileName -RequestedBy $RequestedBy -NotAfterUtc ([DateTime]::UtcNow.AddMinutes($ExpiresMinutes))
+            $script = Get-DemoProfileRunCommandScript -Target @($groups[$vm]) -ProfileName $ProfileName -RequestedBy $RequestedBy -NotAfterUtc $expiresUtc -RetrySeconds $RetrySeconds -RunnerTimeoutSeconds $RunnerTimeoutSeconds
             $body = [ordered]@{
                 location   = [string]$Config['location']
                 properties = [ordered]@{
@@ -636,59 +672,123 @@ function Send-DemoProfileRunCommand {
         Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
     }
 
-    if ($WaitSeconds -le 0) {
-        foreach ($vm in $sent.Keys) {
-            foreach ($item in $groups[$vm]) {
-                & $record $item $vm 'Sent' ('Sent to {0}; it runs there when the VM gets to it.' -f $vm)
-            }
+    foreach ($vm in $sent.Keys) {
+        foreach ($item in $groups[$vm]) {
+            & $record $item $vm 'Sent' ('Sent to {0}; it runs there when the VM gets to it.' -f $vm) ([pscustomobject]@{ Url = $sent[$vm]; NotBefore = $notBefore; SentUtc = $sentUtc; ExpiresUtc = $expiresUtc })
         }
     }
-    else {
-        $terminal = @('Succeeded', 'Failed', 'TimedOut', 'Canceled')
-        $pending = [System.Collections.Generic.List[string]]::new([string[]]@($sent.Keys))
-        while ($pending.Count -gt 0) {
-            foreach ($vm in @($pending)) {
-                $state = Get-DemoRunCommandState -SubscriptionId $subscriptionId -Url $sent[$vm]
-                $startTime = Get-DemoMemberValue -InputObject $state -Name 'StartTime'
-                $fresh = $null -eq $startTime -or $startTime -ge $notBefore
-                $done = $state.Found -and $fresh -and ($state.ExecutionState -in $terminal -or $state.ProvisioningState -eq 'Failed')
-                if (-not $done) {
-                    continue
-                }
-                $null = $pending.Remove($vm)
-                $lines = ConvertFrom-DemoProfileRunCommandOutput -Output ([string]$state.Output) -Target @($groups[$vm])
-                foreach ($item in $groups[$vm]) {
-                    $data = $lines[$item]
-                    if ($null -eq $data) {
-                        $detail = if ($state.ExecutionState -ne 'Succeeded') { 'the Run Command ended {0}{1}' -f $(if ($state.ExecutionState) { $state.ExecutionState } else { 'with provisioning state ' + $state.ProvisioningState }), $(if ($state.Error) { ': ' + $state.Error } else { '' }) } else { 'its result line isn''t in the output the Run Command kept' }
-                        & $record $item $vm 'Failed' $detail
-                        continue
-                    }
-                    $status = [string]$data['status']
-                    $message = Protect-DemoText -Text ([string]$data['message'])
-                    if ($status -in 'Pass', 'Warning') {
-                        & $record $item $vm 'Set' $message $data
-                    }
-                    elseif (($item -eq 'T2' -and (Test-DemoT2NotSetUpText -Text $message)) -or $message -match '(?i)runner is not installed|has no T3 server|has no T4 server') {
-                        & $record $item $vm 'NotSetUp' $message $data
-                    }
-                    else {
-                        & $record $item $vm 'Failed' $message $data
-                    }
-                }
-            }
-            if ($pending.Count -eq 0 -or [DateTime]::UtcNow -ge $deadline) {
-                break
-            }
-            Start-Sleep -Seconds ([int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, ($deadline - [DateTime]::UtcNow).TotalSeconds)))
-        }
-        foreach ($vm in $pending) {
-            foreach ($item in $groups[$vm]) {
-                & $record $item $vm 'TimedOut' ('{0} didn''t finish it within {1} seconds' -f $vm, $WaitSeconds)
-            }
+    if ($WaitSeconds -gt 0 -and $sent.Count -gt 0) {
+        $waitable = @(foreach ($item in $Target) { if ($records.ContainsKey($item) -and $records[$item].Outcome -eq 'Sent') { $records[$item] } })
+        $left = [int][System.Math]::Max(1, [System.Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
+        foreach ($item in @(Wait-DemoProfileRunCommand -Config $Config -Record $waitable -WaitSeconds $left -PollSeconds $PollSeconds -ReportedWaitSeconds $WaitSeconds)) {
+            $records[[string]$item.Target] = $item
         }
     }
     return @(foreach ($item in $Target) {
+            if ($records.ContainsKey($item)) {
+                $records[$item]
+            }
+        })
+}
+
+function Wait-DemoProfileRunCommand {
+    <#
+    .SYNOPSIS
+    Waits for DbHubDemo-Profile Run Commands that Send-DemoProfileRunCommand sent without waiting (its Sent records, whose
+    Data has the Run Command's URL and when it was sent), for every VM together, at most -WaitSeconds, and returns each
+    target's record as a send that waits does: Set, NotSetUp, Failed, or TimedOut. Any other record, and one without a
+    URL, is returned as it is. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyCollection()]
+        [object[]] $Record = @(),
+
+        [ValidateRange(1, 1800)]
+        [int] $WaitSeconds = 180,
+
+        [ValidateRange(1, 60)]
+        [int] $PollSeconds = 10,
+
+        [ValidateRange(0, 3600)]
+        [int] $ReportedWaitSeconds = 0
+    )
+
+    $subscriptionId = [string]$Config['subscriptionId']
+    $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+    $shown = if ($ReportedWaitSeconds -gt 0) { $ReportedWaitSeconds } else { $WaitSeconds }
+    $order = [System.Collections.Generic.List[string]]::new()
+    $records = @{}
+    $groups = [ordered]@{}
+    foreach ($item in @($Record | Where-Object { $null -ne $_ })) {
+        $name = [string]$item.Target
+        $order.Add($name)
+        $url = [string](Get-DemoMemberValue -InputObject $item.Data -Name 'Url')
+        if ([string]$item.Outcome -ne 'Sent' -or -not $url) {
+            $records[$name] = $item
+            continue
+        }
+        $vm = [string]$item.VmName
+        if (-not $groups.Contains($vm)) {
+            $groups[$vm] = [pscustomobject]@{ Url = $url; NotBefore = (Get-DemoMemberValue -InputObject $item.Data -Name 'NotBefore'); SentUtc = (Get-DemoMemberValue -InputObject $item.Data -Name 'SentUtc'); Targets = [System.Collections.Generic.List[string]]::new() }
+        }
+        $groups[$vm].Targets.Add($name)
+    }
+    $addRecord = {
+        param([string] $Item, [string] $Vm, [string] $Outcome, [string] $Detail, [object] $Data = $null)
+        $from = $groups[$Vm].SentUtc
+        $seconds = if ($from -is [datetime]) { [int]([DateTime]::UtcNow - $from).TotalSeconds } else { 0 }
+        $records[$Item] = [pscustomobject]@{ Target = $Item; VmName = $Vm; Outcome = $Outcome; Detail = $Detail; Data = $Data; Seconds = $seconds }
+    }
+    $terminal = @('Succeeded', 'Failed', 'TimedOut', 'Canceled')
+    $pending = [System.Collections.Generic.List[string]]::new([string[]]@($groups.Keys))
+    while ($pending.Count -gt 0) {
+        foreach ($vm in @($pending)) {
+            $group = $groups[$vm]
+            $state = Get-DemoRunCommandState -SubscriptionId $subscriptionId -Url $group.Url
+            $startTime = Get-DemoMemberValue -InputObject $state -Name 'StartTime'
+            $fresh = $null -eq $startTime -or $null -eq $group.NotBefore -or $startTime -ge $group.NotBefore
+            $done = $state.Found -and $fresh -and ($state.ExecutionState -in $terminal -or $state.ProvisioningState -eq 'Failed')
+            if (-not $done) {
+                continue
+            }
+            $null = $pending.Remove($vm)
+            $lines = ConvertFrom-DemoProfileRunCommandOutput -Output ([string]$state.Output) -Target @($group.Targets)
+            foreach ($item in $group.Targets) {
+                $data = $lines[$item]
+                if ($null -eq $data) {
+                    $detail = if ($state.ExecutionState -ne 'Succeeded') { 'the Run Command ended {0}{1}' -f $(if ($state.ExecutionState) { $state.ExecutionState } else { 'with provisioning state ' + $state.ProvisioningState }), $(if ($state.Error) { ': ' + $state.Error } else { '' }) } else { 'its result line isn''t in the output the Run Command kept' }
+                    & $addRecord $item $vm 'Failed' $detail
+                    continue
+                }
+                $status = [string]$data['status']
+                $message = Protect-DemoText -Text ([string]$data['message'])
+                if ($status -in 'Pass', 'Warning') {
+                    & $addRecord $item $vm 'Set' $message $data
+                }
+                elseif (($item -eq 'T2' -and (Test-DemoT2NotSetUpText -Text $message)) -or $message -match '(?i)runner is not installed|has no T3 server|has no T4 server') {
+                    & $addRecord $item $vm 'NotSetUp' $message $data
+                }
+                else {
+                    & $addRecord $item $vm 'Failed' $message $data
+                }
+            }
+        }
+        if ($pending.Count -eq 0 -or [DateTime]::UtcNow -ge $deadline) {
+            break
+        }
+        Start-Sleep -Seconds ([int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, ($deadline - [DateTime]::UtcNow).TotalSeconds)))
+    }
+    foreach ($vm in $pending) {
+        foreach ($item in $groups[$vm].Targets) {
+            & $addRecord $item $vm 'TimedOut' ('{0} didn''t finish it within {1} seconds' -f $vm, $shown)
+        }
+    }
+    return @(foreach ($item in $order) {
             if ($records.ContainsKey($item)) {
                 $records[$item]
             }
@@ -881,13 +981,17 @@ function Invoke-DemoActivityQuiet {
     2026-11-04). Run Commands on a busy VM took minutes (2026-10-23). Internal.
 
     .DESCRIPTION
-    One managed Run Command per VM, sent without waiting, which does nothing after 10 minutes. Each VM is noted before its
-    request goes out, so a stop (Ctrl+C) during the send still leaves it to the run's switch at its end, or to the one a
-    stop or a failure sends, which brings the profile back; a VM Azure refused, which nothing else had noted, is forgotten
-    again. -PassThru returns the VMs it reached. Nothing for a profile without incidents. Never throws, apart from a stop.
+    One managed Run Command per VM, which does nothing after 10 minutes. On a VM that's already running it's sent without
+    waiting. On a VM the run started (-Started), its SQL Server, or for T2 its guest, can still be starting, so the VM
+    tries each target every 15 seconds until it's set or the 10 minutes pass (Get-DemoProfileRunCommandScript
+    -RetrySeconds), and the caller waits for it with Wait-DemoActivityInterim before its own Run Commands there (re-review
+    of PR 16, 2026-11-04). Each VM is noted before its request goes out, so a stop (Ctrl+C) during the send still leaves it
+    to the run's switch at its end, or to the one a stop or a failure sends, which brings the profile back; a VM Azure
+    refused, which nothing else had noted, is forgotten again. -PassThru returns the send's records (Sent, or NotSent with
+    why). Nothing for a profile without incidents. Never throws, apart from a stop.
     #>
     [CmdletBinding()]
-    [OutputType([string[]])]
+    [OutputType([pscustomobject[]])]
     param(
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
@@ -927,8 +1031,10 @@ function Invoke-DemoActivityQuiet {
         Register-DemoActivitySwitch -VmName $vm
     }
     $reachedVms = @()
+    $sent = @()
     try {
-        $sent = @(Send-DemoProfileRunCommand -Config $Config -Target $targets -ProfileName $ActivityProfile.Interim -RequestedBy $RequestedBy -WaitSeconds 0 -ExpiresMinutes 10)
+        $retry = if ($Started) { @{ RetrySeconds = 15; RunnerTimeoutSeconds = 120 } } else { @{} }
+        $sent = @(Send-DemoProfileRunCommand -Config $Config -Target $targets -ProfileName $ActivityProfile.Interim -RequestedBy $RequestedBy -WaitSeconds 0 -ExpiresMinutes 10 @retry)
         $reached = @($sent | Where-Object { $_.Outcome -eq 'Sent' })
         $reachedVms = @($reached | ForEach-Object { [string]$_.VmName } | Select-Object -Unique)
         foreach ($vm in $sending) {
@@ -940,7 +1046,7 @@ function Invoke-DemoActivityQuiet {
             $vmText = Join-DemoActivityList -Item $reachedVms
             $targetText = Join-DemoActivityList -Item @($reached | ForEach-Object { [string]$_.Target })
             $message = if ($Started) {
-                '{0} started, so {1} get the interim {2} now that {4}, without waiting: its profile host resumes the profile stored there about 2 minutes after the boot, and no incident slows this run''s own Run Commands there; {3} comes back at the end.' -f $vmText, $targetText, $ActivityProfile.Interim, $ActivityProfile.Name, $(if ($reachedVms.Count -eq 1) { 'it runs' } else { 'they run' })
+                '{0} started, so {1} get the interim {2} before this run''s own Run Commands there: its profile host resumes the profile stored there about 2 minutes after the boot. {3} tries every 15 seconds until it''s set, for at most 10 minutes, while its SQL Server starts; {4} comes back at the end.' -f $vmText, $targetText, $ActivityProfile.Interim, $(if ($reachedVms.Count -eq 1) { 'The VM' } else { 'Each VM' }), $ActivityProfile.Name
             }
             else {
                 '{0} {1} already running, so {2} get the interim {3} first, without waiting: no incident slows this run''s own Run Commands there, and {4} comes back at the end.' -f $vmText, $(if ($reachedVms.Count -eq 1) { 'was' } else { 'were' }), $targetText, $ActivityProfile.Interim, $ActivityProfile.Name
@@ -952,8 +1058,89 @@ function Invoke-DemoActivityQuiet {
         Write-DemoLog -Level Debug -Message ('The interim baseline wasn''t sent to {0}: {1}' -f (Join-DemoActivityList -Item $sending), (Protect-DemoText -Text $_.Exception.Message))
     }
     if ($PassThru) {
-        return $reachedVms
+        return $sent
     }
+}
+
+function Wait-DemoActivityInterim {
+    <#
+    .SYNOPSIS
+    Waits for the interim baseline Invoke-DemoActivityQuiet -Started sent to VMs the run started, so the run's own first
+    Run Command on such a VM starts only once the baseline is set there or its bound has passed (re-review of PR 16,
+    2026-11-04): every VM together, until its Run Command ends, at most until its 10-minute expiry plus one attempt and a
+    margin. Returns one <CheckPrefix>.INTERIM_<target> per target: Pass when it's set, Not selected when the target has no
+    runner yet, and a Warning with the exact commands when it wasn't set in time, failed, or wasn't accepted. Nothing for
+    a profile without incidents, or without records. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $ActivityProfile,
+
+        [AllowEmptyCollection()]
+        [object[]] $Record = @(),
+
+        [Parameter(Mandatory)]
+        [ValidateSet('DEPLOY', 'START')]
+        [string] $CheckPrefix,
+
+        [ValidateRange(1, 60)]
+        [int] $PollSeconds = 10
+    )
+
+    $items = @($Record | Where-Object { $null -ne $_ })
+    if (-not $ActivityProfile.HasIncidents -or $items.Count -eq 0) {
+        return @()
+    }
+    $name = [string]$ActivityProfile.Name
+    $interim = [string]$ActivityProfile.Interim
+    $docUrl = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
+    # The last attempt can start just before the expiry and take the runner's 2 minutes, so the bound adds those and 30 s.
+    $until = $null
+    foreach ($item in $items) {
+        $expires = Get-DemoMemberValue -InputObject $item.Data -Name 'ExpiresUtc'
+        if ($expires -is [datetime] -and ($null -eq $until -or $expires -gt $until)) {
+            $until = $expires
+        }
+    }
+    if ($null -eq $until) {
+        $until = [DateTime]::UtcNow.AddMinutes(10)
+    }
+    $waitSeconds = [int][System.Math]::Min(1800, [System.Math]::Max(1, [System.Math]::Ceiling(($until.AddSeconds(150) - [DateTime]::UtcNow).TotalSeconds)))
+    $vms = @($items | Where-Object { $_.Outcome -eq 'Sent' } | ForEach-Object { [string]$_.VmName } | Select-Object -Unique)
+    if ($vms.Count -gt 0) {
+        Write-DemoLog -Message ('Waiting for the interim {0} on {1}, which this run started, before its own Run Commands there: at most {2} minutes.' -f $interim, (Join-DemoActivityList -Item $vms), [int][System.Math]::Ceiling($waitSeconds / 60.0))
+    }
+    $records = @(Wait-DemoProfileRunCommand -Config $Config -Record $items -WaitSeconds $waitSeconds -PollSeconds $PollSeconds)
+    $results = foreach ($entry in $records) {
+        $item = [string]$entry.Target
+        $vm = [string]$entry.VmName
+        $checkId = '{0}.INTERIM_{1}' -f $CheckPrefix, $item
+        $attempts = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $entry.Data -Name 'evidence') -Name 'attempts'
+        $evidence = [ordered]@{ profile = $interim; switchTo = $name; vm = $vm; outcome = [string]$entry.Outcome; seconds = $entry.Seconds; attempts = $attempts; runCommand = 'DbHubDemo-Profile' }
+        $fix = './scripts/validate.ps1 -Area Workload -Target {0} says whether {0}''s runner answers now. If this run''s switch to {1} ({2}.INCIDENTS_{0}) didn''t pass, set it once it does: ./scripts/demo-control.ps1 -Target {0} -Scenario {1} -Duration 240.' -f $item, $name, $CheckPrefix
+        $risk = 'This run''s own Run Commands there went on, so the profile stored there could run its incidents beside them.'
+        switch ([string]$entry.Outcome) {
+            'Set' {
+                $tries = if ($attempts -as [int]) { ' and {0} attempt(s)' -f [int]$attempts } else { '' }
+                New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status 'Pass' -Message ('{0}: the interim {1} is set on {2}, which this run started, in {3} seconds{4}, before this run''s own Run Commands there; {5} comes back at the end.' -f $item, $interim, $vm, $entry.Seconds, $tries, $name) -Evidence $evidence -DocUrl $docUrl
+            }
+            'NotSetUp' {
+                New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status 'Not selected' -Message ('{0}: no interim {1} to set on {2}: {3}' -f $item, $interim, $vm, $entry.Detail) -Evidence $evidence -DocUrl $docUrl
+            }
+            'TimedOut' {
+                New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status 'Warning' -Message ('{0}: the interim {1} on {2}, which this run started, wasn''t set within {3} seconds. {4}' -f $item, $interim, $vm, $waitSeconds, $risk) -Evidence $evidence -Remediation $fix -DocUrl $docUrl
+            }
+            default {
+                New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status 'Warning' -Message ('{0}: the interim {1} couldn''t be set on {2}, which this run started: {3}. {4}' -f $item, $interim, $vm, ([string]$entry.Detail).TrimEnd('.'), $risk) -Evidence $evidence -Remediation $fix -DocUrl $docUrl
+            }
+        }
+    }
+    return @($results)
 }
 
 function Get-DemoScheduledIncident {

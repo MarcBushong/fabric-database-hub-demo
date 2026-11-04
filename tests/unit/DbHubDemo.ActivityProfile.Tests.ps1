@@ -31,6 +31,54 @@ BeforeAll {
         'DBHUBDEMO-WORKLOAD ' + ([ordered]@{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = $Status; message = $Message; evidence = [ordered]@{ target = $Target; exitCode = 0 } } | ConvertTo-Json -Depth 4 -Compress)
     }
 
+    function New-RetryBundle([int] $Fails) {
+        # A stand-in for the bundle on a VM, which settings.json names: its control script fails for T1 -Fails times, as
+        # while SQL Server starts, then sets the profile; T3 and T4, files on T1, are set at once; T2 isn't set up yet.
+        # order.txt lists the targets in the order they were tried.
+        $bundle = Join-Path -Path $TestDrive -ChildPath ('bundle-' + [guid]::NewGuid().ToString('N'))
+        $folder = Join-Path -Path $bundle -ChildPath 'vm/bootstrap'
+        $null = New-Item -ItemType Directory -Path $folder -Force
+        Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath 'fails.txt') -Value $Fails
+        Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath 'Invoke-DemoWorkloadControl.ps1') -Value @'
+param($Action, $RequestBase64)
+$request = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($RequestBase64)) | ConvertFrom-Json
+$file = Join-Path -Path $PSScriptRoot -ChildPath ('attempts-{0}.txt' -f $request.target)
+$attempt = 1
+if (Test-Path -LiteralPath $file) { $attempt = [int](Get-Content -LiteralPath $file) + 1 }
+Set-Content -LiteralPath $file -Value $attempt
+Add-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath 'order.txt') -Value $request.target
+$fails = [int](Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath 'fails.txt'))
+if ($request.target -eq 'T2') {
+    $line = @{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = 'Fail'; message = 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'; evidence = @{ exitCode = 1 } }
+}
+elseif ($request.target -eq 'T1' -and $attempt -le $fails) {
+    $line = @{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = 'Fail'; message = 'runner profile set --target T1 failed with exit code 1: A network-related or instance-specific error occurred while establishing a connection to SQL Server.'; evidence = @{ exitCode = 1 } }
+}
+else {
+    $line = @{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = 'Pass'; message = ('runner profile set --target {0}: Pass (1 check(s) passed).' -f $request.target); evidence = @{ exitCode = 0 } }
+}
+[Console]::Out.WriteLine('DBHUBDEMO-WORKLOAD ' + ($line | ConvertTo-Json -Depth 4 -Compress))
+'@
+        Set-Content -LiteralPath (Join-Path -Path $bundle -ChildPath 'settings.json') -Value (@{ bundlePath = $bundle } | ConvertTo-Json)
+        return $bundle
+    }
+
+    function Invoke-RetryScript([string] $Script, [string] $Bundle, [string[]] $Target) {
+        # Runs a generated profile script against the stand-in bundle instead of C:\ProgramData\DbHubDemo, and returns each
+        # target's result line.
+        $text = $Script.Replace('C:\ProgramData\DbHubDemo\settings.json', (Join-Path -Path $Bundle -ChildPath 'settings.json'))
+        $writer = [System.IO.StringWriter]::new()
+        $console = [Console]::Out
+        [Console]::SetOut($writer)
+        try {
+            $null = & ([scriptblock]::Create($text))
+        }
+        finally {
+            [Console]::SetOut($console)
+        }
+        InModuleScope DbHubDemo -Parameters @{ Output = $writer.ToString(); Target = $Target } { ConvertFrom-DemoProfileRunCommandOutput -Output $Output -Target $Target }
+    }
+
     $script:module = Get-Module -Name 'DbHubDemo'
 }
 
@@ -140,6 +188,46 @@ Describe 'The activity profiles'' Run Command (DbHubDemo-Profile)' {
             $lines[$target]['message'] | Should -BeLike ('{0}: not run: the request to set business-day expired at *' -f $target)
             $lines[$target]['evidence']['expired'] | Should -BeTrue
         }
+    }
+
+    It 'tries a target again every -RetrySeconds until the runner sets it, and not a target that isn''t set up (re-review of PR 16)' {
+        # On a VM that has just booted, T1's profile lives in a SQL Server that's still starting, and the runner retries
+        # only transient errors. A stand-in for the bundle's control script fails twice for T1, then sets it.
+        $bundle = New-RetryBundle -Fails 2
+        $script = InModuleScope DbHubDemo { Get-DemoProfileRunCommandScript -Target 'T1', 'T3', 'T4', 'T2' -ProfileName 'baseline' -RequestedBy 'start-demo' -NotAfterUtc ([datetime]::UtcNow.AddMinutes(10)) -RetrySeconds 15 -RunnerTimeoutSeconds 120 }
+        $script | Should -Not -Match '[^\x00-\x7F]'
+        $request = [regex]::Match($script, "-RequestBase64 '([A-Za-z0-9+/=]+)'").Groups[1].Value
+        ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($request)) | ConvertFrom-Json -AsHashtable)['timeoutSeconds'] | Should -Be 120
+        Mock -CommandName Start-Sleep -MockWith { }
+        $lines = Invoke-RetryScript -Script $script -Bundle $bundle -Target 'T1', 'T3', 'T4', 'T2'
+        $lines['T1']['status'] | Should -Be 'Pass'
+        $lines['T1']['evidence']['attempts'] | Should -Be 3
+        $lines['T3']['status'] | Should -Be 'Pass'
+        $lines['T3']['evidence']['attempts'] | Should -Be 1
+        $lines['T4']['evidence']['attempts'] | Should -Be 1
+        $lines['T2']['status'] | Should -Be 'Fail'
+        $lines['T2']['message'] | Should -Match 'isn''t set up yet'
+        $lines['T2']['evidence']['attempts'] | Should -Be 1 -Because 'a target that isn''t set up isn''t tried again'
+        Should -Invoke -CommandName Start-Sleep -Times 2 -Exactly -ParameterFilter { $Seconds -eq 15 }
+        # T3's and T4's profiles are files on T1, so they're set at once, before T1's SQL Server answers.
+        @(Get-Content -LiteralPath (Join-Path -Path $bundle -ChildPath 'vm/bootstrap/order.txt')) | Should -Be @('T3', 'T4', 'T1', 'T1', 'T1', 'T2')
+    }
+
+    It 'stops trying once the next attempt would come after its expiry, and keeps one attempt and the order without -RetrySeconds (re-review of PR 16)' {
+        $bundle = New-RetryBundle -Fails 99
+        Mock -CommandName Start-Sleep -MockWith { }
+        $near = InModuleScope DbHubDemo { Get-DemoProfileRunCommandScript -Target 'T1' -ProfileName 'baseline' -RequestedBy 'start-demo' -NotAfterUtc ([datetime]::UtcNow.AddSeconds(10)) -RetrySeconds 15 }
+        $lines = Invoke-RetryScript -Script $near -Bundle $bundle -Target 'T1'
+        $lines['T1']['status'] | Should -Be 'Fail'
+        $lines['T1']['message'] | Should -Match 'network-related or instance-specific error'
+        $lines['T1']['evidence']['attempts'] | Should -Be 1
+        $once = InModuleScope DbHubDemo { Get-DemoProfileRunCommandScript -Target 'T1', 'T3' -ProfileName 'business-day' -RequestedBy 'deploy' -NotAfterUtc ([datetime]::UtcNow.AddMinutes(30)) }
+        $once | Should -Not -Match 'Start-Sleep'
+        $lines = Invoke-RetryScript -Script $once -Bundle $bundle -Target 'T1', 'T3'
+        $lines['T1']['evidence']['attempts'] | Should -Be 1
+        $lines['T3']['status'] | Should -Be 'Pass'
+        Should -Invoke -CommandName Start-Sleep -Times 0 -Exactly
+        @(Get-Content -LiteralPath (Join-Path -Path $bundle -ChildPath 'vm/bootstrap/order.txt')) | Should -Be @('T1', 'T1', 'T3')
     }
 
     It 'matches the result lines to their targets by the target they name, else in order from the end' {
@@ -414,9 +502,101 @@ Describe 'A stop (Ctrl+C) in the middle of a send (review of PR 16, 2026-11-04)'
         $config = New-TestConfig
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "ERROR: (OperationNotAllowed) Operation 'Run Command' is not allowed on VM since the VM is deallocated." } }
         InModuleScope DbHubDemo { Register-DemoActivitySwitch -VmName 'archost01' }
-        $reached = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoActivityQuiet -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -VmName 'sqlvm01', 'archost01' -RequestedBy 'deploy' -PassThru })
+        $reached = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoActivityQuiet -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -VmName 'sqlvm01', 'archost01' -RequestedBy 'deploy' -PassThru } | Where-Object { $_.Outcome -eq 'Sent' })
         $reached | Should -BeNullOrEmpty
         InModuleScope DbHubDemo { @(Get-DemoActivitySwitchVm) } | Should -Be @('archost01') -Because 'sqlvm01 was noted only for this send, which Azure refused'
+    }
+}
+
+Describe 'The interim baseline on a VM the run started (re-review of PR 16, 2026-11-04)' {
+    BeforeEach {
+        $script:bodies = [System.Collections.Generic.List[hashtable]]::new()
+        $script:states = [System.Collections.Generic.Queue[object]]::new()
+        $script:reads = 0
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $bodyPath = ([string]$ArgumentList[[array]::IndexOf($ArgumentList, '--body') + 1]).TrimStart('@')
+            $script:bodies.Add((Get-Content -LiteralPath $bodyPath -Raw | ConvertFrom-Json -AsHashtable))
+            [pscustomobject]@{ ExitCode = 0; StdOut = '{}'; StdErr = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRunCommandState -MockWith {
+            $script:reads++
+            if ($script:states.Count -gt 1) {
+                return $script:states.Dequeue()
+            }
+            $script:states.Peek()
+        }
+        InModuleScope DbHubDemo { Clear-DemoActivitySwitch }
+
+        function New-StateLine([string] $Target, [string] $Status, [string] $Message, [int] $Attempts) {
+            'DBHUBDEMO-WORKLOAD ' + ([ordered]@{ marker = 'DBHUBDEMO-WORKLOAD'; action = 'Runner'; status = $Status; message = $Message; evidence = [ordered]@{ target = $Target; exitCode = 0; attempts = $Attempts } } | ConvertTo-Json -Depth 4 -Compress)
+        }
+    }
+
+    AfterEach {
+        InModuleScope DbHubDemo { Clear-DemoActivitySwitch }
+    }
+
+    It 'sends a retrying interim to a VM the run started, waits until the VM has set it, and reports each target' {
+        # Reviewer: one attempt usually lost the race with the VM's SQL Server, and nothing waited for it.
+        $config = New-TestConfig
+        $records = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoActivityQuiet -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -VmName 'sqlvm01' -RequestedBy 'start-demo' -Started -PassThru })
+        @($records | ForEach-Object { $_.Outcome }) | Should -Be @('Sent', 'Sent')
+        $records[0].Data.Url | Should -Match '/virtualMachines/sqlvm01/runCommands/DbHubDemo-Profile\?'
+        ($records[0].Data.ExpiresUtc - $records[0].Data.SentUtc).TotalMinutes | Should -Be 10
+        $sent = [string]$script:bodies[0]['properties']['source']['script']
+        $sent | Should -Match 'Start-Sleep -Seconds 15'
+        $request = [regex]::Match($sent, "-RequestBase64 '([A-Za-z0-9+/=]+)'").Groups[1].Value
+        ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($request)) | ConvertFrom-Json -AsHashtable)['timeoutSeconds'] | Should -Be 120
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -eq 'sqlvm01 started, so T1 and T3 get the interim baseline before this run''s own Run Commands there: its profile host resumes the profile stored there about 2 minutes after the boot. The VM tries every 15 seconds until it''s set, for at most 10 minutes, while its SQL Server starts; business-day comes back at the end.' }
+
+        $now = [DateTime]::UtcNow
+        $script:states.Enqueue([pscustomobject]@{ Found = $true; ProvisioningState = 'Succeeded'; ExecutionState = 'Running'; StartTime = $now; Output = ''; Error = '' })
+        $script:states.Enqueue([pscustomobject]@{ Found = $true; ProvisioningState = 'Succeeded'; ExecutionState = 'Succeeded'; StartTime = $now; Output = (@((New-StateLine 'T1' 'Pass' 'profile set: Pass' 4), (New-StateLine 'T3' 'Pass' 'profile set: Pass' 1)) -join "`n"); Error = '' })
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Records = $records } { Wait-DemoActivityInterim -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -Record $Records -CheckPrefix 'START' -PollSeconds 1 })
+        @($results | ForEach-Object { $_.checkId }) | Should -Be @('START.INTERIM_T1', 'START.INTERIM_T3')
+        @($results | ForEach-Object { $_.status }) | Should -Be @('Pass', 'Pass')
+        $results[0].message | Should -BeLike 'T1: the interim baseline is set on sqlvm01, which this run started, in * seconds and 4 attempt(s), before this run''s own Run Commands there; business-day comes back at the end.'
+        $results[0].evidence['attempts'] | Should -Be 4
+        $script:reads | Should -Be 2 -Because 'it waited while the Run Command ran'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -eq 'Waiting for the interim baseline on sqlvm01, which this run started, before its own Run Commands there: at most 13 minutes.' }
+    }
+
+    It 'reports a bound that passed, a failure, and a refused request as a Warning with the commands, and a target without a runner as Not selected' {
+        $config = New-TestConfig
+        $expires = [DateTime]::UtcNow.AddMinutes(10)
+        $data = [pscustomobject]@{ Url = 'https://management.azure.com/x/DbHubDemo-Profile?api-version=1'; NotBefore = [DateTime]::UtcNow.AddMinutes(-1); SentUtc = [DateTime]::UtcNow; ExpiresUtc = $expires }
+        $records = @(
+            [pscustomobject]@{ Target = 'T1'; VmName = 'sqlvm01'; Outcome = 'Sent'; Detail = 'sent'; Data = $data; Seconds = 0 }
+            [pscustomobject]@{ Target = 'T3'; VmName = 'sqlvm01'; Outcome = 'Sent'; Detail = 'sent'; Data = $data; Seconds = 0 }
+            [pscustomobject]@{ Target = 'T2'; VmName = 'archost01'; Outcome = 'Sent'; Detail = 'sent'; Data = $data; Seconds = 0 }
+            [pscustomobject]@{ Target = 'T4'; VmName = 'sqlvm01'; Outcome = 'NotSent'; Detail = 'Azure didn''t accept the Run Command on sqlvm01: (Conflict) busy'; Data = $null; Seconds = 0 }
+        )
+        $script:waited = 0
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoProfileRunCommand -MockWith {
+            $script:waited = $WaitSeconds
+            foreach ($item in $Record) {
+                $outcome = switch ($item.Target) { 'T1' { 'TimedOut' } 'T3' { 'Failed' } 'T2' { 'NotSetUp' } default { $item.Outcome } }
+                [pscustomobject]@{ Target = $item.Target; VmName = $item.VmName; Outcome = $outcome; Detail = $(if ($outcome -eq 'Failed') { 'runner profile set --target T3 failed with exit code 1: Login failed.' } elseif ($outcome -eq 'NotSetUp') { 'T2 isn''t set up yet' } else { $item.Detail }); Data = $null; Seconds = 760 }
+            }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Records = $records } { Wait-DemoActivityInterim -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -Record $Records -CheckPrefix 'DEPLOY' })
+        # At most until the 10-minute expiry, plus one attempt's 2 minutes and 30 seconds.
+        $script:waited | Should -BeGreaterThan 740
+        $script:waited | Should -BeLessOrEqual 751
+        @($results | ForEach-Object { '{0}={1}' -f $_.checkId, $_.status }) | Should -Be @('DEPLOY.INTERIM_T1=Warning', 'DEPLOY.INTERIM_T3=Warning', 'DEPLOY.INTERIM_T2=Not selected', 'DEPLOY.INTERIM_T4=Warning')
+        $results[0].message | Should -Be ('T1: the interim baseline on sqlvm01, which this run started, wasn''t set within {0} seconds. This run''s own Run Commands there went on, so the profile stored there could run its incidents beside them.' -f $script:waited)
+        $results[0].remediation | Should -Be './scripts/validate.ps1 -Area Workload -Target T1 says whether T1''s runner answers now. If this run''s switch to business-day (DEPLOY.INCIDENTS_T1) didn''t pass, set it once it does: ./scripts/demo-control.ps1 -Target T1 -Scenario business-day -Duration 240.'
+        $results[1].message | Should -Be 'T3: the interim baseline couldn''t be set on sqlvm01, which this run started: runner profile set --target T3 failed with exit code 1: Login failed. This run''s own Run Commands there went on, so the profile stored there could run its incidents beside them.'
+        $results[3].message | Should -Match 'Azure didn''t accept the Run Command on sqlvm01'
+        $results[3].remediation | Should -Match ([regex]::Escape('./scripts/demo-control.ps1 -Target T4 -Scenario business-day -Duration 240'))
+    }
+
+    It 'waits for nothing with a profile without incidents, or without records' {
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoProfileRunCommand -MockWith { throw 'nothing to wait for' }
+        @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -ActivityProfile 'baseline') } { Wait-DemoActivityInterim -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -Record @([pscustomobject]@{ Target = 'T1'; VmName = 'sqlvm01'; Outcome = 'Sent'; Detail = ''; Data = $null; Seconds = 0 }) -CheckPrefix 'START' }) | Should -BeNullOrEmpty
+        @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Wait-DemoActivityInterim -Config $Config -ActivityProfile (Get-DemoActivityProfile -Config $Config) -Record @() -CheckPrefix 'START' }) | Should -BeNullOrEmpty
     }
 }
 
