@@ -232,7 +232,7 @@ IF OBJECT_ID(N'demo.activity_profile', N'U') IS NULL
 CREATE TABLE demo.activity_profile
 (
     profile_slot         tinyint       NOT NULL CONSTRAINT pk_activity_profile PRIMARY KEY CONSTRAINT ck_activity_profile_slot CHECK (profile_slot = 1),
-    profile_name         varchar(64)   NOT NULL CONSTRAINT ck_activity_profile_name CHECK (profile_name IN ('off', 'baseline', 'business-day') OR profile_name LIKE 'incident:%'),
+    profile_name         varchar(64)   NOT NULL CONSTRAINT ck_activity_profile_name CHECK (profile_name IN ('off', 'baseline', 'business-day', 'showcase') OR profile_name LIKE 'incident:%'),
     set_at               datetime2(3)  NOT NULL,
     set_by               nvarchar(128) NOT NULL,
     expires_at           datetime2(3)  NULL
