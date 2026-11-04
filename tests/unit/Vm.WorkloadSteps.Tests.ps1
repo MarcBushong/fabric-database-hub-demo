@@ -488,7 +488,9 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
 
         function New-RunnerStatus([int] $Runs, [string] $Target = 'T1') {
             # The runner's 'status --json' as it writes it, indented: the profile near the top, one node per run (each with
-            # its own "profile" string), and the host node last (CommandLine.cs). 2 runs make 2,128 characters, 5 make 3,584.
+            # its own "profile" string), and the host node last (CommandLine.cs). 2 runs make 2,128 characters, 5 make 3,584,
+            # with the line breaks the runner writes on the Windows VMs (System.Text.Json's indented output uses
+            # Environment.NewLine).
             $scenarios = 'cpu-pressure', 'missing-index', 'io-pressure', 'inefficient-query', 'healthy-baseline'
             $runNodes = foreach ($index in 1..$Runs) {
                 $scenario = $scenarios[($index - 1) % $scenarios.Count]
@@ -519,7 +521,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
                 logHeadroomMb  = 912
                 host           = [ordered]@{ status = 'Fail'; message = ('The {0} lane keeps failing: the host restarted it 3 times in the last hour.' -f $Target); file = 'C:\ProgramData\DbHubDemo\host-lanes.json'; processId = 4312; hostStartedAt = '2026-11-03T12:58:40.000Z'; heartbeatAt = '2026-11-03T14:06:58.000Z'; heartbeatAgeSeconds = 2; processAlive = $true; stoppedAt = $null; stopReason = $null; lane = [ordered]@{ state = 'Serving'; generation = 4; restarts = 3; restartsLastHour = 3; lastRestartReason = 'no poll finished for 301 s'; lastPollAt = '2026-11-03T14:06:50.000Z'; lastPollAgeSeconds = 10; operation = 'polling'; consecutiveFailures = 0; lastError = $null; runningRuns = 1 } }
             }
-            return ($document | ConvertTo-Json -Depth 8)
+            return (($document | ConvertTo-Json -Depth 8) -replace '\r?\n', "`r`n")
         }
     }
 
