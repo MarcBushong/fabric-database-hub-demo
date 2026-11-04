@@ -466,11 +466,13 @@ internal static partial class CommandLine
         var setRun = new RunOptions(set);
         var withBaseline = new Option<bool?>("--with-baseline") { Description = "incident:<scenario> only: run the baseline next to the incident (default true)." };
         var tier = new Option<string?>("--tier") { Description = "T4's compute tier, Burstable or GeneralPurpose, which picks the profile's tier-specific slots (showcase, business-day). Without it, only Burstable slots run." };
+        var vcores = new Option<int?>("--vcores") { Description = "T4's vCores (1-64), which scale the profile's CPU-bound T4 slots (showcase, business-day) to the same load per vCore. Without it, each slot keeps its own sessions." };
         var setFile = ProfileFile();
         var setJson = Json();
         set.Options.Add(name);
         set.Options.Add(withBaseline);
         set.Options.Add(tier);
+        set.Options.Add(vcores);
         set.Options.Add(setFile);
         set.Options.Add(setJson);
         var setStamp = new RequestStampOptions(set);
@@ -502,6 +504,20 @@ internal static partial class CommandLine
                     }
                 }
 
+                var vcoresValue = parseResult.GetValue(vcores);
+                if (vcoresValue is not null)
+                {
+                    if (!profileName.HasSchedule)
+                    {
+                        throw new ScenarioRequestException("--vcores applies to showcase and business-day, whose CPU-bound T4 slots scale with it.");
+                    }
+
+                    if (vcoresValue is < 1 or > 64)
+                    {
+                        throw new ScenarioRequestException("--vcores must be a whole number from 1 to 64.");
+                    }
+                }
+
                 var stamp = setStamp.StampOf(parseResult);
                 if (profileName.Kind == ProfileKind.Incident)
                 {
@@ -519,6 +535,7 @@ internal static partial class CommandLine
                     AutoCleanup = request.AutoCleanup ? null : false,
                     WithBaseline = parseResult.GetValue(withBaseline),
                     Tier = tierValue,
+                    VCores = vcoresValue,
                 };
                 var expiresAt = profileName.Kind == ProfileKind.Off
                     ? (DateTimeOffset?)null

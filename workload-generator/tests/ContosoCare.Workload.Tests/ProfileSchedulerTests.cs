@@ -298,6 +298,38 @@ public sealed class ProfileSchedulerTests
     }
 
     [Theory]
+    [InlineData("GeneralPurpose", 4, 6)]
+    [InlineData("GeneralPurpose", 2, 3)]
+    [InlineData("GeneralPurpose", null, 3)]
+    [InlineData("GeneralPurpose", 1, 3)]
+    [InlineData("GeneralPurpose", 64, 16)]
+    [InlineData("Burstable", 1, 2)]
+    [InlineData("Burstable", 2, 4)]
+    public void T4sCpuSlotScalesWithItsVCores(string tier, int? vcores, int sessions)
+    {
+        // The showcase's General Purpose slot has 3 sessions for Standard_D2ds_v5's 2 vCores, and the Burstable slot 2 for
+        // Standard_B1ms's one: the same load per vCore on a larger size, never fewer than the slot's own, at most the
+        // scenario's maximum (16).
+        var state = State("showcase", SetAt.AddMinutes(90), new ProfileParameters { Tier = tier, VCores = vcores });
+
+        var cpu = Assert.Single(ProfileScheduler.Plan(state, DemoTarget.T4, SetAt.AddMinutes(9), Definitions, Catalog, null), a => a.ScenarioId == "cpu-pressure");
+
+        Assert.Equal(sessions, cpu.Concurrency);
+    }
+
+    [Fact]
+    public void VCoresScaleOnlyT4sCpuBoundSlots()
+    {
+        var parameters = new ProfileParameters { Tier = "GeneralPurpose", VCores = 4 };
+        var t4 = ProfileScheduler.Plan(State("showcase", SetAt.AddMinutes(90), parameters), DemoTarget.T4, SetAt.AddMinutes(1), Definitions, Catalog, null);
+        var t1 = ProfileScheduler.Plan(State("showcase", SetAt.AddMinutes(90), parameters), DemoTarget.T1, SetAt.AddMinutes(10), Definitions, Catalog, null);
+        var unscaledT1 = ProfileScheduler.Plan(State("showcase", SetAt.AddMinutes(90)), DemoTarget.T1, SetAt.AddMinutes(10), Definitions, Catalog, null);
+
+        Assert.Equal(5, Assert.Single(t4, a => a.ScenarioId == "connection-surge").Concurrency);
+        Assert.Equal(unscaledT1.Select(a => a.Concurrency), t1.Select(a => a.Concurrency));
+    }
+
+    [Theory]
     [InlineData(null, 1, true)]
     [InlineData("all", 2, true)]
     [InlineData("odd", 3, true)]

@@ -142,13 +142,14 @@ public sealed class ProfileStoreTests : IDisposable
     public void ProfileSetStampsT4sFileAndALaterOlderRequestChangesNothing()
     {
         Directory.CreateDirectory(folder);
-        var (exitCode, output, error) = CliHarness.Invoke("profile", "set", "--target", "T4", "--name", "showcase", "--tier", "GeneralPurpose", "--profile-file", FilePath, "--if-newer", "2026-11-03T18:00:05.000Z", "--request-id", "job-2", "--requested-by", "test");
+        var (exitCode, output, error) = CliHarness.Invoke("profile", "set", "--target", "T4", "--name", "showcase", "--tier", "GeneralPurpose", "--vcores", "4", "--profile-file", FilePath, "--if-newer", "2026-11-03T18:00:05.000Z", "--request-id", "job-2", "--requested-by", "test");
 
         Assert.True(exitCode == 0, error);
         Assert.Contains("profile set to showcase", output, StringComparison.Ordinal);
         var file = JsonNode.Parse(File.ReadAllText(FilePath))!;
         Assert.Equal("showcase", file["profile"]!.GetValue<string>());
         Assert.Equal("GeneralPurpose", file["parameters"]!["tier"]!.GetValue<string>());
+        Assert.Equal(4, file["parameters"]!["vCores"]!.GetValue<int>());
         Assert.Equal("job-2", file["requestId"]!.GetValue<string>());
 
         (exitCode, output, _) = CliHarness.Invoke("profile", "set", "--target", "T4", "--name", "off", "--profile-file", FilePath, "--if-newer", "2026-11-03T18:00:00Z", "--request-id", "job-1");
@@ -168,6 +169,9 @@ public sealed class ProfileStoreTests : IDisposable
     [Theory]
     [InlineData("--name", "baseline", "--tier", "Burstable")]
     [InlineData("--name", "showcase", "--tier", "Premium")]
+    [InlineData("--name", "baseline", "--vcores", "4")]
+    [InlineData("--name", "showcase", "--vcores", "0")]
+    [InlineData("--name", "showcase", "--vcores", "65")]
     [InlineData("--name", "showcase", "--if-newer", "2026-11-03T18:00:00Z")]
     [InlineData("--name", "showcase", "--request-id", "job-1")]
     [InlineData("--name", "showcase", "--if-newer", "2026-11-03T18:00:00", "--request-id", "job-1")]

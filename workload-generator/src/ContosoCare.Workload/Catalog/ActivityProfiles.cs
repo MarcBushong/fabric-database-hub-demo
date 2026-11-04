@@ -172,6 +172,12 @@ internal sealed record ProfileParameters
 
     /// <summary>T4's compute tier (Burstable or GeneralPurpose), which picks the profile's tier-specific slots (showcase).</summary>
     public string? Tier { get; init; }
+
+    /// <summary>
+    /// T4's vCores, which scale its CPU-bound slots to the same load per vCore as the size each slot was written for
+    /// (<see cref="ProfileScheduler.ScaleForVCores"/>); null keeps each slot's own concurrency.
+    /// </summary>
+    public int? VCores { get; init; }
 }
 
 /// <summary>The T3 profile file (<c>C:\ProgramData\DbHubDemo\activity.json</c> on T1), so polling never wakes the serverless database.</summary>
@@ -483,7 +489,7 @@ internal static class ProfileScheduler
                         ScenarioId = slot.Scenario,
                         Start = windowStart,
                         End = windowEnd,
-                        Concurrency = slot.Concurrency ?? scenario.Concurrency.Default,
+                        Concurrency = ScaleForVCores(slot, scenario, target, parameters),
                         Intensity = slot.Intensity ?? scenario.Intensity.Default,
                         Parameters = slot.Parameters,
                         AutoCleanup = parameters?.AutoCleanup ?? true,
@@ -515,6 +521,29 @@ internal static class ProfileScheduler
 
         return activities;
     }
+
+    /// <summary>
+    /// A slot's sessions on T4, scaled by its vCores (2026-11-04, T4's 4-vCore default): a CPU-bound slot was written for
+    /// one Burstable vCore (Standard_B1ms) or two General Purpose vCores (Standard_D2ds_v5), and one session keeps about
+    /// one vCore busy, so the same CPU percentage on a larger size takes proportionally more sessions: Standard_D4ds_v5
+    /// runs twice a General Purpose slot's. Never fewer than the slot's own, and never more than the scenario's maximum
+    /// (ADR 0010). Other targets, other scenarios, and an unknown vCore count keep the slot's own.
+    /// </summary>
+    internal static int ScaleForVCores(IncidentSlot slot, ScenarioDefinition scenario, DemoTarget target, ProfileParameters? parameters)
+    {
+        var concurrency = slot.Concurrency ?? scenario.Concurrency.Default;
+        if (target != DemoTarget.T4 || parameters?.VCores is not { } vcores || vcores < 1 || !CpuBoundScenarios.Contains(slot.Scenario))
+        {
+            return concurrency;
+        }
+
+        var reference = string.Equals(parameters.Tier, ProfileParameters.TierGeneralPurpose, StringComparison.Ordinal) ? 2 : 1;
+        var scaled = (int)Math.Ceiling(concurrency * (double)vcores / reference);
+        return Math.Clamp(scaled, concurrency, Math.Max(concurrency, scenario.Concurrency.Max));
+    }
+
+    /// <summary>The scenarios whose load is CPU: their sessions scale with T4's vCores.</summary>
+    private static readonly HashSet<string> CpuBoundScenarios = new(StringComparer.Ordinal) { "cpu-pressure" };
 
     private static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a <= b ? a : b;
 }
