@@ -38,6 +38,10 @@ $script:DemoJobProcessId = @{}
 $script:DemoJobProcessStart = @{}
 $script:DemoRunCancelWatch = $false
 
+# 2026-11-03 (ADR 0010): the VMs this process's run may have left on the interim baseline, which the run switches to its
+# activity profile at its end, or when it's stopped or fails (Register-DemoActivitySwitch, Invoke-DemoActivitySwitch).
+$script:DemoActivitySwitchVm = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
 # Azure CLI verbs that only read. Any other command (and every token request) needs the validated context.
 $script:AzReadOnlyVerbs = @('show', 'list', 'exists', 'get-instance-view', 'list-skus', 'list-usage', 'list-usages', 'list-versions', 'show-deleted', 'list-locations', 'version')
 

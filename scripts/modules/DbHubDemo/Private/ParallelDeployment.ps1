@@ -342,6 +342,12 @@ function Invoke-DemoParallelDeployment {
        out when T4 is off; Developer mode leaves out T2's telemetry, PAYG, and monitoring. A target whose telemetry
        didn't come gets its monitoring checked, and its telemetry once more, before the run is judged
        (Invoke-DemoTelemetryCheck, in the tracks' telemetry steps and in DONE's checks; Phase 28 live finding).
+    6. The switch (2026-11-03, ADR 0010): the tracks set a profile with incidents (business-day, the default) as its
+       interim, baseline, and note the VMs they set it on, in the handoff directory; once DONE's checks have read what they
+       need, this run's own Run Commands are done, so those VMs' targets get the profile, both VMs within 3 minutes,
+       whether the run is DONE or not (DEPLOY.INCIDENTS_*, Send-DemoPendingActivitySwitch), never a Fail. A run that's
+       stopped or fails before it sends it without waiting (Complete-DemoDeploymentRun). A run without preflight says
+       once when the configuration doesn't set activityProfile (DEPLOY.ACTIVITYPROFILE).
 
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
     does; -ProgressPath is the status page's model, which each stage and track updates; with networkMode private the
@@ -451,6 +457,17 @@ function Invoke-DemoParallelDeployment {
         $plan = Resolve-DemoTrackPlan -StopAfter 'Infrastructure'
     }
     Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume
+    # The run's activity profile (2026-11-03, ADR 0010): the tracks set its interim, and this process switches the VMs they
+    # noted once its own Run Commands are done; Complete-DemoDeploymentRun sends the switch when the run ends before that.
+    # A run without preflight says the default here.
+    $activity = Get-DemoActivityProfile -Config $Config
+    Clear-DemoActivitySwitch
+    if (-not $plan.Preflight -and -not $whatIf) {
+        $notice = New-DemoActivityProfileNotice -ActivityProfile $activity -CheckPrefix 'DEPLOY'
+        if ($null -ne $notice) {
+            $results.Add($notice)
+        }
+    }
     # The tracks run for as long as the T2 wait, the guided stop (at least 45 minutes for the person, plus about 20 to
     # prepare), and what follows it can take (Phase 28).
     if ($WaitForT2) {
@@ -810,6 +827,10 @@ function Invoke-DemoParallelDeployment {
             if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
                 return $results.ToArray()
             }
+            # A VM that was already running may still serve an earlier run's incidents: its targets get the interim
+            # baseline before the tracks' Run Commands reach it, and the switch below brings the profile back (2026-11-03).
+            $alreadyRunning = Get-DemoMemberValue -InputObject $stoppedStart -Name 'Running'
+            Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @($alreadyRunning) -RequestedBy 'deploy'
         }
 
         # 2. The track processes, a few seconds apart, so their guards run while the template deploys.
@@ -1000,6 +1021,11 @@ function Invoke-DemoParallelDeployment {
         if ($ended.Count -gt 0) {
             Write-DemoLog -Level Warning -Message ('Stopped: {0} ended at once; the next ./scripts/deploy.ps1 continues their work.' -f ($ended -join ', '))
         }
+        # The VMs the track processes may have left on the interim baseline, noted in this process before their handoff
+        # directory goes: the switch below, or Complete-DemoDeploymentRun's when the run stops before it (2026-11-03).
+        foreach ($vm in @(Get-DemoActivitySwitchVm -HandoffPath $handoff)) {
+            Register-DemoActivitySwitch -VmName $vm
+        }
         if ($handoff) {
             Remove-DemoPrivateDirectory -Path $handoff -Confirm:$false | Out-Null
         }
@@ -1110,6 +1136,13 @@ function Invoke-DemoParallelDeployment {
     $timing = [ordered]@{ startUtc = $startUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); endUtc = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); minutes = $minutes; phases = $phase; tracks = $trackTiming; targetReadyUtc = $ready; t2Source = $context.T2Source; clockStopped = $clockStopped; withinThirtyMinutes = ($clockStopped -and $minutes -le 30) }
     $timingMessage = if ($clockStopped) { 'Everything is deployed and populated in {0} minutes: Database Hub''s estate for every target, {1}{2}, T1''s inventory with only the engine{3}.' -f $minutes, $(if ($skipT4) { 'T1, T2, and T3 telemetry' } else { 'T1, T2, and T3 telemetry, T4''s metrics' }), $(if ($installMode -eq 'Developer') { '' } else { ', T2''s PAYG and monitoring' }), $(if ($SkipFabric) { '' } else { ', and the required Fabric items' }) } else { 'The run took {0} minutes; not every DONE requirement passed yet, so the clock didn''t stop (see DEPLOY.SUMMARY).' -f $minutes }
     $results.Add((New-DemoResult -CheckId 'DEPLOY.TIMING' -Area 'infra' -Target 'subscription' -Status $(if ($clockStopped) { 'Pass' } else { 'Warning' }) -Message $timingMessage -Evidence $timing))
+
+    # 7. The switch (2026-11-03, ADR 0010): once DONE's checks have read what they need, this run's own Run Commands are
+    # done, so the VMs the tracks left on the interim baseline get the run's activity profile, whether the run is DONE or
+    # not, at most 3 minutes for both VMs together. Never a Fail.
+    if (-not $whatIf -and $activity.HasIncidents) {
+        & $addAll @(Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile $activity -Result $results.ToArray() -CheckPrefix 'DEPLOY' -RequestedBy 'deploy')
+    }
 
     $all = $results.ToArray()
     # Phase 28 live finding (2026-10-30): what only a person can confirm is listed once each, apart from what needs you.

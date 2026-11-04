@@ -17,7 +17,7 @@
   "t3AdminGroupObjectId": "00000000-0000-0000-0000-000000000000",
   "t3AutoPauseMinutes": 15,
   "t3FreeOffer": "auto",
-  "activityProfile": "baseline",
+  "activityProfile": "business-day",
   "activityProfileOnBoot": false,
   "owner": "your-alias",
   "ownerEmail": "you@example.com",

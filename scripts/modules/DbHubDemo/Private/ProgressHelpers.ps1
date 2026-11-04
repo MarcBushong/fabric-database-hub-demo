@@ -455,7 +455,7 @@ function New-DemoProgressModel {
         updatedAt     = $NowUnix
         heartbeatAt   = $NowUnix
         expect        = $expectation
-        run           = [ordered]@{ state = 'Running'; endedAt = 0; reason = ''; next = ''; nextCommand = ''; exitCode = $null; diagnostics = ''; startedVms = @() }
+        run           = [ordered]@{ state = 'Running'; endedAt = 0; reason = ''; next = ''; nextCommand = ''; exitCode = $null; diagnostics = ''; startedVms = @(); activity = '' }
         guidedStop    = [ordered]@{ state = $GuidedStop; message = ''; url = ''; deadlineAt = 0; promptedAt = 0; hostVm = 'archost01'; hostUser = ''; credential = ''; credentialText = ''; signInFallback = $false }
         optional      = @()
         confirm       = @()
@@ -1010,6 +1010,10 @@ function Get-DemoProgressBanner {
             }
         }
         $lines.Add('Where to look: open Database Hub in the Fabric portal and look at Estate and Performance; then start an incident (./scripts/demo-control.ps1) and investigate it with the Database Agent.')
+        # What runs now, and how to choose the other profile (2026-11-03); a model from before it has no activity.
+        if ([string]$run['activity']) {
+            $lines.Add([string]$run['activity'])
+        }
         foreach ($entry in @($Model['optional'])) {
             $lines.Add(('Optional, not needed for the demo: {0}. {1} {2}' -f [string]$entry['name'], [string]$entry['message'], [string]$entry['howTo']))
         }

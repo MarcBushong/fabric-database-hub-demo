@@ -6,7 +6,10 @@ Stops the demo's compute after a session (plan section 9.4, ADR 0016).
 .DESCRIPTION
 - Default: removes on-demand Bastion and then its public IP (also a public IP that an interrupted delete left
   behind), rotates the T2 host's one-time password, sets every activity profile to off so a later boot
-  doesn't keep T3 awake, shuts the T2 guest down cleanly, and deallocates the T2 VM and sqlvm01. T3
+  doesn't keep T3 awake (both VMs at once, waited for about 3 minutes at most: an incident in progress can keep a VM's
+  Run Commands waiting, so a profile that isn't off in time is a Warning, and the VM is deallocated anyway, which stops
+  the incident with it), shuts the T2 guest down cleanly (within the same bound; the host's deallocation shuts it down
+  otherwise), and deallocates the T2 VM and sqlvm01. T3
   persists; serverless auto-pause stops its compute. T4, the PostgreSQL flexible server, is stopped; Azure starts it
   again on its own after seven days, so STOP.T4.STOP says when (the stop time plus seven days), what it then bills at
   its size (the Azure Retail Prices API), and whether the on-demand control's daily safety stop stops it again or

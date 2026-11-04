@@ -1281,6 +1281,11 @@ function Get-DemoDeploymentOutcomeLine {
                 }
             }
             $lines.Add(('Where to look: open Database Hub in the Fabric portal and look at Estate and Performance; then start an incident (./scripts/demo-control.ps1) and investigate it with the Database Agent.{0}' -f $(if ($WorkspaceName) { ' The Real-Time Dashboard and the history report are in the workspace "{0}".' -f $WorkspaceName } else { '' })))
+            # What runs now, and how to choose the other profile (2026-11-03): the incidents fill the Performance page.
+            $activityLine = [string](Get-DemoMemberValue -InputObject $Outcome -Name 'Activity')
+            if ($activityLine) {
+                $lines.Add($activityLine)
+            }
             foreach ($item in @($Outcome.Optional)) {
                 $lines.Add(('Optional, not needed for the demo: {0}. {1} {2}' -f $item['name'], $item['message'], $item['howTo']))
             }

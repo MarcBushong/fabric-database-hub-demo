@@ -40,8 +40,12 @@ function Complete-DemoDeploymentRun {
 
     .PARAMETER Stopped
     The run was stopped (Ctrl+C) before it finished: NOT DONE with the resume command, without reading the resource
-    group's state, so the ending takes no Azure call; a Ctrl+C that Enable-DemoRunCancelWatch recorded counts too. Steps
-    still running on the status page go back to Pending with the reason (Phase 28 live finding).
+    group's state, so the ending takes no Azure call but the switch below; a Ctrl+C that Enable-DemoRunCancelWatch recorded
+    counts too. Steps still running on the status page go back to Pending with the reason (Phase 28 live finding).
+
+    Whatever the outcome, a run that ended before its own switch (Ctrl+C, an error) sends it now, without waiting: the VMs
+    it left on the interim baseline get the run's activity profile, so none stays on the baseline (2026-11-03, ADR 0010;
+    Send-DemoPendingActivitySwitch). That takes a few seconds; a run that switched already sends nothing.
 
     .EXAMPLE
     $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $results
@@ -74,6 +78,17 @@ function Complete-DemoDeploymentRun {
     )
 
     $wasStopped = [bool]$Stopped -or (-not $WhatIfRun -and (Test-DemoRunCancelled))
+    # The run ended before its switch (Ctrl+C, an error): what it left on the interim baseline gets its activity profile
+    # now, sent without waiting (2026-11-03). Nothing is pending after a run that switched.
+    if (-not $WhatIfRun) {
+        $runProfile = Get-DemoActivityProfile -Config $Config
+        try {
+            $null = Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile $runProfile -Result @($Result) -CheckPrefix 'DEPLOY' -RequestedBy 'deploy' -NoWait
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The switch from the interim baseline couldn''t be sent: {0}. Set the profile with ./scripts/demo-control.ps1 -Target all -Scenario {1} -Duration 240.' -f (Protect-DemoText -Text $_.Exception.Message), $runProfile.Name)
+        }
+    }
     $judgedState = $State
     if (-not $PSBoundParameters.ContainsKey('State') -and -not $WhatIfRun -and -not $wasStopped) {
         try {
@@ -137,13 +152,22 @@ function Complete-DemoDeploymentRun {
     }
     $minutes = [int][System.Math]::Round(([System.DateTime]::UtcNow - [datetime]$Run.StartedUtc).TotalMinutes)
     $outcome | Add-Member -NotePropertyName 'Minutes' -NotePropertyValue $minutes -Force
+    # What runs now, and how to choose the other profile: DONE's "Activity:" line, on the console and the status page.
+    $activityLine = ''
+    try {
+        $activityLine = Get-DemoActivitySummaryLine -ActivityProfile (Get-DemoActivityProfile -Config $Config)
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('The activity line couldn''t be built: {0}' -f $_.Exception.Message)
+    }
+    $outcome | Add-Member -NotePropertyName 'Activity' -NotePropertyValue $activityLine -Force
     if ($Run.ProgressPath) {
         $runState = if ($outcome.Kind -eq 'Done') { 'Done' } else { 'NotDone' }
         # The notes are an array, which Get-DemoMemberValue returns whole: assigned first, then each note is its own item,
         # not "System.String[]" (Phase 28 live finding, 2026-10-30).
         $notes = Get-DemoMemberValue -InputObject $outcome -Name 'Notes'
         $reason = (@([string]$outcome.Reason) + @($notes) | Where-Object { $_ } | ForEach-Object { [string]$_ }) -join ' '
-        Set-DemoProgressValue -Path $Run.ProgressPath -Section 'run' -Value ([ordered]@{ state = $runState; endedAt = (Get-DemoUnixTime); reason = $reason; next = [string]$outcome.Next; nextCommand = [string]$outcome.NextCommand; exitCode = [int]$outcome.ExitCode })
+        Set-DemoProgressValue -Path $Run.ProgressPath -Section 'run' -Value ([ordered]@{ state = $runState; endedAt = (Get-DemoUnixTime); reason = $reason; next = [string]$outcome.Next; nextCommand = [string]$outcome.NextCommand; exitCode = [int]$outcome.ExitCode; activity = $activityLine })
         Set-DemoProgressValue -Path $Run.ProgressPath -Section 'optional' -Value @($outcome.Optional)
         # What only a person can confirm, once each, which never kept the run from DONE (Phase 28 live finding).
         $confirmValue = Get-DemoMemberValue -InputObject $outcome -Name 'Confirm'

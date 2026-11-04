@@ -1,8 +1,9 @@
 name: schedule-start
 
 # Scheduled start with warm-up (plan section 9.4, C3): starts the VMs about 45 minutes before a demo, resumes
-# or recreates T3, lets the baseline run for 30 minutes, and checks that telemetry arrives, so Hub charts
-# have history. Off unless the repository variable DBHUB_SCHEDULES_ENABLED is 'true'; a scheduled run uses the
+# or recreates T3, lets the configured activity profile run for 30 minutes (business-day by default: the baseline plus
+# hourly incidents that start once start-demo.ps1's own Run Commands are done), and checks that telemetry arrives, so
+# Hub charts have history. Off unless the repository variable DBHUB_SCHEDULES_ENABLED is 'true'; a scheduled run uses the
 # environment DBHUB_SCHEDULE_ENVIRONMENT (default demo). Edit the cron (UTC) for your demo times.
 on:
   schedule:

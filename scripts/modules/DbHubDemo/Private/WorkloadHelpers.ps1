@@ -118,7 +118,9 @@ function Invoke-DemoActionRunCommand {
     Command that's busy (Conflict, or another operation in progress, for example while a policy updates
     MDE.Windows, R49) is retried for about 12.5 minutes; a VM that isn't running fails at once with a clear
     message. Action Run Command runs one script at a time per VM and returns only the last 4,096 bytes of
-    output (https://learn.microsoft.com/azure/virtual-machines/windows/run-command).
+    output (https://learn.microsoft.com/azure/virtual-machines/windows/run-command). -TimeoutSeconds bounds the whole
+    call, retries included (stop-demo.ps1's guest stop, 2026-11-03): the Azure CLI is stopped then, and the result's
+    ExitCode is -1 (Invoke-DemoAz); the Run Command itself goes on in Azure.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -136,19 +138,27 @@ function Invoke-DemoActionRunCommand {
         [string] $Script,
 
         [ValidateRange(1, 13)]
-        [int] $Attempts = 10
+        [int] $Attempts = 10,
+
+        [ValidateRange(0, 86400)]
+        [int] $TimeoutSeconds = 0
     )
 
     if ($Script -match '[^\x00-\x7F]') {
         throw 'The Run Command script must be ASCII-only for Windows PowerShell 5.1.'
     }
+    $deadline = if ($TimeoutSeconds -gt 0) { [DateTime]::UtcNow.AddSeconds($TimeoutSeconds) } else { [DateTime]::MaxValue }
     $scriptPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('dbhub-action-{0}.ps1' -f [guid]::NewGuid().ToString('N'))
     $run = $null
     try {
         [System.IO.File]::WriteAllText($scriptPath, $Script, [System.Text.Encoding]::ASCII)
         $arguments = @('vm', 'run-command', 'invoke', '--resource-group', $ResourceGroupName, '--name', $VmName, '--command-id', 'RunPowerShellScript', '--scripts', "@$scriptPath", '--output', 'json')
         for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-            $run = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList $arguments -AllowFailure
+            $bound = @{}
+            if ($TimeoutSeconds -gt 0) {
+                $bound['TimeoutSeconds'] = [int][System.Math]::Max(1, [System.Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
+            }
+            $run = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList $arguments -AllowFailure @bound
             if ($run.ExitCode -ne 0 -and (Test-DemoAzVmNotRunning -Text ([string]$run.StdErr))) {
                 $run = [pscustomobject]@{ ExitCode = $run.ExitCode; StdOut = $run.StdOut; StdErr = ('{0} isn''t running (deallocated), so Run Command can''t reach it; start it first (start-demo.ps1). {1}' -f $VmName, $run.StdErr) }
                 break
@@ -157,6 +167,9 @@ function Invoke-DemoActionRunCommand {
                 break
             }
             $delay = Get-DemoConflictDelay -Attempt $attempt
+            if ([DateTime]::UtcNow.AddSeconds($delay + 1) -ge $deadline) {
+                break
+            }
             Write-DemoLog -Level Warning -Message ('A Run Command or an extension that a policy installs or updates (for example MDE.Windows) is busy on {0}; retrying in {1} seconds ({2} of {3}).' -f $VmName, $delay, $attempt, ($Attempts - 1))
             Start-Sleep -Seconds $delay
         }
@@ -253,20 +266,31 @@ function Invoke-DemoWorkloadAction {
         [ValidateSet('EnableT3', 'EnableT4', 'Runner', 'StopGuest')]
         [string] $Action,
 
-        [System.Collections.IDictionary] $Request = @{}
+        [System.Collections.IDictionary] $Request = @{},
+
+        [ValidateRange(0, 86400)]
+        [int] $TimeoutSeconds = 0
     )
 
     $resourceGroup = 'rg-{0}-{1}' -f $Config['prefix'], $Config['environment']
     $script = Get-DemoWorkloadControlScript -Action $Action -Request $Request
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    $run = Invoke-DemoActionRunCommand -SubscriptionId $Config['subscriptionId'] -ResourceGroupName $resourceGroup -VmName $VmName -Script $script
+    $bound = @{}
+    if ($TimeoutSeconds -gt 0) {
+        $bound['TimeoutSeconds'] = $TimeoutSeconds
+    }
+    $run = Invoke-DemoActionRunCommand -SubscriptionId $Config['subscriptionId'] -ResourceGroupName $resourceGroup -VmName $VmName -Script $script @bound
     $seconds = [int]$clock.Elapsed.TotalSeconds
     if ($run.ExitCode -ne 0) {
         $errorText = (Protect-DemoText -Text ([string]$run.StdErr)).Trim()
         if ($errorText.Length -gt 500) {
             $errorText = $errorText.Substring(0, 500) + '...'
         }
-        return @{ marker = 'DBHUBDEMO-WORKLOAD'; action = $Action; status = 'Fail'; message = ('The Run Command on {0} failed: {1}' -f $VmName, $errorText); evidence = @{ operatorSeconds = $seconds } }
+        $evidence = @{ operatorSeconds = $seconds }
+        if ($TimeoutSeconds -gt 0 -and $run.ExitCode -eq -1 -and [string]$run.StdErr -match 'did not finish within') {
+            $evidence['timedOut'] = $true
+        }
+        return @{ marker = 'DBHUBDEMO-WORKLOAD'; action = $Action; status = 'Fail'; message = ('The Run Command on {0} failed: {1}' -f $VmName, $errorText); evidence = $evidence }
     }
     $response = $null
     try {

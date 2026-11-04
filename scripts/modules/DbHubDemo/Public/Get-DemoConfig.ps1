@@ -5,7 +5,9 @@ function Get-DemoConfig {
 
     .DESCRIPTION
     Defaults come from the schema itself, so they're defined in one place. An invalid file stops the
-    script with every validation error listed.
+    script with every validation error listed. activityProfile's default (business-day since 2026-11-03) is resolved
+    where a run uses it (Get-DemoActivityProfile), not merged here, so a run can tell that the file doesn't set it and
+    say so once, and a configuration written back from this one still inherits the default.
 
     .EXAMPLE
     $config = Get-DemoConfig -Path ./config/demo.config.json
@@ -33,6 +35,8 @@ function Get-DemoConfig {
 
     $schema = Get-Content -LiteralPath $SchemaPath -Raw | ConvertFrom-Json -AsHashtable
     $defaults = Get-DemoSchemaDefault -Node $schema
+    # Resolved where it's used (Get-DemoActivityProfile), so an unset activityProfile stays recognizable.
+    $defaults.Remove('activityProfile')
     $values = $json | ConvertFrom-Json -AsHashtable
     $values.Remove('$schema')
 

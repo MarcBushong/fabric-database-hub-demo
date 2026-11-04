@@ -563,7 +563,13 @@ function Invoke-DemoPreflight {
     # Cost: live retail prices against the ceilings, with the subscription's Defender for Cloud plans. T4 is priced at the
     # size it starts with (Phase 28 follow-up): an existing server's own size, the step the fallback starts at, or none
     # when the fallback leaves T4 out, so a fallback whose worst case is over a ceiling leaves T4 out instead of stopping
-    # the run. The estimates share one price cache, so the fallback's own estimate reads only the prices it adds.
+    # the run. The estimates share one price cache, so the fallback's own estimate reads only the prices it adds. The
+    # activity profile's T3 incidents count (business-day by default since 2026-11-03), and a configuration that doesn't
+    # set activityProfile gets one notice (PREFLIGHT.ACTIVITYPROFILE).
+    $notice = New-DemoActivityProfileNotice -ActivityProfile (Get-DemoActivityProfile -Config $Config) -CheckPrefix 'PREFLIGHT'
+    if ($null -ne $notice) {
+        $results.Add($notice)
+    }
     $costConfig = $Config
     if ($t4On -and $t4Exists -and $t4ServerSku -and $t4ServerSku -cne (Get-DemoT4SkuName -Config $Config)) {
         $costConfig = Copy-DemoT4Config -Config $Config -Source server -SkuName $t4ServerSku

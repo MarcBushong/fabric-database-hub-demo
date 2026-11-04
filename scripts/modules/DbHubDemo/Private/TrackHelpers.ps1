@@ -243,8 +243,10 @@ function Write-DemoTrackHandoff {
     'artifacts' comes from the build process: Bundle, Runner, and Error. 'infrastructure' comes from
     deploy.ps1 once the template finished: Succeeded, LoaderSettings, T3UseFreeLimit, and Message. 'cancel' comes from
     deploy.ps1 when it stops the tracks (Ctrl+C, or their time limit): Reason and Utc; the track processes' finally
-    blocks then skip their slow Azure cleanups (Test-DemoRunCancelled; Phase 28 live finding). Nothing in any of them
-    is secret.
+    blocks then skip their slow Azure cleanups (Test-DemoRunCancelled; Phase 28 live finding). 'activity-sqlvm01' and
+    'activity-archost01' come from a track that may have left that VM on the interim baseline: VmName and Utc; deploy.ps1
+    switches the VM's targets to the run's activity profile at its end, or when it's stopped (Register-DemoActivitySwitch,
+    2026-11-03). Nothing in any of them is secret.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -252,7 +254,7 @@ function Write-DemoTrackHandoff {
         [string] $Path,
 
         [Parameter(Mandatory)]
-        [ValidateSet('artifacts', 'infrastructure', 'cancel')]
+        [ValidateSet('artifacts', 'infrastructure', 'cancel', 'activity-sqlvm01', 'activity-archost01')]
         [string] $Name,
 
         [Parameter(Mandatory)]
@@ -521,7 +523,8 @@ function Invoke-DemoDeploymentTrack {
       parallel), Bootstraps (the loader; then T1's monitoring merge while the bootstrap runs; then T1 Ready),
       T3 (the T3Setup results, or the same work again when they didn't pass, then T3's workload and checks),
       T4 (Enable-DemoT4Workload: T1 sets T4 up through the P6 group; a T4 failure is reported but doesn't stop
-      T1's track), Activity (T1, T3, and T4), Monitoring (the plugin confirmed), Telemetry (T1 and T3 in
+      T1's track), Activity (T1, T3, and T4: the activity profile's interim, baseline in place of a profile with
+      incidents, which deploy.ps1 switches at its end; 2026-11-03), Monitoring (the plugin confirmed), Telemetry (T1 and T3 in
       Database Hub).
     - T4 (Phase 24, ADR 0019): Server (Test-DemoT4: the server, its version and size, Entra-only, the network,
       the P6 administrator, the database, the enhanced metrics), Telemetry (METRICS.T4: Azure Monitor has its
@@ -580,7 +583,10 @@ function Invoke-DemoDeploymentTrack {
     }
     $chunkSize = [int](& $option 'ChunkSizeKiB' 512)
     $parallelism = [int](& $option 'ChunkParallelism' 8)
-    $profileName = if ($Config['activityProfile']) { [string]$Config['activityProfile'] } else { 'baseline' }
+    # The run's activity profile (business-day by default since 2026-11-03): the steps set its interim, baseline in place
+    # of a profile with incidents, and deploy.ps1 switches once its own Run Commands on the VM are done (ADR 0010).
+    $activityProfile = Get-DemoActivityProfile -Config $Config
+    $switchTo = if ($activityProfile.HasIncidents) { $activityProfile.Name } else { '' }
     $tagKey = 'Track{0}' -f $Track
     $recordState = -not [bool](& $option 'NoState' $false)
     $handoff = [string](& $option 'HandoffPath' '')
@@ -894,6 +900,11 @@ function Invoke-DemoDeploymentTrack {
             Set-DemoProgressStep -Path $progress -Id $stepIds -State 'Running' -Message ''
         }
         $outcome = 'Pass'
+        # A step that can leave its VM on the interim baseline: the loader can install the runner, which then sets it, and
+        # T3, T4, and Activity (T1) or T2 (T2) set it. deploy.ps1 switches that VM at its end, or when it's stopped or fails.
+        if ($switchTo -and ('{0}/{1}' -f $Track, $name) -in 'T1/Bootstraps', 'T1/T3', 'T1/T4', 'T1/Activity', 'T2/Bootstraps', 'T2/T2') {
+            Register-DemoActivitySwitch -VmName $(if ($Track -eq 'T1') { 'sqlvm01' } else { 'archost01' }) -HandoffPath $handoff
+        }
         try {
             switch ('{0}/{1}' -f $Track, $name) {
                 'T1/T3Setup' {
@@ -1009,7 +1020,7 @@ function Invoke-DemoDeploymentTrack {
                     $current = Get-DemoDeploymentState -Config $Config
                     $skip = if ($current.RunnerSha256) { '' } else { 'No workload runner was deployed (-SkipRunner).' }
                     foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' })) {
-                        $results.Add((Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy'))
+                        $results.Add((Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $activityProfile.Interim -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo))
                     }
                 }
                 'T1/Monitoring' {
@@ -1231,7 +1242,7 @@ function Invoke-DemoDeploymentTrack {
                             & $note 'DEPLOY.T2.READY' 'T2' 'Warning' ('T2''s host isn''t Ready after {0} minutes (state {1}: {2}); its profile is set anyway.' -f $minutes, $state, $message) 'Follow it with ./scripts/status.ps1, and run deploy.ps1 -Resume if a step stays failed.'
                         }
                     }
-                    $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy'))
+                    $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $activityProfile.Interim -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo))
                 }
                 'T2/Telemetry' {
                     if (-not (& $telemetry @('T2') 'T2.Telemetry')) {
