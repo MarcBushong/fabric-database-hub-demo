@@ -32,7 +32,8 @@ public sealed partial class CatalogTests
         Assert.Equal(
             [
                 "blocking-chain", "capacity-max", "connection-surge", "cpu-pressure", "deadlock-storm", "healthy-baseline", "idle-in-transaction", "inefficient-query", "io-pressure",
-                "locking-blocking", "log-flush-waits", "log-rate-pressure", "memory-grant-pressure", "missing-index", "parallel-scans", "resource-governance", "slow-consumer", "tempdb-contention",
+                "locking-blocking", "log-flush-waits", "log-rate-pressure", "memory-grant-pressure", "missing-index", "parallel-scans", "plan-regression", "resource-governance", "slow-consumer",
+                "tempdb-contention",
             ],
             ids);
     }
@@ -63,13 +64,19 @@ public sealed partial class CatalogTests
     public void EveryIncidentRunsOnEveryTarget(string id)
     {
         // The Database Agent's target coverage is undocumented (ADR 0013), so every SQL Server scenario runs on T1, T2,
-        // and T3. T4 (PostgreSQL, ADR 0019) runs exactly the scenarios it has step functions for.
+        // and T3, except one that needs a feature only Azure SQL Database has (plan-regression: automatic tuning, which
+        // SQL Server 2022 Standard lacks). T4 (PostgreSQL, ADR 0019) runs exactly the scenarios it has step functions for.
         var scenario = ScenarioCatalog.Default.Get(id);
         var sqlTargets = scenario.Targets.Applicable.Where(t => t != "T4").Order(StringComparer.Ordinal).ToList();
 
-        Assert.True(sqlTargets.Count == 0 || sqlTargets.SequenceEqual(["T1", "T2", "T3"]), $"{id} runs on some SQL Server targets but not all.");
+        Assert.True(
+            sqlTargets.Count == 0 || sqlTargets.SequenceEqual(["T1", "T2", "T3"]) || (AzureSqlOnlyScenarioIds.Contains(id) && sqlTargets.SequenceEqual(["T3"])),
+            $"{id} runs on some SQL Server targets but not all.");
         Assert.Equal(PostgresScenarioIds.Contains(id), scenario.AppliesTo(DemoTarget.T4));
     }
+
+    /// <summary>The scenarios that run on T3 only, because they need an Azure SQL Database feature (the showcase).</summary>
+    internal static readonly HashSet<string> AzureSqlOnlyScenarioIds = new(["plan-regression"], StringComparer.Ordinal);
 
     /// <summary>The scenarios T4 runs: database/postgresql/120-scenario-functions.sql has their steps.</summary>
     internal static readonly HashSet<string> PostgresScenarioIds = new(["connection-surge", "cpu-pressure", "healthy-baseline", "idle-in-transaction", "io-pressure", "locking-blocking"], StringComparer.Ordinal);
@@ -127,7 +134,7 @@ public sealed partial class CatalogTests
         function = function[..function.IndexOf("\nGO", StringComparison.Ordinal)];
         var rows = CatalogRow().Matches(function).ToDictionary(m => m.Groups[1].Value, m => int.Parse(m.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture), StringComparer.Ordinal);
 
-        var sqlScenarios = ScenarioCatalog.Default.All.Where(s => s.AppliesTo(DemoTarget.T1)).ToList();
+        var sqlScenarios = ScenarioCatalog.Default.All.Where(s => s.AppliesTo(DemoTarget.T1) || s.AppliesTo(DemoTarget.T2) || s.AppliesTo(DemoTarget.T3)).ToList();
         Assert.Equal(sqlScenarios.Select(s => s.Id).Order(StringComparer.Ordinal), rows.Keys.Order(StringComparer.Ordinal));
         foreach (var scenario in sqlScenarios)
         {

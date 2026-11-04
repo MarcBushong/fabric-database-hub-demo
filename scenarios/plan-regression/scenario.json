@@ -1,0 +1,36 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "plan-regression",
+  "title": "Plan regression (automatic plan correction)",
+  "summary": "A front-desk visit summary for a few patients at a time, whose plan depends on the first range it's compiled for. For the first part of the run it's compiled for a few patients and seeks (plan A). Then the runner marks it for recompilation and runs it once for every patient, so the cached plan scans care.appointments (plan B), and the same narrow lookups go on far more slowly: Query Store sees one query regress from plan A to plan B. With FORCE_LAST_GOOD_PLAN on, Azure SQL Database's default, automatic tuning detects the regression and forces plan A. T3 (Azure SQL Database) only.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_plan_regression",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1200 },
+  "concurrency": { "default": 2, "min": 1, "max": 4, "description": "Sessions running the lookups; session 1 also unforces an earlier run's forced plan at the start and makes the switch." },
+  "intensity": { "default": 6, "min": 1, "max": 10, "description": "Pace: a lookup about every 400 ms per session at 1, back to back at 10." },
+  "targets": {
+    "applicable": ["T3"],
+    "default": ["T3"],
+    "notes": {
+      "T3": "The runner signs in to T3 as the P6 group's member, a database owner, so it can recompile the lookup (sp_recompile) and unforce an earlier run's forced plan (sp_query_store_unforce_plan); it touches only demo.usp_visit_summary_lookup. SQL Server 2022 Standard on T1 and T2 has no automatic tuning, and the procedure refuses to run there."
+    }
+  },
+  "parameters": {
+    "goodPercent": { "type": "integer", "default": 35, "minimum": 10, "maximum": 80, "description": "The share of the run on plan A, before the switch to plan B.", "sqlParameter": "@good_percent" }
+  },
+  "expectedHubSignals": [
+    { "signal": "SqlServerCPUUtilization: a step up at the switch, and down again once automatic tuning forces plan A", "surface": "Performance" },
+    { "signal": "sys.dm_db_tuning_recommendations: a FORCE_LAST_GOOD_PLAN recommendation for demo.usp_visit_summary_lookup's query, Verifying or Success once it's applied", "surface": "DMVs", "note": "Also on the Azure portal's automatic tuning page for the database. The DMV shows the regression whether or not FORCE_LAST_GOOD_PLAN is on; with it on, the plan is forced when the estimated CPU gain is over 10 seconds." },
+    { "signal": "A plan regression or forced-plan finding for the lookup", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
+  ],
+  "expectedSymptoms": [
+    "Before the switch, each lookup reads a few dozen pages; after it, each lookup scans care.appointments",
+    "Query Store shows one query with two plans, and the later one regressed on CPU and duration",
+    "Within minutes of enough regressed executions, automatic tuning forces plan A and the lookups are fast again"
+  ],
+  "queryLevelEvidence": [
+    "Query Store's Regressed Queries and Queries With Forced Plans reports (SSMS), and sys.query_store_plan.is_forced_plan",
+    "sys.dm_db_tuning_recommendations: the reason, the estimated CPU gain, and the state, with the plan IDs in its details"
+  ],
+  "reset": "The lookups only read. A forced plan stays after the run, so it can be shown; the next plan-regression run, or reset, unforces it (sp_query_store_unforce_plan, for demo.usp_visit_summary_lookup's queries only)."
+}

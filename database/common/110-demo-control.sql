@@ -143,7 +143,8 @@ RETURN
         ('parallel-scans', 1800),
         ('log-flush-waits', 1800),
         ('slow-consumer', 1800),
-        ('capacity-max', 1200)
+        ('capacity-max', 1200),
+        ('plan-regression', 1200)
     ) AS c (scenario_id, max_duration_seconds);
 GO
 
@@ -808,6 +809,8 @@ BEGIN
     DECLARE @can_view bit = demo.fn_can_view_sessions();
     DECLARE @wait_until datetime2(3), @sessions int, @open int, @killed int, @failed int, @remaining int, @batch int, @deleted int;
     DECLARE @runs_cancelled int, @indexes_dropped int, @scale int, @seed int;
+    DECLARE @forced TABLE (n int IDENTITY(1, 1) PRIMARY KEY, query_id bigint NOT NULL, plan_id bigint NOT NULL);
+    DECLARE @unforced int, @query_id bigint, @plan_id bigint;
 
     IF @wait_seconds IS NULL OR @wait_seconds < 0
         SET @wait_seconds = 0;
@@ -886,6 +889,36 @@ BEGIN
     BEGIN CATCH
         INSERT INTO @checks (check_id, status, message) VALUES ('scratch-emptied', 'Warning', LEFT(CONCAT(N'Scratch tables not emptied: ', ERROR_MESSAGE()), 400));
     END CATCH;
+
+    -- 6b. plan-regression's forced plan (Azure SQL Database, the showcase): a plan that automatic tuning forced for
+    -- demo.usp_visit_summary_lookup is unforced, so the regression can happen again. Nothing else is touched, and a
+    -- check row appears only when there was something to unforce.
+    IF CAST(SERVERPROPERTY('EngineEdition') AS int) = 5 AND OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') IS NOT NULL
+    BEGIN
+        SET @unforced = 0;
+        BEGIN TRY
+            INSERT INTO @forced (query_id, plan_id)
+            SELECT p.query_id, p.plan_id
+            FROM sys.query_store_plan AS p
+            INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+            WHERE q.object_id = OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') AND p.is_forced_plan = 1;
+            SET @remaining = @@ROWCOUNT;
+            WHILE @remaining > 0
+            BEGIN
+                SELECT @query_id = query_id, @plan_id = plan_id FROM @forced WHERE n = @remaining;
+                EXEC sys.sp_query_store_unforce_plan @query_id = @query_id, @plan_id = @plan_id;
+                SET @unforced += 1;
+                SET @remaining -= 1;
+            END;
+            IF @unforced > 0
+                INSERT INTO @checks (check_id, status, message)
+                VALUES ('forced-plan-unforced', 'Pass', LEFT(CONCAT(@unforced, N' plan(s) that automatic tuning forced for plan-regression''s lookup unforced.'), 400));
+        END TRY
+        BEGIN CATCH
+            INSERT INTO @checks (check_id, status, message)
+            VALUES ('forced-plan-unforced', 'Warning', LEFT(CONCAT(N'plan-regression''s forced plan wasn''t unforced (needs ALTER on the database): ', ERROR_MESSAGE()), 400));
+        END CATCH;
+    END;
 
     -- 7. The baseline's audit rows (bounded: at most 200 batches of 5,000).
     SET @remaining = 200;
