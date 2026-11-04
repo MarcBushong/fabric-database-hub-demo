@@ -127,7 +127,9 @@ function Get-DemoActivityControlName {
         SecretId            = '{0}/providers/Microsoft.KeyVault/vaults/{1}/secrets/dbhub-activity-webhook' -f $groupId, $vault
         ControlRunbook      = 'DbHub-Control'
         StopRunbook         = 'DbHub-Stop'
+        MonitorRunbook      = 'DbHub-Monitor'
         AutoStopSchedule    = 'dbhub-autostop'
+        MonitorPrefix       = 'dbhub-monitor-'
         SafetyStopSchedule  = 'dbhub-t4-safety-stop'
         WebhookPrefix       = 'dbhub-activity-'
         RunCommandPrefix    = 'DbHubControl-'
@@ -319,8 +321,9 @@ function Get-DemoActivityControlCatalog {
 function Get-DemoActivityControlRunbookSetting {
     <#
     .SYNOPSIS
-    The settings baked into both runbooks: names, the demo's schedule, the bounds, the allow-lists from the scenario
-    catalog, the pinned API versions, and the VM-side workload-control template. Nothing in it is secret; it holds the
+    The settings baked into the three runbooks: names, the demo's schedule, the bounds, the allow-lists from the scenario
+    catalog, how long the VM-side control waits for each target (readySeconds), how T1's monitoring plugin is looked
+    after, the pinned API versions, and the VM-side workload-control template. Nothing in it is secret; it holds the
     subscription ID and the identity's client ID, which live in Azure only. Internal.
     #>
     [CmdletBinding()]
@@ -362,8 +365,11 @@ function Get-DemoActivityControlRunbookSetting {
         identityClientId       = $IdentityClientId.ToLowerInvariant()
         controlRunbook         = $Name.ControlRunbook
         stopRunbook            = $Name.StopRunbook
+        monitorRunbook         = $Name.MonitorRunbook
         autoStopSchedule       = $Name.AutoStopSchedule
         autoStopBufferMinutes  = 10
+        monitorSchedulePrefix  = $Name.MonitorPrefix
+        monitorRecheckMinutes  = 30
         runCommandPrefix       = $Name.RunCommandPrefix
         sqlVmName              = 'sqlvm01'
         hostVmName             = Get-DemoHostVmName -Config $Config
@@ -379,7 +385,8 @@ function Get-DemoActivityControlRunbookSetting {
         maxBodyBytes           = 4096
         targets                = $targets
         scenarios              = $catalog
-        monitoring             = [ordered]@{ extensionInstanceName = [string]$sqlVm['extensionInstanceName']; statusPlugin = [string]$sqlVm['statusPlugin']; serviceName = 'SQLIaaSExtension' }
+        readySeconds           = [ordered]@{ T1 = 600; T2 = 1200; T3 = 600; T4 = 600 }
+        monitoring             = [ordered]@{ extensionInstanceName = [string]$sqlVm['extensionInstanceName']; statusPlugin = [string]$sqlVm['statusPlugin']; featureFlag = [string]$sqlVm['featureFlag']; serviceName = 'SQLIaaSExtension'; settleMinutes = 5; verifyMinutes = 5 }
         apiVersions            = $apiVersions
         controlScriptTemplate  = (Get-DemoWorkloadControlTemplate).Replace('__ACTION__', 'Runner')
     }
@@ -395,7 +402,7 @@ function Get-DemoActivityControlRunbookContent {
     [OutputType([string])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('DbHub-Control', 'DbHub-Stop')]
+        [ValidateSet('DbHub-Control', 'DbHub-Stop', 'DbHub-Monitor')]
         [string] $Name,
 
         [Parameter(Mandatory)]
@@ -904,8 +911,8 @@ function Invoke-DemoActivityControlTemplate {
 function Publish-DemoActivityControlRunbook {
     <#
     .SYNOPSIS
-    Creates or updates DbHub-Control and DbHub-Stop (PowerShell, that is Windows PowerShell 5.1), replaces each draft
-    with the assembled content, and publishes it. Returns CONTROL.RUNBOOKS. Internal.
+    Creates or updates DbHub-Control, DbHub-Stop, and DbHub-Monitor (PowerShell, that is Windows PowerShell 5.1),
+    replaces each draft with the assembled content, and publishes it. Returns CONTROL.RUNBOOKS. Internal.
     - Runbook - Create Or Update: https://learn.microsoft.com/rest/api/automation/runbook/create-or-update
     - Runbook Draft - Replace Content: https://learn.microsoft.com/rest/api/automation/runbook-draft/replace-content
     - Runbook - Publish: https://learn.microsoft.com/rest/api/automation/runbook/publish
@@ -926,7 +933,7 @@ function Publish-DemoActivityControlRunbook {
     $doc = 'https://learn.microsoft.com/rest/api/automation/runbook-draft/replace-content'
     $version = '2024-10-23'
     $published = [System.Collections.Generic.List[string]]::new()
-    foreach ($runbook in $Name.ControlRunbook, $Name.StopRunbook) {
+    foreach ($runbook in $Name.ControlRunbook, $Name.StopRunbook, $Name.MonitorRunbook) {
         $content = Get-DemoActivityControlRunbookContent -Name $runbook -Setting $Setting
         if (-not $PSCmdlet.ShouldProcess(('{0}/{1}' -f $Name.AutomationAccount, $runbook), 'Create, replace the content of, and publish the runbook')) {
             continue
@@ -941,15 +948,15 @@ function Publish-DemoActivityControlRunbook {
         foreach ($step in $steps) {
             $call = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method $step.Method -Url $step.Url -Body $step.Body -ContentType $step.ContentType
             if (-not $call.Ok) {
-                return (New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('{0}: couldn''t {1}: {2}' -f $runbook, $step.Label, $call.Error) -Remediation 'Run setup-activity-control.ps1 again; it publishes both runbooks each time.' -DocUrl $doc)
+                return (New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('{0}: couldn''t {1}: {2}' -f $runbook, $step.Label, $call.Error) -Remediation 'Run setup-activity-control.ps1 again; it publishes all three runbooks each time.' -DocUrl $doc)
             }
         }
         $published.Add($runbook)
     }
     if ($published.Count -eq 0) {
-        return (New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} and {1} would be published (Windows PowerShell 5.1) with the current catalog and settings.' -f $Name.ControlRunbook, $Name.StopRunbook) -DocUrl $doc)
+        return (New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0}, {1}, and {2} would be published (Windows PowerShell 5.1) with the current catalog and settings.' -f $Name.ControlRunbook, $Name.StopRunbook, $Name.MonitorRunbook) -DocUrl $doc)
     }
-    return (New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('{0} published (Windows PowerShell 5.1) with the current scenario catalog ({1} scenarios) and settings.' -f ($published -join ' and '), @($Setting['scenarios'].Keys).Count) -Evidence ([ordered]@{ runbooks = $published.ToArray(); targets = @($Setting['targets'].Keys); scenarios = @($Setting['scenarios'].Keys) }) -DocUrl $doc)
+    return (New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('{0} published (Windows PowerShell 5.1) with the current scenario catalog ({1} scenarios) and settings.' -f ($published -join ', '), @($Setting['scenarios'].Keys).Count) -Evidence ([ordered]@{ runbooks = $published.ToArray(); targets = @($Setting['targets'].Keys); scenarios = @($Setting['scenarios'].Keys) }) -DocUrl $doc)
 }
 
 function Get-DemoActivityControlSafetyStopTime {
@@ -1821,12 +1828,44 @@ function Remove-DemoActivityControlFabric {
     return (New-DemoResult -CheckId 'CONTROL.REMOVE.FABRIC' -Area 'fabric' -Target 'fabric' -Status $status -Message ('Fabric: {0}.{1}' -f $(if ($done.Count) { ($done -join ', ') + ' removed' } else { 'nothing to remove' }), $(if ($failed.Count) { ' Failed: ' + ($failed -join '; ') } else { '' })) -Remediation $(if ($failed.Count) { 'Delete what''s left in Fabric yourself (it needs the Admin role in the control workspace).' } else { '' }) -DocUrl $doc)
 }
 
+function Get-DemoActivityControlActiveJob {
+    <#
+    .SYNOPSIS
+    One control runbook's jobs that are queued or running, from Job - List By Automation Account
+    (https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account). A control Automation account or
+    group that doesn't exist has none. Returns Ok, Error, and Jobs (Id and Status). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Name,
+
+        [Parameter(Mandatory)]
+        [string] $Runbook
+    )
+
+    $jobs = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/jobs' -f $Name.AutomationAccountId) -Query ([ordered]@{ '$filter' = ("properties/runbook/name eq '{0}'" -f $Runbook); 'api-version' = '2024-10-23' })
+    if (-not $jobs.Ok -and -not $jobs.Missing) {
+        return [pscustomobject]@{ Ok = $false; Error = $jobs.Error; Jobs = @() }
+    }
+    $active = [System.Collections.Generic.List[object]]::new()
+    foreach ($job in @(Get-DemoActivityControlList -InputObject $jobs.Value -Name 'value')) {
+        $properties = Get-DemoMemberValue -InputObject $job -Name 'properties'
+        $status = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
+        $name = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'runbook') -Name 'name')
+        if ($name -eq $Runbook -and $status -in $script:ActivityControlActiveJobStatuses) {
+            $active.Add([pscustomobject]@{ Id = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobId'); Status = $status })
+        }
+    }
+    return [pscustomobject]@{ Ok = $true; Error = ''; Jobs = $active.ToArray() }
+}
+
 function Get-DemoActivityControlActiveStopJob {
     <#
     .SYNOPSIS
-    The control's DbHub-Stop jobs that are queued or running, from Job - List By Automation Account
-    (https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account). A control Automation account or
-    group that doesn't exist has none. Returns Ok, Error, and Jobs (Id and Status). Internal.
+    The control's DbHub-Stop jobs that are queued or running (Get-DemoActivityControlActiveJob). Returns Ok, Error, and
+    Jobs (Id and Status). Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1835,20 +1874,7 @@ function Get-DemoActivityControlActiveStopJob {
         [object] $Name
     )
 
-    $jobs = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/jobs' -f $Name.AutomationAccountId) -Query ([ordered]@{ '$filter' = ("properties/runbook/name eq '{0}'" -f $Name.StopRunbook); 'api-version' = '2024-10-23' })
-    if (-not $jobs.Ok -and -not $jobs.Missing) {
-        return [pscustomobject]@{ Ok = $false; Error = $jobs.Error; Jobs = @() }
-    }
-    $active = [System.Collections.Generic.List[object]]::new()
-    foreach ($job in @(Get-DemoActivityControlList -InputObject $jobs.Value -Name 'value')) {
-        $properties = Get-DemoMemberValue -InputObject $job -Name 'properties'
-        $status = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
-        $runbook = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'runbook') -Name 'name')
-        if ($runbook -eq $Name.StopRunbook -and $status -in $script:ActivityControlActiveJobStatuses) {
-            $active.Add([pscustomobject]@{ Id = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobId'); Status = $status })
-        }
-    }
-    return [pscustomobject]@{ Ok = $true; Error = ''; Jobs = $active.ToArray() }
+    return (Get-DemoActivityControlActiveJob -Name $Name -Runbook $Name.StopRunbook)
 }
 
 function Wait-DemoActivityControlStopJob {
@@ -1928,8 +1954,8 @@ function Clear-DemoActivityControlAutoStop {
     <#
     .SYNOPSIS
     stop-demo.ps1's and start-demo.ps1's part of the on-demand activity control (ADR 0020): removes a pending
-    auto-stop (the one-time schedule dbhub-autostop and its links to DbHub-Stop), and for a start, waits for a stop
-    job in flight. Internal.
+    auto-stop (the one-time schedule dbhub-autostop and its links to DbHub-Stop, with the run's monitoring re-checks
+    dbhub-monitor-<n> and their links to DbHub-Monitor), and for a start, waits for a stop job in flight. Internal.
     https://learn.microsoft.com/rest/api/automation/schedule/delete
     https://learn.microsoft.com/rest/api/automation/job-schedule/delete
 
@@ -2001,12 +2027,23 @@ function Clear-DemoActivityControlAutoStop {
         if (-not $PSCmdlet.ShouldProcess($name.AutoStopSchedule, $action)) {
             return (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: the pending auto-stop {0} would be removed.' -f $name.AutoStopSchedule) -Evidence $evidence -DocUrl $doc)
         }
+        $monitorPattern = '^{0}\d+$' -f [regex]::Escape($name.MonitorPrefix)
         $links = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules' -f $name.AutomationAccountId) -ApiVersion $version)
         foreach ($link in @(Get-DemoActivityControlList -InputObject $links.Value -Name 'value')) {
             $properties = Get-DemoMemberValue -InputObject $link -Name 'properties'
             $linkId = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobScheduleId')
-            if ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'schedule') -Name 'name') -eq $name.AutoStopSchedule -and $linkId -match '^[0-9a-fA-F-]{36}$') {
+            $linked = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'schedule') -Name 'name')
+            if (($linked -eq $name.AutoStopSchedule -or $linked -match $monitorPattern) -and $linkId -match '^[0-9a-fA-F-]{36}$') {
                 $null = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules/{1}' -f $name.AutomationAccountId, $linkId) -ApiVersion $version)
+            }
+        }
+        # The run's monitoring re-checks (dbhub-monitor-<n>, linked to DbHub-Monitor) go with its auto-stop. One that's
+        # left behind does nothing: DbHub-Monitor acts only while an auto-stop is pending.
+        $schedules = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/schedules' -f $name.AutomationAccountId) -ApiVersion $version)
+        foreach ($item in @(Get-DemoActivityControlList -InputObject $schedules.Value -Name 'value')) {
+            $recheck = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
+            if ($recheck -match $monitorPattern) {
+                $null = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $name.AutomationAccountId, $recheck) -ApiVersion $version)
             }
         }
         $deleted = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id $scheduleId -ApiVersion $version)

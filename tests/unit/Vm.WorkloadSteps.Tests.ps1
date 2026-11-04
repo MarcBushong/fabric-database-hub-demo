@@ -18,10 +18,18 @@ BeforeAll {
         return $settings
     }
 
-    foreach ($name in 'Get-VM', 'Stop-VM') {
+    # Hyper-V's cmdlets exist only on a Hyper-V host; elsewhere these stand-ins let Pester mock them.
+    $stubs = @{
+        'Get-VM'                   = 'param([string] $Name)'
+        'Stop-VM'                  = 'param([string] $Name, [switch] $Force, [switch] $AsJob)'
+        'Set-VM'                   = 'param([string] $Name, [string] $AutomaticStartAction, [int] $AutomaticStartDelay, [string] $AutomaticStopAction)'
+        'Start-VM'                 = 'param([string] $Name)'
+        'Get-VMNetworkAdapter'     = 'param([string] $VMName)'
+        'Connect-VMNetworkAdapter' = 'param([object] $VMNetworkAdapter, [string] $SwitchName)'
+    }
+    foreach ($name in $stubs.Keys) {
         if (-not (Get-Command -Name $name -ErrorAction SilentlyContinue)) {
-            $parameters = if ($name -eq 'Get-VM') { 'param([string] $Name)' } else { 'param([string] $Name, [switch] $Force, [switch] $AsJob)' }
-            New-Item -Path ('function:global:' + $name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $parameters)) | Out-Null
+            New-Item -Path ('function:global:' + $name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stubs[$name])) | Out-Null
         }
     }
 }
@@ -701,5 +709,589 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         $root = New-ControlRoot
         Invoke-DemoWorkloadControl -ActionName 'Format' -Request '' -StateRoot $root
         (Get-ControlResult).status | Should -Be 'Fail'
+    }
+}
+
+Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (control start reliability)' {
+    BeforeAll {
+        . (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoWorkloadControl.ps1')
+        # The functions the T2 relay reuses exist here too, so Pester can mock them.
+        . (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoGoldenGuest.ps1')
+        . (Join-Path -Path $repoRoot -ChildPath 'vm/hyperv-guest/GuestVm.ps1')
+
+        function New-ReadyRoot([string] $Role = 'SqlVm', [System.Collections.IDictionary] $Capture = $null) {
+            $root = Join-Path -Path $TestDrive -ChildPath ('ready-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $root -Force | Out-Null
+            $settings = [ordered]@{ role = $Role; workload = [ordered]@{ runnerSha256 = $script:sha; runnerChunkCount = 7; activityProfile = 'baseline'; autoShutdownTime = '1900'; autoShutdownTimeZone = 'UTC' } }
+            Set-Content -LiteralPath (Join-Path -Path $root -ChildPath 'settings.json') -Value ($settings | ConvertTo-Json -Depth 5)
+            if ($Role -eq 'SqlVm') {
+                $dotnet = Join-Path -Path $root -ChildPath 'dotnet.exe'
+                $runner = Join-Path -Path $root -ChildPath 'ContosoCare.Workload.dll'
+                Set-Content -LiteralPath $dotnet -Value 'host'
+                Set-Content -LiteralPath $runner -Value 'runner'
+                $install = [ordered]@{ primaryTarget = 'T1'; runnerDll = $runner; dotnetExe = $dotnet; t3 = [ordered]@{ serverFqdn = 'azuresql01-abc123.database.windows.net' }; t4 = [ordered]@{ serverFqdn = 'pgflex01-abc123.postgres.database.azure.com'; runnerRole = 'contosocare_runner' } }
+                Set-Content -LiteralPath (Join-Path -Path $root -ChildPath 'workload-install.json') -Value ($install | ConvertTo-Json -Depth 5)
+            }
+            if ($null -ne $Capture) {
+                New-Item -ItemType Directory -Path (Join-Path -Path $root -ChildPath 'golden') -Force | Out-Null
+                Set-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture.json') -Value ($Capture | ConvertTo-Json -Depth 5)
+            }
+            return $root
+        }
+
+        function ConvertTo-Request([hashtable] $Request) {
+            [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($Request | ConvertTo-Json -Depth 5 -Compress)))
+        }
+
+        function New-Run([int] $ExitCode = 0, [string] $StdErr = '', [string] $StdOut = '[]') {
+            [pscustomobject]@{ ExitCode = $ExitCode; StdOut = $StdOut; StdErr = $StdErr }
+        }
+
+        $secure = [System.Security.SecureString]::new()
+        foreach ($character in 'not-a-real-secret'.ToCharArray()) { $secure.AppendChar($character) }
+        $script:guestCredential = [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+        $script:profileSet = @('profile', 'set', '--name', 'incident:cpu-pressure', '--duration', '30m', '--not-after', '{{NEXT_SHUTDOWN}}')
+    }
+
+    BeforeEach {
+        $script:lines = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-DemoControlLine -MockWith { $script:lines.Add($Line) }
+        # A clock that moves only when the code sleeps.
+        $script:clock = [datetime]::new(2026, 11, 3, 22, 9, 26, [System.DateTimeKind]::Utc)
+        Mock -CommandName Get-DemoControlUtcNow -MockWith { $script:clock }
+        $script:sleeps = [System.Collections.Generic.List[int]]::new()
+        Mock -CommandName Start-Sleep -MockWith { $script:sleeps.Add([int]$Seconds); $script:clock = $script:clock.AddSeconds([int]$Seconds) }
+
+        function Get-ControlResult {
+            $script:lines.Count | Should -Be 1
+            $script:lines[0] | Should -Match '^DBHUBDEMO-WORKLOAD \{'
+            $script:lines[0].Substring('DBHUBDEMO-WORKLOAD '.Length) | ConvertFrom-Json
+        }
+    }
+
+    It 'treats only activity as needing its target: profile set (but not off) and run' {
+        Test-DemoControlActivityCommand -Arguments $script:profileSet | Should -BeTrue
+        Test-DemoControlActivityCommand -Arguments @('run', 'cpu-pressure', '--duration', '5m') | Should -BeTrue
+        foreach ($other in @(@('profile', 'set', '--name', 'off'), @('profile', 'get', '--json'), @('status', '--json'), @('reset', '--requested-by', 'x'), @('stop'))) {
+            Test-DemoControlActivityCommand -Arguments $other | Should -BeFalse
+        }
+    }
+
+    It 'calls <Text> on <Target> transient: <Transient>' -ForEach @(
+        @{ Target = 'T1'; Text = 'SQL error 2: A network-related or instance-specific error occurred while establishing a connection to SQL Server. (provider: Named Pipes Provider, error: 40)'; Transient = $true }
+        @{ Target = 'T1'; Text = 'SQL error 4060: Cannot open database "ContosoCare" requested by the login.'; Transient = $true }
+        @{ Target = 'T1'; Text = 'SQL error -2: Execution Timeout Expired.'; Transient = $true }
+        @{ Target = 'T1'; Text = 'SQL error 18456: Login failed for user.'; Transient = $false }
+        @{ Target = 'T1'; Text = 'SQL error 229: The SELECT permission was denied.'; Transient = $false }
+        @{ Target = 'T2'; Text = 'The virtual machine arcsql01 is not in running state.'; Transient = $true }
+        @{ Target = 'T3'; Text = 'SQL error 40613: Database ContosoCare on server azuresql01-abc123 is not currently available.'; Transient = $true }
+        @{ Target = 'T3'; Text = 'SQL error 2: Could not open a connection to SQL Server.'; Transient = $false }
+        @{ Target = 'T3'; Text = 'ManagedIdentityCredential authentication unavailable. No response received from the managed identity endpoint.'; Transient = $true }
+        @{ Target = 'T4'; Text = 'PostgreSQL error 57P03: the database system is starting up'; Transient = $true }
+        @{ Target = 'T4'; Text = 'PostgreSQL error 08001: could not connect to server'; Transient = $true }
+        @{ Target = 'T4'; Text = 'PostgreSQL error 08006: connection failure'; Transient = $true }
+        @{ Target = 'T4'; Text = 'PostgreSQL error 53300: sorry, too many clients already'; Transient = $true }
+        @{ Target = 'T4'; Text = 'PostgreSQL error 08P01: invalid frontend message type'; Transient = $false }
+        @{ Target = 'T4'; Text = 'Failed to connect to 10.0.0.4:5432'; Transient = $true }
+        @{ Target = 'T4'; Text = 'PostgreSQL error 28P01: password authentication failed for user "contosocare_runner"'; Transient = $false }
+        @{ Target = 'T1'; Text = 'The runner (warmup --json --target T1) did not finish within 300 seconds and was stopped.'; Transient = $true }
+        @{ Target = 'T1'; Text = 'Unrecognized command or argument ''warmup''.'; Transient = $false }
+        @{ Target = 'T1'; Text = ''; Transient = $false }
+    ) {
+        Test-DemoControlTransientFailure -Target $Target -Text $Text | Should -Be $Transient
+    }
+
+    It 'waits for a cold T1 with growing delays, then sets its profile once (live, 2026-11-03: SQL error 2)' {
+        $root = New-ReadyRoot
+        $script:warmups = 0
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith {
+            if ($ArgumentList[0] -eq 'warmup') {
+                $script:warmups++
+                if ($script:warmups -le 2) {
+                    return (New-Run -ExitCode 1 -StdErr 'SQL error 2: A network-related or instance-specific error occurred while establishing a connection to SQL Server.')
+                }
+                return (New-Run)
+            }
+            return (New-Run -StdOut '[{"checkId":"WORKLOAD.T1.PROFILE.SET","status":"Pass","message":"ok"}]')
+        }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = $script:profileSet; timeoutSeconds = 600 }) -StateRoot $root
+        $result = Get-ControlResult
+        $result.status | Should -Be 'Pass'
+        $result.evidence.ready | Should -Be 'Ready'
+        $result.evidence.readyAttempts | Should -Be 3
+        $result.message | Should -Match 'T1 accepted connections after 15 seconds'
+        @($script:sleeps) | Should -Be @(5, 10)
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 3 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq 'warmup --json --target T1' }
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'profile' }
+    }
+
+    It 'sets nothing on a target that stays unreachable, and stops waiting at its bound' {
+        $root = New-ReadyRoot
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith {
+            if ($ArgumentList[0] -eq 'warmup') {
+                return (New-Run -ExitCode 1 -StdErr 'SQL error 53: The network path was not found.')
+            }
+            throw 'profile set must not run'
+        }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = $script:profileSet; readySeconds = 120 }) -StateRoot $root
+        $result = Get-ControlResult
+        $result.status | Should -Be 'Fail'
+        $result.evidence.ready | Should -Be 'TimedOut'
+        $result.message | Should -Match 'didn''t accept connections within 120 seconds'
+        @($script:sleeps) | Should -Be @(5, 10, 20, 40)
+    }
+
+    It 'goes on when the target answers with an error that isn''t transient, and lets the command report it' {
+        $root = New-ReadyRoot
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith {
+            if ($ArgumentList[0] -eq 'warmup') {
+                return (New-Run -ExitCode 1 -StdErr 'SQL error 229: The SELECT permission was denied on the object.')
+            }
+            return (New-Run -StdOut '[{"status":"Pass","message":"ok"}]')
+        }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = $script:profileSet }) -StateRoot $root
+        $result = Get-ControlResult
+        $result.status | Should -Be 'Pass'
+        $result.evidence.ready | Should -Be 'Answered'
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'warmup' }
+        $script:sleeps.Count | Should -Be 0
+    }
+
+    It 'waits for a resuming T3 and a starting T4 with the same server options as their command' {
+        $root = New-ReadyRoot
+        $script:failures = @{ T3 = 'SQL error 40613: Database ContosoCare is not currently available.'; T4 = 'PostgreSQL error 57P03: the database system is starting up' }
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith {
+            $target = $ArgumentList[[array]::IndexOf([object[]]$ArgumentList, '--target') + 1]
+            if ($ArgumentList[0] -eq 'warmup' -and $script:failures[$target]) {
+                $text = $script:failures[$target]
+                $script:failures[$target] = ''
+                return (New-Run -ExitCode 1 -StdErr $text)
+            }
+            return (New-Run -StdOut '[{"status":"Pass","message":"ok"}]')
+        }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T3'; arguments = $script:profileSet }) -StateRoot $root
+        (Get-ControlResult).evidence.readyAttempts | Should -Be 2
+        $script:lines.Clear()
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T4'; arguments = $script:profileSet }) -StateRoot $root
+        (Get-ControlResult).evidence.readyAttempts | Should -Be 2
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 2 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq 'warmup --json --target T3 --server azuresql01-abc123.database.windows.net' }
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 2 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq 'warmup --json --target T4 --server pgflex01-abc123.postgres.database.azure.com --user contosocare_runner' }
+    }
+
+    It 'doesn''t wait before a read, a stop, a profile set to off, or with readySeconds 0' {
+        $root = New-ReadyRoot
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { New-Run -StdOut '{"name":"baseline"}' }
+        foreach ($request in @(
+                @{ target = 'T1'; arguments = @('profile', 'get', '--json') }
+                @{ target = 'T1'; arguments = @('profile', 'set', '--name', 'off') }
+                @{ target = 'T3'; arguments = @('status', '--json') }
+                @{ target = 'T1'; arguments = $script:profileSet; readySeconds = 0 }
+            )) {
+            $script:lines.Clear()
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request $request) -StateRoot $root
+            (Get-ControlResult).status | Should -Be 'Pass'
+        }
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 0 -ParameterFilter { $ArgumentList[0] -eq 'warmup' }
+    }
+
+    Context 'T2, relayed by archost01 into its guest' {
+        BeforeEach {
+            $script:guest = @{ State = 'Off'; Heartbeat = ''; AutomaticStartAction = 'Nothing' }
+            $script:adapters = @([pscustomobject]@{ SwitchName = '' })
+            $script:imds = 'source-vm'
+            $script:warmupErrors = [System.Collections.Generic.Queue[string]]::new()
+            $script:guestCalls = [System.Collections.Generic.List[string]]::new()
+            Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = $script:guest.State; Heartbeat = $script:guest.Heartbeat; AutomaticStartAction = $script:guest.AutomaticStartAction; VMId = 'hyper-v-id' } }
+            Mock -CommandName Set-VM -MockWith { $script:guest.AutomaticStartAction = $AutomaticStartAction }
+            Mock -CommandName Start-VM -MockWith { $script:guest.State = 'Running'; $script:guest.Heartbeat = 'OkApplicationsHealthy' }
+            Mock -CommandName Get-VMNetworkAdapter -MockWith { $script:adapters }
+            # The golden script's own Connect-GoldenAdapter, which the relay reuses: on a host with the Hyper-V module (the
+            # Windows runners) Pester mocks the real Connect-VMNetworkAdapter, whose -VMNetworkAdapter takes only a real adapter.
+            Mock -CommandName Connect-GoldenAdapter -MockWith { foreach ($adapter in $script:adapters) { if (-not [string]$adapter.SwitchName) { $adapter.SwitchName = $SwitchName } } }
+            Mock -CommandName Get-GoldenImdsVmId -MockWith { if ($script:imds) { $script:imds } else { throw 'The Instance Metadata Service did not answer.' } }
+            Mock -CommandName Wait-GoldenGuest -MockWith { [pscustomobject]@{ Credential = $script:guestCredential; Seconds = 20 } }
+            # The host bootstrap's lock, which a capture's Prepare holds too.
+            Mock -CommandName Enter-GoldenLock -MockWith { [System.IO.MemoryStream]::new() }
+            Mock -CommandName Get-DemoGuestCredential -MockWith { $script:guestCredential }
+            Mock -CommandName Invoke-DemoControlGuestCommand -MockWith {
+                $text = $ScriptBlock.ToString()
+                if ($text -match 'MSSQLSERVER') {
+                    $script:guestCalls.Add('sql')
+                    return [pscustomobject]@{ status = 'Running'; seconds = 40; startedByScript = $true }
+                }
+                if ($text -match "'warmup'") {
+                    $script:guestCalls.Add('warmup')
+                    if ($script:warmupErrors.Count -gt 0) {
+                        return (New-Run -ExitCode 1 -StdErr $script:warmupErrors.Dequeue())
+                    }
+                    return (New-Run)
+                }
+                $script:guestCalls.Add('runner ' + (@($ArgumentList[1]) -join ' '))
+                return (New-Run -StdOut '[{"status":"Pass","message":"ok"}]')
+            }
+
+            function New-Capture([bool] $Released = $false, [string] $ResetUtc = '') {
+                $capture = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = 'source-vm'; arcResourceName = 'arcsql01'; arcResourceGroup = 'rg-dbhub-demo'; released = $Released }
+                if ($ResetUtc) {
+                    $capture['resetUtc'] = $ResetUtc
+                }
+                return $capture
+            }
+
+            function New-CaptureMarker([string] $Root, [datetime] $StartedUtc, [string] $Source = 'source-vm') {
+                # What Prepare writes first (review, 2026-11-04).
+                $marker = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611032130'; startedUtc = $StartedUtc.ToString("yyyy-MM-dd'T'HH':'mm':'ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture); sourceAzureVmId = $Source }
+                New-Item -ItemType Directory -Path (Join-Path -Path $Root -ChildPath 'golden') -Force | Out-Null
+                Set-Content -LiteralPath (Join-Path -Path $Root -ChildPath 'golden\capture-in-progress.json') -Value ($marker | ConvertTo-Json)
+            }
+        }
+
+        It 'releases the source a golden capture left air-gapped, starts its guest, waits for SQL Server, then sets the profile (live, 2026-11-03)' {
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.golden | Should -Be 'Source'
+            $result.evidence.released | Should -Be 'Source'
+            $result.evidence.sqlService | Should -Be 'Running'
+            Should -Invoke -CommandName Connect-GoldenAdapter -Times 1 -Exactly -ParameterFilter { $SwitchName -eq 'DbHubDemoNat' }
+            Should -Invoke -CommandName Set-VM -Times 1 -Exactly -ParameterFilter { $AutomaticStartAction -eq 'Start' -and $AutomaticStartDelay -eq 0 }
+            Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+            $capture = Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json
+            $capture.released | Should -BeTrue
+            $capture.releasedUtc | Should -Not -BeNullOrEmpty
+            @($script:guestCalls)[0..1] | Should -Be @('sql', 'warmup')
+            @($script:guestCalls)[2] | Should -Match '^runner profile set --name incident:cpu-pressure .* --target T2$'
+        }
+
+        It 'never starts a restored copy whose Arc identity wasn''t reset, and says to run deploy.ps1' {
+            $script:imds = 'copy-vm'
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Fail'
+            $result.evidence.golden | Should -Be 'CopyNotReset'
+            $result.message | Should -Match 'deploy\.ps1'
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Invoke-DemoControlGuestCommand') {
+                Should -Invoke -CommandName $command -Times 0 -Exactly
+            }
+            (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
+        }
+
+        It 'leaves the guest off when the host''s VM ID can''t be read, because a copy can''t be told from the source' {
+            $script:imds = ''
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Fail'
+            $result.evidence.golden | Should -Be 'VmIdUnknown'
+            Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+        }
+
+        It 'finishes the release of a copy whose reset is recorded, without resetting it again' {
+            $script:imds = 'copy-vm'
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture -ResetUtc '2026-10-23T14:00:00Z')
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.golden | Should -Be 'ResetCopy'
+            $result.evidence.released | Should -Be 'Copy'
+            Should -Invoke -CommandName Wait-GoldenGuest -Times 1 -Exactly
+            Should -Invoke -CommandName Connect-GoldenAdapter -Times 1 -Exactly
+        }
+
+        It 'reads the host''s VM ID for a released record, and then only waits for the running guest of the source' {
+            $script:guest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start' }
+            $script:adapters = @([pscustomobject]@{ SwitchName = 'DbHubDemoNat' })
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture -Released $true)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.golden | Should -Be 'Released'
+            Should -Invoke -CommandName Get-GoldenImdsVmId -Times 1 -Exactly
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Enter-GoldenLock') {
+                Should -Invoke -CommandName $command -Times 0 -Exactly
+            }
+            # A copy whose reset is recorded is taken at its word: no VM ID is read.
+            $script:lines.Clear()
+            $copy = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture -Released $true -ResetUtc '2026-10-23T14:00:00Z')
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $copy
+            (Get-ControlResult).evidence.golden | Should -Be 'Released'
+            Should -Invoke -CommandName Get-GoldenImdsVmId -Times 1 -Exactly
+        }
+
+        It 'refuses a copy whose record says released without a reset, and starts or runs nothing in it (review, 2026-11-04)' {
+            # A snapshot taken after its source was released by mistake: every copy carries released true and the
+            # captured Arc identity.
+            $script:imds = 'copy-vm'
+            $script:guest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start' }
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture -Released $true)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Fail'
+            $result.evidence.golden | Should -Be 'CopyNotReset'
+            $result.message | Should -Match 'record says released, but its Arc identity was never reset'
+            $result.message | Should -Match 'deploy\.ps1'
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Invoke-DemoControlGuestCommand', 'Wait-GoldenGuest') {
+                Should -Invoke -CommandName $command -Times 0 -Exactly
+            }
+            # The same record on a host whose VM ID can't be read is refused too.
+            $script:imds = ''
+            $script:lines.Clear()
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            (Get-ControlResult).evidence.golden | Should -Be 'VmIdUnknown'
+            Should -Invoke -CommandName Invoke-DemoControlGuestCommand -Times 0 -Exactly
+        }
+
+        It 'leaves the guest as a capture in progress left it, and says when the marker stops counting (review, 2026-11-04)' {
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture)
+            New-CaptureMarker -Root $root -StartedUtc $script:clock.AddMinutes(-40)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Fail'
+            $result.evidence.golden | Should -Be 'CaptureInProgress'
+            $result.message | Should -Match 'A golden capture is in progress .*snapshot snap-dbhub-t2golden-202611032130, since 2026-11-03T21:29:26Z'
+            $result.message | Should -Match 'capture-t2-golden\.ps1'
+            $result.message | Should -Match 'from 2026-11-04T03:29:26Z'
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Enter-GoldenLock', 'Invoke-DemoControlGuestCommand') {
+                Should -Invoke -CommandName $command -Times 0 -Exactly
+            }
+            (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
+        }
+
+        It 'reads everything again under the lock: a capture that prepared the guest while the relay waited wins, and nothing changes (the race)' {
+            # The relay saw an air gap without a marker (an older interrupted capture) and waited for the bootstrap lock,
+            # which a new capture's Prepare held: Prepare wrote its marker and record, air-gapped the guest, and let go.
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture)
+            $script:raceRoot = $root
+            Mock -CommandName Enter-GoldenLock -MockWith {
+                New-CaptureMarker -Root $script:raceRoot -StartedUtc $script:clock
+                [pscustomobject]@{} | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $script:lockReleased = $true } -PassThru
+            }
+            $script:lockReleased = $false
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Fail'
+            $result.evidence.golden | Should -Be 'CaptureInProgress'
+            Should -Invoke -CommandName Enter-GoldenLock -Times 1 -Exactly
+            $script:lockReleased | Should -BeTrue
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter') {
+                Should -Invoke -CommandName $command -Times 0 -Exactly
+            }
+            (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
+        }
+
+        It 'releases the source again once the marker is older than 6 hours, and ignores a copy''s marker from the snapshot' {
+            # An interrupted capture (Ctrl+C) never ends its marker; 6 hours bound it.
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture)
+            New-CaptureMarker -Root $root -StartedUtc $script:clock.AddHours(-7)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.golden | Should -Be 'Source'
+            $result.evidence.released | Should -Be 'Source'
+            # A reset copy restored right after its capture carries the source's recent marker, which means nothing there.
+            $script:imds = 'copy-vm'
+            $script:guest = @{ State = 'Off'; Heartbeat = ''; AutomaticStartAction = 'Nothing' }
+            $script:lines.Clear()
+            $copy = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture -ResetUtc '2026-11-03T22:00:00Z')
+            New-CaptureMarker -Root $copy -StartedUtc $script:clock.AddMinutes(-50)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $copy
+            (Get-ControlResult).evidence.golden | Should -Be 'ResetCopy'
+            # A recent marker on a host whose VM ID can't be read can't be told from the source's.
+            $script:imds = ''
+            $script:lines.Clear()
+            $unknown = New-ReadyRoot -Role 'ArcHost'
+            New-CaptureMarker -Root $unknown -StartedUtc $script:clock.AddMinutes(-5)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $unknown
+            (Get-ControlResult).evidence.golden | Should -Be 'VmIdUnknown'
+        }
+
+        It 'leaves the guest alone when a capture marker can''t be read: only a capture writes it (fail closed, review of 2026-11-04)' {
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture)
+            foreach ($content in @('{"snapshotName":"snap-dbhub-t2golden-202611032130","startedUtc":"2026-11-03T21.29.26Z","sourceAzureVmId":"source-vm"}', 'not json')) {
+                Set-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture-in-progress.json') -Value $content
+                $script:lines.Clear()
+                Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+                $result = Get-ControlResult
+                $result.status | Should -Be 'Fail'
+                $result.evidence.golden | Should -Be 'CaptureMarkerUnreadable'
+                $result.message | Should -Match 'capture marker on .* can''t be read, and only a capture writes it'
+                $result.message | Should -Match 'capture-t2-golden\.ps1 again'
+            }
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-GoldenAdapter', 'Enter-GoldenLock', 'Invoke-DemoControlGuestCommand') {
+                Should -Invoke -CommandName $command -Times 0 -Exactly
+            }
+        }
+        It 'reports a guest without SQL Server as T2 not set up yet, which the module counts as Not selected (Phase 28)' {
+            $script:guest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start' }
+            Mock -CommandName Invoke-DemoControlGuestCommand -MockWith {
+                $script:guestCalls.Add('sql')
+                [pscustomobject]@{ status = 'Missing'; seconds = 0; startedByScript = $false }
+            }
+            $root = New-ReadyRoot -Role 'ArcHost'
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Fail'
+            $result.message | Should -Match 'T2 isn''t set up yet: SQL Server isn''t installed in arcsql01 yet'
+            $result.message | Should -Match 'not installed in the guest yet'
+            @($script:guestCalls) | Should -Be @('sql')
+        }
+
+        It 'starts a guest that''s off, without a capture record, with its designed automatic start' {
+            $script:guest = @{ State = 'Off'; Heartbeat = ''; AutomaticStartAction = 'StartIfRunning' }
+            $script:adapters = @([pscustomobject]@{ SwitchName = 'DbHubDemoNat' })
+            $root = New-ReadyRoot -Role 'ArcHost'
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.golden | Should -Be 'NoCapture'
+            $result.evidence.started | Should -BeTrue
+            $result.evidence.startActionBefore | Should -Be 'StartIfRunning'
+            Should -Invoke -CommandName Set-VM -Times 1 -Exactly -ParameterFilter { $AutomaticStartAction -eq 'Start' }
+            Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+            Should -Invoke -CommandName Connect-GoldenAdapter -Times 0 -Exactly
+        }
+
+        It 'waits while SQL Server in the guest refuses connections, then sets the profile' {
+            $script:guest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start' }
+            $script:warmupErrors.Enqueue('SQL error 2: A network-related or instance-specific error occurred while establishing a connection to SQL Server.')
+            $script:warmupErrors.Enqueue('SQL error 4060: Cannot open database "ContosoCare" requested by the login.')
+            $root = New-ReadyRoot -Role 'ArcHost'
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.ready | Should -Be 'Ready'
+            $result.evidence.readyAttempts | Should -Be 3
+            @($script:guestCalls | Where-Object { $_ -eq 'warmup' }).Count | Should -Be 3
+        }
+
+        It 'fails, within its bound, when the guest never reports a heartbeat, and runs nothing in it' {
+            $script:guest = @{ State = 'Running'; Heartbeat = 'NoContact'; AutomaticStartAction = 'Start' }
+            $root = New-ReadyRoot -Role 'ArcHost'
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet; readySeconds = 120 }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Fail'
+            $result.message | Should -Match 'heartbeat'
+            ($script:sleeps | Measure-Object -Sum).Sum | Should -BeLessOrEqual 120
+            $script:guestCalls.Count | Should -Be 0
+        }
+
+        It 'changes nothing on the host for a read' {
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture)
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = @('profile', 'get', '--json') }) -StateRoot $root
+            $null = Get-ControlResult
+            @($script:guestCalls) | Should -Be @('runner profile get --json --target T2')
+            foreach ($command in 'Get-VM', 'Start-VM', 'Set-VM', 'Get-GoldenImdsVmId', 'Wait-GoldenGuest') {
+                Should -Invoke -CommandName $command -Times 0 -Exactly
+            }
+        }
+    }
+}
+
+Describe 'The health read''s live view of the T2 guest (T2.GUEST.STATE, 2026-11-03)' {
+    BeforeAll {
+        $healthScript = Join-Path -Path $repoRoot -ChildPath 'vm/health/Get-DemoHealth.ps1'
+        # The health read dot-sources the installed golden script for the host's role; it's loaded here first so that
+        # Pester can mock its IMDS read.
+        . (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoGoldenGuest.ps1')
+        # Plain variables, not $script: ones: the mocks run under the health read's own script scope.
+        $hostVmId = 'aaaaaaaa-0000-0000-0000-000000000001'
+
+        function New-HealthRoot([object] $Capture) {
+            $root = Join-Path -Path $TestDrive -ChildPath ('health-' + [guid]::NewGuid().ToString('N'))
+            $null = New-Item -ItemType Directory -Path (Join-Path -Path $root -ChildPath 'golden') -Force
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), '{"schemaVersion":1,"role":"ArcHost","state":"Ready","status":"Pass","message":"Ready.","steps":[]}')
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'settings.json'), (ConvertTo-Json -InputObject @{ bundlePath = $repoRoot }))
+            if ($null -ne $Capture) {
+                [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture.json'), (ConvertTo-Json -InputObject $Capture))
+            }
+            return $root
+        }
+    }
+
+    BeforeEach {
+        $testGuest = @{ State = 'Off'; Heartbeat = ''; AutomaticStartAction = 'Nothing' }
+        $testSwitch = ''
+        Mock -CommandName Get-VM -MockWith { if ($Name -eq 'arcsql01') { [pscustomobject]@{ Name = 'arcsql01'; State = $testGuest.State; Heartbeat = $testGuest.Heartbeat; AutomaticStartAction = $testGuest.AutomaticStartAction } } }
+        Mock -CommandName Get-VMNetworkAdapter -MockWith { @([pscustomobject]@{ Name = 'Network Adapter'; SwitchName = $testSwitch }) }
+        Mock -CommandName Get-GoldenImdsVmId -MockWith { $hostVmId }
+    }
+
+    It 'reports a source a golden capture left air-gapped, with its role and no ID, in both views' {
+        $root = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = $hostVmId; released = $false })
+        $text = & $healthScript -Root $root -View Summary
+        $guest = ($text | ConvertFrom-Json).t2Guest
+        $guest.present | Should -BeTrue
+        $guest.state | Should -Be 'Off'
+        $guest.startAction | Should -Be 'Nothing'
+        $guest.adapters | Should -Be 1
+        $guest.connected | Should -Be 0
+        $guest.golden.released | Should -BeFalse
+        $guest.golden.role | Should -Be 'Source'
+        $text | Should -Not -Match 'aaaaaaaa-0000'
+        ((& $healthScript -Root $root -View Full) | ConvertFrom-Json).t2Guest.golden.role | Should -Be 'Source'
+    }
+
+    It 'tells a copy from the source, and reads the Azure VM ID unless a copy''s reset is recorded (review, 2026-11-04)' {
+        $copy = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = 'bbbbbbbb-0000-0000-0000-000000000002'; released = $false; resetUtc = '2026-10-29T10:00:00Z' })
+        $guest = ((& $healthScript -Root $copy -View Summary) | ConvertFrom-Json).t2Guest
+        $guest.golden.role | Should -Be 'Copy'
+        $guest.golden.reset | Should -BeTrue
+        $testGuest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start' }
+        $testSwitch = 'DbHubDemoNat'
+        # Only the source may carry a released record without a reset, so its role is read too.
+        $released = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = $hostVmId; released = $true; releasedUtc = '2026-11-03T22:37:00Z' })
+        $guest = ((& $healthScript -Root $released -View Summary) | ConvertFrom-Json).t2Guest
+        $guest.golden.released | Should -BeTrue
+        $guest.golden.role | Should -Be 'Source'
+        $guest.connected | Should -Be 1
+        $notReset = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = 'bbbbbbbb-0000-0000-0000-000000000002'; released = $true })
+        ((& $healthScript -Root $notReset -View Summary) | ConvertFrom-Json).t2Guest.golden.role | Should -Be 'Copy'
+        Should -Invoke -CommandName Get-GoldenImdsVmId -Times 3 -Exactly
+        $resetCopy = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = 'bbbbbbbb-0000-0000-0000-000000000002'; released = $true; resetUtc = '2026-10-29T10:00:00Z' })
+        ((& $healthScript -Root $resetCopy -View Summary) | ConvertFrom-Json).t2Guest.golden.role | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Get-GoldenImdsVmId -Times 3 -Exactly
+    }
+
+    It 'reports a capture in progress on this host, and nothing for a copy''s marker or one older than 6 hours (review, 2026-11-04)' {
+        $capture = [ordered]@{ snapshotName = 'snap-dbhub-t2golden-202611040100'; sourceAzureVmId = $hostVmId; released = $false }
+        $since = [DateTime]::UtcNow.AddMinutes(-25)
+        $root = New-HealthRoot -Capture $capture
+        $marker = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611040100'; startedUtc = $since.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"); sourceAzureVmId = $hostVmId }
+        [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture-in-progress.json'), (ConvertTo-Json -InputObject $marker))
+        $guest = ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest
+        $iso = { param([object] $Value) ([datetime]$Value).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'") }
+        $guest.capture.state | Should -Be 'Active'
+        $guest.capture.snapshotName | Should -Be 'snap-dbhub-t2golden-202611040100'
+        & $iso $guest.capture.sinceUtc | Should -Be $since.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        & $iso $guest.capture.untilUtc | Should -Be $since.AddHours(6).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        $guest.golden.role | Should -Be 'Source'
+        $marker['sourceAzureVmId'] = 'bbbbbbbb-0000-0000-0000-000000000002'
+        [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture-in-progress.json'), (ConvertTo-Json -InputObject $marker))
+        ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest.PSObject.Properties['capture'] | Should -BeNullOrEmpty
+        $marker['sourceAzureVmId'] = $hostVmId
+        $marker['startedUtc'] = [DateTime]::UtcNow.AddHours(-7).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture-in-progress.json'), (ConvertTo-Json -InputObject $marker))
+        ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest.PSObject.Properties['capture'] | Should -BeNullOrEmpty
+        # A marker that can't be read fails closed: it's reported, never dropped.
+        [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture-in-progress.json'), '{"snapshotName":"snap-dbhub-t2golden-202611040100","startedUtc":"2026-11-04T09.44.28Z","sourceAzureVmId":"' + $hostVmId + '"}')
+        ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest.capture.state | Should -Be 'Unreadable'
+        [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture-in-progress.json'), 'not json')
+        $broken = ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest
+        $broken.capture.state | Should -Be 'Unreadable'
+        $broken.PSObject.Properties['error'] | Should -BeNullOrEmpty
+    }
+
+    It 'reports a guest that doesn''t exist, and nothing at all on a VM without Hyper-V' {
+        Mock -CommandName Get-VM -MockWith { }
+        $root = New-HealthRoot
+        $guest = ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest
+        $guest.present | Should -BeFalse
+        $guest.PSObject.Properties['golden'] | Should -BeNullOrEmpty
+        Mock -CommandName Get-Command -ParameterFilter { $Name -eq 'Get-VM' } -MockWith { }
+        $summary = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $summary.PSObject.Properties['t2Guest'] | Should -BeNullOrEmpty
+        $summary.state | Should -Be 'Ready'
     }
 }

@@ -8,8 +8,8 @@ Windows PowerShell 5.1 in Azure Automation, published by scripts/setup-activity-
 automation/runbooks/DbHubControl.Common.ps1 and the settings in place of the two markers below.
 
 - Scope All: started by the one-time schedule dbhub-autostop, which DbHub-Control creates at each run's end plus
-  10 minutes. It does exactly what Stop now does: removes that schedule, deallocates both VMs, and stops T4,
-  through Azure Resource Manager only.
+  10 minutes. It does exactly what Stop now does: removes that schedule and the run's monitoring re-checks,
+  deallocates both VMs, and stops T4, through Azure Resource Manager only.
 - Scope T4: started by the daily schedule dbhub-t4-safety-stop. It stops T4 only when it's running, because a stopped
   flexible server starts itself after 7 days (https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server).
   A cost guardrail, not an activity schedule.

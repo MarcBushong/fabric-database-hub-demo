@@ -975,6 +975,22 @@ Describe 'T2 Arc checks' {
         (Invoke-Check 'Connected' (New-TestState -Config $config -Machine $null)).status | Should -Be 'Fail'
     }
 
+    It 'gives a running host 10 minutes from its start or the last status change, whichever is later, then fails (live, 2026-11-03)' -ForEach @(
+        @{ Case = 'the host started 4 minutes ago'; HostMinutes = 4; ChangeMinutes = 6000; Status = 'Warning' }
+        @{ Case = 'the host started 12 minutes ago'; HostMinutes = 12; ChangeMinutes = 6000; Status = 'Fail' }
+        @{ Case = 'it went Disconnected 8 minutes ago on a host running for an hour'; HostMinutes = 60; ChangeMinutes = 8; Status = 'Warning' }
+        @{ Case = 'it went Disconnected 11 minutes ago on a host running for an hour'; HostMinutes = 60; ChangeMinutes = 11; Status = 'Fail' }
+    ) {
+        $state = New-TestState -Config $config -Machine (New-TestMachine -Status 'Disconnected' -LastStatusChange $script:now.AddMinutes(-$ChangeMinutes).ToString('o')) -HostPowerState 'PowerState/running'
+        $state | Add-Member -NotePropertyName 'HostSinceUtc' -NotePropertyValue $script:now.AddMinutes(-$HostMinutes)
+        $result = Invoke-Check 'Connected' $state
+        $result.status | Should -Be $Status
+        if ($Status -eq 'Fail') {
+            $result.message | Should -Match ('archost01 has been running for {0} minutes' -f $HostMinutes)
+            $result.remediation | Should -Match 'T2\.GUEST\.STATE'
+        }
+    }
+
     It 'applies the disconnected-days thresholds: <Days> days is <Status>' -TestCases @(
         @{ Days = 20.9; Status = 'Pass'; Strong = $false }
         @{ Days = 21; Status = 'Warning'; Strong = $false }
@@ -1067,6 +1083,15 @@ Describe 'T1 SQL VM performance monitoring' {
         $pending = & $convert (New-SqlVmState -Settings $flag -Message 'DatabaseMonitorArcPlugin: {"State":"NotRunning","MetricsUploadStatus":""}')
         $pending.status | Should -Be 'Warning'
         $pending.evidence.pending | Should -BeTrue
+        # Live, 2026-11-03: the plugin stopped and T1 sent nothing; the remediation restarts its agent, which
+        # configure-monitoring.ps1 never does.
+        $pending.message | Should -Match 'reports ''NotRunning'''
+        $pending.remediation | Should -Match 'start-demo\.ps1, which restarts the SQL IaaS Agent service'
+        $pending.remediation | Should -Match ([regex]::Escape("--name sqlvm01 --command-id RunPowerShellScript --scripts 'Restart-Service -Name SQLIaaSExtension -Force'"))
+        $pending.remediation | Should -Not -Match 'configure-monitoring'
+        $noStatus = & $convert (New-SqlVmState -Settings $flag -Message 'SqlIaasAgent: OK')
+        $noStatus.status | Should -Be 'Warning'
+        $noStatus.remediation | Should -Match 'check again later'
         (& $convert (New-SqlVmState -Settings $flag -Message 'DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"HTTP 403 Forbidden"}')).status | Should -Be 'Fail'
         (& $convert (New-SqlVmState -Settings $flag -Version '2.0.228.0' -Message $script:running)).status | Should -Be 'Fail'
         (& $convert (New-SqlVmState -Settings $flag -Identity 'None' -Message $script:running)).status | Should -Be 'Fail'

@@ -20,10 +20,16 @@ Actions:
   object ID), applies and seeds the schema, records t4-workload.json, sets T4's activity profile, and
   restarts DbHubDemo-Workload so its host adds T4.
 - Runner (sqlvm01 for T1, T3, and T4; archost01 relays T2 into the guest over PowerShell Direct)
-  { target, arguments[], timeoutSeconds }: runs one runner command. The token {{NEXT_SHUTDOWN}} in an
-  argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, and T4 commands the
+  { target, arguments[], timeoutSeconds, readySeconds }: runs one runner command. The token {{NEXT_SHUTDOWN}}
+  in an argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, and T4 commands the
   flexible server's FQDN and the runner's role. The evidence keeps the end of the runner's output, and the active
-  profile's name and expiry, read from the whole output first (re-review of PR 16, 2026-11-04).
+  profile's name and expiry, read from the whole output first (re-review of PR 16, 2026-11-04). Before a command
+  that starts activity ('profile set' with a profile other than off, or 'run'), the target must accept connections
+  within readySeconds (10 minutes by default, 20 for T2; 0 skips the wait): the runner's warmup is retried while it
+  fails with a documented transient error (Wait-DemoControlTargetReady), so a cold start doesn't fail the command.
+  On archost01 the guest is made ready first (Invoke-DemoControlGuestReady): a golden snapshot's source that the
+  capture left air-gapped is released, a restored copy whose Arc identity wasn't reset is never started, and a
+  guest that's off starts.
 - StopGuest (archost01) { timeoutMinutes }: shuts the guest down cleanly (Stop-VM) and waits until it's
   off, so the host can be deallocated.
 
@@ -48,6 +54,13 @@ $ErrorActionPreference = 'Stop'
 
 $script:ControlBundleRoot = Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent
 $script:ControlMarker = 'DBHUBDEMO-WORKLOAD'
+# Connection errors that pass by themselves (Test-DemoControlTransientFailure; sources in its help). SqlClient's built-in
+# transient list, and -2, its client timeout.
+$script:ControlSqlTransient = @(233, 997, 10060, 4060, 4221, 1204, 1205, 1222, 10928, 10929, 40501, 49918, 49919, 49920, 40143, 40197, 40540, 40613, 42108, 42109, -2)
+# A local instance that isn't running yet: the network-related or instance-specific errors.
+$script:ControlSqlStarting = @(2, 26, 40, 53, -1, 10061)
+# Azure SQL Database's transient fault list.
+$script:ControlAzureSqlTransient = @(615, 926, 4060, 4221, 40197, 40501, 40613, 49918, 49919, 49920)
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Vm.psd1') -Force
 
 function Write-DemoControlLine {
@@ -366,6 +379,643 @@ function Invoke-DemoControlEnableT4 {
     Write-DemoControlResult -ActionName 'EnableT4' -Status $status -Message ($messages -join ' ') -Evidence $evidence
 }
 
+function Get-DemoControlUtcNow {
+    # The readiness waits' clock, in a function of its own so tests can move it.
+    [CmdletBinding()]
+    [OutputType([datetime])]
+    param()
+
+    return [DateTime]::UtcNow
+}
+
+function Test-DemoControlActivityCommand {
+    <#
+    .SYNOPSIS
+    True for runner arguments that start activity: 'profile set' with any profile but off, or 'run'. Only those wait
+    for their target, and on T2 make the guest ready first; a read, a stop, or a reset changes nothing beforehand.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyCollection()]
+        [string[]] $Arguments = @()
+    )
+
+    $list = @($Arguments)
+    if ($list.Count -ge 1 -and $list[0] -eq 'run') {
+        return $true
+    }
+    if ($list.Count -lt 2 -or $list[0] -ne 'profile' -or $list[1] -ne 'set') {
+        return $false
+    }
+    for ($index = 2; $index -lt $list.Count - 1; $index++) {
+        if ($list[$index] -eq '--name') {
+            return ($list[$index + 1] -ne 'off')
+        }
+    }
+    return $true
+}
+
+function Get-DemoControlReadyTimeout {
+    # How long a target may take to accept connections before its activity starts: the request's readySeconds (0 to
+    # 1800; 0 skips the wait), or 20 minutes for T2, whose guest may have to start first, and 10 for the others.
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Target,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Request
+    )
+
+    if ($Request.Contains('readySeconds') -and $null -ne $Request['readySeconds']) {
+        return [int][System.Math]::Max(0, [System.Math]::Min(1800, [int]$Request['readySeconds']))
+    }
+    if ($Target -eq 'T2') {
+        return 1200
+    }
+    return 600
+}
+
+function Test-DemoControlTransientFailure {
+    <#
+    .SYNOPSIS
+    True when a runner's failure (its standard error and output, or an exception's text) is a connection error that
+    passes by itself on that target, so the readiness wait tries again. Pure.
+
+    .DESCRIPTION
+    - T1 and T2, SQL Server on the VM or in the guest: SqlClient's built-in transient errors (233, 997, 10060, 4060,
+      4221, 1204, 1205, 1222, 10928, 10929, 40501, 49918, 49919, 49920, 40143, 40197, 40540, 40613, 42108, 42109), its
+      client timeout (-2), and the network-related or instance-specific errors of an instance that isn't running yet
+      (2, 26, 40, 53, -1, 10061). Live, 2026-11-03: T1's 'profile set' ran 2 minutes before SQL Server accepted
+      connections and failed with SQL error 2. On T2 also a PowerShell Direct session that a guest's start ended.
+    - T3, Azure SQL Database serverless: SqlClient's list and Azure SQL Database's transient faults (615, 926, 4060,
+      4221, 40197, 40501, 40613, 49918, 49919, 49920), 40613 above all while a paused database resumes.
+    - T4, the PostgreSQL flexible server: a connection that can't be opened while the server starts: the connection
+      exceptions 08000, 08001, 08003, 08004, 08006, and 08007 (not 08P01, a protocol violation, which doesn't pass by
+      itself), 57P03 (cannot connect now) and 53300 (too many connections), or Npgsql's failure to connect (a refused
+      or timed-out socket).
+    - Any target: the managed identity endpoint not answering yet right after a boot, and a warmup that ran out of time.
+    Anything else means the target answered.
+    Sources (checked 2026-11-03):
+    - https://learn.microsoft.com/sql/connect/ado-net/internal-retry-logic-providers-sqlclient (built-in transient list)
+    - https://learn.microsoft.com/troubleshoot/sql/database-engine/connect/network-related-or-instance-specific-error-occurred-while-establishing-connection
+    - https://learn.microsoft.com/azure/azure-sql/database/troubleshoot-common-errors-issues (transient fault list)
+    - https://learn.microsoft.com/azure/postgresql/troubleshoot/concepts-connectivity, and PostgreSQL's error codes:
+      https://www.postgresql.org/docs/current/errcodes-appendix.html
+    - https://learn.microsoft.com/entra/identity/managed-identities-azure-resources/how-to-use-vm-token (retry guidance)
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [string] $Target,
+
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    $value = [string]$Text
+    if (-not $value.Trim()) {
+        return $false
+    }
+    if ($value -match '(?i)did not finish within \d+ seconds') {
+        return $true
+    }
+    if ($value -match '(?i)ManagedIdentityCredential' -and $value -match '(?i)unavailable|timed out|no response|not respond|refused|\b(404|410|429|5\d\d)\b') {
+        return $true
+    }
+    if ($Target -eq 'T4') {
+        if ($value -match '(?i)PostgreSQL error (08000|08001|08003|08004|08006|08007|57P03|53300)\b') {
+            return $true
+        }
+        return [bool]($value -match '(?i)failed to connect|exception while connecting|actively refused|connection refused|no connection could be made|timeout during|timed out|database system is starting up')
+    }
+    if ($Target -eq 'T2' -and $value -match '(?i)not in running state|session might have ended') {
+        return $true
+    }
+    $known = $script:ControlSqlTransient + $script:ControlSqlStarting
+    if ($Target -eq 'T3') {
+        $known = $script:ControlSqlTransient + $script:ControlAzureSqlTransient
+    }
+    $numbers = @([regex]::Matches($value, '(?i)\bSQL error (-?\d+)') | ForEach-Object { [int]$_.Groups[1].Value })
+    foreach ($number in $numbers) {
+        if ($known -contains $number) {
+            return $true
+        }
+    }
+    return [bool]($numbers.Count -eq 0 -and $value -match '(?i)TimeoutException|timeout expired')
+}
+
+function Wait-DemoControlTargetReady {
+    <#
+    .SYNOPSIS
+    Waits, bounded, until a target accepts connections: Probe runs the runner's 'warmup' (a connection and a light
+    query) once per attempt, with the attempt's time limit as its argument, and returns the run (ExitCode, StdOut,
+    StdErr). A transient failure (Test-DemoControlTransientFailure) is tried again after 5 seconds, then twice as long
+    each time up to 60 seconds, as Learn recommends for Azure SQL and PostgreSQL connections. Any other failure means
+    the target answered: the caller's command goes on and reports anything that's still wrong. Returns Status (Ready,
+    Answered, or TimedOut), Attempts, Seconds, and LastError.
+    Sources: https://learn.microsoft.com/azure/azure-sql/database/troubleshoot-common-errors-issues#implement-retry-logic,
+    https://learn.microsoft.com/azure/postgresql/troubleshoot/concepts-connectivity (checked 2026-11-03).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [string] $Target,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock] $Probe,
+
+        [ValidateRange(1, 3600)]
+        [int] $TimeoutSeconds = 600,
+
+        [ValidateRange(1, 300)]
+        [int] $FirstDelaySeconds = 5,
+
+        [ValidateRange(1, 300)]
+        [int] $MaxDelaySeconds = 60
+    )
+
+    $start = Get-DemoControlUtcNow
+    $deadline = $start.AddSeconds($TimeoutSeconds)
+    $delay = $FirstDelaySeconds
+    $attempts = 0
+    $lastError = ''
+    while ($true) {
+        $attempts++
+        $left = [int][System.Math]::Ceiling(($deadline - (Get-DemoControlUtcNow)).TotalSeconds)
+        $passed = $false
+        $text = ''
+        try {
+            $run = & $Probe ([System.Math]::Max(30, [System.Math]::Min(300, $left)))
+            if ($null -ne $run -and [int]$run.ExitCode -eq 0) {
+                $passed = $true
+            }
+            elseif ($null -ne $run) {
+                $text = Get-DemoControlTail -Text (([string]$run.StdErr) + ' ' + ([string]$run.StdOut)) -Length 600
+            }
+        }
+        catch {
+            $text = Get-DemoControlTail -Text ([string]$_.Exception.Message) -Length 600
+        }
+        $seconds = [int][System.Math]::Max(0, ((Get-DemoControlUtcNow) - $start).TotalSeconds)
+        if ($passed) {
+            return [pscustomobject]@{ Status = 'Ready'; Attempts = $attempts; Seconds = $seconds; LastError = $lastError }
+        }
+        $lastError = $text
+        if (-not (Test-DemoControlTransientFailure -Target $Target -Text $text)) {
+            return [pscustomobject]@{ Status = 'Answered'; Attempts = $attempts; Seconds = $seconds; LastError = $lastError }
+        }
+        if ((Get-DemoControlUtcNow).AddSeconds($delay) -ge $deadline) {
+            return [pscustomobject]@{ Status = 'TimedOut'; Attempts = $attempts; Seconds = $seconds; LastError = $lastError }
+        }
+        Start-Sleep -Seconds $delay
+        $delay = [System.Math]::Min($MaxDelaySeconds, $delay * 2)
+    }
+}
+
+function Get-DemoControlTargetArgument {
+    <#
+    .SYNOPSIS
+    The target options a runner command gets on sqlvm01: --target, and the server (T3's FQDN; T4's FQDN and the runner's
+    role) from the install record unless the arguments name one. Returns Arguments, or Error when the target isn't set
+    up on this VM.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Target,
+
+        [AllowEmptyCollection()]
+        [string[]] $Arguments = @(),
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Install
+    )
+
+    $full = @($Arguments) + @('--target', $Target)
+    if ($Target -eq 'T3' -and $full -notcontains '--server') {
+        $t3 = $null
+        if ($Install.Contains('t3')) {
+            $t3 = $Install['t3']
+        }
+        if ($null -eq $t3 -or -not $t3['serverFqdn']) {
+            return [pscustomobject]@{ Arguments = @(); Error = 'T1 has no T3 server in its workload settings.' }
+        }
+        $full += @('--server', [string]$t3['serverFqdn'])
+    }
+    if ($Target -eq 'T4') {
+        $t4 = $null
+        if ($Install.Contains('t4')) {
+            $t4 = $Install['t4']
+        }
+        if ($null -eq $t4 -or -not $t4['serverFqdn']) {
+            return [pscustomobject]@{ Arguments = @(); Error = 'T1 has no T4 server in its workload settings: T4 is off (t4Enabled), or T1 was bootstrapped before T4 existed (deploy.ps1 -Resume updates it).' }
+        }
+        if ($full -notcontains '--server') {
+            $full += @('--server', [string]$t4['serverFqdn'])
+        }
+        if ($full -notcontains '--user' -and $t4['runnerRole']) {
+            $full += @('--user', [string]$t4['runnerRole'])
+        }
+    }
+    return [pscustomobject]@{ Arguments = $full; Error = '' }
+}
+
+function Get-DemoControlGoldenDecision {
+    <#
+    .SYNOPSIS
+    What T2's relay does with a golden snapshot's capture record before activity starts (ADR 0018, sections 4 and 5).
+    Returns Action (None, Release, Refuse, or Wait) and Reason (NoCapture, Released, Source, ResetCopy, CopyNotReset,
+    VmIdUnknown, CaptureInProgress, or CaptureMarkerUnreadable). Pure.
+
+    .DESCRIPTION
+    - A capture in progress on this host (CaptureProgress Active, from the marker Prepare writes): nothing is touched
+      until the capture's own Release ends it (review, 2026-11-04: a start between Prepare and the snapshot undid the
+      air gap the snapshot keeps). A recent marker on a host whose VM ID couldn't be read: refused the same way as an
+      unknown VM ID. A marker that can't be read (Unreadable): left alone as well, because only Prepare writes it.
+    - No record: nothing to do.
+    - A released record: nothing to do only on the capture's source (the host's Azure VM ID is the record's
+      sourceAzureVmId) or on a copy whose reset is recorded (resetUtc). A copy whose record says released without a
+      reset (for example a snapshot taken after its source was released by mistake) may hold the captured identity,
+      so it's refused like a copy that wasn't reset; so is a host whose VM ID couldn't be read.
+    - The capture's source, unreleased: the golden script's own Release releases it: on the source it only reconnects
+      the guest's adapter and restores its automatic start, because the Arc identity is still its own.
+    - A copy whose Arc identity was reset (resetUtc): the same Release, which skips the reset it already did.
+    - A copy that wasn't reset may still hold the captured identity, so it's never started here: deploy.ps1 resets it
+      while it's air-gapped. Nor is a host whose VM ID couldn't be read, because it can't be told from such a copy.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $Capture,
+
+        [AllowEmptyString()]
+        [string] $AzureVmId = '',
+
+        [ValidateSet('None', 'Active', 'Unknown', 'Unreadable')]
+        [string] $CaptureProgress = 'None'
+    )
+
+    if ($CaptureProgress -eq 'Active') {
+        return [pscustomobject]@{ Action = 'Wait'; Reason = 'CaptureInProgress' }
+    }
+    if ($CaptureProgress -eq 'Unreadable') {
+        # Only Prepare writes the marker, so one that can't be read fails closed (review, 2026-11-04).
+        return [pscustomobject]@{ Action = 'Wait'; Reason = 'CaptureMarkerUnreadable' }
+    }
+    if ($CaptureProgress -eq 'Unknown') {
+        return [pscustomobject]@{ Action = 'Refuse'; Reason = 'VmIdUnknown' }
+    }
+    if ($null -eq $Capture) {
+        return [pscustomobject]@{ Action = 'None'; Reason = 'NoCapture' }
+    }
+    $read = {
+        param([string] $Name)
+        $property = $Capture.PSObject.Properties[$Name]
+        if ($null -eq $property -or $null -eq $property.Value) {
+            return ''
+        }
+        return [string]$property.Value
+    }
+    $source = & $read 'sourceAzureVmId'
+    $isSource = [bool]($AzureVmId -and $source -and [string]::Equals($source, $AzureVmId, [System.StringComparison]::OrdinalIgnoreCase))
+    $reset = [bool](& $read 'resetUtc')
+    if ((& $read 'released') -eq 'True') {
+        if ($reset -or $isSource) {
+            return [pscustomobject]@{ Action = 'None'; Reason = 'Released' }
+        }
+        if (-not $AzureVmId) {
+            return [pscustomobject]@{ Action = 'Refuse'; Reason = 'VmIdUnknown' }
+        }
+        return [pscustomobject]@{ Action = 'Refuse'; Reason = 'CopyNotReset' }
+    }
+    if (-not $AzureVmId) {
+        return [pscustomobject]@{ Action = 'Refuse'; Reason = 'VmIdUnknown' }
+    }
+    if ($isSource) {
+        return [pscustomobject]@{ Action = 'Release'; Reason = 'Source' }
+    }
+    if ($reset) {
+        return [pscustomobject]@{ Action = 'Release'; Reason = 'ResetCopy' }
+    }
+    return [pscustomobject]@{ Action = 'Refuse'; Reason = 'CopyNotReset' }
+}
+
+function Get-DemoControlGoldenState {
+    <#
+    .SYNOPSIS
+    T2's golden state, read fresh from the host: the capture record, the capture marker (Get-GoldenCaptureProgress),
+    this host's Azure VM ID when either needs it (IMDS; a released copy's record with its reset recorded doesn't), and
+    the relay's decision. Uses the golden script's functions, so the caller dot-sources it first. Returns Capture,
+    Progress, and Decision.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot
+    )
+
+    $capture = Read-GoldenJson -Path ([System.IO.Path]::Combine($StateRoot, 'golden', 'capture.json'))
+    $markerPath = Get-GoldenCaptureMarkerPath -Root $StateRoot
+    $marker = $null
+    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+        try {
+            $marker = Read-GoldenJson -Path $markerPath
+        }
+        catch {
+            $marker = $null
+        }
+        if ($null -eq $marker) {
+            # A marker that exists but can't be read names nothing: Unreadable, which fails closed.
+            $marker = New-Object -TypeName 'psobject'
+        }
+    }
+    $vmId = ''
+    $settled = $null -ne $capture -and (Get-DemoControlGoldenDecision -Capture $capture).Reason -eq 'Released'
+    if ($null -ne $marker -or ($null -ne $capture -and -not $settled)) {
+        try {
+            $vmId = Get-GoldenImdsVmId
+        }
+        catch {
+            $vmId = ''
+        }
+    }
+    $progress = Get-GoldenCaptureProgress -Marker $marker -AzureVmId $vmId -NowUtc (Get-DemoControlUtcNow)
+    return [pscustomobject]@{
+        Capture  = $capture
+        Progress = $progress
+        Decision = (Get-DemoControlGoldenDecision -Capture $capture -AzureVmId $vmId -CaptureProgress $progress.State)
+    }
+}
+
+function Get-DemoControlGoldenRefusal {
+    # The relay's message when its golden decision leaves the guest alone (Refuse or Wait); empty otherwise. Pure.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $State,
+
+        [Parameter(Mandatory = $true)]
+        [string] $GuestName
+    )
+
+    $snapshot = ''
+    $released = $false
+    if ($null -ne $State.Capture) {
+        if ($State.Capture.PSObject.Properties['snapshotName']) {
+            $snapshot = [string]$State.Capture.snapshotName
+        }
+        $released = $State.Capture.PSObject.Properties['released'] -and [string]$State.Capture.released -eq 'True'
+    }
+    switch ($State.Decision.Reason) {
+        'CaptureInProgress' {
+            return ('A golden capture is in progress on {0} (snapshot {1}, since {2}), so {3} stays as the capture left it: off and air-gapped. The capture returns its source to service when it ends (GOLDEN.CAPTURE.SOURCE); start T2 again after that. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again, which ends the marker and releases the source first, or ./scripts/start-demo.ps1 once that capture''s snapshot exists; from {4} this marker no longer holds a start back.' -f $env:COMPUTERNAME, $State.Progress.SnapshotName, $State.Progress.SinceUtc, $GuestName, $State.Progress.UntilUtc)
+        }
+        'CaptureMarkerUnreadable' {
+            return ('A golden capture marker on {0} can''t be read, and only a capture writes it, so {1} is left as it is. Run ./scripts/capture-t2-golden.ps1 again, which ends the marker and releases the source first, or ./scripts/start-demo.ps1 once that capture''s snapshot exists.' -f $env:COMPUTERNAME, $GuestName)
+        }
+        'CopyNotReset' {
+            if ($released) {
+                return ('{0} runs a copy restored from the golden snapshot {1} whose record says released, but its Arc identity was never reset, so it may hold the captured identity; its guest isn''t started or used here. Run ./scripts/deploy.ps1: its T2 track resets the copy. Never reconnect it by hand.' -f $env:COMPUTERNAME, $snapshot)
+            }
+            return ('{0} runs a copy restored from the golden snapshot {1}, and its Arc identity hasn''t been reset yet, so its guest stays off and air-gapped. Run ./scripts/deploy.ps1: its T2 track resets the copy while the guest is still air-gapped, then releases it. Never reconnect it by hand.' -f $env:COMPUTERNAME, $snapshot)
+        }
+        'VmIdUnknown' {
+            return ('This host''s Azure VM ID couldn''t be read (Instance Metadata Service), so it can''t be told from a copy restored from a golden snapshot{0} that may hold the captured Arc identity, and {1} is left as it is. Start T2 again in a few minutes; if it keeps failing, run ./scripts/deploy.ps1, which resets a restored copy.' -f $(if ($snapshot) { ' ({0})' -f $snapshot } else { '' }), $GuestName)
+        }
+    }
+    return ''
+}
+
+function Invoke-DemoControlGuestCommand {
+    # One script block in the guest over PowerShell Direct (VMBus, no network); a function of its own so tests can mock it.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $GuestName,
+
+        [Parameter(Mandatory = $true)]
+        [pscredential] $Credential,
+
+        [Parameter(Mandatory = $true)]
+        [scriptblock] $ScriptBlock,
+
+        [AllowEmptyCollection()]
+        [object[]] $ArgumentList = @()
+    )
+
+    return (Invoke-Command -VMName $GuestName -Credential $Credential -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -ErrorAction Stop)
+}
+
+$script:ControlGuestWarmupBlock = {
+    # In the guest: one 'warmup --target T2', with the guest's own runner. Only functions every guest module has.
+    param($Folder, $TimeoutSeconds)
+    $modulePath = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
+    if (-not (Test-Path -LiteralPath $modulePath)) {
+        throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
+    }
+    Import-Module -Name $modulePath -Force
+    $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $Folder).InstallRecord
+    if ($null -eq $install) {
+        throw 'The workload runner is not installed in the guest yet.'
+    }
+    Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList @('warmup', '--target', 'T2', '--json') -TimeoutSeconds $TimeoutSeconds
+}
+
+function Invoke-DemoControlGuestReady {
+    <#
+    .SYNOPSIS
+    T2's guest, made ready before activity starts on it: a golden snapshot's source that the capture left air-gapped
+    is released, a restored copy whose Arc identity wasn't reset is refused, a guest that's off starts, and then,
+    within TimeoutSeconds, the guest runs with a heartbeat, answers over PowerShell Direct, runs SQL Server, and accepts
+    connections. Returns Status (Pass or Fail), Message, Evidence, and Credential (the one that signed in).
+
+    .DESCRIPTION
+    Live, 2026-11-03: a capture on 10-28 left its source's guest off, with no automatic start and its adapter
+    disconnected, and only start-demo.ps1 or deploy.ps1 released it, so every start from the Fabric notebook found
+    the guest off ("The virtual machine arcsql01 is not in running state") and T2 was missing for six days.
+    The golden script from this bundle (Invoke-DemoGoldenGuest.ps1) is dot-sourced and its functions are reused: the
+    capture record, the host's Azure VM ID, the bootstrap lock, the Release (on the source it only reconnects the
+    adapter, sets the automatic start back to Start, starts the guest, and records released and releasedUtc; on a reset
+    copy it skips the reset), the guest wait that also tries a pending password, and the SQL Server wait (SQL Server is
+    started at once if its delayed automatic start hasn't started it). The snapshot's tag dbhubSourceReleasedUtc isn't
+    written here (the host has no rights on rg-<prefix>-golden): start-demo.ps1 or deploy.ps1 writes it later, and
+    their Release finds the source released and only confirms it. A guest that's off without a capture record gets
+    the automatic start action Start, its designed state (GuestVm.ps1), and starts.
+    Review, 2026-11-04: a start between a capture's Prepare and its snapshot released the source, so the snapshot kept a
+    guest that wasn't air-gapped. Now nothing changes the guest while a capture is in progress on this host (the marker
+    Prepare writes; Get-GoldenCaptureProgress), a released record counts only on the source or a reset copy, and the
+    release and the start run under the host bootstrap's lock (which Prepare holds too), on what's read again under it.
+    Sources: https://learn.microsoft.com/powershell/module/hyper-v/get-vm, https://learn.microsoft.com/powershell/module/hyper-v/set-vm,
+    https://learn.microsoft.com/powershell/module/hyper-v/start-vm,
+    https://learn.microsoft.com/virtualization/hyper-v-on-windows/user-guide/powershell-direct (checked 2026-11-03).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string] $GuestName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $AdministratorName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ToolsFolder,
+
+        [ValidateRange(1, 3600)]
+        [int] $TimeoutSeconds = 1200
+    )
+
+    $start = Get-DemoControlUtcNow
+    $deadline = $start.AddSeconds($TimeoutSeconds)
+    $left = { [int][System.Math]::Max(1, [System.Math]::Ceiling(($deadline - (Get-DemoControlUtcNow)).TotalSeconds)) }
+    $evidence = [ordered]@{ guest = $GuestName }
+    $fail = {
+        param([string] $Message)
+        $evidence['seconds'] = [int][System.Math]::Max(0, ((Get-DemoControlUtcNow) - $start).TotalSeconds)
+        return [pscustomobject]@{ Status = 'Fail'; Message = $Message; Evidence = $evidence; Credential = $null }
+    }
+
+    # The golden script's functions, from this bundle; dot-sourcing runs nothing.
+    . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'bootstrap', 'Invoke-DemoGoldenGuest.ps1')) -GuestName $GuestName -Root $StateRoot
+    $script:Options = @{ Root = $StateRoot; SnapshotName = ''; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+    $golden = Get-DemoControlGoldenState -StateRoot $StateRoot
+    $evidence['golden'] = $golden.Decision.Reason
+    $refusal = Get-DemoControlGoldenRefusal -State $golden -GuestName $GuestName
+    if ($refusal) {
+        return (& $fail $refusal)
+    }
+
+    $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+    if ($golden.Decision.Action -eq 'Release' -or ($vm -and [string]$vm.State -in 'Off', 'Saved')) {
+        # Anything that changes the guest runs under the host bootstrap's lock, which a capture's Prepare holds too, and
+        # on what's read again under it: a capture may have prepared the guest while this waited (review, 2026-11-04).
+        $lock = $null
+        try {
+            try {
+                $lock = Enter-GoldenLock -TimeoutSeconds ([System.Math]::Min(300, (& $left)))
+            }
+            catch {
+                return (& $fail ('{0} wasn''t changed: {1} Start T2 again in a few minutes.' -f $GuestName, [string]$_.Exception.Message))
+            }
+            $golden = Get-DemoControlGoldenState -StateRoot $StateRoot
+            $evidence['golden'] = $golden.Decision.Reason
+            $refusal = Get-DemoControlGoldenRefusal -State $golden -GuestName $GuestName
+            if ($refusal) {
+                return (& $fail $refusal)
+            }
+            if ($golden.Decision.Action -eq 'Release') {
+                try {
+                    $release = Invoke-GoldenRelease -Setting (Get-GoldenHostSetting)
+                    $evidence['released'] = [string]$release['role']
+                }
+                catch {
+                    return (& $fail ('The air gap that a golden capture left on {0} couldn''t be released: {1} Run ./scripts/start-demo.ps1, which releases it too.' -f $GuestName, [string]$_.Exception.Message))
+                }
+            }
+            $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+            if ($vm -and [string]$vm.State -in 'Off', 'Saved') {
+                $evidence['stateBefore'] = [string]$vm.State
+                if ([string]$vm.AutomaticStartAction -ne 'Start') {
+                    $evidence['startActionBefore'] = [string]$vm.AutomaticStartAction
+                    Set-VM -Name $GuestName -AutomaticStartAction Start -AutomaticStartDelay 0
+                }
+                try {
+                    Start-VM -Name $GuestName -ErrorAction Stop
+                }
+                catch {
+                    # Hyper-V's own automatic start may have started it a moment earlier.
+                    $now = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+                    if (-not $now -or [string]$now.State -notin 'Running', 'Starting') {
+                        return (& $fail ('{0} is {1} and couldn''t be started: {2}' -f $GuestName, [string]$vm.State, [string]$_.Exception.Message))
+                    }
+                }
+                $evidence['started'] = $true
+            }
+        }
+        finally {
+            if ($null -ne $lock) {
+                $lock.Dispose()
+            }
+        }
+    }
+
+    $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+    if (-not $vm) {
+        return (& $fail ('T2 isn''t set up yet: the host hasn''t created its guest {0}.' -f $GuestName))
+    }
+    if (-not $evidence.Contains('stateBefore')) {
+        $evidence['stateBefore'] = [string]$vm.State
+    }
+
+    # Running, with a heartbeat from its integration services.
+    $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+    while (-not ($vm -and [string]$vm.State -eq 'Running' -and [string]$vm.Heartbeat -like 'Ok*')) {
+        if ((Get-DemoControlUtcNow).AddSeconds(10) -ge $deadline) {
+            $state = if ($vm) { '{0}, heartbeat {1}' -f [string]$vm.State, [string]$vm.Heartbeat } else { 'missing' }
+            return (& $fail ('{0} didn''t run with a heartbeat within {1} seconds ({2}).' -f $GuestName, $TimeoutSeconds, $state))
+        }
+        Start-Sleep -Seconds 10
+        $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+    }
+
+    # PowerShell Direct, with the stored credential or a pending one that a rotation left.
+    try {
+        $wait = Wait-GoldenGuest -UserName $AdministratorName -TimeoutSeconds (& $left)
+    }
+    catch {
+        return (& $fail ([string]$_.Exception.Message))
+    }
+    $credential = $wait.Credential
+
+    # SQL Server's service: started at once if its delayed automatic start hasn't started it yet.
+    try {
+        $sql = Invoke-DemoControlGuestCommand -GuestName $GuestName -Credential $credential -ScriptBlock $script:GuestSqlWaitBlock -ArgumentList @((& $left), 0)
+    }
+    catch {
+        return (& $fail ('SQL Server''s service in {0} couldn''t be checked: {1}' -f $GuestName, [string]$_.Exception.Message))
+    }
+    $evidence['sqlService'] = [string]$sql.status
+    $evidence['sqlStartedHere'] = [bool]$sql.startedByScript
+    if ([string]$sql.status -eq 'Missing') {
+        # Before the setup wizard's step (PaygWizard) the guest has no SQL Server, so no demo module or runner either:
+        # the caller reports that as Not selected, never a Warning (Phase 28; Test-DemoT2NotSetUpText).
+        return (& $fail ('T2 isn''t set up yet: SQL Server isn''t installed in {0} yet (the setup wizard''s step installs it), so the workload runner is not installed in the guest yet.' -f $GuestName))
+    }
+    if ([string]$sql.status -ne 'Running') {
+        return (& $fail ('SQL Server''s service in {0} is {1} after {2} seconds.' -f $GuestName, [string]$sql.status, [int]$sql.seconds))
+    }
+
+    # Connections: the guest's runner warmup, tried again while it fails with a transient error.
+    $guestFolder = $ToolsFolder
+    $probe = {
+        param($AttemptSeconds)
+        Invoke-DemoControlGuestCommand -GuestName $GuestName -Credential $credential -ScriptBlock $script:ControlGuestWarmupBlock -ArgumentList @($guestFolder, $AttemptSeconds)
+    }
+    $ready = Wait-DemoControlTargetReady -Target 'T2' -Probe $probe -TimeoutSeconds (& $left)
+    $evidence['ready'] = $ready.Status
+    $evidence['readyAttempts'] = $ready.Attempts
+    $evidence['seconds'] = [int][System.Math]::Max(0, ((Get-DemoControlUtcNow) - $start).TotalSeconds)
+    if ($ready.Status -eq 'TimedOut') {
+        return (& $fail ('SQL Server in {0} didn''t accept connections within {1} seconds: {2}' -f $GuestName, $TimeoutSeconds, (Get-DemoControlTail -Text $ready.LastError -Length 300)))
+    }
+    return [pscustomobject]@{ Status = 'Pass'; Message = ''; Evidence = $evidence; Credential = $credential }
+}
+
 function Invoke-DemoControlRunner {
     [CmdletBinding()]
     param(
@@ -389,6 +1039,10 @@ function Invoke-DemoControlRunner {
     $arguments = Get-DemoControlArgument -Value $Request['arguments'] -NextShutdown $shutdown.Iso
     $role = [string]$Settings['role']
     $label = 'runner ' + (@($arguments | Select-Object -First 2) -join ' ') + ' --target ' + $target
+    # Activity waits for its target, bounded; reads, stops, and resets don't (Test-DemoControlActivityCommand).
+    $activity = Test-DemoControlActivityCommand -Arguments $arguments
+    $readySeconds = Get-DemoControlReadyTimeout -Target $target -Request $Request
+    $readyNote = [ordered]@{}
 
     if ($role -eq 'SqlVm' -and $target -in @('T1', 'T3', 'T4')) {
         $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $StateRoot).InstallRecord
@@ -396,32 +1050,32 @@ function Invoke-DemoControlRunner {
             Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message 'The workload runner is not installed on T1 yet.'
             return
         }
-        $full = @($arguments) + @('--target', $target)
-        if ($target -eq 'T3' -and $full -notcontains '--server') {
-            $t3 = $install['t3']
-            if ($null -eq $t3 -or -not $t3['serverFqdn']) {
-                Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message 'T1 has no T3 server in its workload settings.'
+        $targetArguments = Get-DemoControlTargetArgument -Target $target -Arguments $arguments -Install $install
+        if ($targetArguments.Error) {
+            Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message $targetArguments.Error
+            return
+        }
+        $full = $targetArguments.Arguments
+        $dotnet = [string]$install['dotnetExe']
+        $runnerDll = [string]$install['runnerDll']
+        if ($activity -and $readySeconds -gt 0) {
+            # The same target options as the command, so the warmup connects exactly as the command will.
+            $warmup = (Get-DemoControlTargetArgument -Target $target -Arguments @('warmup', '--json') -Install $install).Arguments
+            $probe = {
+                param($AttemptSeconds)
+                Invoke-DemoVmRunnerProcess -DotNetExe $dotnet -RunnerDll $runnerDll -ArgumentList $warmup -TimeoutSeconds $AttemptSeconds
+            }
+            $ready = Wait-DemoControlTargetReady -Target $target -Probe $probe -TimeoutSeconds $readySeconds
+            $readyNote['ready'] = $ready.Status
+            $readyNote['readySeconds'] = $ready.Seconds
+            $readyNote['readyAttempts'] = $ready.Attempts
+            if ($ready.Status -eq 'TimedOut') {
+                $evidence = [ordered]@{ target = $target; ready = $ready.Status; readySeconds = $ready.Seconds; readyAttempts = $ready.Attempts; lastError = (Get-DemoControlTail -Text $ready.LastError -Length 400) }
+                Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message ('{0}: {1} didn''t accept connections within {2} seconds ({3} attempts), so nothing was set. The last error: {4}' -f $label, $target, $readySeconds, $ready.Attempts, (Get-DemoControlTail -Text $ready.LastError -Length 300)) -Evidence $evidence
                 return
             }
-            $full += @('--server', [string]$t3['serverFqdn'])
         }
-        if ($target -eq 'T4') {
-            $t4 = $null
-            if ($install.Contains('t4')) {
-                $t4 = $install['t4']
-            }
-            if ($null -eq $t4 -or -not $t4['serverFqdn']) {
-                Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message 'T1 has no T4 server in its workload settings: T4 is off (t4Enabled), or T1 was bootstrapped before T4 existed (deploy.ps1 -Resume updates it).'
-                return
-            }
-            if ($full -notcontains '--server') {
-                $full += @('--server', [string]$t4['serverFqdn'])
-            }
-            if ($full -notcontains '--user' -and $t4['runnerRole']) {
-                $full += @('--user', [string]$t4['runnerRole'])
-            }
-        }
-        $run = Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $full -TimeoutSeconds $timeout
+        $run = Invoke-DemoVmRunnerProcess -DotNetExe $dotnet -RunnerDll $runnerDll -ArgumentList $full -TimeoutSeconds $timeout
     }
     elseif ($role -eq 'ArcHost' -and $target -eq 'T2') {
         $guest = Import-PowerShellDataFile -Path ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'dsc', 'guest.psd1'))
@@ -429,10 +1083,31 @@ function Invoke-DemoControlRunner {
         if ($Settings.Contains('guest') -and $null -ne $Settings['guest'] -and $Settings['guest']['name']) {
             $guestName = [string]$Settings['guest']['name']
         }
-        . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
-        $credential = Get-DemoGuestCredential -SecretPath ([System.IO.Path]::Combine($StateRoot, 'protected', 'guest-administrator.bin')) -UserName $guest.AdministratorName
+        if ($activity) {
+            # Live, 2026-11-03: the control's start found the guest off and air-gapped since a golden capture.
+            $prepared = Invoke-DemoControlGuestReady -StateRoot $StateRoot -GuestName $guestName -AdministratorName ([string]$guest.AdministratorName) -ToolsFolder ([string]$guest.ToolsFolder) -TimeoutSeconds ([System.Math]::Max(60, $readySeconds))
+            foreach ($key in $prepared.Evidence.Keys) {
+                $readyNote[$key] = $prepared.Evidence[$key]
+            }
+            if ($prepared.Evidence.Contains('seconds')) {
+                $readyNote['readySeconds'] = [int]$prepared.Evidence['seconds']
+            }
+            if ($prepared.Status -ne 'Pass') {
+                $evidence = [ordered]@{ target = $target }
+                foreach ($key in $readyNote.Keys) {
+                    $evidence[$key] = $readyNote[$key]
+                }
+                Write-DemoControlResult -ActionName 'Runner' -Status $prepared.Status -Message ('{0}: {1}' -f $label, $prepared.Message) -Evidence $evidence
+                return
+            }
+            $credential = $prepared.Credential
+        }
+        else {
+            . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
+            $credential = Get-DemoGuestCredential -SecretPath ([System.IO.Path]::Combine($StateRoot, 'protected', 'guest-administrator.bin')) -UserName $guest.AdministratorName
+        }
         $full = @($arguments) + @('--target', 'T2')
-        $run = Invoke-Command -VMName $guestName -Credential $credential -ArgumentList $guest.ToolsFolder, $full, $timeout -ErrorAction Stop -ScriptBlock {
+        $run = Invoke-DemoControlGuestCommand -GuestName $guestName -Credential $credential -ArgumentList @($guest.ToolsFolder, $full, $timeout) -ScriptBlock {
             param($Folder, $Arguments, $TimeoutSeconds)
             $modulePath = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
             if (-not (Test-Path -LiteralPath $modulePath)) {
@@ -460,12 +1135,19 @@ function Invoke-DemoControlRunner {
         stdout   = Get-DemoControlTail -Text $run.StdOut -Length 1800
         stderr   = Get-DemoControlTail -Text $run.StdErr -Length 500
     }
+    foreach ($key in $readyNote.Keys) {
+        $evidence[$key] = $readyNote[$key]
+    }
     # The profile from the whole output, which the cut stdout can no longer show (re-review of PR 16, 2026-11-04).
     $runnerProfile = Get-DemoControlRunnerProfile -Text $run.StdOut
     if ($null -ne $runnerProfile) {
         $evidence['profile'] = $runnerProfile
     }
-    Write-DemoControlResult -ActionName 'Runner' -Status $outcome.Status -Message $outcome.Message -Evidence $evidence
+    $message = $outcome.Message
+    if ($readyNote.Contains('readySeconds') -and [int]$readyNote['readySeconds'] -gt 0) {
+        $message = '{0} ({1} accepted connections after {2} seconds.)' -f $message, $target, [int]$readyNote['readySeconds']
+    }
+    Write-DemoControlResult -ActionName 'Runner' -Status $outcome.Status -Message $message -Evidence $evidence
 }
 
 function Invoke-DemoControlStopGuest {

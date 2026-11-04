@@ -192,7 +192,7 @@ function Stop-DemoEnvironment {
     $notOff = [System.Collections.Generic.List[object]]::new()
     if ($offTargets.Count -gt 0) {
         foreach ($record in @(Send-DemoProfileRunCommand -Config $Config -Target $offTargets.ToArray() -ProfileName 'off' -RequestedBy 'stop-demo' -WaitSeconds $ProfileOffWaitSeconds -ExpiresMinutes 10)) {
-            if ([string]$record.Outcome -in 'Set', 'NotSetUp') {
+            if ([string]$record.Outcome -in 'Set', 'NotSetUp', 'GuestOff') {
                 $results.Add((ConvertTo-DemoStopProfileResult -Record $record -WaitSeconds $ProfileOffWaitSeconds))
             }
             else {

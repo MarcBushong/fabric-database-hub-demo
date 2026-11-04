@@ -41,7 +41,11 @@ function Test-DemoT2GoldenSnapshot {
        change, so a short Connected period that ended before this read fails too; and no Administrative entry,
        that is no operation, on it; or GOLDEN.TEST.SOURCE fails. Resource Health, Policy, and other categories'
        events, such as its availability while its host is deallocated, aren't operations: the evidence lists
-       every entry with its category (operations, otherEvents).
+       every entry with its category (operations, otherEvents). The status counts only while the source's host
+       stays deallocated for the whole test: the capture returns its source to service (ADR 0018, amended
+       2026-11-03), so a source host that runs heartbeats as arcsql01 itself, which is a Warning (the copy's
+       isolation and reset are the proof then), and a Connected source is measured from the latest of the disk
+       check, the release, and its host's deallocation.
     8. Deletes the test group with the destroy path (Remove-DemoEnvironment: Arc resources first, then the
        group, then the residual check), unless -KeepTestGroup. When the tested snapshot is the newest and
        passed (boot-verified, and onboard-verified with -Onboard), older golden snapshots of the prefix are
@@ -255,20 +259,24 @@ function Test-DemoT2GoldenSnapshot {
         return $null
     }
     $readSource = {
+        # The source host's power too: since 2026-11-03 the capture returns its source to service, so a source host
+        # that runs heartbeats as arcsql01 itself, and its status proves nothing about the copy.
+        $hostInfo = Get-DemoVmPowerInfo -SubscriptionId $subscriptionId -ResourceGroupName $sourceGroup -VmName 'archost01'
+        $hostFacts = [ordered]@{ hostPowerState = [string]$hostInfo.PowerState; hostSinceUtc = $(if ($null -ne $hostInfo.SinceUtc) { $hostInfo.SinceUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }) }
         $machine = Get-DemoArcArmResource -SubscriptionId $subscriptionId -Url $sourceUrl
         if ($null -eq $machine) {
-            return [ordered]@{ exists = $false }
+            return ([ordered]@{ exists = $false } + $hostFacts)
         }
         $properties = Get-DemoMemberValue -InputObject $machine -Name 'properties'
         $changed = & $toUtc (Get-DemoMemberValue -InputObject $properties -Name 'lastStatusChange')
-        return [ordered]@{
-            exists              = $true
-            status              = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
-            lastStatusChangeUtc = $(if ($null -ne $changed) { $changed.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' })
-            vmId                = [string](Get-DemoMemberValue -InputObject $properties -Name 'vmId')
-            agentVersion        = [string](Get-DemoMemberValue -InputObject $properties -Name 'agentVersion')
-            provisioningState   = [string](Get-DemoMemberValue -InputObject $properties -Name 'provisioningState')
-        }
+        return ([ordered]@{
+                exists              = $true
+                status              = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
+                lastStatusChangeUtc = $(if ($null -ne $changed) { $changed.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' })
+                vmId                = [string](Get-DemoMemberValue -InputObject $properties -Name 'vmId')
+                agentVersion        = [string](Get-DemoMemberValue -InputObject $properties -Name 'agentVersion')
+                provisioningState   = [string](Get-DemoMemberValue -InputObject $properties -Name 'provisioningState')
+            } + $hostFacts)
     }
     $sourceBefore = $null
     try {
@@ -526,31 +534,43 @@ function Test-DemoT2GoldenSnapshot {
             $operations = @($entries | Where-Object { @('', 'Administrative') -contains [string](Get-DemoMemberValue -InputObject $_ -Name 'category') })
             $otherEvents = @($entries | Where-Object { @('', 'Administrative') -notcontains [string](Get-DemoMemberValue -InputObject $_ -Name 'category') })
             $sourceEvidence = [ordered]@{ before = $sourceBefore; after = $sourceAfter; operations = $operations; otherEvents = $otherEvents; windowStartUtc = $windowStart.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) }
-            # Azure marks a machine Disconnected about 15 minutes after its last heartbeat, so a source captured just
-            # before the test can still read Connected; a Connected source well past that has something heartbeating
-            # as it. The capture shut the source's guest down before the disk check.
-            $quietMinutes = if ($null -ne $snapshot.DiskVerifiedUtc) { [int]([DateTime]::UtcNow - $snapshot.DiskVerifiedUtc).TotalMinutes } else { 9999 }
+            # Azure marks a machine Disconnected 15 to 30 minutes after its last heartbeat
+            # (https://learn.microsoft.com/azure/azure-arc/servers/overview#agent-status), so a source that went quiet
+            # just before the test can still read Connected; a Connected source well past that has something
+            # heartbeating as it. It went quiet at the latest of: the capture's disk check, the release that returned it
+            # to service, and its host's last deallocation (ADR 0018, amended 2026-11-03).
+            $quietFrom = @($snapshot.DiskVerifiedUtc, $snapshot.SourceReleasedUtc, (& $toUtc $sourceAfter['hostSinceUtc'])) | Where-Object { $null -ne $_ } | Sort-Object -Descending | Select-Object -First 1
+            $quietMinutes = if ($null -ne $quietFrom) { [int]([DateTime]::UtcNow - $quietFrom).TotalMinutes } else { 9999 }
             $sourceEvidence['minutesSinceCapture'] = $quietMinutes
             $sourceProblems = [System.Collections.Generic.List[string]]::new()
             $sourceNotes = [System.Collections.Generic.List[string]]::new()
+            $sourceRemediation = 'Read its status again in a few minutes: it must be Disconnected.'
+            # Its status is evidence only while its host stayed deallocated for the whole test.
+            $hostQuiet = $sourceBefore['hostPowerState'] -eq 'PowerState/deallocated' -and $sourceAfter['hostPowerState'] -eq 'PowerState/deallocated' -and [string]$sourceBefore['hostSinceUtc'] -eq [string]$sourceAfter['hostSinceUtc']
+            $sourceEvidence['hostStayedDeallocated'] = $hostQuiet
             if ([bool]$sourceBefore['exists'] -ne [bool]$sourceAfter['exists']) { $sourceProblems.Add('it appeared or disappeared') }
             if ([bool]$sourceAfter['exists']) {
                 $changedUtc = & $toUtc $sourceAfter['lastStatusChangeUtc']
                 if ($sourceBefore['vmId'] -ne $sourceAfter['vmId']) { $sourceProblems.Add('its machine ID changed') }
+                if (-not $hostQuiet) {
+                    $shown = { param($Value) if ($Value) { ([string]$Value).Replace('PowerState/', '') } else { 'unknown' } }
+                    $sourceNotes.Add(('its host archost01 wasn''t deallocated for the whole test ({0} before, {1} after), so its status ({2}) is its own: the capture returns its source to service' -f (& $shown $sourceBefore['hostPowerState']), (& $shown $sourceAfter['hostPowerState']), $sourceAfter['status']))
+                    $sourceRemediation = 'The copy''s isolation (GOLDEN.TEST.ISOLATION) and reset (GOLDEN.TEST.RESET) prove it either way; to prove it from the source''s side too, deallocate the source first (./scripts/stop-demo.ps1) and test again.'
+                }
                 # A source already Disconnected before the test keeps its last status change; a different one means it
                 # connected in between, even if it reads Disconnected again now. A source that still read Connected
-                # right after its capture decays to Disconnected on its own, which the checks below allow.
-                if ([bool]$sourceBefore['exists'] -and [string]$sourceBefore['status'] -eq 'Disconnected' -and [string]$sourceBefore['lastStatusChangeUtc'] -ne [string]$sourceAfter['lastStatusChangeUtc']) {
+                # right after it went quiet decays to Disconnected on its own, which the checks below allow.
+                elseif ([bool]$sourceBefore['exists'] -and [string]$sourceBefore['status'] -eq 'Disconnected' -and [string]$sourceBefore['lastStatusChangeUtc'] -ne [string]$sourceAfter['lastStatusChangeUtc']) {
                     $sourceProblems.Add('its status changed during the test')
                 }
                 elseif ($sourceAfter['status'] -eq 'Connected' -and $null -ne $changedUtc -and $changedUtc -ge $windowStart) {
                     $sourceProblems.Add('it turned Connected during the test')
                 }
-                elseif ($sourceAfter['status'] -eq 'Connected' -and $quietMinutes -gt 20) {
-                    $sourceProblems.Add(('it still reports Connected {0} minutes after its guest was shut down for the capture' -f $quietMinutes))
+                elseif ($sourceAfter['status'] -eq 'Connected' -and $quietMinutes -gt 30) {
+                    $sourceProblems.Add(('it still reports Connected {0} minutes after it went quiet (its host deallocated)' -f $quietMinutes))
                 }
                 elseif ($sourceAfter['status'] -eq 'Connected') {
-                    $sourceNotes.Add(('it still reads Connected only {0} minutes after the capture, before Azure marks it Disconnected (about 15 minutes without heartbeats)' -f $quietMinutes))
+                    $sourceNotes.Add(('it still reads Connected only {0} minutes after it went quiet, before Azure marks it Disconnected (15 to 30 minutes without heartbeats)' -f $quietMinutes))
                 }
             }
             if ($operations.Count -gt 0) { $sourceProblems.Add(('the Activity Log shows {0} operation(s) on it' -f $operations.Count)) }
@@ -558,7 +578,7 @@ function Test-DemoT2GoldenSnapshot {
                 & $add 'GOLDEN.TEST.SOURCE' 'Fail' ('The source''s Arc machine {0}/{1} may have been touched during the test: {2}.' -f $sourceGroup, $sourceName, ($sourceProblems -join '; ')) $sourceEvidence 'Compare the machine''s properties and Activity Log by hand before you rely on the source.'
             }
             elseif ($sourceNotes.Count -gt 0) {
-                & $add 'GOLDEN.TEST.SOURCE' 'Warning' ('The source''s Arc machine {0}/{1} kept the same machine ID and has no operation in the Activity Log, but {2}.' -f $sourceGroup, $sourceName, ($sourceNotes -join '; ')) $sourceEvidence 'Read its status again in a few minutes: it must be Disconnected.'
+                & $add 'GOLDEN.TEST.SOURCE' 'Warning' ('The source''s Arc machine {0}/{1} kept the same machine ID and has no operation in the Activity Log, but {2}.' -f $sourceGroup, $sourceName, ($sourceNotes -join '; ')) $sourceEvidence $sourceRemediation
             }
             else {
                 $otherText = ''

@@ -16,7 +16,11 @@ A disk created from the snapshot proves it's usable.
 
 - The guest's Windows evaluation keeps counting inside the snapshot: the snapshot is tagged with its end,
   and preflight and status.ps1 warn 30 and 7 days before it.
-- The source host stays air-gapped until the next start-demo.ps1 or deploy.ps1 releases it.
+- The source host doesn't stay air-gapped: once its guest is prepared, whatever happens next, the capture starts
+  the host if needed, releases the guest (network back, automatic start Start, started), waits until arcsql01
+  reads Connected again, and returns the host to the power state it found (GOLDEN.CAPTURE.SOURCE).
+- It captures nothing while an on-demand run from the Fabric control is active (GOLDEN.CAPTURE.CONTROL), and
+  a start of T2 from the Fabric control leaves the guest alone while the capture runs.
 - Prove the snapshot boots before you rely on it: ./scripts/test-t2-golden.ps1 -Onboard.
 - This PC and its display stay awake until it finishes (Enter-DemoKeepAwake).
 - It never signs in or changes the Azure CLI context. Exit code: 0 Pass or Warning, 1 Fail.

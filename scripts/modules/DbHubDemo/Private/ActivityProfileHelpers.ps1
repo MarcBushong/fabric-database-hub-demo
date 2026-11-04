@@ -382,6 +382,14 @@ function Get-DemoProfileRunCommandScript {
     errors. T3's and T4's profiles are files on T1 (CommandLine.cs, Store), so with -RetrySeconds they're set first,
     before T1's retries, and only the last target is ever tried again. Each line's evidence has the attempts. Windows
     PowerShell 5.1. Pure. Internal.
+
+    .DESCRIPTION
+    Each request has readySeconds 0, so the VM side doesn't wait for its target on top of these retries (review of PR 17,
+    2026-11-04): T1, T3, and T4 run at once, and T2's relay makes its guest ready within its own 60-second minimum
+    (Invoke-DemoWorkloadControl.ps1). With -RetrySeconds, T2 isn't tried again when its guest stays off: the relay holds
+    it for a golden capture (its evidence's golden reason: a capture in progress, a capture marker that can't be read,
+    or a restored copy whose Arc identity wasn't reset), or PowerShell Direct finds it not running
+    (Get-DemoT2GuestOffReason); the line keeps the reason, and the module reports it as Not selected (GuestOff).
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -445,7 +453,7 @@ function Get-DemoProfileRunCommandScript {
         $lines.Add('$dbhubWriter = New-Object -TypeName System.IO.StringWriter')
         $lines.Add('[Console]::SetOut($dbhubWriter)')
         $lines.Add('try {')
-        $lines.Add((Get-DemoWorkloadControlScript -Action 'Runner' -Request @{ target = $item; arguments = $arguments; timeoutSeconds = $RunnerTimeoutSeconds }))
+        $lines.Add((Get-DemoWorkloadControlScript -Action 'Runner' -Request @{ target = $item; arguments = $arguments; timeoutSeconds = $RunnerTimeoutSeconds; readySeconds = 0 }))
         $lines.Add('}')
         $lines.Add('finally {')
         $lines.Add('    [Console]::SetOut($dbhubOut)')
@@ -460,9 +468,14 @@ function Get-DemoProfileRunCommandScript {
         if ($RetrySeconds -gt 0) {
             $lines.Add('$dbhubState = [string]::Empty')
             $lines.Add('$dbhubSaid = [string]::Empty')
+            $lines.Add('$dbhubHeld = [string]::Empty')
             $lines.Add('if ($null -ne $dbhubResult) { $dbhubState = [string]$dbhubResult.status; $dbhubSaid = [string]$dbhubResult.message }')
+            $lines.Add('if ($null -ne $dbhubResult -and $null -ne $dbhubResult.PSObject.Properties[''evidence''] -and $null -ne $dbhubResult.evidence -and $null -ne $dbhubResult.evidence.PSObject.Properties[''golden'']) { $dbhubHeld = [string]$dbhubResult.evidence.golden }')
             $lines.Add('if ($dbhubState -eq ''Pass'' -or $dbhubState -eq ''Warning'') { break }')
             $lines.Add('if ($dbhubSaid -match ''(?i)not installed|no workload runner|isn.t set up yet|no valid module file|has no T3 server|has no T4 server'') { break }')
+            # A guest the golden capture holds off, or one that isn't running, stays off until someone acts: no retry.
+            $held = @(Get-DemoT2GuestHoldReason | ForEach-Object { '$dbhubHeld -eq ''{0}''' -f $_ }) -join ' -or '
+            $lines.Add(('if ({0} -or $dbhubSaid -match ''(?i)is not in running state'') {{ break }}' -f $held))
             $lines.Add(('if ([System.DateTime]::UtcNow.AddSeconds({0}) -ge $dbhubNotAfter) {{ break }}' -f $RetrySeconds))
             $lines.Add(('Start-Sleep -Seconds {0}' -f $RetrySeconds))
         }
@@ -475,8 +488,13 @@ function Get-DemoProfileRunCommandScript {
         $lines.Add('    $dbhubMessage = [string]$dbhubResult.message')
         $lines.Add('    if ($dbhubMessage.Length -gt 300) { $dbhubMessage = ''...'' + $dbhubMessage.Substring($dbhubMessage.Length - 300) }')
         $lines.Add('    $dbhubExit = $null')
-        $lines.Add('    if ($null -ne $dbhubResult.evidence) { $dbhubExit = $dbhubResult.evidence.exitCode }')
-        $lines.Add(('    $dbhubShort = @{{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = [string]$dbhubResult.status; message = $dbhubMessage; evidence = @{{ target = ''{0}''; exitCode = $dbhubExit; attempts = $dbhubAttempts }} }}' -f $item))
+        $lines.Add('    $dbhubGolden = $null')
+        # Read through PSObject.Properties: a relay's refusal has no exitCode, and an older relay no golden reason.
+        $lines.Add('    if ($null -ne $dbhubResult.PSObject.Properties[''evidence''] -and $null -ne $dbhubResult.evidence) {')
+        $lines.Add('        if ($null -ne $dbhubResult.evidence.PSObject.Properties[''exitCode'']) { $dbhubExit = $dbhubResult.evidence.exitCode }')
+        $lines.Add('        if ($null -ne $dbhubResult.evidence.PSObject.Properties[''golden'']) { $dbhubGolden = $dbhubResult.evidence.golden }')
+        $lines.Add('    }')
+        $lines.Add(('    $dbhubShort = @{{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = [string]$dbhubResult.status; message = $dbhubMessage; evidence = @{{ target = ''{0}''; exitCode = $dbhubExit; attempts = $dbhubAttempts; golden = $dbhubGolden }} }}' -f $item))
         $lines.Add('}')
         $lines.Add('[Console]::Out.WriteLine(''DBHUBDEMO-WORKLOAD '' + (ConvertTo-Json -InputObject $dbhubShort -Depth 4 -Compress))')
     }
@@ -564,10 +582,11 @@ function Send-DemoProfileRunCommand {
     - A state from an earlier request under the same name doesn't count: only an execution that started after this
       request's PUT, less a minute for the clocks.
     - Outcome: Set (the runner set the profile), NotSetUp (the target has no runner yet: T2 before SQL Server setup, or T3
-      or T4 that T1 doesn't drive yet), Failed (the runner or the Run Command failed; Detail says why), TimedOut (no
-      result within -WaitSeconds: the Run Command goes on, until its expiry), NotSent (Azure didn't accept it, for
-      example on a VM that isn't running), or, with -WaitSeconds 0, Sent (accepted, not waited for; its Data has what
-      Wait-DemoProfileRunCommand needs to wait for it later).
+      or T4 that T1 doesn't drive yet), GuestOff (T2's guest runs no activity: the golden capture holds it off, or it
+      isn't running; Detail says which, Get-DemoT2GuestOffReason), Failed (the runner or the Run Command failed; Detail
+      says why), TimedOut (no result within -WaitSeconds: the Run Command goes on, until its expiry), NotSent (Azure
+      didn't accept it, for example on a VM that isn't running), or, with -WaitSeconds 0, Sent (accepted, not waited for;
+      its Data has what Wait-DemoProfileRunCommand needs to wait for it later).
     - -OnSent runs with the VM's name as soon as Azure accepts that VM's request, before the next VM's, so a caller can
       forget a VM only once its request is in, even when a stop (Ctrl+C) ends this midway (review of PR 16, 2026-11-04).
     #>
@@ -696,8 +715,8 @@ function Wait-DemoProfileRunCommand {
     .SYNOPSIS
     Waits for DbHubDemo-Profile Run Commands that Send-DemoProfileRunCommand sent without waiting (its Sent records, whose
     Data has the Run Command's URL and when it was sent), for every VM together, at most -WaitSeconds, and returns each
-    target's record as a send that waits does: Set, NotSetUp, Failed, or TimedOut. Any other record, and one without a
-    URL, is returned as it is. Internal.
+    target's record as a send that waits does: Set, NotSetUp, GuestOff, Failed, or TimedOut. Any other record, and one
+    without a URL, is returned as it is. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject[]])]
@@ -767,8 +786,14 @@ function Wait-DemoProfileRunCommand {
                 }
                 $status = [string]$data['status']
                 $message = Protect-DemoText -Text ([string]$data['message'])
+                $lineEvidence = $data['evidence']
+                $golden = if ($lineEvidence -is [System.Collections.IDictionary]) { [string]$lineEvidence['golden'] } else { '' }
+                $guestOff = if ($item -eq 'T2' -and $status -notin 'Pass', 'Warning') { Get-DemoT2GuestOffReason -Golden $golden -Message $message -VmName $vm } else { '' }
                 if ($status -in 'Pass', 'Warning') {
                     & $addRecord $item $vm 'Set' $message $data
+                }
+                elseif ($guestOff) {
+                    & $addRecord $item $vm 'GuestOff' $guestOff $data
                 }
                 elseif (($item -eq 'T2' -and (Test-DemoT2NotSetUpText -Text $message)) -or $message -match '(?i)runner is not installed|has no T3 server|has no T4 server') {
                     & $addRecord $item $vm 'NotSetUp' $message $data
@@ -894,7 +919,7 @@ function Invoke-DemoActivitySwitch {
                 }
                 New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status 'Pass' -Message $message -Evidence $evidence -DocUrl $docUrl
             }
-            'NotSetUp' {
+            { $_ -in 'NotSetUp', 'GuestOff' } {
                 New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status 'Not selected' -Message ('{0}: not switched to {1}: {2}' -f $item, $name, $record.Detail) -Evidence $evidence -DocUrl $docUrl
             }
             'TimedOut' {
@@ -1069,8 +1094,9 @@ function Wait-DemoActivityInterim {
     Run Command on such a VM starts only once the baseline is set there or its bound has passed (re-review of PR 16,
     2026-11-04): every VM together, until its Run Command ends, at most until its 10-minute expiry plus one attempt and a
     margin. Returns one <CheckPrefix>.INTERIM_<target> per target: Pass when it's set, Not selected when the target has no
-    runner yet, and a Warning with the exact commands when it wasn't set in time, failed, or wasn't accepted. Nothing for
-    a profile without incidents, or without records. Internal.
+    runner yet or T2's guest stays off (GuestOff: a golden capture holds it, or it isn't running, so nothing runs there to
+    quiet; review of PR 17), and a Warning with the exact commands when it wasn't set in time, failed, or wasn't
+    accepted. Nothing for a profile without incidents, or without records. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -1129,7 +1155,7 @@ function Wait-DemoActivityInterim {
                 $tries = if ($attempts -as [int]) { ' and {0} attempt(s)' -f [int]$attempts } else { '' }
                 New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status 'Pass' -Message ('{0}: the interim {1} is set on {2}, which this run started, in {3} seconds{4}, before this run''s own Run Commands there; {5} comes back at the end.' -f $item, $interim, $vm, $entry.Seconds, $tries, $name) -Evidence $evidence -DocUrl $docUrl
             }
-            'NotSetUp' {
+            { $_ -in 'NotSetUp', 'GuestOff' } {
                 New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status 'Not selected' -Message ('{0}: no interim {1} to set on {2}: {3}' -f $item, $interim, $vm, $entry.Detail) -Evidence $evidence -DocUrl $docUrl
             }
             'TimedOut' {
@@ -1141,6 +1167,42 @@ function Wait-DemoActivityInterim {
         }
     }
     return @($results)
+}
+
+function Get-DemoGoldenHeldInterimResult {
+    <#
+    .SYNOPSIS
+    <CheckPrefix>.INTERIM_T2, Not selected, when the golden source's release (T2.GOLDEN.SOURCE), which start-demo.ps1 and
+    deploy.ps1 run on archost01 as soon as it runs and before its interim baseline, left the guest off and air-gapped: a
+    capture is in progress there (its captureInProgress evidence), or the release failed. Nothing runs in that guest to
+    quiet, so the run sends no interim there and waits for none (review of PR 16 and PR 17, 2026-11-04: the interim waited
+    up to 10 minutes for such a guest and ended in a Warning). $null when the release passed, when there was none, or for
+    a profile without incidents. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $ActivityProfile,
+
+        [AllowNull()]
+        [object] $Release,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('DEPLOY', 'START')]
+        [string] $CheckPrefix
+    )
+
+    if (-not $ActivityProfile.HasIncidents -or $null -eq $Release) {
+        return $null
+    }
+    $inProgress = [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Release -Name 'evidence') -Name 'captureInProgress')
+    if (-not $inProgress -and [string]$Release.status -ne 'Fail') {
+        return $null
+    }
+    $why = if ($inProgress) { Get-DemoT2GuestOffReason -Golden 'CaptureInProgress' } else { 'the golden source''s release failed (T2.GOLDEN.SOURCE says why), so its guest is still off and air-gapped' }
+    $evidence = [ordered]@{ profile = [string]$ActivityProfile.Interim; switchTo = [string]$ActivityProfile.Name; vm = 'archost01'; outcome = 'GuestOff'; release = [string]$Release.status }
+    return (New-DemoResult -CheckId ('{0}.INTERIM_T2' -f $CheckPrefix) -Area 'workload' -Target 'T2' -Status 'Not selected' -Message ('T2: no interim {0} to set on archost01, and none to wait for: {1}.' -f $ActivityProfile.Interim, $why) -Evidence $evidence -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed')
 }
 
 function Get-DemoScheduledIncident {

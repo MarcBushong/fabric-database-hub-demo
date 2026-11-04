@@ -222,7 +222,10 @@ function Wait-DemoStoppedStart {
     -Started): its profile host resumes the profile stored there about 2 minutes after the boot (review of PR 16,
     2026-11-04). The VM retries it while its SQL Server, or T2's guest, starts, and this waits for it before the run's
     first Run Command there, at most until its 10-minute bound, with DEPLOY.INTERIM_<target> (Wait-DemoActivityInterim,
-    re-review of PR 16). Internal.
+    re-review of PR 16). On the T2 host the golden source's release comes first, so the interim never waits for a guest a
+    capture left off; when the release leaves it off (a capture in progress there, or a release that failed),
+    DEPLOY.INTERIM_T2 is Not selected and nothing is sent or waited for there (Get-DemoGoldenHeldInterimResult, review of
+    PR 17, 2026-11-04). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -253,15 +256,34 @@ function Wait-DemoStoppedStart {
     # once a VM that was still stopping had settled; never one that was already starting (Phase 28 review).
     $issued = [System.Collections.Generic.List[string]]::new()
     $interimSent = [System.Collections.Generic.List[object]]::new()
+    $hostVm = Get-DemoHostVmName -Config $Config
     foreach ($vm in @($Request.Vms.Keys)) {
         $item = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:([bool]$Request.Vms[$vm].Requested)
         $results.Add($item)
         if ([string]$item.status -ne 'Pass') {
             $notRunning.Add($vm)
         }
-        elseif ($null -ne $ActivityProfile) {
-            foreach ($sentItem in @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $ActivityProfile -VmName $vm -RequestedBy 'deploy' -Started -PassThru)) {
-                $interimSent.Add($sentItem)
+        else {
+            # The T2 guest starts with its host (its automatic start action), except on a golden snapshot's source host,
+            # whose air-gapped guest is reconnected first, as start-demo.ps1 does: before the host's interim baseline,
+            # which would otherwise wait for a guest that stays off (review of PR 16 and PR 17, 2026-11-04).
+            $held = $null
+            if ($vm -eq $hostVm) {
+                $release = Invoke-DemoGoldenSourceRelease -Config $Config
+                if ($null -ne $release) {
+                    $results.Add($release)
+                    if ($null -ne $ActivityProfile) {
+                        $held = Get-DemoGoldenHeldInterimResult -ActivityProfile $ActivityProfile -Release $release -CheckPrefix 'DEPLOY'
+                    }
+                }
+            }
+            if ($null -ne $held) {
+                $results.Add($held)
+            }
+            elseif ($null -ne $ActivityProfile) {
+                foreach ($sentItem in @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $ActivityProfile -VmName $vm -RequestedBy 'deploy' -Started -PassThru)) {
+                    $interimSent.Add($sentItem)
+                }
             }
         }
         $itemEvidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
@@ -270,20 +292,11 @@ function Wait-DemoStoppedStart {
         }
     }
     # The interim baseline on each VM this run started is retried there while its SQL Server, or T2's guest, starts, and
-    # the run's first Run Command there (the golden source's release below, then the tracks') waits for it, at most until
-    # its 10-minute bound (re-review of PR 16, 2026-11-04).
+    # the run's first Run Command there (the tracks') waits for it, at most until its 10-minute bound (re-review of PR 16,
+    # 2026-11-04).
     if ($null -ne $ActivityProfile -and $interimSent.Count -gt 0) {
         foreach ($interim in @(Wait-DemoActivityInterim -Config $Config -ActivityProfile $ActivityProfile -Record $interimSent.ToArray() -CheckPrefix 'DEPLOY')) {
             $results.Add($interim)
-        }
-    }
-    # The T2 guest starts with its host (its automatic start action), except on a golden snapshot's source host,
-    # whose air-gapped guest is reconnected first, as start-demo.ps1 does.
-    $hostVm = Get-DemoHostVmName -Config $Config
-    if ($Request.Vms.Contains($hostVm) -and $hostVm -notin $notRunning) {
-        $release = Invoke-DemoGoldenSourceRelease -Config $Config
-        if ($null -ne $release) {
-            $results.Add($release)
         }
     }
     $t4 = $null
@@ -515,6 +528,61 @@ function Test-DemoT2NotSetUpText {
     return [bool]([string]$Text -match '(?i)not installed|no workload runner|isn''t set up yet|was not loaded because no valid module file was found')
 }
 
+function Get-DemoT2GuestHoldReason {
+    <#
+    .SYNOPSIS
+    The golden reasons for which T2's relay leaves its guest alone (Get-DemoControlGoldenDecision in
+    vm/bootstrap/Invoke-DemoWorkloadControl.ps1): a capture in progress on the host, a capture marker that can't be read,
+    and a restored copy whose Arc identity wasn't reset. Each lasts until the capture ends or deploy.ps1 resets the copy,
+    so nothing tries it again (review of PR 17, 2026-11-04). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    return @('CaptureInProgress', 'CaptureMarkerUnreadable', 'CopyNotReset')
+}
+
+function Get-DemoT2GuestOffReason {
+    <#
+    .SYNOPSIS
+    Why T2's guest runs no activity, from a relay result: the golden reason in its evidence when the relay holds the guest
+    (Get-DemoT2GuestHoldReason), or PowerShell Direct's "is not in running state" when the guest isn't running. Empty
+    otherwise. A profile Run Command's line keeps only the end of the relay's message, so the reason, not the text, tells
+    a hold (review of PR 17, 2026-11-04). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Golden = '',
+
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Message = '',
+
+        [ValidatePattern('^[A-Za-z0-9-]{1,64}$')]
+        [string] $VmName = 'archost01'
+    )
+
+    switch ([string]$Golden) {
+        'CaptureInProgress' {
+            return ('a golden capture is in progress on {0}: it turned T2''s activity off first, and the guest stays off and air-gapped until the capture returns it to service (GOLDEN.CAPTURE.SOURCE)' -f $VmName)
+        }
+        'CaptureMarkerUnreadable' {
+            return ('{0} has a golden capture marker that can''t be read, so its guest is left as the capture left it (T2.GUEST.STATE says what to do)' -f $VmName)
+        }
+        'CopyNotReset' {
+            return ('{0} runs a copy restored from a golden snapshot whose Arc identity wasn''t reset, so its guest isn''t started or used until ./scripts/deploy.ps1 resets it (T2.GUEST.STATE)' -f $VmName)
+        }
+    }
+    if ([string]$Message -match '(?i)is not in running state') {
+        return ('T2''s guest on {0} isn''t running, so no activity runs there' -f $VmName)
+    }
+    return ''
+}
+
 function Set-DemoTargetProfile {
     <#
     .SYNOPSIS
@@ -530,7 +598,12 @@ function Set-DemoTargetProfile {
     workload runner before SQL Server setup; Test-DemoT2NotSetUpText) is Not selected. -Attempts retries a target that
     isn't reachable yet, such as a T2 guest that's still
     booting. -SwitchTo names the profile with incidents that the run sets once its own Run Commands on the VM are done
-    (2026-11-03, Invoke-DemoActivitySwitch): the message says so, and the evidence records it.
+    (2026-11-03, Invoke-DemoActivitySwitch): the message says so, and the evidence records it. Since 2026-11-04 the
+    attempts share one readiness budget, the time the retries allowed before: (Attempts - 1) x RetrySeconds, 4 minutes
+    for start-demo.ps1's T1 and T2 and none for one attempt. Each attempt asks the VM side to wait for its target
+    (readySeconds) for what's left of it, and what the VM side waited counts against it, so a target that stays down
+    costs the budget once, not once per attempt, and a target that answers stops the wait. A host whose bundle predates
+    readySeconds fails at once, as before, and its retries wait RetrySeconds.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Callers confirm once for the whole start or stop; Invoke-DemoWorkloadCommand is called with -Confirm:$false.')]
     [CmdletBinding()]
@@ -584,9 +657,10 @@ function Set-DemoTargetProfile {
     }
     $run = $null
     $detail = ''
+    $left = [System.Math]::Max(0, ($Attempts - 1) * $RetrySeconds)
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            $run = Invoke-DemoWorkloadCommand -Config $Config -Target $Target -ArgumentList $arguments -TimeoutSeconds 300 -Confirm:$false
+            $run = Invoke-DemoWorkloadCommand -Config $Config -Target $Target -ArgumentList $arguments -TimeoutSeconds 300 -ReadySeconds ([System.Math]::Min(1800, $left)) -Confirm:$false
             $detail = [string]$run.Result.message
         }
         catch {
@@ -596,8 +670,23 @@ function Set-DemoTargetProfile {
         if (($null -ne $run -and $run.Status -in 'Pass', 'Warning') -or $attempt -eq $Attempts) {
             break
         }
-        Write-DemoLog -Level Warning -Message ('{0}: the activity profile couldn''t be set yet ({1}); retrying in {2} seconds ({3} of {4}).' -f $Target, $detail, $RetrySeconds, $attempt, $Attempts)
-        Start-Sleep -Seconds $RetrySeconds
+        $runEvidence = if ($null -ne $run) { Get-DemoMemberValue -InputObject $run.Result -Name 'evidence' } else { $null }
+        # A T2 guest the golden capture holds stays off until the capture ends or deploy.ps1 resets the copy, so another
+        # attempt would only be refused again (review of PR 17, 2026-11-04).
+        if ($Target -eq 'T2' -and [string](Get-DemoMemberValue -InputObject $runEvidence -Name 'golden') -in @(Get-DemoT2GuestHoldReason)) {
+            break
+        }
+        # What the VM side waited for the target counts against the budget; once it has waited all of it, the target
+        # stayed down, and another attempt would only wait again.
+        $waited = [int](Get-DemoMemberValue -InputObject $runEvidence -Name 'readySeconds')
+        $left = [System.Math]::Max(0, $left - $waited)
+        if ($waited -gt 0 -and $left -le 0) {
+            break
+        }
+        $pause = [System.Math]::Min($RetrySeconds, $left)
+        Write-DemoLog -Level Warning -Message ('{0}: the activity profile couldn''t be set yet ({1}); retrying in {2} seconds ({3} of {4}).' -f $Target, $detail, $pause, $attempt, $Attempts)
+        Start-Sleep -Seconds $pause
+        $left -= $pause
     }
     $evidence = [ordered]@{ profile = $ProfileName; requestedBy = $RequestedBy }
     if ($SwitchTo) {
@@ -634,10 +723,10 @@ function ConvertTo-DemoStopProfileResult {
     <#
     .SYNOPSIS
     stop-demo.ps1's STOP.PROFILE_<target> from one Send-DemoProfileRunCommand record (2026-11-03): Pass when the profile
-    is off; Not selected when the target has no runner yet; a Warning when it didn't finish within -WaitSeconds or
-    failed, which says that the VM was deallocated anyway, which stops the activity, an incident in progress included.
-    stop-demo.ps1 makes that Warning after the deallocation; -DeallocationFailed says that it failed too
-    (STOP.VM_<vm>), so the activity goes on until the auto-shutdown. Pure. Internal.
+    is off; Not selected when the target has no runner yet, or T2's guest isn't running (GuestOff); a Warning when it
+    didn't finish within -WaitSeconds or failed, which says that the VM was deallocated anyway, which stops the activity,
+    an incident in progress included. stop-demo.ps1 makes that Warning after the deallocation; -DeallocationFailed says
+    that it failed too (STOP.VM_<vm>), so the activity goes on until the auto-shutdown. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -665,6 +754,10 @@ function ConvertTo-DemoStopProfileResult {
         'NotSetUp' {
             $message = if ($target -eq 'T2') { 'T2 isn''t set up yet: the guest gets its demo module and workload runner after SQL Server setup, so no activity runs there to turn off.' } else { '{0}: T1 doesn''t drive {0} yet, so no activity runs there to turn off: {1}' -f $target, [string]$Record.Detail }
             return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Not selected' -Message $message -Evidence $evidence -DocUrl $docUrl)
+        }
+        'GuestOff' {
+            # The guest's stored profile can't change while it's off; it ends at the auto-shutdown it was set for.
+            return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Not selected' -Message ('{0}: nothing to turn off: {1}. The profile stored in the guest ends at the auto-shutdown it was set for, and start-demo.ps1 sets its own when the guest runs again.' -f $target, [string]$Record.Detail) -Evidence $evidence -DocUrl $docUrl)
         }
         default {
             if ($DeallocationFailed) {

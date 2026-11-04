@@ -14,6 +14,9 @@ function Get-DemoEnvironmentStatus {
     - STATUS.T2.AUTOSIGNIN (Phase 28, Get-DemoGuidedSignInStatus), only when there's something to say: Pass while the
       guest's one-time automatic sign-in waits for a guided stop; a Warning when it's armed with no guided stop
       waiting or its last cleanup didn't finish (archost01's next pass removes the leftovers; status stays read-only).
+    - T2.GUEST.STATE (2026-11-03, Get-DemoT2GuestStateResult) while archost01 runs: the nested guest as the host sees
+      it now, from the same health read. Fail when a golden capture left it air-gapped, or it's off or cut off from
+      its NAT switch; a Warning when it won't start with the host next time; each with the exact command.
     - STATUS.DISKS: each VM's disks against the profile. STATUS.RUNCOMMANDS (Phase 28 follow-up,
       Get-DemoRunCommandStatus): managed Run Commands the demo left on its VMs, the on-demand control's DbHubControl-*
       and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap and the activity profiles'
@@ -41,7 +44,9 @@ function Get-DemoEnvironmentStatus {
       STATUS.PROFILE_T2 with -Detail. Each takes on the Warning or Fail of the profile host lane that serves the
       target (Phase 25b, from host-lanes.json): a stalled, restarting, or failing lane, or an active profile that
       nothing runs.
-    - STATUS.ARC: Arc's connection and days disconnected (Get-DemoArcCheck).
+    - STATUS.ARC: Arc's connection and days disconnected (Get-DemoArcCheck). T2.ARC.CONNECTED fails once arcsql01
+      has been Disconnected for 10 minutes while archost01 runs (counted from the later of its last status change and
+      the host's start).
     - STATUS.BASTION: on-demand Bastion and its public IP, with their list price per hour from the Azure
       Retail Prices API; a Warning while either exists, including a public IP left over after an interrupted
       delete (stop-demo.ps1 -RemoveBastionOnly removes it).
@@ -172,6 +177,12 @@ function Get-DemoEnvironmentStatus {
                 $autoSignIn = Get-DemoGuidedSignInStatus -Health $health
                 if ($null -ne $autoSignIn) {
                     $results.Add($autoSignIn)
+                }
+                # The guest as the host sees it now (2026-11-03): air-gapped by a golden capture, off, or cut off from
+                # its switch, any of which keeps T2 out of Database Hub.
+                $guestState = Get-DemoT2GuestStateResult -Config $Config -Health $health
+                if ($null -ne $guestState) {
+                    $results.Add($guestState)
                 }
             }
         }

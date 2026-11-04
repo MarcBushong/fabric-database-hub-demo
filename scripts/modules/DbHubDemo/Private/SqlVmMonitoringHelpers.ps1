@@ -852,6 +852,13 @@ function ConvertTo-DemoSqlVmMonitoringResult {
     if ($plugin.Found -and $plugin.MetricsUploadStatus -ne 'OK' -and $plugin.MetricsUploadStatus -match '(?i)http|error|\b[45]\d\d\b') {
         return (& $new 'Fail' ('Monitoring runs on {0}, but uploads fail: {1}.' -f $State.VmName, $plugin.MetricsUploadStatus) ('Check the VM''s system-assigned identity and outbound HTTPS to telemetry.{0}.arcdataservices.com:443.' -f $State.Location))
     }
+    if ($plugin.Found -and $plugin.State -and $plugin.State -ne 'Running') {
+        # The agent has reported the plugin, and it isn't running: it stopped (live, 2026-10-30: within 90 minutes of a
+        # start). A Warning, as before: T1's database keeps working, and a restart of the agent's service, which
+        # start-demo.ps1 and every Fabric run do on their own, brings it back.
+        $evidence['pending'] = $true
+        return (& $new 'Warning' ('The {0} flag is set on {1}, but {2} reports ''{3}'' (upload ''{4}''), so T1 sends Database Hub no telemetry.' -f $flagName, $State.VmName, $setting['statusPlugin'], $plugin.State, $plugin.MetricsUploadStatus) ('Run ./scripts/start-demo.ps1, which restarts the SQL IaaS Agent service and reads the plugin again (a run from the Fabric control does the same); or restart it yourself: az vm run-command invoke --subscription {0} --resource-group {1} --name {2} --command-id RunPowerShellScript --scripts ''Restart-Service -Name SQLIaaSExtension -Force'', then check again in 5 minutes.' -f $State.SubscriptionId, $State.ResourceGroupName, $State.VmName))
+    }
     if (-not $plugin.Found -or $plugin.State -ne 'Running' -or $plugin.MetricsUploadStatus -ne 'OK') {
         $evidence['pending'] = $true
         return (& $new 'Warning' ('The {0} flag is set on {1}, but {2} doesn''t report Running and OK yet (state ''{3}'', upload ''{4}''); data usually appears within 3 to 15 minutes.' -f $flagName, $State.VmName, $setting['statusPlugin'], $plugin.State, $plugin.MetricsUploadStatus) 'Run configure-monitoring.ps1 -WaitMinutes 15, or check again later.')
