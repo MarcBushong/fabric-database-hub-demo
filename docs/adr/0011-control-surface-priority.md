@@ -34,7 +34,7 @@
 | 2 Infrastructure | Subscription-scope Bicep: resource group, tags, budget, network, VMs, Azure SQL, schedules |
 | 3 Artifacts | Deliver the script bundle in SHA-256-checked Run Command chunks and the runner as ADR 0010 decides; media downloads directly from Microsoft with SHA-256 checks (revised 2026-10-20: the artifact cache was dropped; Phase 6) |
 | 4 Bootstraps (parallel) | T1: SQL Server, seed, runner, P6 membership, then T3 configuration from T1. T2: the host state machine. |
-| 5 Post-configuration | T1 monitoring feature-flag merge; Arc onboarding with the caller's token (ADR 0005); Arc SQL verification; start the activity profile (`baseline` by default) |
+| 5 Post-configuration | T1 monitoring feature-flag merge; Arc onboarding with the caller's token (ADR 0005); Arc SQL verification; start the activity profile (`baseline` by default until 2026-11-03; since then `business-day`, set as `baseline` first and switched once the run's own Run Commands are done, ADR 0010) |
 | 6 Validation | Wait up to 15 minutes for telemetry from every target; print statuses, Hub deep links, and remaining manual items |
 | 7 Fabric | Import or update both notebooks (local path by default; in Actions only when the service-principal tenant setting and a workspace role allow it) |
 
