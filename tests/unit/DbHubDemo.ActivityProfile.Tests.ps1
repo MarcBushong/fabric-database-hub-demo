@@ -420,3 +420,61 @@ Describe 'stop-demo.ps1''s bounded steps (2026-11-03)' {
         @($script:azCalls | Where-Object { $null -ne $_ }) | Should -BeNullOrEmpty -Because 'no bound means no -TimeoutSeconds, as before'
     }
 }
+
+Describe 'Checks during business-day''s incidents (validate.ps1, 2026-11-03)' {
+    It 'finds the incident due on a target at <At> UTC: <Expected>' -ForEach @(
+        @{ At = '2026-11-03T14:07:00Z'; Target = @('T2'); Slack = 3; Expected = 'cpu-pressure 14:05-14:13' }
+        @{ At = '2026-11-03T14:15:59Z'; Target = @('T2'); Slack = 3; Expected = 'cpu-pressure 14:05-14:13' }
+        @{ At = '2026-11-03T14:16:00Z'; Target = @('T2'); Slack = 3; Expected = '' }
+        @{ At = '2026-11-03T14:04:59Z'; Target = @('T2'); Slack = 3; Expected = '' }
+        @{ At = '2026-11-03T14:16:30Z'; Target = @('T3', 'T1'); Slack = 3; Expected = 'resource-governance 14:15-14:20' }
+        @{ At = '2026-11-03T14:08:30Z'; Target = @('T4'); Slack = 3; Expected = 'connection-surge 14:08-14:12' }
+        @{ At = '2026-11-04T00:03:00Z'; Target = @('T2'); Slack = 10; Expected = 'inefficient-query 23:50-23:56' }
+    ) {
+        $now = [datetime]::Parse($At, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
+        $incident = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Unset); Target = $Target; Now = $now; Slack = $Slack } { Get-DemoScheduledIncident -Config $Config -Target $Target -NowUtc $Now -SlackMinutes $Slack }
+        if (-not $Expected) {
+            $incident | Should -BeNullOrEmpty
+            return
+        }
+        ('{0} {1:HH:mm}-{2:HH:mm}' -f $incident.Scenario, $incident.StartUtc, $incident.EndUtc) | Should -Be $Expected
+        $incident.ClearUtc | Should -Be $incident.EndUtc.AddMinutes($Slack)
+        $incident.StartUtc.Kind | Should -Be ([System.DateTimeKind]::Utc)
+    }
+
+    It 'finds none for a profile that runs no incident on a schedule' {
+        $now = [datetime]::new(2026, 11, 3, 14, 7, 0, [System.DateTimeKind]::Utc)
+        foreach ($name in 'baseline', 'off', 'incident:cpu-pressure') {
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -ActivityProfile $name); Now = $now } { Get-DemoScheduledIncident -Config $Config -Target 'T2' -NowUtc $Now } | Should -BeNullOrEmpty -Because $name
+        }
+    }
+
+    It 'turns a Fail that a read got during an incident into a Warning that names it and when to check again' {
+        $now = [datetime]::new(2026, 11, 3, 14, 7, 0, [System.DateTimeKind]::Utc)
+        $fail = New-DemoResult -CheckId 'WORKLOAD.T2.COMMAND' -Area 'workload' -Target 'T2' -Status 'Fail' -Message 'The Run Command on archost01 failed: the runner timed out' -Evidence @{ operatorSeconds = 181 } -Remediation 'Run the command again.' -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command'
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Result = $fail; Now = $now } { ConvertTo-DemoIncidentAwareResult -Result $Result -Config $Config -IncidentTarget 'T2' -ValidationArea 'Workload' -NowUtc $Now }
+        $result.checkId | Should -Be 'WORKLOAD.T2.COMMAND'
+        $result.area | Should -Be 'workload'
+        $result.target | Should -Be 'T2'
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be 'The Run Command on archost01 failed: the runner timed out. It ran during business-day''s cpu-pressure incident on T2 (14:05 to 14:13 UTC), whose load can slow or refuse this read, so it''s a Warning, not a Fail.'
+        $result.remediation | Should -Be 'Run ./scripts/validate.ps1 -Area Workload -Target T2 again after 14:16 UTC, once the incident has ended; a Fail then is a fault. Run the command again.'
+        $result.evidence['operatorSeconds'] | Should -Be 181
+        $result.evidence['failedDuringIncident'] | Should -BeTrue
+        $result.evidence['incident']['scenario'] | Should -Be 'cpu-pressure'
+        $result.docUrl | Should -Be $fail.docUrl
+    }
+
+    It 'returns any other result as it is: a Fail outside an incident, and a Pass or Warning during one' {
+        $quiet = [datetime]::new(2026, 11, 3, 14, 17, 0, [System.DateTimeKind]::Utc)
+        $busy = [datetime]::new(2026, 11, 3, 14, 7, 0, [System.DateTimeKind]::Utc)
+        $fail = New-DemoResult -CheckId 'WORKLOAD.T2.HOST' -Area 'workload' -Target 'T2' -Status 'Fail' -Message 'T2: the lane keeps failing.'
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Result = $fail; Now = $quiet } { ConvertTo-DemoIncidentAwareResult -Result $Result -Config $Config -IncidentTarget 'T2' -ValidationArea 'Workload' -NowUtc $Now } | Should -Be $fail
+        foreach ($status in 'Pass', 'Warning') {
+            $other = New-DemoResult -CheckId 'WORKLOAD.T2.HOST' -Area 'workload' -Target 'T2' -Status $status -Message 'T2: serving.'
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Result = $other; Now = $busy } { ConvertTo-DemoIncidentAwareResult -Result $Result -Config $Config -IncidentTarget 'T2' -ValidationArea 'Workload' -NowUtc $Now } | Should -Be $other
+        }
+        $explicit = New-TestConfig -ActivityProfile 'baseline'
+        InModuleScope DbHubDemo -Parameters @{ Config = $explicit; Result = $fail; Now = $busy } { ConvertTo-DemoIncidentAwareResult -Result $Result -Config $Config -IncidentTarget 'T2' -ValidationArea 'Workload' -NowUtc $Now } | Should -Be $fail -Because 'baseline runs no incident'
+    }
+}

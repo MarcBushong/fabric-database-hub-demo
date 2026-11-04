@@ -293,7 +293,9 @@ function Invoke-DemoValidationT3 {
     <#
     .SYNOPSIS
     The T3 area: Test-DemoT3 with the effective network mode and the free-offer decision. T3.PROPERTY runs
-    its T-SQL through T1, so it's a Warning while sqlvm01 is deallocated, and it resumes a paused T3. Internal.
+    its T-SQL through T1, so it's a Warning while sqlvm01 is deallocated, and it resumes a paused T3. A T3.PROPERTY that
+    couldn't run while one of business-day's incidents is due on T3 or T1 is a Warning, not a Fail
+    (ConvertTo-DemoIncidentAwareResult, 2026-11-03). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -310,7 +312,16 @@ function Invoke-DemoValidationT3 {
         $parameters['T3UseFreeLimit'] = [bool]$Context.T3UseFreeLimit
     }
     Write-DemoLog -Message ('T3 checks use network mode {0}, from {1}.' -f $parameters['NetworkMode'], $Context.NetworkModeSource)
-    @(Test-DemoT3 @parameters)
+    # A T-SQL check that couldn't run while business-day's incidents load T3 (or sqlvm01, which runs it) is a Warning,
+    # not a Fail (2026-11-03); a property that's read and wrong stays a Fail.
+    foreach ($item in @(Test-DemoT3 @parameters)) {
+        if ([string]$item.checkId -eq 'T3.PROPERTY' -and -not ($item.evidence -is [System.Collections.IDictionary] -and $item.evidence.Contains('value'))) {
+            ConvertTo-DemoIncidentAwareResult -Result $item -Config $Context.Config -IncidentTarget 'T3', 'T1' -ValidationArea 'T3'
+        }
+        else {
+            $item
+        }
+    }
 }
 
 function Invoke-DemoValidationT4 {
@@ -464,7 +475,9 @@ function Invoke-DemoValidationWorkload {
     The Workload area: the runner's status on each selected target (Invoke-DemoWorkloadCommand status --json,
     read-only), the scenario bounds from it, and the profile host lane that serves the target (WORKLOAD.<target>.HOST,
     Phase 25b). With control.enabled, the on-demand activity control's CONTROL.* checks (Test-DemoActivityControl, ADR 0020). T1 and T3 run on sqlvm01, and T2 through the host into the guest, so each needs that VM running; T2
-    also needs the host's last step, after the setup wizard. Internal.
+    also needs the host's last step, after the setup wizard. A status read or a host lane that fails while one of
+    business-day's incidents is due on the target (or on T1, whose sqlvm01 runs T3's and T4's commands) is a Warning that
+    names the incident and when to check again, not a Fail (ConvertTo-DemoIncidentAwareResult, 2026-11-03). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -482,6 +495,8 @@ function Invoke-DemoValidationWorkload {
             continue
         }
         $vmName = if ($target -eq 'T2') { $Context.Arc.HostVmName } else { 'sqlvm01' }
+        # The load a status read goes through: the target's own, and sqlvm01's, which runs the commands for T1, T3, and T4.
+        $incidentTargets = @($target) + @(if ($target -in 'T3', 'T4') { 'T1' })
         $state = Get-DemoValidationVmState -Context $Context -VmName $vmName
         if (-not $state.Running) {
             $results.Add((New-DemoValidationStoppedResult -CheckId $checkId -Area 'workload' -Target $target -VmState $state -Context $Context -Checks ('the {0} workload checks' -f $target)))
@@ -529,10 +544,14 @@ function Invoke-DemoValidationWorkload {
             $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Warning' -Message ('The runner''s status on {0} couldn''t be read: {1} {2}' -f $target, $message, (Get-DemoValidationRunCommandNote -ErrorText $message)) -Remediation 'Run validate.ps1 -Area Workload again in about 10 minutes.' -DocUrl $docUrl))
             continue
         }
-        $results.Add($run.Result)
+        $commandResult = $run.Result
+        if ($null -ne $commandResult) {
+            $commandResult = ConvertTo-DemoIncidentAwareResult -Result $commandResult -Config $Context.Config -IncidentTarget $incidentTargets -ValidationArea 'Workload'
+        }
+        $results.Add($commandResult)
         if ($run.Status -in 'Pass', 'Warning') {
             $results.Add((Test-DemoValidationWorkloadBound -Target $target -StdOut $run.StdOut))
-            $results.Add((Test-DemoValidationWorkloadHost -Target $target -StdOut $run.StdOut -VmName $vmName))
+            $results.Add((ConvertTo-DemoIncidentAwareResult -Result (Test-DemoValidationWorkloadHost -Target $target -StdOut $run.StdOut -VmName $vmName) -Config $Context.Config -IncidentTarget $incidentTargets -ValidationArea 'Workload'))
         }
     }
     # The optional on-demand activity control (ADR 0020): CONTROL.*, read-only, or one Not selected when it's off.

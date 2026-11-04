@@ -907,3 +907,110 @@ function Invoke-DemoActivityQuiet {
         Write-DemoLog -Level Debug -Message ('The interim baseline wasn''t sent to the VMs that run: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
 }
+
+function Get-DemoScheduledIncident {
+    <#
+    .SYNOPSIS
+    The business-day incident due on one of -Target at -NowUtc, when the configured activity profile is business-day
+    (2026-11-03): the slot whose window, from its start minute to its end plus -SlackMinutes for the runner to end its
+    sessions and the load to settle, covers the time. With several, the one that clears last. $null for any other
+    profile, which runs no incident on a schedule, or when none is due. Internal.
+
+    .DESCRIPTION
+    The cycles are counted from UTC midnight, as the runner's ProfileScheduler counts them, so this cycle's slot and the
+    previous cycle's, whose slack can reach into this one, are both checked. It reads only the schedule
+    (scenarios/activity-profiles.json); whether the profile is active on the VM isn't known here, so callers use it to
+    explain a read that failed, never to pass one.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [string[]] $Target,
+
+        [datetime] $NowUtc = [System.DateTime]::UtcNow,
+
+        [ValidateRange(0, 30)]
+        [int] $SlackMinutes = 3
+    )
+
+    if ((Get-DemoActivityProfile -Config $Config).Name -cne 'business-day') {
+        return $null
+    }
+    $now = $NowUtc.ToUniversalTime()
+    $dayStart = [System.DateTime]::new($now.Year, $now.Month, $now.Day, 0, 0, 0, [System.DateTimeKind]::Utc)
+    $found = $null
+    foreach ($slot in @(Get-DemoBusinessDaySchedule -Target $Target)) {
+        $cycle = [System.Math]::Max(1, [int]$slot.CycleMinutes)
+        $cycleStart = $dayStart.AddMinutes($cycle * [System.Math]::Floor(($now - $dayStart).TotalMinutes / $cycle))
+        foreach ($start in $cycleStart.AddMinutes($slot.StartMinute), $cycleStart.AddMinutes($slot.StartMinute - $cycle)) {
+            $end = $start.AddMinutes($slot.DurationMinutes)
+            $clear = $end.AddMinutes($SlackMinutes)
+            if ($now -ge $start -and $now -lt $clear -and ($null -eq $found -or $clear -gt $found.ClearUtc)) {
+                $found = [pscustomobject]@{ Target = [string]$slot.Target; Scenario = [string]$slot.Scenario; StartUtc = $start; EndUtc = $end; ClearUtc = $clear }
+            }
+        }
+    }
+    return $found
+}
+
+function ConvertTo-DemoIncidentAwareResult {
+    <#
+    .SYNOPSIS
+    validate.ps1 mustn't Fail just because an incident is running (2026-11-03): a Fail from a check that reads a target
+    through its own load (the runner's status, the T-SQL check of T3's extended property) becomes a Warning while one of
+    business-day's incidents is due on -IncidentTarget (Get-DemoScheduledIncident), with the incident in the message
+    and the evidence, and the time to check again in the remediation. Any other result is returned as it is. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Result,
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [string[]] $IncidentTarget,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('T3', 'Workload')]
+        [string] $ValidationArea,
+
+        [datetime] $NowUtc = [System.DateTime]::UtcNow
+    )
+
+    if ([string]$Result.status -ne 'Fail') {
+        return $Result
+    }
+    $incident = Get-DemoScheduledIncident -Config $Config -Target $IncidentTarget -NowUtc $NowUtc
+    if ($null -eq $incident) {
+        return $Result
+    }
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $evidence = [ordered]@{}
+    if ($Result.evidence -is [System.Collections.IDictionary]) {
+        foreach ($key in $Result.evidence.Keys) {
+            $evidence[$key] = $Result.evidence[$key]
+        }
+    }
+    $evidence['incident'] = [ordered]@{ target = $incident.Target; scenario = $incident.Scenario; startUtc = $incident.StartUtc.ToString('o', $invariant); endUtc = $incident.EndUtc.ToString('o', $invariant) }
+    $evidence['failedDuringIncident'] = $true
+    $base = ([string]$Result.message).TrimEnd()
+    if ($base -notmatch '[.!?]$') {
+        $base += '.'
+    }
+    $message = '{0} It ran during business-day''s {1} incident on {2} ({3} to {4} UTC), whose load can slow or refuse this read, so it''s a Warning, not a Fail.' -f $base, $incident.Scenario, $incident.Target, $incident.StartUtc.ToString('HH:mm', $invariant), $incident.EndUtc.ToString('HH:mm', $invariant)
+    $targetOption = if ([string]$Result.target -in 'T1', 'T2', 'T3', 'T4') { ' -Target {0}' -f $Result.target } else { '' }
+    $remediation = 'Run ./scripts/validate.ps1 -Area {0}{1} again after {2} UTC, once the incident has ended; a Fail then is a fault.' -f $ValidationArea, $targetOption, $incident.ClearUtc.ToString('HH:mm', $invariant)
+    if ([string]$Result.remediation) {
+        $remediation += ' ' + [string]$Result.remediation
+    }
+    return (New-DemoResult -CheckId ([string]$Result.checkId) -Area ([string]$Result.area) -Target ([string]$Result.target) -Status 'Warning' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl ([string]$Result.docUrl) -EvaluationOnly:([bool]$Result.evaluationOnly))
+}

@@ -474,6 +474,79 @@ Describe 'Workload host' {
     }
 }
 
+Describe 'Validation during business-day''s incidents (2026-11-03)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI call expected' }
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Pass'; message = 'Ready.' } }
+        # One incident due now, on $script:incidentTarget only; the schedule itself has its own tests.
+        $script:incidentTarget = 'T2'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -MockWith {
+            if ($script:incidentTarget -in $Target) {
+                [pscustomobject]@{ Target = $script:incidentTarget; Scenario = 'cpu-pressure'; StartUtc = [datetime]::new(2026, 11, 3, 14, 5, 0, [System.DateTimeKind]::Utc); EndUtc = [datetime]::new(2026, 11, 3, 14, 13, 0, [System.DateTimeKind]::Utc); ClearUtc = [datetime]::new(2026, 11, 3, 14, 16, 0, [System.DateTimeKind]::Utc) }
+            }
+        }
+    }
+
+    It 'turns a status read that failed on a target with an incident due into a Warning, and keeps a Fail on the others' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $vm = if ($Target -eq 'T2') { 'archost01' } else { 'sqlvm01' }
+            [pscustomobject]@{ Target = $Target; Status = 'Fail'; StdOut = ''; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Fail' -Message ('The Run Command on {0} failed: the runner timed out' -f $vm) -Remediation 'Run the command again.') }
+        }
+        $context = New-TestContext -Target T1, T2
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X })
+        $t2 = $results | Where-Object { $_.checkId -eq 'WORKLOAD.T2.COMMAND' }
+        $t2.status | Should -Be 'Warning'
+        $t2.message | Should -Match ([regex]::Escape('the runner timed out. It ran during business-day''s cpu-pressure incident on T2 (14:05 to 14:13 UTC)'))
+        $t2.remediation | Should -Match ([regex]::Escape('Run ./scripts/validate.ps1 -Area Workload -Target T2 again after 14:16 UTC'))
+        ($results | Where-Object { $_.checkId -eq 'WORKLOAD.T1.COMMAND' }).status | Should -Be 'Fail' -Because 'no incident is due on T1'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -ParameterFilter { (@($Target) -join ',') -eq 'T2' }
+        @($results | Where-Object { $_.checkId -like 'WORKLOAD.*.HOST' }) | Should -BeNullOrEmpty -Because 'a failed status read has no host state'
+    }
+
+    It 'reads T3''s and T4''s status through sqlvm01, so an incident due on T1 counts for them too; and a host lane that fails during one is a Warning' {
+        $script:incidentTarget = 'T1'
+        $script:hostFail = '{"target":"T3","profile":{"name":"business-day"},"runs":[],"demoSessions":[],"host":{"status":"Fail","message":"The T3 lane keeps failing: the host restarted it 3 times in the last hour.","lane":{"state":"Serving","generation":4}}}'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:hostFail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status') }
+        }
+        $context = New-TestContext -Target T3
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X })
+        $lane = $results | Where-Object { $_.checkId -eq 'WORKLOAD.T3.HOST' }
+        $lane.status | Should -Be 'Warning'
+        $lane.message | Should -Match 'keeps failing.*It ran during business-day''s cpu-pressure incident on T1'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -ParameterFilter { (@($Target) -join ',') -eq 'T3,T1' }
+    }
+
+    It 'turns a T3.PROPERTY check that couldn''t run during an incident into a Warning, and keeps a property that''s read and wrong a Fail' {
+        $script:incidentTarget = 'T3'
+        $script:property = New-DemoResult -CheckId 'T3.PROPERTY' -Area 't3' -Target 'T3' -Status 'Fail' -Message 'The extended property couldn''t be checked: the T-SQL timed out.' -Evidence @{ reason = 'Failed' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT3 -MockWith {
+            New-DemoResult -CheckId 'T3.EXISTS' -Area 't3' -Target 'T3' -Status 'Pass' -Message 'T3 exists.'
+            $script:property
+        }
+        $context = New-TestContext -Target T3
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationT3 -Context $X })
+        @($results | ForEach-Object { $_.checkId }) | Should -Be @('T3.EXISTS', 'T3.PROPERTY')
+        $property = $results | Where-Object { $_.checkId -eq 'T3.PROPERTY' }
+        $property.status | Should -Be 'Warning'
+        $property.remediation | Should -Match ([regex]::Escape('Run ./scripts/validate.ps1 -Area T3 -Target T3 again after 14:16 UTC'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -Times 1 -Exactly -ParameterFilter { (@($Target) -join ',') -eq 'T3,T1' }
+
+        $script:property = New-DemoResult -CheckId 'T3.PROPERTY' -Area 't3' -Target 'T3' -Status 'Fail' -Message 'MS_EnablePerformanceMonitoringPreview is missing on ContosoCare.' -Evidence @{ reason = ''; value = '' }
+        $wrong = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationT3 -Context $X }) | Where-Object { $_.checkId -eq 'T3.PROPERTY' }
+        $wrong.status | Should -Be 'Fail' -Because 'an incident can''t make a property that was read wrong'
+    }
+
+    It 'leaves DONE''s requirements to checks that read Database Hub, Azure, and Fabric, never a target through its load' {
+        foreach ($mode in 'PaygWizard', 'Developer') {
+            $ids = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Mode = $mode } { Get-DemoDoneRequirement -InstallMode $Mode })
+            @($ids | Where-Object { $_ -like 'WORKLOAD.*' -or $_ -eq 'T3.PROPERTY' }) | Should -BeNullOrEmpty -Because $mode
+        }
+    }
+}
+
 Describe 'Cost area' {
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
