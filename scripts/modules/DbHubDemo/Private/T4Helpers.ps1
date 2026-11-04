@@ -172,6 +172,37 @@ function Get-DemoT4SkuSpec {
     throw ('{0} isn''t a documented T4 size ({1}).' -f $SkuName, ($script:T4Sizes -join ', '))
 }
 
+function Test-DemoT4SizeIncrease {
+    <#
+    Whether moving an existing T4 from -From to -To raises its hourly price, so the move is priced first (review of PR 20,
+    2026-11-04): General Purpose costs more than Burstable, and within a tier more vCores cost more (the documented sizes:
+    Standard_B1ms, Standard_B2s, Standard_D2ds_v5, and Standard_D4ds_v5 and Standard_D4ads_v5, which share the vCore price).
+    A size it doesn't know counts as a raise, so it's priced. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $From,
+
+        [Parameter(Mandatory)]
+        [string] $To
+    )
+
+    try {
+        $old = Get-DemoT4SkuSpec -SkuName $From
+        $new = Get-DemoT4SkuSpec -SkuName $To
+    }
+    catch {
+        return $true
+    }
+    $rank = {
+        param([pscustomobject] $Spec)
+        [int]$Spec.VCores + $(if ($Spec.Tier -eq 'GeneralPurpose') { 1000 } else { 0 })
+    }
+    return ((& $rank $new) -gt (& $rank $old))
+}
+
 function Get-DemoT4Tuning {
     <#
     .SYNOPSIS
@@ -275,6 +306,12 @@ function New-DemoT4SizeResult {
     - Waiting: T4 isn't Ready (deploy.ps1 starts a stopped T4 before the template), so it keeps its size this time.
     - Refused: Azure refused the scale (-Failure, SkuNotAvailable), so it keeps its size, which the resource group records
       (DbHubT4Size), and later runs keep it.
+    - Ceiling (review of PR 20): the move's cost check (-Cost, Get-DemoT4GeneralPurposeCost at the larger size, with the
+      restart worst case the daily T4 safety stop allows) put the month over monthlyCeilingUsd, a session over
+      sessionCeilingUsd, or found no price, so this deployment keeps the server's size and names the ceiling to raise; the
+      next run that deploys the template checks again. Nothing is recorded.
+    -Explicit words it for a t4SkuName the configuration changed on an existing server; -Cost on Scale says the check
+    passed.
     Internal.
     Source (checked 2026-11-04; updated 2026-07-16): https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources
     #>
@@ -293,26 +330,69 @@ function New-DemoT4SizeResult {
         [string] $SkuName,
 
         [Parameter(Mandatory)]
-        [ValidateSet('Scale', 'Waiting', 'Refused')]
+        [ValidateSet('Scale', 'Waiting', 'Refused', 'Ceiling')]
         [string] $Outcome,
 
         [string] $State = '',
 
         [AllowNull()]
-        [pscustomobject] $Failure
+        [pscustomobject] $Failure,
+
+        [AllowNull()]
+        [pscustomobject] $Cost,
+
+        [switch] $Explicit
     )
 
     $checkId = '{0}.T4.SIZE' -f $CheckPrefix
     $area = if ($CheckPrefix -eq 'PREFLIGHT') { 'preflight' } else { 't4' }
     $docUrl = 'https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources'
     $from = '{0} ({1})' -f $ServerSku, $(if ((Get-DemoT4SkuSpec -SkuName $ServerSku).Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' })
-    $evidence = [ordered]@{ serverSku = $ServerSku; skuName = $SkuName; outcome = $Outcome }
+    $evidence = [ordered]@{ serverSku = $ServerSku; skuName = $SkuName; outcome = $Outcome; explicit = [bool]$Explicit }
     $keep = 'To keep T4 at {0}, set t4SkuName to {0} in your configuration (autonomous tuning then stays off on a size under 4 vCores); a size you set is never changed.' -f $ServerSku
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($null -ne $Cost) {
+        foreach ($name in 'SkipReason', 'MonthlyWorstCaseUsd', 'SessionUsd', 'MonthlyCeilingUsd', 'SessionCeilingUsd', 'RestartAssumption') {
+            $evidence[$name.Substring(0, 1).ToLowerInvariant() + $name.Substring(1)] = Get-DemoMemberValue -InputObject $Cost -Name $name
+        }
+    }
     switch ($Outcome) {
         'Scale' {
             $who = if ($CheckPrefix -eq 'PREFLIGHT') { 'deploy.ps1 scales it' } else { 'this deployment scales it' }
-            $message = 'T4 exists as {0}, and your configuration doesn''t set t4SkuName, so {1} to the default, General Purpose {2} with 4 vCores and autonomous tuning (since 2026-11-04), which restarts it, usually for a minute or less. The cost checks price it at {2}.' -f $from, $who, $SkuName
-            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('Nothing to do. {0}' -f $keep) -DocUrl $docUrl)
+            $message = if ($Explicit) {
+                'T4 exists as {0}, and your configuration sets t4SkuName to {1}, so {2}, which restarts it, usually for a minute or less.' -f $from, $SkuName, $who
+            }
+            else {
+                'T4 exists as {0}, and your configuration doesn''t set t4SkuName, so {1} to the default, General Purpose {2} with 4 vCores and autonomous tuning (since 2026-11-04), which restarts it, usually for a minute or less. The cost checks price it at {2}.' -f $from, $who, $SkuName
+            }
+            if ($null -ne $Cost -and $null -ne $Cost.HourlyUsd) {
+                $message += ' Its cost check passed: {0}.' -f (Format-DemoT4FallbackCostText -Cost $Cost)
+            }
+            $remediation = if ($Explicit) { 'Nothing to do. To keep T4 at {0}, set t4SkuName back to {0}.' -f $ServerSku } else { 'Nothing to do. {0}' -f $keep }
+            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl $docUrl)
+        }
+        'Ceiling' {
+            $where = if ($Explicit) { 'to {0}, the size your configuration sets in t4SkuName,' -f $SkuName } else { 'to the default, General Purpose {0} with autonomous tuning,' -f $SkuName }
+            $reason = [string](Get-DemoMemberValue -InputObject $Cost -Name 'SkipReason')
+            $why = switch ($reason) {
+                'MonthlyCeiling' { [string]::Format($culture, 'put the demo''s month at {0:N2} USD, over monthlyCeilingUsd ({1:N2} USD)', [double]$Cost.MonthlyWorstCaseUsd, [double]$Cost.MonthlyCeilingUsd) }
+                'SessionCeiling' { [string]::Format($culture, 'put a session at {0:N2} USD, over sessionCeilingUsd ({1:N2} USD)', [double]$Cost.SessionUsd, [double]$Cost.SessionCeilingUsd) }
+                default { 'need a price the Azure Retail Prices API didn''t give just now{0}' -f $(if ($Cost.PriceError) { ' (' + $Cost.PriceError + ')' } else { '' }) }
+            }
+            $message = 'T4 exists as {0}. Moving it {1} would {2}, so this deployment keeps its size, and the next run that deploys the template checks again.' -f $from, $where, $why
+            if ($reason -ne 'Price' -and $null -ne $Cost.HourlyUsd) {
+                $message += ' The check: {0}.' -f (Format-DemoT4FallbackCostText -Cost $Cost)
+            }
+            $back = if ($Explicit) { 'Or set t4SkuName back to {0}.' -f $ServerSku } else { $keep }
+            $remediation = switch ($reason) {
+                'MonthlyCeiling' {
+                    $safety = if ([string]$Cost.RestartAssumption -eq 'RestOfMonth') { ' Or put the daily T4 safety stop in place (./scripts/setup-activity-control.ps1, with its role from -GrantRole or deploy.ps1 with assignRoles), so each of T4''s 7-day restarts counts as about a day.' } else { '' }
+                    [string]::Format($culture, 'To move T4 to {0}, raise monthlyCeilingUsd to at least {1:N0} (the budget follows it), then run ./scripts/deploy.ps1 -FromStage Infrastructure again.{2} {3}', $SkuName, [System.Math]::Ceiling([double]$Cost.MonthlyWorstCaseUsd), $safety, $back)
+                }
+                'SessionCeiling' { [string]::Format($culture, 'To move T4 to {0}, raise sessionCeilingUsd to at least {1:N0}, then run ./scripts/deploy.ps1 -FromStage Infrastructure again. {2}', $SkuName, [System.Math]::Ceiling([double]$Cost.SessionUsd), $back) }
+                default { 'Run ./scripts/deploy.ps1 -FromStage Infrastructure again once the Azure Retail Prices API answers: the move is priced first. {0}' -f $back }
+            }
+            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl 'https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices')
         }
         'Waiting' {
             $evidence['state'] = $State
@@ -465,9 +545,11 @@ function ConvertTo-DemoT4FallbackCost {
 function Get-DemoT4GeneralPurposeCost {
     <#
     .SYNOPSIS
-    The cost check right before T4's fallback creates Standard_D2ds_v5, its 2-vCore size (ADR 0019): the demo's
-    estimate with T4 at that size, priced from the Azure Retail Prices API now (Get-DemoCostEstimate, with the
-    subscription's Defender for Cloud plans and the T2 golden snapshots, both read-only), and its verdict
+    The cost check right before T4's fallback creates Standard_D2ds_v5, its 2-vCore size (ADR 0019), and, with -SkuName,
+    right before deploy.ps1 moves an existing T4 to a larger size: the default Standard_D4ds_v5, or a t4SkuName the
+    configuration changed (review of PR 20, 2026-11-04). The demo's estimate with T4 at that size, priced from the Azure
+    Retail Prices API now (Get-DemoCostEstimate, with the subscription's Defender for Cloud plans, the T2 golden snapshots,
+    and the daily T4 safety stop's coverage of T4's 7-day restart, all read-only), and its verdict
     (ConvertTo-DemoT4FallbackCost). Never throws: an estimate that can't be made is a verdict that doesn't allow it
     (Price). Internal.
     #>
@@ -482,10 +564,12 @@ function Get-DemoT4GeneralPurposeCost {
         [string] $NetworkMode,
 
         [AllowNull()]
-        [object] $T3UseFreeLimit
+        [object] $T3UseFreeLimit,
+
+        [string] $SkuName = 'Standard_D2ds_v5'
     )
 
-    $priced = Copy-DemoT4Config -Config $Config -Source fallback -SkuName 'Standard_D2ds_v5'
+    $priced = Copy-DemoT4Config -Config $Config -Source fallback -SkuName $SkuName
     $parameters = @{ Config = $priced; NetworkMode = $NetworkMode }
     if ($null -ne $T3UseFreeLimit) {
         $parameters['T3UseFreeLimit'] = [bool]$T3UseFreeLimit
@@ -494,23 +578,23 @@ function Get-DemoT4GeneralPurposeCost {
         $parameters['DefenderPlans'] = @(Get-DemoDefenderPlan -SubscriptionId ([string]$Config['subscriptionId']))
     }
     catch {
-        Write-DemoLog -Level Warning -Message ('The Defender for Cloud plans couldn''t be read, so the 2-vCore fallback''s estimate leaves them out: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        Write-DemoLog -Level Warning -Message ('The Defender for Cloud plans couldn''t be read, so T4''s estimate at {0} leaves them out: {1}' -f $SkuName, (Protect-DemoText -Text $_.Exception.Message))
     }
     try {
         $parameters['GoldenSnapshots'] = @(Get-DemoT2GoldenSnapshot -Config $Config)
     }
     catch {
-        Write-DemoLog -Level Warning -Message ('The T2 golden snapshots couldn''t be listed, so the 2-vCore fallback''s estimate leaves them out: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        Write-DemoLog -Level Warning -Message ('The T2 golden snapshots couldn''t be listed, so T4''s estimate at {0} leaves them out: {1}' -f $SkuName, (Protect-DemoText -Text $_.Exception.Message))
     }
     # The daily T4 safety stop caps the restart worst case when it's fully in place (2026-11-04); never throws.
     $parameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
     try {
-        return (ConvertTo-DemoT4FallbackCost -Estimate (Get-DemoCostEstimate @parameters) -Config $priced)
+        return (ConvertTo-DemoT4FallbackCost -Estimate (Get-DemoCostEstimate @parameters) -Config $priced -SkuName $SkuName)
     }
     catch {
         $problem = Protect-DemoText -Text $_.Exception.Message
-        Write-DemoLog -Level Warning -Message ('T4''s 2-vCore fallback couldn''t be priced: {0}' -f $problem)
-        return (ConvertTo-DemoT4FallbackCost -Estimate $null -Config $priced -PriceError $problem)
+        Write-DemoLog -Level Warning -Message ('T4 couldn''t be priced at {0}: {1}' -f $SkuName, $problem)
+        return (ConvertTo-DemoT4FallbackCost -Estimate $null -Config $priced -SkuName $SkuName -PriceError $problem)
     }
 }
 

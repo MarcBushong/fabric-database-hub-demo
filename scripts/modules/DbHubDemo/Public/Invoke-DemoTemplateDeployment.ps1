@@ -44,7 +44,12 @@ function Invoke-DemoTemplateDeployment {
        existing server whose size the configuration doesn't set keeps its size when a record says so; otherwise, with
        -ScaleT4 (deploy.ps1) and T4 Ready, it scales to the default, Standard_D4ds_v5, which restarts it (DEPLOY.T4.SIZE
        Warning; a refused scale keeps its size and records it), and without -ScaleT4 (start-demo.ps1) or while T4 isn't
-       Ready, it keeps its size (DEPLOY.T4.SKU Pass when that differs from the configured size). A record that doesn't
+       Ready, it keeps its size (DEPLOY.T4.SKU Pass when that differs from the configured size). A move to a larger size,
+       the default or a t4SkuName the configuration changed on an existing server (with -ScaleT4), is priced first with
+       the 2-vCore fallback's estimate at that size (Get-DemoT4GeneralPurposeCost, with the daily T4 safety stop's restart
+       coverage), because deploy.ps1 -FromStage Infrastructure skips preflight's cost checks (review of PR 20): over
+       either ceiling, or without a price, the server keeps its size this time (DEPLOY.T4.SIZE Ceiling, naming the ceiling
+       to raise; nothing recorded, so the next run checks again). A record that doesn't
        match the server that exists is cleared, never set to its size, unless it's the size a refused scale kept. A
        record no longer holds once the configuration sets t4SkuName (review finding 5). The VMs that exist are read again
        before each attempt, so a VM a failed attempt created never gets an osProfile again. While the fallback is
@@ -117,7 +122,9 @@ function Invoke-DemoTemplateDeployment {
 
     .PARAMETER ScaleT4
     deploy.ps1's: an existing T4 whose size the configuration doesn't set, and no record keeps, scales to the default,
-    Standard_D4ds_v5, when it's Ready (2026-11-04). Without it (start-demo.ps1's T3 recreation), T4 keeps its size.
+    Standard_D4ds_v5, when it's Ready and its cost check passes (2026-11-04); a t4SkuName the configuration changed to a
+    larger size is priced the same way first. Without it (start-demo.ps1's T3 recreation, which checks the cost before it
+    starts), T4 keeps its size, and a size the configuration sets goes to the template as before.
 
     .PARAMETER TemplatePath
     The compiled template; defaults to the repository's azuredeploy.json.
@@ -257,21 +264,54 @@ function Invoke-DemoTemplateDeployment {
     }
     # T4's 4-vCore default (2026-11-04, user-directed): an existing server whose size the configuration doesn't set and no
     # record keeps (a server from before, whose Phase 28 record isn't read) moves to the default at deploy.ps1's run
-    # (-ScaleT4) while it's Ready, which restarts it (DEPLOY.T4.SIZE); otherwise it keeps its size this time.
+    # (-ScaleT4) while it's Ready, which restarts it (DEPLOY.T4.SIZE); otherwise it keeps its size this time. A move to a
+    # larger size, the default or a t4SkuName the configuration changed, is priced first, as the 2-vCore fallback is,
+    # because deploy.ps1 -FromStage Infrastructure skips preflight's cost checks (review of PR 20): over either ceiling, or
+    # without a price, T4 keeps its size this time (DEPLOY.T4.SIZE Ceiling), and the next run checks again.
     $t4Default = Get-DemoT4DefaultSkuName -Config $Config
     $t4Scaling = $false
+    $priceMove = {
+        param([string] $Target)
+        if (-not (Test-DemoT4SizeIncrease -From $t4ServerSku -To $Target)) {
+            return $null
+        }
+        return (Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $T3UseFreeLimit -SkuName $Target)
+    }
     if ($t4Exists -and -not $t4Explicit -and $t4ServerSku) {
         $toDefault = $t4ServerSku -cne $t4Default -and (Get-DemoT4SkuName -Config $effective) -ceq $t4Default
+        $moveCost = $null
         if ($toDefault -and $ScaleT4 -and $Action -eq 'Create' -and $t4ServerState -eq 'Ready') {
+            $moveCost = & $priceMove $t4Default
+        }
+        if ($toDefault -and $ScaleT4 -and $Action -eq 'Create' -and $t4ServerState -eq 'Ready' -and ($null -eq $moveCost -or $moveCost.Allowed)) {
             $t4Scaling = $true
-            $results.Add((New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $t4Default -Outcome Scale))
+            $results.Add((New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $t4Default -Outcome Scale -Cost $moveCost))
             Write-DemoLog -Level Warning -Message ('T4 exists as {0}; this deployment scales it to the default, {1}, which restarts it.' -f $t4ServerSku, $t4Default)
         }
         else {
-            if ($toDefault -and $ScaleT4 -and $Action -eq 'Create') {
+            if ($null -ne $moveCost) {
+                $ceiling = New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $t4Default -Outcome Ceiling -Cost $moveCost
+                $results.Add($ceiling)
+                Write-DemoLog -Level Warning -Message $ceiling.message
+            }
+            elseif ($toDefault -and $ScaleT4 -and $Action -eq 'Create') {
                 $results.Add((New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $t4Default -Outcome Waiting -State $t4ServerState))
             }
             $effective = & $keepServer $effective $t4ServerSku
+        }
+    }
+    elseif ($t4Exists -and $t4Explicit -and $t4ServerSku -and $ScaleT4 -and $Action -eq 'Create' -and (Get-DemoT4SkuName -Config $effective) -cne $t4ServerSku) {
+        $wanted = Get-DemoT4SkuName -Config $effective
+        $moveCost = & $priceMove $wanted
+        if ($null -ne $moveCost -and -not $moveCost.Allowed) {
+            $ceiling = New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $wanted -Outcome Ceiling -Cost $moveCost -Explicit
+            $results.Add($ceiling)
+            Write-DemoLog -Level Warning -Message $ceiling.message
+            $effective = Copy-DemoT4Config -Config $effective -Source server -SkuName $t4ServerSku
+        }
+        elseif ($null -ne $moveCost) {
+            $results.Add((New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $wanted -Outcome Scale -Cost $moveCost -Explicit))
+            Write-DemoLog -Level Warning -Message ('T4 exists as {0}; this deployment scales it to {1}, the size your configuration sets, which restarts it.' -f $t4ServerSku, $wanted)
         }
     }
 

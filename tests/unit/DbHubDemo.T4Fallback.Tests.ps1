@@ -35,11 +35,12 @@ BeforeAll {
     }
 
     # The cost check's verdict, in ConvertTo-DemoT4FallbackCost's shape.
-    function New-TestCost([string] $SkipReason = '', [object] $HourlyUsd = 0.5, [double] $MonthlyWorstCaseUsd = 220.0, [double] $SessionUsd = 8.0) {
+    function New-TestCost([string] $SkipReason = '', [object] $HourlyUsd = 0.5, [double] $MonthlyWorstCaseUsd = 220.0, [double] $SessionUsd = 8.0, [string] $SkuName = 'Standard_D2ds_v5', [string] $RestartAssumption = '') {
         [pscustomobject]@{
             Allowed               = (-not $SkipReason)
             SkipReason            = $SkipReason
-            SkuName               = 'Standard_D2ds_v5'
+            SkuName               = $SkuName
+            RestartAssumption     = $RestartAssumption
             HourlyUsd             = $HourlyUsd
             T4MonthlyWorstCaseUsd = 385.0
             MonthlyWorstCaseUsd   = $MonthlyWorstCaseUsd
@@ -110,7 +111,9 @@ BeforeAll {
             }
         }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recorded.Add([string]$Value['T4Sku']) }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -MockWith { $script:cost }
+        # The sizes priced since the harness was set up (Should -Invoke counts a whole It's calls).
+        $script:pricedSizes = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -MockWith { $script:pricedSizes.Add([string]$SkuName); $script:cost }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
             $script:currentSize = if (-not $Config['t4Enabled']) { 'none' } elseif ($Config.Contains('t4SkuName') -and $Config['t4SkuName']) { [string]$Config['t4SkuName'] } else { 'Standard_D4ds_v5' }
             $script:sizes.Add($script:currentSize)
@@ -964,6 +967,116 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         (Resolve-TestConfig -Config (New-TestConfig) -Record 'Standard_B1ms')['t4SkuName'] | Should -Be 'Standard_B1ms'
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Test-DemoT4FallbackSize -Config $Config -State ([pscustomobject]@{ T4Sku = 'Standard_B1ms' }) } | Should -BeFalse
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Test-DemoT4FallbackSize -Config $Config -State ([pscustomobject]@{ T4Sku = 'Standard_D4ads_v5' }) } | Should -BeTrue
+    }
+
+    It 'prices the move of an existing T4 to the default first, and keeps its size over a ceiling, naming the ceiling to raise (review of PR 20)' {
+        # The reviewer's case: monthlyCeilingUsd set to 250, no t4SkuName, and no control, so T4's 7-day restart counts the
+        # rest of the month: light use plus that worst case is 312.21 USD, a Fail that -FromStage Infrastructure never ran.
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
+        $config = New-TestConfig
+        $config['monthlyCeilingUsd'] = 250
+        $script:cost = New-TestCost -SkipReason 'MonthlyCeiling' -MonthlyWorstCaseUsd 312.21 -SkuName 'Standard_D4ds_v5' -RestartAssumption 'RestOfMonth'
+        $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D2ds_v5') -Because 'the server keeps its size'
+        $deployment.T4SkuName | Should -Be 'Standard_D2ds_v5'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $SkuName -eq 'Standard_D4ds_v5' -and $NetworkMode -eq 'private' -and $T3UseFreeLimit -eq $false }
+        $size = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE')
+        $size.Count | Should -Be 1
+        $size[0].status | Should -Be 'Warning'
+        $size[0].evidence.outcome | Should -Be 'Ceiling'
+        $size[0].evidence.skipReason | Should -Be 'MonthlyCeiling'
+        $size[0].message | Should -Match '^T4 exists as Standard_D2ds_v5 \(General Purpose\)\. Moving it to the default, General Purpose Standard_D4ds_v5 with autonomous tuning, would put the demo''s month at 312\.21 USD, over monthlyCeilingUsd \(250\.00 USD\), so this deployment keeps its size, and the next run that deploys the template checks again\.'
+        $size[0].remediation | Should -Match 'raise monthlyCeilingUsd to at least 313 \(the budget follows it\), then run \./scripts/deploy\.ps1 -FromStage Infrastructure again\. Or put the daily T4 safety stop in place'
+        $size[0].remediation | Should -Match 'set t4SkuName to Standard_D2ds_v5'
+        @($script:recorded).Count | Should -Be 0 -Because 'nothing is recorded, so the next run checks again'
+        $deployment.T4Note | Should -Not -Match 'scaled'
+
+        # A session over its ceiling, or no price, keeps the size too.
+        foreach ($case in @(@{ Reason = 'SessionCeiling'; Match = 'would put a session at 16\.00 USD, over sessionCeilingUsd \(15\.00 USD\)'; Fix = 'raise sessionCeilingUsd to at least 16' }, @{ Reason = 'Price'; Match = 'would need a price the Azure Retail Prices API didn''t give just now \(offline\)'; Fix = 'once the Azure Retail Prices API answers' })) {
+            Initialize-TemplateHarness
+            $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_B1ms'; tier = 'Burstable' } }
+            $script:cost = New-TestCost -SkipReason $case.Reason -SessionUsd 16 -SkuName 'Standard_D4ds_v5'
+            $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+            @($script:sizes) | Should -Be @('Standard_B1ms') -Because $case.Reason
+            $size = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE'
+            $size.evidence.outcome | Should -Be 'Ceiling'
+            $size.message | Should -Match $case.Match
+            $size.remediation | Should -Match $case.Fix
+        }
+    }
+
+    It 'scales an existing T4 to the default when the move''s cost check fits both ceilings, and says the check passed' {
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
+        $script:cost = New-TestCost -MonthlyWorstCaseUsd 137.55 -SkuName 'Standard_D4ds_v5' -RestartAssumption 'SafetyStop'
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $SkuName -eq 'Standard_D4ds_v5' }
+        $size = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE'
+        $size.evidence.outcome | Should -Be 'Scale'
+        $size.message | Should -Match 'Its cost check passed: about 0\.500 USD an hour while it runs .* counted as about a day per restart because the daily T4 safety stop is in place'
+        $deployment.T4Note | Should -Match '^T4 scaled from Standard_D2ds_v5 to the default'
+
+        # A move that doesn't raise the price isn't priced: the two 4-vCore sizes share the vCore price.
+        Initialize-TemplateHarness
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ads_v5'; tier = 'GeneralPurpose' } }
+        Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -ScaleT4 | Out-Null
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5')
+        @($script:pricedSizes) | Should -BeNullOrEmpty
+    }
+
+    It 'prices a t4SkuName the configuration changed on an existing T4, then scales it or keeps its size (review of PR 20)' {
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
+        $script:cost = New-TestCost -SkipReason 'MonthlyCeiling' -MonthlyWorstCaseUsd 312.21 -SkuName 'Standard_D4ds_v5' -RestartAssumption 'RestOfMonth'
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -SkuName 'Standard_D4ds_v5') -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D2ds_v5') -Because 'over the ceiling, the server keeps its size'
+        $deployment.T4SkuName | Should -Be 'Standard_D2ds_v5'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $SkuName -eq 'Standard_D4ds_v5' }
+        $size = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE'
+        $size.evidence.outcome | Should -Be 'Ceiling'
+        $size.evidence.explicit | Should -BeTrue
+        $size.message | Should -Match '^T4 exists as Standard_D2ds_v5 \(General Purpose\)\. Moving it to Standard_D4ds_v5, the size your configuration sets in t4SkuName, would put the demo''s month at 312\.21 USD, over monthlyCeilingUsd'
+        $size.remediation | Should -Match 'raise monthlyCeilingUsd to at least 313 .* Or set t4SkuName back to Standard_D2ds_v5\.$'
+        @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' -and $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+
+        # Within both ceilings, it scales, and says so.
+        Initialize-TemplateHarness
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
+        $script:cost = New-TestCost -SkuName 'Standard_D4ds_v5'
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -SkuName 'Standard_D4ds_v5') -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5')
+        $size = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE'
+        $size.evidence.outcome | Should -Be 'Scale'
+        $size.message | Should -Match '^T4 exists as Standard_D2ds_v5 \(General Purpose\), and your configuration sets t4SkuName to Standard_D4ds_v5, so this deployment scales it, which restarts it'
+
+        # A smaller size can only lower the cost, so it isn't priced.
+        Initialize-TemplateHarness
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5'; tier = 'GeneralPurpose' } }
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -SkuName 'Standard_B1ms') -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        @($script:sizes) | Should -Be @('Standard_B1ms')
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE') | Should -BeNullOrEmpty
+        @($script:pricedSizes) | Should -BeNullOrEmpty
+
+        # Without -ScaleT4 (start-demo.ps1's T3 recreation, after its own cost check), a size the configuration sets goes as before.
+        Initialize-TemplateHarness
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
+        Invoke-TestTemplate -Config (New-TestConfig -SkuName 'Standard_D4ds_v5') | Out-Null
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5')
+        @($script:pricedSizes) | Should -BeNullOrEmpty
+    }
+
+    It 'tells a larger T4 size from a smaller one: <From> to <To>' -ForEach @(
+        @{ From = 'Standard_B1ms'; To = 'Standard_B2s'; Larger = $true }
+        @{ From = 'Standard_B2s'; To = 'Standard_D2ds_v5'; Larger = $true }
+        @{ From = 'Standard_D2ds_v5'; To = 'Standard_D4ds_v5'; Larger = $true }
+        @{ From = 'Standard_B1ms'; To = 'Standard_D4ads_v5'; Larger = $true }
+        @{ From = 'Standard_D4ads_v5'; To = 'Standard_D4ds_v5'; Larger = $false }
+        @{ From = 'Standard_D4ds_v5'; To = 'Standard_D2ds_v5'; Larger = $false }
+        @{ From = 'Standard_D2ds_v5'; To = 'Standard_B2s'; Larger = $false }
+        @{ From = 'Standard_D4ds_v5'; To = 'Standard_E4ds_v5'; Larger = $true }
+    ) {
+        InModuleScope DbHubDemo -Parameters @{ From = $From; To = $To } { Test-DemoT4SizeIncrease -From $From -To $To } | Should -Be $Larger
     }
 
     It 'drops Phase 28''s record from the group''s tags, and doesn''t read it' {
