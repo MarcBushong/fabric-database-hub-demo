@@ -317,6 +317,22 @@ public sealed class ProfileSchedulerTests
         Assert.Equal(sessions, cpu.Concurrency);
     }
 
+    [Theory]
+    [InlineData("GeneralPurpose", true)]
+    [InlineData("Burstable", false)]
+    public void TheShowcaseRunsT4sMissingIndexLookupsOnItsFourVCoreSize(string tier, bool runs)
+    {
+        // 2026-11-04: lookups that autonomous tuning can recommend indexes for, in every cycle, on General Purpose only
+        // (Query Store shouldn't run on Burstable).
+        var state = State("showcase", SetAt.AddMinutes(90), new ProfileParameters { Tier = tier, VCores = tier == "GeneralPurpose" ? 4 : 1 });
+
+        foreach (var minute in new[] { 21, 51, 81 })
+        {
+            var activities = ProfileScheduler.Plan(state, DemoTarget.T4, SetAt.AddMinutes(minute), Definitions, Catalog, null);
+            Assert.Equal(runs, activities.Any(a => a.ScenarioId == "missing-index"));
+        }
+    }
+
     [Fact]
     public void VCoresScaleOnlyT4sCpuBoundSlots()
     {

@@ -271,10 +271,11 @@ internal sealed class PgDemoDatabase(NpgsqlConnection connection)
             }
         }
 
-        // 8. Optional steps. T4 has no missing-index scenario, so there's no remediation to undo.
+        // 8. Optional steps. On T4, missing-index applies no remediation: autonomous tuning only recommends indexes
+        // (index_tuning.mode REPORT), and nothing in the repo creates them, so there's nothing to undo.
         checks.Add(options.UndoRemediation
-            ? new CheckRecord("remediation-undone", "Not supported", "T4 has no missing-index scenario, so there's no remediation to undo.")
-            : new CheckRecord("remediation-undone", "Not selected", "The missing-index remediation applies to T1 to T3 only."));
+            ? new CheckRecord("remediation-undone", "Not supported", "On T4, missing-index applies no remediation: autonomous tuning only recommends indexes, and nothing in the repo creates them. Drop an index you created from a recommendation yourself.")
+            : new CheckRecord("remediation-undone", "Not selected", "The missing-index remediation script applies to T1 to T3 only."));
         if (options.Reseed)
         {
             try

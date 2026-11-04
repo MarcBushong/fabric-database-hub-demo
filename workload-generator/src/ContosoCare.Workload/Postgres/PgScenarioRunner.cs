@@ -300,7 +300,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     // Scenario orchestrations ----------------------------------------------------------------------------------------------
 
-    /// <summary>healthy-baseline and cpu-pressure: N sessions call the step back to back, pausing by intensity.</summary>
+    /// <summary>healthy-baseline, cpu-pressure, and missing-index: N sessions call the step back to back, pausing by intensity.</summary>
     private async Task<IReadOnlyList<WorkerOutcome>> RunWorkersAsync(RunContext context)
     {
         var plan = context.Plan;
@@ -308,9 +308,11 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         for (var worker = 1; worker <= plan.Concurrency; worker++)
         {
             var index = worker;
+            var turn = 0;
             tasks.Add(plan.Scenario.Id switch
             {
                 "cpu-pressure" => StepLoopAsync(context, "worker", index, (c, t) => CpuStepAsync(c, context, index, plan.Parameters["variant"].Text ?? "problem", t), Pause(plan.Intensity, 2000, 0), TimeSpan.Zero),
+                "missing-index" => StepLoopAsync(context, "worker", index, (c, t) => MissingIndexStepAsync(c, context, index, turn++, time.GetUtcNow(), t), Pause(plan.Intensity, 1000, 20), TimeSpan.Zero),
                 _ => StepLoopAsync(context, "worker", index, (c, t) => BaselineStepAsync(c, context, index, t), Pause(plan.Intensity, 2000, 100), TimeSpan.Zero),
             });
         }
@@ -871,6 +873,39 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     private static Task<IReadOnlyDictionary<string, object?>> CpuStepAsync(NpgsqlConnection connection, RunContext context, int worker, string variant, CancellationToken cancellationToken) =>
         QueryRowAsync(connection, "SELECT executions, pairs_compared, overlap_pairs, elapsed_ms FROM demo.usp_scenario_cpu_pressure(@run_id, @worker, @variant);", cancellationToken, ("run_id", context.RunId), ("worker", worker), ("variant", variant));
+
+    /// <summary>
+    /// missing-index on T4 (2026-11-04): the SQL Server targets' two lookups, claims aging by payer since a date and visits
+    /// by reason code at a facility. The step function only checks that the run still runs (so a stop ends the loop, as
+    /// in every step); the lookup goes as the runner's own top-level parameterized statement, so Query Store
+    /// (pg_qs.query_capture_mode top) captures it and autonomous tuning can recommend its index. Neither payer_code nor
+    /// reason_code has an index (database/postgresql/010-schema.sql). Read-only; the turn alternates the lookups and
+    /// varies their values.
+    /// </summary>
+    private static async Task<IReadOnlyDictionary<string, object?>> MissingIndexStepAsync(NpgsqlConnection connection, RunContext context, int worker, int turn, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        await QueryRowAsync(connection, "SELECT checked FROM demo.usp_scenario_missing_index(@run_id);", cancellationToken, ("run_id", context.RunId)).ConfigureAwait(false);
+        var (sql, parameters) = MissingIndexLookup(worker, turn, now);
+        return await QueryRowAsync(connection, sql, cancellationToken, parameters).ConfigureAwait(false);
+    }
+
+    /// <summary>The lookup a missing-index turn sends on T4, and its parameters. Pure.</summary>
+    internal static (string Sql, (string Name, object Value)[] Parameters) MissingIndexLookup(int worker, int turn, DateTimeOffset now)
+    {
+        if (turn % 2 == 0)
+        {
+            return (
+                "SELECT count(*)::bigint AS rows_found FROM care.claims WHERE payer_code = @payer AND submitted_on >= @since;",
+                [("payer", MissingIndexPayers[((turn / 2) + worker) % MissingIndexPayers.Length]), ("since", DateOnly.FromDateTime(now.UtcDateTime.AddDays(-30)))]);
+        }
+
+        return (
+            "SELECT count(*)::bigint AS rows_found FROM care.appointments WHERE reason_code = @reason AND facility_id = @facility;",
+            [("reason", string.Create(CultureInfo.InvariantCulture, $"R{((turn * 7) + worker) % 50:000}")), ("facility", 1 + ((turn + worker) % 20))]);
+    }
+
+    /// <summary>The payers database/postgresql/020-seed.sql gives claims.</summary>
+    private static readonly string[] MissingIndexPayers = ["CONTOSO-HMO", "FABRIKAM-PPO", "NORTHWIND-MED", "SELF-PAY", "TAILSPIN-INS"];
 
     /// <summary>Runs a step in a transaction that's always rolled back (locking contenders, writers, the active holder).</summary>
     private static async Task<IReadOnlyDictionary<string, object?>> InRolledBackTransactionAsync(NpgsqlConnection connection, string sql, CancellationToken cancellationToken, params (string Name, object Value)[] parameters)

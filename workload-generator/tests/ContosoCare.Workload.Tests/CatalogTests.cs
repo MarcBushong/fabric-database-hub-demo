@@ -78,8 +78,8 @@ public sealed partial class CatalogTests
     /// <summary>The scenarios that run on T3 only, because they need an Azure SQL Database feature (the showcase).</summary>
     internal static readonly HashSet<string> AzureSqlOnlyScenarioIds = new(["plan-regression"], StringComparer.Ordinal);
 
-    /// <summary>The scenarios T4 runs: database/postgresql/120-scenario-functions.sql has their steps.</summary>
-    internal static readonly HashSet<string> PostgresScenarioIds = new(["connection-surge", "cpu-pressure", "healthy-baseline", "idle-in-transaction", "io-pressure", "locking-blocking"], StringComparer.Ordinal);
+    /// <summary>The scenarios T4 runs: database/postgresql/120-scenario-functions.sql has their steps (missing-index's only checks its run; the runner sends its lookups, 2026-11-04).</summary>
+    internal static readonly HashSet<string> PostgresScenarioIds = new(["connection-surge", "cpu-pressure", "healthy-baseline", "idle-in-transaction", "io-pressure", "locking-blocking", "missing-index"], StringComparer.Ordinal);
 
     [Fact]
     public void TheSchemaRejectsABadScenario()

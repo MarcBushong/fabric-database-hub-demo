@@ -9,10 +9,11 @@
   "concurrency": { "default": 2, "min": 1, "max": 16, "description": "Sessions running the lookups." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace: a lookup about once a second per session at 1, about 50 per second at 10." },
   "targets": {
-    "applicable": ["T1", "T2", "T3"],
+    "applicable": ["T1", "T2", "T3", "T4"],
     "default": ["T2"],
     "notes": {
-      "T3": "Azure SQL Database may also raise its own CREATE INDEX tuning recommendation after enough executions."
+      "T3": "Azure SQL Database may also raise its own CREATE INDEX tuning recommendation after enough executions.",
+      "T4": "The same two lookups, sent by the runner as top-level parameterized statements (not a step function), so Query Store captures them and autonomous tuning, on by default on T4's 4-vCore size (2026-11-04), can recommend their indexes in the Azure portal (the server's Intelligent Performance > Autonomous tuning) and through az postgres flexible-server autonomous-tuning, after a tuning session (every 60 minutes while T4 runs). Database Hub doesn't show PostgreSQL recommendations, and remediation.sql is for T1 to T3."
     }
   },
   "parameters": {},
