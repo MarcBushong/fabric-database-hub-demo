@@ -39,7 +39,10 @@ Actions:
   start (starting it after 8 minutes if it's still stopped), checks that it runs Standard edition, and
   rotates the guest's password; then reconnects the adapter and restores the automatic start.
   With EndCapture (only the capture's own Release: its first step, and its return of the source), the capture
-  marker is removed first, because the capture is over.
+  marker is removed first, because the capture is over. Any other Release refuses, and changes nothing, while a
+  capture marker that names this host counts (review, 2026-11-04): unless the snapshot it names is among
+  CapturedSnapshots, the snapshots its caller found (start-demo.ps1 and deploy.ps1), because once that snapshot
+  exists the capture's air gap is in it, and the marker is removed. A marker that can't be read counts too.
   With ProveIsolation, the adapter is connected before the reset, and the reset runs only after
   'azcmagent check' and direct TCP tests show that no Arc endpoint answers (the boot test's network
   security group denies all outbound traffic). With KeepIsolated, the adapter stays disconnected.
@@ -78,6 +81,10 @@ The Azure region for 'azcmagent check' (Release with ProveIsolation).
 
 .PARAMETER EndCapture
 'true' for the capture's own Release only (capture-t2-golden.ps1): it removes the capture marker that Prepare wrote.
+
+.PARAMETER CapturedSnapshots
+The golden snapshots that name this host as their unreleased source, joined with '+' (Release from start-demo.ps1
+and deploy.ps1): a capture marker that names one of them is removed, because that capture's snapshot exists.
 #>
 [CmdletBinding()]
 param(
@@ -88,6 +95,7 @@ param(
     [string] $KeepIsolated = 'false',
     [string] $SkipRotation = 'false',
     [string] $EndCapture = 'false',
+    [string] $CapturedSnapshots = '',
     [string] $GuestName = 'arcsql01',
     [string] $Root = 'C:\ProgramData\DbHubDemo'
 )
@@ -194,14 +202,23 @@ function Get-GoldenCaptureMarkerPath {
     return [System.IO.Path]::Combine($Root, 'golden', 'capture-in-progress.json')
 }
 
+function Format-GoldenUtc {
+    # One UTC time format whatever the host's culture: a culture's own time separator (fi-FI writes 09.44.28) would make
+    # the marker unreadable (review, 2026-11-04).
+    param([Parameter(Mandatory = $true)] [datetime] $Value)
+    return $Value.ToString("yyyy-MM-dd'T'HH':'mm':'ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Get-GoldenCaptureProgress {
     <#
     .SYNOPSIS
     Whether a golden capture is in progress on this host (review of 2026-11-04): Prepare writes the capture marker
-    and only the capture's own Release (EndCapture) removes it, so T2's control relay never undoes the air gap between
-    Prepare and the snapshot. The marker counts for GoldenCaptureMarkerHours after it was written, and only on the host
-    it names: a copy restored from the snapshot carries it too, and there it means nothing. Returns State (None,
-    Active, or Unknown when this host's Azure VM ID couldn't be read), SnapshotName, SinceUtc, and UntilUtc. Pure.
+    and only the capture's own Release (EndCapture), or a Release that finds the snapshot it names, removes it, so
+    nothing undoes the air gap between Prepare and the snapshot. The marker counts for GoldenCaptureMarkerHours after
+    it was written, and only on the host it names: a copy restored from the snapshot carries it too, and there it means
+    nothing. Returns State (None; Active; Unknown when this host's Azure VM ID couldn't be read; or Unreadable when
+    the marker names no host or its time can't be read, which fails closed, because only Prepare writes it),
+    SnapshotName, SinceUtc, and UntilUtc. Pure.
     #>
     param(
         [AllowNull()]
@@ -226,24 +243,45 @@ function Get-GoldenCaptureProgress {
         }
         return [string]$property.Value
     }
+    $source = & $read 'sourceAzureVmId'
+    if ($AzureVmId -and $source -and -not [string]::Equals($source, $AzureVmId, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $none
+    }
     $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
     $since = [datetime]::MinValue
-    if (-not [datetime]::TryParse((& $read 'startedUtc'), [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$since)) {
-        return $none
+    $readable = $false
+    $started = $Marker.PSObject.Properties['startedUtc']
+    if ($null -ne $started -and $started.Value -is [datetime]) {
+        # PowerShell 7's ConvertFrom-Json has already read an ISO time as a date; Windows PowerShell 5.1 keeps the text.
+        $since = if ($started.Value.Kind -eq [System.DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($started.Value, [System.DateTimeKind]::Utc) } else { $started.Value.ToUniversalTime() }
+        $readable = $true
+    }
+    elseif ($null -ne $started -and $started.Value -is [string]) {
+        $readable = [datetime]::TryParseExact($started.Value, "yyyy-MM-dd'T'HH':'mm':'ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$since)
+    }
+    if (-not $source -or -not $readable) {
+        return (New-Object -TypeName 'psobject' -Property @{ State = 'Unreadable'; SnapshotName = (& $read 'snapshotName'); SinceUtc = ''; UntilUtc = '' })
     }
     $now = if ($NowUtc.Kind -eq [System.DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($NowUtc, [System.DateTimeKind]::Utc) } else { $NowUtc.ToUniversalTime() }
     $until = $since.AddHours($script:GoldenCaptureMarkerHours)
     if ($now -ge $until) {
         return $none
     }
-    $state = 'Active'
-    if (-not $AzureVmId) {
-        $state = 'Unknown'
+    $state = if ($AzureVmId) { 'Active' } else { 'Unknown' }
+    return (New-Object -TypeName 'psobject' -Property @{ State = $state; SnapshotName = (& $read 'snapshotName'); SinceUtc = (Format-GoldenUtc -Value $since); UntilUtc = (Format-GoldenUtc -Value $until) })
+}
+
+function Get-GoldenCaptureRefusal {
+    # Why a Release other than the capture's own leaves the guest alone (Invoke-GoldenRelease), or nothing. The words
+    # "golden capture is in progress on this host" and "golden capture marker on this host" are what
+    # Invoke-DemoGoldenSourceRelease recognizes.
+    param([Parameter(Mandatory = $true)] [object] $Progress)
+    switch ($Progress.State) {
+        'Active' { return ('A golden capture is in progress on this host (snapshot {0}, since {1}): its source stays air-gapped until the capture''s own Release ends it, so nothing was released.' -f $Progress.SnapshotName, $Progress.SinceUtc) }
+        'Unknown' { return ('A golden capture is in progress on this host as far as can be told (snapshot {0}, since {1}; this host''s Azure VM ID couldn''t be read), so nothing was released.' -f $Progress.SnapshotName, $Progress.SinceUtc) }
+        'Unreadable' { return 'A golden capture marker on this host can''t be read, and only a capture writes it, so nothing was released. Run capture-t2-golden.ps1 again: its first step ends the marker and releases the source.' }
     }
-    elseif (-not [string]::Equals((& $read 'sourceAzureVmId'), $AzureVmId, [System.StringComparison]::OrdinalIgnoreCase)) {
-        return $none
-    }
-    return (New-Object -TypeName 'psobject' -Property @{ State = $state; SnapshotName = (& $read 'snapshotName'); SinceUtc = $since.ToString('yyyy-MM-ddTHH:mm:ssZ'); UntilUtc = $until.ToString('yyyy-MM-ddTHH:mm:ssZ') })
+    return ''
 }
 
 function Get-GoldenSecretPath {
@@ -821,7 +859,7 @@ function Invoke-GoldenPrepare {
     $marker = [ordered]@{
         schemaVersion   = 1
         snapshotName    = $script:Options.SnapshotName
-        startedUtc      = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        startedUtc      = (Format-GoldenUtc -Value ([DateTime]::UtcNow))
         sourceAzureVmId = $hostFacts['azureVmId']
     }
     Write-GoldenJson -Path (Get-GoldenCaptureMarkerPath -Root $script:Options.Root) -Value $marker
@@ -915,11 +953,46 @@ function Invoke-GoldenPasswordRotation {
 function Invoke-GoldenRelease {
     param([hashtable] $Setting)
     $result = [ordered]@{ action = 'Release'; succeeded = $false }
-    if ($script:Options['EndCapture']) {
-        # The capture's own Release: the capture is over, so T2's control relay may act on the guest again.
-        $markerPath = Get-GoldenCaptureMarkerPath -Root $script:Options.Root
-        $result['captureEnded'] = Test-Path -LiteralPath $markerPath -PathType Leaf
-        Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    $markerPath = Get-GoldenCaptureMarkerPath -Root $script:Options.Root
+    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+        if ($script:Options['EndCapture']) {
+            # The capture's own Release: the capture is over, so the guest may be released again.
+            Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+            $result['captureEnded'] = 'EndCapture'
+        }
+        else {
+            # Any other Release (start-demo.ps1, deploy.ps1, T2's control relay) leaves a capture in progress alone,
+            # except once the snapshot its marker names exists: its air gap is in it then (review, 2026-11-04).
+            $marker = $null
+            try {
+                $marker = Read-GoldenJson -Path $markerPath
+            }
+            catch {
+                $marker = New-Object -TypeName 'psobject'
+            }
+            if ($null -eq $marker) {
+                $marker = New-Object -TypeName 'psobject'
+            }
+            $named = if ($marker.PSObject.Properties['snapshotName']) { [string]$marker.snapshotName } else { '' }
+            $found = @($script:Options['CapturedSnapshots'] | Where-Object { $_ })
+            if ($named -and $found -contains $named) {
+                Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+                $result['captureEnded'] = $named
+            }
+            else {
+                $markerVmId = ''
+                try {
+                    $markerVmId = Get-GoldenImdsVmId
+                }
+                catch {
+                    $markerVmId = ''
+                }
+                $refusal = Get-GoldenCaptureRefusal -Progress (Get-GoldenCaptureProgress -Marker $marker -AzureVmId $markerVmId -NowUtc ([DateTime]::UtcNow))
+                if ($refusal) {
+                    throw $refusal
+                }
+            }
+        }
     }
     $capturePath = [System.IO.Path]::Combine($script:Options.Root, 'golden', 'capture.json')
     $capture = Read-GoldenJson -Path $capturePath
@@ -1031,16 +1104,20 @@ if ($MyInvocation.InvocationName -ne '.') {
         if ($GuestName -notmatch '^[A-Za-z0-9-]{1,15}$') {
             throw 'GuestName is not valid.'
         }
+        if ($CapturedSnapshots -and $CapturedSnapshots -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}(\+[A-Za-z0-9][A-Za-z0-9._-]{0,79})*$') {
+            throw 'CapturedSnapshots is not valid.'
+        }
         if ($Region -and $Region -notmatch '^[a-z0-9]{2,40}$') {
             throw 'Region is not valid.'
         }
         $script:Options = @{
-            Root           = $Root
-            SnapshotName   = $SnapshotName
-            ProveIsolation = ($ProveIsolation -eq 'true')
-            KeepIsolated   = ($KeepIsolated -eq 'true')
-            SkipRotation   = ($SkipRotation -eq 'true')
-            EndCapture     = ($EndCapture -eq 'true')
+            Root              = $Root
+            SnapshotName      = $SnapshotName
+            ProveIsolation    = ($ProveIsolation -eq 'true')
+            KeepIsolated      = ($KeepIsolated -eq 'true')
+            SkipRotation      = ($SkipRotation -eq 'true')
+            EndCapture        = ($EndCapture -eq 'true')
+            CapturedSnapshots = @($CapturedSnapshots -split '\+' | Where-Object { $_ })
         }
         $setting = Get-GoldenHostSetting
         $lock = $null

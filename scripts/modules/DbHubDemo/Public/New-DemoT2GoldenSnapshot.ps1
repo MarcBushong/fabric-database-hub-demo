@@ -45,9 +45,10 @@ function New-DemoT2GoldenSnapshot {
        returns the host to the power state the capture found it in (a clean guest shutdown first, never by force).
        A Fabric start therefore never finds T2 cut off (live, 2026-11-03).
 
-    Nothing is deleted. -WhatIf runs steps 1 and 2 only. An interrupted capture (Ctrl+C) may leave the air gap: a
-    Fabric start of T2 and the next capture release it, start-demo.ps1 and deploy.ps1 too once its snapshot exists,
-    and status.ps1 reports it (T2.GUEST.STATE).
+    Nothing is deleted. -WhatIf runs steps 1 and 2 only. An interrupted capture (Ctrl+C) may leave the air gap and its
+    marker: the next capture releases it at once (its first step ends the marker), start-demo.ps1 and deploy.ps1 once
+    its snapshot exists (they end the marker then), and a Fabric start of T2 once the marker no longer counts (6 hours);
+    status.ps1 reports it (T2.GUEST.STATE).
 
     Sources (checked 2026-10-21):
     - az snapshot create: https://learn.microsoft.com/cli/azure/snapshot#az-snapshot-create

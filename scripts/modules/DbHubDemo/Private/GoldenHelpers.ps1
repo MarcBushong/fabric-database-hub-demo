@@ -412,8 +412,8 @@ function Invoke-DemoGoldenSourceRelease {
     The capture leaves the source's guest disconnected (no network adapter, no automatic start) while it takes the
     snapshot, so the snapshot's copies boot air-gapped; since 2026-11-03 the capture itself releases its source right
     afterwards (Restore-DemoGoldenCaptureSource), and this is the safety net for a capture that was interrupted once
-    its snapshot existed (before that, no snapshot names the host: a Fabric start of T2 or the next capture releases
-    it).
+    its snapshot existed (before that, no snapshot names the host: the next capture releases it, or a Fabric start of T2
+    once its marker no longer counts).
     When archost01's Azure VM ID matches a golden snapshot's
     dbhubSourceVmId (in this resource group) and that snapshot doesn't carry dbhubSourceReleasedUtc yet, the
     guest is reconnected (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Release: on the source, it only
@@ -421,7 +421,10 @@ function Invoke-DemoGoldenSourceRelease {
     later starts skip it. start-demo.ps1, deploy.ps1 (existing host), and the capture call it; a Fabric start of T2
     releases the source on the host itself (Invoke-DemoWorkloadControl.ps1), where it can't tag the snapshot, so a
     later call here releases again, which is harmless, and records it. -EndCapture is for the capture's own return
-    of its source only: its Release removes the capture marker that Prepare wrote (2026-11-04).
+    of its source only: its Release removes the capture marker that Prepare wrote (2026-11-04). Any other call passes
+    the snapshots it found (CapturedSnapshots): the Release ends a marker that names one of them, because that
+    capture's snapshot exists, and refuses while any other marker counts on this host, which is a Warning here: the
+    source stays air-gapped until its capture ends (review, 2026-11-04).
 
     Sources (checked 2026-10-22): https://learn.microsoft.com/cli/azure/vm#az-vm-show,
     https://learn.microsoft.com/cli/azure/tag#az-tag-update
@@ -454,13 +457,23 @@ function Invoke-DemoGoldenSourceRelease {
     }
     $docUrl = 'https://learn.microsoft.com/virtualization/hyper-v-on-windows/user-guide/powershell-direct'
     Write-DemoLog -Message ('archost01 is the source of {0}; reconnecting its air-gapped guest.' -f (($sources | ForEach-Object { $_.Name }) -join ', '))
-    $parameter = if ($EndCapture) { @{ EndCapture = 'true' } } else { @{} }
+    # The snapshots found go along: a capture marker that names one of them is over, because that snapshot exists, so
+    # the Release ends it; any other marker that counts makes the Release refuse (review, 2026-11-04).
+    $parameter = @{ CapturedSnapshots = (@($sources | ForEach-Object { $_.Name }) -join '+') }
+    if ($EndCapture) {
+        $parameter['EndCapture'] = 'true'
+    }
     $release = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -Parameter $parameter -TimeoutSeconds $TimeoutSeconds
     $evidence = [ordered]@{
-        snapshots = @($sources | ForEach-Object { $_.Name })
-        seconds   = $release.Seconds
-        role      = [string](Get-DemoMemberValue -InputObject $release.Data -Name 'role')
-        captured  = Get-DemoMemberValue -InputObject $release.Data -Name 'captured'
+        snapshots    = @($sources | ForEach-Object { $_.Name })
+        seconds      = $release.Seconds
+        role         = [string](Get-DemoMemberValue -InputObject $release.Data -Name 'role')
+        captured     = Get-DemoMemberValue -InputObject $release.Data -Name 'captured'
+        captureEnded = [string](Get-DemoMemberValue -InputObject $release.Data -Name 'captureEnded')
+    }
+    if (-not $release.Succeeded -and [string]$release.Error -match '(?i)golden capture is in progress on this host|golden capture marker on this host') {
+        $evidence['captureInProgress'] = $true
+        return (New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status 'Warning' -Message ('archost01 is the source of {0}, and its guest stays air-gapped: {1}' -f ($evidence['snapshots'] -join ', '), $release.Error) -Evidence $evidence -Remediation 'Let ./scripts/capture-t2-golden.ps1 finish: its return of the source releases it. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again, which ends its marker and releases the source first; this release ends the marker too once that capture''s snapshot exists.' -DocUrl $docUrl)
     }
     if (-not $release.Succeeded) {
         return (New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status 'Fail' -Message ('archost01 is a golden snapshot''s source, and its guest couldn''t be reconnected: {0}' -f $release.Error) -Evidence $evidence -Remediation 'Fix the cause and run start-demo.ps1 (or deploy.ps1) again; the release is safe to repeat.' -DocUrl $docUrl)
@@ -605,7 +618,7 @@ function Restore-DemoGoldenCaptureSource {
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
     $evidence = [ordered]@{ foundPowerState = $FoundPowerState; airGapUtc = $AirGapUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); hostStarted = $false; release = ''; releaseStatus = ''; arcStatus = ''; arcLastStatusChange = ''; arcProof = ''; arcSeconds = 0; hostAfter = '' }
-    $retry = 'Run ./scripts/start-demo.ps1: it releases the source (T2.GOLDEN.SOURCE) and is safe to repeat; a start from the Fabric control does the same.'
+    $retry = 'Run ./scripts/capture-t2-golden.ps1 again: its first step ends this capture''s marker and releases the source. ./scripts/start-demo.ps1 releases it too once this capture''s snapshot exists (T2.GOLDEN.SOURCE ends the marker then), and so does a start of T2 from the Fabric control once no capture marker holds it back (6 hours at most). Each is safe to repeat.'
     $new = { param([string] $Status, [string] $Message, [string] $Remediation = '') New-DemoResult -CheckId 'GOLDEN.CAPTURE.SOURCE' -Area 't2' -Target 'T2' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $docUrl }
 
     # 1. The host.
@@ -738,9 +751,9 @@ function Get-DemoT2GuestStateResult {
       capture; a copy: deploy.ps1 resets it, and it's never connected by hand while it may hold the captured
       identity), a copy whose record says released without a reset (2026-11-04: it may hold the captured identity),
       the guest off, or its adapter not connected to the NAT switch.
-    - Warning while a golden capture is in progress on this host (the marker Prepare writes, for 6 hours at most):
-      the guest is off and air-gapped on purpose, and a Fabric start of T2 is refused until the capture ends (review,
-      2026-11-04). Also when it works now but won't after the next start (an automatic start action other than
+    - Warning while a golden capture is in progress on this host (the marker Prepare writes, for 6 hours at most), or
+      while a marker can't be read (it fails closed): the guest is off and air-gapped on purpose, and a Fabric start of
+      T2 is refused until the capture ends (review, 2026-11-04). Also when it works now but won't after the next start (an automatic start action other than
       Start), or its heartbeat isn't OK yet (it may still be booting), or the host couldn't be read or tell its role.
     - Not selected while the host's build hasn't created the guest yet; Pass otherwise.
     #>
@@ -779,6 +792,10 @@ function Get-DemoT2GuestStateResult {
     }
     $capture = Get-DemoMemberValue -InputObject $guest -Name 'capture'
     $captureState = [string](Get-DemoMemberValue -InputObject $capture -Name 'state')
+    if ($captureState -eq 'Unreadable') {
+        $evidence['capture'] = [ordered]@{ state = $captureState; snapshotName = [string](Get-DemoMemberValue -InputObject $capture -Name 'snapshotName') }
+        return (& $new 'Warning' ('A golden capture marker on archost01 can''t be read, and only a capture writes it, so {0} is left as it is: the Fabric control and every release but the capture''s own leave it alone (2026-11-04).' -f $guestName) 'Run ./scripts/capture-t2-golden.ps1 again: its first step ends the marker and releases the source. ./scripts/start-demo.ps1 ends it too once that capture''s snapshot exists.')
+    }
     if ($captureState -in 'Active', 'Unknown') {
         # The health read's JSON may turn its ISO times into dates: one format for both.
         $time = {
@@ -789,7 +806,7 @@ function Get-DemoT2GuestStateResult {
         }
         $evidence['capture'] = [ordered]@{ state = $captureState; snapshotName = [string](Get-DemoMemberValue -InputObject $capture -Name 'snapshotName'); sinceUtc = (& $time (Get-DemoMemberValue -InputObject $capture -Name 'sinceUtc')); untilUtc = (& $time (Get-DemoMemberValue -InputObject $capture -Name 'untilUtc')) }
         $where = if ($captureState -eq 'Active') { 'on archost01' } else { 'on archost01 (its marker is recent, and archost01''s Azure VM ID couldn''t be read to confirm it''s the host the marker names)' }
-        return (& $new 'Warning' ('A golden capture is in progress {0}: snapshot {1}, since {2}. {3} stays off and air-gapped until the capture returns its source to service (GOLDEN.CAPTURE.SOURCE), and a start of T2 from the Fabric control is refused meanwhile.' -f $where, $evidence['capture']['snapshotName'], $evidence['capture']['sinceUtc'], $guestName) ('Let ./scripts/capture-t2-golden.ps1 finish. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again: it releases the source before anything else. From {0} the marker no longer holds a Fabric start back, and that start releases the source too.' -f $evidence['capture']['untilUtc']))
+        return (& $new 'Warning' ('A golden capture is in progress {0}: snapshot {1}, since {2}. {3} stays off and air-gapped until the capture returns its source to service (GOLDEN.CAPTURE.SOURCE), and a start of T2 from the Fabric control is refused meanwhile.' -f $where, $evidence['capture']['snapshotName'], $evidence['capture']['sinceUtc'], $guestName) ('Let ./scripts/capture-t2-golden.ps1 finish. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again: it ends the marker and releases the source before anything else; ./scripts/start-demo.ps1 does too once that capture''s snapshot exists. From {0} the marker no longer holds a Fabric start back, and that start releases the source too.' -f $evidence['capture']['untilUtc']))
     }
     $seen = '{0}, automatic start {1}, {2} of {3} adapter(s) connected' -f $(if ($evidence['state']) { $evidence['state'] } else { 'in no state' }), $(if ($evidence['startAction']) { $evidence['startAction'] } else { 'unknown' }), $evidence['connected'], $evidence['adapters']
     if (-not $evidence['present']) {

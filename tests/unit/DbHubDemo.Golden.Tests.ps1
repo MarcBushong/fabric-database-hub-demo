@@ -825,6 +825,26 @@ Describe 'Invoke-DemoGoldenSourceRelease' {
         $script:released = $null
         $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoGoldenSourceRelease -Config $c -EndCapture } $config
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 1 -Exactly -ParameterFilter { [string]$Parameter['EndCapture'] -eq 'true' }
+        # Every call names the snapshots it found, so the Release can end a capture marker whose snapshot exists.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 2 -Exactly -ParameterFilter { [string]$Parameter['CapturedSnapshots'] -eq 'snap-dbhub-t2golden-202610221306' }
+    }
+
+    It 'warns, and records nothing, while a golden capture holds the source back (review, 2026-11-04)' {
+        # start-demo.ps1 during a capture, with an older untagged snapshot that names this host: the Release refuses.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
+            $script:calls.Add('Release')
+            [pscustomobject]@{ Succeeded = $false; Error = 'A golden capture is in progress on this host (snapshot snap-dbhub-t2golden-202611040100, since 2026-11-04T09:00:00Z): its source stays air-gapped until the capture''s own Release ends it, so nothing was released.'; Seconds = 20; Data = [pscustomobject]@{ succeeded = $false } }
+        }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoGoldenSourceRelease -Config $c } $config
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'its guest stays air-gapped: A golden capture is in progress on this host'
+        $result.remediation | Should -Match 'Let \./scripts/capture-t2-golden\.ps1 finish'
+        $result.evidence['captureInProgress'] | Should -BeTrue
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -ParameterFilter { $ArgumentList[0] -eq 'tag' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
+            [pscustomobject]@{ Succeeded = $false; Error = 'A golden capture marker on this host can''t be read, and only a capture writes it, so nothing was released.'; Seconds = 20; Data = $null }
+        }
+        (& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoGoldenSourceRelease -Config $c } $config).status | Should -Be 'Warning'
     }
 
     It 'does nothing on a host that isn''t a capture source, or once the release is recorded' {
@@ -978,6 +998,8 @@ Describe 'Restore-DemoGoldenCaptureSource' {
         $result = Invoke-Restore
         $result.status | Should -Be 'Fail'
         $result.message | Should -Match 'didn''t start'
+        # The remediation says which release ends a capture that stopped before its own (review, 2026-11-04).
+        $result.remediation | Should -Match 'capture-t2-golden\.ps1 again: its first step ends this capture''s marker.*start-demo\.ps1 releases it too once this capture''s snapshot exists.*once no capture marker holds it back'
         $script:calls | Should -Not -Contain 'source release'
     }
 }
@@ -1011,6 +1033,7 @@ Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
         @{ Case = 'its heartbeat isn''t OK yet'; Guest = { New-Guest -Heartbeat 'NoContact' }; Status = 'Warning'; Match = 'heartbeat is NoContact'; Fix = 'again in a few minutes' }
         @{ Case = 'the host couldn''t read it'; Guest = { [pscustomobject]@{ present = $false; error = 'Access is denied.' } }; Status = 'Warning'; Match = 'couldn''t read its guest'; Fix = 'again' }
         @{ Case = 'a capture is in progress on this host'; Guest = { $g = New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Source' }); $g | Add-Member -NotePropertyName capture -NotePropertyValue ([pscustomobject]@{ state = 'Active'; snapshotName = 'snap-dbhub-t2golden-202611040100'; sinceUtc = [datetime]::new(2026, 11, 4, 1, 0, 0, [System.DateTimeKind]::Utc); untilUtc = '2026-11-04T07:00:00Z' }) -PassThru }; Status = 'Warning'; Match = 'A golden capture is in progress on archost01: snapshot snap-dbhub-t2golden-202611040100, since 2026-11-04 01:00 UTC'; Fix = '^Let \./scripts/capture-t2-golden\.ps1 finish.*From 2026-11-04 07:00 UTC' }
+        @{ Case = 'a capture marker can''t be read'; Guest = { $g = New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0; $g | Add-Member -NotePropertyName capture -NotePropertyValue ([pscustomobject]@{ state = 'Unreadable'; snapshotName = 'snap-dbhub-t2golden-202611040100'; sinceUtc = ''; untilUtc = '' }) -PassThru }; Status = 'Warning'; Match = 'capture marker on archost01 can''t be read, and only a capture writes it'; Fix = '^Run \./scripts/capture-t2-golden\.ps1 again.*start-demo\.ps1 ends it too' }
         @{ Case = 'a recent marker can''t be matched to this host'; Guest = { $g = New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0; $g | Add-Member -NotePropertyName capture -NotePropertyValue ([pscustomobject]@{ state = 'Unknown'; snapshotName = 'snap-dbhub-t2golden-202611040100'; sinceUtc = '2026-11-04T01:00:00Z'; untilUtc = '2026-11-04T07:00:00Z' }) -PassThru }; Status = 'Warning'; Match = 'Azure VM ID couldn''t be read to confirm'; Fix = 'capture-t2-golden\.ps1' }
         @{ Case = 'a copy''s record says released without a reset'; Guest = { New-Guest -Golden ([pscustomobject]@{ released = $true; reset = $false; role = 'Copy' }) }; Status = 'Fail'; Match = 'record says released, but its Arc identity was never reset'; Fix = 'deploy\.ps1: its T2 track resets the restored copy' }
         @{ Case = 'a released record''s host can''t tell its role'; Guest = { New-Guest -Golden ([pscustomobject]@{ released = $true; reset = $false; role = 'Unknown' }) }; Status = 'Warning'; Match = 'can''t be told from a copy''s'; Fix = 'deploy\.ps1' }

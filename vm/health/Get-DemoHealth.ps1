@@ -70,7 +70,16 @@ function Get-DemoHealthGuestFact {
             $capture = [System.IO.File]::ReadAllText($capturePath) | ConvertFrom-Json
         }
         if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
-            $marker = [System.IO.File]::ReadAllText($markerPath) | ConvertFrom-Json
+            try {
+                $marker = [System.IO.File]::ReadAllText($markerPath) | ConvertFrom-Json
+            }
+            catch {
+                $marker = $null
+            }
+            if ($null -eq $marker) {
+                # A marker that exists but can't be read names nothing: Unreadable, which fails closed.
+                $marker = New-Object -TypeName 'psobject'
+            }
         }
         $golden = $null
         if ($null -ne $capture) {

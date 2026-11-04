@@ -83,7 +83,7 @@ Describe 'The capture marker (review, 2026-11-04)' {
     BeforeAll {
         $script:now = [datetime]::new(2026, 11, 4, 2, 0, 0, [System.DateTimeKind]::Utc)
         function New-Marker([datetime] $StartedUtc, [string] $Source = 'source-vm') {
-            [pscustomobject]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611040100'; startedUtc = $StartedUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"); sourceAzureVmId = $Source }
+            [pscustomobject]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611040100'; startedUtc = $StartedUtc.ToString("yyyy-MM-dd'T'HH':'mm':'ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture); sourceAzureVmId = $Source }
         }
         # Hyper-V's cmdlets exist only on a Hyper-V host; elsewhere these stand-ins let Pester mock them.
         $stubs = @{
@@ -118,7 +118,31 @@ Describe 'The capture marker (review, 2026-11-04)' {
         (Get-GoldenCaptureProgress -Marker (New-Marker -StartedUtc $script:now.AddMinutes(-5)) -AzureVmId 'copy-vm' -NowUtc $script:now).State | Should -Be 'None'
         (Get-GoldenCaptureProgress -Marker (New-Marker -StartedUtc $script:now.AddMinutes(-5)) -AzureVmId '' -NowUtc $script:now).State | Should -Be 'Unknown'
         (Get-GoldenCaptureProgress -Marker $null -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'None'
-        (Get-GoldenCaptureProgress -Marker ([pscustomobject]@{ startedUtc = 'not a time'; sourceAzureVmId = 'source-vm' }) -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'None'
+        # Only Prepare writes the marker, so one that can't be read fails closed (review, 2026-11-04): Windows
+        # PowerShell 5.1 on fi-FI wrote 09.44.28 before the time was written in the invariant culture.
+        (Get-GoldenCaptureProgress -Marker ([pscustomobject]@{ startedUtc = 'not a time'; sourceAzureVmId = 'source-vm' }) -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'Unreadable'
+        (Get-GoldenCaptureProgress -Marker ([pscustomobject]@{ snapshotName = 'snap-a'; startedUtc = '2026-11-04T01.44.28Z'; sourceAzureVmId = 'source-vm' }) -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'Unreadable'
+        (Get-GoldenCaptureProgress -Marker ([pscustomobject]@{ snapshotName = 'snap-a'; startedUtc = '2026-11-04T01.44.28Z'; sourceAzureVmId = 'source-vm' }) -AzureVmId '' -NowUtc $script:now).State | Should -Be 'Unreadable'
+        (Get-GoldenCaptureProgress -Marker ([pscustomobject]@{ startedUtc = '2026-11-04T01:44:28Z' }) -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'Unreadable'
+        (Get-GoldenCaptureProgress -Marker (New-Object -TypeName 'psobject') -AzureVmId 'source-vm' -NowUtc $script:now).State | Should -Be 'Unreadable'
+        # Another host's marker means nothing there, readable or not.
+        (Get-GoldenCaptureProgress -Marker ([pscustomobject]@{ startedUtc = '2026-11-04T01.44.28Z'; sourceAzureVmId = 'source-vm' }) -AzureVmId 'copy-vm' -NowUtc $script:now).State | Should -Be 'None'
+    }
+
+    It 'writes and reads the marker''s time the same way under any culture (fi-FI, review of 2026-11-04)' {
+        $previous = [System.Threading.Thread]::CurrentThread.CurrentCulture
+        try {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('fi-FI')
+            [datetime]::new(2026, 11, 4, 9, 44, 28, [System.DateTimeKind]::Utc).ToString('HH:mm:ss') | Should -Be '09.44.28' -Because 'fi-FI uses its own time separator'
+            Format-GoldenUtc -Value ([datetime]::new(2026, 11, 4, 9, 44, 28, [System.DateTimeKind]::Utc)) | Should -Be '2026-11-04T09:44:28Z'
+            $progress = Get-GoldenCaptureProgress -Marker (New-Marker -StartedUtc $script:now.AddMinutes(-30)) -AzureVmId 'source-vm' -NowUtc $script:now
+            $progress.State | Should -Be 'Active'
+            $progress.SinceUtc | Should -Be '2026-11-04T01:30:00Z'
+            $progress.UntilUtc | Should -Be '2026-11-04T07:30:00Z'
+        }
+        finally {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = $previous
+        }
     }
 
     Context 'Prepare and Release' {
@@ -156,21 +180,84 @@ Describe 'The capture marker (review, 2026-11-04)' {
             (Get-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
         }
 
-        It 'only the capture''s own Release (EndCapture) removes the marker; any other Release leaves it' {
+        It 'Prepare writes the marker''s time with the invariant culture under fi-FI, so it can be read back' {
+            $script:Options = @{ Root = $script:root; SnapshotName = 'snap-dbhub-t2golden-202611040100'; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+            $previous = [System.Threading.Thread]::CurrentThread.CurrentCulture
+            try {
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('fi-FI')
+                $null = Invoke-GoldenPrepare -Setting @{ AdministratorName = 'Administrator' }
+                $marker = Get-Content -LiteralPath $script:markerPath -Raw | ConvertFrom-Json -NoEnumerate:$false
+                $text = (Get-Content -LiteralPath $script:markerPath -Raw) -replace '[\s\S]*"startedUtc"\s*:\s*"([^"]+)"[\s\S]*', '$1'
+                $text | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+                (Get-GoldenCaptureProgress -Marker $marker -AzureVmId 'source-vm' -NowUtc ([DateTime]::UtcNow)).State | Should -Be 'Active'
+            }
+            finally {
+                [System.Threading.Thread]::CurrentThread.CurrentCulture = $previous
+            }
+        }
+
+        It 'only the capture''s own Release (EndCapture), or one that found the marker''s snapshot, ends the marker; any other refuses while it counts (review, 2026-11-04)' {
             $record = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611040100'; sourceAzureVmId = 'source-vm'; released = $false }
             Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Value ($record | ConvertTo-Json)
-            Set-Content -LiteralPath $script:markerPath -Value '{"snapshotName":"snap-dbhub-t2golden-202611040100","startedUtc":"2026-11-04T01:00:00Z","sourceAzureVmId":"source-vm"}'
+            Set-Content -LiteralPath $script:markerPath -Value (New-Marker -StartedUtc ([DateTime]::UtcNow.AddMinutes(-20)) | ConvertTo-Json)
             $script:guestState = 'Off'
-            $script:Options = @{ Root = $script:root; SnapshotName = ''; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
-            $other = Invoke-GoldenRelease -Setting @{ SwitchName = 'DbHubDemoNat'; AdministratorName = 'Administrator'; ArcMarkerFile = 'arc-onboarded.json' }
-            $other['succeeded'] | Should -BeTrue
-            $other.Contains('captureEnded') | Should -BeFalse
+            $setting = @{ SwitchName = 'DbHubDemoNat'; AdministratorName = 'Administrator'; ArcMarkerFile = 'arc-onboarded.json' }
+            # start-demo.ps1 during the capture, with an older snapshot that names this host: refused, nothing changed.
+            $script:Options = @{ Root = $script:root; SnapshotName = ''; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false; CapturedSnapshots = @('snap-dbhub-t2golden-202601020304') }
+            { Invoke-GoldenRelease -Setting $setting } | Should -Throw '*A golden capture is in progress on this host (snapshot snap-dbhub-t2golden-202611040100, since *nothing was released*'
+            foreach ($command in 'Connect-GoldenAdapter', 'Set-VM', 'Start-VM') {
+                Should -Invoke -CommandName $command -Times 0 -Exactly
+            }
             Test-Path -LiteralPath $script:markerPath | Should -BeTrue
-            $script:Options['EndCapture'] = $true
-            $own = Invoke-GoldenRelease -Setting @{ SwitchName = 'DbHubDemoNat'; AdministratorName = 'Administrator'; ArcMarkerFile = 'arc-onboarded.json' }
-            $own['captureEnded'] | Should -BeTrue
+            (Get-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeFalse
+            # A host whose VM ID can't be read can't be told from the source: refused too.
+            Mock -CommandName Get-GoldenImdsVmId -MockWith { throw 'The Instance Metadata Service did not answer.' }
+            { Invoke-GoldenRelease -Setting $setting } | Should -Throw '*golden capture is in progress on this host as far as can be told*'
+            Mock -CommandName Get-GoldenImdsVmId -MockWith { 'source-vm' }
+            # Once the capture's snapshot exists (start-demo.ps1 found it), the marker is over: ended, and the source released.
+            $script:Options['CapturedSnapshots'] = @('snap-dbhub-t2golden-202601020304', 'snap-dbhub-t2golden-202611040100')
+            $found = Invoke-GoldenRelease -Setting $setting
+            $found['succeeded'] | Should -BeTrue
+            $found['captureEnded'] | Should -Be 'snap-dbhub-t2golden-202611040100'
             Test-Path -LiteralPath $script:markerPath | Should -BeFalse
             (Get-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Raw | ConvertFrom-Json).released | Should -BeTrue
+            # The capture's own Release ends a marker whatever it says.
+            Set-Content -LiteralPath $script:markerPath -Value (New-Marker -StartedUtc ([DateTime]::UtcNow.AddMinutes(-5)) | ConvertTo-Json)
+            $script:Options = @{ Root = $script:root; SnapshotName = ''; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $true }
+            $own = Invoke-GoldenRelease -Setting $setting
+            $own['captureEnded'] | Should -Be 'EndCapture'
+            Test-Path -LiteralPath $script:markerPath | Should -BeFalse
+        }
+
+        It 'refuses a marker that can''t be read (fail closed), which only the capture''s own Release ends' {
+            $record = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611040100'; sourceAzureVmId = 'source-vm'; released = $false }
+            Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Value ($record | ConvertTo-Json)
+            $setting = @{ SwitchName = 'DbHubDemoNat'; AdministratorName = 'Administrator'; ArcMarkerFile = 'arc-onboarded.json' }
+            $script:Options = @{ Root = $script:root; SnapshotName = ''; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+            foreach ($content in @('{"snapshotName":"snap-dbhub-t2golden-202611040100","startedUtc":"2026-11-04T09.44.28Z","sourceAzureVmId":"source-vm"}', 'not json')) {
+                Set-Content -LiteralPath $script:markerPath -Value $content
+                { Invoke-GoldenRelease -Setting $setting } | Should -Throw '*golden capture marker on this host can''t be read*capture-t2-golden.ps1*'
+            }
+            Should -Invoke -CommandName Connect-GoldenAdapter -Times 0 -Exactly
+            $script:Options['EndCapture'] = $true
+            $null = Invoke-GoldenRelease -Setting $setting
+            Test-Path -LiteralPath $script:markerPath | Should -BeFalse
+        }
+
+        It 'releases past a marker older than 6 hours, and past a copy''s marker from the snapshot, and leaves both' {
+            $setting = @{ SwitchName = 'DbHubDemoNat'; AdministratorName = 'Administrator'; ArcMarkerFile = 'arc-onboarded.json' }
+            $script:Options = @{ Root = $script:root; SnapshotName = ''; ProveIsolation = $false; KeepIsolated = $false; SkipRotation = $true; EndCapture = $false }
+            $record = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611040100'; sourceAzureVmId = 'source-vm'; released = $false; resetUtc = '2026-11-04T02:00:00Z' }
+            Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Value ($record | ConvertTo-Json)
+            Set-Content -LiteralPath $script:markerPath -Value (New-Marker -StartedUtc ([DateTime]::UtcNow.AddHours(-7)) | ConvertTo-Json)
+            (Invoke-GoldenRelease -Setting $setting)['succeeded'] | Should -BeTrue
+            Test-Path -LiteralPath $script:markerPath | Should -BeTrue
+            Mock -CommandName Get-GoldenImdsVmId -MockWith { 'copy-vm' }
+            Set-Content -LiteralPath $script:markerPath -Value (New-Marker -StartedUtc ([DateTime]::UtcNow.AddMinutes(-30)) | ConvertTo-Json)
+            $copy = Invoke-GoldenRelease -Setting $setting
+            $copy['succeeded'] | Should -BeTrue
+            $copy['role'] | Should -Be 'Copy'
+            Test-Path -LiteralPath $script:markerPath | Should -BeTrue
         }
     }
 }

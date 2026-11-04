@@ -938,7 +938,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
 
             function New-CaptureMarker([string] $Root, [datetime] $StartedUtc, [string] $Source = 'source-vm') {
                 # What Prepare writes first (review, 2026-11-04).
-                $marker = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611032130'; startedUtc = $StartedUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"); sourceAzureVmId = $Source }
+                $marker = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611032130'; startedUtc = $StartedUtc.ToString("yyyy-MM-dd'T'HH':'mm':'ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture); sourceAzureVmId = $Source }
                 New-Item -ItemType Directory -Path (Join-Path -Path $Root -ChildPath 'golden') -Force | Out-Null
                 Set-Content -LiteralPath (Join-Path -Path $Root -ChildPath 'golden\capture-in-progress.json') -Value ($marker | ConvertTo-Json)
             }
@@ -1105,6 +1105,22 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             (Get-ControlResult).evidence.golden | Should -Be 'VmIdUnknown'
         }
 
+        It 'leaves the guest alone when a capture marker can''t be read: only a capture writes it (fail closed, review of 2026-11-04)' {
+            $root = New-ReadyRoot -Role 'ArcHost' -Capture (New-Capture)
+            foreach ($content in @('{"snapshotName":"snap-dbhub-t2golden-202611032130","startedUtc":"2026-11-03T21.29.26Z","sourceAzureVmId":"source-vm"}', 'not json')) {
+                Set-Content -LiteralPath (Join-Path -Path $root -ChildPath 'golden\capture-in-progress.json') -Value $content
+                $script:lines.Clear()
+                Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+                $result = Get-ControlResult
+                $result.status | Should -Be 'Fail'
+                $result.evidence.golden | Should -Be 'CaptureMarkerUnreadable'
+                $result.message | Should -Match 'capture marker on .* can''t be read, and only a capture writes it'
+                $result.message | Should -Match 'capture-t2-golden\.ps1 again'
+            }
+            foreach ($command in 'Start-VM', 'Set-VM', 'Connect-VMNetworkAdapter', 'Enter-GoldenLock', 'Invoke-DemoControlGuestCommand') {
+                Should -Invoke -CommandName $command -Times 0 -Exactly
+            }
+        }
         It 'reports a guest without SQL Server as T2 not set up yet, which the module counts as Not selected (Phase 28)' {
             $script:guest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start' }
             Mock -CommandName Invoke-DemoControlGuestCommand -MockWith {
@@ -1256,6 +1272,13 @@ Describe 'The health read''s live view of the T2 guest (T2.GUEST.STATE, 2026-11-
         $marker['startedUtc'] = [DateTime]::UtcNow.AddHours(-7).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
         [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture-in-progress.json'), (ConvertTo-Json -InputObject $marker))
         ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest.PSObject.Properties['capture'] | Should -BeNullOrEmpty
+        # A marker that can't be read fails closed: it's reported, never dropped.
+        [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture-in-progress.json'), '{"snapshotName":"snap-dbhub-t2golden-202611040100","startedUtc":"2026-11-04T09.44.28Z","sourceAzureVmId":"' + $hostVmId + '"}')
+        ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest.capture.state | Should -Be 'Unreadable'
+        [System.IO.File]::WriteAllText([System.IO.Path]::Combine($root, 'golden', 'capture-in-progress.json'), 'not json')
+        $broken = ((& $healthScript -Root $root -View Summary) | ConvertFrom-Json).t2Guest
+        $broken.capture.state | Should -Be 'Unreadable'
+        $broken.PSObject.Properties['error'] | Should -BeNullOrEmpty
     }
 
     It 'reports a guest that doesn''t exist, and nothing at all on a VM without Hyper-V' {

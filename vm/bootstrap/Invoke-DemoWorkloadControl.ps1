@@ -634,13 +634,13 @@ function Get-DemoControlGoldenDecision {
     .SYNOPSIS
     What T2's relay does with a golden snapshot's capture record before activity starts (ADR 0018, sections 4 and 5).
     Returns Action (None, Release, Refuse, or Wait) and Reason (NoCapture, Released, Source, ResetCopy, CopyNotReset,
-    VmIdUnknown, or CaptureInProgress). Pure.
+    VmIdUnknown, CaptureInProgress, or CaptureMarkerUnreadable). Pure.
 
     .DESCRIPTION
     - A capture in progress on this host (CaptureProgress Active, from the marker Prepare writes): nothing is touched
       until the capture's own Release ends it (review, 2026-11-04: a start between Prepare and the snapshot undid the
       air gap the snapshot keeps). A recent marker on a host whose VM ID couldn't be read: refused the same way as an
-      unknown VM ID.
+      unknown VM ID. A marker that can't be read (Unreadable): left alone as well, because only Prepare writes it.
     - No record: nothing to do.
     - A released record: nothing to do only on the capture's source (the host's Azure VM ID is the record's
       sourceAzureVmId) or on a copy whose reset is recorded (resetUtc). A copy whose record says released without a
@@ -661,12 +661,16 @@ function Get-DemoControlGoldenDecision {
         [AllowEmptyString()]
         [string] $AzureVmId = '',
 
-        [ValidateSet('None', 'Active', 'Unknown')]
+        [ValidateSet('None', 'Active', 'Unknown', 'Unreadable')]
         [string] $CaptureProgress = 'None'
     )
 
     if ($CaptureProgress -eq 'Active') {
         return [pscustomobject]@{ Action = 'Wait'; Reason = 'CaptureInProgress' }
+    }
+    if ($CaptureProgress -eq 'Unreadable') {
+        # Only Prepare writes the marker, so one that can't be read fails closed (review, 2026-11-04).
+        return [pscustomobject]@{ Action = 'Wait'; Reason = 'CaptureMarkerUnreadable' }
     }
     if ($CaptureProgress -eq 'Unknown') {
         return [pscustomobject]@{ Action = 'Refuse'; Reason = 'VmIdUnknown' }
@@ -722,7 +726,20 @@ function Get-DemoControlGoldenState {
     )
 
     $capture = Read-GoldenJson -Path ([System.IO.Path]::Combine($StateRoot, 'golden', 'capture.json'))
-    $marker = Read-GoldenJson -Path (Get-GoldenCaptureMarkerPath -Root $StateRoot)
+    $markerPath = Get-GoldenCaptureMarkerPath -Root $StateRoot
+    $marker = $null
+    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+        try {
+            $marker = Read-GoldenJson -Path $markerPath
+        }
+        catch {
+            $marker = $null
+        }
+        if ($null -eq $marker) {
+            # A marker that exists but can't be read names nothing: Unreadable, which fails closed.
+            $marker = New-Object -TypeName 'psobject'
+        }
+    }
     $vmId = ''
     $settled = $null -ne $capture -and (Get-DemoControlGoldenDecision -Capture $capture).Reason -eq 'Released'
     if ($null -ne $marker -or ($null -ne $capture -and -not $settled)) {
@@ -763,7 +780,10 @@ function Get-DemoControlGoldenRefusal {
     }
     switch ($State.Decision.Reason) {
         'CaptureInProgress' {
-            return ('A golden capture is in progress on {0} (snapshot {1}, since {2}), so {3} stays as the capture left it: off and air-gapped. The capture returns its source to service when it ends (GOLDEN.CAPTURE.SOURCE); start T2 again after that. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again, which releases the source first; from {4} this marker no longer holds a start back.' -f $env:COMPUTERNAME, $State.Progress.SnapshotName, $State.Progress.SinceUtc, $GuestName, $State.Progress.UntilUtc)
+            return ('A golden capture is in progress on {0} (snapshot {1}, since {2}), so {3} stays as the capture left it: off and air-gapped. The capture returns its source to service when it ends (GOLDEN.CAPTURE.SOURCE); start T2 again after that. If no capture runs (one was interrupted), run ./scripts/capture-t2-golden.ps1 again, which ends the marker and releases the source first, or ./scripts/start-demo.ps1 once that capture''s snapshot exists; from {4} this marker no longer holds a start back.' -f $env:COMPUTERNAME, $State.Progress.SnapshotName, $State.Progress.SinceUtc, $GuestName, $State.Progress.UntilUtc)
+        }
+        'CaptureMarkerUnreadable' {
+            return ('A golden capture marker on {0} can''t be read, and only a capture writes it, so {1} is left as it is. Run ./scripts/capture-t2-golden.ps1 again, which ends the marker and releases the source first, or ./scripts/start-demo.ps1 once that capture''s snapshot exists.' -f $env:COMPUTERNAME, $GuestName)
         }
         'CopyNotReset' {
             if ($released) {
