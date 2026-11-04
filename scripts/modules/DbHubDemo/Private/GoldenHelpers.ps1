@@ -409,12 +409,16 @@ function Invoke-DemoGoldenSourceRelease {
     T2.GOLDEN.SOURCE, or nothing when archost01 isn't a capture source that still needs it. Internal.
 
     .DESCRIPTION
-    The capture leaves the source's guest disconnected (no network adapter, no automatic start), so the copy
-    and the source never run connected at once. When archost01's Azure VM ID matches a golden snapshot's
+    The capture leaves the source's guest disconnected (no network adapter, no automatic start) while it takes the
+    snapshot, so the snapshot's copies boot air-gapped; since 2026-11-03 the capture itself releases its source right
+    afterwards (Restore-DemoGoldenCaptureSource), and this is the safety net for a capture that was interrupted.
+    When archost01's Azure VM ID matches a golden snapshot's
     dbhubSourceVmId (in this resource group) and that snapshot doesn't carry dbhubSourceReleasedUtc yet, the
     guest is reconnected (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Release: on the source, it only
     reconnects; the Arc identity is still its own), and the snapshot is tagged dbhubSourceReleasedUtc, so
-    later starts skip it. start-demo.ps1 and deploy.ps1 (existing host) call it.
+    later starts skip it. start-demo.ps1, deploy.ps1 (existing host), and the capture call it; a Fabric start of T2
+    releases the source on the host itself (Invoke-DemoWorkloadControl.ps1), where it can't tag the snapshot, so a
+    later call here releases again, which is harmless, and records it.
 
     Sources (checked 2026-10-22): https://learn.microsoft.com/cli/azure/vm#az-vm-show,
     https://learn.microsoft.com/cli/azure/tag#az-tag-update
@@ -543,4 +547,171 @@ function Invoke-DemoGoldenGuestAction {
         }
     }
     return [pscustomobject]@{ Succeeded = $succeeded; Data = $data; Error = (Protect-DemoText -Text $errorText); Seconds = [int]$watch.Elapsed.TotalSeconds; WhileRunningError = [string](Get-DemoMemberValue -InputObject $run -Name 'WhileRunningError') }
+}
+
+function Restore-DemoGoldenCaptureSource {
+    <#
+    .SYNOPSIS
+    Returns a capture's source to service once its guest has been air-gapped (ADR 0018, section 4, item 9, as
+    amended 2026-11-03), so no Fabric start ever finds T2 cut off. New-DemoT2GoldenSnapshot calls it after Prepare,
+    whatever happens next. Returns GOLDEN.CAPTURE.SOURCE. Internal.
+
+    .DESCRIPTION
+    1. archost01 started when it isn't running (the capture deallocates it for the snapshot).
+    2. The release: Invoke-DemoGoldenSourceRelease when a golden snapshot names this host as its unreleased source (it
+       also tags dbhubSourceReleasedUtc, so later starts skip it); otherwise, when the capture stopped before its
+       snapshot, vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Release. Either way the host's own Azure VM ID
+       decides its role, so only a source is released this way: its guest's adapter is reconnected, its automatic
+       start set to Start, and the guest started.
+    3. arcsql01 Connected, through Azure Resource Manager, at most -ArcWaitMinutes. A machine that misses its
+       heartbeats turns Disconnected within 15 to 30 minutes, so Connected right after the air gap may be left over
+       from before it. Connected counts once its lastStatusChange is later than the air gap (it reconnected), or 30
+       minutes after the air gap (only a heartbeat since then keeps it Connected), or at once when the release found
+       the guest's adapter connected (there was no air gap).
+    4. The host returned to the power state the capture found: deallocated again, after a clean guest shutdown
+       (STOP.GUEST, never by force) when it was deallocated or stopped; left running otherwise.
+    Pass when all of that holds; Warning when the release wasn't recorded on the snapshot, Connected can't be told
+    from a left-over status yet, or the host couldn't be returned; Fail when the guest stays air-gapped or arcsql01
+    doesn't reconnect.
+    Source: https://learn.microsoft.com/azure/azure-arc/servers/overview#agent-status (checked 2026-11-03).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyString()]
+        [string] $FoundPowerState = '',
+
+        [Parameter(Mandatory)]
+        [datetime] $AirGapUtc,
+
+        [ValidateRange(0, 60)]
+        [int] $ArcWaitMinutes = 30,
+
+        [ValidateRange(1, 300)]
+        [int] $PollSeconds = 30
+    )
+
+    $docUrl = 'https://learn.microsoft.com/azure/azure-arc/servers/overview#agent-status'
+    $subscriptionId = [string]$Config['subscriptionId']
+    $resourceGroupName = Get-DemoResourceGroupName -Config $Config
+    $evidence = [ordered]@{ foundPowerState = $FoundPowerState; airGapUtc = $AirGapUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); hostStarted = $false; release = ''; releaseStatus = ''; arcStatus = ''; arcLastStatusChange = ''; arcProof = ''; arcSeconds = 0; hostAfter = '' }
+    $retry = 'Run ./scripts/start-demo.ps1: it releases the source (T2.GOLDEN.SOURCE) and is safe to repeat; a start from the Fabric control does the same.'
+    $new = { param([string] $Status, [string] $Message, [string] $Remediation = '') New-DemoResult -CheckId 'GOLDEN.CAPTURE.SOURCE' -Area 't2' -Target 'T2' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $docUrl }
+
+    # 1. The host.
+    if ((Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName 'archost01') -ne 'PowerState/running') {
+        $start = Invoke-DemoVmPowerAction -Config $Config -VmName 'archost01' -Action Start
+        $evidence['hostStarted'] = $start.status -eq 'Pass'
+        if ($start.status -ne 'Pass') {
+            return (& $new 'Fail' ('archost01 didn''t start, so the source''s guest stays air-gapped: {0}' -f $start.message) $retry)
+        }
+    }
+
+    # 2 and 3: the release, as a source only, then arcsql01 Connected as the release made it, not as it was before
+    # the air gap. Their outcome waits for the host's power state (4).
+    $waitMinutes = $ArcWaitMinutes
+    $pollEvery = $PollSeconds
+    $releaseAndVerify = {
+        $airGapped = $true
+        $released = Invoke-DemoGoldenSourceRelease -Config $Config
+        if ($null -ne $released) {
+            $evidence['release'] = 'T2.GOLDEN.SOURCE'
+            $evidence['releaseStatus'] = [string]$released.status
+            if ($released.status -eq 'Fail') {
+                return [pscustomobject]@{ Status = 'Fail'; Message = ('The source''s guest stays air-gapped: {0}' -f $released.message); Remediation = $retry }
+            }
+        }
+        else {
+            $guest = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -TimeoutSeconds 1800
+            $evidence['release'] = 'Release'
+            $evidence['releaseStatus'] = if ($guest.Succeeded) { 'Pass' } else { 'Fail' }
+            $evidence['role'] = [string](Get-DemoMemberValue -InputObject $guest.Data -Name 'role')
+            if (-not $guest.Succeeded) {
+                return [pscustomobject]@{ Status = 'Fail'; Message = ('The source''s guest stays air-gapped: {0}' -f $guest.Error); Remediation = $retry }
+            }
+            $before = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $guest.Data -Name 'before') -Name 'adapter'
+            if ($null -ne $before -and [int](Get-DemoMemberValue -InputObject $before -Name 'count') -gt 0 -and [int](Get-DemoMemberValue -InputObject $before -Name 'connected') -ge [int](Get-DemoMemberValue -InputObject $before -Name 'count')) {
+                $airGapped = $false
+            }
+        }
+        $evidence['airGapped'] = $airGapped
+        $releaseNote = if ($evidence['releaseStatus'] -eq 'Warning') { ' The release wasn''t recorded on the snapshot, so the next start-demo.ps1 releases it again, which is harmless.' } else { '' }
+
+        $target = Get-DemoArcTarget -Config $Config
+        $decayUtc = $AirGapUtc.AddMinutes(30)
+        $started = Get-DemoUtcNow
+        $deadline = $started.AddMinutes($waitMinutes)
+        $readError = ''
+        $machine = $null
+        $status = ''
+        while ($true) {
+            $now = Get-DemoUtcNow
+            $machine = $null
+            try {
+                $machine = Get-DemoArcArmResource -SubscriptionId $target.SubscriptionId -Url $target.MachineUrl
+                $readError = ''
+            }
+            catch {
+                $readError = Protect-DemoText -Text $_.Exception.Message
+            }
+            $properties = Get-DemoMemberValue -InputObject $machine -Name 'properties'
+            $status = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
+            $changed = ConvertTo-DemoUtcDate -Value (Get-DemoMemberValue -InputObject $properties -Name 'lastStatusChange')
+            $evidence['arcStatus'] = $status
+            $evidence['arcLastStatusChange'] = if ($null -ne $changed) { $changed.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
+            $evidence['arcSeconds'] = [int]($now - $started).TotalSeconds
+            if ($status -eq 'Connected') {
+                if (-not $airGapped) {
+                    $evidence['arcProof'] = 'never disconnected'
+                }
+                elseif ($null -ne $changed -and $changed -gt $AirGapUtc) {
+                    $evidence['arcProof'] = 'reconnected'
+                }
+                elseif ($now -ge $decayUtc) {
+                    $evidence['arcProof'] = 'heartbeat'
+                }
+                if ($evidence['arcProof']) {
+                    break
+                }
+            }
+            if ($now -ge $deadline) {
+                break
+            }
+            Start-Sleep -Seconds $pollEvery
+        }
+        if ($evidence['arcProof']) {
+            $how = @{ 'reconnected' = 'it reconnected after the air gap'; 'heartbeat' = 'still Connected 30 minutes after the air gap, so it heartbeats again'; 'never disconnected' = 'its guest was never disconnected' }[$evidence['arcProof']]
+            return [pscustomobject]@{ Status = $(if ($releaseNote) { 'Warning' } else { 'Pass' }); Message = ('The capture''s source is back in service: its guest is reconnected and starts with the host, and arcsql01 is Connected ({0}, after {1:N0} seconds).{2}' -f $how, $evidence['arcSeconds'], $releaseNote); Remediation = '' }
+        }
+        if ($status -eq 'Connected') {
+            return [pscustomobject]@{ Status = 'Warning'; Message = ('The capture''s source is released, but arcsql01''s Connected status may still be the one from before the air gap (Azure marks a machine Disconnected within 15 to 30 minutes without heartbeats).{0}' -f $releaseNote); Remediation = ('With the demo running, read T2.ARC.CONNECTED again after {0:yyyy-MM-dd HH:mm} UTC: ./scripts/status.ps1.' -f $decayUtc) }
+        }
+        $seen = if ($readError) { 'couldn''t be read ({0})' -f $readError } elseif ($null -eq $machine) { 'doesn''t exist' } else { 'is {0}' -f $(if ($status) { $status } else { 'without a status' }) }
+        return [pscustomobject]@{ Status = 'Fail'; Message = ('The capture''s source is released (its guest reconnected and started), but arcsql01 {0} after {1} minutes.' -f $seen, $waitMinutes); Remediation = 'Run ./scripts/start-demo.ps1, then ./scripts/validate.ps1 -Area T2: T2.ARC.CONNECTED says what to do (azcmagent check in the guest, then configure-arc.ps1 -Force).' }
+    }
+    $outcome = & $releaseAndVerify
+
+    # 4. The host as the capture found it, whatever the outcome: deallocated again after a clean guest shutdown.
+    $evidence['hostAfter'] = 'running'
+    $hostText = ' archost01 keeps running, as the capture found it.'
+    if ($FoundPowerState -in 'PowerState/deallocated', 'PowerState/deallocating', 'PowerState/stopped', 'PowerState/stopping') {
+        $guestStop = Stop-DemoGuestVm -Config $Config -Confirm:$false
+        $evidence['guestStop'] = [string]$guestStop.status
+        $deallocate = Invoke-DemoVmPowerAction -Config $Config -VmName 'archost01' -Action Deallocate
+        if ($deallocate.status -eq 'Pass') {
+            $evidence['hostAfter'] = 'deallocated'
+            $hostText = ' archost01 is deallocated again, as the capture found it.'
+        }
+        else {
+            $hostText = ' archost01 couldn''t be deallocated again: {0}' -f $deallocate.message
+            if ($outcome.Status -eq 'Pass') {
+                $outcome.Status = 'Warning'
+                $outcome.Remediation = 'Run ./scripts/stop-demo.ps1 to deallocate it.'
+            }
+        }
+    }
+    return (& $new $outcome.Status ($outcome.Message + $hostText) $outcome.Remediation)
 }

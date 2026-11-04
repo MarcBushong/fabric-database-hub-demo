@@ -837,6 +837,8 @@ function Invoke-GoldenRelease {
     $capturePath = [System.IO.Path]::Combine($script:Options.Root, 'golden', 'capture.json')
     $capture = Read-GoldenJson -Path $capturePath
     $vm = Get-VM -Name $GuestName -ErrorAction Stop
+    # The guest as the release found it, before anything changed: whether an air gap was in place.
+    $result['before'] = [ordered]@{ guestState = [string]$vm.State; startAction = [string]$vm.AutomaticStartAction; adapter = Get-GoldenAdapterState }
     if ($null -eq $capture) {
         $result['captured'] = $false
         $result['guestState'] = [string]$vm.State

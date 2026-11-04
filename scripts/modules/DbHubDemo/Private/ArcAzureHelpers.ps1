@@ -183,16 +183,46 @@ function Get-DemoVmPowerState {
         [string] $VmName
     )
 
+    return (Get-DemoVmPowerInfo -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName).PowerState
+}
+
+function Get-DemoVmPowerInfo {
+    <#
+    .SYNOPSIS
+    A VM's power state code (PowerState/running, PowerState/deallocated, ...; empty when unknown) and SinceUtc, the
+    time of its provisioning status in the instance view ("the time of the status"), which a start or a deallocation
+    sets when it completes; $null when there's none. Internal.
+    Source: https://learn.microsoft.com/rest/api/compute/virtual-machines/instance-view (InstanceViewStatus, checked
+    2026-11-03).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string] $VmName
+    )
+
     $view = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('vm', 'get-instance-view', '--resource-group', $ResourceGroupName, '--name', $VmName) -AsJson -AllowFailure
     $instanceView = Get-DemoMemberValue -InputObject $view -Name 'instanceView'
     $statuses = Get-DemoMemberValue -InputObject $instanceView -Name 'statuses'
+    $power = ''
+    $since = $null
     foreach ($status in @($statuses)) {
         $code = [string](Get-DemoMemberValue -InputObject $status -Name 'code')
-        if ($code -like 'PowerState/*') {
-            return $code
+        if ($code -like 'PowerState/*' -and -not $power) {
+            $power = $code
+        }
+        elseif ($code -like 'ProvisioningState/*' -and $null -eq $since) {
+            $since = ConvertTo-DemoUtcDate -Value (Get-DemoMemberValue -InputObject $status -Name 'time')
         }
     }
-    return ''
+    return [pscustomobject]@{ PowerState = $power; SinceUtc = $since }
 }
 
 function Remove-DemoArcStaleResource {

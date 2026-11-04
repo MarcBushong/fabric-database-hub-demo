@@ -16,7 +16,9 @@ demo's group:
   PAYG, and monitoring must pass;
 - the source's Arc machine must be untouched during the test: the same properties, the same last status change
   when it was already Disconnected, and no Administrative operation in its Activity Log (Resource Health and
-  other events are listed, but they aren't operations);
+  other events are listed, but they aren't operations); its status counts only while the source host stays
+  deallocated (the capture returns its source to service; a running source host is a Warning, so stop the demo
+  first for the full proof);
 - the test group is deleted through the destroy path, with the residual check.
 The snapshot is tagged boot-verified, then onboard-verified, and older golden snapshots are deleted once the
 newest one passes, unless -KeepOlderSnapshots. This PC and its display stay awake until it finishes. It never signs in or changes the Azure CLI context. Exit code: 0 Pass or Warning, 1 Fail.

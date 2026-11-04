@@ -195,7 +195,12 @@ Describe 'New-DemoT2GoldenSnapshot' {
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoPolicyConstraint -MockWith { [pscustomobject]@{ Results = @([pscustomobject]@{ checkId = 'PREFLIGHT.POLICY.RESOURCETYPES'; evidence = [pscustomobject]@{ denied = @() } }) } }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:calls.Add('power ' + $Action); New-TestResult ('POWER.' + $Action.ToUpperInvariant()) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:calls.Add('power ' + $Action); New-TestResult ('POWER.' + $Action.ToUpperInvariant()) $(if ($script:powerFails -eq $Action) { 'Fail' } else { 'Pass' }) }
+        $script:powerFails = ''
+        $script:hostPower = 'PowerState/deallocated'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:hostPower }
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoGoldenCaptureSource -MockWith { $script:calls.Add('restore ' + $FoundPowerState); New-TestResult 'GOLDEN.CAPTURE.SOURCE' }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoTargetProfile -MockWith { $script:calls.Add('profile ' + $ProfileName); New-TestResult 'STOP.PROFILE.T2' }
         $script:passwordStatus = 'Pass'
         Mock -ModuleName DbHubDemo -CommandName Set-DemoVmLocalPassword -MockWith { $script:calls.Add('password'); New-TestResult 'STOP.HOSTPASSWORD' $script:passwordStatus }
@@ -208,6 +213,8 @@ Describe 'New-DemoT2GoldenSnapshot' {
         }
         $script:sweepPass = $true
         $script:sweepSecurity = 0
+        $script:prepareFails = $false
+        $script:snapshotFails = ''
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSignInDataAction -MockWith { $script:calls.Add(('sweep {0} {1} {2}' -f $Action, $Scope, [bool]$PesterBoundParameters['ClearSecurityLog'])); New-TestSweepOutcome -Pass $script:sweepPass -Security $script:sweepSecurity }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @() }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
@@ -230,6 +237,9 @@ Describe 'New-DemoT2GoldenSnapshot' {
                     }
                 }
                 'Prepare' {
+                    if ($script:prepareFails) {
+                        return [pscustomobject]@{ Succeeded = $false; Error = 'The guest did not shut down cleanly within 15 minutes (state Running); it was not turned off by force.'; Seconds = 900; Data = [pscustomobject]@{ succeeded = $false } }
+                    }
                     [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 120; Data = [pscustomobject]@{ succeeded = $true; cachesRemoved = 0; logFilesRedacted = 0; guestState = 'Off'; guestShutdownSeconds = 40; record = [pscustomobject]@{ sourceAzureVmId = 'vm-source' } } }
                 }
             }
@@ -247,8 +257,15 @@ Describe 'New-DemoT2GoldenSnapshot' {
                 }
                 '^group exists' { return (New-AzResult -StdOut 'false') }
                 '^group create' { return (New-AzResult -StdOut '{}') }
-                '^snapshot create' { return (New-AzResult -StdOut ((New-SnapshotJson) | ConvertTo-Json -Depth 8)) }
-                '^disk create' { return (New-AzResult -StdOut '{"provisioningState":"Succeeded"}') }
+                '^snapshot create' {
+                    if ($script:snapshotFails -eq 'throw') { throw 'The Azure CLI stopped.' }
+                    if ($script:snapshotFails -eq 'policy') { return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (RequestDisallowedByPolicy) Resource was disallowed by policy.') }
+                    return (New-AzResult -StdOut ((New-SnapshotJson) | ConvertTo-Json -Depth 8))
+                }
+                '^disk create' {
+                    if ($script:snapshotFails -eq 'disk') { return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (InternalError) The disk could not be created.') }
+                    return (New-AzResult -StdOut '{"provisioningState":"Succeeded"}')
+                }
                 '^disk delete' { return (New-AzResult) }
                 '^tag update' { return (New-AzResult -StdOut '{}') }
                 default { throw ('unexpected: {0}' -f $text) }
@@ -366,6 +383,54 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $script:calls | Should -Not -Contain 'guest Prepare'
         @($script:calls | Where-Object { $_ -match '^az snapshot create' }).Count | Should -Be 0
     }
+
+    It 'returns the source to service after the snapshot and its disk check, to the power state the capture found (live, 2026-11-03)' {
+        # 2026-10-28: the capture left the source air-gapped, and T2 stayed missing from every Fabric start after it.
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 10, 22, 12, 30, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        @($script:calls | Where-Object { $_ -match '^restore' }) | Should -Be @('restore PowerState/deallocated')
+        $verified = [array]::FindIndex([string[]]$script:calls.ToArray(), [Predicate[string]] { param($call) $call -match '^az tag update .*dbhubDiskVerifiedUtc=' })
+        $restored = [array]::IndexOf([string[]]$script:calls.ToArray(), 'restore PowerState/deallocated')
+        $restored | Should -BeGreaterThan $verified
+        @($results | ForEach-Object checkId | Select-Object -Last 2) | Should -Be @('GOLDEN.CAPTURE', 'GOLDEN.CAPTURE.SOURCE')
+        $script:hostPower = 'PowerState/running'
+        $script:calls.Clear()
+        $null = New-DemoT2GoldenSnapshot -Config $config -Confirm:$false
+        @($script:calls | Where-Object { $_ -match '^restore' }) | Should -Be @('restore PowerState/running')
+    }
+
+    It 'returns the source to service when <Case>, and captures nothing more' -ForEach @(
+        @{ Case = 'Prepare fails after the air gap'; Setup = { $script:prepareFails = $true }; Check = 'GOLDEN.CAPTURE.PREPARE'; Wipe = $false }
+        @{ Case = 'the compaction fails with the guest off'; Setup = { $script:wipeFails = 'HostCompact' }; Check = 'GOLDEN.CAPTURE.COMPACT'; Wipe = $true }
+        @{ Case = 'the host doesn''t deallocate'; Setup = { $script:powerFails = 'Deallocate' }; Check = 'POWER.DEALLOCATE'; Wipe = $false }
+        @{ Case = 'a policy denies the snapshot'; Setup = { $script:snapshotFails = 'policy' }; Check = 'GOLDEN.CAPTURE.SNAPSHOT'; Wipe = $false }
+        @{ Case = 'no disk can be created from the snapshot'; Setup = { $script:snapshotFails = 'disk' }; Check = 'GOLDEN.CAPTURE.DISKVERIFY'; Wipe = $false }
+    ) {
+        & $Setup
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -WipeFreeSpace:([bool]$Wipe) -Confirm:$false)
+        ($results | Where-Object checkId -EQ $Check).status | Should -Be 'Fail'
+        ($results | Where-Object checkId -EQ 'GOLDEN.CAPTURE') | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_ -match '^restore' }).Count | Should -Be 1
+        $results[-1].checkId | Should -Be 'GOLDEN.CAPTURE.SOURCE'
+        if ($Check -eq 'GOLDEN.CAPTURE.SNAPSHOT') {
+            ($results | Where-Object checkId -EQ $Check).remediation | Should -Not -Match 'air-gapped until'
+        }
+    }
+
+    It 'returns the source to service even when a step after Prepare throws' {
+        $script:snapshotFails = 'throw'
+        { New-DemoT2GoldenSnapshot -Config $config -Confirm:$false } | Should -Throw '*Azure CLI stopped*'
+        @($script:calls | Where-Object { $_ -match '^restore' }).Count | Should -Be 1
+    }
+
+    It 'touches no source when the capture stops before Prepare, or under -WhatIf' {
+        $script:sweepPass = $false
+        $null = New-DemoT2GoldenSnapshot -Config $config -Confirm:$false
+        $script:passwordStatus = 'Fail'
+        $script:sweepPass = $true
+        $null = New-DemoT2GoldenSnapshot -Config $config -Confirm:$false
+        $null = New-DemoT2GoldenSnapshot -Config $config -WhatIf
+        @($script:calls | Where-Object { $_ -match '^restore' }) | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Test-DemoT2GoldenSnapshot' {
@@ -390,6 +455,10 @@ Describe 'Test-DemoT2GoldenSnapshot' {
         $script:activityLog = @()
         $script:sourceReads = 0
         $script:adapterConnected = 0
+        # The source host's power state for each read (the last one repeating), and its provisioning status's time.
+        $script:sourceHostPower = @('PowerState/deallocated')
+        $script:sourceHostSince = '2026-10-22T12:40:00Z'
+        $script:hostReads = 0
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' }
@@ -439,6 +508,11 @@ Describe 'Test-DemoT2GoldenSnapshot' {
                 '^tag update' { return (New-AzResult -StdOut '{}') }
                 '^monitor activity-log list' { return $script:activityLog }
                 '^snapshot delete' { return (New-AzResult) }
+                '^vm get-instance-view --resource-group rg-dbhub-demo --name archost01' {
+                    $script:hostReads++
+                    $power = @($script:sourceHostPower)[[Math]::Min($script:hostReads, @($script:sourceHostPower).Count) - 1]
+                    return [pscustomobject]@{ instanceView = [pscustomobject]@{ statuses = @([pscustomobject]@{ code = 'ProvisioningState/succeeded'; time = $script:sourceHostSince }, [pscustomobject]@{ code = $power }) } }
+                }
                 default { throw ('unexpected: {0}' -f $text) }
             }
         }
@@ -642,6 +716,50 @@ Describe 'Test-DemoT2GoldenSnapshot' {
         ($results | Where-Object checkId -EQ 'GOLDEN.TEST').status | Should -Be 'Pass'
     }
 
+    It 'warns, not fails, when the source host ran during the test: the capture returns its source to service (2026-11-03)' {
+        $script:sourceHostPower = @('PowerState/running')
+        $script:sourceBeforeStatus = 'Connected'
+        $script:sourceAfterStatus = 'Connected'
+        $results = @(Test-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
+        $source = $results | Where-Object checkId -EQ 'GOLDEN.TEST.SOURCE'
+        $source.status | Should -Be 'Warning'
+        $source.message | Should -Match 'its host archost01 wasn''t deallocated for the whole test \(running before, running after\), so its status \(Connected\) is its own'
+        $source.remediation | Should -Match 'stop-demo\.ps1'
+        $source.evidence['hostStayedDeallocated'] | Should -BeFalse
+        ($results | Where-Object checkId -EQ 'GOLDEN.TEST').status | Should -Be 'Pass'
+    }
+
+    It 'still fails a source whose host ran on an operation in the Activity Log, and reads a host that started during the test as running' {
+        $script:sourceHostPower = @('PowerState/deallocated', 'PowerState/running')
+        $script:sourceAfterStatus = 'Connected'
+        $script:sourceAfterChange = 'now'
+        $script:activityLog = @([pscustomobject]@{ operation = 'Microsoft.HybridCompute/machines/write'; category = 'Administrative'; status = 'Succeeded'; time = [DateTime]::UtcNow.ToString('o') })
+        $results = @(Test-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
+        $source = $results | Where-Object checkId -EQ 'GOLDEN.TEST.SOURCE'
+        $source.status | Should -Be 'Fail'
+        $source.message | Should -Match 'shows 1 operation'
+        $source.message | Should -Not -Match 'turned Connected during the test'
+    }
+
+    It 'counts a source''s quiet minutes from its host''s deallocation after the capture''s release' {
+        # The capture released the source 40 minutes ago and deallocated its host 10 minutes ago: a Connected status
+        # is still the decay, not a heartbeat.
+        $released = New-SnapshotJson
+        $released.tags | Add-Member -NotePropertyName 'dbhubDiskVerifiedUtc' -NotePropertyValue ([DateTime]::UtcNow.AddMinutes(-60).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        $released.tags | Add-Member -NotePropertyName 'dbhubSourceReleasedUtc' -NotePropertyValue ([DateTime]::UtcNow.AddMinutes(-40).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        $script:snapshots = @(InModuleScope DbHubDemo -Parameters @{ Item = $released } { ConvertFrom-DemoGoldenSnapshot -Snapshot $Item })
+        $script:sourceHostSince = [DateTime]::UtcNow.AddMinutes(-10).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        $script:sourceBeforeStatus = 'Connected'
+        $script:sourceAfterStatus = 'Connected'
+        $script:sourceBeforeChange = [DateTime]::UtcNow.AddMinutes(-45).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        $script:sourceAfterChange = $script:sourceBeforeChange
+        $results = @(Test-DemoT2GoldenSnapshot -Config $config -Confirm:$false)
+        $source = $results | Where-Object checkId -EQ 'GOLDEN.TEST.SOURCE'
+        $source.status | Should -Be 'Warning'
+        $source.evidence['minutesSinceCapture'] | Should -BeLessOrEqual 11
+        $source.message | Should -Match 'before Azure marks it Disconnected'
+    }
+
     It 'never starts a copy whose guest adapter booted connected, and deletes it' {
         $script:adapterConnected = 1
         $results = @(Test-DemoT2GoldenSnapshot -Config $config -Onboard -Confirm:$false)
@@ -699,6 +817,142 @@ Describe 'Invoke-DemoGoldenSourceRelease' {
         $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoGoldenSourceRelease -Config $c } $config
         $result.status | Should -Be 'Fail'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -ParameterFilter { $ArgumentList[0] -eq 'tag' }
+    }
+}
+
+Describe 'Restore-DemoGoldenCaptureSource' {
+    BeforeEach {
+        $config = New-TestConfig
+        $script:calls = [System.Collections.Generic.List[string]]::new()
+        $script:clock = [datetime]::new(2026, 11, 3, 14, 0, 0, [System.DateTimeKind]::Utc)
+        $script:airGap = $script:clock.AddMinutes(-15)
+        $script:power = 'PowerState/deallocated'
+        $script:powerFails = ''
+        $script:sourceRelease = 'Pass'
+        $script:guestRelease = $true
+        $script:adapterBefore = 0
+        # arcsql01's status for the clock; by default Disconnected until 4 minutes after the release, then Connected.
+        $script:arc = { if ($script:clock -lt $script:releasedAt.AddMinutes(4)) { @('Disconnected', $script:airGap.AddMinutes(20)) } else { @('Connected', $script:releasedAt.AddMinutes(4)) } }
+        $script:releasedAt = $script:clock
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:clock }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:clock = $script:clock.AddSeconds($Seconds) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith {
+            $script:calls.Add('power ' + $Action)
+            if ($script:powerFails -eq $Action) { return (New-TestResult ('POWER.' + $Action.ToUpperInvariant()) 'Warning') }
+            $script:power = if ($Action -eq 'Start') { 'PowerState/running' } else { 'PowerState/deallocated' }
+            New-TestResult ('POWER.' + $Action.ToUpperInvariant())
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenSourceRelease -MockWith {
+            $script:calls.Add('source release')
+            $script:releasedAt = $script:clock
+            if ($script:sourceRelease) { New-DemoResult -CheckId 'T2.GOLDEN.SOURCE' -Area 't2' -Target 'T2' -Status $script:sourceRelease -Message 'archost01 is the source of snap-1.' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
+            $script:calls.Add('guest ' + $Action)
+            $script:releasedAt = $script:clock
+            [pscustomobject]@{ Succeeded = $script:guestRelease; Error = $(if ($script:guestRelease) { '' } else { 'The virtual machine arcsql01 could not be found.' }); Seconds = 30; Data = [pscustomobject]@{ succeeded = $script:guestRelease; role = 'Source'; captured = $true; before = [pscustomobject]@{ guestState = 'Off'; startAction = 'Nothing'; adapter = [pscustomobject]@{ count = 1; connected = $script:adapterBefore } } } }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -MockWith {
+            $script:calls.Add('arc')
+            $state = & $script:arc
+            [pscustomobject]@{ properties = [pscustomobject]@{ status = $state[0]; lastStatusChange = $state[1].ToString("yyyy-MM-dd'T'HH:mm:ss'Z'") } }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -MockWith { $script:calls.Add('guest stop'); New-TestResult 'STOP.GUEST' }
+        function Invoke-Restore([string] $Found = 'PowerState/deallocated', [int] $Wait = 30) {
+            & (Get-Module -Name DbHubDemo) { param($c, $f, $g, $w) Restore-DemoGoldenCaptureSource -Config $c -FoundPowerState $f -AirGapUtc $g -ArcWaitMinutes $w } $config $Found $script:airGap $Wait
+        }
+    }
+
+    It 'starts the deallocated source, releases it, sees arcsql01 reconnect, and deallocates it again after a clean guest stop' {
+        $result = Invoke-Restore
+        $result.checkId | Should -Be 'GOLDEN.CAPTURE.SOURCE'
+        $result.status | Should -Be 'Pass'
+        $result.evidence['arcProof'] | Should -Be 'reconnected'
+        $result.evidence['hostAfter'] | Should -Be 'deallocated'
+        $result.message | Should -Match 'deallocated again, as the capture found it'
+        @($script:calls | Where-Object { $_ -ne 'arc' }) | Should -Be @('power Start', 'source release', 'guest stop', 'power Deallocate')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 0 -Exactly
+    }
+
+    It 'doesn''t take a Connected status left over from before the air gap for a reconnection' {
+        # Azure marks a machine Disconnected 15 to 30 minutes after its last heartbeat: right after a short capture it
+        # can still read Connected, with a last status change from before the air gap.
+        $script:arc = { @('Connected', $script:airGap.AddMinutes(-120)) }
+        $result = Invoke-Restore
+        $result.status | Should -Be 'Pass'
+        $result.evidence['arcProof'] | Should -Be 'heartbeat'
+        $script:clock | Should -BeGreaterOrEqual $script:airGap.AddMinutes(30)
+        $script:clock | Should -BeLessThan $script:airGap.AddMinutes(31)
+        $script:clock = $script:airGap.AddMinutes(15)
+        $script:power = 'PowerState/deallocated'
+        $short = Invoke-Restore -Wait 5
+        $short.status | Should -Be 'Warning'
+        $short.message | Should -Match 'may still be the one from before the air gap'
+        $short.remediation | Should -Match 'T2\.ARC\.CONNECTED'
+    }
+
+    It 'leaves a source the capture found running running, without a guest stop' {
+        $script:power = 'PowerState/running'
+        $result = Invoke-Restore -Found 'PowerState/running'
+        $result.status | Should -Be 'Pass'
+        $result.evidence['hostAfter'] | Should -Be 'running'
+        @($script:calls | Where-Object { $_ -ne 'arc' }) | Should -Be @('source release')
+    }
+
+    It 'releases the guest itself when no snapshot names the host yet, and needs no proof when the guest was never disconnected' {
+        $script:sourceRelease = ''
+        $script:power = 'PowerState/running'
+        $script:adapterBefore = 1
+        $script:arc = { @('Connected', $script:airGap.AddMinutes(-120)) }
+        $result = Invoke-Restore -Found 'PowerState/running'
+        $result.status | Should -Be 'Pass'
+        $result.evidence['release'] | Should -Be 'Release'
+        $result.evidence['arcProof'] | Should -Be 'never disconnected'
+        @($script:calls | Where-Object { $_ -eq 'arc' }).Count | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -Times 1 -Exactly -ParameterFilter { $Action -eq 'Release' }
+    }
+
+    It 'fails when the guest can''t be released, and still deallocates the host it started' {
+        $script:sourceRelease = 'Fail'
+        $result = Invoke-Restore
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'stays air-gapped'
+        $result.remediation | Should -Match 'start-demo\.ps1'
+        $script:calls | Should -Not -Contain 'arc'
+        $script:calls | Should -Contain 'power Deallocate'
+    }
+
+    It 'fails when arcsql01 doesn''t reconnect within the wait' {
+        $script:arc = { @('Disconnected', $script:airGap.AddMinutes(20)) }
+        $result = Invoke-Restore -Wait 20
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'arcsql01 is Disconnected after 20 minutes'
+        $result.remediation | Should -Match 'validate\.ps1 -Area T2'
+        $result.evidence['hostAfter'] | Should -Be 'deallocated'
+    }
+
+    It 'warns when the host can''t be deallocated again, or when the release wasn''t recorded on the snapshot' {
+        $script:powerFails = 'Deallocate'
+        $result = Invoke-Restore
+        $result.status | Should -Be 'Warning'
+        $result.remediation | Should -Match 'stop-demo\.ps1'
+        $script:powerFails = ''
+        $script:power = 'PowerState/deallocated'
+        $script:sourceRelease = 'Warning'
+        $script:releasedAt = $script:clock
+        $recorded = Invoke-Restore
+        $recorded.status | Should -Be 'Warning'
+        $recorded.message | Should -Match 'releases it again, which is harmless'
+    }
+
+    It 'fails without a release when the host doesn''t start' {
+        $script:powerFails = 'Start'
+        $result = Invoke-Restore
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'didn''t start'
+        $script:calls | Should -Not -Contain 'source release'
     }
 }
 
