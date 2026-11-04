@@ -103,7 +103,8 @@ BeforeAll {
             '/jobSchedules/([0-9a-f-]{36})$' {
                 $id = $Matches[1]
                 if ($Method -eq 'PUT') {
-                    $script:links.Add([pscustomobject]@{ Id = $id; Schedule = [string]$Body.properties.schedule.name; Runbook = [string]$Body.properties.runbook.name; Parameters = $Body.properties.parameters })
+                    # DbHub-Monitor's links have no parameters: an index, so strict mode allows the missing key.
+                    $script:links.Add([pscustomobject]@{ Id = $id; Schedule = [string]$Body.properties.schedule.name; Runbook = [string]$Body.properties.runbook.name; Parameters = $Body.properties['parameters'] })
                     return (New-Response 201 '{}')
                 }
                 if ($Method -eq 'DELETE') {
