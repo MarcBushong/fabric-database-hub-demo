@@ -185,11 +185,14 @@ Describe 'Notebook <_>' -ForEach $notebookNames {
         $parameters[0].Source | Should -Match '(?m)^GITHUB_REPOSITORY = "MarcBushong/fabric-database-hub-demo"\s*$'
     }
 
-    It 'defaults every safety switch to False' {
-        $parameters[0].Source | Should -Match '(?m)^CONFIRM = False\s*$'
-        foreach ($switchName in [regex]::Matches($parameters[0].Source, '(?m)^(STOP_ACTIVITY|PURGE_DEMO_TABLES) = (\w+)')) {
-            $switchName.Groups[2].Value | Should -Be 'False'
-        }
+    It 'runs on Run all: CONFIRM is True by default, and the switch that stops activity or drops tables stays False (2026-11-03)' {
+        # The owner, 2026-11-03: "We should not default to dry runs anywhere. users should be able to just click run all
+        # and then it should run."
+        $parameters[0].Source | Should -Match '(?m)^CONFIRM = True\s*$'
+        $switches = @([regex]::Matches($parameters[0].Source, '(?m)^(STOP_ACTIVITY|PURGE_DEMO_TABLES) = (\w+)'))
+        $switches.Count | Should -Be 1
+        $switches[0].Groups[2].Value | Should -Be 'False'
+        $nb.Raw | Should -Not -Match 'Run all\*\* is safe|That''s safe|\(the default\) it only prints a dry run|Leave them False'
     }
 
     It 'holds no secrets or token-like strings' {
@@ -447,6 +450,53 @@ Describe 'NB_DatabaseHub_Deployment content' {
         $allCode | Should -Match 'notebooks, error = fabric_list_items\(WORKSPACE_ID, "Notebook"\)'
         $markdown | Should -Match 'the scripts'' import binds the notebook to it'
     }
+
+    It 'never drops a table on Run all with its defaults, and drops all five only with PURGE_DEMO_TABLES and CONFIRM (2026-11-03)' {
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # Runs the notebook's own parameters and cleanup cells, with a stand-in for Spark that records each DROP.
+        $script = Join-Path -Path $TestDrive -ChildPath 'cleanup.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import json, sys
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+params = next(cell for cell in cells if cell.startswith("# Parameters cell"))
+cleanup = next(cell for cell in cells if cell.startswith("# RESOURCE-CHANGING CELL: drops"))
+
+class Catalog:
+    def tableExists(self, name):
+        return True
+
+class Session:
+    def __init__(self):
+        self.catalog = Catalog()
+        self.dropped = []
+    def sql(self, text):
+        self.dropped.append(text)
+
+def run(**overrides):
+    ns = {}
+    exec(params, ns)
+    ns.update(overrides)
+    session = Session()
+    ns["_spark"] = lambda: session
+    exec(cleanup, ns)
+    return ns, session.dropped
+
+ns, dropped = run()
+assert ns["CONFIRM"] is True and ns["PURGE_DEMO_TABLES"] is False, (ns["CONFIRM"], ns["PURGE_DEMO_TABLES"])
+assert dropped == [], dropped
+ns, dropped = run(PURGE_DEMO_TABLES=True)
+assert len(dropped) == 5 and all(text.startswith("DROP TABLE IF EXISTS ") for text in dropped), dropped
+ns, dropped = run(PURGE_DEMO_TABLES=True, CONFIRM=False)
+assert dropped == [], dropped
+print("ok")
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $python $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+    }
 }
 
 Describe 'NB_DatabaseHub_LiveActivity content' {
@@ -508,6 +558,50 @@ Describe 'NB_DatabaseHub_LiveActivity content' {
     It 'prints the GitHub link and CLI command when P9 is not configured' {
         $allCode | Should -Match 'def print_manual_trigger'
         $allCode | Should -Match '"gh", "workflow", "run", GITHUB_WORKFLOW_FILE'
+    }
+
+    It 'sends business-day on every target for 240 minutes on Run all with its defaults, and never the stop (2026-11-03)' {
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # Runs the notebook's own parameters, send, and stop cells, with stand-ins for the helpers that would reach GitHub.
+        $script = Join-Path -Path $TestDrive -ChildPath 'send.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import json, sys
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+params = next(cell for cell in cells if cell.startswith("# Parameters cell"))
+send = next(cell for cell in cells if cell.startswith("# RESOURCE-CHANGING CELL: triggers demo-control.yml"))
+stop = next(cell for cell in cells if cell.startswith("# RESOURCE-CHANGING CELL: sets the activity profile to \"off\""))
+
+def run(**overrides):
+    ns = {}
+    exec(params, ns)
+    ns.update(overrides)
+    sent = []
+    ns["build_simulation_request"] = lambda profile, target, duration, *rest: {"profile": profile, "target": target, "duration_minutes": duration}
+    ns["REQUEST"] = ns["build_simulation_request"](ns["PROFILE"], ns["SIM_TARGET"], ns["DURATION_MINUTES"])
+    ns["LAST_REQUEST"] = None
+    ns["print_simulation_plan"] = lambda request: None
+    ns["submit_simulation_request"] = lambda request: sent.append(request) or dict(request)
+    exec(send, ns)
+    exec(stop, ns)
+    return ns, sent
+
+ns, sent = run()
+assert ns["CONFIRM"] is True and ns["STOP_ACTIVITY"] is False, (ns["CONFIRM"], ns["STOP_ACTIVITY"])
+assert sent == [{"profile": "business-day", "target": "all", "duration_minutes": 240}], sent
+ns, sent = run(CONFIRM=False)
+assert sent == [], sent
+ns, sent = run(STOP_ACTIVITY=True)
+assert [item["profile"] for item in sent] == ["business-day", "off"], sent
+print("ok")
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $python $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $markdown | Should -Match 'With `CONFIRM = False` it sends and records nothing'
+        $markdown | Should -Match '\*\*Run all\*\* never stops anything'
     }
 
     It 'records each request in scenario_runs and saves telemetry_snapshots and analysis_findings' {

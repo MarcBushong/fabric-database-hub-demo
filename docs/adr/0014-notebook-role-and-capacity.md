@@ -39,7 +39,7 @@
 ### Rules for both notebooks
 
 - Markdown narration; parameterized environment values; no credentials; tokens never printed and token-like values redacted before display.
-- Idempotent cells; dry-run by default where meaningful; resource-changing cells flagged and gated by `CONFIRM`.
+- Idempotent cells; ~~dry-run by default where meaningful;~~ resource-changing cells flagged and gated by `CONFIRM`. *Superseded in part on 2026-11-03: no dry-run defaults, `CONFIRM = True` by default; see [the amendment](#amendment-2026-11-03-no-dry-run-defaults).*
 - They never claim that a cell provisioned something a supported API didn't. Where automation isn't supported, a validation cell is paired with a short manual instruction.
 - Results go to Delta tables in `LH_DatabaseHub`: `validation_results`, `scenario_runs`, `telemetry_snapshots`, and `analysis_findings`.
 - Outputs are stripped before commit. CI fails if any cell has outputs or execution counts, and a pre-commit hook strips them locally.
@@ -99,6 +99,15 @@
 - **Import:** `Import-DemoFabricItem` generalizes the notebook import (List Items by display name, Create Item or Update Item Definition, long-running-operation polling, and `-WhatIf` sending nothing) and adds a read-back with Get Item Definition. `Import-DemoFabricNotebook` now calls it, with the same check IDs and messages. `configure-fabric.ps1 -ImportDashboard` imports the dashboard after the notebooks.
 - **Fallbacks:** the dashboard is the governed form of the "Real-Time Dashboard" fallback under Consequences. It queries the telemetry endpoint as each viewer through an Azure Data Explorer data source, so it doesn't depend on the notebook's `kusto` token.
 - **Capacity and viewers:** the dashboard needs the same capacity as the notebooks (P5), and its viewers need Reader on the subscription. Viewers of Power BI content on a capacity smaller than F64 need Pro, PPU, or a trial (P11, `PREFLIGHT.FABRIC.VIEWERLICENSE`); see [presentation surfaces](../presentation.md).
+
+## Amendment (2026-11-03): no dry-run defaults
+
+- **Decision source:** the owner, the decision source of this ADR, verbatim: "We should not default to dry runs anywhere. users should be able to just click run all and then it should run." It supersedes "dry-run by default where meaningful" under [Rules for both notebooks](#rules-for-both-notebooks) for the two notebooks in `fabric/notebooks/`. The on-demand activity control's notebook ([ADR 0020](0020-on-demand-activity-control.md)) isn't changed here.
+- **`CONFIRM = True` by default in both.** Every resource-changing cell is still flagged and still gated by `CONFIRM`, so `CONFIRM = False` gives a read-only run.
+- **`NB_DatabaseHub_LiveActivity`:** **Run all** sends its simulation request in section 3: `PROFILE` `business-day`, the default activity profile since the same day ([ADR 0010](0010-workload-generator-technology.md#activity-profiles-business-day-by-default-2026-11-03)), on every target for `DURATION_MINUTES` 240, the workflow's maximum, so the hourly incidents carry on for the session rather than ending after 30 minutes. With P9 it dispatches `demo-control.yml`; without P9 it prints the link and command and records the request as **Manual action required**, as before. Stopping all activity still needs `STOP_ACTIVITY = True` too, which stays `False`, so **Run all** never stops what it started.
+- **`NB_DatabaseHub_Deployment`:** **Run all** runs every check, as before; its only resource-changing cell, the cleanup, still needs `PURGE_DEMO_TABLES = True` too, which stays `False`, so **Run all** never drops a table.
+- **The scripts' own runs** of the live-activity notebook (`stop-demo.ps1 -SaveHistory` and `configure-fabric.ps1`'s capture) pass `CONFIRM` and `STOP_ACTIVITY` as `false`, as they always did, so they only analyze and save. A person who wants that by hand sets `CONFIRM = False`; `STOP.FABRIC.SAVEHISTORY`'s manual step says so.
+- **Tests:** `tests/unit/Fabric.Notebooks.Tests.ps1` checks the defaults and runs each notebook's own parameters and resource-changing cells in Python with stand-ins: the default run sends one `business-day` request and no stop, and drops no table; `CONFIRM = False` sends and drops nothing.
 
 ## Sources (checked 2026-10-19; Phase 12 sources checked 2026-10-20, live-attempt sources 2026-10-21)
 
