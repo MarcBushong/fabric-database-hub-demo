@@ -632,12 +632,19 @@ function Get-DbHubDemoPath {
 }
 
 function ConvertTo-DbHubUtc {
-    # Parses an ISO 8601 time from Azure; $null when it doesn't parse.
+    # Parses an ISO 8601 time from Azure; $null when it doesn't parse. A DateTime (a JSON parser's) is taken as UTC when it
+    # has no kind.
     param(
         [AllowNull()]
         [object] $Value
     )
 
+    if ($Value -is [datetime]) {
+        if ($Value.Kind -eq [System.DateTimeKind]::Unspecified) {
+            return [datetime]::SpecifyKind($Value, [System.DateTimeKind]::Utc)
+        }
+        return $Value.ToUniversalTime()
+    }
     $parsed = [DateTimeOffset]::MinValue
     if ($null -ne $Value -and [DateTimeOffset]::TryParse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
         return $parsed.UtcDateTime
@@ -860,7 +867,8 @@ function Register-DbHubMonitorRecheck {
     $settings = $Context.Settings
     $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Automation/automationAccounts'
     $account = Get-DbHubAccountPath -Settings $settings
-    # Never sooner than 30 minutes: the run's own job looks after the plugin for up to 25 (Start-DbHubActivityRun).
+    # Never sooner than 30 minutes: the run's own job looks after the plugin for up to 28 (Start-DbHubActivityRun: sqlvm01 runs
+    # within 15, then up to 8 to settle and 5 to verify a restart).
     $interval = [System.Math]::Max(30, [int]$settings.monitorRecheckMinutes)
     $created = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $names = @(Get-DbHubMonitorScheduleName -Settings $settings)
@@ -925,6 +933,35 @@ function Get-DbHubVmState {
         }
     }
     return 'Unknown'
+}
+
+function Get-DbHubVmStartUtc {
+    <#
+    .SYNOPSIS
+    A running VM's latest start, as its instance view gives it: the time of its provisioning status, which a start sets
+    when it completes ("the time of the status"); $null when it can't be read or has no time. Later VM operations can move
+    it later, never earlier, so a plugin status reported after it is from this boot.
+    https://learn.microsoft.com/rest/api/compute/virtual-machines/instance-view (InstanceViewStatus, checked 2026-11-04)
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VmName
+    )
+
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Compute/virtualMachines'
+    $view = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/instanceView' -f (Get-DbHubDemoPath -Settings $Context.Settings), $VmName) -ApiVersion $version
+    if ($view.StatusCode -ne 200) {
+        return $null
+    }
+    foreach ($status in @(Get-DbHubMember -InputObject $view.Body -Name 'statuses')) {
+        if ([string](Get-DbHubMember -InputObject $status -Name 'code') -like 'ProvisioningState/*') {
+            return (ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $status -Name 'time'))
+        }
+    }
+    return $null
 }
 
 function Invoke-DbHubVmAction {
@@ -1362,13 +1399,68 @@ function Clear-DbHubFinishedRunCommand {
     }
 }
 
+function Get-DbHubPluginReportedUtc {
+    <#
+    .SYNOPSIS
+    When the SQL IaaS Agent's main service last reported: the latest ExtensionServiceHealthReport.MainServiceLastReportedTime
+    in the extension's status messages (its ComponentStatus/Resource Provider Plugin substatus; live, 2026-11-04); $null
+    when there's none. Right after a start, the instance view still holds the status from before the stop (live,
+    2026-11-04: Running and OK a minute after boot, NotRunning 12 minutes later), and this time tells the two apart.
+    #>
+    param(
+        [AllowEmptyCollection()]
+        [string[]] $Message = @()
+    )
+
+    $latest = $null
+    foreach ($text in @($Message)) {
+        foreach ($match in [regex]::Matches([string]$text, 'MainServiceLastReportedTime\W{1,8}(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)')) {
+            $time = ConvertTo-DbHubUtc -Value $match.Groups[1].Value
+            if ($null -ne $time -and ($null -eq $latest -or $time -gt $latest)) {
+                $latest = $time
+            }
+        }
+    }
+    return $latest
+}
+
+function Test-DbHubPluginFresh {
+    <#
+    .SYNOPSIS
+    Whether a plugin status (Get-DbHubMonitoringPlugin) was reported after SinceUtc, sqlvm01's start: its ReportedUtc is
+    later. Without SinceUtc there's nothing to compare, so it's fresh. Without a ReportedUtc (an agent that doesn't report
+    the time), it's fresh only once the start is more than 30 minutes old, so a cold start still gets its restart and a VM
+    that has run a while isn't restarted on every look.
+    #>
+    param(
+        [AllowNull()]
+        [object] $Plugin,
+
+        [AllowNull()]
+        [object] $SinceUtc,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $NowUtc
+    )
+
+    if ($null -eq $SinceUtc) {
+        return $true
+    }
+    $reported = Get-DbHubMember -InputObject $Plugin -Name 'ReportedUtc'
+    if ($null -ne $reported) {
+        return ([datetime]$reported -gt [datetime]$SinceUtc)
+    }
+    return (($NowUtc - [datetime]$SinceUtc).TotalMinutes -gt 30)
+}
+
 function Get-DbHubMonitoringPlugin {
     <#
     .SYNOPSIS
     T1's Database Hub monitoring plugin, as the SQL IaaS Agent extension's instance view reports it and as
     start-demo.ps1 reads it (Restore-DemoSqlVmMonitoringPlugin): Read (the extension could be read), FlagSet (its
     settings hold the monitoring feature flag), Found and State (the plugin's line, for example
-    DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"}), Upload, and Message.
+    DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"}), Upload, Message, and ReportedUtc (when the
+    agent's main service last reported, Get-DbHubPluginReportedUtc; $null when it doesn't say).
     https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/enable-performance-monitoring-sql-vm
     #>
     param(
@@ -1377,7 +1469,7 @@ function Get-DbHubMonitoringPlugin {
     )
 
     $settings = $Context.Settings
-    $result = [pscustomobject]@{ Read = $false; FlagSet = $false; Found = $false; State = ''; Upload = ''; Message = '' }
+    $result = [pscustomobject]@{ Read = $false; FlagSet = $false; Found = $false; State = ''; Upload = ''; Message = ''; ReportedUtc = $null }
     $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines'
     $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/extensions/{2}?$expand=instanceView' -f (Get-DbHubDemoPath -Settings $settings), $settings.sqlVmName, $settings.monitoring.extensionInstanceName) -ApiVersion $version
     if ($read.StatusCode -ne 200) {
@@ -1393,25 +1485,30 @@ function Get-DbHubMonitoringPlugin {
         }
     }
     $view = Get-DbHubMember -InputObject $properties -Name 'instanceView'
-    $pattern = [regex]::Escape([string]$settings.monitoring.statusPlugin) + '\s*:\s*(\{[^{}]*\})'
+    $messages = New-Object -TypeName 'System.Collections.Generic.List[string]'
     foreach ($listName in 'statuses', 'substatuses') {
         foreach ($status in @(Get-DbHubMember -InputObject $view -Name $listName)) {
-            $match = [regex]::Match([string](Get-DbHubMember -InputObject $status -Name 'message'), $pattern)
-            if (-not $match.Success) {
-                continue
-            }
-            $result.Message = $match.Value
-            try {
-                $json = $match.Groups[1].Value | ConvertFrom-Json
-                $result.Found = $true
-                $result.State = [string](Get-DbHubMember -InputObject $json -Name 'State')
-                $result.Upload = [string](Get-DbHubMember -InputObject $json -Name 'MetricsUploadStatus')
-            }
-            catch {
-                $result.Found = $false
-            }
-            return $result
+            $messages.Add([string](Get-DbHubMember -InputObject $status -Name 'message'))
         }
+    }
+    $result.ReportedUtc = Get-DbHubPluginReportedUtc -Message $messages.ToArray()
+    $pattern = [regex]::Escape([string]$settings.monitoring.statusPlugin) + '\s*:\s*(\{[^{}]*\})'
+    foreach ($message in $messages) {
+        $match = [regex]::Match($message, $pattern)
+        if (-not $match.Success) {
+            continue
+        }
+        $result.Message = $match.Value
+        try {
+            $json = $match.Groups[1].Value | ConvertFrom-Json
+            $result.Found = $true
+            $result.State = [string](Get-DbHubMember -InputObject $json -Name 'State')
+            $result.Upload = [string](Get-DbHubMember -InputObject $json -Name 'MetricsUploadStatus')
+        }
+        catch {
+            $result.Found = $false
+        }
+        break
     }
     return $result
 }
@@ -1438,8 +1535,15 @@ function Send-DbHubMonitoringRestart {
 }
 
 function Initialize-DbHubMonitorState {
-    # The state of one look after T1's monitoring plugin (Step-DbHubMonitor).
-    return [pscustomobject]@{ Phase = 'Settle'; Done = $false; Outcome = ''; FirstUtc = $null; RestartUtc = $null; Before = ''; After = ''; Restarted = $false }
+    # The state of one look after T1's monitoring plugin (Step-DbHubMonitor). StartUtc is when this run's start of sqlvm01
+    # was accepted; without it (the run didn't start it, or a DbHub-Monitor re-check), the first step reads the VM's
+    # latest start from its instance view (Get-DbHubVmStartUtc).
+    param(
+        [AllowNull()]
+        [object] $StartUtc = $null
+    )
+
+    return [pscustomobject]@{ Phase = 'Settle'; Done = $false; Outcome = ''; FirstUtc = $null; RestartUtc = $null; Before = ''; After = ''; Restarted = $false; StartUtc = $StartUtc; StartKnown = ($null -ne $StartUtc) }
 }
 
 function Step-DbHubMonitor {
@@ -1449,11 +1553,16 @@ function Step-DbHubMonitor {
     it. Live, 2026-10-26: about a minute after boot the extension reported no plugin status, and a restart then left
     the plugin NotRunning for hours; once the agent had reported, the restart brought it to Running and OK. Live,
     2026-11-03: the control read the plugin right after the start, found no status, sent no restart, and T1 sent no
-    telemetry. So:
-    - no status yet: wait, up to monitoring.settleMinutes after the first read;
-    - Running: left alone (Outcome Running), uploads that aren't OK included, because a restart doesn't fix uploads;
-    - any other state, or still no status after the wait: the SQL IaaS Agent's service is restarted, then read until
-      it's Running with uploads OK (Restarted) or monitoring.verifyMinutes pass (StillNotRunning).
+    telemetry. Live, 2026-11-04: 47 seconds after the run's start the instance view still held the status from before
+    the stop, Running and OK, so no restart went out; 12 minutes later it said NotRunning, and T1 had sent nothing. So a
+    status counts only when it's fresh: reported (MainServiceLastReportedTime) after sqlvm01's start in this run, or after
+    the VM's latest start in its instance view when the run didn't start it (Test-DbHubPluginFresh). Then:
+    - no fresh status yet: wait, up to monitoring.settleMinutes (8) after the first read;
+    - fresh and Running: left alone (Outcome Running), uploads that aren't OK included, because a restart doesn't fix
+      uploads;
+    - fresh in any other state, or still no fresh status after the wait: the SQL IaaS Agent's service is restarted once,
+      then read until it's Running with uploads OK in a status reported after the restart (Restarted) or
+      monitoring.verifyMinutes pass (StillNotRunning).
     Other outcomes: NotSelected (the monitoring flag isn't set), Unread (the extension couldn't be read for the whole
     time), RestartRefused (Azure didn't accept the Run Command). Done says the look is over.
     #>
@@ -1475,12 +1584,23 @@ function Step-DbHubMonitor {
     if ($null -eq $State.FirstUtc) {
         $State.FirstUtc = $now
     }
+    if (-not $State.StartKnown) {
+        $State.StartUtc = Get-DbHubVmStartUtc -Context $Context -VmName ([string]$Context.Settings.sqlVmName)
+        $State.StartKnown = $true
+    }
     $plugin = Get-DbHubMonitoringPlugin -Context $Context
     $finish = {
         param([string] $Outcome, [string] $Text)
         $State.Done = $true
         $State.Outcome = $Outcome
         Write-DbHubLog -Context $Context -Message ('T1''s monitoring plugin: {0}' -f $Text)
+    }
+    $timeText = {
+        param([AllowNull()] [object] $Time)
+        if ($null -eq $Time) {
+            return 'an unknown time'
+        }
+        return ([datetime]$Time).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     }
     if (-not $plugin.Read) {
         $bound = $State.FirstUtc.AddMinutes($settle + $verify)
@@ -1505,15 +1625,25 @@ function Step-DbHubMonitor {
     }
     if ($State.Phase -eq 'Settle') {
         $reported = $plugin.Found -and $plugin.State
-        if ($reported -and $plugin.State -eq 'Running') {
+        $fresh = $reported -and (Test-DbHubPluginFresh -Plugin $plugin -SinceUtc $State.StartUtc -NowUtc $now)
+        if ($fresh -and $plugin.State -eq 'Running') {
             $State.Before = $plugin.Message
-            & $finish 'Running' ('running ({0}).' -f $plugin.Message)
+            & $finish 'Running' ('running ({0}, reported at {1}).' -f $plugin.Message, (& $timeText $plugin.ReportedUtc))
             return
         }
-        if (-not $reported -and $now -lt $State.FirstUtc.AddMinutes($settle)) {
+        if (-not $fresh -and $now -lt $State.FirstUtc.AddMinutes($settle)) {
             return
         }
-        $State.Before = if ($reported) { $plugin.Message } else { 'no plugin status after {0} minutes' -f $settle }
+        if ($fresh) {
+            $State.Before = $plugin.Message
+        }
+        elseif ($reported) {
+            # Live, 2026-11-04: the status from before the stop said Running and OK, and the plugin was NotRunning.
+            $State.Before = 'no fresh plugin status since {0}''s start at {1} (waited {2} minutes); the last one, reported at {3}, said {4}' -f $Context.Settings.sqlVmName, (& $timeText $State.StartUtc), $settle, (& $timeText $plugin.ReportedUtc), $plugin.Message
+        }
+        else {
+            $State.Before = 'no plugin status after {0} minutes' -f $settle
+        }
         if (-not (Send-DbHubMonitoringRestart -Context $Context -Stamp $Stamp)) {
             & $finish 'RestartRefused' ('{0}; the SQL IaaS Agent service''s restart wasn''t accepted.' -f $State.Before)
             return
@@ -1524,7 +1654,9 @@ function Step-DbHubMonitor {
         Write-DbHubLog -Context $Context -Message ('T1''s monitoring plugin: {0}; the SQL IaaS Agent service is restarted.' -f $State.Before)
         return
     }
-    if ($plugin.State -eq 'Running' -and $plugin.Upload -eq 'OK') {
+    # After the restart, only a status reported since then counts; an agent that doesn't report the time is taken at its word.
+    $afterRestart = $null -eq $plugin.ReportedUtc -or $plugin.ReportedUtc -gt $State.RestartUtc
+    if ($plugin.State -eq 'Running' -and $plugin.Upload -eq 'OK' -and $afterRestart) {
         $State.After = $plugin.Message
         & $finish 'Restarted' ('running with uploads OK after the restart ({0}).' -f $plugin.Message)
         return
@@ -1641,8 +1773,10 @@ function Start-DbHubActivityRun {
     at most T4WaitMinutes after the start, or with sqlvm01's when T4 is already Ready then (live, 2026-11-03: the run
     waited up to 15 minutes for T4 before it dispatched anything). The VM-side control waits for each target to accept
     connections before it sets the profile (readySeconds). Meanwhile T1's monitoring plugin is looked after once sqlvm01
-    runs (Step-DbHubMonitor): left alone when it runs, restarted when it reports another state or no status after
-    monitoring.settleMinutes. The job ends when every VM, T4, and the plugin are done, or at their bounds.
+    runs (Step-DbHubMonitor): left alone when a status reported since this run's start of sqlvm01 says it runs, and
+    restarted once when a fresh status says another state, or when no fresh status comes within monitoring.settleMinutes
+    (live, 2026-11-04: right after a cold start the status from before the stop said Running). The job ends when every VM,
+    T4, and the plugin are done, or at their bounds.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -1744,9 +1878,14 @@ function Start-DbHubActivityRun {
         $result.rechecks = @(Register-DbHubMonitorRecheck -Context $Context -StartUtc $Context.NowUtc -RunEndUtc $plan.RunEndUtc)
     }
 
+    # When this run's start of sqlvm01 was accepted: T1's monitoring plugin counts only a status reported after it.
+    $sqlStartedUtc = $null
     foreach ($vm in @($byVm.Keys)) {
         if ((Get-DbHubVmState -Context $Context -VmName $vm) -ne 'running') {
-            $null = Invoke-DbHubVmAction -Context $Context -VmName $vm -Action start
+            $accepted = Invoke-DbHubVmAction -Context $Context -VmName $vm -Action start
+            if ($accepted -and $vm -eq $sqlVm) {
+                $sqlStartedUtc = Get-DbHubUtcNow
+            }
         }
     }
     if ($null -ne $t4 -and $t4.State -eq 'Stopped' -and -not (Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action start)) {
@@ -1777,7 +1916,7 @@ function Start-DbHubActivityRun {
     $t4Pending = $null -ne $t4Activity
     $monitor = $null
     if ($plans.Contains($sqlVm)) {
-        $monitor = Initialize-DbHubMonitorState
+        $monitor = Initialize-DbHubMonitorState -StartUtc $sqlStartedUtc
     }
     $dispatch = {
         param([string] $VmName, [object[]] $Chosen, [string] $Name)
@@ -2088,8 +2227,9 @@ function Invoke-DbHubMonitor {
     .SYNOPSIS
     DbHub-Monitor's entry point, which a run's monitoring re-checks start (Register-DbHubMonitorRecheck): while the run
     lasts (its auto-stop is pending) and sqlvm01 runs, it looks after T1's monitoring plugin as the run's start did
-    (Step-DbHubMonitor): left alone when it runs, its agent's service restarted when it reports another state or no
-    status. It never starts or stops a VM or T4, and does nothing once the run has ended.
+    (Step-DbHubMonitor): left alone when a status reported since the VM's latest start says it runs, its agent's service
+    restarted once when a fresh status says another state or no fresh status comes. It never starts or stops a VM or T4,
+    and does nothing once the run has ended.
     #>
     param(
         [Parameter(Mandatory = $true)]

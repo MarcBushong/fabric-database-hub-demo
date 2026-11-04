@@ -92,7 +92,8 @@ function Get-DemoSqlVmMonitoringStatus {
     When monitoring runs and uploads, the status includes
     DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"} (enable-performance-monitoring-sql-vm,
     "Check the monitoring status"). The documented command reads statuses[0].message; every status and
-    substatus message is searched here, so another plugin's line can't hide it.
+    substatus message is searched here, so another plugin's line can't hide it. ReportedUtc is the latest
+    MainServiceLastReportedTime in those messages, or $null when there's none.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -103,12 +104,23 @@ function Get-DemoSqlVmMonitoringStatus {
         [string] $Plugin = 'DatabaseMonitorArcPlugin'
     )
 
-    $result = [ordered]@{ Found = $false; State = ''; MetricsUploadStatus = ''; Message = '' }
+    $result = [ordered]@{ Found = $false; State = ''; MetricsUploadStatus = ''; Message = ''; ReportedUtc = $null }
     $instanceView = Get-DemoMemberValue -InputObject $Extension -Name 'instanceView'
     $messages = foreach ($listName in 'statuses', 'substatuses') {
         $list = Get-DemoMemberValue -InputObject $instanceView -Name $listName
         foreach ($status in @($list)) {
             [string](Get-DemoMemberValue -InputObject $status -Name 'message')
+        }
+    }
+    # When the agent's main service last reported (its ComponentStatus/Resource Provider Plugin substatus; live,
+    # 2026-11-04): right after a start the instance view still holds the status from before the stop, and this tells
+    # the two apart (Test-DemoSqlVmPluginFresh).
+    foreach ($message in @($messages)) {
+        foreach ($match in [regex]::Matches([string]$message, 'MainServiceLastReportedTime\W{1,8}(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)')) {
+            $time = ConvertTo-DemoUtcDate -Value $match.Groups[1].Value
+            if ($null -ne $time -and ($null -eq $result.ReportedUtc -or $time -gt $result.ReportedUtc)) {
+                $result.ReportedUtc = $time
+            }
         }
     }
     $pattern = [regex]::Escape($Plugin) + '\s*:\s*(\{[^{}]*\})'
@@ -130,6 +142,38 @@ function Get-DemoSqlVmMonitoringStatus {
         break
     }
     return [pscustomobject]$result
+}
+
+function Test-DemoSqlVmPluginFresh {
+    <#
+    .SYNOPSIS
+    Whether a plugin status (Get-DemoSqlVmMonitoringStatus) was reported after -SinceUtc, sqlvm01's start: its ReportedUtc
+    is later. Without -SinceUtc there's nothing to compare, so it's fresh. Without a ReportedUtc (an agent that doesn't
+    report the time), it's fresh only once the start is more than 30 minutes old, so a cold start still gets its restart
+    and a VM that has run a while isn't restarted on every check. The control runbook's Test-DbHubPluginFresh is the same
+    rule. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $Plugin,
+
+        [AllowNull()]
+        [object] $SinceUtc,
+
+        [Parameter(Mandatory)]
+        [datetime] $NowUtc
+    )
+
+    if ($null -eq $SinceUtc) {
+        return $true
+    }
+    $reported = Get-DemoMemberValue -InputObject $Plugin -Name 'ReportedUtc'
+    if ($null -ne $reported) {
+        return ([datetime]$reported -gt [datetime]$SinceUtc)
+    }
+    return (($NowUtc - [datetime]$SinceUtc).TotalMinutes -gt 30)
 }
 
 function Get-DemoSqlVmPluginGrace {
@@ -242,11 +286,16 @@ function Restore-DemoSqlVmMonitoringPlugin {
     Live (2026-10-26, Phase 24): about a minute after boot the extension reported no plugin status at all. A
     restart then left the plugin NotRunning for hours, while the same restart once the agent had settled brought
     it to Running and OK in 144 seconds.
-    So this reads the plugin's state from the extension's instance view (Get-DemoSqlVmMonitoringStatus) and,
-    while there's no plugin status yet, waits up to -SettleMinutes for the agent to report one before it
-    decides. Only when the DatabaseWatcheronAzureVM flag is set and the plugin isn't Running, or still has no
-    status after that wait, it restarts the service with a Run Command and waits up to -WaitMinutes for Running
-    and OK. Nothing else changes. A restart that doesn't help is a Warning, not a Fail (ADR 0012): the start's
+    Live (2026-11-04, the control's cold start of #17): 47 seconds after the start the instance view still held the
+    status from before the stop, Running and OK, so no restart went out; 12 minutes later it said NotRunning, T1 had
+    sent nothing, and the restart brought it to Running and OK in 194 seconds.
+    So this reads the plugin's state from the extension's instance view (Get-DemoSqlVmMonitoringStatus) and counts
+    only a fresh status: one reported (MainServiceLastReportedTime) after -StartedUtc, or after the VM's latest start
+    in its instance view when that isn't given (Get-DemoVmPowerInfo's SinceUtc; Test-DemoSqlVmPluginFresh). While
+    there's no fresh status, it waits up to -SettleMinutes (8; 5 before 2026-11-04) for the agent to report one before
+    it decides. Only when the DatabaseWatcheronAzureVM flag is set and the fresh status isn't Running, or there's still
+    no fresh status after that wait, it restarts the service once with a Run Command and waits up to -WaitMinutes for
+    Running and OK in a status reported since the restart. Nothing else changes. A restart that doesn't help is a Warning, not a Fail (ADR 0012): the start's
     other steps hold, validate.ps1's TELEMETRY.T1 is the check that fails without T1 data, and a Fail here would
     also skip start-demo.ps1's -ResetAdminPassword step for T2.
     Live (2026-10-27, Phase 25d): a deployment's template run left the plugin NotRunning too (at 14:11 UTC, still
@@ -277,8 +326,11 @@ function Restore-DemoSqlVmMonitoringPlugin {
 
         [string] $VmName = 'sqlvm01',
 
+        [AllowNull()]
+        [object] $StartedUtc = $null,
+
         [ValidateRange(0, 30)]
-        [int] $SettleMinutes = 5,
+        [int] $SettleMinutes = 8,
 
         [ValidateRange(0, 30)]
         [int] $NotRunningGraceMinutes = 0,
@@ -318,13 +370,31 @@ function Restore-DemoSqlVmMonitoringPlugin {
     if (-not (Test-DemoSqlIaasFeatureFlag -Settings $settings -Name ([string]$setting['featureFlag']))) {
         return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Not selected' -Message ('Performance monitoring isn''t turned on for {0} ({1} isn''t set), so there''s no plugin to check.' -f $VmName, $setting['featureFlag']) -DocUrl $docUrl)
     }
+    # The start this check compares the plugin's status with: right after a start the instance view can still hold the
+    # status from before the stop (live, 2026-11-04).
+    $sinceUtc = $StartedUtc
+    if ($null -eq $sinceUtc) {
+        try {
+            $sinceUtc = (Get-DemoVmPowerInfo -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName).SinceUtc
+        }
+        catch {
+            $sinceUtc = $null
+        }
+    }
+    $isFresh = { param([object] $Plugin) Test-DemoSqlVmPluginFresh -Plugin $Plugin -SinceUtc $sinceUtc -NowUtc (Get-DemoUtcNow) }
+    $timeText = { param([AllowNull()] [object] $Time) if ($null -eq $Time) { 'an unknown time' } else { ([datetime]$Time).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) } }
     # Right after boot the agent hasn't reported the plugin yet, and a restart then can leave it NotRunning.
     $settlePolls = 0
     $maxSettlePolls = [int][Math]::Ceiling($SettleMinutes * 60 / $PollSeconds)
     $settle = [System.Diagnostics.Stopwatch]::StartNew()
-    while (-not ($state.Plugin.Found -and $state.Plugin.State) -and $settlePolls -lt $maxSettlePolls -and $settle.Elapsed.TotalMinutes -lt $SettleMinutes) {
+    while (-not ($state.Plugin.Found -and $state.Plugin.State -and (& $isFresh $state.Plugin)) -and $settlePolls -lt $maxSettlePolls -and $settle.Elapsed.TotalMinutes -lt $SettleMinutes) {
         if ($settlePolls -eq 0) {
-            Write-DemoLog -Message ('{0}''s SQL IaaS Agent reports no monitoring plugin status yet; waiting up to {1} minutes for one before deciding, because a restart this early can leave the plugin NotRunning.' -f $VmName, $SettleMinutes)
+            if ($state.Plugin.Found -and $state.Plugin.State) {
+                Write-DemoLog -Message ('{0}''s SQL IaaS Agent still shows the monitoring plugin status from before its start at {1} ({2}, reported at {3}); waiting up to {4} minutes for a fresh one before deciding.' -f $VmName, (& $timeText $sinceUtc), $state.Plugin.Message, (& $timeText $state.Plugin.ReportedUtc), $SettleMinutes)
+            }
+            else {
+                Write-DemoLog -Message ('{0}''s SQL IaaS Agent reports no monitoring plugin status yet; waiting up to {1} minutes for one before deciding, because a restart this early can leave the plugin NotRunning.' -f $VmName, $SettleMinutes)
+            }
         }
         Start-Sleep -Seconds $PollSeconds
         $settlePolls++
@@ -332,8 +402,9 @@ function Restore-DemoSqlVmMonitoringPlugin {
     }
     $settledSeconds = [int]$settle.Elapsed.TotalSeconds
     $reported = [bool]($state.Plugin.Found -and $state.Plugin.State)
-    $evidence = [ordered]@{ before = $state.Plugin.Message; settlePolls = $settlePolls; settledSeconds = $settledSeconds; gracePolls = 0; restarted = $false; after = '' }
-    if ($reported -and $state.Plugin.State -ne 'Running' -and $NotRunningGraceMinutes -gt 0) {
+    $fresh = [bool](& $isFresh $state.Plugin)
+    $evidence = [ordered]@{ before = $state.Plugin.Message; settlePolls = $settlePolls; settledSeconds = $settledSeconds; gracePolls = 0; restarted = $false; after = ''; startedUtc = (& $timeText $sinceUtc); reportedUtc = (& $timeText $state.Plugin.ReportedUtc); fresh = $fresh }
+    if ($reported -and $fresh -and $state.Plugin.State -ne 'Running' -and $NotRunningGraceMinutes -gt 0) {
         # A plugin that reports NotRunning gets a short grace to start by itself; live (2026-10-30) it rarely does, and the
         # restart below brings it back in 2 to 3 minutes. The grace counts elapsed time, reads included (a read takes 15
         # to 20 seconds); a sleep never runs past its end.
@@ -359,8 +430,11 @@ function Restore-DemoSqlVmMonitoringPlugin {
         $evidence['gracePolls'] = $gracePolls
         $evidence['before'] = $state.Plugin.Message
         $reported = [bool]($state.Plugin.Found -and $state.Plugin.State)
+        $fresh = [bool](& $isFresh $state.Plugin)
+        $evidence['reportedUtc'] = & $timeText $state.Plugin.ReportedUtc
+        $evidence['fresh'] = $fresh
     }
-    if ($state.Plugin.State -eq 'Running') {
+    if ($fresh -and $state.Plugin.State -eq 'Running') {
         $evidence['after'] = $state.Plugin.Message
         $upload = [string]$state.Plugin.MetricsUploadStatus
         if ($upload -eq 'OK') {
@@ -382,13 +456,26 @@ function Restore-DemoSqlVmMonitoringPlugin {
 Restart-Service -Name '$service' -Force
 [Console]::Out.WriteLine(('$service is {0}.' -f (Get-Service -Name '$service').Status))
 "@
-    $before = if ($reported) { $state.Plugin.Message } else { 'no plugin status after {0:N0} seconds' -f $settledSeconds }
+    $before = if ($reported -and $fresh) {
+        $state.Plugin.Message
+    }
+    elseif ($reported) {
+        'no fresh plugin status since its start at {0} (waited {1:N0} seconds); the last one, reported at {2}, said {3}' -f (& $timeText $sinceUtc), $settledSeconds, (& $timeText $state.Plugin.ReportedUtc), $state.Plugin.Message
+    }
+    else {
+        'no plugin status after {0:N0} seconds' -f $settledSeconds
+    }
+    # A status from before the start says nothing about the plugin now (live, 2026-11-04).
+    $stale = $reported -and -not $fresh
+    $stateText = if ($stale) { 'has no fresh status' } else { 'isn''t running' }
+    $pastText = if ($stale) { 'had no fresh status' } else { 'wasn''t running' }
     Write-DemoLog -Message ('{0}''s monitoring plugin reports {1}; restarting the SQL IaaS Agent service so it starts again; no action needed.' -f $VmName, $before)
     Set-DemoProgressStep -Path $ProgressPath -Id $ProgressStepId -State 'Running' -AzureSide -Message 'Restarting T1''s monitoring plugin, which stopped after a restart; no action needed.'
+    $restartUtc = Get-DemoUtcNow
     $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-MonitoringRestart' -Script $script -TimeoutSeconds 300
     $evidence['restarted'] = [bool]$run.Succeeded
     if (-not $run.Succeeded) {
-        return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Warning' -Message ('{0}''s monitoring plugin isn''t running ({1}), and the SQL IaaS Agent service couldn''t be restarted.' -f $VmName, $before) -Remediation ('Restart the {0} service on {1}, or run ./scripts/configure-monitoring.ps1.' -f $service, $VmName) -Evidence $evidence -DocUrl $docUrl)
+        return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Warning' -Message ('{0}''s monitoring plugin {1} ({2}), and the SQL IaaS Agent service couldn''t be restarted.' -f $VmName, $stateText, $before) -Remediation ('Restart the {0} service on {1}, or run ./scripts/configure-monitoring.ps1.' -f $service, $VmName) -Evidence $evidence -DocUrl $docUrl)
     }
     Write-DemoLog -Message ('The SQL IaaS Agent service on {0} restarted; waiting up to {1} minutes for its monitoring plugin to report Running and OK; no action needed.' -f $VmName, $WaitMinutes)
     $polls = 0
@@ -398,9 +485,11 @@ Restart-Service -Name '$service' -Force
         Start-Sleep -Seconds $PollSeconds
         $polls++
         $state = & $read
-        if ($state.Plugin.State -eq 'Running' -and $state.Plugin.MetricsUploadStatus -eq 'OK') {
+        # Only a status reported since the restart counts; an agent that doesn't report the time is taken at its word.
+        $sinceRestart = $null -eq $state.Plugin.ReportedUtc -or $state.Plugin.ReportedUtc -gt $restartUtc
+        if ($state.Plugin.State -eq 'Running' -and $state.Plugin.MetricsUploadStatus -eq 'OK' -and $sinceRestart) {
             $evidence['after'] = $state.Plugin.Message
-            return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Pass' -Message ('{0}''s monitoring plugin wasn''t running after {1} ({2}); the SQL IaaS Agent service was restarted, and it''s Running with uploads OK after {3:N0} seconds.' -f $VmName, $Occasion, $before, $watch.Elapsed.TotalSeconds) -Evidence $evidence -DocUrl $docUrl)
+            return (New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status 'Pass' -Message ('{0}''s monitoring plugin {1} after {2} ({3}); the SQL IaaS Agent service was restarted, and it''s Running with uploads OK after {4:N0} seconds.' -f $VmName, $pastText, $Occasion, $before, $watch.Elapsed.TotalSeconds) -Evidence $evidence -DocUrl $docUrl)
         }
     }
     $evidence['after'] = $state.Plugin.Message

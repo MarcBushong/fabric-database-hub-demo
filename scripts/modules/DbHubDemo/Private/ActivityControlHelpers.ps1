@@ -412,7 +412,7 @@ function Get-DemoActivityControlRunbookSetting {
         scenarios              = $catalog
         profiles               = Get-DemoActivityControlProfile
         readySeconds           = [ordered]@{ T1 = 600; T2 = 1200; T3 = 600; T4 = 600 }
-        monitoring             = [ordered]@{ extensionInstanceName = [string]$sqlVm['extensionInstanceName']; statusPlugin = [string]$sqlVm['statusPlugin']; featureFlag = [string]$sqlVm['featureFlag']; serviceName = 'SQLIaaSExtension'; settleMinutes = 5; verifyMinutes = 5 }
+        monitoring             = [ordered]@{ extensionInstanceName = [string]$sqlVm['extensionInstanceName']; statusPlugin = [string]$sqlVm['statusPlugin']; featureFlag = [string]$sqlVm['featureFlag']; serviceName = 'SQLIaaSExtension'; settleMinutes = 8; verifyMinutes = 5 }
         apiVersions            = $apiVersions
         controlScriptTemplate  = (Get-DemoWorkloadControlTemplate).Replace('__ACTION__', 'Runner')
     }

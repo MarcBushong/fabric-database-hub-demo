@@ -3450,7 +3450,9 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         # Shaped like the live instance view (2026-10-26): the plugin's state is in statuses[0].message, and the
         # DatabaseMonitorArcPlugin substatus holds only its endpoint. 'Empty' is the agent right after boot, before
         # it reports the plugin.
-        function New-TestSqlIaasExtension([string] $PluginState, [bool] $FlagOn = $true) {
+        # -ReportedUtc adds the agent's health report (its ComponentStatus/Resource Provider Plugin substatus; live,
+        # 2026-11-04) with MainServiceLastReportedTime.
+        function New-TestSqlIaasExtension([string] $PluginState, [bool] $FlagOn = $true, [string] $ReportedUtc = '') {
             $plugin = switch ($PluginState) {
                 'Empty' { '' }
                 'Running' { 'DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"};' }
@@ -3463,7 +3465,10 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
                 settings     = [pscustomobject]@{ FeatureFlags = @([pscustomobject]@{ Name = 'DatabaseWatcheronAzureVM'; Enable = $FlagOn }) }
                 instanceView = [pscustomobject]@{
                     statuses    = @([pscustomobject]@{ code = 'ProvisioningState/succeeded'; message = ('SQL Server IaaS Agent: Healthy;{0}Resource Provider Plugin: Rp plugin is enabled.' -f $plugin) })
-                    substatuses = @([pscustomobject]@{ code = 'ComponentStatus/DatabaseMonitorArcPlugin/succeeded'; message = '{"endpointUrl":"https://telemetry.{0}.arcdataservices.com/","endpointAppId":"<id>"}' })
+                    substatuses = @(
+                        [pscustomobject]@{ code = 'ComponentStatus/DatabaseMonitorArcPlugin/succeeded'; message = '{"endpointUrl":"https://telemetry.{0}.arcdataservices.com/","endpointAppId":"<id>"}' }
+                        if ($ReportedUtc) { [pscustomobject]@{ code = 'ComponentStatus/Resource Provider Plugin/succeeded'; message = ('{"ExtensionServiceHealthReport":{"MainServiceStatus":"Running","MainServiceLastReportedTime":"' + $ReportedUtc + '"}}') } }
+                    )
                 }
             }
         }
@@ -3474,12 +3479,17 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         $script:flagOn = $true
         $script:reads = 0
         $script:readsAtRestart = -1
+        # The VM's latest start in its instance view; $null (no time) compares with nothing, so every status is fresh.
+        $script:vmSinceUtc = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerInfo -MockWith { [pscustomobject]@{ PowerState = 'PowerState/running'; SinceUtc = $script:vmSinceUtc } }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm extension show ' } -MockWith {
             $script:reads++
-            $state = if ($script:pluginStates.Count -gt 1) { $script:pluginStates.Dequeue() } else { $script:pluginStates.Peek() }
-            New-TestSqlIaasExtension -PluginState $state -FlagOn $script:flagOn
+            # 'State' or 'State|<MainServiceLastReportedTime>'.
+            $entry = if ($script:pluginStates.Count -gt 1) { $script:pluginStates.Dequeue() } else { $script:pluginStates.Peek() }
+            $parts = $entry.Split('|')
+            New-TestSqlIaasExtension -PluginState $parts[0] -FlagOn $script:flagOn -ReportedUtc $(if ($parts.Count -gt 1) { $parts[1] } else { '' })
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
             $script:readsAtRestart = $script:reads
@@ -3649,6 +3659,88 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         $result.remediation | Should -Match 'configure-monitoring\.ps1'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 2 -Exactly -ParameterFilter { $Seconds -eq 30 }
+    }
+
+    It 'reads when the agent last reported, and has no time when it doesn''t say' {
+        $status = & (Get-Module -Name DbHubDemo) { param($e) Get-DemoSqlVmMonitoringStatus -Extension $e } (New-TestSqlIaasExtension -PluginState 'Running' -ReportedUtc '2026-11-04T14:46:32Z')
+        $status.State | Should -Be 'Running'
+        $status.ReportedUtc | Should -Be ([datetime]::new(2026, 11, 4, 14, 46, 32, [System.DateTimeKind]::Utc))
+        (& (Get-Module -Name DbHubDemo) { param($e) Get-DemoSqlVmMonitoringStatus -Extension $e } (New-TestSqlIaasExtension -PluginState 'Running')).ReportedUtc | Should -BeNullOrEmpty
+    }
+
+    It 'counts only a status reported after the VM''s start: a stale Running gets one restart when no fresh status comes within the wait (live, 2026-11-04)' {
+        # Live: a minute after a cold start the instance view still said Running and OK from before the stop; 12 minutes
+        # later NotRunning, and T1 had sent no telemetry. The restart brought it to Running and OK in 194 seconds.
+        $script:vmSinceUtc = [datetime]::new(2026, 11, 4, 14, 35, 0, [System.DateTimeKind]::Utc)
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { [datetime]::new(2026, 11, 4, 14, 36, 0, [System.DateTimeKind]::Utc) }
+        foreach ($entry in 'Running|2026-11-04T03:10:00Z', 'Running|2026-11-04T03:10:00Z', 'Running|2026-11-04T03:10:00Z', 'Running|2026-11-04T14:40:00Z') {
+            $script:pluginStates.Enqueue($entry)
+        }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -SettleMinutes 1 -PollSeconds 30 } $config
+        $script:readsAtRestart | Should -Be 3 -Because 'it waited the whole -SettleMinutes for a fresh status'
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match ('^sqlvm01''s monitoring plugin had no fresh status after the start \(no fresh plugin status since its start at 2026-11-04T14:35:00Z \(waited \d+ seconds\); the last one, reported at 2026-11-04T03:10:00Z, said ' + [regex]::Escape('DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"}') + '\); the SQL IaaS Agent service was restarted')
+        $result.evidence.fresh | Should -BeFalse
+        # The result's JSON round trip can turn these into DateTime values in PowerShell 7.
+        $asUtc = { param($Value) ([datetime]$Value).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+        & $asUtc $result.evidence.startedUtc | Should -Be '2026-11-04T14:35:00Z'
+        & $asUtc $result.evidence.reportedUtc | Should -Be '2026-11-04T03:10:00Z'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly
+
+        # -StartedUtc, when a caller knows its start, comes before the instance view.
+        $script:pluginStates.Clear()
+        $script:reads = 0
+        $script:vmSinceUtc = $null
+        foreach ($entry in 'Running|2026-11-04T03:10:00Z', 'Running|2026-11-04T03:10:00Z', 'Running|2026-11-04T03:10:00Z', 'Running|2026-11-04T14:40:00Z') {
+            $script:pluginStates.Enqueue($entry)
+        }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -StartedUtc ([datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc)) -SettleMinutes 1 -PollSeconds 30 } $config
+        $script:readsAtRestart | Should -Be 3
+        & $asUtc $result.evidence.startedUtc | Should -Be '2026-11-04T14:34:25Z'
+    }
+
+    It 'restarts the SQL IaaS Agent at once when a fresh status says NotRunning' {
+        $script:vmSinceUtc = [datetime]::new(2026, 11, 4, 14, 35, 0, [System.DateTimeKind]::Utc)
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { [datetime]::new(2026, 11, 4, 14, 36, 0, [System.DateTimeKind]::Utc) }
+        foreach ($entry in 'NotRunning|2026-11-04T14:35:40Z', 'Running|2026-11-04T14:39:00Z') {
+            $script:pluginStates.Enqueue($entry)
+        }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c } $config
+        $script:readsAtRestart | Should -Be 1
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'wasn''t running after the start \(DatabaseMonitorArcPlugin: \{"State":"NotRunning"\}\); the SQL IaaS Agent service was restarted'
+        $result.evidence.fresh | Should -BeTrue
+    }
+
+    It 'leaves the plugin alone when a fresh status says Running' {
+        $script:vmSinceUtc = [datetime]::new(2026, 11, 4, 14, 35, 0, [System.DateTimeKind]::Utc)
+        $script:pluginStates.Enqueue('Running|2026-11-04T14:35:40Z')
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c } $config
+        $result.status | Should -Be 'Pass'
+        $result.evidence.fresh | Should -BeTrue
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'restarts once after a recent start when the agent reports no time, and takes a VM that has run a while at its word' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { [datetime]::new(2026, 11, 4, 14, 36, 0, [System.DateTimeKind]::Utc) }
+        $script:vmSinceUtc = [datetime]::new(2026, 11, 4, 14, 34, 0, [System.DateTimeKind]::Utc)
+        foreach ($entry in 'Running', 'Running', 'Running', 'Running') {
+            $script:pluginStates.Enqueue($entry)
+        }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -SettleMinutes 1 -PollSeconds 30 } $config
+        $script:readsAtRestart | Should -Be 3
+        $result.status | Should -Be 'Pass' -Because 'after the restart, an agent without the time is taken at its word'
+        $result.evidence.reportedUtc | Should -Be 'an unknown time'
+
+        $script:pluginStates.Clear()
+        $script:reads = 0
+        $script:readsAtRestart = -1
+        $script:vmSinceUtc = [datetime]::new(2026, 11, 4, 12, 0, 0, [System.DateTimeKind]::Utc)
+        $script:pluginStates.Enqueue('Running')
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c } $config
+        $result.status | Should -Be 'Pass'
+        $script:readsAtRestart | Should -Be -1 -Because 'a VM started more than 30 minutes ago isn''t restarted for a status without a time'
     }
 
     It 'touches nothing when monitoring isn''t turned on' {

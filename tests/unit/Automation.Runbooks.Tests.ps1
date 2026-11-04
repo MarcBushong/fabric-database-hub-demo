@@ -57,6 +57,11 @@ BeforeAll {
         # T1's plugin state, or a script block that returns it for the clock; '' means the agent reports no plugin
         # status yet.
         $script:plugin = 'Running'
+        # When the agent's main service last reported (MainServiceLastReportedTime), a script block for the clock; by
+        # default it reports all the time, as live (2026-11-04). $null leaves the time out, as an agent that doesn't report it.
+        $script:pluginReported = { $script:clock }
+        # A VM's latest start in its instance view (the provisioning status's time), by VM name; without an entry, no time.
+        $script:vmSince = @{}
         $script:flag = $true
         $script:restartedAt = $null
         $script:runCommandStatus = 201
@@ -118,7 +123,11 @@ BeforeAll {
             }
             '/virtualMachines/(\w+)/instanceView$' {
                 $name = $Matches[1]
-                return (New-Response 200 (ConvertTo-Json -InputObject @{ statuses = @(@{ code = 'ProvisioningState/succeeded' }, @{ code = ('PowerState/{0}' -f (Get-TestVmState $name)) }) } -Depth 4))
+                $provisioning = @{ code = 'ProvisioningState/succeeded' }
+                if ($script:vmSince.ContainsKey($name)) {
+                    $provisioning['time'] = $script:vmSince[$name].ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ', [System.Globalization.CultureInfo]::InvariantCulture)
+                }
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ statuses = @($provisioning, @{ code = ('PowerState/{0}' -f (Get-TestVmState $name)) }) } -Depth 4))
             }
             '/virtualMachines/(\w+)/start$' {
                 $name = $Matches[1]
@@ -139,7 +148,13 @@ BeforeAll {
                     $statuses += @{ message = ('DatabaseMonitorArcPlugin: {{"State":"{0}","MetricsUploadStatus":"OK"}}' -f $state) }
                 }
                 $flags = @(@{ Name = 'DatabaseWatcheronAzureVM'; Enable = $script:flag })
-                return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ settings = @{ FeatureFlags = $flags }; instanceView = @{ statuses = $statuses } } } -Depth 8))
+                # Shaped like the live substatus (2026-11-04): the agent's health report, with its main service's last report.
+                $substatuses = @()
+                $reportedAt = & $script:pluginReported
+                if ($null -ne $reportedAt) {
+                    $substatuses += @{ code = 'ComponentStatus/Resource Provider Plugin/succeeded'; message = ('{{"ExtensionServiceHealthReport":{{"MainServiceStatus":"Running","MainServiceLastReportedTime":"{0}"}}}}' -f ([datetime]$reportedAt).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)) }
+                }
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ settings = @{ FeatureFlags = $flags }; instanceView = @{ statuses = $statuses; substatuses = $substatuses } } } -Depth 8))
             }
             '/virtualMachines/(\w+)/runCommands(\?\$expand=instanceView)?$' {
                 if ($script:runCommands.ContainsKey($Matches[1])) {
@@ -465,7 +480,7 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         @($script:calls | Where-Object { $_.Method -eq 'GET' -and $_.Path -match '/extensions/SqlIaasExtension' }).Count | Should -BeGreaterThan 1
     }
 
-    It 'restarts the plugin''s agent when the plugin reports no status for 5 minutes, then sees it run' {
+    It 'restarts the plugin''s agent when the plugin reports no status for 8 minutes, then sees it run' {
         $start = $script:clock
         $script:plugin = { if ($null -ne $script:restartedAt -and $script:clock -ge $script:restartedAt.AddMinutes(2)) { 'Running' } else { '' } }
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
@@ -473,8 +488,9 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         $result.message | Should -Match 'was restarted and runs'
         $restart = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-20261027150000$' })
         $restart.Count | Should -Be 1
-        ($restart[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 5
-        ($restart[0].At - $start).TotalMinutes | Should -BeLessThan 6
+        # monitoring.settleMinutes is 8 since 2026-11-04 (5 before).
+        ($restart[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 8
+        ($restart[0].At - $start).TotalMinutes | Should -BeLessThan 9
         # The activity went out first: the plugin never holds back a dispatch.
         (@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-sqlvm01-' })[0].At) | Should -Be $start
     }
@@ -485,6 +501,77 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
         $result.monitoring | Should -Be 'NotSelected'
         @($script:calls | Where-Object { $_.Path -match '/runCommands/DbHubControl-monitoring-' }) | Should -BeNullOrEmpty
+    }
+
+    It 'counts only a plugin status reported after the run''s start of sqlvm01: a stale Running gets one restart when no fresh status comes (live, 2026-11-04)' {
+        # Live: the run started sqlvm01 at 14:34:25Z; at 14:35:12Z the instance view still said Running and OK from before
+        # the stop, so no restart went out; at 14:46:51Z it said NotRunning, and T1 had sent no telemetry for 12 minutes.
+        $start = $script:clock
+        $script:staleAt = $start.AddHours(-3)
+        $script:pluginReported = { if ($null -ne $script:restartedAt -and $script:clock -ge $script:restartedAt.AddMinutes(2)) { $script:clock } else { $script:staleAt } }
+        $context = New-TestContext
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }); durationMinutes = 90 }) -Context $context
+        $result.status | Should -Be 'Dispatched'
+        $result.monitoring | Should -Be 'Restarted'
+        $restart = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' })
+        $restart.Count | Should -Be 1 -Because 'the agent is restarted once'
+        ($restart[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 8 -Because 'it waits monitoring.settleMinutes for a fresh status first'
+        ($restart[0].At - $start).TotalMinutes | Should -BeLessThan 9
+        (@($context.Log) -join [System.Environment]::NewLine) | Should -Match ([regex]::Escape('T1''s monitoring plugin: no fresh plugin status since sqlvm01''s start at 2026-10-27T15:00:00Z (waited 8 minutes); the last one, reported at 2026-10-27T12:00:00Z, said DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"OK"}; the SQL IaaS Agent service is restarted.'))
+    }
+
+    It 'restarts the plugin''s agent at once when a fresh status says NotRunning' {
+        $start = $script:clock
+        $script:plugin = { if ($null -ne $script:restartedAt -and $script:clock -ge $script:restartedAt.AddMinutes(2)) { 'Running' } else { 'NotRunning' } }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Restarted'
+        $restart = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' })
+        $restart.Count | Should -Be 1
+        # The first read comes as the start is accepted, before the agent can report; the next one, 20 seconds later, is fresh.
+        ($restart[0].At - $start).TotalSeconds | Should -Be 20
+    }
+
+    It 'leaves the plugin alone when a fresh status says Running' {
+        $start = $script:clock
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Running'
+        $result.message | Should -Match 'monitoring plugin runs'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' }) | Should -BeNullOrEmpty
+        ($script:clock - $start).TotalMinutes | Should -BeLessThan 1
+    }
+
+    It 'restarts the plugin''s agent once after a cold start when the agent reports no time, after the wait' {
+        # Without MainServiceLastReportedTime a status can't be told from the one before the stop, so a cold start gets the
+        # restart the 2026-10-22 and 2026-10-30 findings call for; after it, the agent is taken at its word.
+        $start = $script:clock
+        $script:pluginReported = { $null }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Restarted'
+        $restart = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' })
+        $restart.Count | Should -Be 1
+        ($restart[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 8
+        ($restart[0].At - $start).TotalMinutes | Should -BeLessThan 9
+    }
+
+    It 'compares the status with sqlvm01''s latest start in its instance view when the run didn''t start it' {
+        $script:vm['sqlvm01'] = 'running'
+        # Started in the portal 2 minutes ago: the status from before that start is stale.
+        $script:vmSince['sqlvm01'] = $script:clock.AddMinutes(-2)
+        $script:staleAt = $script:clock.AddHours(-3)
+        $script:pluginReported = { if ($null -ne $script:restartedAt) { $script:clock } else { $script:staleAt } }
+        $start = $script:clock
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Restarted'
+        (@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' })[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 8
+
+        # Running for hours, with an agent that reports no time: taken at its word, as before.
+        Reset-TestAzure
+        $script:vm['sqlvm01'] = 'running'
+        $script:vmSince['sqlvm01'] = $script:clock.AddHours(-2)
+        $script:pluginReported = { $null }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Running'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' }) | Should -BeNullOrEmpty
     }
 
     It 'neither reads the plugin nor schedules re-checks for a run that doesn''t use sqlvm01' {
@@ -742,6 +829,38 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         foreach ($action in 'read', 'write', 'delete') {
             $actions | Should -Contain ('Microsoft.Compute/virtualMachines/runCommands/{0}' -f $action)
         }
+    }
+}
+
+Describe 'T1''s monitoring plugin status: when it was reported, and whether it''s fresh (live, 2026-11-04)' {
+    It 'reads MainServiceLastReportedTime from <Case>' -ForEach @(
+        @{ Case = 'the agent''s health report'; Message = @('{"ExtensionServiceHealthReport":{"MainServiceStatus":"Running","MainServiceLastReportedTime":"2026-11-04T14:46:32Z"}}'); Expected = '2026-11-04T14:46:32' }
+        @{ Case = 'escaped JSON with fractions and an offset'; Message = @('{\"ExtensionServiceHealthReport\":{\"MainServiceLastReportedTime\":\"2026-11-04T15:46:32.1234567+01:00\"}}'); Expected = '2026-11-04T14:46:32' }
+        @{ Case = 'a time without a zone, which is UTC'; Message = @('MainServiceLastReportedTime: 2026-11-04 14:46:32'); Expected = '2026-11-04T14:46:32' }
+        @{ Case = 'two messages, the latest of them'; Message = @('"MainServiceLastReportedTime":"2026-11-04T14:20:00Z"', 'SQL Server IaaS Agent: Healthy', '"MainServiceLastReportedTime":"2026-11-04T14:46:32Z"'); Expected = '2026-11-04T14:46:32' }
+    ) {
+        $time = Get-DbHubPluginReportedUtc -Message $Message
+        $time.ToString('yyyy-MM-ddTHH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be $Expected
+        $time.Kind | Should -Be 'Utc'
+    }
+
+    It 'has no time when no message holds one' {
+        Get-DbHubPluginReportedUtc -Message @('SQL Server IaaS Agent: Healthy;DatabaseMonitorArcPlugin: {"State":"Running"}', '') | Should -BeNullOrEmpty
+        Get-DbHubPluginReportedUtc -Message @('"MainServiceLastReportedTime":"not a time"') | Should -BeNullOrEmpty
+    }
+
+    It 'is fresh <Case>' -ForEach @(
+        @{ Case = 'when there''s no start to compare with'; Reported = $null; Since = $null; Expected = $true }
+        @{ Case = 'when reported after the start'; Reported = [datetime]::new(2026, 11, 4, 14, 46, 32, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $true }
+        @{ Case = 'not when reported before the start (the stale Running of 2026-11-04)'; Reported = [datetime]::new(2026, 11, 3, 23, 10, 0, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
+        @{ Case = 'not when reported at the start itself'; Reported = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
+        @{ Case = 'not without a time, 12 minutes after the start'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
+        @{ Case = 'without a time, more than 30 minutes after the start'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 16, 0, [System.DateTimeKind]::Utc); Expected = $true }
+    ) {
+        $plugin = [pscustomobject]@{ State = 'Running'; ReportedUtc = $Reported }
+        Test-DbHubPluginFresh -Plugin $plugin -SinceUtc $Since -NowUtc ([datetime]::new(2026, 11, 4, 14, 46, 51, [System.DateTimeKind]::Utc)) | Should -Be $Expected
+        # The module's check before a start-demo.ps1 or deploy.ps1 run is the same rule.
+        InModuleScope -ModuleName DbHubDemo -Parameters @{ Plugin = $plugin; Since = $Since } { Test-DemoSqlVmPluginFresh -Plugin $Plugin -SinceUtc $Since -NowUtc ([datetime]::new(2026, 11, 4, 14, 46, 51, [System.DateTimeKind]::Utc)) } | Should -Be $Expected
     }
 }
 

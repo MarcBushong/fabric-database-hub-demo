@@ -508,7 +508,8 @@ Describe 'The runbooks'' settings' {
         $setting['monitorRecheckMinutes'] | Should -Be 30
         $setting['monitoring']['featureFlag'] | Should -Be 'DatabaseWatcheronAzureVM'
         $setting['monitoring']['statusPlugin'] | Should -Be 'DatabaseMonitorArcPlugin'
-        $setting['monitoring']['settleMinutes'] | Should -Be 5
+        # 8 since 2026-11-04 (5 before): the look waits for a status reported after sqlvm01's start, not the one from before the stop.
+        $setting['monitoring']['settleMinutes'] | Should -Be 8
         $setting['monitoring']['verifyMinutes'] | Should -Be 5
         foreach ($type in $setting['apiVersions'].Keys) {
             $setting['apiVersions'][$type] | Should -Match '^\d{4}-\d{2}-\d{2}(-preview)?$' -Because $type
