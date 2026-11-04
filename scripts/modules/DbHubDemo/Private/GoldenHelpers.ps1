@@ -411,7 +411,9 @@ function Invoke-DemoGoldenSourceRelease {
     .DESCRIPTION
     The capture leaves the source's guest disconnected (no network adapter, no automatic start) while it takes the
     snapshot, so the snapshot's copies boot air-gapped; since 2026-11-03 the capture itself releases its source right
-    afterwards (Restore-DemoGoldenCaptureSource), and this is the safety net for a capture that was interrupted.
+    afterwards (Restore-DemoGoldenCaptureSource), and this is the safety net for a capture that was interrupted once
+    its snapshot existed (before that, no snapshot names the host: a Fabric start of T2 or the next capture releases
+    it).
     When archost01's Azure VM ID matches a golden snapshot's
     dbhubSourceVmId (in this resource group) and that snapshot doesn't carry dbhubSourceReleasedUtc yet, the
     guest is reconnected (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Release: on the source, it only
@@ -727,8 +729,9 @@ function Get-DemoT2GuestStateResult {
     Live, 2026-11-03: a golden capture had left the source's guest air-gapped (off, automatic start Nothing, adapter
     disconnected) for six days, and nothing said so. Statuses (ADR 0012):
     - Fail when T2 can't be in Database Hub while its host runs: a golden capture record that isn't released (the
-      source: start-demo.ps1 or a Fabric start releases it; a copy: deploy.ps1 resets it, and it's never connected by
-      hand while it may hold the captured identity), the guest off, or its adapter not connected to the NAT switch.
+      source: a Fabric start of T2 releases it, and so do start-demo.ps1 once a snapshot names the host and the next
+      capture; a copy: deploy.ps1 resets it, and it's never connected by hand while it may hold the captured
+      identity), the guest off, or its adapter not connected to the NAT switch.
     - Warning when it works now but won't after the next start (an automatic start action other than Start), or its
       heartbeat isn't OK yet (it may still be booting), or the host couldn't be read.
     - Not selected while the host's build hasn't created the guest yet; Pass otherwise.
@@ -778,7 +781,7 @@ function Get-DemoT2GuestStateResult {
     if ($null -ne $golden -and -not $evidence['golden']['released']) {
         switch ($evidence['golden']['role']) {
             'Source' {
-                return (& $new 'Fail' ('{0} is still air-gapped by a golden capture ({1}): T2 is missing from Database Hub until its source is released.' -f $guestName, $seen) ('Run ./scripts/start-demo.ps1, or {0}: either releases the source (T2.GOLDEN.SOURCE), which only reconnects the guest and restores its automatic start, because its Arc identity is its own.' -f $fabricStart))
+                return (& $new 'Fail' ('{0} is still air-gapped by a golden capture ({1}): T2 is missing from Database Hub until its source is released.' -f $guestName, $seen) 'Start T2 from the Fabric control (NB_DatabaseHub_Control): archost01 releases its source itself. ./scripts/start-demo.ps1 releases it too (T2.GOLDEN.SOURCE) once a golden snapshot names archost01 as its source; a capture stopped before its snapshot is released by the next ./scripts/capture-t2-golden.ps1. The release only reconnects the guest and restores its automatic start, because its Arc identity is its own.')
             }
             'Copy' {
                 if ($evidence['golden']['reset']) {
