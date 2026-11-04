@@ -65,6 +65,51 @@ BeforeAll {
             New-DemoValidationContext -Config $C -Target $T
         }
     }
+
+    function New-RunnerStatus([int] $Runs, [string] $Target = 'T2', [string] $ProfileName = 'business-day') {
+        # The runner's 'status --json' as it writes it, indented: the profile near the top, one node per run (each with its
+        # own "profile" string), and the host node last (CommandLine.cs). 2 runs make 2,128 characters, 5 make 3,584.
+        $scenarios = 'cpu-pressure', 'missing-index', 'io-pressure', 'inefficient-query', 'healthy-baseline'
+        $runNodes = foreach ($index in 1..$Runs) {
+            $scenario = $scenarios[($index - 1) % $scenarios.Count]
+            $start = [datetime]::new(2026, 11, 3, 13, 5, 0, [System.DateTimeKind]::Utc).AddMinutes(15 * ($index - 1))
+            [ordered]@{
+                runId              = ('{0:yyyyMMddTHHmmss}-{1}' -f $start, $scenario)
+                scenario           = $scenario
+                target             = $Target
+                status             = $(if ($index -eq $Runs) { 'Running' } else { 'Completed' })
+                startedAt          = $start.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+                deadlineAt         = $start.AddMinutes(8).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+                stoppedAt          = $(if ($index -eq $Runs) { $null } else { $start.AddMinutes(8).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') })
+                maxDurationSeconds = 600
+                concurrency        = 8
+                intensity          = 5
+                profile            = $ProfileName
+                requestedBy        = 'profile-host'
+                outcome            = $(if ($index -eq $Runs) { $null } else { 'Completed' })
+            }
+        }
+        $document = [ordered]@{
+            target         = $Target
+            profile        = [ordered]@{ name = $ProfileName; setAt = '2026-11-03T13:01:12.000Z'; setBy = 'deploy'; expiresAt = '2099-11-03T21:01:12.000Z'; description = 'business-day: incidents at :05, :20, :35, and :50 past each UTC hour.' }
+            runs           = @($runNodes)
+            stopRequests   = @()
+            demoSessions   = @()
+            dataHeadroomMb = 1834
+            logHeadroomMb  = 912
+            host           = [ordered]@{ status = 'Fail'; message = ('The {0} lane keeps failing: the host restarted it 3 times in the last hour.' -f $Target); file = 'C:\ProgramData\DbHubDemo\host-lanes.json'; processId = 4312; hostStartedAt = '2026-11-03T12:58:40.000Z'; heartbeatAt = '2026-11-03T14:06:58.000Z'; heartbeatAgeSeconds = 2; processAlive = $true; stoppedAt = $null; stopReason = $null; lane = [ordered]@{ state = 'Serving'; generation = 4; restarts = 3; restartsLastHour = 3; lastRestartReason = 'no poll finished for 301 s'; lastPollAt = '2026-11-03T14:06:50.000Z'; lastPollAgeSeconds = 10; operation = 'polling'; consecutiveFailures = 0; lastError = $null; runningRuns = 1 } }
+        }
+        return ($document | ConvertTo-Json -Depth 8)
+    }
+
+    function Get-RelayTail([string] $Text) {
+        # What the VM's relay keeps of the runner's output (Get-DemoControlTail -Length 1800).
+        $value = $Text.Trim()
+        if ($value.Length -gt 1800) {
+            return ('...' + $value.Substring($value.Length - 1800))
+        }
+        return $value
+    }
 }
 
 AfterAll {
@@ -570,6 +615,48 @@ Describe 'Validation during business-day''s incidents (2026-11-03)' {
         $lane.status | Should -Be 'Warning'
         $lane.evidence['downgrade'] | Should -Be 'profileOnVm'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -Times 1 -Exactly -ParameterFilter { $ProfileName -ceq 'business-day' }
+    }
+
+    It 'reads the profile the VM''s relay kept for a status with <Runs> runs (<Size> characters), whose kept tail no longer has it (re-review of PR 16)' -ForEach @(
+        @{ Runs = 2; Size = 2128 }
+        @{ Runs = 5; Size = 3584 }
+    ) {
+        # Reviewer: the relay keeps the last 1,800 characters, so with two or more runs the status's own profile was gone, and
+        # a host lane during an incident stayed a Fail.
+        $status = New-RunnerStatus -Runs $Runs
+        $status.Length | Should -Be $Size
+        $script:tail = Get-RelayTail $status
+        $script:tail | Should -Not -Match '"description"' -Because 'the kept tail has the runs'' "profile" strings, not the status''s own profile'
+        $script:relayProfile = [ordered]@{ name = 'business-day'; expiresAt = '2099-11-03T21:01:12.000Z' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $evidence = [ordered]@{ exitCode = 0; stdout = $script:tail }
+            if ($null -ne $script:relayProfile) {
+                $evidence['profile'] = $script:relayProfile
+            }
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:tail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status' -Evidence $evidence) }
+        }
+        $context = New-TestContext -Target T2
+        $lane = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }
+        $lane.status | Should -Be 'Warning'
+        $lane.evidence['downgrade'] | Should -Be 'profileOnVm'
+
+        # A VM whose bundle predates the relay's profile: the tail can't say what runs, so the lane stays a Fail, as before.
+        $script:relayProfile = $null
+        (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Fail'
+        # And a VM whose relay says it runs baseline stays a Fail.
+        $script:relayProfile = [ordered]@{ name = 'baseline'; expiresAt = '2099-11-03T21:01:12.000Z' }
+        (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Fail'
+    }
+
+    It 'still reads a status with one run, which the relay keeps whole, without the relay''s profile' {
+        $status = New-RunnerStatus -Runs 1
+        $status.Length | Should -BeLessOrEqual 1800
+        $script:whole = Get-RelayTail $status
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:whole; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status' -Evidence ([ordered]@{ exitCode = 0; stdout = $script:whole })) }
+        }
+        $context = New-TestContext -Target T2
+        (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Warning'
     }
 
     It 'turns a T3.PROPERTY check that couldn''t run during an incident into a Warning, and keeps a property that''s read and wrong a Fail' {

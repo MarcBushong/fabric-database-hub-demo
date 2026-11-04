@@ -555,7 +555,10 @@ function Invoke-DemoValidationWorkload {
         $results.Add($commandResult)
         if ($run.Status -in 'Pass', 'Warning') {
             $results.Add((Test-DemoValidationWorkloadBound -Target $target -StdOut $run.StdOut))
-            $results.Add((ConvertTo-DemoIncidentAwareResult -Result (Test-DemoValidationWorkloadHost -Target $target -StdOut $run.StdOut -VmName $vmName) -Config $Context.Config -IncidentTarget $incidentTargets -ValidationArea 'Workload' -Kind Host -RunnerStdOut $run.StdOut))
+            # The relay reads the profile from the runner's whole output, which the cut stdout no longer shows once the status
+            # lists two or more runs (re-review of PR 16, 2026-11-04).
+            $runnerProfile = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $run -Name 'Result') -Name 'evidence') -Name 'profile'
+            $results.Add((ConvertTo-DemoIncidentAwareResult -Result (Test-DemoValidationWorkloadHost -Target $target -StdOut $run.StdOut -VmName $vmName) -Config $Context.Config -IncidentTarget $incidentTargets -ValidationArea 'Workload' -Kind Host -RunnerStdOut $run.StdOut -RunnerProfile $runnerProfile))
         }
     }
     # The optional on-demand activity control (ADR 0020): CONTROL.*, read-only, or one Not selected when it's off.

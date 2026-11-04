@@ -22,7 +22,8 @@ Actions:
 - Runner (sqlvm01 for T1, T3, and T4; archost01 relays T2 into the guest over PowerShell Direct)
   { target, arguments[], timeoutSeconds }: runs one runner command. The token {{NEXT_SHUTDOWN}} in an
   argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, and T4 commands the
-  flexible server's FQDN and the runner's role.
+  flexible server's FQDN and the runner's role. The evidence keeps the end of the runner's output, and the active
+  profile's name and expiry, read from the whole output first (re-review of PR 16, 2026-11-04).
 - StopGuest (archost01) { timeoutMinutes }: shuts the guest down cleanly (Stop-VM) and waits until it's
   off, so the host can be deallocated.
 
@@ -128,6 +129,51 @@ function Get-DemoControlTail {
         return ('...' + $value.Substring($value.Length - $Length))
     }
     return $value
+}
+
+function Get-DemoControlRunnerProfile {
+    <#
+    .SYNOPSIS
+    The active profile's name and expiry from a runner command's whole output, read before Get-DemoControlTail cuts it:
+    'status --json' and 'profile get --json' write the profile near the top and the host node last, so once a status
+    lists two or more runs, the tail the result keeps has the host node but not the profile, which validate.ps1's
+    WORKLOAD.<target>.HOST needs (re-review of PR 16, 2026-11-04). $null for output without a profile node.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    $value = [string]$Text
+    $start = $value.IndexOf('{')
+    $end = $value.LastIndexOf('}')
+    if ($start -lt 0 -or $end -le $start) {
+        return $null
+    }
+    try {
+        $document = $value.Substring($start, $end - $start + 1) | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+    if ($null -eq $document -or $null -eq $document.PSObject.Properties['profile']) {
+        return $null
+    }
+    $node = $document.profile
+    if ($null -eq $node -or $node -is [string] -or $null -eq $node.PSObject.Properties['name']) {
+        return $null
+    }
+    $expires = $null
+    if ($null -ne $node.PSObject.Properties['expiresAt'] -and $null -ne $node.expiresAt) {
+        $expires = $node.expiresAt
+        if ($expires -is [datetime]) {
+            $expires = $expires.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        $expires = [string]$expires
+    }
+    return [ordered]@{ name = [string]$node.name; expiresAt = $expires }
 }
 
 function Get-DemoControlArgument {
@@ -413,6 +459,11 @@ function Invoke-DemoControlRunner {
         exitCode = [int]$run.ExitCode
         stdout   = Get-DemoControlTail -Text $run.StdOut -Length 1800
         stderr   = Get-DemoControlTail -Text $run.StdErr -Length 500
+    }
+    # The profile from the whole output, which the cut stdout can no longer show (re-review of PR 16, 2026-11-04).
+    $runnerProfile = Get-DemoControlRunnerProfile -Text $run.StdOut
+    if ($null -ne $runnerProfile) {
+        $evidence['profile'] = $runnerProfile
     }
     Write-DemoControlResult -ActionName 'Runner' -Status $outcome.Status -Message $outcome.Message -Evidence $evidence
 }

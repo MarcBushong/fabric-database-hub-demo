@@ -782,6 +782,26 @@ Describe 'Checks during business-day''s incidents (validate.ps1, 2026-11-03)' {
         }
     }
 
+    It 'takes the profile the VM''s relay read from the whole output first, which the kept tail of a status with runs no longer shows (re-review of PR 16)' {
+        $now = [datetime]::new(2026, 11, 3, 14, 7, 0, [System.DateTimeKind]::Utc)
+        # A run node has its own "profile" string; only the document's profile object counts.
+        $tail = '...","profile": "business-day","requestedBy": "host","outcome": null}],"stopRequests": [],"host": {"status": "Fail","processAlive": true}}'
+        $cases = @(
+            @{ Node = $null; Expected = '' }
+            @{ Node = [ordered]@{ name = 'business-day'; expiresAt = '2026-11-03T18:58:00.000Z' }; Expected = 'business-day' }
+            @{ Node = [ordered]@{ name = 'business-day'; expiresAt = [datetime]::new(2026, 11, 3, 18, 58, 0, [System.DateTimeKind]::Utc) }; Expected = 'business-day' }
+            @{ Node = [ordered]@{ name = 'business-day'; expiresAt = '2026-11-03T14:00:00.000Z' }; Expected = '' }
+            @{ Node = [ordered]@{ name = 'off'; expiresAt = $null }; Expected = '' }
+            @{ Node = [ordered]@{ name = 'baseline'; expiresAt = '2026-11-03T18:58:00.000Z' }; Expected = 'baseline' }
+        )
+        foreach ($case in $cases) {
+            InModuleScope DbHubDemo -Parameters @{ StdOut = $tail; Node = $case.Node; Now = $now } { Get-DemoRunnerActiveProfile -StdOut $StdOut -ProfileNode $Node -NowUtc $Now } | Should -Be $case.Expected -Because ($case.Node | ConvertTo-Json -Compress)
+        }
+        # A relay without one (a VM whose bundle predates it) leaves the output's own profile node, as before.
+        $whole = '{"target":"T2","profile":{"name":"business-day","expiresAt":"2026-11-03T18:58:00Z"},"runs":[]}'
+        InModuleScope DbHubDemo -Parameters @{ StdOut = $whole; Now = $now } { Get-DemoRunnerActiveProfile -StdOut $StdOut -ProfileNode ([ordered]@{ name = '' }) -NowUtc $Now } | Should -Be 'business-day'
+    }
+
     It 'keeps the reviewer''s faults a Fail during an incident, with business-day by default (review of PR 16)' {
         # Reviewer: "settings.json is missing" came back as a Warning, and so did a host whose profile.name was off.
         $busy = [datetime]::new(2026, 11, 3, 14, 7, 0, [System.DateTimeKind]::Utc)

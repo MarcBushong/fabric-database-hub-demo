@@ -1233,9 +1233,11 @@ function Get-DemoRunnerActiveProfile {
     <#
     .SYNOPSIS
     The activity profile the runner's 'status --json' output says its target runs (review of PR 16, 2026-11-04): the
-    profile node's name while its expiresAt is unset or after -NowUtc. '' when the profile is off or has expired, and when
-    the output has no whole document to read it from: a Run Command keeps only the last 4,096 bytes of output, and the
-    profile comes first. Pure. Internal.
+    profile node's name while its expiresAt is unset or after -NowUtc. -ProfileNode, the name and expiry the VM's relay
+    read from the whole output before cutting it (the Runner action's evidence.profile), comes first: a Run Command keeps
+    only the last 4,096 bytes of output and the relay the last 1,800 characters of the runner's, the profile comes first
+    in the status, and a status with two or more runs leaves it out of that tail (re-review of PR 16). Without it, the
+    output's own profile node; '' when the profile is off or has expired, or when neither has a profile. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -1244,12 +1246,17 @@ function Get-DemoRunnerActiveProfile {
         [AllowNull()]
         [string] $StdOut,
 
+        [AllowNull()]
+        [object] $ProfileNode = $null,
+
         [datetime] $NowUtc = [System.DateTime]::UtcNow
     )
 
-    $document = ConvertFrom-DemoRunnerDocument -StdOut $StdOut
-    $node = Get-DemoMemberValue -InputObject $document -Name 'profile'
-    if ($null -eq $node) {
+    $node = $ProfileNode
+    if (-not [string](Get-DemoMemberValue -InputObject $node -Name 'name')) {
+        $node = Get-DemoMemberValue -InputObject (ConvertFrom-DemoRunnerDocument -StdOut $StdOut) -Name 'profile'
+    }
+    if ($null -eq $node -or $node -is [string]) {
         return ''
     }
     $name = [string](Get-DemoMemberValue -InputObject $node -Name 'name')
@@ -1278,8 +1285,9 @@ function ConvertTo-DemoIncidentAwareResult {
       profile the VM runs, so the schedule decides; settings.json missing, no runner, a refused login, and any failure it
       doesn't know stay a Fail.
     - -Kind Host (WORKLOAD.<target>.HOST): the status the host check read says the target runs business-day itself
-      (-RunnerStdOut, Get-DemoRunnerActiveProfile), whatever the configuration says, an incident is due, and the host's
-      process is alive: a profile host that ended is a fault no incident causes, and a VM on baseline or off runs none.
+      (-RunnerProfile, the relay's evidence.profile, else -RunnerStdOut; Get-DemoRunnerActiveProfile), whatever the
+      configuration says, an incident is due, and the host's process is alive: a profile host that ended is a fault no
+      incident causes, and a VM on baseline or off runs none.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1301,6 +1309,9 @@ function ConvertTo-DemoIncidentAwareResult {
         [ValidateSet('Read', 'Host')]
         [string] $Kind = 'Read',
 
+        [AllowNull()]
+        [object] $RunnerProfile = $null,
+
         [AllowEmptyString()]
         [AllowNull()]
         [string] $RunnerStdOut = '',
@@ -1314,7 +1325,7 @@ function ConvertTo-DemoIncidentAwareResult {
     $sourceEvidence = if ($Result.evidence -is [System.Collections.IDictionary]) { $Result.evidence } else { @{} }
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     if ($Kind -eq 'Host') {
-        $running = Get-DemoRunnerActiveProfile -StdOut $RunnerStdOut -NowUtc $NowUtc
+        $running = Get-DemoRunnerActiveProfile -StdOut $RunnerStdOut -ProfileNode $RunnerProfile -NowUtc $NowUtc
         if ($running -cne 'business-day') {
             return $Result
         }
