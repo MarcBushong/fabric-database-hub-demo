@@ -457,12 +457,82 @@ Describe 'Checks during business-day''s incidents (validate.ps1, 2026-11-03)' {
         $result.area | Should -Be 'workload'
         $result.target | Should -Be 'T2'
         $result.status | Should -Be 'Warning'
-        $result.message | Should -Be 'The Run Command on archost01 failed: the runner timed out. It ran during business-day''s cpu-pressure incident on T2 (14:05 to 14:13 UTC), whose load can slow or refuse this read, so it''s a Warning, not a Fail.'
+        $result.message | Should -Be 'The Run Command on archost01 failed: the runner timed out. It failed the way load makes a read fail (a time-out or a busy VM) during business-day''s cpu-pressure incident on T2 (14:05 to 14:13 UTC), so it''s a Warning, not a Fail.'
         $result.remediation | Should -Be 'Run ./scripts/validate.ps1 -Area Workload -Target T2 again after 14:16 UTC, once the incident has ended; a Fail then is a fault. Run the command again.'
         $result.evidence['operatorSeconds'] | Should -Be 181
         $result.evidence['failedDuringIncident'] | Should -BeTrue
+        $result.evidence['downgrade'] | Should -Be 'loadFailure'
         $result.evidence['incident']['scenario'] | Should -Be 'cpu-pressure'
         $result.docUrl | Should -Be $fail.docUrl
+    }
+
+    It 'tells a failure load causes from one it can''t (review of PR 16): <Expected> for <Text>' -ForEach @(
+        @{ Text = 'The runner (status --json --runs 5 --target T1) did not finish within 180 seconds and was stopped.'; Expected = $true }
+        @{ Text = 'The Run Command on sqlvm01 failed: ERROR: (Conflict) Another operation is in progress.'; Expected = $true }
+        @{ Text = 'Microsoft.Data.SqlClient.SqlException (0x80131904): Execution Timeout Expired. The timeout period elapsed prior to completion of the operation or the server is not responding.'; Expected = $true }
+        @{ Text = 'Lock request time out period exceeded.'; Expected = $true }
+        @{ Text = 'Transaction (Process ID 61) was deadlocked on lock resources with another process and has been chosen as the deadlock victim.'; Expected = $true }
+        @{ Text = 'Resource ID : 1. The request limit for the database is 30 and has been reached.'; Expected = $true }
+        @{ Text = 'Npgsql.PostgresException (0x80004005): 53300: sorry, too many clients already'; Expected = $true }
+        @{ Text = '57014: canceling statement due to statement timeout'; Expected = $true }
+        @{ Text = 'settings.json is missing; the bootstrap loader has not run on this VM.'; Expected = $false }
+        @{ Text = 'The workload runner is not installed on T1 yet.'; Expected = $false }
+        @{ Text = 'T1 has no T3 server in its workload settings.'; Expected = $false }
+        @{ Text = 'Login failed for user ''NT AUTHORITY\SYSTEM''. The request timed out.'; Expected = $false }
+        @{ Text = '28P01: password authentication failed for user "contosocare_runner"'; Expected = $false }
+        @{ Text = 'sqlvm01 isn''t running (deallocated), so Run Command can''t reach it; start it first (start-demo.ps1).'; Expected = $false }
+        @{ Text = 'sqlvm01 returned no workload result: no result line'; Expected = $false }
+        @{ Text = ''; Expected = $false }
+    ) {
+        InModuleScope DbHubDemo -Parameters @{ Text = $Text } { Test-DemoLoadFailureText -Text $Text } | Should -Be $Expected
+    }
+
+    It 'reads the profile the target runs from its status, and nothing it can''t be sure of (review of PR 16)' {
+        $now = [datetime]::new(2026, 11, 3, 14, 7, 0, [System.DateTimeKind]::Utc)
+        $cases = [ordered]@{
+            '{"target":"T2","profile":{"name":"business-day","expiresAt":"2026-11-03T18:58:00Z"},"runs":[]}' = 'business-day'
+            '{"target":"T2","profile":{"name":"business-day"},"runs":[]}'                                     = 'business-day'
+            '{"target":"T2","profile":{"name":"business-day","expiresAt":"2026-11-03T14:00:00Z"},"runs":[]}' = ''
+            '{"target":"T2","profile":{"name":"off"},"runs":[]}'                                              = ''
+            '{"target":"T2","profile":{"name":"baseline","expiresAt":"2026-11-03T18:58:00Z"},"runs":[]}'     = 'baseline'
+            '..."runs":[]},"host":{"status":"Fail"}}'                                                          = ''
+            ''                                                                                                 = ''
+        }
+        foreach ($stdout in $cases.Keys) {
+            InModuleScope DbHubDemo -Parameters @{ StdOut = $stdout; Now = $now } { Get-DemoRunnerActiveProfile -StdOut $StdOut -NowUtc $Now } | Should -Be $cases[$stdout] -Because $stdout
+        }
+    }
+
+    It 'keeps the reviewer''s faults a Fail during an incident, with business-day by default (review of PR 16)' {
+        # Reviewer: "settings.json is missing" came back as a Warning, and so did a host whose profile.name was off.
+        $busy = [datetime]::new(2026, 11, 3, 14, 7, 0, [System.DateTimeKind]::Utc)
+        $missing = New-DemoResult -CheckId 'WORKLOAD.T2.COMMAND' -Area 'workload' -Target 'T2' -Status 'Fail' -Message 'settings.json is missing; the bootstrap loader has not run on this VM.'
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Unset); Result = $missing; Now = $busy } { ConvertTo-DemoIncidentAwareResult -Result $Result -Config $Config -IncidentTarget 'T2' -ValidationArea 'Workload' -NowUtc $Now } | Should -Be $missing
+        $hostFail = New-DemoResult -CheckId 'WORKLOAD.T2.HOST' -Area 'workload' -Target 'T2' -Status 'Fail' -Message 'T2: the lane keeps failing.' -Evidence ([ordered]@{ processAlive = $true })
+        $off = '{"target":"T2","profile":{"name":"off"},"runs":[],"host":{"status":"Fail"}}'
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Unset); Result = $hostFail; Now = $busy; StdOut = $off } { ConvertTo-DemoIncidentAwareResult -Result $Result -Config $Config -IncidentTarget 'T2' -ValidationArea 'Workload' -Kind Host -RunnerStdOut $StdOut -NowUtc $Now } | Should -Be $hostFail
+
+        # The same lane on a VM that runs business-day is a Warning during the incident, and a Fail once it has cleared.
+        $running = '{"target":"T2","profile":{"name":"business-day","expiresAt":"2026-11-03T18:58:00Z"},"runs":[],"host":{"status":"Fail"}}'
+        $warning = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -ActivityProfile 'baseline'); Result = $hostFail; Now = $busy; StdOut = $running } { ConvertTo-DemoIncidentAwareResult -Result $Result -Config $Config -IncidentTarget 'T2' -ValidationArea 'Workload' -Kind Host -RunnerStdOut $StdOut -NowUtc $Now }
+        $warning.status | Should -Be 'Warning'
+        $warning.message | Should -Be 'T2: the lane keeps failing. T2 runs business-day, as its status says, and its cpu-pressure incident on T2 (14:05 to 14:13 UTC) can slow this lane, so it''s a Warning, not a Fail.'
+        $warning.evidence['processAlive'] | Should -BeTrue
+        $cleared = [datetime]::new(2026, 11, 3, 14, 17, 0, [System.DateTimeKind]::Utc)
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Result = $hostFail; Now = $cleared; StdOut = $running } { ConvertTo-DemoIncidentAwareResult -Result $Result -Config $Config -IncidentTarget 'T2' -ValidationArea 'Workload' -Kind Host -RunnerStdOut $StdOut -NowUtc $Now } | Should -Be $hostFail
+    }
+
+    It 'covers a third to most of each hour, which is why only load''s failures and the VM''s own profile count (review of PR 16)' {
+        # The incidents' windows plus 3 minutes: 33% of the hour on T1, 70% on T2, and, with T1's for the reads sqlvm01
+        # makes, 43% on T3 and 58% on T4 (docs/implementation-report.md, R609).
+        $day = [datetime]::new(2026, 11, 4, 0, 0, 0, [System.DateTimeKind]::Utc)
+        $share = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Day = $day } {
+            foreach ($set in @(@('T1'), @('T2'), @('T3', 'T1'), @('T4', 'T1'))) {
+                $hits = @(0..59 | Where-Object { $null -ne (Get-DemoScheduledIncident -Config $Config -Target $set -NowUtc $Day.AddMinutes($_)) }).Count
+                [int][System.Math]::Round(100.0 * $hits / 60)
+            }
+        }
+        $share | Should -Be @(33, 70, 43, 58)
     }
 
     It 'returns any other result as it is: a Fail outside an incident, and a Pass or Warning during one' {

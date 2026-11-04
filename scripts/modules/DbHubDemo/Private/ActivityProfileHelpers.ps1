@@ -919,8 +919,9 @@ function Get-DemoScheduledIncident {
     .DESCRIPTION
     The cycles are counted from UTC midnight, as the runner's ProfileScheduler counts them, so this cycle's slot and the
     previous cycle's, whose slack can reach into this one, are both checked. It reads only the schedule
-    (scenarios/activity-profiles.json); whether the profile is active on the VM isn't known here, so callers use it to
-    explain a read that failed, never to pass one.
+    (scenarios/activity-profiles.json). -ProfileName, the profile a VM's status says the target runs, replaces the
+    configured one; without it, whether the profile is active on the VM isn't known here, so callers use it only to
+    explain a read that failed the way load makes reads fail, never to pass one (ConvertTo-DemoIncidentAwareResult).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -935,10 +936,14 @@ function Get-DemoScheduledIncident {
         [datetime] $NowUtc = [System.DateTime]::UtcNow,
 
         [ValidateRange(0, 30)]
-        [int] $SlackMinutes = 3
+        [int] $SlackMinutes = 3,
+
+        [AllowEmptyString()]
+        [string] $ProfileName = ''
     )
 
-    if ((Get-DemoActivityProfile -Config $Config).Name -cne 'business-day') {
+    $name = if ($ProfileName) { $ProfileName } else { (Get-DemoActivityProfile -Config $Config).Name }
+    if ($name -cne 'business-day') {
         return $null
     }
     $now = $NowUtc.ToUniversalTime()
@@ -958,13 +963,88 @@ function Get-DemoScheduledIncident {
     return $found
 }
 
+function Test-DemoLoadFailureText {
+    <#
+    .SYNOPSIS
+    True when a failed read's text says load made it fail, the only failure one of business-day's incidents can cause
+    (review of PR 16, 2026-11-04): a Run Command, the runner, or the Azure CLI that didn't finish in time; Azure's 409
+    Conflict (another operation in progress); a SQL Server, Azure SQL, or PostgreSQL time-out, lock time-out, or deadlock;
+    or a resource or connection limit (Azure SQL 10928, 10936, 40501; PostgreSQL 53300). False for a fault no incident
+    causes, which wins when both appear: settings.json missing, no runner, a target that isn't set up, a refused login, a
+    missing server or database, or a VM that isn't running. False for any other text too, so an unknown failure stays a
+    Fail. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    $value = [string]$Text
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return $false
+    }
+    $fixed = '(?i)\bis missing\b|not installed|no workload runner|isn''t set up yet|no valid module file|bootstrap bundle|has no T[34] server|login failed|password authentication failed|\b28P01\b|\b28000\b|permission denied|access (is )?denied|AuthorizationFailed|not authori[sz]ed|\bForbidden\b|OperationNotAllowed|isn''t running|not running|deallocat|does not exist|doesn''t exist|could not be found|\bnot found\b|NotFound|cannot open (database|server)'
+    if ($value -match $fixed) {
+        return $false
+    }
+    $load = '(?i)did not finish within|didn''t finish within|\(409\)|\b409\b|\bConflict\b|AnotherOperationInProgress|another operation|operation (is )?(already )?in progress|already in progress|Execution Timeout Expired|Connection Timeout Expired|timeout period elapsed|wait operation timed out|\btimed out\b|lock request time ?out|\block timeout\b|statement timeout|\b57014\b|\b55P03\b|TimeoutException|Timeout during|\bdeadlock|request limit|session limit|resource limit|\b10928\b|\b10936\b|\b40501\b|service is currently busy|too many clients|\b53300\b|remaining connection slots|connection pool has been exhausted|server is not responding'
+    return ($value -match $load)
+}
+
+function Get-DemoRunnerActiveProfile {
+    <#
+    .SYNOPSIS
+    The activity profile the runner's 'status --json' output says its target runs (review of PR 16, 2026-11-04): the
+    profile node's name while its expiresAt is unset or after -NowUtc. '' when the profile is off or has expired, and when
+    the output has no whole document to read it from: a Run Command keeps only the last 4,096 bytes of output, and the
+    profile comes first. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $StdOut,
+
+        [datetime] $NowUtc = [System.DateTime]::UtcNow
+    )
+
+    $document = ConvertFrom-DemoRunnerDocument -StdOut $StdOut
+    $node = Get-DemoMemberValue -InputObject $document -Name 'profile'
+    if ($null -eq $node) {
+        return ''
+    }
+    $name = [string](Get-DemoMemberValue -InputObject $node -Name 'name')
+    if (-not $name -or $name -ceq 'off') {
+        return ''
+    }
+    $expires = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $node -Name 'expiresAt')
+    if ($null -ne $expires -and $expires -le $NowUtc.ToUniversalTime()) {
+        return ''
+    }
+    return $name
+}
+
 function ConvertTo-DemoIncidentAwareResult {
     <#
     .SYNOPSIS
-    validate.ps1 mustn't Fail just because an incident is running (2026-11-03): a Fail from a check that reads a target
-    through its own load (the runner's status, the T-SQL check of T3's extended property) becomes a Warning while one of
-    business-day's incidents is due on -IncidentTarget (Get-DemoScheduledIncident), with the incident in the message
-    and the evidence, and the time to check again in the remediation. Any other result is returned as it is. Internal.
+    validate.ps1 mustn't Fail just because an incident is running (2026-11-03), and mustn't hide a fault behind one
+    either (review of PR 16, 2026-11-04): a Fail from a check that reads a target through its own load becomes a Warning
+    only when an incident can explain it, with the incident in the message and the evidence, and the time to check again
+    in the remediation. Any other result is returned as it is. Internal.
+
+    .DESCRIPTION
+    - -Kind Read (WORKLOAD.<target>.COMMAND, and T3.PROPERTY when its T-SQL didn't run): the read failed the way load makes
+      reads fail (Test-DemoLoadFailureText: a time-out, a 409, a lock, or a resource limit), and the configured profile is
+      business-day with an incident due on -IncidentTarget (Get-DemoScheduledIncident). A failed read can't say which
+      profile the VM runs, so the schedule decides; settings.json missing, no runner, a refused login, and any failure it
+      doesn't know stay a Fail.
+    - -Kind Host (WORKLOAD.<target>.HOST): the status the host check read says the target runs business-day itself
+      (-RunnerStdOut, Get-DemoRunnerActiveProfile), whatever the configuration says, an incident is due, and the host's
+      process is alive: a profile host that ended is a fault no incident causes, and a VM on baseline or off runs none.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -983,30 +1063,59 @@ function ConvertTo-DemoIncidentAwareResult {
         [ValidateSet('T3', 'Workload')]
         [string] $ValidationArea,
 
+        [ValidateSet('Read', 'Host')]
+        [string] $Kind = 'Read',
+
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $RunnerStdOut = '',
+
         [datetime] $NowUtc = [System.DateTime]::UtcNow
     )
 
     if ([string]$Result.status -ne 'Fail') {
         return $Result
     }
-    $incident = Get-DemoScheduledIncident -Config $Config -Target $IncidentTarget -NowUtc $NowUtc
+    $sourceEvidence = if ($Result.evidence -is [System.Collections.IDictionary]) { $Result.evidence } else { @{} }
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Kind -eq 'Host') {
+        $running = Get-DemoRunnerActiveProfile -StdOut $RunnerStdOut -NowUtc $NowUtc
+        if ($running -cne 'business-day') {
+            return $Result
+        }
+        if ($sourceEvidence.Contains('processAlive') -and $sourceEvidence['processAlive'] -is [bool] -and -not $sourceEvidence['processAlive']) {
+            return $Result
+        }
+        $incident = Get-DemoScheduledIncident -Config $Config -Target $IncidentTarget -NowUtc $NowUtc -ProfileName $running
+    }
+    else {
+        $text = @([string]$Result.message) + @(if ($sourceEvidence.Contains('stderr')) { [string]$sourceEvidence['stderr'] })
+        if (-not (Test-DemoLoadFailureText -Text ($text -join "`n"))) {
+            return $Result
+        }
+        $incident = Get-DemoScheduledIncident -Config $Config -Target $IncidentTarget -NowUtc $NowUtc
+    }
     if ($null -eq $incident) {
         return $Result
     }
-    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $evidence = [ordered]@{}
-    if ($Result.evidence -is [System.Collections.IDictionary]) {
-        foreach ($key in $Result.evidence.Keys) {
-            $evidence[$key] = $Result.evidence[$key]
-        }
+    foreach ($key in $sourceEvidence.Keys) {
+        $evidence[$key] = $sourceEvidence[$key]
     }
     $evidence['incident'] = [ordered]@{ target = $incident.Target; scenario = $incident.Scenario; startUtc = $incident.StartUtc.ToString('o', $invariant); endUtc = $incident.EndUtc.ToString('o', $invariant) }
     $evidence['failedDuringIncident'] = $true
+    $evidence['downgrade'] = if ($Kind -eq 'Host') { 'profileOnVm' } else { 'loadFailure' }
     $base = ([string]$Result.message).TrimEnd()
     if ($base -notmatch '[.!?]$') {
         $base += '.'
     }
-    $message = '{0} It ran during business-day''s {1} incident on {2} ({3} to {4} UTC), whose load can slow or refuse this read, so it''s a Warning, not a Fail.' -f $base, $incident.Scenario, $incident.Target, $incident.StartUtc.ToString('HH:mm', $invariant), $incident.EndUtc.ToString('HH:mm', $invariant)
+    $window = '{0} to {1} UTC' -f $incident.StartUtc.ToString('HH:mm', $invariant), $incident.EndUtc.ToString('HH:mm', $invariant)
+    $message = if ($Kind -eq 'Host') {
+        '{0} {1} runs business-day, as its status says, and its {2} incident on {3} ({4}) can slow this lane, so it''s a Warning, not a Fail.' -f $base, $Result.target, $incident.Scenario, $incident.Target, $window
+    }
+    else {
+        '{0} It failed the way load makes a read fail (a time-out or a busy VM) during business-day''s {1} incident on {2} ({3}), so it''s a Warning, not a Fail.' -f $base, $incident.Scenario, $incident.Target, $window
+    }
     $targetOption = if ([string]$Result.target -in 'T1', 'T2', 'T3', 'T4') { ' -Target {0}' -f $Result.target } else { '' }
     $remediation = 'Run ./scripts/validate.ps1 -Area {0}{1} again after {2} UTC, once the incident has ended; a Fail then is a fault.' -f $ValidationArea, $targetOption, $incident.ClearUtc.ToString('HH:mm', $invariant)
     if ([string]$Result.remediation) {
