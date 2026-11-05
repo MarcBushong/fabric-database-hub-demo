@@ -201,11 +201,11 @@ function Remove-DemoEnvironment {
     # A PaygWizard install holds the setup-wizard step, which no script can redo: keep it in a golden snapshot first.
     $goldenGroup = Get-DemoGoldenResourceGroupName -Config $Config
     $goldenDoc = 'https://learn.microsoft.com/azure/virtual-machines/disks-incremental-snapshots'
-    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     if ($groupExists -and $installMode -eq 'PaygWizard' -and (Get-DemoHostVmName -Config $Config) -eq 'archost01') {
         $hostRead = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'show', '--resource-group', $resourceGroupName, '--name', 'archost01', '--query', 'name', '--output', 'tsv') -AllowFailure
         if ($hostRead.ExitCode -eq 0 -and ([string]$hostRead.StdOut).Trim()) {
-            $kept = @(Get-DemoT2GoldenSnapshot -Config $Config -NowUtc $NowUtc | Where-Object { $null -ne $_.BootVerifiedUtc -and $null -ne $_.EvalDaysLeft -and $_.EvalDaysLeft -ge 1 })
+            $kept = @(Get-DemoT2GoldenSnapshot -Config $Config -NowUtc $NowUtc | Where-Object { $null -ne $_.BootVerifiedUtc -and (Test-DemoGoldenEvaluationOk -Snapshot $_) })
             if ($kept.Count -gt 0 -and -not $IncludeGolden) {
                 $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN.GUARD' -Area 'teardown' -Target 'T2' -Status 'Pass' -Message ('archost01 holds a PaygWizard install, and the boot-verified golden snapshot {0} in {1} keeps it; the next deploy restores from it.' -f $kept[0].Name, $goldenGroup) -Evidence ([ordered]@{ snapshot = $kept[0].Name; bootVerifiedUtc = $kept[0].BootVerifiedUtc; evalDaysLeft = $kept[0].EvalDaysLeft }) -DocUrl $goldenDoc))
             }

@@ -36,13 +36,14 @@ flowchart LR
     subgraph VNET["VNet 10.42.0.0/24, no VM public IPs"]
       T1["T1 sqlvm01: SQL Server 2022 Std PAYG, SQL IaaS Agent ext, system MI, runner for T1 and T3"]
       subgraph HOST["archost01: Hyper-V host, NAT 192.168.200.0/24, DNS forwarder"]
-        T2["T2 arcsql01: WS2022 eval guest, SQL Server 2022 Std, Arc agent and SQL ext, runner"]
+        T2["T2 arcsql01: WS2022 guest from Arc Jumpstart's image by default, SQL Server 2022 Std, Arc agent and SQL ext, runner"]
       end
       BAS["Bastion Basic (on demand only)"]
     end
     T3["T3 azuresql01: Azure SQL Database, GP serverless, Entra-only"]
     ARC["Arc projection: machine and sqlServerInstance"]
   end
+  JS["Arc Jumpstart public storage: the prebuilt SQL Server guest image"]
   subgraph MS["Microsoft-managed previews"]
     TEL["SQL telemetry pipeline and REST endpoint"]
     HUB["Fabric Database Hub and Database Agent"]
@@ -58,6 +59,7 @@ flowchart LR
   UAMI -->|"Contributor"| RG
   CLI -.->|"bundle in Run Command chunks"| T1
   CLI -.->|"bundle in Run Command chunks"| HOST
+  JS -.->|"HTTPS download, checked against its Content-MD5"| HOST
   T1 -->|"service or private endpoint"| T3
   T1 -->|"HTTPS 443"| TEL
   T2 -->|"HTTPS 443 through host NAT"| TEL
@@ -83,12 +85,12 @@ Every value is a parameter. Profiles (`lowest-cost`, `demo-day`, `enhanced-perfo
 | Resource groups | `rg-dbhub-demo`, plus `rg-dbhub-control` only for the GitHub path | [ADR 0002](adr/0002-resource-group-topology.md) |
 | Network | VNet `10.42.0.0/24`: `snet-sqlvm`, `snet-archost`, `snet-pe` (private mode), `AzureBastionSubnet` | No VM public IPs. [ADR 0007](adr/0007-networking-modes-and-egress.md) |
 | T1 `sqlvm01` | `Standard_D2s_v5` (`lowest-cost`), `MicrosoftSQLServer:sql2022-ws2022:standard-gen2`, OS disk (plus a data disk outside `lowest-cost`), system-assigned identity, SQL connectivity `LOCAL` | `Microsoft.SqlVirtualMachine/sqlVirtualMachines` with license type PAYG. Runs the workload runner for T1 and T3. |
-| T2 host `archost01` | `Standard_E2s_v5` (`lowest-cost`), Windows Server 2022 Datacenter Gen2, `securityType = Standard`; in `lowest-cost` the guest's VHDX and media use the 128 GiB OS disk, and the other profiles add a 128 GiB data disk | No Arc agent and no SQL IaaS extension. [ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md) |
-| T2 guest `arcsql01` | Generation 2, 2 vCPU, 8 GiB static memory, 64 GB dynamic VHDX, Windows Server 2022 Datacenter Evaluation (Desktop Experience) | IMDS and wire server blocked; automatic start and shutdown. [ADR 0004](adr/0004-guest-imds-isolation.md), [ADR 0006](adr/0006-sql-editions-and-licensing.md) |
+| T2 host `archost01` | `Standard_E2s_v5` (`lowest-cost`), Windows Server 2022 Datacenter Gen2, `securityType = Standard`; in `lowest-cost` the guest's VHDX (and, in the build modes, its media) use the 128 GiB OS disk, and the other profiles add a 128 GiB data disk | No Arc agent and no SQL IaaS extension. [ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md) |
+| T2 guest `arcsql01` | Generation 2, 2 vCPU, 8 GiB static memory. By default (`JumpstartImage`, since 2026-11-05) Arc Jumpstart ArcBox's prebuilt guest disk: a dynamic VHDX with a 100 GiB maximum (34 GiB to download), Windows Server 2022 Standard (not an evaluation), and SQL Server 2022 Standard. In the build modes (`PaygWizard`, `ProductKey`, `Developer`): a 64 GB dynamic VHDX, Windows Server 2022 Datacenter Evaluation (Desktop Experience) | IMDS and wire server blocked; automatic start and shutdown. [ADR 0004](adr/0004-guest-imds-isolation.md), [ADR 0006](adr/0006-sql-editions-and-licensing.md) |
 | T3 `azuresql01` | Logical server `azuresql01-<deploymentId>`, database `ContosoCare`, GP serverless Gen5, 0.5–1 vCore, auto-pause 15 minutes, 32 GB maximum size | Entra-only with the P6 group as admin; TLS 1.2 |
 | Budget | `monthlyCeilingUsd` (250, the hard monthly ceiling), alerts at 50%, 80%, and 100% to `ownerEmail` | Resource-group scope |
 | Auto-shutdown | DevTest Labs schedules for T1 and the host | The host's guest shuts down cleanly through its stop action |
-| Bastion | Basic SKU with a Standard public IP, created and removed on demand | Removed automatically after `bastionMaxHours` |
+| Bastion | Basic SKU with a Standard public IP, created and removed on demand | Optional: no deployment needs it except the opt-in `PaygWizard` guided stop. Removed automatically after `bastionMaxHours` |
 | Key Vault, Log Analytics, storage accounts | Not deployed | Hub telemetry is Microsoft-managed. The artifact cache storage account was dropped on 2026-10-20 ([ADR 0016](adr/0016-cost-profiles.md), C9). Key Vault is an opt-in since Phase 13 (`keyVault.enabled`, which requires `assignRoles`): an RBAC-mode vault `kv-<prefix><environment>-<deploymentId>`, created on demand like Bastion, for the one-time host password ([ADR 0009](adr/0009-secrets-handling.md)). |
 
 ## Naming and tags
@@ -114,9 +116,9 @@ One orchestrator, two triggers: `scripts/deploy.ps1` (Cloud Shell or local Power
 ```mermaid
 flowchart TD
   S1["1 Preflight: P1-P6, region, sizes, quota, policy inventory, policy what-if, cost vs ceilings"] --> S2["2 Infrastructure: subscription-scope Bicep"]
-  S2 --> S3["3 Artifacts: bundle in Run Command chunks, media direct from Microsoft"]
+  S2 --> S3["3 Artifacts: bundle in Run Command chunks; the T2 host downloads its guest image or media itself"]
   S3 --> S4A["4a T1 bootstrap: SQL config, seed, runner"]
-  S3 --> S4B["4b T2 host state machine: Hyper-V, NAT, guest build, SQL install"]
+  S3 --> S4B["4b T2 host state machine: Hyper-V, NAT, the guest from Arc Jumpstart's image by default or built from media, SQL Server"]
   S4A --> S4C["4c P6 membership, then T3 configured from T1"]
   S4C --> S5["5 Post-configuration"]
   S4B --> S5
@@ -130,16 +132,17 @@ flowchart TD
   - Onboards T2 to Arc with the caller's token ([ADR 0005](adr/0005-arc-onboarding-authentication.md)).
   - Verifies the Arc SQL instance (Standard edition, license type, monitoring enabled).
   - Starts the `baseline` activity profile.
-- **`PaygWizard` mode (default):** the orchestrator reports **Manual action required** with the wizard steps and an on-demand Bastion link, and keeps polling for up to `-WaitForManualMinutes`. The guest state machine resumes on its own once it detects the instance; `deploy.ps1 -Resume` finishes the Azure-side steps if the wait ran out.
+- **`JumpstartImage` mode (default since 2026-11-05):** no step needs a person. The T2 host downloads Arc Jumpstart ArcBox's prebuilt SQL Server 2022 Standard guest disk, makes it `arcsql01` at its first boot while it has no network, checks it, and stage 5 onboards it as in the other modes. Nothing switches to another mode by itself: an image that can't be used ends T2 **NOT DONE** with the fix ([ADR 0006](adr/0006-sql-editions-and-licensing.md)).
+- **`PaygWizard` mode (opt-in):** the orchestrator reports **Manual action required** with the wizard steps and an on-demand Bastion link, and keeps polling for up to `-WaitForManualMinutes`. The guest state machine resumes on its own once it detects the instance; `deploy.ps1 -Resume` finishes the Azure-side steps if the wait ran out.
 - **Deploy to Azure button:** secondary. It runs stage 2 (infrastructure only), then links to `deploy.ps1 -Resume`, which sends the bootstrap bundle in Run Command chunks, starts the VM bootstraps (stages 3 and 4), and finishes the steps ARM can't do. It works only once the repo is public ([ADR 0001](adr/0001-iac-bicep-avm-compiled-arm.md), [ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md#phase-6-implementation-notes-2026-10-19)).
 - **Bootstrap delivery (stages 3 and 4):** `deploy.ps1` deploys the VMs, sends each one the bundle with `Send-DemoBootstrapBundle` (SHA-256-checked chunks, one Run Command at a time, each deleted after it succeeds), deploys again with the bundle's SHA-256 and chunk count to add the loader Run Command, and reports the loader's exit code with `Wait-DemoBootstrapLoader` ([ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md#phase-6-implementation-notes-2026-10-19)).
-- **Expected first-deploy time (estimate, measured in Phase 6 once live runs are approved):** about 15 minutes of infrastructure, a few minutes to send the bundle, 60–90 minutes for the T2 build (including about 6.2 GB of media downloads), and 3–15 minutes of telemetry latency. About 1.5–2 hours end to end, plus the manual wizard step in `PaygWizard` mode.
-- **Parallel tracks and the T2 golden snapshot (Phase 20, [ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)):** `deploy.ps1` now runs stages 1–2 in one process, then three tracks at once in their own processes: T1 with T3 (the artifacts, T1's bootstrap with `deploy.ps1` running the loader itself, T3 from T1, the profiles, monitoring, telemetry), T2, and Fabric (the notebooks, the dashboard, and the history report); `-Sequential` keeps the stages above. A new `archost01` is restored from a golden snapshot of a finished host in `rg-<prefix>-golden` when one is boot-verified (`t2Source auto`), which keeps the pay-as-you-go wizard step: its OS disk is copied from the snapshot, the guest boots air-gapped, its Arc identity is reset locally, both passwords are rotated, and Arc is onboarded fresh. Measured on 2026-10-22: **38.8 minutes** end to end for a redeploy (T1 and T3 ready at +36.3 minutes, T2 at +37.7, Fabric about 2.4 minutes); the 30-minute target wasn't met. Phase 22 built the remaining overlaps: the tracks start before the template, a golden T2 starts as soon as `archost01` is deployed, with its artifacts sent during the Release, T1's artifacts go in one wave with its monitoring merged during the bootstrap, and T3 is set up first ([deployment](deployment.md#faster-redeploy-phase-22)).
-- **One command, one guided stop (Phase 28, [ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md#amendments-2026-10-29-phase-28-one-command-one-guided-stop)):** `deploy.ps1` after `az login` is the whole deployment. With no configuration it runs the first run itself; it keeps the PC awake, writes a progress model and a self-refreshing local status page (`status.ps1 -Watch` shows the same), waits for T2 by default, and in `PaygWizard` mode stops once for a person: Bastion, the host password (clipboard, Key Vault, or the portal's **Reset password**), the guest's one automatic sign-in, and SQL Server setup pre-filled from a configuration file, so the person chooses pay-as-you-go and Standard and signs in to Azure; the host checks the result, and the T2 track finishes by itself. With `networkMode` `private` the policy inventory runs beside the deployment; T4 falls back from B1ms to B2s, or to no T4, when its size isn't set; chunk Run Command deletes aren't waited for, extensions settle first, and a watchdog restarts a stuck VM once. Every run ends **DONE** (Database Hub shows every target; what only a person can confirm, such as a tenant setting the run couldn't read, is listed under **Please confirm** and never blocks it) or **NOT DONE** (the exact next command), and a plain rerun continues where it stopped, starting VMs that were stopped, for example by the nightly auto-shutdown, and checking T1's monitoring plugin, which can stop after a restart. Without a golden snapshot, a first run takes about 2 to 3 hours (an estimate), with a person needed for about 10 minutes, about 60 to 90 minutes in. In the state machine below, the `ManualWizard` state is preceded by a `GuidedSetup` step that prepares the pre-filled setup and the logon tasks ([deployment](deployment.md#one-command-one-guided-stop-phase-28)).
+- **Expected first-deploy time (estimate, measured in Phase 6 once live runs are approved):** about 15 minutes of infrastructure, a few minutes to send the bundle, 60–90 minutes for the T2 build (including about 6.2 GB of media downloads), and 3–15 minutes of telemetry latency. About 1.5–2 hours end to end, plus the manual wizard step in `PaygWizard` mode. In the default `JumpstartImage` mode (since 2026-11-05), the T2 host's setup, the image's download, and its first boot take about 30 to 60 minutes (the download and first boot about 20 to 40), and a first deployment about 1 to 2 hours; all are estimates, not measured yet.
+- **Parallel tracks and the T2 golden snapshot (Phase 20, [ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)):** `deploy.ps1` now runs stages 1–2 in one process, then three tracks at once in their own processes: T1 with T3 (the artifacts, T1's bootstrap with `deploy.ps1` running the loader itself, T3 from T1, the profiles, monitoring, telemetry), T2, and Fabric (the notebooks, the dashboard, and the history report); `-Sequential` keeps the stages above. A new `archost01` is restored from a golden snapshot of a finished host in `rg-<prefix>-golden` when one is boot-verified (`t2Source auto`), which keeps the pay-as-you-go wizard step: its OS disk is copied from the snapshot, the guest boots air-gapped, its Arc identity is reset locally, both passwords are rotated, and Arc is onboarded fresh. Since 2026-11-05 the snapshot is optional in the default `JumpstartImage` mode, where it only saves the image's download and first boot. Measured on 2026-10-22, with a `PaygWizard` guest, before `JumpstartImage`: **38.8 minutes** end to end for a redeploy (T1 and T3 ready at +36.3 minutes, T2 at +37.7, Fabric about 2.4 minutes); the 30-minute target wasn't met. Phase 22 built the remaining overlaps: the tracks start before the template, a golden T2 starts as soon as `archost01` is deployed, with its artifacts sent during the Release, T1's artifacts go in one wave with its monitoring merged during the bootstrap, and T3 is set up first ([deployment](deployment.md#faster-redeploy-phase-22)).
+- **One command, one guided stop (Phase 28, [ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md#amendments-2026-10-29-phase-28-one-command-one-guided-stop)):** `deploy.ps1` after `az login` is the whole deployment. With no configuration it runs the first run itself; it keeps the PC awake, writes a progress model and a self-refreshing local status page (`status.ps1 -Watch` shows the same), waits for T2 by default, and in `PaygWizard` mode stops once for a person: Bastion, the host password (clipboard, Key Vault, or the portal's **Reset password**), the guest's one automatic sign-in, and SQL Server setup pre-filled from a configuration file, so the person chooses pay-as-you-go and Standard and signs in to Azure; the host checks the result, and the T2 track finishes by itself. With `networkMode` `private` the policy inventory runs beside the deployment; T4 falls back from B1ms to B2s, or to no T4, when its size isn't set; chunk Run Command deletes aren't waited for, extensions settle first, and a watchdog restarts a stuck VM once. Every run ends **DONE** (Database Hub shows every target; what only a person can confirm, such as a tenant setting the run couldn't read, is listed under **Please confirm** and never blocks it) or **NOT DONE** (the exact next command), and a plain rerun continues where it stopped, starting VMs that were stopped, for example by the nightly auto-shutdown, and checking T1's monitoring plugin, which can stop after a restart. Without a golden snapshot, a first `PaygWizard` run takes about 2 to 3 hours (an estimate), with a person needed for about 10 minutes, about 60 to 90 minutes in; the default `JumpstartImage` mode (since 2026-11-05) has no guided stop and needs no Bastion to deploy. In the state machine below, the `ManualWizard` state is preceded by a `GuidedSetup` step that prepares the pre-filled setup and the logon tasks ([deployment](deployment.md#one-command-one-guided-stop-phase-28)).
 
 ### T2 host state machine
 
-The host runs a resumable state machine as a SYSTEM scheduled task. State is kept in `C:\ProgramData\DbHubDemo\state.json` ([ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md)).
+The host runs a resumable state machine as a SYSTEM scheduled task. State is kept in `C:\ProgramData\DbHubDemo\state.json` ([ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md)). Since 2026-11-05 the default `JumpstartImage` mode takes the image path: `GuestSource` records where the guest comes from and refuses a mode that an existing guest wasn't made for, `GuestImage` downloads and verifies Jumpstart's image, `GuestFirstBoot` makes it `arcsql01` while its network adapter isn't connected, and `JumpstartImageCheck` checks it before Arc onboarding ([ADR 0006](adr/0006-sql-editions-and-licensing.md)). The build modes take the media path.
 
 ```mermaid
 stateDiagram-v2
@@ -147,12 +150,20 @@ stateDiagram-v2
   CheckNested --> InstallHyperV: capable
   CheckNested --> Failed: not capable
   InstallHyperV --> NetworkAndDns: after reboot
-  NetworkAndDns --> DataDisk
-  DataDisk --> GuestMedia
+  NetworkAndDns --> GuestSource
+  GuestSource --> DataDisk
+  DataDisk --> GuestImage: JumpstartImage, the default
+  DataDisk --> GuestMedia: PaygWizard, ProductKey, or Developer
+  GuestImage --> CreateGuest: Content-MD5 and length verified
   GuestMedia --> BuildVhdx: SHA-256 verified
   BuildVhdx --> CreateGuest
-  CreateGuest --> HardenGuest
-  HardenGuest --> SqlMedia
+  CreateGuest --> FirstBoot: JumpstartImage, no network
+  CreateGuest --> HardenGuest: build modes
+  FirstBoot --> HardenGuest: password replaced, renamed, then connected
+  HardenGuest --> ImageCheck: JumpstartImage
+  HardenGuest --> SqlMedia: build modes
+  ImageCheck --> WaitArc: SQL Server 2022 Standard
+  ImageCheck --> Failed: image not usable
   SqlMedia --> UnattendedInstall: ProductKey or Developer
   SqlMedia --> WaitArcFirst: PaygWizard
   UnattendedInstall --> WaitArc
@@ -178,6 +189,7 @@ stateDiagram-v2
   - Allowed: TCP 443, and TCP 1688 to the two documented Azure KMS addresses. T1 also gets TCP 1433 and 11000–11999 to `Sql.<region>` for T3 in public mode. DNS, IMDS, and Windows licensing are platform traffic that NSGs allow by default; their service tags can only deny ([ADR 0007](adr/0007-networking-modes-and-egress.md)).
   - Everything else to the internet is denied.
   - NSGs can't restrict HTTPS by FQDN; this gap is documented.
+  - In the default T2 mode, `JumpstartImage`, the T2 host also downloads from Arc Jumpstart's public storage (`jumpstartprodsg.blob.core.windows.net`) and from GitHub (`raw.githubusercontent.com`), over the TCP 443 that's already allowed ([outbound access](prerequisites.md#outbound-access)).
 - **Modes:** `public` (T3 reachable only through a VNet rule from `snet-sqlvm`) or `private` (T3 private endpoint plus the `privatelink.database.windows.net` zone). The default, `auto`, is resolved by preflight from Azure Policy: `private` when a policy turns off public network access on SQL servers, otherwise `public` ([ADR 0007](adr/0007-networking-modes-and-egress.md)).
 - **Outbound path:** `outboundMode`. `DefaultOutboundAccess` is the default: the VM subnets set `defaultOutboundAccess: true` explicitly, because subnets are now private by default. `NatGateway` adds a NAT gateway and public IP at extra cost ([ADR 0017](adr/0017-outbound-access.md)).
 - **Lateral movement:** the VM and private-endpoint subnets also deny outbound RDP and SSH into the VNet.
@@ -192,6 +204,7 @@ Full rules: [ADR 0007](adr/0007-networking-modes-and-egress.md).
 - **No stored secrets:**
   - VM passwords are used only at creation; break-glass is a VMAccess reset.
   - The guest password stays on the host under DPAPI.
+  - In `JumpstartImage` mode, the image's published default credential is read at run time from Jumpstart's pinned script, used once while the guest has no network, and replaced with a random guest password kept the same way ([security model](security-model.md#the-jumpstart-image-jumpstartimage-mode-2026-11-05)).
   - The Arc token lives in memory only.
   - Details: [ADR 0009](adr/0009-secrets-handling.md).
 - **Threat model:** [security model](security-model.md). The T2 host is a trust boundary for the guest.
@@ -240,8 +253,8 @@ Discovery, monitoring, agents, and mirroring are separate concerns.
 |---|---|
 | `start-demo.ps1` | Starts T1 and the T2 host (the guest auto-starts), warms up T3, and sets an activity profile. `-Interactive` creates Bastion; `-ResetAdminPassword` adds a break-glass reset. |
 | `stop-demo.ps1` | Stops the profile, shuts the guest down, deallocates the host and T1, lets T3 auto-pause, and removes Bastion. `-ParkT2` stops only T2. |
-| `reset-demo.ps1` | Stops scenarios, verifies no demo transaction is open, and restores the seed state without redeploying. `-RebuildGuest` reports **Not supported**: rebuild T2 before its evaluation OS expires with `destroy.ps1`, then `deploy.ps1` (R196). |
-| `status.ps1` | Health per target, active profile, evaluation-OS days left, Arc days disconnected, Bastion presence, month-to-date cost, next auto-shutdown |
+| `reset-demo.ps1` | Stops scenarios, verifies no demo transaction is open, and restores the seed state without redeploying. `-RebuildGuest` reports **Not supported**: rebuild T2 with `destroy.ps1`, then `deploy.ps1` (R196), for example when a build mode's evaluation OS has no rearm left (the default `JumpstartImage` guest isn't an evaluation). |
+| `status.ps1` | Health per target, active profile, evaluation-OS days left (the build modes), T2's free disk space and Jumpstart image (`STATUS.T2.DISKSPACE`, `STATUS.T2.IMAGE`), Arc days disconnected, Bastion presence, month-to-date cost, next auto-shutdown |
 | `validate.ps1` | The validation catalog ([ADR 0012](adr/0012-validation-model.md)) |
 | `estimate-cost.ps1` | Live-price estimates per profile against the ceilings |
 | `destroy.ps1` | Deletes Arc resources explicitly, then the resource group and the subscription deployment record, then checks for residual resources, Arc and identities included ([ADR 0002](adr/0002-resource-group-topology.md), [cleanup](cleanup.md)) |
@@ -412,6 +425,7 @@ These engineering refinements were made while writing the ADRs. None of them cha
 | 26 | Two more scenarios, `resource-governance` and `log-rate-pressure`, for the T3 incidents; every scenario runs on every target | Plan §9.3 lists them for T3, and Database Agent target coverage is undocumented (Phase 11) | 0010, 0013 |
 | 27 | `deploy.ps1` runs three tracks in parallel and restores a new T2 host from a golden snapshot; a third resource group, `rg-<prefix>-golden`, holds the snapshots and outlives `destroy.ps1` unless `-IncludeGolden` | User-directed, 2026-10-21: a repeatable deploy of 30 minutes or less that keeps the pay-as-you-go wizard state; measured at 38.8 minutes (Phase 20) | 0002, 0003, 0018 |
 | 28 | Eight more scenarios, one per wait family: a deep blocking chain with lock escalation, a deadlock storm, tempdb contention, memory grants, parallelism, log flushes, a slow client, and a target at full capacity; `tempdb-contention`'s own temporary tables are the one write outside `ContosoCare` | User-directed, 2026-10-23: diverse, bounded activity for the Performance page and the Database Agent; every scenario keeps a hard maximum duration, runs on every target, and touches only `ContosoCare.Demo/` sessions (Phase 25b) | 0010, 0013 |
+| 29 | T2's default install mode is `JumpstartImage`: the guest is Arc Jumpstart ArcBox's prebuilt SQL Server 2022 Standard image, made `arcsql01` at its first boot with no network; `PaygWizard`, `ProductKey`, and `Developer` are opt-in, with no automatic fallback between modes, and the golden snapshot is an optional speed-up | User-directed, 2026-11-05: a one-click deployment that works with no person, for public users in their own subscriptions, reusing Arc Jumpstart's process and prebuilt images | 0006, 0018 |
 
 ## Sources (checked 2026-10-19)
 

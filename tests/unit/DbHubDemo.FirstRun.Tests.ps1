@@ -138,7 +138,7 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
         $config['ownerEmail'] | Should -Be 'colleague@contoso.example'
         $config['owner'] | Should -Be 'colleague'
         $config['t3AdminGroupObjectId'] | Should -Be $script:groupId
-        $config['t2SqlInstallMode'] | Should -Be 'PaygWizard'
+        $config['t2SqlInstallMode'] | Should -Be 'JumpstartImage' -Because 'the default since 2026-11-05: no person is needed for T2'
         $config['autoShutdownTimeZone'] | Should -Be 'Eastern Standard Time'
         $config['fabric']['workspaceName'] | Should -Be 'Database Hub Demo'
         $config['fabric']['lakehouseName'] | Should -Be 'LH_DatabaseHub'
@@ -198,7 +198,7 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
         $script:init.Interactive = $true
         $script:init.Profile = [pscustomobject]@{ Installed = $true; SignedIn = $true; Error = ''; Subscriptions = @((New-ProfileEntry $script:subA 'Contoso Demo' $true), (New-ProfileEntry $script:subB 'Contoso Lab')) }
         $script:init.Capacities = @((New-FabricItem 'sharedcap' 'Inactive'), (New-FabricItem 'mycap'))
-        foreach ($answer in 1, 1, 1) {
+        foreach ($answer in 1, 1, 2) {
             $script:init.Choices.Enqueue($answer)
         }
         $init = Initialize-DemoConfig -Path $script:path -CreateAdminGroup -BackupDirectory $script:backup -Confirm:$false
@@ -206,9 +206,10 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
         $config = Get-DemoConfig -Path $script:path
         $config['subscriptionId'] | Should -Be $script:subB
         $config['fabric']['capacityName'] | Should -Be 'mycap'
-        $config['t2SqlInstallMode'] | Should -Be 'Developer'
+        $config['t2SqlInstallMode'] | Should -Be 'Developer' -Because 'the third choice, after JumpstartImage (the default) and PaygWizard'
         (Get-InitResult $init 'INIT.FABRIC.CAPACITY').status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Read-DemoChoice -Times 1 -Exactly -ParameterFilter { $Title -like '*capacity*' -and $Default -eq 1 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Read-DemoChoice -Times 1 -Exactly -ParameterFilter { $Title -like '*T2*' -and $Default -eq 0 -and $Option.Count -eq 3 -and $Option[0] -like 'JumpstartImage*' }
     }
 
     It 'never guesses without asking: several subscriptions with -NonInteractive are Manual action required, and nothing is written' {

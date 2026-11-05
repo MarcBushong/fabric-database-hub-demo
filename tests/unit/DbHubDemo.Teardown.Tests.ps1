@@ -588,7 +588,7 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
     It 'reads the manifest first, deletes the group, then the deployment record, then checks for residue' {
         $manifestPath = Join-Path -Path $TestDrive -ChildPath 'out/destroy-manifest.json'
         $results = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
-        $script:order | Should -Be @('vm show --resource-group', 'Manifest', 'group delete --name', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123')
+        $script:order | Should -Be @('Manifest', 'group delete --name', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.DEPLOYMENT' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.BUDGET' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }).status | Should -Be 'Pass'
@@ -936,10 +936,13 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
     It 'deletes nothing when a PaygWizard host has no boot-verified golden snapshot (ADR 0018)' {
         $script:hostName = 'archost01'
         $script:goldenSnapshots = @([pscustomobject]@{ Name = 'snap-dbhub-t2golden-202601010000'; BootVerifiedUtc = $null; EvalDaysLeft = 100 })
-        $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
+        $wizard = New-TestConfig
+        $wizard['t2SqlInstallMode'] = 'PaygWizard'
+        $results = @(Remove-DemoEnvironment -Config $wizard -Confirm:$false)
         $guard = $results | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN.GUARD' }
         $guard.status | Should -Be 'Fail'
         $guard.remediation | Should -Match '-WithoutGolden'
+        $script:order | Should -Contain 'vm show --resource-group'
         $script:order | Should -Not -Contain 'group delete --name'
         $script:order | Should -Not -Contain 'Manifest'
         Get-DemoExitCode -Result $results | Should -Be 1
@@ -949,7 +952,9 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         $script:hostName = 'archost01'
         $script:goldenGroupExists = $true
         $script:goldenSnapshots = @([pscustomobject]@{ Name = 'snap-dbhub-t2golden-202601010000'; BootVerifiedUtc = [datetime]'2026-01-01'; EvalDaysLeft = 100 })
-        $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
+        $wizard = New-TestConfig
+        $wizard['t2SqlInstallMode'] = 'PaygWizard'
+        $results = @(Remove-DemoEnvironment -Config $wizard -Confirm:$false)
         ($results | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN.GUARD' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
         $golden = $results | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN' }
@@ -961,21 +966,25 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
     It 'treats a snapshot whose guest evaluation is over as no golden snapshot' {
         $script:hostName = 'archost01'
         $script:goldenSnapshots = @([pscustomobject]@{ Name = 'snap-dbhub-t2golden-202601010000'; BootVerifiedUtc = [datetime]'2026-01-01'; EvalDaysLeft = 0 })
-        ($(Remove-DemoEnvironment -Config $config -Confirm:$false) | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN.GUARD' }).status | Should -Be 'Fail'
+        $wizard = New-TestConfig
+        $wizard['t2SqlInstallMode'] = 'PaygWizard'
+        ($(Remove-DemoEnvironment -Config $wizard -Confirm:$false) | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN.GUARD' }).status | Should -Be 'Fail'
     }
 
     It 'accepts losing the wizard state with -WithoutGolden, as a Warning' {
         $script:hostName = 'archost01'
-        $results = @(Remove-DemoEnvironment -Config $config -WithoutGolden -Confirm:$false)
+        $wizard = New-TestConfig
+        $wizard['t2SqlInstallMode'] = 'PaygWizard'
+        $results = @(Remove-DemoEnvironment -Config $wizard -WithoutGolden -Confirm:$false)
         ($results | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN.GUARD' }).status | Should -Be 'Warning'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
     }
 
-    It 'skips the guard when the environment has no PaygWizard install' {
+    It 'skips the guard when the environment has no PaygWizard install (<_>)' -ForEach @('JumpstartImage', 'Developer') {
         $script:hostName = 'archost01'
-        $developer = New-TestConfig
-        $developer['t2SqlInstallMode'] = 'Developer'
-        $results = @(Remove-DemoEnvironment -Config $developer -Confirm:$false)
+        $other = New-TestConfig
+        $other['t2SqlInstallMode'] = $_
+        $results = @(Remove-DemoEnvironment -Config $other -Confirm:$false)
         $results | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN.GUARD' } | Should -BeNullOrEmpty
         $script:order | Should -Not -Contain 'vm show --resource-group'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
@@ -985,7 +994,9 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         $script:hostName = 'archost01'
         $script:goldenGroupExists = $true
         $script:goldenSnapshots = @([pscustomobject]@{ Name = 'snap-dbhub-t2golden-202601010000'; BootVerifiedUtc = [datetime]'2026-01-01'; EvalDaysLeft = 100 })
-        $results = @(Remove-DemoEnvironment -Config $config -IncludeGolden -Confirm:$false)
+        $wizard = New-TestConfig
+        $wizard['t2SqlInstallMode'] = 'PaygWizard'
+        $results = @(Remove-DemoEnvironment -Config $wizard -IncludeGolden -Confirm:$false)
         ($results | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN.GUARD' }).status | Should -Be 'Warning'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.GOLDEN' }).status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match '^group delete --name rg-dbhub-golden --yes' }

@@ -67,7 +67,9 @@ function Get-DemoHostOsDiskRequirement {
     <#
     .SYNOPSIS
     Bytes the guest needs on the OS disk without a data disk: the VHDX's maximum size, the Windows Server
-    and SQL Server media for the install mode (sizes from the bundle manifest), and a margin.
+    and SQL Server media for the install mode (sizes from the bundle manifest), and a margin. In JumpstartImage mode:
+    the image's download size plus a growth allowance and the margin, not its 100 GiB maximum (user decision,
+    2026-11-05); status.ps1 warns early when the drive runs low.
     #>
     [CmdletBinding()]
     param(
@@ -75,6 +77,23 @@ function Get-DemoHostOsDiskRequirement {
         [System.Collections.IDictionary] $Context
     )
 
+    $marginBytes = [long]$Context.Host.DataDisk.OsDiskMarginGB * 1GB
+    if ($Context.Mode -eq 'JumpstartImage') {
+        $pin = Get-DemoVmMediaPin -Name $Context.Host.Media.JumpstartImage -BundleRoot $Context.BundleRoot
+        $imageBytes = [long]40GB
+        if ($pin.Contains('sizeBytes') -and [long]$pin['sizeBytes'] -gt 0) {
+            $imageBytes = [long]$pin['sizeBytes']
+        }
+        $growthBytes = [long]$Context.Host.JumpstartImage.GrowthAllowanceGB * 1GB
+        return [pscustomobject]@{
+            VhdxBytes   = $imageBytes + $growthBytes
+            ImageBytes  = $imageBytes
+            GrowthBytes = $growthBytes
+            MediaBytes  = [long]0
+            MarginBytes = $marginBytes
+            TotalBytes  = $imageBytes + $growthBytes + $marginBytes
+        }
+    }
     $mediaBytes = [long]0
     foreach ($name in @($Context.Host.Media.WindowsServer, (Get-DemoHostSqlMediaName -Context $Context))) {
         $pin = Get-DemoVmMediaPin -Name $name -BundleRoot $Context.BundleRoot
@@ -87,9 +106,10 @@ function Get-DemoHostOsDiskRequirement {
         }
     }
     $vhdxBytes = [long]$Context.VhdxGB * 1GB
-    $marginBytes = [long]$Context.Host.DataDisk.OsDiskMarginGB * 1GB
     return [pscustomobject]@{
         VhdxBytes   = $vhdxBytes
+        ImageBytes  = [long]0
+        GrowthBytes = [long]0
         MediaBytes  = $mediaBytes
         MarginBytes = $marginBytes
         TotalBytes  = $vhdxBytes + $mediaBytes + $marginBytes
@@ -132,7 +152,11 @@ function Initialize-DemoHostStorage {
     $need = Get-DemoHostOsDiskRequirement -Context $Context
     $free = Get-DemoHostDriveFreeSpace -Drive $drive
     if ($free -lt $need.TotalBytes) {
-        return (New-DemoVmStepResult -Outcome 'Failed' -Message ('Not enough free space on {0} for the guest without a data disk: {1:N1} GB free, {2:N1} GB needed (VHDX up to {3:N0} GB, media {4:N1} GB, and a {5:N0} GB margin). Set dataDiskSku to E10 in the configuration to add a data disk, or free space on {0} (ADR 0016).' -f $drive, ($free / 1GB), ($need.TotalBytes / 1GB), ($need.VhdxBytes / 1GB), ($need.MediaBytes / 1GB), ($need.MarginBytes / 1GB)))
+        $parts = '(VHDX up to {0:N0} GB, media {1:N1} GB, and a {2:N0} GB margin)' -f ($need.VhdxBytes / 1GB), ($need.MediaBytes / 1GB), ($need.MarginBytes / 1GB)
+        if ($Context.Mode -eq 'JumpstartImage') {
+            $parts = '(the Jumpstart image {0:N1} GB, {1:N0} GB for it to grow, and a {2:N0} GB margin)' -f ($need.ImageBytes / 1GB), ($need.GrowthBytes / 1GB), ($need.MarginBytes / 1GB)
+        }
+        return (New-DemoVmStepResult -Outcome 'Failed' -Message ('Not enough free space on {0} for the guest without a data disk: {1:N1} GB free, {2:N1} GB needed {3}. Set dataDiskSku to E10 in the configuration to add a data disk, or free space on {0} (ADR 0016).' -f $drive, ($free / 1GB), ($need.TotalBytes / 1GB), $parts))
     }
     foreach ($kind in @('Media', 'Vms')) {
         $path = Get-DemoHostDataPath -Context $Context -Kind $kind
@@ -504,7 +528,7 @@ function Clear-DemoHostGuestSignIn {
     }
 }
 function Test-DemoHostSqlEdition {
-    # Developer mode expects Developer; the other modes expect Standard (Enterprise also drives Hub Performance).
+    # Developer mode expects Developer; PaygWizard and JumpstartImage expect Standard; ProductKey Standard or Enterprise.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -526,7 +550,7 @@ function Test-DemoHostSqlEdition {
     if ($Context.Mode -eq 'Developer') {
         return ([string]$instance.Edition -like 'Developer*')
     }
-    if ($Context.Mode -eq 'PaygWizard') {
+    if ($Context.Mode -in 'PaygWizard', 'JumpstartImage') {
         return ([string]$instance.Edition -like 'Standard*')
     }
     return ([string]$instance.Edition -like 'Standard*' -or [string]$instance.Edition -like 'Enterprise*')
@@ -627,4 +651,295 @@ function Invoke-DemoHostSeed {
 
     $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
     Invoke-DemoGuestSqlQuery -Name $Context.GuestName -Credential $credential -GuestToolsFolder $Context.Guest.ToolsFolder -Database 'ContosoCare' -Query ('EXEC demo.usp_seed_contosocare @scale = {0};' -f [int]$Context.SeedScale) | Out-Null
+}
+
+# ---- The guest's source (ADR 0006, amendment of 2026-11-05) ----
+
+function Get-DemoHostGuestSourcePath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    return (Join-Path -Path $Context.Root -ChildPath 'guest-source.json')
+}
+
+function Get-DemoHostGuestSourceDecision {
+    <#
+    .SYNOPSIS
+    Pure: whether the configured install mode may use the guest that's there. A guest is made once, either from the
+    Jumpstart image (JumpstartImage) or by the build (every other mode); a guest that exists without a record was built,
+    as every guest was before the record existed.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Mode,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Record,
+
+        [bool] $GuestExists
+    )
+
+    $expected = 'Build'
+    if ($Mode -eq 'JumpstartImage') {
+        $expected = 'JumpstartImage'
+    }
+    $recorded = ''
+    $recordedMode = ''
+    if ($null -ne $Record -and [string]$Record['source']) {
+        $recorded = [string]$Record['source']
+        $recordedMode = [string]$Record['installMode']
+    }
+    elseif ($GuestExists) {
+        $recorded = 'Build'
+    }
+    return [pscustomobject]@{
+        Ok           = (-not $recorded -or $recorded -eq $expected)
+        Expected     = $expected
+        Recorded     = $recorded
+        RecordedMode = $recordedMode
+    }
+}
+
+function Get-DemoHostGuestSourceState {
+    # The decision for this host: its record, and whether the guest VM or its disk exists. Never throws.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $exists = $false
+    try {
+        $exists = [bool](Get-VM -Name $Context.GuestName -ErrorAction SilentlyContinue)
+        if (-not $exists -and (Test-DemoHostStorage -Context $Context)) {
+            $folder = Get-DemoHostDataPath -Context $Context -Kind 'Vms'
+            $exists = Test-Path -LiteralPath ([System.IO.Path]::Combine($folder, $Context.GuestName, ($Context.GuestName + '.vhdx'))) -PathType Leaf
+        }
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('Guest source check: {0}' -f $_.Exception.Message)
+    }
+    return (Get-DemoHostGuestSourceDecision -Mode $Context.Mode -Record (Read-DemoVmJsonFile -Path (Get-DemoHostGuestSourcePath -Context $Context)) -GuestExists $exists)
+}
+
+function Set-DemoHostGuestSource {
+    # Records where the guest came from, when it's made: JumpstartImage or Build.
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('JumpstartImage', 'Build')]
+        [string] $Source
+    )
+
+    if ($PSCmdlet.ShouldProcess($Context.GuestName, ('Record the guest''s source as {0}' -f $Source))) {
+        Write-DemoVmJsonFile -Path (Get-DemoHostGuestSourcePath -Context $Context) -InputObject ([ordered]@{ source = $Source; installMode = $Context.Mode; recordedUtc = (Get-DemoVmUtcNow) })
+    }
+}
+
+function Get-DemoHostGuestSourceFailure {
+    # The GuestSource step's result when the configured mode can't use the guest that's there. Nothing is changed.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $decision = Get-DemoHostGuestSourceState -Context $Context
+    if ($decision.Ok) {
+        return
+    }
+    $was = 'built from the evaluation media'
+    if ($decision.Recorded -eq 'JumpstartImage') {
+        $was = 'made from Arc Jumpstart''s image (t2SqlInstallMode JumpstartImage)'
+    }
+    elseif ($decision.RecordedMode) {
+        $was = 'built from the evaluation media (t2SqlInstallMode {0})' -f $decision.RecordedMode
+    }
+    return (New-DemoVmStepResult -Outcome 'Failed' -Message ('The guest {0} was {1}, but t2SqlInstallMode is now {2}, and an existing guest never changes its source. Set t2SqlInstallMode back in config/demo.config.json, then run ./scripts/deploy.ps1 -FromStage Infrastructure, which brings the setting to the host; or rebuild T2 for the new mode: ./scripts/destroy.ps1, then ./scripts/deploy.ps1 (ADR 0006).' -f $Context.GuestName, $was, $Context.Mode))
+}
+
+# ---- Free space and the guest's Windows evaluation ----
+
+function Get-DemoHostStorageDetail {
+    # Free space on the drive that holds the guest's disk, for health.json and status.ps1's early warning. Never throws.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $detail = [ordered]@{ drive = ''; freeGiB = $null; warnBelowGiB = [int]$Context.Host.Storage.LowSpaceWarningGB; low = $false }
+    try {
+        $drive = Get-DemoHostSystemDrive
+        if (Test-DemoHostHasDataDisk -Context $Context) {
+            $volume = Get-DemoVmDataVolume -Label $Context.Host.DataDisk.Label
+            if ($volume) {
+                $drive = '{0}:' -f $volume.DriveLetter
+            }
+        }
+        $free = Get-DemoHostDriveFreeSpace -Drive $drive
+        $detail.drive = $drive
+        $detail.freeGiB = [Math]::Round($free / 1GB, 1)
+        $detail.low = ($free -lt ([long]$detail.warnBelowGiB * 1GB))
+    }
+    catch {
+        $detail.error = Protect-DemoVmText -Text $_.Exception.Message
+    }
+    return $detail
+}
+
+function Get-DemoGuestRearmDecision {
+    <#
+    .SYNOPSIS
+    Pure: whether to extend the guest's Windows evaluation now. Only an evaluation (license channel TIMEBASED_EVAL) with
+    RearmDays or fewer left; never while an activity profile runs (a rearm restarts the guest); a Warning when no rearm
+    is left.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $License,
+
+        [Parameter(Mandatory = $true)]
+        [int] $RearmDays,
+
+        [bool] $ProfileActive
+    )
+
+    if ($null -eq $License) {
+        return [pscustomobject]@{ Action = 'None'; Reason = 'The guest''s license couldn''t be read.' }
+    }
+    if (-not [bool]$License.isEvaluation) {
+        return [pscustomobject]@{ Action = 'None'; Reason = ('The guest''s Windows isn''t an evaluation ({0}).' -f $License.description) }
+    }
+    if ($null -eq $License.daysLeft -or [int]$License.daysLeft -gt $RearmDays) {
+        return [pscustomobject]@{ Action = 'None'; Reason = ('{0} evaluation day(s) left; a rearm comes at {1} or fewer.' -f $License.daysLeft, $RearmDays) }
+    }
+    if ($null -eq $License.rearmCount -or [int]$License.rearmCount -le 0) {
+        return [pscustomobject]@{ Action = 'Warn'; Reason = ('{0} evaluation day(s) left and no rearm left: rebuild T2 before the evaluation ends (./scripts/destroy.ps1, then ./scripts/deploy.ps1).' -f $License.daysLeft) }
+    }
+    if ($ProfileActive) {
+        return [pscustomobject]@{ Action = 'None'; Reason = ('{0} evaluation day(s) left; the rearm waits until no activity profile runs, because it restarts the guest.' -f $License.daysLeft) }
+    }
+    return [pscustomobject]@{ Action = 'Rearm'; Reason = ('{0} evaluation day(s) left and {1} rearm(s) left.' -f $License.daysLeft, $License.rearmCount) }
+}
+
+# In the guest, read-only: the Windows license (an evaluation is the TIMEBASED_EVAL channel) and the rearms left.
+$script:DemoGuestLicenseBlock = {
+    $license = Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "PartialProductKey IS NOT NULL AND Name LIKE 'Windows%'" | Select-Object -First 1
+    $service = Get-CimInstance -ClassName SoftwareLicensingService
+    if (-not $license) {
+        return $null
+    }
+    $isEvaluation = [string]$license.Description -match 'TIMEBASED_EVAL'
+    $daysLeft = $null
+    if ($isEvaluation) {
+        $daysLeft = [int]([double]$license.GracePeriodRemaining / 1440)
+    }
+    [pscustomobject]@{
+        description   = [string]$license.Description
+        licenseStatus = [int]$license.LicenseStatus
+        isEvaluation  = $isEvaluation
+        daysLeft      = $daysLeft
+        rearmCount    = [int]$service.RemainingWindowsReArmCount
+    }
+}
+
+# In the guest, read-only: whether T2's activity profile runs now (demo.activity_profile in ContosoCare).
+$script:DemoGuestProfileBlock = {
+    try {
+        $connection = New-Object -TypeName 'System.Data.SqlClient.SqlConnection' -ArgumentList 'Data Source=.;Initial Catalog=master;Integrated Security=True;Application Name=DbHubDemo.Bootstrap;Connect Timeout=15'
+        $connection.Open()
+        $command = $connection.CreateCommand()
+        $command.CommandText = "IF DB_ID(N'ContosoCare') IS NULL SELECT 0 ELSE EXEC (N'SELECT COUNT(*) FROM ContosoCare.demo.activity_profile WHERE profile_name <> ''off'' AND (expires_at IS NULL OR expires_at > SYSUTCDATETIME())')"
+        $active = [int]$command.ExecuteScalar() -gt 0
+        $connection.Dispose()
+        return $active
+    }
+    catch {
+        # Unknown counts as running, so the guest is never restarted in doubt.
+        return $true
+    }
+}
+
+function Invoke-DemoHostEvaluationGuard {
+    <#
+    .SYNOPSIS
+    Runs after a pass that finds the host Ready, at most every Evaluation.CheckIntervalHours: reads the guest's Windows
+    license and, when Get-DemoGuestRearmDecision says so, extends its evaluation with slmgr.vbs /rearm (documented in
+    "Slmgr.vbs options"), restarts the guest, and activates it online with /ato. Records the outcome in
+    guest-evaluation.json for health.json. Skipped while a golden capture is in progress. Never throws.
+    https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $path = Join-Path -Path $Context.Root -ChildPath 'guest-evaluation.json'
+    try {
+        $previous = Read-DemoVmJsonFile -Path $path
+        $hours = [int]$Context.Host.Evaluation.CheckIntervalHours
+        if ($null -ne $previous -and $previous['checkedUtc']) {
+            $checked = [DateTime]::MinValue
+            if ([DateTime]::TryParse([string]$previous['checkedUtc'], [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$checked) -and $checked.AddHours($hours) -gt [DateTime]::UtcNow) {
+                return
+            }
+        }
+        if (Test-Path -LiteralPath ([System.IO.Path]::Combine($Context.Root, 'golden', 'capture-in-progress.json')) -PathType Leaf) {
+            return
+        }
+        if (-not (Test-DemoHostGuestReachable -Context $Context)) {
+            return
+        }
+        $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+        $license = Invoke-Command -VMName $Context.GuestName -Credential $credential -ScriptBlock $script:DemoGuestLicenseBlock -ErrorAction Stop
+        $active = $false
+        if ($null -ne $license -and [bool]$license.isEvaluation) {
+            $active = [bool](Invoke-Command -VMName $Context.GuestName -Credential $credential -ScriptBlock $script:DemoGuestProfileBlock -ErrorAction Stop)
+        }
+        $decision = Get-DemoGuestRearmDecision -License $license -RearmDays ([int]$Context.Host.Evaluation.RearmDays) -ProfileActive $active
+        $record = [ordered]@{ checkedUtc = (Get-DemoVmUtcNow); license = $license; action = $decision.Action; reason = $decision.Reason }
+        if ($null -ne $previous -and $previous['lastRearmUtc']) {
+            $record.lastRearmUtc = $previous['lastRearmUtc']
+        }
+        if ($decision.Action -eq 'Rearm') {
+            Write-DemoVmLog -Message ('Extending the guest''s Windows evaluation: {0}' -f $decision.Reason)
+            $rearm = Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ScriptBlock {
+                $output = & cscript.exe //nologo (Join-Path -Path $env:windir -ChildPath 'System32\slmgr.vbs') /rearm
+                [pscustomobject]@{ exitCode = $LASTEXITCODE; output = (@($output) -join ' ') }
+            }
+            Invoke-Command -VMName $Context.GuestName -Credential $credential -ScriptBlock { Restart-Computer -Force } -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 30
+            if (Wait-DemoGuestOnline -Name $Context.GuestName -Credential $credential -TimeoutMinutes 15) {
+                $activation = Invoke-Command -VMName $Context.GuestName -Credential $credential -ErrorAction Stop -ScriptBlock {
+                    $output = & cscript.exe //nologo (Join-Path -Path $env:windir -ChildPath 'System32\slmgr.vbs') /ato
+                    [pscustomobject]@{ exitCode = $LASTEXITCODE; output = (@($output) -join ' ') }
+                }
+                $record.after = Invoke-Command -VMName $Context.GuestName -Credential $credential -ScriptBlock $script:DemoGuestLicenseBlock -ErrorAction Stop
+                $record.activation = [ordered]@{ exitCode = $activation.exitCode; output = (Protect-DemoVmText -Text ([string]$activation.output)) }
+            }
+            $record.rearm = [ordered]@{ exitCode = $rearm.exitCode; output = (Protect-DemoVmText -Text ([string]$rearm.output)) }
+            $record.lastRearmUtc = Get-DemoVmUtcNow
+        }
+        elseif ($decision.Action -eq 'Warn') {
+            Write-DemoVmLog -Level 'Warning' -Message $decision.Reason
+        }
+        Write-DemoVmJsonFile -Path $path -InputObject $record -Redact
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('The guest''s evaluation check didn''t finish; it runs again later: {0}' -f $_.Exception.Message)
+    }
 }

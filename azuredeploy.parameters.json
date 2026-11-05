@@ -60,7 +60,7 @@
       "value": false
     },
     "t2SqlInstallMode": {
-      "value": "PaygWizard"
+      "value": "JumpstartImage"
     },
     "t3AdminGroupObjectId": {
       "value": "00000000-0000-0000-0000-000000000000"

@@ -100,9 +100,9 @@
       "default": "Nested"
     },
     "t2SqlInstallMode": {
-      "description": "PaygWizard: one documented setup-wizard step per guest build. ProductKey: unattended, needs prerequisite P10. Developer: unattended, Estate only (ADR 0006).",
-      "enum": ["PaygWizard", "ProductKey", "Developer"],
-      "default": "PaygWizard"
+      "description": "JumpstartImage (default): T2's guest is Arc Jumpstart's prebuilt SQL Server 2022 Standard disk (config/versions.json media.jumpstartArcBoxSqlStd), made arcsql01 at first boot; unattended, with Hub Performance. PaygWizard: one documented setup-wizard step per guest build. ProductKey: unattended, needs prerequisite P10. Developer: unattended, Estate only (ADR 0006).",
+      "enum": ["JumpstartImage", "PaygWizard", "ProductKey", "Developer"],
+      "default": "JumpstartImage"
     },
     "t2ArcBillableCores": {
       "description": "Billable cores used by estimate-cost.ps1 for Arc SQL PAYG. Defaults to the larger of the guest vCPU count and the documented minimum of four cores per OSE when omitted; configure-arc.ps1 records the instance's actual cores as evidence.",

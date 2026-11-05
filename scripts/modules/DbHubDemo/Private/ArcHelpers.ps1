@@ -57,7 +57,7 @@ function Get-DemoArcTarget {
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = 'rg-{0}-{1}' -f $Config['prefix'], $Config['environment']
     $t2Mode = if ($Config.Contains('t2Mode') -and $Config['t2Mode']) { [string]$Config['t2Mode'] } else { 'Nested' }
-    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $evaluationOnly = $t2Mode -eq 'EvaluationOnlyAzureVm'
     $machineName = $setting.MachineName
     $hostVmName = if ($evaluationOnly) { $machineName } else { 'archost01' }
@@ -112,6 +112,9 @@ function Get-DemoArcExpectation {
     What each T2 install mode should produce in Azure (ADR 0006). Internal.
 
     .DESCRIPTION
+    - JumpstartImage: Standard edition with license type PAYG. Arc Jumpstart's own automation sets Paid (Software
+      Assurance) for its image; this demo's resource-group tag and configure-arc.ps1 set PAYG, which needs no
+      entitlement (ADR 0006, amendment of 2026-11-05).
     - PaygWizard: Standard edition with license type PAYG.
     - ProductKey: Standard or Enterprise with PAYG or Paid (Software Assurance), per the customer's attested
       entitlement; the resource-group tag sets PAYG at automatic deployment.
@@ -122,11 +125,12 @@ function Get-DemoArcExpectation {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
         [string] $InstallMode
     )
 
     switch ($InstallMode) {
+        'JumpstartImage' { [pscustomobject]@{ Editions = @('Standard'); LicenseTypes = @('PAYG'); MonitoringSupported = $true } }
         'PaygWizard' { [pscustomobject]@{ Editions = @('Standard'); LicenseTypes = @('PAYG'); MonitoringSupported = $true } }
         'ProductKey' { [pscustomobject]@{ Editions = @('Standard', 'Enterprise'); LicenseTypes = @('PAYG', 'Paid'); MonitoringSupported = $true } }
         default { [pscustomobject]@{ Editions = @('Developer'); LicenseTypes = @(); MonitoringSupported = $false } }

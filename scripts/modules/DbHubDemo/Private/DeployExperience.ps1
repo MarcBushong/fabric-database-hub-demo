@@ -58,12 +58,14 @@ function Get-DemoDeploymentExpectation {
     the person is needed about 60 to 90 minutes after the start (it can be later; the run waits for them): about 10
     minutes of clicks, then 10 to 15 minutes while setup installs. Afterward, the sign-in cleanup, the database, Arc's
     PAYG and monitoring, and telemetry take about 30 to 45 minutes.
+    JumpstartImage mode (the default since 2026-11-05) replaces the guest build with the Jumpstart image's 34 GiB download
+    and its first boot, about 20 to 40 minutes together (an estimate; not measured yet), and needs no person.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
-        [string] $InstallMode = 'PaygWizard',
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
+        [string] $InstallMode = 'JumpstartImage',
 
         [switch] $WaitForT2,
 
@@ -75,6 +77,9 @@ function Get-DemoDeploymentExpectation {
     $lines.Add('What to expect (estimates from documented step times, not a measured run):')
     if ($InstallMode -eq 'PaygWizard') {
         $lines.Add('- A first deployment takes about 2 to 3 hours in all; the T2 guest build alone is 60 to 90 minutes.')
+    }
+    elseif ($InstallMode -eq 'JumpstartImage') {
+        $lines.Add('- A first deployment takes about 1 to 2 hours in all (not measured yet with the Jumpstart image); T2''s image download and first boot are about 20 to 40 minutes of it. No step needs a person.')
     }
     else {
         $lines.Add('- A first deployment takes about 1.5 to 2.5 hours in all; the T2 guest build alone is 60 to 90 minutes. No step needs a person.')
@@ -92,7 +97,7 @@ function Get-DemoDeploymentExpectation {
     }
     $lines.Add('- This PC stays awake while deploy.ps1 runs (Windows); keep it plugged in, and don''t close this window.')
     $lines.Add('- If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.')
-    $text = if ($InstallMode -eq 'PaygWizard') { 'A first deployment takes about 2 to 3 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' } else { 'A first deployment takes about 1.5 to 2.5 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' }
+    $text = if ($InstallMode -eq 'PaygWizard') { 'A first deployment takes about 2 to 3 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' } elseif ($InstallMode -eq 'JumpstartImage') { 'A first deployment takes about 1 to 2 hours (estimate, not measured yet with the Jumpstart image); a redeploy from a golden snapshot about 30 to 45 minutes.' } else { 'A first deployment takes about 1.5 to 2.5 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' }
     return [pscustomobject]@{
         Lines      = $lines.ToArray()
         Text       = $text
@@ -114,8 +119,8 @@ function Get-DemoDeploymentNotice {
         [Parameter(Mandatory)]
         [pscustomobject] $Environment,
 
-        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
-        [string] $InstallMode = 'PaygWizard',
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
+        [string] $InstallMode = 'JumpstartImage',
 
         [switch] $WaitForT2,
 
@@ -126,6 +131,7 @@ function Get-DemoDeploymentNotice {
     $guided = $InstallMode -eq 'PaygWizard' -and $WaitForT2
     if ($guided -and -not [bool]$Environment.Interactive) {
         $lines.Add('This session doesn''t take keyboard input (its input is redirected, or it runs in an automation shell or under an assistant). That''s fine, but the PaygWizard guided stop needs a person at a browser for about 10 minutes, about 60 to 90 minutes from now, and no assistant can do its sign-ins. If nobody will be there, stop now (Ctrl+C) and choose one:')
+        $lines.Add('  t2SqlInstallMode JumpstartImage (the default): fully unattended with Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest; T2 gets performance data and the agent''s findings.')
         $lines.Add('  -NoWaitForT2: T1, T3, T4, and Fabric now; T2 builds in the background, and a later ./scripts/deploy.ps1 guides you through its step.')
         $lines.Add('  t2SqlInstallMode ProductKey: fully unattended with your own SQL Server Standard product key; T2 gets performance data and the agent''s findings.')
         $lines.Add('  t2SqlInstallMode Developer: fully unattended, but T2 shows in Database Hub''s Estate only, with no T2 performance data or findings.')
@@ -646,16 +652,16 @@ function Get-DemoDoneRequirement {
     .SYNOPSIS
     The checks DONE needs to pass (brief item 16; the same list stops ADR 0018's clock): Database Hub's own views of
     every target. HUB.ESTATE.T1 to T4; TELEMETRY.T1, T2, and T3; METRICS.T4; T2.ARC.SQLINSTANCE (Standard with PAYG or
-    Paid) and T2.ARC.MONITORING in PaygWizard and ProductKey modes; T1.SQLVM.ASSOCIATEDSERVICES (T1's inventory); and
-    FABRIC.ITEMS.REQUIRED (the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the history model and
-    report). T4's are left out when T4 is off; Developer mode (opt-in) leaves out T2's performance telemetry and its
-    PAYG and monitoring. The Insights app is never required (item 15). Pure. Internal.
+    Paid) and T2.ARC.MONITORING in JumpstartImage, PaygWizard, and ProductKey modes; T1.SQLVM.ASSOCIATEDSERVICES (T1's
+    inventory); and FABRIC.ITEMS.REQUIRED (the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the
+    history model and report). T4's are left out when T4 is off; Developer mode (opt-in) leaves out T2's performance
+    telemetry and its PAYG and monitoring. The Insights app is never required (item 15). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
-        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
-        [string] $InstallMode = 'PaygWizard',
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
+        [string] $InstallMode = 'JumpstartImage',
 
         [switch] $T4Off,
 
@@ -1087,7 +1093,7 @@ function Get-DemoDeploymentOutcome {
     $optional = @(Get-DemoOptionalItem -Result $all)
     $confirm = @(Get-DemoConfirmItem -Result $all)
     $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
-    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $t4Off = Get-DemoT4OffReason -Config $Config -State $State -Result $all
     $notes = [System.Collections.Generic.List[string]]::new()
     if ($t4Off) {
@@ -1101,7 +1107,7 @@ function Get-DemoDeploymentOutcome {
         $notes.Add($t4Fallback)
     }
     if ($installMode -eq 'Developer') {
-        $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. ProductKey or PaygWizard mode gives them.')
+        $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default), PaygWizard, or ProductKey mode gives them.')
     }
     $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); Optional = $optional; Confirm = $confirm; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume }
     if ($WhatIfRun) {

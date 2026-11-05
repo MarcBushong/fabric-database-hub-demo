@@ -103,6 +103,10 @@ This supersedes the Phase 5 addendum's next step ("if the trial shows clean crea
 
 Revisit when what-if supports stacks, or if the demo moves to a role that can manage deny settings; the trial runs again in about 15 minutes and costs nothing.
 
+## Addendum: the JumpstartImage guest disk's delivery (2026-11-05)
+
+Since 2026-11-05 the default T2 install mode, `JumpstartImage` (user-directed, [ADR 0006](0006-sql-editions-and-licensing.md#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default)), replaces the guest build's media with Arc Jumpstart's prebuilt guest disk, which the T2 host downloads from Jumpstart's public storage (`https://jumpstartprodsg.blob.core.windows.net/arcbox/prod/ArcBox-SQL-STD.vhdx`, 34.13 GiB), not from a Microsoft download URL. It's checked against the blob's own Content-MD5 and length (fail closed); its pin in `config/versions.json` (`media.jumpstartArcBoxSqlStd`) names the tested image by its ETag, with no SHA-256 until a streamed hash is pinned, and a newer image is used only after the host's image check, with a **Warning** ([ADR 0003](0003-t2-host-size-security-type-bootstrap.md#amendment-the-hosts-steps-for-jumpstartimage-2026-11-05)). So "media downloads directly from pinned Microsoft URLs with SHA-256 checks" above now holds for the opt-in build modes, and in the default mode a guest rebuild downloads that disk again. The template only gains the new `t2SqlInstallMode` value as its default; the bundle still travels in Run Command chunks, and nothing inside Azure depends on this repository.
+
 ## Sources (checked 2026-10-19)
 
 - Bicep file functions and size limits: <https://learn.microsoft.com/azure/azure-resource-manager/bicep/bicep-functions-files>

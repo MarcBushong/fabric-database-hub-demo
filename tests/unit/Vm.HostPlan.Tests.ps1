@@ -61,9 +61,10 @@ Describe 'T2 host step plan' {
     It 'follows the ADR 0003 order' {
         $plan = Get-DemoHostStepPlan -Context (New-TestHostContext -Mode 'PaygWizard')
         $plan.Name | Should -Be @(
-            'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'DataDisk', 'GuestOsMedia',
-            'GuestVhdx', 'GuestVm', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall', 'ArcOnboarding',
-            'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner')
+            'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'GuestSource', 'DataDisk', 'GuestOsMedia',
+            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall',
+            'JumpstartImageCheck', 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql',
+            'SeedDatabase', 'WorkloadRunner')
     }
 
     It 'reads guest sizing from settings.json and the network from vm/dsc/host.psd1' {

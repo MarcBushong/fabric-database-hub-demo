@@ -1,6 +1,6 @@
 # ADR 0023: First-run automation
 
-- **Status:** Accepted (amended 2026-10-29 for Phase 28: `deploy.ps1` runs the first run itself)
+- **Status:** Accepted (amended 2026-10-29 for Phase 28: `deploy.ps1` runs the first run itself; and 2026-11-05: `JumpstartImage` is T2's default mode, see the [amendment](#amendment-jumpstartimage-first-in-the-first-run-2026-11-05))
 - **Date:** 2026-10-27
 - **Decision source:** User-directed (2026-10-26: "automate as much as possible for other folks using the repo"; 2026-10-27: a colleague in another tenant tests the seamless first run), with the coordinator's decisions on the approved plan
 - **Related:** [ADR 0008](0008-identity-rbac-abac.md), [ADR 0009](0009-secrets-handling.md), [ADR 0011](0011-control-surface-priority.md), [ADR 0012](0012-validation-model.md), [ADR 0014](0014-notebook-role-and-capacity.md), [deployment](../deployment.md#first-run-initps1), [prerequisites](../prerequisites.md)
@@ -61,6 +61,10 @@
 ## Amendment: the first run from `deploy.ps1` (Phase 28, 2026-10-29)
 
 The owner wants one command after `az login` ([ADR 0018](0018-fast-redeploy-parallel-tracks-golden-snapshot.md#amendments-2026-10-29-phase-28-one-command-one-guided-stop)). So `deploy.ps1` with no configuration file runs the same first run itself (`Initialize-DemoFirstRun`): `Initialize-DemoConfig` with `-CreateAdminGroup`, the same prompts, and `-NonInteractive` where nobody can answer (CI, redirected input, an assistant), so an ambiguous choice is **Manual action required** there, as in `init.ps1`. When the file is written and no `INIT.*` result is **Fail** or **Manual action required**, the deployment goes on with it; otherwise the run ends **NOT DONE**, before anything is created, with the first open item's fix and the command to run next. `-WhatIf` writes nothing. Every rule above stands: the one pre-guard read, no sign-in, no change to the Azure CLI context, and `init.ps1` keeps working on its own. Unit-tested in `tests/unit/DbHubDemo.OneCommand.Tests.ps1` and `tests/unit/Repo.LifecycleScripts.Tests.ps1`.
+
+## Amendment: JumpstartImage first in the first run (2026-11-05)
+
+Since 2026-11-05 T2's default install mode is `JumpstartImage` (user-directed, [ADR 0006](0006-sql-editions-and-licensing.md#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default)), which supersedes "T2's mode is asked: `PaygWizard` (the default) or `Developer`" above. `init.ps1`, and the first run from `deploy.ps1`, offer three modes in this order: `JumpstartImage`, the default (no stop, unattended: Arc Jumpstart's prebuilt SQL Server 2022 Standard guest, with T2's performance data and the agent's findings); `PaygWizard` (the guided stop); and `Developer` (Estate only). `-T2SqlInstallMode` takes any of the three, and `-NonInteractive` (CI, redirected input, an assistant) writes `JumpstartImage` without asking. `ProductKey` stays a choice in the configuration file (P10, with the key in `$env:DBHUB_SQL_PRODUCT_KEY`). With the default, T2's setup wizard drops out of the first run's manual steps listed under Consequences, since it's needed only in the opt-in `PaygWizard` mode, and `init.ps1`'s next steps say that nothing in the deployment needs a person and that a first deploy with the Jumpstart image isn't timed yet. Unit-tested in `tests/unit/DbHubDemo.FirstRun.Tests.ps1` and `tests/unit/DbHubDemo.Config.Tests.ps1`.
 
 ## Sources
 

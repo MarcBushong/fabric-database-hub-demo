@@ -1060,7 +1060,7 @@ function Invoke-DemoParallelDeployment {
         return ([string](Get-DemoMemberValue -InputObject $state -Name ('Track{0}' -f $Track)) -eq $LastStep)
     }
     $allTracksDone = (& $trackFinished 'T1' 'Telemetry') -and (& $trackFinished 'T2' 'Telemetry') -and ($skipT4 -or (& $trackFinished 'T4' 'Telemetry')) -and ($SkipFabric -or (& $trackFinished 'Fabric' 'Fabric'))
-    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:$skipT4 -SkipFabric:$SkipFabric
     $validationStart = $results.Count
     if ($plan.Validation) {
