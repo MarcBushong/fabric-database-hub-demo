@@ -160,14 +160,7 @@ function Test-DemoFabricAppPrerequisite {
             $results.Add((New-DemoResult -CheckId $info.CheckId -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message ('The Fabric admin API didn''t list the tenant settings ({0}); the caller may not be a Fabric administrator.' -f $list.Error) -Evidence @{ checkedThroughApi = $true; statusCode = $list.StatusCode } -Remediation $info.Steps -DocUrl $info.DocUrl))
             continue
         }
-        $titles = @(@($info.Title) + @($setting['alternateTitles'] | Where-Object { $_ }))
-        $found = $null
-        if ($setting['settingName']) {
-            $found = $items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'settingName') -ieq [string]$setting['settingName'] } | Select-Object -First 1
-        }
-        if (-not $found) {
-            $found = $items | Where-Object { $titles -contains [string](Get-DemoMemberValue -InputObject $_ -Name 'title') } | Select-Object -First 1
-        }
+        $found = Find-DemoFabricAppTenantSetting -Item $items -Setting $setting
         $evidence = [ordered]@{ checkedThroughApi = $true; settingsRead = $items.Count }
         if (-not $found) {
             $results.Add((New-DemoResult -CheckId $info.CheckId -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message ('The tenant setting "{0}" wasn''t found among {1} settings; the preview may have renamed it.' -f $info.Title, $items.Count) -Evidence $evidence -Remediation ('{0} Then record its settingName in config/versions.json (fabricApp.tenantSettings).' -f $info.Steps) -DocUrl $info.DocUrl))

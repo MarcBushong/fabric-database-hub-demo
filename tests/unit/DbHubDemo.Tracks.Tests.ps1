@@ -556,9 +556,10 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:warned[0] | Should -Match '^The monitoring step failed: Track T1 stopped at Monitoring: A network error reached'
     }
 
-    It 'gives the optional Insights app the workspace the Fabric step resolved, and shows its actual reason, never a Fail, on the status page (Phase 28 live finding)' {
+    It 'gives the Insights app the workspace the Fabric step resolved, and shows its actual reason as Failed, while the track passes (Phase 28 live finding; 2026-11-05)' {
         # Live: the app's own lookup by name of the workspace just created failed, and the page showed Skipped with a
-        # status of Fail and a generic message about tenant settings that were on.
+        # status of Fail and a generic message about tenant settings that were on. Since 2026-11-05 the app is part of
+        # every deployment: when it isn't created, its row is Failed with the actual reason, never Skipped or Optional.
         $workspaceId = '44444444-4444-4444-4444-444444444444'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith {
             New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Created the Fabric workspace.' -Evidence ([ordered]@{ workspaceId = '44444444-4444-4444-4444-444444444444'; source = 'created' })
@@ -574,15 +575,87 @@ Describe 'Invoke-DemoDeploymentTrack' {
         InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
         $script:context['ProgressPath'] = $progress
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
-        $outcome.Status | Should -Be 'Pass' -Because 'the optional app never stops the track'
+        $outcome.Status | Should -Be 'Pass' -Because 'the app never stops the track'
         $script:appWorkspace | Should -Be $workspaceId
         $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
         $app = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Fabric.App') { $item } } })[0]
-        $app['state'] | Should -Be 'Skipped'
+        $app['state'] | Should -Be 'Failed'
         $app['status'] | Should -Be 'Manual action required'
-        $app['message'] | Should -Match ([regex]::Escape('FABRIC.APP.SIGNIN: The Rayfin CLI isn''t signed in'))
+        $app['message'] | Should -Match ([regex]::Escape('It wasn''t created: FABRIC.APP.SIGNIN: The Rayfin CLI isn''t signed in'))
         $app['message'] | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
         $app['message'] | Should -Not -Match 'tenant settings' -Because 'nothing says the tenant settings are the cause'
+        $app['message'] | Should -Not -Match '(?i)optional'
+    }
+
+    It 'keeps the Fabric track''s outcome and the other steps'' rows whatever the Insights app''s step does: <Name> (2026-11-05)' -ForEach @(
+        @{ Name = 'an exception'; Expected = 'The Insights app step stopped: The stage folder is locked by another process'; Network = $false }
+        @{ Name = 'a network error'; Expected = 'A network error reached api\.fabric\.microsoft\.com'; Network = $true }
+        @{ Name = 'a timeout'; Expected = 'node did not finish within 1200 seconds'; Network = $false }
+        @{ Name = 'a sign-in that didn''t happen'; Expected = 'FABRIC\.APP\.SIGNIN: The Rayfin CLI isn''t signed in'; Network = $false }
+        @{ Name = 'an error in the workspace''s lookup around it'; Expected = 'The workspace ID couldn''t be read'; Network = $false }
+    ) {
+        $script:warned = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ($PesterBoundParameters['Level'] -eq 'Warning') { $script:warned.Add([string]$PesterBoundParameters['Message']) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.REPORT' }
+        $script:appCase = $Name
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResolvedWorkspaceId -MockWith {
+            if ($script:appCase -eq 'an error in the workspace''s lookup around it') {
+                throw [System.FormatException]::new('The workspace ID couldn''t be read.')
+            }
+            ''
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith {
+            switch ($script:appCase) {
+                'an exception' { throw [System.InvalidOperationException]::new('The stage folder is locked by another process.') }
+                'a network error' {
+                    $failure = [System.Net.Http.HttpRequestException]::new('A network error reached api.fabric.microsoft.com on each of 4 attempts: The SSL connection could not be established.')
+                    throw $failure
+                }
+                'a timeout' {
+                    & (Get-Module -Name DbHubDemo) { ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code -1, 1200 s): node did not finish within 1200 seconds and was stopped.') }
+                }
+                default {
+                    & (Get-Module -Name DbHubDemo) {
+                        ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Rayfin CLI isn''t signed in, so the app can''t be deployed unattended.')
+                        ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'Not deployed: FABRIC.APP.SIGNIN needs attention first.')
+                    }
+                }
+            }
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $script:context['ProgressPath'] = $progress
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Pass' -Because ('{0} in the app''s step never stops the track' -f $Name)
+        $outcome.Steps | Should -Be @('Fabric')
+        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.TRACK.FABRIC' } | Should -BeNullOrEmpty
+        @($outcome.Results | Where-Object { $_.status -eq 'Fail' }).Count | Should -Be 0
+        $app = @($outcome.Results | Where-Object { InModuleScope DbHubDemo -Parameters @{ R = $_ } { Test-DemoInsightsAppRecord -Result $R } })
+        $app.Count | Should -BeGreaterThan 0
+        @($app | Where-Object { [string]$_.evidence.nonBlocking -ne 'insightsApp' -and $_.checkId -notlike 'FABRIC.APP.*' }).Count | Should -Be 0
+        if ($Network) {
+            @($app | Where-Object { [bool]$_.evidence.networkError }).Count | Should -Be 1
+            @($app | ForEach-Object { [string]$_.remediation }) -join ' ' | Should -Not -Match 'deploy\.ps1'
+        }
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $rows = @{}
+        foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { $rows[[string]$item['id']] = $item } }
+        $rows['Fabric.App']['state'] | Should -Be 'Failed'
+        $rows['Fabric.App']['message'] | Should -Match $Expected
+        $rows['Fabric.Items']['state'] | Should -Be 'Done'
+        $rows['Fabric.Report']['state'] | Should -Be 'Done'
+        # The console says so at once, and that the run goes on; no line says the Fabric step failed.
+        @($script:warned | Where-Object { $_ -like 'The Insights app step failed; it doesn''t block DONE, and the deployment goes on.*' }).Count | Should -Be 1
+        @($script:warned | Where-Object { $_ -like 'The Fabric step failed*' }).Count | Should -Be 0
+    }
+
+    It 'still fails the Fabric track when the history report fails, whatever the Insights app''s step does' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.SEMANTICMODEL.REFRESH' 'Fail' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Deployed.' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Fail'
     }
     It 'reconnects a golden snapshot''s source host on an existing image-built archost01' {
         $script:context['T2Source'] = 'existing-build'
@@ -941,6 +1014,11 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:calls.Add(('interim {0}' -f (@($Record | ForEach-Object { $_.Target }) -join ',')))
             foreach ($item in $Record) { [pscustomobject]@{ Target = $item.Target; VmName = $item.VmName; Outcome = 'Set'; Detail = ''; Data = $null; Seconds = 30 } }
         }
+        # The Insights app's sign-in (2026-11-05) never starts for real here: already signed in.
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith {
+            $script:calls.Add('app sign-in')
+            [pscustomobject]@{ Process = $null; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes(15); TimeoutMinutes = 15; Done = $true; Reported = $false; Result = (New-TestResult 'DEPLOY.FABRIC.APPSIGNIN') }
+        }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -959,6 +1037,44 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         @($script:calls | Where-Object { $_ -match '^state .*Stage' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'starts the Insights app''s sign-in before preflight, lets nothing wait for it, and settles it once the tracks are done (2026-11-05)' {
+        # The user: "Make sure a failure doesn't stop the deployment of everything. It should move on and continue."
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith {
+            $script:calls.Add('app sign-in')
+            [pscustomobject]@{ Process = $null; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes(15); TimeoutMinutes = 15; Done = $false; Reported = $false; Result = $null }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoFabricAppSignIn -MockWith {
+            if ($Final) {
+                $script:calls.Add('app sign-in final')
+                return (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message 'Nobody finished the Rayfin CLI''s sign-in within 15 minutes, so it was stopped.')
+            }
+            $script:calls.Add('app sign-in tick')
+        }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoFabricAppSignIn -MockWith { $script:calls.Add('app sign-in stop') }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $calls = @($script:calls)
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeGreaterOrEqual 0
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeLessThan ([array]::IndexOf($calls, 'preflight'))
+        # Preflight, the template, and every track ran while it was still open.
+        $calls | Should -Contain 'template disk=golden'
+        $calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        $calls | Should -Contain 'track Fabric: Fabric'
+        [array]::IndexOf($calls, 'app sign-in final') | Should -BeGreaterThan ([array]::IndexOf($calls, 'track Fabric: Fabric'))
+        $calls | Should -Contain 'app sign-in stop'
+        $signIn = @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' })
+        $signIn.Count | Should -Be 1
+        $signIn[0].status | Should -Be 'Warning'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass' -Because 'a sign-in that didn''t finish never fails the run'
+    }
+
+    It 'starts no sign-in for a run without the Fabric track, or a what-if' {
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:calls.Add('app sign-in') }
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -SkipFabric })
+        $script:calls | Should -Not -Contain 'app sign-in'
+        $script:calls | Should -Contain 'preflight'
     }
 
     It 'switches what the tracks left on the interim baseline to business-day only after DONE''s reads, and keeps an explicit baseline (2026-11-03)' {

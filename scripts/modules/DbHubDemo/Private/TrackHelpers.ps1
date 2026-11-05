@@ -1285,25 +1285,18 @@ function Invoke-DemoDeploymentTrack {
                     $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks)
                     & $addAll $fabric
                     & $partDone 'Fabric.Items' $fabric
-                    # The history semantic model and report (Phase 19), then the Fabric app when Phase 19b's script exists.
+                    # The history semantic model and report (Phase 19), then the Insights app.
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message ''
                     $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $fabricConfigPath)
                     & $addAll $powerBI
                     & $partDone 'Fabric.Report' $powerBI
-                    # The Insights app is optional and never stops the track or blocks DONE (brief item 15). It gets the
+                    # The Insights app is part of every deployment, and nothing about it stops the track or keeps the run
+                    # from DONE (2026-11-05): its records are non-blocking (ConvertTo-DemoInsightsAppRecord), an exception
+                    # here becomes one of them, and the track's outcome comes only from the steps above. It gets the
                     # workspace the step above just resolved or created, so it doesn't look it up by name again (live, a
-                    # second lookup right after the creation failed, and the app was skipped), and its results are never a
-                    # Fail: the status page and DONE show the actual reason and how to add it later (Phase 28 live finding).
-                    Set-DemoProgressStep -Path $progress -Id 'Fabric.App' -State 'Running' -Message 'Optional.'
-                    $fabricApp = @(Invoke-DemoFabricAppStage -Config $Config -ConfigPath $fabricConfigPath -WorkspaceId (Get-DemoResolvedWorkspaceId -Result $fabric))
-                    & $addAll $fabricApp
-                    $app = Get-DemoInsightsAppSummary -Result $fabricApp
-                    if ($null -ne $app) {
-                        Set-DemoProgressStep -Path $progress -Id 'Fabric.App' -State $app.State -Status $app.Status -Message $app.StepMessage
-                    }
-                    else {
-                        Set-DemoProgressStep -Path $progress -Id 'Fabric.App' -State 'Skipped' -Status 'Not selected' -Message 'Optional: its step reported nothing.'
-                    }
+                    # second lookup right after the creation failed). The status page shows its actual reason, as Failed
+                    # when it wasn't created, and the console says so at once.
+                    & $addAll @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $fabricConfigPath -FabricResult $fabric -ProgressPath $progress)
                     if (& $hasStatus @($fabric + $powerBI) 'Fail') {
                         $outcome = 'Fail'
                     }

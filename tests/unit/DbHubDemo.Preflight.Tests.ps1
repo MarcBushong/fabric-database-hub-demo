@@ -70,6 +70,11 @@ BeforeAll {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricResolution -MockWith {
             [pscustomobject]@{ Result = (New-DemoResult -CheckId 'PREFLIGHT.P5.WORKSPACE' -Area 'preflight' -Target 'fabric' -Status 'Pass' -Message 'The workspace is ready.'); Config = $Config; CapacityResult = $null }
         }
+        # P12 and P13 (2026-11-05) have their own tests (DbHubDemo.FabricAppSignIn.Tests.ps1); here it sends nothing.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricAppTenantSetting -MockWith {
+            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.APPSETTINGS' -Area 'preflight' -Target 'tenant' -Status $script:appSettingsStatus -Message 'The tenant settings the Insights app needs.'
+        }
+        $script:appSettingsStatus = 'Pass'
     }
 
     # One policy assignment whose definition turns off public network access on SQL servers (fake data).
@@ -110,6 +115,17 @@ Describe 'Invoke-DemoPreflight' {
 
         # A configuration that names its profile gets no notice.
         @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -EQ 'PREFLIGHT.ACTIVITYPROFILE').Count | Should -Be 0
+    }
+
+    It 'checks the Insights app''s tenant settings (P12, P13) after P11, and a Warning there never stops preflight (2026-11-05)' {
+        Set-HappyAzMock
+        $script:appSettingsStatus = 'Warning'
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $ids | Should -Contain 'PREFLIGHT.FABRIC.APPSETTINGS'
+        [array]::IndexOf($ids, 'PREFLIGHT.FABRIC.APPSETTINGS') | Should -BeGreaterThan ([array]::IndexOf($ids, 'PREFLIGHT.FABRIC.VIEWERLICENSE'))
+        @($results | Where-Object { $_.status -eq 'Fail' }).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricAppTenantSetting -Times 1 -Exactly
     }
 
     It 'fails T4 on a size Azure refused for the same zone, warns for one more try in another zone, and says nothing without a refusal (Phase 24)' {
