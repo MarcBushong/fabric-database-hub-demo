@@ -981,6 +981,11 @@ function Invoke-DemoParallelDeployment {
             & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
         }
         if ($StopAfter -in 'Preflight', 'Infrastructure') {
+            # The nightly safety stop (ADR 0024) comes with what the template deployed, as in a full run.
+            if ($StopAfter -eq 'Infrastructure' -and $plan.Infrastructure -and -not $whatIf) {
+                Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
+                & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+            }
             & $applyPolicy 15
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
             return $results.ToArray()
@@ -1005,6 +1010,12 @@ function Invoke-DemoParallelDeployment {
                 $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run New-DemoBootstrapBundle and Publish-DemoWorkloadRunner yourself to see the error (the runner needs the .NET SDK, or use -SkipRunner).'))
                 return $results.ToArray()
             }
+        }
+        # The nightly safety stop (ADR 0024), on every run, a resumed one too: here, after the tracks got the template's
+        # handoff, so none of them waits for it. Its problems are Warnings, never a Fail.
+        if (-not $whatIf) {
+            Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
+            & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
         }
 
         # 4. The tracks.

@@ -9,9 +9,10 @@ demo-day session, idle cost per month, and a light-use month, and compares them 
 configuration. The monthly ceiling (monthlyCeilingUsd, 375 USD by default since 2026-11-04) is hard: a light-use month
 above it is Fail and the script exits with code 1. A session above sessionCeilingUsd is a Warning.
 
-T4's 7-day automatic restart: when signed in, the script also reads whether the on-demand control's daily T4 safety
-stop is fully in place (Get-DemoT4RestartCoverage: its schedule, A1, and the last DbHub-Stop job; read-only). Then
-each restart counts as about a day; otherwise, and when not signed in, the worst case counts the rest of the month.
+T4's 7-day automatic restart: when signed in, the script also reads whether a safety stop is fully in place
+(Get-DemoT4RestartCoverage, read-only): the nightly safety stop that every deployment sets up (its schedule, its role, and
+its last run; ADR 0024), or the on-demand control's daily T4 safety stop. Then each restart counts as about a day;
+otherwise, and when not signed in, the worst case counts the rest of the month.
 Prices are list prices in USD on the day you run it: estimates, not quotes.
 
 Microsoft Defender for Cloud: when the Azure CLI is already signed in to the configured subscription, the

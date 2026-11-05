@@ -49,6 +49,14 @@ BeforeAll {
         $script:t4Sku = ''
         $script:t4Tier = ''
         $script:t3 = 200
+        # T3's status and auto-pause delay in its Databases - Get answer (the nightly safety stop's T3 check, ADR 0024).
+        $script:t3Status = 'Paused'
+        $script:t3Delay = 15
+        # The nightly safety stop: an HTTP status a VM's deallocate answers with, by VM name (409 while another operation runs),
+        # the state a VM is in after that answer, and when a starting T4 is Ready.
+        $script:deallocateStatus = @{}
+        $script:conflictState = @{}
+        $script:t4ReadyAt = $null
         $script:group = 200
         $script:jobs = @()
         $script:autostop = ''
@@ -140,7 +148,14 @@ BeforeAll {
                 }
                 return (New-Response 202)
             }
-            '/virtualMachines/(\w+)/deallocate$' { $script:vm[$Matches[1]] = 'deallocating'; return (New-Response 202) }
+            '/virtualMachines/(\w+)/deallocate$' {
+                $name = $Matches[1]
+                if ($script:deallocateStatus.ContainsKey($name) -and $script:deallocateStatus[$name] -ne 202) {
+                    if ($script:conflictState.ContainsKey($name)) { $script:vm[$name] = $script:conflictState[$name] }
+                    return (New-Response $script:deallocateStatus[$name] '{"error":{"code":"OperationNotAllowed","message":"Another operation on this VM is in progress."}}')
+                }
+                $script:vm[$name] = 'deallocating'; return (New-Response 202)
+            }
             '/extensions/SqlIaasExtension' {
                 $state = if ($script:plugin -is [scriptblock]) { & $script:plugin } else { [string]$script:plugin }
                 $statuses = @(@{ code = 'ProvisioningState/succeeded'; message = 'SQL Server IaaS Agent is running.' })
@@ -169,9 +184,13 @@ BeforeAll {
                 }
                 return (New-Response 202)
             }
-            '/servers/azuresql01-abc123/databases/ContosoCare$' { return (New-Response $script:t3 '{}') }
+            '/servers/azuresql01-abc123/databases/ContosoCare$' {
+                if ($script:t3 -ne 200) { return (New-Response $script:t3 '{}') }
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ status = $script:t3Status; autoPauseDelay = $script:t3Delay } }))
+            }
             '/flexibleServers/pgflex01-abc123$' {
                 if (-not $script:t4) { return (New-Response 404) }
+                if ($script:t4 -eq 'Starting' -and $null -ne $script:t4ReadyAt -and $script:clock -ge $script:t4ReadyAt) { $script:t4 = 'Ready' }
                 if ($script:t4Sku) {
                     return (New-Response 200 (ConvertTo-Json -InputObject @{ sku = @{ name = $script:t4Sku; tier = $script:t4Tier }; properties = @{ state = $script:t4 } }))
                 }
@@ -894,6 +913,172 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
     }
 }
 
+Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 0024) against a mocked Azure Resource Manager' {
+    # Start-Sleep moves the fake clock (Get-DbHubUtcNow), so the waits take no real time.
+    BeforeEach {
+        Reset-TestAzure
+        Mock Get-DbHubUtcNow { return $script:clock }
+        Mock Start-Sleep { $script:clock = $script:clock.AddSeconds($Seconds) }
+        Mock Invoke-DbHubArm {
+            $script:calls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body; At = $script:clock })
+            return (Invoke-TestAzure -Method $Method -Path $Path -Body $Body)
+        }
+        function Get-TestWrite {
+            @($script:calls | Where-Object Method -NE 'GET')
+        }
+    }
+
+    It 'deallocates the running VMs and stops a running T4, through Azure Resource Manager only, and starts nothing' {
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:t4 = 'Ready'
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.action | Should -Be 'stop-nightly'
+        $result.status | Should -Be 'Stopped'
+        $result.message | Should -Be 'Nightly safety stop: sqlvm01 deallocated (was running), archost01 deallocated (was running), T4 stopped (was Ready).'
+        @($result.failed) | Should -BeNullOrEmpty
+        $result.vms['sqlvm01'] | Should -Be 'deallocated (was running)'
+        $result.t4 | Should -Be 'T4 stopped (was Ready)'
+        @(Get-TestWrite | ForEach-Object { '{0} {1}' -f $_.Method, ($_.Path -replace '^.*/providers/', '') }) | Should -Be @('POST Microsoft.Compute/virtualMachines/sqlvm01/deallocate', 'POST Microsoft.Compute/virtualMachines/archost01/deallocate', 'POST Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123/stop')
+        @($script:calls | Where-Object { $_.Path -match '/start$|/runCommands|/schedules|/jobSchedules|/jobs' }) | Should -BeNullOrEmpty
+    }
+
+    It 'leaves VMs that are deallocated or deallocating, and a T4 that''s stopped or stopping, alone' -ForEach @(
+        @{ Sql = 'deallocated'; HostVm = 'deallocating'; T4 = 'Stopped'; Text = 'sqlvm01 already deallocated, archost01 already deallocating, T4 already stopped' }
+        @{ Sql = 'deallocated'; HostVm = 'deallocated'; T4 = 'Stopping'; Text = 'sqlvm01 already deallocated, archost01 already deallocated, T4 already stopping' }
+        @{ Sql = 'deallocated'; HostVm = 'deallocated'; T4 = ''; Text = 'sqlvm01 already deallocated, archost01 already deallocated, T4 missing' }
+    ) {
+        $script:vm = @{ sqlvm01 = $Sql; archost01 = $HostVm }
+        $script:t4 = $T4
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.message | Should -Be ('Nightly safety stop: {0}.' -f $Text)
+        Get-TestWrite | Should -BeNullOrEmpty
+    }
+
+    It 'deallocates a VM stopped from inside its guest, which still bills its compute' {
+        $script:vm = @{ sqlvm01 = 'stopped'; archost01 = 'deallocated' }
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.vms['sqlvm01'] | Should -Be 'deallocated (was stopped)'
+        @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 1
+    }
+
+    It 'counts a VM its auto-shutdown is deallocating already (409 Conflict) as done, without trying again' {
+        # The DevTest Labs auto-shutdown runs at the same minute: Azure refuses a second operation while it runs.
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:deallocateStatus['sqlvm01'] = 409
+        $script:conflictState['sqlvm01'] = 'deallocating'
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.vms['sqlvm01'] | Should -Be 'already deallocating (its auto-shutdown)'
+        @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 1
+    }
+
+    It 'tries a VM again after a 409 while another operation holds it, and reports it when it never takes' {
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:deallocateStatus['sqlvm01'] = 409
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Partial'
+        $result.message | Should -Match 'failed: sqlvm01 \(HTTP 409\)\.$'
+        @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 3
+        # Its attempts were 30 seconds apart: the fake clock moved twice.
+        ($script:clock - [datetime]::new(2026, 10, 27, 15, 0, 0, [System.DateTimeKind]::Utc)).TotalSeconds | Should -Be 60
+        @($script:calls | Where-Object { $_.Path -match '/start$' }) | Should -BeNullOrEmpty
+    }
+
+    It 'waits for a T4 that''s starting (its 7-day restart), then stops it once it''s Ready' {
+        $script:t4 = 'Starting'
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.t4 | Should -Be 'T4 stopped (was Starting)'
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' }).Count | Should -Be 1
+        $stop = @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' })[0]
+        $stop.At | Should -BeGreaterOrEqual $script:t4ReadyAt
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/start$' }) | Should -BeNullOrEmpty
+    }
+
+    It 'gives up on a T4 that''s still starting after 10 minutes, says so, and never starts it' {
+        $script:t4 = 'Starting'
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Partial'
+        $result.t4 | Should -Match '^failed: it was still Starting after 10 minutes; tomorrow''s safety stop tries again$'
+        ($script:clock - [datetime]::new(2026, 10, 27, 15, 0, 0, [System.DateTimeKind]::Utc)).TotalMinutes | Should -BeLessOrEqual 11
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/(start|stop)$' }) | Should -BeNullOrEmpty
+    }
+
+    It 'says <Status>, and changes nothing, when the demo resource group <Name>' -ForEach @(
+        @{ Name = 'can''t be read: the role isn''t assigned'; Code = 403; Status = 'NotGranted'; Match = 'role "DbHub Demo Safety Stop" isn''t assigned there yet \(an Owner runs \./scripts/grant-safety-stop\.ps1\)' }
+        @{ Name = 'doesn''t answer'; Code = 500; Status = 'Partial'; Match = 'couldn''t be read' }
+        @{ Name = 'doesn''t exist'; Code = 404; Status = 'NoEnvironment'; Match = 'Missing; nothing was stopped' }
+    ) {
+        $script:group = $Code
+        foreach ($scope in 'Nightly', 'T3Check') {
+            $script:calls.Clear()
+            $result = Invoke-DbHubStop -Scope $scope -Context (New-TestContext)
+            $result.status | Should -Be $Status
+            $result.message | Should -Match $Match
+            Get-TestWrite | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'the T3 check reads T3''s status through Azure Resource Manager only and says what it found: <Case>' -ForEach @(
+        @{ Case = 'paused'; Code = 200; Status = 'Paused'; Delay = 15; Minutes = 30; Verdict = 'Paused'; Job = 'Checked'; Match = 'is Paused, 30 minutes after the safety stop: it bills no compute' }
+        @{ Case = 'pausing'; Code = 200; Status = 'Pausing'; Delay = 15; Minutes = 30; Verdict = 'Pausing'; Job = 'Checked'; Match = 'its auto-pause has begun' }
+        @{ Case = 'online past its delay'; Code = 200; Status = 'Online'; Delay = 15; Minutes = 30; Verdict = 'Awake'; Job = 'Checked'; Match = 'past its 15-minute auto-pause delay: a session or a feature keeps it awake\. The activity log''s Resume Databases events name what resumed it\.$' }
+        @{ Case = 'online before its delay'; Code = 200; Status = 'Online'; Delay = 60; Minutes = 30; Verdict = 'TooEarly'; Job = 'Checked'; Match = 'its 60-minute auto-pause delay, plus 10 minutes, hasn''t passed yet' }
+        @{ Case = 'auto-pause off'; Code = 200; Status = 'Online'; Delay = -1; Minutes = 30; Verdict = 'AutoPauseOff'; Job = 'Checked'; Match = 'its auto-pause is off \(delay -1\)' }
+        @{ Case = 'removed'; Code = 404; Status = ''; Delay = 15; Minutes = 30; Verdict = 'Missing'; Job = 'Checked'; Match = 'doesn''t exist \(stop-demo\.ps1 -RemoveT3 removed it' }
+        @{ Case = 'unread'; Code = 500; Status = ''; Delay = 15; Minutes = 30; Verdict = 'Unread'; Job = 'Partial'; Match = 'couldn''t be read' }
+    ) {
+        $script:t3 = $Code
+        $script:t3Status = $Status
+        $script:t3Delay = $Delay
+        # The tests' auto-shutdown is 19:00 Eastern: 23:00 UTC on 2026-10-27 (daylight saving time).
+        $now = [datetime]::new(2026, 10, 27, 23, 0, 0, [System.DateTimeKind]::Utc).AddMinutes($Minutes)
+        $result = Invoke-DbHubStop -Scope T3Check -Context (New-TestContext -NowUtc $now)
+        $result.action | Should -Be 'check-t3'
+        $result.status | Should -Be $Job
+        $result.t3 | Should -Be $Verdict
+        $result.minutesSinceStop | Should -Be $Minutes
+        $result.message | Should -Match $Match
+        Get-TestWrite | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Path -notmatch '/resourceGroups/rg-dbhub-demo$' } | ForEach-Object { $_.Path -replace '^.*/providers/', '' }) | Should -Be @('Microsoft.Sql/servers/azuresql01-abc123/databases/ContosoCare')
+    }
+
+    It 'counts the minutes since the latest scheduled shutdown, across midnight and in winter time' {
+        $settings = $script:settings
+        # 2026-11-03 01:15 UTC is 2026-11-02 20:15 Eastern Standard Time: the stop was at 19:00, 75 minutes earlier.
+        (Get-DbHubLastShutdownUtc -Settings $settings -NowUtc ([datetime]::new(2026, 11, 3, 1, 15, 0, [System.DateTimeKind]::Utc))) | Should -Be ([datetime]::new(2026, 11, 3, 0, 0, 0, [System.DateTimeKind]::Utc))
+        # Before that day's 19:00, the latest is the day before's.
+        (Get-DbHubLastShutdownUtc -Settings $settings -NowUtc ([datetime]::new(2026, 10, 27, 15, 0, 0, [System.DateTimeKind]::Utc))) | Should -Be ([datetime]::new(2026, 10, 26, 23, 0, 0, [System.DateTimeKind]::Utc))
+    }
+    It 'DbHub-Stop takes the Nightly and T3Check scopes, and its safety stop settings pass the shared checks and assemble into a script that parses' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHub-Stop.ps1'), [ref]$null, [ref]$null)
+        $scope = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Scope' })[0]
+        $set = @($scope.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' })[0]
+        @($set.PositionalArguments | ForEach-Object { $_.Value }) | Should -Be @('All', 'T4', 'Nightly', 'T3Check')
+        $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHub-Stop.ps1') -Raw
+        # A Nightly or T3Check job that couldn't do its work fails after its result line, so the job history shows it.
+        $text | Should -Match ([regex]::Escape("`$Scope -in 'Nightly', 'T3Check' -and [string]`$result.status -in 'Partial', 'NotGranted'"))
+        $json = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $script:config } {
+            $name = Get-DemoSafetyStopName -Config $Config
+            ConvertTo-Json -InputObject (Get-DemoSafetyStopRunbookSetting -Config $Config -Name $name -IdentityClientId '99999999-9999-9999-9999-999999999999') -Depth 16 -Compress
+        }
+        $settings = ConvertFrom-DbHubSetting -Json $json
+        $settings.purpose | Should -Be 'safety-stop'
+        $settings.automationAccount | Should -Be 'aa-dbhub-demo-safetystop'
+        $settings.controlResourceGroup | Should -Be 'rg-dbhub-demo'
+        $settings.identityClientId | Should -Be '99999999-9999-9999-9999-999999999999'
+        $settings.t4WaitMinutes | Should -Be 10
+        $content = InModuleScope -ModuleName DbHubDemo -Parameters @{ Json = $json } { Get-DemoActivityControlRunbookContent -Name 'DbHub-Stop' -Setting ($Json | ConvertFrom-Json -AsHashtable) }
+        $errors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$null, [ref]$errors)
+        $errors | Should -BeNullOrEmpty
+        $content | Should -Match '"purpose":"safety-stop"'
+        [regex]::Matches($content, '[^\x00-\x7F]').Count | Should -Be 0
+    }
+}
 Describe 'T1''s monitoring plugin status: when it was reported, and whether it''s fresh (live, 2026-11-04)' {
     It 'reads MainServiceLastReportedTime from <Case>' -ForEach @(
         @{ Case = 'the agent''s health report'; Message = @('{"ExtensionServiceHealthReport":{"MainServiceStatus":"Running","MainServiceLastReportedTime":"2026-11-04T14:46:32Z"}}'); Expected = '2026-11-04T14:46:32' }

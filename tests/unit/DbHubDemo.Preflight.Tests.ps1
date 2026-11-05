@@ -316,12 +316,13 @@ Describe 'Invoke-DemoPreflight' {
         # both ceilings: 60 + 0.2 x 690 = 198 USD for the month, 9 for a session.
         $script:lightUse = 60.0
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
-        # T4's restart (2026-11-04): the example configuration has no on-demand control, so the rest of the month counts.
+        # T4's restart (2026-11-04): the example configuration's nightly safety stop isn't set up (ADR 0024), and it has no
+        # on-demand control, so the rest of the month counts.
         $restart = $results | Where-Object checkId -eq 'PREFLIGHT.COST.T4RESTART'
         $restart.status | Should -Be 'Warning'
-        $restart.message | Should -Match 'control\.enabled is false'
-        $restart.remediation | Should -Match 'setup-activity-control\.ps1'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $null -ne $T4RestartCoverage -and $T4RestartCoverage.Missing -eq 'Control' }
+        $restart.message | Should -Match 'the nightly safety stop isn''t in place yet'
+        $restart.remediation | Should -Match '\./scripts/deploy\.ps1 sets it up after its template, so the checks after that run count about a day per restart \(a first deployment''s own preflight can''t: it runs before the template\)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $null -ne $T4RestartCoverage -and $T4RestartCoverage.Missing -eq 'SafetyStop' }
         $fallback = $results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
         $fallback.status | Should -Be 'Pass'
         $fallback.evidence.startSku | Should -Be ''

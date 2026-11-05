@@ -86,8 +86,9 @@ Every value is a parameter. Profiles (`lowest-cost`, `demo-day`, `enhanced-perfo
 | T2 host `archost01` | `Standard_E2s_v5` (`lowest-cost`), Windows Server 2022 Datacenter Gen2, `securityType = Standard`; in `lowest-cost` the guest's VHDX and media use the 128 GiB OS disk, and the other profiles add a 128 GiB data disk | No Arc agent and no SQL IaaS extension. [ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md) |
 | T2 guest `arcsql01` | Generation 2, 2 vCPU, 8 GiB static memory, 64 GB dynamic VHDX, Windows Server 2022 Datacenter Evaluation (Desktop Experience) | IMDS and wire server blocked; automatic start and shutdown. [ADR 0004](adr/0004-guest-imds-isolation.md), [ADR 0006](adr/0006-sql-editions-and-licensing.md) |
 | T3 `azuresql01` | Logical server `azuresql01-<deploymentId>`, database `ContosoCare`, GP serverless Gen5, 0.5–1 vCore, auto-pause 15 minutes, 32 GB maximum size | Entra-only with the P6 group as admin; TLS 1.2 |
-| Budget | `monthlyCeilingUsd` (250, the hard monthly ceiling), alerts at 50%, 80%, and 100% to `ownerEmail` | Resource-group scope |
+| Budget | `monthlyCeilingUsd` (375 by default since 2026-11-04, the hard monthly ceiling), alerts at 50%, 80%, and 100% to `ownerEmail` | Resource-group scope |
 | Auto-shutdown | DevTest Labs schedules for T1 and the host | The host's guest shuts down cleanly through its stop action |
+| Nightly safety stop | The identity `id-<prefix>-<environment>-safetystop` and the Automation account `aa-<prefix>-<environment>-safetystop` (Basic, local authentication off) with `DbHub-Stop` on two daily schedules | At the auto-shutdown time it deallocates both VMs and stops T4, then reads T3's status; its stop-only custom role at the demo resource group ([ADR 0024](adr/0024-nightly-safety-stop.md)) |
 | Bastion | Basic SKU with a Standard public IP, created and removed on demand | Removed automatically after `bastionMaxHours` |
 | Key Vault, Log Analytics, storage accounts | Not deployed | Hub telemetry is Microsoft-managed. The artifact cache storage account was dropped on 2026-10-20 ([ADR 0016](adr/0016-cost-profiles.md), C9). Key Vault is an opt-in since Phase 13 (`keyVault.enabled`, which requires `assignRoles`): an RBAC-mode vault `kv-<prefix><environment>-<deploymentId>`, created on demand like Bastion, for the one-time host password ([ADR 0009](adr/0009-secrets-handling.md)). |
 
@@ -187,7 +188,7 @@ Full rules: [ADR 0007](adr/0007-networking-modes-and-egress.md).
 
 ## Identity, permissions, and secrets
 
-- **Minimum:** Contributor on the subscription (P1). No role assignments by default (`assignRoles = false`). Optional prerequisites P7–P11 add GitHub one-click, presenter Reader, notebook triggering, a product key, and Power BI viewer licenses ([ADR 0008](adr/0008-identity-rbac-abac.md), [permissions](permissions.md), [prerequisites](prerequisites.md)).
+- **Minimum:** Contributor on the subscription (P1). No role assignments by default (`assignRoles = false`), with one owner-approved exception: the nightly safety stop's stop-only role for its own identity at the demo resource group, which `deploy.ps1` assigns when the deployer may, and otherwise an Owner once (P16, [ADR 0024](adr/0024-nightly-safety-stop.md)). Optional prerequisites P7–P11 add GitHub one-click, presenter Reader, notebook triggering, a product key, and Power BI viewer licenses ([ADR 0008](adr/0008-identity-rbac-abac.md), [permissions](permissions.md), [prerequisites](prerequisites.md)).
 - **T3 administration:** the P6 group, which the deploying user owns, is the T3 Entra admin. T1's system-assigned identity is added to it, so T1 configures T3 in both network modes. This over-privilege is documented (risk R26), along with a hardened option.
 - **No stored secrets:**
   - VM passwords are used only at creation; break-glass is a VMAccess reset.
@@ -241,7 +242,7 @@ Discovery, monitoring, agents, and mirroring are separate concerns.
 | `start-demo.ps1` | Starts T1 and the T2 host (the guest auto-starts), warms up T3, and sets an activity profile. `-Interactive` creates Bastion; `-ResetAdminPassword` adds a break-glass reset. |
 | `stop-demo.ps1` | Stops the profile, shuts the guest down, deallocates the host and T1, lets T3 auto-pause, and removes Bastion. `-ParkT2` stops only T2. |
 | `reset-demo.ps1` | Stops scenarios, verifies no demo transaction is open, and restores the seed state without redeploying. `-RebuildGuest` reports **Not supported**: rebuild T2 before its evaluation OS expires with `destroy.ps1`, then `deploy.ps1` (R196). |
-| `status.ps1` | Health per target, active profile, evaluation-OS days left, Arc days disconnected, Bastion presence, month-to-date cost, next auto-shutdown |
+| `status.ps1` | Health per target, active profile, evaluation-OS days left, Arc days disconnected, Bastion presence, month-to-date cost, next auto-shutdown, and the nightly safety stop's last runs |
 | `validate.ps1` | The validation catalog ([ADR 0012](adr/0012-validation-model.md)) |
 | `estimate-cost.ps1` | Live-price estimates per profile against the ceilings |
 | `destroy.ps1` | Deletes Arc resources explicitly, then the resource group and the subscription deployment record, then checks for residual resources, Arc and identities included ([ADR 0002](adr/0002-resource-group-topology.md), [cleanup](cleanup.md)) |
@@ -279,9 +280,9 @@ flowchart LR
 
 ## Cost
 
-- **Ceilings:** a hard $250 a month for idle plus light use (preflight fails above it), and $15 per demo-day session (a Warning above it). Every default stays the cheapest working option.
+- **Ceilings:** a hard $375 a month for idle plus light use since 2026-11-04 ($250 before; preflight fails above it), and $15 per demo-day session (a Warning above it). Every default stays the cheapest working option, except T4's 4-vCore size.
 - **Live estimates:** `estimate-cost.ps1` computes hourly, daily-demo, and idle-monthly figures from the Azure Retail Prices API. It includes `Global` meters for SQL Server licenses and Arc SQL, and the subscription's Microsoft Defender for Cloud plans on their documented billing basis.
-- **Guardrails C1–C11:** budget alerts, schedules, expiry, Spot, Hybrid Benefit, short T3 auto-pause, Bastion auto-removal, and month-to-date reporting. C9, the artifact cache, was dropped on 2026-10-20.
+- **Guardrails C1–C11:** budget alerts, schedules, expiry, Spot, Hybrid Benefit, short T3 auto-pause, Bastion auto-removal, and month-to-date reporting. C9, the artifact cache, was dropped on 2026-10-20. Since 2026-11-05 the nightly safety stop also stops the VMs and T4 each evening, so T4's 7-day restart counts as about a day ([ADR 0024](adr/0024-nightly-safety-stop.md)).
 - **Biggest cost driver:** the T2 host size.
 - **Bills while stopped:** disks, T3 storage, Defender for Azure SQL and Defender CSPM on T3 where those plans are on, the private endpoint and DNS zone in private mode, and anything left on demand (Bastion).
 - See [ADR 0016](adr/0016-cost-profiles.md) and [cost management](cost-management.md).

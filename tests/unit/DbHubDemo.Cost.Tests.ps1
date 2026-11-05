@@ -152,7 +152,7 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.T4AutoRestartWorstCaseMonthly | Should -Be ([System.Math]::Round(0.02 * (730 - 10), 2))
         $monthly = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
         $monthly.message | Should -Match 'T4 \(PostgreSQL, Standard_B1ms\) costs 27\.46 USD a month even while stopped'
-        $monthly.message | Should -Match 'whether the on-demand control''s daily T4 safety stop is in place wasn''t checked, so the worst case counts it running for the rest of the month: 720 hours, 14\.40 USD of T4 compute'
+        $monthly.message | Should -Match 'whether the nightly safety stop is in place wasn''t checked, so the worst case counts it running for the rest of the month: 720 hours, 14\.40 USD of T4 compute'
         $monthly.message | Should -Match 'To keep the month cheaper: set t4SkuName to Standard_B1ms \(which turns autonomous tuning off\), set t4Enabled to false, or set a lower monthlyCeilingUsd\.'
         $estimate.T4RestartAssumption | Should -Be 'RestOfMonth'
         $estimate.T4RestartHours | Should -Be 720
@@ -192,20 +192,20 @@ Describe 'Get-DemoCostEstimate' {
         @($estimate.MissingPrices) | Should -BeNullOrEmpty
     }
 
-    It 'counts each 7-day restart as about a day where the daily T4 safety stop is in place, and the rest of the month otherwise (2026-11-04)' {
+    It 'counts each 7-day restart as about a day where a safety stop is in place, and the rest of the month otherwise (2026-11-04, ADR 0024)' {
         $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }
-        $counted = [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the daily T4 safety stop is scheduled, A1 is assigned, and the last DbHub-Stop job didn''t fail'; Fix = ''; Evidence = [ordered]@{ counts = $true } }
+        $counted = [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the nightly safety stop is scheduled, its role is assigned, and its last run didn''t fail'; Fix = ''; Evidence = [ordered]@{ counts = $true } }
         $capped = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $counted
         # 4 restarts a month (7 days stopped, then up to a day running) of 24 hours each, at 2 vCores x 0.09.
         $capped.T4RestartHours | Should -Be 96
         $capped.T4RestartAssumption | Should -Be 'SafetyStop'
         $capped.T4AutoRestartWorstCaseMonthly | Should -Be ([System.Math]::Round(0.18 * 96, 2))
         $monthly = $capped.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
-        $monthly.message | Should -Match 'and the daily T4 safety stop is scheduled, A1 is assigned, and the last DbHub-Stop job didn''t fail, so the worst case counts up to 4 restarts a month of about a day each, until the next safety stop: 96 hours, 17\.28 USD of T4 compute, against the ceiling\.'
+        $monthly.message | Should -Match 'and the nightly safety stop is scheduled, its role is assigned, and its last run didn''t fail, so the worst case counts up to 4 restarts a month of about a day each, until the next safety stop: 96 hours, 17\.28 USD of T4 compute, against the ceiling\.'
         $monthly.evidence.t4RestartAssumption | Should -Be 'SafetyStop'
         $monthly.evidence.t4RestartHours | Should -Be 96
 
-        $missing = [pscustomobject]@{ Counts = $false; Missing = 'A1'; Reason = 'A1, id-dbhub-automation''s "DbHub Demo Activity Operator" role on rg-dbhub-demo, isn''t assigned: without it DbHub-Stop can''t stop T4, and destroy deletes it with the group'; Fix = 'An Owner runs ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole, or set assignRoles to true and run ./scripts/deploy.ps1, which grants A1 again after the template.'; Evidence = [ordered]@{ counts = $false; missing = 'A1' } }
+        $missing = [pscustomobject]@{ Counts = $false; Missing = 'Role'; Reason = 'the nightly safety stop can''t stop T4: its role isn''t assigned (id-dbhub-demo-safetystop doesn''t hold "DbHub Demo Safety Stop" at rg-dbhub-demo)'; Fix = 'An Owner of the subscription runs ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json once; deploy.ps1 assigns it when the person who runs it may.'; Evidence = [ordered]@{ counts = $false; missing = 'Role' } }
         $config['monthlyCeilingUsd'] = 100
         $uncapped = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $missing
         $uncapped.T4RestartHours | Should -Be 720
@@ -213,10 +213,10 @@ Describe 'Get-DemoCostEstimate' {
         $uncapped.T4AutoRestartWorstCaseMonthly | Should -Be ([System.Math]::Round(0.18 * 720, 2))
         $monthly = $uncapped.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
         $monthly.status | Should -Be 'Fail'
-        $monthly.message | Should -Match 'and A1, .* isn''t assigned: without it DbHub-Stop can''t stop T4, and destroy deletes it with the group, so the worst case counts it running for the rest of the month: 720 hours, 129\.60 USD of T4 compute'
-        $monthly.evidence.t4RestartMissing | Should -Be 'A1'
+        $monthly.message | Should -Match 'and the nightly safety stop can''t stop T4: its role isn''t assigned \(.*\), so the worst case counts it running for the rest of the month: 720 hours, 129\.60 USD of T4 compute'
+        $monthly.evidence.t4RestartMissing | Should -Be 'Role'
         # The three ways to stay cheaper, the ceiling that keeps this T4, and the fix that caps the restart.
-        $monthly.remediation | Should -Match '^To keep the month cheaper: set t4SkuName to Standard_B1ms \(which turns autonomous tuning off\), set t4Enabled to false, or set a lower monthlyCeilingUsd\. To keep this T4, raise monthlyCeilingUsd to at least \d+ \(the budget follows it at the next deploy\.ps1 -FromStage Infrastructure\)\. Or put the daily T4 safety stop in place, so each restart counts as about a day: An Owner runs'
+        $monthly.remediation | Should -Match '^To keep the month cheaper: set t4SkuName to Standard_B1ms \(which turns autonomous tuning off\), set t4Enabled to false, or set a lower monthlyCeilingUsd\. To keep this T4, raise monthlyCeilingUsd to at least \d+ \(the budget follows it at the next deploy\.ps1 -FromStage Infrastructure\)\. Or put the nightly safety stop fully in place, so each restart counts as about a day: An Owner of the subscription runs \./scripts/grant-safety-stop\.ps1'
     }
     It 'fails the monthly ceiling when T4''s restart worst case pushes the estimate over it' {
         $first = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
@@ -364,6 +364,17 @@ Describe 'Get-DemoCostEstimate' {
         $with.MissingPrices | Should -BeNullOrEmpty
     }
 
+    It 'adds the nightly safety stop''s job minutes to every estimate, at the included tier (ADR 0024)' {
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $minutes = $estimate.Components | Where-Object { $_.Name -like 'Nightly safety stop job minutes*' }
+        @($minutes).Count | Should -Be 1
+        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced, so it adds nothing.
+        $minutes.UnitPrice | Should -Be 0
+        $minutes.Quantity | Should -Be 120
+        $minutes.Basis | Should -Be 'idle'
+        $minutes.Cost | Should -Be 0
+        $estimate.MissingPrices | Should -BeNullOrEmpty
+    }
     It 'adds the on-demand activity control''s vault operations and job minutes only when control.enabled is true (ADR 0020)' {
         $without = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         $without.Components.Name | Should -Not -Match 'Activity control'

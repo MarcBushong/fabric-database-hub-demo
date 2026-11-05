@@ -554,6 +554,9 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith { @() }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { $script:order.Add('Manifest'); New-TestManifest }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @($script:goldenSnapshots) }
+        # The nightly safety stop's role definition (ADR 0024): none, unless a test says so.
+        $script:safetyRoleId = ''
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopRoleState -MockWith { [pscustomobject]@{ Id = $script:safetyRoleId; Actions = @(); Error = '' } }
         $script:goldenSnapshots = @()
         $script:hostName = ''
         $script:goldenGroupExists = $false
@@ -601,6 +604,21 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
         $script:order | Should -Be @('Manifest', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123')
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).message | Should -Match 'doesn''t exist'
+    }
+
+    It 'says the nightly safety stop''s role stays, unassigned and free, with an Owner''s command to delete it (ADR 0024)' {
+        $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
+        $results | Where-Object { $_.checkId -eq 'DESTROY.SAFETYSTOP.ROLE' } | Should -BeNullOrEmpty
+
+        $script:groupExists = $true
+        $script:safetyRoleId = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/eeeeeeee-0000-0000-0000-000000000024' -f $config['subscriptionId']
+        $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
+        $role = $results | Where-Object { $_.checkId -eq 'DESTROY.SAFETYSTOP.ROLE' }
+        $role.status | Should -Be 'Not selected'
+        $role.message | Should -Match 'no assignment left \(its one assignment went with rg-dbhub-demo\) and no cost'
+        $role.message | Should -Match ([regex]::Escape(('az role definition delete --name "DbHub Demo Safety Stop" --scope /subscriptions/{0}' -f $config['subscriptionId'])))
+        $role.evidence.roleId | Should -Be $script:safetyRoleId
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match 'role definition delete' }
     }
 
     Context 'the budget at the group''s scope, which outlives the group (live, 2026-10-22)' {

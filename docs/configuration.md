@@ -40,3 +40,15 @@ The demo's Fabric items live in one workspace and its lakehouse, which you confi
 **What creating needs:** the Fabric tenant setting "Create workspaces" for you, and a contributor or administrator role on the capacity ([prerequisites](prerequisites.md), P5). Without them, the script reports **Manual action required** with the exact steps, and a workspace administrator can create the workspace and add you as Contributor or higher instead. Using an existing workspace needs only Contributor on it.
 
 **Checks** (ADR 0012): `FABRIC.RESOLVE.WORKSPACE`, `FABRIC.RESOLVE.LAKEHOUSE`, and, when a capacity is assigned, `FABRIC.RESOLVE.CAPACITY`, in `configure-fabric.ps1`, `configure-powerbi.ps1`, `configure-fabric-app.ps1`, and `validate.ps1`; `PREFLIGHT.P5.WORKSPACE` in `preflight.ps1`; and `STATUS.FABRIC` in `status.ps1`. Messages name the workspace, the lakehouse, and the capacity, never their IDs.
+
+## The nightly safety stop
+
+The nightly safety stop ([ADR 0024](adr/0024-nightly-safety-stop.md)) is part of every deployment and has no setting of its own. It follows three settings, and the next `deploy.ps1` moves its schedules when one changes:
+
+| Setting | Default | What it sets |
+|---|---|---|
+| `autoShutdownTime` | `1900` | The stop's daily time, the same as the VMs' auto-shutdown |
+| `autoShutdownTimeZone` | `Pacific Standard Time` | The time zone of both its schedules |
+| `t3AutoPauseMinutes` | `15` | The T3 check's time: 30 minutes after the stop, or this delay plus 15 minutes when that's longer, at most 345 minutes. With `-1` (auto-pause off), the check reports that T3 stays online |
+
+To skip one night, turn off its schedule `dbhub-safety-stop` in `aa-<prefix>-<environment>-safetystop` in the Azure portal; the next `deploy.ps1` turns it on again ([what stops or pauses on its own](../README.md#what-stops-or-pauses-on-its-own)).

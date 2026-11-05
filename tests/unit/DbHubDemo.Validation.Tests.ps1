@@ -729,14 +729,17 @@ Describe 'Cost area' {
         $script:costResponse['^resource list .*bastionHosts'] = Get-TestAzOk @()
         $script:costResponse['^network public-ip list'] = Get-TestAzOk @()
         Set-TestAzResponse $script:costResponse
+        # The nightly safety stop's own check (ADR 0024), which tests/unit/DbHubDemo.SafetyStop.Tests.ps1 covers.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopStatus -MockWith { New-DemoResult -CheckId $CheckId -Area $Area -Target 'subscription' -Status 'Pass' -Message 'in place' }
     }
 
-    It 'reuses preflight''s estimate and passes the budget, the schedules, and no Bastion' {
+    It 'reuses preflight''s estimate and passes the budget, the schedules, the nightly safety stop, and no Bastion' {
         $context = New-TestContext
         $context.Results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'estimate'))
         Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith { throw 'should not run' }
         $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationCost -Context $X })
-        ($results | ForEach-Object { '{0}={1}' -f $_.checkId, $_.status }) | Should -Be @('COST.BUDGET=Pass', 'COST.AUTOSHUTDOWN=Pass', 'COST.BASTION=Pass')
+        ($results | ForEach-Object { '{0}={1}' -f $_.checkId, $_.status }) | Should -Be @('COST.BUDGET=Pass', 'COST.AUTOSHUTDOWN=Pass', 'COST.SAFETYSTOP=Pass', 'COST.BASTION=Pass')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopStatus -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'COST.SAFETYSTOP' -and $Area -eq 'cost' }
         @($script:TestAzCalls | Where-Object { $_ -match '^resource show .*shutdown-computevm-' }).Count | Should -Be 2
         @($script:TestAzCalls | Where-Object { $_ -match '(^| )--ids( |$)' }).Count | Should -Be 0 -Because 'Invoke-DemoAz adds --subscription, which --ids would bypass'
     }

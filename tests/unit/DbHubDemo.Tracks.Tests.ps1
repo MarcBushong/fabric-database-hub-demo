@@ -973,6 +973,8 @@ Describe 'Invoke-DemoParallelDeployment' {
             [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true }
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoKeyVaultSetting -MockWith { [pscustomobject]@{ Enabled = $false } }
+        # The nightly safety stop's setup (ADR 0024), on every run that isn't -WhatIf.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -MockWith { $script:calls.Add('safety stop'); New-TestResult 'SAFETYSTOP.SCHEDULE' }
         Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
         Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { [pscustomobject]@{ Path = 'runner.zip'; Sha256 = ('d' * 64); SizeBytes = 20 } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
@@ -1172,6 +1174,17 @@ Describe 'Invoke-DemoParallelDeployment' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -StopAfter 'Infrastructure' -InProcess })
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).message | Should -Match 'Infrastructure'
+        # The nightly safety stop comes with what the template deployed, as in a full run (ADR 0024).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
+        ($results | Where-Object { $_.checkId -eq 'SAFETYSTOP.SCHEDULE' }).status | Should -Be 'Pass'
+    }
+
+    It 'sets up the nightly safety stop once, after the template''s handoff and before the tracks (ADR 0024)' {
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
+        $script:calls.IndexOf('safety stop') | Should -BeGreaterThan $script:calls.IndexOf('template disk=golden')
+        $script:calls.IndexOf('safety stop') | Should -BeLessThan $script:calls.IndexOf(@($script:calls | Where-Object { $_ -like 'track *' })[0])
+        ($results | Where-Object { $_.checkId -eq 'SAFETYSTOP.SCHEDULE' }).status | Should -Be 'Pass'
     }
 
     It 'leaves the clock running when T2 builds in the background' {

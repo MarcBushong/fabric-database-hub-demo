@@ -873,6 +873,16 @@ Describe 'Invoke-DemoDeployment' {
         # Phase 28 live finding: what's stopped starts before the first stage that needs it; here both VMs run.
         $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
+        # The nightly safety stop's setup (ADR 0024), after the Infrastructure stage.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -MockWith { New-TestResult 'SAFETYSTOP.SCHEDULE' 'Pass' 'infra' }
+    }
+
+    It 'sets up the nightly safety stop after the Infrastructure stage, and not with -WhatIf (ADR 0024)' {
+        $results = @(Invoke-DemoDeployment -Config $config -StopAfter Infrastructure)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
+        ($results | Where-Object { $_.checkId -eq 'SAFETYSTOP.SCHEDULE' }).status | Should -Be 'Pass'
+        Invoke-DemoDeployment -Config $config -Resume -WhatIf | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
     }
 
     It 'starts deallocated VMs while preflight runs, and runs them before the first stage that needs them; running ones are only read (Phase 28 live finding)' {
@@ -2277,11 +2287,13 @@ Describe 'Get-DemoEnvironmentStatus' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4StoppedUtc -MockWith { [datetime]::new(2026, 10, 20, 23, 0, 0, [System.DateTimeKind]::Utc) }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4MetricSnapshot -MockWith { throw 'a stopped server sends no fresh metrics' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { 0.178 }
+        # Neither safety stop is in place (ADR 0024, ADR 0020): nothing here stops a restarted T4.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4RestartStopState -MockWith { [pscustomobject]@{ State = 'NotScheduled'; NextRunUtc = $null } }
         $results = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc))
         $t4 = $results | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Pass'
         $t4.message | Should -BeLike 'pgflex01-abc123 is stopped since 2026-10-20 23:00 UTC. Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, *'
-        $t4.message | Should -Match 'it then bills compute at about 0\.178 USD an hour \(Standard_D4ds_v5, list price\) until it''s stopped again: nothing here stops it on its own'
+        $t4.message | Should -Match 'it then bills compute at about 0\.178 USD an hour \(Standard_D4ds_v5, list price\) until it''s stopped again: the nightly safety stop isn''t in place \(\./scripts/deploy\.ps1 sets it up\), so nothing here stops it on its own'
         ([datetime]$t4.evidence.autoStartUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm', [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be '2026-10-27T23:00'
         $t4.evidence.hourlyUsd | Should -Be 0.178
         $t4.evidence.dailySafetyStop | Should -BeFalse
@@ -2302,11 +2314,22 @@ Describe 'Get-DemoEnvironmentStatus' {
         # An obviously fake price, as the Retail Prices API would give it at run time.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { 0.5 }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlStatus -MockWith { New-TestResult 'STATUS.CONTROL' 'Pass' 'infra' 'subscription' }
-        # The daily safety stop's schedule, read as CONTROL.SAFETYSTOP reads it (review of 20e855c).
-        $script:safetyState = 'Scheduled'
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:safetyState; NextRunUtc = $null } }
         $config = New-TestConfig -WithT4
         $config['control']['enabled'] = $true
+
+        # The nightly safety stop in place (ADR 0024): it stops a restarted T4 at the next auto-shutdown time.
+        $script:nightlyState = 'InPlace'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopState -MockWith { [pscustomobject]@{ State = $script:nightlyState; NextRunUtc = $null; CheckNextRunUtc = $null; CheckScheduled = ($script:nightlyState -eq 'InPlace'); RoleAssigned = ($script:nightlyState -eq 'InPlace'); Missing = ''; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopLastRun -MockWith { [pscustomobject]@{ Ok = $true; Error = ''; Stop = $null; Check = $null } }
+        $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.message | Should -Match 'and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the nightly safety stop stops it again, at the next auto-shutdown time\.'
+        $t4.evidence.dailySafetyStop | Should -BeTrue
+        $t4.evidence.safetyStop | Should -Be 'Nightly'
+
+        # Without it, the daily safety stop's schedule, read as CONTROL.SAFETYSTOP reads it (review of 20e855c).
+        $script:nightlyState = 'NotScheduled'
+        $script:safetyState = 'Scheduled'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:safetyState; NextRunUtc = $null } }
         $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.message | Should -Match 'Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the on-demand control''s daily safety stop stops it again, within a day\.'
         $t4.message | Should -Match 'It''s General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off\.$'
@@ -2315,10 +2338,11 @@ Describe 'Get-DemoEnvironmentStatus' {
         $t4.evidence.skuName | Should -Be 'Standard_D2ds_v5'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -ParameterFilter { $SkuName -eq 'Standard_D2ds_v5' }
 
-        # The control is on, but its daily safety stop couldn't be scheduled: nothing here stops a restarted T4.
+        # The control is on, but its daily safety stop couldn't be scheduled, and the nightly one isn't in place: nothing
+        # here stops a restarted T4.
         $script:safetyState = 'NotScheduled'
         $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
-        $t4.message | Should -Match 'Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until it''s stopped again: the on-demand control''s daily safety stop isn''t scheduled'
+        $t4.message | Should -Match 'Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until it''s stopped again: the nightly safety stop isn''t in place'
         $t4.message | Should -Not -Match 'stops it again, within a day'
         $t4.evidence.dailySafetyStop | Should -BeFalse
         $t4.evidence.safetyStop | Should -Be 'NotScheduled'
@@ -2639,6 +2663,8 @@ Describe 'Remove-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { [pscustomobject]@{ DeploymentId = 'abc123'; Principals = @() } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoTeardownResidue -MockWith { $script:order.Add('Residue'); New-TestResult 'TEARDOWN.RESIDUAL.ARC' 'Pass' 'teardown' 'T2' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @() }
+        # The nightly safety stop's role definition (ADR 0024): none in these tests, unless one says so.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopRoleState -MockWith { [pscustomobject]@{ Id = ''; Actions = @(); Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
             $script:order.Add('az ' + ($ArgumentList[0..1] -join ' '))
             $script:groupExists = $false

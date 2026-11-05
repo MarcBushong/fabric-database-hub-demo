@@ -12,8 +12,9 @@ Stops the demo's compute after a session (plan section 9.4, ADR 0016).
   otherwise), and deallocates the T2 VM and sqlvm01. T3
   persists; serverless auto-pause stops its compute. T4, the PostgreSQL flexible server, is stopped; Azure starts it
   again on its own after seven days, so STOP.T4.STOP says when (the stop time plus seven days), what it then bills at
-  its size (the Azure Retail Prices API), and whether the on-demand control's daily safety stop stops it again or
-  nothing does (Phase 28 follow-up). Its storage and the Defender plans a tenant policy enables are billed while it's
+  its size (the Azure Retail Prices API), and whether the nightly safety stop (ADR 0024), part of every deployment,
+  stops it again or nothing does (Phase 28 follow-up). The nightly safety stop also deallocates the VMs and stops T4 at
+  the auto-shutdown time on its own. Its storage and the Defender plans a tenant policy enables are billed while it's
   stopped (Phase 24, ADR 0019).
 - -ParkT2: only the T2 side (its profile, the guest, and the host), for demos on T1 and T3.
 - -RemoveBastionOnly: only Bastion and the password rotation; with -IfExpired, a Bastion host goes only after

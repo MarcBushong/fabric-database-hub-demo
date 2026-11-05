@@ -630,9 +630,10 @@ function Invoke-DemoPreflight {
     catch {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots could not be listed, so the cost estimate leaves them out: {0}' -f $_.Exception.Message)
     }
-    # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where the daily T4
-    # safety stop is fully in place (its schedule, A1, and a last DbHub-Stop job that didn't fail); otherwise the rest of
-    # the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART).
+    # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where a safety stop
+    # is fully in place (the nightly safety stop, ADR 0024: its schedule, its role, and a last run that didn't fail; or the
+    # control's); otherwise the rest of the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART). On
+    # a first deployment the nightly safety stop doesn't exist yet: this run sets it up after the template.
     if ($t4On) {
         $costParameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
     }
