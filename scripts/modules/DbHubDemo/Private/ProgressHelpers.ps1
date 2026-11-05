@@ -113,12 +113,13 @@ function Get-DemoProgressCatalog {
     The status page's ordered steps per track (Phase 28, brief item 11). Pure. Internal.
 
     .DESCRIPTION
-    Preflight, with the start of the VMs that were stopped (StartVms; Phase 28 live finding); Infrastructure; T1
-    (artifacts, bootstrap, activity, monitoring, telemetry); T3; T4; Fabric (the optional Insights app included, marked
-    optional); T2 (a golden restore, or the host build, and in PaygWizard mode the guided stop and the setup check, then
-    the sign-in cleanup, Arc onboarding, PAYG and monitoring, and telemetry; Set-DemoProgressPlan skips what the T2
-    source doesn't use); Validation. Each step has an id, a label, and the track steps (Get-DemoTrackStep) it belongs
-    to.
+    Preflight, with the start of the VMs that were stopped (StartVms; Phase 28 live finding) and the Insights app's
+    sign-in, which runs alongside everything else (Fabric.AppSignIn, 2026-11-05; not with -SkipFabric); Infrastructure;
+    T1 (artifacts, bootstrap, activity, monitoring, telemetry); T3; T4; Fabric (the Insights app included, marked
+    non-blocking: it's part of every deployment, but it never blocks DONE); T2 (a golden restore, or the host build, and
+    in PaygWizard mode the guided stop and the setup check, then the sign-in cleanup, Arc onboarding, PAYG and
+    monitoring, and telemetry; Set-DemoProgressPlan skips what the T2 source doesn't use); Validation. Each step has an
+    id, a label, the track steps (Get-DemoTrackStep) it belongs to, and nonBlocking.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -131,13 +132,16 @@ function Get-DemoProgressCatalog {
         [switch] $SkipFabric
     )
 
-    $step = { param([string] $Id, [string] $Label, [string[]] $From, [bool] $Optional = $false) [ordered]@{ id = $Id; label = $Label; from = @($From); optional = $Optional } }
+    $step = { param([string] $Id, [string] $Label, [string[]] $From, [bool] $NonBlocking = $false) [ordered]@{ id = $Id; label = $Label; from = @($From); nonBlocking = $NonBlocking } }
     $tracks = [System.Collections.Generic.List[object]]::new()
-    $tracks.Add([ordered]@{ name = 'Preflight'; label = 'Preflight'; steps = @(
-                (& $step 'StartVms' 'Start the VMs that were stopped (the nightly auto-shutdown, stop-demo.ps1)' @('StartVms'))
-                (& $step 'Preflight' 'Checks before anything is created' @('Preflight'))
-            )
-        })
+    $preflight = [System.Collections.Generic.List[object]]::new()
+    $preflight.Add((& $step 'StartVms' 'Start the VMs that were stopped (the nightly auto-shutdown, stop-demo.ps1)' @('StartVms')))
+    if (-not $SkipFabric) {
+        # Displayed under Preflight, when it happens; deploy.ps1 itself sets it (Start-DemoFabricAppSignIn).
+        $preflight.Add((& $step 'Fabric.AppSignIn' 'Sign-in for the Insights app (the Rayfin CLI; a browser opens once, alongside the deployment)' @('Fabric/Fabric') $true))
+    }
+    $preflight.Add((& $step 'Preflight' 'Checks before anything is created' @('Preflight')))
+    $tracks.Add([ordered]@{ name = 'Preflight'; label = 'Preflight'; steps = $preflight.ToArray() })
     $tracks.Add([ordered]@{ name = 'Infrastructure'; label = 'Infrastructure'; steps = @(& $step 'Infrastructure' 'Azure resources (the template)' @('Infrastructure')) })
     $tracks.Add([ordered]@{ name = 'T1'; label = 'T1: SQL Server on an Azure VM (sqlvm01)'; steps = @(
                 (& $step 'T1.Artifacts' 'Artifacts to sqlvm01' @('T1/Artifacts'))
@@ -164,7 +168,7 @@ function Get-DemoProgressCatalog {
         $tracks.Add([ordered]@{ name = 'Fabric'; label = 'Fabric'; steps = @(
                     (& $step 'Fabric.Items' 'Workspace, notebooks, and the Real-Time Dashboard' @('Fabric/Fabric'))
                     (& $step 'Fabric.Report' 'History report' @('Fabric/Fabric'))
-                    (& $step 'Fabric.App' 'Insights app (optional)' @('Fabric/Fabric') $true)
+                    (& $step 'Fabric.App' 'Insights app' @('Fabric/Fabric') $true)
                 )
             })
     }
@@ -435,7 +439,7 @@ function New-DemoProgressModel {
                     $message = 'Not part of this run.'
                 }
             }
-            $steps.Add([ordered]@{ id = [string]$item['id']; label = [string]$item['label']; optional = [bool]$item['optional']; state = $state; status = ''; startedAt = 0; endedAt = 0; message = $message; azureSide = $false })
+            $steps.Add([ordered]@{ id = [string]$item['id']; label = [string]$item['label']; nonBlocking = [bool]$item['nonBlocking']; state = $state; status = ''; startedAt = 0; endedAt = 0; message = $message; azureSide = $false })
         }
         $tracks.Add([ordered]@{ name = [string]$track['name']; label = [string]$track['label']; steps = $steps.ToArray() })
     }
@@ -457,7 +461,7 @@ function New-DemoProgressModel {
         expect        = $expectation
         run           = [ordered]@{ state = 'Running'; endedAt = 0; reason = ''; next = ''; nextCommand = ''; exitCode = $null; diagnostics = ''; startedVms = @(); activity = '' }
         guidedStop    = [ordered]@{ state = $GuidedStop; message = ''; url = ''; deadlineAt = 0; promptedAt = 0; hostVm = 'archost01'; hostUser = ''; credential = ''; credentialText = ''; signInFallback = $false }
-        optional      = @()
+        nonBlocking   = @()
         confirm       = @()
         tracks        = $tracks.ToArray()
     }
@@ -653,7 +657,8 @@ function Set-DemoProgressStep {
     .SYNOPSIS
     Moves one step of the progress model: its state (Pending, Running, Done, Action needed, Failed, or Skipped, or from
     -Status, an ADR 0012 status), a one-line message, and -AzureSide when it waits for Azure (no action needed). A
-    step's clock starts when it first runs and stops when it ends. Internal.
+    step's clock starts when it first runs and stops when it ends. -MaxLength is the longest message kept (400 by
+    default; the Insights app's row keeps its error and its fix whole, 2026-11-05). Internal.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
     [CmdletBinding()]
@@ -675,7 +680,10 @@ function Set-DemoProgressStep {
         [AllowNull()]
         [string] $Message = $null,
 
-        [switch] $AzureSide
+        [switch] $AzureSide,
+
+        [ValidateRange(20, 4000)]
+        [int] $MaxLength = 400
     )
 
     if (-not $Path -or @($Id | Where-Object { $_ }).Count -eq 0) {
@@ -690,7 +698,7 @@ function Set-DemoProgressStep {
         Status  = $Status
         Side    = [bool]$AzureSide
         HasText = ($null -ne $Message)
-        Text    = $(if ($null -ne $Message) { Protect-DemoProgressText -Text $Message } else { '' })
+        Text    = $(if ($null -ne $Message) { Protect-DemoProgressText -Text $Message -MaxLength $MaxLength } else { '' })
     }
     Update-DemoProgress -Path $Path -Data $data -Action {
         param($Model, $Change)
@@ -793,8 +801,9 @@ function Add-DemoProgressStartedVm {
 }
 
 function Set-DemoProgressValue {
-    # Merges -Value into one section of the progress model: run, guidedStop, or expect; or replaces optional, or confirm
-    # (the lines DONE lists under "Please confirm"; Phase 28 live finding). Internal.
+    # Merges -Value into one section of the progress model: run, guidedStop, or expect; or replaces nonBlocking (what
+    # didn't work but never blocks DONE, Get-DemoNonBlockingItem; 2026-11-05), or confirm (the lines DONE lists under
+    # "Please confirm"; Phase 28 live finding). Internal.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
     [CmdletBinding()]
     param(
@@ -802,7 +811,7 @@ function Set-DemoProgressValue {
         [string] $Path,
 
         [Parameter(Mandatory)]
-        [ValidateSet('run', 'guidedStop', 'expect', 'optional', 'confirm')]
+        [ValidateSet('run', 'guidedStop', 'expect', 'nonBlocking', 'confirm')]
         [string] $Section,
 
         [Parameter(Mandatory)]
@@ -821,9 +830,14 @@ function Set-DemoProgressValue {
             $clean[[string]$key] = if ($item -is [string] -and [string]$key -notin 'url', 'state', 'credential', 'hostVm', 'hostUser', 'nextCommand') { Protect-DemoProgressText -Text $item -MaxLength 1200 } else { $item }
         }
     }
-    elseif ($Section -eq 'optional') {
-        $clean = @(foreach ($entry in @($Value)) {
-                [ordered]@{ name = Protect-DemoProgressText -Text ([string]$entry['name']); message = Protect-DemoProgressText -Text ([string]$entry['message']) -MaxLength 600; howTo = Protect-DemoProgressText -Text ([string]$entry['howTo']) -MaxLength 1200 }
+    elseif ($Section -eq 'nonBlocking') {
+        $clean = @(foreach ($entry in @($Value | Where-Object { $null -ne $_ })) {
+                [ordered]@{
+                    name    = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'name'))
+                    state   = $(if ([string](Get-DemoMemberValue -InputObject $entry -Name 'state') -in 'Failed', 'Action needed') { [string](Get-DemoMemberValue -InputObject $entry -Name 'state') } else { 'Failed' })
+                    message = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'message')) -MaxLength 1200
+                    howTo   = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'howTo')) -MaxLength 1200
+                }
             })
     }
     elseif ($Section -eq 'confirm') {
@@ -833,7 +847,7 @@ function Set-DemoProgressValue {
     }
     Update-DemoProgress -Path $Path -Data @{ Section = $Section; Value = $clean } -Action {
         param($Model, $Change)
-        if ($Change['Section'] -in 'optional', 'confirm') {
+        if ($Change['Section'] -in 'nonBlocking', 'confirm') {
             $Model[$Change['Section']] = @($Change['Value'])
             return
         }
@@ -968,12 +982,42 @@ function Get-DemoGuidedStopInstruction {
     return $steps
 }
 
+function Get-DemoProgressProblem {
+    <#
+    .SYNOPSIS
+    The status page's "Needs attention" lines (2026-11-05): what didn't work but never blocks DONE, each one line with
+    its state, its actual reason, and how to fix it (Format-DemoNonBlockingLine). While deploy.ps1 runs, the non-blocking
+    steps that failed (the Insights app); once it ended, the outcome's list (the model's nonBlocking section). Pure.
+    Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Model
+    )
+
+    if ([string]$Model['run']['state'] -in 'Done', 'NotDone') {
+        # A model from before 2026-11-05 has no nonBlocking section.
+        return @(@($Model['nonBlocking']) | Where-Object { $null -ne $_ } | ForEach-Object { Format-DemoNonBlockingLine -Item $_ } | Where-Object { $_ })
+    }
+    $lines = foreach ($track in @($Model['tracks'])) {
+        foreach ($item in @($track['steps'])) {
+            if ([bool]$item['nonBlocking'] -and [string]$item['state'] -eq 'Failed') {
+                Format-DemoNonBlockingLine -Item ([ordered]@{ name = [string]$item['label']; state = 'Failed'; message = [string]$item['message']; howTo = '' })
+            }
+        }
+    }
+    return @($lines | Where-Object { $_ })
+}
+
 function Get-DemoProgressBanner {
     <#
     .SYNOPSIS
     The status page's top banner, in exactly one of four states (brief item 11): Deploying (no action needed), Waiting
     (for you, at the guided stop), Done, or Stopped (not done). A running model whose heartbeat went quiet is Stopped:
-    deploy.ps1 isn't running any more. Pure. Internal.
+    deploy.ps1 isn't running any more. Problems are the "Needs attention" lines, what didn't work but never blocks DONE
+    (Get-DemoProgressProblem; 2026-11-05), in every state. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -995,6 +1039,7 @@ function Get-DemoProgressBanner {
     $command = if ([string]$run['nextCommand']) { [string]$run['nextCommand'] } elseif ([string]$Model['command']) { [string]$Model['command'] } else { './scripts/deploy.ps1' }
     $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
     $state = [string]$run['state']
+    $problems = @(Get-DemoProgressProblem -Model $Model)
     if ($state -eq 'Done') {
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add('The demo is complete.')
@@ -1014,11 +1059,8 @@ function Get-DemoProgressBanner {
         if ([string]$run['activity']) {
             $lines.Add([string]$run['activity'])
         }
-        foreach ($entry in @($Model['optional'])) {
-            $lines.Add(('Optional, not needed for the demo: {0}. {1} {2}' -f [string]$entry['name'], [string]$entry['message'], [string]$entry['howTo']))
-        }
         $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip the build and the guided stop.')
-        return [pscustomobject]@{ Kind = 'Done'; Title = 'Done'; Lines = $lines.ToArray(); Command = ''; Link = ''; Countdown = '' }
+        return [pscustomobject]@{ Kind = 'Done'; Title = 'Done'; Lines = $lines.ToArray(); Problems = $problems; Command = ''; Link = ''; Countdown = '' }
     }
     $stale = Test-DemoProgressStale -Model $Model -NowUnix $NowUnix -HeartbeatMinutes $HeartbeatMinutes
     if ($state -eq 'NotDone' -or $stale.Heartbeat) {
@@ -1037,7 +1079,7 @@ function Get-DemoProgressBanner {
         $lines.Add(('Run: {0}' -f $command))
         $lines.Add($resume)
         $lines.Add('For help, attach the redacted bundle from ./scripts/collect-diagnostics.ps1 to a Deployment problem issue.')
-        return [pscustomobject]@{ Kind = 'Stopped'; Title = 'Stopped, not done'; Lines = $lines.ToArray(); Command = $command; Link = ''; Countdown = '' }
+        return [pscustomobject]@{ Kind = 'Stopped'; Title = 'Stopped, not done'; Lines = $lines.ToArray(); Problems = $problems; Command = $command; Link = ''; Countdown = '' }
     }
     if ([string]$guided['state'] -eq 'Ready') {
         $lines = [System.Collections.Generic.List[string]]::new()
@@ -1054,7 +1096,7 @@ function Get-DemoProgressBanner {
             $left = [System.Math]::Max(0, $deadline - $NowUnix)
             $countdown = 'Time limit: {0} left (until {1}). After that, deploy.ps1 stops; run ./scripts/deploy.ps1 again and it waits for this step again.' -f (Format-DemoProgressDuration -Seconds $left), (Format-DemoProgressClock -Unix $deadline)
         }
-        return [pscustomobject]@{ Kind = 'Waiting'; Title = 'Waiting for you'; Lines = $lines.ToArray(); Command = ''; Link = [string]$guided['url']; Countdown = $countdown }
+        return [pscustomobject]@{ Kind = 'Waiting'; Title = 'Waiting for you'; Lines = $lines.ToArray(); Problems = $problems; Command = ''; Link = [string]$guided['url']; Countdown = $countdown }
     }
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add('You can step away. Keep this PC on and this window open; deploy.ps1 keeps the PC awake while it runs.')
@@ -1073,7 +1115,7 @@ function Get-DemoProgressBanner {
         $side = if ([bool]$item['azureSide']) { ' (Azure-side, no action needed)' } else { '' }
         $lines.Add(('Running: {0}{1}{2}' -f [string]$item['label'], $side, $(if ([string]$item['message']) { ': ' + [string]$item['message'] } else { '' })))
     }
-    return [pscustomobject]@{ Kind = 'Deploying'; Title = 'Deploying, no action needed'; Lines = $lines.ToArray(); Command = ''; Link = ''; Countdown = '' }
+    return [pscustomobject]@{ Kind = 'Deploying'; Title = 'Deploying, no action needed'; Lines = $lines.ToArray(); Problems = $problems; Command = ''; Link = ''; Countdown = '' }
 }
 
 function ConvertTo-DemoHtmlText {
@@ -1092,8 +1134,9 @@ function ConvertTo-DemoHtmlText {
 function ConvertTo-DemoProgressHtml {
     <#
     .SYNOPSIS
-    The status page for a progress model: the banner, the steps per track with their state, elapsed time, and message,
-    the optional items, the last update time, and a stale warning. Every text is HTML-encoded; the page has inline CSS
+    The status page for a progress model: the banner, the "Needs attention" box of what didn't work but never blocks
+    DONE (the Insights app, with its actual error and fix; 2026-11-05), the steps per track with their state, elapsed
+    time, and message, the last update time, and a stale warning. Every text is HTML-encoded; the page has inline CSS
     only, no script, and no external resource, and while the run goes on it refreshes itself every -RefreshSeconds.
     Only an https://portal.azure.com link is ever made a link. Pure. Internal.
     #>
@@ -1135,6 +1178,7 @@ function ConvertTo-DemoProgressHtml {
     $null = $html.AppendLine('tr.track th{background:#eef2f7;font-size:15px}.state{font-weight:bold;white-space:nowrap}')
     $null = $html.AppendLine('.s-Pending{color:#6b7280}.s-Running{color:#0b5cad}.s-Done{color:#15803d}.s-Action{color:#b45309}.s-Failed{color:#b91c1c}.s-Skipped{color:#9ca3af}')
     $null = $html.AppendLine('.meta{color:#4b5563}.warn{background:#fef3c7;border:1px solid #f59e0b;padding:8px 12px;border-radius:4px;margin:8px 0}')
+    $null = $html.AppendLine('.problems{background:#fef2f2;border:2px solid #b91c1c;padding:8px 16px;border-radius:6px;margin:0 0 16px 0}.problems h2{margin:4px 0 8px 0;font-size:18px;color:#b91c1c}.problems p{margin:6px 0}')
     $null = $html.AppendLine('</style>')
     $null = $html.AppendLine('</head>')
     $null = $html.AppendLine('<body>')
@@ -1153,6 +1197,16 @@ function ConvertTo-DemoProgressHtml {
         $null = $html.AppendLine(('<p>Command: <span class="command">{0}</span></p>' -f (& $e $banner.Command)))
     }
     $null = $html.AppendLine('</div>')
+    # What didn't work but never blocks DONE, right under the banner, so its error is the first thing below it.
+    $problems = @($banner.Problems | Where-Object { $_ })
+    if ($problems.Count -gt 0) {
+        $null = $html.AppendLine('<div class="problems">')
+        $null = $html.AppendLine('<h2>Needs attention</h2>')
+        foreach ($line in $problems) {
+            $null = $html.AppendLine(('<p>{0}</p>' -f (& $e $line)))
+        }
+        $null = $html.AppendLine('</div>')
+    }
     $updated = Format-DemoProgressClock -Unix ([long]$Model['updatedAt']) -Seconds
     $beat = Format-DemoProgressClock -Unix ([long]$Model['heartbeatAt']) -Seconds
     $null = $html.AppendLine(('<p class="meta">Environment {0}, resource group {1}. Started at {2}; the last step change at {3}; this page was written at {4} (local time).{5}</p>' -f (& $e $Model['environment']), (& $e $Model['resourceGroup']), (& $e (Format-DemoProgressClock -Unix ([long]$Model['startedAt']))), (& $e $updated), (& $e $beat), $(if ($running) { (' It refreshes every {0} seconds. If that time stops moving for a few minutes, deploy.ps1 isn''t running any more: run ./scripts/deploy.ps1 again.' -f $RefreshSeconds) } else { '' })))
@@ -1174,17 +1228,11 @@ function ConvertTo-DemoProgressHtml {
                 $detail = 'Azure-side, no action needed. ' + $detail
             }
             $statusNote = if ([string]$item['status']) { ' <span class="meta">({0})</span>' -f (& $e $item['status']) } else { '' }
-            $null = $html.AppendLine(('<tr><td>{0}</td><td class="state s-{1}">{2}{3}</td><td>{4}</td><td>{5}</td></tr>' -f (& $e $item['label']), (& $e $class), (& $e $stateText), $statusNote, (& $e $elapsed), (& $e $detail)))
+            $labelNote = if ([bool]$item['nonBlocking']) { ' <span class="meta">(doesn''t block DONE)</span>' } else { '' }
+            $null = $html.AppendLine(('<tr><td>{0}{1}</td><td class="state s-{2}">{3}{4}</td><td>{5}</td><td>{6}</td></tr>' -f (& $e $item['label']), $labelNote, (& $e $class), (& $e $stateText), $statusNote, (& $e $elapsed), (& $e $detail)))
         }
     }
     $null = $html.AppendLine('</table>')
-    $optional = @($Model['optional'])
-    if ($optional.Count -gt 0) {
-        $null = $html.AppendLine('<h2>Optional, not needed for the demo</h2>')
-        foreach ($entry in $optional) {
-            $null = $html.AppendLine(('<p><b>{0}</b>: {1} {2}</p>' -f (& $e $entry['name']), (& $e $entry['message']), (& $e $entry['howTo'])))
-        }
-    }
     $null = $html.AppendLine('<p class="meta">This page is written by deploy.ps1 from out/deploy-progress.json on this PC; it has no secrets. ./scripts/status.ps1 -Watch shows the same in a terminal.</p>')
     $null = $html.AppendLine('</body>')
     $null = $html.AppendLine('</html>')
@@ -1194,8 +1242,9 @@ function ConvertTo-DemoProgressHtml {
 function Format-DemoProgressConsole {
     <#
     .SYNOPSIS
-    The status page as console lines, for status.ps1 -Watch: the banner, then each track's steps with their state,
-    elapsed time, and message, cut to -Width. Pure. Internal.
+    The status page as console lines, for status.ps1 -Watch: the banner, the "Needs attention" lines (what didn't work
+    but never blocks DONE; 2026-11-05), then each track's steps with their state, elapsed time, and message, cut to
+    -Width. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
@@ -1227,6 +1276,13 @@ function Format-DemoProgressConsole {
     foreach ($line in @($banner.Lines)) {
         $lines.Add((& $cut ('  {0}' -f $line)))
     }
+    $problems = @($banner.Problems | Where-Object { $_ })
+    if ($problems.Count -gt 0) {
+        $lines.Add('  NEEDS ATTENTION:')
+        foreach ($line in $problems) {
+            $lines.Add((& $cut ('  ! {0}' -f $line)))
+        }
+    }
     $lines.Add($rule)
     $marks = @{ 'Pending' = '[ ]'; 'Running' = '[>]'; 'Done' = '[+]'; 'Action needed' = '[!]'; 'Failed' = '[X]'; 'Skipped' = '[-]' }
     foreach ($track in @($Model['tracks'])) {
@@ -1240,7 +1296,8 @@ function Format-DemoProgressConsole {
             if ([bool]$item['azureSide'] -and $state -eq 'Running') {
                 $detail = 'Azure-side, no action needed. ' + $detail
             }
-            $lines.Add((& $cut ('  {0} {1,-14} {2,-9} {3} {4}' -f $marks[$state], $state, $elapsed, [string]$item['label'], $(if ($detail) { '- ' + $detail } else { '' }))))
+            $label = if ([bool]$item['nonBlocking']) { '{0} (doesn''t block DONE)' -f [string]$item['label'] } else { [string]$item['label'] }
+            $lines.Add((& $cut ('  {0} {1,-14} {2,-9} {3} {4}' -f $marks[$state], $state, $elapsed, $label, $(if ($detail) { '- ' + $detail } else { '' }))))
         }
     }
     $stale = Test-DemoProgressStale -Model $Model -NowUnix $NowUnix

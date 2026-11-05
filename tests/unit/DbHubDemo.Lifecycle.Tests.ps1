@@ -849,6 +849,12 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { $script:order.Add('RunnerStatus'); [pscustomobject]@{ Status = 'Pass'; Result = (New-TestResult 'WORKLOAD.T1.COMMAND' 'Pass' 'workload' 'T1') } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith { $script:order.Add('DoneGate'); New-TestResult 'HUB.ESTATE.T1' 'Pass' 'hub' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:order.Add('PowerBI'); New-TestResult 'FABRIC.REPORT' 'Pass' 'fabric' 'fabric' }
+        # The Insights app, part of every deployment (2026-11-05): its sign-in starts before the stages, and its step runs
+        # after the report. Both have their own tests (DbHubDemo.FabricAppSignIn.Tests.ps1, DbHubDemo.FabricTrack.Tests.ps1);
+        # here the CLI is already signed in, and the app deploys.
+        $script:appSignIn = [pscustomobject]@{ Process = $null; Done = $true; Reported = $false; Result = (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Pass' -Message 'The Rayfin CLI is already signed in to the demo''s tenant.') }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:appSignIn }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith { $script:order.Add('App'); New-TestResult 'FABRIC.APP.DEPLOY' 'Pass' 'fabric' 'fabric' }
         # The switch from the interim baseline to a profile with incidents, after DONE's reads (2026-11-03).
         $script:switchOutcome = 'Set'
         Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
@@ -960,6 +966,44 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Not -Contain 'DoneGate'
     }
 
+    It 'starts the Insights app''s sign-in before its stages and runs the app''s step after the report; a failed app never stops the stage or keeps the run from DONE (-Sequential, 2026-11-05)' {
+        # Every requirement passes, so the outcome turns on the app alone.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith {
+            $script:order.Add('DoneGate')
+            foreach ($id in @($Requirement)) {
+                New-TestResult $id 'Pass' 'hub' 'subscription'
+            }
+        }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 1 -Exactly
+        $script:order[$script:order.IndexOf('PowerBI') + 1] | Should -Be 'App'
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' }).Count | Should -Be 1 -Because 'the sign-in''s record is handed out once'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.FABRIC' }).message | Should -Match 'with the Insights app'
+
+        # The app wasn't created: its step's record never blocks, the stage passes, and the run goes on to DONE.
+        $script:order.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith {
+            $script:order.Add('App')
+            New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The Insights app''s step failed: rayfin up exited with code 1.' -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn.' -Evidence ([ordered]@{ nonBlocking = 'insightsApp'; reportedStatus = 'Fail' })
+        }
+        $appFailed = @(Invoke-DemoDeployment -Config $config)
+        $stage = $appFailed | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.FABRIC' }
+        $stage.status | Should -Be 'Pass'
+        $stage.message | Should -Match 'the Insights app wasn''t created or doesn''t work, which doesn''t block DONE'
+        $script:order | Should -Contain 'DoneGate'
+        @($appFailed | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $appFailed; State = $script:state; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Sequential }
+        $outcome.Kind | Should -Be 'Done' -Because ('Missing: {0}; reason: {1}' -f (@($outcome.Missing) -join ', '), $outcome.Reason)
+        $outcome.ExitCode | Should -Be 0
+        (@($outcome.NonBlocking | ForEach-Object { [string]$_['message'] }) -join ' ') | Should -Match 'rayfin up exited with code 1'
+
+        # -SkipFabric starts no sign-in and runs no app step.
+        $script:order.Clear()
+        Invoke-DemoDeployment -Config $config -SkipFabric | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 2 -Exactly -Because 'only the two runs above started it'
+        $script:order | Should -Not -Contain 'App'
+    }
+
     It 'can end DONE on a new workspace, because its Fabric stage creates what FABRIC.ITEMS.REQUIRED looks for (review follow-up)' {
         # Before, every stage passed on a new workspace and the run still ended NOT DONE with exit code 1.
         $names = InModuleScope DbHubDemo { Get-DemoFabricAppSetting }
@@ -1050,7 +1094,7 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Be @(
             'Preflight', 'Switch:T1,T3,T2=baseline', 'Template', 'Bundle', 'SendBundle:sqlvm01', 'SendBundle:archost01', 'Publish', 'SendRunner:sqlvm01', 'SendRunner:archost01',
             'Template+Bundle', 'Loader:sqlvm01', 'Loader:archost01', 'T1Ready', 'Group', 'T3Setup', 'EnableT3', 'TestT3',
-            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate', 'Switch:T1,T3,T2=business-day'
+            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'App', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate', 'Switch:T1,T3,T2=business-day'
         )
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         $script:state.Stage | Should -Be 'Validation'

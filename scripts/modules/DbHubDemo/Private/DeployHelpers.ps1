@@ -926,11 +926,17 @@ function Invoke-DemoFabricAppStage {
     19b verifies the app itself. Internal.
 
     .DESCRIPTION
-    The app is optional (brief item 15), so here its records are never a Fail: a Fail becomes Manual action required
-    (evidence reportedStatus Fail), every record is marked optional (evidence optional insightsApp, which
-    Test-DemoOptionalResult reads), and the records that aren't the app's own (the script's own workspace and capacity
-    checks, for example) say they're the app's. -WorkspaceId is the workspace the Fabric step resolved or created, so
-    the script doesn't look it up by name again (Phase 28 live finding).
+    The Insights app is part of every deployment (2026-11-05), and it never blocks: when it isn't created, the run goes
+    on, the Fabric track still passes, and DONE still comes. So its records never stop anything
+    (ConvertTo-DemoInsightsAppRecord): a Fail becomes Manual action required (evidence reportedStatus Fail), as does a
+    FABRIC.APP.DEPLOY that's Not selected because something wasn't ready; every record is marked non-blocking (evidence
+    nonBlocking insightsApp, which Test-DemoNonBlockingResult reads); and the records that aren't the app's own (the
+    script's own workspace and capacity checks, for example) say they're the app's. The status page shows the step as
+    Failed with the actual reason (Get-DemoInsightsAppSummary), and DONE or NOT DONE names it. -WorkspaceId is the
+    workspace the Fabric step resolved or created, so the script doesn't look it up by name again (Phase 28 live
+    finding). The Rayfin CLI's sign-in, which only a person can do, starts at the beginning of the run, alongside
+    everything else (Start-DemoFabricAppSignIn); this step runs in the Fabric track's own process, which can't open a
+    browser, and waits for that sign-in only until its deadline (Wait-DemoFabricAppSignIn, in the track).
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -946,7 +952,7 @@ function Invoke-DemoFabricAppStage {
 
     $scriptPath = Join-Path -Path $script:RepoRoot -ChildPath 'scripts/configure-fabric-app.ps1'
     if (-not (Test-Path -LiteralPath $scriptPath)) {
-        return @(New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'scripts/configure-fabric-app.ps1 (Phase 19b) isn''t in this checkout, so the Fabric app wasn''t deployed.')
+        return @(New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'scripts/configure-fabric-app.ps1 (Phase 19b) isn''t in this checkout, so the Insights app wasn''t deployed.')
     }
     $argument = @{}
     if ($WorkspaceId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
@@ -954,14 +960,28 @@ function Invoke-DemoFabricAppStage {
     }
     $records = @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.FABRIC.APP' -Argument $argument)
     return @(foreach ($record in $records) {
-            ConvertTo-DemoOptionalAppRecord -Record $record
+            ConvertTo-DemoInsightsAppRecord -Record $record
         })
 }
 
-function ConvertTo-DemoOptionalAppRecord {
-    # One record of the optional Insights app's step as deploy.ps1 reports it (brief item 15; Phase 28 live finding):
-    # marked optional, a Fail as Manual action required, and named as the app's when it isn't one of its own checks.
-    # Internal.
+function ConvertTo-DemoInsightsAppRecord {
+    <#
+    .SYNOPSIS
+    One record of the Insights app's step as deploy.ps1 reports it (2026-11-05): non-blocking, so it never stops the
+    run, the Fabric track, or DONE, with the script's own status and the actual reason kept. Internal.
+
+    .DESCRIPTION
+    - Every record is marked non-blocking (evidence nonBlocking insightsApp, which Test-DemoNonBlockingResult reads), and
+      a status that changes is kept in evidence reportedStatus.
+    - A Fail becomes Manual action required, so nothing that reads a Fail counts it: the DONE gate, DEPLOY.SUMMARY, and
+      the exit code in GitHub Actions (Phase 28 live finding).
+    - FABRIC.APP.DEPLOY Not selected becomes Manual action required too: deploy.ps1 always selects the app, so "Not
+      deployed: ..." means it wasn't created, never that someone chose to skip it.
+    - A network error (evidence networkError) asks for configure-fabric-app.ps1, never for a rerun of the whole
+      deployment: the rest of the run doesn't need the app.
+    - A record that isn't one of the app's own checks (the script's workspace and capacity checks, for example) says
+      it's the app's.
+    #>
     [CmdletBinding()]
     [OutputType([object])]
     param(
@@ -969,16 +989,16 @@ function ConvertTo-DemoOptionalAppRecord {
         [object] $Record
     )
 
-    $own = [string]$Record.checkId -like 'FABRIC.APP.*' -or [string]$Record.checkId -eq 'DEPLOY.FABRIC.APP'
-    $marks = [ordered]@{ optional = 'insightsApp' }
-    if ([string]$Record.status -eq 'Fail') {
-        $marks['reportedStatus'] = 'Fail'
+    $id = [string]$Record.checkId
+    $own = $id -like 'FABRIC.APP.*' -or $id -eq 'DEPLOY.FABRIC.APP'
+    $marks = [ordered]@{ nonBlocking = 'insightsApp' }
+    $reported = [string]$Record.status
+    if ($reported -eq 'Fail' -or ($id -eq 'FABRIC.APP.DEPLOY' -and $reported -eq 'Not selected')) {
+        $marks['reportedStatus'] = $reported
         $Record.status = 'Manual action required'
-        if (-not [string](Get-DemoMemberValue -InputObject $Record -Name 'remediation')) {
-            $Record | Add-Member -NotePropertyName 'remediation' -NotePropertyValue 'To add the optional Insights app, run ./scripts/configure-fabric-app.ps1 -SignIn.' -Force
-        }
     }
     $evidence = Get-DemoMemberValue -InputObject $Record -Name 'evidence'
+    $network = [string](Get-DemoMemberValue -InputObject $evidence -Name 'networkError') -eq 'True'
     if ($evidence -is [System.Collections.IDictionary]) {
         foreach ($key in $marks.Keys) {
             $evidence[$key] = $marks[$key]
@@ -992,10 +1012,101 @@ function ConvertTo-DemoOptionalAppRecord {
     else {
         $Record | Add-Member -NotePropertyName 'evidence' -NotePropertyValue ([pscustomobject]$marks) -Force
     }
-    if (-not $own -and [string]$Record.message -notlike 'Optional Insights app:*') {
-        $Record.message = 'Optional Insights app: {0}' -f [string]$Record.message
+    $fix = ([string](Get-DemoMemberValue -InputObject $Record -Name 'remediation')).Trim()
+    if ($network) {
+        $Record | Add-Member -NotePropertyName 'remediation' -NotePropertyValue 'A network error stopped it (requests that are safe to repeat were retried). Run ./scripts/configure-fabric-app.ps1 -SignIn: it adds the Insights app without running the deployment again.' -Force
+    }
+    elseif ($marks.Contains('reportedStatus') -and -not $fix) {
+        $Record | Add-Member -NotePropertyName 'remediation' -NotePropertyValue 'To add the Insights app, run ./scripts/configure-fabric-app.ps1 -SignIn.' -Force
+    }
+    if (-not $own -and [string]$Record.message -notlike 'Insights app:*') {
+        $Record.message = 'Insights app: {0}' -f [string]$Record.message
     }
     return $Record
+}
+
+function ConvertTo-DemoInsightsAppErrorRecord {
+    # The Insights app step's own record when its code stopped with an exception (2026-11-05): DEPLOY.FABRIC.APP with the
+    # innermost cause (a network error said as one), non-blocking as ConvertTo-DemoInsightsAppRecord makes it, so the
+    # Fabric track and the run go on. Internal.
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Exception] $Exception
+    )
+
+    $evidence = [ordered]@{}
+    if (Test-DemoNetworkFailure -Exception $Exception) {
+        $evidence['networkError'] = $true
+    }
+    $record = New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('The Insights app step stopped: {0}' -f (Get-DemoExceptionText -Exception $Exception)) -Evidence $evidence -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn to see its output; it adds the Insights app, which nothing else in the deployment needs.'
+    return (ConvertTo-DemoInsightsAppRecord -Record $record)
+}
+
+function Invoke-DemoInsightsAppStep {
+    <#
+    .SYNOPSIS
+    The Insights app's part of deploy.ps1's Fabric step (2026-11-05), in the parallel Fabric track and the sequential
+    Fabric stage: waits for the run's sign-in until its deadline (Wait-DemoFabricAppSignIn), creates or updates the app
+    (Invoke-DemoFabricAppStage), and shows the outcome on the status page's Fabric.App row and, when the app wasn't
+    created or doesn't work, on the console at once. Returns the app's records, every one non-blocking. Internal.
+
+    .DESCRIPTION
+    Nothing here stops the step it's part of: an exception becomes the app's own DEPLOY.FABRIC.APP record
+    (ConvertTo-DemoInsightsAppErrorRecord), so the Fabric track's outcome still comes only from the notebooks, the
+    dashboard, and the history model and report, the other tracks go on, and the run can still end DONE. Only a stop of
+    the run itself (Ctrl+C) goes through. The row is Done when the app is deployed and checked, and Failed, in red, with
+    the actual reason and how to add it, when it isn't (Get-DemoInsightsAppSummary).
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = '',
+
+        # The Fabric step's records, whose FABRIC.RESOLVE.WORKSPACE names the workspace (Get-DemoResolvedWorkspaceId).
+        [AllowEmptyCollection()]
+        [object[]] $FabricResult = @(),
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    $records = @()
+    try {
+        Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State 'Running' -Message 'Creating or updating the Insights app (it doesn''t block DONE).'
+        $null = Wait-DemoFabricAppSignIn -ProgressPath $ProgressPath
+        $records = @(Invoke-DemoFabricAppStage -Config $Config -ConfigPath $ConfigPath -WorkspaceId (Get-DemoResolvedWorkspaceId -Result $FabricResult))
+    }
+    catch {
+        # A stop of the run goes through; anything else is the app's own failure.
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException] -or ($_.Exception -is [System.OperationCanceledException] -and (Test-DemoRunCancelled))) {
+            throw
+        }
+        $records = @(ConvertTo-DemoInsightsAppErrorRecord -Exception $_.Exception)
+    }
+    try {
+        $app = Get-DemoInsightsAppSummary -Result $records
+        if ($null -eq $app) {
+            $records = @($records) + @(ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The Insights app step reported nothing.' -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn to see why; it adds the Insights app, which nothing else in the deployment needs.'))
+            $app = Get-DemoInsightsAppSummary -Result $records
+        }
+        Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State $app.State -Status $app.Status -Message $app.StepMessage -MaxLength 1200
+        if ($app.State -eq 'Failed') {
+            # The console says so at once, as for any other step (Phase 28 live finding), and that the run goes on.
+            Write-DemoLog -Level Warning -Message ('The Insights app step failed; it doesn''t block DONE, and the deployment goes on. {0} {1}' -f $app.Reason, $app.HowTo)
+        }
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) {
+            throw
+        }
+        Write-DemoLog -Level Warning -Message ('The Insights app''s outcome couldn''t be shown on the status page: {0}' -f (Get-DemoExceptionText -Exception $_.Exception))
+    }
+    return $records
 }
 
 function Get-DemoResolvedWorkspaceId {

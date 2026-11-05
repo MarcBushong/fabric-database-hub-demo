@@ -623,12 +623,12 @@ function Initialize-DemoConfig {
     }
     $nextSteps.Add(('./scripts/preflight.ps1{0}   # checks P1-P6, quota, policies, and the cost; registers missing providers' -f $configArgument))
     if ($mode -eq 'PaygWizard') {
-        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 2 to 3 hours and keeps this PC awake; about 60 to 90 minutes in, it asks you for about 10 minutes (the guided stop), then finishes by itself' -f $configArgument))
+        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 2 to 3 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); about 60 to 90 minutes in, it asks you for about 10 minutes (the guided stop), then finishes by itself' -f $configArgument))
     }
     else {
-        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 to 2.5 hours and keeps this PC awake; nothing needs you' -f $configArgument))
+        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 to 2.5 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))
     }
-    $nextSteps.Add(('./scripts/configure-fabric-app.ps1 -SignIn{0}   # optional, the Insights app: one browser sign-in, then it deploys' -f $configArgument))
+    $nextSteps.Add(('./scripts/configure-fabric-app.ps1 -SignIn{0}   # only when deploy.ps1 says the Insights app wasn''t created: one browser sign-in, then it deploys' -f $configArgument))
     $nextSteps.Add(('Each session: ./scripts/start-demo.ps1{0}, then ./scripts/stop-demo.ps1 -SaveHistory{0}' -f $configArgument))
     #endregion Next steps
 

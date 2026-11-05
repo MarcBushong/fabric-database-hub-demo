@@ -21,6 +21,12 @@ One command, one guided stop (Phase 28):
 - Run it again with no parameters and it continues an unfinished deployment (the resource group's state tags), as
   -Resume does. It starts VMs that were stopped, for example by the nightly auto-shutdown or stop-demo.ps1, and a
   stopped T4, while preflight runs; running VMs are only read.
+- The Insights app (APP_DatabaseHub_Insights) is part of every deployment. Its Rayfin CLI needs one browser sign-in
+  (P14), which starts at the beginning, while you're still at the keyboard, when the CLI isn't signed in yet: on
+  Windows in a window of its own, elsewhere in this terminal. Nothing waits for it but the app's own step, and that only
+  until its deadline (15 minutes after the start). In CI, or a session that can't take keyboard input, it isn't started.
+  When the app isn't created, or doesn't work, the run still goes on and can still end DONE; the status page shows the
+  app's step Failed with the actual error and how to fix it, and the banner says so.
 - It ends with one banner: DONE (Database Hub shows every target, and where to look) or NOT DONE (why, the single next
   action, and the exact command). The exit code is 0 only when it's DONE (and for a -WhatIf with no Fail).
 - Ctrl+C stops it within seconds, track processes included: their slow Azure cleanups are left to the next run or
@@ -35,7 +41,7 @@ has deployed archost01 and is released first: passwords rotated and the copy's A
 artifacts sent meanwhile; then its loader, Arc onboarding and configuration with PAYG and monitoring, and
 telemetry), T4 (the PostgreSQL flexible server's checks and its Azure Monitor metrics; T1's track sets it
 up through the P6 group, and a stopped T4 is started before the template; Phase 24, ADR 0019), and Fabric
-(the notebooks, the Real-Time Dashboard, the history report, and the optional Insights app).
+(the notebooks, the Real-Time Dashboard, the history report, and the Insights app).
 The bundle and the runner are built while Preflight runs. With networkMode private, the policy inventory runs
 alongside the deployment instead of before it (with public or auto it stays in preflight). The validation then checks
 Database Hub's estate for every target, the runner, the Hub checklist with the T3 gate, and the dashboard's tiles, and
