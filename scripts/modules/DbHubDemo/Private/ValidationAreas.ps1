@@ -691,6 +691,9 @@ function Invoke-DemoValidationCost {
         $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Pass' -Message ('Auto-shutdown is enabled at {0} {1} for {2}.' -f $time, $zone, (@($Context.VmNames.Values) -join ' and ')) -Evidence $evidence -DocUrl $scheduleDoc))
     }
 
+    # The nightly safety stop (ADR 0024) behind the auto-shutdown: its schedules, its role, and its last runs. Read-only.
+    $results.Add((Get-DemoSafetyStopStatus -Config $config -CheckId 'COST.SAFETYSTOP' -Area 'cost'))
+
     # On-demand Bastion and public IPs (C8). An interrupted Bastion delete can leave its public IP (live finding, 2026-10-20).
     $bastionDoc = 'https://learn.microsoft.com/azure/bastion/bastion-overview'
     $bastionName = 'bas-{0}-{1}' -f $config['prefix'], $config['environment']

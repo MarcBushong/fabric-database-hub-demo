@@ -16,7 +16,7 @@ Only the `main` branch is supported.
 ## Security model
 
 - The threat model, trust boundaries, and residual risks are in [docs/security-model.md](docs/security-model.md).
-- The permission model is in [docs/permissions.md](docs/permissions.md). The minimum is Contributor on the subscription, with no role assignments by default.
+- The permission model is in [docs/permissions.md](docs/permissions.md). The minimum is Contributor on the subscription, with one role assignment by default: the nightly safety stop's stop-only role at the demo resource group, made only when the deployer may ([ADR 0024](docs/adr/0024-nightly-safety-stop.md)).
 - Secrets handling is in [ADR 0009](docs/adr/0009-secrets-handling.md). The default deployment stores no secrets.
 - The public repository's controls (fork safety, the GitHub environments, and the masked Actions logs) are in [ADR 0022](docs/adr/0022-public-repository-and-github-actions-hardening.md).
 

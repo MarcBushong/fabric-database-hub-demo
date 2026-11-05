@@ -3,7 +3,7 @@
 ## Getting started
 
 **What do I need?**
-Contributor on an existing Azure subscription, Database Hub enabled in your Fabric tenant, and an Entra security group you own for the Azure SQL admin. The notebooks also need a Fabric workspace on a running F or Trial capacity. The full list, P1–P11, with who provides each item, is in [prerequisites](prerequisites.md): P1–P6 are required, and P7–P11 are optional.
+Contributor on an existing Azure subscription, Database Hub enabled in your Fabric tenant, and an Entra security group you own for the Azure SQL admin. The notebooks also need a Fabric workspace on a running F or Trial capacity. The full list, P1–P11, with who provides each item, is in [prerequisites](prerequisites.md): P1–P6 are required, and P7–P11 are optional. An Owner once per environment is recommended for the nightly safety stop's role (P16); without one, the deployment still ends **DONE**.
 
 **Do I have to change my Azure CLI default subscription?**
 No. If you aren't signed in to the demo's tenant, sign in yourself with `az login --tenant <tenantId>` and press Enter at the subscription selector for no changes. Every Azure call names the configured subscription, and the subscription guard checks that subscription's tenant and account before anything is written; the scripts never sign in or change your default. On a shared machine you can give the demo its own Azure CLI profile ([prerequisites](prerequisites.md#optional-a-separate-azure-cli-profile)).
@@ -34,6 +34,9 @@ Yes, apart from about 10 minutes at the guided stop, when you sign in through Ba
 **Why is there no Key Vault?**
 The default path needs only Contributor, and Contributor can't grant itself vault data roles. VM passwords are used once and discarded, and break-glass access is a VMAccess reset ([ADR 0009](adr/0009-secrets-handling.md)). An opt-in vault for the one-time host password exists for accounts that can assign roles ([deployment](deployment.md#opt-in-the-password-in-key-vault-instead-of-the-clipboard)).
 
+**Why does `deploy.ps1` create a role assignment when I'm an Owner?**
+For the nightly safety stop, the owner-approved exception to the Contributor-only default (2026-11-05): its identity needs a role to deallocate the VMs and stop T4 each night. The role, "DbHub Demo Safety Stop", can only read the demo's resources and deallocate its VMs and stop T4, at the demo resource group only. When you can't assign roles, nothing is assigned: the run still ends **DONE** and prints the one command for an Owner, `./scripts/grant-safety-stop.ps1` ([ADR 0024](adr/0024-nightly-safety-stop.md), [permissions](permissions.md#the-nightly-safety-stop)).
+
 **Can I use Fabric mirroring with this demo?**
 Not in v1. Hub doesn't need it. A future optional add-on would need a running capacity and, depending on the source, vCore Azure SQL, a gateway, or SQL Server 2025 with Arc ([ADR 0015](adr/0015-mirroring-deferral.md)).
 
@@ -60,7 +63,7 @@ On 2026-10-21 the `lowest-cost` profile estimated $7.41 for a 5-hour session and
 Not for Database Hub: each Hub user needs only a Fabric Free license (P4). The notebooks and the Real-Time Dashboard (Phase 18) need a workspace on a running F or Trial capacity (P5), and so will the Power BI report (Phase 19, pending). A paid capacity bills by the hour while it runs, outside the demo's ceiling, so pause it when no workspace needs it ([cost management](cost-management.md#microsoft-fabric-capacity)).
 
 **How do I stop paying between demos?**
-`./scripts/stop-demo.ps1` deallocates the VMs and lets T3 auto-pause, and the VMs also stop every evening. `-ParkT2` stops only T2, and `-RemoveT3` deletes T3 until the next start. Pause the Fabric capacity when no workspace needs it. `./scripts/destroy.ps1` removes everything ([cleanup](cleanup.md)).
+`./scripts/stop-demo.ps1` deallocates the VMs, stops T4, and lets T3 auto-pause. If you forget, every evening at `autoShutdownTime` the VMs' auto-shutdown and the nightly safety stop deallocate the VMs and stop T4, then check that T3 paused ([what stops or pauses on its own](../README.md#what-stops-or-pauses-on-its-own)). `-ParkT2` stops only T2, and `-RemoveT3` deletes T3 until the next start. Pause the Fabric capacity when no workspace needs it. `./scripts/destroy.ps1` removes everything ([cleanup](cleanup.md)).
 
 **How do I rebuild the T2 guest before its evaluation OS expires?**
 The guest's Windows Server evaluation lasts 180 days. `reset-demo.ps1 -RebuildGuest` isn't supported yet, so rebuild with `destroy.ps1`, then `deploy.ps1`, and do the setup-wizard step again ([limitations](limitations.md#targets-and-licensing)).

@@ -506,14 +506,14 @@ Describe 'Guardrail 3: the console, DONE, and the status page say it, with the h
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-TestState -T4Sku 'Standard_D2ds_v5') } { Get-DemoDeploymentOutcome -Result @() -State $State -Config $Config -T4HourlyUsd 0.5 }
         $note = @($outcome.Notes | Where-Object { $_ -match '^T4 created as General Purpose' })
         $note.Count | Should -Be 1
-        $note[0] | Should -Be 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API). Azure starts a stopped T4 again on its own after 7 days, and nothing here stops it again (no daily safety stop is set up), so ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show that date.'
+        $note[0] | Should -Be 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API). Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again at the next auto-shutdown time when it''s in place, and ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show the date and whether it is.'
         $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
         $lines | Should -Contain $note[0]
 
-        # With the on-demand control, its daily safety stop stops T4 again when its schedule is in place, which
-        # stop-demo.ps1 and status.ps1 read (review of 20e855c).
+        # With the on-demand control too, the note says it as a condition: DONE reads no schedule, while stop-demo.ps1
+        # and status.ps1 read the nightly safety stop's (ADR 0024; review of 20e855c).
         $controlled = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Control); State = (New-TestState -T4Sku 'Standard_D2ds_v5') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 -Created $true }
-        $controlled | Should -Match 'Azure starts a stopped T4 again on its own after 7 days; the on-demand control''s daily safety stop stops it again within a day when its schedule is in place, and \./scripts/stop-demo\.ps1 and \./scripts/status\.ps1 show the date and whether it is\.$'
+        $controlled | Should -Match 'Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again at the next auto-shutdown time when it''s in place, and \./scripts/stop-demo\.ps1 and \./scripts/status\.ps1 show the date and whether it is\.$'
         # Only for the size the fallback chose: not one you set, and not a size an existing server kept.
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -SkuName 'Standard_D2ds_v5'); State = (New-TestState -T4Sku 'Standard_D2ds_v5') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 } | Should -BeNullOrEmpty
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-TestState -T4Sku 'Standard_B1ms') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 } | Should -BeNullOrEmpty
@@ -975,8 +975,8 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
     }
 
     It 'prices the move of an existing T4 to the default first, and keeps its size over a ceiling, naming the ceiling to raise (review of PR 20)' {
-        # The reviewer's case: monthlyCeilingUsd set to 250, no t4SkuName, and no control, so T4's 7-day restart counts the
-        # rest of the month: light use plus that worst case is 312.21 USD, a Fail that -FromStage Infrastructure never ran.
+        # The reviewer's case: monthlyCeilingUsd set to 250, no t4SkuName, and no safety stop in place, so T4's 7-day restart
+        # counts the rest of the month: light use plus that worst case is 312.21 USD, a Fail that -FromStage Infrastructure never ran.
         $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
         $config = New-TestConfig
         $config['monthlyCeilingUsd'] = 250
@@ -993,7 +993,7 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         $size[0].evidence.outcome | Should -Be 'Ceiling'
         $size[0].evidence.skipReason | Should -Be 'MonthlyCeiling'
         $size[0].message | Should -Match '^T4 exists as Standard_D2ds_v5 \(General Purpose\)\. Moving it to the default, General Purpose Standard_D4ds_v5 with autonomous tuning, would put the demo''s month at 312\.21 USD, over monthlyCeilingUsd \(250\.00 USD\), so this deployment keeps its size, and the next run that deploys the template checks again\.'
-        $size[0].remediation | Should -Match 'raise monthlyCeilingUsd to at least 313 \(the budget follows it\), then run \./scripts/deploy\.ps1 -FromStage Infrastructure again\. Or put the daily T4 safety stop in place'
+        $size[0].remediation | Should -Match 'raise monthlyCeilingUsd to at least 313 \(the budget follows it\), then run \./scripts/deploy\.ps1 -FromStage Infrastructure again\. Or put the nightly safety stop fully in place \(\./scripts/deploy\.ps1 sets it up, and an Owner runs \./scripts/grant-safety-stop\.ps1 once when deploy\.ps1 couldn''t assign its role\)'
         $size[0].remediation | Should -Match 'set t4SkuName to Standard_D2ds_v5'
         @($script:recorded).Count | Should -Be 0 -Because 'nothing is recorded, so the next run checks again'
         $deployment.T4Note | Should -Not -Match 'scaled'
@@ -1020,7 +1020,7 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['SkuName'] -eq 'Standard_D4ds_v5' }
         $size = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE'
         $size.evidence.outcome | Should -Be 'Scale'
-        $size.message | Should -Match 'Its cost check passed: about 0\.500 USD an hour while it runs .* counted as about a day per restart because the daily T4 safety stop is in place'
+        $size.message | Should -Match 'Its cost check passed: about 0\.500 USD an hour while it runs .* counted as about a day per restart because a safety stop is in place'
         $deployment.T4Note | Should -Match '^T4 scaled from Standard_D2ds_v5 to the default'
 
         # A move that doesn't raise the price isn't priced: the two 4-vCore sizes share the vCore price.

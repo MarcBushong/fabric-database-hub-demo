@@ -484,6 +484,8 @@ function Invoke-DemoDeployment {
                 # The on-demand activity control's A1 (ADR 0020): a redeploy deleted it with the group. Granted again only
                 # with assignRoles; otherwise, or when it fails, Manual action required with the -GrantRole command.
                 & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                # The nightly safety stop (ADR 0024), part of every deployment; its problems are Warnings, never a Fail.
+                & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
             }
             'Artifacts' {
                 $current = Get-DemoDeploymentState -Config $Config

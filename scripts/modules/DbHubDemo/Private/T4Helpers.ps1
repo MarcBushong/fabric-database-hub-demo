@@ -307,7 +307,7 @@ function New-DemoT4SizeResult {
     - Refused: Azure refused the scale (-Failure, SkuNotAvailable), so it keeps its size, which the resource group records
       (DbHubT4Size), and later runs keep it.
     - Ceiling (review of PR 20): the move's cost check (-Cost, Get-DemoT4GeneralPurposeCost at the larger size, with the
-      restart worst case the daily T4 safety stop allows) put the month over monthlyCeilingUsd, a session over
+      restart worst case a safety stop allows) put the month over monthlyCeilingUsd, a session over
       sessionCeilingUsd, or found no price, so this deployment keeps the server's size and names the ceiling to raise; the
       next run that deploys the template checks again. Nothing is recorded.
     -Explicit words it for a t4SkuName the configuration changed on an existing server; -Cost on Scale says the check
@@ -386,7 +386,7 @@ function New-DemoT4SizeResult {
             $back = if ($Explicit) { 'Or set t4SkuName back to {0}.' -f $ServerSku } else { $keep }
             $remediation = switch ($reason) {
                 'MonthlyCeiling' {
-                    $safety = if ([string]$Cost.RestartAssumption -eq 'RestOfMonth') { ' Or put the daily T4 safety stop in place (./scripts/setup-activity-control.ps1, with its role from -GrantRole or deploy.ps1 with assignRoles), so each of T4''s 7-day restarts counts as about a day.' } else { '' }
+                    $safety = if ([string]$Cost.RestartAssumption -eq 'RestOfMonth') { ' Or put the nightly safety stop fully in place (./scripts/deploy.ps1 sets it up, and an Owner runs ./scripts/grant-safety-stop.ps1 once when deploy.ps1 couldn''t assign its role), so each of T4''s 7-day restarts counts as about a day.' } else { '' }
                     [string]::Format($culture, 'To move T4 to {0}, raise monthlyCeilingUsd to at least {1:N0} (the budget follows it), then run ./scripts/deploy.ps1 -FromStage Infrastructure again.{2} {3}', $SkuName, [System.Math]::Ceiling([double]$Cost.MonthlyWorstCaseUsd), $safety, $back)
                 }
                 'SessionCeiling' { [string]::Format($culture, 'To move T4 to {0}, raise sessionCeilingUsd to at least {1:N0}, then run ./scripts/deploy.ps1 -FromStage Infrastructure again. {2}', $SkuName, [System.Math]::Ceiling([double]$Cost.SessionUsd), $back) }
@@ -471,7 +471,7 @@ function ConvertTo-DemoT4FallbackCost {
     The worst case counts Azure starting a stopped flexible server again on its own after seven days ("The server remains
     stopped for seven days unless you restart it sooner", https://learn.microsoft.com/azure/postgresql/overview;
     https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server): the estimate's light-use month plus
-    its T4 restart worst case (Get-DemoCostEstimate: about a day per restart where the daily T4 safety stop is fully in
+    its T4 restart worst case (Get-DemoCostEstimate: about a day per restart where a safety stop is fully in
     place, otherwise the rest of the month's compute at that size), with T4's storage, its private DNS zone, and, where
     the subscription's plans are on Standard (what a tenant policy enforces, PREFLIGHT.POLICY.DEFENDER), Defender CSPM
     and Defender for open-source relational databases. Unpriced names what the Retail Prices API had no price for, which
@@ -507,7 +507,7 @@ function ConvertTo-DemoT4FallbackCost {
     $monthlyWorst = [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthly') + [double](Get-DemoMemberValue -InputObject $Estimate -Name 'T4AutoRestartWorstCaseMonthly'), 2)
     $session = [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'SessionCost'), 2)
     # T4 alone: its fixed costs and its compute for the light-use hours plus the restart worst case the estimate counted
-    # (T4RestartHours: the rest of the month, or about a day per restart where the daily T4 safety stop is in place;
+    # (T4RestartHours: the rest of the month, or about a day per restart where a safety stop is in place;
     # 2026-11-04). An estimate without it counts every hour of the month.
     $restartHours = Get-DemoMemberValue -InputObject $Estimate -Name 'T4RestartHours'
     $t4Hours = if ($null -ne $restartHours) { [System.Math]::Min($hoursPerMonth, [double](Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseHoursPerMonth') + [double]$restartHours) } else { $hoursPerMonth }
@@ -549,7 +549,7 @@ function Get-DemoT4GeneralPurposeCost {
     right before deploy.ps1 moves an existing T4 to a larger size: the default Standard_D4ds_v5, or a t4SkuName the
     configuration changed (review of PR 20, 2026-11-04). The demo's estimate with T4 at that size, priced from the Azure
     Retail Prices API now (Get-DemoCostEstimate, with the subscription's Defender for Cloud plans, the T2 golden snapshots,
-    and the daily T4 safety stop's coverage of T4's 7-day restart, all read-only), and its verdict
+    and the safety stops' coverage of T4's 7-day restart, all read-only), and its verdict
     (ConvertTo-DemoT4FallbackCost). Never throws: an estimate that can't be made is a verdict that doesn't allow it
     (Price). Internal.
     #>
@@ -586,7 +586,7 @@ function Get-DemoT4GeneralPurposeCost {
     catch {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots couldn''t be listed, so T4''s estimate at {0} leaves them out: {1}' -f $SkuName, (Protect-DemoText -Text $_.Exception.Message))
     }
-    # The daily T4 safety stop caps the restart worst case when it's fully in place (2026-11-04); never throws.
+    # A safety stop caps the restart worst case when it's fully in place (2026-11-04, ADR 0024); never throws.
     $parameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
     try {
         return (ConvertTo-DemoT4FallbackCost -Estimate (Get-DemoCostEstimate @parameters) -Config $priced -SkuName $SkuName)
@@ -609,7 +609,7 @@ function Format-DemoT4FallbackCostText {
     )
 
     $culture = [System.Globalization.CultureInfo]::InvariantCulture
-    $worst = if ([string](Get-DemoMemberValue -InputObject $Cost -Name 'RestartAssumption') -eq 'SafetyStop') { 'its worst case, Azure starting a stopped server again on its own after 7 days, counted as about a day per restart because the daily T4 safety stop is in place,' } else { 'its worst case, every hour of a month because Azure starts a stopped server again on its own after 7 days,' }
+    $worst = if ([string](Get-DemoMemberValue -InputObject $Cost -Name 'RestartAssumption') -eq 'SafetyStop') { 'its worst case, Azure starting a stopped server again on its own after 7 days, counted as about a day per restart because a safety stop is in place,' } else { 'its worst case, every hour of a month because Azure starts a stopped server again on its own after 7 days,' }
     $text = [string]::Format($culture, 'about {0:N3} USD an hour while it runs (list price in {1}, Azure Retail Prices API, read now); {7} is {2:N2} USD a month for T4 with its storage and Defender plans, and {3:N2} USD for the demo''s month against monthlyCeilingUsd ({4:N2} USD); a session is {5:N2} USD against sessionCeilingUsd ({6:N2} USD)', [object[]]@([double]$Cost.HourlyUsd, $Cost.Location, [double]$Cost.T4MonthlyWorstCaseUsd, [double]$Cost.MonthlyWorstCaseUsd, [double]$Cost.MonthlyCeilingUsd, [double]$Cost.SessionUsd, [double]$Cost.SessionCeilingUsd, $worst))
     if (@($Cost.Unpriced).Count -gt 0) {
         $text += '. Not priced, so left out of these totals: {0}' -f (@($Cost.Unpriced) -join '; ')
@@ -946,7 +946,7 @@ function Get-DemoT4SkipReason {
     $reason = if ($null -ne $Cost) { [string]$Cost.SkipReason } else { 'Price' }
     $then = if ($Ahead) { 'Nothing to do unless Azure refuses both 4-vCore sizes. To have the fallback create T4 then, ' } else { 'To add T4, ' }
     $again = if ($Ahead) { '' } else { ', then run ./scripts/deploy.ps1, which checks the fallback again' }
-    $worst = if ($null -ne $Cost -and [string](Get-DemoMemberValue -InputObject $Cost -Name 'RestartAssumption') -eq 'SafetyStop') { 'its worst case (Azure starts a stopped server again on its own after 7 days, about a day each time while the daily T4 safety stop is in place)' } else { 'its worst case, every hour of a month (Azure starts a stopped server again on its own after 7 days)' }
+    $worst = if ($null -ne $Cost -and [string](Get-DemoMemberValue -InputObject $Cost -Name 'RestartAssumption') -eq 'SafetyStop') { 'its worst case (Azure starts a stopped server again on its own after 7 days, about a day each time while a safety stop is in place)' } else { 'its worst case, every hour of a month (Azure starts a stopped server again on its own after 7 days)' }
     switch ($reason) {
         'MonthlyCeiling' {
             $because = [string]::Format($culture, '{3} at about {0:N3} USD an hour, with its storage and Defender plans, brings the demo''s month to {1:N2} USD, over monthlyCeilingUsd ({2:N2} USD)', [double]$Cost.HourlyUsd, [double]$Cost.MonthlyWorstCaseUsd, [double]$Cost.MonthlyCeilingUsd, $worst)
@@ -1277,13 +1277,8 @@ function Get-DemoT4FallbackNote {
     $sku = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku')
     $tuning = (Get-DemoT4Tuning -Config $Config -SkuName $sku).Enabled
     if ($Created -is [bool] -and $Created) {
-        # Whether the daily safety stop is scheduled isn't read here, so it's said as a condition (status.ps1 reads it).
-        $restart = if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
-            'Azure starts a stopped T4 again on its own after 7 days; the on-demand control''s daily safety stop stops it again within a day when its schedule is in place, and ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show the date and whether it is.'
-        }
-        else {
-            'Azure starts a stopped T4 again on its own after 7 days, and nothing here stops it again (no daily safety stop is set up), so ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show that date.'
-        }
+        # Whether the nightly safety stop is in place isn't read here, so it's said as a condition (status.ps1 reads it).
+        $restart = 'Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again at the next auto-shutdown time when it''s in place, and ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show the date and whether it is.'
         return ('{0} {1}' -f (Format-DemoT4FallbackCreatedText -HourlyUsd $HourlyUsd -Location $location -SkuName $sku -Tuning $tuning), $restart)
     }
     $hourly = Format-DemoT4HourlyText -HourlyUsd $HourlyUsd -Location $location
@@ -1345,10 +1340,11 @@ function Format-DemoT4RestartText {
     Azure starts a stopped flexible server again after 7 days ("The server remains stopped for seven days unless you
     restart it sooner", https://learn.microsoft.com/azure/postgresql/overview; "Server will be automatically started after
     7 days", https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server), so it's the stop time
-    plus -Days. -SafetyStop is the on-demand control's daily safety stop (ADR 0020) as Get-DemoT4SafetyStopState read it:
-    Scheduled stops T4 again within a day; Off (the control isn't set up) and NotScheduled (setup couldn't schedule it)
-    mean nothing here stops it again; Unknown (its schedule couldn't be read) is said as a condition (review of 20e855c).
-    -HourlyUsd is the caller's, from the Retail Prices API. Pure. Internal.
+    plus -Days. -SafetyStop is what stops it again, as Get-DemoT4RestartStopState read it: Nightly (the nightly safety stop,
+    ADR 0024) and Scheduled (the on-demand control's daily safety stop, ADR 0020) stop it within a day; NoRole (the
+    nightly safety stop is scheduled, but its role isn't assigned), NotScheduled, and Off mean nothing here stops it again;
+    Unknown (a read failed) is said as a condition (review of 20e855c). -HourlyUsd is the caller's, from the Retail Prices
+    API. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -1364,7 +1360,7 @@ function Format-DemoT4RestartText {
         [ValidateRange(1, 30)]
         [int] $Days = 7,
 
-        [ValidateSet('Off', 'Scheduled', 'NotScheduled', 'Unknown')]
+        [ValidateSet('Off', 'Nightly', 'Scheduled', 'NoRole', 'NotScheduled', 'Unknown')]
         [string] $SafetyStop = 'Off'
     )
 
@@ -1372,10 +1368,11 @@ function Format-DemoT4RestartText {
     $when = if ($null -ne $RestartUtc) { [string]::Format($culture, 'at {0:yyyy-MM-dd HH:mm} UTC, {1} days after the stop', ([datetime]$RestartUtc).ToUniversalTime(), $Days) } else { '{0} days after it was stopped' -f $Days }
     $bills = if ($null -ne $HourlyUsd) { [string]::Format($culture, ', and it then bills compute at about {0:N3} USD an hour ({1}, list price)', [double]$HourlyUsd, $SkuName) } elseif ($SkuName) { ', and it then bills compute at its size ({0})' -f $SkuName } else { ', and it then bills compute' }
     $after = switch ($SafetyStop) {
+        'Nightly' { ' until the nightly safety stop stops it again, at the next auto-shutdown time.' }
         'Scheduled' { ' until the on-demand control''s daily safety stop stops it again, within a day.' }
-        'NotScheduled' { ' until it''s stopped again: the on-demand control''s daily safety stop isn''t scheduled (./scripts/setup-activity-control.ps1 schedules it), so nothing here stops it on its own; run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.' }
-        'Unknown' { ' until it''s stopped again: the on-demand control''s daily safety stop does that within a day if it''s scheduled, which couldn''t be read just now (./scripts/validate.ps1 checks it as CONTROL.SAFETYSTOP); otherwise run ./scripts/stop-demo.ps1 again once it has started.' }
-        default { ' until it''s stopped again: nothing here stops it on its own (the on-demand control''s daily safety stop isn''t set up), so run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.' }
+        'NoRole' { (' until it''s stopped again: the nightly safety stop is scheduled, but it can''t stop T4 until an Owner assigns its role once ({0}), so run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.' -f (Get-DemoSafetyStopCommand)) }
+        'Unknown' { ' until it''s stopped again: the nightly safety stop does that at the next auto-shutdown time if it''s in place, which couldn''t be read just now (./scripts/status.ps1 shows it as STATUS.SAFETYSTOP); otherwise run ./scripts/stop-demo.ps1 again once it has started.' }
+        default { ' until it''s stopped again: the nightly safety stop isn''t in place (./scripts/deploy.ps1 sets it up), so nothing here stops it on its own; run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.' }
     }
     return ('Azure starts it again on its own {0}{1}{2}' -f $when, $bills, $after)
 }
@@ -1424,22 +1421,109 @@ function Get-DemoT4LastStopJob {
 function Get-DemoT4RestartCoverage {
     <#
     .SYNOPSIS
-    Whether the on-demand control's daily T4 safety stop caps T4's 7-day automatic restart in the cost estimate's worst case
-    (the owner's decision, 2026-11-04, ADR 0016). Returns Counts, Missing (Control, Schedule, A1, StopJob, or ''), Reason,
-    Fix, and Evidence. Never throws. Internal.
+    Whether a safety stop caps T4's 7-day automatic restart in the cost estimate's worst case (the owner's decision,
+    2026-11-04, ADR 0016): the nightly safety stop, part of every deployment since 2026-11-05 (ADR 0024), or else the
+    on-demand control's daily T4 safety stop (ADR 0020). Returns Counts, Missing (SafetyStop, Role, or StopJob for the
+    nightly safety stop; '' when it counts), Reason, Fix, and Evidence. Never throws. Internal.
 
     .DESCRIPTION
-    Azure starts a stopped flexible server again on its own after 7 days, and it then runs until something stops it. The
-    safety stop counts, so each restart counts as about a day, only when all three hold:
+    Azure starts a stopped flexible server again on its own after 7 days, and it then runs until something stops it. Each
+    restart counts as about a day, until the next safety stop, only when one of them is fully in place:
+    - the nightly safety stop (Get-DemoSafetyStopState): dbhub-safety-stop is enabled and linked to DbHub-Stop -Scope
+      Nightly, its identity holds "DbHub Demo Safety Stop" at the demo resource group (destroy deletes that assignment with
+      the group; deploy.ps1 makes it again when the person who runs it may), and its last stop run didn't fail; or
+    - the control's own (Get-DemoT4ControlRestartCoverage): its schedule, A1, and a last DbHub-Stop job that didn't fail.
+    Anything else, a read that fails included (fail safe), means the worst case counts the rest of the month, and Missing,
+    Reason, and Fix say what's missing from the nightly safety stop and the exact command that fixes it.
+    - Schedules: https://learn.microsoft.com/rest/api/automation/schedule/get
+    - Role assignments: https://learn.microsoft.com/rest/api/authorization/role-assignments/list-for-scope
+    - Jobs: https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = ''
+    )
+
+    $grant = Get-DemoSafetyStopCommand -ConfigPath $ConfigPath
+    $missing = {
+        param([string] $Piece, [string] $Reason, [string] $Fix, [System.Collections.IDictionary] $Evidence)
+        $Evidence['counts'] = $false
+        $Evidence['missing'] = $Piece
+        [pscustomobject]@{ Counts = $false; Missing = $Piece; Reason = $Reason; Fix = $Fix; Evidence = $Evidence }
+    }
+    $evidence = [ordered]@{}
+    try {
+        $nightly = Get-DemoSafetyStopState -Config $Config
+        $evidence['nightly'] = $nightly.State
+        $gap = $null
+        if ($nightly.State -eq 'InPlace') {
+            $runs = Get-DemoSafetyStopLastRun -Name (Get-DemoSafetyStopName -Config $Config)
+            if (-not $runs.Ok) {
+                $evidence['nightlyLastRun'] = 'unread'
+                $gap = @('StopJob', ('the nightly safety stop''s last run couldn''t be read ({0}), so it''s taken as failed' -f $runs.Error), 'Run ./scripts/status.ps1 to see it (STATUS.SAFETYSTOP), then run this again.')
+            }
+            else {
+                $stopStatus = if ($null -ne $runs.Stop) { [string](Get-DemoMemberValue -InputObject $runs.Stop.Result -Name 'status') } else { '' }
+                $evidence['nightlyLastRun'] = if ($null -eq $runs.Stop) { 'none' } else { '{0} ({1})' -f $runs.Stop.Status, $(if ($stopStatus) { $stopStatus } else { 'no result line' }) }
+                if ($null -ne $runs.Stop -and ($runs.Stop.Status -ne 'Completed' -or $stopStatus -ne 'Stopped')) {
+                    $when = if ($null -ne $runs.Stop.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$runs.Stop.CreatedUtc) } else { '' }
+                    $gap = @('StopJob', ('the nightly safety stop''s last run{0} didn''t finish its work (job {1}), so it may not stop T4' -f $when, $runs.Stop.Status), 'Run ./scripts/status.ps1 to see what it said (STATUS.SAFETYSTOP), fix that, then run this again.')
+                }
+                else {
+                    $evidence['counts'] = $true
+                    $evidence['missing'] = ''
+                    $ran = if ($null -eq $runs.Stop) { 'it hasn''t run yet' } else { 'its last run didn''t fail' }
+                    return [pscustomobject]@{ Counts = $true; Missing = ''; Reason = ('the nightly safety stop is scheduled, its role is assigned, and {0}' -f $ran); Fix = ''; Evidence = $evidence }
+                }
+            }
+        }
+        elseif ($nightly.State -eq 'NoRole') {
+            $gap = @('Role', ('the nightly safety stop can''t stop T4: its role isn''t assigned ({0})' -f $nightly.Missing), ('An Owner of the subscription runs {0} once; deploy.ps1 assigns it when the person who runs it may.' -f $grant))
+        }
+        elseif ($nightly.State -eq 'Unknown') {
+            $gap = @('SafetyStop', ('whether the nightly safety stop is in place couldn''t be read ({0}), so it''s taken as missing' -f $nightly.Error), 'Run ./scripts/status.ps1 to see it (STATUS.SAFETYSTOP), then run this again.')
+        }
+        else {
+            $gap = @('SafetyStop', ('the nightly safety stop isn''t in place yet ({0})' -f $nightly.Missing), ('./scripts/deploy.ps1 sets it up after its template, so the checks after that run count about a day per restart (a first deployment''s own preflight can''t: it runs before the template); when deploy.ps1 can''t assign its role, an Owner runs {0} once.' -f $grant))
+        }
+        # The on-demand control's own daily T4 safety stop still covers T4 when it's fully in place (ADR 0020).
+        if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
+            $control = Get-DemoT4ControlRestartCoverage -Config $Config -ConfigPath $ConfigPath
+            $evidence['control'] = $control.Evidence
+            if ($control.Counts) {
+                $evidence['counts'] = $true
+                $evidence['missing'] = ''
+                return [pscustomobject]@{ Counts = $true; Missing = ''; Reason = $control.Reason; Fix = ''; Evidence = $evidence }
+            }
+        }
+        return (& $missing $gap[0] $gap[1] $gap[2] $evidence)
+    }
+    catch {
+        $problem = Protect-DemoText -Text $_.Exception.Message
+        Write-DemoLog -Level Warning -Message ('Whether a safety stop is in place couldn''t be read, so the cost estimate counts T4''s restart for the rest of the month: {0}' -f $problem)
+        $evidence['error'] = $problem
+        return (& $missing 'SafetyStop' ('the nightly safety stop couldn''t be checked ({0}), so it''s taken as missing' -f $problem) 'Run ./scripts/status.ps1 to see it (STATUS.SAFETYSTOP), then run this again.' $evidence)
+    }
+}
+
+function Get-DemoT4ControlRestartCoverage {
+    <#
+    .SYNOPSIS
+    Whether the on-demand control's daily T4 safety stop (ADR 0020) caps T4's 7-day automatic restart: the second check of
+    Get-DemoT4RestartCoverage, after the nightly safety stop. Returns Counts, Missing (Control, Schedule, A1, StopJob, or
+    ''), Reason, Fix, and Evidence. Never throws. Internal.
+
+    .DESCRIPTION
+    It counts only when all three hold:
     - the schedule dbhub-t4-safety-stop exists, is enabled, and is linked to DbHub-Stop (Get-DemoT4SafetyStopState);
     - A1, the control identity's custom role on the demo's resource group, is assigned: DbHub-Stop can't stop T4 without
       it, and destroy deletes it with the group, so only assignRoles or -GrantRole grants it again;
     - the last DbHub-Stop job that ended didn't fail (Failed, Stopped, or Suspended).
-    Anything else, a read that fails included (fail safe), means the worst case counts the rest of the month, and Missing,
-    Reason, and Fix say what's missing and the exact command that fixes it.
-    - Schedules: https://learn.microsoft.com/rest/api/automation/schedule/get
-    - Role assignments: https://learn.microsoft.com/rest/api/authorization/role-assignments/list-for-scope
-    - Jobs: https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
+    Anything else, a read that fails included (fail safe), doesn't count, and Missing, Reason, and Fix say what's missing.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1493,7 +1577,7 @@ function Get-DemoT4RestartCoverage {
         }
         $evidence['counts'] = $true
         $evidence['missing'] = ''
-        return [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the daily T4 safety stop is scheduled, A1 is assigned, and the last DbHub-Stop job didn''t fail'; Fix = ''; Evidence = $evidence }
+        return [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the on-demand control''s daily T4 safety stop is scheduled, A1 is assigned, and the last DbHub-Stop job didn''t fail'; Fix = ''; Evidence = $evidence }
     }
     catch {
         $problem = Protect-DemoText -Text $_.Exception.Message
@@ -1506,8 +1590,8 @@ function Get-DemoT4RestartCoverage {
 function Get-DemoT4RestartWorstCase {
     <#
     The hours of T4 compute the estimate's worst case adds for its 7-day automatic restart (2026-11-04, ADR 0016). Without
-    the safety stop (-Capped false), the rest of the month after the light-use hours. With it, each restart runs until the
-    next daily safety stop, about 24 hours, and a restart comes at most every 8 days (7 stopped, then up to 1 running): at
+    a safety stop (-Capped false), the rest of the month after the light-use hours. With one, each restart runs until the
+    next nightly safety stop, at most about 24 hours, and a restart comes at most every 8 days (7 stopped, then up to 1 running): at
     most floor(HoursPerMonth / 192) + 1 restarts a month, 4 for a 730-hour month, so 96 hours, never more than the rest
     of the month. Returns Hours and Restarts (0 without the cap). Pure. Internal.
     #>
@@ -1538,7 +1622,7 @@ function Get-DemoT4RestartWorstCase {
 function New-DemoT4RestartCoverageResult {
     <#
     <Prefix>.COST.T4RESTART (2026-11-04, ADR 0016): which worst case the monthly ceiling counts for T4's 7-day automatic
-    restart, and why. Pass when the daily T4 safety stop caps it (about a day per restart); a Warning that names what's
+    restart, and why. Pass when a safety stop caps it (about a day per restart); a Warning that names what's
     missing, and the exact fix, when it counts the rest of the month; Not selected when T4 is off. Internal.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
@@ -1563,8 +1647,8 @@ function New-DemoT4RestartCoverageResult {
     if ($null -ne $Coverage -and $Coverage.Counts) {
         return (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Pass' -Message ('Azure starts a stopped T4 again on its own after 7 days, and {0}, so the monthly ceiling counts each restart as about a day, until the next safety stop.' -f $Coverage.Reason) -Evidence $Coverage.Evidence -DocUrl $doc)
     }
-    $reason = if ($null -ne $Coverage) { $Coverage.Reason } else { 'whether the daily T4 safety stop is in place wasn''t checked' }
-    $fix = if ($null -ne $Coverage -and $Coverage.Fix) { $Coverage.Fix } else { 'Run ./scripts/setup-activity-control.ps1 to set up the daily T4 safety stop (ADR 0020).' }
+    $reason = if ($null -ne $Coverage) { $Coverage.Reason } else { 'whether the nightly safety stop is in place wasn''t checked' }
+    $fix = if ($null -ne $Coverage -and $Coverage.Fix) { $Coverage.Fix } else { 'Run ./scripts/deploy.ps1, which sets up the nightly safety stop (ADR 0024).' }
     $evidence = if ($null -ne $Coverage) { $Coverage.Evidence } else { [ordered]@{ counts = $false; missing = 'NotChecked' } }
     return (New-DemoResult -CheckId $checkId -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure starts a stopped T4 again on its own after 7 days, and {0}, so the monthly ceiling counts it running for the rest of the month.' -f $reason) -Evidence $evidence -Remediation ('{0} With it in place, each restart counts as about a day.' -f $fix) -DocUrl $doc)
 }
@@ -1718,7 +1802,8 @@ function Invoke-DemoT4PowerAction {
     its own after seven days (Learn: Stop an Azure Database for PostgreSQL flexible server, and the overview's "Stop and
     start server to lower TCO"), so the stop result says when (Phase 28 follow-up): the stop time plus seven days (for a
     server that was already stopped, its stop in the activity log), what it then bills at its own size (the Retail Prices
-    API), and whether the on-demand control's daily safety stop stops it again (Format-DemoT4RestartText). A missing
+    API), and whether the nightly safety stop (ADR 0024), or else the on-demand control's daily one, stops it again
+    (Format-DemoT4RestartText). A missing
     server, or T4 turned off (t4Enabled false), is Not selected.
     -Requested says that the caller already sent this operation in an earlier call (-WaitMinutes 0), so a server
     that's in the wanted state by now "is now" running or stopped, not "was already" (Phase 25d).
@@ -1811,10 +1896,10 @@ function Invoke-DemoT4PowerAction {
         $evidence['autoStartUtc'] = if ($null -ne $restartUtc) { $restartUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
         $evidence['skuName'] = $serverSku
         $evidence['hourlyUsd'] = $hourly
-        # Whether the on-demand control's daily safety stop stops it again: its schedule, not only control.enabled (review of
-        # 20e855c).
-        $safety = Get-DemoT4SafetyStopState -Config $Config
-        $evidence['dailySafetyStop'] = $safety.State -eq 'Scheduled'
+        # Whether anything stops it again: the nightly safety stop (ADR 0024), or else the on-demand control's daily one, by
+        # their schedules and roles, not only by the configuration (review of 20e855c).
+        $safety = Get-DemoT4RestartStopState -Config $Config
+        $evidence['dailySafetyStop'] = $safety.State -in 'Nightly', 'Scheduled'
         $evidence['safetyStop'] = $safety.State
         $autoStart = ' ' + (Format-DemoT4RestartText -RestartUtc $restartUtc -SkuName $serverSku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State)
     }
