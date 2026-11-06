@@ -163,9 +163,10 @@ function Get-DemoNonBlockingItem {
     <#
     .SYNOPSIS
     What didn't work but never blocks DONE (2026-11-05), each with the actual reason and how to fix it: the Insights app
-    when it wasn't created or doesn't work (Get-DemoInsightsAppSummary: State Failed; it's part of every deployment), and
+    when it wasn't created or doesn't work (Get-DemoInsightsAppSummary: State Failed; it's part of every deployment),
     the history report's data check while the Execute Queries setting is off (FABRIC.SEMANTICMODEL.* Manual action
-    required). Each item has name, state (Failed or Action needed, as on the status page), message, and howTo;
+    required), and deploy.ps1's history snapshot at the end of the run when it didn't work (Get-DemoHistorySnapshotItem,
+    2026-11-06). Each item has name, state (Failed or Action needed, as on the status page), message, and howTo;
     Format-DemoNonBlockingLine words it the same everywhere. Pure. Internal.
     #>
     [CmdletBinding()]
@@ -195,6 +196,11 @@ function Get-DemoNonBlockingItem {
                 message = 'The report is deployed; its DAX data check needs a tenant setting.'
                 howTo   = 'A Fabric administrator turns on Dataset Execute Queries REST API; then run ./scripts/configure-powerbi.ps1 -CheckModelData.'
             })
+    }
+    # deploy.ps1's history snapshot at the end of the run, when it didn't work (2026-11-06).
+    $history = Get-DemoHistorySnapshotItem -Result $Result
+    if ($null -ne $history) {
+        $items.Add($history)
     }
     return $items.ToArray()
 }
@@ -330,8 +336,9 @@ function Get-DemoInsightsAppSummary {
 
 function Test-DemoNonBlockingResult {
     # True for a result that never blocks DONE (2026-11-05): the Insights app's (Test-DemoInsightsAppRecord; it's part of
-    # every deployment, but DONE never waits for it), or the history report's data check waiting for the Execute Queries
-    # setting. Internal.
+    # every deployment, but DONE never waits for it), the history report's data check waiting for the Execute Queries
+    # setting, or deploy.ps1's history snapshot (DEPLOY.FABRIC.HISTORY, 2026-11-06; never a Fail or Manual action required
+    # anyway). Internal.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -343,7 +350,7 @@ function Test-DemoNonBlockingResult {
         return $false
     }
     $id = [string]$Result.checkId
-    return ((Test-DemoInsightsAppRecord -Result $Result) -or ($id -like 'FABRIC.SEMANTICMODEL.*' -and [string]$Result.status -eq 'Manual action required'))
+    return ((Test-DemoInsightsAppRecord -Result $Result) -or ($id -like 'FABRIC.SEMANTICMODEL.*' -and [string]$Result.status -eq 'Manual action required') -or $id -eq 'DEPLOY.FABRIC.HISTORY')
 }
 
 function Test-DemoTenantSettingRead {

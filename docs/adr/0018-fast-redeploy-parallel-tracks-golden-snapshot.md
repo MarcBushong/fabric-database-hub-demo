@@ -320,6 +320,17 @@ Static only: unit tests for the first run from `deploy.ps1`, the wait by default
 
 Unit-tested: `tests/unit/DbHubDemo.Tracks.Tests.ps1` (a `JumpstartImage` host restored from its own snapshot, whose guest has no evaluation to end, and never from another mode's), `tests/unit/DbHubDemo.Teardown.Tests.ps1` (no destroy guard for `JumpstartImage` or `Developer`), and `tests/unit/Vm.JumpstartImage.Tests.ps1` (the evaluation guard). Not yet run live: no `JumpstartImage` snapshot has been captured.
 
+## Amendments (2026-11-06: the history report's snapshot after DONE's checks)
+
+**Why (the owner, 2026-11-06):** "Can we add a step that calls the acitivty notebook one time after deployment so it starts to populate data?" The Fabric track's first run of `NB_DatabaseHub_LiveActivity` comes while T1 and T2 still deploy, before any telemetry, so the history report was blank after a deployment ([ADR 0014](0014-notebook-role-and-capacity.md#amendment-2026-11-06-one-analyze-only-run-at-the-end-of-each-deployment)).
+
+| Before | Since 2026-11-06 | Why it's safe |
+|---|---|---|
+| The run ended with the validation, **DONE**'s checks, `DEPLOY.TIMING`, the switch to the activity profile, and `DEPLOY.SUMMARY` | Between the switch and `DEPLOY.SUMMARY`, on every run that reaches its validation, `Invoke-DemoHistorySnapshotStep` runs the notebook once, analyze-only, then refreshes the history model (`DEPLOY.FABRIC.HISTORY`, the status page's last row); `-Sequential` does the same after its **DONE** checks and switch; a `-WhatIf` run reports it **Not selected** at the template's what-if | It reads **DONE**'s telemetry results and comes after the switch, which the VMs' incidents wait for, since the notebook never touches the VMs. It's bounded (10 minutes for the job, 5 for the refresh) and never a **Fail** or **Manual action required**, so section 1's list and the clock are unchanged: `DEPLOY.TIMING` is written before it, and **DONE** never waits for it |
+| A resumed run with nothing left to do ran the validation and **DONE**'s checks | It takes the snapshot again | Each run saves its own rows; another snapshot adds what happened since, such as incidents |
+
+Unit-tested (`tests/unit/DbHubDemo.HistorySnapshot.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, `DbHubDemo.Lifecycle.Tests.ps1`, `DbHubDemo.Progress.Tests.ps1`). Not run live yet ([implementation report](../implementation-report.md#the-history-reports-snapshot-at-the-end-of-deployps1)).
+
 ## Sources (checked 2026-11-05)
 
 - `slmgr.vbs` options (`/rearm` "resets the activation timers"; `/ato` tries activation): <https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options>

@@ -52,6 +52,10 @@ function Invoke-DemoDeployment {
         live finding, 2026-10-30). Since Phase 28 (review finding 4), with no
         stage open and nothing failed, DONE's read-only checks follow (Invoke-DemoDoneGate: Database Hub's estate,
         T4's metrics, T2's PAYG and monitoring, and the Fabric items), so deploy.ps1 -Sequential can end DONE.
+    11. The history report's snapshot (2026-11-06, ADR 0014's amendment), after DONE's checks and the switch to the run's
+        activity profile, on a run whose validation ran: NB_DatabaseHub_LiveActivity once, analyze-only (CONFIRM false),
+        then the history model's refresh (Invoke-DemoHistorySnapshotStep, DEPLOY.FABRIC.HISTORY), as the parallel path
+        does. It never stops the run or keeps it from DONE.
 
     A Fail stops the run, and nothing after it runs. Manual action required never stops it and is never
     hidden: it's in the results and in DEPLOY.SUMMARY. Deployment success alone is never Pass (ADR 0012).
@@ -111,7 +115,7 @@ function Invoke-DemoDeployment {
     .PARAMETER Parallel
     Run Invoke-DemoParallelDeployment instead (ADR 0018): Preflight here, the T1, T2, and Fabric tracks in
     their own processes, started before the template so their guards run while it deploys, then the
-    validation and DEPLOY.TIMING. deploy.ps1 passes it unless -Sequential.
+    validation, DEPLOY.TIMING, and the history report's snapshot. deploy.ps1 passes it unless -Sequential.
 
     .PARAMETER WaitForT2
     With -Parallel: when T2 builds its guest (no golden snapshot), wait up to -T2WaitMinutes instead of
@@ -467,6 +471,8 @@ function Invoke-DemoDeployment {
                 & $addAll $deployment.Results
                 if ($whatIf) {
                     & $stageResult 'Infrastructure' 'Not selected' 'What if: the template''s what-if ran; nothing was deployed, and later stages were skipped.'
+                    # Nor is the history report's snapshot taken, which a deployment takes at its end (2026-11-06).
+                    $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -WhatIfRun -SkipFabric:$SkipFabric -ProgressPath $ProgressPath))
                     return (& $finishEarly)
                 }
                 if (-not $deployment.Succeeded) {
@@ -815,15 +821,24 @@ function Invoke-DemoDeployment {
     # after this run's validation, with no stage open and nothing failed, each DONE requirement the results don't show
     # passing yet (Database Hub's estate, T4's metrics, T2's PAYG and monitoring, the Fabric items) is checked, so a
     # sequential run is judged by the same requirements and can end DONE.
+    $requirement = @()
+    $doneChecked = $false
     if ($validated -and -not $context.OpenStage -and -not (& $hasStatus $results.ToArray() 'Fail')) {
         $current = Get-DemoDeploymentState -Config $Config
         $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
         $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool](Get-DemoT4OffReason -Config $userConfig -State $current)) -SkipFabric:$SkipFabric
         & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
+        $doneChecked = $true
     }
 
     # The switch (2026-11-03): DONE's checks have read what they need, so this run's own Run Commands are done.
     & $switchActivity
+
+    # The history report's snapshot (2026-11-06), as in the parallel path: after DONE's telemetry checks and the switch,
+    # NB_DatabaseHub_LiveActivity runs once, analyze-only, and the history model is refreshed. Never a Fail.
+    if ($validated) {
+        $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
+    }
 
     $all = $results.ToArray()
     # Phase 28 live finding (2026-10-30): what only a person can confirm is listed once each, apart from what needs you.

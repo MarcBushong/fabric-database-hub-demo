@@ -55,7 +55,7 @@ configured activityProfile on T1, T3, and T4, business-day by default: as baseli
 (T1, waiting while the SQL IaaS extension updates after the
 template), T2 (Arc onboarding and configuration, then T2's profile), Fabric (the Hub checklist and, on
 request, the notebook import), and Validation (telemetry for each ready target, the runner's status, and a
-summary). It has no guided stop.
+summary), then DONE's checks and the history report's snapshot. It has no guided stop.
 
 - The activity profile (2026-11-03, ADR 0010): business-day by default, the steady mix plus bounded incidents at fixed
   minutes past each UTC hour, which fill Database Hub's Performance page; set activityProfile to baseline for the
@@ -64,6 +64,17 @@ summary). It has no guided stop.
   an error), the switch is sent without waiting. A VM the run starts gets baseline as soon as its SQL Server, or T2's
   guest, answers, and the run's own Run Commands there wait for it, at most about 12.5 minutes (DEPLOY.INTERIM_*). A
   configuration that doesn't set activityProfile gets one notice.
+
+- The history report's snapshot (2026-11-06, ADR 0014): last, once DONE's telemetry checks have passed and the switch is
+  sent, NB_DatabaseHub_LiveActivity runs once in Fabric, analyze-only (CONFIRM false, so it sends no activity request
+  of its own), saves the last 24 hours to the lakehouse, and the history model is refreshed, so the history report has
+  data; about 2 to 5 minutes, at most about 15 (DEPLOY.FABRIC.HISTORY, the status page's last row). It runs as you,
+  with the Azure CLI's Fabric token; it never resumes, pauses, or scales the capacity, and it never keeps the run from
+  DONE: a paused capacity or a job that outlives the wait is a Warning, and -WhatIf, -SkipFabric, GitHub Actions, or a
+  run whose telemetry checks didn't pass take none (Not selected). The data is partial: incidents start only at the end
+  of the run, so incident measures stay blank until incidents have run and the notebook runs again
+  (./scripts/stop-demo.ps1 -SaveHistory, or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport
+  -RunLiveActivity).
 
 - Every step is idempotent. The last step each track finished is recorded in the resource group's tags, so
   a later run continues from there on any machine, and GitHub Actions (deploy.yml) runs the same tracks.
@@ -97,7 +108,7 @@ Stop after this stage. Infrastructure provisions what the Deploy to Azure button
 Deploy without the workload runner (no .NET SDK needed); the activity profiles don't run.
 
 .PARAMETER SkipFabric
-Skip the Fabric stage.
+Skip the Fabric stage, and the history report's snapshot at the end (Not selected).
 
 .PARAMETER ImportNotebooks
 Import or update both notebooks in the Fabric workspace (also fabric.importNotebooks).

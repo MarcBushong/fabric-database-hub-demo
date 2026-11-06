@@ -28,7 +28,7 @@ Both notebooks keep the supplied notebook's PySpark kernel (`synapse_pyspark`), 
 
 - **`NB_DatabaseHub_Deployment`** runs every check and changes no Azure or Fabric resource; its cleanup also needs `PURGE_DEMO_TABLES = True`, which stays `False`, so **Run all** never drops a table.
 - **`NB_DatabaseHub_LiveActivity`** sends its simulation request in section 3: `PROFILE` `business-day` on every target for `DURATION_MINUTES` (240), through `demo-control.yml` with P9, or, without P9, the printed link and command, recorded in `scenario_runs` as **Manual action required**. Its stop cell also needs `STOP_ACTIVITY = True`, which stays `False`, so **Run all** never stops the activity it started.
-- **For a read-only run,** set `CONFIRM = False`. The scripts' own runs of the live-activity notebook (`stop-demo.ps1 -SaveHistory` and `configure-fabric.ps1`'s first capture) pass `CONFIRM` and `STOP_ACTIVITY` as `false`, so they only analyze and save.
+- **For a read-only run,** set `CONFIRM = False`. The scripts' own runs of the live-activity notebook (`stop-demo.ps1 -SaveHistory`, `configure-fabric.ps1`'s first capture, and, since 2026-11-06, `deploy.ps1`'s snapshot at its end) pass `CONFIRM` and `STOP_ACTIVITY` as `false`, so they only analyze and save.
 
 ### What runs where
 
@@ -92,7 +92,7 @@ Re-running a cell in the same session replaces that run's rows, so nothing is du
 - **Idempotent:** re-runs update the same notebooks. If two notebooks share a name, it stops with **Fail** instead of guessing.
 - **Workspace and lakehouse by name:** the script first finds `fabric.workspaceName` and `fabric.lakehouseName`, and creates them when they're missing and `fabric.createIfMissing` is true ([configuration](../docs/configuration.md#fabric)). Only the uploaded copy of each notebook is bound to them; the files in Git don't change.
 - **Results:** one **Pass**, **Warning**, **Fail**, or **Not selected** record per notebook, in `out/configure-fabric.jsonl`.
-- `deploy.ps1` imports a notebook that isn't in the workspace yet without asking, and updates one that is only when `fabric.importNotebooks` is `true` (`-NewNotebooksOnly`); running the script yourself is the explicit request to create or update both. When the live-activity notebook was just created, or bound to a lakehouse that was just created, it runs once, so the history tables exist.
+- `deploy.ps1` imports a notebook that isn't in the workspace yet without asking, and updates one that is only when `fabric.importNotebooks` is `true` (`-NewNotebooksOnly`); running the script yourself is the explicit request to create or update both. When the live-activity notebook was just created, or bound to a lakehouse that was just created, it runs once, so the history tables exist. That run comes before the targets send telemetry, so `deploy.ps1` runs the notebook once more at its end, analyze-only, once its telemetry checks pass, and refreshes the history model, so the report has the run's data (2026-11-06; [deployment](../docs/deployment.md#the-history-reports-snapshot-at-the-end-2026-11-06)).
 - In GitHub Actions it would run only where the Fabric tenant lets service principals use Fabric APIs and the identity has a workspace role; the local path is the default.
 
 ## The Real-Time Dashboard
