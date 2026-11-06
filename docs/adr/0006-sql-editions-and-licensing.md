@@ -225,7 +225,7 @@ Within the same scope: license type PAYG rather than ArcBox's `Paid`; Integratio
 ### Validation
 
 - **Unit-tested:** `tests/unit/Vm.JumpstartImage.Tests.ps1` (the host's steps, the download and its checks, the published credential, the image check, and the evaluation guard), `tests/unit/DbHubDemo.Arc.Tests.ps1` (Standard with PAYG expected; Enterprise or `Paid` a **Fail**), `tests/unit/DbHubDemo.Config.Tests.ps1` and `tests/unit/DbHubDemo.FirstRun.Tests.ps1` (the default), and `tests/unit/Vm.EvalArcVm.Tests.ps1` (the evaluation-only VM refuses the mode).
-- **The first live proof is pending:** a first deployment in `JumpstartImage` mode, with the Phase 6, 7, and 9 checks above (`SERVERPROPERTY('Edition')`; the instance's edition, license type, and monitoring; T2's telemetry). Its `DEPLOY.TIMING` will be the mode's first measured time; until then, every time for it is an estimate (about 1 to 2 hours for a first deployment).
+- **First live proof (2026-11-06):** a clean first deployment in `JumpstartImage` mode, from a fresh clone (West US 3, `lowest-cost`), ended **DONE** in 91 minutes, the mode's first measured time (`DEPLOY.TIMING`). **DONE** needs the Phase 7 and 9 checks above to pass: the instance's edition and license type (`T2.ARC.SQLINSTANCE`, Standard with PAYG), its monitoring (`T2.ARC.MONITORING`), and T2's telemetry (`TELEMETRY.T2`); in the guest, the image check (`SERVERPROPERTY('Edition')` Standard, version 16.x) passed, and the first boot's cleanup deleted `C:\Jumpstart`. T2's host build took about 27 minutes and its Arc onboarding about 33. Not seen live yet: a resumed download, and the mode's `destroy.ps1`.
 
 ### Sources (checked 2026-11-05)
 

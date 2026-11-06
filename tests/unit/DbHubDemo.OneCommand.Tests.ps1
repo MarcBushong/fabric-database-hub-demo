@@ -73,14 +73,16 @@ Describe 'What a run can expect (brief goal 7, items 3 and 13)' {
         }
     }
 
-    It 'says no T2 step needs a person in JumpstartImage mode, the default, and calls its time an estimate not measured yet (2026-11-05)' {
+    It 'says no T2 step needs a person in JumpstartImage mode, the default, and gives the first deployment''s measured time (2026-11-06)' {
         $expect = InModuleScope DbHubDemo { Get-DemoDeploymentExpectation -WaitForT2 }
         $expect.GuidedStop | Should -BeFalse
         $text = $expect.Lines -join ' '
         $text | Should -Match 'No T2 step needs a person'
-        $text | Should -Match 'about 1 to 2 hours in all \(not measured yet'
-        $text | Should -Match '20 to 40 minutes'
-        $expect.Text | Should -Match 'estimate, not measured yet'
+        $text | Should -Match 'about 1\.5 hours in all: 91 minutes when measured on 2026-11-06'
+        $text | Should -Match 'host build, with the Jumpstart image''s download and first boot, took about 27'
+        $text | Should -Not -Match 'not measured yet'
+        $expect.Lines[0] | Should -Match 'measured on 2026-11-06; the rest are estimates'
+        $expect.Text | Should -Match '91 minutes, measured on 2026-11-06'
         $expect.HumanText | Should -BeNullOrEmpty
         $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
         $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' }

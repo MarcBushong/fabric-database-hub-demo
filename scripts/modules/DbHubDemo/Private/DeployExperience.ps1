@@ -48,8 +48,9 @@ function Get-DemoStopDemoCommand {
 function Get-DemoDeploymentExpectation {
     <#
     .SYNOPSIS
-    What a deploy.ps1 run can expect, as estimates from documented step times, not a measured run: the whole first run,
-    a redeploy from a golden snapshot, and in PaygWizard mode when a person is needed and for how long. Pure. Internal.
+    What a deploy.ps1 run can expect: the whole first run, a redeploy from a golden snapshot, and in PaygWizard mode
+    when a person is needed and for how long. In JumpstartImage mode, the default, the first run is the one measured
+    live on 2026-11-06; the rest are estimates from documented step times, not a measured run. Pure. Internal.
 
     .DESCRIPTION
     The T2 guest build to the setup step takes 60 to 90 minutes (an ADR 0018 estimate; Phase 16 measured about 35
@@ -59,7 +60,8 @@ function Get-DemoDeploymentExpectation {
     minutes of clicks, then 10 to 15 minutes while setup installs. Afterward, the sign-in cleanup, the database, Arc's
     PAYG and monitoring, and telemetry take about 30 to 45 minutes.
     JumpstartImage mode (the default since 2026-11-05) replaces the guest build with the Jumpstart image's 34 GiB download
-    and its first boot, about 20 to 40 minutes together (an estimate; not measured yet), and needs no person. Without
+    and its first boot, and needs no person: a clean first deployment took 91 minutes when measured on 2026-11-06, of
+    which T2's host build took about 27 and its Arc onboarding about 33. Without
     -SkipFabric, it says that the Insights app's Rayfin CLI sign-in may open a browser at the start, which the run doesn't
     wait for (2026-11-05).
     #>
@@ -78,12 +80,17 @@ function Get-DemoDeploymentExpectation {
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
-    $lines.Add('What to expect (estimates from documented step times, not a measured run):')
+    if ($InstallMode -eq 'JumpstartImage') {
+        $lines.Add('What to expect (the first deployment as measured on 2026-11-06; the rest are estimates from documented step times):')
+    }
+    else {
+        $lines.Add('What to expect (estimates from documented step times, not a measured run):')
+    }
     if ($InstallMode -eq 'PaygWizard') {
         $lines.Add('- A first deployment takes about 2 to 3 hours in all; the T2 guest build alone is 60 to 90 minutes.')
     }
     elseif ($InstallMode -eq 'JumpstartImage') {
-        $lines.Add('- A first deployment takes about 1 to 2 hours in all (not measured yet with the Jumpstart image); T2''s image download and first boot are about 20 to 40 minutes of it. No T2 step needs a person.')
+        $lines.Add('- A first deployment takes about 1.5 hours in all: 91 minutes when measured on 2026-11-06, of which T2''s host build, with the Jumpstart image''s download and first boot, took about 27 and its Arc onboarding about 33. No T2 step needs a person.')
     }
     else {
         $lines.Add('- A first deployment takes about 1.5 to 2.5 hours in all; the T2 guest build alone is 60 to 90 minutes. No T2 step needs a person.')
@@ -104,7 +111,7 @@ function Get-DemoDeploymentExpectation {
     }
     $lines.Add('- This PC stays awake while deploy.ps1 runs (Windows); keep it plugged in, and don''t close this window.')
     $lines.Add('- If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.')
-    $text = if ($InstallMode -eq 'PaygWizard') { 'A first deployment takes about 2 to 3 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' } elseif ($InstallMode -eq 'JumpstartImage') { 'A first deployment takes about 1 to 2 hours (estimate, not measured yet with the Jumpstart image); a redeploy from a golden snapshot about 30 to 45 minutes.' } else { 'A first deployment takes about 1.5 to 2.5 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' }
+    $text = if ($InstallMode -eq 'PaygWizard') { 'A first deployment takes about 2 to 3 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' } elseif ($InstallMode -eq 'JumpstartImage') { 'A first deployment takes about 1.5 hours (91 minutes, measured on 2026-11-06); a redeploy from a golden snapshot about 30 to 45 minutes (estimate).' } else { 'A first deployment takes about 1.5 to 2.5 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' }
     return [pscustomobject]@{
         Lines      = $lines.ToArray()
         Text       = $text

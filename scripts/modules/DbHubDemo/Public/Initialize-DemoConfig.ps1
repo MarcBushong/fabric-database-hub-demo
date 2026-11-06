@@ -627,7 +627,7 @@ function Initialize-DemoConfig {
         $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 2 to 3 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); about 60 to 90 minutes in, it asks you for about 10 minutes (the guided stop), then finishes by itself' -f $configArgument))
     }
     elseif ($mode -eq 'JumpstartImage') {
-        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1 to 2 hours (an estimate; not timed yet with the Jumpstart image) and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))
+        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 hours (91 minutes, measured on 2026-11-06) and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))
     }
     else {
         $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 to 2.5 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))

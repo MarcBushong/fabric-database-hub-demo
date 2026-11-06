@@ -179,7 +179,7 @@ function Get-DemoProgressCatalog {
     $t2.Add((& $step 'T2.Bootstraps' 'Bootstrap' @('T2/Bootstraps')))
     $hostBuild = 'Host and guest build (about 60 to 90 minutes)'
     if ($InstallMode -eq 'JumpstartImage') {
-        $hostBuild = 'Host, then the Jumpstart image''s download and first boot (an estimated 30 to 60 minutes)'
+        $hostBuild = 'Host, then the Jumpstart image''s download and first boot (about 27 minutes, measured on 2026-11-06)'
     }
     $t2.Add((& $step 'T2.HostBuild' $hostBuild @('T2/T2')))
     if ($InstallMode -eq 'PaygWizard') {
