@@ -115,6 +115,12 @@ Implemented and statically tested; every item still needs the live validation ab
 - **Propagation:** a connect that Azure refuses for authorization with the host identity is retried after 30, 60, 120, 120, and 120 seconds.
 - **Still to prove live:** whether `azcmagent connect` accepts the managed identity's token (the TODO above), with the golden recapture's `test-t2-golden.ps1 -Onboard`. The owner updates the master configuration only after that.
 
+## Amendment: JumpstartImage onboards after its image check (2026-11-05)
+
+- **The default changed (user-directed, 2026-11-05):** T2's default install mode is now `JumpstartImage` ([ADR 0006](0006-sql-editions-and-licensing.md#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default)). `PaygWizard`, marked "(default)" under "When onboarding runs" above, is opt-in, and still onboards before its setup step.
+- **When:** as in `ProductKey` and `Developer` modes, once SQL Server is in place: after the host's `JumpstartImageCheck` passes (SQL Server 2022 Standard on the default instance), its `ArcOnboarding` step reports `WaitingForArcOnboarding`, and the orchestrator onboards with the same tokens (the caller's, or the host identity's whenever it's attached), the same decision table, the same sweep, and the same marker ([ADR 0003](0003-t2-host-size-security-type-bootstrap.md#amendment-the-hosts-steps-for-jumpstartimage-2026-11-05)).
+- **No inherited identity:** Jumpstart's image has no Arc agent installed; still, the first boot resets any agent identity it finds in the image locally ([`azcmagent disconnect --force-local-only`](https://learn.microsoft.com/azure/azure-arc/servers/azcmagent-disconnect)) while the guest has no network, so onboarding never meets an identity from elsewhere.
+
 ## Sources (checked 2026-10-19)
 
 Rechecked on 2026-10-20 for Phase 7: `azcmagent connect` and `show`, the Windows install steps, managed Run Command, the Machines REST API (2026-07-15), and Delete SQL Server from Azure Arc.

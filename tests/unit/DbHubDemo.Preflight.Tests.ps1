@@ -128,6 +128,23 @@ Describe 'Invoke-DemoPreflight' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricAppTenantSetting -Times 1 -Exactly
     }
 
+    It 'passes JumpstartImage, the default, on the nested host, and fails it with the evaluation-only Azure VM (2026-11-05)' {
+        Set-HappyAzMock
+        $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE'
+        $check.status | Should -Be 'Pass'
+        $check.message | Should -Match 'no step needs a person'
+
+        $evaluation = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $evaluation[$key] = $config[$key] }
+        $evaluation['t2Mode'] = 'EvaluationOnlyAzureVm'
+        $evaluation['t2SqlInstallMode'] | Should -Be 'JumpstartImage'
+        $check = Invoke-DemoPreflight -Config $evaluation -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE'
+        $check.status | Should -Be 'Fail'
+        $check.remediation | Should -Match 't2Mode Nested'
+        $evaluation['t2SqlInstallMode'] = 'Developer'
+        (Invoke-DemoPreflight -Config $evaluation -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE').status | Should -Be 'Warning'
+    }
+
     It 'fails T4 on a size Azure refused for the same zone, warns for one more try in another zone, and says nothing without a refusal (Phase 24)' {
         Set-HappyAzMock
         # Live, 2026-10-26: the capability list included Standard_B1ms, and Azure still refused it with SkuNotAvailable;
@@ -998,7 +1015,7 @@ Describe 'Get-DemoDeploymentParameter' {
         $parameters.existingVmNames.value | Should -Be @('archost01')
         $parameters.t1SecurityType.value | Should -Be 'Standard'
         $parameters.hostSecurityType.value | Should -Be 'Standard'
-        $parameters.t2SqlInstallMode.value | Should -Be 'PaygWizard'
+        $parameters.t2SqlInstallMode.value | Should -Be 'JumpstartImage'
         $parameters.Contains('adminPassword') | Should -BeFalse
         $parameters.Contains('bootstrapBundleUrl') | Should -BeFalse
         (Get-DemoDeploymentParameter -Config $copy -T3UseFreeLimit $true -NetworkMode private -T1SecurityType 'TrustedLaunch').parameters.t1SecurityType.value | Should -Be 'TrustedLaunch'

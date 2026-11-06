@@ -43,7 +43,7 @@
       }
     },
     "details": {
-      "description": "Role-specific facts: host size and Secure Boot, guest state over PowerShell Direct, evaluation days left, SQL Server edition and version, and Arc onboarding.",
+      "description": "Role-specific facts: host size and Secure Boot, free space on the guest's drive (storage), the guest's source and, in JumpstartImage mode, the Jumpstart image and its first boot (jumpstart), guest state over PowerShell Direct, its Windows license and evaluation days left (an evaluation only), the evaluation guard's last check, SQL Server edition and version, and Arc onboarding.",
       "type": "object"
     }
   }

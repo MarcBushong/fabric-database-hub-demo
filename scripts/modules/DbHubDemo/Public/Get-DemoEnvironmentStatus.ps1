@@ -17,6 +17,9 @@ function Get-DemoEnvironmentStatus {
     - T2.GUEST.STATE (2026-11-03, Get-DemoT2GuestStateResult) while archost01 runs: the nested guest as the host sees
       it now, from the same health read. Fail when a golden capture left it air-gapped, or it's off or cut off from
       its NAT switch; a Warning when it won't start with the host next time; each with the exact command.
+    - STATUS.T2.DISKSPACE (2026-11-05, Get-DemoT2DiskSpaceResult) while archost01 runs: free space on the drive that holds
+      the guest's dynamic disk, a Warning below the host's threshold. STATUS.T2.IMAGE (Get-DemoT2ImageResult), in
+      JumpstartImage mode: Pass for the tested Arc Jumpstart image, a Warning naming a newer one.
     - STATUS.DISKS: each VM's disks against the profile. STATUS.RUNCOMMANDS (Phase 28 follow-up,
       Get-DemoRunCommandStatus): managed Run Commands the demo left on its VMs, the on-demand control's DbHubControl-*
       and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap and the activity profiles'
@@ -186,6 +189,12 @@ function Get-DemoEnvironmentStatus {
                 $guestState = Get-DemoT2GuestStateResult -Config $Config -Health $health
                 if ($null -ne $guestState) {
                     $results.Add($guestState)
+                }
+                # Free space for the guest's dynamic disk, and which Jumpstart image it came from (2026-11-05).
+                foreach ($t2Result in @((Get-DemoT2DiskSpaceResult -Config $Config -Health $health), (Get-DemoT2ImageResult -Health $health))) {
+                    if ($null -ne $t2Result) {
+                        $results.Add($t2Result)
+                    }
                 }
             }
         }

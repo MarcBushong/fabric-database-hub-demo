@@ -200,12 +200,13 @@ function Test-DemoT2GoldenSnapshot {
     if ($snapshot.Location -ne $location) { $problems.Add(('it''s in {0}, not {1}' -f $snapshot.Location, $location)) }
     if ($snapshot.NetworkAccessPolicy -ne 'DenyAll') { $problems.Add(('its network access is {0}, not DenyAll' -f $snapshot.NetworkAccessPolicy)) }
     if ($snapshot.ProvisioningState -and $snapshot.ProvisioningState -ne 'Succeeded') { $problems.Add(('it''s {0}' -f $snapshot.ProvisioningState)) }
-    if ($null -eq $snapshot.EvalDaysLeft -or $snapshot.EvalDaysLeft -lt 1) { $problems.Add('its guest''s Windows evaluation is over or unknown') }
+    if (-not (Test-DemoGoldenEvaluationOk -Snapshot $snapshot)) { $problems.Add('its guest''s Windows evaluation is over or unknown') }
     if ($problems.Count -gt 0) {
         & $add 'GOLDEN.TEST.SNAPSHOT' 'Fail' ('{0} can''t be tested: {1}.' -f $snapshot.Name, ($problems -join '; ')) $snapshotEvidence 'Capture a new snapshot (./scripts/capture-t2-golden.ps1).'
         return $results.ToArray()
     }
-    & $add 'GOLDEN.TEST.SNAPSHOT' 'Pass' ('{0}: captured {1:yyyy-MM-dd HH:mm} UTC, {2}, the guest''s evaluation ends in {3} days.' -f $snapshot.Name, $snapshot.CapturedUtc, $snapshot.Sku, $snapshot.EvalDaysLeft) $snapshotEvidence
+    $lifetime = if (Test-DemoGoldenIsEvaluation -Snapshot $snapshot) { 'the guest''s evaluation ends in {0} days' -f $snapshot.EvalDaysLeft } else { 'the guest isn''t a Windows evaluation' }
+    & $add 'GOLDEN.TEST.SNAPSHOT' 'Pass' ('{0}: captured {1:yyyy-MM-dd HH:mm} UTC, {2}, {3}.' -f $snapshot.Name, $snapshot.CapturedUtc, $snapshot.Sku, $lifetime) $snapshotEvidence
 
     $groupExists = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('group', 'exists', '--name', $testGroup) -AllowFailure
     if (([string]$groupExists.StdOut).Trim() -eq 'true') {

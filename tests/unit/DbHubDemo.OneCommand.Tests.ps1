@@ -73,6 +73,20 @@ Describe 'What a run can expect (brief goal 7, items 3 and 13)' {
         }
     }
 
+    It 'says no step needs a person in JumpstartImage mode, the default, and calls its time an estimate not measured yet (2026-11-05)' {
+        $expect = InModuleScope DbHubDemo { Get-DemoDeploymentExpectation -WaitForT2 }
+        $expect.GuidedStop | Should -BeFalse
+        $text = $expect.Lines -join ' '
+        $text | Should -Match 'No step needs a person'
+        $text | Should -Match 'about 1 to 2 hours in all \(not measured yet'
+        $text | Should -Match '20 to 40 minutes'
+        $expect.Text | Should -Match 'estimate, not measured yet'
+        $expect.HumanText | Should -BeNullOrEmpty
+        $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
+        $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' }
+        @($notice) | Should -BeNullOrEmpty -Because 'a session without keyboard input needs no warning when no step needs a person'
+    }
+
     It 'warns a session that can''t take keyboard input before anything is spent, with the alternatives and the plan for a person' {
         $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
         $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -InstallMode 'PaygWizard' -WaitForT2 -PagePath 'out/deploy-status.html' }
@@ -1447,10 +1461,15 @@ Describe 'Invoke-DemoT2GuidedStop: the stop, then the run continues on its own' 
     }
 
     It 'knows the host''s phases, and the host''s step list matches the VM side''s plan' {
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestVhdx' }) }).Phase | Should -Be 'Build'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard' }) }).Phase | Should -Be 'GuidedStop'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestVhdx' }) -InstallMode PaygWizard }).Phase | Should -Be 'Build'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard' }) -InstallMode PaygWizard }).Phase | Should -Be 'GuidedStop'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'ConfigureSql' }) -InstallMode PaygWizard }).Phase | Should -Be 'AfterSetup'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'Failed'; currentStep = 'GuestOnline' }) -InstallMode PaygWizard }).Phase | Should -Be 'Failed'
+        $jumpstart = InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestImage' }) }
+        $jumpstart.Phase | Should -Be 'Build' -Because 'JumpstartImage is the default, and the image download is part of the build'
+        $jumpstart.RemainingHigh | Should -BeLessOrEqual 60
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'JumpstartImageCheck' }) }).Phase | Should -Be 'Build'
         (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'ConfigureSql' }) }).Phase | Should -Be 'AfterSetup'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'Failed'; currentStep = 'GuestOnline' }) }).Phase | Should -Be 'Failed'
         $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-HostBootstrap.ps1') -Raw
         $vmOrder = @([regex]::Matches($text, "@\{ Name = '([A-Za-z0-9]+)'") | ForEach-Object { $_.Groups[1].Value })
         $vmOrder | Should -Be @(InModuleScope DbHubDemo { Get-DemoHostStepOrder })

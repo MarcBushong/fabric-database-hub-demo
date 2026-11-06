@@ -86,7 +86,7 @@ function Test-DemoHubTelemetry {
     $docUrl = [string]$telemetry['docUrl']
     $endpoint = [string]$telemetry['queryUrl']
     $evaluationOnly = [string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm'
-    $installMode = if ($Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ($Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $region = ([string]$Config['location']).Replace(' ', '').ToLowerInvariant()
     $access = 'Querying needs Reader (or higher) on the subscription and the Microsoft.Sql resource provider registered (prerequisites P2 and P8), and an empty result never means a target is healthy.'
     $noRows = @{
@@ -108,7 +108,7 @@ function Test-DemoHubTelemetry {
             Add-TargetResult $name 'Not selected' ('{0} ({1}) was not selected for this telemetry check.' -f $name, $descriptor.Name) @{}
         }
         elseif ($name -eq 'T2' -and $installMode -eq 'Developer') {
-            Add-TargetResult 'T2' 'Not supported' 'T2 runs SQL Server Developer edition (t2SqlInstallMode Developer), and SQL Server enabled by Azure Arc sends performance telemetry only for Standard or Enterprise edition, so T2 appears in Estate but not in Performance.' @{ t2SqlInstallMode = $installMode } 'Use t2SqlInstallMode PaygWizard or ProductKey for Hub Performance on T2 (ADR 0006).'
+            Add-TargetResult 'T2' 'Not supported' 'T2 runs SQL Server Developer edition (t2SqlInstallMode Developer), and SQL Server enabled by Azure Arc sends performance telemetry only for Standard or Enterprise edition, so T2 appears in Estate but not in Performance.' @{ t2SqlInstallMode = $installMode } 'Use t2SqlInstallMode JumpstartImage (the default), PaygWizard, or ProductKey for Hub Performance on T2 (ADR 0006).'
         }
         elseif (-not $descriptor.ResourceId) {
             Add-TargetResult $name 'Fail' ('{0}''s resource ID is unknown, so its telemetry can''t be queried. {1}' -f $name, $descriptor.Error) @{} 'Run this check with -DeploymentId, or make sure the resource group carries its deploymentId tag (deploy.ps1 sets it).'

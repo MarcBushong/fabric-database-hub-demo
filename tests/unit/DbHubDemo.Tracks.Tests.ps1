@@ -19,12 +19,13 @@ BeforeAll {
     }
 
     function New-TestSnapshot {
-        param([int] $DaysLeft = 179, [bool] $BootVerified = $true, [string] $Location = 'westus3')
+        param([int] $DaysLeft = 179, [bool] $BootVerified = $true, [string] $Location = 'westus3', [string] $InstallMode = 'PaygWizard', [bool] $Evaluation = $true)
         [pscustomobject]@{
             Name = 'snap-dbhub-t2golden-202610221306'; Id = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-golden/providers/Microsoft.Compute/snapshots/snap-dbhub-t2golden-202610221306'
-            Location = $Location; NetworkAccessPolicy = 'DenyAll'; ProvisioningState = 'Succeeded'; InstallMode = 'PaygWizard'; SecurityType = 'Standard'
+            Location = $Location; NetworkAccessPolicy = 'DenyAll'; ProvisioningState = 'Succeeded'; InstallMode = $InstallMode; SecurityType = 'Standard'
             CapturedUtc = [datetime]::new(2026, 10, 22, 13, 6, 0, [System.DateTimeKind]::Utc); BootVerifiedUtc = $(if ($BootVerified) { [datetime]::new(2026, 10, 22, 14, 30, 0, [System.DateTimeKind]::Utc) } else { $null })
-            OnboardVerifiedUtc = $null; EvalExpiresUtc = [datetime]::new(2027, 4, 19, 13, 46, 0, [System.DateTimeKind]::Utc); EvalDaysLeft = $DaysLeft
+            OnboardVerifiedUtc = $null; Evaluation = $Evaluation
+            EvalExpiresUtc = $(if ($Evaluation) { [datetime]::new(2027, 4, 19, 13, 46, 0, [System.DateTimeKind]::Utc) } else { $null }); EvalDaysLeft = $(if ($Evaluation) { $DaysLeft } else { $null })
         }
     }
 
@@ -166,6 +167,8 @@ Describe 'Get-DemoTrackRecordReset: a resume trusts only what was recorded since
 Describe 'Resolve-DemoT2Source' {
     BeforeEach {
         $config = New-TestConfig
+        # The snapshots below keep a PaygWizard guest (a Windows evaluation); a snapshot is used only for its own mode.
+        $config['t2SqlInstallMode'] = 'PaygWizard'
         $script:vm = $null
         $script:snapshots = @(New-TestSnapshot)
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
@@ -221,6 +224,23 @@ Describe 'Resolve-DemoT2Source' {
         $source = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoT2Source -Config $Config }
         $source.Result.status | Should -Be 'Warning'
         $source.Result.message | Should -Match 're-capture now'
+    }
+
+    It 'restores a JumpstartImage host from its own snapshot, whose guest has no evaluation to end (2026-11-05)' {
+        $config['t2SqlInstallMode'] = 'JumpstartImage'
+        $script:snapshots = @(New-TestSnapshot -InstallMode 'JumpstartImage' -Evaluation $false)
+        $source = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoT2Source -Config $Config }
+        $source.Source | Should -Be 'golden'
+        $source.Result.status | Should -Be 'Pass'
+        $source.Result.message | Should -Match 'isn''t a Windows evaluation'
+    }
+
+    It 'never restores a snapshot of another install mode: a JumpstartImage configuration makes its guest from the image' {
+        $config['t2SqlInstallMode'] = 'JumpstartImage'
+        $source = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoT2Source -Config $Config }
+        $source.Source | Should -Be 'build'
+        $source.Result.message | Should -Match 'install mode PaygWizard'
+        $source.Result.message | Should -Match 'Arc Jumpstart'
     }
 }
 
@@ -465,7 +485,9 @@ Describe 'Invoke-DemoDeploymentTrack' {
 
     It 'cleans up what an earlier guided stop left open at the end of the T2 step: after -NoWaitForT2, on a golden redeploy, and once when the guided stop isn''t needed (Phase 28 review)' {
         # The review: a rerun after a Ctrl+C at the guided stop, with setup finished meanwhile, could end DONE with Bastion
-        # up and the handed-over host password valid.
+        # up and the handed-over host password valid. Only PaygWizard mode has a guided stop (JumpstartImage, the default
+        # since 2026-11-05, has none; checked at the end).
+        $config['t2SqlInstallMode'] = 'PaygWizard'
         Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); $script:state.HostPasswordUtc = ''; @() }
         $cleanups = { @($script:calls | Where-Object { $_ -eq 'cleanup' }).Count }
 
@@ -505,6 +527,12 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
         & $cleanups | Should -Be 0
         $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' } | Should -BeNullOrEmpty
+
+        # JumpstartImage: the same wait has no guided stop at all.
+        $config['t2SqlInstallMode'] = 'JumpstartImage'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Pass'
+        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' } | Should -BeNullOrEmpty
     }
 
     It 'runs the Fabric track: notebooks and dashboard, the history report, then the Fabric app step' {

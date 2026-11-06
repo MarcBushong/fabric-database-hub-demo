@@ -858,10 +858,20 @@ Describe 'Invoke-DemoArcConfiguration' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcOnboarding -MockWith { New-DemoResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'Connected.' -Evidence @{ azureStatus = 'Connected' } }
         foreach ($case in $cases) {
             $script:health = [pscustomobject]$case
-            $results = @(Invoke-DemoArcConfiguration -Config (New-TestConfig) -WaitMinutes 1)
+            $results = @(Invoke-DemoArcConfiguration -Config (New-TestConfig -Override @{ t2SqlInstallMode = 'PaygWizard' }) -WaitMinutes 1)
             ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Manual action required' -Because ('{0} at {1}' -f $case.state, $case.currentStep)
         }
         Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoArcSqlConfiguration -Times 0 -Exactly
+    }
+
+    It 'doesn''t wait for a setup check in JumpstartImage mode (the default): nothing needs a person' {
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { [pscustomobject]@{ Health = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboarding'; sqlEdition = 'Standard Edition (64-bit)'; guidedArmed = $false }; Polls = 0 } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcOnboarding -MockWith { New-DemoResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'Connected.' -Evidence @{ azureStatus = 'Connected' } }
+        $config = New-TestConfig
+        $config['t2SqlInstallMode'] | Should -Be 'JumpstartImage'
+        $results = @(Invoke-DemoArcConfiguration -Config $config -WaitMinutes 1)
+        ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoArcSqlConfiguration -Times 1 -Exactly
     }
 
     It 'checks an evaluation-only VM through Azure once its guest agent is disabled' {
@@ -924,7 +934,9 @@ Describe 'T2 Arc checks' {
         (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine) -Extension (New-TestExtension -State 'Creating'))).status | Should -Be 'Warning'
         (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine) -Extension (New-TestExtension -LicenseType 'LicenseOnly'))).status | Should -Be 'Fail'
         (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine) -Extension $null)).status | Should -Be 'Fail'
-        (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine -SqlDetected $false) -Extension $null)).status | Should -Be 'Manual action required'
+        $wizard = New-TestConfig -Override @{ t2SqlInstallMode = 'PaygWizard' }
+        (Invoke-Check 'Extension' (New-TestState -Config $wizard -Machine (New-TestMachine -SqlDetected $false) -Extension $null)).status | Should -Be 'Manual action required'
+        (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine -SqlDetected $false) -Extension $null)).status | Should -Be 'Warning'
     }
 
     It 'checks the instance''s edition and license type per install mode, and records billable cores' {
@@ -938,7 +950,12 @@ Describe 'T2 Arc checks' {
         (Invoke-Check 'Instance' (New-TestState -Config $developer -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Developer' -LicenseType 'LicenseOnly'))).status | Should -Be 'Pass'
         $productKey = New-TestConfig -Override @{ t2SqlInstallMode = 'ProductKey' }
         (Invoke-Check 'Instance' (New-TestState -Config $productKey -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Enterprise' -LicenseType 'Paid'))).status | Should -Be 'Pass'
-        (Invoke-Check 'Instance' (New-TestState -Config $config -Machine (New-TestMachine -SqlDetected $false))).status | Should -Be 'Manual action required'
+        $wizard = New-TestConfig -Override @{ t2SqlInstallMode = 'PaygWizard' }
+        (Invoke-Check 'Instance' (New-TestState -Config $wizard -Machine (New-TestMachine) -Instances @(New-TestInstance))).status | Should -Be 'Pass'
+        (Invoke-Check 'Instance' (New-TestState -Config $wizard -Machine (New-TestMachine -SqlDetected $false))).status | Should -Be 'Manual action required'
+        (Invoke-Check 'Instance' (New-TestState -Config $config -Machine (New-TestMachine -SqlDetected $false))).status | Should -Be 'Warning'
+        (Invoke-Check 'Instance' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Enterprise' -LicenseType 'PAYG'))).status | Should -Be 'Fail'
+        (Invoke-Check 'Instance' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -LicenseType 'Paid'))).status | Should -Be 'Fail'
     }
 
     It 'reports monitoring as Not supported in Developer mode' {

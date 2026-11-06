@@ -12,7 +12,7 @@
   "zone": null,
   "dataDiskSku": "Auto",
   "t2Mode": "Nested",
-  "t2SqlInstallMode": "PaygWizard",
+  "t2SqlInstallMode": "JumpstartImage",
   "t2Source": "auto",
   "t3AdminGroupObjectId": "00000000-0000-0000-0000-000000000000",
   "t3AutoPauseMinutes": 15,

@@ -25,8 +25,20 @@ Describe 'Evaluation-only T2 bootstrap (EvalArcVm)' {
     It 'follows the evaluation procedure, with the Azure guest agent disabled last' {
         $plan = Get-DemoEvalArcStepPlan -Context (New-TestEvalContext)
         $plan.Name | Should -Be @(
-            'ArcEvaluationPrep', 'SqlMedia', 'SqlUnattendedInstall', 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'SqlSetupWizard',
+            'InstallMode', 'ArcEvaluationPrep', 'SqlMedia', 'SqlUnattendedInstall', 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'SqlSetupWizard',
             'SignInCleanup', 'SqlAdminAccess', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner', 'DisableAzureGuestAgent')
+    }
+
+    It 'stops at once, with the fix, when the install mode is JumpstartImage: a Hyper-V image needs the nested host' {
+        $step = Get-DemoEvalArcStepPlan -Context (New-TestEvalContext -Mode 'JumpstartImage') | Where-Object { $_.Name -eq 'InstallMode' }
+        [bool](& $step.Test $step) | Should -BeFalse
+        $result = & $step.Set $step
+        $result.Outcome | Should -Be 'Failed'
+        $result.Message | Should -Match 't2Mode Nested'
+        foreach ($mode in 'PaygWizard', 'ProductKey', 'Developer') {
+            $other = Get-DemoEvalArcStepPlan -Context (New-TestEvalContext -Mode $mode) | Where-Object { $_.Name -eq 'InstallMode' }
+            [bool](& $other.Test $other) | Should -BeTrue -Because $mode
+        }
     }
 
     It 'selects the steps for the install mode, and cleans up sign-in data in every mode' -TestCases @(

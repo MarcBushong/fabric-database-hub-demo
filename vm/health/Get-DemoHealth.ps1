@@ -13,8 +13,10 @@ Arc onboarding, the guest's state, and its SQL Server edition. Since Phase 28 it
 guided stop's state (details.guidedSetup): whether automatic sign-in is armed in the guest, deploy.ps1's
 request (none, valid, expired, or invalid), setup's sign-in preparation (none, preparing, ready, or restoring:
 the WebView2 runtime, IE Enhanced Security Configuration off for administrators, and the Trusted sites entries;
-deploy.ps1 asks for a person only at ready), the last cleanup's reason, and up to five problems it left. That
-always fits in 4 KB, even when instructions are long.
+deploy.ps1 asks for a person only at ready), the last cleanup's reason, and up to five problems it left. Since
+2026-11-05 it also prints the free space on the drive that holds the guest's disk (details.storage, for status.ps1's
+early warning) and, in JumpstartImage mode, the Jumpstart image's etag, Last-Modified, and whether it's the tested one.
+That always fits in 4 KB, even when instructions are long.
 
 .PARAMETER Root
 State folder. Defaults to C:\ProgramData\DbHubDemo.
@@ -168,23 +170,30 @@ if ($View -eq 'Summary') {
         $message = $message.Substring(0, 500)
     }
     $summary = [ordered]@{
-        schemaVersion = 1
-        role          = & $read $health @('role')
-        state         = & $read $health @('state')
-        status        = & $read $health @('status')
-        message       = $message
-        currentStep   = & $read $health @('currentStep')
-        generation    = & $read $health @('generation')
-        updatedUtc    = & $read $health @('updatedUtc')
-        installMode   = & $read $health @('details', 'installMode')
-        arcOnboarded  = & $read $health @('details', 'arcOnboarded')
-        guestState    = & $read $health @('details', 'guest', 'state')
-        sqlEdition    = & $read $health @('details', 'guest', 'sql', 'edition')
-        guidedArmed   = & $read $health @('details', 'guidedSetup', 'armed')
-        guidedRequest = & $read $health @('details', 'guidedSetup', 'request')
-        guidedSignIn  = & $read $health @('details', 'guidedSetup', 'signIn')
-        guidedLast    = & $read $health @('details', 'guidedSetup', 'lastReason')
-        guidedLeft    = @(& $read $health @('details', 'guidedSetup', 'lastProblems') | Where-Object { $_ } | Select-Object -First 5)
+        schemaVersion  = 1
+        role           = & $read $health @('role')
+        state          = & $read $health @('state')
+        status         = & $read $health @('status')
+        message        = $message
+        currentStep    = & $read $health @('currentStep')
+        generation     = & $read $health @('generation')
+        updatedUtc     = & $read $health @('updatedUtc')
+        installMode    = & $read $health @('details', 'installMode')
+        arcOnboarded   = & $read $health @('details', 'arcOnboarded')
+        guestState     = & $read $health @('details', 'guest', 'state')
+        sqlEdition     = & $read $health @('details', 'guest', 'sql', 'edition')
+        guidedArmed    = & $read $health @('details', 'guidedSetup', 'armed')
+        guidedRequest  = & $read $health @('details', 'guidedSetup', 'request')
+        guidedSignIn   = & $read $health @('details', 'guidedSetup', 'signIn')
+        guidedLast     = & $read $health @('details', 'guidedSetup', 'lastReason')
+        guidedLeft     = @(& $read $health @('details', 'guidedSetup', 'lastProblems') | Where-Object { $_ } | Select-Object -First 5)
+        storageDrive   = & $read $health @('details', 'storage', 'drive')
+        storageFreeGiB = & $read $health @('details', 'storage', 'freeGiB')
+        storageWarnGiB = & $read $health @('details', 'storage', 'warnBelowGiB')
+        storageLow     = & $read $health @('details', 'storage', 'low')
+        imageEtag      = & $read $health @('details', 'jumpstart', 'image', 'etag')
+        imageModified  = & $read $health @('details', 'jumpstart', 'image', 'lastModified')
+        imagePinned    = & $read $health @('details', 'jumpstart', 'image', 'pinned')
     }
     if ($null -ne $guestFacts) {
         $summary['t2Guest'] = $guestFacts

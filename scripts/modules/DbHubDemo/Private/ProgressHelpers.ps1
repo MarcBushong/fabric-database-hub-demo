@@ -116,16 +116,17 @@ function Get-DemoProgressCatalog {
     Preflight, with the start of the VMs that were stopped (StartVms; Phase 28 live finding) and the Insights app's
     sign-in, which runs alongside everything else (Fabric.AppSignIn, 2026-11-05; not with -SkipFabric); Infrastructure;
     T1 (artifacts, bootstrap, activity, monitoring, telemetry); T3; T4; Fabric (the Insights app included, marked
-    non-blocking: it's part of every deployment, but it never blocks DONE); T2 (a golden restore, or the host build, and
-    in PaygWizard mode the guided stop and the setup check, then the sign-in cleanup, Arc onboarding, PAYG and
-    monitoring, and telemetry; Set-DemoProgressPlan skips what the T2 source doesn't use); Validation. Each step has an
-    id, a label, the track steps (Get-DemoTrackStep) it belongs to, and nonBlocking.
+    non-blocking: it's part of every deployment, but it never blocks DONE); T2 (a golden restore, or the host build,
+    which in JumpstartImage mode is the Jumpstart image's download and first boot, and in PaygWizard mode the guided stop
+    and the setup check, then the sign-in cleanup, Arc onboarding, PAYG and monitoring, and telemetry;
+    Set-DemoProgressPlan skips what the T2 source doesn't use); Validation. Each step has an id, a label, the track steps
+    (Get-DemoTrackStep) it belongs to, and nonBlocking.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
-        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
-        [string] $InstallMode = 'PaygWizard',
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
+        [string] $InstallMode = 'JumpstartImage',
 
         [switch] $T4Enabled,
 
@@ -176,7 +177,11 @@ function Get-DemoProgressCatalog {
     $t2.Add((& $step 'T2.Restore' 'Restore from the golden snapshot' @('T2/Restore')))
     $t2.Add((& $step 'T2.Artifacts' 'Artifacts to archost01' @('T2/Artifacts')))
     $t2.Add((& $step 'T2.Bootstraps' 'Bootstrap' @('T2/Bootstraps')))
-    $t2.Add((& $step 'T2.HostBuild' 'Host and guest build (about 60 to 90 minutes)' @('T2/T2')))
+    $hostBuild = 'Host and guest build (about 60 to 90 minutes)'
+    if ($InstallMode -eq 'JumpstartImage') {
+        $hostBuild = 'Host, then the Jumpstart image''s download and first boot (an estimated 30 to 60 minutes)'
+    }
+    $t2.Add((& $step 'T2.HostBuild' $hostBuild @('T2/T2')))
     if ($InstallMode -eq 'PaygWizard') {
         $t2.Add((& $step 'T2.GuidedStop' 'Guided stop: you choose pay-as-you-go and Standard (about 10 minutes)' @('T2/T2')))
         $t2.Add((& $step 'T2.SetupCheck' 'Setup check: Standard, the default instance, the Azure extension' @('T2/T2')))
@@ -228,16 +233,20 @@ function Get-DemoProgressStepLabel {
     .SYNOPSIS
     A status-page step's label (Get-DemoProgressCatalog) as it reads in a console sentence: without its parenthetical or
     its colon's detail, lowercased unless it starts with an abbreviation, and with T3 or T4 in front of their steps,
-    which T1's track runs. Pure. Internal.
+    which T1's track runs. The install mode's catalog comes first, then PaygWizard's, the only one with the guided
+    stop's steps, so every step id has a label. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [Parameter(Mandatory)]
-        [string] $Id
+        [string] $Id,
+
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
+        [string] $InstallMode = 'JumpstartImage'
     )
 
-    foreach ($track in @(Get-DemoProgressCatalog -T4Enabled)) {
+    foreach ($track in @(@($InstallMode, 'PaygWizard') | Select-Object -Unique | ForEach-Object { Get-DemoProgressCatalog -T4Enabled -InstallMode $_ })) {
         foreach ($item in @($track['steps'])) {
             if ([string]$item['id'] -ne $Id) {
                 continue

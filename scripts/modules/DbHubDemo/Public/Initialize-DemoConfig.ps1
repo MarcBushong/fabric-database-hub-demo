@@ -24,10 +24,10 @@ function Initialize-DemoConfig {
        <prefix>-<environment>-sql-admins), and whether you own it. With -CreateAdminGroup, a missing group is created
        with you as its owner (Microsoft Graph Create group and Add owners, the calls behind 'az ad group create' and
        'az ad group owner add'). A tenant that forbids it is Manual action required with the Entra steps.
-    8. T2's SQL Server install mode: PaygWizard (the default: Hub Performance on T2; once per guest build, deploy.ps1
-       stops for about 10 minutes of pre-filled SQL Server setup through Bastion, the guided stop) or Developer (no
-       stop; T2 in Hub's Estate only). It asks unless
-       -T2SqlInstallMode or -NonInteractive.
+    8. T2's SQL Server install mode: JumpstartImage (the default: Arc Jumpstart's prebuilt SQL Server 2022 Standard
+       guest, no stop, Hub Performance on T2), PaygWizard (Hub Performance on T2; once per guest build, deploy.ps1
+       stops for about 10 minutes of pre-filled SQL Server setup through Bastion, the guided stop), or Developer (no
+       stop; T2 in Hub's Estate only). It asks unless -T2SqlInstallMode or -NonInteractive.
     9. The file (INIT.CONFIG): the example configuration with these values, validated against
        config/environment.schema.json, then written (not with -WhatIf). fabric.manageCapacity stays false unless
        -ManageCapacity.
@@ -62,7 +62,7 @@ function Initialize-DemoConfig {
     The resource name prefix (default dbhub).
 
     .PARAMETER T2SqlInstallMode
-    PaygWizard or Developer; empty asks (or PaygWizard with -NonInteractive).
+    JumpstartImage, PaygWizard, or Developer; empty asks (or JumpstartImage with -NonInteractive).
 
     .PARAMETER WorkspaceName
     The Fabric workspace's name (default "Database Hub Demo").
@@ -127,7 +127,7 @@ function Initialize-DemoConfig {
         [string] $Prefix = '',
 
         [AllowEmptyString()]
-        [ValidateSet('', 'PaygWizard', 'Developer')]
+        [ValidateSet('', 'JumpstartImage', 'PaygWizard', 'Developer')]
         [string] $T2SqlInstallMode = '',
 
         [AllowEmptyString()]
@@ -517,13 +517,14 @@ function Initialize-DemoConfig {
     #region 8. T2's SQL Server install mode
     $mode = $T2SqlInstallMode
     if (-not $mode) {
-        $mode = 'PaygWizard'
+        $mode = 'JumpstartImage'
         if ($interactive) {
             $options = @(
-                'PaygWizard (default): Database Hub shows T2''s performance and the agent''s findings. Once per guest build, deploy.ps1 stops for about 10 minutes: through Bastion you choose pay-as-you-go and Standard in a pre-filled SQL Server setup.'
+                'JumpstartImage (default): no stop, unattended. T2 is Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest, and Database Hub shows its performance and the agent''s findings.'
+                'PaygWizard: Database Hub shows T2''s performance and the agent''s findings. Once per guest build, deploy.ps1 stops for about 10 minutes: through Bastion you choose pay-as-you-go and Standard in a pre-filled SQL Server setup.'
                 'Developer: no stop, unattended. T2 shows in Database Hub''s Estate only, with no T2 performance data or agent findings; T1, T3, and T4 still show performance.'
             )
-            $mode = @('PaygWizard', 'Developer')[(Read-DemoChoice -Title 'How should T2 (the Arc-enabled SQL Server) install SQL Server?' -Option $options -Default 0)]
+            $mode = @('JumpstartImage', 'PaygWizard', 'Developer')[(Read-DemoChoice -Title 'How should T2 (the Arc-enabled SQL Server) get SQL Server?' -Option $options -Default 0)]
         }
     }
     #endregion 8. T2
@@ -624,6 +625,9 @@ function Initialize-DemoConfig {
     $nextSteps.Add(('./scripts/preflight.ps1{0}   # checks P1-P6, quota, policies, and the cost; registers missing providers' -f $configArgument))
     if ($mode -eq 'PaygWizard') {
         $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 2 to 3 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); about 60 to 90 minutes in, it asks you for about 10 minutes (the guided stop), then finishes by itself' -f $configArgument))
+    }
+    elseif ($mode -eq 'JumpstartImage') {
+        $nextSteps.Add(('./scripts/deploy.ps1{0}      # keeps this PC awake until it''s done; nothing needs you (a first deploy with the Jumpstart image isn''t timed yet)' -f $configArgument))
     }
     else {
         $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 to 2.5 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))

@@ -23,9 +23,10 @@ function Get-DemoHostStepOrder {
     param()
 
     return @(
-        'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'DataDisk', 'GuestOsMedia',
-        'GuestVhdx', 'GuestVm', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall', 'ArcOnboarding',
-        'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner')
+        'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'GuestSource', 'DataDisk', 'GuestOsMedia',
+        'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall',
+        'JumpstartImageCheck', 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql',
+        'SeedDatabase', 'WorkloadRunner')
 }
 
 function Get-DemoT2HostPhase {
@@ -33,7 +34,8 @@ function Get-DemoT2HostPhase {
     .SYNOPSIS
     Where the T2 host is, from its health summary: Phase (Build, GuidedStop, AfterSetup, Ready, Failed), Step, Index and
     Count among the build's steps (until it waits for Arc onboarding), and a rough estimate of the build's remaining
-    minutes from the documented 60 to 90 minutes a guest build takes. Pure. Internal.
+    minutes from the documented 60 to 90 minutes a guest build takes, or, in JumpstartImage mode, an estimated 30 to 60
+    for the host, the image's download, and its first boot (not measured yet). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -41,8 +43,8 @@ function Get-DemoT2HostPhase {
         [AllowNull()]
         [object] $Health,
 
-        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
-        [string] $InstallMode = 'PaygWizard'
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
+        [string] $InstallMode = 'JumpstartImage'
     )
 
     $order = @(Get-DemoHostStepOrder)
@@ -71,14 +73,20 @@ function Get-DemoT2HostPhase {
     }
     $position = [System.Math]::Max(0, [System.Math]::Min($index, $buildEnd))
     $left = 1.0 - ($position / [double][System.Math]::Max(1, $buildEnd))
+    $low = 60
+    $high = 90
+    if ($InstallMode -eq 'JumpstartImage') {
+        $low = 30
+        $high = 60
+    }
     return [pscustomobject]@{
         Phase         = $phase
         Step          = $step
         State         = $state
         Index         = $position + 1
         Count         = $buildEnd + 1
-        RemainingLow  = [int][System.Math]::Round(60 * $left)
-        RemainingHigh = [int][System.Math]::Round(90 * $left)
+        RemainingLow  = [int][System.Math]::Round($low * $left)
+        RemainingHigh = [int][System.Math]::Round($high * $left)
     }
 }
 

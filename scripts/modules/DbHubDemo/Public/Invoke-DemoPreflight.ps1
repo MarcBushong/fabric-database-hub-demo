@@ -412,9 +412,18 @@ function Invoke-DemoPreflight {
         $results.Add((New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT))
     }
 
-    # T2 mode (ADR 0006). The evaluation-only fallback is opt-in, and everything about it is labeled.
-    if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
+    # T2 mode (ADR 0006). The evaluation-only fallback is opt-in, and everything about it is labeled. The Jumpstart image
+    # is a Hyper-V guest disk, so it needs the nested host; an existing guest's source is checked on the host itself
+    # (its GuestSource step), which refuses a mode the guest wasn't made for.
+    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
+    if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm' -and $installMode -eq 'JumpstartImage') {
+        Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Fail' 't2SqlInstallMode JumpstartImage needs the nested Hyper-V host: Arc Jumpstart''s image is a Hyper-V guest disk, but t2Mode EvaluationOnlyAzureVm makes T2 an Azure VM.' -Remediation 'Use t2Mode Nested with a nested-virtualization size, or, for the evaluation-only Azure VM, set t2SqlInstallMode to PaygWizard, ProductKey, or Developer (ADR 0006).' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine'
+    }
+    elseif ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T2.MODE' -Area 'preflight' -Target 'T2' -Status 'Warning' -Message 't2Mode is EvaluationOnlyAzureVm: T2 is the Azure VM arcsql01, onboarded to Azure Arc with Microsoft''s evaluation procedure, which is for evaluation and testing only. Use it only when the nested-virtualization checks fail (ADR 0006).' -Remediation 'Set t2Mode to Nested when a nested-virtualization size is available.' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine' -EvaluationOnly))
+    }
+    elseif ($installMode -eq 'JumpstartImage') {
+        Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Pass' 'T2 is the nested Hyper-V guest arcsql01 on archost01 (t2Mode Nested), made from Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest (t2SqlInstallMode JumpstartImage): no step needs a person (ADR 0006).'
     }
     else {
         Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Pass' 'T2 is the nested Hyper-V guest arcsql01 on archost01 (t2Mode Nested, ADR 0006).'
@@ -454,10 +463,13 @@ function Invoke-DemoPreflight {
     $networkUsage = @(Invoke-Az -Arguments @('network', 'list-usages', '--location', $location) -Json)
     $ipRow = $networkUsage | Where-Object { $_.name.value -eq 'PublicIPAddresses' } | Select-Object -First 1
     if ($ipRow -and ([int]$ipRow.limit - [int]$ipRow.currentValue) -ge 1) {
-        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Pass' 'Public IP quota allows on-demand Bastion.'
+        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Pass' 'Public IP quota allows on-demand Bastion (the PaygWizard guided stop, or optional interactive access).'
+    }
+    elseif ($installMode -eq 'PaygWizard') {
+        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so on-demand Bastion, which the PaygWizard guided stop needs, cannot be created.' -Remediation 'Request a public IP quota increase, or choose t2SqlInstallMode JumpstartImage, which needs no Bastion.'
     }
     else {
-        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so on-demand Bastion cannot be created.' -Remediation 'Request a public IP quota increase if you need interactive access.'
+        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so optional on-demand Bastion cannot be created; the deployment itself doesn''t need it.' -Remediation 'Request a public IP quota increase if you need interactive access.'
     }
 
     # P4 and P5: Fabric. P4 (Phase 28 live finding, 2026-10-30): the Hub setting is read through the Fabric admin API,
