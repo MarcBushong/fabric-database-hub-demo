@@ -1053,7 +1053,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         # here it notes when it ran and what it was given, and never reaches Fabric.
         $script:historyStatus = 'Pass'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -MockWith {
-            $script:calls.Add(('history done={0} skipFabric={1} whatIf={2}' -f [bool]$DoneChecked, [bool]$SkipFabric, [bool]$WhatIfRun))
+            $script:calls.Add(('history done={0} skipFabric={1} whatIf={2}' -f [bool]$PesterBoundParameters['DoneChecked'], [bool]$PesterBoundParameters['SkipFabric'], [bool]$PesterBoundParameters['WhatIfRun']))
             New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status $script:historyStatus -Message ('history {0}' -f $script:historyStatus) -Evidence @{ nonBlocking = 'historySnapshot' }
         }
     }
@@ -1278,7 +1278,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 1 -Exactly -ParameterFilter {
-            $DoneChecked -and -not $SkipFabric -and -not $WhatIfRun -and $ProgressPath -eq 'progress.json' -and [string]$ActivityProfile.Name -eq 'business-day' -and
+            [bool]$PesterBoundParameters['DoneChecked'] -and -not [bool]$PesterBoundParameters['SkipFabric'] -and -not [bool]$PesterBoundParameters['WhatIfRun'] -and $ProgressPath -eq 'progress.json' -and [string]$ActivityProfile.Name -eq 'business-day' -and
             @($Requirement) -contains 'TELEMETRY.T2' -and @($Requirement) -contains 'FABRIC.ITEMS.REQUIRED' -and
             @($Result | Where-Object { [string]$_.checkId -eq 'TELEMETRY.T1' -and [string]$_.status -eq 'Pass' }).Count -eq 1 -and
             @($Result | Where-Object { [string]$_.checkId -like 'DEPLOY.INCIDENTS_*' }).Count -gt 0

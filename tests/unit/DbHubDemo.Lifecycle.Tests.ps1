@@ -879,7 +879,7 @@ Describe 'Invoke-DemoDeployment' {
         # notes what had run before it and what it was given, apart from the stages' order, and never reaches Fabric.
         $script:history = [System.Collections.Generic.List[object]]::new()
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -MockWith {
-            $script:history.Add([pscustomobject]@{ Before = $script:order.ToArray(); DoneChecked = [bool]$DoneChecked; SkipFabric = [bool]$SkipFabric; WhatIfRun = [bool]$WhatIfRun })
+            $script:history.Add([pscustomobject]@{ Before = $script:order.ToArray(); DoneChecked = [bool]$PesterBoundParameters['DoneChecked']; SkipFabric = [bool]$PesterBoundParameters['SkipFabric']; WhatIfRun = [bool]$PesterBoundParameters['WhatIfRun'] })
             New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Saved the history report''s snapshots.' -Evidence @{ nonBlocking = 'historySnapshot' }
         }
     }
@@ -1167,7 +1167,7 @@ Describe 'Invoke-DemoDeployment' {
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 1 -Exactly -ParameterFilter {
-            $DoneChecked -and -not $SkipFabric -and -not $WhatIfRun -and [string]$ActivityProfile.Name -eq 'business-day' -and
+            [bool]$PesterBoundParameters['DoneChecked'] -and -not [bool]$PesterBoundParameters['SkipFabric'] -and -not [bool]$PesterBoundParameters['WhatIfRun'] -and [string]$ActivityProfile.Name -eq 'business-day' -and
             @($Requirement) -contains 'TELEMETRY.T2' -and @($Requirement) -contains 'FABRIC.ITEMS.REQUIRED' -and
             @($Result | Where-Object { [string]$_.checkId -eq 'HUB.ESTATE.T1' }).Count -gt 0
         }
