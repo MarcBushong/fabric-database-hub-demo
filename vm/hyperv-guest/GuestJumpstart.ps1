@@ -138,25 +138,6 @@ function New-DemoJumpstartHasher {
     }
 }
 
-function Add-DemoJumpstartHashBlock {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [pscustomobject] $Hasher,
-
-        [Parameter(Mandatory = $true)]
-        [byte[]] $Buffer,
-
-        [Parameter(Mandatory = $true)]
-        [int] $Count
-    )
-
-    if ($null -ne $Hasher.Md5) {
-        [void]$Hasher.Md5.TransformBlock($Buffer, 0, $Count, $null, 0)
-    }
-    [void]$Hasher.Sha256.TransformBlock($Buffer, 0, $Count, $null, 0)
-}
-
 function Complete-DemoJumpstartHash {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -293,8 +274,12 @@ function Save-DemoJumpstartImage {
     }
     Write-DemoVmJsonFile -Path $sidecar -InputObject ([ordered]@{ url = $uri; etag = $remote.ETag; startedUtc = (Get-DemoVmUtcNow) })
 
+    # The copy loops below call .NET methods only, never a PowerShell function: Windows PowerShell 5.1 checks a
+    # mandatory array parameter by walking every element, so a hash function called per chunk walked the whole 4 MiB
+    # buffer for each network read and held the 34 GiB download to 0.2 MB/s (live finding, 2026-11-06).
     $hasher = New-DemoJumpstartHasher
-    $buffer = New-Object -TypeName 'byte[]' -ArgumentList ([int]$settings.BufferMB * 1MB)
+    $bufferBytes = [int]$settings.BufferMB * 1MB
+    $buffer = New-Object -TypeName 'byte[]' -ArgumentList $bufferBytes
     $offset = [long]0
     if (Test-Path -LiteralPath $partial) {
         $offset = (Get-Item -LiteralPath $partial).Length
@@ -304,10 +289,15 @@ function Save-DemoJumpstartImage {
         }
         elseif ($offset -gt 0) {
             # A resumed download: the bytes already on disk go through the hashes first.
+            $md5Algorithm = $hasher.Md5
+            $sha256Algorithm = $hasher.Sha256
             $existing = [System.IO.File]::OpenRead($partial)
             try {
-                while (($count = $existing.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                    Add-DemoJumpstartHashBlock -Hasher $hasher -Buffer $buffer -Count $count
+                while (($count = $existing.Read($buffer, 0, $bufferBytes)) -gt 0) {
+                    if ($null -ne $md5Algorithm) {
+                        [void]$md5Algorithm.TransformBlock($buffer, 0, $count, $null, 0)
+                    }
+                    [void]$sha256Algorithm.TransformBlock($buffer, 0, $count, $null, 0)
                 }
             }
             finally {
@@ -335,11 +325,18 @@ function Save-DemoJumpstartImage {
             if ($offset -eq 0) {
                 $mode = [System.IO.FileMode]::Create
             }
-            $target = New-Object -TypeName 'System.IO.FileStream' -ArgumentList $partial, $mode, ([System.IO.FileAccess]::Write), ([System.IO.FileShare]::None)
+            # A network read returns a few KiB; the file's own BufferMB buffer turns them into large disk writes.
+            $target = New-Object -TypeName 'System.IO.FileStream' -ArgumentList $partial, $mode, ([System.IO.FileAccess]::Write), ([System.IO.FileShare]::None), $bufferBytes
+            $source = $download.Stream
+            $md5Algorithm = $hasher.Md5
+            $sha256Algorithm = $hasher.Sha256
             try {
-                while (($count = $download.Stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                while (($count = $source.Read($buffer, 0, $bufferBytes)) -gt 0) {
                     $target.Write($buffer, 0, $count)
-                    Add-DemoJumpstartHashBlock -Hasher $hasher -Buffer $buffer -Count $count
+                    if ($null -ne $md5Algorithm) {
+                        [void]$md5Algorithm.TransformBlock($buffer, 0, $count, $null, 0)
+                    }
+                    [void]$sha256Algorithm.TransformBlock($buffer, 0, $count, $null, 0)
                 }
             }
             finally {

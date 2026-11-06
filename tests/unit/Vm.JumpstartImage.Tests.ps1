@@ -211,6 +211,52 @@ Describe 'Disk space without a data disk' {
 }
 
 Describe 'The image download' {
+    BeforeAll {
+        # A stand-in for an HTTPS response stream: each Read returns at most MaxRead bytes, however large the buffer.
+        Add-Type -TypeDefinition @'
+namespace DbHubDemoTest
+{
+    public sealed class TrickleStream : System.IO.Stream
+    {
+        private readonly System.IO.Stream inner;
+        private readonly int maxRead;
+
+        public TrickleStream(System.IO.Stream inner, int maxRead)
+        {
+            this.inner = inner;
+            this.maxRead = maxRead;
+        }
+
+        public int Reads { get; private set; }
+        public override bool CanRead { get { return true; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { throw new System.NotSupportedException(); } }
+        public override long Position { get { throw new System.NotSupportedException(); } set { throw new System.NotSupportedException(); } }
+        public override void Flush() { }
+        public override long Seek(long offset, System.IO.SeekOrigin origin) { throw new System.NotSupportedException(); }
+        public override void SetLength(long value) { throw new System.NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new System.NotSupportedException(); }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            this.Reads++;
+            return this.inner.Read(buffer, offset, System.Math.Min(count, this.maxRead));
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                this.inner.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+}
+'@
+    }
+
     BeforeEach {
         $script:context = New-TestJumpstartContext
         $script:vhdx = Join-Path -Path $TestDrive -ChildPath ('vms-' + [guid]::NewGuid().ToString('N') + '/arcsql01/arcsql01.vhdx')
@@ -248,6 +294,48 @@ Describe 'The image download' {
         Save-DemoJumpstartImage -Context $script:context -VhdxPath $script:vhdx | Should -BeNullOrEmpty
         Should -Invoke -CommandName Open-DemoJumpstartDownload -Times 1 -Exactly -ParameterFilter { $Offset -eq 1MB }
         (Get-TestSha256 ([System.IO.File]::ReadAllBytes($script:vhdx))) | Should -Be (Get-TestSha256 $script:imageBytes)
+    }
+
+    It 'writes and hashes every chunk when the network returns a few KiB per read (<PartialBytes> bytes on disk)' -ForEach @(
+        @{ PartialBytes = 0 }
+        @{ PartialBytes = [int](2.5 * 1MB) }
+    ) {
+        # A 1 MiB buffer: the resume reads the bytes on disk in several blocks, and each network read fills a sliver of it.
+        $script:context.Host.JumpstartImage.BufferMB = 1
+        $script:network = $null
+        Mock -CommandName Open-DemoJumpstartDownload -MockWith {
+            $rest = New-Object -TypeName 'byte[]' -ArgumentList ($script:imageBytes.Length - $Offset)
+            [Array]::Copy($script:imageBytes, $Offset, $rest, 0, $rest.Length)
+            $script:network = [DbHubDemoTest.TrickleStream]::new([System.IO.MemoryStream]::new($rest), 16KB - 7)
+            [pscustomobject]@{ Stream = $script:network; StatusCode = $(if ($Offset -gt 0) { 206 } else { 200 }); ContentRange = $(if ($Offset -gt 0) { 'bytes {0}-{1}/{2}' -f $Offset, ($script:imageBytes.Length - 1), $script:imageBytes.Length } else { '' }); Response = $null }
+        }
+        if ($PartialBytes -gt 0) {
+            New-Item -ItemType Directory -Path (Split-Path -Path $script:vhdx -Parent) -Force | Out-Null
+            $first = New-Object -TypeName 'byte[]' -ArgumentList $PartialBytes
+            [Array]::Copy($script:imageBytes, 0, $first, 0, $first.Length)
+            [System.IO.File]::WriteAllBytes($script:vhdx + '.partial', $first)
+            Write-DemoVmJsonFile -Path ($script:vhdx + '.partial.json') -InputObject ([ordered]@{ url = 'x'; etag = '0xPINNED' })
+        }
+
+        Save-DemoJumpstartImage -Context $script:context -VhdxPath $script:vhdx | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Open-DemoJumpstartDownload -Times 1 -Exactly -ParameterFilter { $Offset -eq $PartialBytes }
+        $script:network.Reads | Should -BeGreaterThan ([math]::Floor(($script:imageBytes.Length - $PartialBytes) / 16KB))
+        (Get-TestSha256 ([System.IO.File]::ReadAllBytes($script:vhdx))) | Should -Be (Get-TestSha256 $script:imageBytes)
+        $record = Read-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $script:context).Image
+        $record['md5Verified'] | Should -BeTrue
+        $record['sha256'] | Should -Be (Get-TestSha256 $script:imageBytes)
+    }
+
+    It 'calls only .NET methods in its copy loops, never a PowerShell command per chunk (live finding, 2026-11-06)' {
+        # Windows PowerShell 5.1 checks a mandatory array parameter by walking every element, so a function called per
+        # network read with the 4 MiB buffer held the 34 GiB download to 0.2 MB/s.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path -Path $repoRoot -ChildPath 'vm/hyperv-guest/GuestJumpstart.ps1'), [ref]$null, [ref]$null)
+        $loops = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.LoopStatementAst] -and $node.Condition.Extent.Text -match '\.Read\(\$buffer\b' }, $true))
+        $loops.Count | Should -Be 2
+        foreach ($loop in $loops) {
+            @($loop.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.Extent.Text }) | Should -BeNullOrEmpty
+        }
+        $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Add-DemoJumpstartHashBlock' }, $true) | Should -BeNullOrEmpty
     }
 
     It 'accepts a newer image with a warning that names it (user decision, 2026-11-05)' {
