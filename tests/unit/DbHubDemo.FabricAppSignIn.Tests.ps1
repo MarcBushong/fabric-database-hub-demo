@@ -89,6 +89,7 @@ Describe 'Start-DemoFabricAppSignIn: the Insights app''s sign-in starts alongsid
         $script:started | Should -Be 1
         $state.Done | Should -BeFalse
         $state.Process | Should -Be $script:fake
+        $state.TenantId | Should -Be '66666666-7777-8888-9999-000000000000' -Because 'Complete-DemoFabricAppSignIn reads the CLI''s status for that tenant'
         $row = Get-TestRow -Path $script:progress -Id 'Fabric.AppSignIn'
         $row['state'] | Should -Be 'Running'
         $row['message'] | Should -Match 'The deployment goes on meanwhile; only the Insights app waits for it'
@@ -127,9 +128,13 @@ Describe 'Complete-DemoFabricAppSignIn: settled once, from its exit code or its 
         $script:progress = New-TestModelFile
         $script:newState = {
             param([object] $Process, [int] $MinutesLeft = 10)
-            [pscustomobject]@{ Process = $Process; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes($MinutesLeft); TimeoutMinutes = 15; Done = $false; Reported = $false; Result = $null }
+            [pscustomobject]@{ Process = $Process; TenantId = '66666666-7777-8888-9999-000000000000'; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes($MinutesLeft); TimeoutMinutes = 15; Done = $false; Reported = $false; Result = $null }
         }
         $script:complete = { param([object] $State, [switch] $Final, [switch] $Wait) @(InModuleScope DbHubDemo -Parameters @{ State = $State; Path = $script:progress; Final = [bool]$Final; Wait = [bool]$Wait } { Complete-DemoFabricAppSignIn -SignIn $State -ProgressPath $Path -Final:$Final -Wait:$Wait }) }
+        # What the CLI's own status says when the sign-in didn't finish (Get-DemoRayfinSignInState): not signed in, unless
+        # a test says otherwise.
+        $script:cliState = 'NotSignedIn'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinSignInState -MockWith { $script:cliState }
     }
 
     It 'is Pass when the person signed in (exit code 0), handed out once' {
@@ -147,7 +152,55 @@ Describe 'Complete-DemoFabricAppSignIn: settled once, from its exit code or its 
         $result[0].status | Should -Be 'Warning'
         $result[0].message | Should -Match 'exit code 3'
         $result[0].message | Should -Match 'The deployment went on'
+        $result[0].message | Should -Match 'without the sign-in the Insights app isn''t created'
         (Get-TestRow -Path $script:progress -Id 'Fabric.AppSignIn')['state'] | Should -Be 'Action needed'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRayfinSignInState -Times 1 -Exactly -ParameterFilter { $TenantId -eq '66666666-7777-8888-9999-000000000000' }
+    }
+
+    It 'is Pass, not a Warning, when the window was closed but the CLI is signed in to the demo''s tenant anyway (live, 2026-11-06)' {
+        # The live run: the window that opened no browser was closed (-1) after a separate rayfin login had signed in.
+        $script:cliState = 'SignedIn'
+        $state = & $script:newState (New-TestProcess -Exited $true -ExitCode -1)
+        $result = @(& $script:complete $state)
+        $result.Count | Should -Be 1
+        $result[0].status | Should -Be 'Pass'
+        $result[0].message | Should -BeExactly 'The Rayfin CLI is signed in to the demo''s tenant (its sign-in window was closed, with exit code -1, but a sign-in already exists); the Insights app''s step uses it.'
+        $row = Get-TestRow -Path $script:progress -Id 'Fabric.AppSignIn'
+        $row['state'] | Should -Be 'Done'
+        $row['message'] | Should -Not -Match 'isn''t created'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRayfinSignInState -Times 1 -Exactly -ParameterFilter { $TenantId -eq '66666666-7777-8888-9999-000000000000' }
+    }
+
+    It 'is Pass when a window stopped at its deadline, or once the tracks are done, finds the CLI signed in anyway' {
+        $script:cliState = 'SignedIn'
+        $late = New-TestProcess
+        $result = @(& $script:complete (& $script:newState $late -MinutesLeft -1))
+        $late.Killed | Should -BeTrue
+        $result[0].status | Should -Be 'Pass'
+        $result[0].message | Should -Match 'its sign-in window was still open, so it was stopped, but a sign-in already exists'
+        $open = New-TestProcess
+        $result = @(& $script:complete (& $script:newState $open) -Final)
+        $open.Killed | Should -BeTrue
+        $result[0].status | Should -Be 'Pass'
+    }
+
+    It 'says so when the CLI''s status couldn''t be read, instead of claiming there''s no sign-in' {
+        $script:cliState = 'Unknown'
+        $result = @(& $script:complete (& $script:newState (New-TestProcess -Exited $true -ExitCode -1)))
+        $result[0].status | Should -Be 'Warning'
+        $result[0].message | Should -Match '^The Rayfin CLI''s sign-in ended with exit code -1: it was closed, cancelled, or failed\. Whether the CLI is signed in another way couldn''t be read'
+        $result[0].message | Should -Match 'uses a sign-in this machine already has, if any'
+        $result[0].message | Should -Not -Match 'isn''t created'
+        $result[0].remediation | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
+    }
+
+    It 'doesn''t read the CLI''s status when the sign-in finished, or after Ctrl+C, so a stop stays quick' {
+        $null = @(& $script:complete (& $script:newState (New-TestProcess -Exited $true -ExitCode 0)))
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
+        $result = @(& $script:complete (& $script:newState (New-TestProcess)) -Final)
+        $result[0].status | Should -Be 'Warning'
+        $result[0].message | Should -Match 'couldn''t be read'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRayfinSignInState -Times 0 -Exactly
     }
 
     It 'stops a sign-in nobody finished by its deadline, and one still open once the tracks are done' {
@@ -181,6 +234,75 @@ Describe 'Complete-DemoFabricAppSignIn: settled once, from its exit code or its 
         $script:polls | Should -Be 3
         $result[0].status | Should -Be 'Pass'
         $slow.Killed | Should -BeFalse
+    }
+}
+
+Describe 'Get-DemoRayfinSignInState: the CLI''s own status, never a browser, bounded, and never an exception (2026-11-06)' {
+    BeforeAll {
+        $script:tenant = '66666666-7777-8888-9999-000000000000'
+        $script:read = { param([string] $Tenant = $script:tenant) InModuleScope DbHubDemo -Parameters @{ Tenant = $Tenant } { Get-DemoRayfinSignInState -TenantId $Tenant } }
+    }
+
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:stageCli = ''
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinCliPath -MockWith { $script:stageCli }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; Data = @{ status = 'ok'; identityType = 'user'; tenant = '66666666-7777-8888-9999-000000000000' } } }
+        $script:npxOut = '{"status":"ok","identityType":"user","tenant":"66666666-7777-8888-9999-000000000000"}'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:npxOut; StdErr = '' } }
+    }
+
+    It 'reads the stage''s pinned CLI when it''s installed, within a minute' {
+        $script:stageCli = 'C:\stage\node_modules\@microsoft\rayfin-cli\bin\rayfin.js'
+        & $script:read | Should -Be 'SignedIn'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq 'login status --json' -and $TimeoutSeconds -le 60 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -Times 0 -Exactly
+    }
+
+    It 'without a stage (a first run), reads the same pinned CLI through npx, from npm''s cache, within a minute' {
+        # npm can print warnings before the CLI's JSON.
+        $script:npxOut = "npm warn exec The following package was not found and will be installed`n" + $script:npxOut
+        & $script:read | Should -Be 'SignedIn'
+        $settings = InModuleScope DbHubDemo { Get-DemoFabricAppSetting }
+        $expected = '--yes --prefer-offline --package={0}@{1} -- rayfin login status --json' -f $settings['cliPackage'], $settings['cliVersion']
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -Times 1 -Exactly -ParameterFilter {
+            $Tool -eq 'npx' -and ($ArgumentList -join ' ') -eq $expected -and $TimeoutSeconds -le 60 -and
+            $Environment['RAYFIN_TELEMETRY_OPTOUT'] -eq '1' -and $Environment.Contains('RAYFIN_TOKEN') -and $null -eq $Environment['RAYFIN_TOKEN']
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 0 -Exactly
+    }
+
+    It 'is NotSignedIn when <Case>' -ForEach @(
+        @{ Case = 'the CLI isn''t signed in'; Out = '{"status":"not-signed-in","command":"login status","recovery":"Run ''rayfin login'' to authenticate."}' }
+        @{ Case = 'it''s signed in to another tenant'; Out = '{"status":"ok","identityType":"user","tenant":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}' }
+    ) {
+        $script:npxOut = $Out
+        & $script:read | Should -Be 'NotSignedIn'
+    }
+
+    It 'is Unknown, without an exception, when <Case>' -ForEach @(
+        @{ Case = 'the npx call timed out'; Out = '' }
+        @{ Case = 'the output isn''t JSON'; Out = 'npm error code ENOTCACHED' }
+        @{ Case = 'the CLI reports an error'; Out = '{"status":"error","error":"Sign-in tenant differs from the configured tenant."}' }
+        @{ Case = 'npx can''t run'; Out = 'THROW' }
+        @{ Case = 'the stage''s CLI throws'; Out = 'STAGE-THROW' }
+    ) {
+        $script:npxOut = $Out
+        if ($Out -eq 'THROW') {
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -MockWith { throw 'npx was not found on PATH. Install Node.js 20, 22, 24, which includes npm.' }
+        }
+        if ($Out -eq 'STAGE-THROW') {
+            $script:stageCli = 'C:\stage\node_modules\@microsoft\rayfin-cli\bin\rayfin.js'
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { throw 'node did not finish within 60 seconds and was stopped.' }
+        }
+        { & $script:read } | Should -Not -Throw
+        & $script:read | Should -Be 'Unknown'
+    }
+
+    It 'is Unknown without a tenant, and runs nothing' {
+        & $script:read '' | Should -Be 'Unknown'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 0 -Exactly
     }
 }
 
@@ -226,6 +348,17 @@ Describe 'Wait-DemoFabricAppSignIn: only the Insights app''s step waits, and onl
 }
 
 Describe 'Start-DemoRayfinSignInProcess' {
+    BeforeAll {
+        # Its BROWSER check reads this process's environment (Get-DemoRayfinSignInEnvironment): none here, whatever the
+        # terminal that runs the tests has.
+        $script:browserOutside = [System.Environment]::GetEnvironmentVariable('BROWSER')
+        [System.Environment]::SetEnvironmentVariable('BROWSER', $null)
+    }
+
+    AfterAll {
+        [System.Environment]::SetEnvironmentVariable('BROWSER', $script:browserOutside)
+    }
+
     It 'runs the pinned CLI''s sign-in through npx, in a window of its own on Windows, with the telemetry off and no ambient token' {
         $script:startArguments = $null
         Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'npx' } -MockWith { [pscustomobject]@{ Source = 'C:\nodejs\npx.cmd' } }
@@ -244,6 +377,126 @@ Describe 'Start-DemoRayfinSignInProcess' {
     It 'throws, naming Node.js, when npx isn''t on PATH' {
         Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'npx' } -MockWith { }
         { InModuleScope DbHubDemo { Start-DemoRayfinSignInProcess -TenantId '66666666-7777-8888-9999-000000000000' } } | Should -Throw '*npx wasn''t found on PATH*'
+    }
+}
+
+Describe 'The Rayfin CLI''s sign-in and BROWSER: one the CLI can''t start is removed for its process only (live finding, 2026-11-06)' {
+    BeforeAll {
+        $script:browserBefore = [System.Environment]::GetEnvironmentVariable('BROWSER')
+        # The live run's value: a command line set for az login, which Python's webbrowser module accepts. The Rayfin CLI
+        # runs "<BROWSER>" "<url>", so nothing opened.
+        $script:liveBrowser = '"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --inprivate %s'
+        $script:environmentFor = {
+            param([string] $WorkingDirectory)
+            InModuleScope DbHubDemo -Parameters @{ Dir = $WorkingDirectory } { Get-DemoRayfinSignInEnvironment -WorkingDirectory $Dir }
+        }
+    }
+
+    AfterAll {
+        [System.Environment]::SetEnvironmentVariable('BROWSER', $script:browserBefore)
+    }
+
+    BeforeEach {
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add(('{0}: {1}' -f $Level, $Message)) }
+        # A stand-in for a dev container's browser helper: a file that exists.
+        $script:helper = Join-Path -Path $TestDrive -ChildPath 'tools/browser-helper.sh'
+        $null = New-Item -ItemType File -Path $script:helper -Force
+    }
+
+    AfterEach {
+        [System.Environment]::SetEnvironmentVariable('BROWSER', $script:browserBefore)
+    }
+
+    It 'removes a BROWSER that isn''t a program for the CLI only, says so in one line, and leaves the caller''s as it was: <Case>' -ForEach @(
+        @{ Case = 'the live run''s command line for az login'; Value = '"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --inprivate %s' }
+        @{ Case = 'a program name with arguments'; Value = 'msedge --inprivate %s' }
+        @{ Case = 'a list of browsers'; Value = 'firefox:chromium' }
+        @{ Case = 'a file that doesn''t exist'; Value = '<TestDrive>/tools/missing-browser.exe' }
+        @{ Case = 'a folder'; Value = '<TestDrive>/tools' }
+        @{ Case = 'blank'; Value = ' ' }
+    ) {
+        $browser = $Value.Replace('<TestDrive>', $TestDrive)
+        $env:BROWSER = $browser
+        $environment = & $script:environmentFor $TestDrive
+        $environment.ContainsKey('BROWSER') | Should -BeTrue
+        $environment['BROWSER'] | Should -BeNullOrEmpty -Because 'a $null value removes it from the CLI''s process (Start-Process -Environment)'
+        $environment['RAYFIN_TELEMETRY_OPTOUT'] | Should -Be '1'
+        $environment.ContainsKey('RAYFIN_TOKEN') | Should -BeTrue
+        $environment['RAYFIN_TOKEN'] | Should -BeNullOrEmpty
+        $environment['NO_COLOR'] | Should -Be '1'
+        $env:BROWSER | Should -BeExactly $browser -Because 'the caller''s own environment never changes'
+        $script:logged.Count | Should -Be 1
+        $script:logged[0] | Should -Match '^Warning: The Rayfin CLI can''t open its sign-in page with BROWSER'
+        $script:logged[0] | Should -Match 'opens your default browser instead \(for the CLI only; BROWSER stays as it is in this terminal\)'
+    }
+
+    It 'keeps a BROWSER that''s the path of an existing file, such as a dev container''s helper, a relative one from the CLI''s working directory too' {
+        foreach ($browser in @($script:helper, 'tools/browser-helper.sh')) {
+            $env:BROWSER = $browser
+            (& $script:environmentFor $TestDrive).ContainsKey('BROWSER') | Should -BeFalse -Because ('{0} reaches the CLI as it is' -f $browser)
+            $env:BROWSER | Should -BeExactly $browser
+        }
+        $script:logged.Count | Should -Be 0
+        # The same relative path names no file from another working directory.
+        $env:BROWSER = 'tools/browser-helper.sh'
+        (& $script:environmentFor (Join-Path -Path $TestDrive -ChildPath 'tools')).ContainsKey('BROWSER') | Should -BeTrue
+    }
+
+    It 'keeps a BROWSER that''s a program on PATH' {
+        $program = if ($IsWindows) { 'cmd' } else { 'sh' }
+        $env:BROWSER = $program
+        (& $script:environmentFor $TestDrive).ContainsKey('BROWSER') | Should -BeFalse
+        $env:BROWSER | Should -BeExactly $program
+        $script:logged.Count | Should -Be 0
+    }
+
+    It 'leaves an unset BROWSER alone' {
+        [System.Environment]::SetEnvironmentVariable('BROWSER', $null)
+        (& $script:environmentFor $TestDrive).ContainsKey('BROWSER') | Should -BeFalse
+        [System.Environment]::GetEnvironmentVariable('BROWSER') | Should -BeNullOrEmpty
+        $script:logged.Count | Should -Be 0
+    }
+
+    It 'is what both sign-ins give the CLI: deploy.ps1''s (Start-DemoRayfinSignInProcess) and -SignIn''s (Invoke-DemoRayfinInteractive)' {
+        $script:starts = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'npx' } -MockWith { [pscustomobject]@{ Source = 'C:\nodejs\npx.cmd' } }
+        Mock -ModuleName DbHubDemo -CommandName Start-Process -MockWith { $script:starts.Add($PesterBoundParameters); [pscustomobject]@{ Handle = [System.IntPtr]::Zero; HasExited = $true; ExitCode = 0 } }
+        $tenant = '66666666-7777-8888-9999-000000000000'
+        $rayfinSignIn = @('login', '--tenant', $tenant)
+        foreach ($browser in @($script:liveBrowser, $script:helper)) {
+            $env:BROWSER = $browser
+            $null = InModuleScope DbHubDemo -Parameters @{ Tenant = $tenant } { Start-DemoRayfinSignInProcess -TenantId $Tenant }
+            $null = InModuleScope DbHubDemo -Parameters @{ Dir = $TestDrive; SignIn = $rayfinSignIn } { Invoke-DemoRayfinInteractive -NodePath 'node' -CliPath 'C:\stage\node_modules\@microsoft\rayfin-cli\scripts\main' -ArgumentList $SignIn -WorkingDirectory $Dir }
+            $env:BROWSER | Should -BeExactly $browser -Because 'neither sign-in changes the caller''s environment'
+        }
+        $script:starts.Count | Should -Be 4
+        foreach ($start in $script:starts[0..1]) {
+            $start['Environment'].ContainsKey('BROWSER') | Should -BeTrue
+            $start['Environment']['BROWSER'] | Should -BeNullOrEmpty
+            $start['Environment']['RAYFIN_TELEMETRY_OPTOUT'] | Should -Be '1'
+        }
+        foreach ($start in $script:starts[2..3]) {
+            $start['Environment'].ContainsKey('BROWSER') | Should -BeFalse -Because 'a usable BROWSER reaches the CLI'
+        }
+        $script:starts[1].ContainsKey('NoNewWindow') | Should -BeTrue -Because '-SignIn runs the CLI in this console'
+        $script:starts[1].ContainsKey('Wait') | Should -BeTrue
+        $script:logged.Count | Should -Be 2 -Because 'each sign-in with the unusable BROWSER says so once'
+    }
+
+    It 'leaves BROWSER out of a real child process, and in the caller''s environment (Start-Process -Environment)' {
+        $env:BROWSER = $script:liveBrowser
+        $environment = & $script:environmentFor $TestDrive
+        # The child writes what it sees to a file itself. Start-Process -RedirectStandardOutput differs by platform: on
+        # Linux and macOS it writes each line the child prints, with a line ending, from handlers that run as the output
+        # arrives, so the file ended with a newline in CI (2026-11-06); on Windows the file gets the child's bytes as written.
+        $file = Join-Path -Path $TestDrive -ChildPath 'child-environment.txt'
+        $probe = '[System.IO.File]::WriteAllText(''{0}'', ''BROWSER=['' + [System.Environment]::GetEnvironmentVariable(''BROWSER'') + ''] RAYFIN_TELEMETRY_OPTOUT=['' + $env:RAYFIN_TELEMETRY_OPTOUT + '']'')' -f $file.Replace("'", "''")
+        $encoded = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($probe))
+        $child = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded -Environment $environment -NoNewWindow -Wait -PassThru
+        $child.ExitCode | Should -Be 0
+        Get-Content -LiteralPath $file -Raw | Should -BeExactly 'BROWSER=[] RAYFIN_TELEMETRY_OPTOUT=[1]'
+        $env:BROWSER | Should -BeExactly $script:liveBrowser
     }
 }
 
