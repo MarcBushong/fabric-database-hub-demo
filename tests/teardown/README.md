@@ -41,4 +41,4 @@ Every script runs the subscription guard first, never signs in, and never change
 
   It refuses the configured environment's resource group, and a `rg-<prefix>-stacktest` group it didn't create (its `purpose` tag isn't `deployment-stack-trial`). Results go to `out/stack-trial.jsonl`; `TEARDOWN.STACK.CLEANUP` confirms that no trial stack, resource group, or deny assignment is left.
 
-Use a disposable environment (its own `environment` name, so its own resource group) with `t2SqlInstallMode` `Developer`, so a redeploy needs no manual step. Never point `-Destroy` at an environment someone else uses without their agreement.
+Use a disposable environment (its own `environment` name, so its own resource group) with `t2SqlInstallMode` `JumpstartImage` (the default since 2026-11-05) or `Developer`, so a redeploy needs no manual step; `Developer` also has no SQL Server license charge, but T2 then shows in Database Hub's Estate only. Never point `-Destroy` at an environment someone else uses without their agreement.

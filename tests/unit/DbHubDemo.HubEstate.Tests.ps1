@@ -74,6 +74,9 @@ Describe 'Test-DemoHubEstate' {
 
     It 'reports an Arc machine without a SQL instance as the pending wizard step, or a Warning in the other modes' {
         Initialize-HubAzMock -Token (Get-HubFakeToken) -GraphRow (Get-HubGraphRow -Without 'microsoft.azurearcdata/sqlserverinstances|arcsql01')
+        $config['t2SqlInstallMode'] | Should -Be 'JumpstartImage'
+        @(Test-DemoHubEstate -Config $config -Target T2)[1].status | Should -Be 'Warning' -Because 'JumpstartImage, the default, needs no person'
+        $config['t2SqlInstallMode'] = 'PaygWizard'
         @(Test-DemoHubEstate -Config $config -Target T2)[1].status | Should -Be 'Manual action required'
         $config['t2SqlInstallMode'] = 'ProductKey'
         @(Test-DemoHubEstate -Config $config -Target T2)[1].status | Should -Be 'Warning'

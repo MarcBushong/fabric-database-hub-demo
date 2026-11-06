@@ -65,7 +65,7 @@ Describe 'Repository layout' {
     It 'has the script scripts/<_>.ps1 with #Requires and comment-based help' -ForEach @(
         'init', 'deploy', 'preflight', 'configure-fabric', 'configure-powerbi', 'configure-fabric-app', 'configure-arc', 'configure-monitoring', 'validate',
         'start-demo', 'stop-demo', 'reset-demo', 'status', 'estimate-cost', 'destroy', 'setup-github-oidc', 'setup-github-repo', 'setup-activity-control',
-        'collect-diagnostics'
+        'grant-safety-stop', 'collect-diagnostics'
     ) {
         $path = Join-Path -Path $repoRoot -ChildPath "scripts/$_.ps1"
         Test-Path -LiteralPath $path | Should -BeTrue
@@ -370,7 +370,7 @@ Describe 'Configuration files' {
 
     It 'media pins use HTTPS and a SHA-256 or null (trust on first use)' {
         $versions = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
-        foreach ($name in 'windowsServer2022Eval', 'sqlServer2022', 'sqlServer2022Developer') {
+        foreach ($name in 'windowsServer2022Eval', 'sqlServer2022', 'sqlServer2022Developer', 'jumpstartArcBoxSqlStd') {
             $pin = $versions.media[$name]
             $pin.url | Should -Match '^https://'
             $pin.fileName | Should -Be ([System.IO.Path]::GetFileName(([uri]$pin.url).AbsolutePath))

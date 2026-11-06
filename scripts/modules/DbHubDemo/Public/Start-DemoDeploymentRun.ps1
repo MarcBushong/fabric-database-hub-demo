@@ -72,7 +72,7 @@ function Start-DemoDeploymentRun {
     $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
     $paths = Get-DemoProgressPath -Directory $OutputDirectory
     $command = Get-DemoDeployCommand -ConfigPath $ConfigPath
-    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -WaitForT2:$WaitForT2 -T2WaitMinutes $T2WaitMinutes
+    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -WaitForT2:$WaitForT2 -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric
     $run = [pscustomobject]@{
         ProgressPath = ''
         PagePath     = ''
@@ -106,7 +106,7 @@ function Start-DemoDeploymentRun {
                 Write-DemoLog -Level Warning -Message ('The status page couldn''t be set up, so the console is the only view: {0}' -f $_.Exception.Message)
             }
         }
-        $notices = Get-DemoDeploymentNotice -Environment $environment -InstallMode $installMode -WaitForT2:$WaitForT2 -PagePath $run.PagePath
+        $notices = Get-DemoDeploymentNotice -Environment $environment -InstallMode $installMode -WaitForT2:$WaitForT2 -PagePath $run.PagePath -SkipFabric:$SkipFabric
         Write-DemoConsoleBlock -Color 'Cyan' -Line (Get-DemoBannerLine -Title ('deploy.ps1: environment {0}, resource group {1}' -f $Config['environment'], (Get-DemoResourceGroupName -Config $Config)))
         Write-DemoConsoleBlock -Color 'White' -Line $expect.Lines
         $more = @(

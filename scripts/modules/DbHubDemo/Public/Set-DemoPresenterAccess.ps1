@@ -46,7 +46,7 @@ function Set-DemoPresenterAccess {
     $resourceGroup = 'rg-{0}-{1}' -f $Config['prefix'], $Config['environment']
     $subscriptionScope = '/subscriptions/{0}' -f $subscriptionId
     $groupScope = '{0}/resourceGroups/{1}' -f $subscriptionScope, $resourceGroup
-    $installMode = if ($Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ($Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $permissionsApi = [string]$settings['authorizationPermissionsApiVersion']
     $guidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
     $presenters = @(@($Config['presenterObjectIds']) | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Select-Object -Unique)

@@ -22,7 +22,7 @@ function Stop-DemoEnvironment {
       auto-pause stops its compute t3AutoPauseMinutes after the last session. T4, the PostgreSQL flexible
       server (Phase 24, ADR 0019), gets its profile off and is stopped (STOP.T4.STOP; Servers - Stop). A
       stopped flexible server starts on its own after seven days, so the result says when (the stop time plus seven days),
-      what it then bills, and whether the on-demand control's daily safety stop stops it again (Phase 28 follow-up); its
+      what it then bills, and whether the nightly safety stop (ADR 0024) stops it again (Phase 28 follow-up); its
       storage and the Defender plans a tenant policy enables are billed while it's stopped.
       With the on-demand activity control (control.enabled, ADR 0020), it first removes a pending auto-stop, so
       it can't deallocate a later session's VMs (STOP.CONTROL.AUTOSTOP).

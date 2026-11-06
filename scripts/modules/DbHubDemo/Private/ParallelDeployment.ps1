@@ -319,7 +319,10 @@ function Invoke-DemoParallelDeployment {
        the template deploys (Wait-DemoStoppedStart, DEPLOY.VMSTART; Phase 28 live finding). Running VMs are only read.
        Then, on a run that ends with the validation and has no T1 Monitoring step of its own, T1's monitoring plugin is
        checked, and restarted when it isn't running, beside the tracks (Start-DemoT1MonitoringJob, DEPLOY.T1.MONITORING;
-       Phase 28 live finding, 2026-10-30).
+       Phase 28 live finding, 2026-10-30). When the Fabric track runs, the Insights app's sign-in starts too
+       (Start-DemoFabricAppSignIn, DEPLOY.FABRIC.APPSIGNIN; 2026-11-05): alongside everything else, which never waits for
+       it; it's settled while the tracks run (Complete-DemoFabricAppSignIn) and stopped when they're done, and only the
+       app's own step waits for it, until its deadline.
     1. The subscription guard; then the bootstrap bundle and the workload runner start building in their own
        process (Start-DemoArtifactBuildJob), which hands them over through a private handoff directory.
        Preflight (Invoke-DemoPreflight) and the T2 source (Resolve-DemoT2Source, PREFLIGHT.T2.SOURCE). Any
@@ -533,6 +536,13 @@ function Invoke-DemoParallelDeployment {
     $policyJob = $null
     $policy = @{ Collected = $false; Applied = $false; Items = @() }
     $t4StartSku = ''
+    # The Insights app's sign-in (2026-11-05): started before preflight, alongside everything else (Start-DemoFabricAppSignIn).
+    $appSignIn = $null
+    # Settles it once it ended or its deadline passed, and adds its record once; never throws.
+    $signInTick = {
+        param([switch] $Final)
+        & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -ProgressPath $ProgressPath -Final:$Final)
+    }
     # T1's monitoring plugin, checked on a run that ends with the validation and has no T1 Monitoring step of its own
     # (Phase 28 live finding, 2026-10-30), in its own process while the tracks run (Start-DemoT1MonitoringJob).
     $checkT1Monitoring = -not $whatIf -and [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists') -and [bool]$plan.Validation -and 'Monitoring' -notin @($plan.Tracks['T1'])
@@ -680,9 +690,10 @@ function Invoke-DemoParallelDeployment {
                 & $guidedTick
                 & $collectPolicy 0
                 & $collectMonitoring 0
+                & $signInTick
             }
             catch {
-                Write-DemoLog -Level Warning -Message ('The guided stop''s prompt, the policy inventory, or T1''s monitoring check couldn''t be read this time: {0}' -f $_.Exception.Message)
+                Write-DemoLog -Level Warning -Message ('The guided stop''s prompt, the policy inventory, T1''s monitoring check, or the Insights app''s sign-in couldn''t be read this time: {0}' -f $_.Exception.Message)
             }
             if ($null -ne $buildJob -and $buildJob.State -notin 'NotStarted', 'Running' -and -not (Test-Path -LiteralPath (Join-Path -Path $handoff -ChildPath 'artifacts.xml'))) {
                 # A build process that died without a word: the tracks get its error instead of waiting.
@@ -750,6 +761,18 @@ function Invoke-DemoParallelDeployment {
             Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -State 'Skipped' -Message $(if ([bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')) { 'Not part of this run.' } else { 'Not needed: nothing is deployed yet.' })
         }
 
+        # The Insights app's sign-in (2026-11-05): when the Fabric track runs, it starts now, while the person is still at
+        # the keyboard, and runs alongside preflight, the template, and the tracks, none of which waits for it. Only the
+        # app's own step waits for it, until its deadline; one that's cancelled, times out, or fails leaves that step to
+        # say why, and the run goes on.
+        if (-not $whatIf -and @($plan.Tracks['Fabric']) -contains 'Fabric') {
+            $appSignIn = Start-DemoFabricAppSignIn -Config $Config -ProgressPath $ProgressPath -Confirm:$false
+            & $signInTick
+        }
+        else {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.AppSignIn' -State 'Skipped' -Message $(if ($whatIf) { 'What if: nothing signs in.' } else { 'Not needed: the Fabric track isn''t part of this run.' })
+        }
+
         # 1. Preflight and the T2 source.
         if ($plan.Preflight) {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -793,6 +816,7 @@ function Invoke-DemoParallelDeployment {
             & $ensureContext
             $mark.Invoke('Preflight', $watch)
             & $stageResult 'Preflight' 'Pass' (Get-DemoPreflightPassText -NetworkMode ([string]$context.NetworkMode) -T3UseFreeLimit ([bool]$context.T3UseFreeLimit) -T2Source ([string]$context.T2Source))
+            & $signInTick
         }
         if (-not $whatIf) {
             & $ensureContext
@@ -957,6 +981,11 @@ function Invoke-DemoParallelDeployment {
             & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
         }
         if ($StopAfter -in 'Preflight', 'Infrastructure') {
+            # The nightly safety stop (ADR 0024) comes with what the template deployed, as in a full run.
+            if ($StopAfter -eq 'Infrastructure' -and $plan.Infrastructure -and -not $whatIf) {
+                Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
+                & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+            }
             & $applyPolicy 15
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
             return $results.ToArray()
@@ -982,6 +1011,12 @@ function Invoke-DemoParallelDeployment {
                 return $results.ToArray()
             }
         }
+        # The nightly safety stop (ADR 0024), on every run, a resumed one too: here, after the tracks got the template's
+        # handoff, so none of them waits for it. Its problems are Warnings, never a Fail.
+        if (-not $whatIf) {
+            Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
+            & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+        }
 
         # 4. The tracks.
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1000,6 +1035,9 @@ function Invoke-DemoParallelDeployment {
                 $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f $buildError) -Remediation 'Run New-DemoBootstrapBundle and Publish-DemoWorkloadRunner yourself to see the error (the runner needs the .NET SDK, or use -SkipRunner).'))
             }
         }
+        # The tracks are done, the Insights app's step with them: a sign-in still open is stopped now, and its record (never
+        # a Fail) is added.
+        & $signInTick -Final
         # The deferred policy inventory has had the whole run; it gets up to 5 more minutes.
         & $applyPolicy 5
         # T1's monitoring check matters to DONE's telemetry checks, which run once every track finished: it gets up to 20
@@ -1024,6 +1062,8 @@ function Invoke-DemoParallelDeployment {
         if ($ended.Count -gt 0) {
             Write-DemoLog -Level Warning -Message ('Stopped: {0} ended at once; the next ./scripts/deploy.ps1 continues their work.' -f ($ended -join ', '))
         }
+        # The Insights app's sign-in, when the run ended or was stopped before it settled.
+        Stop-DemoFabricAppSignIn -SignIn $appSignIn
         # The VMs the track processes may have left on the interim baseline, noted in this process before their handoff
         # directory goes: the switch below, or Complete-DemoDeploymentRun's when the run stops before it (2026-11-03).
         foreach ($vm in @(Get-DemoActivitySwitchVm -HandoffPath $handoff)) {
@@ -1060,7 +1100,7 @@ function Invoke-DemoParallelDeployment {
         return ([string](Get-DemoMemberValue -InputObject $state -Name ('Track{0}' -f $Track)) -eq $LastStep)
     }
     $allTracksDone = (& $trackFinished 'T1' 'Telemetry') -and (& $trackFinished 'T2' 'Telemetry') -and ($skipT4 -or (& $trackFinished 'T4' 'Telemetry')) -and ($SkipFabric -or (& $trackFinished 'Fabric' 'Fabric'))
-    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:$skipT4 -SkipFabric:$SkipFabric
     $validationStart = $results.Count
     if ($plan.Validation) {
@@ -1110,10 +1150,10 @@ function Invoke-DemoParallelDeployment {
         catch {
             Write-DemoLog -Level Warning -Message ('The validation ran, but the stage wasn''t recorded: {0}' -f $_.Exception.Message)
         }
-        # What only a person can confirm, and the optional parts, don't make this step look blocked (Phase 28 live finding);
-        # the Hub tenant setting by its latest read (Phase 28 review).
+        # What only a person can confirm, and the non-blocking parts (the Insights app), don't make this step look blocked
+        # (Phase 28 live finding); the Hub tenant setting by its latest read (Phase 28 review).
         $runSoFar = $results.ToArray()
-        $validationStatus = Get-DemoWorstStatus -Status @($results | Select-Object -Skip $validationStart | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_ -Context $runSoFar) -and -not (Test-DemoOptionalResult -Result $_) } | ForEach-Object { [string]$_.status })
+        $validationStatus = Get-DemoWorstStatus -Status @($results | Select-Object -Skip $validationStart | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_ -Context $runSoFar) -and -not (Test-DemoNonBlockingResult -Result $_) } | ForEach-Object { [string]$_.status })
         Set-DemoProgressStep -Path $ProgressPath -Id 'Validation' -Status $(if ($validationStatus) { $validationStatus } else { 'Pass' }) -Message $(if ($allTracksDone) { 'Database Hub''s estate, telemetry, and metrics checked for every target.' } else { 'Checked what finished; the rest waits for the unfinished tracks.' })
     }
     $mark.Invoke('Validation', $validationWatch)

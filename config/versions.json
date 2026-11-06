@@ -247,6 +247,45 @@
       "sizeBytes": 1163053056,
       "sha256": "80d2cd75dd2b28098c0182f50ad86bd44f9b3a9f357c30ff617480a1497daffd",
       "verifiedOn": "2026-10-19"
+    },
+    "jumpstartArcBoxSqlStd": {
+      "description": "Arc Jumpstart ArcBox's prebuilt SQL Server Standard guest disk, the JumpstartImage install mode's T2 guest (ADR 0006, 2026-11-05 amendment). Read on 2026-11-05 with HTTP range requests, without downloading it: a dynamic Generation 2 VHDX (GPT: EFI, MSR, Windows, WinRE) with a 100 GiB maximum and 34.13 GiB allocated; Windows Server 2022 Standard (EditionID ServerStandard, build 20348.3932), not an evaluation, specialized (not sysprepped), computer name ARCBOX-SQL; SQL Server 2022 Standard Edition 16.0.1140.6 (GDR) on the default instance MSSQLSERVER, mixed-mode authentication, sysadmin ARCBOX-SQL-STD\\Administrator, with Integration Services, the sample database AdventureWorksLT2022, and SQL Server Standard media in C:\\Jumpstart. The host verifies every download against the blob's own Content-MD5 and length (fail closed); when Jumpstart publishes a newer image at the same URL (another etag), it's used once the guest passes the image checks, with a Warning that names it (user decision, 2026-11-05). sha256 is null until a streamed hash is pinned; the host records the SHA-256 of what it downloaded.",
+      "sourceUrl": "https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md",
+      "url": "https://jumpstartprodsg.blob.core.windows.net/arcbox/prod/ArcBox-SQL-STD.vhdx",
+      "fileName": "ArcBox-SQL-STD.vhdx",
+      "sizeBytes": 36645634048,
+      "sha256": null,
+      "etag": "0x8DDD21BE1292CD1",
+      "contentMd5": "5g1R6mb40rKCJPN8Zm+WZQ==",
+      "lastModified": "2025-08-02T23:25:34Z",
+      "virtualSizeBytes": 107374182400,
+      "expected": {
+        "sqlEdition": "Standard",
+        "sqlMajorVersion": 16,
+        "instanceName": "MSSQLSERVER",
+        "computerName": "ARCBOX-SQL",
+        "sampleDatabases": ["AdventureWorksLT2022"],
+        "jumpstartFolder": "C:\\Jumpstart"
+      },
+      "credentialSource": {
+        "description": "The image's published default credential (Jumpstart's ITPro docs list it under 'Windows virtual machine credentials'). Never stored in this repository (user decision, 2026-11-05): the host reads it at run time from Jumpstart's own script at this commit, checks the file's SHA-256, takes the two values with these patterns, keeps them only in memory, uses them once over PowerShell Direct while the guest has no network, and replaces the password with a random one.",
+        "url": "https://raw.githubusercontent.com/microsoft/azure_arc/e2c114eed98d18105dcf3a718bef965d5112781b/azure_jumpstart_arcbox/artifacts/ArcServersLogonScript.ps1",
+        "sha256": "1442c2d5a306dcde19fdfe9111a7fdf88ac91431d2b77af4d8d6430a484d6026",
+        "userNamePattern": "(?m)^\\s*\\$nestedWindowsUsername\\s*=\\s*'(?<value>[^']+)'\\s*$",
+        "passwordPattern": "(?m)^\\s*\\$nestedWindowsPassword\\s*=\\s*'(?<value>[^']+)'\\s*$"
+      },
+      "docUrls": {
+        "arcBoxItPro": "https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md",
+        "jumpstartFaq": "https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/FAQ/_index.md",
+        "arcBoxLogonScript": "https://github.com/microsoft/azure_arc/blob/e2c114eed98d18105dcf3a718bef965d5112781b/azure_jumpstart_arcbox/artifacts/ArcServersLogonScript.ps1",
+        "hubPrerequisites": "https://learn.microsoft.com/fabric/database/hub/add-sql#prerequisites-for-sql-server-enabled-by-azure-arc",
+        "licenseTypes": "https://learn.microsoft.com/sql/sql-server/azure-arc/manage-license-billing",
+        "renameSqlServerHost": "https://learn.microsoft.com/sql/database-engine/install-windows/rename-a-computer-that-hosts-a-stand-alone-instance-of-sql-server",
+        "uninstallFeature": "https://learn.microsoft.com/sql/sql-server/install/uninstall-an-existing-instance-of-sql-server-setup",
+        "powerShellDirect": "https://learn.microsoft.com/virtualization/hyper-v-on-windows/user-guide/powershell-direct",
+        "slmgr": "https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options"
+      },
+      "verifiedOn": "2026-11-05"
     }
   },
   "dotnetRuntime": {

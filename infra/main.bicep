@@ -145,13 +145,14 @@ param sqlHybridBenefit bool = false
 @description('I attest that I hold the licenses that Azure Hybrid Benefit requires (ADR 0006, C6).')
 param hybridBenefitAttested bool = false
 
-@description('How SQL Server is installed in the T2 guest (ADR 0006).')
+@description('How SQL Server gets into the T2 guest (ADR 0006): JumpstartImage (default) uses Arc Jumpstart\'s prebuilt SQL Server 2022 Standard guest disk, unattended.')
 @allowed([
+  'JumpstartImage'
   'PaygWizard'
   'ProductKey'
   'Developer'
 ])
-param t2SqlInstallMode string = 'PaygWizard'
+param t2SqlInstallMode string = 'JumpstartImage'
 
 @description('Nested: T2 is the nested Hyper-V guest arcsql01 on archost01 (default). EvaluationOnlyAzureVm: the opt-in fallback when the nested preflight fails; arcsql01 is an Azure VM onboarded to Arc with Microsoft\'s evaluation procedure, labeled evaluation only everywhere (ADR 0006).')
 @allowed([

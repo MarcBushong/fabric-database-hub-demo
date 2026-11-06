@@ -46,7 +46,7 @@ function Invoke-DemoTemplateDeployment {
        Warning; a refused scale keeps its size and records it), and without -ScaleT4 (start-demo.ps1) or while T4 isn't
        Ready, it keeps its size (DEPLOY.T4.SKU Pass when that differs from the configured size). A move to a larger size,
        the default or a t4SkuName the configuration changed on an existing server (with -ScaleT4), is priced first with
-       the 2-vCore fallback's estimate at that size (Get-DemoT4GeneralPurposeCost, with the daily T4 safety stop's restart
+       the 2-vCore fallback's estimate at that size (Get-DemoT4GeneralPurposeCost, with the safety stops' restart
        coverage), because deploy.ps1 -FromStage Infrastructure skips preflight's cost checks (review of PR 20): over
        either ceiling, or without a price, the server keeps its size this time (DEPLOY.T4.SIZE Ceiling, naming the ceiling
        to raise; nothing recorded, so the next run checks again). A record that doesn't

@@ -334,7 +334,7 @@ function Test-DemoArcSqlExtension {
             return (New-DemoArcResult -CheckId 'T2.ARC.SQLEXTENSION' -Target $target -Status 'Manual action required' -Message 'SQL Server isn''t installed in arcsql01 yet: finish the PaygWizard setup-wizard step. The extension is deployed when SQL Server is detected.' -Evidence $evidence -Remediation 'Follow the setup-wizard steps in docs/deployment.md (health.json on the host lists them), then run configure-arc.ps1 again.' -DocUrl $setting.DocUrls['autoDeploy'])
         }
         if (-not $sqlDetected) {
-            return (New-DemoArcResult -CheckId 'T2.ARC.SQLEXTENSION' -Target $target -Status 'Warning' -Message ('The Arc machine {0} doesn''t report SQL Server yet, so the extension isn''t deployed yet.' -f $target.MachineName) -Evidence $evidence -Remediation 'Wait for the host to finish installing SQL Server, then run configure-arc.ps1 again.' -DocUrl $setting.DocUrls['autoDeploy'])
+            return (New-DemoArcResult -CheckId 'T2.ARC.SQLEXTENSION' -Target $target -Status 'Warning' -Message ('The Arc machine {0} doesn''t report SQL Server yet, so the extension isn''t deployed yet.' -f $target.MachineName) -Evidence $evidence -Remediation 'Wait for the host to finish setting up SQL Server in the guest, then run configure-arc.ps1 again.' -DocUrl $setting.DocUrls['autoDeploy'])
         }
         return (New-DemoArcResult -CheckId 'T2.ARC.SQLEXTENSION' -Target $target -Status 'Fail' -Message ('SQL Server is detected on {0}, but the {1} extension is missing.' -f $target.MachineName, $setting.SqlExtension['name']) -Evidence $evidence -Remediation 'Run ./scripts/configure-arc.ps1, which installs it with license type PAYG.' -DocUrl $setting.DocUrls['configuration'])
     }

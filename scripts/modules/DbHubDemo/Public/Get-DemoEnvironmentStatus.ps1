@@ -17,6 +17,9 @@ function Get-DemoEnvironmentStatus {
     - T2.GUEST.STATE (2026-11-03, Get-DemoT2GuestStateResult) while archost01 runs: the nested guest as the host sees
       it now, from the same health read. Fail when a golden capture left it air-gapped, or it's off or cut off from
       its NAT switch; a Warning when it won't start with the host next time; each with the exact command.
+    - STATUS.T2.DISKSPACE (2026-11-05, Get-DemoT2DiskSpaceResult) while archost01 runs: free space on the drive that holds
+      the guest's dynamic disk, a Warning below the host's threshold. STATUS.T2.IMAGE (Get-DemoT2ImageResult), in
+      JumpstartImage mode: Pass for the tested Arc Jumpstart image, a Warning naming a newer one.
     - STATUS.DISKS: each VM's disks against the profile. STATUS.RUNCOMMANDS (Phase 28 follow-up,
       Get-DemoRunCommandStatus): managed Run Commands the demo left on its VMs, the on-demand control's DbHubControl-*
       and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap and the activity profiles'
@@ -27,8 +30,8 @@ function Get-DemoEnvironmentStatus {
       15 minutes (CPU, memory, connections, CPU credits, and the enhanced metrics: sessions by state and by
       wait event type, the oldest transaction, deadlocks); while it's stopped, when Azure starts it again on its own (seven
       days after the stop in the activity log; a Warning within a day), what it then bills at its own size (the Retail
-      Prices API), and whether the on-demand control's daily safety stop stops it again or nothing does (Phase 28
-      follow-up); a General Purpose T4 says so, and when the fallback chose it, with its hourly list price. A server that
+      Prices API), and whether the nightly safety stop (ADR 0024), or else the on-demand control's daily safety stop, stops
+      it again or nothing does (Phase 28 follow-up; Get-DemoT4RestartStopState); a General Purpose T4 says so, and when the fallback chose it, with its hourly list price. A server that
       exists although the record says T4 is off (DbHubT4Size None or Refused) is a Warning that it bills, and what keeps or
       removes it (review of 64c28b2; New-DemoT4RecordedOffResult).
       STATUS.PROFILE_T4 is its activity
@@ -63,6 +66,9 @@ function Get-DemoEnvironmentStatus {
     - STATUS.COST: month-to-date actual cost of the resource group, plus rg-<prefix>-golden while it holds a
       snapshot (Cost Management Query API), against monthlyCeilingUsd; Warning above 80%.
     - STATUS.SHUTDOWN: the next auto-shutdown.
+    - STATUS.SAFETYSTOP (ADR 0024, Get-DemoSafetyStopStatus): the nightly safety stop's times, whether its role is
+      assigned, what its last run stopped, and what its last T3 check found; a Warning that names the fix when it isn't
+      set up, can't act (its role; T4 isn't covered then), didn't finish, or found T3 still online past its auto-pause.
     - STATUS.FABRIC.CAPACITY, with fabric.manageCapacity true or a DbHubFabricCapacityResumed record only (Phase 26b,
       Get-DemoFabricCapacityStatus): the capacity's state, and whether start-demo.ps1 resumed it (the record, which
       stop-demo.ps1 pauses and clears). Read-only: a stale record is shown, and stop-demo.ps1 clears it.
@@ -184,6 +190,12 @@ function Get-DemoEnvironmentStatus {
                 if ($null -ne $guestState) {
                     $results.Add($guestState)
                 }
+                # Free space for the guest's dynamic disk, and which Jumpstart image it came from (2026-11-05).
+                foreach ($t2Result in @((Get-DemoT2DiskSpaceResult -Config $Config -Health $health), (Get-DemoT2ImageResult -Health $health))) {
+                    if ($null -ne $t2Result) {
+                        $results.Add($t2Result)
+                    }
+                }
             }
         }
         catch {
@@ -268,11 +280,11 @@ function Get-DemoEnvironmentStatus {
         elseif ($t4.State -eq 'Stopped') {
             $days = [int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays']
             $stopped = Get-DemoT4StoppedUtc -Config $Config -ServerId $t4.Names.ServerId -NowUtc $NowUtc
-            # What the restart bills, priced at run time (ADR 0016), and whether the on-demand control's daily safety stop
-            # stops it again: its schedule, not only control.enabled (review of 20e855c).
+            # What the restart bills, priced at run time (ADR 0016), and whether anything stops it again: the nightly safety
+            # stop (ADR 0024), or the on-demand control's daily one, by their schedules and roles (review of 20e855c).
             $hourly = Get-DemoT4HourlyPrice -Config $t4Config -SkuName $t4Sku
-            $safety = Get-DemoT4SafetyStopState -Config $Config
-            $safetyStop = $safety.State -eq 'Scheduled'
+            $safety = Get-DemoT4RestartStopState -Config $Config
+            $safetyStop = $safety.State -in 'Nightly', 'Scheduled'
             $size = if ($t4GeneralPurpose) { ' It''s General Purpose {0}{1}.' -f $t4Sku, $t4Origin } else { '' }
             if ($null -ne $stopped) {
                 $restart = $stopped.AddDays($days)
@@ -453,5 +465,7 @@ function Get-DemoEnvironmentStatus {
 
     $shutdown = Get-DemoNextShutdownUtc -Config $Config -NowUtc $NowUtc
     $results.Add((New-DemoResult -CheckId 'STATUS.SHUTDOWN' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('Next auto-shutdown: {0:yyyy-MM-dd HH:mm} UTC ({1} {2}).' -f $shutdown, $Config['autoShutdownTime'], $Config['autoShutdownTimeZone'])))
+    # The nightly safety stop (ADR 0024): its times, its role, and what its last stop and T3 check did. Read-only.
+    $results.Add((Get-DemoSafetyStopStatus -Config $Config -NowUtc $NowUtc))
     return $results.ToArray()
 }

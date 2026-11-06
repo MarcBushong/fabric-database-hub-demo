@@ -70,6 +70,11 @@ BeforeAll {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricResolution -MockWith {
             [pscustomobject]@{ Result = (New-DemoResult -CheckId 'PREFLIGHT.P5.WORKSPACE' -Area 'preflight' -Target 'fabric' -Status 'Pass' -Message 'The workspace is ready.'); Config = $Config; CapacityResult = $null }
         }
+        # P12 and P13 (2026-11-05) have their own tests (DbHubDemo.FabricAppSignIn.Tests.ps1); here it sends nothing.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricAppTenantSetting -MockWith {
+            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.APPSETTINGS' -Area 'preflight' -Target 'tenant' -Status $script:appSettingsStatus -Message 'The tenant settings the Insights app needs.'
+        }
+        $script:appSettingsStatus = 'Pass'
     }
 
     # One policy assignment whose definition turns off public network access on SQL servers (fake data).
@@ -110,6 +115,34 @@ Describe 'Invoke-DemoPreflight' {
 
         # A configuration that names its profile gets no notice.
         @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -EQ 'PREFLIGHT.ACTIVITYPROFILE').Count | Should -Be 0
+    }
+
+    It 'checks the Insights app''s tenant settings (P12, P13) after P11, and a Warning there never stops preflight (2026-11-05)' {
+        Set-HappyAzMock
+        $script:appSettingsStatus = 'Warning'
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $ids | Should -Contain 'PREFLIGHT.FABRIC.APPSETTINGS'
+        [array]::IndexOf($ids, 'PREFLIGHT.FABRIC.APPSETTINGS') | Should -BeGreaterThan ([array]::IndexOf($ids, 'PREFLIGHT.FABRIC.VIEWERLICENSE'))
+        @($results | Where-Object { $_.status -eq 'Fail' }).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricAppTenantSetting -Times 1 -Exactly
+    }
+
+    It 'passes JumpstartImage, the default, on the nested host, and fails it with the evaluation-only Azure VM (2026-11-05)' {
+        Set-HappyAzMock
+        $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE'
+        $check.status | Should -Be 'Pass'
+        $check.message | Should -Match 'no T2 step needs a person'
+
+        $evaluation = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $evaluation[$key] = $config[$key] }
+        $evaluation['t2Mode'] = 'EvaluationOnlyAzureVm'
+        $evaluation['t2SqlInstallMode'] | Should -Be 'JumpstartImage'
+        $check = Invoke-DemoPreflight -Config $evaluation -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE'
+        $check.status | Should -Be 'Fail'
+        $check.remediation | Should -Match 't2Mode Nested'
+        $evaluation['t2SqlInstallMode'] = 'Developer'
+        (Invoke-DemoPreflight -Config $evaluation -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE').status | Should -Be 'Warning'
     }
 
     It 'fails T4 on a size Azure refused for the same zone, warns for one more try in another zone, and says nothing without a refusal (Phase 24)' {
@@ -300,12 +333,13 @@ Describe 'Invoke-DemoPreflight' {
         # both ceilings: 60 + 0.2 x 690 = 198 USD for the month, 9 for a session.
         $script:lightUse = 60.0
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
-        # T4's restart (2026-11-04): the example configuration has no on-demand control, so the rest of the month counts.
+        # T4's restart (2026-11-04): the example configuration's nightly safety stop isn't set up (ADR 0024), and it has no
+        # on-demand control, so the rest of the month counts.
         $restart = $results | Where-Object checkId -eq 'PREFLIGHT.COST.T4RESTART'
         $restart.status | Should -Be 'Warning'
-        $restart.message | Should -Match 'control\.enabled is false'
-        $restart.remediation | Should -Match 'setup-activity-control\.ps1'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $null -ne $T4RestartCoverage -and $T4RestartCoverage.Missing -eq 'Control' }
+        $restart.message | Should -Match 'the nightly safety stop isn''t in place yet'
+        $restart.remediation | Should -Match '\./scripts/deploy\.ps1 sets it up after its template, so the checks after that run count about a day per restart \(a first deployment''s own preflight can''t: it runs before the template\)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { $null -ne $T4RestartCoverage -and $T4RestartCoverage.Missing -eq 'SafetyStop' }
         $fallback = $results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
         $fallback.status | Should -Be 'Pass'
         $fallback.evidence.startSku | Should -Be ''
@@ -981,7 +1015,7 @@ Describe 'Get-DemoDeploymentParameter' {
         $parameters.existingVmNames.value | Should -Be @('archost01')
         $parameters.t1SecurityType.value | Should -Be 'Standard'
         $parameters.hostSecurityType.value | Should -Be 'Standard'
-        $parameters.t2SqlInstallMode.value | Should -Be 'PaygWizard'
+        $parameters.t2SqlInstallMode.value | Should -Be 'JumpstartImage'
         $parameters.Contains('adminPassword') | Should -BeFalse
         $parameters.Contains('bootstrapBundleUrl') | Should -BeFalse
         (Get-DemoDeploymentParameter -Config $copy -T3UseFreeLimit $true -NetworkMode private -T1SecurityType 'TrustedLaunch').parameters.t1SecurityType.value | Should -Be 'TrustedLaunch'

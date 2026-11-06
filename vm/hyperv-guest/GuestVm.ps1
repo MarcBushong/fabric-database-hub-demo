@@ -117,6 +117,11 @@ function Initialize-DemoGuestVm {
     .SYNOPSIS
     Creates or reconfigures the Generation 2 guest: static memory, automatic start, ShutDown stop action
     (so host auto-shutdown and deallocation shut the guest down cleanly), Secure Boot, no checkpoints.
+
+    .DESCRIPTION
+    With -Disconnected (the JumpstartImage mode), a new guest's network adapter isn't connected to the switch: the image's
+    published password is replaced over PowerShell Direct before the guest has any network, and the first-boot step
+    connects it afterward (vm/hyperv-guest/GuestJumpstart.ps1).
     #>
     [CmdletBinding()]
     param(
@@ -136,16 +141,24 @@ function Initialize-DemoGuestVm {
         [int] $VCpu,
 
         [Parameter(Mandatory = $true)]
-        [int] $MemoryGiB
+        [int] $MemoryGiB,
+
+        [switch] $Disconnected
     )
 
     $memory = [int64]$MemoryGiB * 1GB
     $vm = Get-VM -Name $Name -ErrorAction SilentlyContinue
     if (-not $vm) {
-        New-VM -Name $Name -Generation 2 -MemoryStartupBytes $memory -VHDPath $VhdxPath -SwitchName $SwitchName -Path $VmFolder | Out-Null
+        if ($Disconnected) {
+            # New-VM adds one network adapter, connected only when a switch is named.
+            New-VM -Name $Name -Generation 2 -MemoryStartupBytes $memory -VHDPath $VhdxPath -Path $VmFolder | Out-Null
+        }
+        else {
+            New-VM -Name $Name -Generation 2 -MemoryStartupBytes $memory -VHDPath $VhdxPath -SwitchName $SwitchName -Path $VmFolder | Out-Null
+        }
         Set-VMFirmware -VMName $Name -EnableSecureBoot On -SecureBootTemplate 'MicrosoftWindows'
         Enable-VMIntegrationService -VMName $Name -Name 'Guest Service Interface'
-        Write-DemoVmLog -Message ('Created the guest VM {0}.' -f $Name)
+        Write-DemoVmLog -Message ('Created the guest VM {0}{1}.' -f $Name, $(if ($Disconnected) { ' with its network adapter not connected yet' } else { '' }))
     }
     elseif ([int]$vm.ProcessorCount -ne $VCpu -or [int64]$vm.MemoryStartup -ne $memory -or $vm.DynamicMemoryEnabled) {
         if ([string]$vm.State -ne 'Off') {

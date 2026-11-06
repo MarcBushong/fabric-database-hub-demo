@@ -5,8 +5,9 @@ function New-DemoT2GoldenSnapshot {
     and 5). capture-t2-golden.ps1 calls it.
 
     .DESCRIPTION
-    1. The subscription guard. The nested T2 mode with PaygWizard, and a host without data disks (the guest
-       lives on the OS disk); anything else is Not supported.
+    1. The subscription guard. The nested T2 mode with PaygWizard (the snapshot keeps the setup-wizard state) or
+       JumpstartImage (a speed-up only: a redeploy skips the image's download and first boot), and a host without data
+       disks (the guest lives on the OS disk); anything else is Not supported.
     2. Policy: the read-only inventory must not deny snapshots or disks (unless -SkipPolicyInventory).
        Then no on-demand run may be active (GOLDEN.CAPTURE.CONTROL, Get-DemoGoldenCaptureControlResult): no
        DbHub-Control or DbHub-Stop job queued or running, and no pending auto-stop, because a run starts and
@@ -15,8 +16,8 @@ function New-DemoT2GoldenSnapshot {
        host's Azure VM ID matches the capture record, so only the guest's network and start action return).
     4. Inspects the host and guest (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Inspect, read-only) and
        checks: the host's health is Ready, no SQL Server product key file, SQL Server Standard running, the
-       guest's Arc agent connected to this environment's arcsql01, and the guest's Windows evaluation more
-       than 7 days from its end (a Warning within 30 days).
+       guest's Arc agent connected to this environment's arcsql01, and, for a guest whose Windows is an evaluation,
+       its evaluation more than 7 days from its end (a Warning within 30 days).
     5. Turns T2's activity profile off and rotates the host administrator's password to a value nobody keeps.
        Then the sign-in data gate (ADR 0009): vm/bootstrap/Invoke-DemoSignInResidue.ps1 removes the sign-in data
        left on the host and in the guest and scans again; anything left (GOLDEN.CAPTURE.SIGNIN Fail, or Manual
@@ -126,8 +127,8 @@ function New-DemoT2GoldenSnapshot {
         & $add 'GOLDEN.CAPTURE.MODE' 'Not supported' 'The evaluation-only T2 is an Azure VM, not a nested guest; golden snapshots keep a nested guest''s setup-wizard state.'
         return $results.ToArray()
     }
-    if ([string]$Config['t2SqlInstallMode'] -ne 'PaygWizard') {
-        & $add 'GOLDEN.CAPTURE.MODE' 'Not supported' ('Golden snapshots keep the PaygWizard setup-wizard state; t2SqlInstallMode is {0}, which installs unattended on every build.' -f $Config['t2SqlInstallMode'])
+    if ([string]$Config['t2SqlInstallMode'] -notin 'PaygWizard', 'JumpstartImage') {
+        & $add 'GOLDEN.CAPTURE.MODE' 'Not supported' ('Golden snapshots keep the PaygWizard setup-wizard state or speed up a JumpstartImage redeploy; t2SqlInstallMode is {0}, which installs unattended on every build.' -f $Config['t2SqlInstallMode'])
         return $results.ToArray()
     }
     $vm = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'show', '--resource-group', $resourceGroupName, '--name', 'archost01') -AsJson -AllowFailure
@@ -222,9 +223,12 @@ function New-DemoT2GoldenSnapshot {
     $guest = Get-DemoMemberValue -InputObject $inspect.Data -Name 'guest'
     $agent = Get-DemoMemberValue -InputObject $guest -Name 'agent'
     $expires = [string](Get-DemoMemberValue -InputObject $guest -Name 'evaluationExpiresUtc')
+    # Only an evaluation (the TIMEBASED_EVAL channel) expires; the Jumpstart image's Windows Server 2022 Standard doesn't.
+    $licenseDescription = [string](Get-DemoMemberValue -InputObject $guest -Name 'licenseDescription')
+    $isEvaluation = -not $licenseDescription -or $licenseDescription -match 'TIMEBASED_EVAL'
     $expiresUtc = [datetime]::MinValue
     $daysLeft = $null
-    if ([datetime]::TryParse($expires, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$expiresUtc)) {
+    if ($isEvaluation -and [datetime]::TryParse($expires, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$expiresUtc)) {
         $daysLeft = [int][System.Math]::Floor(($expiresUtc - $NowUtc.ToUniversalTime()).TotalDays)
     }
     $agentKeys = Get-DemoMemberValue -InputObject $agent -Name 'keys'
@@ -239,8 +243,9 @@ function New-DemoT2GoldenSnapshot {
         sqlVersion             = [string](Get-DemoMemberValue -InputObject $guest -Name 'sqlVersion')
         sqlUpdateLevel         = [string](Get-DemoMemberValue -InputObject $guest -Name 'sqlUpdateLevel')
         sqlUpdateReference     = [string](Get-DemoMemberValue -InputObject $guest -Name 'sqlUpdateReference')
-        evaluationExpiresUtc   = $expires
+        evaluationExpiresUtc   = $(if ($isEvaluation) { $expires } else { 'none' })
         evaluationDaysLeft     = $daysLeft
+        licenseDescription     = $licenseDescription
         agentStatus            = [string](Get-DemoMemberValue -InputObject $agent -Name 'status')
         agentResourceName      = [string](Get-DemoMemberValue -InputObject $agent -Name 'resourceName')
         agentResourceGroup     = [string](Get-DemoMemberValue -InputObject $agent -Name 'resourceGroup')
@@ -257,14 +262,14 @@ function New-DemoT2GoldenSnapshot {
     if ($facts.agentStatus -ne 'Connected' -or $facts.agentResourceName -ne 'arcsql01' -or ($facts.agentResourceGroup -and $facts.agentResourceGroup -ne $resourceGroupName)) {
         $problems.Add(('the guest''s Arc agent reports {0} for {1} in {2}, not Connected for arcsql01 in {3}' -f $facts.agentStatus, $facts.agentResourceName, $facts.agentResourceGroup, $resourceGroupName))
     }
-    if ($null -eq $daysLeft) { $problems.Add('the guest''s Windows evaluation expiry couldn''t be read') }
-    elseif ($daysLeft -le 7) { $problems.Add(('the guest''s Windows evaluation ends in {0} days' -f $daysLeft)) }
+    if ($isEvaluation -and $null -eq $daysLeft) { $problems.Add('the guest''s Windows evaluation expiry couldn''t be read') }
+    elseif ($isEvaluation -and $daysLeft -le 7) { $problems.Add(('the guest''s Windows evaluation ends in {0} days' -f $daysLeft)) }
     if ($problems.Count -gt 0) {
         & $add 'GOLDEN.CAPTURE.INSPECT' 'Fail' ('Not captured: {0}.' -f ($problems -join '; ')) $facts 'Fix each item (deploy.ps1 -Resume converges the host), then run capture-t2-golden.ps1 again.'
         return $results.ToArray()
     }
-    $inspectStatus = if ($daysLeft -le 30) { 'Warning' } else { 'Pass' }
-    $inspectMessage = 'The host is Ready, SQL Server Standard runs, the guest is connected to arcsql01, and its Windows evaluation ends on {0} ({1} days).' -f $expiresUtc.ToString('yyyy-MM-dd'), $daysLeft
+    $inspectStatus = if ($isEvaluation -and $daysLeft -le 30) { 'Warning' } else { 'Pass' }
+    $inspectMessage = if ($isEvaluation) { 'The host is Ready, SQL Server Standard runs, the guest is connected to arcsql01, and its Windows evaluation ends on {0} ({1} days).' -f $expiresUtc.ToString('yyyy-MM-dd'), $daysLeft } else { 'The host is Ready, SQL Server Standard runs, the guest is connected to arcsql01, and its Windows isn''t an evaluation ({0}).' -f $licenseDescription }
     if ($inspectStatus -eq 'Warning') {
         $inspectMessage += ' Re-capture after a fresh build within 30 days.'
     }
@@ -357,13 +362,13 @@ function New-DemoT2GoldenSnapshot {
         }
         $snapshotTags[$names['Role']] = 't2-golden'
         $snapshotTags[$names['CapturedUtc']] = $NowUtc.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
-        $snapshotTags[$names['EvalExpiresUtc']] = $expiresUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+        $snapshotTags[$names['EvalExpiresUtc']] = if ($isEvaluation) { $expiresUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } else { 'none' }
         $snapshotTags[$names['BundleSha256']] = $facts.bundleSha256
         $snapshotTags[$names['RunnerSha256']] = $facts.runnerSha256
         $snapshotTags[$names['SqlEdition']] = 'Standard'
         $snapshotTags[$names['SqlVersion']] = $facts.sqlVersion
         $snapshotTags[$names['SqlUpdateLevel']] = if ($facts.sqlUpdateLevel) { '{0}-{1}' -f $facts.sqlUpdateLevel, $facts.sqlUpdateReference } else { 'RTM' }
-        $snapshotTags[$names['InstallMode']] = 'PaygWizard'
+        $snapshotTags[$names['InstallMode']] = [string]$Config['t2SqlInstallMode']
         $snapshotTags[$names['HostSize']] = $hostSize
         $snapshotTags[$names['SecurityType']] = $securityType
         $snapshotTags[$names['UsedGiB']] = [string]$facts.usedGiB

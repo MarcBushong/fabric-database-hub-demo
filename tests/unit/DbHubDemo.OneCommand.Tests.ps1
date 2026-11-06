@@ -64,13 +64,30 @@ Describe 'What a run can expect (brief goal 7, items 3 and 13)' {
         $expect.HumanText | Should -Match 'Bastion'
     }
 
-    It 'says no step needs a person in ProductKey and Developer modes' {
+    It 'says no T2 step needs a person in ProductKey and Developer modes' {
         foreach ($mode in 'ProductKey', 'Developer') {
             $expect = InModuleScope DbHubDemo -Parameters @{ Mode = $mode } { Get-DemoDeploymentExpectation -InstallMode $Mode -WaitForT2 }
             $expect.GuidedStop | Should -BeFalse
-            ($expect.Lines -join ' ') | Should -Match 'No step needs a person'
+            ($expect.Lines -join ' ') | Should -Match 'No T2 step needs a person'
             $expect.HumanText | Should -BeNullOrEmpty
         }
+    }
+
+    It 'says no T2 step needs a person in JumpstartImage mode, the default, and calls its time an estimate not measured yet (2026-11-05)' {
+        $expect = InModuleScope DbHubDemo { Get-DemoDeploymentExpectation -WaitForT2 }
+        $expect.GuidedStop | Should -BeFalse
+        $text = $expect.Lines -join ' '
+        $text | Should -Match 'No T2 step needs a person'
+        $text | Should -Match 'about 1 to 2 hours in all \(not measured yet'
+        $text | Should -Match '20 to 40 minutes'
+        $expect.Text | Should -Match 'estimate, not measured yet'
+        $expect.HumanText | Should -BeNullOrEmpty
+        $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
+        $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' }
+        @($notice | Where-Object { $_ -notlike 'The Insights app''s browser sign-in*' }) | Should -BeNullOrEmpty -Because 'a session without keyboard input needs no T2 warning when no T2 step needs a person'
+        @($notice | Where-Object { $_ -like 'The Insights app''s browser sign-in*' }).Count | Should -Be 1 -Because 'the Insights app''s sign-in still doesn''t start in such a session (2026-11-05)'
+        $quiet = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' -SkipFabric }
+        @($quiet) | Should -BeNullOrEmpty -Because 'without Fabric, nothing in JumpstartImage mode needs a person'
     }
 
     It 'warns a session that can''t take keyboard input before anything is spent, with the alternatives and the plan for a person' {
@@ -231,7 +248,7 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         ($lines -join ' ') | Should -Match 'capture-t2-golden\.ps1 to make future redeploys skip the build and the guided stop'
     }
 
-    It 'is DONE with the optional Insights app listed and how to add it later, when its prerequisites aren''t met' {
+    It 'is DONE, naming the Insights app as a failure that doesn''t block DONE with its reason and fix, when its prerequisites aren''t met (2026-11-05)' {
         $config = New-TestConfig -WithT4
         $result = @(New-DoneResult -WithT4) + @(
             (New-DemoResult -CheckId 'FABRIC.APP.TENANTSETTING' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Fabric tenant setting "Fabric Apps (preview)" is disabled.' -Remediation 'Ask a Fabric administrator.')
@@ -239,15 +256,24 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         )
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $outcome.Kind | Should -Be 'Done'
-        @($outcome.Optional).Count | Should -Be 2
-        $lines = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join ' '
-        $lines | Should -Match 'Optional, not needed for the demo: the Insights app'
-        $lines | Should -Match 'Fabric Apps \(preview\) and Dataset Execute Queries REST API'
-        $lines | Should -Match 'configure-fabric-app\.ps1 -SignIn'
-        $lines | Should -Match 'an assistant can''t do that sign-in for you'
+        $outcome.ExitCode | Should -Be 0
+        @($outcome.NonBlocking).Count | Should -Be 2
+        $outcome.NonBlocking[0]['state'] | Should -Be 'Failed'
+        $outcome.NonBlocking[1]['state'] | Should -Be 'Action needed'
+        $outcome.Reason | Should -Match 'the Real-Time Dashboard, and the history report\.' -Because 'the app wasn''t created, so DONE doesn''t claim it'
+        $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
+        $text = $lines -join ' '
+        $text | Should -Match ([regex]::Escape('Failed (doesn''t block DONE): the Insights app. It wasn''t created: FABRIC.APP.TENANTSETTING: The Fabric tenant setting "Fabric Apps (preview)" is disabled.'))
+        $text | Should -Match ([regex]::Escape('Action needed (doesn''t block DONE): the history report''s data check.'))
+        $text | Should -Match 'Fabric Apps \(preview\) and Dataset Execute Queries REST API'
+        $text | Should -Match 'configure-fabric-app\.ps1 -SignIn'
+        $text | Should -Match 'an assistant can''t do that sign-in for you'
+        $text | Should -Not -Match '(?i)optional'
+        # Right after the reason, before "Where to look", so it isn't missed.
+        [array]::IndexOf($lines, @($lines | Where-Object { $_ -like 'Failed (doesn''t block DONE)*' })[0]) | Should -BeLessThan ([array]::IndexOf($lines, @($lines | Where-Object { $_ -like 'Where to look*' })[0]))
     }
 
-    It 'is DONE when the optional app''s own workspace lookup failed, and says that, not a tenant setting, is why (Phase 28 live finding)' {
+    It 'is DONE when the app''s own workspace lookup failed, and says that, not a tenant setting, is why (Phase 28 live finding)' {
         # Live: the app's step failed FABRIC.RESOLVE.WORKSPACE, a check ID that isn't the app's own, so it would have
         # counted as a Fail of the demo, and the page blamed tenant settings that were on.
         $config = New-TestConfig -WithT4
@@ -256,17 +282,33 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
                     (New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'Your Fabric workspaces couldn''t be listed: HTTP 429.' -Remediation 'Check your Fabric access, then run the script again.')
                     (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'The Fabric workspace isn''t resolved, so nothing was deployed.')
                 )) {
-                ConvertTo-DemoOptionalAppRecord -Record $record
+                ConvertTo-DemoInsightsAppRecord -Record $record
             }
         }
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult -WithT4) + @($appRecords)); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $outcome.Kind | Should -Be 'Done'
         $outcome.ExitCode | Should -Be 0
-        @($outcome.Optional).Count | Should -Be 1
-        $outcome.Optional[0]['message'] | Should -Match ([regex]::Escape('FABRIC.RESOLVE.WORKSPACE: Your Fabric workspaces couldn''t be listed'))
-        $outcome.Optional[0]['howTo'] | Should -Not -Match 'tenant settings'
+        @($outcome.NonBlocking).Count | Should -Be 1
+        $outcome.NonBlocking[0]['message'] | Should -Match ([regex]::Escape('FABRIC.RESOLVE.WORKSPACE: Your Fabric workspaces couldn''t be listed'))
+        $outcome.NonBlocking[0]['howTo'] | Should -Not -Match 'tenant settings'
         $lines = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join ' '
-        $lines | Should -Match ([regex]::Escape('Optional, not needed for the demo: the Insights app (Fabric Apps preview). It wasn''t added: FABRIC.RESOLVE.WORKSPACE'))
+        $lines | Should -Match ([regex]::Escape('Failed (doesn''t block DONE): the Insights app. It wasn''t created: FABRIC.RESOLVE.WORKSPACE'))
+    }
+
+    It 'says DONE includes the Insights app when this run deployed it (2026-11-05)' {
+        $config = New-TestConfig -WithT4
+        $appRecords = InModuleScope DbHubDemo {
+            foreach ($record in @(
+                    (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Deployed.')
+                    (New-DemoResult -CheckId 'FABRIC.APP.QUERIES' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Every query returned rows.')
+                )) {
+                ConvertTo-DemoInsightsAppRecord -Record $record
+            }
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult -WithT4) + @($appRecords)); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done'
+        $outcome.Reason | Should -Match 'the Real-Time Dashboard, the history report, and the Insights app\.'
+        @($outcome.NonBlocking).Count | Should -Be 0
     }
 
     It 'says T4 isn''t deployed and why: off in the configuration, or after the Burstable fallback' {
@@ -418,7 +460,7 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
                         (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'The app is deployed.')
                         (New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'A person must confirm the app in the browser: sign-in and the connector in the app can''t be checked from a script.' -Remediation 'In the Fabric portal, open the app''s item in the workspace; it shows "Connector check passed".')
                     )) {
-                    ConvertTo-DemoOptionalAppRecord -Record $record
+                    ConvertTo-DemoInsightsAppRecord -Record $record
                 }
             })
     }
@@ -431,13 +473,14 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
         $outcome.Kind | Should -Be 'Done'
         $outcome.ExitCode | Should -Be 0
         @($outcome.Confirm).Count | Should -Be 2
-        @($outcome.Optional).Count | Should -Be 0 -Because 'the deployed app''s browser check is to confirm, not optional work left'
+        @($outcome.NonBlocking).Count | Should -Be 0 -Because 'the deployed app''s browser check is to confirm, not something that didn''t work'
         $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
         $text = $lines -join "`n"
         @($lines | Where-Object { $_ -like 'Please confirm*' }).Count | Should -Be 1
         @($lines | Where-Object { $_ -match 'Fabric tenant setting' }).Count | Should -Be 1 -Because 'the setting is one line, whichever check reported it'
         $lines | Should -Contain '- Couldn''t check the Fabric tenant setting "Users can access the Database hub (preview)" (needs a Fabric administrator; HTTP 403): please confirm it''s enabled.'
-        $text | Should -Match '- The optional Insights app is deployed; confirm it once in the browser\.'
+        $text | Should -Match '- The Insights app is deployed; confirm it once in the browser\.'
+        $text | Should -Not -Match '(?i)optional'
         $text | Should -Not -Match 'is disabled|not enabled|System\.String\[\]'
         @($lines | Where-Object { $_ -match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both 4-vCore sizes' }).Count | Should -Be 1 -Because 'the T4 note is its own line'
     }
@@ -563,6 +606,78 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
         $confirmOnly = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + $confirmItems) } { Get-DemoDeploySummary -Result $Result -FinishedText 'Every track and the validation finished.' }
         $confirmOnly.Message | Should -Match '^Every track and the validation finished\. Nothing else needs you for DONE\. Please confirm \(none of these keeps the run from DONE\): Couldn''t check the Fabric tenant setting'
         @($confirmOnly.Evidence['manual']).Count | Should -Be 0
+    }
+}
+
+Describe 'The Insights app is part of every deployment, and nothing about it keeps the run from DONE (2026-11-05)' {
+    BeforeAll {
+        # The app's records as the Fabric track reports them (ConvertTo-DemoInsightsAppRecord), for each way it can fail.
+        function New-AppRecord([string] $CheckId, [string] $Status, [string] $Message, [string] $Remediation = '', [System.Collections.IDictionary] $Evidence = @{}) {
+            InModuleScope DbHubDemo -Parameters @{ CheckId = $CheckId; Status = $Status; Message = $Message; Remediation = $Remediation; Evidence = $Evidence } {
+                ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Remediation $Remediation -Evidence $Evidence)
+            }
+        }
+        $script:appFailures = [ordered]@{
+            exception = @(InModuleScope DbHubDemo { ConvertTo-DemoInsightsAppErrorRecord -Exception ([System.InvalidOperationException]::new('The stage folder is locked by another process.')) })
+            timeout   = @(New-AppRecord 'FABRIC.APP.DEPLOY' 'Fail' 'rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code -1, 1200 s): node did not finish within 1200 seconds and was stopped.' 'Fix the reported problem and run the script again; nothing is deleted, and a re-run reuses the item.')
+            network   = @(New-AppRecord 'DEPLOY.FABRIC.APP' 'Fail' 'configure-fabric-app.ps1 stopped: A network error reached api.fabric.microsoft.com on each of 4 attempts: The SSL connection could not be established.' 'Run ./scripts/deploy.ps1 again: it resumes where it stopped. A network error stopped it (requests that are safe to repeat were retried).' ([ordered]@{ networkError = $true }))
+            signIn    = @(
+                (New-AppRecord 'FABRIC.APP.SIGNIN' 'Manual action required' 'The Rayfin CLI isn''t signed in, so the app can''t be deployed unattended.' 'Sign in once as the demo''s Fabric user, from any folder.')
+                (New-AppRecord 'FABRIC.APP.DEPLOY' 'Not selected' 'Not deployed: FABRIC.APP.SIGNIN needs attention first.')
+            )
+        }
+        $script:appReasons = @{
+            exception = 'The stage folder is locked by another process'
+            timeout   = 'did not finish within 1200 seconds'
+            network   = 'A network error reached api\.fabric\.microsoft\.com'
+            signIn    = 'FABRIC\.APP\.SIGNIN: The Rayfin CLI isn''t signed in'
+        }
+        # What the run's own sign-in left: skipped in a session that can't answer it, or a sign-in that didn't finish.
+        $script:signInRecords = @(
+            (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Not supported' -Message 'This session can''t answer a browser sign-in.')
+            (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message 'Nobody finished the Rayfin CLI''s sign-in within 15 minutes, so it was stopped.')
+        )
+    }
+
+    It 'is DONE, exit code 0, after <_> in the app''s step, with the app named as failed with its real error' -ForEach @('exception', 'timeout', 'network', 'signIn') {
+        $kind = $_
+        $records = @(New-DoneResult -WithT4) + @($script:signInRecords) + @($script:appFailures[$kind])
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $records; State = (New-FinishedState -WithT4); Config = (New-TestConfig -WithT4) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done' -Because $kind
+        $outcome.ExitCode | Should -Be 0
+        $outcome.NextCommand | Should -BeNullOrEmpty -Because 'DONE asks for no rerun, whatever the app''s records say'
+        @($outcome.NonBlocking).Count | Should -Be 1
+        $outcome.NonBlocking[0]['name'] | Should -Be 'the Insights app'
+        $outcome.NonBlocking[0]['state'] | Should -Be 'Failed'
+        $outcome.NonBlocking[0]['message'] | Should -Match $script:appReasons[$kind]
+        $outcome.NonBlocking[0]['howTo'] | Should -Not -Match 'deploy\.ps1' -Because 'the fix is the app''s own command, never a rerun of the whole deployment'
+        $outcome.NonBlocking[0]['howTo'] | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
+        $text = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n"
+        $text | Should -Match '##  DONE'
+        $text | Should -Match ('Failed \(doesn''t block DONE\): the Insights app\. It wasn''t created: .*' + $script:appReasons[$kind])
+        # DEPLOY.SUMMARY and the exit code in GitHub Actions never see a Fail from the app.
+        @($records | Where-Object { $_.status -eq 'Fail' }).Count | Should -Be 0
+        (Get-DemoExitCode -Result $records) | Should -Be 0
+        $summary = InModuleScope DbHubDemo -Parameters @{ Result = $records } { Get-DemoDeploySummary -Result $Result -FinishedText 'Every track and the validation finished.' }
+        $summary.Status | Should -Not -Be 'Fail'
+        $summary.Message | Should -Match 'Nothing else needs you for DONE\.'
+        $summary.Message | Should -Match ([regex]::Escape('Doesn''t block DONE: the Insights app (failed).'))
+        @($summary.Evidence['manual']).Count | Should -Be 0
+    }
+
+    It 'names only what blocks DONE when something else failed too, never the app''s network error or its rerun' {
+        $records = @(New-DoneResult) + @(New-TestResult 'DEPLOY.EXTENSIONS_SQLVM01' 'Fail') + @($script:appFailures['network'])
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $records; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.ExitCode | Should -Be 1
+        $outcome.Reason | Should -Match '^DEPLOY\.EXTENSIONS_SQLVM01'
+        $outcome.Next | Should -Not -Match 'network error'
+        $text = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n"
+        $text | Should -Match 'Failed \(doesn''t block DONE\): the Insights app\.'
+
+        # The app's network error alone: DONE, and no rerun.
+        $alone = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($script:appFailures['network'])); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $alone.Kind | Should -Be 'Done'
     }
 }
 
@@ -1349,10 +1464,15 @@ Describe 'Invoke-DemoT2GuidedStop: the stop, then the run continues on its own' 
     }
 
     It 'knows the host''s phases, and the host''s step list matches the VM side''s plan' {
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestVhdx' }) }).Phase | Should -Be 'Build'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard' }) }).Phase | Should -Be 'GuidedStop'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestVhdx' }) -InstallMode PaygWizard }).Phase | Should -Be 'Build'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard' }) -InstallMode PaygWizard }).Phase | Should -Be 'GuidedStop'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'ConfigureSql' }) -InstallMode PaygWizard }).Phase | Should -Be 'AfterSetup'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'Failed'; currentStep = 'GuestOnline' }) -InstallMode PaygWizard }).Phase | Should -Be 'Failed'
+        $jumpstart = InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestImage' }) }
+        $jumpstart.Phase | Should -Be 'Build' -Because 'JumpstartImage is the default, and the image download is part of the build'
+        $jumpstart.RemainingHigh | Should -BeLessOrEqual 60
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'JumpstartImageCheck' }) }).Phase | Should -Be 'Build'
         (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'ConfigureSql' }) }).Phase | Should -Be 'AfterSetup'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'Failed'; currentStep = 'GuestOnline' }) }).Phase | Should -Be 'Failed'
         $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-HostBootstrap.ps1') -Raw
         $vmOrder = @([regex]::Matches($text, "@\{ Name = '([A-Za-z0-9]+)'") | ForEach-Object { $_.Groups[1].Value })
         $vmOrder | Should -Be @(InModuleScope DbHubDemo { Get-DemoHostStepOrder })

@@ -42,7 +42,9 @@ function Remove-DemoEnvironment {
 
     ConfirmImpact is High: destroy.ps1 asks unless -Force. Returns DESTROY.EXPIRY (with -IfExpired),
     DESTROY.GOLDEN.GUARD, DESTROY.ARC.SQLINSTANCES, DESTROY.ARC.MACHINES, DESTROY.RESOURCEGROUP,
-    DESTROY.KEYVAULT (with the Key Vault opt-in), DESTROY.DEPLOYMENT, DESTROY.BUDGET, DESTROY.GOLDEN, the
+    DESTROY.KEYVAULT (with the Key Vault opt-in), DESTROY.DEPLOYMENT, DESTROY.BUDGET, DESTROY.SAFETYSTOP.ROLE (Not
+    selected: the nightly safety stop's custom role, a role definition that stays unassigned for the next deployment,
+    ADR 0024; its identity, account, schedules, and assignment go with the group), DESTROY.GOLDEN, the
     TEARDOWN.RESIDUAL.* checks, and DESTROY.RESIDUAL. With -ResidueOnly it deletes nothing and asks nothing: it runs
     the residual check again with the manifest an earlier destroy wrote (DESTROY.MANIFEST, the TEARDOWN.RESIDUAL.*
     checks, and DESTROY.RESIDUAL).
@@ -201,11 +203,11 @@ function Remove-DemoEnvironment {
     # A PaygWizard install holds the setup-wizard step, which no script can redo: keep it in a golden snapshot first.
     $goldenGroup = Get-DemoGoldenResourceGroupName -Config $Config
     $goldenDoc = 'https://learn.microsoft.com/azure/virtual-machines/disks-incremental-snapshots'
-    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     if ($groupExists -and $installMode -eq 'PaygWizard' -and (Get-DemoHostVmName -Config $Config) -eq 'archost01') {
         $hostRead = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'show', '--resource-group', $resourceGroupName, '--name', 'archost01', '--query', 'name', '--output', 'tsv') -AllowFailure
         if ($hostRead.ExitCode -eq 0 -and ([string]$hostRead.StdOut).Trim()) {
-            $kept = @(Get-DemoT2GoldenSnapshot -Config $Config -NowUtc $NowUtc | Where-Object { $null -ne $_.BootVerifiedUtc -and $null -ne $_.EvalDaysLeft -and $_.EvalDaysLeft -ge 1 })
+            $kept = @(Get-DemoT2GoldenSnapshot -Config $Config -NowUtc $NowUtc | Where-Object { $null -ne $_.BootVerifiedUtc -and (Test-DemoGoldenEvaluationOk -Snapshot $_) })
             if ($kept.Count -gt 0 -and -not $IncludeGolden) {
                 $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN.GUARD' -Area 'teardown' -Target 'T2' -Status 'Pass' -Message ('archost01 holds a PaygWizard install, and the boot-verified golden snapshot {0} in {1} keeps it; the next deploy restores from it.' -f $kept[0].Name, $goldenGroup) -Evidence ([ordered]@{ snapshot = $kept[0].Name; bootVerifiedUtc = $kept[0].BootVerifiedUtc; evalDaysLeft = $kept[0].EvalDaysLeft }) -DocUrl $goldenDoc))
             }
@@ -355,6 +357,18 @@ function Remove-DemoEnvironment {
         else {
             $results.Add((New-DemoResult -CheckId 'DESTROY.BUDGET' -Area 'teardown' -Target 'subscription' -Status 'Warning' -Message ('The budget {0} couldn''t be deleted: {1}' -f $budgetName, (Get-DemoDeploymentErrorText -Text $removed.StdErr -MaxLength 400)) -Remediation $budgetRemediation -DocUrl $budgetDoc))
         }
+    }
+
+    # The nightly safety stop's custom role (ADR 0024) is a role definition in the subscription: its one assignment went
+    # with the group, and the definition stays, unassigned and free, for the next deploy.ps1. Said here, never deleted.
+    try {
+        $safetyRole = Get-DemoSafetyStopRoleState -SubscriptionId $subscriptionId
+        if ($safetyRole.Id) {
+            $results.Add((New-DemoResult -CheckId 'DESTROY.SAFETYSTOP.ROLE' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('The custom role "{0}" stays: a role definition in the subscription, with no assignment left (its one assignment went with {1}) and no cost, which the next deploy.ps1 assigns again. An Owner who wants it gone runs: az role definition delete --name "{0}" --scope /subscriptions/{2}' -f $script:SafetyStopRoleName, $resourceGroupName, $subscriptionId) -Evidence ([ordered]@{ role = $script:SafetyStopRoleName; roleId = $safetyRole.Id }) -DocUrl 'https://learn.microsoft.com/azure/role-based-access-control/custom-roles-cli#delete-a-custom-role'))
+        }
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('The nightly safety stop''s role definition wasn''t read: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
 
     # The golden group belongs to the prefix, not to this environment (ADR 0018): it stays unless -IncludeGolden.

@@ -15,7 +15,8 @@ function Test-DemoActivityControl {
       -GrantRole command when missing (a redeploy deletes A1 with the demo resource group).
     - CONTROL.AUTOSTOP: Pass with no pending auto-stop or one in the future (a run is active); Warning for one that
       should have run more than an hour ago.
-    - CONTROL.SAFETYSTOP: the daily T4 safety stop's schedule and its link to DbHub-Stop.
+    - CONTROL.SAFETYSTOP: the daily T4 safety stop's schedule and its link to DbHub-Stop; Pass without it too while the
+      nightly safety stop (ADR 0024), part of every deployment, is in place, because it stops T4 every night.
     Metadata only: no secret value is read.
 
     .PARAMETER Config
@@ -113,11 +114,16 @@ function Test-DemoActivityControl {
     }
 
     # The same read stop-demo.ps1 and status.ps1 make to say whether anything stops a T4 Azure started again (Phase 28
-    # follow-up).
+    # follow-up). The nightly safety stop (ADR 0024), part of every deployment, stops T4 too, so a control schedule that's
+    # missing then leaves nothing uncovered.
     $safety = Get-DemoT4SafetyStopState -Config $Config
     $safetyDoc = 'https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server'
+    $nightly = if ($safety.State -ne 'Scheduled') { Get-DemoSafetyStopState -Config $Config } else { $null }
     if ($safety.State -eq 'Scheduled') {
         $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The daily T4 safety stop is scheduled{0}.' -f $(if ($null -ne $safety.NextRunUtc) { ' (next {0:yyyy-MM-dd HH:mm} UTC)' -f $safety.NextRunUtc } else { '' })) -DocUrl $safetyDoc))
+    }
+    elseif ($null -ne $nightly -and $nightly.State -eq 'InPlace') {
+        $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The control''s daily T4 safety stop {0}, but the nightly safety stop stops T4 every night{1} (ADR 0024).' -f $(if ($safety.State -eq 'Unknown') { 'couldn''t be read' } else { 'isn''t scheduled' }), $(if ($null -ne $nightly.NextRunUtc) { ' (next {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$nightly.NextRunUtc) } else { '' })) -Remediation $(if ($safety.State -eq 'Unknown') { '' } else { ('To have both, run {0}.' -f $setup) }) -DocUrl $safetyDoc))
     }
     elseif ($safety.State -eq 'Unknown') {
         $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'The daily T4 safety stop''s schedule couldn''t be read, so it may not stop a T4 that starts itself after 7 days.' -Remediation ('Run validate.ps1 again; if it stays unread, run {0}.' -f $setup) -DocUrl $safetyDoc))

@@ -160,8 +160,9 @@ function Invoke-DemoValidationSecurity {
         $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.DEPLOYMENTS' -Area 'security' -Target 'subscription' -Status 'Pass' -Message ('No secret or token pattern in the parameters, outputs, errors, and operations of the {0} newest deployment(s) in {1} and the environment''s subscription deployments.' -f $scannedDeployments.Count, $group) -Evidence $evidence -DocUrl $deploymentDoc))
     }
 
-    # 4. Role assignments at or below the resource group (ADR 0008): none unless assignRoles is true. With the
-    #    Key Vault opt-in (keyVault.enabled, Phase 13), its two data-plane roles are expected on that vault only.
+    # 4. Role assignments at or below the resource group (ADR 0008): none unless assignRoles is true, but the nightly safety
+    #    stop's one role for its identity at the group (ADR 0024). With the Key Vault opt-in (keyVault.enabled, Phase 13),
+    #    its two data-plane roles are expected on that vault only.
     $rbacDoc = 'https://learn.microsoft.com/cli/azure/role/assignment#az-role-assignment-list'
     $groupScope = '/subscriptions/{0}/resourceGroups/{1}' -f $Context.SubscriptionId, $group
     $vaultOptIn = Get-DemoValidationKeyVaultOptIn -Context $Context
@@ -188,6 +189,11 @@ function Invoke-DemoValidationSecurity {
                 return $true
             }
             $scope = [string](Get-DemoMemberValue -InputObject $Assignment -Name 'scope')
+            # The nightly safety stop's one role for its identity, at the group itself (ADR 0024; the owner's exception to
+            # this ADR's default, 2026-11-05).
+            if ($role -eq $script:SafetyStopRoleName -and [string]::Equals($scope, $groupScope, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
             # A1 of the on-demand activity control (ADR 0020): its custom role for its identity, at the group itself.
             if ($controlOn -and $role -eq $script:ActivityControlRoleName -and [string]::Equals($scope, $groupScope, [System.StringComparison]::OrdinalIgnoreCase)) {
                 return $true
@@ -206,7 +212,7 @@ function Invoke-DemoValidationSecurity {
         $contributorNote = if ($canAssign) { ' The caller can also create role assignments, so this run alone doesn''t prove the Contributor-only path.' } else { ' The caller can''t create role assignments, so this run exercises the Contributor-only path.' }
         $evidence = [ordered]@{ assignmentsInGroup = $inGroup.Count; unexpected = $unexpected.Count; assignRoles = [bool]$config['assignRoles']; keyVaultOptIn = [bool]$vaultOptIn.Enabled; callerCanAssignRoles = [bool]$canAssign; roles = @($inGroup | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'roleDefinitionName') }) }
         if ($unexpected.Count -gt 0) {
-            $results.Add((New-DemoResult -CheckId 'SECURITY.RBAC.ROLEASSIGNMENTS' -Area 'security' -Target 'subscription' -Status 'Warning' -Message ('Role assignments that the demo never creates are at or below {0}: {1}.{2}' -f $group, (& $describe $unexpected), $contributorNote) -Evidence $evidence -Remediation 'Check who added them and why; the demo needs none, presenters need only Reader and the Arc telemetry role, the Key Vault opt-in needs only Key Vault Secrets Officer and Key Vault Secrets User on its vault, and the on-demand activity control only its custom role for its identity at the group (A1; docs/permissions.md).' -DocUrl $rbacDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.RBAC.ROLEASSIGNMENTS' -Area 'security' -Target 'subscription' -Status 'Warning' -Message ('Role assignments that the demo never creates are at or below {0}: {1}.{2}' -f $group, (& $describe $unexpected), $contributorNote) -Evidence $evidence -Remediation 'Check who added them and why; the demo needs none but the nightly safety stop''s custom role for its identity at the group (ADR 0024), presenters need only Reader and the Arc telemetry role, the Key Vault opt-in needs only Key Vault Secrets Officer and Key Vault Secrets User on its vault, and the on-demand activity control only its custom role for its identity at the group (A1; docs/permissions.md).' -DocUrl $rbacDoc))
         }
         elseif ($inGroup.Count -gt 0) {
             $results.Add((New-DemoResult -CheckId 'SECURITY.RBAC.ROLEASSIGNMENTS' -Area 'security' -Target 'subscription' -Status 'Pass' -Message ('Only the documented optional roles are assigned at or below {0}: {1}.{2}' -f $group, (& $describe $inGroup), $contributorNote) -Evidence $evidence -DocUrl $rbacDoc))

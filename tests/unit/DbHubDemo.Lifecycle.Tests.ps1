@@ -849,6 +849,12 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { $script:order.Add('RunnerStatus'); [pscustomobject]@{ Status = 'Pass'; Result = (New-TestResult 'WORKLOAD.T1.COMMAND' 'Pass' 'workload' 'T1') } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith { $script:order.Add('DoneGate'); New-TestResult 'HUB.ESTATE.T1' 'Pass' 'hub' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:order.Add('PowerBI'); New-TestResult 'FABRIC.REPORT' 'Pass' 'fabric' 'fabric' }
+        # The Insights app, part of every deployment (2026-11-05): its sign-in starts before the stages, and its step runs
+        # after the report. Both have their own tests (DbHubDemo.FabricAppSignIn.Tests.ps1, DbHubDemo.FabricTrack.Tests.ps1);
+        # here the CLI is already signed in, and the app deploys.
+        $script:appSignIn = [pscustomobject]@{ Process = $null; Done = $true; Reported = $false; Result = (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Pass' -Message 'The Rayfin CLI is already signed in to the demo''s tenant.') }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:appSignIn }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith { $script:order.Add('App'); New-TestResult 'FABRIC.APP.DEPLOY' 'Pass' 'fabric' 'fabric' }
         # The switch from the interim baseline to a profile with incidents, after DONE's reads (2026-11-03).
         $script:switchOutcome = 'Set'
         Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
@@ -867,6 +873,16 @@ Describe 'Invoke-DemoDeployment' {
         # Phase 28 live finding: what's stopped starts before the first stage that needs it; here both VMs run.
         $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
+        # The nightly safety stop's setup (ADR 0024), after the Infrastructure stage.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -MockWith { New-TestResult 'SAFETYSTOP.SCHEDULE' 'Pass' 'infra' }
+    }
+
+    It 'sets up the nightly safety stop after the Infrastructure stage, and not with -WhatIf (ADR 0024)' {
+        $results = @(Invoke-DemoDeployment -Config $config -StopAfter Infrastructure)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
+        ($results | Where-Object { $_.checkId -eq 'SAFETYSTOP.SCHEDULE' }).status | Should -Be 'Pass'
+        Invoke-DemoDeployment -Config $config -Resume -WhatIf | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
     }
 
     It 'starts deallocated VMs while preflight runs, and runs them before the first stage that needs them; running ones are only read (Phase 28 live finding)' {
@@ -960,6 +976,44 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Not -Contain 'DoneGate'
     }
 
+    It 'starts the Insights app''s sign-in before its stages and runs the app''s step after the report; a failed app never stops the stage or keeps the run from DONE (-Sequential, 2026-11-05)' {
+        # Every requirement passes, so the outcome turns on the app alone.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith {
+            $script:order.Add('DoneGate')
+            foreach ($id in @($Requirement)) {
+                New-TestResult $id 'Pass' 'hub' 'subscription'
+            }
+        }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 1 -Exactly
+        $script:order[$script:order.IndexOf('PowerBI') + 1] | Should -Be 'App'
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' }).Count | Should -Be 1 -Because 'the sign-in''s record is handed out once'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.FABRIC' }).message | Should -Match 'with the Insights app'
+
+        # The app wasn't created: its step's record never blocks, the stage passes, and the run goes on to DONE.
+        $script:order.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith {
+            $script:order.Add('App')
+            New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The Insights app''s step failed: rayfin up exited with code 1.' -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn.' -Evidence ([ordered]@{ nonBlocking = 'insightsApp'; reportedStatus = 'Fail' })
+        }
+        $appFailed = @(Invoke-DemoDeployment -Config $config)
+        $stage = $appFailed | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.FABRIC' }
+        $stage.status | Should -Be 'Pass'
+        $stage.message | Should -Match 'the Insights app wasn''t created or doesn''t work, which doesn''t block DONE'
+        $script:order | Should -Contain 'DoneGate'
+        @($appFailed | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $appFailed; State = $script:state; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Sequential }
+        $outcome.Kind | Should -Be 'Done' -Because ('Missing: {0}; reason: {1}' -f (@($outcome.Missing) -join ', '), $outcome.Reason)
+        $outcome.ExitCode | Should -Be 0
+        (@($outcome.NonBlocking | ForEach-Object { [string]$_['message'] }) -join ' ') | Should -Match 'rayfin up exited with code 1'
+
+        # -SkipFabric starts no sign-in and runs no app step.
+        $script:order.Clear()
+        Invoke-DemoDeployment -Config $config -SkipFabric | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 2 -Exactly -Because 'only the two runs above started it'
+        $script:order | Should -Not -Contain 'App'
+    }
+
     It 'can end DONE on a new workspace, because its Fabric stage creates what FABRIC.ITEMS.REQUIRED looks for (review follow-up)' {
         # Before, every stage passed on a new workspace and the run still ended NOT DONE with exit code 1.
         $names = InModuleScope DbHubDemo { Get-DemoFabricAppSetting }
@@ -1050,7 +1104,7 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Be @(
             'Preflight', 'Switch:T1,T3,T2=baseline', 'Template', 'Bundle', 'SendBundle:sqlvm01', 'SendBundle:archost01', 'Publish', 'SendRunner:sqlvm01', 'SendRunner:archost01',
             'Template+Bundle', 'Loader:sqlvm01', 'Loader:archost01', 'T1Ready', 'Group', 'T3Setup', 'EnableT3', 'TestT3',
-            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate', 'Switch:T1,T3,T2=business-day'
+            'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'App', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate', 'Switch:T1,T3,T2=business-day'
         )
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         $script:state.Stage | Should -Be 'Validation'
@@ -2233,11 +2287,13 @@ Describe 'Get-DemoEnvironmentStatus' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4StoppedUtc -MockWith { [datetime]::new(2026, 10, 20, 23, 0, 0, [System.DateTimeKind]::Utc) }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4MetricSnapshot -MockWith { throw 'a stopped server sends no fresh metrics' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { 0.178 }
+        # Neither safety stop is in place (ADR 0024, ADR 0020): nothing here stops a restarted T4.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4RestartStopState -MockWith { [pscustomobject]@{ State = 'NotScheduled'; NextRunUtc = $null } }
         $results = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc))
         $t4 = $results | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Pass'
         $t4.message | Should -BeLike 'pgflex01-abc123 is stopped since 2026-10-20 23:00 UTC. Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, *'
-        $t4.message | Should -Match 'it then bills compute at about 0\.178 USD an hour \(Standard_D4ds_v5, list price\) until it''s stopped again: nothing here stops it on its own'
+        $t4.message | Should -Match 'it then bills compute at about 0\.178 USD an hour \(Standard_D4ds_v5, list price\) until it''s stopped again: the nightly safety stop isn''t in place \(\./scripts/deploy\.ps1 sets it up\), so nothing here stops it on its own'
         ([datetime]$t4.evidence.autoStartUtc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm', [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be '2026-10-27T23:00'
         $t4.evidence.hourlyUsd | Should -Be 0.178
         $t4.evidence.dailySafetyStop | Should -BeFalse
@@ -2258,11 +2314,22 @@ Describe 'Get-DemoEnvironmentStatus' {
         # An obviously fake price, as the Retail Prices API would give it at run time.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -MockWith { 0.5 }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlStatus -MockWith { New-TestResult 'STATUS.CONTROL' 'Pass' 'infra' 'subscription' }
-        # The daily safety stop's schedule, read as CONTROL.SAFETYSTOP reads it (review of 20e855c).
-        $script:safetyState = 'Scheduled'
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:safetyState; NextRunUtc = $null } }
         $config = New-TestConfig -WithT4
         $config['control']['enabled'] = $true
+
+        # The nightly safety stop in place (ADR 0024): it stops a restarted T4 at the next auto-shutdown time.
+        $script:nightlyState = 'InPlace'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopState -MockWith { [pscustomobject]@{ State = $script:nightlyState; NextRunUtc = $null; CheckNextRunUtc = $null; CheckScheduled = ($script:nightlyState -eq 'InPlace'); RoleAssigned = ($script:nightlyState -eq 'InPlace'); Missing = ''; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopLastRun -MockWith { [pscustomobject]@{ Ok = $true; Error = ''; Stop = $null; Check = $null } }
+        $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.message | Should -Match 'and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the nightly safety stop stops it again, at the next auto-shutdown time\.'
+        $t4.evidence.dailySafetyStop | Should -BeTrue
+        $t4.evidence.safetyStop | Should -Be 'Nightly'
+
+        # Without it, the daily safety stop's schedule, read as CONTROL.SAFETYSTOP reads it (review of 20e855c).
+        $script:nightlyState = 'NotScheduled'
+        $script:safetyState = 'Scheduled'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:safetyState; NextRunUtc = $null } }
         $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.message | Should -Match 'Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the on-demand control''s daily safety stop stops it again, within a day\.'
         $t4.message | Should -Match 'It''s General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off\.$'
@@ -2271,10 +2338,11 @@ Describe 'Get-DemoEnvironmentStatus' {
         $t4.evidence.skuName | Should -Be 'Standard_D2ds_v5'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4HourlyPrice -ParameterFilter { $SkuName -eq 'Standard_D2ds_v5' }
 
-        # The control is on, but its daily safety stop couldn't be scheduled: nothing here stops a restarted T4.
+        # The control is on, but its daily safety stop couldn't be scheduled, and the nightly one isn't in place: nothing
+        # here stops a restarted T4.
         $script:safetyState = 'NotScheduled'
         $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
-        $t4.message | Should -Match 'Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until it''s stopped again: the on-demand control''s daily safety stop isn''t scheduled'
+        $t4.message | Should -Match 'Azure starts it again on its own at 2026-10-27 23:00 UTC, 7 days after the stop, and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until it''s stopped again: the nightly safety stop isn''t in place'
         $t4.message | Should -Not -Match 'stops it again, within a day'
         $t4.evidence.dailySafetyStop | Should -BeFalse
         $t4.evidence.safetyStop | Should -Be 'NotScheduled'
@@ -2595,6 +2663,8 @@ Describe 'Remove-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { [pscustomobject]@{ DeploymentId = 'abc123'; Principals = @() } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoTeardownResidue -MockWith { $script:order.Add('Residue'); New-TestResult 'TEARDOWN.RESIDUAL.ARC' 'Pass' 'teardown' 'T2' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @() }
+        # The nightly safety stop's role definition (ADR 0024): none in these tests, unless one says so.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopRoleState -MockWith { [pscustomobject]@{ Id = ''; Actions = @(); Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
             $script:order.Add('az ' + ($ArgumentList[0..1] -join ' '))
             $script:groupExists = $false
@@ -2604,7 +2674,7 @@ Describe 'Remove-DemoEnvironment' {
 
     It 'deletes the Arc SQL instances, then the Arc machines, then the resource group, then the deployment record and the budget, and checks for residue' {
         $results = Remove-DemoEnvironment -Config $config -Confirm:$false
-        $script:order | Should -Be @('az vm show', 'Instance', 'Machine', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue')
+        $script:order | Should -Be @('Instance', 'Machine', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.ARC.SQLINSTANCES' }).area | Should -Be 'teardown'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }).status | Should -Be 'Pass'

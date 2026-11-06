@@ -42,8 +42,10 @@ function Invoke-DemoDeployment {
        (Clear-DemoGuidedStopLeftover; Phase 28 review).
     9. Fabric: configure-fabric.ps1 (the Hub checklist, the Real-Time Dashboard, and the notebook import with
        -ImportNotebooks or fabric.importNotebooks), then configure-powerbi.ps1 (the history semantic model and
-       report), as the parallel Fabric track imports them (Phase 28 review follow-up); the optional Insights app stays
-       configure-fabric-app.ps1's. Not selected with -SkipFabric.
+       report), as the parallel Fabric track imports them (Phase 28 review follow-up), then the Insights app
+       (configure-fabric-app.ps1, part of every deployment since 2026-11-05; Invoke-DemoInsightsAppStep), whose step
+       never stops the stage or keeps the run from DONE. Its sign-in starts with the run, alongside the stages
+       (Start-DemoFabricAppSignIn), and this stage waits for it until its deadline. Not selected with -SkipFabric.
     10. Validation: Test-DemoHubTelemetry for each ready target, the runner's status on T1, and a summary that
         lists every Manual action required item with its exact steps. A target whose telemetry didn't come gets its
         monitoring checked, and its telemetry once more, before the run is judged (Invoke-DemoTelemetryCheck; Phase 28
@@ -344,6 +346,14 @@ function Invoke-DemoDeployment {
     # 2026-10-30), so a run that ends with the validation and has no Monitoring stage checks it once the VMs run.
     $inRange = { param([string] $Name) $position = [array]::IndexOf($stages, $Name); $position -ge $startIndex -and $position -le $stopIndex }
     $checkT1Monitoring = $existing -and (& $inRange 'Validation') -and -not (& $inRange 'Monitoring')
+    # The Insights app's sign-in (2026-11-05), as in the parallel path: when the Fabric stage runs, it starts now, while the
+    # person is still at the keyboard, and runs alongside the stages, none of which waits for it; the Fabric stage waits for
+    # it until its deadline, right before the app's step (Complete-DemoFabricAppSignIn -Wait).
+    $appSignIn = $null
+    if (-not $whatIf -and -not $SkipFabric -and (& $inRange 'Fabric')) {
+        $appSignIn = Start-DemoFabricAppSignIn -Config $Config -Confirm:$false
+        & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn)
+    }
     # -Sequential records only its stage, never a track, so once preflight passes, the records of the parallel tracks whose
     # steps this run does again are lowered (all of them from preflight): a later parallel -Resume then runs those steps
     # again instead of trusting an earlier run's record (Get-DemoTrackRecordReset; Phase 28 live finding, 2026-10-30).
@@ -484,6 +494,8 @@ function Invoke-DemoDeployment {
                 # The on-demand activity control's A1 (ADR 0020): a redeploy deleted it with the group. Granted again only
                 # with assignRoles; otherwise, or when it fails, Manual action required with the -GrantRole command.
                 & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                # The nightly safety stop (ADR 0024), part of every deployment; its problems are Warnings, never a Fail.
+                & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
             }
             'Artifacts' {
                 $current = Get-DemoDeploymentState -Config $Config
@@ -755,7 +767,8 @@ function Invoke-DemoDeployment {
                 }
                 # The notebooks, the Hub checklist, and the Real-Time Dashboard, then the history semantic model and report, as the
                 # parallel Fabric track imports them (review follow-up): DONE's FABRIC.ITEMS.REQUIRED looks for all of them, and a
-                # new workspace has none. The optional Insights app stays configure-fabric-app.ps1's.
+                # new workspace has none. Then the Insights app, part of every deployment (2026-11-05), whose step never stops
+                # the stage or keeps the run from DONE (Invoke-DemoInsightsAppStep).
                 $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -ImportNotebooks:$importNotebooks -NewNotebooksOnly -ImportDashboard)
                 & $addAll $fabric
                 if (& $hasStatus $fabric 'Fail') {
@@ -768,8 +781,13 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Fabric' 'Fail' 'The history semantic model or report failed.' 'Read the FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
                     return (& $finishEarly)
                 }
+                & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -Wait)
+                $app = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $fabric)
+                & $addAll $app
+                $appSummary = Get-DemoInsightsAppSummary -Result $app
+                $appText = if ($null -ne $appSummary -and [bool]$appSummary.Failed) { '; the Insights app wasn''t created or doesn''t work, which doesn''t block DONE (the summary says why)' } elseif ($null -ne $appSummary -and [bool]$appSummary.Deployed) { ', with the Insights app' } else { '' }
                 & $recordStage 'Fabric'
-                & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }))
+                & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}{1}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }), $appText)
             }
             'Validation' {
                 $targets = @('T1', 'T3')
@@ -799,7 +817,7 @@ function Invoke-DemoDeployment {
     # sequential run is judged by the same requirements and can end DONE.
     if ($validated -and -not $context.OpenStage -and -not (& $hasStatus $results.ToArray() 'Fail')) {
         $current = Get-DemoDeploymentState -Config $Config
-        $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+        $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
         $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool](Get-DemoT4OffReason -Config $userConfig -State $current)) -SkipFabric:$SkipFabric
         & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
     }

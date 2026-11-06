@@ -1,6 +1,7 @@
 # Shared by the DbHub-Control, DbHub-Stop, and DbHub-Monitor runbooks (ADR 0020). scripts/setup-activity-control.ps1
 # publishes each runbook with this file and the settings in place of its markers, so a published runbook is
-# self-contained.
+# self-contained. deploy.ps1 publishes DbHub-Stop the same way to the nightly safety stop's own account in the demo
+# resource group (ADR 0024), where only its Nightly and T3Check scopes are scheduled.
 #
 # Windows PowerShell 5.1, the runtime Learn recommends for webhooks (a PowerShell 7 runbook receives the webhook's
 # input as invalid JSON): https://learn.microsoft.com/azure/automation/automation-webhooks
@@ -1730,6 +1731,342 @@ function Stop-DbHubDemo {
     return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray() }
 }
 
+function Get-DbHubLastShutdownUtc {
+    # The VMs' latest scheduled auto-shutdown at or before NowUtc, in UTC: the time the nightly safety stop is scheduled
+    # for (ADR 0024), from autoShutdownTime (HHmm) and autoShutdownTimeZone, as Get-DbHubNextShutdownUtc reads them.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $NowUtc
+    )
+
+    $time = [string]$Settings.autoShutdownTime
+    if ($time -notmatch '^([01]\d|2[0-3])([0-5]\d)$') {
+        throw ('autoShutdownTime ''{0}'' isn''t HHmm.' -f $time)
+    }
+    $hour = [int]$Matches[1]
+    $minute = [int]$Matches[2]
+    $zone = [System.TimeZoneInfo]::FindSystemTimeZoneById([string]$Settings.autoShutdownTimeZone)
+    $local = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::SpecifyKind($NowUtc, [System.DateTimeKind]::Utc), $zone)
+    $candidate = New-Object -TypeName DateTime -ArgumentList $local.Year, $local.Month, $local.Day, $hour, $minute, 0, ([System.DateTimeKind]::Unspecified)
+    if ($candidate -gt $local) {
+        $candidate = $candidate.AddDays(-1)
+    }
+    if ($zone.IsInvalidTime($candidate)) {
+        $candidate = $candidate.AddHours(1)
+    }
+    return [System.TimeZoneInfo]::ConvertTimeToUtc($candidate, $zone)
+}
+
+function Send-DbHubVmDeallocate {
+    <#
+    .SYNOPSIS
+    The nightly safety stop's deallocation of one VM (ADR 0024): POST deallocate, without waiting. Its DevTest Labs
+    auto-shutdown runs at the same minute, and Azure answers 409 Conflict while that operation runs, so after a 409 the
+    VM's state is read again: deallocating or deallocated counts as done, and otherwise the request goes again, at most
+    Attempts times, RetrySeconds apart. Returns Outcome (Sent, AlreadyStopping, or Failed), State, and Error.
+    https://learn.microsoft.com/rest/api/compute/virtual-machines/deallocate
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VmName,
+
+        [int] $Attempts = 3,
+
+        [int] $RetrySeconds = 30
+    )
+
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Compute/virtualMachines'
+    $path = '{0}/providers/Microsoft.Compute/virtualMachines/{1}/deallocate' -f (Get-DbHubDemoPath -Settings $Context.Settings), $VmName
+    $errorText = ''
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $sent = Invoke-DbHubArm -Context $Context -Method POST -Path $path -ApiVersion $version
+        if ($sent.StatusCode -in 200, 202) {
+            Write-DbHubLog -Context $Context -Message ('{0}: deallocate accepted.' -f $VmName)
+            return [pscustomobject]@{ Outcome = 'Sent'; State = ''; Error = '' }
+        }
+        $errorText = $sent.Error
+        if ($sent.StatusCode -ne 409) {
+            break
+        }
+        $state = Get-DbHubVmState -Context $Context -VmName $VmName
+        if ($state -in 'deallocating', 'deallocated') {
+            Write-DbHubLog -Context $Context -Message ('{0}: already {1}; another operation, such as its auto-shutdown, holds it.' -f $VmName, $state)
+            return [pscustomobject]@{ Outcome = 'AlreadyStopping'; State = $state; Error = '' }
+        }
+        if ($attempt -lt $Attempts) {
+            Start-Sleep -Seconds $RetrySeconds
+        }
+    }
+    Write-DbHubLog -Context $Context -Message ('{0}: deallocate failed: {1}' -f $VmName, $errorText)
+    return [pscustomobject]@{ Outcome = 'Failed'; State = ''; Error = $errorText }
+}
+
+function Invoke-DbHubT4NightlyStop {
+    <#
+    .SYNOPSIS
+    The nightly safety stop's T4 part (ADR 0024): stops T4 when it's Ready. One that's starting (Azure starts a stopped
+    flexible server again on its own after 7 days), updating, restarting, or provisioning is read again every
+    PollSeconds for up to WaitMinutes, because Azure stops only a Ready server; one that's stopped, stopping, missing,
+    disabled, or dropping is left alone. It never starts T4. Returns Outcome (Sent, AlreadyStopped, Missing, Skipped, or
+    Failed), Name, State (as first read), Current (as last read), and Error.
+    https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [int] $WaitMinutes = 10,
+
+        [int] $PollSeconds = 30
+    )
+
+    $giveUp = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    $transitional = @('Starting', 'Updating', 'Restarting', 'Provisioning')
+    $first = ''
+    $errorText = ''
+    while ($true) {
+        $t4 = Get-DbHubT4 -Context $Context -Tags $Tags
+        if (-not $first) {
+            $first = [string]$t4.State
+        }
+        $outcome = [pscustomobject]@{ Outcome = ''; Name = [string]$t4.Name; State = $first; Current = [string]$t4.State; Error = '' }
+        if ($t4.State -eq 'Ready') {
+            $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
+            $sent = Invoke-DbHubArm -Context $Context -Method POST -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}/stop' -f (Get-DbHubDemoPath -Settings $Context.Settings), $t4.Name) -ApiVersion $version
+            if ($sent.StatusCode -in 200, 202) {
+                Write-DbHubLog -Context $Context -Message ('{0}: stop accepted.' -f $t4.Name)
+                $outcome.Outcome = 'Sent'
+                return $outcome
+            }
+            # A server that's busy with another operation, or no longer Ready, refuses the stop (ServerIsNotReady,
+            # SeverBusyWithOtherOperation): read it again while there's time.
+            $errorText = $sent.Error
+            if ($sent.StatusCode -in 400, 409 -and (Get-DbHubUtcNow) -lt $giveUp) {
+                Start-Sleep -Seconds $PollSeconds
+                continue
+            }
+            Write-DbHubLog -Context $Context -Message ('{0}: stop failed: {1}' -f $t4.Name, $errorText)
+            $outcome.Outcome = 'Failed'
+            $outcome.Error = $errorText
+            return $outcome
+        }
+        if ($t4.State -in 'Stopped', 'Stopping') {
+            $outcome.Outcome = 'AlreadyStopped'
+            return $outcome
+        }
+        if ($t4.State -eq 'Missing') {
+            $outcome.Outcome = 'Missing'
+            return $outcome
+        }
+        if ($t4.State -in 'Disabled', 'Dropping') {
+            $outcome.Outcome = 'Skipped'
+            return $outcome
+        }
+        if ($t4.State -in $transitional -and (Get-DbHubUtcNow) -lt $giveUp) {
+            Start-Sleep -Seconds $PollSeconds
+            continue
+        }
+        if ($t4.State -in $transitional) {
+            $errorText = 'it was still {0} after {1} minutes; tomorrow''s safety stop tries again' -f $t4.State, $WaitMinutes
+        }
+        elseif (-not $errorText) {
+            $errorText = 'its state is {0}' -f $(if ($t4.State) { $t4.State } else { 'Unknown' })
+        }
+        Write-DbHubLog -Context $Context -Message ('T4: not stopped: {0}.' -f $errorText)
+        $outcome.Outcome = 'Failed'
+        $outcome.Error = $errorText
+        return $outcome
+    }
+}
+
+function Invoke-DbHubNightlyStop {
+    <#
+    .SYNOPSIS
+    The nightly safety stop (ADR 0024), DbHub-Stop -Scope Nightly at the VMs' auto-shutdown time: deallocates each demo
+    VM that isn't deallocated (a VM stopped from inside the guest still bills its compute), and stops T4 when it runs
+    (Invoke-DbHubT4NightlyStop). The T2 guest shuts down with its host. Azure Resource Manager only: it never starts anything,
+    never uses Run Command, never connects to a database, and never touches the control's schedules. Returns Done,
+    Failed, Vms (each VM's outcome), and T4 (its outcome).
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [int] $PollSeconds = 30
+    )
+
+    $settings = $Context.Settings
+    $done = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $failed = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $vms = [ordered]@{}
+    foreach ($vm in @([string]$settings.sqlVmName, [string]$settings.hostVmName)) {
+        $state = Get-DbHubVmState -Context $Context -VmName $vm
+        if ($state -eq 'Missing') {
+            $vms[$vm] = 'missing'
+            $done.Add(('{0} missing' -f $vm))
+            continue
+        }
+        if ($state -in 'deallocated', 'deallocating') {
+            $vms[$vm] = 'already {0}' -f $state
+            $done.Add(('{0} {1}' -f $vm, $vms[$vm]))
+            continue
+        }
+        $sent = Send-DbHubVmDeallocate -Context $Context -VmName $vm -RetrySeconds $PollSeconds
+        if ($sent.Outcome -eq 'Sent') {
+            $vms[$vm] = 'deallocated (was {0})' -f $state
+            $done.Add(('{0} {1}' -f $vm, $vms[$vm]))
+        }
+        elseif ($sent.Outcome -eq 'AlreadyStopping') {
+            $vms[$vm] = 'already {0} (its auto-shutdown)' -f $sent.State
+            $done.Add(('{0} {1}' -f $vm, $vms[$vm]))
+        }
+        else {
+            $vms[$vm] = 'failed: {0}' -f $sent.Error
+            $failed.Add(('{0} ({1})' -f $vm, $sent.Error))
+        }
+    }
+    $waitMinutes = 10
+    $configured = Get-DbHubMember -InputObject $settings -Name 't4WaitMinutes'
+    if ($null -ne $configured) {
+        $waitMinutes = [int]$configured
+    }
+    $t4 = Invoke-DbHubT4NightlyStop -Context $Context -Tags $Tags -WaitMinutes $waitMinutes -PollSeconds $PollSeconds
+    $t4Text = switch ($t4.Outcome) {
+        'Sent' { 'T4 stopped (was {0})' -f $t4.State }
+        'AlreadyStopped' { 'T4 already {0}' -f $t4.Current.ToLowerInvariant() }
+        'Missing' { 'T4 missing' }
+        'Skipped' { 'T4 {0}' -f $t4.Current.ToLowerInvariant() }
+        default { '' }
+    }
+    if ($t4.Outcome -eq 'Failed') {
+        $failed.Add(('T4 ({0})' -f $t4.Error))
+        $t4Text = 'failed: {0}' -f $t4.Error
+    }
+    else {
+        $done.Add($t4Text)
+    }
+    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); Vms = $vms; T4 = $t4Text }
+}
+
+function Get-DbHubT3Database {
+    <#
+    .SYNOPSIS
+    T3's database (<t3ServerPrefix><deploymentId>/<demoDatabase>) through Azure Resource Manager only (Databases - Get):
+    the way Learn monitors a serverless database's pause status. It never connects to the database, so it never resumes
+    it. Returns State (Present, Missing, or Unknown), Name, Status (Online, Paused, Pausing, Resuming, ...),
+    AutoPauseDelay (minutes, -1 when auto-pause is off, or $null), and Error.
+    https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-monitor#monitor-pause-and-resume-status
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $deploymentId = [string](Get-DbHubMember -InputObject $Tags -Name 'deploymentId')
+    if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
+        return [pscustomobject]@{ State = 'Unknown'; Name = ''; Status = ''; AutoPauseDelay = $null; Error = 'the demo resource group has no deploymentId tag' }
+    }
+    $name = '{0}{1}/{2}' -f $Context.Settings.t3ServerPrefix, $deploymentId, $Context.Settings.demoDatabase
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Sql/servers/databases'
+    $path = '{0}/providers/Microsoft.Sql/servers/{1}{2}/databases/{3}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $Context.Settings.t3ServerPrefix, $deploymentId, $Context.Settings.demoDatabase
+    $read = Invoke-DbHubArm -Context $Context -Method GET -Path $path -ApiVersion $version
+    if ($read.StatusCode -eq 404) {
+        return [pscustomobject]@{ State = 'Missing'; Name = $name; Status = ''; AutoPauseDelay = $null; Error = '' }
+    }
+    if ($read.StatusCode -ne 200) {
+        return [pscustomobject]@{ State = 'Unknown'; Name = $name; Status = ''; AutoPauseDelay = $null; Error = $read.Error }
+    }
+    $properties = Get-DbHubMember -InputObject $read.Body -Name 'properties'
+    $delay = Get-DbHubMember -InputObject $properties -Name 'autoPauseDelay'
+    if ($null -ne $delay) {
+        $delay = [int]$delay
+    }
+    return [pscustomobject]@{ State = 'Present'; Name = $name; Status = [string](Get-DbHubMember -InputObject $properties -Name 'status'); AutoPauseDelay = $delay; Error = '' }
+}
+
+function Test-DbHubT3Paused {
+    <#
+    .SYNOPSIS
+    The nightly safety stop's T3 check (ADR 0024), DbHub-Stop -Scope T3Check, its own short job after the stop. Azure has
+    no "pause now" for a serverless database: it pauses itself once it has had no session and no CPU for its auto-pause
+    delay, so this only reads T3's status (Get-DbHubT3Database) and says what it found. t3: Paused, Pausing, Missing (T3
+    isn't deployed), AutoPauseOff (its delay is -1), TooEarly (online before the delay since the stop, plus
+    t3CheckMarginMinutes, has passed), Awake (online after it: a session or a feature keeps it awake), or Unread.
+    https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-auto-pause-resume
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $settings = $Context.Settings
+    $database = Get-DbHubT3Database -Context $Context -Tags $Tags
+    $since = [int][System.Math]::Floor(($Context.NowUtc - (Get-DbHubLastShutdownUtc -Settings $settings -NowUtc $Context.NowUtc)).TotalMinutes)
+    $margin = 10
+    $configured = Get-DbHubMember -InputObject $settings -Name 't3CheckMarginMinutes'
+    if ($null -ne $configured) {
+        $margin = [int]$configured
+    }
+    $delay = $database.AutoPauseDelay
+    $verdict = 'Unread'
+    $message = 'T3''s status couldn''t be read: {0}.' -f $database.Error
+    if ($database.State -eq 'Missing') {
+        $verdict = 'Missing'
+        $message = 'T3 ({0}) doesn''t exist (stop-demo.ps1 -RemoveT3 removed it, or it isn''t deployed), so it bills no compute.' -f $database.Name
+    }
+    elseif ($database.State -eq 'Present') {
+        $what = 'T3 ({0}) is {1}, {2} minutes after the safety stop' -f $database.Name, $database.Status, $since
+        if ($database.Status -eq 'Paused') {
+            $verdict = 'Paused'
+            $message = $what + ': it bills no compute until something connects.'
+        }
+        elseif ($database.Status -eq 'Pausing') {
+            $verdict = 'Pausing'
+            $message = $what + ': its auto-pause has begun.'
+        }
+        elseif ($null -ne $delay -and $delay -eq -1) {
+            $verdict = 'AutoPauseOff'
+            $message = $what + ': its auto-pause is off (delay -1), so it stays online and bills at least its minimum vCores. Set t3AutoPauseMinutes and run deploy.ps1 -FromStage Infrastructure.'
+        }
+        elseif ($null -ne $delay -and $since -lt ($delay + $margin)) {
+            $verdict = 'TooEarly'
+            $message = $what + (': its {0}-minute auto-pause delay, plus {1} minutes, hasn''t passed yet.' -f $delay, $margin)
+        }
+        else {
+            $verdict = 'Awake'
+            $delayText = 'its auto-pause delay'
+            if ($null -ne $delay) {
+                $delayText = 'its {0}-minute auto-pause delay' -f $delay
+            }
+            $message = $what + (', past {0}: a session or a feature keeps it awake. The activity log''s Resume Databases events name what resumed it.' -f $delayText)
+        }
+    }
+    Write-DbHubLog -Context $Context -Message $message
+    $status = 'Checked'
+    if ($verdict -eq 'Unread') {
+        $status = 'Partial'
+    }
+    return [pscustomobject]@{ action = 'check-t3'; status = $status; t3 = $verdict; t3Status = $database.Status; autoPauseDelay = $delay; minutesSinceStop = $since; message = $message }
+}
+
 function Get-DbHubRequester {
     # What the runner records as requested-by: the request's name and the job's first 8 characters.
     param(
@@ -2206,27 +2543,58 @@ function Invoke-DbHubControl {
 function Invoke-DbHubStop {
     <#
     .SYNOPSIS
-    DbHub-Stop's entry point. Scope All (the per-run auto-stop): what Stop now does. Scope T4 (the daily safety stop):
-    stops T4 only when it's running, because a stopped flexible server starts itself after 7 days; it never starts
-    anything.
+    DbHub-Stop's entry point. Scope All (the per-run auto-stop): what Stop now does. Scope T4 (the control's daily T4
+    safety stop): stops T4 only when it's running, because a stopped flexible server starts itself after 7 days. Scope
+    Nightly (the nightly safety stop, ADR 0024): deallocates the VMs and stops T4 (Invoke-DbHubNightlyStop). Scope T3Check (its
+    check, ADR 0024): reads T3's status (Test-DbHubT3Paused). None of them starts anything. Nightly and T3Check say when
+    the safety stop's identity can't read the demo resource group (NotGranted: its role isn't assigned).
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('All', 'T4')]
+        [ValidateSet('All', 'T4', 'Nightly', 'T3Check')]
         [string] $Scope,
 
         [Parameter(Mandatory = $true)]
-        [object] $Context
+        [object] $Context,
+
+        [int] $PollSeconds = 30
     )
 
     $label = 'stop-' + $Scope.ToLowerInvariant()
+    if ($Scope -eq 'T3Check') {
+        $label = 'check-t3'
+    }
     $group = Get-DbHubResourceGroupTag -Context $Context
     if ($group.GroupState -ne 'Present') {
         if ($Scope -eq 'All') {
             $null = Clear-DbHubAutoStop -Context $Context
         }
         Write-DbHubLog -Context $Context -Message ('Nothing to stop: the demo resource group is {0}.' -f $group.GroupState)
+        if ($Scope -in 'Nightly', 'T3Check' -and $group.GroupState -ne 'Missing') {
+            # The safety stop's own identity lives in the demo resource group, so a group it can't read means its role
+            # isn't assigned (NotGranted) or Azure didn't answer (Unknown): that night's work wasn't done.
+            $why = 'its identity can''t read the demo resource group: the role "DbHub Demo Safety Stop" isn''t assigned there yet (an Owner runs ./scripts/grant-safety-stop.ps1)'
+            $status = 'NotGranted'
+            if ($group.GroupState -eq 'Unknown') {
+                $why = 'the demo resource group couldn''t be read: {0}' -f $group.Error
+                $status = 'Partial'
+            }
+            return [pscustomobject]@{ action = $label; status = $status; message = ('Nothing was done: {0}.' -f $why) }
+        }
         return [pscustomobject]@{ action = $label; status = 'NoEnvironment'; message = ('The demo resource group is {0}; nothing was stopped.' -f $group.GroupState) }
+    }
+    if ($Scope -eq 'T3Check') {
+        return (Test-DbHubT3Paused -Context $Context -Tags $group.Tags)
+    }
+    if ($Scope -eq 'Nightly') {
+        $nightly = Invoke-DbHubNightlyStop -Context $Context -Tags $group.Tags -PollSeconds $PollSeconds
+        $status = 'Stopped'
+        $failedText = ''
+        if (@($nightly.Failed).Count -gt 0) {
+            $status = 'Partial'
+            $failedText = '; failed: ' + (@($nightly.Failed) -join ', ')
+        }
+        return [pscustomobject]@{ action = $label; status = $status; message = ('Nightly safety stop: {0}{1}.' -f (@($nightly.Done) -join ', '), $failedText); done = $nightly.Done; failed = $nightly.Failed; vms = $nightly.Vms; t4 = $nightly.T4 }
     }
     if ($Scope -eq 'T4') {
         $t4 = Get-DbHubT4 -Context $Context -Tags $group.Tags

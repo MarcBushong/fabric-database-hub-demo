@@ -25,9 +25,10 @@ What it does, in order:
 3. Finds the Microsoft Entra security group for T3's and T4's administrators (P6) by name, by default
    <prefix>-<environment>-sql-admins. With -CreateAdminGroup it creates it with you as the owner when it's missing; a
    tenant that doesn't allow that gets Manual action required with the steps for an administrator.
-4. Asks how T2 installs SQL Server: PaygWizard (the default: Hub Performance on T2; once per guest build, deploy.ps1
-   stops for about 10 minutes of pre-filled SQL Server setup through Bastion, the guided stop) or Developer (no stop;
-   T2 in Hub's Estate only).
+4. Asks how T2 gets SQL Server: JumpstartImage (the default: Arc Jumpstart's prebuilt SQL Server 2022 Standard guest;
+   no stop, and Hub Performance on T2), PaygWizard (Hub Performance on T2; once per guest build, deploy.ps1 stops for
+   about 10 minutes of pre-filled SQL Server setup through Bastion, the guided stop), or Developer (no stop; T2 in
+   Hub's Estate only).
 5. Writes the configuration, validated against config/environment.schema.json. Git ignores the file, and it holds no
    secrets. An existing file is replaced only with -Force, after a copy to out/config-backup. -WhatIf writes nothing
    and creates no group.
@@ -52,7 +53,7 @@ The Azure region (default westus3). Preflight checks that Database Hub supports 
 The resource name prefix (default dbhub).
 
 .PARAMETER T2SqlInstallMode
-PaygWizard or Developer; without it, init.ps1 asks (PaygWizard with -NonInteractive).
+JumpstartImage, PaygWizard, or Developer; without it, init.ps1 asks (JumpstartImage with -NonInteractive).
 
 .PARAMETER WorkspaceName
 The Fabric workspace's name (default "Database Hub Demo"). deploy.ps1 creates it when it's missing.
@@ -112,7 +113,7 @@ param(
 
     [string] $Prefix = '',
 
-    [ValidateSet('', 'PaygWizard', 'Developer')]
+    [ValidateSet('', 'JumpstartImage', 'PaygWizard', 'Developer')]
     [string] $T2SqlInstallMode = '',
 
     [string] $WorkspaceName = '',

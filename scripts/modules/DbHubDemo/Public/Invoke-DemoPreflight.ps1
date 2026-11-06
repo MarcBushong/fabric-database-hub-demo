@@ -19,7 +19,9 @@ function Invoke-DemoPreflight {
       Phase 28 live finding), and the Fabric workspace and lakehouse by
       name, read-only (Test-DemoFabricResolution, Phase 26a): your role and the capacity of a workspace that exists,
       or the capacity deploy.ps1 would create it on; the optional P11, Power BI viewer licensing on the workspace's
-      capacity (Test-DemoFabricViewerLicense, a Warning below F64).
+      capacity (Test-DemoFabricViewerLicense, a Warning below F64); and P12 and P13, the tenant settings the Insights
+      app needs, which never block the run (Test-DemoFabricAppTenantSetting, PREFLIGHT.FABRIC.APPSETTINGS: a Pass, or a
+      Warning when one is off or can't be read; 2026-11-05).
     - P6: the T3 Entra admin group exists and the caller owns it, read from Microsoft Graph with a token
       verified for the configured tenant (Invoke-DemoRestRequest). The group's display name is in the
       evidence (groupDisplayName), for T3's administrator login.
@@ -410,9 +412,18 @@ function Invoke-DemoPreflight {
         $results.Add((New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT))
     }
 
-    # T2 mode (ADR 0006). The evaluation-only fallback is opt-in, and everything about it is labeled.
-    if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
+    # T2 mode (ADR 0006). The evaluation-only fallback is opt-in, and everything about it is labeled. The Jumpstart image
+    # is a Hyper-V guest disk, so it needs the nested host; an existing guest's source is checked on the host itself
+    # (its GuestSource step), which refuses a mode the guest wasn't made for.
+    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
+    if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm' -and $installMode -eq 'JumpstartImage') {
+        Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Fail' 't2SqlInstallMode JumpstartImage needs the nested Hyper-V host: Arc Jumpstart''s image is a Hyper-V guest disk, but t2Mode EvaluationOnlyAzureVm makes T2 an Azure VM.' -Remediation 'Use t2Mode Nested with a nested-virtualization size, or, for the evaluation-only Azure VM, set t2SqlInstallMode to PaygWizard, ProductKey, or Developer (ADR 0006).' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine'
+    }
+    elseif ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T2.MODE' -Area 'preflight' -Target 'T2' -Status 'Warning' -Message 't2Mode is EvaluationOnlyAzureVm: T2 is the Azure VM arcsql01, onboarded to Azure Arc with Microsoft''s evaluation procedure, which is for evaluation and testing only. Use it only when the nested-virtualization checks fail (ADR 0006).' -Remediation 'Set t2Mode to Nested when a nested-virtualization size is available.' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine' -EvaluationOnly))
+    }
+    elseif ($installMode -eq 'JumpstartImage') {
+        Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Pass' 'T2 is the nested Hyper-V guest arcsql01 on archost01 (t2Mode Nested), made from Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest (t2SqlInstallMode JumpstartImage): no T2 step needs a person (ADR 0006).'
     }
     else {
         Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Pass' 'T2 is the nested Hyper-V guest arcsql01 on archost01 (t2Mode Nested, ADR 0006).'
@@ -452,10 +463,13 @@ function Invoke-DemoPreflight {
     $networkUsage = @(Invoke-Az -Arguments @('network', 'list-usages', '--location', $location) -Json)
     $ipRow = $networkUsage | Where-Object { $_.name.value -eq 'PublicIPAddresses' } | Select-Object -First 1
     if ($ipRow -and ([int]$ipRow.limit - [int]$ipRow.currentValue) -ge 1) {
-        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Pass' 'Public IP quota allows on-demand Bastion.'
+        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Pass' 'Public IP quota allows on-demand Bastion (the PaygWizard guided stop, or optional interactive access).'
+    }
+    elseif ($installMode -eq 'PaygWizard') {
+        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so on-demand Bastion, which the PaygWizard guided stop needs, cannot be created.' -Remediation 'Request a public IP quota increase, or choose t2SqlInstallMode JumpstartImage, which needs no Bastion.'
     }
     else {
-        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so on-demand Bastion cannot be created.' -Remediation 'Request a public IP quota increase if you need interactive access.'
+        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so optional on-demand Bastion cannot be created; the deployment itself doesn''t need it.' -Remediation 'Request a public IP quota increase if you need interactive access.'
     }
 
     # P4 and P5: Fabric. P4 (Phase 28 live finding, 2026-10-30): the Hub setting is read through the Fabric admin API,
@@ -467,6 +481,9 @@ function Invoke-DemoPreflight {
     $results.Add($fabricCheck.Result)
     # P11 (optional, Phase 18): Power BI viewer licensing on the workspace's capacity; a Warning below F64.
     $results.Add((Test-DemoFabricViewerLicense -Config $fabricCheck.Config -CapacityResult $fabricCheck.CapacityResult))
+    # P12 and P13 (2026-11-05): the tenant settings the Insights app needs, which is part of every deployment but never
+    # blocks it; read through the Fabric admin API, and never more than a Warning.
+    $results.Add((Test-DemoFabricAppTenantSetting -Config $Config))
 
     # P6: the T3 admin group exists and the caller owns it. Microsoft Graph is read with a token verified for
     # the configured tenant; 'az ad' would answer for the Azure CLI's default account, which can be in another
@@ -625,9 +642,10 @@ function Invoke-DemoPreflight {
     catch {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots could not be listed, so the cost estimate leaves them out: {0}' -f $_.Exception.Message)
     }
-    # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where the daily T4
-    # safety stop is fully in place (its schedule, A1, and a last DbHub-Stop job that didn't fail); otherwise the rest of
-    # the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART).
+    # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where a safety stop
+    # is fully in place (the nightly safety stop, ADR 0024: its schedule, its role, and a last run that didn't fail; or the
+    # control's); otherwise the rest of the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART). On
+    # a first deployment the nightly safety stop doesn't exist yet: this run sets it up after the template.
     if ($t4On) {
         $costParameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
     }

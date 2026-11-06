@@ -2,7 +2,8 @@ function Complete-DemoDeploymentRun {
     <#
     .SYNOPSIS
     Ends one deploy.ps1 run's experience (Phase 28): decides DONE or NOT DONE (Get-DemoDeploymentOutcome), records it in
-    the progress model with the optional items, stops the status page's writer, and writes the page a last time.
+    the progress model with what didn't work but never blocks DONE (the Insights app; 2026-11-05), stops the status
+    page's writer, and writes the page a last time.
 
     .DESCRIPTION
     The outcome reads the resource group's state after the run (each track's last finished step), unless -State is
@@ -11,8 +12,9 @@ function Complete-DemoDeploymentRun {
     follow-up). The note says T4 was created only with evidence that its server exists: this run's results, the T4
     track's record, or else a Servers - Get (review of 20e855c), which also decides when this run's template failed or
     T4.SERVER failed, since neither means the server is missing (review of 64c28b2). Returns the outcome: Kind (Done,
-    NotDone, or WhatIf), Done, Reason, Next, NextCommand, Optional, Unfinished, ExitCode, Resume, and Minutes. Never
-    throws: a run that can't be judged is NOT DONE.
+    NotDone, or WhatIf), Done, Reason, Next, NextCommand, NonBlocking, Unfinished, ExitCode, Resume, and Minutes. Never
+    throws: a run that can't be judged is NOT DONE. The Insights app's sign-in, when it still runs because the run ended
+    before it settled (Start-DemoFabricAppSignIn), is ended too.
 
     .PARAMETER Run
     What Start-DemoDeploymentRun returned.
@@ -148,7 +150,7 @@ function Complete-DemoDeploymentRun {
         $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen -StartedVm $startedVms -T4HourlyUsd $t4Hourly -T4Created $t4Created -T4Why $t4Why
     }
     catch {
-        $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; Optional = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }
+        $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; NonBlocking = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }
     }
     $minutes = [int][System.Math]::Round(([System.DateTime]::UtcNow - [datetime]$Run.StartedUtc).TotalMinutes)
     $outcome | Add-Member -NotePropertyName 'Minutes' -NotePropertyValue $minutes -Force
@@ -168,7 +170,9 @@ function Complete-DemoDeploymentRun {
         $notes = Get-DemoMemberValue -InputObject $outcome -Name 'Notes'
         $reason = (@([string]$outcome.Reason) + @($notes) | Where-Object { $_ } | ForEach-Object { [string]$_ }) -join ' '
         Set-DemoProgressValue -Path $Run.ProgressPath -Section 'run' -Value ([ordered]@{ state = $runState; endedAt = (Get-DemoUnixTime); reason = $reason; next = [string]$outcome.Next; nextCommand = [string]$outcome.NextCommand; exitCode = [int]$outcome.ExitCode; activity = $activityLine })
-        Set-DemoProgressValue -Path $Run.ProgressPath -Section 'optional' -Value @($outcome.Optional)
+        # What didn't work but never blocks DONE (the Insights app), with its error and fix (2026-11-05).
+        $nonBlockingValue = Get-DemoMemberValue -InputObject $outcome -Name 'NonBlocking'
+        Set-DemoProgressValue -Path $Run.ProgressPath -Section 'nonBlocking' -Value @(@($nonBlockingValue) | Where-Object { $null -ne $_ })
         # What only a person can confirm, once each, which never kept the run from DONE (Phase 28 live finding).
         $confirmValue = Get-DemoMemberValue -InputObject $outcome -Name 'Confirm'
         Set-DemoProgressValue -Path $Run.ProgressPath -Section 'confirm' -Value @(@($confirmValue) | Where-Object { $null -ne $_ } | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'text') })
@@ -180,6 +184,8 @@ function Complete-DemoDeploymentRun {
         }
     }
     Stop-DemoProgressPageWriter -Job $Run.Writer -ModelPath ([string]$Run.ProgressPath) -PagePath ([string]$Run.PagePath)
+    # A sign-in for the Insights app that still runs (the run ended or was stopped before it settled) ends with the run.
+    Stop-DemoFabricAppSignIn
     # The run is over: a later Ctrl+C in this session belongs to another command.
     Disable-DemoRunCancelWatch
     return $outcome

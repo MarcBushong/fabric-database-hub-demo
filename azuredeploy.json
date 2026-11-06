@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "7688273784718142831"
+      "templateHash": "3615327758996869364"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -266,14 +266,15 @@
     },
     "t2SqlInstallMode": {
       "type": "string",
-      "defaultValue": "PaygWizard",
+      "defaultValue": "JumpstartImage",
       "allowedValues": [
+        "JumpstartImage",
         "PaygWizard",
         "ProductKey",
         "Developer"
       ],
       "metadata": {
-        "description": "How SQL Server is installed in the T2 guest (ADR 0006)."
+        "description": "How SQL Server gets into the T2 guest (ADR 0006): JumpstartImage (default) uses Arc Jumpstart's prebuilt SQL Server 2022 Standard guest disk, unattended."
       }
     },
     "t2Mode": {

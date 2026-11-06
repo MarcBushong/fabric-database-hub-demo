@@ -1,7 +1,7 @@
 # ADR 0006: SQL Server editions, guest OS, and licensing
 
 - **Status:** Accepted
-- **Date:** 2026-10-19 (revised the same day for plan §9, Revision 2; amended 2026-10-29 for Phase 28: one command, one guided stop; and 2026-10-30: setup's Azure sign-in and IE Enhanced Security Configuration)
+- **Date:** 2026-10-19 (revised the same day for plan §9, Revision 2; amended 2026-10-29 for Phase 28: one command, one guided stop; and 2026-10-30: setup's Azure sign-in and IE Enhanced Security Configuration; amended 2026-11-05, user-directed: `JumpstartImage` by default, which supersedes `PaygWizard` as the default, see the [amendment](#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default))
 - **Decision source:** User-directed (Q1a, Q1b, Q2a, Q2b, Q2c) and plan §9.2 (T2 install modes), §9.4 (C6); the owner's decision of 2026-10-29 for the guided stop (user-directed)
 - **Related:** [ADR 0003](0003-t2-host-size-security-type-bootstrap.md), [ADR 0005](0005-arc-onboarding-authentication.md), [ADR 0009](0009-secrets-handling.md), [ADR 0015](0015-mirroring-deferral.md), [ADR 0016](0016-cost-profiles.md), [ADR 0018](0018-fast-redeploy-parallel-tracks-golden-snapshot.md), [limitations](../limitations.md)
 
@@ -138,6 +138,104 @@ Implemented and statically tested; live validation pending.
 - **Unchanged:** `GuestSignInCleanup` right after setup, Arc's PAYG and monitoring through `configure-arc.ps1`, and the `ProductKey` and `Developer` paths.
 
 Unit-tested (`tests/unit/Vm.GuidedSetup.Tests.ps1`, `tests/unit/Vm.HostPlan.Tests.ps1`); not yet run live. A live proof needs a person at the guided stop.
+
+## 2026-11-05 (user-directed): JumpstartImage, Arc Jumpstart's SQL Server Standard image, by default
+
+This amendment supersedes "`PaygWizard` (default, Q2b)" in the install-mode table above and the Phase 28 amendment's "T2's default stays `PaygWizard`"; both stay as the record of what was decided then. Unit-tested; not yet run live.
+
+### Context
+
+- **The owner's direction (2026-11-05, verbatim):** "I want a one click deployment that works without anything and fast", for public users of this repository in their own subscriptions, and "to reuse the arc jumpstart process and images". The owner confirmed that this use of Arc Jumpstart's images is approved for Arc.
+- **No mode met it:** `PaygWizard` needs a person once per guest build (the guided stop, an estimated 10 minutes through Bastion plus 10 to 15 while setup installs); `ProductKey` needs each user's own SQL Server Standard product key (P10); and `Developer` gives T2 no Hub Performance data and no Database Agent findings.
+- **Arc Jumpstart's ArcBox** publishes a prebuilt SQL Server Standard guest disk for its own nested Hyper-V host, and reaches that guest over PowerShell Direct ([ArcBox ITPro docs](https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md), [ArcBox's logon script](https://github.com/microsoft/azure_arc/blob/e2c114eed98d18105dcf3a718bef965d5112781b/azure_jumpstart_arcbox/artifacts/ArcServersLogonScript.ps1), both at pinned commits).
+
+### Decision
+
+| Mode | How | Manual steps | Hub Performance | Arc license type |
+|---|---|---|---|---|
+| `JumpstartImage` (default since 2026-11-05) | The T2 host downloads Arc Jumpstart ArcBox's prebuilt SQL Server 2022 Standard guest disk, makes it `arcsql01` at its first boot while it has no network, and checks it; the orchestrator then onboards it to Azure Arc with license type PAYG and monitoring on ([ADR 0003](0003-t2-host-size-security-type-bootstrap.md#amendment-the-hosts-steps-for-jumpstartimage-2026-11-05)) | None | Yes | PAYG |
+
+- **No person for T2:** no setup wizard, no product key, no Bastion, and no sign-in beyond the operator's own `az login`; this mode has no `PLAN FOR A PERSON` line and no `DEPLOY.T2.GUIDEDSTOP`. The configuration schema, the example configuration, `infra/main.bicep`, `azuredeploy.json`, and `init.ps1` default to it ([ADR 0023](0023-first-run-automation.md#amendment-jumpstartimage-first-in-the-first-run-2026-11-05)).
+- **The other modes stay as they are, opt-in:** `PaygWizard` with its guided stop, `ProductKey` (P10), and `Developer` (Estate only). Nothing falls back from `JumpstartImage` to another mode by itself.
+- **The first boot,** over [PowerShell Direct](https://learn.microsoft.com/virtualization/hyper-v-on-windows/user-guide/powershell-direct) while the guest's network adapter isn't connected: the image's published password replaced with a random one ([ADR 0009](0009-secrets-handling.md#amendment-the-jumpstart-images-published-default-credential-2026-11-05)); the computer renamed `arcsql01` and set to UTC; SQL Server renamed with the documented procedure (`sp_dropserver`, `sp_addserver ... 'local'`, a service restart; [rename a computer that hosts SQL Server](https://learn.microsoft.com/sql/database-engine/install-windows/rename-a-computer-that-hosts-a-stand-alone-instance-of-sql-server)); `BUILTIN\Administrators` made sysadmin, as in the build modes; every enabled SQL login disabled; the sample database dropped; Integration Services' and Launchpad's services stopped and disabled, and Integration Services uninstalled with setup as on T1 above, so Arc's inventory lists only the engine (a failed uninstall is a **Warning**; [uninstall with setup](https://learn.microsoft.com/sql/sql-server/install/uninstall-an-existing-instance-of-sql-server-setup)); `C:\Jumpstart` deleted; and an Arc agent identity, if the image held one, reset locally. Then the adapter is connected.
+- **The image check before onboarding** (`JumpstartImageCheck`): a default instance, Standard edition, version 16.x (SQL Server 2022), and the guest's Administrator a sysadmin, or T2 stops with the cause and the commands, and the deploy ends **NOT DONE**. After it comes the existing path: Arc onboarding ([ADR 0005](0005-arc-onboarding-authentication.md#amendment-jumpstartimage-onboards-after-its-image-check-2026-11-05)), the PAYG tag and `configure-arc.ps1` (PAYG and monitoring), `GuestSignInCleanup`, `ContosoCare`, the seed, and the workload runner.
+- **What Azure should show** (`Get-DemoArcExpectation`): Standard edition, license type PAYG, and monitoring on, as in `PaygWizard` mode; Enterprise or `Paid` is a **Fail** (`T2.ARC.SQLINSTANCE`). Billing doesn't change: Arc SQL Server Standard PAYG per core-hour, with the four-core minimum per OSE (Phase 7 notes above), and `estimate-cost.ps1` prices both modes the same ([ADR 0016](0016-cost-profiles.md#2026-11-05-user-directed-the-jumpstartimage-defaults-cost)).
+- **The guest's Windows isn't activated** by the demo; the host records its license state in `health.json` (R21, below).
+- **Decided with it:** Bastion isn't needed to deploy any more (only the opt-in `PaygWizard` guided stop needs it; it stays optional for interactive access, [ADR 0016](0016-cost-profiles.md#2026-11-05-user-directed-the-jumpstartimage-defaults-cost)); in this mode the golden snapshot is an optional speed-up ([ADR 0018](0018-fast-redeploy-parallel-tracks-golden-snapshot.md#amendments-2026-11-05-golden-snapshots-in-jumpstartimage-mode)); and the host now extends a build mode's Windows Server evaluation guest with `slmgr.vbs /rearm` when 30 or fewer days are left and a rearm is left ([ADR 0003](0003-t2-host-size-security-type-bootstrap.md#amendment-the-hosts-steps-for-jumpstartimage-2026-11-05), [slmgr.vbs options](https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options)).
+- **Credit:** Arc Jumpstart is named wherever the image is introduced: the README, this ADR, and `config/versions.json`.
+
+### The image
+
+Verified on 2026-11-05 with HTTP range reads, without a full download; pinned in `config/versions.json` as `media.jumpstartArcBoxSqlStd`.
+
+- **The file:** `https://jumpstartprodsg.blob.core.windows.net/arcbox/prod/ArcBox-SQL-STD.vhdx` on Jumpstart's public storage (anonymous read): 36,645,634,048 bytes (34.13 GiB), a dynamic Generation 2 VHDX with a 100 GiB maximum. The pin records its ETag (`0x8DDD21BE1292CD1`), its Content-MD5, and its Last-Modified date (2025-08-02).
+- **Windows:** Windows Server 2022 Standard (build 20348.3932), **not an evaluation**, so it has no 180-day expiry; specialized (not sysprepped), computer name `ARCBOX-SQL`. In this mode it replaces the Datacenter Evaluation guest above.
+- **SQL Server:** SQL Server 2022 Standard Edition 16.0.1140.6 on the default instance `MSSQLSERVER`, with mixed-mode authentication. The extras the first boot removes or stops: Integration Services, ML Services' Launchpad, the sample database `AdventureWorksLT2022`, and `C:\Jumpstart` (SQL Server media and sample files). What stays: SSMS 20.2 and 21.4, Edge, WebView2, and PowerShell 7.4. No Arc agent is installed.
+- **How ArcBox uses it:** a Generation 2 guest with 2 vCPUs and 6 GB, reached over PowerShell Direct with a published default credential that Jumpstart's docs list, the resource-group tag `ArcSQLServerExtensionDeployment=Disabled`, and the SQL Server extension with license type `Paid`. Here the guest gets the profile's size (`lowest-cost`: 2 vCPUs, 8 GiB static), this repository's tag `ArcSQLServerExtensionDeployment=PAYG`, and `configure-arc.ps1`.
+- **A newer image:** Jumpstart can publish another image at the same URL (another ETag). The host uses it only once the guest passes the image check, with a **Warning** that names its ETag and date (`STATUS.T2.IMAGE`); the pinned ETag stays "the tested image" until the pin is updated after a full deploy passes with the new one.
+
+### Database Hub's prerequisites
+
+The [prerequisites for SQL Server enabled by Azure Arc](https://learn.microsoft.com/fabric/database/hub/add-sql#prerequisites-for-sql-server-enabled-by-azure-arc), as the Jumpstart guest meets them:
+
+| Prerequisite | `JumpstartImage` |
+|---|---|
+| SQL Server on Windows, not Windows Server 2012 R2 or earlier | Windows Server 2022 |
+| Standard or Enterprise edition | Standard; anything else fails the image check |
+| SQL Server 2016 SP1 or later | SQL Server 2022 (16.x); another major version fails the image check |
+| License type pay-as-you-go or Software Assurance | PAYG, from the resource-group tag and `configure-arc.ps1` (`T2.ARC.SQLINSTANCE`) |
+| Azure extension for SQL Server 1.1.2504.99 or later | As in every mode: deployed by the tag, or by `configure-arc.ps1` (`T2.ARC.SQLEXTENSION`) |
+| Connectivity to `*.<region>.arcdataservices.com` | The host's outbound HTTPS ([ADR 0007](0007-networking-modes-and-egress.md#addendum-the-t2-hosts-downloads-in-jumpstartimage-mode-2026-11-05)) |
+| Not a failover cluster instance | A stand-alone default instance |
+
+**PAYG, not ArcBox's `Paid`.** Of the [license types](https://learn.microsoft.com/sql/sql-server/azure-arc/manage-license-billing#license-types), `PAYG` subscribes to Standard or Enterprise on an hourly meter, while `Paid` means bringing a Standard or Enterprise license with Software Assurance or a SQL Server subscription, which whoever selects it attests to. A public user of this repository may hold neither, so the demo keeps PAYG, as in `PaygWizard` mode.
+
+### Terms
+
+- **Jumpstart's own terms:** the [Jumpstart FAQ](https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/FAQ/_index.md) says: "Jumpstart Scenarios, ArcBox, LocalBox, and Agora are all intended for evaluation, training, and demo purposes only and are not supported for production use cases." This repository is a demo, which matches.
+- **Licenses:** `microsoft/azure_arc` is CC BY 4.0 for its content ([LICENSE](https://github.com/microsoft/azure_arc/blob/e2c114eed98d18105dcf3a718bef965d5112781b/LICENSE)) and MIT for its code ([LICENSE-CODE](https://github.com/microsoft/azure_arc/blob/e2c114eed98d18105dcf3a718bef965d5112781b/LICENSE-CODE)); `Azure/arc_jumpstart_docs` is CC BY 4.0 ([LICENSE](https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/LICENSE)). Jumpstart publishes no separate license for its disk images. This repository holds no part of the image: each T2 host downloads it from Jumpstart's storage.
+- **The software in the image is Microsoft's:** SQL Server is billed through Arc pay-as-you-go. How a Windows guest in nested Hyper-V on Azure is licensed isn't documented: R21, accepted above, covers this guest too, and the demo doesn't activate its Windows.
+
+### The owner's decisions (2026-11-05)
+
+1. **No automatic fallback:** when the image can't be used (its download fails, or the booted guest fails the image check), T2 ends **NOT DONE** with the cause and the commands to retry or to choose another mode; nothing switches by itself.
+2. **No disk shrink:** a realistic free-space check (the download, 20 GiB for the dynamic disk to grow, and the 10 GiB margin: about 64 GiB, on the 128 GiB OS disk in `lowest-cost`), not the image's 100 GiB maximum, plus an early **Warning** when less than 20 GiB is free (`STATUS.T2.DISKSPACE`).
+3. **Newer images are accepted** once the guest passes the image check, with a **Warning** that names the version.
+4. **The published default credential** is read at deploy time from Jumpstart's pinned, SHA-256-checked script, and never stored in this repository.
+
+Within the same scope: license type PAYG rather than ArcBox's `Paid`; Integration Services removed as on T1; the sample database and `C:\Jumpstart` deleted; and Windows activation not attempted, with the license state recorded (R21).
+
+### Consequences
+
+- **Positive:** T2 needs no person in a first deployment after `az login`, for anyone with Contributor on their own subscription (the Insights app's browser sign-in, since 2026-11-05 in every deployment, is the one other step for a person, and it never keeps the run from **DONE**); T2 keeps Hub Estate, Performance, and the Database Agent's findings at the cost of `PaygWizard` mode; its Windows doesn't expire; Bastion isn't needed to deploy; and no Azure resource is added.
+- **Negative:**
+  - **No fallback:** if Jumpstart's storage can't be reached, or the image fails the check, T2 stays **NOT DONE** until the user retries with the commands that the result gives (a partial download resumes) or chooses another mode.
+  - **No mode switch on an existing guest:** the host's `GuestSource` step refuses a mode whose source (the image or the build) differs from the existing guest's, with the fix: set `t2SqlInstallMode` back, or `./scripts/destroy.ps1`, then `./scripts/deploy.ps1`. Preflight doesn't check it; the host does.
+  - **`EvaluationOnlyAzureVm` can't use it:** the image is a Hyper-V guest disk, so `PREFLIGHT.T2.MODE` is a **Fail** with the fix (`t2Mode` `Nested` with a nested-virtualization size, or another install mode), and the evaluation-only VM's bootstrap refuses it too.
+  - **Jumpstart at deploy time:** a 34.13 GiB download per guest build, and two more HTTPS hosts for the T2 host (ADR 0007). Jumpstart controls the image and its password: a changed password fails the first boot after 15 minutes, and the fix is to point `media.jumpstartArcBoxSqlStd.credentialSource` in `config/versions.json` at the Jumpstart commit that matches the image.
+- **Risks accepted:** R21, as above, for this guest's Windows.
+
+### Alternatives considered
+
+1. **Keep `PaygWizard` as the default:** rejected, because it needs a person once per guest build. It stays opt-in.
+2. **`ProductKey` as the default:** unattended, but every user needs their own SQL Server Standard key (P10).
+3. **`Developer` as the default:** unattended, but Developer edition gets no Arc monitoring, so T2 would have no Performance data and no agent findings.
+4. **A shared golden snapshot of the owner's T2:** still rejected (Phase 28 amendment): nothing depends on the owner's resources, while Jumpstart's image is public.
+
+### Validation
+
+- **Unit-tested:** `tests/unit/Vm.JumpstartImage.Tests.ps1` (the host's steps, the download and its checks, the published credential, the image check, and the evaluation guard), `tests/unit/DbHubDemo.Arc.Tests.ps1` (Standard with PAYG expected; Enterprise or `Paid` a **Fail**), `tests/unit/DbHubDemo.Config.Tests.ps1` and `tests/unit/DbHubDemo.FirstRun.Tests.ps1` (the default), and `tests/unit/Vm.EvalArcVm.Tests.ps1` (the evaluation-only VM refuses the mode).
+- **The first live proof is pending:** a first deployment in `JumpstartImage` mode, with the Phase 6, 7, and 9 checks above (`SERVERPROPERTY('Edition')`; the instance's edition, license type, and monitoring; T2's telemetry). Its `DEPLOY.TIMING` will be the mode's first measured time; until then, every time for it is an estimate (about 1 to 2 hours for a first deployment).
+
+### Sources (checked 2026-11-05)
+
+- Database Hub, prerequisites for SQL Server enabled by Azure Arc: <https://learn.microsoft.com/fabric/database/hub/add-sql#prerequisites-for-sql-server-enabled-by-azure-arc>
+- Arc license types and billing: <https://learn.microsoft.com/sql/sql-server/azure-arc/manage-license-billing>
+- Rename a computer that hosts a stand-alone instance of SQL Server: <https://learn.microsoft.com/sql/database-engine/install-windows/rename-a-computer-that-hosts-a-stand-alone-instance-of-sql-server>
+- Uninstall an instance or a feature with setup: <https://learn.microsoft.com/sql/sql-server/install/uninstall-an-existing-instance-of-sql-server-setup>
+- PowerShell Direct: <https://learn.microsoft.com/virtualization/hyper-v-on-windows/user-guide/powershell-direct>
+- `slmgr.vbs` options (`/rearm`, `/ato`): <https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options>
+- Arc Jumpstart, at pinned commits: the ArcBox ITPro docs <https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md>, the FAQ <https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/FAQ/_index.md>, and ArcBox's logon script <https://github.com/microsoft/azure_arc/blob/e2c114eed98d18105dcf3a718bef965d5112781b/azure_jumpstart_arcbox/artifacts/ArcServersLogonScript.ps1>
 
 ## Sources (checked 2026-10-19)
 

@@ -111,6 +111,8 @@ Remove the override once a pinned Rayfin release depends on zod 4.6.6 or later.
 ./scripts/configure-fabric-app.ps1
 ```
 
+`./scripts/deploy.ps1` runs it in its Fabric track, after the history report, as part of every deployment (2026-11-05). When the Rayfin CLI isn't signed in to the demo's tenant, `deploy.ps1` starts its browser sign-in (step 3 below) at the beginning of the run, in a session that can take keyboard input, and the rest of the run goes on; only this step waits for it, at most 15 minutes from the start. When the app can't be created, the deployment goes on and still ends **DONE**: the status page shows the app's step as **Failed**, with the actual error and the fix ([deployment](../../docs/deployment.md#the-insights-app-part-of-every-deployment-2026-11-05)).
+
 The script is unattended and idempotent; it deploys to the item named `APP_DatabaseHub_Insights` and updates it in place on every run. It never deletes anything. It needs:
 
 1. `SM_DatabaseHub_History` deployed (`./scripts/configure-powerbi.ps1`), and the workspace on an **Active** Fabric capacity: `rayfin up` can start a trial or assign a capacity when a workspace has none, so the script deploys only on an Active one.

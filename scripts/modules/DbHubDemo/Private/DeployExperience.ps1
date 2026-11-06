@@ -1,8 +1,8 @@
 # deploy.ps1's start, expectations, and ending (Phase 28, brief goals 1, 7 and prompting items 1, 2, 3, 7, 8, 13, 15):
 # the start banner with the expected timeline and the person's part, the notices for sessions that can't take keyboard
-# input and for GitHub Codespaces, and the one ending: DONE (every target ready, where to look, the optional items) or
-# NOT DONE (why, the single next action as an exact command, and how to resume), with a nonzero exit code when it isn't
-# done.
+# input and for GitHub Codespaces, and the one ending: DONE (every target ready, where to look, and what didn't work but
+# never blocks DONE, such as the Insights app, with its error and fix; 2026-11-05) or NOT DONE (why, the single next
+# action as an exact command, and how to resume), with a nonzero exit code when it isn't done.
 # Sources (checked 2026-10-29):
 # - Codespaces idle timeout: https://docs.github.com/codespaces/setting-your-user-preferences/setting-your-timeout-period-for-github-codespaces
 # - Codespaces maximum lifetime: https://docs.github.com/codespaces/about-codespaces/understanding-the-codespace-lifecycle
@@ -58,17 +58,23 @@ function Get-DemoDeploymentExpectation {
     the person is needed about 60 to 90 minutes after the start (it can be later; the run waits for them): about 10
     minutes of clicks, then 10 to 15 minutes while setup installs. Afterward, the sign-in cleanup, the database, Arc's
     PAYG and monitoring, and telemetry take about 30 to 45 minutes.
+    JumpstartImage mode (the default since 2026-11-05) replaces the guest build with the Jumpstart image's 34 GiB download
+    and its first boot, about 20 to 40 minutes together (an estimate; not measured yet), and needs no person. Without
+    -SkipFabric, it says that the Insights app's Rayfin CLI sign-in may open a browser at the start, which the run doesn't
+    wait for (2026-11-05).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
-        [string] $InstallMode = 'PaygWizard',
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
+        [string] $InstallMode = 'JumpstartImage',
 
         [switch] $WaitForT2,
 
         [ValidateRange(0, 600)]
-        [int] $T2WaitMinutes = 180
+        [int] $T2WaitMinutes = 180,
+
+        [switch] $SkipFabric
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -76,10 +82,16 @@ function Get-DemoDeploymentExpectation {
     if ($InstallMode -eq 'PaygWizard') {
         $lines.Add('- A first deployment takes about 2 to 3 hours in all; the T2 guest build alone is 60 to 90 minutes.')
     }
+    elseif ($InstallMode -eq 'JumpstartImage') {
+        $lines.Add('- A first deployment takes about 1 to 2 hours in all (not measured yet with the Jumpstart image); T2''s image download and first boot are about 20 to 40 minutes of it. No T2 step needs a person.')
+    }
     else {
-        $lines.Add('- A first deployment takes about 1.5 to 2.5 hours in all; the T2 guest build alone is 60 to 90 minutes. No step needs a person.')
+        $lines.Add('- A first deployment takes about 1.5 to 2.5 hours in all; the T2 guest build alone is 60 to 90 minutes. No T2 step needs a person.')
     }
     $lines.Add('- A redeploy from a golden snapshot (./scripts/capture-t2-golden.ps1) takes about 30 to 45 minutes, with no build and no guided stop.')
+    if (-not $SkipFabric) {
+        $lines.Add('- The Insights app needs its Rayfin CLI signed in once: when it isn''t yet, a browser opens for your sign-in right at the start. The run goes on meanwhile; only the app waits for it, and without it the app isn''t created, which doesn''t keep the run from DONE.')
+    }
     $human = ''
     if ($InstallMode -eq 'PaygWizard') {
         $human = 'about 60 to 90 minutes after the start (an estimate; it can be later, and the run waits), for about 10 minutes, plus 10 to 15 minutes while SQL Server setup installs: you sign in to archost01 through Bastion, choose pay-as-you-go and Standard in the pre-filled setup, and sign in to Azure on its Azure page.'
@@ -92,7 +104,7 @@ function Get-DemoDeploymentExpectation {
     }
     $lines.Add('- This PC stays awake while deploy.ps1 runs (Windows); keep it plugged in, and don''t close this window.')
     $lines.Add('- If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.')
-    $text = if ($InstallMode -eq 'PaygWizard') { 'A first deployment takes about 2 to 3 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' } else { 'A first deployment takes about 1.5 to 2.5 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' }
+    $text = if ($InstallMode -eq 'PaygWizard') { 'A first deployment takes about 2 to 3 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' } elseif ($InstallMode -eq 'JumpstartImage') { 'A first deployment takes about 1 to 2 hours (estimate, not measured yet with the Jumpstart image); a redeploy from a golden snapshot about 30 to 45 minutes.' } else { 'A first deployment takes about 1.5 to 2.5 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' }
     return [pscustomobject]@{
         Lines      = $lines.ToArray()
         Text       = $text
@@ -105,8 +117,9 @@ function Get-DemoDeploymentNotice {
     <#
     .SYNOPSIS
     The start banner's notices (brief items 7, 8, 13): a session that can't take keyboard input (an assistant, a script,
-    or CI) and what the guided stop then needs, with the alternatives; a GitHub Codespaces idle timeout; and the plain
-    line an assistant can relay ahead of the guided stop. Pure. Internal.
+    or CI) and what the guided stop then needs, with the alternatives, and that the Insights app's browser sign-in isn't
+    started there (2026-11-05); a GitHub Codespaces idle timeout; and the plain line an assistant can relay ahead of the
+    guided stop. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
@@ -114,21 +127,27 @@ function Get-DemoDeploymentNotice {
         [Parameter(Mandatory)]
         [pscustomobject] $Environment,
 
-        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
-        [string] $InstallMode = 'PaygWizard',
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
+        [string] $InstallMode = 'JumpstartImage',
 
         [switch] $WaitForT2,
 
-        [string] $PagePath = ''
+        [string] $PagePath = '',
+
+        [switch] $SkipFabric
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
     $guided = $InstallMode -eq 'PaygWizard' -and $WaitForT2
     if ($guided -and -not [bool]$Environment.Interactive) {
         $lines.Add('This session doesn''t take keyboard input (its input is redirected, or it runs in an automation shell or under an assistant). That''s fine, but the PaygWizard guided stop needs a person at a browser for about 10 minutes, about 60 to 90 minutes from now, and no assistant can do its sign-ins. If nobody will be there, stop now (Ctrl+C) and choose one:')
+        $lines.Add('  t2SqlInstallMode JumpstartImage (the default): fully unattended with Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest; T2 gets performance data and the agent''s findings.')
         $lines.Add('  -NoWaitForT2: T1, T3, T4, and Fabric now; T2 builds in the background, and a later ./scripts/deploy.ps1 guides you through its step.')
         $lines.Add('  t2SqlInstallMode ProductKey: fully unattended with your own SQL Server Standard product key; T2 gets performance data and the agent''s findings.')
         $lines.Add('  t2SqlInstallMode Developer: fully unattended, but T2 shows in Database Hub''s Estate only, with no T2 performance data or findings.')
+    }
+    if (-not $SkipFabric -and -not [bool]$Environment.Interactive) {
+        $lines.Add('The Insights app''s browser sign-in (the Rayfin CLI) isn''t started in a session like this one. When this machine''s Rayfin CLI isn''t signed in yet, the app isn''t created; the run still finishes, and ./scripts/configure-fabric-app.ps1 -SignIn, which you run yourself in a terminal, adds it later.')
     }
     if ([bool]$Environment.Codespaces) {
         $lines.Add('GitHub Codespaces stops a codespace after 30 minutes without activity by default, and always after 12 hours. Terminal output counts as activity, and deploy.ps1 prints progress at least every 5 minutes, but raise the idle timeout to be safe: GitHub Settings > Codespaces > Default idle timeout (up to 240 minutes; it applies to codespaces you create afterward), or gh codespace create --idle-timeout 240m. An organization policy can lower it.')
@@ -140,13 +159,14 @@ function Get-DemoDeploymentNotice {
     return $lines.ToArray()
 }
 
-function Get-DemoOptionalItem {
+function Get-DemoNonBlockingItem {
     <#
     .SYNOPSIS
-    The optional parts that didn't finish and never block DONE (brief item 15): the Insights app (its step's records,
-    Get-DemoInsightsAppSummary) and the history report's data check when the Execute Queries setting is off
-    (FABRIC.SEMANTICMODEL.* Manual action required), each with the actual reason and how to add it later (Phase 28 live
-    finding). Pure. Internal.
+    What didn't work but never blocks DONE (2026-11-05), each with the actual reason and how to fix it: the Insights app
+    when it wasn't created or doesn't work (Get-DemoInsightsAppSummary: State Failed; it's part of every deployment), and
+    the history report's data check while the Execute Queries setting is off (FABRIC.SEMANTICMODEL.* Manual action
+    required). Each item has name, state (Failed or Action needed, as on the status page), message, and howTo;
+    Format-DemoNonBlockingLine words it the same everywhere. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -159,9 +179,10 @@ function Get-DemoOptionalItem {
     $open = @($Result | Where-Object { $null -ne $_ -and [string]$_.status -in 'Fail', 'Manual action required' })
     $app = Get-DemoInsightsAppSummary -Result $Result
     # A deployed app that only waits for its browser check is under "Please confirm" instead (Get-DemoConfirmItem).
-    if ($null -ne $app -and $app.Status -eq 'Manual action required' -and -not [bool](Get-DemoMemberValue -InputObject $app -Name 'ConfirmOnly')) {
+    if ($null -ne $app -and [bool](Get-DemoMemberValue -InputObject $app -Name 'Failed')) {
         $items.Add([ordered]@{
-                name    = $(if ($app.Deployed) { 'the Insights app' } else { 'the Insights app (Fabric Apps preview)' })
+                name    = 'the Insights app'
+                state   = 'Failed'
                 message = $app.Reason
                 howTo   = $app.HowTo
             })
@@ -170,6 +191,7 @@ function Get-DemoOptionalItem {
     if ($model.Count -gt 0) {
         $items.Add([ordered]@{
                 name    = 'the history report''s data check'
+                state   = 'Action needed'
                 message = 'The report is deployed; its DAX data check needs a tenant setting.'
                 howTo   = 'A Fabric administrator turns on Dataset Execute Queries REST API; then run ./scripts/configure-powerbi.ps1 -CheckModelData.'
             })
@@ -177,9 +199,36 @@ function Get-DemoOptionalItem {
     return $items.ToArray()
 }
 
+function Format-DemoNonBlockingLine {
+    # One line for an item that didn't work but never blocks DONE (Get-DemoNonBlockingItem), the same on the console, in
+    # DONE and NOT DONE, in DEPLOY.SUMMARY's evidence, and on the status page (2026-11-05): "Failed (doesn't block DONE):
+    # the Insights app. <its actual reason> <how to fix it>". '' for nothing. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $Item
+    )
+
+    if ($null -eq $Item) {
+        return ''
+    }
+    $state = [string](Get-DemoMemberValue -InputObject $Item -Name 'state')
+    if ($state -notin 'Failed', 'Action needed') {
+        $state = 'Failed'
+    }
+    $name = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $Item -Name 'name')
+    $message = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $Item -Name 'message')
+    $howTo = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $Item -Name 'howTo')
+    if (-not $name -and -not $message) {
+        return ''
+    }
+    return (('{0} (doesn''t block DONE): {1}. {2} {3}' -f $state, $name.TrimEnd('.'), $message, $howTo) -replace '\s+', ' ').Trim()
+}
+
 function Test-DemoInsightsAppRecord {
-    # True for a record of the optional Insights app's step: its own checks (FABRIC.APP.*, DEPLOY.FABRIC.APP), or one its
-    # step reported and marked optional (Invoke-DemoFabricAppStage). Internal.
+    # True for a record of the Insights app's step: its own checks (FABRIC.APP.*, DEPLOY.FABRIC.APP), or one its step
+    # reported and marked non-blocking (ConvertTo-DemoInsightsAppRecord). Internal.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -194,17 +243,26 @@ function Test-DemoInsightsAppRecord {
     if ($id -like 'FABRIC.APP.*' -or $id -eq 'DEPLOY.FABRIC.APP') {
         return $true
     }
-    return ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Result -Name 'evidence') -Name 'optional') -eq 'insightsApp')
+    return ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Result -Name 'evidence') -Name 'nonBlocking') -eq 'insightsApp')
 }
 
 function Get-DemoInsightsAppSummary {
     <#
     .SYNOPSIS
-    The optional Insights app's outcome from its step's records, never a Fail (brief item 15; Phase 28 live finding):
-    State (Done or Skipped, for the status page), Status (Pass, Warning, Manual action required, or Not selected), Reason
-    (the first record that kept it from being added, with its check ID), HowTo (that record's own fix, then the
-    sign-in that adds it), StepMessage (both, in one line), and Deployed. $null without any of its records. Pure.
-    Internal.
+    The Insights app's outcome from its step's records (2026-11-05): State for the status page (Done, Failed, or
+    Skipped), Status (the worst status its open records reported, so an error reads Fail), Reason (the first record that
+    kept it from working, with its check ID), HowTo (that record's own fix, then the tenant settings while they're open,
+    then the sign-in that adds it), StepMessage (both, in one line), Deployed, ConfirmOnly, and Failed. $null without any
+    of its records. Pure. Internal.
+
+    .DESCRIPTION
+    The app is part of every deployment, and it never blocks DONE (Test-DemoNonBlockingResult), so this is what shows
+    when it didn't work, never "Skipped" or "Optional" (Phase 28 showed it Skipped):
+    - Not created, or deployed with a check that failed: Failed, with the actual error.
+    - Deployed, with only its browser check open (FABRIC.APP.BROWSER): Done; DONE lists that check under "Please
+      confirm" (Phase 28 live finding).
+    - Deployed and checked: Done.
+    - Only DEPLOY.FABRIC.APP Not selected (this checkout has no configure-fabric-app.ps1): Skipped.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -223,9 +281,9 @@ function Get-DemoInsightsAppSummary {
     $blocking = @($open | Where-Object { [string]$_.checkId -ne 'FABRIC.APP.BROWSER' })
     if ($blocking.Count -gt 0) {
         $first = $blocking[0]
-        $lead = if ($deployed) { 'It''s deployed, but' } else { 'It wasn''t added:' }
-        $reason = '{0} {1}: {2}' -f $lead, [string]$first.checkId, (([string]$first.message) -replace '^Optional Insights app: ', '').TrimEnd()
-        $fix = ([string](Get-DemoMemberValue -InputObject $first -Name 'remediation')).Trim()
+        $lead = if ($deployed) { 'It''s deployed, but' } else { 'It wasn''t created:' }
+        $reason = '{0} {1}: {2}' -f $lead, [string]$first.checkId, ((ConvertTo-DemoPlainText -Value $first.message) -replace '^Insights app: ', '')
+        $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $first -Name 'remediation')
         # Its own fix first (unless it's the sign-in or a tenant setting), then the tenant settings while they're open, then
         # the sign-in that deploys the app.
         $steps = [System.Collections.Generic.List[string]]::new()
@@ -236,32 +294,44 @@ function Get-DemoInsightsAppSummary {
             $steps.Add('a Fabric administrator turns on the tenant settings Fabric Apps (preview) and Dataset Execute Queries REST API, if they aren''t on')
         }
         $steps.Add($signIn)
-        $howTo = 'To add it later: {0}.' -f ($steps -join '; then ')
-        return [pscustomobject]@{ State = $(if ($deployed) { 'Done' } else { 'Skipped' }); Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('Optional. {0} {1}' -f $reason, $howTo); Deployed = $deployed }
+        $howTo = '{0}: {1}.' -f $(if ($deployed) { 'To fix it' } else { 'To add it' }), ($steps -join '; then ')
+        # An error the script reported (evidence reportedStatus Fail) reads Fail here, though its record is non-blocking.
+        $statuses = @(foreach ($item in $blocking) {
+                if ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name 'reportedStatus') -eq 'Fail') { 'Fail' } else { [string]$item.status }
+            })
+        return [pscustomobject]@{ State = 'Failed'; Status = (Get-DemoWorstStatus -Status $statuses); Reason = $reason; HowTo = $howTo; StepMessage = ('{0} {1}' -f $reason, $howTo); Deployed = $deployed; ConfirmOnly = $false; Failed = $true }
     }
     if ($open.Count -gt 0) {
         # Deployed and checked; a person confirms it once in the browser, which a rerun can't do: listed under "Please
-        # confirm", never as optional work left (Phase 28 live finding, 2026-10-30).
-        $reason = 'It''s deployed: {0}' -f ([string]$open[0].message).TrimEnd()
-        $howTo = ([string](Get-DemoMemberValue -InputObject $open[0] -Name 'remediation')).Trim()
-        return [pscustomobject]@{ State = 'Done'; Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('Optional. {0} {1}' -f $reason, $howTo).TrimEnd(); Deployed = $true; ConfirmOnly = $true }
+        # confirm", never as something that didn't work (Phase 28 live finding, 2026-10-30).
+        $reason = 'It''s deployed: {0}' -f (ConvertTo-DemoPlainText -Value $open[0].message)
+        $howTo = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $open[0] -Name 'remediation')
+        return [pscustomobject]@{ State = 'Done'; Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('{0} {1}' -f $reason, $howTo).TrimEnd(); Deployed = $true; ConfirmOnly = $true; Failed = $false }
     }
     if ($deployed) {
         # A Not selected record beside a deploy that passed (the workspace passed in, for example) changes nothing.
         $statuses = @($records | ForEach-Object { [string]$_.status } | Where-Object { $_ -ne 'Not selected' })
         $worst = if ($statuses.Count -gt 0) { Get-DemoWorstStatus -Status $statuses } else { 'Pass' }
-        return [pscustomobject]@{ State = 'Done'; Status = $worst; Reason = 'It''s deployed and checked.'; HowTo = ''; StepMessage = 'Optional: deployed and checked.'; Deployed = $true }
+        $warning = @($records | Where-Object { [string]$_.status -eq 'Warning' } | Select-Object -First 1)
+        $text = if ($warning.Count -gt 0) { 'Deployed and checked; {0}: {1}' -f [string]$warning[0].checkId, (ConvertTo-DemoPlainText -Value $warning[0].message) } else { 'Deployed and checked: open it from its item in the Fabric workspace.' }
+        return [pscustomobject]@{ State = 'Done'; Status = $worst; Reason = 'It''s deployed and checked.'; HowTo = ''; StepMessage = $text; Deployed = $true; ConfirmOnly = $false; Failed = $false }
     }
-    # Not deployed, with nothing for a person to fix: skipped on purpose (a dry run, or a checkout without the app).
-    $skipped = @($records | Where-Object { [string]$_.status -eq 'Not selected' -and [string]$_.checkId -in 'FABRIC.APP.DEPLOY', 'DEPLOY.FABRIC.APP' }) + @($records | Where-Object { [string]$_.status -eq 'Not selected' })
-    $reason = if ($skipped.Count -gt 0) { 'It wasn''t added: {0}' -f ([string]$skipped[0].message).TrimEnd() } else { 'It wasn''t added.' }
-    $howTo = 'To add it later, {0}.' -f $signIn
-    return [pscustomobject]@{ State = 'Skipped'; Status = 'Not selected'; Reason = $reason; HowTo = $howTo; StepMessage = ('Optional. {0} {1}' -f $reason, $howTo); Deployed = $false }
+    # Not created, with nothing open: skipped on purpose only when this checkout has no configure-fabric-app.ps1;
+    # otherwise it didn't work, and its records don't say why.
+    $onPurpose = @($records | Where-Object { [string]$_.checkId -eq 'DEPLOY.FABRIC.APP' -and [string]$_.status -eq 'Not selected' }) | Select-Object -First 1
+    $howTo = 'To add it, {0}.' -f $signIn
+    if ($null -ne $onPurpose) {
+        $reason = 'It wasn''t created: {0}' -f (ConvertTo-DemoPlainText -Value $onPurpose.message)
+        return [pscustomobject]@{ State = 'Skipped'; Status = 'Not selected'; Reason = $reason; HowTo = $howTo; StepMessage = ('{0} {1}' -f $reason, $howTo); Deployed = $false; ConfirmOnly = $false; Failed = $false }
+    }
+    $reason = 'It wasn''t created, and its step didn''t say why.'
+    return [pscustomobject]@{ State = 'Failed'; Status = 'Manual action required'; Reason = $reason; HowTo = $howTo; StepMessage = ('{0} {1}' -f $reason, $howTo); Deployed = $false; ConfirmOnly = $false; Failed = $true }
 }
 
-function Test-DemoOptionalResult {
-    # True for a result that never blocks DONE: the optional Insights app's (Test-DemoInsightsAppRecord), or the history
-    # report's data check waiting for the Execute Queries setting (brief item 15). Internal.
+function Test-DemoNonBlockingResult {
+    # True for a result that never blocks DONE (2026-11-05): the Insights app's (Test-DemoInsightsAppRecord; it's part of
+    # every deployment, but DONE never waits for it), or the history report's data check waiting for the Execute Queries
+    # setting. Internal.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -335,7 +405,7 @@ function Test-DemoConfirmOnlyResult {
     - FABRIC.P5.CAPACITY on an Active capacity whose SKU the check doesn't recognize (a Trial: its SKU name isn't
       documented).
     - HUB.PRESENTER.*: with assignRoles false (the default, ADR 0008), an administrator grants the presenters' roles.
-    - FABRIC.APP.BROWSER: the optional Insights app, confirmed once in the browser.
+    - FABRIC.APP.BROWSER: the Insights app, deployed and confirmed once in the browser.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -412,7 +482,7 @@ function Get-DemoConfirmItem {
     }
     $app = Get-DemoInsightsAppSummary -Result $all
     if ($null -ne $app -and [bool](Get-DemoMemberValue -InputObject $app -Name 'ConfirmOnly')) {
-        & $add 'FABRIC.APP.BROWSER' 'FABRIC.APP.BROWSER' ('The optional Insights app is deployed; confirm it once in the browser. {0}' -f [string]$app.HowTo)
+        & $add 'FABRIC.APP.BROWSER' 'FABRIC.APP.BROWSER' ('The Insights app is deployed; confirm it once in the browser. {0}' -f [string]$app.HowTo)
     }
     return $items.ToArray()
 }
@@ -469,9 +539,10 @@ function Get-DemoDeploySummary {
     <#
     .SYNOPSIS
     DEPLOY.SUMMARY's status, message, and evidence for both deployment paths (Phase 28 live finding, 2026-10-30): Fail
-    with the failed checks; Manual action required with the items a person or a rerun acts on, each with its fix; and
-    the confirm-only items (Get-DemoConfirmItem), each once, saying that none of them keeps the run from DONE. Every
-    text is one plain line (ConvertTo-DemoPlainText). Pure. Internal.
+    with the failed checks; Manual action required with the items a person or a rerun acts on, each with its fix; the
+    confirm-only items (Get-DemoConfirmItem), each once, saying that none of them keeps the run from DONE; and, in every
+    case, what didn't work but never blocks DONE (Get-DemoNonBlockingItem: the Insights app, 2026-11-05). Every text is
+    one plain line (ConvertTo-DemoPlainText). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -485,29 +556,30 @@ function Get-DemoDeploySummary {
     $all = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' })
     $failed = @($all | Where-Object { [string]$_.status -eq 'Fail' })
     $manual = @($all | Where-Object { [string]$_.status -eq 'Manual action required' })
-    $actionable = @($manual | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_ -Context $all) -and -not (Test-DemoOptionalResult -Result $_) })
+    $actionable = @($manual | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_ -Context $all) -and -not (Test-DemoNonBlockingResult -Result $_) })
     $steps = @($actionable | ForEach-Object {
             $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $_ -Name 'remediation')
             '{0}: {1}' -f [string]$_.checkId, $(if ($fix) { $fix } else { ConvertTo-DemoPlainText -Value $_.message })
         })
     $confirm = @(Get-DemoConfirmItem -Result $all | ForEach-Object { [string]$_['text'] })
     $confirmText = if ($confirm.Count -gt 0) { ' Please confirm (none of these keeps the run from DONE): {0}' -f ($confirm -join ' | ') } else { '' }
-    $optional = @(Get-DemoOptionalItem -Result $all | ForEach-Object { [string]$_['name'] })
-    $optionalText = if ($optional.Count -gt 0) { ' Optional, not needed for the demo: {0}.' -f ($optional -join ', ') } else { '' }
+    $nonBlockingItems = @(Get-DemoNonBlockingItem -Result $all)
+    $nonBlocking = @($nonBlockingItems | ForEach-Object { '{0} ({1})' -f [string]$_['name'], ([string]$_['state']).ToLowerInvariant() })
+    $nonBlockingText = if ($nonBlocking.Count -gt 0) { ' Doesn''t block DONE: {0}.' -f ($nonBlocking -join ', ') } else { '' }
     $status = if ($failed.Count -gt 0) { 'Fail' } elseif ($manual.Count -gt 0) { 'Manual action required' } else { 'Pass' }
     $message = if ($failed.Count -gt 0) {
-        '{0} check(s) failed.{1}' -f $failed.Count, $(if ($steps.Count -gt 0) { ' Also {0} item(s) need you: {1}' -f $steps.Count, ($steps -join ' | ') } else { '' })
+        '{0} check(s) failed.{1}{2}' -f $failed.Count, $(if ($steps.Count -gt 0) { ' Also {0} item(s) need you: {1}' -f $steps.Count, ($steps -join ' | ') } else { '' }), $nonBlockingText
     }
     elseif ($steps.Count -gt 0) {
-        '{0} item(s) need you: {1}{2}' -f $steps.Count, ($steps -join ' | '), $confirmText
+        '{0} item(s) need you: {1}{2}{3}' -f $steps.Count, ($steps -join ' | '), $confirmText, $nonBlockingText
     }
     elseif ($manual.Count -gt 0) {
-        '{0} Nothing else needs you for DONE.{1}{2}' -f $FinishedText, $confirmText, $optionalText
+        '{0} Nothing else needs you for DONE.{1}{2}' -f $FinishedText, $confirmText, $nonBlockingText
     }
     else {
         $FinishedText
     }
-    return [pscustomobject]@{ Status = $status; Message = $message.Trim(); Evidence = ([ordered]@{ manual = $steps; confirm = $confirm; failed = @($failed | ForEach-Object { [string]$_.checkId }) }) }
+    return [pscustomobject]@{ Status = $status; Message = $message.Trim(); Evidence = ([ordered]@{ manual = $steps; confirm = $confirm; failed = @($failed | ForEach-Object { [string]$_.checkId }); nonBlocking = @($nonBlockingItems | ForEach-Object { Format-DemoNonBlockingLine -Item $_ }) }) }
 }
 
 function Get-DemoStartedVm {
@@ -646,16 +718,17 @@ function Get-DemoDoneRequirement {
     .SYNOPSIS
     The checks DONE needs to pass (brief item 16; the same list stops ADR 0018's clock): Database Hub's own views of
     every target. HUB.ESTATE.T1 to T4; TELEMETRY.T1, T2, and T3; METRICS.T4; T2.ARC.SQLINSTANCE (Standard with PAYG or
-    Paid) and T2.ARC.MONITORING in PaygWizard and ProductKey modes; T1.SQLVM.ASSOCIATEDSERVICES (T1's inventory); and
-    FABRIC.ITEMS.REQUIRED (the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the history model and
-    report). T4's are left out when T4 is off; Developer mode (opt-in) leaves out T2's performance telemetry and its
-    PAYG and monitoring. The Insights app is never required (item 15). Pure. Internal.
+    Paid) and T2.ARC.MONITORING in JumpstartImage, PaygWizard, and ProductKey modes; T1.SQLVM.ASSOCIATEDSERVICES (T1's
+    inventory); and FABRIC.ITEMS.REQUIRED (the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the
+    history model and report). T4's are left out when T4 is off; Developer mode (opt-in) leaves out T2's performance
+    telemetry and its PAYG and monitoring. The Insights app is part of every deployment, but DONE never needs it
+    (2026-11-05): when it didn't work, DONE says so (Get-DemoNonBlockingItem). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
-        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
-        [string] $InstallMode = 'PaygWizard',
+        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
+        [string] $InstallMode = 'JumpstartImage',
 
         [switch] $T4Off,
 
@@ -721,7 +794,7 @@ function Test-DemoFabricRequiredItem {
     .SYNOPSIS
     FABRIC.ITEMS.REQUIRED (brief item 16): the required Fabric items exist by name, read-only: the workspace and the
     lakehouse (Resolve-DemoFabricConfig without -Create), the notebooks in fabric/notebooks, the Real-Time Dashboard,
-    and the history model and report (Items - List Items). The Insights app isn't required. Internal.
+    and the history model and report (Items - List Items). The Insights app isn't a DONE requirement. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1009,10 +1082,10 @@ function Get-DemoDeploymentOutcome {
     The one ending of a deploy.ps1 run (brief item 1): Kind Done, NotDone, or WhatIf, with Reason, Next (the single next
     action), NextCommand (the exact command), Notes (what DONE states plainly: T4 off and why, T4 on the General Purpose
     fallback with its hourly price from -T4HourlyUsd, "created" only when -T4Created or this run's evidence shows the
-    server, Developer mode's T2),
-    Optional (items that never block DONE), Unfinished (tracks that didn't finish), Missing (DONE requirements without a
-    Pass), and ExitCode: 0 when DONE, 1 when NOT DONE with a Fail, 2 when NOT DONE otherwise; -WhatIfRun is 0 unless a
-    check failed. Pure. Internal.
+    server, a nightly safety stop this run set up only in part (Get-DemoSafetyStopNote, ADR 0024), Developer mode's T2),
+    NonBlocking (what didn't work but never blocks DONE, such as the Insights app; Get-DemoNonBlockingItem), Unfinished
+    (tracks that didn't finish), Missing (DONE requirements without a Pass), and ExitCode: 0 when DONE, 1 when NOT DONE
+    with a Fail, 2 when NOT DONE otherwise; -WhatIfRun is 0 unless a check failed. Pure. Internal.
 
     .DESCRIPTION
     DONE (brief item 16) needs every track this configuration has (T1, T2, T4 unless it's off, and Fabric unless
@@ -1020,7 +1093,9 @@ function Get-DemoDeploymentOutcome {
     (Get-DemoDoneRequirement: Database Hub's own views of every target); no Fail; and no Manual action required except
     what only a person can confirm, which a rerun can't resolve (Test-DemoConfirmOnlyResult: the Hub tenant setting
     that couldn't be read, from either check, decided by its evidence, a capacity SKU, presenters' roles, the app's
-    browser check; Phase 28 live finding, 2026-10-30), and the optional parts (Test-DemoOptionalResult). Confirm, on every
+    browser check; Phase 28 live finding, 2026-10-30), and the non-blocking parts (Test-DemoNonBlockingResult: the
+    Insights app's records, which are part of every deployment but never block DONE, whatever they say, a network error
+    included, so a rerun of the whole deployment is never the next step for them; 2026-11-05). Confirm, on every
     outcome, lists the confirm-only items once each (Get-DemoConfirmItem), which DONE's banner shows under "Please
     confirm". Without a state, this run's DEPLOY.TRACK results stand in. -Sequential (deploy.ps1
     -Sequential, which records stages and no tracks) needs the recorded stage Validation instead of the tracks (or,
@@ -1080,14 +1155,14 @@ function Get-DemoDeploymentOutcome {
 
     $all = @($Result | Where-Object { $null -ne $_ })
     $billing = Get-DemoBillingNote -Config $Config -Name $StartedVm -Command $Command
-    $core = @($all | Where-Object { -not (Test-DemoOptionalResult -Result $_) })
+    $core = @($all | Where-Object { -not (Test-DemoNonBlockingResult -Result $_) })
     $fails = @($core | Where-Object { [string]$_.status -eq 'Fail' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' })
     # Only what a person or a rerun can act on blocks DONE; what only a person can confirm is listed instead.
     $manual = @($core | Where-Object { [string]$_.status -eq 'Manual action required' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' -and -not (Test-DemoConfirmOnlyResult -Result $_ -Context $all) })
-    $optional = @(Get-DemoOptionalItem -Result $all)
+    $nonBlocking = @(Get-DemoNonBlockingItem -Result $all)
     $confirm = @(Get-DemoConfirmItem -Result $all)
     $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
-    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ($Config.Contains('t2SqlInstallMode') -and $Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $t4Off = Get-DemoT4OffReason -Config $Config -State $State -Result $all
     $notes = [System.Collections.Generic.List[string]]::new()
     if ($t4Off) {
@@ -1100,10 +1175,15 @@ function Get-DemoDeploymentOutcome {
     if ($t4Fallback) {
         $notes.Add($t4Fallback)
     }
-    if ($installMode -eq 'Developer') {
-        $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. ProductKey or PaygWizard mode gives them.')
+    # The nightly safety stop (ADR 0024), said plainly when this run set it up only in part, such as without its role.
+    $safetyStop = Get-DemoSafetyStopNote -Result $all
+    if ($safetyStop) {
+        $notes.Add($safetyStop)
     }
-    $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); Optional = $optional; Confirm = $confirm; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume }
+    if ($installMode -eq 'Developer') {
+        $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default), PaygWizard, or ProductKey mode gives them.')
+    }
+    $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); NonBlocking = $nonBlocking; Confirm = $confirm; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume }
     if ($WhatIfRun) {
         $outcome.Kind = 'WhatIf'
         $outcome.ExitCode = if ($fails.Count -gt 0) { 1 } else { 0 }
@@ -1175,7 +1255,10 @@ function Get-DemoDeploymentOutcome {
         $performance = if ($installMode -eq 'Developer') { 'performance telemetry from T1 and T3' } else { 'performance telemetry from T1, T2, and T3' }
         $metrics = if ($t4Off) { '' } else { ' and T4''s Azure Monitor metrics' }
         $t2 = if ($installMode -eq 'Developer') { '' } else { ' T2 runs SQL Server Standard with pay-as-you-go (or your license) and monitoring on.' }
-        $fabricText = if ($SkipFabric) { ' Fabric was skipped (-SkipFabric).' } else { ' Fabric has the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the history report.' }
+        # The Insights app, part of every deployment, when this run's records show it deployed and working.
+        $app = Get-DemoInsightsAppSummary -Result $all
+        $appText = if ($null -ne $app -and [bool]$app.Deployed -and -not [bool]$app.Failed) { ' the history report, and the Insights app' } else { ' and the history report' }
+        $fabricText = if ($SkipFabric) { ' Fabric was skipped (-SkipFabric).' } else { ' Fabric has the workspace, the lakehouse, the notebooks, the Real-Time Dashboard,{0}.' -f $appText }
         $outcome.Reason = 'Database Hub shows every target: {0} in Estate, with {1}{2}.{3}{4}' -f $targets, $performance, $metrics, $t2, $fabricText
         return [pscustomobject]$outcome
     }
@@ -1264,12 +1347,18 @@ function Get-DemoDeploymentOutcomeLine {
     $lines = [System.Collections.Generic.List[string]]::new()
     # Get-DemoMemberValue returns an array whole, so the notes are assigned first: each note is then its own line.
     $notes = Get-DemoMemberValue -InputObject $Outcome -Name 'Notes'
+    # What didn't work but never blocks DONE (the Insights app; 2026-11-05), one line each, as on the status page.
+    $nonBlockingValue = Get-DemoMemberValue -InputObject $Outcome -Name 'NonBlocking'
+    $nonBlocking = @(@($nonBlockingValue) | Where-Object { $null -ne $_ } | ForEach-Object { Format-DemoNonBlockingLine -Item $_ } | Where-Object { $_ })
     switch ($Outcome.Kind) {
         'Done' {
             foreach ($line in (Get-DemoBannerLine -Title 'DONE')) { $lines.Add($line) }
             $lines.Add(('The demo is complete. {0}{1}' -f $Outcome.Reason, $(if ($Minutes -gt 0) { ' This run took {0} minutes.' -f $Minutes } else { '' })))
             foreach ($note in @($notes)) {
                 if ($note) { $lines.Add([string]$note) }
+            }
+            foreach ($line in $nonBlocking) {
+                $lines.Add($line)
             }
             # What only a person can confirm, once each; none of it kept the run from DONE (Phase 28 live finding).
             $confirmValue = Get-DemoMemberValue -InputObject $Outcome -Name 'Confirm'
@@ -1285,9 +1374,6 @@ function Get-DemoDeploymentOutcomeLine {
             $activityLine = [string](Get-DemoMemberValue -InputObject $Outcome -Name 'Activity')
             if ($activityLine) {
                 $lines.Add($activityLine)
-            }
-            foreach ($item in @($Outcome.Optional)) {
-                $lines.Add(('Optional, not needed for the demo: {0}. {1} {2}' -f $item['name'], $item['message'], $item['howTo']))
             }
             $lines.Add('Each session: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.')
             $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip the build and the guided stop.')
@@ -1307,8 +1393,8 @@ function Get-DemoDeploymentOutcomeLine {
             foreach ($note in @($notes)) {
                 if ($note) { $lines.Add([string]$note) }
             }
-            foreach ($item in @($Outcome.Optional)) {
-                $lines.Add(('Optional, not needed for the demo: {0}. {1} {2}' -f $item['name'], $item['message'], $item['howTo']))
+            foreach ($line in $nonBlocking) {
+                $lines.Add($line)
             }
         }
     }

@@ -31,9 +31,39 @@
 
     # Pinned media names in the bundle manifest (config/versions.json media).
     Media            = @{
-        WindowsServer = 'windowsServer2022Eval'
-        SqlServer     = 'sqlServer2022'
-        SqlDeveloper  = 'sqlServer2022Developer'
+        WindowsServer  = 'windowsServer2022Eval'
+        SqlServer      = 'sqlServer2022'
+        SqlDeveloper   = 'sqlServer2022Developer'
+        JumpstartImage = 'jumpstartArcBoxSqlStd'
+    }
+
+    # JumpstartImage mode (ADR 0006, amendment of 2026-11-05): Arc Jumpstart's prebuilt SQL Server 2022 Standard guest
+    # disk, a dynamic VHDX with a 100 GiB maximum. The space check needs the download plus GrowthAllowanceGB and the
+    # margin, not the maximum: the guest's database files are capped (database/arcsql01), and status.ps1 warns at
+    # Storage.LowSpaceWarningGB (user decision, 2026-11-05: no shrink). The first boot stops and disables
+    # AssociatedServices and uninstalls UninstallFeatures with SQL Server setup, as on T1 (vm/dsc/sqlvm.psd1).
+    JumpstartImage   = @{
+        GrowthAllowanceGB     = 20
+        BufferMB              = 4
+        CredentialWaitMinutes = 15
+        SetupTimeoutMinutes   = 30
+        AssociatedServices    = @('MsDtsServer160', 'SSISTELEMETRY160', 'MSSQLLaunchpad')
+        UninstallFeatures     = 'IS'
+    }
+
+    # Free space on the drive that holds the guest's disk: health.json reports it, and status.ps1 warns below this.
+    Storage          = @{
+        LowSpaceWarningGB = 20
+    }
+
+    # The guest's Windows evaluation (the build modes' guests come from the evaluation ISO): a guard after each pass that
+    # finds the host Ready checks it at most every CheckIntervalHours and, with RearmDays or fewer left, a rearm left, and
+    # no activity profile running, runs slmgr.vbs /rearm, restarts the guest, and activates it online (/ato). A guest
+    # that isn't an evaluation, such as the Jumpstart image's Windows Server 2022 Standard, is only recorded.
+    # https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options
+    Evaluation       = @{
+        RearmDays          = 30
+        CheckIntervalHours = 24
     }
 
     # PaygWizard: the WebView2 runtime, which Windows Server 2022 doesn't include, installed in the guest before the setup

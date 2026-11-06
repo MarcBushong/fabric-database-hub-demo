@@ -106,7 +106,7 @@ Describe 'Invoke-DemoPowerBIStage and Invoke-DemoFabricAppStage' {
         }
     }
 
-    It 'passes the workspace the Fabric step resolved, and never reports the optional app as a Fail (Phase 28 live finding)' {
+    It 'passes the workspace the Fabric step resolved, and never reports the Insights app as a Fail of the run, while its own row reads Fail (Phase 28 live finding; 2026-11-05)' {
         # Live: the app's own lookup of the workspace, right after the Fabric step created it, failed; the app was
         # skipped with a Fail, and nothing said why.
         $workspaceId = '44444444-4444-4444-4444-444444444444'
@@ -126,21 +126,79 @@ Describe 'Invoke-DemoPowerBIStage and Invoke-DemoFabricAppStage' {
         $listed.status | Should -Be 'Manual action required'
         $listed.evidence.reportedStatus | Should -Be 'Fail'
         $listed.evidence.statusCode | Should -Be 429
-        $listed.message | Should -Match '^Optional Insights app: Your Fabric workspaces couldn''t be listed'
+        $listed.message | Should -Match '^Insights app: Your Fabric workspaces couldn''t be listed'
+        # In deploy.ps1 the app is always selected, so a deploy that didn't happen is something to act on, never a choice.
+        $deploy = $records | Where-Object { $_.checkId -eq 'FABRIC.APP.DEPLOY' }
+        $deploy.status | Should -Be 'Manual action required'
+        $deploy.evidence.reportedStatus | Should -Be 'Not selected'
+        $deploy.remediation | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
         foreach ($record in $records) {
-            $record.evidence.optional | Should -Be 'insightsApp' -Because $record.checkId
-            (& (Get-Module -Name DbHubDemo) { param($r) Test-DemoOptionalResult -Result $r } $record) | Should -BeTrue -Because ('{0} never blocks DONE' -f $record.checkId)
+            $record.evidence.nonBlocking | Should -Be 'insightsApp' -Because $record.checkId
+            (& (Get-Module -Name DbHubDemo) { param($r) Test-DemoNonBlockingResult -Result $r } $record) | Should -BeTrue -Because ('{0} never blocks DONE' -f $record.checkId)
         }
         $summary = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoInsightsAppSummary -Result $r } $records
-        $summary.State | Should -Be 'Skipped'
-        $summary.Status | Should -Be 'Manual action required'
-        $summary.Reason | Should -Match ([regex]::Escape('It wasn''t added: FABRIC.RESOLVE.WORKSPACE: Your Fabric workspaces couldn''t be listed: HTTP 429'))
-        $summary.HowTo | Should -Match 'Check your Fabric access'
+        $summary.State | Should -Be 'Failed'
+        $summary.Status | Should -Be 'Fail'
+        $summary.Failed | Should -BeTrue
+        $summary.Reason | Should -Match ([regex]::Escape('It wasn''t created: FABRIC.RESOLVE.WORKSPACE: Your Fabric workspaces couldn''t be listed: HTTP 429'))
+        $summary.HowTo | Should -Match '^To add it: Check your Fabric access'
         $summary.HowTo | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
+        $summary.StepMessage | Should -Not -Match '(?i)optional'
 
         # Without a resolved workspace, the script looks it up itself, as before.
         $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoFabricAppStage -Config $c -WorkspaceId '' } $config
         $script:stepArgument.Contains('WorkspaceId') | Should -BeFalse
+    }
+
+    It 'asks for configure-fabric-app.ps1, never a rerun of the whole deployment, when a network error stopped the app''s step (2026-11-05)' {
+        # Invoke-DemoFabricScriptStep's own record for a network error says to run deploy.ps1 again, which is right for the
+        # steps DONE needs, but not for the app, which DONE never waits for.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricScriptStep -MockWith {
+            New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'configure-fabric-app.ps1 stopped: A network error reached api.fabric.microsoft.com on each of 4 attempts: The SSL connection could not be established.' -Evidence ([ordered]@{ networkError = $true }) -Remediation 'Run ./scripts/deploy.ps1 again: it resumes where it stopped. A network error stopped it (requests that are safe to repeat were retried).'
+        }
+        $records = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoFabricAppStage -Config $c } $config)
+        $records.Count | Should -Be 1
+        $records[0].status | Should -Be 'Manual action required'
+        $records[0].evidence.networkError | Should -BeTrue
+        $records[0].evidence.reportedStatus | Should -Be 'Fail'
+        $records[0].remediation | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
+        $records[0].remediation | Should -Not -Match 'deploy\.ps1'
+        (& (Get-Module -Name DbHubDemo) { param($r) Test-DemoNonBlockingResult -Result $r } $records[0]) | Should -BeTrue
+        $summary = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoInsightsAppSummary -Result $r } $records
+        $summary.State | Should -Be 'Failed'
+        $summary.Reason | Should -Match 'A network error reached api\.fabric\.microsoft\.com'
+        $summary.HowTo | Should -Not -Match 'deploy\.ps1'
+    }
+
+    It 'reads the app''s state from its records: Done, Done with the browser check to confirm, Failed while deployed, or Skipped only without the script (2026-11-05)' {
+        $module = Get-Module -Name DbHubDemo
+        $record = {
+            param([string] $CheckId, [string] $Status, [string] $Message = 'x', [string] $Remediation = '')
+            & $module { param($i, $s, $m, $f) ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId $i -Area 'fabric' -Target 'fabric' -Status $s -Message $m -Remediation $f) } $CheckId $Status $Message $Remediation
+        }
+        $summary = { param([object[]] $Records) & $module { param($r) Get-DemoInsightsAppSummary -Result $r } $Records }
+
+        $checked = & $summary @((& $record 'FABRIC.APP.DEPLOY' 'Pass'), (& $record 'FABRIC.APP.QUERIES' 'Pass'))
+        $checked.State | Should -Be 'Done'
+        $checked.Failed | Should -BeFalse
+        $checked.Deployed | Should -BeTrue
+
+        $browser = & $summary @((& $record 'FABRIC.APP.DEPLOY' 'Pass'), (& $record 'FABRIC.APP.BROWSER' 'Manual action required' 'Confirm it in the browser.' 'Open its item.'))
+        $browser.State | Should -Be 'Done'
+        $browser.ConfirmOnly | Should -BeTrue
+        $browser.Failed | Should -BeFalse
+
+        $broken = & $summary @((& $record 'FABRIC.APP.DEPLOY' 'Pass'), (& $record 'FABRIC.APP.QUERIES' 'Fail' 'Every query failed: HTTP 401.' 'Turn on Dataset Execute Queries REST API.'))
+        $broken.State | Should -Be 'Failed'
+        $broken.Status | Should -Be 'Fail'
+        $broken.Reason | Should -Be 'It''s deployed, but FABRIC.APP.QUERIES: Every query failed: HTTP 401.'
+        $broken.HowTo | Should -Match '^To fix it: Turn on Dataset Execute Queries REST API'
+
+        $skipped = & $summary @((New-DemoResult -CheckId 'DEPLOY.FABRIC.APP' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'scripts/configure-fabric-app.ps1 (Phase 19b) isn''t in this checkout, so the Insights app wasn''t deployed.'))
+        $skipped.State | Should -Be 'Skipped'
+        $skipped.Failed | Should -BeFalse
+
+        (& $summary @((New-DemoResult -CheckId 'FABRIC.ITEMS.REQUIRED' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'The workspace has every item.'))) | Should -BeNullOrEmpty
     }
 
     It 'finds the workspace configure-fabric.ps1 resolved: found, created, or the override, and not a failed one' {
@@ -154,6 +212,106 @@ Describe 'Invoke-DemoPowerBIStage and Invoke-DemoFabricAppStage' {
         & $module { param($r) Get-DemoResolvedWorkspaceId -Result $r } @((& $resolved 'Fail' '66666666-6666-6666-6666-666666666666')) | Should -Be ''
         & $module { param($r) Get-DemoResolvedWorkspaceId -Result $r } @((& $resolved 'Pass' '00000000-0000-0000-0000-000000000000')) | Should -Be ''
         & $module { param($r) Get-DemoResolvedWorkspaceId -Result $r } @() | Should -Be ''
+    }
+}
+
+Describe 'Invoke-DemoInsightsAppStep (2026-11-05)' {
+    BeforeEach {
+        $config = New-TestConfig
+        $script:warned = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ($PesterBoundParameters['Level'] -eq 'Warning') { $script:warned.Add([string]$PesterBoundParameters['Message']) } }
+        $script:progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        & (Get-Module -Name DbHubDemo) { param($p) Initialize-DemoProgress -Path $p -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false } $script:progress
+        $script:readRow = {
+            $model = Get-Content -LiteralPath $script:progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+            @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Fabric.App') { $item } } })[0]
+        }
+        $script:invoke = { & (Get-Module -Name DbHubDemo) { param($c, $p) Invoke-DemoInsightsAppStep -Config $c -ProgressPath $p } $config $script:progress }
+    }
+
+    It 'turns an exception into the app''s own record and a Failed row with the error, and never throws' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { throw [System.InvalidOperationException]::new('The stage folder is locked by another process.') }
+        $records = @(& $script:invoke)
+        $records.Count | Should -Be 1
+        $records[0].checkId | Should -Be 'DEPLOY.FABRIC.APP'
+        $records[0].status | Should -Be 'Manual action required'
+        $records[0].evidence.reportedStatus | Should -Be 'Fail'
+        $records[0].evidence.nonBlocking | Should -Be 'insightsApp'
+        $records[0].message | Should -Be 'The Insights app step stopped: The stage folder is locked by another process.'
+        $row = & $script:readRow
+        $row['state'] | Should -Be 'Failed'
+        $row['status'] | Should -Be 'Fail'
+        $row['message'] | Should -Match ([regex]::Escape('It wasn''t created: DEPLOY.FABRIC.APP: The Insights app step stopped: The stage folder is locked by another process.'))
+        @($script:warned).Count | Should -Be 1
+        $script:warned[0] | Should -Match '^The Insights app step failed; it doesn''t block DONE, and the deployment goes on\.'
+    }
+
+    It 'contains a network error and a timeout as the app''s failure, with configure-fabric-app.ps1 as the fix' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith {
+            $failure = [System.Net.Http.HttpRequestException]::new('A network error reached api.fabric.microsoft.com on each of 4 attempts: The SSL connection could not be established.')
+            throw $failure
+        }
+        $records = @(& $script:invoke)
+        $records[0].evidence.networkError | Should -BeTrue
+        $records[0].remediation | Should -Not -Match 'deploy\.ps1'
+        (& $script:readRow)['state'] | Should -Be 'Failed'
+
+        # An HTTP client's timeout is a TaskCanceledException, an OperationCanceledException: it's the app's failure, not a
+        # stop of the run, while nobody pressed Ctrl+C.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $false }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { throw [System.Threading.Tasks.TaskCanceledException]::new('The request was canceled due to the configured HttpClient.Timeout of 100 seconds elapsing.') }
+        $records = @(& $script:invoke)
+        $records[0].message | Should -Match 'HttpClient\.Timeout of 100 seconds'
+        (& $script:readRow)['state'] | Should -Be 'Failed'
+
+        # rayfin up that ran past its time limit is the script's own Fail record.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith {
+            & (Get-Module -Name DbHubDemo) { ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code -1, 1200 s): node did not finish within 1200 seconds and was stopped.' -Remediation 'Fix the reported problem and run the script again; nothing is deleted, and a re-run reuses the item.') }
+        }
+        $null = & $script:invoke
+        $row = & $script:readRow
+        $row['state'] | Should -Be 'Failed'
+        $row['message'] | Should -Match 'did not finish within 1200 seconds'
+    }
+
+    It 'lets a stop of the run through, and nothing else' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { throw [System.OperationCanceledException]::new('deploy.ps1 was stopped (Ctrl+C).') }
+        { & $script:invoke } | Should -Throw -ExceptionType ([System.OperationCanceledException])
+    }
+
+    It 'shows a deployed and checked app as Done, and a missing sign-in as Failed with the sign-in to run' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith {
+            & (Get-Module -Name DbHubDemo) {
+                foreach ($record in @(
+                        (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'rayfin up deployed the Fabric app item APP_DatabaseHub_Insights in 40 s.')
+                        (New-DemoResult -CheckId 'FABRIC.APP.QUERIES' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Every query returned rows.')
+                    )) {
+                    ConvertTo-DemoInsightsAppRecord -Record $record
+                }
+            }
+        }
+        $null = & $script:invoke
+        $row = & $script:readRow
+        $row['state'] | Should -Be 'Done'
+        @($script:warned).Count | Should -Be 0
+
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith {
+            & (Get-Module -Name DbHubDemo) {
+                foreach ($record in @(
+                        (New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Rayfin CLI isn''t signed in, so the app can''t be deployed unattended.' -Remediation 'Sign in once as the demo''s Fabric user.')
+                        (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'Not deployed: FABRIC.APP.SIGNIN needs attention first.')
+                    )) {
+                    ConvertTo-DemoInsightsAppRecord -Record $record
+                }
+            }
+        }
+        $null = & $script:invoke
+        $row = & $script:readRow
+        $row['state'] | Should -Be 'Failed'
+        $row['status'] | Should -Be 'Manual action required'
+        $row['message'] | Should -Match ([regex]::Escape('It wasn''t created: FABRIC.APP.SIGNIN: The Rayfin CLI isn''t signed in'))
+        $row['message'] | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
     }
 }
 
