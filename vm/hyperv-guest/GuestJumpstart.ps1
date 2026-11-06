@@ -720,7 +720,7 @@ $script:DemoJumpstartSqlBlock = {
 $script:DemoJumpstartCleanupBlock = {
     param($ServiceNames, $Features, $InstanceName, $JumpstartFolder, $SetupTimeoutMinutes)
     $ErrorActionPreference = 'Stop'
-    $result = [ordered]@{ disabled = @(); uninstall = $null; folderRemoved = $false; arcReset = '' }
+    $result = [ordered]@{ disabled = @(); uninstall = $null; folder = [string]$JumpstartFolder; folderRemoved = $false; arcReset = '' }
     foreach ($name in @($ServiceNames)) {
         $service = Get-Service -Name $name -ErrorAction SilentlyContinue
         if ($service) {
@@ -890,9 +890,16 @@ function Invoke-DemoJumpstartFirstBoot {
     # Every typed argument is in parentheses: in argument mode, [string]$x is an expandable string, not a cast (live finding,
     # 2026-11-06: the cleanup got "[string]System.Collections.Hashtable[jumpstartFolder]" and never deleted C:\Jumpstart).
     $cleanup = Invoke-Command -VMName $name -Credential $credential -ScriptBlock $script:DemoJumpstartCleanupBlock -ArgumentList @($settings.AssociatedServices), ([string]$settings.UninstallFeatures), ([string]$Context.Guest.Sql.InstanceName), ([string]$expected['jumpstartFolder']), ([int]$settings.SetupTimeoutMinutes) -ErrorAction Stop
+    $uninstallText = 'nothing to uninstall'
     if ($null -ne $cleanup.uninstall) {
         $exitCode = $cleanup.uninstall.exitCode
-        if ([bool]$cleanup.uninstall.serviceLeft -or ($null -ne $exitCode -and [int]$exitCode -notin 0, 3010)) {
+        $uninstalled = -not ([bool]$cleanup.uninstall.serviceLeft -or ($null -ne $exitCode -and [int]$exitCode -notin 0, 3010))
+        $uninstallText = '{0} {1} with setup ({2}{3})' -f $settings.UninstallFeatures, $(if ($uninstalled) { 'uninstalled' } else { 'not uninstalled' }), $(if ($null -eq $exitCode) { 'no exit code' } else { 'exit code {0}' -f $exitCode }), $(if ($cleanup.uninstall.finalResult) { ', final result "{0}"' -f $cleanup.uninstall.finalResult } else { '' })
+    }
+    # What the cleanup did, logged before a restart can end this pass.
+    Write-DemoVmLog -Message ('The guest''s cleanup: {0} service(s) stopped and disabled; {1}; {2} {3}{4}.' -f @($cleanup.disabled).Count, $uninstallText, $cleanup.folder, $(if ([bool]$cleanup.folderRemoved) { 'removed' } else { 'absent' }), $(if ($cleanup.arcReset) { '; Arc identity ' + $cleanup.arcReset } else { '' }))
+    if ($null -ne $cleanup.uninstall) {
+        if (-not $uninstalled) {
             $warnings += ('Uninstalling {0} in {1} didn''t pass (setup {2}, exit code {3}, final result "{4}"); its services stay stopped and disabled, and Arc''s inventory may list it as another instance.' -f $settings.UninstallFeatures, $name, $(if ($cleanup.uninstall.setup) { $cleanup.uninstall.setup } else { 'not found' }), $(if ($null -eq $exitCode) { 'none' } else { $exitCode }), $cleanup.uninstall.finalResult)
         }
         if ($null -ne $exitCode -and [int]$exitCode -eq 3010) {
@@ -922,7 +929,7 @@ function Invoke-DemoJumpstartFirstBoot {
         warnings           = @($warnings)
     }
     Write-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $Context).FirstBoot -InputObject $record -Redact
-    Write-DemoVmLog -Message ('The Jumpstart guest is {0}: renamed, password replaced, SQL Server prepared, extras removed, and on {1}.' -f $name, $Context.Host.SwitchName)
+    Write-DemoVmLog -Message ('The Jumpstart guest {0} finished its first boot and is on {1}.' -f $name, $Context.Host.SwitchName)
     if ($warnings.Count -gt 0) {
         return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $warnings)
     }

@@ -414,10 +414,8 @@ Describe 'The image request (live finding, 2026-11-06)' {
 }
 
 Describe 'The first boot' {
-    It 'hands the cleanup its real values: the services, the feature, the instance, the folder, and the timeout (live finding, 2026-11-06)' {
-        # In argument mode an unparenthesized [string]$x is an expandable string, not a cast: the cleanup got
-        # "[string]System.Collections.Hashtable[jumpstartFolder]" for the folder, so C:\Jumpstart was never deleted.
-        $context = New-TestJumpstartContext
+    BeforeEach {
+        $script:context = New-TestJumpstartContext
         Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = 'Running' } }
         Mock -CommandName Wait-DemoGuestHeartbeat -MockWith { $true }
         Mock -CommandName Get-DemoJumpstartPin -MockWith { New-TestPin -Size 1 }
@@ -427,6 +425,7 @@ Describe 'The first boot' {
             [System.Management.Automation.PSCredential]::new('Administrator', $secure)
         }
         Mock -CommandName Test-DemoGuestAdapterConnected -MockWith { $true }
+        $script:cleanupResult = [pscustomobject]@{ disabled = @(); uninstall = $null; folder = 'C:\Jumpstart'; folderRemoved = $true; arcReset = '' }
         $script:guestCalls = @{}
         Mock -CommandName Invoke-Command -MockWith {
             # Each guest block is told apart by its first parameter.
@@ -438,19 +437,40 @@ Describe 'The first boot' {
             switch ($first) {
                 'NewName' { [pscustomobject]@{ oldName = 'arcsql01'; renamed = $false; timeZone = 'UTC' } }
                 'ServerName' { [pscustomobject]@{ oldServerName = 'arcsql01'; serverRenamed = $false; sysadminGroupAdded = $false; loginsDisabled = @(); databasesDropped = @(); restarted = $false } }
-                'ServiceNames' { [pscustomobject]@{ disabled = @(); uninstall = $null; folderRemoved = $true; arcReset = '' } }
+                'ServiceNames' { $script:cleanupResult }
             }
         }
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-DemoVmLog -MockWith { $script:logged.Add([string]$Message) }
+    }
 
-        Invoke-DemoJumpstartFirstBoot -Context $context | Should -BeNullOrEmpty
+    It 'hands the cleanup its real values: the services, the feature, the instance, the folder, and the timeout (live finding, 2026-11-06)' {
+        # In argument mode an unparenthesized [string]$x is an expandable string, not a cast: the cleanup got
+        # "[string]System.Collections.Hashtable[jumpstartFolder]" for the folder, so C:\Jumpstart was never deleted.
+        Invoke-DemoJumpstartFirstBoot -Context $script:context | Should -BeNullOrEmpty
         $cleanup = $script:guestCalls['ServiceNames']
         $cleanup.Count | Should -Be 5
-        @($cleanup[0]) | Should -Be @($context.Host.JumpstartImage.AssociatedServices)
-        $cleanup[1] | Should -BeExactly ([string]$context.Host.JumpstartImage.UninstallFeatures)
+        @($cleanup[0]) | Should -Be @($script:context.Host.JumpstartImage.AssociatedServices)
+        $cleanup[1] | Should -BeExactly ([string]$script:context.Host.JumpstartImage.UninstallFeatures)
         $cleanup[2] | Should -BeExactly 'MSSQLSERVER'
         $cleanup[3] | Should -BeExactly 'C:\Jumpstart'
-        $cleanup[4] | Should -Be ([int]$context.Host.JumpstartImage.SetupTimeoutMinutes)
-        (Read-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $context).FirstBoot)['jumpstartFolder'] | Should -Be 'removed'
+        $cleanup[4] | Should -Be ([int]$script:context.Host.JumpstartImage.SetupTimeoutMinutes)
+        (Read-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $script:context).FirstBoot)['jumpstartFolder'] | Should -Be 'removed'
+    }
+
+    It 'logs what the cleanup did, not "extras removed": <Case>' -ForEach @(
+        @{ Case = 'the folder removed, nothing to uninstall'; Cleanup = @{ disabled = @('MSSQLLaunchpad'); uninstall = $null; folder = 'C:\Jumpstart'; folderRemoved = $true; arcReset = '' }; Expect = @('1 service\(s\) stopped and disabled', 'nothing to uninstall', 'C:\\Jumpstart removed'); Warnings = 0 }
+        @{ Case = 'IS uninstalled, the folder already gone'; Cleanup = @{ disabled = @('MsDtsServer160', 'SSISTELEMETRY160', 'MSSQLLaunchpad'); uninstall = @{ setup = 'C:\Jumpstart\SQL\setup.exe'; exitCode = 0; finalResult = 'Passed'; serviceLeft = $false }; folder = 'C:\Jumpstart'; folderRemoved = $false; arcReset = 'reset' }; Expect = @('3 service\(s\)', 'IS uninstalled with setup \(exit code 0, final result "Passed"\)', 'C:\\Jumpstart absent', 'Arc identity reset'); Warnings = 0 }
+        @{ Case = 'the uninstall failed'; Cleanup = @{ disabled = @('MsDtsServer160'); uninstall = @{ setup = 'C:\Jumpstart\SQL\setup.exe'; exitCode = 1603; finalResult = 'Failed'; serviceLeft = $true }; folder = 'C:\Jumpstart'; folderRemoved = $true; arcReset = '' }; Expect = @('IS not uninstalled with setup \(exit code 1603, final result "Failed"\)', 'C:\\Jumpstart removed'); Warnings = 1 }
+    ) {
+        $script:cleanupResult = [pscustomobject]$Cleanup
+        $result = Invoke-DemoJumpstartFirstBoot -Context $script:context
+        $text = $script:logged -join "`n"
+        foreach ($pattern in $Expect) {
+            $text | Should -Match $pattern
+        }
+        $text | Should -Not -Match 'extras removed'
+        @($result | Where-Object { $null -ne $_ } | ForEach-Object { $_.WarningMessage }).Count | Should -Be $Warnings
     }
 }
 
