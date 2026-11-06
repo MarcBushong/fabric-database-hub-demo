@@ -66,27 +66,59 @@ function Get-DemoJumpstartRemoteFact {
     }
 }
 
-function Open-DemoJumpstartDownload {
-    # GET on the image from Offset (an HTTP Range request when Offset > 0). Returns the response stream, the status code,
-    # Content-Range, and the response to close. Tests mock it with a MemoryStream.
+function New-DemoJumpstartDownloadRequest {
+    <#
+    .SYNOPSIS
+    The GET for the image from Offset, not sent yet. A resumed download asks for a closed range, bytes=Offset-(Length-1):
+    Blob storage serves an anonymous request without x-ms-version at its earliest service version, which takes only that
+    form, so an open-ended range (bytes=Offset-) got the whole file and every resume started over (live finding,
+    2026-11-06). No x-ms-version is sent: it changes the format of the ETag that the sidecar and the pin compare.
+
+    .NOTES
+    https://learn.microsoft.com/rest/api/storageservices/specifying-the-range-header-for-blob-service-operations
+    https://learn.microsoft.com/rest/api/storageservices/versioning-for-the-azure-storage-services
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory object only.')]
     [CmdletBinding()]
-    [OutputType([pscustomobject])]
+    [OutputType([System.Net.HttpWebRequest])]
     param(
         [Parameter(Mandatory = $true)]
         [string] $Uri,
 
-        [long] $Offset = 0
+        [long] $Offset = 0,
+
+        [Parameter(Mandatory = $true)]
+        [long] $Length
     )
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $request = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($Uri)
     $request.Method = 'GET'
     $request.AllowAutoRedirect = $true
     $request.Timeout = 120000
     $request.ReadWriteTimeout = 300000
     if ($Offset -gt 0) {
-        $request.AddRange([long]$Offset)
+        $request.AddRange([long]$Offset, [long]($Length - 1))
     }
+    return $request
+}
+
+function Open-DemoJumpstartDownload {
+    # Sends New-DemoJumpstartDownloadRequest's GET for the image of Length bytes from Offset. Returns the response stream,
+    # the status code, Content-Range, and the response to close. Tests mock it with a MemoryStream.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Uri,
+
+        [long] $Offset = 0,
+
+        [Parameter(Mandatory = $true)]
+        [long] $Length
+    )
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $request = New-DemoJumpstartDownloadRequest -Uri $Uri -Offset $Offset -Length $Length
     $response = [System.Net.HttpWebResponse]$request.GetResponse()
     return [pscustomobject]@{
         Stream       = $response.GetResponseStream()
@@ -136,25 +168,6 @@ function New-DemoJumpstartHasher {
         Md5    = $md5
         Sha256 = New-DemoJumpstartHashAlgorithm -Name 'SHA256'
     }
-}
-
-function Add-DemoJumpstartHashBlock {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [pscustomobject] $Hasher,
-
-        [Parameter(Mandatory = $true)]
-        [byte[]] $Buffer,
-
-        [Parameter(Mandatory = $true)]
-        [int] $Count
-    )
-
-    if ($null -ne $Hasher.Md5) {
-        [void]$Hasher.Md5.TransformBlock($Buffer, 0, $Count, $null, 0)
-    }
-    [void]$Hasher.Sha256.TransformBlock($Buffer, 0, $Count, $null, 0)
 }
 
 function Complete-DemoJumpstartHash {
@@ -293,8 +306,12 @@ function Save-DemoJumpstartImage {
     }
     Write-DemoVmJsonFile -Path $sidecar -InputObject ([ordered]@{ url = $uri; etag = $remote.ETag; startedUtc = (Get-DemoVmUtcNow) })
 
+    # The copy loops below call .NET methods only, never a PowerShell function: Windows PowerShell 5.1 checks a
+    # mandatory array parameter by walking every element, so a hash function called per chunk walked the whole 4 MiB
+    # buffer for each network read and held the 34 GiB download to 0.2 MB/s (live finding, 2026-11-06).
     $hasher = New-DemoJumpstartHasher
-    $buffer = New-Object -TypeName 'byte[]' -ArgumentList ([int]$settings.BufferMB * 1MB)
+    $bufferBytes = [int]$settings.BufferMB * 1MB
+    $buffer = New-Object -TypeName 'byte[]' -ArgumentList $bufferBytes
     $offset = [long]0
     if (Test-Path -LiteralPath $partial) {
         $offset = (Get-Item -LiteralPath $partial).Length
@@ -304,10 +321,15 @@ function Save-DemoJumpstartImage {
         }
         elseif ($offset -gt 0) {
             # A resumed download: the bytes already on disk go through the hashes first.
+            $md5Algorithm = $hasher.Md5
+            $sha256Algorithm = $hasher.Sha256
             $existing = [System.IO.File]::OpenRead($partial)
             try {
-                while (($count = $existing.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                    Add-DemoJumpstartHashBlock -Hasher $hasher -Buffer $buffer -Count $count
+                while (($count = $existing.Read($buffer, 0, $bufferBytes)) -gt 0) {
+                    if ($null -ne $md5Algorithm) {
+                        [void]$md5Algorithm.TransformBlock($buffer, 0, $count, $null, 0)
+                    }
+                    [void]$sha256Algorithm.TransformBlock($buffer, 0, $count, $null, 0)
                 }
             }
             finally {
@@ -321,11 +343,12 @@ function Save-DemoJumpstartImage {
             $resumeText = ', resuming at {0:N1} GiB' -f ($offset / 1GB)
         }
         Write-DemoVmLog -Message ('Downloading the Jumpstart image ({0:N1} GiB, etag {1}){2}.' -f ($remote.ContentLength / 1GB), $remote.ETag, $resumeText)
-        $download = Open-DemoJumpstartDownload -Uri $uri -Offset $offset
+        $download = Open-DemoJumpstartDownload -Uri $uri -Offset $offset -Length $remote.ContentLength
         try {
             $mode = [System.IO.FileMode]::Append
             if ($offset -gt 0 -and $download.StatusCode -ne 206) {
-                # The server sent the whole file instead of the rest: start over.
+                # The server sent the whole file instead of the rest: start over, and say so.
+                Write-DemoVmLog -Level 'Warning' -Message ('The server ignored the range request from byte {0:N0} and sent the whole Jumpstart image (HTTP {1}, not 206), so the download starts over.' -f $offset, $download.StatusCode)
                 $hasher = New-DemoJumpstartHasher
                 $offset = 0
             }
@@ -335,11 +358,18 @@ function Save-DemoJumpstartImage {
             if ($offset -eq 0) {
                 $mode = [System.IO.FileMode]::Create
             }
-            $target = New-Object -TypeName 'System.IO.FileStream' -ArgumentList $partial, $mode, ([System.IO.FileAccess]::Write), ([System.IO.FileShare]::None)
+            # A network read returns a few KiB; the file's own BufferMB buffer turns them into large disk writes.
+            $target = New-Object -TypeName 'System.IO.FileStream' -ArgumentList $partial, $mode, ([System.IO.FileAccess]::Write), ([System.IO.FileShare]::None), $bufferBytes
+            $source = $download.Stream
+            $md5Algorithm = $hasher.Md5
+            $sha256Algorithm = $hasher.Sha256
             try {
-                while (($count = $download.Stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                while (($count = $source.Read($buffer, 0, $bufferBytes)) -gt 0) {
                     $target.Write($buffer, 0, $count)
-                    Add-DemoJumpstartHashBlock -Hasher $hasher -Buffer $buffer -Count $count
+                    if ($null -ne $md5Algorithm) {
+                        [void]$md5Algorithm.TransformBlock($buffer, 0, $count, $null, 0)
+                    }
+                    [void]$sha256Algorithm.TransformBlock($buffer, 0, $count, $null, 0)
                 }
             }
             finally {
@@ -690,7 +720,7 @@ $script:DemoJumpstartSqlBlock = {
 $script:DemoJumpstartCleanupBlock = {
     param($ServiceNames, $Features, $InstanceName, $JumpstartFolder, $SetupTimeoutMinutes)
     $ErrorActionPreference = 'Stop'
-    $result = [ordered]@{ disabled = @(); uninstall = $null; folderRemoved = $false; arcReset = '' }
+    $result = [ordered]@{ disabled = @(); uninstall = $null; folder = [string]$JumpstartFolder; folderRemoved = $false; arcReset = '' }
     foreach ($name in @($ServiceNames)) {
         $service = Get-Service -Name $name -ErrorAction SilentlyContinue
         if ($service) {
@@ -857,10 +887,19 @@ function Invoke-DemoJumpstartFirstBoot {
     $sql = Invoke-Command -VMName $name -Credential $credential -ScriptBlock $script:DemoJumpstartSqlBlock -ArgumentList $name, @($expected['sampleDatabases']) -ErrorAction Stop
     Write-DemoVmLog -Message ('SQL Server in the guest: name {0}{1}, sysadmin group {2}, {3} SQL login(s) disabled, {4} sample database(s) dropped.' -f $name, $(if ([bool]$sql.serverRenamed) { ' (was ' + [string]$sql.oldServerName + ')' } else { '' }), $(if ([bool]$sql.sysadminGroupAdded) { 'added' } else { 'in place' }), @($sql.loginsDisabled).Count, @($sql.databasesDropped).Count)
 
-    $cleanup = Invoke-Command -VMName $name -Credential $credential -ScriptBlock $script:DemoJumpstartCleanupBlock -ArgumentList @($settings.AssociatedServices), [string]$settings.UninstallFeatures, [string]$Context.Guest.Sql.InstanceName, [string]$expected['jumpstartFolder'], ([int]$settings.SetupTimeoutMinutes) -ErrorAction Stop
+    # Every typed argument is in parentheses: in argument mode, [string]$x is an expandable string, not a cast (live finding,
+    # 2026-11-06: the cleanup got "[string]System.Collections.Hashtable[jumpstartFolder]" and never deleted C:\Jumpstart).
+    $cleanup = Invoke-Command -VMName $name -Credential $credential -ScriptBlock $script:DemoJumpstartCleanupBlock -ArgumentList @($settings.AssociatedServices), ([string]$settings.UninstallFeatures), ([string]$Context.Guest.Sql.InstanceName), ([string]$expected['jumpstartFolder']), ([int]$settings.SetupTimeoutMinutes) -ErrorAction Stop
+    $uninstallText = 'nothing to uninstall'
     if ($null -ne $cleanup.uninstall) {
         $exitCode = $cleanup.uninstall.exitCode
-        if ([bool]$cleanup.uninstall.serviceLeft -or ($null -ne $exitCode -and [int]$exitCode -notin 0, 3010)) {
+        $uninstalled = -not ([bool]$cleanup.uninstall.serviceLeft -or ($null -ne $exitCode -and [int]$exitCode -notin 0, 3010))
+        $uninstallText = '{0} {1} with setup ({2}{3})' -f $settings.UninstallFeatures, $(if ($uninstalled) { 'uninstalled' } else { 'not uninstalled' }), $(if ($null -eq $exitCode) { 'no exit code' } else { 'exit code {0}' -f $exitCode }), $(if ($cleanup.uninstall.finalResult) { ', final result "{0}"' -f $cleanup.uninstall.finalResult } else { '' })
+    }
+    # What the cleanup did, logged before a restart can end this pass.
+    Write-DemoVmLog -Message ('The guest''s cleanup: {0} service(s) stopped and disabled; {1}; {2} {3}{4}.' -f @($cleanup.disabled).Count, $uninstallText, $cleanup.folder, $(if ([bool]$cleanup.folderRemoved) { 'removed' } else { 'absent' }), $(if ($cleanup.arcReset) { '; Arc identity ' + $cleanup.arcReset } else { '' }))
+    if ($null -ne $cleanup.uninstall) {
+        if (-not $uninstalled) {
             $warnings += ('Uninstalling {0} in {1} didn''t pass (setup {2}, exit code {3}, final result "{4}"); its services stay stopped and disabled, and Arc''s inventory may list it as another instance.' -f $settings.UninstallFeatures, $name, $(if ($cleanup.uninstall.setup) { $cleanup.uninstall.setup } else { 'not found' }), $(if ($null -eq $exitCode) { 'none' } else { $exitCode }), $cleanup.uninstall.finalResult)
         }
         if ($null -ne $exitCode -and [int]$exitCode -eq 3010) {
@@ -890,7 +929,7 @@ function Invoke-DemoJumpstartFirstBoot {
         warnings           = @($warnings)
     }
     Write-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $Context).FirstBoot -InputObject $record -Redact
-    Write-DemoVmLog -Message ('The Jumpstart guest is {0}: renamed, password replaced, SQL Server prepared, extras removed, and on {1}.' -f $name, $Context.Host.SwitchName)
+    Write-DemoVmLog -Message ('The Jumpstart guest {0} finished its first boot and is on {1}.' -f $name, $Context.Host.SwitchName)
     if ($warnings.Count -gt 0) {
         return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $warnings)
     }
