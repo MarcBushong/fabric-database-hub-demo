@@ -451,6 +451,121 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
     }
 }
 
+Describe 'NOT DONE names the exact command its fix needs, with the run''s -ConfigPath (live finding, 2026-11-06)' {
+    BeforeAll {
+        # The T2 track's remediation for a host step that failed, as TrackHelpers.ps1 writes it.
+        $script:hostFix = 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full) and C:\ProgramData\DbHubDemo\logs on it, fix the cause, then run ./scripts/deploy.ps1 -FromStage Artifacts: a failed step is tried again only in a new bootstrap generation, which that starts (a plain rerun resumes and finds the same step failed, unless your fix changed the bootstrap bundle, which a plain rerun then sends again, starting one too).'
+        $script:own = './scripts/deploy.ps1 -ConfigPath "./config/livetest.local.json"'
+    }
+
+    It 'gives the same command in Next and on the Run line, built from the run''s own command' {
+        # Live (15:05Z): Next said -FromStage Artifacts, the Run line gave the plain command, and neither kept -ConfigPath.
+        $config = New-TestConfig
+        $result = @(New-DoneResult) + @(New-DemoResult -CheckId 'DEPLOY.T2.HOST' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'archost01 failed at step JumpstartImageCheck: SQL Server is Developer Edition.' -Remediation $script:hostFix)
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.ExitCode | Should -Be 1
+        $outcome.NextCommand | Should -Be './scripts/deploy.ps1 -ConfigPath "./config/livetest.local.json" -FromStage Artifacts'
+        $outcome.Next | Should -Match ([regex]::Escape('then run ./scripts/deploy.ps1 -ConfigPath "./config/livetest.local.json" -FromStage Artifacts: a failed step is tried again only in a new bootstrap generation'))
+        $outcome.Next | Should -Match 'unless your fix changed the bootstrap bundle' -Because 'the common case, a transient failure or a fix outside the bundle, needs the new generation that -FromStage Artifacts starts'
+        $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
+        $lines | Should -Contain 'Run: ./scripts/deploy.ps1 -ConfigPath "./config/livetest.local.json" -FromStage Artifacts'
+
+        # The default configuration: the same command without -ConfigPath.
+        $plain = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $plain.NextCommand | Should -Be './scripts/deploy.ps1 -FromStage Artifacts'
+    }
+
+    It 'takes a requirement''s own fix the same way, and keeps the plain command when the fix names none' {
+        $config = New-TestConfig
+        $missing = @(New-DoneResult | Where-Object { $_.checkId -ne 'T2.ARC.MONITORING' }) + @(New-DemoResult -CheckId 'T2.ARC.MONITORING' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'Monitoring is off.' -Remediation 'Fix T2''s monitoring, then run deploy.ps1 -FromStage T2.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $missing; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.Missing | Should -Be @('T2.ARC.MONITORING')
+        $outcome.NextCommand | Should -Be ('{0} -FromStage T2' -f $script:own)
+        $outcome.Next | Should -Be ('Fix T2''s monitoring, then run {0} -FromStage T2.' -f $script:own)
+
+        $other = @(New-DoneResult) + @(New-DemoResult -CheckId 'FABRIC.P4.HUBSETTING' -Area 'fabric' -Target 'tenant' -Status 'Fail' -Message 'Off.' -Remediation 'A Fabric administrator turns it on.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $other; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.NextCommand | Should -Be $script:own
+        $outcome.Next | Should -Be ('A Fabric administrator turns it on. Then run {0}.' -f $script:own)
+    }
+
+    It 'names the plain command for a fix that says deploy.ps1 -Resume, which starts over when the stage reached Validation (review finding)' {
+        # A rerun after DONE starts over; when its template then fails, the recorded stage stays Validation, where -Resume
+        # would skip preflight and the template and run every track against the failed deployment's outputs.
+        $config = New-TestConfig
+        $templateFix = 'Fix the cause in the message, then run deploy.ps1 -Resume. A 409 Conflict while a policy installs an extension clears within minutes.'
+        $failed = @(New-DoneResult) + @(New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message 'The deployment failed: Conflict.' -Remediation $templateFix)
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $failed; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.NextCommand | Should -Be $script:own
+        $outcome.Next | Should -Be ('Fix the cause in the message, then run {0}. A 409 Conflict while a policy installs an extension clears within minutes.' -f $script:own)
+        # deploy.ps1 resumes by itself only while the recorded stage isn't Validation (-AutoResume); there, -Resume would skip
+        # the template, and the plain command's plan runs it.
+        $state = [pscustomobject]@{ Stage = 'Validation' }
+        (InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State }).Infrastructure | Should -BeFalse
+        $plain = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -State $State }
+        $plain.Preflight | Should -BeTrue
+        $plain.Infrastructure | Should -BeTrue
+    }
+
+    It 'gives a script that the fix names the run''s -ConfigPath too, when the fix names no deploy.ps1' {
+        $config = New-TestConfig
+        $vmStart = @(New-DoneResult) + @(New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'archost01 didn''t start.' -Remediation 'Start it in the portal, or run ./scripts/start-demo.ps1.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $vmStart; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.NextCommand | Should -Be $script:own
+        $outcome.Next | Should -Be ('Start it in the portal, or run ./scripts/start-demo.ps1 -ConfigPath "./config/livetest.local.json". Then run {0}.' -f $script:own)
+
+        $missing = @(New-DoneResult | Where-Object { $_.checkId -ne 'T2.ARC.MONITORING' }) + @(New-DemoResult -CheckId 'T2.ARC.MONITORING' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'Monitoring is off.' -Remediation 'Run ./scripts/configure-monitoring.ps1 -Target T2.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $missing; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.NextCommand | Should -Be $script:own
+        $outcome.Next | Should -Be ('Run ./scripts/configure-monitoring.ps1 -ConfigPath "./config/livetest.local.json" -Target T2. Then run {0}.' -f $script:own)
+    }
+
+    It 'writes each deploy.ps1 to run as the run''s command, gives the other scripts its -ConfigPath, and leaves mentions in passing alone' {
+        $named = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'Set t2SqlInstallMode back, then run ./scripts/deploy.ps1 -FromStage Infrastructure; or rebuild T2: ./scripts/destroy.ps1, then ./scripts/deploy.ps1.' -Command $Command }
+        $named.Command | Should -Be ('{0} -FromStage Infrastructure' -f $script:own)
+        $named.Text | Should -Be ('Set t2SqlInstallMode back, then run {0} -FromStage Infrastructure; or rebuild T2: ./scripts/destroy.ps1 -ConfigPath "./config/livetest.local.json", then {0}.' -f $script:own)
+
+        $passing = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'deploy.ps1''s watchdog restarts the VM once; the next deploy.ps1 does the rest.' -Command $Command }
+        $passing.Command | Should -BeNullOrEmpty
+        $passing.Text | Should -Be 'deploy.ps1''s watchdog restarts the VM once; the next deploy.ps1 does the rest.'
+
+        $resume = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'Run deploy.ps1 -Resume later; it keeps converging. Then run deploy.ps1 again.' -Command $Command }
+        $resume.Command | Should -Be $script:own -Because 'a plain run resumes by itself, and after a run whose stage reached Validation it starts over, where -Resume would run only the validation'
+        $resume.Text | Should -Be ('Run {0} later; it keeps converging. Then run {0} again.' -f $script:own)
+
+        $switch = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'Run deploy.ps1 -SkipRunner now; the VMs keep their runner.' -Command $Command }
+        $switch.Command | Should -Be ('{0} -SkipRunner' -f $script:own) -Because 'a switch takes no value: "now" stays text'
+        $switch.Text | Should -Be ('Run {0} -SkipRunner now; the VMs keep their runner.' -f $script:own)
+
+        # A command that already names its configuration keeps it; the default configuration adds nothing to other scripts.
+        $already = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly -ConfigPath "./config/a.json". Then go on.' -Command $Command }
+        $already.Text | Should -Be 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly -ConfigPath "./config/a.json". Then go on.'
+        $default = InModuleScope DbHubDemo { Resolve-DemoDeployCommandText -Text 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly, then deploy.ps1 -FromStage T2.' -Command './scripts/deploy.ps1' }
+        $default.Text | Should -Be 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly, then ./scripts/deploy.ps1 -FromStage T2.'
+        $default.Command | Should -Be './scripts/deploy.ps1 -FromStage T2'
+    }
+
+    It 'logs every remediation with the run''s command in deploy.ps1''s report; the results stay as they are' {
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add($Message) }
+        $results = @(
+            (New-DemoResult -CheckId 'DEPLOY.T2.HOST' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'failed' -Remediation 'Fix it, then run ./scripts/deploy.ps1 -FromStage Artifacts.')
+            (New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'waits' -Remediation 'Run ./scripts/deploy.ps1 again when you have about 15 minutes.')
+        )
+        Write-DemoResultReport -Result $results -Title 'deploy.ps1' -DeployCommand $script:own 6>$null
+        $script:logged | Should -Contain ('DEPLOY.T2.HOST: Fix it, then run {0} -FromStage Artifacts.' -f $script:own)
+        $script:logged | Should -Contain ('  DEPLOY.T2.GUIDEDSTOP: Run {0} again when you have about 15 minutes.' -f $script:own)
+        $results[0].remediation | Should -Be 'Fix it, then run ./scripts/deploy.ps1 -FromStage Artifacts.'
+    }
+
+    It 'says after Ctrl+C that the rerun sends a bootstrap bundle or workload runner that changed meanwhile' {
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result @() -State $null -Config $Config -Stopped }
+        $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+        $outcome.Next | Should -Be 'Run ./scripts/deploy.ps1 again when you''re ready: it continues where it stopped, and when the bootstrap bundle or the workload runner changed meanwhile (a fix you pulled, for example), it sends them to the VMs again first.'
+    }
+}
+
 Describe 'What only a person can confirm never keeps the run from DONE (Phase 28 live finding, 2026-10-30)' {
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }

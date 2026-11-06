@@ -312,7 +312,8 @@ try {
         }
     }
 
-    Write-DemoResultReport -Result $results -Title 'deploy.ps1' -OutcomeDone:($null -ne $outcome -and [string]$outcome.Kind -eq 'Done')
+    # A remediation that says to run deploy.ps1 names this run's own command, with its -ConfigPath (2026-11-06).
+    Write-DemoResultReport -Result $results -Title 'deploy.ps1' -OutcomeDone:($null -ne $outcome -and [string]$outcome.Kind -eq 'Done') -DeployCommand ([string]$run.Command)
     Export-DemoResult -Result $results -Path $OutputPath
     Write-DemoDeploymentOutcome -Outcome $outcome -WorkspaceName $workspaceName
     if ($environment.GitHubActions) {

@@ -103,6 +103,57 @@ Describe 'Resolve-DemoTrackPlan' {
         $plan.Tracks['T4'] | Should -Be @('Telemetry')
         @($plan.Tracks['Fabric']).Count | Should -Be 0
     }
+
+    It 'names the VM tracks a resume continues past their Artifacts step, and sends a -Resend track back to it (live finding, 2026-11-06)' {
+        # Live: T2 had recorded Bootstraps when a fix to the host's bootstrap was pulled; the plain rerun resumed at T2's T2
+        # step, so archost01 kept the old bundle.
+        $state = New-TestState
+        $state.Stage = 'Infrastructure'
+        $state.TrackT1 = 'Telemetry'
+        $state.TrackT2 = 'Bootstraps'
+        $state.TrackFabric = 'Fabric'
+        $plan = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State }
+        $plan.PastArtifacts | Should -Be @('T1', 'T2')
+        @($plan.Resend).Count | Should -Be 0
+        $plan.Tracks['T2'] | Should -Be @('T2', 'Telemetry')
+
+        $resent = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State -Resend 'T2' }
+        $resent.Resend | Should -Be @('T2')
+        $resent.Tracks['T2'] | Should -Be @('Artifacts', 'Bootstraps', 'T2', 'Telemetry')
+        @($resent.Tracks['T1']).Count | Should -Be 0 -Because 'only the tracks in -Resend go back'
+        $resent.Preflight | Should -BeFalse
+        $resent.Infrastructure | Should -BeFalse
+
+        # T1's finished track goes back to its Artifacts step too, with every step after it; T3Setup stays done.
+        $both = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State -Resend 'T1', 'T2' }
+        $both.Tracks['T1'] | Should -Be @('Artifacts', 'Bootstraps', 'T3', 'T4', 'Activity', 'Monitoring', 'Telemetry')
+        $both.Resend | Should -Be @('T1', 'T2')
+        @($both.Tracks['Fabric']).Count | Should -Be 0
+    }
+
+    It 'changes nothing with -Resend for a track whose Artifacts step runs anyway, a range, or a stop before the artifacts' {
+        $state = New-TestState
+        $state.Stage = 'Infrastructure'
+        $state.TrackT1 = 'T3Setup'
+        $state.TrackT2 = 'Restore'
+        $plan = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State -Resend 'T1', 'T2' }
+        @($plan.PastArtifacts).Count | Should -Be 0
+        @($plan.Resend).Count | Should -Be 0
+        $plan.Tracks['T1'][0] | Should -Be 'Artifacts'
+        $plan.Tracks['T2'][0] | Should -Be 'Artifacts'
+
+        $state.TrackT2 = 'Telemetry'
+        foreach ($case in @(
+                @{ FromStage = 'T2'; StopAfter = '' }
+                @{ FromStage = ''; StopAfter = 'Infrastructure' }
+            )) {
+            $other = InModuleScope DbHubDemo -Parameters @{ State = $state; Case = $case } { Resolve-DemoTrackPlan -FromStage $Case.FromStage -StopAfter $Case.StopAfter -Resume -State $State -Resend 'T2' }
+            @($other.PastArtifacts).Count | Should -Be 0 -Because ('-FromStage {0} -StopAfter {1}' -f $case.FromStage, $case.StopAfter)
+            @($other.Tracks['T2']) | Should -Not -Contain 'Artifacts'
+        }
+        # Without -Resume nothing is past its Artifacts step: a run from the start sends what's missing anyway.
+        @((InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -State $State -Resend 'T2' }).PastArtifacts).Count | Should -Be 0
+    }
 }
 
 Describe 'Get-DemoTrackRecordReset: a resume trusts only what was recorded since the last fresh start (Phase 28 live finding, 2026-10-30)' {
@@ -143,6 +194,16 @@ Describe 'Get-DemoTrackRecordReset: a resume trusts only what was recorded since
         $reset.Count | Should -Be 0
     }
 
+    It 'lowers the record of a resumed track that goes back to its Artifacts step, so a stop before it finishes sends them again (2026-11-06)' {
+        $state = New-TestState
+        $state.Stage = 'Monitoring'
+        $state.TrackT1 = 'Monitoring'
+        $state.TrackT2 = 'Bootstraps'
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -Resume -State $State -Resend 'T2') -State $State }
+        $reset['TrackT2'] | Should -Be 'Restore'
+        $reset.Contains('TrackT1') | Should -BeFalse
+    }
+
     It 'lowers a record to the step before where -FromStage starts its track, and never raises one' {
         $state = New-DoneState
         $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -FromStage 'T4') -State $State }
@@ -161,6 +222,115 @@ Describe 'Get-DemoTrackRecordReset: a resume trusts only what was recorded since
         $state.TrackT1 = 'Bootstraps'
         $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -FromStage 'T4') -State $State }
         $reset.Contains('TrackT1') | Should -BeFalse
+    }
+}
+
+Describe 'A resume sends a VM''s artifacts again when this checkout builds other ones (live finding, 2026-11-06)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:built = @{ Bundle = ('a' * 64); Runner = ('b' * 64) }
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = $script:built.Bundle; SizeBytes = 10 } }
+        Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { [pscustomobject]@{ Path = 'runner.zip'; Sha256 = $script:built.Runner; SizeBytes = 20 } }
+        $script:state = New-TestState
+        $script:state.Stage = 'Infrastructure'
+        $script:state.TrackT1 = 'Telemetry'
+        $script:state.TrackT2 = 'Bootstraps'
+    }
+
+    It 'finds nothing when both VMs have what this checkout builds' {
+        $changes = @(InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Get-DemoArtifactChange -State $State -Bundle ([pscustomobject]@{ Sha256 = ('A' * 64) }) -Runner ([pscustomobject]@{ Sha256 = ('b' * 64) }) })
+        $changes.Count | Should -Be 0
+    }
+
+    It 'says what changed, what the VM has, and what this checkout builds, for the console and for the status page' {
+        $changes = @(InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Get-DemoArtifactChange -State $State -Bundle ([pscustomobject]@{ Sha256 = ('c' * 64) }) -Runner ([pscustomobject]@{ Sha256 = ('b' * 64) }) -Track 'T2' })
+        $changes.Count | Should -Be 1
+        $changes[0].Track | Should -Be 'T2'
+        $changes[0].VmName | Should -Be 'archost01'
+        $changes[0].Kinds | Should -Be @('Bundle')
+        $changes[0].Note | Should -Be ('The bootstrap bundle changed since the last run (archost01 has {0}; this checkout builds {1}), so it''s sent again, and the loader runs again.' -f ('a' * 12), ('c' * 12))
+        $changes[0].Message | Should -Be ('T2: the bootstrap bundle changed since the last run (archost01 has {0}; this checkout builds {1}), so this run sends it to archost01 again and runs T2''s Artifacts and Bootstraps steps again, with the steps after them.' -f ('a' * 12), ('c' * 12))
+        $changes[0].Evidence['bundle']['onVm'] | Should -BeTrue
+        $changes[0].Evidence.Contains('runner') | Should -BeFalse
+    }
+
+    It 'counts a VM the record doesn''t list, the runner, and both together; a runner it doesn''t compare never counts' {
+        # The earlier run sent the new bundle to sqlvm01 before it was stopped: archost01 isn't listed for it.
+        $script:state.BundleSha256 = ('c' * 64)
+        $script:state.BundleSentTo = @('sqlvm01')
+        $changes = @(InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Get-DemoArtifactChange -State $State -Bundle ([pscustomobject]@{ Sha256 = ('c' * 64) }) -Runner ([pscustomobject]@{ Sha256 = ('d' * 64) }) })
+        @($changes | ForEach-Object { $_.Track }) | Should -Be @('T1', 'T2')
+        $changes[0].Kinds | Should -Be @('Runner')
+        $changes[0].Note | Should -Match '^The workload runner changed since the last run \(sqlvm01 has bbbbbbbbbbbb; this checkout builds dddddddddddd\), so it''s sent again'
+        $changes[1].Kinds | Should -Be @('Bundle', 'Runner')
+        $changes[1].Note | Should -Match '^The bootstrap bundle this checkout builds \(cccccccccccc\) isn''t recorded as sent to archost01, and the workload runner changed since the last run .*, so they''re sent again, and the loader runs again\.$'
+        @(InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Get-DemoArtifactChange -State $State -Bundle ([pscustomobject]@{ Sha256 = ('c' * 64) }) -Runner $null -Track 'T1' }).Count | Should -Be 0
+    }
+
+    It 'builds nothing when no VM track resumes past its Artifacts step' {
+        $script:state.TrackT1 = 'T3Setup'
+        $script:state.TrackT2 = 'Restore'
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        @($resend.Tracks).Count | Should -Be 0
+        @($resend.Results).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -Times 0 -Exactly
+    }
+
+    It 'resumes as recorded when nothing changed, and says it checked' {
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        @($resend.Tracks).Count | Should -Be 0
+        @($resend.Results).Count | Should -Be 0
+        $resend.Notes.Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq 'sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout builds, so each track continues where it stopped.' }
+    }
+
+    It 'sends a changed bundle again to every VM that resumes past its Artifacts step, says why, and returns each track''s note' {
+        $script:built.Bundle = ('c' * 64)
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        $resend.Tracks | Should -Be @('T1', 'T2')
+        $resend.Notes['T2'] | Should -Match '^The bootstrap bundle changed since the last run \(archost01 has aaaaaaaaaaaa; this checkout builds cccccccccccc\), so it''s sent again'
+        $changed = @($resend.Results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.CHANGED_ARCHOST01' })
+        $changed.Count | Should -Be 1
+        $changed[0].status | Should -Be 'Pass'
+        $changed[0].target | Should -Be 'T2'
+        $changed[0].message | Should -Match 'so this run sends it to archost01 again and runs T2''s Artifacts and Bootstraps steps again'
+        ($resend.Results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.CHANGED_SQLVM01' }).status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'T2: the bootstrap bundle changed since the last run*' }
+    }
+
+    It 'compares no runner with -SkipRunner or when the record has none' {
+        $script:built.Runner = ('d' * 64)
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) -SkipRunner }
+        @($resend.Tracks).Count | Should -Be 0
+        $script:state.RunnerSha256 = ''
+        $script:state.RunnerSentTo = @()
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        @($resend.Tracks).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -Times 0 -Exactly
+    }
+
+    It 'resumes as recorded with a Warning when the bundle can''t be built, and still compares the bundle when only the runner can''t' {
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { throw 'disk full' }
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        @($resend.Tracks).Count | Should -Be 0
+        $warning = @($resend.Results)
+        $warning.Count | Should -Be 1
+        $warning[0].checkId | Should -Be 'DEPLOY.ARTIFACTS.CHANGED'
+        $warning[0].status | Should -Be 'Warning'
+        $warning[0].message | Should -Match 'disk full'
+        $warning[0].remediation | Should -Match 'deploy\.ps1 -FromStage Artifacts'
+
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
+        Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { throw 'The .NET SDK was not found.' }
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        $resend.Tracks | Should -Be @('T1', 'T2')
+        $runnerWarning = @($resend.Results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.CHANGED' })
+        $runnerWarning.Count | Should -Be 1
+        $runnerWarning[0].message | Should -Match 'The workload runner couldn''t be built'
+        $runnerWarning[0].remediation | Should -Match '-SkipRunner'
     }
 }
 
@@ -276,6 +446,22 @@ Describe 'Invoke-DemoBootstrapLoaderRun' {
         $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName 'archost01' -BundleSha256 ('a' * 64) -ChunkCount 1 -Settings @{ role = 'ArcHost' } }
         $result.status | Should -Be 'Fail'
         $result.message | Should -Match 'chunk 1 missing'
+        # A plain rerun runs the loader again, and sends the bundle again first when its chunks were unusable (2026-11-06).
+        $result.remediation | Should -Match 'run \./scripts/deploy\.ps1 again: it runs the loader again, and when the loader found the bundle''s chunks missing or damaged, it sends the bundle again first'
+    }
+
+    It 'says when the loader stopped an earlier bundle''s bootstrap run that was still going (live finding, 2026-11-06)' {
+        $script:run = [pscustomobject]@{ Succeeded = $true; Output = ("2026-11-06T15:00:00Z [INFO] Loader started.`nDbHubDemo loader finished: role ArcHost, bundle {0}.`nDbHubDemo loader took over: stopped bundle {1}'s bootstrap run, which was still going (process 4242); bundle {0}'s run starts now." -f ('c' * 12), ('a' * 12)); Error = '' }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName 'archost01' -BundleSha256 ('c' * 64) -ChunkCount 1 -Settings @{ role = 'ArcHost' } }
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match ('a new bootstrap generation is running\. It stopped bundle {0}''s bootstrap run, which was still going \(process 4242\); bundle {1}''s run starts now\.$' -f ('a' * 12), ('c' * 12))
+        $result.evidence['tookOver'] | Should -Match '^stopped bundle '
+
+        # Nothing stopped: the message stays as it was.
+        $script:run = [pscustomobject]@{ Succeeded = $true; Output = 'DbHubDemo loader finished: role ArcHost'; Error = '' }
+        $quiet = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName 'archost01' -BundleSha256 ('c' * 64) -ChunkCount 1 -Settings @{ role = 'ArcHost' } }
+        $quiet.message | Should -Match 'a new bootstrap generation is running\.$'
+        $quiet.evidence.Contains('tookOver') | Should -BeFalse
     }
 }
 
@@ -338,6 +524,50 @@ Describe 'Invoke-DemoDeploymentTrack' {
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add('monitoring'); New-TestResult 'T1.SQLVM.MONITORING' }
         # Phase 28: the VM's extensions settle before its artifacts and its loader (brief item 14); its own tests are in DbHubDemo.OneCommand.Tests.ps1.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith { [pscustomobject]@{ Settled = $true; Results = @() } }
+    }
+
+    It 'says on the console and the status page why a resumed run sends a VM''s artifacts again (live finding, 2026-11-06)' {
+        $script:state.BundleSentTo = @('sqlvm01')
+        $script:state.RunnerSentTo = @('sqlvm01')
+        $note = 'The bootstrap bundle changed since the last run (archost01 has aaaaaaaaaaaa; this checkout builds cccccccccccc), so it''s sent again, and the loader runs again.'
+        $script:context['ResendNote'] = @{ T2 = $note }
+        $script:context['ProgressPath'] = Join-Path -Path $TestDrive -ChildPath 'progress-resend.json'
+        $script:context['T2Source'] = 'build'
+        $script:progressSteps = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:progressSteps.Add([pscustomobject]@{ Id = @($Id) -join ','; State = $State; Message = $Message }) }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts', 'Bootstraps') }
+        $outcome.Status | Should -Be 'Pass'
+        $script:calls | Should -Contain 'chunks archost01 bootstrap bundle+workload runner 8'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq ('Track T2: Artifacts. {0}' -f $note) }
+        $artifacts = @($script:progressSteps | Where-Object { $_.Id -eq 'T2.Artifacts' })
+        $artifacts[0].State | Should -Be 'Running'
+        $artifacts[0].Message | Should -Be $note
+        $artifacts[-1].State | Should -Be 'Done'
+        $artifacts[-1].Message | Should -Match ('^{0} Done in ' -f [regex]::Escape($note))
+        # Only the Artifacts step says it; the loader's step reads as before.
+        @($script:progressSteps | Where-Object { $_.Id -eq 'T2.Bootstraps' -and $_.State -eq 'Running' })[0].Message | Should -BeNullOrEmpty
+    }
+
+    It 'takes a VM off the bundle''s record when its loader found the chunks unusable, so the next run sends them again (2026-11-06)' {
+        $script:removed = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith {
+            if ($PesterBoundParameters['RemoveBundleVm']) {
+                $script:removed.Add([string]$PesterBoundParameters['RemoveBundleVm'])
+            }
+        }
+        $script:context['T2Source'] = 'build'
+        foreach ($case in @(
+                @{ Error = 'DbHubDemo loader failed: The bundle in C:\ProgramData\DbHubDemo\downloads\aaaaaaaaaaaa is incomplete (2 expected): missing chunk(s) 2.'; Removed = @('archost01') }
+                @{ Error = 'DbHubDemo loader failed: Bundle SHA-256 mismatch: expected aaaa, got bbbb. The joined file and the chunks were deleted and nothing was installed.'; Removed = @('archost01') }
+                @{ Error = 'DbHubDemo loader failed: icacls failed with exit code 5.'; Removed = @() }
+            )) {
+            $script:removed.Clear()
+            $script:loaderError = $case.Error
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoBootstrapLoaderRun -MockWith { New-DemoResult -CheckId 'INFRA.BOOTSTRAP.LOADER_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('The bootstrap loader on archost01 failed: {0}' -f $script:loaderError) -Evidence @{ notStarted = $false; error = $script:loaderError } }
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+            $outcome.Status | Should -Be 'Fail'
+            @($script:removed) | Should -Be $case.Removed -Because $case.Error
+        }
     }
 
     It 'restores a golden T2 host: passwords and the reset first, then its artifacts, loader, onboarding with -Force, profile, and telemetry' {
@@ -1003,8 +1233,10 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoKeyVaultSetting -MockWith { [pscustomobject]@{ Enabled = $false } }
         # The nightly safety stop's setup (ADR 0024), on every run that isn't -WhatIf.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -MockWith { $script:calls.Add('safety stop'); New-TestResult 'SAFETYSTOP.SCHEDULE' }
-        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
-        Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { [pscustomobject]@{ Path = 'runner.zip'; Sha256 = ('d' * 64); SizeBytes = 20 } }
+        # What this checkout builds is what New-TestState records for both VMs: a resume sends nothing again unless a test
+        # changes it (2026-11-06).
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('a' * 64); SizeBytes = 10 } }
+        Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { [pscustomobject]@{ Path = 'runner.zip'; Sha256 = ('b' * 64); SizeBytes = 20 } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
             $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
             $ready = switch ($Track) { 'T1' { [ordered]@{ T1 = '2026-10-22T15:00:00Z'; T3 = '2026-10-22T15:01:00Z' } } 'T2' { [ordered]@{ T2 = '2026-10-22T15:10:00Z' } } default { [ordered]@{} } }
@@ -1243,6 +1475,49 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Validation'; $state }
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
         $script:calls | Should -Contain 'preflight'
+    }
+
+    It 'sends a VM''s changed artifacts again on a plain rerun, with its loader and the steps after them, and says why (live finding, 2026-11-06)' {
+        # Live: a fix to the host's bootstrap was pulled while T2 built its guest, and the plain rerun that NOT DONE named
+        # resumed T2 at its T2 step, so archost01 kept the old bundle.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state.TrackFabric = 'Fabric'; $state }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
+        $script:resendNotes = @{}
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
+            $script:resendNotes[$Track] = [string](@($Context['ResendNote']) | ForEach-Object { $_[$Track] })
+            [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = @() }
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume -ProgressPath $Path })
+        $script:calls | Should -Not -Contain 'preflight'
+        $script:calls | Should -Contain 'track T1: Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        $script:calls | Should -Contain 'track T2: Artifacts,Bootstraps,T2,Telemetry'
+        @($script:calls | Where-Object { $_ -like 'track Fabric*' }) | Should -BeNullOrEmpty -Because 'the Fabric track has nothing to do with the bundle'
+        # The records go back before any track writes, so a stop before the Artifacts step sends them again next time.
+        @($script:calls | Where-Object { $_ -match '^state .*TrackT2' }).Count | Should -BeGreaterThan 0
+        foreach ($vm in 'SQLVM01', 'ARCHOST01') {
+            ($results | Where-Object { $_.checkId -eq ('DEPLOY.ARTIFACTS.CHANGED_{0}' -f $vm) }).status | Should -Be 'Pass'
+        }
+        $script:resendNotes['T2'] | Should -Match '^The bootstrap bundle changed since the last run \(archost01 has aaaaaaaaaaaa; this checkout builds cccccccccccc\), so it''s sent again'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'T2: the bootstrap bundle changed since the last run*' }
+        # The status page says why on the Artifacts row, and what ran before it as finished.
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $rows = @{}
+        foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { $rows[[string]$item['id']] = $item } }
+        $rows['T2.Artifacts']['state'] | Should -Be 'Pending'
+        $rows['T2.Artifacts']['message'] | Should -Be $script:resendNotes['T2']
+        $rows['T2.HostBuild']['message'] | Should -Not -Match 'previous run'
+    }
+
+    It 'checks the artifacts only on a resume, never with -FromStage' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state }
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Validation' } | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -Times 0 -Exactly
+        $script:calls | Should -Contain 'track T2: Telemetry'
     }
 
     Context 'track records across runs (Phase 28 live finding, 2026-10-30)' {

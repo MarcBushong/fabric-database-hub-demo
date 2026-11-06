@@ -353,7 +353,10 @@ function Invoke-DemoParallelDeployment {
        once when the configuration doesn't set activityProfile (DEPLOY.ACTIVITYPROFILE).
 
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
-    does; -ProgressPath is the status page's model, which each stage and track updates; with networkMode private the
+    does; a resume first checks that sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout
+    builds, and a VM track whose VM doesn't goes back to its Artifacts step, with the steps after it, and says why
+    (Resolve-DemoArtifactResend, DEPLOY.ARTIFACTS.CHANGED_<VM>; live finding, 2026-11-06); -ProgressPath is the status
+    page's model, which each stage and track updates; with networkMode private the
     policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
     its results replace preflight's placeholders at the end; preflight's T4 startSku says where T4's fallback starts
     (Standard_D4ads_v5, Standard_D2ds_v5 after its cost check, or no T4; ADR 0019), and a "no T4"
@@ -449,17 +452,25 @@ function Invoke-DemoParallelDeployment {
         $Resume = [switch]::new($true)
         Write-DemoLog -Message ('An unfinished deployment is on record (its last finished stage is {0}), so this run continues it, as deploy.ps1 -Resume does. To start over from preflight instead: ./scripts/deploy.ps1 -FromStage Preflight.' -f $state.Stage)
     }
+    # A resume sends a VM's artifacts again, with its loader and the steps after them, when the bootstrap bundle or the
+    # workload runner this checkout builds isn't what the resource group's state records for that VM, so a fix pulled since
+    # the last run reaches it (live finding, 2026-11-06). With nothing changed, each track resumes as recorded.
+    $resend = [pscustomobject]@{ Tracks = @(); Notes = @{}; Results = @() }
+    if ($Resume -and -not $FromStage -and -not $whatIf) {
+        $resend = Resolve-DemoArtifactResend -State $state -Plan (Resolve-DemoTrackPlan -StopAfter $StopAfter -Resume -State $state -SkipFabric:$SkipFabric) -SkipRunner:$SkipRunner
+        & $addAll @($resend.Results)
+    }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28): a "no T4" record
     # (None) gets the 2-vCore fallback, and its cost check, again when this run deploys the template (Phase 28
     # follow-up).
-    $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric).Infrastructure
+    $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -Resend @($resend.Tracks)).Infrastructure
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:$templateRuns
     $skipT4 = -not (Test-DemoT4Enabled -Config $Config)
-    $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4
+    $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4 -Resend @($resend.Tracks)
     if ($whatIf) {
         $plan = Resolve-DemoTrackPlan -StopAfter 'Infrastructure'
     }
-    Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume
+    Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -ResendNote $resend.Notes
     # The run's activity profile (2026-11-03, ADR 0010): the tracks set its interim, and this process switches the VMs they
     # noted once its own Run Commands are done; Complete-DemoDeploymentRun sends the switch when the run ends before that.
     # A run without preflight says the default here.
@@ -498,6 +509,8 @@ function Invoke-DemoParallelDeployment {
         ProgressPath          = $ProgressPath
         PagePath              = $PagePath
         PromptInParent        = $false
+        # Why a resumed track sends its VM's artifacts again, by track; its Artifacts step says it (2026-11-06).
+        ResendNote            = $resend.Notes
     }
     $ensureContext = {
         if (-not $context.NetworkMode) {
@@ -820,7 +833,7 @@ function Invoke-DemoParallelDeployment {
         }
         if (-not $whatIf) {
             & $ensureContext
-            Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -T2Source ([string]$context.T2Source)
+            Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -T2Source ([string]$context.T2Source) -ResendNote $resend.Notes
             # The tracks' records describe this run before any track writes, and before the template reads the group's tags
             # (Phase 28 live finding, 2026-10-30: a fresh run's failed Fabric step kept an earlier run's record, and the next
             # plain deploy.ps1 resumed past it). A run that starts over clears them all; any other run lowers those of the

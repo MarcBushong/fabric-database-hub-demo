@@ -18,6 +18,9 @@ chunk-001.sha256, and so on), one chunk Run Command at a time. The loader:
 4. Writes settings.json, restricts C:\ProgramData\DbHubDemo to SYSTEM and Administrators, registers the
    SYSTEM scheduled task DbHubDemo-Bootstrap (at startup and every 5 minutes), which runs the role's
    resumable state machine, starts it, and returns. Reboots happen in the task, never here.
+5. Before it starts the task, stops a run of an earlier bundle's state machine that's still going, with the
+   processes it started (Stop-DemoLoaderEarlierRun): the task starts no second run while one runs, and a run
+   can last up to its 6-hour limit, so the new bundle would wait for it. A run of the same bundle goes on.
 
 Nothing here is secret: the parameters and the bundle hold no credentials (ADR 0009). Targets Windows
 PowerShell 5.1. Keep this file small: Bicep embeds it with loadTextContent (96 KB limit). The template
@@ -164,7 +167,7 @@ function Assert-DemoLoaderChunk {
         if ($bad.Count -gt 0) {
             $parts += ('chunk(s) {0} failed their SHA-256 check' -f ($bad -join ', '))
         }
-        throw ('The bundle in {0} is incomplete ({1} expected): {2}. Nothing was installed; send the bundle again with Send-DemoBootstrapBundle (deploy.ps1 -Resume).' -f $ChunkDirectory, $ChunkCount, ($parts -join '; '))
+        throw ('The bundle in {0} is incomplete ({1} expected): {2}. Nothing was installed; the next ./scripts/deploy.ps1 sends the bundle again (Send-DemoBootstrapBundle), then runs this loader again.' -f $ChunkDirectory, $ChunkCount, ($parts -join '; '))
     }
 }
 
@@ -343,6 +346,279 @@ function Invoke-DemoLoaderTask {
     Start-ScheduledTask -TaskName $script:LoaderTaskName
 }
 
+function Get-DemoLoaderBootstrapRun {
+    # The bootstrap runs among -Process (Win32_Process records): a powershell.exe whose command line runs a role's state
+    # machine from a bundle under -Root (bundle\<sha12>\vm\bootstrap\Invoke-*Bootstrap.ps1), as the task's action does.
+    # Returns ProcessId, Bundle (the hash prefix), Script, and CreationDate for each. Pure.
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Process = @(),
+
+        [Parameter(Mandatory = $true)]
+        [string] $Root
+    )
+
+    $bundleRoot = Join-Path -Path $Root.TrimEnd('\', '/') -ChildPath 'bundle'
+    $pattern = '(?i)' + [regex]::Escape($bundleRoot) + '[\\/]([0-9a-f]{12})[\\/]vm[\\/]bootstrap[\\/](Invoke-(?:SqlVm|Host|EvalArcVm)Bootstrap\.ps1)'
+    foreach ($item in @($Process)) {
+        if ($null -eq $item -or [string]$item.Name -notin 'powershell.exe', 'pwsh.exe' -or -not [string]$item.CommandLine) {
+            continue
+        }
+        $match = [regex]::Match([string]$item.CommandLine, $pattern)
+        if ($match.Success) {
+            [pscustomobject]@{
+                ProcessId    = [int]$item.ProcessId
+                Bundle       = $match.Groups[1].Value.ToLowerInvariant()
+                Script       = $match.Groups[2].Value
+                CreationDate = $item.CreationDate
+            }
+        }
+    }
+}
+
+function Get-DemoLoaderProcessTree {
+    # The processes that -Parent started, and the ones those started, among -Process (Win32_Process records), by
+    # ParentProcessId while the parents still run; a process created before its parent never counts, so one that reused
+    # an ID is never taken for a child. Pure.
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Process = @(),
+
+        [AllowEmptyCollection()]
+        [object[]] $Parent = @()
+    )
+
+    $seen = New-Object -TypeName 'System.Collections.Generic.HashSet[int]'
+    $queue = New-Object -TypeName 'System.Collections.Generic.Queue[object]'
+    foreach ($item in @($Parent)) {
+        if ($null -ne $item -and $seen.Add([int]$item.ProcessId)) {
+            $queue.Enqueue($item)
+        }
+    }
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        foreach ($item in @($Process)) {
+            if ($null -eq $item -or [int]$item.ParentProcessId -ne [int]$current.ProcessId -or $seen.Contains([int]$item.ProcessId)) {
+                continue
+            }
+            if ($null -ne $current.CreationDate -and $null -ne $item.CreationDate -and [datetime]$item.CreationDate -lt [datetime]$current.CreationDate) {
+                continue
+            }
+            [void]$seen.Add([int]$item.ProcessId)
+            $queue.Enqueue($item)
+            $item
+        }
+    }
+}
+
+function Test-DemoLoaderProcessMatch {
+    # True while process -ProcessId runs and is the one -CreationDate names (within 2 seconds); a process that later got
+    # the same ID doesn't match.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int] $ProcessId,
+
+        [AllowNull()]
+        [object] $CreationDate
+    )
+
+    try {
+        $process = [System.Diagnostics.Process]::GetProcessById($ProcessId)
+    }
+    catch {
+        return $false
+    }
+    try {
+        if ($process.HasExited) {
+            return $false
+        }
+        if ($null -eq $CreationDate) {
+            return $true
+        }
+        return ([System.Math]::Abs(($process.StartTime.ToUniversalTime() - ([datetime]$CreationDate).ToUniversalTime()).TotalSeconds) -le 2)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Stop-DemoLoaderProcess {
+    # Ends process -ProcessId when it's still the one -CreationDate names. True when it's gone or was ended.
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int] $ProcessId,
+
+        [AllowNull()]
+        [object] $CreationDate
+    )
+
+    if (-not (Test-DemoLoaderProcessMatch -ProcessId $ProcessId -CreationDate $CreationDate)) {
+        return $true
+    }
+    if (-not $PSCmdlet.ShouldProcess(('process {0}' -f $ProcessId), 'Stop an earlier bundle''s bootstrap run')) {
+        return $false
+    }
+    try {
+        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return (-not (Test-DemoLoaderProcessMatch -ProcessId $ProcessId -CreationDate $CreationDate))
+    }
+}
+
+function Test-DemoLoaderLockFree {
+    # True when no bootstrap run holds bootstrap.lock: Enter-DemoVmLock opens it exclusively, and the operating system
+    # closes that handle when the run's process ends. This opens it the same way and closes it at once.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $true
+    }
+    try {
+        $stream = New-Object -TypeName 'System.IO.FileStream' -ArgumentList @($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $stream.Dispose()
+        return $true
+    }
+    catch {
+        $exception = $_.Exception
+        while ($null -ne $exception.InnerException -and $exception -isnot [System.IO.IOException]) {
+            $exception = $exception.InnerException
+        }
+        return ($exception -isnot [System.IO.IOException] -or $exception -is [System.IO.FileNotFoundException])
+    }
+}
+
+function Test-DemoLoaderTaskIdle {
+    # True when the task reports no running instance, so Start-ScheduledTask isn't ignored (MultipleInstances IgnoreNew).
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    $task = Get-ScheduledTask -TaskName $script:LoaderTaskName -ErrorAction SilentlyContinue
+    return ($null -eq $task -or [string]$task.State -ne 'Running')
+}
+
+function Stop-DemoLoaderEarlierRun {
+    <#
+    .SYNOPSIS
+    Stops a bootstrap run that still runs an earlier bundle's state machine, with the processes it started, so the task
+    starts the new bundle at once (live finding, 2026-11-06). Returns Stopped (the earlier runs), Children (the processes
+    they had started), Same (runs of this bundle, left alone), Ready, and Text (one line for the Run Command's output;
+    empty when nothing was stopped).
+
+    .DESCRIPTION
+    The task ignores a new instance while one runs (MultipleInstances IgnoreNew) and ends one only after 6 hours, and
+    registering it again doesn't stop the one that runs, so the new bundle waited for the old run, live for a 34 GiB
+    download. The runs are found by their command line (Win32_Process): the role's Invoke-*Bootstrap.ps1 under
+    -Root\bundle\<sha12>. A run of this bundle is left alone: its next pass takes the new generation. An earlier one is
+    stopped as a restart stops it (the nightly stop, the watchdog, the task's time limit), which the resumable state
+    machine is built for (ADR 0003): its lock goes with its process; state.json and the other records are replaced
+    whole from a temporary file, so they hold the old or the new content; a step left Running runs again from its check,
+    and the new generation checks every step again; downloads keep their .partial files and resume. The processes it
+    started are found while it still runs, by their parent process ID, and stopped after it, so none goes on with work
+    that the new run does again; the guest's own processes aren't the host's. A process is stopped only while its ID and
+    start time still match. Ready is true once they've ended, the lock is free, and the task is idle, within
+    -TimeoutSeconds; otherwise the task's next pass starts the new run once they have.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Root,
+
+        [Parameter(Mandatory = $true)]
+        [string] $BundleSha256,
+
+        [ValidateRange(1, 600)]
+        [int] $TimeoutSeconds = 60
+    )
+
+    $shortSha = $BundleSha256.Substring(0, 12).ToLowerInvariant()
+    $result = [pscustomobject]@{ Stopped = @(); Children = @(); Same = @(); Ready = $true; Text = '' }
+    try {
+        $processes = @(Get-CimInstance -ClassName 'Win32_Process' -ErrorAction Stop)
+    }
+    catch {
+        Write-DemoLoaderLog -Level 'Warning' -Message ('The running processes couldn''t be read ({0}), so no earlier bundle''s bootstrap run was looked for: one that still runs ends on its own, and the new run starts at the task''s next pass after it.' -f $_.Exception.Message)
+        return $result
+    }
+    $runs = @(Get-DemoLoaderBootstrapRun -Process $processes -Root $Root | Where-Object { $_.ProcessId -ne $PID })
+    $result.Same = @($runs | Where-Object { $_.Bundle -eq $shortSha })
+    $earlier = @($runs | Where-Object { $_.Bundle -ne $shortSha })
+    if ($earlier.Count -eq 0) {
+        if ($result.Same.Count -gt 0) {
+            Write-DemoLoaderLog -Message ('A bootstrap run of bundle {0} is in progress (process {1}); it goes on, and its next pass takes the new generation.' -f $shortSha, (@($result.Same | ForEach-Object { $_.ProcessId }) -join ', '))
+        }
+        return $result
+    }
+    $children = @(Get-DemoLoaderProcessTree -Process $processes -Parent $earlier)
+    $result.Stopped = $earlier
+    $result.Children = $children
+    $old = (@($earlier | ForEach-Object { $_.Bundle }) | Select-Object -Unique) -join ', '
+    $ids = (@($earlier | ForEach-Object { $_.ProcessId }) -join ', ')
+    $childText = if ($children.Count -gt 0) { ', and the {0} process(es) it started ({1})' -f $children.Count, ((@($children | ForEach-Object { [string]$_.Name }) | Select-Object -Unique) -join ', ') } else { '' }
+    Write-DemoLoaderLog -Message ('Bundle {0}''s bootstrap run is still going (process {1}): it''s stopped{2}, so bundle {3}''s run starts now instead of after it (the task starts no second run while one runs). Its steps are resumable: the new run checks each one again (ADR 0003).' -f $old, $ids, $childText, $shortSha)
+    # The run first, so it starts nothing more; then what it started.
+    $failed = New-Object -TypeName 'System.Collections.Generic.List[int]'
+    foreach ($item in @($earlier) + @($children)) {
+        if (-not (Stop-DemoLoaderProcess -ProcessId ([int]$item.ProcessId) -CreationDate $item.CreationDate)) {
+            $failed.Add([int]$item.ProcessId)
+        }
+    }
+    $lockPath = Join-Path -Path $Root -ChildPath 'bootstrap.lock'
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $startedByTask = $false
+    while ($true) {
+        $alive = @(@($earlier) + @($children) | Where-Object { Test-DemoLoaderProcessMatch -ProcessId ([int]$_.ProcessId) -CreationDate $_.CreationDate })
+        if ($alive.Count -eq 0) {
+            if ((Test-DemoLoaderLockFree -Path $lockPath) -and (Test-DemoLoaderTaskIdle)) {
+                $result.Ready = $true
+                break
+            }
+            # The task's own 5-minute trigger may already have started the new bundle's run, which holds the lock.
+            try {
+                $startedByTask = @(Get-DemoLoaderBootstrapRun -Process @(Get-CimInstance -ClassName 'Win32_Process' -ErrorAction Stop) -Root $Root | Where-Object { $_.Bundle -eq $shortSha }).Count -gt 0
+            }
+            catch {
+                $startedByTask = $false
+            }
+            if ($startedByTask) {
+                $result.Ready = $true
+                break
+            }
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            $result.Ready = $false
+            break
+        }
+        Start-Sleep -Seconds 1
+    }
+    if ($result.Ready) {
+        Write-DemoLoaderLog -Message ('Bundle {0}''s run has ended{1}.' -f $old, $(if ($startedByTask) { ', and the task''s own trigger has already started bundle ' + $shortSha + '''s run' } else { ', and the bootstrap lock is free' }))
+        $result.Text = 'stopped bundle {0}''s bootstrap run, which was still going (process {1}){2}; bundle {3}''s run starts now.' -f $old, $ids, $childText, $shortSha
+    }
+    else {
+        $still = if ($failed.Count -gt 0) { 'process(es) {0} couldn''t be stopped' -f ($failed -join ', ') } else { 'the run hasn''t ended, the bootstrap lock is still held, or the task still reports a run' }
+        Write-DemoLoaderLog -Level 'Warning' -Message ('Bundle {0}''s run was stopped, but after {1} seconds {2}; bundle {3}''s run starts at the task''s next pass once it has.' -f $old, $TimeoutSeconds, $still, $shortSha)
+        $result.Text = 'stopped bundle {0}''s bootstrap run, which was still going (process {1}){2}, but after {3} seconds {4}; bundle {5}''s run starts at the task''s next pass once it has.' -f $old, $ids, $childText, $TimeoutSeconds, $still, $shortSha
+    }
+    return $result
+}
+
 function Remove-DemoLoaderOldBundle {
     # Keeps the current bundle and the newest previous one, for rollback.
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -440,9 +716,12 @@ function Invoke-DemoBootstrapLoader {
     $settingsPath = Join-Path -Path $Root -ChildPath 'settings.json'
     [System.IO.File]::WriteAllText($settingsPath, ($merged | ConvertTo-Json -Depth 10), (New-Object -TypeName 'System.Text.UTF8Encoding' -ArgumentList $false))
     Protect-DemoLoaderFolder -Path $Root
-    Remove-DemoLoaderOldBundle -BundleDirectory $bundleDirectory -Keep $shortSha
 
+    # Registered first, so a run the task starts from here on runs this bundle; registering it doesn't stop a run that
+    # runs an earlier one, which is stopped next, before the old bundle folders go (live finding, 2026-11-06).
     Register-DemoLoaderTask -ScriptPath $scriptPath -StateRoot $Root
+    $takeover = Stop-DemoLoaderEarlierRun -Root $Root -BundleSha256 $sha
+    Remove-DemoLoaderOldBundle -BundleDirectory $bundleDirectory -Keep $shortSha
     Invoke-DemoLoaderTask
     Write-DemoLoaderLog -Message ('Scheduled task {0} registered and started (generation {1}). The state machine continues in the background; progress is in state.json and health.json.' -f $script:LoaderTaskName, $generation)
 
@@ -453,6 +732,7 @@ function Invoke-DemoBootstrapLoader {
         ScriptPath   = $scriptPath
         TaskName     = $script:LoaderTaskName
         Generation   = $generation
+        TookOver     = [string]$takeover.Text
     }
 }
 
@@ -461,6 +741,10 @@ if ($MyInvocation.InvocationName -ne '.') {
     try {
         $loaderResult = Invoke-DemoBootstrapLoader -BundleSha256 $BundleSha256 -ChunkCount $ChunkCount -Role $Role -SettingsJson $SettingsJson -Root $Root
         [Console]::Out.WriteLine(('DbHubDemo loader finished: role {0}, bundle {1}.' -f $loaderResult.Role, $loaderResult.BundleSha256.Substring(0, 12)))
+        if ($loaderResult.TookOver) {
+            # deploy.ps1 reads this line from the Run Command's output (Invoke-DemoBootstrapLoaderRun).
+            [Console]::Out.WriteLine('DbHubDemo loader took over: ' + $loaderResult.TookOver)
+        }
         exit 0
     }
     catch {
