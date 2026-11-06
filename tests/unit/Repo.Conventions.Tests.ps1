@@ -424,6 +424,28 @@ Describe 'VM-side files' {
         }
         $offenders | Should -BeNullOrEmpty
     }
+
+    It 'VM-side PowerShell and the runbooks declare no mandatory [byte[]] parameter, which Windows PowerShell 5.1 walks on every call (live finding, 2026-11-06)' {
+        # Windows PowerShell 5.1 checks a mandatory array argument for null elements one by one (PowerShell 6 and later skip
+        # value types, PowerShell/PowerShell#5432): a hash function given the 4 MiB buffer per network read held the
+        # Jumpstart image's download to 0.2 MB/s. Call .NET methods in such loops, or take the parameter as optional.
+        $offenders = foreach ($file in Get-ChildItem -Path (Join-Path -Path $repoRoot -ChildPath 'vm'), (Join-Path -Path $repoRoot -ChildPath 'automation') -Recurse -File -Include '*.ps1', '*.psm1') {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            $found = $ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.ParameterAst] -and $node.StaticType -eq [byte[]] -and
+                    @($node.Attributes | Where-Object {
+                            $_ -is [System.Management.Automation.Language.AttributeAst] -and
+                            $_.TypeName.GetReflectionAttributeType() -eq [System.Management.Automation.ParameterAttribute] -and
+                            @($_.NamedArguments | Where-Object { $_.ArgumentName -eq 'Mandatory' -and $_.Argument.Extent.Text -ne '$false' }).Count -gt 0
+                        }).Count -gt 0
+                }, $true)
+            foreach ($node in $found) {
+                '{0}:{1}' -f $file.FullName.Substring($repoRoot.Length), $node.Extent.StartLineNumber
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Network security rules in the compiled template' {

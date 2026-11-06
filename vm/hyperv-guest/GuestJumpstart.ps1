@@ -66,27 +66,59 @@ function Get-DemoJumpstartRemoteFact {
     }
 }
 
-function Open-DemoJumpstartDownload {
-    # GET on the image from Offset (an HTTP Range request when Offset > 0). Returns the response stream, the status code,
-    # Content-Range, and the response to close. Tests mock it with a MemoryStream.
+function New-DemoJumpstartDownloadRequest {
+    <#
+    .SYNOPSIS
+    The GET for the image from Offset, not sent yet. A resumed download asks for a closed range, bytes=Offset-(Length-1):
+    Blob storage serves an anonymous request without x-ms-version at its earliest service version, which takes only that
+    form, so an open-ended range (bytes=Offset-) got the whole file and every resume started over (live finding,
+    2026-11-06). No x-ms-version is sent: it changes the format of the ETag that the sidecar and the pin compare.
+
+    .NOTES
+    https://learn.microsoft.com/rest/api/storageservices/specifying-the-range-header-for-blob-service-operations
+    https://learn.microsoft.com/rest/api/storageservices/versioning-for-the-azure-storage-services
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory object only.')]
     [CmdletBinding()]
-    [OutputType([pscustomobject])]
+    [OutputType([System.Net.HttpWebRequest])]
     param(
         [Parameter(Mandatory = $true)]
         [string] $Uri,
 
-        [long] $Offset = 0
+        [long] $Offset = 0,
+
+        [Parameter(Mandatory = $true)]
+        [long] $Length
     )
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $request = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($Uri)
     $request.Method = 'GET'
     $request.AllowAutoRedirect = $true
     $request.Timeout = 120000
     $request.ReadWriteTimeout = 300000
     if ($Offset -gt 0) {
-        $request.AddRange([long]$Offset)
+        $request.AddRange([long]$Offset, [long]($Length - 1))
     }
+    return $request
+}
+
+function Open-DemoJumpstartDownload {
+    # Sends New-DemoJumpstartDownloadRequest's GET for the image of Length bytes from Offset. Returns the response stream,
+    # the status code, Content-Range, and the response to close. Tests mock it with a MemoryStream.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Uri,
+
+        [long] $Offset = 0,
+
+        [Parameter(Mandatory = $true)]
+        [long] $Length
+    )
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $request = New-DemoJumpstartDownloadRequest -Uri $Uri -Offset $Offset -Length $Length
     $response = [System.Net.HttpWebResponse]$request.GetResponse()
     return [pscustomobject]@{
         Stream       = $response.GetResponseStream()
@@ -311,11 +343,12 @@ function Save-DemoJumpstartImage {
             $resumeText = ', resuming at {0:N1} GiB' -f ($offset / 1GB)
         }
         Write-DemoVmLog -Message ('Downloading the Jumpstart image ({0:N1} GiB, etag {1}){2}.' -f ($remote.ContentLength / 1GB), $remote.ETag, $resumeText)
-        $download = Open-DemoJumpstartDownload -Uri $uri -Offset $offset
+        $download = Open-DemoJumpstartDownload -Uri $uri -Offset $offset -Length $remote.ContentLength
         try {
             $mode = [System.IO.FileMode]::Append
             if ($offset -gt 0 -and $download.StatusCode -ne 206) {
-                # The server sent the whole file instead of the rest: start over.
+                # The server sent the whole file instead of the rest: start over, and say so.
+                Write-DemoVmLog -Level 'Warning' -Message ('The server ignored the range request from byte {0:N0} and sent the whole Jumpstart image (HTTP {1}, not 206), so the download starts over.' -f $offset, $download.StatusCode)
                 $hasher = New-DemoJumpstartHasher
                 $offset = 0
             }

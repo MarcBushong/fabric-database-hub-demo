@@ -292,7 +292,7 @@ namespace DbHubDemoTest
         [System.IO.File]::WriteAllBytes($script:vhdx + '.partial', $first)
         Write-DemoVmJsonFile -Path ($script:vhdx + '.partial.json') -InputObject ([ordered]@{ url = 'x'; etag = '0xPINNED' })
         Save-DemoJumpstartImage -Context $script:context -VhdxPath $script:vhdx | Should -BeNullOrEmpty
-        Should -Invoke -CommandName Open-DemoJumpstartDownload -Times 1 -Exactly -ParameterFilter { $Offset -eq 1MB }
+        Should -Invoke -CommandName Open-DemoJumpstartDownload -Times 1 -Exactly -ParameterFilter { $Offset -eq 1MB -and $Length -eq $script:imageBytes.Length }
         (Get-TestSha256 ([System.IO.File]::ReadAllBytes($script:vhdx))) | Should -Be (Get-TestSha256 $script:imageBytes)
     }
 
@@ -318,7 +318,7 @@ namespace DbHubDemoTest
         }
 
         Save-DemoJumpstartImage -Context $script:context -VhdxPath $script:vhdx | Should -BeNullOrEmpty
-        Should -Invoke -CommandName Open-DemoJumpstartDownload -Times 1 -Exactly -ParameterFilter { $Offset -eq $PartialBytes }
+        Should -Invoke -CommandName Open-DemoJumpstartDownload -Times 1 -Exactly -ParameterFilter { $Offset -eq $PartialBytes -and $Length -eq $script:imageBytes.Length }
         $script:network.Reads | Should -BeGreaterThan ([math]::Floor(($script:imageBytes.Length - $PartialBytes) / 16KB))
         (Get-TestSha256 ([System.IO.File]::ReadAllBytes($script:vhdx))) | Should -Be (Get-TestSha256 $script:imageBytes)
         $record = Read-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $script:context).Image
@@ -336,6 +336,25 @@ namespace DbHubDemoTest
             @($loop.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.Extent.Text }) | Should -BeNullOrEmpty
         }
         $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Add-DemoJumpstartHashBlock' }, $true) | Should -BeNullOrEmpty
+    }
+
+    It 'starts over with a warning when the server ignores the range and sends the whole image' {
+        New-Item -ItemType Directory -Path (Split-Path -Path $script:vhdx -Parent) -Force | Out-Null
+        $first = New-Object -TypeName 'byte[]' -ArgumentList 1MB
+        [Array]::Copy($script:imageBytes, 0, $first, 0, $first.Length)
+        [System.IO.File]::WriteAllBytes($script:vhdx + '.partial', $first)
+        Write-DemoVmJsonFile -Path ($script:vhdx + '.partial.json') -InputObject ([ordered]@{ url = 'x'; etag = '0xPINNED' })
+        Mock -CommandName Open-DemoJumpstartDownload -MockWith {
+            [pscustomobject]@{ Stream = [System.IO.MemoryStream]::new($script:imageBytes, $false); StatusCode = 200; ContentRange = ''; Response = $null }
+        }
+        Mock -CommandName Write-DemoVmLog
+
+        Save-DemoJumpstartImage -Context $script:context -VhdxPath $script:vhdx | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Write-DemoVmLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'ignored the range request' -and $Message -match 'HTTP 200' -and $Message -match 'starts over' }
+        (Get-TestSha256 ([System.IO.File]::ReadAllBytes($script:vhdx))) | Should -Be (Get-TestSha256 $script:imageBytes)
+        $record = Read-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $script:context).Image
+        $record['md5Verified'] | Should -BeTrue
+        $record['sha256'] | Should -Be (Get-TestSha256 $script:imageBytes)
     }
 
     It 'accepts a newer image with a warning that names it (user decision, 2026-11-05)' {
@@ -370,6 +389,27 @@ namespace DbHubDemoTest
     It 'decides a short download is incomplete, so the next run resumes it' {
         $decision = Get-DemoJumpstartImageDecision -Pin (New-TestPin -Size 100) -Remote ([pscustomobject]@{ ContentLength = 100; ETag = '0xPINNED'; ContentMd5 = ''; LastModified = '' }) -Length 60 -Hash ([pscustomobject]@{ Md5Base64 = ''; Sha256 = '' })
         $decision.Outcome | Should -Be 'Incomplete'
+    }
+}
+
+Describe 'The image request (live finding, 2026-11-06)' {
+    It 'asks for a closed range when it resumes, the form Blob storage takes without x-ms-version' {
+        # An anonymous request without x-ms-version is served at Blob storage's earliest version, which answered the open-ended
+        # bytes=N- with 200 and the whole image, so every resume started over.
+        $uri = 'https://jumpstart.example.invalid/arcbox/prod/ArcBox-SQL-STD.vhdx'
+        $request = New-DemoJumpstartDownloadRequest -Uri $uri -Offset 1000000 -Length 36645634048
+        $request.Method | Should -Be 'GET'
+        $request.Headers['Range'] | Should -Be 'bytes=1000000-36645634047'
+        $request.Headers['x-ms-version'] | Should -BeNullOrEmpty
+        (New-DemoJumpstartDownloadRequest -Uri $uri -Length 36645634048).Headers['Range'] | Should -BeNullOrEmpty
+    }
+
+    It 'sends the request for the rest of the image of the length it was given' {
+        $script:fakeRequest = [pscustomobject]@{}
+        $script:fakeRequest | Add-Member -MemberType ScriptMethod -Name 'GetResponse' -Value { throw 'not sent in a test' }
+        Mock -CommandName New-DemoJumpstartDownloadRequest -MockWith { $script:fakeRequest }
+        { Open-DemoJumpstartDownload -Uri 'https://jumpstart.example.invalid/x.vhdx' -Offset 5 -Length 10 } | Should -Throw '*not sent in a test*'
+        Should -Invoke -CommandName New-DemoJumpstartDownloadRequest -Times 1 -Exactly -ParameterFilter { $Offset -eq 5 -and $Length -eq 10 }
     }
 }
 
