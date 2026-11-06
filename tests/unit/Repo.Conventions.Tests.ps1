@@ -75,6 +75,70 @@ Describe 'Repository layout' {
     }
 }
 
+Describe 'Entry scripts load this checkout''s DbHubDemo on every run (live finding, 2026-11-06)' {
+    # Live: deploy.ps1 -Resume, run again in the terminal of an earlier run after a pull, reused the DbHubDemo that the
+    # earlier run had loaded (its import skipped a module already loaded), so the run's own code was the old one: it never
+    # checked the changed bootstrap bundle. The track processes, which import the module themselves, ran the new code.
+    BeforeAll {
+        $script:entryScripts = @(Get-ChildItem -Path (Join-Path -Path $repoRoot -ChildPath 'scripts') -Filter '*.ps1' -File |
+                Where-Object { (Get-Content -LiteralPath $_.FullName -Raw).Contains('modules/DbHubDemo/DbHubDemo.psd1') })
+        $script:entryLines = @(
+            '$entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath ''..'')).TrimEnd(''\'', ''/'') + [System.IO.Path]::DirectorySeparatorChar'
+            '$entryNested = $false'
+            'foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {'
+            '    $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))'
+            '}'
+            'Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath ''modules/DbHubDemo/DbHubDemo.psd1'') -Force:(-not $entryNested)'
+        ) -join "`n"
+    }
+
+    It 'finds the entry scripts that import DbHubDemo' {
+        $script:entryScripts.Count | Should -BeGreaterOrEqual 20
+        @($script:entryScripts | ForEach-Object { $_.Name }) | Should -Contain 'deploy.ps1'
+    }
+
+    It 'imports it with -Force unless the repository''s own code runs the script, and never reuses a module that''s loaded already' {
+        $wrong = foreach ($file in $script:entryScripts) {
+            $text = (Get-Content -LiteralPath $file.FullName -Raw) -replace "`r`n", "`n"
+            $imports = @([regex]::Matches($text, '(?m)^.*Import-Module\b.*DbHubDemo\.psd1.*$') | ForEach-Object { $_.Value.Trim() })
+            if (-not $text.Contains($script:entryLines)) {
+                '{0}: lacks the shared lines that load the module again' -f $file.Name
+            }
+            if ($imports.Count -ne 1 -or $imports[0] -notmatch '-Force:\(-not \$entryNested\)$') {
+                '{0}: imports DbHubDemo {1} time(s), not once with -Force:(-not $entryNested)' -f $file.Name, $imports.Count
+            }
+            if ($text -match "if \(-not \(Get-Module -Name 'DbHubDemo'\)\)") {
+                '{0}: reuses a DbHubDemo that''s loaded already' -f $file.Name
+            }
+        }
+        $wrong | Should -BeNullOrEmpty
+    }
+
+    It 'replaces a module that an earlier run loaded, and keeps it, with its state, when DbHubDemo''s own code runs the script' {
+        $pwsh = (Get-Process -Id $PID).Path
+        $missing = Join-Path -Path $TestDrive -ChildPath 'missing.json'
+        $probe = Join-Path -Path $TestDrive -ChildPath 'probe.ps1'
+        # Outside the repository, as a terminal or a workflow step runs a script.
+        [System.IO.File]::WriteAllText($probe, @'
+param([string] $Repo, [string] $Missing)
+$ErrorActionPreference = 'Stop'
+$status = Join-Path -Path $Repo -ChildPath 'scripts/status.ps1'
+Import-Module -Name (Join-Path -Path $Repo -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')
+$mark = { & (Get-Module -Name 'DbHubDemo') { $script:StaleMarker = 'earlier run' } }
+$read = { [string](& (Get-Module -Name 'DbHubDemo') { Get-Variable -Name 'StaleMarker' -Scope Script -ValueOnly -ErrorAction SilentlyContinue }) }
+& $mark
+try { & $status -ConfigPath $Missing *> $null } catch { $null = $_ }
+'TOP [{0}]' -f (& $read)
+& $mark
+try { & (Get-Module -Name 'DbHubDemo') { param($Path, $Config) Invoke-DemoRepositoryScript -Path $Path -Argument @{ ConfigPath = $Config } } $status $Missing *> $null } catch { $null = $_ }
+'NESTED [{0}]' -f (& $read)
+'@)
+        $output = @(& $pwsh -NoProfile -NonInteractive -File $probe -Repo $repoRoot -Missing $missing 2>&1 | ForEach-Object { [string]$_ })
+        $output | Should -Contain 'TOP []' -Because ('a run from outside the repository loads the module again: {0}' -f ($output -join ' | '))
+        $output | Should -Contain 'NESTED [earlier run]' -Because 'a script that the module runs keeps the module and its state'
+    }
+}
+
 Describe 'PowerShell files' {
     It 'are ASCII-only, so Windows PowerShell 5.1 reads them correctly' {
         $nonAscii = foreach ($file in Get-RepoFile -Include '*.ps1', '*.psm1', '*.psd1') {
