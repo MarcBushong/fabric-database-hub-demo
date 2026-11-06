@@ -781,6 +781,27 @@ Describe 'Invoke-DemoDeploymentTrack' {
         @($script:calls | Where-Object { $_ -like 'monitoring*' }) | Should -Be @('monitoring wait 0 grace ', 'monitoring wait 20 grace 5')
     }
 
+    It 'adds the AutoLogonSecret step''s note to DEPLOY.T1.READY: Pass for the lone LSA secret, Warning when automatic sign-in was armed (ADR 0009)' {
+        $script:state.BundleSentTo = @('sqlvm01')
+        $script:t1Health = [pscustomobject]@{ state = 'Ready'; message = 'Every step is in the desired state.'; signInFound = 'LoneSecret'; signInNote = 'Deleted the LSA secret DefaultPassword that Azure''s provisioning leaves; automatic sign-in was off.' }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { [pscustomobject]@{ Health = $script:t1Health; Polls = 1 } }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps') }
+        $ready = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T1.READY' }
+        $ready.status | Should -Be 'Pass'
+        $ready.message | Should -Be 'T1''s bootstrap is Ready: Every step is in the desired state. Deleted the LSA secret DefaultPassword that Azure''s provisioning leaves; automatic sign-in was off.'
+
+        $script:t1Health = [pscustomobject]@{ state = 'Ready'; message = 'Every step is in the desired state.'; signInFound = 'Armed'; signInNote = 'Windows automatic sign-in was armed on sqlvm01, which nothing in the demo does; the cleanup turned it off and deleted its LSA secret and Winlogon values.' }
+        $armed = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps') }
+        $warned = $armed.Results | Where-Object { $_.checkId -eq 'DEPLOY.T1.READY' }
+        $warned.status | Should -Be 'Warning'
+        $warned.message | Should -Match 'was armed on sqlvm01'
+
+        # A bundle from before the step (no signIn in health.json): as before.
+        $script:t1Health = [pscustomobject]@{ state = 'Ready'; message = 'Every step is in the desired state.' }
+        $plain = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps') }
+        ($plain.Results | Where-Object { $_.checkId -eq 'DEPLOY.T1.READY' }).message | Should -Be 'T1''s bootstrap is Ready: Every step is in the desired state.'
+    }
+
     It 'checks T1''s missing telemetry again, after checking its plugin once, before the Telemetry step fails (Phase 28 live finding, 2026-10-30)' {
         $script:telemetryPolls = 0
         Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith {
