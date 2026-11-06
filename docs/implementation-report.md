@@ -1236,6 +1236,11 @@ The integration:
 
 **Validation.**
 
-- VALIDATION-PLACEHOLDER
+- **Static (2026-11-05, on the combined branch, Windows, PowerShell 7.4.22, Pester 5.9.1, PSScriptAnalyzer 1.25.0, PSRule.Rules.Azure 1.47.0, the pinned Bicep CLI 0.47.16 through a temporary stand-in for `az bicep build` and `az bicep lint` outside the repository, and markdownlint-cli2 0.23.3 on Node.js 26.13.0):** `./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester, Bicep, PSRule, Markdown -CI`: PSScriptAnalyzer **Pass** (no findings in 340 files); Pester **Pass** (3,575 passed, 17 skipped, 0 failed, in 1,659 seconds); Bicep **Pass** (`infra/main.bicep` and the 3 standalone templates build and lint cleanly, and `azuredeploy.json` is in sync); PSRule **Pass** (273 rules); markdownlint **Pass** (0 issues in 134 files).
+  - A first full Pester run, started on the merge commits while the wording change above was being made, failed the three tests whose expectations it touched (3,572 passed); with them updated, the affected files passed (390 tests), and then the full run above.
+  - The 725 intra-repository Markdown links with a `#fragment`, checked by script against their targets' GitHub heading anchors: none broken.
+  - Not run here: DotNet and FabricApp (no .NET SDK on this machine; neither the workload generator nor the Fabric App's code changed). CI runs them with the rest.
+- **The cost figures:** `./scripts/estimate-cost.ps1 -AllProfiles -Detailed` on the combined code (public list prices, no sign-in) gave the same figures as the branches; `Get-DemoCostEstimate -BastionHours 0` gave the session and month without the Bastion hour.
+- **Live:** none, by the owner's direction; the owner's live test follows the merge (R690).
 
 **Risks.** R690 (new).
