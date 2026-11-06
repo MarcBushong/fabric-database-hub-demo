@@ -854,6 +854,16 @@ Describe 'Invoke-DemoDeployment' {
         # here the CLI is already signed in, and the app deploys.
         $script:appSignIn = [pscustomobject]@{ Process = $null; Done = $true; Reported = $false; Result = (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Pass' -Message 'The Rayfin CLI is already signed in to the demo''s tenant.') }
         Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:appSignIn }
+        # The read of its sign-in that starts before the guard (2026-11-06) never runs the CLI here either; what it does is
+        # kept apart from the stages' order.
+        $script:signInCalls = [System.Collections.Generic.List[string]]::new()
+        $script:signInCheck = [pscustomobject]@{ TenantId = '66666666-7777-8888-9999-000000000000'; Via = 'npx'; Run = $null; Result = $null }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignInCheck -MockWith { $script:signInCalls.Add('check'); $script:signInCheck }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoRayfinSignInStatus -MockWith {
+            if ($null -ne $Status) {
+                $script:signInCalls.Add('stop')
+            }
+        }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith { $script:order.Add('App'); New-TestResult 'FABRIC.APP.DEPLOY' 'Pass' 'fabric' 'fabric' }
         # The switch from the interim baseline to a profile with incidents, after DONE's reads (2026-11-03).
         $script:switchOutcome = 'Set'
@@ -1019,6 +1029,52 @@ Describe 'Invoke-DemoDeployment' {
         Invoke-DemoDeployment -Config $config -SkipFabric | Out-Null
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 2 -Exactly -Because 'only the two runs above started it'
         $script:order | Should -Not -Contain 'App'
+    }
+
+    It 'reads the Rayfin CLI''s sign-in from before the guard when the Fabric stage can run, and the sign-in''s start takes that read (-Sequential, 2026-11-06)' {
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { $script:signInCalls.Add('guard'); New-TestResult 'PREFLIGHT.GUARD.CONTEXT' 'Pass' 'preflight' }
+        Invoke-DemoDeployment -Config $config | Out-Null
+        @($script:signInCalls) | Should -Be @('check', 'guard') -Because 'the read runs alongside the guard, and the sign-in''s start uses it'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 1 -Exactly -ParameterFilter { [object]::ReferenceEquals($Check, $script:signInCheck) }
+
+        # A run whose stages can't reach the Fabric stage reads nothing.
+        $script:signInCalls.Clear()
+        Invoke-DemoDeployment -Config $config -StopAfter Infrastructure | Out-Null
+        Invoke-DemoDeployment -Config $config -SkipFabric | Out-Null
+        $script:signInCalls | Should -Not -Contain 'check'
+
+        # A resume that turns out to start after the Fabric stage ends the read it started for nothing.
+        $script:state = New-TestState @{ Stage = 'Fabric' }
+        Invoke-DemoDeployment -Config $config -Resume | Out-Null
+        @($script:signInCalls | Where-Object { $_ -ne 'guard' }) | Should -Be @('check', 'stop')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 1 -Exactly
+    }
+
+    It 'ends the read of the Rayfin CLI''s sign-in when the guard stops the run (-Sequential, 2026-11-06)' {
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { throw 'Subscription guard: check ''account'' failed: the Azure CLI has no sign-in for the subscription. Nothing was changed.' }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        ($results | Where-Object { $_.checkId -eq 'PREFLIGHT.GUARD.CONTEXT' }).status | Should -Be 'Fail'
+        @($script:signInCalls) | Should -Be @('check', 'stop')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 0 -Exactly
+    }
+
+    It 'settles the sign-in''s Warning from the app step''s records, so the two agree (-Sequential, live, 2026-11-06)' {
+        # The live run: the sign-in's row said the app isn't created, and the app's row said it's deployed.
+        $newSignIn = { [pscustomobject]@{ Process = $null; Done = $true; Reported = $false; Result = (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message 'Nobody finished the Rayfin CLI''s sign-in within 15 minutes, so it was stopped. The deployment went on; without the sign-in the Insights app isn''t created, and its step says why.') } }
+        $script:appSignIn = & $newSignIn
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith { $script:order.Add('App'); New-TestResult 'FABRIC.APP.SIGNIN' 'Pass' 'fabric' 'tenant'; New-TestResult 'FABRIC.APP.DEPLOY' 'Pass' 'fabric' 'fabric' }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $signIn = @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' })
+        $signIn.Count | Should -Be 1
+        $signIn[0].status | Should -Be 'Pass'
+        $signIn[0].message | Should -Match 'the Insights app''s step found it signed in and used that sign-in'
+        $signIn[0].message | Should -Not -Match 'isn''t created'
+
+        # An app step that found no sign-in either leaves the Warning as it was.
+        $script:appSignIn = & $newSignIn
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith { $script:order.Add('App'); New-TestResult 'FABRIC.APP.SIGNIN' 'Manual action required' 'fabric' 'tenant' }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' }).status | Should -Be 'Warning'
     }
 
     It 'can end DONE on a new workspace, because its Fabric stage creates what FABRIC.ITEMS.REQUIRED looks for (review follow-up)' {

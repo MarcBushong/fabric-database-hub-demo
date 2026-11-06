@@ -322,7 +322,8 @@ function Invoke-DemoParallelDeployment {
        Phase 28 live finding, 2026-10-30). When the Fabric track runs, the Insights app's sign-in starts too
        (Start-DemoFabricAppSignIn, DEPLOY.FABRIC.APPSIGNIN; 2026-11-05): alongside everything else, which never waits for
        it; it's settled while the tracks run (Complete-DemoFabricAppSignIn) and stopped when they're done, and only the
-       app's own step waits for it, until its deadline.
+       app's own step waits for it, until its deadline. Whether it's needed is read from the run's start, before the
+       subscription guard, so the read runs alongside the guard (Start-DemoFabricAppSignInCheck; 2026-11-06).
     1. The subscription guard; then the bootstrap bundle and the workload runner start building in their own
        process (Start-DemoArtifactBuildJob), which hands them over through a private handoff directory.
        Preflight (Invoke-DemoPreflight) and the T2 source (Resolve-DemoT2Source, PREFLIGHT.T2.SOURCE). Any
@@ -439,10 +440,20 @@ function Invoke-DemoParallelDeployment {
     $phase = [ordered]@{}
     $mark = { param([string] $Name, [System.Diagnostics.Stopwatch] $Watch) $phase[$Name] = [int]$Watch.Elapsed.TotalSeconds }
 
+    # The Insights app's sign-in (2026-11-06 live finding): reading whether the Rayfin CLI is already signed in took about
+    # 9 seconds warm and 44 cold, so the read starts now, alongside the subscription guard and the run's first steps, and
+    # the sign-in's start below takes its answer (Start-DemoFabricAppSignInCheck). Not in a what-if, when the Fabric track
+    # can't run, or where nobody could sign in.
+    $signInCheck = $null
+    if (-not $whatIf -and @((Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -SkipFabric:$SkipFabric).Tracks['Fabric']) -contains 'Fabric') {
+        $signInCheck = Start-DemoFabricAppSignInCheck -Config $Config
+    }
+
     try {
         $results.Add((Assert-DemoAzContext -SubscriptionId ([string]$Config['subscriptionId']) -TenantId ([string]$Config['tenantId']) -Account ([string]$Config['azureAccount'])))
     }
     catch {
+        Stop-DemoRayfinSignInStatus -Status $signInCheck
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing ran. Sign in yourself and select nothing else: the scripts pass --subscription on every call.'))
         Set-DemoProgressStep -Path $ProgressPath -Id 'Preflight' -State 'Failed' -Status 'Fail' -Message $_.Exception.Message
         return $results.ToArray()
@@ -544,10 +555,15 @@ function Invoke-DemoParallelDeployment {
     $t4StartSku = ''
     # The Insights app's sign-in (2026-11-05): started before preflight, alongside everything else (Start-DemoFabricAppSignIn).
     $appSignIn = $null
-    # Settles it once it ended or its deadline passed, and adds its record once; never throws.
+    # Settles it once it ended or its deadline passed, and adds its record once; never throws. Once the Fabric track's
+    # records are in, its app step's records, which prove whether the CLI was signed in, settle a Warning that they
+    # contradict (2026-11-06 live finding: Update-DemoFabricAppSignInFromApp).
     $signInTick = {
         param([switch] $Final)
         & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -ProgressPath $ProgressPath -Final:$Final)
+        if ($trackResults.Contains('Fabric')) {
+            $null = Update-DemoFabricAppSignInFromApp -SignIn $appSignIn -AppResult @($trackResults['Fabric']) -Results $results -ProgressPath $ProgressPath
+        }
     }
     # T1's monitoring plugin, checked on a run that ends with the validation and has no T1 Monitoring step of its own
     # (Phase 28 live finding, 2026-10-30), in its own process while the tracks run (Start-DemoT1MonitoringJob).
@@ -770,12 +786,14 @@ function Invoke-DemoParallelDeployment {
         # The Insights app's sign-in (2026-11-05): when the Fabric track runs, it starts now, while the person is still at
         # the keyboard, and runs alongside preflight, the template, and the tracks, none of which waits for it. Only the
         # app's own step waits for it, until its deadline; one that's cancelled, times out, or fails leaves that step to
-        # say why, and the run goes on.
+        # say why, and the run goes on. Whether it's needed comes from the read that started before the guard
+        # ($signInCheck; 2026-11-06), which a run without the Fabric track ends here.
         if (-not $whatIf -and @($plan.Tracks['Fabric']) -contains 'Fabric') {
-            $appSignIn = Start-DemoFabricAppSignIn -Config $Config -ProgressPath $ProgressPath -Confirm:$false
+            $appSignIn = Start-DemoFabricAppSignIn -Config $Config -ProgressPath $ProgressPath -Check $signInCheck -Confirm:$false
             & $signInTick
         }
         else {
+            Stop-DemoRayfinSignInStatus -Status $signInCheck
             Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.AppSignIn' -State 'Skipped' -Message $(if ($whatIf) { 'What if: nothing signs in.' } else { 'Not needed: the Fabric track isn''t part of this run.' })
         }
 

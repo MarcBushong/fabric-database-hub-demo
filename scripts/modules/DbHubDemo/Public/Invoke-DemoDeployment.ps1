@@ -234,10 +234,22 @@ function Invoke-DemoDeployment {
     # The runner goes to T1 and, in the nested mode, to the T2 host (the evaluation-only mode has none).
     $runnerVms = @('sqlvm01') + @(if ($hostVm -eq 'archost01') { 'archost01' })
 
+    # The Insights app's sign-in (2026-11-06 live finding), as in the parallel path: whether the Rayfin CLI is already
+    # signed in is read from now on, alongside the subscription guard, when the Fabric stage can run; the sign-in's start
+    # below takes its answer (Start-DemoFabricAppSignInCheck).
+    $signInCheck = $null
+    $fabricIndex = [array]::IndexOf($stages, 'Fabric')
+    $firstIndex = if ($FromStage) { [array]::IndexOf($stages, $FromStage) } else { 0 }
+    $lastIndex = if ($StopAfter) { [array]::IndexOf($stages, $StopAfter) } else { $stages.Count - 1 }
+    if (-not $whatIf -and -not $SkipFabric -and $firstIndex -le $fabricIndex -and $fabricIndex -le $lastIndex) {
+        $signInCheck = Start-DemoFabricAppSignInCheck -Config $Config
+    }
+
     try {
         $results.Add((Assert-DemoAzContext -SubscriptionId ([string]$Config['subscriptionId']) -TenantId ([string]$Config['tenantId']) -Account ([string]$Config['azureAccount'])))
     }
     catch {
+        Stop-DemoRayfinSignInStatus -Status $signInCheck
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing ran. Sign in yourself (az login --tenant <tenantId>) and select nothing else: the scripts pass --subscription on every call.'))
         return $results.ToArray()
     }
@@ -352,11 +364,15 @@ function Invoke-DemoDeployment {
     $checkT1Monitoring = $existing -and (& $inRange 'Validation') -and -not (& $inRange 'Monitoring')
     # The Insights app's sign-in (2026-11-05), as in the parallel path: when the Fabric stage runs, it starts now, while the
     # person is still at the keyboard, and runs alongside the stages, none of which waits for it; the Fabric stage waits for
-    # it until its deadline, right before the app's step (Complete-DemoFabricAppSignIn -Wait).
+    # it until its deadline, right before the app's step (Complete-DemoFabricAppSignIn -Wait). Whether it's needed comes
+    # from the read that started before the guard ($signInCheck; 2026-11-06), which a run without the Fabric stage ends.
     $appSignIn = $null
     if (-not $whatIf -and -not $SkipFabric -and (& $inRange 'Fabric')) {
-        $appSignIn = Start-DemoFabricAppSignIn -Config $Config -Confirm:$false
+        $appSignIn = Start-DemoFabricAppSignIn -Config $Config -Check $signInCheck -Confirm:$false
         & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn)
+    }
+    else {
+        Stop-DemoRayfinSignInStatus -Status $signInCheck
     }
     # -Sequential records only its stage, never a track, so once preflight passes, the records of the parallel tracks whose
     # steps this run does again are lowered (all of them from preflight): a later parallel -Resume then runs those steps
@@ -790,6 +806,9 @@ function Invoke-DemoDeployment {
                 & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -Wait)
                 $app = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $fabric)
                 & $addAll $app
+                # The app's step proves whether the CLI was signed in, so its records settle a sign-in Warning they contradict
+                # (2026-11-06 live finding).
+                $null = Update-DemoFabricAppSignInFromApp -SignIn $appSignIn -AppResult $app -Results $results
                 $appSummary = Get-DemoInsightsAppSummary -Result $app
                 $appText = if ($null -ne $appSummary -and [bool]$appSummary.Failed) { '; the Insights app wasn''t created or doesn''t work, which doesn''t block DONE (the summary says why)' } elseif ($null -ne $appSummary -and [bool]$appSummary.Deployed) { ', with the Insights app' } else { '' }
                 & $recordStage 'Fabric'
