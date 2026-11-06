@@ -30,6 +30,11 @@ function Write-DemoResultReport {
     deploy.ps1's run ended DONE: the heading of the Manual action required items says that none of them keeps it from
     DONE (what only a person can confirm, and the optional parts).
 
+    .PARAMETER DeployCommand
+    deploy.ps1's own command (Get-DemoDeployCommand): a remediation that tells you to run deploy.ps1 names it, with its
+    -ConfigPath, in the lines this logs (Resolve-DemoDeployCommandText; live finding, 2026-11-06). The results themselves
+    don't change.
+
     .EXAMPLE
     Write-DemoResultReport -Result $results -Title 'deploy.ps1'
     #>
@@ -42,10 +47,16 @@ function Write-DemoResultReport {
         [Parameter(Mandatory)]
         [string] $Title,
 
-        [switch] $OutcomeDone
+        [switch] $OutcomeDone,
+
+        [AllowEmptyString()]
+        [string] $DeployCommand = ''
     )
 
     $items = @($Result | Where-Object { $null -ne $_ })
+    # A remediation as this run's deploy.ps1 command, when the caller gives it.
+    $runCommand = $DeployCommand
+    $commandText = { param([string] $Text) if ($runCommand -and $Text) { [string](Resolve-DemoDeployCommandText -Text $Text -Command $runCommand).Text } else { $Text } }
     Protect-DemoLogText -Text ($items | Format-Table -Property checkId, status, message -AutoSize -Wrap | Out-String -Width 220) | Write-Information -InformationAction Continue
     # The same check with the same remediation from two sources (Phase 28 live run: PREFLIGHT.FABRIC.VIEWERLICENSE from
     # preflight and from the Fabric track) is logged once; a Fail's pair wins over the same Warning's.
@@ -91,16 +102,16 @@ function Write-DemoResultReport {
         $remediation = [string]$item.remediation
         if ($item.status -eq 'Warning' -and $shared.ContainsKey($remediation)) {
             if ($logged.Add($remediation)) {
-                Write-DemoLog -Level Warning -Message ('{0}: {1}' -f (& $groupLabel $shared[$remediation]), $remediation)
+                Write-DemoLog -Level Warning -Message ('{0}: {1}' -f (& $groupLabel $shared[$remediation]), (& $commandText $remediation))
             }
             continue
         }
-        Write-DemoLog -Level Warning -Message ('{0}: {1}' -f $item.checkId, $item.remediation)
+        Write-DemoLog -Level Warning -Message ('{0}: {1}' -f $item.checkId, (& $commandText $remediation))
     }
     $manual = @($items | Where-Object { $_.status -eq 'Manual action required' })
     $manualSeen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     $manualLines = @(foreach ($item in $manual) {
-            $steps = if ($item.remediation) { [string]$item.remediation } else { [string]$item.message }
+            $steps = if ($item.remediation) { & $commandText ([string]$item.remediation) } else { [string]$item.message }
             if ($manualSeen.Add(('{0}|{1}' -f [string]$item.checkId, $steps))) {
                 '  {0}: {1}' -f $item.checkId, $steps
             }
@@ -129,7 +140,7 @@ function Write-DemoResultReport {
             $lines.Add('### Manual action required')
             $lines.Add('')
             foreach ($item in $manual) {
-                $lines.Add(('- **{0}:** {1}' -f $item.checkId, (& $escape $(if ($item.remediation) { $item.remediation } else { $item.message }))))
+                $lines.Add(('- **{0}:** {1}' -f $item.checkId, (& $escape $(if ($item.remediation) { & $commandText ([string]$item.remediation) } else { $item.message }))))
             }
         }
         $lines.Add('')

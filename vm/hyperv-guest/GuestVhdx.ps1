@@ -85,6 +85,41 @@ function Test-DemoGuestVhdx {
     return ((Test-Path -LiteralPath $VhdxPath -PathType Leaf) -and (Test-Path -LiteralPath ($VhdxPath + '.built') -PathType Leaf))
 }
 
+function Dismount-DemoGuestBuildMedia {
+    <#
+    .SYNOPSIS
+    Detaches the Windows Server ISO and the guest's VHDX when a build that stopped part way left them attached.
+
+    .DESCRIPTION
+    Build-DemoGuestVhdx detaches both in a finally block, which a run that's stopped doesn't reach: the loader stopping
+    an earlier bundle's run (2026-11-06), or the task's 6-hour limit. They then stay attached until the host restarts,
+    and the next build couldn't delete the half-built disk.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $IsoPath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $VhdxPath
+    )
+
+    if (Test-Path -LiteralPath $VhdxPath -PathType Leaf) {
+        $disk = Get-VHD -Path $VhdxPath -ErrorAction SilentlyContinue
+        if ($null -ne $disk -and $disk.Attached) {
+            Write-DemoVmLog -Message ('{0} is still attached from a build that stopped part way; it''s detached first.' -f $VhdxPath)
+            Dismount-VHD -Path $VhdxPath -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path -LiteralPath $IsoPath -PathType Leaf) {
+        $image = Get-DiskImage -ImagePath $IsoPath -ErrorAction SilentlyContinue
+        if ($null -ne $image -and $image.Attached) {
+            Write-DemoVmLog -Message ('{0} is still attached from a build that stopped part way; it''s detached first.' -f $IsoPath)
+            Dismount-DiskImage -ImagePath $IsoPath -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
 function Get-DemoBcdbootArgument {
     <#
     .SYNOPSIS
@@ -154,6 +189,7 @@ function Build-DemoGuestVhdx {
 
     $basicData = '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
     $marker = $VhdxPath + '.built'
+    Dismount-DemoGuestBuildMedia -IsoPath $IsoPath -VhdxPath $VhdxPath
     foreach ($path in @($marker, $VhdxPath)) {
         if (Test-Path -LiteralPath $path) {
             Remove-Item -LiteralPath $path -Force

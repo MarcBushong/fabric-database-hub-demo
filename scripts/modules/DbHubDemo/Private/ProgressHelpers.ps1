@@ -297,7 +297,9 @@ function Set-DemoProgressPlan {
     Marks the progress model's steps by this run's plan (Resolve-DemoTrackPlan): a step a resumed run picks up after is
     Done (an earlier run finished it), the step it picks up at says it didn't finish in the previous run and runs again,
     a step outside the run is Skipped, and the T2 steps its source doesn't use are Skipped (a golden restore has no build
-    or guided stop; a build has no restore). Internal.
+    or guided stop; a build has no restore). A track in -ResendNote, which a resumed run sends back to its Artifacts step
+    because its VM's artifacts changed since the last run (Resolve-DemoArtifactResend), shows that note on its Artifacts
+    step instead. Internal.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
     [CmdletBinding()]
@@ -311,7 +313,10 @@ function Set-DemoProgressPlan {
         [switch] $Resume,
 
         [AllowEmptyString()]
-        [string] $T2Source = ''
+        [string] $T2Source = '',
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $ResendNote = @{}
     )
 
     if (-not $Path) {
@@ -328,18 +333,25 @@ function Set-DemoProgressPlan {
         @{}
     }
     $map = @{}
+    $notes = @{}
     foreach ($track in 'T1', 'T2', 'T4', 'Fabric') {
         $names = @((Get-DemoTrackStep -Track $track).Keys)
         $planned = @($Plan.Tracks[$track])
         $firstIndex = if ($planned.Count -gt 0) { [array]::IndexOf($names, [string]$planned[0]) } else { $names.Count }
         # A resumed track picks up at the step its previous run didn't finish, which says so on the first row this run uses
-        # (Phase 28 live finding, 2026-10-30).
+        # (Phase 28 live finding, 2026-10-30); one that sends its VM's artifacts again says why on its Artifacts row instead.
         $again = [bool]$Resume
+        $resendText = if ($null -ne $ResendNote -and $ResendNote.Contains($track)) { [string]$ResendNote[$track] } else { '' }
         for ($i = 0; $i -lt $names.Count; $i++) {
             foreach ($id in @(Get-DemoProgressStepId -Track $track -Step $names[$i])) {
                 if ($names[$i] -in $planned) {
                     if ($unused.Contains($id)) {
                         $map[$id] = $unused[$id]
+                    }
+                    elseif ($resendText -and $names[$i] -eq 'Artifacts') {
+                        $map[$id] = 'Resend'
+                        $notes[$id] = Protect-DemoProgressText -Text $resendText
+                        $again = $false
                     }
                     elseif ($again) {
                         $map[$id] = 'Again'
@@ -361,7 +373,7 @@ function Set-DemoProgressPlan {
     $map['Preflight'] = if ($Plan.Preflight) { 'Run' } elseif ($Resume) { 'Earlier' } else { 'Skip' }
     $map['Infrastructure'] = if ($Plan.Infrastructure) { 'Run' } elseif ($Resume) { 'Earlier' } else { 'Skip' }
     $map['Validation'] = if ($Plan.Validation) { 'Run' } else { 'Skip' }
-    Update-DemoProgress -Path $Path -Data @{ Map = $map } -Action {
+    Update-DemoProgress -Path $Path -Data @{ Map = $map; Notes = $notes } -Action {
         param($Model, $Change)
         $now = Get-DemoUnixTime
         foreach ($track in @($Model['tracks'])) {
@@ -370,6 +382,7 @@ function Set-DemoProgressPlan {
                 $text = switch ($verdict) {
                     'Earlier' { 'Finished in an earlier run.' }
                     'Again' { 'Didn''t finish in the previous run; running it again.' }
+                    'Resend' { [string]$Change['Notes'][[string]$item['id']] }
                     'Skip' { 'Not part of this run.' }
                     'Golden' { 'Restored from the golden snapshot: no build and no guided stop.' }
                     'Build' { 'No golden snapshot: the host builds its guest instead.' }
@@ -378,7 +391,7 @@ function Set-DemoProgressPlan {
                 if (-not $text) {
                     continue
                 }
-                if ($verdict -eq 'Again') {
+                if ($verdict -in 'Again', 'Resend') {
                     $item['state'] = 'Pending'
                     $item['message'] = $text
                     $item['startedAt'] = 0
