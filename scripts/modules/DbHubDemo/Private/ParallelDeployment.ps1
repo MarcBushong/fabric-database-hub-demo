@@ -549,10 +549,15 @@ function Invoke-DemoParallelDeployment {
     $t4StartSku = ''
     # The Insights app's sign-in (2026-11-05): started before preflight, alongside everything else (Start-DemoFabricAppSignIn).
     $appSignIn = $null
-    # Settles it once it ended or its deadline passed, and adds its record once; never throws.
+    # Settles it once it ended or its deadline passed, and adds its record once; never throws. Once the Fabric track's
+    # records are in, its app step's records, which prove whether the CLI was signed in, settle a Warning that they
+    # contradict (2026-11-06 live finding: Update-DemoFabricAppSignInFromApp).
     $signInTick = {
         param([switch] $Final)
         & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -ProgressPath $ProgressPath -Final:$Final)
+        if ($trackResults.Contains('Fabric')) {
+            $null = Update-DemoFabricAppSignInFromApp -SignIn $appSignIn -AppResult @($trackResults['Fabric']) -Results $results -ProgressPath $ProgressPath
+        }
     }
     # T1's monitoring plugin, checked on a run that ends with the validation and has no T1 Monitoring step of its own
     # (Phase 28 live finding, 2026-10-30), in its own process while the tracks run (Start-DemoT1MonitoringJob).

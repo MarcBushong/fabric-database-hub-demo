@@ -229,7 +229,8 @@ Describe 'Complete-DemoFabricAppSignIn: settled once, from its exit code or its 
         $result[0].message | Should -Match 'The deployment went on'
         $result[0].message | Should -Match 'without the sign-in the Insights app isn''t created'
         (Get-TestRow -Path $script:progress -Id 'Fabric.AppSignIn')['state'] | Should -Be 'Action needed'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRayfinSignInState -Times 1 -Exactly -ParameterFilter { $TenantId -eq '66666666-7777-8888-9999-000000000000' }
+        # Read twice when it says not signed in: a read while another Rayfin process renews its token can (live, 2026-11-06).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRayfinSignInState -Times 1 -Exactly -ParameterFilter { $TenantId -eq '66666666-7777-8888-9999-000000000000' -and $Attempts -eq 2 }
     }
 
     It 'is Pass, not a Warning, when the window was closed but the CLI is signed in to the demo''s tenant anyway (live, 2026-11-06)' {
@@ -403,15 +404,205 @@ Describe 'Start- and Receive-DemoRayfinSignInStatus: the CLI''s own status, neve
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -Times 0 -Exactly
     }
 
-    It 'reads once and gives the same answer after that; Get-DemoRayfinSignInState reads now, within a minute unless told otherwise' {
+    It 'reads once and gives the same answer after that; Get-DemoRayfinSignInState reads now, within the start''s 90 seconds unless told otherwise (a cold read took 64.8 seconds live, 2026-11-06)' {
         $status = InModuleScope DbHubDemo -Parameters @{ Tenant = $script:tenant } { Start-DemoRayfinSignInStatus -TenantId $Tenant }
         $status.TimeoutSeconds | Should -Be 90
         $first = InModuleScope DbHubDemo -Parameters @{ Status = $status } { Receive-DemoRayfinSignInStatus -Status $Status }
         $second = InModuleScope DbHubDemo -Parameters @{ Status = $status } { Receive-DemoRayfinSignInStatus -Status $Status }
         [object]::ReferenceEquals($first, $second) | Should -BeTrue
         Should -Invoke -ModuleName DbHubDemo -CommandName Receive-DemoFabricAppProcess -Times 1 -Exactly
-        (InModuleScope DbHubDemo -Parameters @{ Tenant = $script:tenant } { Get-DemoRayfinSignInState -TenantId $Tenant }).State | Should -Be 'SignedIn'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 60 }
+        $state = InModuleScope DbHubDemo -Parameters @{ Tenant = $script:tenant } { Get-DemoRayfinSignInState -TenantId $Tenant }
+        $state.State | Should -Be 'SignedIn'
+        $state.Attempts | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -Times 2 -Exactly -ParameterFilter { $TimeoutSeconds -eq 90 }
+    }
+}
+
+Describe 'Get-DemoRayfinSignInState: a second read when the first finds no sign-in, which a token renewal elsewhere can cause (live, 2026-11-06)' {
+    BeforeEach {
+        $script:logs = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logs.Add(('{0}: {1}' -f $(if ($PesterBoundParameters.ContainsKey('Level')) { $PesterBoundParameters['Level'] } else { 'Info' }), $Message)) }
+        # What each read answers, in order; the last answer repeats.
+        $script:answers = @(@{ State = 'NotSignedIn'; Detail = 'not signed in' })
+        $script:reads = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoRayfinSignInStatus -MockWith { New-TestStatusRead -TenantId $TenantId -TimeoutSeconds $TimeoutSeconds }
+        Mock -ModuleName DbHubDemo -CommandName Receive-DemoRayfinSignInStatus -MockWith {
+            $answer = $script:answers[[System.Math]::Min($script:reads, $script:answers.Count - 1)]
+            $script:reads++
+            [pscustomobject]@{ State = $answer.State; Detail = $answer.Detail; Seconds = 9; Via = 'the stage''s CLI' }
+        }
+        $script:sleeps = [System.Collections.Generic.List[int]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:sleeps.Add($Seconds) }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $false }
+        $script:read = { param([int] $Attempts = 2) InModuleScope DbHubDemo -Parameters @{ Attempts = $Attempts } { Get-DemoRayfinSignInState -TenantId '66666666-7777-8888-9999-000000000000' -Attempts $Attempts } }
+    }
+
+    It 'reads once by default, within 90 seconds, even when it says not signed in' {
+        $answer = InModuleScope DbHubDemo { Get-DemoRayfinSignInState -TenantId '66666666-7777-8888-9999-000000000000' }
+        $answer.State | Should -Be 'NotSignedIn'
+        $answer.Attempts | Should -Be 1
+        $script:reads | Should -Be 1
+        $script:sleeps.Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoRayfinSignInStatus -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 90 }
+    }
+
+    It 'reads again 10 seconds later when the first read says not signed in, and the second answer counts, both within 90 seconds' {
+        $script:answers = @(@{ State = 'NotSignedIn'; Detail = 'not signed in' }, @{ State = 'SignedIn'; Detail = 'signed in to the demo''s tenant' })
+        $answer = & $script:read
+        $answer.State | Should -Be 'SignedIn'
+        $answer.Attempts | Should -Be 2
+        $script:reads | Should -Be 2
+        @($script:sleeps) -join ',' | Should -Be '10'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoRayfinSignInStatus -Times 2 -Exactly -ParameterFilter { $TimeoutSeconds -eq 90 -and $TenantId -eq '66666666-7777-8888-9999-000000000000' }
+        $script:logs | Should -Contain 'Info: The Rayfin CLI''s sign-in says it isn''t signed in (rayfin login status through the stage''s CLI, 9 seconds); it''s read again in 10 seconds, because a read while another Rayfin process rewrites its token cache can find no sign-in for a moment.'
+        $script:logs | Should -Contain 'Info: The Rayfin CLI''s sign-in, read again: signed in to the demo''s tenant (9 seconds).'
+    }
+
+    It 'reads again when the first read couldn''t be read: <Detail>' -ForEach @(
+        @{ Detail = 'exit code 1: no output' }
+        @{ Detail = 'it couldn''t be read: the read broke' }
+    ) {
+        $script:answers = @(@{ State = 'Unknown'; Detail = $Detail }, @{ State = 'NotSignedIn'; Detail = 'not signed in' })
+        $answer = & $script:read
+        $answer.State | Should -Be 'NotSignedIn'
+        $answer.Attempts | Should -Be 2
+        ($script:logs -join "`n") | Should -Match ([regex]::Escape(('couldn''t be read ({0})' -f $Detail)))
+    }
+
+    It 'doesn''t read again when a second read can''t change it: <Case>' -ForEach @(
+        @{ Case = 'signed in at once'; State = 'SignedIn'; Detail = 'signed in to the demo''s tenant' }
+        @{ Case = 'the read ran out of time, which another 90 seconds would only repeat'; State = 'Unknown'; Detail = 'no answer within 90 seconds' }
+        @{ Case = 'the read couldn''t start'; State = 'Unknown'; Detail = 'it couldn''t start: npx was not found on PATH.' }
+        @{ Case = 'signed in to another tenant, which a renewal doesn''t cause'; State = 'NotSignedIn'; Detail = 'signed in to another tenant than the demo''s' }
+    ) {
+        $script:answers = @(@{ State = $State; Detail = $Detail }, @{ State = 'SignedIn'; Detail = 'signed in to the demo''s tenant' })
+        $answer = & $script:read
+        $answer.State | Should -Be $State
+        $answer.Detail | Should -Be $Detail
+        $answer.Attempts | Should -Be 1
+        $script:reads | Should -Be 1
+        $script:sleeps.Count | Should -Be 0
+    }
+
+    It 'doesn''t read again after Ctrl+C, so a stop stays quick' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
+        $answer = & $script:read
+        $answer.State | Should -Be 'NotSignedIn'
+        $script:reads | Should -Be 1
+        $script:sleeps.Count | Should -Be 0
+    }
+
+    It 'reads at most -Attempts times' {
+        $answer = & $script:read 3
+        $answer.State | Should -Be 'NotSignedIn'
+        $answer.Attempts | Should -Be 3
+        $script:reads | Should -Be 3
+        @($script:sleeps) -join ',' | Should -Be '10,10'
+    }
+
+    It 'makes the window''s deadline a Pass when the second read finds the sign-in the first missed (Complete-DemoFabricAppSignIn, the live finding)' {
+        $script:answers = @(@{ State = 'NotSignedIn'; Detail = 'not signed in' }, @{ State = 'SignedIn'; Detail = 'signed in to the demo''s tenant' })
+        $progress = New-TestModelFile
+        $late = New-TestProcess
+        $state = [pscustomobject]@{ Process = $late; TenantId = '66666666-7777-8888-9999-000000000000'; StartedUtc = [DateTime]::UtcNow.AddMinutes(-16); DeadlineUtc = [DateTime]::UtcNow.AddMinutes(-1); TimeoutMinutes = 15; Done = $false; Reported = $false; Result = $null }
+        $result = @(InModuleScope DbHubDemo -Parameters @{ State = $state; Path = $progress } { Complete-DemoFabricAppSignIn -SignIn $State -ProgressPath $Path })
+        $late.Killed | Should -BeTrue
+        $result.Count | Should -Be 1
+        $result[0].status | Should -Be 'Pass'
+        $result[0].message | Should -Match 'its sign-in window was still open, so it was stopped, but a sign-in already exists'
+        (Get-TestRow -Path $progress -Id 'Fabric.AppSignIn')['state'] | Should -Be 'Done'
+        $script:reads | Should -Be 2
+    }
+}
+
+Describe 'Update-DemoFabricAppSignInFromApp: the app step''s records settle the sign-in''s row, so the two never disagree (live, 2026-11-06)' {
+    BeforeEach {
+        $script:logs = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logs.Add([string]$Message) }
+        $script:progress = New-TestModelFile
+        # The live run: nobody answered the window, and the read at its deadline said "not signed in".
+        $script:signIn = [pscustomobject]@{ Process = $null; TenantId = '66666666-7777-8888-9999-000000000000'; Done = $false; Reported = $true; Result = $null }
+        $script:earlier = 'Nobody finished the Rayfin CLI''s sign-in within 15 minutes, so it was stopped. The deployment went on; without the sign-in the Insights app isn''t created, and its step says why. ./scripts/configure-fabric-app.ps1 -SignIn adds it later.'
+        InModuleScope DbHubDemo -Parameters @{ SignIn = $script:signIn; Path = $script:progress; Message = $script:earlier } {
+            Set-DemoFabricAppSignInResult -SignIn $SignIn -ProgressPath $Path -Status 'Warning' -Message $Message -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn in a terminal.'
+        }
+        $script:warning = $script:signIn.Result
+        # The run's results, with the Warning between two others.
+        $script:results = [System.Collections.Generic.List[object]]::new()
+        $script:results.Add((New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok'))
+        $script:results.Add($script:warning)
+        $script:results.Add((New-DemoResult -CheckId 'FABRIC.NOTEBOOKS' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'ok'))
+        # The app step's records, from "ID=Status" pairs.
+        $script:records = { param([string[]] $Spec) foreach ($item in $Spec) { $id, $status = $item -split '=', 2; New-DemoResult -CheckId $id -Area 'fabric' -Target 'fabric' -Status $status -Message ('{0}: {1}' -f $id, $status) } }
+        $script:update = { param([object[]] $App) InModuleScope DbHubDemo -Parameters @{ SignIn = $script:signIn; App = $App; Results = $script:results; Path = $script:progress } { Update-DemoFabricAppSignInFromApp -SignIn $SignIn -AppResult $App -Results $Results -ProgressPath $Path } }
+    }
+
+    It 'makes the Warning a Pass when the app''s step found the CLI signed in: the record, the run''s results, and the row, once' {
+        $app = @(& $script:records 'FABRIC.APP.SIGNIN=Pass', 'FABRIC.APP.DEPLOY=Pass', 'DEPLOY.FABRIC.APP=Manual action required')
+        $new = & $script:update $app
+        $new.checkId | Should -Be 'DEPLOY.FABRIC.APPSIGNIN'
+        $new.status | Should -Be 'Pass'
+        $new.message | Should -BeExactly 'The Rayfin CLI was signed in to the demo''s tenant: the Insights app''s step found it signed in and used that sign-in, so the sign-in this run started wasn''t needed.'
+        $new.message | Should -Not -Match 'isn''t created'
+        $new.evidence['settledBy'] | Should -Be 'FABRIC.APP.SIGNIN, FABRIC.APP.DEPLOY'
+        $new.evidence['earlierStatus'] | Should -Be 'Warning'
+        $new.evidence['earlierMessage'] | Should -Be $script:earlier
+        [object]::ReferenceEquals($script:signIn.Result, $new) | Should -BeTrue
+        # The run's results hold the new record where the Warning was, and the Warning no more.
+        $script:results.Count | Should -Be 3
+        [object]::ReferenceEquals($script:results[1], $new) | Should -BeTrue
+        @($script:results | Where-Object { [object]::ReferenceEquals($_, $script:warning) }).Count | Should -Be 0
+        $row = Get-TestRow -Path $script:progress -Id 'Fabric.AppSignIn'
+        $row['state'] | Should -Be 'Done'
+        $row['message'] | Should -Be $new.message
+        $script:logs | Should -Contain ('The Insights app''s sign-in, settled from the app''s step: {0}' -f $new.message)
+        # Once: a second look changes nothing.
+        $logged = $script:logs.Count
+        & $script:update $app | Should -BeNullOrEmpty
+        [object]::ReferenceEquals($script:results[1], $new) | Should -BeTrue
+        $script:logs.Count | Should -Be $logged
+    }
+
+    It 'makes it a Pass on the app''s deployment alone (FABRIC.APP.DEPLOY Pass)' {
+        $new = & $script:update @(& $script:records 'FABRIC.APP.DEPLOY=Pass')
+        $new.status | Should -Be 'Pass'
+        $new.message | Should -Match 'the Insights app''s step deployed the app with that sign-in'
+        $new.evidence['settledBy'] | Should -Be 'FABRIC.APP.DEPLOY'
+    }
+
+    It 'leaves a Warning that the step''s records don''t contradict: <Case>' -ForEach @(
+        @{ Case = 'no records yet'; Spec = @() }
+        @{ Case = 'the step found no sign-in either'; Spec = @('FABRIC.APP.SIGNIN=Manual action required', 'DEPLOY.FABRIC.APP=Manual action required') }
+        @{ Case = 'the app wasn''t deployed'; Spec = @('FABRIC.APP.DEPLOY=Manual action required') }
+        @{ Case = 'only other checks passed'; Spec = @('FABRIC.APP.TENANTSETTING=Pass', 'DEPLOY.FABRIC.APP=Pass') }
+    ) {
+        & $script:update @(& $script:records $Spec) | Should -BeNullOrEmpty
+        [object]::ReferenceEquals($script:signIn.Result, $script:warning) | Should -BeTrue
+        [object]::ReferenceEquals($script:results[1], $script:warning) | Should -BeTrue
+        (Get-TestRow -Path $script:progress -Id 'Fabric.AppSignIn')['state'] | Should -Be 'Action needed'
+    }
+
+    It 'leaves a sign-in that isn''t a Warning alone: <Status>' -ForEach @(
+        @{ Status = 'Pass' }
+        @{ Status = 'Not supported' }
+        @{ Status = 'Not selected' }
+    ) {
+        InModuleScope DbHubDemo -Parameters @{ SignIn = $script:signIn; Status = $Status } { Set-DemoFabricAppSignInResult -SignIn $SignIn -Status $Status -Message 'Settled before.' }
+        $before = $script:signIn.Result
+        & $script:update @(& $script:records 'FABRIC.APP.SIGNIN=Pass') | Should -BeNullOrEmpty
+        [object]::ReferenceEquals($script:signIn.Result, $before) | Should -BeTrue
+    }
+
+    It 'never throws: no sign-in, one not settled yet, or odd records, which don''t keep a real one from settling it' {
+        { InModuleScope DbHubDemo { Update-DemoFabricAppSignInFromApp -SignIn $null -AppResult @() } } | Should -Not -Throw
+        $open = [pscustomobject]@{ Process = $null; Done = $false; Reported = $false; Result = $null }
+        (InModuleScope DbHubDemo -Parameters @{ SignIn = $open } { Update-DemoFabricAppSignInFromApp -SignIn $SignIn -AppResult @([pscustomobject]@{ checkId = 'FABRIC.APP.SIGNIN'; status = 'Pass' }) }) | Should -BeNullOrEmpty
+        $odd = @($null, 'text', @{ checkId = 'FABRIC.APP.SIGNIN' }, [pscustomobject]@{ status = 'Pass' })
+        { $script:none = & $script:update $odd } | Should -Not -Throw
+        $script:none | Should -BeNullOrEmpty
+        [object]::ReferenceEquals($script:signIn.Result, $script:warning) | Should -BeTrue
+        $new = & $script:update (@($odd) + @(& $script:records 'FABRIC.APP.SIGNIN=Pass'))
+        $new.status | Should -Be 'Pass'
     }
 }
 
@@ -479,7 +670,7 @@ Describe 'Start-DemoFabricAppSignInCheck: the read starts before the guard, and 
     }
 }
 
-Describe 'Wait-DemoFabricAppSignIn: only the Insights app''s step waits, and only until the deadline (2026-11-05)' {
+Describe 'Wait-DemoFabricAppSignIn: only the Insights app''s step waits: until the deadline, then while the run reads the sign-in, at most 4 minutes (2026-11-05, 2026-11-06)' {
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         $script:progress = New-TestModelFile
@@ -510,12 +701,52 @@ Describe 'Wait-DemoFabricAppSignIn: only the Insights app''s step waits, and onl
         (Get-TestRow -Path $script:progress -Id 'Fabric.App')['message'] | Should -Match 'Waiting for the Rayfin CLI''s sign-in in the browser, at most until'
     }
 
-    It 'doesn''t wait past the deadline' {
-        InModuleScope DbHubDemo -Parameters @{ Path = $script:progress; Until = ([System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 1) } {
+    It 'past the deadline, waits while the run reads the CLI''s sign-in, and says so on the app''s row, so the two reads don''t overlap (live, 2026-11-06)' {
+        $until = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 5
+        InModuleScope DbHubDemo -Parameters @{ Path = $script:progress; Until = $until } {
             Set-DemoProgressValue -Path $Path -Section 'run' -Value ([ordered]@{ appSignInUntil = $Until })
             Set-DemoProgressStep -Path $Path -Id 'Fabric.AppSignIn' -State 'Running' -Message 'A browser opens for your sign-in.'
         }
+        $script:polls = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith {
+            $script:polls++
+            if ($script:polls -eq 3) {
+                # deploy.ps1's read at the deadline settles the sign-in meanwhile.
+                & (Get-Module -Name DbHubDemo) { param($p) Set-DemoProgressStep -Path $p -Id 'Fabric.AppSignIn' -State 'Action needed' -Status 'Warning' -Message 'Not signed in.' } $script:progress
+            }
+        }
+        $null = InModuleScope DbHubDemo -Parameters @{ Path = $script:progress } { Wait-DemoFabricAppSignIn -ProgressPath $Path -PollSeconds 1 }
+        $script:polls | Should -Be 3
+        (Get-TestRow -Path $script:progress -Id 'Fabric.App')['message'] | Should -Match 'reached its deadline; the run is checking whether the CLI is signed in, and the Insights app''s step goes on once it has, at most at'
+    }
+
+    It 'waits at most -GraceSeconds past the deadline when nothing settles the sign-in, saying each wait once' {
+        # A clock that moves only when the wait sleeps.
+        $script:clock = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUnixTime -MockWith { $script:clock }
+        $script:slept = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:slept += $Seconds; $script:clock += $Seconds }
+        $script:logs = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logs.Add([string]$Message) }
+        InModuleScope DbHubDemo -Parameters @{ Path = $script:progress; Until = ($script:clock + 20) } {
+            Set-DemoProgressValue -Path $Path -Section 'run' -Value ([ordered]@{ appSignInUntil = $Until })
+            Set-DemoProgressStep -Path $Path -Id 'Fabric.AppSignIn' -State 'Running' -Message 'A browser opens for your sign-in.'
+        }
+        $null = InModuleScope DbHubDemo -Parameters @{ Path = $script:progress } { Wait-DemoFabricAppSignIn -ProgressPath $Path }
+        $script:slept | Should -Be 260 -Because 'it waits 20 seconds to the deadline, then 240 more at most'
+        @($script:logs | Where-Object { $_ -like 'Waiting for the Rayfin CLI''s sign-in in the browser*' }).Count | Should -Be 1
+        @($script:logs | Where-Object { $_ -like 'The Rayfin CLI''s sign-in reached its deadline*' }).Count | Should -Be 1
+    }
+
+    It 'doesn''t wait past the deadline without a grace (-GraceSeconds 0), or once the grace is over' {
+        $now = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { throw 'no wait expected' }
+        InModuleScope DbHubDemo -Parameters @{ Path = $script:progress; Until = ($now - 1) } {
+            Set-DemoProgressValue -Path $Path -Section 'run' -Value ([ordered]@{ appSignInUntil = $Until })
+            Set-DemoProgressStep -Path $Path -Id 'Fabric.AppSignIn' -State 'Running' -Message 'A browser opens for your sign-in.'
+        }
+        (InModuleScope DbHubDemo -Parameters @{ Path = $script:progress } { Wait-DemoFabricAppSignIn -ProgressPath $Path -GraceSeconds 0 }) | Should -Be 0
+        InModuleScope DbHubDemo -Parameters @{ Path = $script:progress; Until = ($now - 241) } { Set-DemoProgressValue -Path $Path -Section 'run' -Value ([ordered]@{ appSignInUntil = $Until }) }
         (InModuleScope DbHubDemo -Parameters @{ Path = $script:progress } { Wait-DemoFabricAppSignIn -ProgressPath $Path }) | Should -Be 0
     }
 }

@@ -1,8 +1,9 @@
 # The Insights app's Rayfin CLI sign-in during deploy.ps1 (2026-11-05). It starts at the beginning of the run, while the
 # person is still at the keyboard, and runs alongside preflight, the template, and the tracks, which never wait for it.
-# Only the Insights app's own step waits for it, and never past its deadline; a sign-in that's cancelled, times out, or
-# fails only leaves that step to say why. Nothing here is ever a Fail or Manual action required: the app never blocks
-# DONE.
+# Only the Insights app's own step waits for it: until its deadline, then while the run settles it, at most 4 minutes
+# more, so the two never read the CLI's token cache at once (2026-11-06). A sign-in that's cancelled, times out, or fails
+# only leaves that step to say why, and the step's own records settle the sign-in in the end. Nothing here is ever a
+# Fail or Manual action required: the app never blocks DONE.
 # Sources (checked 2026-11-05):
 # - Rayfin CLI reference (rayfin login, rayfin login status): https://learn.microsoft.com/fabric/apps/cli-reference
 # - Start-Process (-NoNewWindow, -Environment, -PassThru): https://learn.microsoft.com/powershell/module/microsoft.powershell.management/start-process
@@ -275,10 +276,12 @@ function Set-DemoFabricAppSignInResult {
         [Parameter(Mandatory)]
         [string] $Message,
 
-        [string] $Remediation = ''
+        [string] $Remediation = '',
+
+        [System.Collections.IDictionary] $Evidence = @{}
     )
 
-    $SignIn.Result = New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status $Status -Message $Message -Remediation $Remediation -DocUrl 'https://learn.microsoft.com/fabric/apps/cli-reference'
+    $SignIn.Result = New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl 'https://learn.microsoft.com/fabric/apps/cli-reference'
     $SignIn.Done = $true
     $rowState = switch ($Status) { 'Pass' { 'Done' } 'Warning' { 'Action needed' } default { 'Skipped' } }
     Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.AppSignIn' -State $rowState -Status $Status -Message $Message
@@ -296,8 +299,11 @@ function Complete-DemoFabricAppSignIn {
     started, and it's a Warning. With -Wait (deploy.ps1 -Sequential, right before the Insights app's step), it first waits
     for the process to end, at most until the deadline. A window that's closed or stopped doesn't mean there's no sign-in,
     though: one can exist already, from another sign-in (live, 2026-11-06). So before a Warning, the CLI's own status is
-    read once, at most a minute (Get-DemoRayfinSignInState): signed in to the demo's tenant is Pass, and the Warning says
-    what it means only when the CLI isn't, or when that couldn't be read (never after Ctrl+C, so a stop stays quick).
+    read, at most 90 seconds, and read again 10 seconds later when it says otherwise, because a read while another Rayfin
+    process rewrites the token cache says "not signed in" for a moment (Get-DemoRayfinSignInState; the rerun of
+    2026-11-06): signed in to the demo's tenant is Pass, and the Warning says what it means only when the CLI isn't, or
+    when that couldn't be read (never after Ctrl+C, so a stop stays quick). The Insights app's step settles it in the end
+    from its own records (Update-DemoFabricAppSignInFromApp).
     Returns the record when it settles, or when it settled at the start and wasn't handed out yet; nothing while it still
     runs, or once it's handed out. Never throws.
     #>
@@ -362,7 +368,7 @@ function Complete-DemoFabricAppSignIn {
                 return
             }
             if ($why) {
-                $cli = if (Test-DemoRunCancelled) { $null } else { Get-DemoRayfinSignInState -TenantId ([string](Get-DemoMemberValue -InputObject $SignIn -Name 'TenantId')) }
+                $cli = if (Test-DemoRunCancelled) { $null } else { Get-DemoRayfinSignInState -TenantId ([string](Get-DemoMemberValue -InputObject $SignIn -Name 'TenantId')) -Attempts 2 }
                 $cliState = [string](Get-DemoMemberValue -InputObject $cli -Name 'State')
                 if ($cliState -eq 'SignedIn') {
                     Set-DemoFabricAppSignInResult -SignIn $SignIn -ProgressPath $ProgressPath -Status 'Pass' -Message ('The Rayfin CLI is signed in to the demo''s tenant ({0}, but a sign-in already exists); the Insights app''s step uses it.' -f $window)
@@ -390,12 +396,88 @@ function Complete-DemoFabricAppSignIn {
     }
 }
 
+function Update-DemoFabricAppSignInFromApp {
+    <#
+    .SYNOPSIS
+    Settles the Insights app's sign-in from its step's own records, which prove whether the Rayfin CLI was signed in: when
+    the step found the CLI signed in to the demo's tenant (FABRIC.APP.SIGNIN Pass) or deployed the app (FABRIC.APP.DEPLOY
+    Pass), a DEPLOY.FABRIC.APPSIGNIN Warning becomes Pass, in -SignIn, in -Results (the same record, replaced), and on the
+    status page's Fabric.AppSignIn row. Returns the new record, or nothing when nothing changes. Never throws. Internal.
+
+    .DESCRIPTION
+    Live, 2026-11-06: nobody answered the sign-in window, and at its deadline the read of the CLI's sign-in said "not
+    signed in", while the app's step, starting at the same moment, found the CLI signed in and deployed the app. The
+    sign-in row said the app isn't created, and the app's row said it's deployed. The step's records are what the app
+    used, so they decide. A record that's Pass, Not supported, or Not selected stays as it is, and so does a Warning the
+    step's records don't contradict.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Changes an in-memory record and the Git-ignored local progress model only.')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [AllowNull()]
+        [object] $SignIn,
+
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]] $AppResult = @(),
+
+        # The run's results, whose DEPLOY.FABRIC.APPSIGNIN record (the same object as -SignIn's Result) is replaced.
+        [AllowNull()]
+        [System.Collections.Generic.List[object]] $Results = $null,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    try {
+        $old = Get-DemoMemberValue -InputObject $SignIn -Name 'Result'
+        if ($null -eq $old -or [string]$old.status -ne 'Warning') {
+            return
+        }
+        $records = @($AppResult | Where-Object { $null -ne $_ })
+        $proof = @($records | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'status') -eq 'Pass' -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -in 'FABRIC.APP.SIGNIN', 'FABRIC.APP.DEPLOY' } | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') } | Sort-Object -Unique -Descending)
+        if ($proof.Count -eq 0) {
+            return
+        }
+        $message = if ($proof -contains 'FABRIC.APP.SIGNIN') {
+            'The Rayfin CLI was signed in to the demo''s tenant: the Insights app''s step found it signed in and used that sign-in, so the sign-in this run started wasn''t needed.'
+        }
+        else {
+            'The Rayfin CLI was signed in to the demo''s tenant: the Insights app''s step deployed the app with that sign-in, so the sign-in this run started wasn''t needed.'
+        }
+        $evidence = [ordered]@{ settledBy = ($proof -join ', '); earlierStatus = 'Warning'; earlierMessage = [string]$old.message }
+        Set-DemoFabricAppSignInResult -SignIn $SignIn -ProgressPath $ProgressPath -Status 'Pass' -Message $message -Evidence $evidence
+        $new = $SignIn.Result
+        if ($null -ne $Results) {
+            for ($index = 0; $index -lt $Results.Count; $index++) {
+                if ([object]::ReferenceEquals($Results[$index], $old)) {
+                    $Results[$index] = $new
+                }
+            }
+        }
+        Write-DemoLog -Message ('The Insights app''s sign-in, settled from the app''s step: {0}' -f $message)
+        return $new
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('The Insights app''s sign-in couldn''t be settled from its step''s records: {0}' -f $_.Exception.Message)
+    }
+}
+
 function Get-DemoRayfinSignInState {
     <#
     .SYNOPSIS
-    Whether the Rayfin CLI is signed in to -TenantId, read now and waited for, at most -TimeoutSeconds
+    Whether the Rayfin CLI is signed in to -TenantId, read now and waited for, at most -TimeoutSeconds, 90 by default
     (Start-DemoRayfinSignInStatus, then Receive-DemoRayfinSignInStatus): State (SignedIn, NotSignedIn, or Unknown),
-    Detail, Seconds, and Via. Never throws. Internal.
+    Detail, Seconds, Via, and Attempts. Never throws. Internal.
+
+    .DESCRIPTION
+    With -Attempts above 1, "not signed in", or an answer that couldn't be read, is read again after -PauseSeconds; never
+    one that ran out of time, couldn't start, or found the CLI signed in to another tenant, which a second read can't
+    change, and never after Ctrl+C. The CLI's token cache is a file that a Rayfin process rewrites in place when it
+    renews a token, and a read at that moment can find it empty, so no account, and say "not signed in"
+    (@azure/msal-node-extensions 1.5.32 in the pinned CLI 1.36.2, read on 2026-11-06; the rerun's finding that day).
+    Info lines say when it reads again, why, and what the second read says.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -404,10 +486,37 @@ function Get-DemoRayfinSignInState {
         [string] $TenantId = '',
 
         [ValidateRange(5, 600)]
-        [int] $TimeoutSeconds = 60
+        [int] $TimeoutSeconds = $script:DemoRayfinStatusTimeoutSeconds,
+
+        [ValidateRange(1, 5)]
+        [int] $Attempts = 1,
+
+        [ValidateRange(0, 120)]
+        [int] $PauseSeconds = 10
     )
 
-    return (Receive-DemoRayfinSignInStatus -Status (Start-DemoRayfinSignInStatus -TenantId $TenantId -TimeoutSeconds $TimeoutSeconds))
+    $answer = $null
+    $attempt = 1
+    while ($true) {
+        $answer = Receive-DemoRayfinSignInStatus -Status (Start-DemoRayfinSignInStatus -TenantId $TenantId -TimeoutSeconds $TimeoutSeconds)
+        $detail = [string](Get-DemoMemberValue -InputObject $answer -Name 'Detail')
+        $state = [string](Get-DemoMemberValue -InputObject $answer -Name 'State')
+        if ($attempt -gt 1) {
+            Write-DemoLog -Message ('The Rayfin CLI''s sign-in, read again: {0} ({1} seconds).' -f $detail, (Get-DemoMemberValue -InputObject $answer -Name 'Seconds'))
+        }
+        $settled = $state -eq 'SignedIn' -or $detail -like 'no answer within*' -or $detail -like 'it couldn''t start*' -or $detail -like 'signed in to another tenant*'
+        if ($settled -or $attempt -ge $Attempts -or (Test-DemoRunCancelled)) {
+            break
+        }
+        $said = if ($state -eq 'NotSignedIn') { 'says it isn''t signed in' } else { 'couldn''t be read ({0})' -f $detail }
+        Write-DemoLog -Message ('The Rayfin CLI''s sign-in {0} (rayfin login status through {1}, {2} seconds); it''s read again in {3} seconds, because a read while another Rayfin process rewrites its token cache can find no sign-in for a moment.' -f $said, (Get-DemoMemberValue -InputObject $answer -Name 'Via'), (Get-DemoMemberValue -InputObject $answer -Name 'Seconds'), $PauseSeconds)
+        Start-Sleep -Seconds $PauseSeconds
+        $attempt++
+    }
+    if ($null -ne $answer) {
+        $answer | Add-Member -NotePropertyName 'Attempts' -NotePropertyValue $attempt -Force
+    }
+    return $answer
 }
 
 function Start-DemoFabricAppSignInCheck {
@@ -659,13 +768,18 @@ function Wait-DemoFabricAppSignIn {
     <#
     .SYNOPSIS
     Right before the Insights app's step: while the run's sign-in (Start-DemoFabricAppSignIn) still waits for the person,
-    waits for it, at most until its deadline (the model's run.appSignInUntil), so a sign-in finished meanwhile counts.
-    Returns the seconds it waited. Internal.
+    waits for it, at most until its deadline (the model's run.appSignInUntil), so a sign-in finished meanwhile counts;
+    past the deadline, while the run settles it, at most -GraceSeconds more. Returns the seconds it waited. Internal.
 
     .DESCRIPTION
     Only the app's step waits, in the Fabric track's own process; nothing else in the run does, and it reads the progress
     model only, whose Fabric.AppSignIn row deploy.ps1 settles while it waits for the tracks (Complete-DemoFabricAppSignIn).
-    Nothing without a model, or once the row isn't Running. Never throws.
+    At the deadline, deploy.ps1 ends the sign-in's window and reads the CLI's sign-in, at most 90 seconds, and once more
+    when it says "not signed in"; the app's step reads the same sign-in first thing. Read at the same moment, one read can
+    find the token cache empty while the other renews its token (live, 2026-11-06: the run's read said "not signed in",
+    and the app's step, starting at the same deadline, deployed with that sign-in). So past the deadline the step waits
+    for the row to settle, at most -GraceSeconds (4 minutes), and the two reads come one after the other. Nothing without a
+    model, or once the row isn't Running. Never throws.
     #>
     [CmdletBinding()]
     [OutputType([int])]
@@ -674,7 +788,10 @@ function Wait-DemoFabricAppSignIn {
         [string] $ProgressPath = '',
 
         [ValidateRange(1, 60)]
-        [int] $PollSeconds = 5
+        [int] $PollSeconds = 5,
+
+        [ValidateRange(0, 900)]
+        [int] $GraceSeconds = 240
     )
 
     if (-not $ProgressPath) {
@@ -682,6 +799,7 @@ function Wait-DemoFabricAppSignIn {
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $said = $false
+    $saidLate = $false
     try {
         while ($true) {
             $model = Read-DemoProgress -Path $ProgressPath
@@ -692,16 +810,24 @@ function Wait-DemoFabricAppSignIn {
             $run = Get-DemoMemberValue -InputObject $model -Name 'run'
             $until = [long](Get-DemoMemberValue -InputObject $run -Name 'appSignInUntil')
             $now = Get-DemoUnixTime
-            if ($null -eq $row -or [string]$row['state'] -ne 'Running' -or $until -le $now) {
+            $limit = $until + $GraceSeconds
+            if ($null -eq $row -or [string]$row['state'] -ne 'Running' -or $until -le 0 -or $limit -le $now) {
                 break
             }
-            if (-not $said) {
+            if ($until -gt $now -and -not $said) {
                 $said = $true
                 $text = 'Waiting for the Rayfin CLI''s sign-in in the browser, at most until {0}; then the Insights app is created, or its step says why not.' -f (Format-DemoProgressClock -Unix $until)
                 Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State 'Running' -Message $text
                 Write-DemoLog -Message $text
             }
-            Start-Sleep -Seconds ([int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, $until - $now)))
+            if ($until -le $now -and -not $saidLate) {
+                $saidLate = $true
+                $text = 'The Rayfin CLI''s sign-in reached its deadline; the run is checking whether the CLI is signed in, and the Insights app''s step goes on once it has, at most at {0}.' -f (Format-DemoProgressClock -Unix $limit)
+                Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State 'Running' -Message $text
+                Write-DemoLog -Message $text
+            }
+            $next = if ($until -gt $now) { $until } else { $limit }
+            Start-Sleep -Seconds ([int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, $next - $now)))
         }
     }
     catch {

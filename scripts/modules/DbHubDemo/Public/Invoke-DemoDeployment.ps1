@@ -800,6 +800,9 @@ function Invoke-DemoDeployment {
                 & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -Wait)
                 $app = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $fabric)
                 & $addAll $app
+                # The app's step proves whether the CLI was signed in, so its records settle a sign-in Warning they contradict
+                # (2026-11-06 live finding).
+                $null = Update-DemoFabricAppSignInFromApp -SignIn $appSignIn -AppResult $app -Results $results
                 $appSummary = Get-DemoInsightsAppSummary -Result $app
                 $appText = if ($null -ne $appSummary -and [bool]$appSummary.Failed) { '; the Insights app wasn''t created or doesn''t work, which doesn''t block DONE (the summary says why)' } elseif ($null -ne $appSummary -and [bool]$appSummary.Deployed) { ', with the Insights app' } else { '' }
                 & $recordStage 'Fabric'

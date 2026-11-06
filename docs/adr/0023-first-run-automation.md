@@ -84,6 +84,24 @@ A rerun the same day (`deploy.ps1 -FromStage Artifacts`, with the app's stage in
 
 The read is a process started without waiting (`Start-DemoFabricAppProcess`); `Invoke-DemoFabricAppProcess` is now that start and a wait (`Receive-DemoFabricAppProcess`). Decision 3's rules stand: only where a person can answer it, and the script never sees the token. Unit-tested in `tests/unit/DbHubDemo.FabricAppSignIn.Tests.ps1`, `DbHubDemo.FabricApp.Tests.ps1` (with real child processes), `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`.
 
+## Amendment: one answer for the sign-in and the app (2026-11-06, the third live finding)
+
+A live run at 15:47Z, without the amendment above, still opened the sign-in's window, and nobody answered it. At its deadline, `DEPLOY.FABRIC.APPSIGNIN` was a **Warning** saying the app isn't created, because the read then said "not signed in"; six minutes later the app's step reported the app deployed, with the CLI's sign-in. A cold read of the stage's status afterwards answered `ok`, in 64.8 seconds.
+
+The cause, read in the pinned packages' code (`@microsoft/rayfin-cli` 1.36.2 and `@azure/msal-node-extensions` 1.5.32; nothing ran against the person's token cache):
+
+- `rayfin login` changes no token cache when it starts, or when it's stopped while it waits for the browser. It writes the cache only after a sign-in.
+- `rayfin login status` says "not signed in" when the cache has no account. The cache's file persistence rewrites the file in place (truncate, then write) when a token is renewed, and it reads an empty file as an empty cache, without an error.
+- At the deadline, `deploy.ps1` read the status while the Fabric track's app step, released by the same deadline, read its own and renewed the token. One read most likely found the file empty.
+
+Three changes:
+
+1. **One read at a time.** Past the deadline, the app's step waits while `deploy.ps1` settles the sign-in, at most 4 minutes more (`Wait-DemoFabricAppSignIn -GraceSeconds`), and its row says so.
+2. **Time, and a second read.** The read after a window that didn't finish has 90 seconds, as the start's does; the minute it had would have missed the 64.8-second cold read. When it says "not signed in", or couldn't be read, it's read once more 10 seconds later (`Get-DemoRayfinSignInState -Attempts 2`), with an Info line; never after a time-out, a start failure, another tenant, or Ctrl+C.
+3. **The app's step has the last word.** When its records show the CLI signed in (`FABRIC.APP.SIGNIN` **Pass**) or the app deployed (`FABRIC.APP.DEPLOY` **Pass**), a **Warning** on the sign-in becomes **Pass**, in the run's results and on the status page, with the earlier message in its evidence (`Update-DemoFabricAppSignInFromApp`, in the parallel and the sequential path). The two rows can't disagree anymore.
+
+Decision 3's rules stand. Unit-tested in `tests/unit/DbHubDemo.FabricAppSignIn.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`.
+
 ## Sources
 
 Checked 2026-10-27:

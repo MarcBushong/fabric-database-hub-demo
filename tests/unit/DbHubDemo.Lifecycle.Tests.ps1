@@ -1051,6 +1051,25 @@ Describe 'Invoke-DemoDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 0 -Exactly
     }
 
+    It 'settles the sign-in''s Warning from the app step''s records, so the two agree (-Sequential, live, 2026-11-06)' {
+        # The live run: the sign-in's row said the app isn't created, and the app's row said it's deployed.
+        $newSignIn = { [pscustomobject]@{ Process = $null; Done = $true; Reported = $false; Result = (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message 'Nobody finished the Rayfin CLI''s sign-in within 15 minutes, so it was stopped. The deployment went on; without the sign-in the Insights app isn''t created, and its step says why.') } }
+        $script:appSignIn = & $newSignIn
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith { $script:order.Add('App'); New-TestResult 'FABRIC.APP.SIGNIN' 'Pass' 'fabric' 'tenant'; New-TestResult 'FABRIC.APP.DEPLOY' 'Pass' 'fabric' 'fabric' }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $signIn = @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' })
+        $signIn.Count | Should -Be 1
+        $signIn[0].status | Should -Be 'Pass'
+        $signIn[0].message | Should -Match 'the Insights app''s step found it signed in and used that sign-in'
+        $signIn[0].message | Should -Not -Match 'isn''t created'
+
+        # An app step that found no sign-in either leaves the Warning as it was.
+        $script:appSignIn = & $newSignIn
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith { $script:order.Add('App'); New-TestResult 'FABRIC.APP.SIGNIN' 'Manual action required' 'fabric' 'tenant' }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' }).status | Should -Be 'Warning'
+    }
+
     It 'can end DONE on a new workspace, because its Fabric stage creates what FABRIC.ITEMS.REQUIRED looks for (review follow-up)' {
         # Before, every stage passed on a new workspace and the run still ended NOT DONE with exit code 1.
         $names = InModuleScope DbHubDemo { Get-DemoFabricAppSetting }
