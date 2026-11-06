@@ -85,6 +85,25 @@ Describe 'PowerShell files' {
         }
         $nonAscii | Should -BeNullOrEmpty
     }
+
+    It 'never pass [type]$value as a command argument, where it is a string, not a cast (live finding, 2026-11-06)' {
+        # In argument mode, [string]$x is the text "[string]" followed by the value: the first boot's cleanup got
+        # "[string]System.Collections.Hashtable[jumpstartFolder]" as its folder and never deleted C:\Jumpstart. Write
+        # ([string]$x). A bare type name with no variable, such as Should -BeOfType [string], is fine.
+        $offenders = foreach ($file in Get-RepoFile -Include '*.ps1', '*.psm1') {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            $found = $ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
+                    $node.StringConstantType -eq [System.Management.Automation.Language.StringConstantType]::BareWord -and
+                    $node.Extent.Text -match '^\[[A-Za-z_][\w.,\[\]]*\]\$'
+                }, $true)
+            foreach ($node in $found) {
+                '{0}:{1}: {2}' -f $file.FullName.Substring($repoRoot.Length), $node.Extent.StartLineNumber, $node.Extent.Text
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Safety rules' {
