@@ -74,6 +74,34 @@ Since 2026-11-05 T2's default install mode is `JumpstartImage` (user-directed, [
 
 The first live run of the 2026-11-05 amendment found two problems. First, `deploy.ps1`'s sign-in opened no browser: the terminal's `BROWSER` held `"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --inprivate %s`, a command line set for `az login` (Python's [`webbrowser`](https://docs.python.org/3/library/webbrowser.html) module takes one with `%s`), and the Rayfin CLI 1.36.2 opens its sign-in page with `"<BROWSER>" "<url>"` through a shell without checking the result. That's in the pinned package's own code (`dist/auth/rayfin-auth.js`); the [CLI reference](https://learn.microsoft.com/fabric/apps/cli-reference) doesn't document it. Both sign-ins, decision 3's and `deploy.ps1`'s, now remove a `BROWSER` that's neither the path of an existing file nor a program on `PATH` ([Get-Command](https://learn.microsoft.com/powershell/module/microsoft.powershell.core/get-command)) from the CLI's process only (`Get-DemoRayfinSignInEnvironment`, with [Start-Process](https://learn.microsoft.com/powershell/module/microsoft.powershell.management/start-process) `-Environment` and `$null`), and say so in one line. The CLI then opens the default browser, where `rayfin login` still asks which account to use. The person's own environment never changes, so `az login` keeps that `BROWSER`, and a usable one, such as a dev container's helper, still reaches the CLI. Second, after that window was closed, `DEPLOY.FABRIC.APPSIGNIN` was a **Warning** that said the app wouldn't be created, though a separate `rayfin login` had signed the CLI in. A window that's closed, fails, or is stopped now settles from the CLI's own `rayfin login status --json`, read once, at most a minute (`Get-DemoRayfinSignInState`): through the stage's pinned CLI, or before a stage exists, the same version through `npx --prefer-offline`. Signed in to the demo's tenant is **Pass**; otherwise it stays a **Warning**, which says so when the status couldn't be read. Nothing reads it after Ctrl+C. Decision 3's rules stand. Unit-tested in `tests/unit/DbHubDemo.FabricAppSignIn.Tests.ps1`.
 
+## Amendment: the start's read of the sign-in (2026-11-06, the second live finding)
+
+A rerun the same day (`deploy.ps1 -FromStage Artifacts`, with the app's stage in place and the CLI already signed in to the demo's tenant) still started a sign-in nobody needed. The start's read, `rayfin login status --json` through the stage's CLI, had 30 seconds; run by hand right after, the same read answered `ok` in 44 seconds, and later in about 9, so a cold start, or the token the CLI reads silently to show its expiry, ran past it. Only a debug line had said why, so neither the console nor the log explained the browser. The command has no option that skips anything: its `--help` lists only `-h`. Three changes:
+
+1. **The read starts earlier and has longer.** `deploy.ps1` starts it with the run, before the subscription guard (`Start-DemoFabricAppSignInCheck`), so it runs alongside the guard, which took 22 seconds in a timed run, and the stopped VMs' start. The sign-in's start takes its answer where it always decided, before preflight, waiting at most 90 seconds from the read's start; while it waits, the console and the status page say so. Only an interactive run whose stages can reach the Fabric track starts the read; a run that turns out not to need it, or whose guard fails, ends it, and so does the run's end.
+2. **The log says why a browser opens:** at Info when the CLI isn't signed in to the demo's tenant, and at Warning, with the reason and the command to read it yourself, when the read failed or ran out of time.
+3. **A first run reads it too:** before the app's stage exists, from a fresh clone too, the same pinned version answers through `npx --prefer-offline`, as the check after a sign-in window from the first finding does.
+
+The read is a process started without waiting (`Start-DemoFabricAppProcess`); `Invoke-DemoFabricAppProcess` is now that start and a wait (`Receive-DemoFabricAppProcess`). Decision 3's rules stand: only where a person can answer it, and the script never sees the token. Unit-tested in `tests/unit/DbHubDemo.FabricAppSignIn.Tests.ps1`, `DbHubDemo.FabricApp.Tests.ps1` (with real child processes), `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`.
+
+## Amendment: one answer for the sign-in and the app (2026-11-06, the third live finding)
+
+A live run at 15:47Z, without the amendment above, still opened the sign-in's window, and nobody answered it. At its deadline, `DEPLOY.FABRIC.APPSIGNIN` was a **Warning** saying the app isn't created, because the read then said "not signed in"; six minutes later the app's step reported the app deployed, with the CLI's sign-in. A cold read of the stage's status afterwards answered `ok`, in 64.8 seconds.
+
+The cause, read in the pinned packages' code (`@microsoft/rayfin-cli` 1.36.2 and `@azure/msal-node-extensions` 1.5.32; nothing ran against the person's token cache):
+
+- `rayfin login` changes no token cache when it starts, or when it's stopped while it waits for the browser. It writes the cache only after a sign-in.
+- `rayfin login status` says "not signed in" when the cache has no account. The cache's file persistence rewrites the file in place (truncate, then write) when a token is renewed, and it reads an empty file as an empty cache, without an error.
+- At the deadline, `deploy.ps1` read the status while the Fabric track's app step, released by the same deadline, read its own and renewed the token. One read most likely found the file empty.
+
+Three changes:
+
+1. **One read at a time.** Past the deadline, the app's step waits while `deploy.ps1` settles the sign-in, at most 4 minutes more (`Wait-DemoFabricAppSignIn -GraceSeconds`), and its row says so.
+2. **Time, and a second read.** The read after a window that didn't finish has 90 seconds, as the start's does; the minute it had would have missed the 64.8-second cold read. When it says "not signed in", or couldn't be read, it's read once more 10 seconds later (`Get-DemoRayfinSignInState -Attempts 2`), with an Info line; never after a time-out, a start failure, another tenant, or Ctrl+C.
+3. **The app's step has the last word.** When its records show the CLI signed in (`FABRIC.APP.SIGNIN` **Pass**) or the app deployed (`FABRIC.APP.DEPLOY` **Pass**), a **Warning** on the sign-in becomes **Pass**, in the run's results and on the status page, with the earlier message in its evidence (`Update-DemoFabricAppSignInFromApp`, in the parallel and the sequential path). The two rows can't disagree anymore.
+
+Decision 3's rules stand. Unit-tested in `tests/unit/DbHubDemo.FabricAppSignIn.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`.
+
 ## Sources
 
 Checked 2026-10-27:

@@ -164,6 +164,89 @@ Describe 'Fabric App helpers' {
     }
 }
 
+Describe 'Start-, Receive-, and Stop-DemoFabricAppProcess: node, npm, and npx, also without waiting (2026-11-06)' {
+    BeforeAll {
+        # This PowerShell stands in for node, so the child processes are real wherever the tests run (Windows or Linux).
+        $script:standIn = (Get-Process -Id $PID).Path
+        $script:childArguments = {
+            param([string] $Script)
+            @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Script)))
+        }
+    }
+
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'node' } -MockWith { [pscustomobject]@{ Source = $script:standIn } }
+    }
+
+    AfterEach {
+        Remove-Item -Path 'Env:DBHUB_TEST_REMOVED' -ErrorAction SilentlyContinue
+    }
+
+    It 'starts without waiting, then reads the exit code, the output, and how long it ran; the child gets its environment, and this process keeps its own' {
+        $env:DBHUB_TEST_REMOVED = 'this process'
+        $arguments = & $script:childArguments 'Start-Sleep -Seconds 6; [Console]::Out.Write(''out ['' + $env:DBHUB_TEST_SET + ''] ['' + $env:DBHUB_TEST_REMOVED + '']''); [Console]::Error.Write(''err''); exit 7'
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $handle = InModuleScope DbHubDemo -Parameters @{ Arguments = $arguments; Dir = $TestDrive } { Start-DemoFabricAppProcess -Tool 'node' -ArgumentList $Arguments -WorkingDirectory $Dir -TimeoutSeconds 120 -Environment @{ DBHUB_TEST_SET = 'set'; DBHUB_TEST_REMOVED = $null } }
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 4 -Because 'nothing waits for the child, which runs for at least 6 seconds'
+        $read = InModuleScope DbHubDemo -Parameters @{ Handle = $handle } { Receive-DemoFabricAppProcess -Handle $Handle }
+        $read.ExitCode | Should -Be 7
+        $read.StdOut | Should -BeExactly 'out [set] []'
+        $read.StdErr | Should -BeExactly 'err'
+        $read.TimedOut | Should -BeFalse
+        $read.Seconds | Should -BeGreaterOrEqual 5
+        $env:DBHUB_TEST_REMOVED | Should -BeExactly 'this process'
+        { InModuleScope DbHubDemo -Parameters @{ Handle = $handle } { Receive-DemoFabricAppProcess -Handle $Handle } } | Should -Throw '*already read or stopped*'
+    }
+
+    It 'ends a child that runs past its time limit, with every process it started, and says so' {
+        $arguments = & $script:childArguments 'Start-Sleep -Seconds 120'
+        $handle = InModuleScope DbHubDemo -Parameters @{ Arguments = $arguments; Dir = $TestDrive } { Start-DemoFabricAppProcess -Tool 'node' -ArgumentList $Arguments -WorkingDirectory $Dir -TimeoutSeconds 3 }
+        $childId = $handle.Process.Id
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $read = InModuleScope DbHubDemo -Parameters @{ Handle = $handle } { Receive-DemoFabricAppProcess -Handle $Handle }
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 30
+        $read.ExitCode | Should -Be -1
+        $read.TimedOut | Should -BeTrue
+        $read.StdOut | Should -BeExactly ''
+        $read.StdErr | Should -BeExactly 'node did not finish within 3 seconds and was stopped.'
+        $read.Seconds | Should -Be 3
+        $gone = $false
+        for ($attempt = 0; $attempt -lt 20 -and -not $gone; $attempt++) {
+            $gone = $null -eq (Get-Process -Id $childId -ErrorAction SilentlyContinue)
+            if (-not $gone) {
+                Start-Sleep -Milliseconds 250
+            }
+        }
+        $gone | Should -BeTrue -Because 'the child was ended, not left running'
+    }
+
+    It 'runs and waits in one call, as before, and the output''s line ending is trimmed on every platform (Invoke-DemoFabricAppProcess)' {
+        $arguments = & $script:childArguments '[Console]::Out.WriteLine(''{"status":"ok"}''); exit 0'
+        $read = InModuleScope DbHubDemo -Parameters @{ Arguments = $arguments; Dir = $TestDrive } { Invoke-DemoFabricAppProcess -Tool 'node' -ArgumentList $Arguments -WorkingDirectory $Dir -TimeoutSeconds 120 }
+        $read.ExitCode | Should -Be 0
+        $read.StdOut | Should -BeExactly '{"status":"ok"}'
+        $read.StdErr | Should -BeExactly ''
+        $read.TimedOut | Should -BeFalse
+    }
+
+    It 'ends a child that''s no longer needed once, with every process it started, and its handle can''t be read after that' {
+        $process = [pscustomobject]@{ HasExited = $false; Killed = $null; Disposed = 0 }
+        $process | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($Tree) $this.Killed = [bool]$Tree; $this.HasExited = $true }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Disposed++ }
+        $handle = [pscustomobject]@{ Tool = 'npx'; Process = $process; StartedUtc = [DateTime]::UtcNow; TimeoutSeconds = 90; Closed = $false }
+        { InModuleScope DbHubDemo -Parameters @{ Handle = $handle } { Stop-DemoFabricAppProcess -Handle $Handle; Stop-DemoFabricAppProcess -Handle $Handle; Stop-DemoFabricAppProcess -Handle $null } } | Should -Not -Throw
+        $process.Killed | Should -BeTrue
+        $process.Disposed | Should -Be 1
+        $handle.Closed | Should -BeTrue
+        { InModuleScope DbHubDemo -Parameters @{ Handle = $handle } { Receive-DemoFabricAppProcess -Handle $Handle } } | Should -Throw '*already read or stopped*'
+    }
+
+    It 'throws, naming Node.js, when the tool isn''t on PATH' {
+        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'node' } -MockWith { }
+        { InModuleScope DbHubDemo -Parameters @{ Dir = $TestDrive } { Start-DemoFabricAppProcess -Tool 'node' -ArgumentList @('--version') -WorkingDirectory $Dir } } | Should -Throw '*node was not found on PATH. Install Node.js*'
+    }
+}
+
 Describe 'Sync-DemoFabricAppStage' {
     BeforeEach {
         $script:source = Join-Path -Path $TestDrive -ChildPath ('src-' + [guid]::NewGuid().ToString('N'))

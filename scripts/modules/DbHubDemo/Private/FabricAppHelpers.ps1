@@ -46,14 +46,53 @@ function Invoke-DemoFabricAppProcess {
     <#
     .SYNOPSIS
     Runs node, npm, or npx in a working directory with a time limit, and returns ExitCode, StdOut, and StdErr
-    (redacted).
+    (redacted), Seconds, and TimedOut.
 
     .DESCRIPTION
-    Standard input is closed, so nothing can wait for a reply; when the time limit passes, the whole process tree is
-    stopped and ExitCode is -1. Environment entries are set for the child only (null removes one), so the operator's
-    session is never changed. Output is redacted with Protect-DemoRayfinText before anything else sees it.
-    On Windows, npm and npx are batch files: they run through cmd.exe with fixed arguments that need no quoting.
+    Start-DemoFabricAppProcess, then Receive-DemoFabricAppProcess: standard input is closed, so nothing can wait for a
+    reply; when the time limit passes, the whole process tree is stopped and ExitCode is -1. Environment entries are set
+    for the child only (null removes one), so the operator's session is never changed. Output is redacted with
+    Protect-DemoRayfinText before anything else sees it. On Windows, npm and npx are batch files: they run through
+    cmd.exe with fixed arguments that need no quoting.
     #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('node', 'npm', 'npx')]
+        [string] $Tool,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $ArgumentList,
+
+        [Parameter(Mandatory)]
+        [string] $WorkingDirectory,
+
+        [ValidateRange(1, 86400)]
+        [int] $TimeoutSeconds = 600,
+
+        [System.Collections.IDictionary] $Environment = @{}
+    )
+
+    $handle = Start-DemoFabricAppProcess -Tool $Tool -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory -TimeoutSeconds $TimeoutSeconds -Environment $Environment
+    return (Receive-DemoFabricAppProcess -Handle $handle)
+}
+
+function Start-DemoFabricAppProcess {
+    <#
+    .SYNOPSIS
+    Starts node, npm, or npx in a working directory without waiting for it, and returns a handle for
+    Receive-DemoFabricAppProcess (which waits at most -TimeoutSeconds from now) or Stop-DemoFabricAppProcess.
+    Internal.
+
+    .DESCRIPTION
+    Standard input is closed, so nothing can wait for a reply, and its output is read as it comes. Environment entries
+    are set for the child only (null removes one), so the operator's session is never changed. On Windows, npm and npx
+    are batch files: they run through cmd.exe with fixed arguments that need no quoting. Throws when the tool isn't on
+    PATH or doesn't start.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Starts a local process for its caller, which decides; nothing outside this machine changes.')]
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -116,32 +155,109 @@ function Invoke-DemoFabricAppProcess {
     $process.StartInfo = $startInfo
     try {
         $null = $process.Start()
+        $started = [System.DateTime]::UtcNow
         $process.StandardInput.Close()
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    }
+    catch {
+        $process.Dispose()
+        throw
+    }
+    [pscustomobject]@{
+        Tool           = $Tool
+        Process        = $process
+        StdOutTask     = $stdoutTask
+        StdErrTask     = $stderrTask
+        StartedUtc     = $started
+        TimeoutSeconds = $TimeoutSeconds
+        Closed         = $false
+    }
+}
+
+function Receive-DemoFabricAppProcess {
+    <#
+    .SYNOPSIS
+    Waits for a process Start-DemoFabricAppProcess started, at most until its time limit from its start, and returns
+    ExitCode, StdOut, and StdErr (redacted), Seconds (how long it ran), and TimedOut. Internal.
+
+    .DESCRIPTION
+    When the time limit passes, the whole process tree is stopped, ExitCode is -1, TimedOut is true, and StdErr says so;
+    the output it had written is dropped. The handle is closed afterwards, so it's read once; a second read throws.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Handle
+    )
+
+    if ([bool]$Handle.Closed) {
+        throw ('The {0} process was already read or stopped.' -f $Handle.Tool)
+    }
+    $process = $Handle.Process
+    try {
+        $left = $Handle.StartedUtc.AddSeconds($Handle.TimeoutSeconds) - [System.DateTime]::UtcNow
+        $milliseconds = [int][System.Math]::Max(0, [System.Math]::Min([double][int]::MaxValue, $left.TotalMilliseconds))
+        if (-not $process.WaitForExit($milliseconds)) {
             try {
                 $process.Kill($true)
             }
             catch {
-                Write-Verbose -Message ('The {0} process had already exited.' -f $Tool)
+                Write-Verbose -Message ('The {0} process had already exited.' -f $Handle.Tool)
             }
             $null = $process.WaitForExit(15000)
             return [pscustomobject]@{
                 ExitCode = -1
                 StdOut   = ''
-                StdErr   = ('{0} did not finish within {1} seconds and was stopped.' -f $Tool, $TimeoutSeconds)
+                StdErr   = ('{0} did not finish within {1} seconds and was stopped.' -f $Handle.Tool, $Handle.TimeoutSeconds)
+                Seconds  = [int]$Handle.TimeoutSeconds
+                TimedOut = $true
             }
         }
         $process.WaitForExit()
+        $ended = try { $process.ExitTime.ToUniversalTime() } catch { [System.DateTime]::UtcNow }
         [pscustomobject]@{
             ExitCode = $process.ExitCode
-            StdOut   = (Protect-DemoRayfinText -Text ([string]$stdoutTask.GetAwaiter().GetResult()).TrimEnd())
-            StdErr   = (Protect-DemoRayfinText -Text ([string]$stderrTask.GetAwaiter().GetResult()).TrimEnd())
+            StdOut   = (Protect-DemoRayfinText -Text ([string]$Handle.StdOutTask.GetAwaiter().GetResult()).TrimEnd())
+            StdErr   = (Protect-DemoRayfinText -Text ([string]$Handle.StdErrTask.GetAwaiter().GetResult()).TrimEnd())
+            Seconds  = [int][System.Math]::Max(0, [System.Math]::Round(($ended - $Handle.StartedUtc).TotalSeconds))
+            TimedOut = $false
         }
     }
     finally {
+        $Handle.Closed = $true
         $process.Dispose()
+    }
+}
+
+function Stop-DemoFabricAppProcess {
+    # Ends a process Start-DemoFabricAppProcess started when it still runs, with every process it started, and closes its
+    # handle without reading it. Never throws. Internal.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Ends only a local process its caller started and no longer needs.')]
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object] $Handle
+    )
+
+    if ($null -eq $Handle -or [bool](Get-DemoMemberValue -InputObject $Handle -Name 'Closed')) {
+        return
+    }
+    $process = Get-DemoMemberValue -InputObject $Handle -Name 'Process'
+    try {
+        if ($null -ne $process -and -not $process.HasExited) {
+            $process.Kill($true)
+        }
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('A local process couldn''t be ended: {0}' -f $_.Exception.Message)
+    }
+    finally {
+        $Handle.Closed = $true
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
     }
 }
 
