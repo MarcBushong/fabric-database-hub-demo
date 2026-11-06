@@ -887,7 +887,9 @@ function Invoke-DemoJumpstartFirstBoot {
     $sql = Invoke-Command -VMName $name -Credential $credential -ScriptBlock $script:DemoJumpstartSqlBlock -ArgumentList $name, @($expected['sampleDatabases']) -ErrorAction Stop
     Write-DemoVmLog -Message ('SQL Server in the guest: name {0}{1}, sysadmin group {2}, {3} SQL login(s) disabled, {4} sample database(s) dropped.' -f $name, $(if ([bool]$sql.serverRenamed) { ' (was ' + [string]$sql.oldServerName + ')' } else { '' }), $(if ([bool]$sql.sysadminGroupAdded) { 'added' } else { 'in place' }), @($sql.loginsDisabled).Count, @($sql.databasesDropped).Count)
 
-    $cleanup = Invoke-Command -VMName $name -Credential $credential -ScriptBlock $script:DemoJumpstartCleanupBlock -ArgumentList @($settings.AssociatedServices), [string]$settings.UninstallFeatures, [string]$Context.Guest.Sql.InstanceName, [string]$expected['jumpstartFolder'], ([int]$settings.SetupTimeoutMinutes) -ErrorAction Stop
+    # Every typed argument is in parentheses: in argument mode, [string]$x is an expandable string, not a cast (live finding,
+    # 2026-11-06: the cleanup got "[string]System.Collections.Hashtable[jumpstartFolder]" and never deleted C:\Jumpstart).
+    $cleanup = Invoke-Command -VMName $name -Credential $credential -ScriptBlock $script:DemoJumpstartCleanupBlock -ArgumentList @($settings.AssociatedServices), ([string]$settings.UninstallFeatures), ([string]$Context.Guest.Sql.InstanceName), ([string]$expected['jumpstartFolder']), ([int]$settings.SetupTimeoutMinutes) -ErrorAction Stop
     if ($null -ne $cleanup.uninstall) {
         $exitCode = $cleanup.uninstall.exitCode
         if ([bool]$cleanup.uninstall.serviceLeft -or ($null -ne $exitCode -and [int]$exitCode -notin 0, 3010)) {

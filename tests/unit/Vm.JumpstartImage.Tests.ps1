@@ -413,6 +413,47 @@ Describe 'The image request (live finding, 2026-11-06)' {
     }
 }
 
+Describe 'The first boot' {
+    It 'hands the cleanup its real values: the services, the feature, the instance, the folder, and the timeout (live finding, 2026-11-06)' {
+        # In argument mode an unparenthesized [string]$x is an expandable string, not a cast: the cleanup got
+        # "[string]System.Collections.Hashtable[jumpstartFolder]" for the folder, so C:\Jumpstart was never deleted.
+        $context = New-TestJumpstartContext
+        Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = 'Running' } }
+        Mock -CommandName Wait-DemoGuestHeartbeat -MockWith { $true }
+        Mock -CommandName Get-DemoJumpstartPin -MockWith { New-TestPin -Size 1 }
+        Mock -CommandName Get-DemoJumpstartGuestCredential -MockWith {
+            $secure = [System.Security.SecureString]::new()
+            foreach ($character in ('t' + [guid]::NewGuid().ToString('N')).ToCharArray()) { $secure.AppendChar($character) }
+            [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+        }
+        Mock -CommandName Test-DemoGuestAdapterConnected -MockWith { $true }
+        $script:guestCalls = @{}
+        Mock -CommandName Invoke-Command -MockWith {
+            # Each guest block is told apart by its first parameter.
+            $first = ''
+            if ($null -ne $ScriptBlock.Ast.ParamBlock) {
+                $first = [string]$ScriptBlock.Ast.ParamBlock.Parameters[0].Name.VariablePath.UserPath
+            }
+            $script:guestCalls[$first] = @($ArgumentList)
+            switch ($first) {
+                'NewName' { [pscustomobject]@{ oldName = 'arcsql01'; renamed = $false; timeZone = 'UTC' } }
+                'ServerName' { [pscustomobject]@{ oldServerName = 'arcsql01'; serverRenamed = $false; sysadminGroupAdded = $false; loginsDisabled = @(); databasesDropped = @(); restarted = $false } }
+                'ServiceNames' { [pscustomobject]@{ disabled = @(); uninstall = $null; folderRemoved = $true; arcReset = '' } }
+            }
+        }
+
+        Invoke-DemoJumpstartFirstBoot -Context $context | Should -BeNullOrEmpty
+        $cleanup = $script:guestCalls['ServiceNames']
+        $cleanup.Count | Should -Be 5
+        @($cleanup[0]) | Should -Be @($context.Host.JumpstartImage.AssociatedServices)
+        $cleanup[1] | Should -BeExactly ([string]$context.Host.JumpstartImage.UninstallFeatures)
+        $cleanup[2] | Should -BeExactly 'MSSQLSERVER'
+        $cleanup[3] | Should -BeExactly 'C:\Jumpstart'
+        $cleanup[4] | Should -Be ([int]$context.Host.JumpstartImage.SetupTimeoutMinutes)
+        (Read-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $context).FirstBoot)['jumpstartFolder'] | Should -Be 'removed'
+    }
+}
+
 Describe 'The published credential' {
     BeforeAll {
         $script:versions = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
