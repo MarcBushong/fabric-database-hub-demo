@@ -398,6 +398,101 @@ Describe 'Invoke-DemoSignInSweep' {
         $summary.found.autologon | Should -BeGreaterThan 0
         $summary.remaining.autologon | Should -Be 0
     }
+
+    It 'counts the LSA secret alone, with automatic sign-in off, apart from automatic sign-in left armed, and still fails the scan' {
+        # Live finding (2026-11-06): Azure's Windows provisioning leaves the LSA secret DefaultPassword on every VM, with
+        # AutoAdminLogon, AutoLogonCount, and the Winlogon values all absent.
+        $machine = New-TestMachine
+        $lone = { param($Mode) $null = $Mode; @{ Enabled = 0; Secret = 1; PlainValue = 0; UserName = 0 } }
+        $result = Invoke-DemoSignInSweep -Folder $machine -EventLogReader $script:noEvents -AutoLogonProvider $lone
+        $result.pass | Should -BeFalse -Because 'a stored password nothing needs is left until Clean deletes it'
+        $result.found.autoLogonLoneSecrets | Should -Be 1
+        $result.found.autoLogonSecrets | Should -Be 0
+        $summary = ConvertTo-DemoSignInSummary -Sweep $result
+        $summary.found.loneSecret | Should -Be 1
+        $summary.found.autologon | Should -Be 0 -Because 'it isn''t automatic sign-in left armed'
+
+        # DefaultUserName makes it armed only where the setup wizard signs in (IncludeBrowserCache).
+        $withName = { param($Mode) $null = $Mode; @{ Enabled = 0; Secret = 1; PlainValue = 0; UserName = 1 } }
+        (Invoke-DemoSignInSweep -Folder $machine -EventLogReader $script:noEvents -AutoLogonProvider $withName).found.autoLogonLoneSecrets | Should -Be 1
+        $guest = Invoke-DemoSignInSweep -IncludeBrowserCache $true -Folder $machine -EventLogReader $script:noEvents -AutoLogonProvider $withName
+        $guest.found.autoLogonLoneSecrets | Should -Be 0
+        $guest.found.autoLogonSecrets | Should -Be 1
+        foreach ($armed in @(@{ Enabled = 1; Secret = 1; PlainValue = 0; UserName = 0 }, @{ Enabled = 0; Secret = 1; PlainValue = 1; UserName = 0 })) {
+            $script:autoState = $armed
+            $sweep = Invoke-DemoSignInSweep -Folder $machine -EventLogReader $script:noEvents -AutoLogonProvider { param($Mode) $null = $Mode; $script:autoState }
+            $sweep.found.autoLogonLoneSecrets | Should -Be 0
+            $sweep.found.autoLogonSecrets | Should -Be 1
+        }
+    }
+
+    It 'deletes only the lone LSA secret in Clean, and reports it apart from turning automatic sign-in off' {
+        $machine = New-TestMachine
+        $script:modes = [System.Collections.Generic.List[string]]::new()
+        $script:secret = 1
+        $provider = {
+            param($Mode)
+            $script:modes.Add($Mode)
+            if ($Mode -in 'Clear', 'DeleteSecret') {
+                $script:secret = 0
+            }
+            @{ Enabled = 0; Secret = $script:secret; PlainValue = 0; UserName = 0 }
+        }
+        $result = Invoke-DemoSignInSweep -Clean $true -Folder $machine -EventLogReader $script:noEvents -EventLogClearer { param($Name) $null = $Name } -AutoLogonProvider $provider
+        $result.pass | Should -BeTrue
+        $script:modes | Should -Contain 'DeleteSecret'
+        $script:modes | Should -Not -Contain 'Clear' -Because 'automatic sign-in is already off, so the Winlogon values stay as they are'
+        $result.actions.loneSecretDeleted | Should -Be 1
+        $result.actions.autoLogonCleared | Should -Be 0
+        $summary = ConvertTo-DemoSignInSummary -Sweep $result
+        $summary.actions.loneSecret | Should -Be 1
+        $summary.actions.autologon | Should -Be 0
+        $summary.remaining.loneSecret | Should -Be 0
+
+        # Armed: Clear, as before, and no lone-secret note.
+        $script:modes.Clear()
+        $script:armed = 1
+        $armedProvider = {
+            param($Mode)
+            $script:modes.Add($Mode)
+            if ($Mode -eq 'Clear') {
+                $script:armed = 0
+            }
+            @{ Enabled = $script:armed; Secret = $script:armed; PlainValue = 0; UserName = 0 }
+        }
+        $cleared = Invoke-DemoSignInSweep -Clean $true -Folder $machine -EventLogReader $script:noEvents -EventLogClearer { param($Name) $null = $Name } -AutoLogonProvider $armedProvider
+        $cleared.pass | Should -BeTrue
+        $script:modes | Should -Contain 'Clear'
+        $script:modes | Should -Not -Contain 'DeleteSecret'
+        $cleared.actions.autoLogonCleared | Should -Be 1
+        $cleared.actions.loneSecretDeleted | Should -Be 0
+    }
+
+    It 'checks only automatic sign-in with AutoLogonOnly: no file, cache, or event log is read or changed' {
+        $file = $script:tempFile
+        $before = [System.IO.File]::ReadAllText($file)
+        $script:read = 0
+        $reader = { param($Name, $XPath) $null = $Name, $XPath; $script:read++ }
+        $script:secret = 1
+        $provider = {
+            param($Mode)
+            if ($Mode -eq 'DeleteSecret') {
+                $script:secret = 0
+            }
+            @{ Enabled = 0; Secret = $script:secret; PlainValue = 0; UserName = 0 }
+        }
+        $scan = Invoke-DemoSignInSweep -AutoLogonOnly $true -IncludeBrowserCache $true -Folder $script:machine -EventLogReader $reader -AutoLogonProvider $provider
+        $scan.pass | Should -BeFalse
+        $scan.found.filesScanned | Should -Be 0
+        $scan.found.userTokens | Should -Be 0
+        $scan.found.browserCaches | Should -Be 0
+        $result = Invoke-DemoSignInSweep -Clean $true -AutoLogonOnly $true -Folder $script:machine -EventLogReader $reader -EventLogClearer { param($Name) throw ('cleared ' + $Name) } -AutoLogonProvider $provider
+        $result.pass | Should -BeTrue
+        $result.actions.loneSecretDeleted | Should -Be 1
+        $result.actions.filesRedacted | Should -Be 0
+        $script:read | Should -Be 0
+        [System.IO.File]::ReadAllText($file) | Should -Be $before
+    }
 }
 
 Describe 'Invoke-DemoSignInResidue.ps1 as a Run Command script' {

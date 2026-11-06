@@ -103,6 +103,73 @@ Describe 'Get-DemoSignInDataResult' {
         $result.status | Should -Be 'Warning'
         $result.message | Should -Match '3 token\(s\) of an application or a managed identity'
     }
+
+    It 'passes with a note, not "left armed", when the cleanup deleted only the LSA secret Azure''s provisioning leaves (live finding, 2026-11-06)' {
+        $hostPart = New-TestPart
+        $hostPart.found['loneSecret'] = 1
+        $hostPart.actions['loneSecret'] = 1
+        $result = InModuleScope DbHubDemo -Parameters @{ O = (New-TestOutcome -Local $hostPart -Guest (New-TestPart) -Action 'Clean') } {
+            param($O)
+            Get-DemoSignInDataResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -VmName 'archost01' -GuestName 'arcsql01' -Outcome $O
+        }
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'The cleanup deleted the LSA secret DefaultPassword that Azure''s provisioning leaves on archost01; automatic sign-in was off\.$'
+        $result.message | Should -Not -Match 'armed'
+        $result.evidence['note'] | Should -Match 'on archost01;'
+
+        # T1 is reported the same way.
+        $t1 = New-TestPart
+        $t1.found['loneSecret'] = 1
+        $t1.actions['loneSecret'] = 1
+        $sqlvm = InModuleScope DbHubDemo -Parameters @{ O = (New-TestOutcome -Local $t1 -Action 'Clean') } {
+            param($O)
+            Get-DemoSignInDataResult -CheckId 'SECURITY.SIGNIN.SQLVM01' -Area 'security' -Target 'T1' -VmName 'sqlvm01' -Outcome $O
+        }
+        $sqlvm.status | Should -Be 'Pass'
+        $sqlvm.message | Should -Match 'that Azure''s provisioning leaves on sqlvm01; automatic sign-in was off'
+
+        # Azure doesn't provision the nested guest, so the note there doesn't say where the secret came from.
+        $guestPart = New-TestPart
+        $guestPart.found['loneSecret'] = 1
+        $guestPart.actions['loneSecret'] = 1
+        $guest = InModuleScope DbHubDemo -Parameters @{ O = (New-TestOutcome -Local (New-TestPart) -Guest $guestPart -Action 'Clean') } {
+            param($O)
+            Get-DemoSignInDataResult -CheckId 'SECURITY.SIGNIN.ARCHOST01' -Area 'security' -Target 'T2' -VmName 'archost01' -GuestName 'arcsql01' -Outcome $O
+        }
+        $guest.status | Should -Be 'Pass'
+        $guest.message | Should -Match 'deleted a leftover LSA secret DefaultPassword on arcsql01 \(guest\)'
+    }
+
+    It 'keeps the Warning when automatic sign-in really was armed, and still notes a lone secret elsewhere' {
+        $guestPart = New-TestPart
+        $guestPart.found['autologon'] = 2
+        $guestPart.actions['autologon'] = 1
+        $hostPart = New-TestPart
+        $hostPart.found['loneSecret'] = 1
+        $hostPart.actions['loneSecret'] = 1
+        $result = InModuleScope DbHubDemo -Parameters @{ O = (New-TestOutcome -Local $hostPart -Guest $guestPart -Action 'Clean') } {
+            param($O)
+            Get-DemoSignInDataResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -VmName 'archost01' -GuestName 'arcsql01' -Outcome $O
+        }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^Windows automatic sign-in was left armed on arcsql01 \(guest\), and the cleanup turned it off'
+        $result.message | Should -Match 'The cleanup deleted the LSA secret DefaultPassword that Azure''s provisioning leaves on archost01'
+        $result.remediation | Should -Match 'guided stop'
+    }
+
+    It 'fails a read-only scan that finds the lone LSA secret, and names it accurately' {
+        $part = New-TestPart -Pass $false
+        $part.found['loneSecret'] = 1
+        $part.remaining['loneSecret'] = 1
+        $result = InModuleScope DbHubDemo -Parameters @{ O = (New-TestOutcome -Local $part) } {
+            param($O)
+            Get-DemoSignInDataResult -CheckId 'SECURITY.SIGNIN.SQLVM01' -Area 'security' -Target 'T1' -VmName 'sqlvm01' -Outcome $O
+        }
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'sqlvm01: the LSA secret DefaultPassword, a stored password nothing needs \(automatic sign-in is off'
+        $result.message | Should -Not -Match 'left armed'
+        $result.remediation | Should -Match '-Clean'
+    }
 }
 
 Describe 'Find-DemoSignInData' {

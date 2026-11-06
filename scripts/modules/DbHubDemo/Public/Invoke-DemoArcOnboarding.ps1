@@ -310,7 +310,7 @@ function Invoke-DemoArcOnboarding {
     if ($parameters['Action'] -eq 'Onboard') {
         $sweep = Invoke-DemoSignInDataAction -Config $Config -VmName $target.HostVmName -Action 'Clean' -Scope $(if ($target.EvaluationOnly) { 'Local' } else { 'Both' }) -IncludeBrowserCache:$target.EvaluationOnly
         $sweepResult = Get-DemoSignInDataResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -VmName $target.HostVmName -GuestName $(if ($target.EvaluationOnly) { '' } else { $target.MachineName }) -Outcome $sweep
-        $evidence['signInData'] = [ordered]@{ status = $sweepResult.status; message = $sweepResult.message; seconds = $sweep.Seconds }
+        $evidence['signInData'] = [ordered]@{ status = $sweepResult.status; message = $sweepResult.message; seconds = $sweep.Seconds; note = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $sweepResult -Name 'evidence') -Name 'note') }
         if ($sweepResult.status -eq 'Fail') {
             return (& $newResult 'Fail' ('{0} is onboarded, but the onboarding token''s traces couldn''t be removed and verified: {1}' -f $target.MachineName, $sweepResult.message) 'Run ./scripts/check-sign-in-data.ps1 -Clean until it passes, then ./scripts/configure-arc.ps1 again.')
         }
@@ -333,8 +333,13 @@ function Invoke-DemoArcOnboarding {
     if ($evidence.Contains('signInData') -and $evidence['signInData']['status'] -eq 'Warning') {
         $warnings.Add([string]$evidence['signInData']['message'])
     }
-    if ($warnings.Count -gt 0) {
-        return (& $newResult 'Warning' ('{0} {1}; the host continues its bootstrap. {2}' -f $target.MachineName, $verb, ($warnings -join ' ')))
+    # A Pass from the sweep can carry a note: the LSA secret Azure's provisioning leaves, deleted with automatic sign-in off.
+    $signInNote = ''
+    if ($evidence.Contains('signInData') -and $evidence['signInData']['status'] -ne 'Warning' -and $evidence['signInData']['note']) {
+        $signInNote = ' ' + [string]$evidence['signInData']['note']
     }
-    return (& $newResult 'Pass' ('{0} {1}; the host continues its bootstrap.' -f $target.MachineName, $verb))
+    if ($warnings.Count -gt 0) {
+        return (& $newResult 'Warning' ('{0} {1}; the host continues its bootstrap. {2}{3}' -f $target.MachineName, $verb, ($warnings -join ' '), $signInNote))
+    }
+    return (& $newResult 'Pass' ('{0} {1}; the host continues its bootstrap.{2}' -f $target.MachineName, $verb, $signInNote))
 }

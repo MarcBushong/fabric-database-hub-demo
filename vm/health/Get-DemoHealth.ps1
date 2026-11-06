@@ -194,6 +194,8 @@ if ($View -eq 'Summary') {
         imageEtag      = & $read $health @('details', 'jumpstart', 'image', 'etag')
         imageModified  = & $read $health @('details', 'jumpstart', 'image', 'lastModified')
         imagePinned    = & $read $health @('details', 'jumpstart', 'image', 'pinned')
+        signInFound    = & $read $health @('details', 'signIn', 'found')
+        signInNote     = & $read $health @('details', 'signIn', 'note')
     }
     if ($null -ne $guestFacts) {
         $summary['t2Guest'] = $guestFacts

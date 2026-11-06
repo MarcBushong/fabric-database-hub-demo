@@ -298,6 +298,7 @@ function Format-DemoSignInSweep {
         $autoLogon = @('autoLogonEnabled', 'autoLogonSecrets', 'autoLogonPasswords', 'autoLogonUnverified' | Where-Object { $Counts.PSObject.Properties[$_] -and [int]$Counts.$_ -gt 0 })
         if ($autoLogon.Count -gt 0) { $parts += ('automatic sign-in left armed ({0})' -f ($autoLogon -join ', ')) }
         if ($Counts.PSObject.Properties['autoLogonUserNames'] -and [int]$Counts.autoLogonUserNames -gt 0) { $parts += 'the Winlogon DefaultUserName value' }
+        if ($Counts.PSObject.Properties['autoLogonLoneSecrets'] -and [int]$Counts.autoLogonLoneSecrets -gt 0) { $parts += 'the LSA secret DefaultPassword alone, with automatic sign-in off (Azure''s provisioning leaves it)' }
         if ($parts.Count -eq 0) { return 'nothing' }
         return ($parts -join ', ')
     }
@@ -309,7 +310,11 @@ function Format-DemoSignInSweep {
     }
     $actions = & $member 'actions'
     if ([bool](& $member 'cleaned') -and $null -ne $actions) {
-        $text += '; redacted {0} file(s), deleted {1}, removed {2} cache(s), cleared {3} event log(s); left: {4}' -f [int]$actions.filesRedacted, [int]$actions.filesDeleted, ([int]$actions.cachesRemoved + [int]$actions.brokerEntriesRemoved), @($actions.eventLogsCleared).Count, (& $describe (& $member 'remaining'))
+        $secret = ''
+        if ($actions.PSObject.Properties['loneSecretDeleted'] -and [int]$actions.loneSecretDeleted -gt 0) {
+            $secret = ', deleted the LSA secret DefaultPassword'
+        }
+        $text += '; redacted {0} file(s), deleted {1}, removed {2} cache(s), cleared {3} event log(s){4}; left: {5}' -f [int]$actions.filesRedacted, [int]$actions.filesDeleted, ([int]$actions.cachesRemoved + [int]$actions.brokerEntriesRemoved), @($actions.eventLogsCleared).Count, $secret, (& $describe (& $member 'remaining'))
     }
     return ($text + '.')
 }
