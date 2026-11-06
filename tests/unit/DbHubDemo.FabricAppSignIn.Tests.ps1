@@ -487,12 +487,15 @@ Describe 'The Rayfin CLI''s sign-in and BROWSER: one the CLI can''t start is rem
     It 'leaves BROWSER out of a real child process, and in the caller''s environment (Start-Process -Environment)' {
         $env:BROWSER = $script:liveBrowser
         $environment = & $script:environmentFor $TestDrive
-        $out = Join-Path -Path $TestDrive -ChildPath 'child-environment.txt'
-        $probe = '[Console]::Out.Write(''BROWSER=['' + [System.Environment]::GetEnvironmentVariable(''BROWSER'') + ''] RAYFIN_TELEMETRY_OPTOUT=['' + $env:RAYFIN_TELEMETRY_OPTOUT + '']'')'
+        # The child writes what it sees to a file itself. Start-Process -RedirectStandardOutput differs by platform: on
+        # Linux and macOS it writes each line the child prints, with a line ending, from handlers that run as the output
+        # arrives, so the file ended with a newline in CI (2026-11-06); on Windows the file gets the child's bytes as written.
+        $file = Join-Path -Path $TestDrive -ChildPath 'child-environment.txt'
+        $probe = '[System.IO.File]::WriteAllText(''{0}'', ''BROWSER=['' + [System.Environment]::GetEnvironmentVariable(''BROWSER'') + ''] RAYFIN_TELEMETRY_OPTOUT=['' + $env:RAYFIN_TELEMETRY_OPTOUT + '']'')' -f $file.Replace("'", "''")
         $encoded = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($probe))
-        $child = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded -Environment $environment -NoNewWindow -Wait -PassThru -RedirectStandardOutput $out
+        $child = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded -Environment $environment -NoNewWindow -Wait -PassThru
         $child.ExitCode | Should -Be 0
-        Get-Content -LiteralPath $out -Raw | Should -BeExactly 'BROWSER=[] RAYFIN_TELEMETRY_OPTOUT=[1]'
+        Get-Content -LiteralPath $file -Raw | Should -BeExactly 'BROWSER=[] RAYFIN_TELEMETRY_OPTOUT=[1]'
         $env:BROWSER | Should -BeExactly $script:liveBrowser
     }
 }
