@@ -83,10 +83,10 @@ function Get-DemoDeploymentExpectation {
         $lines.Add('- A first deployment takes about 2 to 3 hours in all; the T2 guest build alone is 60 to 90 minutes.')
     }
     elseif ($InstallMode -eq 'JumpstartImage') {
-        $lines.Add('- A first deployment takes about 1 to 2 hours in all (not measured yet with the Jumpstart image); T2''s image download and first boot are about 20 to 40 minutes of it. No step needs a person.')
+        $lines.Add('- A first deployment takes about 1 to 2 hours in all (not measured yet with the Jumpstart image); T2''s image download and first boot are about 20 to 40 minutes of it. No T2 step needs a person.')
     }
     else {
-        $lines.Add('- A first deployment takes about 1.5 to 2.5 hours in all; the T2 guest build alone is 60 to 90 minutes. No step needs a person.')
+        $lines.Add('- A first deployment takes about 1.5 to 2.5 hours in all; the T2 guest build alone is 60 to 90 minutes. No T2 step needs a person.')
     }
     $lines.Add('- A redeploy from a golden snapshot (./scripts/capture-t2-golden.ps1) takes about 30 to 45 minutes, with no build and no guided stop.')
     if (-not $SkipFabric) {

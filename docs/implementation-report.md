@@ -103,6 +103,9 @@ Dated examples from `estimate-cost.ps1` at list prices from the Azure Retail Pri
 - **The showcase** (2026-11-03): Run all on all four targets, with each visual in the README's table checked against its threshold and timing; T1 and T2 in High CPU; `plan-regression`'s forced plan within its slot; T4's restart for `max_connections` and **Failed connections** on its size (R640 to R648).
 - **The showcase, PR-A** (2026-11-04): Run all from the re-imported notebook on T1 to T4 with the runners updated; T1's plugin after a cold start (a fresh status, or one restart after 8 minutes); T4's move to `Standard_D4ds_v5` (its restart), the zone retry and `Standard_D4ads_v5` on a refusal, the tuning parameters, the `missing-index` lookups in Query Store, and the first autonomous tuning recommendation; `cpu-pressure` on 4 vCores; the restart assumption with and without the safety stop (R649 to R659).
 - **The Insights app in every deployment** (2026-11-05): unit-tested only. Live: a `deploy.ps1` whose Rayfin CLI isn't signed in (the sign-in's window and browser at the start, the run going on meanwhile, the app created after the sign-in), one where nobody signs in (the deadline, the app's row **Failed** with the reason, the run **DONE**), one with a tenant setting off (`PREFLIGHT.FABRIC.APPSETTINGS` and the app's row), and one on macOS or Linux (R669 to R674).
+- **The nightly safety stop** (2026-11-05): unit-tested only. Live, as [ADR 0024](adr/0024-nightly-safety-stop.md#validation) lists: `deploy.ps1` as an Owner with `SAFETYSTOP.*` **Pass**; the VMs and T4 left running past the shutdown time, then `STATUS.SAFETYSTOP` showing them stopped and T3 **Paused**, with both jobs in the account's job history; a Contributor's `deploy.ps1` (**DONE** with the **Warning** and the note), then an Owner's `./scripts/grant-safety-stop.ps1`; and `destroy.ps1` with `DESTROY.SAFETYSTOP.ROLE` and a clean residual check (R662, R666).
+- **T2's `JumpstartImage` default** (2026-11-05): unit-tested, with the image read offline in part. Live: `./scripts/deploy.ps1` with the defaults in a throwaway resource group, ending **DONE** with no guided stop, `HUB.ESTATE.T2` and `TELEMETRY.T2` **Pass**, `T2.ARC.SQLINSTANCE` Standard with PAYG, `T2.ARC.MONITORING` on, `STATUS.T2.IMAGE` **Pass**, the first measured time in `DEPLOY.TIMING`, and the first boot's results in `jumpstart-firstboot.json`; then `./scripts/destroy.ps1` (R680, R685).
+- **The three together** (combined 2026-11-05): one default deployment with the Insights app's sign-in at the start, T2 from the Jumpstart image, and the safety stop's setup after the template, run once from a fresh resource group (R690).
 
 ## Risk register
 
@@ -322,6 +325,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R687 | The image's SHA-256 isn't pinned (`sha256` null): only the blob's own Content-MD5 and length and the pinned ETag identify it, and a host that can't compute MD5 (FIPS mode) checks the length only, with a warning in its log | **Accepted:** trust on first use, as for the other media without a hash; the host records the SHA-256 of what it downloaded in `jumpstart-image.json`. Streaming the 34 GiB for a hash wasn't feasible from the authoring machine (2026-11-05); the live proof's record can be pinned |
 | R688 | The evaluation guard (`slmgr.vbs /rearm`, a restart, `/ato`) for the build modes' guests isn't proven live, and it runs only while the host runs | **Open:** the first build-mode guest that reaches 30 days left; with no rearm left it's a warning in the host's log and `health.json` (not a status check of its own), and `STATUS.VM_ARCHOST01` shows the days left |
 | R689 | Preflight doesn't see a mode that differs from an existing host's guest; the host refuses it later in the run (`GuestSource`) | **Accepted:** preflight can't read a deallocated host cheaply; the refusal comes before any change to the guest, with the fix |
+| R690 | The three 2026-11-05 changes were combined and tested together offline only: the Insights app's sign-in at the start, T2 from the Jumpstart image, and the nightly safety stop's setup after the template have never run in one live deployment | **Open:** the owner's live test after the merge ([still to verify](#still-to-verify)); each change keeps its own risks (R662 to R668, R669 to R674, R680 to R689) (the three changes combined) |
 
 ## Phase log
 
@@ -1139,6 +1143,7 @@ The integration:
 - **Live:** none, by the coordinator's direction; a live deploy follows the merge (R674).
 
 **Risks.** R669 to R674 (new; R662 to R667 on their own branch, renumbered when the three 2026-11-05 branches were combined).
+
 ### The nightly safety stop
 
 2026-11-05. The owner asked, "Can we have safety stops for all the databases?", and chose a daily safety stop in every deployment at the nightly shutdown time, with its role assigned by the deployment when the deployer may, as an exception to ADR 0008 ([ADR 0024](adr/0024-nightly-safety-stop.md)). The owner's standing direction holds: one-click and fast, and the Fabric capacity left to its users.
@@ -1213,3 +1218,24 @@ The integration:
 **Live proof (not run; the owner deploys after the merge).** A throwaway prefix and resource group in the owner's subscription after the owner's `az login`, then `./scripts/deploy.ps1` with the defaults. Expected: **DONE** with no guided stop, `HUB.ESTATE.T2` and `TELEMETRY.T2` **Pass**, `T2.ARC.SQLINSTANCE` Standard with PAYG, `T2.ARC.MONITORING` on, `STATUS.T2.IMAGE` **Pass**, and the first measured time in `DEPLOY.TIMING`; `jumpstart-firstboot.json` records the first boot's results. Then `./scripts/destroy.ps1`. Its cost is a normal deployment's, which `estimate-cost.ps1` prices live.
 
 **Risks.** R680 to R689 (new).
+
+### The three 2026-11-05 changes combined
+
+2026-11-05, the owner: "Merge tonight after offline tests and CI; live test afterward", then "I will not be able to live test until tomorrow morning so affter the offline tests and CI stop before the live test", and "Make sure to update all the readme information to be accurate with all the changes and steps and documentation as well as cost and things like that." The owner's standing direction holds: the Fabric capacity is left to its users, so no estimate or automatic stop includes it. Three finished branches, each with its own offline tests, became one pull request to `main`: [the Insights app in every deployment](#the-insights-app-in-every-deployment), [the nightly safety stop](#the-nightly-safety-stop), and [T2 from Arc Jumpstart's image](#t2-from-arc-jumpstarts-image-jumpstartimage-by-default).
+
+**Work summary.**
+
+1. **Real merges, in this order:** the Insights app, the nightly safety stop, then `JumpstartImage`, each with `git merge --no-ff`, so every branch's commit stays in the history.
+2. **Numbering:** the nightly safety stop keeps R662 to R668, and the Insights app's risks, R662 to R667 on its own branch, are R669 to R674 here, with every reference to them; `JumpstartImage` keeps R680 to R689. In the automation support matrix, the Insights app keeps rows 173 and 174, the nightly safety stop's rows are 175 and 176, and `JumpstartImage`'s 177 to 180, with every reference and the matrix's introduction.
+3. **The README as one story:** where it goes, the steps (9, with the Insights app as step 7), while it runs, the options, Codespaces, the AI assistant, automated vs manual, the prerequisites, the quick start, cost, what stops or pauses on its own, clean up, and the sign-ins. A default deployment's only steps for a person after `az login` are the Insights app's browser sign-in at the start of a run in a terminal you type in, and, when the deployer isn't an Owner, an Owner's `./scripts/grant-safety-stop.ps1`.
+4. **Cost:** one dated example for the default deployment ([cost management](cost-management.md#dated-example-the-default-deployment-2026-11-05)), every profile with T4's restart worst case with and without the nightly safety stop, no Bastion needed to deploy, and no golden snapshot; `./scripts/estimate-cost.ps1 -AllProfiles` on the combined code read the same list prices as the branches had. The README's 2026-10-21 example gave way to it, and the FAQ, the presentation guide, and the architecture's decision table now say $375 a month.
+5. **Text that the combination made wrong:** "no step needs a person" for `JumpstartImage` is now "no T2 step needs a person" in the start banner's expectations, `PREFLIGHT.T2.MODE`, and the docs, because the Insights app's sign-in is a step for a person in every mode; `init.ps1`'s next steps for the default mode name that sign-in and the time estimate, and add `./scripts/grant-safety-stop.ps1` for when **DONE** asks for it; the deployment notebook's text says that `PaygWizard` is opt-in.
+6. **Tests the combination needed:** `JumpstartImage`'s check that a session without keyboard input gets no notice now expects the Insights app's notice there (it gets none with `-SkipFabric`); the tests that run `Invoke-DemoDeployment` and `Invoke-DemoParallelDeployment` already mock the Insights app's sign-in and step and the safety stop's setup.
+
+**Changed files.** The three branches' files; the merge commits' conflict resolutions in `README.md`, `CHANGELOG.md`, ADRs 0012, 0016, 0018, and 0023, `docs/architecture.md`, `deployment.md`, `prerequisites.md`, `automation-support-matrix.md`, this report, `Private/DeployExperience.ps1`, `Private/ProgressHelpers.ps1`, and `tests/unit/DbHubDemo.Preflight.Tests.ps1`; then `README.md`, `CHANGELOG.md`, `docs/` (cost management, the FAQ, presentation, architecture, deployment, troubleshooting, the automation support matrix, the demo walkthrough, and ADRs 0006 and 0023), `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, `Private/DeployExperience.ps1`, `Public/Invoke-DemoPreflight.ps1`, `Public/Initialize-DemoConfig.ps1`, and `tests/unit/DbHubDemo.OneCommand.Tests.ps1` and `DbHubDemo.Preflight.Tests.ps1`.
+
+**Validation.**
+
+- VALIDATION-PLACEHOLDER
+
+**Risks.** R690 (new).

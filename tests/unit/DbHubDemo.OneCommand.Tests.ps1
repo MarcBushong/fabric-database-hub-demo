@@ -64,27 +64,30 @@ Describe 'What a run can expect (brief goal 7, items 3 and 13)' {
         $expect.HumanText | Should -Match 'Bastion'
     }
 
-    It 'says no step needs a person in ProductKey and Developer modes' {
+    It 'says no T2 step needs a person in ProductKey and Developer modes' {
         foreach ($mode in 'ProductKey', 'Developer') {
             $expect = InModuleScope DbHubDemo -Parameters @{ Mode = $mode } { Get-DemoDeploymentExpectation -InstallMode $Mode -WaitForT2 }
             $expect.GuidedStop | Should -BeFalse
-            ($expect.Lines -join ' ') | Should -Match 'No step needs a person'
+            ($expect.Lines -join ' ') | Should -Match 'No T2 step needs a person'
             $expect.HumanText | Should -BeNullOrEmpty
         }
     }
 
-    It 'says no step needs a person in JumpstartImage mode, the default, and calls its time an estimate not measured yet (2026-11-05)' {
+    It 'says no T2 step needs a person in JumpstartImage mode, the default, and calls its time an estimate not measured yet (2026-11-05)' {
         $expect = InModuleScope DbHubDemo { Get-DemoDeploymentExpectation -WaitForT2 }
         $expect.GuidedStop | Should -BeFalse
         $text = $expect.Lines -join ' '
-        $text | Should -Match 'No step needs a person'
+        $text | Should -Match 'No T2 step needs a person'
         $text | Should -Match 'about 1 to 2 hours in all \(not measured yet'
         $text | Should -Match '20 to 40 minutes'
         $expect.Text | Should -Match 'estimate, not measured yet'
         $expect.HumanText | Should -BeNullOrEmpty
         $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
         $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' }
-        @($notice) | Should -BeNullOrEmpty -Because 'a session without keyboard input needs no warning when no step needs a person'
+        @($notice | Where-Object { $_ -notlike 'The Insights app''s browser sign-in*' }) | Should -BeNullOrEmpty -Because 'a session without keyboard input needs no T2 warning when no T2 step needs a person'
+        @($notice | Where-Object { $_ -like 'The Insights app''s browser sign-in*' }).Count | Should -Be 1 -Because 'the Insights app''s sign-in still doesn''t start in such a session (2026-11-05)'
+        $quiet = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' -SkipFabric }
+        @($quiet) | Should -BeNullOrEmpty -Because 'without Fabric, nothing in JumpstartImage mode needs a person'
     }
 
     It 'warns a session that can''t take keyboard input before anything is spent, with the alternatives and the plan for a person' {

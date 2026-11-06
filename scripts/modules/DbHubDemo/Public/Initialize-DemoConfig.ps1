@@ -627,11 +627,12 @@ function Initialize-DemoConfig {
         $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 2 to 3 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); about 60 to 90 minutes in, it asks you for about 10 minutes (the guided stop), then finishes by itself' -f $configArgument))
     }
     elseif ($mode -eq 'JumpstartImage') {
-        $nextSteps.Add(('./scripts/deploy.ps1{0}      # keeps this PC awake until it''s done; nothing needs you (a first deploy with the Jumpstart image isn''t timed yet)' -f $configArgument))
+        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1 to 2 hours (an estimate; not timed yet with the Jumpstart image) and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))
     }
     else {
         $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 to 2.5 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))
     }
+    $nextSteps.Add(('./scripts/grant-safety-stop.ps1{0}   # only when DONE asks for it: an Owner, once, for the nightly safety stop''s role' -f $configArgument))
     $nextSteps.Add(('./scripts/configure-fabric-app.ps1 -SignIn{0}   # only when deploy.ps1 says the Insights app wasn''t created: one browser sign-in, then it deploys' -f $configArgument))
     $nextSteps.Add(('Each session: ./scripts/start-demo.ps1{0}, then ./scripts/stop-demo.ps1 -SaveHistory{0}' -f $configArgument))
     #endregion Next steps

@@ -132,7 +132,7 @@ Describe 'Invoke-DemoPreflight' {
         Set-HappyAzMock
         $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE'
         $check.status | Should -Be 'Pass'
-        $check.message | Should -Match 'no step needs a person'
+        $check.message | Should -Match 'no T2 step needs a person'
 
         $evaluation = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $evaluation[$key] = $config[$key] }

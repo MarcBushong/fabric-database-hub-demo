@@ -53,7 +53,7 @@ The rule for Power BI content, from Microsoft Learn: "On F SKUs smaller than F64
 ## Cost
 
 - **Database Hub** is free and needs no capacity ([Database Hub FAQ](https://learn.microsoft.com/fabric/database/hub/faq)).
-- **The Real-Time Dashboard, the report, the app, and the notebooks** are Fabric items, so they need the workspace's capacity running. The shared capacity runs at the owner's choice, bills while it runs, and is outside the demo's resource group: it isn't in `estimate-cost.ps1`, and it's outside the demo's $250-a-month ceiling ([ADR 0016](adr/0016-cost-profiles.md)). Never pause or resize it for a demo; ask the owner.
+- **The Real-Time Dashboard, the report, the app, and the notebooks** are Fabric items, so they need the workspace's capacity running. The shared capacity runs at the owner's choice, bills while it runs, and is outside the demo's resource group: it isn't in `estimate-cost.ps1`, and it's outside the demo's $375-a-month ceiling ($250 before 2026-11-04; [ADR 0016](adr/0016-cost-profiles.md)). Never pause or resize it for a demo; ask the owner.
 - **Licenses** for viewers below F64 (Pro, PPU, or a trial) are per-user costs outside Azure. This page quotes no prices.
 - **The Fabric app** (the Insights app, Phase 19b) runs as Fabric Apps services that consume the workspace capacity's units ([Fabric Apps overview](https://learn.microsoft.com/fabric/apps/overview)); it has no database, storage, or functions, so it uses capacity only when a deployment deploys and checks it (every `deploy.ps1` does, since 2026-11-05) and while someone loads it and its queries run. Like the rest of the capacity, that's outside the demo's ceiling and in no estimate.
 

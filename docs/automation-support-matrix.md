@@ -7,12 +7,12 @@ Every capability in the demo, classified by how much of it is automated. Rows 1�
 | Class | Meaning |
 |---|---|
 | **FA**: Fully automated | Runs with no human step under the documented minimum permissions (Contributor on the subscription) |
-| **AP**: Automated with prerequisite | Automated once a listed prerequisite (P1–P11) or input is in place |
+| **AP**: Automated with prerequisite | Automated once a listed prerequisite (P1–P16) or input is in place |
 | **MAN**: Manual | No supported automation exists. The repo validates the result and prints exact steps. |
 | **OPT**: Optional preview | A preview capability that is opt-in, presenter-driven, or validated empirically |
 | **DEF**: Unsupported or deferred | Not supported by the docs, or deliberately out of scope for v1 |
 
-**P** marks a preview dependency. Prerequisites P1–P11 are defined in [ADR 0008](adr/0008-identity-rbac-abac.md) and [prerequisites](prerequisites.md). Validation statuses are defined in [ADR 0012](adr/0012-validation-model.md).
+**P** marks a preview dependency. Prerequisites P1–P16 are defined in [prerequisites](prerequisites.md), P1–P11 first in [ADR 0008](adr/0008-identity-rbac-abac.md). Validation statuses are defined in [ADR 0012](adr/0012-validation-model.md).
 
 ## Matrix
 
@@ -206,7 +206,7 @@ Every manual step reports **Manual action required** with its exact steps, so no
 
 | Step | Row | Why it's manual | Where it's documented |
 |---|---|---|---|
-| In the opt-in `PaygWizard` mode, the T2 setup-wizard step, with **Use Azure Login** and never a service principal secret: since Phase 28, a guided stop of about 10 minutes in `deploy.ps1`'s run (choose pay-as-you-go and Standard in the pre-filled setup, and sign in to Azure) | 15a, 161 | Pay-as-you-go SQL Server without a product key is documented only in the [installation wizard](https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-from-the-installation-wizard-setup); the [command-prompt reference](https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-from-the-command-prompt) has no such option (rechecked 2026-10-29). The default `JumpstartImage` mode (row 15) needs no person, `ProductKey` mode (P10) is fully unattended with Hub Performance, and `Developer` mode is unattended but Estate only | [Deployment](deployment.md#the-guided-stop-paygwizard) |
+| In the opt-in `PaygWizard` mode, the T2 setup-wizard step, with **Use Azure Login** and never a service principal secret: since Phase 28, a guided stop of about 10 minutes in `deploy.ps1`'s run (choose pay-as-you-go and Standard in the pre-filled setup, and sign in to Azure) | 15a, 161 | Pay-as-you-go SQL Server without a product key is documented only in the [installation wizard](https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-from-the-installation-wizard-setup); the [command-prompt reference](https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-from-the-command-prompt) has no such option (rechecked 2026-10-29). The default `JumpstartImage` mode (row 15) needs no person for T2, `ProductKey` mode (P10) is fully unattended with Hub Performance, and `Developer` mode is unattended but Estate only | [Deployment](deployment.md#the-guided-stop-paygwizard) |
 | The Hub tenant setting (P4) | 27 | A tenant-wide Fabric administrator setting whose internal name isn't documented ([List Tenant Settings](https://learn.microsoft.com/rest/api/fabric/admin/tenants/list-tenant-settings) can only match it by title) | [Prerequisites](prerequisites.md) |
 | The Database Hub UI, its saved views, and monitor templates, including the template wizard shown live next to the dashboard as code | 31a, 33, 34, 104 | Database Hub has no public API, ARM, or Bicep resource; Learn documents these only as portal experiences ([overview](https://learn.microsoft.com/fabric/database/hub/overview)) | [Walkthrough](demo-walkthrough.md) and [presentation surfaces](presentation.md) |
 | The in-Hub Database Agent and Copilot, and the record of their coverage | 35, 35b | No API, and coverage isn't documented ([FAQ](https://learn.microsoft.com/fabric/database/hub/faq)) | [Agent guide](../fabric/agent/README.md#live-coverage-record) |

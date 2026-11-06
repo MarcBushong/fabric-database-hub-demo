@@ -207,7 +207,7 @@ Within the same scope: license type PAYG rather than ArcBox's `Paid`; Integratio
 
 ### Consequences
 
-- **Positive:** a first deployment needs no person after `az login`, for anyone with Contributor on their own subscription; T2 keeps Hub Estate, Performance, and the Database Agent's findings at the cost of `PaygWizard` mode; its Windows doesn't expire; Bastion isn't needed to deploy; and no Azure resource is added.
+- **Positive:** T2 needs no person in a first deployment after `az login`, for anyone with Contributor on their own subscription (the Insights app's browser sign-in, since 2026-11-05 in every deployment, is the one other step for a person, and it never keeps the run from **DONE**); T2 keeps Hub Estate, Performance, and the Database Agent's findings at the cost of `PaygWizard` mode; its Windows doesn't expire; Bastion isn't needed to deploy; and no Azure resource is added.
 - **Negative:**
   - **No fallback:** if Jumpstart's storage can't be reached, or the image fails the check, T2 stays **NOT DONE** until the user retries with the commands that the result gives (a partial download resumes) or chooses another mode.
   - **No mode switch on an existing guest:** the host's `GuestSource` step refuses a mode whose source (the image or the build) differs from the existing guest's, with the fix: set `t2SqlInstallMode` back, or `./scripts/destroy.ps1`, then `./scripts/deploy.ps1`. Preflight doesn't check it; the host does.
