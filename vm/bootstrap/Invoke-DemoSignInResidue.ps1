@@ -20,7 +20,11 @@ managed identity's; nothing is printed, logged, or kept. Since Phase 28 it also 
 sign-in left armed, which the PaygWizard guided stop uses once in the T2 guest: AutoAdminLogon on (or
 AutoLogonCount), the LSA DefaultPassword secret, the Winlogon DefaultPassword value, and, where the setup
 wizard signs in (IncludeBrowserCache), the Winlogon DefaultUserName value. Any of them fails the result, and
-Clean turns automatic sign-in off and deletes them.
+Clean turns automatic sign-in off and deletes them. The LSA secret alone, with none of the others, isn't
+automatic sign-in left armed: Azure's Windows provisioning leaves one on every VM the demo creates (live
+finding, 2026-11-06). It's counted apart (autoLogonLoneSecrets) and still fails the result, because it's a
+stored password nothing needs; Clean deletes only that secret. AutoLogonOnly checks automatic sign-in and
+nothing else (T1's bootstrap).
 
 Where it looks, on every machine: SQL Server setup's log folders, the Windows and user temporary folders,
 PowerShell history and transcripts (including a transcription policy's folder), the managed Run Command
@@ -126,7 +130,8 @@ function Invoke-DemoSignInSweep {
         [scriptblock] $EventLogClearer = $null,
         [scriptblock] $ArchiveExpander = $null,
         [long] $MaxArchiveBytes = 268435456,
-        [scriptblock] $AutoLogonProvider = $null
+        [scriptblock] $AutoLogonProvider = $null,
+        [bool] $AutoLogonOnly = $false
     )
 
     $ErrorActionPreference = 'Continue'
@@ -137,7 +142,7 @@ function Invoke-DemoSignInSweep {
     $archiveExtensions = @('.cab', '.zip', '.7z', '.gz')
     $blockingLocations = @('SetupLogs', 'RunCommand')
     # The nested functions read these through dynamic scope. Folder overrides the machine's folders (tests).
-    $options = @{ IncludeBrowserCache = $IncludeBrowserCache; MaxPaths = $MaxPaths; MaxFileBytes = $MaxFileBytes; EventLogReader = $EventLogReader; ArchiveExpander = $ArchiveExpander; MaxArchiveBytes = $MaxArchiveBytes; AutoLogonProvider = $AutoLogonProvider }
+    $options = @{ IncludeBrowserCache = $IncludeBrowserCache; MaxPaths = $MaxPaths; MaxFileBytes = $MaxFileBytes; EventLogReader = $EventLogReader; ArchiveExpander = $ArchiveExpander; MaxArchiveBytes = $MaxArchiveBytes; AutoLogonProvider = $AutoLogonProvider; AutoLogonOnly = $AutoLogonOnly }
     $base = @{
         ProgramFiles = $env:ProgramFiles
         ProgramData  = $env:ProgramData
@@ -497,7 +502,8 @@ function Invoke-DemoSignInSweep {
     function Invoke-SweepAutoLogon {
         # Windows automatic sign-in on this machine (Phase 28): Read reports AutoAdminLogon on (or AutoLogonCount), the
         # LSA DefaultPassword secret, and the Winlogon DefaultPassword and DefaultUserName values; Clear turns it off and
-        # deletes them. The guided stop arms it in the T2 guest for one sign-in, and its cleanup removes all of it, so
+        # deletes them; DeleteSecret deletes only the LSA secret (the one Azure's provisioning leaves, with automatic
+        # sign-in off). The guided stop arms it in the T2 guest for one sign-in, and its cleanup removes all of it, so
         # anything found is a leftover. DefaultUserName counts only where the setup wizard signs in (IncludeBrowserCache):
         # elsewhere Windows writes it as the last console user. The secret's presence comes from LsaRetrievePrivateData,
         # whose buffer is freed without being read (https://learn.microsoft.com/windows/win32/secauthn/protecting-the-automatic-logon-password).
@@ -600,6 +606,9 @@ public static class DbHubDemoSweepLsa
             }
             [DbHubDemoSweepLsa]::Delete('DefaultPassword')
         }
+        elseif ($Mode -eq 'DeleteSecret') {
+            [DbHubDemoSweepLsa]::Delete('DefaultPassword')
+        }
         $item = Get-ItemProperty -LiteralPath $winlogon -ErrorAction SilentlyContinue
         $has = {
             param([string] $Name)
@@ -621,13 +630,17 @@ public static class DbHubDemoSweepLsa
             filesScanned = 0; filesSkipped = 0; filesUnverified = 0; userTokens = 0; appTokens = 0; otherTokens = 0
             filesWithUserData = 0; filesWithAppTokens = 0; archives = 0; archivesChecked = 0; browserCaches = 0; brokerEntries = 0
             eventLogUserTokens = 0; eventLogAppTokens = 0; securityLogTokens = 0; productKeys = 0; eventLogKeys = 0
-            autoLogonEnabled = 0; autoLogonSecrets = 0; autoLogonPasswords = 0; autoLogonUserNames = 0; autoLogonUnverified = 0
+            autoLogonEnabled = 0; autoLogonSecrets = 0; autoLogonLoneSecrets = 0; autoLogonPasswords = 0; autoLogonUserNames = 0; autoLogonUnverified = 0
         }
         $expandRoot = $base.ExpandRoot.TrimEnd('\', '/')
         $toClean = New-Object -TypeName 'System.Collections.Generic.List[object]'
         $locations = New-Object -TypeName 'System.Collections.Generic.List[object]'
         $seen = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($root in @(Get-SweepRoot)) {
+        $roots = @()
+        if (-not $options.AutoLogonOnly) {
+            $roots = @(Get-SweepRoot)
+        }
+        foreach ($root in $roots) {
             $items = @()
             if ($root.Filter) {
                 $items = @(Get-ChildItem -LiteralPath $root.Path -Filter $root.Filter -File -Force -ErrorAction SilentlyContinue)
@@ -707,7 +720,7 @@ public static class DbHubDemoSweepLsa
             }
         }
         $caches = @{ Verified = @(); Broker = @() }
-        if ($options.IncludeBrowserCache) {
+        if ($options.IncludeBrowserCache -and -not $options.AutoLogonOnly) {
             $caches = Get-SweepCache
             $summary.browserCaches = @($caches.Verified).Count
             $summary.brokerEntries = @($caches.Broker).Count
@@ -717,7 +730,10 @@ public static class DbHubDemoSweepLsa
                 }
             }
         }
-        $eventLogs = @(Get-SweepEventLog)
+        $eventLogs = @()
+        if (-not $options.AutoLogonOnly) {
+            $eventLogs = @(Get-SweepEventLog)
+        }
         foreach ($entry in $eventLogs) {
             if ($entry.security) {
                 $summary.securityLogTokens += $entry.user + $entry.app + $entry.other + $entry.key
@@ -727,21 +743,28 @@ public static class DbHubDemoSweepLsa
             $summary.eventLogAppTokens += $entry.app
             $summary.eventLogKeys += $entry.key
         }
-        # Automatic sign-in left armed (Phase 28) fails the result: it keeps a password and signs someone in.
+        # Automatic sign-in left armed (Phase 28) fails the result: it keeps a password and signs someone in. The LSA secret
+        # alone, with automatic sign-in off and none of its values (the one Azure's provisioning leaves), is counted apart:
+        # it still fails the result, because it's a stored password nothing needs, and Clean deletes only it.
         try {
             $auto = Invoke-SweepAutoLogon -Mode 'Read'
             $summary.autoLogonEnabled = [int]$auto['Enabled']
-            $summary.autoLogonSecrets = [int]$auto['Secret']
             $summary.autoLogonPasswords = [int]$auto['PlainValue']
             if ($options.IncludeBrowserCache) {
                 $summary.autoLogonUserNames = [int]$auto['UserName']
+            }
+            if ([int]$auto['Secret'] -gt 0 -and ($summary.autoLogonEnabled + $summary.autoLogonPasswords + $summary.autoLogonUserNames) -eq 0) {
+                $summary.autoLogonLoneSecrets = 1
+            }
+            else {
+                $summary.autoLogonSecrets = [int]$auto['Secret']
             }
         }
         catch {
             $summary.autoLogonUnverified = 1
         }
         # The Security log is reported apart: it's never cleared automatically (securityLogTokens).
-        $autoLogon = $summary.autoLogonEnabled + $summary.autoLogonSecrets + $summary.autoLogonPasswords + $summary.autoLogonUserNames + $summary.autoLogonUnverified
+        $autoLogon = $summary.autoLogonEnabled + $summary.autoLogonSecrets + $summary.autoLogonLoneSecrets + $summary.autoLogonPasswords + $summary.autoLogonUserNames + $summary.autoLogonUnverified
         $summary.pass = ($summary.userTokens + $summary.otherTokens + $summary.productKeys + $summary.archives + $summary.browserCaches + $summary.filesUnverified + $summary.eventLogUserTokens + $summary.eventLogKeys + $autoLogon) -eq 0
         return @{
             Summary   = $summary
@@ -768,7 +791,7 @@ public static class DbHubDemoSweepLsa
     }
 
     $before = Invoke-SweepScan
-    $actions = [ordered]@{ filesRedacted = 0; filesDeleted = 0; filesFailed = 0; cachesRemoved = 0; brokerEntriesRemoved = 0; eventLogsCleared = @(); eventLogsNotCleared = @(); autoLogonCleared = 0; logonNameRemoved = 0 }
+    $actions = [ordered]@{ filesRedacted = 0; filesDeleted = 0; filesFailed = 0; cachesRemoved = 0; brokerEntriesRemoved = 0; eventLogsCleared = @(); eventLogsNotCleared = @(); autoLogonCleared = 0; logonNameRemoved = 0; loneSecretDeleted = 0 }
     $after = $before
     if ($Clean) {
         $armed = $before.Summary.autoLogonEnabled + $before.Summary.autoLogonSecrets + $before.Summary.autoLogonPasswords
@@ -781,6 +804,16 @@ public static class DbHubDemoSweepLsa
                 if ($before.Summary.autoLogonUserNames -gt 0) {
                     $actions.logonNameRemoved = 1
                 }
+            }
+            catch {
+                $actions.filesFailed++
+            }
+        }
+        elseif ($before.Summary.autoLogonLoneSecrets -gt 0) {
+            # Automatic sign-in is off, so only the secret goes; the Winlogon values stay as they are.
+            try {
+                $null = Invoke-SweepAutoLogon -Mode 'DeleteSecret'
+                $actions.loneSecretDeleted = 1
             }
             catch {
                 $actions.filesFailed++
@@ -920,6 +953,7 @@ function ConvertTo-DemoSignInSummary {
             security = [int]$Counts.securityLogTokens; keys = [int]$Counts.productKeys; logKeys = [int]$Counts.eventLogKeys
             autologon = (& $read 'autoLogonEnabled') + (& $read 'autoLogonSecrets') + (& $read 'autoLogonPasswords') + (& $read 'autoLogonUnverified')
             logonName = & $read 'autoLogonUserNames'
+            loneSecret = & $read 'autoLogonLoneSecrets'
         }
     }
     $place = {
@@ -949,6 +983,7 @@ function ConvertTo-DemoSignInSummary {
             logsCleared = @($actions.eventLogsCleared); logsNotCleared = @($actions.eventLogsNotCleared)
             autologon = $(if ($actions.PSObject.Properties['autoLogonCleared']) { [int]$actions.autoLogonCleared } else { 0 })
             logonName = $(if ($actions.PSObject.Properties['logonNameRemoved']) { [int]$actions.logonNameRemoved } else { 0 })
+            loneSecret = $(if ($actions.PSObject.Properties['loneSecretDeleted']) { [int]$actions.loneSecretDeleted } else { 0 })
         }
     }
     return $summary

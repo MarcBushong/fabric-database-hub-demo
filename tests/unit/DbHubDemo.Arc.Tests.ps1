@@ -447,6 +447,8 @@ Describe 'Invoke-DemoArcOnboarding' {
         $script:machine = $null
         $script:hostState = 'WaitingForArcOnboarding'
         $script:sweepPart = [ordered]@{ computer = 'VM'; reachable = $true; pass = $true; found = [ordered]@{ user = 1; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 1; logApp = 0 }; remaining = [ordered]@{ user = 0; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 0; logApp = 0 }; eventLogs = @('Windows PowerShell|u1 a0 o0|..'); found_at = @(); left_at = @(); seconds = 9 }
+        # The guest's part when a test sets it; the host's otherwise.
+        $script:sweepGuest = $null
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ state = $script:hostState; message = 'host message' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -MockWith { $script:machine }
@@ -470,7 +472,7 @@ Describe 'Invoke-DemoArcOnboarding' {
                 foreach ($key in $PesterBoundParameters['Parameter'].Keys) { $parameterCopy[$key] = $PesterBoundParameters['Parameter'][$key] }
             }
             $script:runs.Add([pscustomobject]@{ Name = $RunCommandName; Parameter = $parameterCopy; Protected = $protectedCopy; VmName = $PesterBoundParameters['VmName'] })
-            $output = if ($RunCommandName -eq 'DbHubDemo-ArcProbe') { $script:probe | ConvertTo-Json -Compress } elseif ($RunCommandName -eq 'DbHubDemo-SignInData') { [ordered]@{ action = 'Clean'; succeeded = $true; pass = [bool]$script:sweepPart.pass; local = $script:sweepPart; guest = $script:sweepPart } | ConvertTo-Json -Compress -Depth 6 } else { '{"succeeded":true,"outcome":"Onboarded","resourceId":"' + $script:machineId + '"}' }
+            $output = if ($RunCommandName -eq 'DbHubDemo-ArcProbe') { $script:probe | ConvertTo-Json -Compress } elseif ($RunCommandName -eq 'DbHubDemo-SignInData') { [ordered]@{ action = 'Clean'; succeeded = $true; pass = [bool]$script:sweepPart.pass; local = $script:sweepPart; guest = $(if ($null -ne $script:sweepGuest) { $script:sweepGuest } else { $script:sweepPart }) } | ConvertTo-Json -Compress -Depth 6 } else { '{"succeeded":true,"outcome":"Onboarded","resourceId":"' + $script:machineId + '"}' }
             [pscustomobject]@{ Succeeded = $true; ExecutionState = 'Succeeded'; ExitCode = 0; Output = $output; Error = '' }
         }
     }
@@ -558,6 +560,18 @@ Describe 'Invoke-DemoArcOnboarding' {
         $failed.message | Should -Match 'traces couldn''t be removed and verified'
         $failed.message | Should -Match '2 sign-in token\(s\) in event logs'
         ($failed | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($script:fakeToken))
+    }
+
+    It 'passes with a note when the sweep after onboarding deleted only the LSA secret Azure''s provisioning leaves on the host (live finding, 2026-11-06)' {
+        $script:machine = New-TestMachine -Status 'Disconnected'
+        $script:sweepPart.found['loneSecret'] = 1
+        $script:sweepPart['actions'] = [ordered]@{ redacted = 0; deleted = 0; failed = 0; caches = 0; broker = 0; logsCleared = @(); logsNotCleared = @(); autologon = 0; loneSecret = 1 }
+        $script:sweepGuest = [ordered]@{ computer = 'VM'; reachable = $true; pass = $true; found = [ordered]@{ user = 0; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 0; logApp = 0 }; remaining = [ordered]@{ user = 0; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 0; logApp = 0 }; eventLogs = @(); found_at = @(); left_at = @(); seconds = 9 }
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Be 'arcsql01 is onboarded and Connected; the host continues its bootstrap. The cleanup deleted the LSA secret DefaultPassword that Azure''s provisioning leaves on archost01; automatic sign-in was off.'
+        $result.evidence.signInData.status | Should -Be 'Pass'
+        $result.evidence.signInData.note | Should -Match 'on archost01;'
     }
 
     It 'clears the host''s Windows PowerShell log after onboarding with the caller''s token, warns, and passes the check that follows' {

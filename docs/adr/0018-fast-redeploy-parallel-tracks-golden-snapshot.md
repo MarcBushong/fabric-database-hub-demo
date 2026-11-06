@@ -304,7 +304,7 @@ Static only: unit tests for the first run from `deploy.ps1`, the wait by default
 
 ## Amendments (2026-11-05: golden snapshots in JumpstartImage mode)
 
-**Why:** since 2026-11-05, T2's default install mode is `JumpstartImage` (user-directed, [ADR 0006](0006-sql-editions-and-licensing.md#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default)): the T2 host downloads Arc Jumpstart's prebuilt SQL Server 2022 Standard guest and prepares it with no person. A new host then needs nothing that only a snapshot keeps, so in this mode the golden snapshot is an **optional speed-up**: it saves the image's download and first boot, an estimated 20 to 40 minutes, and nothing irreplaceable is lost without one, because the next deploy downloads and prepares the image again. In `PaygWizard` mode it still keeps the setup-wizard state, as decided above.
+**Why:** since 2026-11-05, T2's default install mode is `JumpstartImage` (user-directed, [ADR 0006](0006-sql-editions-and-licensing.md#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default)): the T2 host downloads Arc Jumpstart's prebuilt SQL Server 2022 Standard guest and prepares it with no person. A new host then needs nothing that only a snapshot keeps, so in this mode the golden snapshot is an **optional speed-up**: it skips T2's host build with the image's download and first boot, which took about 27 minutes on 2026-11-06, and nothing irreplaceable is lost without one, because the next deploy downloads and prepares the image again. In `PaygWizard` mode it still keeps the setup-wizard state, as decided above.
 
 | Before | Since 2026-11-05 | Why it's safe |
 |---|---|---|
@@ -314,7 +314,7 @@ Static only: unit tests for the first run from `deploy.ps1`, the wait by default
 | The clock's DONE list had T2's instance and monitoring in `PaygWizard` and `ProductKey` modes (section 1) | In `JumpstartImage` mode too, so in every mode but `Developer`: `T2.ARC.SQLINSTANCE` (Standard with PAYG) and `T2.ARC.MONITORING` | The default gives T2 the same Hub views |
 | A build mode's guest ran to the end of its 180-day Windows evaluation, and only a rebuild helped | The host's evaluation guard extends the running guest's evaluation with `slmgr.vbs /rearm` when 30 or fewer days are left and a rearm is left ([ADR 0003](0003-t2-host-size-security-type-bootstrap.md#amendment-the-hosts-steps-for-jumpstartimage-2026-11-05)). It's skipped while a golden capture is in progress on the host, and waits while an activity profile runs; a snapshot keeps the expiry it was tagged with at capture | A rearm restarts the guest, so it never runs while a capture prepares the guest or while a profile runs; the Jumpstart guest isn't an evaluation, so nothing changes there |
 
-**Estimates, not measurements:** a golden redeploy stays about 30 to 45 minutes. The measured runs (38.8 minutes on 2026-10-22 and 63.7 on 2026-10-23) restored `PaygWizard`-built guests and predate `JumpstartImage`. Without a snapshot, a first `JumpstartImage` deployment takes about 1 to 2 hours with no person, and T2 is ready about 30 to 60 minutes after its host starts. `DEPLOY.TIMING` records the first measured `JumpstartImage` run.
+**Times:** a golden redeploy stays about 30 to 45 minutes, an estimate. The measured redeploys (38.8 minutes on 2026-10-22 and 63.7 on 2026-10-23) restored `PaygWizard`-built guests and predate `JumpstartImage`, and a golden redeploy in `JumpstartImage` mode isn't measured yet. Without a snapshot, a clean first `JumpstartImage` deployment ended **DONE** in 91 minutes with no person (measured on 2026-11-06), of which T2's host build took about 27 minutes and its Arc onboarding about 33.
 
 **Cost (section 11):** the estimate still prices the 128 GiB provisioned size. A `JumpstartImage` host's OS disk also holds the 34 GiB image, so its snapshot's used size, which Azure bills, is an estimated 50 to 60 GiB, more than the 37 GiB measured for a `PaygWizard` host ([ADR 0016](0016-cost-profiles.md#2026-11-05-user-directed-the-jumpstartimage-defaults-cost)).
 
@@ -333,6 +333,17 @@ Unit-tested: `tests/unit/DbHubDemo.Tracks.Tests.ps1` (a `JumpstartImage` host re
 | A run stopped with Ctrl+C said that running the command again "continues where it stopped" | It adds that the run first sends the bootstrap bundle or the workload runner again when they changed meanwhile, a fix you pulled, for example | The same command, the run's own |
 
 Unit-tested (`tests/unit/DbHubDemo.Tracks.Tests.ps1`, `tests/unit/DbHubDemo.Progress.Tests.ps1`, `tests/unit/DbHubDemo.OneCommand.Tests.ps1`): the plan with and without `-Resend`, the comparison for each case (a changed SHA-256, a VM not listed, the runner, `-SkipRunner`, nothing changed), a build that fails, the record lowered, the step's note, the chunk failure that takes the VM out of the record, a resume that sends the bundle again end to end with its progress model, `-FromStage` without the check, the status page's row, and **NOT DONE**'s command and text with and without `-ConfigPath`. Not yet run live.
+
+## Amendments (2026-11-06: the history report's snapshot after DONE's checks)
+
+**Why (the owner, 2026-11-06):** "Can we add a step that calls the acitivty notebook one time after deployment so it starts to populate data?" The Fabric track's first run of `NB_DatabaseHub_LiveActivity` comes while T1 and T2 still deploy, before any telemetry, so the history report was blank after a deployment ([ADR 0014](0014-notebook-role-and-capacity.md#amendment-2026-11-06-one-analyze-only-run-at-the-end-of-each-deployment)).
+
+| Before | Since 2026-11-06 | Why it's safe |
+|---|---|---|
+| The run ended with the validation, **DONE**'s checks, `DEPLOY.TIMING`, the switch to the activity profile, and `DEPLOY.SUMMARY` | Between the switch and `DEPLOY.SUMMARY`, on every run that reaches its validation, `Invoke-DemoHistorySnapshotStep` runs the notebook once, analyze-only, then refreshes the history model (`DEPLOY.FABRIC.HISTORY`, the status page's last row); `-Sequential` does the same after its **DONE** checks and switch; a `-WhatIf` run reports it **Not selected** at the template's what-if | It reads **DONE**'s telemetry results and comes after the switch, which the VMs' incidents wait for, since the notebook never touches the VMs. It's bounded (10 minutes for the job, 5 for the refresh) and never a **Fail** or **Manual action required**, so section 1's list and the clock are unchanged: `DEPLOY.TIMING` is written before it, and **DONE** never waits for it |
+| A resumed run with nothing left to do ran the validation and **DONE**'s checks | It takes the snapshot again | Each run saves its own rows; another snapshot adds what happened since, such as incidents |
+
+Unit-tested (`tests/unit/DbHubDemo.HistorySnapshot.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, `DbHubDemo.Lifecycle.Tests.ps1`, `DbHubDemo.Progress.Tests.ps1`). Not run live yet ([implementation report](../implementation-report.md#the-history-reports-snapshot-at-the-end-of-deployps1)).
 
 ## Sources (checked 2026-11-05)
 

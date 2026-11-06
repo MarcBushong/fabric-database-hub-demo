@@ -1142,7 +1142,10 @@ function Invoke-DemoDeploymentTrack {
                     $state = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'state')
                     $message = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'message')
                     if ($state -eq 'Ready') {
-                        & $note 'DEPLOY.T1.READY' 'T1' 'Pass' ('T1''s bootstrap is Ready: {0}' -f $message)
+                        # The AutoLogonSecret step's note (ADR 0009): the lone LSA secret it deleted keeps the Pass; armed is a Warning.
+                        $signInNote = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'signInNote')
+                        $signInArmed = [string](Get-DemoMemberValue -InputObject $wait.Health -Name 'signInFound') -eq 'Armed'
+                        & $note 'DEPLOY.T1.READY' 'T1' $(if ($signInArmed) { 'Warning' } else { 'Pass' }) ('T1''s bootstrap is Ready: {0}{1}' -f $message, $(if ($signInNote) { ' ' + $signInNote } else { '' })) $(if ($signInArmed) { 'Nothing more to do: the cleanup turned automatic sign-in off. If it happens again, read docs/troubleshooting.md (the sign-in data sweep).' } else { '' })
                     }
                     elseif ($state -eq 'Failed') {
                         & $note 'DEPLOY.T1.READY' 'T1' 'Fail' ('T1''s bootstrap failed: {0}' -f $message) 'Read C:\ProgramData\DbHubDemo\logs on sqlvm01 (Get-DemoVmHealth -View Full), fix the cause, then run deploy.ps1 -FromStage Artifacts.'

@@ -35,7 +35,8 @@ function Get-DemoT2HostPhase {
     Where the T2 host is, from its health summary: Phase (Build, GuidedStop, AfterSetup, Ready, Failed), Step, Index and
     Count among the build's steps (until it waits for Arc onboarding), and a rough estimate of the build's remaining
     minutes from the documented 60 to 90 minutes a guest build takes, or, in JumpstartImage mode, an estimated 30 to 60
-    for the host, the image's download, and its first boot (not measured yet). Pure. Internal.
+    for the host, the image's download, and its first boot (one live run measured about 27 on 2026-11-06, so the
+    estimate errs long). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]

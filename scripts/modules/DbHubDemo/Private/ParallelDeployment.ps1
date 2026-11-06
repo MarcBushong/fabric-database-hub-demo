@@ -352,6 +352,12 @@ function Invoke-DemoParallelDeployment {
        whether the run is DONE or not (DEPLOY.INCIDENTS_*, Send-DemoPendingActivitySwitch), never a Fail. A run that's
        stopped or fails before it sends it without waiting (Complete-DemoDeploymentRun). A run without preflight says
        once when the configuration doesn't set activityProfile (DEPLOY.ACTIVITYPROFILE).
+    7. The history report's snapshot (2026-11-06, ADR 0014's amendment; Invoke-DemoHistorySnapshotStep,
+       DEPLOY.FABRIC.HISTORY): on a run that reaches its validation, once DONE's telemetry checks have passed,
+       NB_DatabaseHub_LiveActivity runs once, analyze-only (CONFIRM false), and the history model is refreshed, at most
+       about 15 minutes; a resumed run with nothing left to do runs it again. Never a Fail: a paused capacity or a job that
+       outlives its wait is a Warning, and -WhatIf, -SkipFabric, GitHub Actions, or checks that didn't pass are Not
+       selected. The status page's Fabric.History row shows it.
 
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
     does; a resume first checks that sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout
@@ -960,6 +966,8 @@ function Invoke-DemoParallelDeployment {
             & $addAll $deployment.Results
             if ($whatIf) {
                 & $stageResult 'Infrastructure' 'Not selected' 'What if: the template''s what-if ran; nothing was deployed, and the tracks were skipped.'
+                # Nor is the history report's snapshot taken, which a deployment takes at its end (2026-11-06).
+                $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -WhatIfRun -SkipFabric:$SkipFabric -ProgressPath $ProgressPath))
                 return $results.ToArray()
             }
             if (-not $deployment.Succeeded) {
@@ -1134,6 +1142,8 @@ function Invoke-DemoParallelDeployment {
     $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:$skipT4 -SkipFabric:$SkipFabric
     $validationStart = $results.Count
+    # Whether DONE's checks ran, which the history report's snapshot at the end needs (2026-11-06).
+    $doneChecked = $false
     if ($plan.Validation) {
         Set-DemoProgressStep -Path $ProgressPath -Id 'Validation' -State 'Running' -Message 'Checking Database Hub''s estate, telemetry, and metrics, and the Fabric items.'
         # T4's estate only when it's deployed: the Burstable fallback can leave it out of this run (Phase 28).
@@ -1174,6 +1184,7 @@ function Invoke-DemoParallelDeployment {
         # and its telemetry once more, before the run is judged (Invoke-DemoTelemetryCheck; Phase 28 live finding).
         if ($allTracksDone -and -not (& $hasStatus $results.ToArray() 'Fail')) {
             & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
+            $doneChecked = $true
         }
         try {
             Set-DemoDeploymentState -Config $Config -Value @{ Stage = $(if ($allTracksDone) { 'Validation' } elseif ($t1Done) { 'Monitoring' } else { 'Infrastructure' }) } -Confirm:$false
@@ -1216,6 +1227,14 @@ function Invoke-DemoParallelDeployment {
     # not, at most 3 minutes for both VMs together. Never a Fail.
     if (-not $whatIf -and $activity.HasIncidents) {
         & $addAll @(Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile $activity -Result $results.ToArray() -CheckPrefix 'DEPLOY' -RequestedBy 'deploy')
+    }
+
+    # 8. The history report's snapshot (2026-11-06, ADR 0014's amendment): once DONE's telemetry checks have passed,
+    # NB_DatabaseHub_LiveActivity runs once, analyze-only, and the history model is refreshed, so the report has this run's
+    # data. After the switch, which the VMs' incidents wait for: the notebook never touches the VMs. On every run that
+    # reaches its validation, a resumed one with nothing left to do included; never a Fail, and never in DONE's way.
+    if ($plan.Validation) {
+        $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
     }
 
     $all = $results.ToArray()
