@@ -1360,9 +1360,26 @@ The integration:
 
 **Validation.**
 
-- **Pester 5.9.1** (2026-11-06, Windows, PowerShell 7.6.9), on the suites this change touches and those that run the deployment's functions: `DbHubDemo.HistorySnapshot` (24 tests, new), `DbHubDemo.Progress`, `.Tracks`, `.Lifecycle`, `.OneCommand`, `.FabricTrack`, `.FirstRun`, `.ActivityControl`, `.ActivityProfile`, `.FabricAppSignIn`, `.SafetyStop`, `.T4Fallback`, `.TransientRetry`, `Repo.LifecycleScripts`, and `Repo.FunctionNames`: **Pass**, 972 passed and 0 failed, in 681 seconds. The new tests cover the parameters sent (checked against the notebook's parameters cell), the **Pass** path and its partial-data text, a paused capacity before the run and at its submit (no resume, pause, or scale call), a job that outlives its wait, a deduplicated one, a failed notebook and a failed refresh, every **Not selected** case, an exception and Ctrl+C, **DONE** and the exit code 0 with a **Warning** or an error, the row on the status page and its **Needs attention** box, and the order in both paths.
-- **Mutations** checked that the new tests fail when the code regresses: without the record in `Test-DemoNonBlockingResult`, with `CONFIRM` true, without the capacity check, with the snapshot before the switch, without `Fabric.History` in `Set-DemoProgressPlan`'s map, and without the telemetry gate. Each made tests fail; the files were restored.
-- **PSScriptAnalyzer 1.25.0**, on the changed and new PowerShell files: no findings. **markdownlint-cli2 0.23.3** (Node.js 26.13.0): 0 issues in 134 files.
-- **Live:** none, by the coordinator's direction: a live clean deployment was running in the same subscription and tenant. Pending go-ahead ([still to verify](#still-to-verify), R695).
+- **The new tests** (`DbHubDemo.HistorySnapshot`, 24 tests, and new cases in `DbHubDemo.Tracks`, `.Lifecycle`, `.Progress`, and `.Fabric`) cover:
+  - the parameters sent, checked against the notebook's parameters cell, and the **Pass** path with its partial-data text;
+  - a paused capacity before the run and at its submit, with no resume, pause, or scale call;
+  - a job that outlives its wait, a deduplicated one, a failed notebook, a failed refresh, an exception, and Ctrl+C;
+  - every **Not selected** case, and **DONE** with exit code 0 after a **Warning** or an error;
+  - the status page's row and its **Needs attention** box, and the order in both paths;
+  - step 5's `RESOURCE_GROUP` for a configuration whose prefix isn't the default.
+- **Mutations** checked that the new tests fail when the code regresses:
+  - without the record in `Test-DemoNonBlockingResult`, with `CONFIRM` true, or without the capacity check;
+  - with the snapshot before the switch, without `Fabric.History` in `Set-DemoProgressPlan`'s map, or without the telemetry gate;
+  - without step 5's `RESOURCE_GROUP`.
+
+  Each made tests fail, and the files were restored.
+- **Static, full** (2026-11-06, on `00cf7b9` after the merge of `main`; Windows, PowerShell 7.6.9, Pester 5.9.1, PSScriptAnalyzer 1.25.0, markdownlint-cli2 0.23.3 on Node.js 26.13.0): `./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester, Markdown -CI` passed:
+  - PSScriptAnalyzer **Pass**: no findings in 342 files.
+  - Pester **Pass**: 3,644 passed, 17 skipped, 0 failed, in 754 seconds.
+  - markdownlint **Pass**: no issues in 134 files.
+
+  The first full run had found 54 failures, all in the track and lifecycle tests' mock of the snapshot. Under `Set-StrictMode -Version Latest`, which the script sets, a mock can't read a switch that the call didn't bind; the mocks now read `$PesterBoundParameters`, as the repository's other mocks do (`00cf7b9`). Not run here: Bicep, PSRule, DotNet, and FabricApp, because nothing under `infra/`, `workload-generator/`, or `fabric/app` changed; nor gitleaks, which isn't on this PC. CI runs them.
+- **Step 5's fix, after the full run:** `DbHubDemo.Fabric`, `.FabricItem`, `.DashboardData`, `.HubReadiness`, and `.FabricTrack` passed in strict mode (117 passed, 0 failed). PSScriptAnalyzer with the repository's settings found nothing in its files. After the docs' last edit, `Repo.Conventions`, `Repo.FunctionNames`, `Docs.Walkthrough`, and `Repo.NeutralWording` passed in strict mode, and markdownlint found no issues.
+- **Live:** none here, by the coordinator's direction: a live clean deployment was running in the same subscription and tenant (R695). The coordinator's live run of `-RunLiveActivity` after that deployment found R696.
 
 **Risks.** R695 to R697 (new); R696 is closed (item 11).
