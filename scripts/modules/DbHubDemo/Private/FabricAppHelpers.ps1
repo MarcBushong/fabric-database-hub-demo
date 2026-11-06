@@ -45,19 +45,20 @@ function Protect-DemoRayfinText {
 function Invoke-DemoFabricAppProcess {
     <#
     .SYNOPSIS
-    Runs node or npm in a working directory with a time limit, and returns ExitCode, StdOut, and StdErr (redacted).
+    Runs node, npm, or npx in a working directory with a time limit, and returns ExitCode, StdOut, and StdErr
+    (redacted).
 
     .DESCRIPTION
     Standard input is closed, so nothing can wait for a reply; when the time limit passes, the whole process tree is
     stopped and ExitCode is -1. Environment entries are set for the child only (null removes one), so the operator's
     session is never changed. Output is redacted with Protect-DemoRayfinText before anything else sees it.
-    On Windows, npm is a batch file: it runs through cmd.exe with fixed arguments that need no quoting.
+    On Windows, npm and npx are batch files: they run through cmd.exe with fixed arguments that need no quoting.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('node', 'npm')]
+        [ValidateSet('node', 'npm', 'npx')]
         [string] $Tool,
 
         [Parameter(Mandatory)]
@@ -205,22 +206,38 @@ function Invoke-DemoRayfinCli {
     }
     $environment = @{ RAYFIN_TELEMETRY_OPTOUT = '1'; RAYFIN_TOKEN = $null; NO_COLOR = '1' }
     $run = Invoke-DemoFabricAppProcess -Tool 'node' -ArgumentList (@($cli) + $ArgumentList) -WorkingDirectory $StagePath -TimeoutSeconds $TimeoutSeconds -Environment $environment
-    $data = $null
-    $text = [string]$run.StdOut
-    $start = $text.IndexOf('{')
-    if ($start -ge 0) {
-        try {
-            $data = $text.Substring($start) | ConvertFrom-Json -AsHashtable -Depth 64
-        }
-        catch {
-            $data = $null
-        }
-    }
     [pscustomobject]@{
         ExitCode = $run.ExitCode
         StdOut   = $run.StdOut
         StdErr   = $run.StdErr
-        Data     = $data
+        Data     = (ConvertFrom-DemoRayfinOutput -Text ([string]$run.StdOut))
+    }
+}
+
+function ConvertFrom-DemoRayfinOutput {
+    <#
+    .SYNOPSIS
+    The JSON a Rayfin CLI command printed with --json, from its first '{' on (anything before it, such as npm's
+    warnings, is skipped), as a hashtable; $null when there's none or it doesn't parse. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.IDictionary])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    $value = [string]$Text
+    $start = $value.IndexOf('{')
+    if ($start -lt 0) {
+        return $null
+    }
+    try {
+        return ($value.Substring($start) | ConvertFrom-Json -AsHashtable -Depth 64)
+    }
+    catch {
+        return $null
     }
 }
 
