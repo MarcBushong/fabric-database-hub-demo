@@ -28,7 +28,7 @@ Both notebooks keep the supplied notebook's PySpark kernel (`synapse_pyspark`), 
 
 - **`NB_DatabaseHub_Deployment`** runs every check and changes no Azure or Fabric resource; its cleanup also needs `PURGE_DEMO_TABLES = True`, which stays `False`, so **Run all** never drops a table.
 - **`NB_DatabaseHub_LiveActivity`** sends its simulation request in section 3: `PROFILE` `business-day` on every target for `DURATION_MINUTES` (240), through `demo-control.yml` with P9, or, without P9, the printed link and command, recorded in `scenario_runs` as **Manual action required**. Its stop cell also needs `STOP_ACTIVITY = True`, which stays `False`, so **Run all** never stops the activity it started.
-- **For a read-only run,** set `CONFIRM = False`. The scripts' own runs of the live-activity notebook (`stop-demo.ps1 -SaveHistory`, `configure-fabric.ps1`'s first capture, and, since 2026-11-06, `deploy.ps1`'s snapshot at its end) pass `CONFIRM` and `STOP_ACTIVITY` as `false`, so they only analyze and save.
+- **For a read-only run,** set `CONFIRM = False`. The scripts' own runs of the live-activity notebook (`stop-demo.ps1 -SaveHistory`, `configure-fabric.ps1`'s first capture, and, since 2026-11-06, `deploy.ps1`'s snapshot at its end) pass `CONFIRM` and `STOP_ACTIVITY` as `false`, so they only analyze and save, and the demo's resource group as `RESOURCE_GROUP`, which scopes the notebook's queries (`configure-fabric.ps1` too since 2026-11-06; before, its runs kept the default, `rg-dbhub-demo`).
 
 ### What runs where
 

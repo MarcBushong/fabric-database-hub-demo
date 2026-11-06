@@ -667,4 +667,29 @@ Describe 'configure-fabric.ps1' {
         # A newly created live-activity notebook runs once, so the lakehouse gets the history tables.
         ($results | Where-Object checkId -EQ 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY').status | Should -Be 'Pass'
     }
+
+    It 'scopes -RunLiveActivity to the configured resource group, analyze-only (live finding, 2026-11-06)' {
+        # Live: a clean deploy in rg-dbhublt-demo, then -RunLiveActivity without RESOURCE_GROUP, which left the notebook on
+        # its default, rg-dbhub-demo: its queries found nothing, so it saved no telemetry snapshots.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        $otherConfig = Get-Content -LiteralPath $idConfigPath -Raw | ConvertFrom-Json -AsHashtable
+        $otherConfig['prefix'] = 'dbhublt'
+        $otherConfigPath = Join-Path -Path $TestDrive -ChildPath 'demo.dbhublt.config.json'
+        Set-Content -LiteralPath $otherConfigPath -Value ($otherConfig | ConvertTo-Json -Depth 10) -Encoding utf8NoBOM
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
+            @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = 'Completed' }) }
+            @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$itemId/jobs/instances/$operationId" }) }
+        )
+        $null = & $configureFabric -ConfigPath $otherConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
+        $LASTEXITCODE | Should -Be 0
+        (Read-ImportResult | Where-Object checkId -EQ 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY').status | Should -Be 'Pass'
+        $run = @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -like '*jobType=RunNotebook' })
+        $run.Count | Should -Be 1
+        $sent = (Get-RequestBody -Request $run[0]).executionData.parameters
+        $sent.RESOURCE_GROUP.value | Should -Be 'rg-dbhublt-demo' -Because 'the notebook''s queries are scoped to it'
+        $sent.CONFIRM.value | Should -Be 'false' -Because 'Run all would otherwise send an activity request'
+        $sent.STOP_ACTIVITY.value | Should -Be 'false'
+        $sent.SAVE_RESULTS.value | Should -Be 'true'
+    }
 }
