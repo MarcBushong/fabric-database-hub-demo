@@ -211,6 +211,52 @@ Describe 'Disk space without a data disk' {
 }
 
 Describe 'The image download' {
+    BeforeAll {
+        # A stand-in for an HTTPS response stream: each Read returns at most MaxRead bytes, however large the buffer.
+        Add-Type -TypeDefinition @'
+namespace DbHubDemoTest
+{
+    public sealed class TrickleStream : System.IO.Stream
+    {
+        private readonly System.IO.Stream inner;
+        private readonly int maxRead;
+
+        public TrickleStream(System.IO.Stream inner, int maxRead)
+        {
+            this.inner = inner;
+            this.maxRead = maxRead;
+        }
+
+        public int Reads { get; private set; }
+        public override bool CanRead { get { return true; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { throw new System.NotSupportedException(); } }
+        public override long Position { get { throw new System.NotSupportedException(); } set { throw new System.NotSupportedException(); } }
+        public override void Flush() { }
+        public override long Seek(long offset, System.IO.SeekOrigin origin) { throw new System.NotSupportedException(); }
+        public override void SetLength(long value) { throw new System.NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new System.NotSupportedException(); }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            this.Reads++;
+            return this.inner.Read(buffer, offset, System.Math.Min(count, this.maxRead));
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                this.inner.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+}
+'@
+    }
+
     BeforeEach {
         $script:context = New-TestJumpstartContext
         $script:vhdx = Join-Path -Path $TestDrive -ChildPath ('vms-' + [guid]::NewGuid().ToString('N') + '/arcsql01/arcsql01.vhdx')
@@ -246,8 +292,69 @@ Describe 'The image download' {
         [System.IO.File]::WriteAllBytes($script:vhdx + '.partial', $first)
         Write-DemoVmJsonFile -Path ($script:vhdx + '.partial.json') -InputObject ([ordered]@{ url = 'x'; etag = '0xPINNED' })
         Save-DemoJumpstartImage -Context $script:context -VhdxPath $script:vhdx | Should -BeNullOrEmpty
-        Should -Invoke -CommandName Open-DemoJumpstartDownload -Times 1 -Exactly -ParameterFilter { $Offset -eq 1MB }
+        Should -Invoke -CommandName Open-DemoJumpstartDownload -Times 1 -Exactly -ParameterFilter { $Offset -eq 1MB -and $Length -eq $script:imageBytes.Length }
         (Get-TestSha256 ([System.IO.File]::ReadAllBytes($script:vhdx))) | Should -Be (Get-TestSha256 $script:imageBytes)
+    }
+
+    It 'writes and hashes every chunk when the network returns a few KiB per read (<PartialBytes> bytes on disk)' -ForEach @(
+        @{ PartialBytes = 0 }
+        @{ PartialBytes = [int](2.5 * 1MB) }
+    ) {
+        # A 1 MiB buffer: the resume reads the bytes on disk in several blocks, and each network read fills a sliver of it.
+        $script:context.Host.JumpstartImage.BufferMB = 1
+        $script:network = $null
+        Mock -CommandName Open-DemoJumpstartDownload -MockWith {
+            $rest = New-Object -TypeName 'byte[]' -ArgumentList ($script:imageBytes.Length - $Offset)
+            [Array]::Copy($script:imageBytes, $Offset, $rest, 0, $rest.Length)
+            $script:network = [DbHubDemoTest.TrickleStream]::new([System.IO.MemoryStream]::new($rest), 16KB - 7)
+            [pscustomobject]@{ Stream = $script:network; StatusCode = $(if ($Offset -gt 0) { 206 } else { 200 }); ContentRange = $(if ($Offset -gt 0) { 'bytes {0}-{1}/{2}' -f $Offset, ($script:imageBytes.Length - 1), $script:imageBytes.Length } else { '' }); Response = $null }
+        }
+        if ($PartialBytes -gt 0) {
+            New-Item -ItemType Directory -Path (Split-Path -Path $script:vhdx -Parent) -Force | Out-Null
+            $first = New-Object -TypeName 'byte[]' -ArgumentList $PartialBytes
+            [Array]::Copy($script:imageBytes, 0, $first, 0, $first.Length)
+            [System.IO.File]::WriteAllBytes($script:vhdx + '.partial', $first)
+            Write-DemoVmJsonFile -Path ($script:vhdx + '.partial.json') -InputObject ([ordered]@{ url = 'x'; etag = '0xPINNED' })
+        }
+
+        Save-DemoJumpstartImage -Context $script:context -VhdxPath $script:vhdx | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Open-DemoJumpstartDownload -Times 1 -Exactly -ParameterFilter { $Offset -eq $PartialBytes -and $Length -eq $script:imageBytes.Length }
+        $script:network.Reads | Should -BeGreaterThan ([math]::Floor(($script:imageBytes.Length - $PartialBytes) / 16KB))
+        (Get-TestSha256 ([System.IO.File]::ReadAllBytes($script:vhdx))) | Should -Be (Get-TestSha256 $script:imageBytes)
+        $record = Read-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $script:context).Image
+        $record['md5Verified'] | Should -BeTrue
+        $record['sha256'] | Should -Be (Get-TestSha256 $script:imageBytes)
+    }
+
+    It 'calls only .NET methods in its copy loops, never a PowerShell command per chunk (live finding, 2026-11-06)' {
+        # Windows PowerShell 5.1 checks a mandatory array parameter by walking every element, so a function called per
+        # network read with the 4 MiB buffer held the 34 GiB download to 0.2 MB/s.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path -Path $repoRoot -ChildPath 'vm/hyperv-guest/GuestJumpstart.ps1'), [ref]$null, [ref]$null)
+        $loops = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.LoopStatementAst] -and $node.Condition.Extent.Text -match '\.Read\(\$buffer\b' }, $true))
+        $loops.Count | Should -Be 2
+        foreach ($loop in $loops) {
+            @($loop.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.Extent.Text }) | Should -BeNullOrEmpty
+        }
+        $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Add-DemoJumpstartHashBlock' }, $true) | Should -BeNullOrEmpty
+    }
+
+    It 'starts over with a warning when the server ignores the range and sends the whole image' {
+        New-Item -ItemType Directory -Path (Split-Path -Path $script:vhdx -Parent) -Force | Out-Null
+        $first = New-Object -TypeName 'byte[]' -ArgumentList 1MB
+        [Array]::Copy($script:imageBytes, 0, $first, 0, $first.Length)
+        [System.IO.File]::WriteAllBytes($script:vhdx + '.partial', $first)
+        Write-DemoVmJsonFile -Path ($script:vhdx + '.partial.json') -InputObject ([ordered]@{ url = 'x'; etag = '0xPINNED' })
+        Mock -CommandName Open-DemoJumpstartDownload -MockWith {
+            [pscustomobject]@{ Stream = [System.IO.MemoryStream]::new($script:imageBytes, $false); StatusCode = 200; ContentRange = ''; Response = $null }
+        }
+        Mock -CommandName Write-DemoVmLog
+
+        Save-DemoJumpstartImage -Context $script:context -VhdxPath $script:vhdx | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Write-DemoVmLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'ignored the range request' -and $Message -match 'HTTP 200' -and $Message -match 'starts over' }
+        (Get-TestSha256 ([System.IO.File]::ReadAllBytes($script:vhdx))) | Should -Be (Get-TestSha256 $script:imageBytes)
+        $record = Read-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $script:context).Image
+        $record['md5Verified'] | Should -BeTrue
+        $record['sha256'] | Should -Be (Get-TestSha256 $script:imageBytes)
     }
 
     It 'accepts a newer image with a warning that names it (user decision, 2026-11-05)' {
@@ -282,6 +389,88 @@ Describe 'The image download' {
     It 'decides a short download is incomplete, so the next run resumes it' {
         $decision = Get-DemoJumpstartImageDecision -Pin (New-TestPin -Size 100) -Remote ([pscustomobject]@{ ContentLength = 100; ETag = '0xPINNED'; ContentMd5 = ''; LastModified = '' }) -Length 60 -Hash ([pscustomobject]@{ Md5Base64 = ''; Sha256 = '' })
         $decision.Outcome | Should -Be 'Incomplete'
+    }
+}
+
+Describe 'The image request (live finding, 2026-11-06)' {
+    It 'asks for a closed range when it resumes, the form Blob storage takes without x-ms-version' {
+        # An anonymous request without x-ms-version is served at Blob storage's earliest version, which answered the open-ended
+        # bytes=N- with 200 and the whole image, so every resume started over.
+        $uri = 'https://jumpstart.example.invalid/arcbox/prod/ArcBox-SQL-STD.vhdx'
+        $request = New-DemoJumpstartDownloadRequest -Uri $uri -Offset 1000000 -Length 36645634048
+        $request.Method | Should -Be 'GET'
+        $request.Headers['Range'] | Should -Be 'bytes=1000000-36645634047'
+        $request.Headers['x-ms-version'] | Should -BeNullOrEmpty
+        (New-DemoJumpstartDownloadRequest -Uri $uri -Length 36645634048).Headers['Range'] | Should -BeNullOrEmpty
+    }
+
+    It 'sends the request for the rest of the image of the length it was given' {
+        $script:fakeRequest = [pscustomobject]@{}
+        $script:fakeRequest | Add-Member -MemberType ScriptMethod -Name 'GetResponse' -Value { throw 'not sent in a test' }
+        Mock -CommandName New-DemoJumpstartDownloadRequest -MockWith { $script:fakeRequest }
+        { Open-DemoJumpstartDownload -Uri 'https://jumpstart.example.invalid/x.vhdx' -Offset 5 -Length 10 } | Should -Throw '*not sent in a test*'
+        Should -Invoke -CommandName New-DemoJumpstartDownloadRequest -Times 1 -Exactly -ParameterFilter { $Offset -eq 5 -and $Length -eq 10 }
+    }
+}
+
+Describe 'The first boot' {
+    BeforeEach {
+        $script:context = New-TestJumpstartContext
+        Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = 'Running' } }
+        Mock -CommandName Wait-DemoGuestHeartbeat -MockWith { $true }
+        Mock -CommandName Get-DemoJumpstartPin -MockWith { New-TestPin -Size 1 }
+        Mock -CommandName Get-DemoJumpstartGuestCredential -MockWith {
+            $secure = [System.Security.SecureString]::new()
+            foreach ($character in ('t' + [guid]::NewGuid().ToString('N')).ToCharArray()) { $secure.AppendChar($character) }
+            [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+        }
+        Mock -CommandName Test-DemoGuestAdapterConnected -MockWith { $true }
+        $script:cleanupResult = [pscustomobject]@{ disabled = @(); uninstall = $null; folder = 'C:\Jumpstart'; folderRemoved = $true; arcReset = '' }
+        $script:guestCalls = @{}
+        Mock -CommandName Invoke-Command -MockWith {
+            # Each guest block is told apart by its first parameter.
+            $first = ''
+            if ($null -ne $ScriptBlock.Ast.ParamBlock) {
+                $first = [string]$ScriptBlock.Ast.ParamBlock.Parameters[0].Name.VariablePath.UserPath
+            }
+            $script:guestCalls[$first] = @($ArgumentList)
+            switch ($first) {
+                'NewName' { [pscustomobject]@{ oldName = 'arcsql01'; renamed = $false; timeZone = 'UTC' } }
+                'ServerName' { [pscustomobject]@{ oldServerName = 'arcsql01'; serverRenamed = $false; sysadminGroupAdded = $false; loginsDisabled = @(); databasesDropped = @(); restarted = $false } }
+                'ServiceNames' { $script:cleanupResult }
+            }
+        }
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-DemoVmLog -MockWith { $script:logged.Add([string]$Message) }
+    }
+
+    It 'hands the cleanup its real values: the services, the feature, the instance, the folder, and the timeout (live finding, 2026-11-06)' {
+        # In argument mode an unparenthesized [string]$x is an expandable string, not a cast: the cleanup got
+        # "[string]System.Collections.Hashtable[jumpstartFolder]" for the folder, so C:\Jumpstart was never deleted.
+        Invoke-DemoJumpstartFirstBoot -Context $script:context | Should -BeNullOrEmpty
+        $cleanup = $script:guestCalls['ServiceNames']
+        $cleanup.Count | Should -Be 5
+        @($cleanup[0]) | Should -Be @($script:context.Host.JumpstartImage.AssociatedServices)
+        $cleanup[1] | Should -BeExactly ([string]$script:context.Host.JumpstartImage.UninstallFeatures)
+        $cleanup[2] | Should -BeExactly 'MSSQLSERVER'
+        $cleanup[3] | Should -BeExactly 'C:\Jumpstart'
+        $cleanup[4] | Should -Be ([int]$script:context.Host.JumpstartImage.SetupTimeoutMinutes)
+        (Read-DemoVmJsonFile -Path (Get-DemoJumpstartPath -Context $script:context).FirstBoot)['jumpstartFolder'] | Should -Be 'removed'
+    }
+
+    It 'logs what the cleanup did, not "extras removed": <Case>' -ForEach @(
+        @{ Case = 'the folder removed, nothing to uninstall'; Cleanup = @{ disabled = @('MSSQLLaunchpad'); uninstall = $null; folder = 'C:\Jumpstart'; folderRemoved = $true; arcReset = '' }; Expect = @('1 service\(s\) stopped and disabled', 'nothing to uninstall', 'C:\\Jumpstart removed'); Warnings = 0 }
+        @{ Case = 'IS uninstalled, the folder already gone'; Cleanup = @{ disabled = @('MsDtsServer160', 'SSISTELEMETRY160', 'MSSQLLaunchpad'); uninstall = @{ setup = 'C:\Jumpstart\SQL\setup.exe'; exitCode = 0; finalResult = 'Passed'; serviceLeft = $false }; folder = 'C:\Jumpstart'; folderRemoved = $false; arcReset = 'reset' }; Expect = @('3 service\(s\)', 'IS uninstalled with setup \(exit code 0, final result "Passed"\)', 'C:\\Jumpstart absent', 'Arc identity reset'); Warnings = 0 }
+        @{ Case = 'the uninstall failed'; Cleanup = @{ disabled = @('MsDtsServer160'); uninstall = @{ setup = 'C:\Jumpstart\SQL\setup.exe'; exitCode = 1603; finalResult = 'Failed'; serviceLeft = $true }; folder = 'C:\Jumpstart'; folderRemoved = $true; arcReset = '' }; Expect = @('IS not uninstalled with setup \(exit code 1603, final result "Failed"\)', 'C:\\Jumpstart removed'); Warnings = 1 }
+    ) {
+        $script:cleanupResult = [pscustomobject]$Cleanup
+        $result = Invoke-DemoJumpstartFirstBoot -Context $script:context
+        $text = $script:logged -join "`n"
+        foreach ($pattern in $Expect) {
+            $text | Should -Match $pattern
+        }
+        $text | Should -Not -Match 'extras removed'
+        @($result | Where-Object { $null -ne $_ } | ForEach-Object { $_.WarningMessage }).Count | Should -Be $Warnings
     }
 }
 
