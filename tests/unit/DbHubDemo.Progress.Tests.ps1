@@ -204,6 +204,26 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
         @($model['tracks'] | ForEach-Object { $_['steps'] } | Where-Object { [string]$_['message'] -match 'previous run' }) | Should -BeNullOrEmpty
     }
+
+    It 'says on a resent track''s Artifacts row why it runs again, instead of saying it didn''t finish (live finding, 2026-11-06)' {
+        $path = New-TestModelFile
+        $note = 'The bootstrap bundle changed since the last run (archost01 has aaaaaaaaaaaa; this checkout builds cccccccccccc), so it''s sent again, and the loader runs again.'
+        InModuleScope DbHubDemo -Parameters @{ Path = $path; Note = $note } {
+            $state = [pscustomobject]@{ Stage = 'Infrastructure'; TrackT1 = 'Monitoring'; TrackT2 = 'Bootstraps'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            $plan = Resolve-DemoTrackPlan -Resume -State $state -SkipT4 -Resend 'T2'
+            Set-DemoProgressPlan -Path $Path -Plan $plan -Resume -T2Source 'existing-build' -ResendNote @{ T2 = $Note }
+        }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        (Get-TestStep -Model $model -Id 'T2.Artifacts')['state'] | Should -Be 'Pending'
+        (Get-TestStep -Model $model -Id 'T2.Artifacts')['message'] | Should -Be $note
+        (Get-TestStep -Model $model -Id 'T2.Restore')['message'] | Should -Be 'Finished in an earlier run.'
+        (Get-TestStep -Model $model -Id 'T2.Bootstraps')['state'] | Should -Be 'Pending'
+        (Get-TestStep -Model $model -Id 'T2.Bootstraps')['message'] | Should -BeNullOrEmpty
+        (Get-TestStep -Model $model -Id 'T2.HostBuild')['message'] | Should -BeNullOrEmpty -Because 'the track runs again from its Artifacts step, not from where it stopped'
+        # A track without a note reads as before.
+        (Get-TestStep -Model $model -Id 'T1.Telemetry')['message'] | Should -Be 'Didn''t finish in the previous run; running it again.'
+        (Get-TestStep -Model $model -Id 'T1.Artifacts')['message'] | Should -Be 'Finished in an earlier run.'
+    }
 }
 
 Describe 'The status page''s banner: exactly one of four states' {

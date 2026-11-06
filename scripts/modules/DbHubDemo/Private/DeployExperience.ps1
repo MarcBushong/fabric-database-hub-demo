@@ -45,6 +45,77 @@ function Get-DemoStopDemoCommand {
     return $stop
 }
 
+function Resolve-DemoDeployCommandText {
+    <#
+    .SYNOPSIS
+    A remediation's text with each deploy.ps1 it tells you to run written as this run's own command (-Command, from
+    Get-DemoDeployCommand, so it keeps -ConfigPath), every other ./scripts/*.ps1 it names given the same -ConfigPath, and
+    the first such deploy.ps1 command with that text's parameters. Returns Text and Command; Command is empty when the text
+    names no deploy.ps1 to run. Pure. Internal.
+
+    .DESCRIPTION
+    Live finding (2026-11-06): NOT DONE said "run ./scripts/deploy.ps1 -FromStage Artifacts" while its Run line gave the
+    plain command, and both dropped the run's -ConfigPath, so a copied command would have deployed config/demo.config.json,
+    and a copied destroy.ps1 would have removed that environment. A deploy.ps1 mention is a command when it's
+    ./scripts/deploy.ps1, when "run" comes right before it, or when deploy.ps1's own parameters follow it (a stage name or a
+    number for those that take one); "deploy.ps1's" and other mentions in passing stay as they are, and so does a script
+    that already names -ConfigPath. Every script in scripts/ takes -ConfigPath. -Resume, which remediations from before
+    Phase 28 name, is left out of the command: a plain run resumes by itself whenever the state allows it, and after a run
+    whose recorded stage reached Validation (a rerun after DONE whose template then failed, for example) it starts over,
+    template included, where -Resume would run only the validation (review finding, 2026-11-06).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text,
+
+        [AllowEmptyString()]
+        [string] $Command = './scripts/deploy.ps1'
+    )
+
+    if (-not $Command) {
+        $Command = './scripts/deploy.ps1'
+    }
+    if (-not $Text) {
+        return [pscustomobject]@{ Text = [string]$Text; Command = '' }
+    }
+    $stage = '(?:Preflight|Infrastructure|Artifacts|Bootstraps|T3|T4|Activity|Monitoring|T2|Fabric|Validation)'
+    $parameter = '[ ]+(?:-(?:FromStage|StopAfter)[ ]+{0}\b|-(?:T1WaitMinutes|T2WaitMinutes|MonitoringWaitMinutes|TelemetryWaitMinutes|PolicyCacheHours)[ ]+\d+\b|-(?:Resume|SkipRunner|SkipFabric|ImportNotebooks|SkipPolicyInventory|Sequential|WaitForT2|NoWaitForT2|NoStatusPage|NoBrowser|WhatIf|TreatManualAsError)\b)' -f $stage
+    $pattern = '(?<![\w./\\-])(?<path>(?:\./)?scripts/)?deploy\.ps1(?![\w''])(?<parameters>(?:{0})*)' -f $parameter
+    $found = @{ Command = '' }
+    $source = $Text
+    $rewritten = [regex]::Replace($Text, $pattern, {
+            param($Match)
+            $before = $source.Substring(0, $Match.Index)
+            $after = $source.Substring($Match.Index + $Match.Length)
+            $parameters = $Match.Groups['parameters'].Value
+            $isCommand = $Match.Groups['path'].Success -or $parameters -or $before -match '(?i)\brun\s+$'
+            if (-not $isCommand -or $after -match '^[^.;:,()]*?\s-ConfigPath\b') {
+                return $Match.Value
+            }
+            $named = '{0}{1}' -f $Command, ($parameters -replace '[ ]+-Resume\b', '')
+            if (-not $found.Command) {
+                $found.Command = $named
+            }
+            return $named
+        })
+    # The run's own -ConfigPath (what follows deploy.ps1 in -Command) for the other scripts the text names.
+    $rest = if ($Command -match '^\./scripts/deploy\.ps1(?<rest>( .*)?)$') { [string]$Matches['rest'] } else { '' }
+    if ($rest) {
+        $other = $rewritten
+        $rewritten = [regex]::Replace($other, '(?<![\w./\\-])\./scripts/(?!deploy\.ps1)[A-Za-z0-9-]+\.ps1(?![\w''])', {
+                param($Match)
+                if ($other.Substring($Match.Index + $Match.Length) -match '^[^.;:,()]*?\s-ConfigPath\b') {
+                    return $Match.Value
+                }
+                return ('{0}{1}' -f $Match.Value, $rest)
+            })
+    }
+    return [pscustomobject]@{ Text = $rewritten; Command = $found.Command }
+}
+
 function Get-DemoDeploymentExpectation {
     <#
     .SYNOPSIS
@@ -1120,7 +1191,10 @@ function Get-DemoDeploymentOutcome {
     that isn't rotated): that's NOT DONE naming stop-demo.ps1 -RemoveBastionOnly (Phase 28 review). A NOT DONE's reason
     names only what blocks DONE, and its next step is that item's own fix (a requirement's latest result included),
     never a plain rerun for something a rerun can't change; a step that a network error stopped (Test-DemoNetworkResult)
-    is exactly that, so its next step is the rerun, which resumes (Phase 28 live finding).
+    is exactly that, so its next step is the rerun, which resumes (Phase 28 live finding). A fix that names a deploy.ps1
+    command (-FromStage Artifacts, for example) names it as this run's own -Command with that fix's parameters, and
+    NextCommand is that command, so the Run line and the text agree and keep the run's -ConfigPath
+    (Resolve-DemoDeployCommandText; live finding, 2026-11-06).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1206,9 +1280,11 @@ function Get-DemoDeploymentOutcome {
         return [pscustomobject]$outcome
     }
     if ($Stopped) {
-        # Ctrl+C (Phase 28 live finding): whatever it had reached, a stopped run isn't DONE, and nothing is lost.
+        # Ctrl+C (Phase 28 live finding): whatever it had reached, a stopped run isn't DONE, and nothing is lost. A fix pulled
+        # before the rerun reaches the VMs: the resume sends them a bootstrap bundle or workload runner that changed
+        # (Resolve-DemoArtifactResend; live finding, 2026-11-06).
         $outcome.Reason = 'You stopped deploy.ps1 (Ctrl+C) before it finished. What it finished is kept, and the resource group''s state records where it stopped.'
-        $outcome.Next = 'Run {0} again when you''re ready: it continues where it stopped.' -f $Command
+        $outcome.Next = 'Run {0} again when you''re ready: it continues where it stopped, and when the bootstrap bundle or the workload runner changed meanwhile (a fix you pulled, for example), it sends them to the VMs again first.' -f $Command
         if ($GuidedStopOpen) {
             $outcome.Next += ' It stopped at the guided stop: on-demand Bastion stays up, and the host password from the guided stop stays valid, until the next run cleans them up when it gets to T2, whether or not setup finished meanwhile (it isn''t DONE before), or ./scripts/stop-demo.ps1 does. Stopping for the day? Run ./scripts/stop-demo.ps1 now.'
         }
@@ -1295,10 +1371,15 @@ function Get-DemoDeploymentOutcome {
             $outcome.Next = 'Run {0} again: it resumes where it stopped. {1}' -f $Command, (Get-DemoNetworkErrorNote)
         }
         else {
+            # The fix's own command, as this run's command with that fix's parameters (live finding, 2026-11-06).
             $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $blocking -Name 'remediation')
-            $outcome.Next = if ($fix) { $fix } else { 'Fix the cause in the message above.' }
-            if ($outcome.Next -notmatch 'deploy\.ps1') {
-                $outcome.Next = '{0} Then run {1}.' -f $outcome.Next.TrimEnd(), $Command
+            $named = Resolve-DemoDeployCommandText -Text $fix -Command $Command
+            if ($named.Command) {
+                $outcome.Next = $named.Text
+                $outcome.NextCommand = $named.Command
+            }
+            else {
+                $outcome.Next = '{0} Then run {1}.' -f $(if ($fix) { $named.Text.TrimEnd() } else { 'Fix the cause in the message above.' }), $Command
             }
         }
     }
@@ -1328,11 +1409,16 @@ function Get-DemoDeploymentOutcome {
         # example); for telemetry, estate, or metrics that only lag, the wait they need after a deployment.
         $lag = $null -ne $problem -and [string]$problem.status -eq 'Warning' -and (($first -like 'TELEMETRY.*' -and @(Get-DemoTelemetryRetryTarget -Result @($problem)).Count -gt 0) -or $first -like 'HUB.ESTATE.*' -or $first -eq 'METRICS.T4')
         $fix = if ($null -ne $problem -and -not $lag) { ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $problem -Name 'remediation') } else { '' }
-        $outcome.Next = if ($fix) {
-            if ($fix -match 'deploy\.ps1') { $fix } else { '{0} Then run {1}.' -f $fix.TrimEnd(), $Command }
+        $named = Resolve-DemoDeployCommandText -Text $fix -Command $Command
+        if ($named.Command) {
+            $outcome.Next = $named.Text
+            $outcome.NextCommand = $named.Command
+        }
+        elseif ($fix) {
+            $outcome.Next = '{0} Then run {1}.' -f $named.Text.TrimEnd(), $Command
         }
         else {
-            'Telemetry and estate entries can take a few more minutes after a deployment. Wait about 10 minutes, then run {0}: it checks again.' -f $Command
+            $outcome.Next = 'Telemetry and estate entries can take a few more minutes after a deployment. Wait about 10 minutes, then run {0}: it checks again.' -f $Command
         }
     }
     if ($leftover -and -not $leftoverShown) {

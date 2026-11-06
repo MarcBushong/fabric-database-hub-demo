@@ -115,7 +115,15 @@ function Invoke-DemoBootstrapLoaderRun {
     }
     $evidence = [ordered]@{ vmName = $VmName; bundle = $BundleSha256.Substring(0, 12).ToLowerInvariant(); runner = $(if ($RunnerSha256) { $RunnerSha256.Substring(0, 12).ToLowerInvariant() } else { '' }); seconds = [int]$watch.Elapsed.TotalSeconds; notStarted = [bool](Get-DemoMemberValue -InputObject $run -Name 'NotStarted') }
     if ($null -ne $run -and $run.Succeeded) {
-        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('The bootstrap loader on {0} finished in {1} seconds: the bundle is verified and installed, and a new bootstrap generation is running.' -f $VmName, $evidence['seconds']) -Evidence $evidence -DocUrl $docUrl)
+        # The loader stopped an earlier bundle's bootstrap run that was still going, so this bundle's started at once (its
+        # line in the output; 2026-11-06).
+        $tookOver = @(([string]$run.Output) -split '\r?\n' | Where-Object { $_ -match '^DbHubDemo loader took over: (.+)$' } | ForEach-Object { $Matches[1].Trim() } | Select-Object -Last 1)
+        $takeoverText = ''
+        if ($tookOver.Count -gt 0) {
+            $evidence['tookOver'] = $tookOver[0]
+            $takeoverText = ' It {0}' -f $tookOver[0]
+        }
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('The bootstrap loader on {0} finished in {1} seconds: the bundle is verified and installed, and a new bootstrap generation is running.{2}' -f $VmName, $evidence['seconds'], $takeoverText) -Evidence $evidence -DocUrl $docUrl)
     }
     if ($evidence['notStarted']) {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('The bootstrap loader on {0} didn''t start within {1} minutes: the VM agent is still busy with Azure-side extension work.' -f $VmName, [int]($StartTimeoutSeconds / 60)) -Evidence $evidence -Remediation 'deploy.ps1''s watchdog restarts the VM once and runs the loader again; if it stays stuck, run ./scripts/deploy.ps1 again later.' -DocUrl $docUrl)
@@ -125,7 +133,7 @@ function Invoke-DemoBootstrapLoaderRun {
         $detail = $detail.Substring($detail.Length - 1000)
     }
     $evidence['error'] = $detail
-    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('The bootstrap loader on {0} failed: {1}' -f $VmName, $detail) -Evidence $evidence -Remediation 'Read C:\ProgramData\DbHubDemo\logs\loader.log on the VM, then run deploy.ps1 -Resume, which sends the bundle again and re-runs the loader (ADR 0003).' -DocUrl $docUrl)
+    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('The bootstrap loader on {0} failed: {1}' -f $VmName, $detail) -Evidence $evidence -Remediation 'Read C:\ProgramData\DbHubDemo\logs\loader.log on the VM, fix the cause, then run ./scripts/deploy.ps1 again: it runs the loader again, and when the loader found the bundle''s chunks missing or damaged, it sends the bundle again first (ADR 0003).' -DocUrl $docUrl)
 }
 
 function Get-DemoStateLockName {
@@ -148,7 +156,8 @@ function Set-DemoDeploymentStateLocked {
     .SYNOPSIS
     Set-DemoDeploymentState under a lock that the parallel tracks on this machine share. With -AddVm, it
     adds the VM to BundleSentTo or RunnerSentTo for that SHA-256 inside the lock (a list another track may be
-    extending at the same moment). Internal.
+    extending at the same moment); with -RemoveBundleVm, it takes the VM out of BundleSentTo, which a loader that found
+    the VM's chunks unusable needs (2026-11-06). Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -164,7 +173,9 @@ function Set-DemoDeploymentStateLocked {
 
         [string] $Sha256 = '',
 
-        [int] $ChunkCount = 0
+        [int] $ChunkCount = 0,
+
+        [string] $RemoveBundleVm = ''
     )
 
     if (-not $PSCmdlet.ShouldProcess((Get-DemoResourceGroupName -Config $Config), 'Record the deployment state under the tracks'' lock')) {
@@ -197,6 +208,10 @@ function Set-DemoDeploymentStateLocked {
             $values[('{0}Sha256' -f $AddKind)] = $Sha256.ToLowerInvariant()
             $values[('{0}ChunkCount' -f $AddKind)] = $ChunkCount
             $values[('{0}SentTo' -f $AddKind)] = $list
+        }
+        if ($RemoveBundleVm) {
+            $state = Get-DemoDeploymentState -Config $Config
+            $values['BundleSentTo'] = @(@($state.BundleSentTo) | Where-Object { $_ -and $_ -ne $RemoveBundleVm })
         }
         if ($values.Count -gt 0) {
             Set-DemoDeploymentState -Config $Config -Value $values -Confirm:$false
@@ -391,6 +406,11 @@ function Resolve-DemoTrackPlan {
     track's record, and any other run lowers the records of the tracks it runs, before any of them writes
     (Get-DemoTrackRecordReset), so a resume never trusts a record older than a step that has failed since (Phase 28 live
     finding, 2026-10-30).
+
+    PastArtifacts names the VM tracks (T1, T2) that a resume continues after their Artifacts step, so their VM's bootstrap
+    bundle and workload runner aren't sent again. A track in -Resend goes back to its Artifacts step instead, and runs its
+    Bootstraps step and the steps after it again, because what the resource group's state records for its VM isn't what
+    this checkout builds (Resolve-DemoArtifactResend; live finding, 2026-11-06); Resend names the tracks it moved back.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -406,7 +426,10 @@ function Resolve-DemoTrackPlan {
 
         [switch] $SkipFabric,
 
-        [switch] $SkipT4
+        [switch] $SkipT4,
+
+        [AllowEmptyCollection()]
+        [string[]] $Resend = @()
     )
 
     $stages = @(Get-DemoDeploymentStageName)
@@ -425,6 +448,8 @@ function Resolve-DemoTrackPlan {
     $stop = if ($StopAfter) { [array]::IndexOf($stages, $StopAfter) } else { $stages.Count - 1 }
     $inRange = { param([string] $Stage) $i = [array]::IndexOf($stages, $Stage); $i -ge $from -and $i -le $stop }
     $tracks = [ordered]@{}
+    $pastArtifacts = [System.Collections.Generic.List[string]]::new()
+    $resent = [System.Collections.Generic.List[string]]::new()
     foreach ($track in 'T1', 'T2', 'T4', 'Fabric') {
         if (($track -eq 'Fabric' -and $SkipFabric) -or ($track -eq 'T4' -and $SkipT4)) {
             $tracks[$track] = @()
@@ -437,6 +462,14 @@ function Resolve-DemoTrackPlan {
             $last = [string](Get-DemoMemberValue -InputObject $State -Name ('Track{0}' -f $track))
             if ($last -and $last -in $names) {
                 $first = [array]::IndexOf($names, $last) + 1
+            }
+            $artifactsAt = [array]::IndexOf($names, 'Artifacts')
+            if ($artifactsAt -ge 0 -and $first -gt $artifactsAt -and $stop -ge [array]::IndexOf($stages, 'Artifacts')) {
+                $pastArtifacts.Add($track)
+                if ($track -in $Resend) {
+                    $first = $artifactsAt
+                    $resent.Add($track)
+                }
             }
         }
         $tracks[$track] = @(for ($i = $first; $i -lt $names.Count; $i++) {
@@ -452,6 +485,8 @@ function Resolve-DemoTrackPlan {
         Infrastructure = (& $inRange 'Infrastructure')
         Tracks         = $tracks
         Validation     = (& $inRange 'Validation')
+        PastArtifacts  = $pastArtifacts.ToArray()
+        Resend         = $resent.ToArray()
     }
 }
 
@@ -468,7 +503,9 @@ function Get-DemoTrackRecordReset {
     DbHubTrackFabric still said Fabric from the run before, and the next plain deploy.ps1 resumed past it and ended DONE
     without running it again. For each track -Plan runs, its record is lowered to the step before the track's first
     step in this run: cleared when the track runs from its first step, and never raised, so a resumed track (whose first
-    step follows its record) keeps it, and -FromStage keeps an older record. With -FreshStart (a run from preflight that
+    step follows its record) keeps it, and -FromStage keeps an older record. A resumed track that goes back to its
+    Artifacts step because its VM's artifacts changed (Resolve-DemoArtifactResend) is lowered too, so a run stopped before
+    that step finishes sends them again. With -FreshStart (a run from preflight that
     doesn't resume), every track's record is cleared, run or not (-StopAfter, -SkipFabric): a later resume then trusts
     only what was recorded since. Otherwise a track the plan doesn't run keeps its record. Returns the
     Set-DemoDeploymentState values to write; empty when nothing changes.
@@ -509,6 +546,148 @@ function Get-DemoTrackRecordReset {
     return $reset
 }
 
+function Get-DemoArtifactChange {
+    <#
+    .SYNOPSIS
+    The VM tracks whose VM doesn't have the bootstrap bundle or the workload runner that this checkout builds, by the
+    resource group's state: sqlvm01 (T1) or archost01 (T2) has an artifact only when BundleSha256 or RunnerSha256 is its
+    SHA-256 and BundleSentTo or RunnerSentTo lists the VM. Returns, per such track, Track, VmName, Kinds (Bundle, Runner),
+    Note (the status page's line for its Artifacts step), Message (the console's), and Evidence. Pure. Internal.
+
+    .DESCRIPTION
+    -Runner is $null when the runner isn't compared: -SkipRunner, or a deployment whose state records no runner. Each
+    artifact's text says what the VM has: another SHA-256 (it changed since the last run), or nothing on record.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $State,
+
+        [Parameter(Mandatory)]
+        [object] $Bundle,
+
+        [AllowNull()]
+        [object] $Runner,
+
+        [ValidateSet('T1', 'T2')]
+        [string[]] $Track = @('T1', 'T2')
+    )
+
+    $short = { param([string] $Sha) if ($Sha.Length -gt 12) { $Sha.Substring(0, 12) } else { $Sha } }
+    foreach ($name in $Track) {
+        $vm = if ($name -eq 'T1') { 'sqlvm01' } else { 'archost01' }
+        $kinds = [System.Collections.Generic.List[string]]::new()
+        $parts = [System.Collections.Generic.List[string]]::new()
+        $evidence = [ordered]@{ track = $name; vmName = $vm }
+        foreach ($kind in 'Bundle', 'Runner') {
+            $artifact = if ($kind -eq 'Bundle') { $Bundle } else { $Runner }
+            if ($null -eq $artifact) {
+                continue
+            }
+            $built = ([string](Get-DemoMemberValue -InputObject $artifact -Name 'Sha256')).ToLowerInvariant()
+            $recorded = ([string](Get-DemoMemberValue -InputObject $State -Name ('{0}Sha256' -f $kind))).ToLowerInvariant()
+            $sentTo = Get-DemoMemberValue -InputObject $State -Name ('{0}SentTo' -f $kind)
+            $onVm = [bool]$recorded -and $vm -in @($sentTo)
+            if ($onVm -and $recorded -eq $built) {
+                continue
+            }
+            $label = if ($kind -eq 'Bundle') { 'bootstrap bundle' } else { 'workload runner' }
+            $parts.Add($(if ($onVm) { 'the {0} changed since the last run ({1} has {2}; this checkout builds {3})' -f $label, $vm, (& $short $recorded), (& $short $built) } else { 'the {0} this checkout builds ({1}) isn''t recorded as sent to {2}' -f $label, (& $short $built), $vm }))
+            $kinds.Add($kind)
+            $evidence[$kind.ToLowerInvariant()] = [ordered]@{ built = (& $short $built); recorded = (& $short $recorded); onVm = $onVm }
+        }
+        if ($kinds.Count -eq 0) {
+            continue
+        }
+        $what = $parts -join ', and '
+        $sent = if ($kinds.Count -gt 1) { 'they''re' } else { 'it''s' }
+        $them = if ($kinds.Count -gt 1) { 'them' } else { 'it' }
+        [pscustomobject]@{
+            Track    = $name
+            VmName   = $vm
+            Kinds    = $kinds.ToArray()
+            Note     = '{0}{1}, so {2} sent again, and the loader runs again.' -f $what.Substring(0, 1).ToUpperInvariant(), $what.Substring(1), $sent
+            Message  = '{0}: {1}, so this run sends {2} to {3} again and runs {0}''s Artifacts and Bootstraps steps again, with the steps after them.' -f $name, $what, $them, $vm
+            Evidence = $evidence
+        }
+    }
+}
+
+function Resolve-DemoArtifactResend {
+    <#
+    .SYNOPSIS
+    The VM tracks a resumed deploy.ps1 run sends their artifacts again (Resolve-DemoTrackPlan -Resend): those the run would
+    continue past their Artifacts step (the plan's PastArtifacts) whose VM, by the resource group's state, doesn't have the
+    bootstrap bundle or the workload runner that this checkout builds (Get-DemoArtifactChange). Returns Tracks, Notes (the
+    status page's line for each track's Artifacts step), and Results. Internal.
+
+    .DESCRIPTION
+    Live finding (2026-11-06): a fix to the T2 host's bootstrap was pulled while archost01 built its guest, and the plain
+    ./scripts/deploy.ps1 that NOT DONE named resumed T2 after its Bootstraps step, so the host kept running the bundle it
+    had; only -FromStage Artifacts sent the new one. Now the bundle is built as the Artifacts step builds it
+    (New-DemoBootstrapBundle: the same content gives the same SHA-256), and the runner too, unless -SkipRunner or the state
+    records no runner (Publish-DemoWorkloadRunner, which reuses a zip built from the same inputs). A track whose VM lacks
+    either gets DEPLOY.ARTIFACTS.CHANGED_<VM> (Pass) and a console line that says why it's sent again. Nothing changed, or
+    no track past its Artifacts step: no track, and the resume runs as recorded. A build that fails is a Warning
+    (DEPLOY.ARTIFACTS.CHANGED), and what it couldn't build isn't compared.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $State,
+
+        [Parameter(Mandatory)]
+        [object] $Plan,
+
+        [switch] $SkipRunner
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $notes = @{}
+    $past = Get-DemoMemberValue -InputObject $Plan -Name 'PastArtifacts'
+    $tracks = @(@($past) | Where-Object { [string]$_ -in 'T1', 'T2' } | ForEach-Object { [string]$_ })
+    $none = { [pscustomobject]@{ Tracks = @(); Notes = $notes; Results = $results.ToArray() } }
+    if ($tracks.Count -eq 0) {
+        return (& $none)
+    }
+    $vms = @($tracks | ForEach-Object { if ($_ -eq 'T1') { 'sqlvm01' } else { 'archost01' } }) -join ' and '
+    $compareRunner = -not $SkipRunner -and [bool][string](Get-DemoMemberValue -InputObject $State -Name 'RunnerSha256')
+    $warn = {
+        param([string] $Message, [string] $Remediation)
+        $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.CHANGED' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $Message -Remediation $Remediation))
+        Write-DemoLog -Level Warning -Message $Message
+    }
+    Write-DemoLog -Message ('Resuming: checking that {0} {1} the bootstrap bundle{2} this checkout builds, so a fix pulled since the last run reaches {3}.' -f $vms, $(if ($tracks.Count -gt 1) { 'have' } else { 'has' }), $(if ($compareRunner) { ' and the workload runner' } else { '' }), $(if ($tracks.Count -gt 1) { 'them' } else { 'it' }))
+    try {
+        $bundle = New-DemoBootstrapBundle -Confirm:$false
+    }
+    catch {
+        & $warn ('The bootstrap bundle couldn''t be built, so this run can''t tell whether {0} has the one this checkout builds, and resumes as recorded: {1}' -f $vms, (Protect-DemoText -Text $_.Exception.Message)) 'Run New-DemoBootstrapBundle yourself to see the error, fix it, then run ./scripts/deploy.ps1 again, which sends a changed bundle; or run ./scripts/deploy.ps1 -FromStage Artifacts.'
+        return (& $none)
+    }
+    $runner = $null
+    if ($compareRunner) {
+        try {
+            $runner = Publish-DemoWorkloadRunner -Confirm:$false
+        }
+        catch {
+            & $warn ('The workload runner couldn''t be built, so this run can''t tell whether {0} has the one this checkout builds: {1}' -f $vms, (Protect-DemoText -Text $_.Exception.Message)) 'Install the .NET SDK that config/versions.json pins (docs/prerequisites.md), or run with -SkipRunner to keep the runner the VMs have; then run ./scripts/deploy.ps1 again.'
+        }
+    }
+    $changes = @(Get-DemoArtifactChange -State $State -Bundle $bundle -Runner $runner -Track $tracks)
+    foreach ($change in $changes) {
+        $notes[$change.Track] = $change.Note
+        Write-DemoLog -Message $change.Message
+        $results.Add((New-DemoResult -CheckId ('DEPLOY.ARTIFACTS.CHANGED_{0}' -f $change.VmName.ToUpperInvariant()) -Area 'infra' -Target $change.Track -Status 'Pass' -Message $change.Message -Evidence $change.Evidence))
+    }
+    if ($changes.Count -eq 0) {
+        Write-DemoLog -Message ('{0} {1} the bootstrap bundle{2} this checkout builds, so each track continues where it stopped.' -f $vms, $(if ($tracks.Count -gt 1) { 'have' } else { 'has' }), $(if ($null -ne $runner) { ' and the workload runner' } else { '' }))
+    }
+    return [pscustomobject]@{ Tracks = @($changes | ForEach-Object { $_.Track }); Notes = $notes; Results = $results.ToArray() }
+}
+
 function Invoke-DemoDeploymentTrack {
     <#
     .SYNOPSIS
@@ -545,7 +724,9 @@ function Invoke-DemoDeploymentTrack {
     its Restore as soon as archost01's own nested deployment succeeded, which comes after the template's
     resource group update, so no tag it writes can be overwritten. Each step's end is recorded in the
     track's tag under the tracks' shared lock; a Fail stops the track, and an exception is a Fail for that
-    step.
+    step. A resumed run that sends a VM's artifacts again because they changed since the last run hands the reason over
+    in the context's ResendNote (by track; Resolve-DemoArtifactResend), and that track's Artifacts step says it on the
+    console and on the status page.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -769,6 +950,16 @@ function Invoke-DemoDeploymentTrack {
             }
         }
         $results.Add($loader)
+        if ($loader.status -ne 'Pass' -and $recordState -and [string](Get-DemoMemberValue -InputObject $loader.evidence -Name 'error') -match 'is incomplete|SHA-256 mismatch') {
+            # The loader couldn't use the chunks on the VM (a mismatch deletes them, fail closed), so the record no longer
+            # says the VM has the bundle, and the next run sends it again before the loader (Resolve-DemoArtifactResend).
+            try {
+                Set-DemoDeploymentStateLocked -Config $Config -RemoveBundleVm $VmName -Confirm:$false
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('Track {0}: the record still says {1} has the bundle, so the next run doesn''t send it again by itself: {2}' -f $Track, $VmName, (Protect-DemoText -Text $_.Exception.Message))
+            }
+        }
         if ($VmName -eq 'archost01' -and -not [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
             # The loader ran, so a bootstrap generation that may build the guest has started (review follow-up).
             & $recordT2Build ([DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture))
@@ -890,14 +1081,17 @@ function Invoke-DemoDeploymentTrack {
             $firstStepUtc = [DateTime]::UtcNow
         }
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
-        Write-DemoLog -Message ('Track {0}: {1}.' -f $Track, $name)
+        # A resumed run that sends this VM's artifacts again says why, on the console and on the status page, while the step
+        # runs and once it's done: they changed since the last run (Resolve-DemoArtifactResend; live finding, 2026-11-06).
+        $stepNote = if ($name -eq 'Artifacts') { [string](Get-DemoMemberValue -InputObject (& $option 'ResendNote' $null) -Name $Track) } else { '' }
+        Write-DemoLog -Message ('Track {0}: {1}.{2}' -f $Track, $name, $(if ($stepNote) { ' ' + $stepNote } else { '' }))
         # The status page (Phase 28): the step runs; T2's T2 step and the Fabric step report their own parts.
         $stepIds = @(Get-DemoProgressStepId -Track $Track -Step $name)
         $ownProgress = ('{0}/{1}' -f $Track, $name) -in 'T2/T2', 'Fabric/Fabric'
         $resultsBefore = $results.Count
         $shared['FailureLogged'] = $false
         if (-not $ownProgress -and $stepIds.Count -gt 0) {
-            Set-DemoProgressStep -Path $progress -Id $stepIds -State 'Running' -Message ''
+            Set-DemoProgressStep -Path $progress -Id $stepIds -State 'Running' -Message $stepNote
         }
         $outcome = 'Pass'
         # A step that can leave its VM on the interim baseline: the loader can install the runner, which then sets it, and
@@ -1149,7 +1343,7 @@ function Invoke-DemoDeploymentTrack {
                         $build = Wait-DemoT2HostBuild -Config $Config -DeadlineUtc $t2Deadline -ProgressPath $progress -PollSeconds ([int](& $option 'HostPollSeconds' 300)) -StartedUtc $firstStepUtc
                         if ($build.Failed) {
                             Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Failed' -Status 'Fail' -Message ([string](Get-DemoMemberValue -InputObject $build.Health -Name 'message'))
-                            & $note 'DEPLOY.T2.HOST' 'T2' 'Fail' ('archost01 failed at step {0}: {1}' -f [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep'), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'message')) 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full) and C:\ProgramData\DbHubDemo\logs on it, fix the cause, then run ./scripts/deploy.ps1 -FromStage Artifacts: a failed step is tried again only in a new bootstrap generation, which that starts (a plain rerun resumes and finds the same step failed).'
+                            & $note 'DEPLOY.T2.HOST' 'T2' 'Fail' ('archost01 failed at step {0}: {1}' -f [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep'), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'message')) 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full) and C:\ProgramData\DbHubDemo\logs on it, fix the cause, then run ./scripts/deploy.ps1 -FromStage Artifacts: a failed step is tried again only in a new bootstrap generation, which that starts (a plain rerun resumes and finds the same step failed, unless your fix changed the bootstrap bundle, which a plain rerun then sends again, starting one too).'
                             $outcome = 'Fail'
                             break
                         }
@@ -1336,7 +1530,7 @@ function Invoke-DemoDeploymentTrack {
             $worst = Get-DemoWorstStatus -Status @($stepResults | ForEach-Object { [string]$_.status })
             $stepState = switch ($outcome) { 'Pass' { 'Done' } 'Background' { 'Skipped' } 'Open' { 'Action needed' } default { 'Failed' } }
             $first = @($stepResults | Where-Object { [string]$_.status -notin 'Pass', 'Not selected' } | Select-Object -First 1)
-            $stepMessage = if ($first.Count -gt 0) { [string]$first[0].message } else { 'Done in {0}.' -f (Format-DemoProgressDuration -Seconds ([long]$timing[$name])) }
+            $stepMessage = if ($first.Count -gt 0) { [string]$first[0].message } else { '{0}Done in {1}.' -f $(if ($stepNote) { $stepNote + ' ' } else { '' }), (Format-DemoProgressDuration -Seconds ([long]$timing[$name])) }
             Set-DemoProgressStep -Path $progress -Id $stepIds -State $stepState -Status $worst -Message $stepMessage
         }
         elseif ($ownProgress -and $outcome -eq 'Fail') {
