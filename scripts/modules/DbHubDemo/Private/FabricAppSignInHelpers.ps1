@@ -7,6 +7,9 @@
 # - Rayfin CLI reference (rayfin login, rayfin login status): https://learn.microsoft.com/fabric/apps/cli-reference
 # - Start-Process (-NoNewWindow, -Environment, -PassThru): https://learn.microsoft.com/powershell/module/microsoft.powershell.management/start-process
 # - Process.Kill(entireProcessTree): https://learn.microsoft.com/dotnet/api/system.diagnostics.process.kill
+# - Get-Command (-CommandType Application; checked 2026-11-06): https://learn.microsoft.com/powershell/module/microsoft.powershell.core/get-command
+# - How the Rayfin CLI opens its sign-in page with BROWSER isn't in its reference: read on 2026-11-06 from the pinned
+#   package's own code (@microsoft/rayfin-cli 1.36.2, dist/auth/rayfin-auth.js).
 
 # The sign-in this session started last, which Stop-DemoFabricAppSignIn ends when the run ends without settling it.
 $script:DemoFabricAppSignIn = $null
@@ -31,8 +34,9 @@ function Start-DemoFabricAppSignIn {
       opens for the person's sign-in. The status page's Fabric.AppSignIn row says so, with the deadline (-TimeoutMinutes),
       which the model keeps (run.appSignInUntil) for the app's step (Wait-DemoFabricAppSignIn).
     - No tenant, no Node.js or npx, or a start that fails: a Warning, and the app's step says what that means for it.
-    Returns Process (or $null), StartedUtc, DeadlineUtc, TimeoutMinutes, Done, Reported, and Result (the
-    DEPLOY.FABRIC.APPSIGNIN record once it's settled, which Complete-DemoFabricAppSignIn hands out once).
+    Returns Process (or $null), TenantId (once the sign-in starts), StartedUtc, DeadlineUtc, TimeoutMinutes, Done,
+    Reported, and Result (the DEPLOY.FABRIC.APPSIGNIN record once it's settled, which Complete-DemoFabricAppSignIn hands
+    out once).
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -48,7 +52,7 @@ function Start-DemoFabricAppSignIn {
     )
 
     $now = [System.DateTime]::UtcNow
-    $state = [pscustomobject]@{ Process = $null; StartedUtc = $now; DeadlineUtc = $now.AddMinutes($TimeoutMinutes); TimeoutMinutes = $TimeoutMinutes; Done = $false; Reported = $false; Result = $null }
+    $state = [pscustomobject]@{ Process = $null; TenantId = ''; StartedUtc = $now; DeadlineUtc = $now.AddMinutes($TimeoutMinutes); TimeoutMinutes = $TimeoutMinutes; Done = $false; Reported = $false; Result = $null }
     $later = 'Run ./scripts/configure-fabric-app.ps1 -SignIn in a terminal: it opens a browser for your own sign-in (an assistant can''t do it for you), then adds the Insights app.'
     if (-not (Test-DemoInteractiveSession)) {
         Set-DemoFabricAppSignInResult -SignIn $state -ProgressPath $ProgressPath -Status 'Not supported' -Message 'This session can''t answer a browser sign-in (CI, or input redirected, as under an assistant), so the Rayfin CLI''s sign-in for the Insights app wasn''t started. The app''s step uses a sign-in this machine already has, if any.' -Remediation $later
@@ -82,6 +86,7 @@ function Start-DemoFabricAppSignIn {
     }
     try {
         $state.Process = Start-DemoRayfinSignInProcess -TenantId $tenantId
+        $state.TenantId = $tenantId
     }
     catch {
         Set-DemoFabricAppSignInResult -SignIn $state -ProgressPath $ProgressPath -Status 'Warning' -Message ('The Rayfin CLI''s sign-in for the Insights app couldn''t start: {0}' -f (Get-DemoExceptionText -Exception $_.Exception)) -Remediation $later
@@ -112,8 +117,9 @@ function Start-DemoRayfinSignInProcess {
     On Windows it gets a console window of its own (Start-Process without -NoNewWindow), so it has its own input and
     output and this console goes on; elsewhere it runs in this terminal. npx runs the version config/versions.json pins
     (fabricApp.cliVersion), the one the Insights app's stage installs, so no stage is needed yet and the Fabric track's
-    stage is never touched. The CLI's telemetry is off and an ambient RAYFIN_TOKEN is removed for the child only; the
-    CLI keeps its own token cache, and nothing is captured or logged. Throws when npx isn't on PATH.
+    stage is never touched. The CLI's telemetry is off, and an ambient RAYFIN_TOKEN and a BROWSER the CLI can't start
+    are removed, for the child only (Get-DemoRayfinSignInEnvironment); the CLI keeps its own token cache, and nothing
+    of its output is captured or logged. Throws when npx isn't on PATH.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Its caller, Start-DemoFabricAppSignIn, asks ShouldProcess.')]
     [CmdletBinding()]
@@ -129,11 +135,12 @@ function Start-DemoRayfinSignInProcess {
     if (-not $npx) {
         throw ('npx wasn''t found on PATH. Install Node.js {0} (LTS), which includes npm and npx.' -f (@($settings['supportedNodeMajors']) -join ', '))
     }
+    $environment = Get-DemoRayfinSignInEnvironment -WorkingDirectory $script:RepoRoot
     $start = @{
         FilePath         = $npx.Source
         ArgumentList     = @('--yes', ('--package={0}@{1}' -f $settings['cliPackage'], $settings['cliVersion']), '--', 'rayfin', 'login', '--tenant', $TenantId)
         WorkingDirectory = $script:RepoRoot
-        Environment      = @{ RAYFIN_TELEMETRY_OPTOUT = '1'; RAYFIN_TOKEN = $null; NO_COLOR = '1' }
+        Environment      = $environment
         PassThru         = $true
         WhatIf           = $false
     }
@@ -144,6 +151,76 @@ function Start-DemoRayfinSignInProcess {
     # Read the handle now, so the exit code can still be read after the process ends.
     $null = $process.Handle
     return $process
+}
+
+function Get-DemoRayfinSignInEnvironment {
+    <#
+    .SYNOPSIS
+    The environment for the Rayfin CLI's sign-in process, as Start-Process -Environment takes it, so only that process
+    changes: the CLI's telemetry off, no ambient RAYFIN_TOKEN, no colors, and no BROWSER that names nothing the CLI can
+    start. Internal.
+
+    .DESCRIPTION
+    When BROWSER is set, the Rayfin CLI 1.36.2 opens its sign-in page with it, as "<BROWSER>" "<url>" through a shell,
+    and doesn't check the result (dist/auth/rayfin-auth.js), so a value it can't start opens nothing, and the sign-in
+    waits until its deadline. That happened live on 2026-11-06: BROWSER held a command line set for az login,
+    '"<path>\msedge.exe" --inprivate %s', which Python's webbrowser module accepts. So a BROWSER that's set, but is
+    neither the path of an existing file nor a program on PATH (Test-DemoBrowserCommand, from -WorkingDirectory, where
+    the CLI runs), is removed ($null) for the CLI's process, which then opens the default browser, and one line says
+    so. The caller's own environment never changes, and a usable BROWSER, such as a dev container's helper or a Linux
+    desktop's browser, reaches the CLI as before. Either way 'rayfin login' asks which account to use.
+    Used by both sign-ins: deploy.ps1's (Start-DemoRayfinSignInProcess) and configure-fabric-app.ps1 -SignIn's
+    (Invoke-DemoRayfinInteractive). The CLI's other calls use --json, which never opens a browser.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $WorkingDirectory
+    )
+
+    $environment = @{ RAYFIN_TELEMETRY_OPTOUT = '1'; RAYFIN_TOKEN = $null; NO_COLOR = '1' }
+    $browser = [System.Environment]::GetEnvironmentVariable('BROWSER')
+    if (-not [string]::IsNullOrEmpty($browser) -and -not (Test-DemoBrowserCommand -Value $browser -WorkingDirectory $WorkingDirectory)) {
+        $environment['BROWSER'] = $null
+        Write-DemoLog -Level Warning -Message ('The Rayfin CLI can''t open its sign-in page with BROWSER, which is neither the path of a file nor a program on PATH, so it opens your default browser instead (for the CLI only; BROWSER stays as it is in this terminal). BROWSER is: {0}' -f ($browser -replace '\p{Cc}', ' '))
+    }
+    return $environment
+}
+
+function Test-DemoBrowserCommand {
+    <#
+    .SYNOPSIS
+    True when -Value, a BROWSER setting, names a program the Rayfin CLI's shell can start: the path of an existing file
+    (a relative one from -WorkingDirectory, the CLI's), or a program on PATH (Get-Command -CommandType Application).
+    False for anything else, such as a command line with arguments or %s, or a list of browsers. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $Value,
+
+        [Parameter(Mandatory)]
+        [string] $WorkingDirectory
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+    try {
+        if ([System.IO.Path]::IsPathRooted($Value) -or $Value.IndexOfAny([char[]]'/\') -ge 0) {
+            $path = [System.IO.Path]::GetFullPath($Value, (Resolve-DemoUserPath -Path $WorkingDirectory))
+            return [System.IO.File]::Exists($path)
+        }
+        # A name, as the shell looks it up: on PATH, and with no wildcards.
+        $found = Get-Command -Name ([System.Management.Automation.WildcardPattern]::Escape($Value)) -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        return ($null -ne $found)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Set-DemoFabricAppSignInResult {
@@ -182,11 +259,15 @@ function Complete-DemoFabricAppSignIn {
     Internal.
 
     .DESCRIPTION
-    When its process has ended, from its exit code: 0 is Pass; anything else is a Warning (closed, cancelled, or failed).
+    When its process has ended, from its exit code: 0 is Pass; anything else (closed, cancelled, or failed) is a Warning.
     When its deadline has passed, or with -Final (the tracks are done), its process is ended, with every process it
     started, and it's a Warning. With -Wait (deploy.ps1 -Sequential, right before the Insights app's step), it first waits
-    for the process to end, at most until the deadline. Returns the record when it settles, or when it settled at the start
-    and wasn't handed out yet; nothing while it still runs, or once it's handed out. Never throws.
+    for the process to end, at most until the deadline. A window that's closed or stopped doesn't mean there's no sign-in,
+    though: one can exist already, from another sign-in (live, 2026-11-06). So before a Warning, the CLI's own status is
+    read once, at most a minute (Get-DemoRayfinSignInState): signed in to the demo's tenant is Pass, and the Warning says
+    what it means only when the CLI isn't, or when that couldn't be read (never after Ctrl+C, so a stop stays quick).
+    Returns the record when it settles, or when it settled at the start and wasn't handed out yet; nothing while it still
+    runs, or once it's handed out. Never throws.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -215,6 +296,10 @@ function Complete-DemoFabricAppSignIn {
                 }
             }
             $consequence = 'The deployment went on; without the sign-in the Insights app isn''t created, and its step says why. ./scripts/configure-fabric-app.ps1 -SignIn adds it later.'
+            $remediation = 'Run ./scripts/configure-fabric-app.ps1 -SignIn in a terminal: it opens a browser for your own sign-in, then adds the Insights app.'
+            # What happened to the sign-in's window, when it didn't finish: $why for a Warning, $window for a Pass.
+            $why = ''
+            $window = ''
             if (& $ended) {
                 $code = -1
                 try {
@@ -227,7 +312,8 @@ function Complete-DemoFabricAppSignIn {
                     Set-DemoFabricAppSignInResult -SignIn $SignIn -ProgressPath $ProgressPath -Status 'Pass' -Message 'The Rayfin CLI''s sign-in finished; the Insights app''s step uses it.'
                 }
                 else {
-                    Set-DemoFabricAppSignInResult -SignIn $SignIn -ProgressPath $ProgressPath -Status 'Warning' -Message ('The Rayfin CLI''s sign-in ended with exit code {0}: it was closed, cancelled, or failed. {1}' -f $code, $consequence) -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn in a terminal: it opens a browser for your own sign-in, then adds the Insights app.'
+                    $why = 'The Rayfin CLI''s sign-in ended with exit code {0}: it was closed, cancelled, or failed.' -f $code
+                    $window = 'its sign-in window was closed, with exit code {0}' -f $code
                 }
             }
             elseif ($Final -or $Wait -or [System.DateTime]::UtcNow -ge $SignIn.DeadlineUtc) {
@@ -238,10 +324,22 @@ function Complete-DemoFabricAppSignIn {
                     Write-DemoLog -Level Debug -Message ('The Rayfin CLI''s sign-in had already ended: {0}' -f $_.Exception.Message)
                 }
                 $why = if ([System.DateTime]::UtcNow -ge $SignIn.DeadlineUtc) { 'Nobody finished the Rayfin CLI''s sign-in within {0} minutes, so it was stopped.' -f $SignIn.TimeoutMinutes } else { 'The Rayfin CLI''s sign-in was still open when the Insights app''s step was over, so it was stopped.' }
-                Set-DemoFabricAppSignInResult -SignIn $SignIn -ProgressPath $ProgressPath -Status 'Warning' -Message ('{0} {1}' -f $why, $consequence) -Remediation 'Run ./scripts/configure-fabric-app.ps1 -SignIn in a terminal: it opens a browser for your own sign-in, then adds the Insights app.'
+                $window = 'its sign-in window was still open, so it was stopped'
             }
             else {
                 return
+            }
+            if ($why) {
+                $cli = if (Test-DemoRunCancelled) { 'Unknown' } else { Get-DemoRayfinSignInState -TenantId ([string](Get-DemoMemberValue -InputObject $SignIn -Name 'TenantId')) }
+                if ($cli -eq 'SignedIn') {
+                    Set-DemoFabricAppSignInResult -SignIn $SignIn -ProgressPath $ProgressPath -Status 'Pass' -Message ('The Rayfin CLI is signed in to the demo''s tenant ({0}, but a sign-in already exists); the Insights app''s step uses it.' -f $window)
+                }
+                elseif ($cli -eq 'NotSignedIn') {
+                    Set-DemoFabricAppSignInResult -SignIn $SignIn -ProgressPath $ProgressPath -Status 'Warning' -Message ('{0} {1}' -f $why, $consequence) -Remediation $remediation
+                }
+                else {
+                    Set-DemoFabricAppSignInResult -SignIn $SignIn -ProgressPath $ProgressPath -Status 'Warning' -Message ('{0} Whether the CLI is signed in another way couldn''t be read: the deployment went on, and the Insights app''s step uses a sign-in this machine already has, if any, or says why there''s none. ./scripts/configure-fabric-app.ps1 -SignIn adds the app later.' -f $why) -Remediation $remediation
+                }
             }
             if ([object]::ReferenceEquals($script:DemoFabricAppSignIn, $SignIn)) {
                 $script:DemoFabricAppSignIn = $null
@@ -256,6 +354,65 @@ function Complete-DemoFabricAppSignIn {
     catch {
         Write-DemoLog -Level Debug -Message ('The Rayfin CLI''s sign-in couldn''t be read: {0}' -f $_.Exception.Message)
     }
+}
+
+function Get-DemoRayfinSignInState {
+    <#
+    .SYNOPSIS
+    Whether the Rayfin CLI is signed in to -TenantId, from 'rayfin login status --json', which never opens a browser:
+    SignedIn; NotSignedIn (not signed in, or to another tenant); or Unknown (no tenant, or not read within
+    -TimeoutSeconds). Never throws. Internal.
+
+    .DESCRIPTION
+    The stage's pinned CLI answers when it's installed (Invoke-DemoRayfinCli), as Start-DemoFabricAppSignIn and
+    Test-DemoFabricAppPrerequisite read it. Otherwise the same pinned version answers through npx, as the sign-in itself
+    runs (Start-DemoRayfinSignInProcess), because a first run has no stage until the Insights app's step; --prefer-offline
+    uses the package that sign-in left in npm's cache without asking the registry again. Both read the CLI's own token
+    cache, which is per user, so a sign-in from any of them counts. Measured on 2026-11-06 through npx: about 9 seconds
+    warm, and more than 30 on a cold start, hence the minute. Only a debug line is logged when it can't be read.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $TenantId = '',
+
+        [ValidateRange(5, 300)]
+        [int] $TimeoutSeconds = 60
+    )
+
+    if ($TenantId -notmatch $script:GuidPattern) {
+        return 'Unknown'
+    }
+    # A read-only status query of the Rayfin CLI's own token cache; nothing here signs in or out.
+    $statusQuery = @('login', 'status', '--json')
+    try {
+        $stage = Join-Path -Path $script:RepoRoot -ChildPath 'out/fabric-app'
+        if (Get-DemoRayfinCliPath -StagePath $stage) {
+            $data = (Invoke-DemoRayfinCli -StagePath $stage -ArgumentList $statusQuery -TimeoutSeconds $TimeoutSeconds).Data
+        }
+        else {
+            $settings = Get-DemoFabricAppSetting
+            $arguments = @('--yes', '--prefer-offline', ('--package={0}@{1}' -f $settings['cliPackage'], $settings['cliVersion']), '--', 'rayfin') + $statusQuery
+            $run = Invoke-DemoFabricAppProcess -Tool 'npx' -ArgumentList $arguments -WorkingDirectory $script:RepoRoot -TimeoutSeconds $TimeoutSeconds -Environment @{ RAYFIN_TELEMETRY_OPTOUT = '1'; RAYFIN_TOKEN = $null; NO_COLOR = '1' }
+            $data = ConvertFrom-DemoRayfinOutput -Text ([string]$run.StdOut)
+        }
+        $status = [string](Get-DemoMemberValue -InputObject $data -Name 'status')
+        if ($status -eq 'ok') {
+            if ([string](Get-DemoMemberValue -InputObject $data -Name 'tenant') -ieq $TenantId) {
+                return 'SignedIn'
+            }
+            return 'NotSignedIn'
+        }
+        if ($status -eq 'not-signed-in') {
+            return 'NotSignedIn'
+        }
+        Write-DemoLog -Level Debug -Message ('The Rayfin CLI''s sign-in status didn''t say: {0}' -f $(if ($status) { $status } else { 'no status' }))
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('The Rayfin CLI''s sign-in status couldn''t be read: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    return 'Unknown'
 }
 
 function Stop-DemoFabricAppSignIn {

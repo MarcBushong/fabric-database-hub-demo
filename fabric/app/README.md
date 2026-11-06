@@ -127,6 +127,8 @@ The script is unattended and idempotent; it deploys to the item named `APP_Datab
 
    Or run `./scripts/configure-fabric-app.ps1 -SignIn` (Phase 26b): when the CLI isn't signed in to the demo's tenant, it runs that same sign-in in your console, checks it, and deploys. It runs only in an interactive session; in CI it's **Not supported**, and nothing is deployed.
 
+   If no browser opens, check your terminal's `BROWSER`: when it's set, the CLI opens its sign-in page with `"<BROWSER>" "<url>"` and doesn't check the result, so a command line such as `"<path>\msedge.exe" --inprivate %s`, set for `az login`, opens nothing. `-SignIn` and `deploy.ps1` remove such a value for the CLI's process only (2026-11-06); for the command above, remove it from that terminal first ([troubleshooting](../../docs/troubleshooting.md#the-insights-app-fabric-app)).
+
 What it does, as ADR 0012 results in `out/configure-fabric-app.jsonl`:
 
 | Step | Check IDs |
