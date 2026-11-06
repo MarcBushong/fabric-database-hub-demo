@@ -106,7 +106,7 @@ Dated examples from `estimate-cost.ps1` at list prices from the Azure Retail Pri
 - **The nightly safety stop** (2026-11-05): unit-tested only. Live, as [ADR 0024](adr/0024-nightly-safety-stop.md#validation) lists: `deploy.ps1` as an Owner with `SAFETYSTOP.*` **Pass**; the VMs and T4 left running past the shutdown time, then `STATUS.SAFETYSTOP` showing them stopped and T3 **Paused**, with both jobs in the account's job history; a Contributor's `deploy.ps1` (**DONE** with the **Warning** and the note), then an Owner's `./scripts/grant-safety-stop.ps1`; and `destroy.ps1` with `DESTROY.SAFETYSTOP.ROLE` and a clean residual check (R662, R666).
 - **T2's `JumpstartImage` default** (2026-11-05): unit-tested, with the image read offline in part. Live: `./scripts/deploy.ps1` with the defaults in a throwaway resource group, ending **DONE** with no guided stop, `HUB.ESTATE.T2` and `TELEMETRY.T2` **Pass**, `T2.ARC.SQLINSTANCE` Standard with PAYG, `T2.ARC.MONITORING` on, `STATUS.T2.IMAGE` **Pass**, the first measured time in `DEPLOY.TIMING`, and the first boot's results in `jumpstart-firstboot.json`; then `./scripts/destroy.ps1` (R680, R685).
 - **The three together** (combined 2026-11-05): one default deployment with the Insights app's sign-in at the start, T2 from the Jumpstart image, and the safety stop's setup after the template, run once from a fresh resource group (R690).
-- **The Insights app's sign-in fixes** (2026-11-06): unit-tested, with the failure and the status read reproduced offline. Live: a `deploy.ps1` from a terminal whose `BROWSER` holds the `az login` value (the one line, then the default browser and its account picker), and one whose sign-in window is closed while the CLI is already signed in (the row **Done**, `DEPLOY.FABRIC.APPSIGNIN` **Pass**) (R691, R692).
+- **The Insights app's sign-in fixes** (2026-11-06): unit-tested, with the failure and the status read reproduced offline. Live: a `deploy.ps1` from a terminal whose `BROWSER` holds the `az login` value (the one line, then the default browser and its account picker), and one whose sign-in window is closed while the CLI is already signed in (the row **Done**, `DEPLOY.FABRIC.APPSIGNIN` **Pass**) (R691, R692). Since the rerun's finding, also a `deploy.ps1` with the CLI already signed in, with the app's stage and without it (a fresh clone): no browser, the log's Info line with the read's seconds, and how much of the read the guard hid (R693 to R695).
 
 ## Risk register
 
@@ -329,6 +329,9 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R690 | The three 2026-11-05 changes were combined and tested together offline only: the Insights app's sign-in at the start, T2 from the Jumpstart image, and the nightly safety stop's setup after the template have never run in one live deployment | **Open:** the owner's live test after the merge ([still to verify](#still-to-verify)); each change keeps its own risks (R662 to R668, R669 to R674, R680 to R689) (the three changes combined) |
 | R691 | Both 2026-11-06 sign-in fixes rely on what the Rayfin CLI 1.36.2 does, which its reference doesn't document: that it opens its sign-in page as `"<BROWSER>" "<url>"`, and what `rayfin login status --json` prints. A later CLI could change either | **Accepted:** `config/versions.json` pins the version, and both fail safe. If the CLI changed how it uses `BROWSER`, at worst a usable value is left out and the default browser opens. A status the module doesn't recognize is `Unknown`, a **Warning**, never a false **Pass** (the sign-in fixes) |
 | R692 | The status read after a sign-in window that didn't finish holds `deploy.ps1`'s wait for the tracks for up to a minute, once a run. Before a stage exists it runs the pinned CLI through `npx --prefer-offline`, which downloads the package when npm's cache lacks it | **Accepted:** only when the window was closed, failed, or was stopped; never after Ctrl+C; the tracks run in their own processes meanwhile; the sign-in itself has just put the package in npm's cache. Measured through npx on 2026-11-06: about 9 seconds warm, and more than 30 cold (the sign-in fixes) |
+| R693 | The read of the CLI's sign-in starts before the subscription guard, judged from `-FromStage` and `-StopAfter` alone, so a run that turns out not to need it (a resume past the Fabric track, or a guard that fails) runs a read-only status query for nothing; through `npx`, on a machine whose npm cache lacks the pinned CLI, that includes its download | **Accepted:** the read is read-only, and the run ends it as soon as it knows; the download is the one the sign-in and the app's stage need anyway (the start's read, 2026-11-06) |
+| R694 | A read that doesn't answer within 90 seconds of its start, such as a slow first download through `npx` or a token refresh that hangs, still starts a sign-in, which may not be needed. Cold reads measured 44 seconds through the stage's CLI (live) and 42 and 61 seconds through `npx` on a busy machine (2026-11-06) | **Mitigated:** the **Warning** line says why and names the command to read it yourself; signing in again is harmless, and only the app's step ever waits for it (the start's read, 2026-11-06) |
+| R695 | The early read, its overlap with the subscription guard, and the "Checking" message are unit-tested only, with the process layer's start and wait run as real processes | **Open:** the next live `deploy.ps1` with the CLI signed in, cold and warm: no browser, and the log's Info line with the read's seconds ([still to verify](#still-to-verify)) (the start's read, 2026-11-06) |
 
 ## Phase log
 
@@ -1287,3 +1290,54 @@ The integration:
 - **Live:** none here, by the coordinator's direction, while the owner's live test ran from another worktree (R691, R692).
 
 **Risks.** R691 and R692 (new).
+
+### The Insights app's sign-in: the start's read of the sign-in
+
+2026-11-06. The owner's rerun at 15:05Z, after [#34](https://github.com/MarcBushong/fabric-database-hub-demo/pull/34) merged, still asked for a sign-in nobody needed. It was `deploy.ps1 -FromStage Artifacts`, with the app's stage in `out/fabric-app` and the Rayfin CLI already signed in to the demo's tenant. The status page said "A browser opens for your sign-in", and the CLI's sign-in window started. That sign-in finished (**Pass**), so nothing broke, but the person was asked to sign in again for no reason. Run by hand right after, the stage's own `rayfin login status --json` answered `ok` for the demo's tenant in 44.0 seconds, and later in 9.2 and 9.3 seconds. So the first, cold read, or the token refresh it does, ran past the start check's 30 seconds. The check logged why only at Debug, so the console and the log said nothing. `rayfin login status --help` lists no option but `-h`. The owner's standing goal: "I want a one click deployment that works without anything and fast."
+
+**Work summary.**
+
+1. **The read starts with the run, alongside the guard** (`Start-DemoFabricAppSignInCheck`, in `Invoke-DemoParallelDeployment` and in `Invoke-DemoDeployment`'s sequential path). It starts `rayfin login status --json` without waiting, before the subscription guard, when the run is interactive, has a tenant, isn't a what-if, and its stages can reach the Fabric track (from `-FromStage` and `-StopAfter`). `Start-DemoFabricAppSignIn -Check` takes its answer where the sign-in always decided: after the stopped VMs' start, before preflight. The guard alone took 22 seconds in a timed run, so a warm read, about 9 seconds, is done by then. When the plan turns out not to include the Fabric track, or the guard fails, the run ends the read at once (`Stop-DemoRayfinSignInStatus`). The run's end ends a read nobody used (`Stop-DemoFabricAppSignIn`, from `Complete-DemoDeploymentRun`).
+2. **It has 90 seconds from its start** (`$script:DemoRayfinStatusTimeoutSeconds`). While the run waits for it, the console and the status page's **Sign-in for the Insights app** row say "Checking whether the Rayfin CLI is already signed in to the demo's tenant, at most until HH:MM; a browser opens only if it isn't."
+3. **The log says why** (`Receive-DemoRayfinSignInStatus` returns a state with a detail):
+   - signed in: an Info line with the seconds the read took, and no browser;
+   - not signed in, or signed in to another tenant: an Info line, then the sign-in;
+   - failed or out of time: a **Warning** with the reason, such as "no answer within 90 seconds", "exit code 1: ...", or "it couldn't start: npx was not found on PATH ...", and the command to read it yourself; then the sign-in.
+4. **No stage, still no needless browser:** before the app's stage exists, the same pinned version answers through `npx --yes --prefer-offline` (`Start-DemoRayfinSignInStatus`), as the end-of-window check from #34 did. That check now uses the same read (`Get-DemoRayfinSignInState`), and its **Warning** gives the reason too.
+5. **A process start that doesn't wait** (`FabricAppHelpers.ps1`):
+   - `Start-DemoFabricAppProcess` starts the process as before: standard input closed, the environment set for the child only, and npm and npx through cmd.exe on Windows.
+   - `Receive-DemoFabricAppProcess` waits at most the time limit from the start, ends the process tree after it, and adds `Seconds` and `TimedOut` to the result.
+   - `Stop-DemoFabricAppProcess` ends a process that's no longer needed.
+   - `Invoke-DemoFabricAppProcess` is the start and the wait, as before.
+6. **Docs:** deployment, troubleshooting (a row for a browser that opens though the CLI is signed in), the automation support matrix (row 173), ADR 0023's amendment, the CHANGELOG, and this report.
+
+**Changed files.**
+
+- `scripts/modules/DbHubDemo/Private/FabricAppSignInHelpers.ps1`, `FabricAppHelpers.ps1`, and `ParallelDeployment.ps1`; `scripts/modules/DbHubDemo/Public/Invoke-DemoDeployment.ps1`
+- `tests/unit/DbHubDemo.FabricAppSignIn.Tests.ps1`, `DbHubDemo.FabricApp.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`
+- `CHANGELOG.md`, `docs/deployment.md`, `docs/troubleshooting.md`, `docs/automation-support-matrix.md`, `docs/adr/0023-first-run-automation.md`, and this report
+
+**Validation.**
+
+- **The pieces, with real processes** (Windows, PowerShell 7.6.9, Node.js 24.22.2):
+  - a child started without waiting returned in 0.4 seconds and was read later, with its exit code, output, and environment;
+  - one past its time limit was ended after 2.1 seconds;
+  - a stopped one was gone;
+  - a real read through `npx`, with `RAYFIN_CONFIG_DIR` pointed at an empty folder (no token cache, nothing sent to Microsoft Entra ID or Fabric), answered "not signed in" in 42 seconds. That cold read through npx also ran past the old 30 seconds.
+- **End to end, with a real read** (the same machine, while another session's live test was using it). Only the browser sign-in itself was replaced, so nothing opened:
+  - the early read through `npx` started in 0.6 seconds and answered "not signed in" after 61 seconds, within the 90. Meanwhile the run said "Checking whether the Rayfin CLI is already signed in ...". Then it logged "The Rayfin CLI is not signed in (rayfin login status through npx, 61 seconds), so its sign-in for the Insights app starts: a browser opens." and started the sign-in;
+  - with the limit set to 5 seconds, the real read ran out of time, and the **Warning** gave the reason, "no answer within 5 seconds", and the command to read it yourself;
+  - a read nobody used ended with the run (`Stop-DemoFabricAppSignIn`), and its process was gone.
+- **Pester 5.9.1:** all **Pass**:
+  - `DbHubDemo.FabricAppSignIn.Tests.ps1`: 61 tests;
+  - `DbHubDemo.FabricApp.Tests.ps1`: 38 tests, 5 of them with real child processes (this PowerShell stands in for node);
+  - `DbHubDemo.Tracks.Tests.ps1` and `DbHubDemo.Lifecycle.Tests.ps1`: 320 tests.
+- **Mutations:** each of ten failed at least one new test: the early read ignored, the old 30 seconds, the Warning at Debug, no "Checking" line, the run's end leaving the read, no npx without a stage, a time limit that doesn't end the child, the parallel path not passing the read, a failed guard leaving it, and the sequential path not starting it.
+- **Static (2026-11-06, Windows, PowerShell 7.6.9, Pester 5.9.1, PSScriptAnalyzer 1.25.0, markdownlint-cli2 0.23.3 on Node.js 24.22.2):** `./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester, Markdown -CI`:
+  - PSScriptAnalyzer: **Pass** (no findings in 340 files).
+  - Pester: **Pass** (3,626 passed, 17 skipped, 0 failed, in 1,972 seconds, on a machine another session's live test shared).
+  - markdownlint: one issue, a `<time>` placeholder in this entry that read as HTML. Written as HH:MM, it passed: **Pass** (0 issues in 134 files).
+  - Not run here: Bicep, PSRule, DotNet, and FabricApp, because nothing under `infra/` or `workload-generator/`, and no app code under `fabric/app`, changed. CI runs them.
+- **Live:** none here, by the coordinator's direction (R693 to R695).
+
+**Risks.** R693 to R695 (new).

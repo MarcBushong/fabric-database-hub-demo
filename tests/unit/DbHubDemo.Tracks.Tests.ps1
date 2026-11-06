@@ -1049,6 +1049,14 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:calls.Add('app sign-in')
             [pscustomobject]@{ Process = $null; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes(15); TimeoutMinutes = 15; Done = $true; Reported = $false; Result = (New-TestResult 'DEPLOY.FABRIC.APPSIGNIN') }
         }
+        # Nor does the read of its sign-in that starts before the guard (2026-11-06).
+        $script:signInCheck = [pscustomobject]@{ TenantId = '66666666-7777-8888-9999-000000000000'; Via = 'npx'; Run = $null; Result = $null }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignInCheck -MockWith { $script:calls.Add('app sign-in check'); $script:signInCheck }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoRayfinSignInStatus -MockWith {
+            if ($null -ne $Status) {
+                $script:calls.Add('app sign-in check stop')
+            }
+        }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -1104,7 +1112,32 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:calls.Add('app sign-in') }
         $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -SkipFabric })
         $script:calls | Should -Not -Contain 'app sign-in'
+        $script:calls | Should -Not -Contain 'app sign-in check' -Because 'nothing reads the sign-in either'
         $script:calls | Should -Contain 'preflight'
+    }
+
+    It 'reads the Rayfin CLI''s sign-in from before the subscription guard, so the read runs alongside it, and the sign-in''s start takes that read (2026-11-06)' {
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { $script:calls.Add('guard'); New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $calls = @($script:calls)
+        [array]::IndexOf($calls, 'app sign-in check') | Should -Be 0 -Because 'it starts first'
+        [array]::IndexOf($calls, 'guard') | Should -Be 1
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeGreaterThan 1
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeLessThan ([array]::IndexOf($calls, 'preflight'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignInCheck -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 1 -Exactly -ParameterFilter { [object]::ReferenceEquals($Check, $script:signInCheck) }
+        $calls | Should -Not -Contain 'app sign-in check stop'
+    }
+
+    It 'reads nothing when the Fabric track can''t run, and ends the read when the guard stops the run (2026-11-06)' {
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -StopAfter 'Infrastructure' })
+        $script:calls | Should -Not -Contain 'app sign-in check'
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { throw 'Subscription guard: check ''account'' failed: the Azure CLI has no sign-in for the subscription. Nothing was changed.' }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        ($results | Where-Object { $_.checkId -eq 'PREFLIGHT.GUARD.CONTEXT' }).status | Should -Be 'Fail'
+        @($script:calls | Where-Object { $_ -eq 'app sign-in check' }).Count | Should -Be 1
+        $script:calls | Should -Contain 'app sign-in check stop'
+        $script:calls | Should -Not -Contain 'app sign-in'
     }
 
     It 'switches what the tracks left on the interim baseline to business-day only after DONE''s reads, and keeps an explicit baseline (2026-11-03)' {
