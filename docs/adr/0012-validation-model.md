@@ -264,6 +264,18 @@ Since 2026-11-05 the default `t2SqlInstallMode` is `JumpstartImage` (user-direct
 
 Unit-tested: the host's steps (`tests/unit/Vm.JumpstartImage.Tests.ps1`), the Arc checks' **Warning** in this mode (`tests/unit/DbHubDemo.Arc.Tests.ps1`), and `HUB.ESTATE.T2`'s (`tests/unit/DbHubDemo.HubEstate.Tests.ps1`). Not yet run live.
 
+### 2026-11-06: the history report's snapshot at the end of `deploy.ps1`
+
+The owner asked for one run of the live-activity notebook after each deployment, so the history report has data, and for its result, like every non-blocking step's, on the status page with its error ([ADR 0014](0014-notebook-role-and-capacity.md#amendment-2026-11-06-one-analyze-only-run-at-the-end-of-each-deployment)). The six statuses and the exit codes stay. The step's own record is never a **Fail** or **Manual action required**, so nothing reads it as one; `Test-DemoNonBlockingResult` names it as well, so **DONE** never depends on it.
+
+| Check | What it reports | Status |
+|---|---|---|
+| `DEPLOY.FABRIC.HISTORY` (new; `deploy.ps1`, last, after **DONE**'s checks and the switch) | `NB_DatabaseHub_LiveActivity` run once on demand, analyze-only (`CONFIRM` and `STOP_ACTIVITY` false, `SAVE_RESULTS` true, a 1,440-minute window), then the history model's refresh (Direct Lake framing); evidence `nonBlocking` `historySnapshot`, `outcome` (`Saved`, `SavedNotRefreshed`, `StillRunning`, `Deduped`, `Unconfirmed`, `CapacityPaused`, `Failed`, `NotSelected`), `parameters`, `jobStatus`, `seconds`, `refreshStatus`, `capacityState`, and `reportedStatus` `Fail` for an error | **Pass** when the job completed and the model was refreshed, with what stays partial (incident measures blank until incidents have run and the notebook runs again); **Warning** with the reason and fix when the capacity isn't Active, the job outlived its 10 minutes, another run deduplicated it, the refresh didn't pass, the notebook failed, or the step stopped with an error; **Not selected** with `-WhatIf` or `-SkipFabric`, in GitHub Actions, when **DONE**'s checks didn't run or their telemetry checks didn't pass, or when the Fabric track didn't create the lakehouse or import the notebook. Never **Fail** or **Manual action required** |
+
+- **On the status page:** its row, **History report's snapshot**, under **Validation**, marked "(doesn't block DONE)": **Done**, **Action needed** for a **Warning**, **Failed** for one whose `reportedStatus` is `Fail`, or **Skipped**. Once the run ends, one that didn't work is in the **Needs attention** box, in **DONE** and **NOT DONE**, and in `DEPLOY.SUMMARY`'s evidence (`Get-DemoHistorySnapshotItem`, worded by `Format-DemoNonBlockingLine`).
+
+Unit-tested (`tests/unit/DbHubDemo.HistorySnapshot.Tests.ps1`, and the deployment paths' order in `DbHubDemo.Tracks.Tests.ps1` and `DbHubDemo.Lifecycle.Tests.ps1`). Not yet run live.
+
 ## Consequences
 
 - **Positive:** a presenter can trust a green result. Every manual step is explicit and actionable. Results are machine-readable for the notebooks and CI.

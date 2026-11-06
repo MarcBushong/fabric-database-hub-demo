@@ -885,6 +885,13 @@ Describe 'Invoke-DemoDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
         # The nightly safety stop's setup (ADR 0024), after the Infrastructure stage.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -MockWith { New-TestResult 'SAFETYSTOP.SCHEDULE' 'Pass' 'infra' }
+        # The history report's snapshot at the end (2026-11-06) has its own tests (DbHubDemo.HistorySnapshot.Tests.ps1); here it
+        # notes what had run before it and what it was given, apart from the stages' order, and never reaches Fabric.
+        $script:history = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -MockWith {
+            $script:history.Add([pscustomobject]@{ Before = $script:order.ToArray(); DoneChecked = [bool]$PesterBoundParameters['DoneChecked']; SkipFabric = [bool]$PesterBoundParameters['SkipFabric']; WhatIfRun = [bool]$PesterBoundParameters['WhatIfRun'] })
+            New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Saved the history report''s snapshots.' -Evidence @{ nonBlocking = 'historySnapshot' }
+        }
     }
 
     It 'sets up the nightly safety stop after the Infrastructure stage, and not with -WhatIf (ADR 0024)' {
@@ -1205,6 +1212,48 @@ Describe 'Invoke-DemoDeployment' {
         @($script:order | Where-Object { $_ -like 'Switch:*' }) | Should -BeNullOrEmpty
         @($results | Where-Object { $_.checkId -like 'DEPLOY.INCIDENTS_*' -or $_.checkId -eq 'DEPLOY.ACTIVITYPROFILE' }) | Should -BeNullOrEmpty
         Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoTargetProfile -Times 3 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and -not $SwitchTo }
+    }
+
+    It 'takes the history report''s snapshot last: after DONE''s checks and the switch, before DEPLOY.SUMMARY (-Sequential, 2026-11-06)' {
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $script:history.Count | Should -Be 1
+        $script:history[0].Before[-2..-1] | Should -Be @('DoneGate', 'Switch:T1,T3,T2=business-day') -Because 'DONE''s checks read first, and the VMs'' incidents don''t wait for Spark'
+        $script:history[0].DoneChecked | Should -BeTrue
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 1 -Exactly -ParameterFilter {
+            [bool]$PesterBoundParameters['DoneChecked'] -and -not [bool]$PesterBoundParameters['SkipFabric'] -and -not [bool]$PesterBoundParameters['WhatIfRun'] -and [string]$ActivityProfile.Name -eq 'business-day' -and
+            @($Requirement) -contains 'TELEMETRY.T2' -and @($Requirement) -contains 'FABRIC.ITEMS.REQUIRED' -and
+            @($Result | Where-Object { [string]$_.checkId -eq 'HUB.ESTATE.T1' }).Count -gt 0
+        }
+    }
+
+    It 'tells the snapshot when DONE''s checks didn''t run, passes -SkipFabric on, takes none on a run that stops before its validation, and reports it Not selected with -WhatIf (-Sequential, 2026-11-06)' {
+        # T2 waits for a manual step, so DONE's checks don't run; the validation still does.
+        $script:arcStatus = 'Manual action required'
+        Invoke-DemoDeployment -Config $config | Out-Null
+        $script:history.Count | Should -Be 1
+        $script:history[0].DoneChecked | Should -BeFalse
+
+        $script:arcStatus = 'Pass'
+        $script:history.Clear()
+        $script:state = New-TestState
+        Invoke-DemoDeployment -Config $config -SkipFabric | Out-Null
+        $script:history[0].SkipFabric | Should -BeTrue
+
+        $script:history.Clear()
+        $script:state = New-TestState
+        Invoke-DemoDeployment -Config $config -StopAfter Fabric | Out-Null
+        $script:history.Count | Should -Be 0
+
+        $script:order.Clear()
+        $script:state = New-TestState
+        $results = @(Invoke-DemoDeployment -Config $config -Resume -WhatIf)
+        $script:order | Should -Be @('Preflight', 'Template')
+        $script:history.Count | Should -Be 1
+        $script:history[0].WhatIfRun | Should -BeTrue
+        $results[-1].checkId | Should -Be 'DEPLOY.FABRIC.HISTORY'
     }
 
     It 'still switches when it stops at a Fail after the profiles were set, so no VM stays on the interim baseline (-Sequential)' {

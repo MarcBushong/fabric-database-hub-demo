@@ -67,6 +67,38 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         $model['guidedStop']['state'] | Should -Be 'Pending'
     }
 
+    It 'shows the history report''s snapshot after the validation, where it happens, as not blocking DONE, and leaves it out with -SkipFabric (2026-11-06)' {
+        $model = New-TestModel
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History')
+        $history = Get-TestStep -Model $model -Id 'Fabric.History'
+        $history['nonBlocking'] | Should -BeTrue
+        $history['state'] | Should -Be 'Pending'
+        $history['label'] | Should -Be 'History report''s snapshot (NB_DatabaseHub_LiveActivity, once, analyze-only)'
+        (InModuleScope DbHubDemo { Get-DemoProgressStepLabel -Id 'Fabric.History' }) | Should -Be 'history report''s snapshot'
+        $skipFabric = InModuleScope DbHubDemo { New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -SkipFabric) }
+        Get-TestStep -Model $skipFabric -Id 'Fabric.History' | Should -BeNullOrEmpty
+        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation')
+    }
+
+    It 'takes the snapshot again on a resumed run that has nothing left to do, never "finished in an earlier run", and skips it on a run without the validation (2026-11-06)' {
+        $path = New-TestModelFile
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+            $state = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            Set-DemoProgressPlan -Path $Path -Plan (Resolve-DemoTrackPlan -Resume -State $state -SkipT4) -Resume
+        }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        (Get-TestStep -Model $model -Id 'Fabric.Items')['message'] | Should -Be 'Finished in an earlier run.'
+        $history = Get-TestStep -Model $model -Id 'Fabric.History'
+        $history['state'] | Should -Be 'Pending'
+        $history['message'] | Should -BeNullOrEmpty
+
+        $path = New-TestModelFile
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } { Set-DemoProgressPlan -Path $Path -Plan (Resolve-DemoTrackPlan -StopAfter 'Infrastructure') }
+        $history = Get-TestStep -Model (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20) -Id 'Fabric.History'
+        $history['state'] | Should -Be 'Skipped'
+        $history['message'] | Should -Be 'Not part of this run.'
+    }
+
     It 'maps each ADR 0012 status onto one friendly state, and keeps the status underneath' -ForEach @(
         @{ Status = 'Pass'; State = 'Done' }
         @{ Status = 'Warning'; State = 'Done' }

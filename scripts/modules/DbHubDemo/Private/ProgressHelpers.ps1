@@ -119,7 +119,8 @@ function Get-DemoProgressCatalog {
     non-blocking: it's part of every deployment, but it never blocks DONE); T2 (a golden restore, or the host build,
     which in JumpstartImage mode is the Jumpstart image's download and first boot, and in PaygWizard mode the guided stop
     and the setup check, then the sign-in cleanup, Arc onboarding, PAYG and monitoring, and telemetry;
-    Set-DemoProgressPlan skips what the T2 source doesn't use); Validation. Each step has an id, a label, the track steps
+    Set-DemoProgressPlan skips what the T2 source doesn't use); Validation, with the history report's snapshot after it
+    (Fabric.History, 2026-11-06; marked non-blocking, not with -SkipFabric). Each step has an id, a label, the track steps
     (Get-DemoTrackStep) it belongs to, and nonBlocking.
     #>
     [CmdletBinding()]
@@ -191,7 +192,14 @@ function Get-DemoProgressCatalog {
     $t2.Add((& $step 'T2.Monitoring' 'PAYG and monitoring' @('T2/T2')))
     $t2.Add((& $step 'T2.Telemetry' 'Telemetry in Database Hub' @('T2/Telemetry')))
     $tracks.Add([ordered]@{ name = 'T2'; label = 'T2: Arc-enabled SQL Server (arcsql01 on archost01)'; steps = $t2.ToArray() })
-    $tracks.Add([ordered]@{ name = 'Validation'; label = 'Validation'; steps = @(& $step 'Validation' 'Estate, checklist, and timing' @('Validation')) })
+    $validation = [System.Collections.Generic.List[object]]::new()
+    $validation.Add((& $step 'Validation' 'Estate, checklist, and timing' @('Validation')))
+    if (-not $SkipFabric) {
+        # Displayed after the validation, when it happens: deploy.ps1 itself runs it once DONE's checks are done
+        # (Invoke-DemoHistorySnapshotStep, 2026-11-06).
+        $validation.Add((& $step 'Fabric.History' 'History report''s snapshot (NB_DatabaseHub_LiveActivity, once, analyze-only)' @('Validation') $true))
+    }
+    $tracks.Add([ordered]@{ name = 'Validation'; label = 'Validation'; steps = $validation.ToArray() })
     return $tracks.ToArray()
 }
 
@@ -361,6 +369,9 @@ function Set-DemoProgressPlan {
     $map['Preflight'] = if ($Plan.Preflight) { 'Run' } elseif ($Resume) { 'Earlier' } else { 'Skip' }
     $map['Infrastructure'] = if ($Plan.Infrastructure) { 'Run' } elseif ($Resume) { 'Earlier' } else { 'Skip' }
     $map['Validation'] = if ($Plan.Validation) { 'Run' } else { 'Skip' }
+    # The history report's snapshot runs at the end of every run that reaches its validation, a resumed one included, so it's
+    # never "finished in an earlier run" (2026-11-06).
+    $map['Fabric.History'] = if ($Plan.Validation) { 'Run' } else { 'Skip' }
     Update-DemoProgress -Path $Path -Data @{ Map = $map } -Action {
         param($Model, $Change)
         $now = Get-DemoUnixTime

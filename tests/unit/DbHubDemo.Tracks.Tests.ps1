@@ -1080,6 +1080,13 @@ Describe 'Invoke-DemoParallelDeployment' {
                 $script:calls.Add('app sign-in check stop')
             }
         }
+        # The history report's snapshot at the end of the run (2026-11-06) has its own tests (DbHubDemo.HistorySnapshot.Tests.ps1);
+        # here it notes when it ran and what it was given, and never reaches Fabric.
+        $script:historyStatus = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -MockWith {
+            $script:calls.Add(('history done={0} skipFabric={1} whatIf={2}' -f [bool]$PesterBoundParameters['DoneChecked'], [bool]$PesterBoundParameters['SkipFabric'], [bool]$PesterBoundParameters['WhatIfRun']))
+            New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status $script:historyStatus -Message ('history {0}' -f $script:historyStatus) -Evidence @{ nonBlocking = 'historySnapshot' }
+        }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -1330,6 +1337,77 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Validation'; $state }
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
         $script:calls | Should -Contain 'preflight'
+    }
+
+    It 'takes the history report''s snapshot last: after DONE''s checks and the switch, before DEPLOY.SUMMARY, and as the deploying run''s own step (2026-11-06)' {
+        # The tracks set baseline and note the VMs, so the switch to business-day comes after DONE's reads (2026-11-03).
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
+            $vm = switch ($Track) { 'T1' { 'sqlvm01' } 'T2' { 'archost01' } default { '' } }
+            if ($vm) {
+                & (Get-Module -Name 'DbHubDemo') { param($Name) Register-DemoActivitySwitch -VmName $Name } $vm
+            }
+            $trackResults = switch ($Track) {
+                'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) }
+                'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2')) }
+                default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') }
+            }
+            [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath 'progress.json' })
+        $calls = @($script:calls)
+        $history = [array]::IndexOf($calls, 'history done=True skipFabric=False whatIf=False')
+        $history | Should -BeGreaterThan ([array]::IndexOf($calls, 'fabric items')) -Because 'DONE''s checks come first'
+        $history | Should -BeGreaterThan ([array]::IndexOf($calls, 'switch T1,T3,T2=business-day wait=180')) -Because 'the notebook never touches the VMs, so their incidents don''t wait for Spark'
+        [array]::IndexOf($calls, 'switch T1,T3,T2=business-day wait=180') | Should -BeGreaterOrEqual 0
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.TIMING'))
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 1 -Exactly -ParameterFilter {
+            [bool]$PesterBoundParameters['DoneChecked'] -and -not [bool]$PesterBoundParameters['SkipFabric'] -and -not [bool]$PesterBoundParameters['WhatIfRun'] -and $ProgressPath -eq 'progress.json' -and [string]$ActivityProfile.Name -eq 'business-day' -and
+            @($Requirement) -contains 'TELEMETRY.T2' -and @($Requirement) -contains 'FABRIC.ITEMS.REQUIRED' -and
+            @($Result | Where-Object { [string]$_.checkId -eq 'TELEMETRY.T1' -and [string]$_.status -eq 'Pass' }).Count -eq 1 -and
+            @($Result | Where-Object { [string]$_.checkId -like 'DEPLOY.INCIDENTS_*' }).Count -gt 0
+        }
+    }
+
+    It 'never lets the snapshot change the summary or the clock: a Warning stays a Warning (2026-11-06)' {
+        $script:historyStatus = 'Warning'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.HISTORY' }).status | Should -Be 'Warning'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+    }
+
+    It 'tells the snapshot when DONE''s checks didn''t run, passes -SkipFabric on, and takes none on a run that stops before its validation (2026-11-06)' {
+        # T2 builds in the background: the tracks aren't all finished, so DONE's checks don't run.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $status = if ($Track -eq 'T2') { 'Background' } else { 'Pass' }
+            $trackResults = if ($Track -eq 'T2') { @(New-DemoResult -CheckId 'DEPLOY.T2.BACKGROUND' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'building' -Remediation 'deploy.ps1 -FromStage T2') } elseif ($Track -eq 'T1') { @((New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) } else { @() }
+            [pscustomobject]@{ Track = $Track; Status = $status; Steps = @(); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
+        }
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $script:calls | Should -Contain 'history done=False skipFabric=False whatIf=False'
+
+        $script:calls.Clear()
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -SkipFabric })
+        $script:calls | Should -Contain 'history done=False skipFabric=True whatIf=False'
+
+        $script:calls.Clear()
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -StopAfter 'Monitoring' })
+        @($script:calls | Where-Object { $_ -like 'history *' }) | Should -BeNullOrEmpty
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TRACK.T1' }) | Should -Not -BeNullOrEmpty -Because 'the tracks ran; only the validation, and the snapshot after it, didn''t'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 2 -Exactly -Because 'only the two runs above took it'
+    }
+
+    It 'reports the snapshot Not selected with -WhatIf, at the template''s what-if, and runs nothing after it (2026-11-06)' {
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -WhatIf })
+        $script:calls | Should -Contain 'history done=False skipFabric=False whatIf=True'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $ids[-1] | Should -Be 'DEPLOY.FABRIC.HISTORY'
+        [array]::IndexOf($ids, 'DEPLOY.STAGE.INFRASTRUCTURE') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY'))
     }
 
     Context 'track records across runs (Phase 28 live finding, 2026-10-30)' {
