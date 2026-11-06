@@ -1005,13 +1005,15 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -MockWith { $script:calls.Add('safety stop'); New-TestResult 'SAFETYSTOP.SCHEDULE' }
         Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
         Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { [pscustomobject]@{ Path = 'runner.zip'; Sha256 = ('d' * 64); SizeBytes = 20 } }
+        # What the Fabric track's app step adds to its records; nothing unless a test says so.
+        $script:fabricAppRecords = @()
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
             $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
             $ready = switch ($Track) { 'T1' { [ordered]@{ T1 = '2026-10-22T15:00:00Z'; T3 = '2026-10-22T15:01:00Z' } } 'T2' { [ordered]@{ T2 = '2026-10-22T15:10:00Z' } } default { [ordered]@{} } }
             $trackResults = switch ($Track) {
                 'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) }
                 'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2')) }
-                default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') }
+                default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') + @($script:fabricAppRecords) }
             }
             [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = $ready; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
         }
@@ -1048,6 +1050,14 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith {
             $script:calls.Add('app sign-in')
             [pscustomobject]@{ Process = $null; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes(15); TimeoutMinutes = 15; Done = $true; Reported = $false; Result = (New-TestResult 'DEPLOY.FABRIC.APPSIGNIN') }
+        }
+        # Nor does the read of its sign-in that starts before the guard (2026-11-06).
+        $script:signInCheck = [pscustomobject]@{ TenantId = '66666666-7777-8888-9999-000000000000'; Via = 'npx'; Run = $null; Result = $null }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignInCheck -MockWith { $script:calls.Add('app sign-in check'); $script:signInCheck }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoRayfinSignInStatus -MockWith {
+            if ($null -ne $Status) {
+                $script:calls.Add('app sign-in check stop')
+            }
         }
     }
 
@@ -1100,11 +1110,67 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass' -Because 'a sign-in that didn''t finish never fails the run'
     }
 
+    It 'settles the sign-in''s Warning from the Fabric track''s app records, so its row and the app''s agree (live, 2026-11-06)' {
+        # The live run: nobody answered the window, the read at its deadline said "not signed in", and the app's step,
+        # starting at the same moment, found the CLI signed in and deployed the app.
+        $newState = { [pscustomobject]@{ Process = $null; TenantId = '66666666-7777-8888-9999-000000000000'; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes(15); TimeoutMinutes = 15; Done = $false; Reported = $false; Result = $null } }
+        $script:appSignInState = & $newState
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:calls.Add('app sign-in'); $script:appSignInState }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoFabricAppSignIn -MockWith {
+            if ($Final -and -not $SignIn.Done) {
+                $SignIn.Result = New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message 'Nobody finished the Rayfin CLI''s sign-in within 15 minutes, so it was stopped. The deployment went on; without the sign-in the Insights app isn''t created, and its step says why.'
+                $SignIn.Done = $true
+                $SignIn.Reported = $true
+                return $SignIn.Result
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoFabricAppSignIn -MockWith { }
+        $script:fabricAppRecords = @((New-TestResult 'FABRIC.APP.SIGNIN'), (New-TestResult 'FABRIC.APP.DEPLOY'))
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $signIn = @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' })
+        $signIn.Count | Should -Be 1
+        $signIn[0].status | Should -Be 'Pass'
+        $signIn[0].message | Should -Match 'the Insights app''s step found it signed in and used that sign-in'
+        $signIn[0].evidence['earlierStatus'] | Should -Be 'Warning'
+        [object]::ReferenceEquals($signIn[0], $script:appSignInState.Result) | Should -BeTrue
+
+        # An app step that found no sign-in either leaves the Warning as it was.
+        $script:appSignInState = & $newState
+        $script:fabricAppRecords = @(New-TestResult 'FABRIC.APP.SIGNIN' 'Manual action required')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' }).status | Should -Be 'Warning'
+    }
+
     It 'starts no sign-in for a run without the Fabric track, or a what-if' {
         Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:calls.Add('app sign-in') }
         $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -SkipFabric })
         $script:calls | Should -Not -Contain 'app sign-in'
+        $script:calls | Should -Not -Contain 'app sign-in check' -Because 'nothing reads the sign-in either'
         $script:calls | Should -Contain 'preflight'
+    }
+
+    It 'reads the Rayfin CLI''s sign-in from before the subscription guard, so the read runs alongside it, and the sign-in''s start takes that read (2026-11-06)' {
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { $script:calls.Add('guard'); New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $calls = @($script:calls)
+        [array]::IndexOf($calls, 'app sign-in check') | Should -Be 0 -Because 'it starts first'
+        [array]::IndexOf($calls, 'guard') | Should -Be 1
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeGreaterThan 1
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeLessThan ([array]::IndexOf($calls, 'preflight'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignInCheck -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 1 -Exactly -ParameterFilter { [object]::ReferenceEquals($Check, $script:signInCheck) }
+        $calls | Should -Not -Contain 'app sign-in check stop'
+    }
+
+    It 'reads nothing when the Fabric track can''t run, and ends the read when the guard stops the run (2026-11-06)' {
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -StopAfter 'Infrastructure' })
+        $script:calls | Should -Not -Contain 'app sign-in check'
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { throw 'Subscription guard: check ''account'' failed: the Azure CLI has no sign-in for the subscription. Nothing was changed.' }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        ($results | Where-Object { $_.checkId -eq 'PREFLIGHT.GUARD.CONTEXT' }).status | Should -Be 'Fail'
+        @($script:calls | Where-Object { $_ -eq 'app sign-in check' }).Count | Should -Be 1
+        $script:calls | Should -Contain 'app sign-in check stop'
+        $script:calls | Should -Not -Contain 'app sign-in'
     }
 
     It 'switches what the tracks left on the interim baseline to business-day only after DONE''s reads, and keeps an explicit baseline (2026-11-03)' {
