@@ -1240,6 +1240,7 @@ The integration:
   - A first full Pester run, started on the merge commits while the wording change above was being made, failed the three tests whose expectations it touched (3,572 passed); with them updated, the affected files passed (390 tests), and then the full run above.
   - The 725 intra-repository Markdown links with a `#fragment`, checked by script against their targets' GitHub heading anchors: none broken.
   - Not run here: DotNet and FabricApp (no .NET SDK on this machine; neither the workload generator nor the Fabric App's code changed). CI runs them with the rest.
+- **Secret scan:** gitleaks 8.30.1, the CI job's pinned version, checked against its release's checksums file: `gitleaks git --redact --no-banner --verbose .` from the repository root, as CI runs it with `.gitleaks.toml`, found no leaks in the whole history, this branch's commits included (like CI's, it reads each commit's diff, and merge commits have none), and `gitleaks dir --redact --no-banner .`, which also reads the merges' resolutions in the working tree, found none.
 - **The cost figures:** `./scripts/estimate-cost.ps1 -AllProfiles -Detailed` on the combined code (public list prices, no sign-in) gave the same figures as the branches; `Get-DemoCostEstimate -BastionHours 0` gave the session and month without the Bastion hour.
 - **Live:** none, by the owner's direction; the owner's live test follows the merge (R690).
 
