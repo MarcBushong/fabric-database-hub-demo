@@ -286,20 +286,25 @@ Describe 'Lifecycle scripts' {
                     param([string] $ModulePath, [string] $Deploy, [string] $ConfigFile, [string] $OutputFile, [string] $LogFile)
                     Import-Module -Name $ModulePath
                     # Stand-ins for the deployment's commands. Simple functions: the parameters they don't name land in $args.
+                    # deploy.ps1 loads DbHubDemo again, as a run from a terminal does (2026-11-06), which replaces global
+                    # functions of the module's names, so the stand-ins are reached through global aliases, which come first.
                     . ([scriptblock]::Create(("function global:Write-StopTestLog([string] `$Text) {{ [System.IO.File]::AppendAllText('{0}', `$Text + [System.Environment]::NewLine) }}" -f ($LogFile -replace "'", "''"))))
-                    function global:Get-DemoRunEnvironment { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+                    function global:Get-StopTestRunEnvironment { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
                     function global:Start-Transcript { }
                     function global:Stop-Transcript { }
-                    function global:Initialize-DemoFirstRun { [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = ''; NextSteps = @(); Outcome = $null } }
-                    function global:Start-DemoDeploymentRun { [pscustomobject]@{ ProgressPath = ''; PagePath = ''; Writer = $null; KeepAwake = $true; StartedUtc = [DateTime]::UtcNow; Command = './scripts/deploy.ps1'; Environment = $null; InstallMode = 'PaygWizard'; WaitForT2 = $true } }
-                    function global:Invoke-DemoDeployment { Write-StopTestLog 'deploying'; Start-Sleep -Seconds 60; Write-StopTestLog 'not stopped' }
-                    function global:Complete-DemoDeploymentRun {
+                    function global:Initialize-StopTestFirstRun { [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = ''; NextSteps = @(); Outcome = $null } }
+                    function global:Start-StopTestDeploymentRun { [pscustomobject]@{ ProgressPath = ''; PagePath = ''; Writer = $null; KeepAwake = $true; StartedUtc = [DateTime]::UtcNow; Command = './scripts/deploy.ps1'; Environment = $null; InstallMode = 'PaygWizard'; WaitForT2 = $true } }
+                    function global:Invoke-StopTestDeployment { Write-StopTestLog 'deploying'; Start-Sleep -Seconds 60; Write-StopTestLog 'not stopped' }
+                    function global:Complete-StopTestDeploymentRun {
                         param([switch] $Stopped)
                         Write-StopTestLog ('complete stopped={0}' -f [bool]$Stopped)
                         [pscustomobject]@{ Kind = 'NotDone'; ExitCode = 2; Minutes = 1; Reason = 'stopped'; Next = 'continue'; NextCommand = './scripts/deploy.ps1'; Optional = @(); Notes = @(); Resume = '' }
                     }
-                    function global:Exit-DemoKeepAwake { Write-StopTestLog 'awake released'; $true }
-                    function global:Write-DemoDeploymentOutcome { param($Outcome) Write-StopTestLog ('banner {0}' -f $Outcome.Kind) }
+                    function global:Exit-StopTestKeepAwake { Write-StopTestLog 'awake released'; $true }
+                    function global:Write-StopTestDeploymentOutcome { param($Outcome) Write-StopTestLog ('banner {0}' -f $Outcome.Kind) }
+                    foreach ($name in 'Get-DemoRunEnvironment', 'Initialize-DemoFirstRun', 'Start-DemoDeploymentRun', 'Invoke-DemoDeployment', 'Complete-DemoDeploymentRun', 'Exit-DemoKeepAwake', 'Write-DemoDeploymentOutcome') {
+                        Set-Alias -Name $name -Value ($name -replace '-Demo', '-StopTest') -Scope Global
+                    }
                     & $Deploy -ConfigPath $ConfigFile -OutputPath $OutputFile
                 }).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1')).AddArgument($configPath).AddArgument($outputPath).AddArgument($log)
             $null = $runner.BeginInvoke()
