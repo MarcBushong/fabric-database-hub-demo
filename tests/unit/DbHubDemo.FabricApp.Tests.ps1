@@ -38,6 +38,17 @@ BeforeAll {
         Set-Content -LiteralPath (Join-Path -Path $cliRoot -ChildPath 'scripts/main') -Value '' -Encoding utf8NoBOM
     }
 
+    # Linux and macOS hide a file or folder whose name starts with a dot, as the app's stage has (rayfin/.env,
+    # rayfin/.temp, rayfin/.deployments.json), and Remove-Item, Get-Item, and Get-ChildItem refuse or skip a hidden item
+    # without -Force (CI on Ubuntu, 2026-11-09: Remove-Item of rayfin/.env said "the item is hidden"). This marks such an
+    # item hidden on Windows too, so every OS reads and removes it the way Linux does. Mark only what the code reads or
+    # removes: Windows also refuses to overwrite a hidden file with [System.IO.File]::WriteAllText, which Linux allows.
+    function Set-TestDotItemHidden([string] $Path) {
+        if ($IsWindows -and (Split-Path -Path $Path -Leaf).StartsWith('.')) {
+            [System.IO.File]::SetAttributes($Path, [System.IO.File]::GetAttributes($Path) -bor [System.IO.FileAttributes]::Hidden)
+        }
+    }
+
     function New-TestConfigFile {
         $config = Get-HubTestConfig
         $config['fabric']['workspaceId'] = $script:workspaceId
@@ -612,6 +623,7 @@ Describe 'Test-DemoFabricApp' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -MockWith {
             $folder = Join-Path -Path $WorkingDirectory -ChildPath $ArgumentList[3]
             $null = New-Item -ItemType Directory -Path $folder -Force
+            Set-TestDotItemHidden -Path (Split-Path -Path $folder -Parent)
             $ids = @('connector-check', 'history-meta', 'estate-targets', 'replay-T3')
             foreach ($id in $ids) {
                 @{ query = ('EVALUATE /* {0} */ ROW("x", 1)' -f $id); resultSetRowCountLimit = $script:rowLimits[$id] } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath ($id + '.json')) -Encoding utf8NoBOM
@@ -784,11 +796,12 @@ Describe 'Test-DemoFabricApp' {
         It 'reads the workspace and the model from the stage''s rayfin/.env when they aren''t passed, and fails clearly without them' {
             $null = New-Item -ItemType Directory -Path (Join-Path -Path $script:checkStage -ChildPath 'rayfin') -Force
             Set-Content -LiteralPath (Join-Path -Path $script:checkStage -ChildPath 'rayfin/.env') -Value @('RAYFIN_PUBLIC_URL=https://app-example.invalid', ('DBHUB_FABRIC_WORKSPACE_ID={0}' -f $script:workspaceId), ('DBHUB_SEMANTIC_MODEL_ID={0}' -f $script:modelId)) -Encoding utf8NoBOM
+            Set-TestDotItemHidden -Path (Join-Path -Path $script:checkStage -ChildPath 'rayfin/.env')
             $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Queries Probe -Token $script:token)
             ($results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR').status | Should -Be 'Pass'
             Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq $script:workspaceId -and $SemanticModelId -eq $script:modelId }
 
-            Remove-Item -LiteralPath (Join-Path -Path $script:checkStage -ChildPath 'rayfin/.env')
+            Remove-Item -LiteralPath (Join-Path -Path $script:checkStage -ChildPath 'rayfin/.env') -Force
             $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Queries Probe -Token $script:token)
             $connector = $results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR'
             $connector.status | Should -Be 'Fail'
@@ -906,6 +919,7 @@ Describe 'Test-DemoFabricApp' {
         $null = New-Item -ItemType Directory -Path (Join-Path -Path $script:checkStage -ChildPath 'rayfin') -Force
         @{ active = 'demo'; deployments = @{ demo = @{ itemName = 'APP_DatabaseHub_Insights'; fabricItemId = $script:itemId; hostingUrl = $script:hosting; fabricDeepLink = 'https://app.fabric.microsoft.com/groups/x/appbackends/y'; publishableKey = $script:fakeKey } } } |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path -Path $script:checkStage -ChildPath 'rayfin/.deployments.json') -Encoding utf8NoBOM
+        Set-TestDotItemHidden -Path (Join-Path -Path $script:checkStage -ChildPath 'rayfin/.deployments.json')
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { New-CliResult @{ status = 'ok'; output = @{ status = 'success'; table = @{ columns = @(@{ name = '[ValidationRows]' }); rows = @(, @(12)) } } } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '' } }
         $results = @(Test-DemoFabricApp -StagePath $script:checkStage -Queries Probe -Token $script:token)
