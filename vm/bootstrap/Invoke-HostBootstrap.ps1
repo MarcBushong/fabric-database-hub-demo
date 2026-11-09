@@ -32,7 +32,11 @@ stops there if any remains (ADR 0009). It runs again whenever a new bundle gener
 Then the database is configured and seeded, and the WorkloadRunner step installs the runner and the .NET
 runtime in the guest and starts its activity host for T2 (ADR 0010), once the guest's SQL Server is ready.
 In every mode, the GuestSource step first refuses a mode whose source (the Jumpstart image or the build) differs from an
-existing guest's, and after a pass that finds the host Ready, Invoke-DemoHostEvaluationGuard extends an evaluation
+existing guest's, with two exceptions in JumpstartImage mode since 2026-11-09: a guest built in PaygWizard mode whose SQL
+Server setup was never finished (no SQL Server instance in it, the wizard never completed, no setup running, no guided
+stop waiting) is deleted with its disk and records, and the image's steps make a new one; and a build guest with SQL
+Server set up is kept as it is, in the mode it was built in (guest-source.json sqlSetUp). After a pass that finds the host
+Ready, Invoke-DemoHostEvaluationGuard extends an evaluation
 guest's Windows evaluation when it runs low (slmgr.vbs /rearm, at most once a day, never while an activity profile runs).
 
 .PARAMETER Root
@@ -83,10 +87,18 @@ function Get-DemoHostContext {
     if ($guestSettings.Contains('name') -and $guestSettings['name']) {
         $guestName = [string]$guestSettings['name']
     }
-    $mode = [string]$Settings['t2SqlInstallMode']
-    if (-not $mode) {
-        $mode = 'JumpstartImage'
+    $configuredMode = [string]$Settings['t2SqlInstallMode']
+    if (-not $configuredMode) {
+        $configuredMode = 'JumpstartImage'
     }
+    # Whether the configuration names the mode (2026-11-09: configuration, default, or legacy for an older configuration's
+    # PaygWizard, which deploy.ps1 runs as JumpstartImage). Reported in health.json; a finished guest keeps its mode either
+    # way. Without the setting (the template's own loader, deploy.ps1 -Sequential), it counts as configuration.
+    $modeSource = [string]$Settings['t2SqlInstallModeSource']
+    if ($modeSource -notin 'default', 'legacy') {
+        $modeSource = 'configuration'
+    }
+    $effective = Get-DemoHostEffectiveMode -ConfiguredMode $configuredMode -Record (Read-DemoVmJsonFile -Path (Join-Path -Path $StateRoot -ChildPath 'guest-source.json'))
     $context = @{
         Root           = $StateRoot
         BundleRoot     = $BundleRoot
@@ -94,7 +106,10 @@ function Get-DemoHostContext {
         Host           = $hostConfig
         Guest          = $guestConfig
         GuestName      = $guestName
-        Mode           = $mode
+        Mode           = $effective.Mode
+        ConfiguredMode = $configuredMode
+        ModeSource     = $modeSource
+        ModeAdopted    = $effective.Adopted
         DataDiskTier   = [string]$Settings['dataDiskTier']
         VCpu           = [int]$guestSettings['vcpus']
         MemoryGiB      = [int]$guestSettings['memoryGiB']
@@ -162,9 +177,9 @@ function Get-DemoHostStepPlan {
         @{ Name = 'DnsForwarder'
             Test = { param($Step) Test-DemoHostDnsForwarder -HostConfig $Step.Context.Host }
             Set = { param($Step) Initialize-DemoHostDnsForwarder -HostConfig $Step.Context.Host } }
-        @{ Name = 'GuestSource'
+        @{ Name = 'GuestSource'; MaxAttempts = 3
             Test = { param($Step) (Get-DemoHostGuestSourceState -Context $Step.Context).Ok }
-            Set = { param($Step) Get-DemoHostGuestSourceFailure -Context $Step.Context } }
+            Set = { param($Step) Invoke-DemoHostGuestSourceStep -Context $Step.Context } }
         @{ Name = 'DataDisk'
             Test = { param($Step) Test-DemoHostStorage -Context $Step.Context }
             Set = { param($Step) Initialize-DemoHostStorage -Context $Step.Context } }
@@ -328,16 +343,23 @@ function Get-DemoHostHealthDetail {
     )
 
     $detail = [ordered]@{
-        installMode  = $Context.Mode
-        dataDiskTier = $Context.DataDiskTier
-        host         = Get-DemoHostInstanceInfo
-        storage      = Get-DemoHostStorageDetail -Context $Context
-        arcOnboarded = Test-DemoArcOnboarded -MarkerPath $Context.ArcMarkerPath -MachineName $Context.GuestName -GuestVmId (Get-DemoHostGuestVmId -Name $Context.GuestName)
-        guest        = [ordered]@{ name = $Context.GuestName; state = 'NotCreated' }
+        installMode           = $Context.Mode
+        configuredInstallMode = $Context.ConfiguredMode
+        installModeSource     = $Context.ModeSource
+        installModeAdopted    = [bool]$Context.ModeAdopted
+        dataDiskTier          = $Context.DataDiskTier
+        host                  = Get-DemoHostInstanceInfo
+        storage               = Get-DemoHostStorageDetail -Context $Context
+        arcOnboarded          = Test-DemoArcOnboarded -MarkerPath $Context.ArcMarkerPath -MachineName $Context.GuestName -GuestVmId (Get-DemoHostGuestVmId -Name $Context.GuestName)
+        guest                 = [ordered]@{ name = $Context.GuestName; state = 'NotCreated' }
     }
     $source = Read-DemoVmJsonFile -Path (Get-DemoHostGuestSourcePath -Context $Context)
     if ($null -ne $source) {
-        $detail.guestSource = [ordered]@{ source = $source['source']; installMode = $source['installMode'] }
+        $detail.guestSource = [ordered]@{ source = $source['source']; installMode = $source['installMode']; sqlSetUp = [bool]$source['sqlSetUp'] }
+    }
+    $rebuild = Get-DemoHostGuestRebuildDetail -Context $Context
+    if ($null -ne $rebuild) {
+        $detail.guestRebuild = $rebuild
     }
     if ($Context.Mode -eq 'JumpstartImage') {
         $detail.jumpstart = Get-DemoJumpstartHealthDetail -Context $Context

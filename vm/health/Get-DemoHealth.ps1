@@ -9,7 +9,12 @@ already redacted by the bootstrap. Windows PowerShell 5.1.
 
 With -View Summary (Phase 7), only the fields the orchestrator gates on are printed: role, state, status,
 the first 500 characters of message, currentStep, generation, updatedUtc, and from details the install mode,
-Arc onboarding, the guest's state, and its SQL Server edition. Since Phase 28 it also prints the PaygWizard
+Arc onboarding, the guest's state, and its SQL Server edition. Since 2026-11-09 it also prints the configured install
+mode, whether the configuration names it (modeSource), whether the host kept an existing guest's mode (modeAdopted), the
+guest's own mode (guestMode) and whether a pass saw SQL Server set up in it (guestSetUp), and the last rebuild of an
+unfinished guest, read from guest-rebuild.json itself (guestRebuild,
+rebuildUtc, rebuildMode, rebuildArcId, the old guest's Arc machine, and rebuildArcNew, whether the Arc marker is already
+for the guest that exists now; the Full view adds them as t2Rebuild). Since Phase 28 it also prints the PaygWizard
 guided stop's state (details.guidedSetup): whether automatic sign-in is armed in the guest, deploy.ps1's
 request (none, valid, expired, or invalid), setup's sign-in preparation (none, preparing, ready, or restoring:
 the WebView2 runtime, IE Enhanced Security Configuration off for administrators, and the Trusted sites entries;
@@ -138,8 +143,51 @@ function Get-DemoHealthGuestFact {
     return $facts
 }
 
+function Get-DemoHealthRebuildFact {
+    # The last rebuild of an unfinished T2 guest (2026-11-09), read from guest-rebuild.json itself, because health.json's
+    # details are written only at the end of the host's pass, which a rebuild's download keeps going for about half an hour.
+    # arcCurrent: the Arc marker is for the guest that exists now (its guestVmId), so the Arc machine is the new guest's.
+    # $null without a record. Never throws.
+    param([string] $StateRoot, [string] $Guest)
+
+    $recordPath = Join-Path -Path $StateRoot -ChildPath 'guest-rebuild.json'
+    if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
+        return $null
+    }
+    $facts = [ordered]@{ state = 'Unreadable'; startedUtc = ''; oldMode = ''; arcResourceId = ''; arcCurrent = $false }
+    try {
+        $record = [System.IO.File]::ReadAllText($recordPath) | ConvertFrom-Json
+        foreach ($name in 'state', 'startedUtc', 'oldMode', 'arcResourceId') {
+            $property = $record.PSObject.Properties[$name]
+            if ($property -and $null -ne $property.Value) {
+                # PowerShell 7's ConvertFrom-Json reads an ISO time as a DateTime; Windows PowerShell 5.1 keeps the text.
+                if ($property.Value -is [datetime]) {
+                    $facts[$name] = $property.Value.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+                }
+                else {
+                    $facts[$name] = [string]$property.Value
+                }
+            }
+        }
+        $markerPath = Join-Path -Path $StateRoot -ChildPath 'arc-onboarded.json'
+        if ((Test-Path -LiteralPath $markerPath -PathType Leaf) -and (Get-Command -Name 'Get-VM' -ErrorAction SilentlyContinue)) {
+            $marker = [System.IO.File]::ReadAllText($markerPath) | ConvertFrom-Json
+            $vm = Get-VM -Name $Guest -ErrorAction SilentlyContinue
+            $markerVmId = $marker.PSObject.Properties['guestVmId']
+            if ($vm -and $markerVmId -and [string]$markerVmId.Value -and [string]::Equals([string]$markerVmId.Value, [string]$vm.VMId, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $facts['arcCurrent'] = $true
+            }
+        }
+    }
+    catch {
+        $facts['error'] = ([string]$_.Exception.Message) -replace '[\r\n]+', ' '
+    }
+    return $facts
+}
+
 $path = Join-Path -Path $Root -ChildPath 'health.json'
 $guestFacts = Get-DemoHealthGuestFact -StateRoot $Root -Guest $GuestName
+$rebuildFacts = Get-DemoHealthRebuildFact -StateRoot $Root -Guest $GuestName
 if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
     $missing = [ordered]@{ schemaVersion = 1; state = 'NotStarted'; status = 'Warning'; message = 'The bootstrap has not written health.json yet.' }
     if ($null -ne $guestFacts) {
@@ -179,6 +227,16 @@ if ($View -eq 'Summary') {
         generation     = & $read $health @('generation')
         updatedUtc     = & $read $health @('updatedUtc')
         installMode    = & $read $health @('details', 'installMode')
+        configuredMode = & $read $health @('details', 'configuredInstallMode')
+        modeSource     = & $read $health @('details', 'installModeSource')
+        modeAdopted    = & $read $health @('details', 'installModeAdopted')
+        guestMode      = & $read $health @('details', 'guestSource', 'installMode')
+        guestSetUp     = & $read $health @('details', 'guestSource', 'sqlSetUp')
+        guestRebuild   = $(if ($null -ne $rebuildFacts) { $rebuildFacts['state'] } else { $null })
+        rebuildUtc     = $(if ($null -ne $rebuildFacts) { $rebuildFacts['startedUtc'] } else { $null })
+        rebuildMode    = $(if ($null -ne $rebuildFacts) { $rebuildFacts['oldMode'] } else { $null })
+        rebuildArcId   = $(if ($null -ne $rebuildFacts) { $rebuildFacts['arcResourceId'] } else { $null })
+        rebuildArcNew  = $(if ($null -ne $rebuildFacts) { [bool]$rebuildFacts['arcCurrent'] } else { $null })
         arcOnboarded   = & $read $health @('details', 'arcOnboarded')
         guestState     = & $read $health @('details', 'guest', 'state')
         sqlEdition     = & $read $health @('details', 'guest', 'sql', 'edition')
@@ -210,5 +268,8 @@ foreach ($step in @($health.steps)) {
 $health.steps = $steps
 if ($null -ne $guestFacts) {
     $health | Add-Member -NotePropertyName 't2Guest' -NotePropertyValue $guestFacts -Force
+}
+if ($null -ne $rebuildFacts) {
+    $health | Add-Member -NotePropertyName 't2Rebuild' -NotePropertyValue $rebuildFacts -Force
 }
 Write-Output ($health | ConvertTo-Json -Depth 10 -Compress)

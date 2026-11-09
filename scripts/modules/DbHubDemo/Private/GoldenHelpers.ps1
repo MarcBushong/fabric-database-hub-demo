@@ -281,6 +281,9 @@ function Resolve-DemoT2Source {
     $zone = if ($Config.Contains('zone') -and $Config['zone']) { [string]$Config['zone'] } else { '' }
     $hostDataDisk = Resolve-DemoDataDiskTier -VmSizing $hostSizing -Zone $zone -Override (Get-DemoDataDiskOverride -Config $Config)
     $installMode = [string]$Config['t2SqlInstallMode']
+    # 2026-11-09: in JumpstartImage mode, a snapshot of a finished PaygWizard guest is kept as it is too, as an existing
+    # finished guest is, with no setup wizard; one of the image is preferred. PaygWizard on purpose takes only its own.
+    $modes = if ($installMode -eq 'JumpstartImage') { @('JumpstartImage', 'PaygWizard') } else { @($installMode) }
     $securityType = [string]$Config['securityType']['t2Host']
     $snapshots = @(Get-DemoT2GoldenSnapshot -Config $Config -NowUtc $NowUtc)
     $rejected = [ordered]@{}
@@ -291,7 +294,7 @@ function Resolve-DemoT2Source {
         if ($snapshot.Location -ne [string]$Config['location']) { $why.Add(('in {0}' -f $snapshot.Location)) }
         if ($snapshot.NetworkAccessPolicy -ne 'DenyAll') { $why.Add(('network access {0}' -f $snapshot.NetworkAccessPolicy)) }
         if ($snapshot.ProvisioningState -and $snapshot.ProvisioningState -ne 'Succeeded') { $why.Add(('state {0}' -f $snapshot.ProvisioningState)) }
-        if ($snapshot.InstallMode -ne $installMode) { $why.Add(('install mode {0}' -f $snapshot.InstallMode)) }
+        if ($snapshot.InstallMode -notin $modes) { $why.Add(('install mode {0}' -f $snapshot.InstallMode)) }
         if ($snapshot.SecurityType -and $snapshot.SecurityType -ne $securityType) { $why.Add(('security type {0}' -f $snapshot.SecurityType)) }
         if ($hostDataDisk -ne 'None') { $why.Add(('the profile gives the host a {0} data disk' -f $hostDataDisk)) }
         if (-not (Test-DemoGoldenEvaluationOk -Snapshot $snapshot)) { $why.Add('its guest''s Windows evaluation is over') }
@@ -314,7 +317,7 @@ function Resolve-DemoT2Source {
         return (& $decide 'build' $status ('No usable golden snapshot{0}: a new archost01 {1}.' -f $reasons, $makes) $evidence $(if ($expired.Count -gt 0) { 'After this build and the wizard, capture again: ./scripts/capture-t2-golden.ps1.' } else { '' }))
     }
 
-    $chosen = $usable[0]
+    $chosen = @($usable | Where-Object { $_.InstallMode -eq $installMode }) + @($usable | Where-Object { $_.InstallMode -ne $installMode }) | Select-Object -First 1
     $evidence['snapshot'] = $chosen.Name
     $evidence['capturedUtc'] = $chosen.CapturedUtc
     $evidence['bootVerifiedUtc'] = $chosen.BootVerifiedUtc

@@ -243,26 +243,39 @@ Describe 'Invoke-DemoPreflight' {
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
         $check = $results | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
         $check.status | Should -Be 'Warning'
-        # Neither 4-vCore size listed, so the 2-vCore fallback is next, after its cost check, with autonomous tuning off.
+        # Neither 4-vCore size listed, so the 2-vCore fallback is next, with autonomous tuning off; its cost check only
+        # reports (PREFLIGHT.T4.FALLBACK): it never leaves T4 out (2026-11-09).
         $check.evidence.startSku | Should -Be 'Standard_D2ds_v5'
-        $check.message | Should -Match '2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off, once its cost check passes'
+        $check.message | Should -Match '2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off \(PREFLIGHT\.T4\.FALLBACK gives its price\)'
+        $check.remediation | Should -Not -Match 't4Enabled'
         $tuning = $results | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING'
         $tuning.status | Should -Be 'Warning'
         $tuning.message | Should -Match 'Standard_D2ds_v5 \(General Purpose, 2 vCores\).*deploy\.ps1''s fallback uses Standard_D2ds_v5'
-        # With t4AutonomousTuning true, that's a Fail: the fallback stops after the 4-vCore sizes.
+        # With t4AutonomousTuning true, that's a Warning too: tuning never leaves T4 out, so the fallback goes on to the
+        # 2-vCore size (2026-11-09). Only a t4SkuName the file sets to a size that can't run it is a Fail.
         $strict = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $strict[$key] = $config[$key] }
         $strict['t4AutonomousTuning'] = $true
         $tuning = Invoke-DemoPreflight -Config $strict -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING'
+        $tuning.status | Should -Be 'Warning'
+        $tuning.message | Should -Match 'T4 is part of every deployment, so it''s created with autonomous tuning off'
+        $tuning.remediation | Should -Match 'Region access request'
+        $strict['t4SkuName'] = 'Standard_D2ds_v5'
+        $tuning = Invoke-DemoPreflight -Config $strict -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING'
         $tuning.status | Should -Be 'Fail'
         $tuning.remediation | Should -Match 'set t4AutonomousTuning to false'
 
-        # None of the fallback's sizes listed: no T4, and DONE says why.
+        # None of the fallback's sizes listed: T4 is part of every deployment, so deploy.ps1 tries them all anyway, from the
+        # default (the list can lag), and only Azure's refusal of every size ends the run NOT DONE (2026-11-09).
         $script:listSkusJson = & $script:listSkus @('Standard_D8ds_v5')
-        $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
+        $check = $results | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
         $check.status | Should -Be 'Warning'
-        $check.evidence.startSku | Should -Be 'None'
-        $check.remediation | Should -Match 't4Enabled to false'
+        $check.evidence.startSku | Should -Be ''
+        $check.message | Should -Match 'T4 is part of every deployment, so deploy\.ps1 tries them anyway, and if Azure refuses them all, the run ends NOT DONE with the fix'
+        $check.remediation | Should -Match 'Region access request'
+        $check.remediation | Should -Not -Match 't4Enabled'
+        (InModuleScope DbHubDemo -Parameters @{ Results = $results } { Select-DemoT4StartSku -Sku @($Results | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'startSku') }) }) | Should -Be '' -Because 'deploy.ps1 starts from the default size'
 
         # A size the configuration sets that the region doesn't list is a Fail before anything is created.
         $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
@@ -350,23 +363,29 @@ Describe 'Invoke-DemoPreflight' {
         ($results | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING').status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $Config['t4SkuName'] -eq 'Standard_D2ds_v5' -and $null -ne $PriceCache }
 
-        # Over monthlyCeilingUsd (150 + 138 = 288 USD): a Warning that T4 would be left out, and how to allow it.
+        # Over monthlyCeilingUsd (150 + 138 = 288 USD): a Warning that the fallback would still create T4, because T4 is part
+        # of every deployment (2026-11-09), and how to keep the month within the ceilings.
         $script:lightUse = 150.0
         $fallback = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
         $fallback.status | Should -Be 'Warning'
         $fallback.evidence.skipReason | Should -Be 'MonthlyCeiling'
-        $fallback.message | Should -Match 'would leave T4 out instead: its worst case, every hour of a month'
-        $fallback.remediation | Should -Match '^Nothing to do unless Azure refuses both 4-vCore sizes\. To have the fallback create T4 then, raise monthlyCeilingUsd to at least 288'
+        $fallback.message | Should -Match 'would still create T4, because T4 is part of every deployment, though its cost check doesn''t pass: its worst case, every hour of a month'
+        $fallback.remediation | Should -Match '^Nothing to do unless Azure refuses both 4-vCore sizes\. To keep the month within your ceilings then, raise monthlyCeilingUsd to at least 288'
+        $fallback.remediation | Should -Not -Match 't4Enabled'
 
-        # The region lists neither 4-vCore size: the run starts at the 2-vCore size, so the run's own estimate prices it,
-        # and over a ceiling T4 is left out (startSku None) and the ceilings are checked without it, not failed.
+        # The region lists neither 4-vCore size: the run starts at the 2-vCore size, so the run's own estimate prices it. Over
+        # a ceiling, the fallback's check says so (startSku None, which deploy.ps1 takes as Standard_D2ds_v5) but never
+        # leaves T4 out: there's no estimate without T4, and the run's own cost checks stay (2026-11-09).
         $script:listSkusJson = & $script:listSkus @('Standard_D2ds_v5')
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
         $fallback = $results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
         $fallback.status | Should -Be 'Warning'
         $fallback.evidence.startSku | Should -Be 'None'
         $fallback.evidence.skipReason | Should -Be 'MonthlyCeiling'
-        @($results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Be @('Priced with T4 at nothing.')
+        $fallback.message | Should -Match 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: .*brings the demo''s month to 288\.00 USD, over monthlyCeilingUsd \(250\.00 USD\)\. T4 is part of every deployment, so a ceiling never leaves it out\.'
+        $fallback.remediation | Should -Match '^To keep the month within your ceilings, raise monthlyCeilingUsd to at least 288 in your configuration \(the budget follows it\), and stop T4 between sessions with \./scripts/stop-demo\.ps1\.$'
+        @($results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Be @('Priced with T4 at Standard_D2ds_v5.')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 0 -Exactly -ParameterFilter { $Config['t4Enabled'] -eq $false }
         (InModuleScope DbHubDemo -Parameters @{ Results = $results } { Select-DemoT4StartSku -Sku @($Results | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'startSku') }) }) | Should -Be 'None'
         $script:lightUse = 60.0
         $fallback = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
@@ -374,7 +393,8 @@ Describe 'Invoke-DemoPreflight' {
         $fallback.evidence.startSku | Should -Be 'Standard_D2ds_v5'
         $fallback.message | Should -Match 'so this run creates T4 as General Purpose Standard_D2ds_v5'
 
-        # A size the configuration sets has no fallback to price, and T4 turned off has nothing to price.
+        # A size the configuration sets has no fallback to price, and a configuration with T4 off in memory (Get-DemoConfig
+        # never gives one since 2026-11-09) has nothing to price.
         $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
         $pinned['t4SkuName'] = 'Standard_B1ms'
@@ -385,10 +405,12 @@ Describe 'Invoke-DemoPreflight' {
         @(Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK').Count | Should -Be 0
     }
 
-    It 'keeps the run''s own cost checks, a monthly-ceiling Fail included, when the fallback''s extra estimate fails: <Case> (review of 20e855c)' -ForEach @(
-        @{ Case = 'a 4-vCore start, the 2-vCore estimate refused (HTTP 429)'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'fallback'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; Match = 'deploy\.ps1 prices its 2-vCore fallback, Standard_D2ds_v5, right before it would create it; right now, its price couldn''t be read from the Azure Retail Prices API \(HTTP 429' }
-        @{ Case = 'a 2-vCore start over a ceiling, the estimate without T4 refused (HTTP 429)'; GeneralPurpose = @('Standard_D2ds_v5'); Throws = 'off'; StartSku = 'None'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; Match = 'The ceilings without T4 couldn''t be checked \(HTTP 429.*\), so PREFLIGHT\.COST\.\* still price T4 at Standard_D2ds_v5' }
-        @{ Case = 'the fallback''s check itself throws'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'check'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; Match = '^T4''s 2-vCore fallback couldn''t be priced in preflight: HTTP 429' }
+    It 'keeps the run''s own cost checks, a monthly-ceiling Fail included, whatever the fallback''s check does: <Case> (review of 20e855c)' -ForEach @(
+        @{ Case = 'a 4-vCore start, the 2-vCore estimate refused (HTTP 429)'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'fallback'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D4ds_v5.'; Match = 'deploy\.ps1 prices its 2-vCore fallback, Standard_D2ds_v5, right before it would create it; right now, its price couldn''t be read from the Azure Retail Prices API \(HTTP 429' }
+        # 2026-11-09: T4 is part of every deployment, so a 2-vCore start over a ceiling is a Warning, T4 is created anyway,
+        # and no estimate without T4 is made (one would throw here).
+        @{ Case = 'a 2-vCore start over a ceiling, which still creates T4 and makes no estimate without it (2026-11-09)'; GeneralPurpose = @('Standard_D2ds_v5'); Throws = 'off'; StartSku = 'None'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D2ds_v5.'; Match = 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: .*brings the demo''s month to 398\.00 USD, over monthlyCeilingUsd \(375\.00 USD\)\. T4 is part of every deployment, so a ceiling never leaves it out\.' }
+        @{ Case = 'the fallback''s check itself throws'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'check'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D4ds_v5.'; Match = '^T4''s 2-vCore fallback couldn''t be priced in preflight: HTTP 429' }
     ) {
         Set-HappyAzMock
         # The run's own estimate is over monthlyCeilingUsd, a Fail; obviously fake prices.
@@ -420,6 +442,7 @@ Describe 'Invoke-DemoPreflight' {
         $monthly = @($results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY')
         $monthly.Count | Should -Be 1
         $monthly[0].status | Should -Be 'Fail' -Because 'a hard ceiling is never dropped, whatever the fallback''s estimate does'
+        $monthly[0].message | Should -Be $MonthlyMessage
         @($results | Where-Object { $_.status -eq 'Fail' }).Count | Should -BeGreaterOrEqual 1
         @($results | Where-Object { [string]$_.message -match 'could not be computed' }) | Should -BeNullOrEmpty
         $fallback = @($results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK')
@@ -428,6 +451,7 @@ Describe 'Invoke-DemoPreflight' {
         [string]$fallback[0].evidence.startSku | Should -Be $StartSku
         $fallback[0].evidence.skipReason | Should -Be $SkipReason
         $fallback[0].message | Should -Match $Match
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 0 -Exactly -ParameterFilter { $Config['t4Enabled'] -eq $false } -Because 'no cost check leaves T4 out (2026-11-09)'
     }
 
     It 'leaves the policy inventory to deploy.ps1 only with networkMode private, and keeps it with public and auto (Phase 28; review finding 7)' {

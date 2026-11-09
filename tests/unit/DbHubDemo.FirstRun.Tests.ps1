@@ -194,22 +194,33 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
         }
     }
 
-    It 'asks which subscription, capacity, and T2 mode when there''s a choice, and writes the answers' {
+    It 'asks which subscription and capacity when there''s a choice, never how T2 gets SQL Server, and writes the answers' {
         $script:init.Interactive = $true
         $script:init.Profile = [pscustomobject]@{ Installed = $true; SignedIn = $true; Error = ''; Subscriptions = @((New-ProfileEntry $script:subA 'Contoso Demo' $true), (New-ProfileEntry $script:subB 'Contoso Lab')) }
         $script:init.Capacities = @((New-FabricItem 'sharedcap' 'Inactive'), (New-FabricItem 'mycap'))
-        foreach ($answer in 1, 1, 2) {
+        foreach ($answer in 1, 1) {
             $script:init.Choices.Enqueue($answer)
         }
         $init = Initialize-DemoConfig -Path $script:path -CreateAdminGroup -BackupDirectory $script:backup -Confirm:$false
-        @($script:calls | Where-Object { $_ -like 'Ask:*' }).Count | Should -Be 3
+        @($script:calls | Where-Object { $_ -like 'Ask:*' }).Count | Should -Be 2
         $config = Get-DemoConfig -Path $script:path
         $config['subscriptionId'] | Should -Be $script:subB
         $config['fabric']['capacityName'] | Should -Be 'mycap'
-        $config['t2SqlInstallMode'] | Should -Be 'Developer' -Because 'the third choice, after JumpstartImage (the default) and PaygWizard'
+        $config['t2SqlInstallMode'] | Should -Be 'JumpstartImage' -Because 'a first deployment is one click (2026-11-09): no question, and the default needs nobody'
         (Get-InitResult $init 'INIT.FABRIC.CAPACITY').status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Read-DemoChoice -Times 1 -Exactly -ParameterFilter { $Title -like '*capacity*' -and $Default -eq 1 }
-        Should -Invoke -ModuleName DbHubDemo -CommandName Read-DemoChoice -Times 1 -Exactly -ParameterFilter { $Title -like '*T2*' -and $Default -eq 0 -and $Option.Count -eq 3 -and $Option[0] -like 'JumpstartImage*' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Read-DemoChoice -Times 0 -Exactly -ParameterFilter { $Title -like '*T2*' -or $Title -like '*SQL Server*' }
+    }
+
+    It 'writes the mode -T2SqlInstallMode chooses on purpose, without asking, and offers no setup-wizard mode (2026-11-09)' {
+        $script:init.Interactive = $true
+        Initialize-DemoConfig -Path $script:path -T2SqlInstallMode Developer -CreateAdminGroup -BackupDirectory $script:backup -Confirm:$false | Out-Null
+        $written = Get-Content -LiteralPath $script:path -Raw | ConvertFrom-Json -AsHashtable
+        $written['t2SqlInstallMode'] | Should -Be 'Developer'
+        $written.Contains('t2PaygWizardOptIn') | Should -BeFalse
+        $written.Contains('t4Enabled') | Should -BeFalse -Because 'T4 is part of every deployment'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Read-DemoChoice -Times 0 -Exactly -ParameterFilter { $Title -like '*T2*' -or $Title -like '*SQL Server*' }
+        (Get-Command -Name Initialize-DemoConfig).Parameters['T2SqlInstallMode'].Attributes.ValidValues | Should -Not -Contain 'PaygWizard' -Because 'no first run leads to the setup wizard'
     }
 
     It 'never guesses without asking: several subscriptions with -NonInteractive are Manual action required, and nothing is written' {

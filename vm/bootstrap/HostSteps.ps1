@@ -747,11 +747,14 @@ function Set-DemoHostGuestSource {
 }
 
 function Get-DemoHostGuestSourceFailure {
-    # The GuestSource step's result when the configured mode can't use the guest that's there. Nothing is changed.
+    # The GuestSource step's result when the configured mode can't use the guest that's there. Nothing is changed. -Reason
+    # says why the guest wasn't rebuilt or kept in its own mode (2026-11-09).
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [System.Collections.IDictionary] $Context
+        [System.Collections.IDictionary] $Context,
+
+        [string] $Reason = ''
     )
 
     $decision = Get-DemoHostGuestSourceState -Context $Context
@@ -765,7 +768,489 @@ function Get-DemoHostGuestSourceFailure {
     elseif ($decision.RecordedMode) {
         $was = 'built from the evaluation media (t2SqlInstallMode {0})' -f $decision.RecordedMode
     }
-    return (New-DemoVmStepResult -Outcome 'Failed' -Message ('The guest {0} was {1}, but t2SqlInstallMode is now {2}, and an existing guest never changes its source. Set t2SqlInstallMode back in config/demo.config.json, then run ./scripts/deploy.ps1 -FromStage Infrastructure, which brings the setting to the host; or rebuild T2 for the new mode: ./scripts/destroy.ps1, then ./scripts/deploy.ps1 (ADR 0006).' -f $Context.GuestName, $was, $Context.Mode))
+    $why = ''
+    if ($Reason) {
+        $why = ' {0}' -f $Reason
+    }
+    return (New-DemoVmStepResult -Outcome 'Failed' -Message ('The guest {0} was {1}, but t2SqlInstallMode is now {2}, and an existing guest never changes its source.{3} Set t2SqlInstallMode back in config/demo.config.json, then run ./scripts/deploy.ps1 -FromStage Infrastructure, which brings the setting to the host; or rebuild T2 for the new mode: ./scripts/destroy.ps1, then ./scripts/deploy.ps1 (ADR 0006).' -f $Context.GuestName, $was, $Context.Mode, $why))
+}
+
+# ---- An unfinished PaygWizard guest rebuilt, and a finished guest's mode kept (ADR 0006, amendment of 2026-11-09) ----
+
+function Get-DemoHostEffectiveMode {
+    <#
+    .SYNOPSIS
+    Pure: the install mode the host runs. In JumpstartImage mode, an existing guest built in PaygWizard mode that a pass
+    has seen with SQL Server set up (guest-source.json sqlSetUp) keeps that mode, whatever the configuration says
+    (2026-11-09, user-directed: a finished guest is never rebuilt and never needs the setup wizard), so a finished
+    PaygWizard demo upgrades without a configuration change. Only PaygWizard: it was the old default, and Azure expects
+    the same of it as of JumpstartImage (Standard, PAYG), while ProductKey and Developer were deliberate choices whose
+    license and checks differ, so their configuration keeps naming them. Any other mode runs as configured, whatever the
+    mode's source (configuration, default, or legacy), which health.json reports.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyString()]
+        [string] $ConfiguredMode = '',
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Record
+    )
+
+    $mode = $ConfiguredMode
+    if (-not $mode) {
+        $mode = 'JumpstartImage'
+    }
+    $adopted = $false
+    if ($mode -eq 'JumpstartImage' -and $null -ne $Record -and [string]$Record['source'] -eq 'Build' -and
+        [string]$Record['installMode'] -eq 'PaygWizard' -and [bool]$Record['sqlSetUp']) {
+        $mode = [string]$Record['installMode']
+        $adopted = $true
+    }
+    return [pscustomobject]@{ Mode = $mode; Adopted = $adopted }
+}
+
+function Get-DemoHostGuestBuildMode {
+    <#
+    .SYNOPSIS
+    Pure: the mode a build guest was made in. Its record names it (guests built since 2026-11-05). Before the record, the
+    host's step records tell (state.json, kept across generations): only PaygWizard runs ArcOnboardingBeforeWizard,
+    GuidedSetup, and SqlSetupWizard, and only ProductKey and Developer run SqlUnattendedInstall, whose edition tells them
+    apart. '' when nothing tells.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [System.Collections.IDictionary] $Record,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Steps,
+
+        [AllowEmptyString()]
+        [string] $Edition = ''
+    )
+
+    if ($null -ne $Record -and [string]$Record['installMode'] -in 'PaygWizard', 'ProductKey', 'Developer') {
+        return [string]$Record['installMode']
+    }
+    $started = @()
+    if ($null -ne $Steps) {
+        foreach ($name in 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'SqlUnattendedInstall') {
+            if ($Steps.Contains($name) -and $Steps[$name] -is [System.Collections.IDictionary] -and [string]$Steps[$name]['firstStartedUtc']) {
+                $started += $name
+            }
+        }
+    }
+    $wizard = @($started | Where-Object { $_ -ne 'SqlUnattendedInstall' }).Count -gt 0
+    $unattended = $started -contains 'SqlUnattendedInstall'
+    if ($wizard -and -not $unattended) {
+        return 'PaygWizard'
+    }
+    if ($unattended -and -not $wizard) {
+        if ($Edition -like 'Developer*') {
+            return 'Developer'
+        }
+        if ($Edition -like 'Standard*' -or $Edition -like 'Enterprise*') {
+            return 'ProductKey'
+        }
+    }
+    return ''
+}
+
+function Get-DemoHostGuestFinding {
+    <#
+    .SYNOPSIS
+    What the host knows about an existing build guest, read-only: its record and build mode, whether SQL Server setup ever
+    completed (state.json), whether a guided stop waits for a person (guided-setup-request.json), and, over PowerShell
+    Direct, its SQL Server instances, setup processes, and edition. It starts a guest that's off and waits up to 10 minutes
+    for it (Wait-DemoHostGuest). Reachable is false when the guest couldn't be read. Never throws.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $finding = [ordered]@{
+        GuestExists     = $false
+        GuestVmId       = ''
+        Record          = $null
+        BuildMode       = ''
+        WizardCompleted = $false
+        GuidedWaiting   = $false
+        Reachable       = $false
+        DefaultInstance = $false
+        NamedInstances  = @()
+        SetupRunning    = @()
+        Edition         = ''
+        ArcResourceId   = ''
+        Error           = ''
+    }
+    $steps = $null
+    try {
+        $finding.Record = Read-DemoVmJsonFile -Path (Get-DemoHostGuestSourcePath -Context $Context)
+        $steps = (Get-DemoVmState)['steps']
+        foreach ($name in 'SqlSetupWizard', 'SqlUnattendedInstall') {
+            if ($null -ne $steps -and $steps.Contains($name) -and [string]$steps[$name]['completedUtc']) {
+                $finding.WizardCompleted = $true
+            }
+        }
+        $finding.GuidedWaiting = (Get-DemoGuidedSetupRequest -Path (Get-DemoGuidedSetupPath -Root $Context.Root)).Valid
+        $marker = Read-DemoVmJsonFile -Path $Context.ArcMarkerPath
+        if ($null -ne $marker) {
+            $finding.ArcResourceId = [string]$marker['resourceId']
+        }
+        $finding.GuestVmId = Get-DemoHostGuestVmId -Name $Context.GuestName
+        $finding.GuestExists = [bool]$finding.GuestVmId
+        if ($finding.GuestExists -and (Test-Path -LiteralPath $Context.SecretPath -PathType Leaf) -and (Wait-DemoHostGuest -Context $Context)) {
+            $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+            $facts = Get-DemoGuestSetupFact -Name $Context.GuestName -Credential $credential
+            $finding.DefaultInstance = [bool]$facts.DefaultInstance
+            $finding.NamedInstances = @($facts.NamedInstances | Where-Object { $_ })
+            $finding.SetupRunning = @($facts.SetupProcess | Where-Object { $_ })
+            if ($finding.DefaultInstance) {
+                $finding.Edition = [string](Get-DemoGuestSqlInstance -Name $Context.GuestName -Credential $credential).Edition
+            }
+            $finding.Reachable = $true
+        }
+    }
+    catch {
+        $finding.Error = Protect-DemoVmText -Text $_.Exception.Message
+        $finding.Reachable = $false
+        Write-DemoVmLog -Level 'Warning' -Message ('The existing guest couldn''t be read: {0}' -f $finding.Error)
+    }
+    $finding.BuildMode = Get-DemoHostGuestBuildMode -Record $finding.Record -Steps $steps -Edition $finding.Edition
+    return [pscustomobject]$finding
+}
+
+function Get-DemoHostGuestSourcePlan {
+    <#
+    .SYNOPSIS
+    Pure: what the GuestSource step does with a build guest when the host runs JumpstartImage mode (2026-11-09). Returns
+    Action (Rebuild, Adopt, Wait, or Refuse), GuestMode, and Reason. Fail safe: only positive evidence that nothing is there
+    to keep rebuilds, and anything unclear keeps the guest.
+    - Adopt: SQL Server is set up (an instance, or setup completed by the host's records) in a guest built in PaygWizard
+      mode: the guest is kept as it is, in that mode, whatever the configuration says (user-directed: a finished guest is
+      never rebuilt and never needs the setup wizard). A finished ProductKey or Developer guest is kept too, but refused:
+      those were deliberate choices whose license and checks differ from JumpstartImage's, so the configuration names them.
+    - Rebuild: built in PaygWizard mode, read over PowerShell Direct just now, with no SQL Server instance (default or named),
+      no setup running, SQL Server setup never completed by the host's records, and no guided stop waiting for a person.
+    - Wait: the guest couldn't be read, setup runs in it, or a guided stop waits; the step tries again (MaxAttempts).
+    - Refuse: anything else, with the reason in the step's failure.
+    The mode's source (configuration, default, or legacy) doesn't change the plan.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Finding
+    )
+
+    $plan = { param([string] $Action, [string] $Reason) [pscustomobject]@{ Action = $Action; GuestMode = [string]$Finding.BuildMode; Reason = $Reason } }
+    $instances = [bool]$Finding.DefaultInstance -or @($Finding.NamedInstances).Count -gt 0
+    $setUp = $instances -or [bool]$Finding.WizardCompleted
+    $mode = [string]$Finding.BuildMode
+    $modeText = if ($mode) { $mode } else { 'an unknown build mode' }
+    if ($setUp) {
+        if ($mode -eq 'PaygWizard') {
+            return (& $plan 'Adopt' 'SQL Server is set up in the guest, built in PaygWizard mode, so T2 keeps it as it is, in that mode, with no setup wizard.')
+        }
+        if ($mode) {
+            return (& $plan 'Refuse' ('SQL Server is set up in the guest, built in {0} mode, a deliberate choice whose license and checks differ from JumpstartImage''s, so it''s kept as it is and used only in its own mode.' -f $mode))
+        }
+        return (& $plan 'Refuse' 'SQL Server is set up in the guest, so it''s kept, but the mode it was built in couldn''t be told, so it isn''t used on its own: name that mode with t2SqlInstallMode.')
+    }
+    if (-not [bool]$Finding.Reachable) {
+        $detail = ''
+        if ($Finding.Error) {
+            $detail = ' ({0})' -f $Finding.Error
+        }
+        return (& $plan 'Wait' ('The guest couldn''t be read over PowerShell Direct{0}, so whether its SQL Server setup finished isn''t known yet; nothing is deleted.' -f $detail))
+    }
+    if (@($Finding.SetupRunning).Count -gt 0) {
+        return (& $plan 'Wait' ('SQL Server setup is running in the guest ({0}), so nothing is deleted while it runs.' -f (@($Finding.SetupRunning) -join ', ')))
+    }
+    if ([bool]$Finding.GuidedWaiting) {
+        return (& $plan 'Wait' 'A guided stop is waiting for a person to run SQL Server setup in the guest, so nothing is deleted until it ends.')
+    }
+    if ($mode -eq 'PaygWizard') {
+        return (& $plan 'Rebuild' 'The guest was built in PaygWizard mode, and its SQL Server setup wizard was never finished: it has no SQL Server instance, and the host never saw setup complete. Nothing in it is kept, so the host deletes it and makes T2 from Arc Jumpstart''s image.')
+    }
+    return (& $plan 'Refuse' ('SQL Server isn''t installed in the guest, but it wasn''t built in PaygWizard mode ({0}), so it isn''t deleted on its own.' -f $modeText))
+}
+
+function Get-DemoHostGuestRebuildPath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    return (Join-Path -Path $Context.Root -ChildPath 'guest-rebuild.json')
+}
+
+function Get-DemoHostGuestRebuildDetail {
+    # For health.json (details.guestRebuild): the last rebuild of an unfinished guest, without its file list. $null when
+    # there's none. Never throws.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    try {
+        $record = Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $Context)
+    }
+    catch {
+        return [ordered]@{ state = 'Unreadable' }
+    }
+    if ($null -eq $record) {
+        return $null
+    }
+    return [ordered]@{
+        state         = [string]$record['state']
+        startedUtc    = [string]$record['startedUtc']
+        removedUtc    = [string]$record['removedUtc']
+        oldMode       = [string]$record['oldMode']
+        arcResourceId = [string]$record['arcResourceId']
+    }
+}
+
+function Get-DemoHostGuestRebuildSpace {
+    <#
+    .SYNOPSIS
+    Whether the Jumpstart image fits once the unfinished guest and the build media are deleted, without a data disk: the
+    free space now plus what the deletion frees, against the JumpstartImage requirement (the image, its growth allowance,
+    and the margin; Get-DemoHostOsDiskRequirement). With a data disk, Ok. Returns Ok, FreeBytes, FreedBytes, and
+    NeededBytes. Never deletes anything.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [string[]] $Path = @()
+    )
+
+    if (Test-DemoHostHasDataDisk -Context $Context) {
+        return [pscustomobject]@{ Ok = $true; FreeBytes = [long]0; FreedBytes = [long]0; NeededBytes = [long]0 }
+    }
+    $freed = [long]0
+    foreach ($item in $Path) {
+        if (Test-Path -LiteralPath $item -PathType Leaf) {
+            $freed += [long](Get-Item -LiteralPath $item).Length
+        }
+        elseif (Test-Path -LiteralPath $item -PathType Container) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $item -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+                $freed += [long]$file.Length
+            }
+        }
+    }
+    $free = Get-DemoHostDriveFreeSpace -Drive (Get-DemoHostSystemDrive)
+    $need = (Get-DemoHostOsDiskRequirement -Context $Context).TotalBytes
+    return [pscustomobject]@{ Ok = (($free + $freed) -ge $need); FreeBytes = $free; FreedBytes = $freed; NeededBytes = $need }
+}
+
+function Remove-DemoHostGuest {
+    <#
+    .SYNOPSIS
+    Deletes an unfinished guest so JumpstartImage mode makes a new one (2026-11-09): the guest VM (turned off, then removed),
+    its folder with its disk, the build modes' media, and the guest's records on the host (its source, the Arc marker, the
+    evaluation guard's record, any Jumpstart records, the guided stop's request, records, scripts, and host logon task), and
+    its DPAPI-protected password. guest-rebuild.json records it (state Removing, then Removed; no secret), so a run stopped
+    midway finishes it, and deploy.ps1 deletes the old guest's Arc resources in Azure (DEPLOY.T2.REBUILD). Without a data
+    disk, the space check comes first, and when the image wouldn't fit, nothing is deleted. Returns a step result only for
+    that failure.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [AllowNull()]
+        [pscustomobject] $Finding,
+
+        [string] $Reason = '',
+
+        [switch] $Resume
+    )
+
+    $name = $Context.GuestName
+    $recordPath = Get-DemoHostGuestRebuildPath -Context $Context
+    $guestFolder = ''
+    try {
+        $guestFolder = [System.IO.Path]::Combine((Get-DemoHostDataPath -Context $Context -Kind 'Vms'), $name)
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('The guest''s folder couldn''t be found: {0}' -f $_.Exception.Message)
+    }
+    $media = @()
+    foreach ($mediaName in @($Context.Host.Media.WindowsServer, $Context.Host.Media.SqlServer, $Context.Host.Media.SqlDeveloper) | Where-Object { $_ } | Select-Object -Unique) {
+        try {
+            $file = (Get-DemoHostMediaFile -Context $Context -MediaName $mediaName).Path
+            $media += @($file, ($file + '.partial'))
+        }
+        catch {
+            Write-DemoVmLog -Level 'Warning' -Message ('The build media {0} couldn''t be found: {1}' -f $mediaName, $_.Exception.Message)
+        }
+    }
+    $record = Read-DemoVmJsonFile -Path $recordPath
+    if (-not $Resume -or $null -eq $record) {
+        $space = Get-DemoHostGuestRebuildSpace -Context $Context -Path (@($guestFolder) + $media | Where-Object { $_ })
+        if (-not $space.Ok) {
+            return (New-DemoVmStepResult -Outcome 'Failed' -Message ('{0} was built in PaygWizard mode and its SQL Server setup was never finished, but the Jumpstart image wouldn''t fit on {1} after deleting it: {2:N1} GB free, {3:N1} GB freed, {4:N1} GB needed. Nothing was deleted. Set dataDiskSku to E10 in the configuration to add a data disk, or free space on {1}, then run ./scripts/deploy.ps1 again (ADR 0016).' -f $name, (Get-DemoHostSystemDrive), ($space.FreeBytes / 1GB), ($space.FreedBytes / 1GB), ($space.NeededBytes / 1GB)))
+        }
+        $oldMode = 'PaygWizard'
+        $vmId = ''
+        $arcResourceId = ''
+        if ($null -ne $Finding) {
+            if ($Finding.BuildMode) {
+                $oldMode = [string]$Finding.BuildMode
+            }
+            $vmId = [string]$Finding.GuestVmId
+            $arcResourceId = [string]$Finding.ArcResourceId
+        }
+        $record = [ordered]@{
+            schemaVersion = 1
+            state         = 'Removing'
+            reason        = $Reason
+            startedUtc    = Get-DemoVmUtcNow
+            removedUtc    = ''
+            oldMode       = $oldMode
+            oldGuestVmId  = $vmId
+            arcResourceId = $arcResourceId
+            removed       = @()
+        }
+    }
+    if (-not $PSCmdlet.ShouldProcess($name, 'Delete the unfinished guest, its disk, the build media, and its records')) {
+        return
+    }
+    Write-DemoVmJsonFile -Path $recordPath -InputObject $record
+    Write-DemoVmLog -Level 'Warning' -Message ('Rebuilding T2''s guest from Arc Jumpstart''s image: {0}' -f $(if ($Reason) { $Reason } else { [string]$record['reason'] }))
+    $removed = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $vm = Get-VM -Name $name -ErrorAction SilentlyContinue
+    if ($vm) {
+        if ([string]$vm.State -ne 'Off') {
+            Stop-VM -Name $name -TurnOff -Force -ErrorAction Stop
+        }
+        Remove-VM -Name $name -Force -ErrorAction Stop
+        $removed.Add(('the guest VM {0}' -f $name))
+    }
+    if ($guestFolder -and (Test-Path -LiteralPath $guestFolder)) {
+        Remove-Item -LiteralPath $guestFolder -Recurse -Force -ErrorAction Stop
+        $removed.Add(('its folder and disk {0}' -f $guestFolder))
+    }
+    foreach ($file in $media) {
+        if (Test-Path -LiteralPath $file -PathType Leaf) {
+            Remove-Item -LiteralPath $file -Force -ErrorAction Stop
+            $removed.Add(('the build media {0}' -f (Split-Path -Path $file -Leaf)))
+        }
+    }
+    $guided = Get-DemoGuidedSetupPath -Root $Context.Root
+    $records = @(
+        (Get-DemoHostGuestSourcePath -Context $Context), $Context.ArcMarkerPath, (Join-Path -Path $Context.Root -ChildPath 'guest-evaluation.json'),
+        (Join-Path -Path $Context.Root -ChildPath 'jumpstart-image.json'), (Join-Path -Path $Context.Root -ChildPath 'jumpstart-firstboot.json'),
+        $guided.HostRequest, $guided.HostArmed, $guided.HostSignIn, $guided.HostLast, $guided.HostConsoleScript, $guided.HostSteps)
+    foreach ($file in $records) {
+        if (Test-Path -LiteralPath $file -PathType Leaf) {
+            Remove-Item -LiteralPath $file -Force -ErrorAction Stop
+            $removed.Add((Split-Path -Path $file -Leaf))
+        }
+    }
+    if (Get-ScheduledTask -TaskName 'DbHubDemo-GuestConsole' -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName 'DbHubDemo-GuestConsole' -Confirm:$false
+        $removed.Add('the host logon task DbHubDemo-GuestConsole')
+    }
+    foreach ($file in @($Context.SecretPath, ($Context.SecretPath + '.pending'))) {
+        if (Test-Path -LiteralPath $file -PathType Leaf) {
+            Remove-Item -LiteralPath $file -Force -ErrorAction Stop
+            $removed.Add('the guest''s protected password')
+        }
+    }
+    $record['state'] = 'Removed'
+    $record['removedUtc'] = Get-DemoVmUtcNow
+    $record['removed'] = @(@($record['removed']) + $removed.ToArray() | Where-Object { $_ } | Select-Object -Unique)
+    Write-DemoVmJsonFile -Path $recordPath -InputObject $record
+    Write-DemoVmLog -Message ('Deleted the unfinished guest: {0}. The next steps download Arc Jumpstart''s image and make a new {1}; deploy.ps1 deletes the old guest''s Arc resources in Azure.' -f $(if ($removed.Count -gt 0) { $removed -join ', ' } else { 'nothing was left' }), $name)
+}
+
+function Set-DemoHostGuestSqlSetUp {
+    # Records that SQL Server is set up in a build guest, with the mode it was built in, so JumpstartImage mode keeps that
+    # mode on every later pass (Get-DemoHostEffectiveMode). Keeps the record's first time.
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('PaygWizard', 'ProductKey', 'Developer')]
+        [string] $Mode
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($Context.GuestName, ('Record its SQL Server as set up, in {0} mode' -f $Mode))) {
+        return
+    }
+    $path = Get-DemoHostGuestSourcePath -Context $Context
+    $old = Read-DemoVmJsonFile -Path $path
+    $recorded = Get-DemoVmUtcNow
+    if ($null -ne $old -and [string]$old['recordedUtc']) {
+        $recorded = [string]$old['recordedUtc']
+    }
+    Write-DemoVmJsonFile -Path $path -InputObject ([ordered]@{ source = 'Build'; installMode = $Mode; recordedUtc = $recorded; sqlSetUp = $true; sqlSetUpUtc = (Get-DemoVmUtcNow) })
+}
+
+function Invoke-DemoHostGuestSourceStep {
+    <#
+    .SYNOPSIS
+    The GuestSource step's Set (2026-11-09). A rebuild that a stopped run left Removing finishes first. A guest whose source
+    the mode can use needs nothing. In JumpstartImage mode, a build guest is planned (Get-DemoHostGuestSourcePlan): Rebuild
+    deletes it (Remove-DemoHostGuest), and the image's steps that follow make a new one in this pass; Adopt records it and
+    runs its own mode from now on; Wait throws, so the step tries again on the next pass, up to its attempts; Refuse fails
+    with the reason and the fix (Get-DemoHostGuestSourceFailure). Any other mismatch fails as before.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $rebuild = Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $Context)
+    if ($null -ne $rebuild -and [string]$rebuild['state'] -eq 'Removing') {
+        return (Remove-DemoHostGuest -Context $Context -Resume -Confirm:$false)
+    }
+    $decision = Get-DemoHostGuestSourceState -Context $Context
+    if ($decision.Ok) {
+        return
+    }
+    if ($decision.Recorded -ne 'Build' -or $Context.Mode -ne 'JumpstartImage') {
+        return (Get-DemoHostGuestSourceFailure -Context $Context)
+    }
+    $finding = Get-DemoHostGuestFinding -Context $Context
+    $plan = Get-DemoHostGuestSourcePlan -Finding $finding
+    Write-DemoVmLog -Message ('The existing guest: built in {0}, SQL Server instance {1}, setup completed by the records {2}, read over PowerShell Direct {3}; plan {4}. {5}' -f $(if ($finding.BuildMode) { $finding.BuildMode + ' mode' } else { 'an unknown mode' }), $(if ($finding.DefaultInstance -or @($finding.NamedInstances).Count -gt 0) { 'present' } else { 'absent' }), $(if ($finding.WizardCompleted) { 'yes' } else { 'no' }), $(if ($finding.Reachable) { 'yes' } else { 'no' }), $plan.Action, $plan.Reason)
+    switch ($plan.Action) {
+        'Rebuild' {
+            return (Remove-DemoHostGuest -Context $Context -Finding $finding -Reason $plan.Reason -Confirm:$false)
+        }
+        'Adopt' {
+            Set-DemoHostGuestSqlSetUp -Context $Context -Mode $plan.GuestMode -Confirm:$false
+            $Context.Mode = $plan.GuestMode
+            $Context.ModeAdopted = $true
+            Write-DemoVmLog -Message ('T2 keeps its guest as it is, in the mode it was built in, {0}: {1}' -f $plan.GuestMode, $plan.Reason)
+            return
+        }
+        'Wait' {
+            throw $plan.Reason
+        }
+        default {
+            return (Get-DemoHostGuestSourceFailure -Context $Context -Reason $plan.Reason)
+        }
+    }
 }
 
 # ---- Free space and the guest's Windows evaluation ----

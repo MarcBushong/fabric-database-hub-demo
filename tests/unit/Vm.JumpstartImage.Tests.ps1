@@ -562,7 +562,9 @@ Describe 'The image checks' {
         $result = Invoke-DemoJumpstartImageCheck -Context $context
         $result.Outcome | Should -Be 'Failed'
         $result.Message | Should -Match 'Nothing switches by itself'
-        $result.Message | Should -Match 'PaygWizard, ProductKey, or Developer'
+        # 2026-11-09: the unattended modes come first, and PaygWizard says it needs a person.
+        $result.Message | Should -Match 'ProductKey .* or Developer .*, both unattended; or PaygWizard, which needs a person in Bastion'
+        $result.Message.IndexOf('ProductKey') | Should -BeLessThan $result.Message.IndexOf('PaygWizard')
     }
 }
 

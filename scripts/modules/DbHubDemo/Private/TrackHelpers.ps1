@@ -45,7 +45,8 @@ function Invoke-DemoBootstrapLoaderRun {
     time: two tracks never deploy the template at once, T1's SQL IaaS extension isn't updated again (about 10
     minutes of Updating, Phase 13), and each VM's loader runs as soon as its own chunks have arrived. The
     settings are the template's loaderSettings output (nothing secret) with the workload runner's SHA-256 and
-    chunk count filled in; the loader receives them Base64-encoded, as from the template. A new value starts a
+    chunk count filled in, and for the T2 host the run's install mode and whether the configuration names it
+    (t2SqlInstallModeSource, 2026-11-09); the loader receives them Base64-encoded, as from the template. A new value starts a
     new bootstrap generation, which re-checks every step.
 
     Source: managed Run Command, https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed
@@ -98,6 +99,19 @@ function Invoke-DemoBootstrapLoaderRun {
     }
     $tree['workload']['runnerSha256'] = $RunnerSha256.ToLowerInvariant()
     $tree['workload']['runnerChunkCount'] = $RunnerChunkCount
+    if ($role -eq 'ArcHost') {
+        # The run's own install mode and where it comes from (2026-11-09); the template's last output may hold an earlier
+        # run's mode. PaygWizard reaches the host only when chosen on purpose (t2PaygWizardOptIn): it builds a guest that
+        # waits for a person at the setup wizard.
+        $mode = (Get-DemoArcTarget -Config $Config).InstallMode
+        $source = Get-DemoT2InstallModeSource -Config $Config
+        if ($mode -eq 'PaygWizard' -and -not (Test-DemoT2PaygWizardOptIn -Config $Config)) {
+            $mode = 'JumpstartImage'
+            $source = 'legacy'
+        }
+        $tree['t2SqlInstallMode'] = $mode
+        $tree['t2SqlInstallModeSource'] = $source
+    }
     $encoded = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($tree | ConvertTo-Json -Depth 20 -Compress)))
     $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Invoke-DemoBootstrapLoader.ps1') -Raw
     $parameters = [ordered]@{
@@ -1340,7 +1354,12 @@ function Invoke-DemoDeploymentTrack {
                         # Phase 28: wait for the build (bounded by T2WaitMinutes) with progress, then, in PaygWizard mode, the
                         # guided stop; then configure-arc's sequence waits for the host to finish after setup.
                         $t2Deadline = [DateTime]::UtcNow.AddMinutes([int](& $option 'T2WaitMinutes' 180))
-                        $build = Wait-DemoT2HostBuild -Config $Config -DeadlineUtc $t2Deadline -ProgressPath $progress -PollSeconds ([int](& $option 'HostPollSeconds' 300)) -StartedUtc $firstStepUtc
+                        # 2026-11-09: a report from the bundle before this run's doesn't end the wait, and a rebuilt guest is
+                        # followed up while it waits (Wait-DemoT2HostBuild).
+                        $sent = Get-DemoDeploymentState -Config $Config
+                        $bundlePrefix = if ([string]$sent.BundleSha256 -and 'archost01' -in @($sent.BundleSentTo)) { ([string]$sent.BundleSha256).Substring(0, [System.Math]::Min(12, ([string]$sent.BundleSha256).Length)) } else { '' }
+                        $build = Wait-DemoT2HostBuild -Config $Config -DeadlineUtc $t2Deadline -ProgressPath $progress -PollSeconds ([int](& $option 'HostPollSeconds' 300)) -StartedUtc $firstStepUtc -BundlePrefix $bundlePrefix
+                        & $addAll @(Get-DemoMemberValue -InputObject $build -Name 'Results')
                         if ($build.Failed) {
                             Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Failed' -Status 'Fail' -Message ([string](Get-DemoMemberValue -InputObject $build.Health -Name 'message'))
                             & $note 'DEPLOY.T2.HOST' 'T2' 'Fail' ('archost01 failed at step {0}: {1}' -f [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep'), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'message')) 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full) and C:\ProgramData\DbHubDemo\logs on it, fix the cause, then run ./scripts/deploy.ps1 -FromStage Artifacts: a failed step is tried again only in a new bootstrap generation, which that starts (a plain rerun resumes and finds the same step failed, unless your fix changed the bootstrap bundle, which a plain rerun then sends again, starting one too).'
@@ -1353,8 +1372,24 @@ function Invoke-DemoDeploymentTrack {
                             $outcome = 'Open'
                             break
                         }
-                        Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Done' -Status 'Pass' -Message 'The host and its guest are built.'
-                        if ($installMode -eq 'PaygWizard') {
+                        Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Done' -Status 'Pass' -Message $(if ([bool](Get-DemoMemberValue -InputObject $build -Name 'Rebuilt')) { 'The host made T2 again from Arc Jumpstart''s image (DEPLOY.T2.REBUILD says why).' } else { 'The host and its guest are built.' })
+                        # 2026-11-09: a host that kept its existing finished guest in its own mode says so, and its setup is
+                        # done; the guided stop runs only when the configuration chooses PaygWizard on purpose
+                        # (t2PaygWizardOptIn), never for an older configuration's default or a kept guest.
+                        $adopted = [bool](Get-DemoMemberValue -InputObject $build.Health -Name 'modeAdopted')
+                        if ($adopted) {
+                            $installMode = [string](Get-DemoMemberValue -InputObject $build.Health -Name 'installMode')
+                            $modeResult = Get-DemoT2ModeResult -Health $build.Health
+                            if ($null -ne $modeResult) {
+                                $results.Add($modeResult)
+                                Write-DemoLog -Message ('T2: {0}' -f $modeResult.message)
+                            }
+                        }
+                        elseif ([bool](Get-DemoMemberValue -InputObject $build -Name 'Rebuilt')) {
+                            $installMode = 'JumpstartImage'
+                        }
+                        Update-DemoT2InstallModeRecord -Config $Config -Health $build.Health -State $sent -Confirm:$false
+                        if ($installMode -eq 'PaygWizard' -and -not $adopted -and (Test-DemoT2PaygWizardOptIn -Config $Config)) {
                             $guided = Invoke-DemoT2GuidedStop -Config $Config -Context $Context -Health $build.Health -DeadlineUtc $t2Deadline
                             & $addAll @($guided.Results)
                             if ($guided.Status -eq 'Failed') {
