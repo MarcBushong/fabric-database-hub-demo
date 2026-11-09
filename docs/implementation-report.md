@@ -114,6 +114,7 @@ Dated examples from `estimate-cost.ps1` at list prices from the Azure Retail Pri
 - **The LSA secret Azure's provisioning leaves** (2026-11-06): unit-tested only. Live: a `deploy.ps1` whose `T2.ARC.ONBOARDING` and `DEPLOY.T1.READY` are **Pass** with the note, and a read-only presence check on `sqlvm01` and `archost01` that finds no LSA `DefaultPassword` secret (R707 to R709).
 - **The history report's snapshot at the end of `deploy.ps1`** (2026-11-06): unit-tested only. Live: a `deploy.ps1` that ends **DONE** with `DEPLOY.FABRIC.HISTORY` **Pass**, its time, and the history report showing the run's telemetry with **Blocking Incidents** still blank; then `./scripts/stop-demo.ps1 -SaveHistory` after an incident, and the measure filled; and one with the capacity paused (a **Warning**, the run **DONE**, the capacity left paused) (R710, R711).
 - **The `@azure/msal-node` override and .NET 10.0.14** (2026-11-09): proven offline only. Live: the Insights app's step with MSAL Node 7.2.1 in the stage, reading a sign-in that 5.6.0 cached (`FABRIC.APP.SIGNIN`) and deploying with it (`FABRIC.APP.DEPLOY`, `FABRIC.APP.QUERIES`); `./scripts/configure-fabric-app.ps1 -SignIn`'s browser sign-in with it; and the workload runner, rebuilt with SDK 10.0.403, running on the VMs' runtime 10.0.14 (R720, R722).
+- **The .NET SDK checked before anything is created** (2026-11-09): run on the PC of the live finding, read-only, with its own `dotnet` installs. Live: a fresh `./scripts/deploy.ps1` on a PC whose first `dotnet` is a runtime-only install, which stops at preflight with `PREFLIGHT.TOOLS.DOTNETSDK` **Fail** and nothing created, then passes the check after `winget install Microsoft.DotNet.SDK.10` and builds the runner (R740 to R742).
 
 ## Risk register
 
@@ -367,6 +368,9 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R721 | `deploy.ps1`'s browser sign-in, its sign-in status read before the app's stage exists, and the one-time command in the docs run the Rayfin CLI through npx, which installs its dependencies from the registry without `fabric/app`'s overrides, so they still run MSAL Node 5.6.0. Found offline on 2026-11-09: 5.6.0's loopback takes an authorization response whose state belongs to another request, and the CLI redeems that code; 7.2 refuses it | **Open:** a follow-up stops running the CLI through npx in `deploy.ps1` (user-directed, 2026-11-09). Meanwhile, the advisory's own pattern isn't used, and the state gap needs a page in the person's browser to post a code to the CLI's random loopback port during the sign-in (Phase 27 follow-up) |
 | R722 | The .NET pins moved to SDK 10.0.403 and runtime 10.0.14: the workload runner's source hash includes the SDK version, so the next deployment rebuilds the runner and installs runtime 10.0.14 on the VMs, which hasn't run live; and a PC with only SDK 10.0.402 can't build the runner until it installs 10.0.403 | **Open** until the next live deploy shows the runner running on 10.0.14; the Release build and the tests (518: 501 passed, 17 skipped) passed with SDK 10.0.403 offline, and the runtime zip's SHA-512 and size were confirmed. The docs name the pin in `config/versions.json`, and `deploy.ps1 -SkipRunner` deploys without the runner (Phase 27 follow-up, 2026-11-09) |
 | R723 | `npm audit` in `fabric/app` reports 14 moderate advisories, all in dev dependencies: `glob` (GHSA-3g3m-2fjr-6pw4) and `minimatch` (GHSA-g3hv-75wg-m249), through ESLint, typescript-eslint, and the Rayfin CLI's `archiver`. They aren't part of this change, and the production dependencies have none | **Open:** a follow-up (Phase 27 follow-up, 2026-11-09) |
+| R740 | `PREFLIGHT.TOOLS.DOTNETSDK` runs the build's `dotnet --version` on every preflight and `deploy.ps1` run, with no time limit of its own (`Invoke-DemoDotNet`, as the build), so a `dotnet` that hung would hold preflight | **Accepted:** a local, read-only call that answered in about a second in each case measured on 2026-11-09 (a runtime-only install, an SDK first on `PATH`, and an SDK in `DOTNET_ROOT` only); the build that follows has no time limit either ([the .NET SDK check](#the-net-sdk-checked-before-anything-is-created)) |
+| R741 | The check looks for an SDK that isn't first on `PATH` only in four well-known folders: `DOTNET_ROOT`, `%ProgramFiles%\dotnet`, `%LOCALAPPDATA%\Microsoft\dotnet`, and `~/.dotnet`. One elsewhere, such as a tools folder or a Linux distribution's `/usr/share/dotnet` behind another `dotnet`, isn't named; and `DEPLOY.ARTIFACTS.BUILD` recognizes an SDK failure by the host's exit code (-2147450725, `0x8000809B`) or its English words | **Accepted:** the message still says which `dotnet` ran, which SDKs it has, what `global.json` needs, and how to install it; the four are where Microsoft's installers and install scripts put it. Another build failure keeps the generic remediation, as before ([the .NET SDK check](#the-net-sdk-checked-before-anything-is-created)) |
+| R742 | Installing the .NET SDK stays a one-time manual prerequisite, while the owner wants one click after `az login`, with tool installs as one-time prerequisites | **Open:** an automatic per-user install of the pinned SDK is proposed for the owner's decision, not implemented ([the proposal](#proposal-deployps1-installs-the-pinned-sdk-per-user)) |
 
 ## Phase log
 
@@ -1763,3 +1767,69 @@ The integration:
 - **Live:** none. Nothing ran against Azure or Fabric, and the Fabric capacity is paused; what needs a live check is in [Still to verify](#still-to-verify) (R720, R722).
 
 **Risks.** R540 mitigated; R720 to R723 new.
+
+### The .NET SDK checked before anything is created
+
+2026-11-09, a live finding in the fresh-deploy test of #41, which includes #40: T1's and T2's Artifacts steps failed about 15 minutes into the run, after preflight passed. `DEPLOY.ARTIFACTS.BUILD` said "dotnet publish failed with exit code -2147450725: The command could not be loaded, possibly because: ... A compatible .NET SDK was not found", with a generic remediation ("Run New-DemoBootstrapBundle and Publish-DemoWorkloadRunner yourself to see the error").
+
+**The cause:** in that terminal, `dotnet` was `C:\Program Files\dotnet\dotnet.exe`, a runtime-only install: the host (`host\fxr\10.0.14`) and the shared runtimes, with no `sdk` folder, ahead on `PATH`. `DOTNET_ROOT` was empty, and the folder with SDKs 10.0.402 and 10.0.403 wasn't on `PATH`. Earlier runs on that PC had passed only because `Publish-DemoWorkloadRunner` reused the runner's zip; #40 changed the runner's inputs (`global.json` 10.0.403), so it had to build. Real users can hit the same: a runtime-only install, which Windows apps and Visual Studio leave behind, or the 10.0.402 SDK the docs pinned until 2026-11-09, which `global.json`'s `latestFeature` can't roll back to. Reproduced the same day on that PC, read-only: `dotnet --version` in `workload-generator` exits with -2147450725 (`0x8000809B`, the host's SDK resolution failure) and prints the same text, and `dotnet --list-sdks` exits with 0 and prints nothing.
+
+**Work summary.**
+
+1. **`PREFLIGHT.TOOLS.DOTNETSDK`** (`Test-DemoDotNetSdk`, `Get-DemoDotNetSdkStatus`, in the new `Private/DotNetSdkHelpers.ps1`), right after the subscription guard, unless `-SkipRunner`:
+   - It runs the `dotnet` the build runs (`Get-DemoDotNetPath`: the first on `PATH`, which `Invoke-DemoDotNet` now uses too) with `--version` in `workload-generator`, so `global.json` applies as it does to `dotnet publish` ([global.json](https://learn.microsoft.com/dotnet/core/tools/global-json)).
+   - **Pass** has the SDK's version, the `dotnet`'s path, and the pin in its evidence.
+   - **Fail**, before anything is created: which `dotnet` ran, which SDKs it has (`--list-sdks`), what `global.json` needs, in words (the pin, `rollForward` `latestFeature`: "10.0.403 or any later 10.0 SDK"), and the exact fix. On Windows that's `winget install Microsoft.DotNet.SDK.10` ([install .NET on Windows](https://learn.microsoft.com/dotnet/core/install/windows); winget's newest .NET 10 SDK is 10.0.403, checked on 2026-11-09) or Microsoft's installer; elsewhere, the installer or the dev container; and `-SkipRunner` as the way to deploy without the runner.
+   - It runs `--version` with each other well-known folder's `dotnet`: `DOTNET_ROOT`, `%ProgramFiles%\dotnet`, `%LOCALAPPDATA%\Microsoft\dotnet`, and `~/.dotnet`, where [the install scripts](https://learn.microsoft.com/dotnet/core/tools/dotnet-install-script) put it. When one has an SDK that `global.json` accepts, the message says so, and the fix starts with the command that puts that folder first on `PATH` in the terminal, and where to make it stay.
+   - On Windows, when the `dotnet` that ran isn't in `%ProgramFiles%\dotnet`, the fix adds that winget and the installer put the SDK there, so that folder must come first.
+2. **`-SkipRunner`:** `Invoke-DemoPreflight -SkipRunner` makes the check **Not selected** and runs no `dotnet`. `deploy.ps1`'s parallel and sequential paths pass their `-SkipRunner`, and `preflight.ps1` has the switch. `validate.ps1`'s preflight area builds nothing, so it passes `-SkipRunner` and drops the record.
+3. **`DEPLOY.ARTIFACTS.BUILD`:** when the build's error is the SDK (`Test-DemoDotNetSdkFailure`: the host's exit code or words, or `Invoke-DemoDotNet`'s "not found on PATH"), its remediation is the check's own diagnosis and fix, read again then (`Get-DemoArtifactBuildRemediation`). Any other build error keeps the generic step.
+4. **Docs:** the prerequisites (the SDK that `global.json` accepts, first on `PATH`, and the check), troubleshooting (a row for the check under Preflight, and one for the build's failure), the CHANGELOG, and this report.
+
+**Checked on the PC of the live finding (read-only, with its own `dotnet` installs; nothing ran against Azure):**
+
+- **The live finding's terminal:** **Fail** in about 1 second: "The dotnet first on PATH, C:\Program Files\dotnet\dotnet.exe, has no .NET SDK, only runtimes, and workload-generator/global.json needs 10.0.403 or any later 10.0 SDK (rollForward latestFeature), so the workload runner can't be built." The fix was the winget and installer step.
+- **The same terminal with `DOTNET_ROOT` set to the tools folder** (SDKs 10.0.402 and 10.0.403, not on `PATH`): **Fail**, which named that folder ("has the .NET SDK 10.0.403, which it accepts, but isn't first on PATH"). The fix started with `$env:PATH = '<that folder>;' + $env:PATH`.
+- **With the tools first on `PATH`:** **Pass**, "The .NET SDK 10.0.403 builds the workload runner", in about 1 second.
+- **The live run's `DEPLOY.ARTIFACTS.BUILD` message**, given to `Get-DemoArtifactBuildRemediation`: the same diagnosis and fix as the check. A bundle error kept the generic step.
+
+**Changed files.**
+
+- Scripts: `scripts/preflight.ps1`; in `scripts/modules/DbHubDemo`, `Private/DotNetSdkHelpers.ps1` (new), `Private/WorkloadHelpers.ps1` (`Invoke-DemoDotNet -DotNetPath`), `Private/ParallelDeployment.ps1` and `Public/Invoke-DemoDeployment.ps1` (`-SkipRunner` to preflight; the build's remediation), `Private/ValidationAreas.ps1`, and `Public/Invoke-DemoPreflight.ps1`.
+- Tests: `tests/unit/DbHubDemo.DotNetSdk.Tests.ps1` (new), `DbHubDemo.Preflight.Tests.ps1`, and `DbHubDemo.Tracks.Tests.ps1`.
+- Docs: `docs/prerequisites.md`, `docs/troubleshooting.md`, `CHANGELOG.md`, and this report.
+
+**Validation.** Static, 2026-11-09, on Windows with PowerShell 7.6.9, Pester 5.9.1 in strict mode, PSScriptAnalyzer 1.25.0, and markdownlint-cli2 0.23.3. Only the affected files ran, at the coordinator's request; CI runs the rest, on Windows and Linux.
+
+- Pester, the new `DbHubDemo.DotNetSdk` (30 tests): passed.
+- Pester, the affected files (`DbHubDemo.Tracks`, `.Lifecycle`, `.Workload`, `.Validation`, `.Preflight`, `.DotNetSdk`, and `.OneCommand`, plus `Repo.Conventions`): 781 passed, 0 failed. `Docs.Walkthrough` and `Repo.NeutralWording`: 71 passed.
+- PSScriptAnalyzer with the repository's settings on the 10 changed PowerShell files: no findings; each parses and is ASCII-only. `./tests/Invoke-StaticValidation.ps1 -Check Markdown -CI`: **Pass**.
+- **Live:** none from here. Nothing ran against Azure; [still to verify](#still-to-verify).
+
+**Risks.** R740 to R742, new.
+
+#### Proposal: deploy.ps1 installs the pinned SDK per user
+
+Not implemented; for the owner's decision (R742). The owner wants one click after `az login`. The check above turns a 15-minute failure into a clear stop before anything is created, but the SDK is still a manual install. `deploy.ps1` could install the pinned SDK for the user when the check finds none that `global.json` accepts, and no other well-known folder has one:
+
+- **Where:** a folder of the demo's own, per user, with no administrator rights: `%LOCALAPPDATA%\DbHubDemo\dotnet\<version>` on Windows, and `~/.local/share/dbhub-demo/dotnet/<version>` on Linux and macOS.
+  - Not `%ProgramFiles%\dotnet`, which needs elevation and changes the machine for every app.
+  - Not the install scripts' default folders, which other tools use.
+  - Nothing changes on `PATH` or in the registry. The build runs that `dotnet` by its full path, which `Invoke-DemoDotNet -DotNetPath` (added here) already supports, so `global.json` and its `rollForward` still decide the SDK. The check would then be a **Pass** that names the demo's own SDK.
+- **What, and its size:** Microsoft's SDK archive for the platform, from Microsoft's own download server (`https://builds.dotnet.microsoft.com/dotnet/Sdk/<version>/dotnet-sdk-<version>-<rid>.zip`, or `.tar.gz` on Linux and macOS). Measured on 2026-11-09 for 10.0.403 on win-x64, it's a 286.8 MB download and about 770 MB on disk:
+  - the SDK, 399 MB;
+  - its three runtimes, 199 MB;
+  - the reference packs, 160 MB;
+  - the templates, 10 MB.
+
+  That's once per SDK pin, and the previous version is deleted after the new one passes. It takes about one to three minutes on a fast connection, and it would run alongside preflight, before the build that needs it.
+- **Verification, fail closed:**
+  - **The pin:** `config/versions.json` pins each archive's URL, file name, and SHA-512, taken from Microsoft's release metadata (`release-metadata/10.0/releases.json`), as `dotnetRuntime` is pinned for the VMs today. A Pester test keeps it equal to `global.json` and `tools.dotnetSdk`, and a Dependabot bump of `global.json` then needs the new hashes, which a helper script would fill in from the metadata.
+  - **The download:** HTTPS to a temporary file, whose SHA-512 must match the pin; otherwise it's deleted and the check is a **Fail**.
+  - **The install:** the archive is extracted to a temporary folder, which is then moved into place, so an interrupted install is never used.
+  - **The result:** on Windows, `Get-AuthenticodeSignature` on `dotnet.exe` must be **Valid** and signed by Microsoft Corporation. Then `dotnet --version` in `workload-generator` must print the pinned version.
+- **Alternatives considered:**
+  - **Microsoft's `dotnet-install.ps1`:** the script is signed, but it means downloading a script and running it during the deploy, and the archive's check would rest on it, not on the repository's pin.
+  - **`global.json` `paths`:** since the .NET 10 SDK, `"paths": [".dotnet", "$host$"]` lets even a runtime-only .NET 10 host, such as this PC's 10.0.14, find an SDK next to the repository. But it changes `global.json`, which is one of the runner's inputs, so every deployment would rebuild and resend the runner once. It also needs a .NET 10 host, and the full path already does the job.
+  - **`winget install` from the script:** it's machine-wide, needs elevation (a UAC prompt), and isn't one click.
+- **Recommendation:** install it automatically when no accepted SDK is found, and say so on the console and the status page. Keep `-SkipRunner` as it is, and add an opt-out for a machine whose owner doesn't want the download.

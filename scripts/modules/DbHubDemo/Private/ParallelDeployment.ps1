@@ -814,7 +814,7 @@ function Invoke-DemoParallelDeployment {
         if ($plan.Preflight) {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
             Set-DemoProgressStep -Path $ProgressPath -Id 'Preflight' -State 'Running' -Message 'Checking access, quotas, sizes, Fabric, and policies before anything is created.'
-            $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf -DeferPolicyInventory:$deferPolicy)
+            $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf -DeferPolicyInventory:$deferPolicy -SkipRunner:$SkipRunner)
             & $addAll $preflight
             $source = Resolve-DemoT2Source -Config $Config
             $results.Add($source.Result)
@@ -1046,7 +1046,7 @@ function Invoke-DemoParallelDeployment {
                 $context['Runner'] = if ($SkipRunner) { $null } else { Publish-DemoWorkloadRunner -Confirm:$false }
             }
             catch {
-                $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run New-DemoBootstrapBundle and Publish-DemoWorkloadRunner yourself to see the error (the runner needs the .NET SDK, or use -SkipRunner).'))
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation (Get-DemoArtifactBuildRemediation -Message $_.Exception.Message)))
                 return $results.ToArray()
             }
         }
@@ -1071,7 +1071,7 @@ function Invoke-DemoParallelDeployment {
             $built = if ($needsArtifacts -and $handoff) { Read-DemoTrackHandoff -Path $handoff -Name 'artifacts' } else { $null }
             $buildError = [string](Get-DemoMemberValue -InputObject $built -Name 'Error')
             if ($buildError) {
-                $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f $buildError) -Remediation 'Run New-DemoBootstrapBundle and Publish-DemoWorkloadRunner yourself to see the error (the runner needs the .NET SDK, or use -SkipRunner).'))
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f $buildError) -Remediation (Get-DemoArtifactBuildRemediation -Message $buildError)))
             }
         }
         # The tracks are done, the Insights app's step with them: a sign-in still open is stopped now, and its record (never

@@ -424,7 +424,7 @@ function Invoke-DemoDeployment {
         }
         switch ($stage) {
             'Preflight' {
-                $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf)
+                $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf -SkipRunner:$SkipRunner)
                 & $addAll $preflight
                 if (& $hasStatus $preflight 'Fail') {
                     & $stageResult 'Preflight' 'Fail' 'Preflight has at least one Fail, so nothing was deployed.' 'Fix each Fail above (its remediation says how), then run deploy.ps1 again.'

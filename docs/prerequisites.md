@@ -89,11 +89,11 @@ Preflight reads the Azure Policy assignments that apply to the subscription, inc
 
 ## Tools
 
-- **Azure Cloud Shell:** has everything below except, possibly, the pinned .NET SDK. Without it, run `deploy.ps1 -SkipRunner`, which deploys without the workload runner (the activity profiles are then **Not selected**), or install the SDK.
+- **Azure Cloud Shell:** has everything below except, possibly, the pinned .NET SDK. Without it, preflight's `PREFLIGHT.TOOLS.DOTNETSDK` is a **Fail**: run `deploy.ps1 -SkipRunner`, which deploys without the workload runner (the activity profiles are then **Not selected**), or install the SDK.
 - **Local machine:**
   - PowerShell 7.4 or later.
   - Azure CLI with Bicep (the Bicep version pinned in `config/versions.json`).
-  - The .NET SDK pinned in `config/versions.json` (10.0), which `deploy.ps1` uses to build the workload runner.
+  - The .NET SDK that `workload-generator/global.json` accepts, first on `PATH`: the version `config/versions.json` pins (`tools.dotnetSdk`), or any later .NET 10 SDK (`rollForward` `latestFeature`). `deploy.ps1` uses it to build the workload runner. On Windows, `winget install Microsoft.DotNet.SDK.10` installs the newest one; elsewhere, Microsoft's [installer](https://dotnet.microsoft.com/download/dotnet/10.0). A .NET runtime alone isn't enough, though Windows apps and Visual Studio often install one in `C:\Program Files\dotnet`. Preflight checks it before anything is created (`PREFLIGHT.TOOLS.DOTNETSDK`, 2026-11-09): the dotnet the build runs, which SDKs it has, and, when another usual folder has an SDK that isn't first on `PATH`, how to put it first ([troubleshooting](troubleshooting.md#preflight)). `-SkipRunner` needs no SDK.
   - *(The Insights app, part of every deployment)* Node.js 20, 22, or 24 with npm, for `configure-fabric-app.ps1`, `fabric/app`, and the Rayfin CLI's sign-in (P14). Without it, the app isn't created, and `deploy.ps1` still ends **DONE**.
   - Git, and a clone of the repository. While the repository is private, cloning it needs GitHub access (`gh auth login`, risk R30).
   - *(Optional, GitHub path)* GitHub CLI, signed in with `gh auth login`: `setup-github-oidc.ps1 -ConfigureGitHub` and `setup-github-repo.ps1` use it, and without `-ConfigureGitHub` you run the `gh secret set` commands that `setup-github-oidc.ps1` prints.

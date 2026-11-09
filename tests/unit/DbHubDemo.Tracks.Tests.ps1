@@ -2144,6 +2144,27 @@ Describe 'Invoke-DemoParallelDeployment' {
             Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
         }
 
+        It 'gives DEPLOY.ARTIFACTS.BUILD the .NET SDK check''s diagnosis and fix when the build failed on the SDK, and preflight -SkipRunner (2026-11-09 live finding)' {
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoArtifactBuildJob -MockWith {
+                $script:calls.Add('build')
+                $value = [pscustomobject]@{ Bundle = $null; Runner = $null; Error = 'dotnet publish failed with exit code -2147450725: The command could not be loaded, possibly because: * You intended to execute a .NET SDK command: A compatible .NET SDK was ...' }
+                [System.IO.File]::WriteAllText((Join-Path -Path $HandoffPath -ChildPath 'artifacts.xml'), [System.Management.Automation.PSSerializer]::Serialize($value, 5))
+                Start-ThreadJob -Name 'dbhub-build-artifacts' -ScriptBlock { }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDotNetSdkStatus -MockWith {
+                [pscustomobject]@{ Ok = $false; Message = 'The dotnet first on PATH, C:\Program Files\dotnet\dotnet.exe, has no .NET SDK, only runtimes.'; Fix = 'Install the .NET SDK 10.0.403 or later: winget install Microsoft.DotNet.SDK.10.' }
+            }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config })
+            $build = $results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.BUILD' }
+            $build.status | Should -Be 'Fail'
+            $build.remediation | Should -BeExactly 'The dotnet first on PATH, C:\Program Files\dotnet\dotnet.exe, has no .NET SDK, only runtimes. Install the .NET SDK 10.0.403 or later: winget install Microsoft.DotNet.SDK.10.'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -Times 1 -Exactly -ParameterFilter { -not $SkipRunner }
+
+            $script:received = @{}
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -SkipRunner })
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -Times 1 -Exactly -ParameterFilter { [bool]$SkipRunner }
+        }
+
         It 'doesn''t start an early T2 restore when the T2 source isn''t a new golden host' {
             $script:source = 'build'
             InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config } | Out-Null
