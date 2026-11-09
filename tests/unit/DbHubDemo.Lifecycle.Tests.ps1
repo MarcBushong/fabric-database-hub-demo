@@ -2422,12 +2422,13 @@ Describe 'Get-DemoEnvironmentStatus' {
         $config = New-TestConfig -WithT4
         $config['control']['enabled'] = $true
 
-        # The nightly safety stop in place (ADR 0024): it stops a restarted T4 at the next auto-shutdown time.
+        # The nightly safety stop in place (ADR 0024): it stops a restarted T4 at its first run after the restart, here that
+        # evening's stop (2026-10-27 23:00 UTC is 16:00 Pacific daylight time).
         $script:nightlyState = 'InPlace'
         Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopState -MockWith { [pscustomobject]@{ State = $script:nightlyState; NextRunUtc = $null; CheckNextRunUtc = $null; CheckScheduled = ($script:nightlyState -eq 'InPlace'); RoleAssigned = ($script:nightlyState -eq 'InPlace'); Missing = ''; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopLastRun -MockWith { [pscustomobject]@{ Ok = $true; Error = ''; Stop = $null; Check = $null } }
         $t4 = Get-DemoEnvironmentStatus -Config $config -NowUtc ([datetime]::new(2026, 10, 21, 2, 0, 0, [System.DateTimeKind]::Utc)) | Where-Object { $_.checkId -eq 'STATUS.T4' }
-        $t4.message | Should -Match 'and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the nightly safety stop stops it again, at the next auto-shutdown time\.'
+        $t4.message | Should -Match 'and it then bills compute at about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the nightly safety stop stops it again at 2026-10-28 02:00 UTC \(19:00 Pacific Standard Time\), about 3 hours after it starts\.'
         $t4.evidence.dailySafetyStop | Should -BeTrue
         $t4.evidence.safetyStop | Should -Be 'Nightly'
 

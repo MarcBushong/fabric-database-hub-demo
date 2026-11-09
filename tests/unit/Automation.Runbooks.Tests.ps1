@@ -1025,7 +1025,7 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
     It 'the T3 check reads T3''s status through Azure Resource Manager only and says what it found: <Case>' -ForEach @(
         @{ Case = 'paused'; Code = 200; Status = 'Paused'; Delay = 15; Minutes = 30; Verdict = 'Paused'; Job = 'Checked'; Match = 'is Paused, 30 minutes after the safety stop: it bills no compute' }
         @{ Case = 'pausing'; Code = 200; Status = 'Pausing'; Delay = 15; Minutes = 30; Verdict = 'Pausing'; Job = 'Checked'; Match = 'its auto-pause has begun' }
-        @{ Case = 'online past its delay'; Code = 200; Status = 'Online'; Delay = 15; Minutes = 30; Verdict = 'Awake'; Job = 'Checked'; Match = 'past its 15-minute auto-pause delay: a session or a feature keeps it awake\. The activity log''s Resume Databases events name what resumed it\.$' }
+        @{ Case = 'online past its delay'; Code = 200; Status = 'Online'; Delay = 15; Minutes = 30; Verdict = 'Awake'; Job = 'Checked'; Match = 'past its 15-minute auto-pause delay: a session or a feature keeps it awake\. The activity log''s Resume Databases events name what resumed it\. T4 missing\.$' }
         @{ Case = 'online before its delay'; Code = 200; Status = 'Online'; Delay = 60; Minutes = 30; Verdict = 'TooEarly'; Job = 'Checked'; Match = 'its 60-minute auto-pause delay, plus 10 minutes, hasn''t passed yet' }
         @{ Case = 'auto-pause off'; Code = 200; Status = 'Online'; Delay = -1; Minutes = 30; Verdict = 'AutoPauseOff'; Job = 'Checked'; Match = 'its auto-pause is off \(delay -1\)' }
         @{ Case = 'removed'; Code = 404; Status = ''; Delay = 15; Minutes = 30; Verdict = 'Missing'; Job = 'Checked'; Match = 'doesn''t exist \(stop-demo\.ps1 -RemoveT3 removed it' }
@@ -1042,8 +1042,71 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         $result.t3 | Should -Be $Verdict
         $result.minutesSinceStop | Should -Be $Minutes
         $result.message | Should -Match $Match
+        # No T4 is deployed here: the check reads it, and says so.
+        $result.t4 | Should -Be 'T4 missing'
+        $result.message | Should -Match ' T4 missing\.$'
         Get-TestWrite | Should -BeNullOrEmpty
-        @($script:calls | Where-Object { $_.Path -notmatch '/resourceGroups/rg-dbhub-demo$' } | ForEach-Object { $_.Path -replace '^.*/providers/', '' }) | Should -Be @('Microsoft.Sql/servers/azuresql01-abc123/databases/ContosoCare')
+        @($script:calls | Where-Object { $_.Path -notmatch '/resourceGroups/rg-dbhub-demo$' } | ForEach-Object { $_.Path -replace '^.*/providers/', '' }) | Should -Be @('Microsoft.Sql/servers/azuresql01-abc123/databases/ContosoCare', 'Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123')
+    }
+
+    It 'the T3 check stops a T4 that runs, after reading T3, through Azure Resource Manager only, and starts nothing (2026-11-09)' {
+        # Azure started T4 again just after the evening's stop (its 7-day restart): the T3 check stops it that evening.
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $script:t4 = 'Ready'
+        $now = [datetime]::new(2026, 10, 27, 23, 30, 0, [System.DateTimeKind]::Utc)
+        $result = Invoke-DbHubStop -Scope T3Check -Context (New-TestContext -NowUtc $now)
+        $result.action | Should -Be 'check-t3'
+        $result.status | Should -Be 'Checked'
+        $result.t3 | Should -Be 'Paused'
+        $result.t4 | Should -Be 'T4 stopped (was Ready)'
+        @($result.failed) | Should -BeNullOrEmpty
+        $result.message | Should -Be 'T3 (azuresql01-abc123/ContosoCare) is Paused, 30 minutes after the safety stop: it bills no compute until something connects. T4 stopped (was Ready).'
+        @(Get-TestWrite | ForEach-Object { '{0} {1}' -f $_.Method, ($_.Path -replace '^.*/providers/', '') }) | Should -Be @('POST Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123/stop')
+        # T3 is only read (Databases - Get), before T4; nothing starts, and no VM, schedule, or job is touched.
+        @($script:calls | Where-Object { $_.Path -match '/servers/azuresql01-abc123/' } | ForEach-Object Method | Select-Object -Unique) | Should -Be @('GET')
+        $t3Read = [array]::IndexOf(@($script:calls | ForEach-Object Path), @($script:calls | Where-Object { $_.Path -match '/databases/ContosoCare$' })[0].Path)
+        $t4Read = [array]::IndexOf(@($script:calls | ForEach-Object Path), @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123$' })[0].Path)
+        $t3Read | Should -BeLessThan $t4Read
+        @($script:calls | Where-Object { $_.Path -match '/start$|/deallocate$|/virtualMachines/|/runCommands|/schedules|/jobSchedules|/jobs' }) | Should -BeNullOrEmpty
+    }
+
+    It 'the T3 check waits for a T4 that''s starting, then stops it once it''s Ready, and never starts it' {
+        $script:t4 = 'Starting'
+        $script:t4ReadyAt = $script:clock.AddMinutes(3)
+        $result = Invoke-DbHubStop -Scope T3Check -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 23, 30, 0, [System.DateTimeKind]::Utc)))
+        $result.status | Should -Be 'Checked'
+        $result.t4 | Should -Be 'T4 stopped (was Starting)'
+        $stop = @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' })
+        $stop.Count | Should -Be 1
+        $stop[0].At | Should -BeGreaterOrEqual $script:t4ReadyAt
+        @($script:calls | Where-Object { $_.Path -match '/start$' }) | Should -BeNullOrEmpty
+    }
+
+    It 'the T3 check leaves a T4 that''s <State> alone and says so' -ForEach @(
+        @{ State = 'Stopped'; Text = 'T4 already stopped' }
+        @{ State = 'Stopping'; Text = 'T4 already stopping' }
+        @{ State = 'Disabled'; Text = 'T4 disabled' }
+    ) {
+        $script:t4 = $State
+        $result = Invoke-DbHubStop -Scope T3Check -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 23, 30, 0, [System.DateTimeKind]::Utc)))
+        $result.status | Should -Be 'Checked'
+        $result.t4 | Should -Be $Text
+        $result.message | Should -Match ([regex]::Escape(' {0}.' -f $Text) + '$')
+        Get-TestWrite | Should -BeNullOrEmpty
+    }
+
+    It 'the T3 check reports a T4 it couldn''t stop as Partial, so its job fails, and never starts it' {
+        $script:t4 = 'Starting'
+        $result = Invoke-DbHubStop -Scope T3Check -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 23, 30, 0, [System.DateTimeKind]::Utc)))
+        $result.status | Should -Be 'Partial'
+        $result.t3 | Should -Be 'Paused'
+        $result.t4 | Should -Be 'failed: it was still Starting after 10 minutes; tomorrow''s safety stop tries again'
+        @($result.failed) | Should -Be @('T4 (it was still Starting after 10 minutes; tomorrow''s safety stop tries again)')
+        $result.message | Should -Match 'it bills no compute until something connects\. T4 couldn''t be stopped: it was still Starting after 10 minutes; tomorrow''s safety stop tries again\.$'
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/(start|stop)$' }) | Should -BeNullOrEmpty
+        # The result line as DbHub-Stop writes it, in the JSON status.ps1 reads.
+        $line = $result | ConvertTo-Json -Depth 6 -Compress
+        ($line | ConvertFrom-Json).failed.Count | Should -Be 1
     }
 
     It 'counts the minutes since the latest scheduled shutdown, across midnight and in winter time' {

@@ -145,11 +145,24 @@ BeforeAll {
                 return (New-AzResult -StdOut '{}')
             }
             '/jobSchedules$' {
-                $value = @($script:links | ForEach-Object { @{ properties = @{ jobScheduleId = $_.Id; schedule = @{ name = $_.Schedule }; runbook = @{ name = $_.Runbook }; parameters = $_.Parameters } } })
+                # As live (2026-11-09) and as Learn's sample answer: the list returns no parameters.
+                $value = @($script:links | ForEach-Object { @{ properties = @{ jobScheduleId = $_.Id; schedule = @{ name = $_.Schedule }; runbook = @{ name = $_.Runbook }; parameters = $null; runOn = $null } } })
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ value = $value } -Depth 8))
             }
             '/jobSchedules/(?<id>[0-9a-f-]{36})$' {
                 $id = $Matches['id']
+                if ($Method -eq 'get') {
+                    # Job Schedule - Get returns the link's parameters.
+                    $script:linkReads++
+                    if ($script:linkReadFails) {
+                        return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (InternalServerError) The service is unavailable.')
+                    }
+                    $link = $script:links | Where-Object Id -EQ $id | Select-Object -First 1
+                    if ($null -eq $link) {
+                        return (Get-NotFound $id)
+                    }
+                    return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ jobScheduleId = $link.Id; schedule = @{ name = $link.Schedule }; runbook = @{ name = $link.Runbook }; parameters = $link.Parameters; runOn = $null } } -Depth 8))
+                }
                 if ($Method -eq 'delete') {
                     $script:links = [System.Collections.Generic.List[object]]@($script:links | Where-Object Id -NE $id)
                     return (New-AzResult)
@@ -194,6 +207,8 @@ BeforeAll {
         $script:jobsReadFails = $false
         $script:outputs = @{}
         $script:outputReads = 0
+        $script:linkReads = 0
+        $script:linkReadFails = $false
     }
 
     function Register-FakeAzure {
@@ -357,7 +372,8 @@ Describe 'Invoke-DemoSafetyStopSetup against a fake Azure (ADR 0024)' {
         $script:assignments[0].principalId | Should -Be $script:principal
         $script:assignments[0].principalType | Should -Be 'ServicePrincipal'
         $script:assignments[0].roleDefinitionId | Should -Match ('/roleDefinitions/{0}$' -f $script:roleId)
-        ($results | Where-Object checkId -EQ 'SAFETYSTOP.SCHEDULE').message | Should -Be 'The nightly safety stop runs DbHub-Stop -Scope Nightly daily at 19:00 and its T3 check at 19:30 (Pacific Standard Time); it never starts anything.'
+        ($results | Where-Object checkId -EQ 'SAFETYSTOP.SCHEDULE').message | Should -Be 'The nightly safety stop runs DbHub-Stop -Scope Nightly daily at 19:00 and its T3 check, which also stops a running T4, at 19:30 (Pacific Standard Time); it never starts anything.'
+        ($script:scheduleBodies | Where-Object Name -EQ 'dbhub-safety-t3check').Properties['description'] | Should -Match 'reads whether T3 paused, through Azure Resource Manager only, and stops T4 when it runs'
     }
 
     It 'as a Contributor: sets up everything but the role, which is a Warning with the Owner''s one command, and DONE says what still applies' {
@@ -393,12 +409,47 @@ Describe 'Invoke-DemoSafetyStopSetup against a fake Azure (ADR 0024)' {
 
     It 'keeps what''s in place on a rerun: nothing is written but the template''s deployment' {
         Set-FakeInPlace
+        $script:linkReads = 0
         $results = & $script:setup
         @($results | ForEach-Object status | Select-Object -Unique) | Should -Be @('Pass')
         $script:deployments.Count | Should -Be 1
         $script:writes | Should -BeNullOrEmpty
         ($results | Where-Object checkId -EQ 'SAFETYSTOP.RUNBOOK').evidence.published | Should -Be 'unchanged'
         @(($results | Where-Object checkId -EQ 'SAFETYSTOP.SCHEDULE').evidence.kept).Count | Should -Be 2
+        # The list of job schedules returns no parameters (live, 2026-11-09), so each link's scope is read from the link:
+        # before, every run deleted and created both schedules and both links again.
+        $script:linkReads | Should -Be 2
+    }
+
+    It 'keeps a schedule that''s right when deploy.ps1 runs minutes before its time, so that evening''s run stays' {
+        Set-FakeInPlace
+        $before = $script:schedules['dbhub-safety-stop'].nextRun
+        # 2026-11-06 02:55 UTC is 18:55 Pacific: a schedule created now would first run the next evening.
+        $results = InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig); Now = [datetime]::new(2026, 11, 6, 2, 55, 0, [System.DateTimeKind]::Utc) } { @(Invoke-DemoSafetyStopSetup -Config $Config -NowUtc $Now -Confirm:$false) }
+        ($results | Where-Object checkId -EQ 'SAFETYSTOP.SCHEDULE').status | Should -Be 'Pass'
+        $script:writes | Should -BeNullOrEmpty
+        $script:schedules['dbhub-safety-stop'].nextRun | Should -Be $before
+        $before | Should -Be '2026-11-06T03:00:00.0000000Z'
+    }
+
+    It 'creates a schedule again when its link has another scope, read from the link itself' {
+        Set-FakeInPlace
+        ($script:links | Where-Object Schedule -EQ 'dbhub-safety-stop').Parameters = @{ Scope = 'T4' }
+        $results = & $script:setup
+        ($results | Where-Object checkId -EQ 'SAFETYSTOP.SCHEDULE').status | Should -Be 'Pass'
+        @(($results | Where-Object checkId -EQ 'SAFETYSTOP.SCHEDULE').evidence.kept) | Should -Be @('dbhub-safety-t3check at 19:30')
+        @($script:links | ForEach-Object { '{0} {1}' -f $_.Schedule, $_.Parameters['Scope'] } | Sort-Object) | Should -Be @('dbhub-safety-stop Nightly', 'dbhub-safety-t3check T3Check')
+        @($script:writes | Where-Object { $_ -match '/schedules/dbhub-safety-t3check$|^delete .*/jobSchedules/' }).Count | Should -Be 1 -Because 'only the stop''s old link is deleted, and the T3 check is kept'
+    }
+
+    It 'warns, and changes no schedule, when a link can''t be read by its ID' {
+        Set-FakeInPlace
+        $script:linkReadFails = $true
+        $results = & $script:setup
+        $schedule = $results | Where-Object checkId -EQ 'SAFETYSTOP.SCHEDULE'
+        $schedule.status | Should -Be 'Warning'
+        $schedule.message | Should -Match '^The nightly safety stop''s job schedules couldn''t be read: the job schedule [0-9a-f-]{36} \(dbhub-safety-stop\) couldn''t be read: .*InternalServerError'
+        @($script:writes | Where-Object { $_ -match '/(schedules|jobSchedules)/' }) | Should -BeNullOrEmpty
     }
 
     It 'turns a disabled schedule on again, links a schedule whose link is gone with a new link ID, and moves one whose time changed' {
@@ -490,8 +541,10 @@ Describe 'The nightly safety stop''s state, runs, and status (ADR 0024)' {
         @{ Case = 'the role isn''t assigned'; Setup = { Set-FakeInPlace; $script:assignments.Clear() }; State = 'NoRole'; Missing = 'id-dbhub-demo-safetystop doesn''t hold "DbHub Demo Safety Stop" at rg-dbhub-demo' }
         @{ Case = 'the role doesn''t exist'; Setup = { Set-FakeInPlace; $script:roleId = '' }; State = 'NoRole'; Missing = 'the custom role "DbHub Demo Safety Stop" doesn''t exist' }
         @{ Case = 'the role definitions can''t be read'; Setup = { Set-FakeInPlace; $script:roleReadFails = $true }; State = 'Unknown'; Missing = '' }
+        @{ Case = 'a link can''t be read by its ID'; Setup = { Set-FakeInPlace; $script:linkReadFails = $true }; State = 'Unknown'; Missing = '' }
     ) {
         & $Setup
+        $script:linkReads = 0
         $read = & $script:state
         $read.State | Should -Be $State
         $read.Missing | Should -Match ([regex]::Escape($Missing))
@@ -499,6 +552,11 @@ Describe 'The nightly safety stop''s state, runs, and status (ADR 0024)' {
             $read.RoleAssigned | Should -BeTrue
             $read.CheckScheduled | Should -BeTrue
             $read.NextRunUtc | Should -Be ([datetime]::new(2026, 11, 6, 3, 0, 0, [System.DateTimeKind]::Utc))
+            # The list of job schedules returns no parameters (live, 2026-11-09): each link is read once by its ID.
+            $script:linkReads | Should -Be 2
+        }
+        if ($Case -match 'by its ID') {
+            $read.Error | Should -Match 'the job schedule [0-9a-f-]{36} \(dbhub-safety-stop\) couldn''t be read'
         }
     }
 
@@ -517,7 +575,24 @@ Describe 'The nightly safety stop''s state, runs, and status (ADR 0024)' {
         $status = & $script:status
         $status.checkId | Should -Be 'STATUS.SAFETYSTOP'
         $status.status | Should -Be 'Pass'
-        $status.message | Should -Be 'The nightly safety stop runs at 19:00, and checks T3 at 19:30 (Pacific Standard Time) (next 2026-11-06 03:00 UTC). Last run 2026-11-05 03:00 UTC (job Completed): Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready). T3 check 2026-11-05 03:30 UTC: T3 (azuresql01-abc123/ContosoCare) is Paused, 30 minutes after the safety stop: it bills no compute until something connects.'
+        $status.message | Should -Be 'The nightly safety stop runs at 19:00, and its T3 check, which also stops a running T4, at 19:30 (Pacific Standard Time) (next 2026-11-06 03:00 UTC). Last run 2026-11-05 03:00 UTC (job Completed): Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready). T3 check 2026-11-05 03:30 UTC: T3 (azuresql01-abc123/ContosoCare) is Paused, 30 minutes after the safety stop: it bills no compute until something connects.'
+    }
+
+    It 'shows what the T3 check did to T4, and warns when it couldn''t stop it (2026-11-09)' {
+        Set-FakeInPlace
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000002' -Status 'Completed' -Created '2026-11-05T03:00:05Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; message = 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped.' }
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000003' -Status 'Completed' -Created '2026-11-05T03:30:05Z' -Result @{ action = 'check-t3'; status = 'Checked'; t3 = 'Paused'; t4 = 'T4 stopped (was Ready)'; failed = @(); message = 'T3 (azuresql01-abc123/ContosoCare) is Paused, 30 minutes after the safety stop: it bills no compute until something connects. T4 stopped (was Ready).' }
+        $status = & $script:status
+        $status.status | Should -Be 'Pass'
+        $status.message | Should -Match 'T3 check 2026-11-05 03:30 UTC: T3 \(azuresql01-abc123/ContosoCare\) is Paused, 30 minutes after the safety stop: it bills no compute until something connects\. T4 stopped \(was Ready\)\.$'
+        $script:jobs = @()
+        $script:outputs = @{}
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000005' -Status 'Failed' -Created '2026-11-05T03:30:05Z' -Result @{ action = 'check-t3'; status = 'Partial'; t3 = 'Paused'; t4 = 'failed: it was still Starting after 10 minutes; tomorrow''s safety stop tries again'; failed = @('T4 (it was still Starting after 10 minutes; tomorrow''s safety stop tries again)'); message = 'T3 (azuresql01-abc123/ContosoCare) is Paused, 30 minutes after the safety stop: it bills no compute until something connects. T4 couldn''t be stopped: it was still Starting after 10 minutes; tomorrow''s safety stop tries again.' }
+        $warned = & $script:status
+        $warned.status | Should -Be 'Warning'
+        $warned.message | Should -Match 'To check: its last T3 check couldn''t stop T4\.$'
+        $warned.message | Should -Not -Match 'didn''t read T3'
+        $warned.remediation | Should -Match 'Process Automation > Jobs'
     }
 
     It 'warns, with the fix, when <Case>' -ForEach @(
@@ -558,7 +633,39 @@ Describe 'What stops T4 after its 7-day restart, and DONE (ADR 0024)' {
         $script:controlState = $Control
         Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopState -MockWith { [pscustomobject]@{ State = $script:nightlyState; NextRunUtc = $null; CheckNextRunUtc = $null; CheckScheduled = $true; RoleAssigned = $null; Missing = ''; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:controlState; NextRunUtc = $null } }
-        (InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoT4RestartStopState -Config $Config }).State | Should -Be $Expected
+        $restart = InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoT4RestartStopState -Config $Config }
+        $restart.State | Should -Be $Expected
+        # Only the nightly safety stop's T3 check stops T4 too (2026-11-09).
+        $restart.CheckStopsT4 | Should -Be ($Expected -eq 'Nightly')
+    }
+
+    It 'says the T3 check doesn''t stop T4 when the check isn''t scheduled' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopState -MockWith { [pscustomobject]@{ State = 'InPlace'; NextRunUtc = $null; CheckNextRunUtc = $null; CheckScheduled = $false; RoleAssigned = $true; Missing = ''; Error = '' } }
+        $restart = InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoT4RestartStopState -Config $Config }
+        $restart.State | Should -Be 'Nightly'
+        $restart.CheckStopsT4 | Should -BeFalse
+    }
+
+    It 'finds the first run that stops a T4 restarted at <Restart> UTC: <Run> at <Utc> UTC (<Case>)' -ForEach @(
+        # The live case: the stop of 2026-11-07 00:01Z ended at 00:03Z, so Azure starts T4 again 3 minutes after the stop
+        # of 2026-11-13 19:00 Eastern; the T3 check stops it that evening.
+        @{ Case = 'just after the stop'; Zone = 'Eastern Standard Time'; AutoPause = 15; WithCheck = $true; Restart = '2026-11-14T00:03:00Z'; Run = 'Check'; Utc = '2026-11-14T00:30' }
+        # The T3 check's own stop ends just after its time, so the next restart comes after it: the next evening's stop.
+        @{ Case = 'just after the T3 check'; Zone = 'Eastern Standard Time'; AutoPause = 15; WithCheck = $true; Restart = '2026-11-14T00:33:00Z'; Run = 'Stop'; Utc = '2026-11-15T00:00' }
+        @{ Case = 'without the T3 check'; Zone = 'Eastern Standard Time'; AutoPause = 15; WithCheck = $false; Restart = '2026-11-14T00:03:00Z'; Run = 'Stop'; Utc = '2026-11-15T00:00' }
+        @{ Case = 'during the day'; Zone = 'Pacific Standard Time'; AutoPause = 15; WithCheck = $true; Restart = '2026-11-05T18:00:00Z'; Run = 'Stop'; Utc = '2026-11-06T03:00' }
+        @{ Case = 'at the stop''s very minute'; Zone = 'Pacific Standard Time'; AutoPause = 15; WithCheck = $true; Restart = '2026-11-06T03:00:00Z'; Run = 'Stop'; Utc = '2026-11-06T03:00' }
+        @{ Case = 'a T3 check after midnight'; Zone = 'Pacific Standard Time'; AutoPause = 1440; WithCheck = $true; Restart = '2026-11-06T03:10:00Z'; Run = 'Check'; Utc = '2026-11-06T08:45' }
+        # Daylight saving time starts on 2026-03-08 in the US: 19:00 Eastern is 00:00 UTC before it and 23:00 UTC after.
+        @{ Case = 'across daylight saving time'; Zone = 'Eastern Standard Time'; AutoPause = 15; WithCheck = $true; Restart = '2026-03-08T12:00:00Z'; Run = 'Stop'; Utc = '2026-03-08T23:00' }
+    ) {
+        $config = New-SafetyConfig -Zone $Zone -AutoPause $AutoPause
+        $after = [datetime]::Parse($Restart, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+        $found = InModuleScope DbHubDemo -Parameters @{ Config = $config; After = $after; WithCheck = $WithCheck } { Get-DemoSafetyStopRunAfter -Config $Config -AfterUtc $After -WithCheck:$WithCheck }
+        $found.Run | Should -Be $Run
+        $found.Utc.ToString('yyyy-MM-ddTHH:mm', [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be $Utc
+        $found.Utc.Kind | Should -Be ([System.DateTimeKind]::Utc)
+        $found.TimeZone | Should -Be $Zone
     }
 
     It 'adds no note to DONE when the safety stop is in place, and keeps a run with only its role missing DONE, with the note' {

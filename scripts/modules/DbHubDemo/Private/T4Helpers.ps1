@@ -1278,7 +1278,7 @@ function Get-DemoT4FallbackNote {
     $tuning = (Get-DemoT4Tuning -Config $Config -SkuName $sku).Enabled
     if ($Created -is [bool] -and $Created) {
         # Whether the nightly safety stop is in place isn't read here, so it's said as a condition (status.ps1 reads it).
-        $restart = 'Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again at the next auto-shutdown time when it''s in place, and ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show the date and whether it is.'
+        $restart = 'Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again within a day when it''s in place, at its T3 check or at the next auto-shutdown time, and ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show the date and whether it is.'
         return ('{0} {1}' -f (Format-DemoT4FallbackCreatedText -HourlyUsd $HourlyUsd -Location $location -SkuName $sku -Tuning $tuning), $restart)
     }
     $hourly = Format-DemoT4HourlyText -HourlyUsd $HourlyUsd -Location $location
@@ -1343,8 +1343,10 @@ function Format-DemoT4RestartText {
     plus -Days. -SafetyStop is what stops it again, as Get-DemoT4RestartStopState read it: Nightly (the nightly safety stop,
     ADR 0024) and Scheduled (the on-demand control's daily safety stop, ADR 0020) stop it within a day; NoRole (the
     nightly safety stop is scheduled, but its role isn't assigned), NotScheduled, and Off mean nothing here stops it again;
-    Unknown (a read failed) is said as a condition (review of 20e855c). -HourlyUsd is the caller's, from the Retail Prices
-    API. Pure. Internal.
+    Unknown (a read failed) is said as a condition (review of 20e855c). With Nightly and -Config, it names the run that
+    stops it (Get-DemoSafetyStopRunAfter): the stop at the auto-shutdown time, or, with -CheckStopsT4, the T3 check, which
+    also stops a running T4 since 2026-11-09, when the restart comes between the two. -HourlyUsd is the caller's, from
+    the Retail Prices API. Pure, but for a debug log line when the configured times can't be worked out. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -1361,17 +1363,49 @@ function Format-DemoT4RestartText {
         [int] $Days = 7,
 
         [ValidateSet('Off', 'Nightly', 'Scheduled', 'NoRole', 'NotScheduled', 'Unknown')]
-        [string] $SafetyStop = 'Off'
+        [string] $SafetyStop = 'Off',
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Config,
+
+        [switch] $CheckStopsT4
     )
 
     $culture = [System.Globalization.CultureInfo]::InvariantCulture
     $when = if ($null -ne $RestartUtc) { [string]::Format($culture, 'at {0:yyyy-MM-dd HH:mm} UTC, {1} days after the stop', ([datetime]$RestartUtc).ToUniversalTime(), $Days) } else { '{0} days after it was stopped' -f $Days }
     $bills = if ($null -ne $HourlyUsd) { [string]::Format($culture, ', and it then bills compute at about {0:N3} USD an hour ({1}, list price)', [double]$HourlyUsd, $SkuName) } elseif ($SkuName) { ', and it then bills compute at its size ({0})' -f $SkuName } else { ', and it then bills compute' }
+    $nightly = ' until the nightly safety stop stops it again, at the next auto-shutdown time.'
+    if ($SafetyStop -eq 'Nightly' -and $null -ne $Config) {
+        try {
+            if ($null -ne $RestartUtc) {
+                # The first of the safety stop's runs at or after the restart (2026-11-09: the T3 check stops T4 too).
+                $restart = ([datetime]$RestartUtc).ToUniversalTime()
+                $run = Get-DemoSafetyStopRunAfter -Config $Config -AfterUtc $restart -WithCheck:$CheckStopsT4
+                $gap = $run.Utc - $restart
+                $span = if ($gap.TotalMinutes -lt 2) { 'within minutes' } elseif ($gap.TotalMinutes -lt 90) { 'about {0} minutes' -f [int][System.Math]::Round($gap.TotalMinutes) } else { 'about {0} hours' -f [int][System.Math]::Round($gap.TotalHours) }
+                $by = if ($run.Run -eq 'Check') { 'the nightly safety stop''s T3 check' } else { 'the nightly safety stop' }
+                $nightly = [string]::Format($culture, ' until {0} stops it again at {1:yyyy-MM-dd HH:mm} UTC ({2} {3}), {4} after it starts.', $by, $run.Utc, $run.LocalTime, $run.TimeZone, $span)
+            }
+            else {
+                $times = Get-DemoSafetyStopTime -Config $Config
+                $nightly = if ($CheckStopsT4) {
+                    ' until the nightly safety stop stops it again, within a day: its T3 check at {0} when it starts between {1} and then, otherwise its stop at the next {1} ({2}).' -f $times.CheckLocalTime, $times.StopLocalTime, $times.TimeZone
+                }
+                else {
+                    ' until the nightly safety stop stops it again, at the next auto-shutdown time ({0} {1}).' -f $times.StopLocalTime, $times.TimeZone
+                }
+            }
+        }
+        catch {
+            # A configuration whose time zone can't be read keeps the general text; preflight reports the zone itself.
+            Write-DemoLog -Level Debug -Message ('The nightly safety stop''s times couldn''t be worked out for T4''s restart: {0}' -f $_.Exception.Message)
+        }
+    }
     $after = switch ($SafetyStop) {
-        'Nightly' { ' until the nightly safety stop stops it again, at the next auto-shutdown time.' }
+        'Nightly' { $nightly }
         'Scheduled' { ' until the on-demand control''s daily safety stop stops it again, within a day.' }
         'NoRole' { (' until it''s stopped again: the nightly safety stop is scheduled, but it can''t stop T4 until an Owner assigns its role once ({0}), so run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.' -f (Get-DemoSafetyStopCommand)) }
-        'Unknown' { ' until it''s stopped again: the nightly safety stop does that at the next auto-shutdown time if it''s in place, which couldn''t be read just now (./scripts/status.ps1 shows it as STATUS.SAFETYSTOP); otherwise run ./scripts/stop-demo.ps1 again once it has started.' }
+        'Unknown' { ' until it''s stopped again: the nightly safety stop does that within a day if it''s in place, which couldn''t be read just now (./scripts/status.ps1 shows it as STATUS.SAFETYSTOP); otherwise run ./scripts/stop-demo.ps1 again once it has started.' }
         default { ' until it''s stopped again: the nightly safety stop isn''t in place (./scripts/deploy.ps1 sets it up), so nothing here stops it on its own; run ./scripts/stop-demo.ps1 again once it has started, or ./scripts/destroy.ps1 if the demo stays idle.' }
     }
     return ('Azure starts it again on its own {0}{1}{2}' -f $when, $bills, $after)
@@ -1901,7 +1935,7 @@ function Invoke-DemoT4PowerAction {
         $safety = Get-DemoT4RestartStopState -Config $Config
         $evidence['dailySafetyStop'] = $safety.State -in 'Nightly', 'Scheduled'
         $evidence['safetyStop'] = $safety.State
-        $autoStart = ' ' + (Format-DemoT4RestartText -RestartUtc $restartUtc -SkuName $serverSku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State)
+        $autoStart = ' ' + (Format-DemoT4RestartText -RestartUtc $restartUtc -SkuName $serverSku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State -Config $Config -CheckStopsT4:([bool](Get-DemoMemberValue -InputObject $safety -Name 'CheckStopsT4')))
     }
     if ($current.State -eq $wanted) {
         $verb = if ($Action -eq 'Start') { 'running (Ready)' } else { 'stopped' }

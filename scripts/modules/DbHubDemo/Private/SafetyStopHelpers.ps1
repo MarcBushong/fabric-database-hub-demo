@@ -147,6 +147,52 @@ function Get-DemoSafetyStopTime {
     }
 }
 
+function Get-DemoSafetyStopRunAfter {
+    <#
+    .SYNOPSIS
+    The nightly safety stop's first run at or after -AfterUtc that stops T4 (ADR 0024): its stop, daily at StopLocalTime,
+    or with -WithCheck its T3 check, daily at CheckLocalTime, which also stops a running T4 since 2026-11-09
+    (Get-DemoSafetyStopTime; both in autoShutdownTimeZone, so daylight saving time moves them in UTC). Returns Run (Stop or
+    Check), Utc, LocalTime, and TimeZone. A run at the very minute counts: it waits up to 10 minutes for a T4 that's
+    starting. Internal and pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [datetime] $AfterUtc,
+
+        [switch] $WithCheck
+    )
+
+    $after = if ($AfterUtc.Kind -eq [System.DateTimeKind]::Local) { $AfterUtc.ToUniversalTime() } else { [DateTime]::SpecifyKind($AfterUtc, [System.DateTimeKind]::Utc) }
+    $when = Get-DemoSafetyStopTime -Config $Config -NowUtc $after
+    $zone = [System.TimeZoneInfo]::FindSystemTimeZoneById($when.TimeZone)
+    $local = [System.TimeZoneInfo]::ConvertTimeFromUtc($after, $zone)
+    $runs = @([pscustomobject]@{ Run = 'Stop'; LocalTime = $when.StopLocalTime }) + @(if ($WithCheck) { [pscustomobject]@{ Run = 'Check'; LocalTime = $when.CheckLocalTime } })
+    $first = $null
+    foreach ($run in $runs) {
+        $time = [timespan]::ParseExact($run.LocalTime, 'hh\:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+        for ($day = -1; $day -le 2; $day++) {
+            $candidate = [datetime]::new($local.Year, $local.Month, $local.Day, 0, 0, 0, [System.DateTimeKind]::Unspecified).AddDays($day).Add($time)
+            if ($zone.IsInvalidTime($candidate)) {
+                $candidate = $candidate.AddHours(1)
+            }
+            $utc = [System.TimeZoneInfo]::ConvertTimeToUtc($candidate, $zone)
+            if ($utc -ge $after) {
+                if ($null -eq $first -or $utc -lt $first.Utc) {
+                    $first = [pscustomobject]@{ Run = $run.Run; Utc = $utc; LocalTime = $run.LocalTime; TimeZone = $when.TimeZone }
+                }
+                break
+            }
+        }
+    }
+    return $first
+}
+
 function Get-DemoSafetyStopRoleDefinition {
     <#
     .SYNOPSIS
@@ -231,7 +277,8 @@ function Get-DemoSafetyStopRunbookSetting {
 }
 
 function Get-DemoSafetyStopLinkScope {
-    # A job schedule's Scope parameter, whatever case Azure gives the parameter's name in; empty without one. Internal.
+    # A job schedule's Scope parameter, whatever case Azure gives the parameter's name in; empty without one. Only Job
+    # Schedule - Get returns the parameters (Get-DemoSafetyStopLink). Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -255,6 +302,62 @@ function Get-DemoSafetyStopLinkScope {
         }
     }
     return ''
+}
+
+function Get-DemoSafetyStopLink {
+    <#
+    .SYNOPSIS
+    The safety stop account's job schedules for -Schedule (ADR 0024), each with its Scope read from the link itself.
+    Returns Ok, Missing (the account doesn't exist), Error, and Links: Id, Schedule, Runbook, and Scope (empty for a link
+    to another runbook, or one without a Scope). Read-only. Internal.
+
+    .DESCRIPTION
+    Job Schedule - List By Automation Account gives each link's schedule and runbook, but not its parameters: live on
+    2026-11-09 it returned "parameters": null for both safety stop links, whose jobs ran with {"Scope":"Nightly"} and
+    {"Scope":"T3Check"}, and Learn's own sample answer shows null too. Job Schedule - Get of one link returns them. So each
+    link of -Schedule to DbHub-Stop is read once more by its ID. A link deleted in between is left out; any other failed
+    read makes the whole answer not Ok, so a caller never takes an unread link as unlinked.
+    - Job Schedule - List By Automation Account: https://learn.microsoft.com/rest/api/automation/job-schedule/list-by-automation-account
+    - Job Schedule - Get: https://learn.microsoft.com/rest/api/automation/job-schedule/get
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name,
+
+        [Parameter(Mandatory)]
+        [string[]] $Schedule
+    )
+
+    $version = $script:SafetyStopAutomationApiVersion
+    $list = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules' -f $Name.AutomationAccountId) -ApiVersion $version)
+    if (-not $list.Ok) {
+        return [pscustomobject]@{ Ok = $false; Missing = [bool]$list.Missing; Error = $list.Error; Links = @() }
+    }
+    $links = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in @(Get-DemoActivityControlList -InputObject $list.Value -Name 'value')) {
+        $properties = Get-DemoMemberValue -InputObject $item -Name 'properties'
+        $scheduleName = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'schedule') -Name 'name')
+        if ($scheduleName -notin $Schedule) {
+            continue
+        }
+        $runbook = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'runbook') -Name 'name')
+        $id = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobScheduleId')
+        $scope = ''
+        if ($runbook -eq $Name.Runbook -and $id -match '^[0-9a-fA-F-]{36}$') {
+            $read = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules/{1}' -f $Name.AutomationAccountId, $id) -ApiVersion $version)
+            if ($read.Missing) {
+                continue
+            }
+            if (-not $read.Ok) {
+                return [pscustomobject]@{ Ok = $false; Missing = $false; Error = ('the job schedule {0} ({1}) couldn''t be read: {2}' -f $id, $scheduleName, $read.Error); Links = @() }
+            }
+            $scope = Get-DemoSafetyStopLinkScope -Link $read.Value
+        }
+        $links.Add([pscustomobject]@{ Id = $id; Schedule = $scheduleName; Runbook = $runbook; Scope = $scope })
+    }
+    return [pscustomobject]@{ Ok = $true; Missing = $false; Error = ''; Links = $links.ToArray() }
 }
 
 function Get-DemoSafetyStopScheduleLocalTime {
@@ -461,9 +564,17 @@ function Set-DemoSafetyStopSchedule {
     kept; any other is deleted with its links and created again, so a deploy.ps1 run turns a disabled one on again. Each
     new link has a new ID (Azure Automation refused the ID of a link deleted moments earlier, Phase 25d). Returns
     SAFETYSTOP.SCHEDULE. Internal.
+
+    .DESCRIPTION
+    Each link's scope is read from the link itself (Get-DemoSafetyStopLink), because the list of job schedules doesn't
+    return parameters. Before 2026-11-09 it was read from the list, so no link ever matched, and every run deleted and
+    created both schedules and both links again (the activity log of 2026-11-06, live). Keeping a schedule also keeps
+    that evening's run: a schedule created again starts at its next time at least 10 minutes ahead
+    (Get-DemoSafetyStopTime; Azure Automation wants at least 5), so one created again within 10 minutes of its time
+    first runs the next day.
     - Schedule: https://learn.microsoft.com/rest/api/automation/schedule/create-or-update
     - Job schedule: https://learn.microsoft.com/rest/api/automation/job-schedule/create
-    - Time zones (an IANA or a Windows ID): https://learn.microsoft.com/powershell/module/az.automation/new-azautomationschedule
+    - Time zones (an IANA or a Windows ID), and a start at least five minutes ahead: https://learn.microsoft.com/powershell/module/az.automation/new-azautomationschedule
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([object])]
@@ -484,13 +595,13 @@ function Set-DemoSafetyStopSchedule {
         param([string] $Message)
         New-DemoResult -CheckId 'SAFETYSTOP.SCHEDULE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $Message -Evidence $evidence -Remediation 'Run ./scripts/deploy.ps1 again; it schedules the safety stop each time. Meanwhile the VMs'' nightly auto-shutdown and T3''s auto-pause still apply.' -DocUrl $script:SafetyStopDoc
     }
-    $links = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules' -f $Name.AutomationAccountId) -ApiVersion $version)
+    $links = Get-DemoSafetyStopLink -Name $Name -Schedule @($Name.StopSchedule, $Name.CheckSchedule)
     if (-not $links.Ok) {
         return (& $warn ('The nightly safety stop''s job schedules couldn''t be read: {0}' -f $links.Error))
     }
     $plan = @(
         [pscustomobject]@{ Schedule = $Name.StopSchedule; Scope = 'Nightly'; LocalTime = $when.StopLocalTime; StartTime = $when.StopStartTime; Description = 'Nightly safety stop: DbHub-Stop -Scope Nightly deallocates the demo''s VMs and stops T4 at the VMs'' auto-shutdown time (ADR 0024).' }
-        [pscustomobject]@{ Schedule = $Name.CheckSchedule; Scope = 'T3Check'; LocalTime = $when.CheckLocalTime; StartTime = $when.CheckStartTime; Description = 'Nightly safety stop''s T3 check: DbHub-Stop -Scope T3Check reads whether T3 paused, through Azure Resource Manager only (ADR 0024).' }
+        [pscustomobject]@{ Schedule = $Name.CheckSchedule; Scope = 'T3Check'; LocalTime = $when.CheckLocalTime; StartTime = $when.CheckStartTime; Description = 'Nightly safety stop''s T3 check: DbHub-Stop -Scope T3Check reads whether T3 paused, through Azure Resource Manager only, and stops T4 when it runs (ADR 0024).' }
     )
     $kept = [System.Collections.Generic.List[string]]::new()
     $made = [System.Collections.Generic.List[string]]::new()
@@ -501,8 +612,8 @@ function Set-DemoSafetyStopSchedule {
         if (-not $existing.Ok -and -not $existing.Missing) {
             return (& $warn ('The schedule {0} couldn''t be read: {1}' -f $item.Schedule, $existing.Error))
         }
-        $mine = @(@(Get-DemoActivityControlList -InputObject $links.Value -Name 'value') | Where-Object { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'schedule') -Name 'name') -eq $item.Schedule })
-        $linked = @($mine | Where-Object { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'runbook') -Name 'name') -eq $Name.Runbook -and (Get-DemoSafetyStopLinkScope -Link $_) -eq $item.Scope })
+        $mine = @($links.Links | Where-Object { $_.Schedule -eq $item.Schedule })
+        $linked = @($mine | Where-Object { $_.Runbook -eq $Name.Runbook -and $_.Scope -eq $item.Scope })
         $enabled = $existing.Ok -and [bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $existing.Value -Name 'properties') -Name 'isEnabled')
         $current = if ($existing.Ok) { Get-DemoSafetyStopScheduleLocalTime -Schedule $existing.Value -TimeZone $when.TimeZone } else { '' }
         if ($enabled -and $current -eq $item.LocalTime -and $linked.Count -eq 1 -and $mine.Count -eq 1) {
@@ -514,9 +625,8 @@ function Set-DemoSafetyStopSchedule {
             continue
         }
         foreach ($link in $mine) {
-            $linkId = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $link -Name 'properties') -Name 'jobScheduleId')
-            if ($linkId -match '^[0-9a-fA-F-]{36}$') {
-                $null = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules/{1}' -f $Name.AutomationAccountId, $linkId) -ApiVersion $version)
+            if ($link.Id -match '^[0-9a-fA-F-]{36}$') {
+                $null = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules/{1}' -f $Name.AutomationAccountId, $link.Id) -ApiVersion $version)
             }
         }
         if ($existing.Ok) {
@@ -539,7 +649,7 @@ function Set-DemoSafetyStopSchedule {
     if ($whatIf.Count -gt 0) {
         return (New-DemoResult -CheckId 'SAFETYSTOP.SCHEDULE' -Area 'infra' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} would be scheduled ({1}).' -f ($whatIf -join ' and '), $when.TimeZone) -Evidence $evidence -DocUrl $script:SafetyStopDoc)
     }
-    return (New-DemoResult -CheckId 'SAFETYSTOP.SCHEDULE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The nightly safety stop runs {0} -Scope Nightly daily at {1} and its T3 check at {2} ({3}); it never starts anything.' -f $Name.Runbook, $when.StopLocalTime, $when.CheckLocalTime, $when.TimeZone) -Evidence $evidence -DocUrl $script:SafetyStopDoc)
+    return (New-DemoResult -CheckId 'SAFETYSTOP.SCHEDULE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The nightly safety stop runs {0} -Scope Nightly daily at {1} and its T3 check, which also stops a running T4, at {2} ({3}); it never starts anything.' -f $Name.Runbook, $when.StopLocalTime, $when.CheckLocalTime, $when.TimeZone) -Evidence $evidence -DocUrl $script:SafetyStopDoc)
 }
 
 function Grant-DemoSafetyStopRole {
@@ -648,10 +758,14 @@ function Get-DemoSafetyStopState {
     State is InPlace (dbhub-safety-stop is enabled and linked to DbHub-Stop with Scope Nightly, and the identity holds
     "DbHub Demo Safety Stop" at the demo resource group), NoRole (scheduled, but the role isn't assigned, so it can't stop
     anything), NotScheduled (its account, schedule, or link is missing, or the schedule is disabled), or Unknown (a read
-    failed). Also NextRunUtc, CheckNextRunUtc, CheckScheduled, RoleAssigned ($true, $false, or $null when unread),
-    Missing (what isn't in place), and Error.
+    failed). Also NextRunUtc, CheckNextRunUtc, CheckScheduled (dbhub-safety-t3check is enabled and linked with Scope
+    T3Check: the check that reads T3 and, since 2026-11-09, stops a running T4), RoleAssigned ($true, $false, or $null when
+    unread), Missing (what isn't in place), and Error. Each link's scope comes from the link itself
+    (Get-DemoSafetyStopLink): the list of job schedules returns no parameters, so before 2026-11-09 this said NotScheduled
+    for a safety stop that ran every night (live).
     - Schedule: https://learn.microsoft.com/rest/api/automation/schedule/get
-    - Job schedules: https://learn.microsoft.com/rest/api/automation/job-schedule/list-by-automation-account
+    - Job schedules: https://learn.microsoft.com/rest/api/automation/job-schedule/list-by-automation-account and
+      https://learn.microsoft.com/rest/api/automation/job-schedule/get
     - Role assignments: https://learn.microsoft.com/rest/api/authorization/role-assignments/list-for-scope
     #>
     [CmdletBinding()]
@@ -671,19 +785,14 @@ function Get-DemoSafetyStopState {
         }
         $stop = & $read $name.StopSchedule
         $check = & $read $name.CheckSchedule
-        $links = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobSchedules' -f $name.AutomationAccountId) -ApiVersion $version)
+        $links = Get-DemoSafetyStopLink -Name $name -Schedule @($name.StopSchedule, $name.CheckSchedule)
         if ((-not $stop.Ok -and -not $stop.Missing) -or (-not $links.Ok -and -not $links.Missing)) {
             $answer.Error = if (-not $stop.Ok -and -not $stop.Missing) { $stop.Error } else { $links.Error }
             return [pscustomobject]$answer
         }
         $isLinked = {
             param([string] $Schedule, [string] $Scope)
-            @(@(Get-DemoActivityControlList -InputObject $links.Value -Name 'value') | Where-Object {
-                    $properties = Get-DemoMemberValue -InputObject $_ -Name 'properties'
-                    [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'schedule') -Name 'name') -eq $Schedule -and
-                    [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'runbook') -Name 'name') -eq $name.Runbook -and
-                    (Get-DemoSafetyStopLinkScope -Link $_) -eq $Scope
-                }).Count -gt 0
+            @($links.Links | Where-Object { $_.Schedule -eq $Schedule -and $_.Runbook -eq $name.Runbook -and $_.Scope -eq $Scope }).Count -gt 0
         }
         $stopProperties = Get-DemoMemberValue -InputObject $stop.Value -Name 'properties'
         $checkProperties = Get-DemoMemberValue -InputObject $check.Value -Name 'properties'
@@ -840,13 +949,14 @@ function Get-DemoSafetyStopStatus {
     .SYNOPSIS
     The nightly safety stop in one result (ADR 0024), read-only: STATUS.SAFETYSTOP for status.ps1, COST.SAFETYSTOP for
     validate.ps1's Cost area. Pass when it's scheduled, its role is assigned, its last run stopped what ran, and its last
-    T3 check found T3 paused (or about to); a Warning that names the fix otherwise. Internal.
+    T3 check found T3 paused (or about to) and stopped T4 if it ran; a Warning that names the fix otherwise. Internal.
 
     .DESCRIPTION
     Its times (Get-DemoSafetyStopTime), its state (Get-DemoSafetyStopState), and its last stop and T3 check with what they
     did, from the result line of each job (Get-DemoSafetyStopLastRun). A Warning when it isn't set up (deploy.ps1 sets
     it up), when its role isn't assigned (an Owner's command; T4 isn't covered until then), when its last stop didn't
-    finish, when T3 was still online past its auto-pause delay or has auto-pause off, or when anything couldn't be read.
+    finish, when T3 was still online past its auto-pause delay or has auto-pause off, when the T3 check couldn't stop a
+    running T4 (since 2026-11-09), or when anything couldn't be read.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -868,7 +978,7 @@ function Get-DemoSafetyStopStatus {
     $command = Get-DemoSafetyStopCommand -ConfigPath $ConfigPath
     $when = Get-DemoSafetyStopTime -Config $Config -NowUtc $NowUtc
     $state = Get-DemoSafetyStopState -Config $Config
-    $times = 'at {0}, and checks T3 at {1} ({2})' -f $when.StopLocalTime, $when.CheckLocalTime, $when.TimeZone
+    $times = 'at {0}, and its T3 check, which also stops a running T4, at {1} ({2})' -f $when.StopLocalTime, $when.CheckLocalTime, $when.TimeZone
     $evidence = [ordered]@{ state = $state.State; automationAccount = $name.AutomationAccount; stopLocalTime = $when.StopLocalTime; checkLocalTime = $when.CheckLocalTime; timeZone = $when.TimeZone; nextRunUtc = $state.NextRunUtc; checkNextRunUtc = $state.CheckNextRunUtc; roleAssigned = $state.RoleAssigned }
     $identity = @{ CheckId = $CheckId; Area = $Area }
     $result = {
@@ -925,8 +1035,21 @@ function Get-DemoSafetyStopStatus {
             $evidence['lastT3CheckUtc'] = $runs.Check.CreatedUtc
             $evidence['lastT3Check'] = $verdict
             $parts.Add(('T3 check {0:yyyy-MM-dd HH:mm} UTC: {1}' -f ([datetime]$runs.Check.CreatedUtc), $checkText.TrimEnd('.') + '.'))
-            if ($verdict -in 'Awake', 'AutoPauseOff', 'Unread' -or $runs.Check.Status -ne 'Completed') {
-                $problems.Add($(if ($verdict -eq 'Awake') { 'T3 was still online past its auto-pause delay' } elseif ($verdict -eq 'AutoPauseOff') { 'T3''s auto-pause is off' } else { 'its last T3 check didn''t read T3' }))
+            $t3Problem = switch ($verdict) {
+                'Awake' { 'T3 was still online past its auto-pause delay' }
+                'AutoPauseOff' { 'T3''s auto-pause is off' }
+                { $_ -in 'Paused', 'Pausing', 'Missing', 'TooEarly' } { '' }
+                default { 'its last T3 check didn''t read T3' }
+            }
+            if ($t3Problem) {
+                $problems.Add($t3Problem)
+            }
+            # Since 2026-11-09 the T3 check also stops a running T4 (its result's failed list names it when it couldn't).
+            if (@(Get-DemoActivityControlList -InputObject $checkResult -Name 'failed').Count -gt 0) {
+                $problems.Add('its last T3 check couldn''t stop T4')
+            }
+            elseif (-not $t3Problem -and $runs.Check.Status -ne 'Completed') {
+                $problems.Add(('its last T3 check didn''t finish (job {0})' -f $runs.Check.Status))
             }
         }
     }
@@ -980,7 +1103,8 @@ function Get-DemoT4RestartStopState {
     What stops T4 again after Azure starts it on its own (7 days after a stop), for STATUS.T4 and STOP.T4.STOP
     (Format-DemoT4RestartText): Nightly (the nightly safety stop is in place, ADR 0024), Scheduled (otherwise the on-demand
     control's daily T4 safety stop, ADR 0020), NoRole (the nightly safety stop is scheduled but can't act), NotScheduled,
-    or Unknown. Also NextRunUtc. Never throws. Internal.
+    or Unknown. Also NextRunUtc, and CheckStopsT4: with Nightly, whether its T3 check is scheduled too, which stops a
+    running T4 since 2026-11-09. Never throws. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -991,17 +1115,17 @@ function Get-DemoT4RestartStopState {
 
     $nightly = Get-DemoSafetyStopState -Config $Config
     if ($nightly.State -eq 'InPlace') {
-        return [pscustomobject]@{ State = 'Nightly'; NextRunUtc = $nightly.NextRunUtc }
+        return [pscustomobject]@{ State = 'Nightly'; NextRunUtc = $nightly.NextRunUtc; CheckStopsT4 = [bool](Get-DemoMemberValue -InputObject $nightly -Name 'CheckScheduled') }
     }
     $control = Get-DemoT4SafetyStopState -Config $Config
     if ($control.State -eq 'Scheduled') {
-        return [pscustomobject]@{ State = 'Scheduled'; NextRunUtc = $control.NextRunUtc }
+        return [pscustomobject]@{ State = 'Scheduled'; NextRunUtc = $control.NextRunUtc; CheckStopsT4 = $false }
     }
     if ($nightly.State -eq 'NoRole') {
-        return [pscustomobject]@{ State = 'NoRole'; NextRunUtc = $nightly.NextRunUtc }
+        return [pscustomobject]@{ State = 'NoRole'; NextRunUtc = $nightly.NextRunUtc; CheckStopsT4 = $false }
     }
     if ($nightly.State -eq 'Unknown' -or $control.State -eq 'Unknown') {
-        return [pscustomobject]@{ State = 'Unknown'; NextRunUtc = $null }
+        return [pscustomobject]@{ State = 'Unknown'; NextRunUtc = $null; CheckStopsT4 = $false }
     }
-    return [pscustomobject]@{ State = 'NotScheduled'; NextRunUtc = $null }
+    return [pscustomobject]@{ State = 'NotScheduled'; NextRunUtc = $null; CheckStopsT4 = $false }
 }

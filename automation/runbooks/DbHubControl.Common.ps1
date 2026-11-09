@@ -1937,27 +1937,46 @@ function Invoke-DbHubNightlyStop {
             $failed.Add(('{0} ({1})' -f $vm, $sent.Error))
         }
     }
-    $waitMinutes = 10
-    $configured = Get-DbHubMember -InputObject $settings -Name 't4WaitMinutes'
-    if ($null -ne $configured) {
-        $waitMinutes = [int]$configured
-    }
-    $t4 = Invoke-DbHubT4NightlyStop -Context $Context -Tags $Tags -WaitMinutes $waitMinutes -PollSeconds $PollSeconds
-    $t4Text = switch ($t4.Outcome) {
-        'Sent' { 'T4 stopped (was {0})' -f $t4.State }
-        'AlreadyStopped' { 'T4 already {0}' -f $t4.Current.ToLowerInvariant() }
-        'Missing' { 'T4 missing' }
-        'Skipped' { 'T4 {0}' -f $t4.Current.ToLowerInvariant() }
-        default { '' }
-    }
+    $t4 = Invoke-DbHubT4NightlyStop -Context $Context -Tags $Tags -WaitMinutes (Get-DbHubT4WaitMinute -Settings $settings) -PollSeconds $PollSeconds
+    $t4Text = Get-DbHubT4StopText -Outcome $t4
     if ($t4.Outcome -eq 'Failed') {
         $failed.Add(('T4 ({0})' -f $t4.Error))
-        $t4Text = 'failed: {0}' -f $t4.Error
     }
     else {
         $done.Add($t4Text)
     }
     return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); Vms = $vms; T4 = $t4Text }
+}
+
+function Get-DbHubT4WaitMinute {
+    # How long the safety stop waits for a T4 that's starting: t4WaitMinutes, 10 without it.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings
+    )
+
+    $configured = Get-DbHubMember -InputObject $Settings -Name 't4WaitMinutes'
+    if ($null -ne $configured) {
+        return [int]$configured
+    }
+    return 10
+}
+
+function Get-DbHubT4StopText {
+    # What the safety stop says it did to T4, from Invoke-DbHubT4NightlyStop's outcome: 'T4 stopped (was Ready)', 'T4
+    # already stopped', 'T4 missing', 'T4 disabled', or 'failed: <why>'.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Outcome
+    )
+
+    switch ($Outcome.Outcome) {
+        'Sent' { return ('T4 stopped (was {0})' -f $Outcome.State) }
+        'AlreadyStopped' { return ('T4 already {0}' -f $Outcome.Current.ToLowerInvariant()) }
+        'Missing' { return 'T4 missing' }
+        'Skipped' { return ('T4 {0}' -f $Outcome.Current.ToLowerInvariant()) }
+    }
+    return ('failed: {0}' -f $Outcome.Error)
 }
 
 function Get-DbHubT3Database {
@@ -2002,11 +2021,12 @@ function Get-DbHubT3Database {
 function Test-DbHubT3Paused {
     <#
     .SYNOPSIS
-    The nightly safety stop's T3 check (ADR 0024), DbHub-Stop -Scope T3Check, its own short job after the stop. Azure has
-    no "pause now" for a serverless database: it pauses itself once it has had no session and no CPU for its auto-pause
-    delay, so this only reads T3's status (Get-DbHubT3Database) and says what it found. t3: Paused, Pausing, Missing (T3
-    isn't deployed), AutoPauseOff (its delay is -1), TooEarly (online before the delay since the stop, plus
-    t3CheckMarginMinutes, has passed), Awake (online after it: a session or a feature keeps it awake), or Unread.
+    The T3 part of the nightly safety stop's T3 check (ADR 0024), DbHub-Stop -Scope T3Check (Invoke-DbHubT3Check), its
+    own short job after the stop. Azure has no "pause now" for a serverless database: it pauses itself once it has had
+    no session and no CPU for its auto-pause delay, so this only reads T3's status (Get-DbHubT3Database) and says what it
+    found. t3: Paused, Pausing, Missing (T3 isn't deployed), AutoPauseOff (its delay is -1), TooEarly (online before the
+    delay since the stop, plus t3CheckMarginMinutes, has passed), Awake (online after it: a session or a feature keeps it
+    awake), or Unread.
     https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-auto-pause-resume
     #>
     param(
@@ -2065,6 +2085,45 @@ function Test-DbHubT3Paused {
         $status = 'Partial'
     }
     return [pscustomobject]@{ action = 'check-t3'; status = $status; t3 = $verdict; t3Status = $database.Status; autoPauseDelay = $delay; minutesSinceStop = $since; message = $message }
+}
+
+function Invoke-DbHubT3Check {
+    <#
+    .SYNOPSIS
+    DbHub-Stop -Scope T3Check, the nightly safety stop's check after its stop (ADR 0024): reads T3's status
+    (Test-DbHubT3Paused), then stops T4 when it runs, as the stop does (Invoke-DbHubT4NightlyStop). Returns check-t3's
+    result with t4, what happened to T4, and failed; Partial when T3 couldn't be read or T4 couldn't be stopped.
+
+    .DESCRIPTION
+    Azure starts a stopped flexible server again 7 days after its stop. The stop's own T4 stop ends a minute or two after
+    its time, so a week later that restart comes just after the stop, which finds T4 still stopped, and T4 would run
+    until the next evening (live: the stop of 2026-11-07 00:01Z ended at 00:03Z, so status.ps1 puts the restart at
+    2026-11-14 00:03Z, 3 minutes after that evening's stop). Since 2026-11-09 the check stops it that evening. Azure
+    Resource Manager only: T3 is only read, which never wakes it, and nothing is started.
+    https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [int] $PollSeconds = 30
+    )
+
+    $check = Test-DbHubT3Paused -Context $Context -Tags $Tags
+    $t4 = Invoke-DbHubT4NightlyStop -Context $Context -Tags $Tags -WaitMinutes (Get-DbHubT4WaitMinute -Settings $Context.Settings) -PollSeconds $PollSeconds
+    $t4Text = Get-DbHubT4StopText -Outcome $t4
+    $status = $check.status
+    $failed = @()
+    $sentence = $t4Text
+    if ($t4.Outcome -eq 'Failed') {
+        $status = 'Partial'
+        $failed = @(('T4 ({0})' -f $t4.Error))
+        $sentence = 'T4 couldn''t be stopped: {0}' -f $t4.Error
+    }
+    return [pscustomobject]@{ action = 'check-t3'; status = $status; t3 = $check.t3; t3Status = $check.t3Status; autoPauseDelay = $check.autoPauseDelay; minutesSinceStop = $check.minutesSinceStop; message = ('{0} {1}.' -f $check.message, $sentence); t4 = $t4Text; failed = $failed }
 }
 
 function Get-DbHubRequester {
@@ -2546,8 +2605,9 @@ function Invoke-DbHubStop {
     DbHub-Stop's entry point. Scope All (the per-run auto-stop): what Stop now does. Scope T4 (the control's daily T4
     safety stop): stops T4 only when it's running, because a stopped flexible server starts itself after 7 days. Scope
     Nightly (the nightly safety stop, ADR 0024): deallocates the VMs and stops T4 (Invoke-DbHubNightlyStop). Scope T3Check (its
-    check, ADR 0024): reads T3's status (Test-DbHubT3Paused). None of them starts anything. Nightly and T3Check say when
-    the safety stop's identity can't read the demo resource group (NotGranted: its role isn't assigned).
+    check, ADR 0024): reads T3's status and stops T4 when it runs (Invoke-DbHubT3Check). None of them starts anything.
+    Nightly and T3Check say when the safety stop's identity can't read the demo resource group (NotGranted: its role isn't
+    assigned).
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -2584,7 +2644,7 @@ function Invoke-DbHubStop {
         return [pscustomobject]@{ action = $label; status = 'NoEnvironment'; message = ('The demo resource group is {0}; nothing was stopped.' -f $group.GroupState) }
     }
     if ($Scope -eq 'T3Check') {
-        return (Test-DbHubT3Paused -Context $Context -Tags $group.Tags)
+        return (Invoke-DbHubT3Check -Context $Context -Tags $group.Tags -PollSeconds $PollSeconds)
     }
     if ($Scope -eq 'Nightly') {
         $nightly = Invoke-DbHubNightlyStop -Context $Context -Tags $group.Tags -PollSeconds $PollSeconds

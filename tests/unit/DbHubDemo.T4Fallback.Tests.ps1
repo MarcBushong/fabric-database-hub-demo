@@ -506,14 +506,14 @@ Describe 'Guardrail 3: the console, DONE, and the status page say it, with the h
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-TestState -T4Sku 'Standard_D2ds_v5') } { Get-DemoDeploymentOutcome -Result @() -State $State -Config $Config -T4HourlyUsd 0.5 }
         $note = @($outcome.Notes | Where-Object { $_ -match '^T4 created as General Purpose' })
         $note.Count | Should -Be 1
-        $note[0] | Should -Be 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API). Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again at the next auto-shutdown time when it''s in place, and ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show the date and whether it is.'
+        $note[0] | Should -Be 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API). Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again within a day when it''s in place, at its T3 check or at the next auto-shutdown time, and ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show the date and whether it is.'
         $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
         $lines | Should -Contain $note[0]
 
         # With the on-demand control too, the note says it as a condition: DONE reads no schedule, while stop-demo.ps1
         # and status.ps1 read the nightly safety stop's (ADR 0024; review of 20e855c).
         $controlled = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Control); State = (New-TestState -T4Sku 'Standard_D2ds_v5') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 -Created $true }
-        $controlled | Should -Match 'Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again at the next auto-shutdown time when it''s in place, and \./scripts/stop-demo\.ps1 and \./scripts/status\.ps1 show the date and whether it is\.$'
+        $controlled | Should -Match 'Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again within a day when it''s in place, at its T3 check or at the next auto-shutdown time, and \./scripts/stop-demo\.ps1 and \./scripts/status\.ps1 show the date and whether it is\.$'
         # Only for the size the fallback chose: not one you set, and not a size an existing server kept.
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -SkuName 'Standard_D2ds_v5'); State = (New-TestState -T4Sku 'Standard_D2ds_v5') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 } | Should -BeNullOrEmpty
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-TestState -T4Sku 'Standard_B1ms') } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.5 } | Should -BeNullOrEmpty
