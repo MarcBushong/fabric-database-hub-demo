@@ -21,7 +21,9 @@ publishes it to the nightly safety stop's own account in the demo resource group
   T4 when it runs, waiting up to 10 minutes for one that's starting.
 - Scope T3Check: started by the daily schedule dbhub-safety-t3check after the stop. It reads T3's status through Azure
   Resource Manager only, which never resumes a paused serverless database
-  (https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-monitor), and says whether it paused.
+  (https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-monitor), and says whether it paused. Then it
+  stops T4 when it runs, as Scope Nightly does: a T4 that Azure started again 7 days after a stop, just after the
+  stop's time, doesn't run until the next evening (2026-11-09).
 
 When the demo resource group doesn't exist (destroyed) or can't be read, it logs that and exits cleanly. The job
 output holds the log and one result line, 'DBHUB-STOP <json>'. A Nightly or T3Check job that couldn't do its work

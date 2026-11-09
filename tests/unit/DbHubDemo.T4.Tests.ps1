@@ -408,7 +408,7 @@ Describe 'Invoke-DemoT4PowerAction' {
         $stop.evidence.hourlyUsd | Should -Be 0.5
         $stop.evidence.dailySafetyStop | Should -BeTrue
         $stop.evidence.safetyStop | Should -Be 'Nightly'
-        $stop.message | Should -Match 'about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the nightly safety stop stops it again, at the next auto-shutdown time\.$'
+        $stop.message | Should -Match 'about 0\.500 USD an hour \(Standard_D2ds_v5, list price\) until the nightly safety stop stops it again at \d{4}-\d\d-\d\d \d\d:\d\d UTC \(19:00 Pacific Standard Time\), (within minutes|about \d+ (minutes|hours)) after it starts\.$'
         ([datetime]$stop.evidence.stoppedUtc).ToUniversalTime() | Should -BeGreaterOrEqual $before -Because 'this call''s stop is now'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -ParameterFilter { $Filter -match 'General Purpose Ddsv5 Series Compute' }
 
@@ -431,7 +431,7 @@ Describe 'Invoke-DemoT4PowerAction' {
     It 'says nothing stops a restarted T4 when the nightly safety stop <Case> (review of 20e855c, ADR 0024)' -ForEach @(
         @{ Case = 'isn''t in place'; SafetyStop = 'NotScheduled'; Text = 'until it''s stopped again: the nightly safety stop isn''t in place \(\./scripts/deploy\.ps1 sets it up\), so nothing here stops it on its own; run \./scripts/stop-demo\.ps1 again once it has started' }
         @{ Case = 'can''t act without its role'; SafetyStop = 'NoRole'; Text = 'until it''s stopped again: the nightly safety stop is scheduled, but it can''t stop T4 until an Owner assigns its role once \(\./scripts/grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json\), so run \./scripts/stop-demo\.ps1 again once it has started' }
-        @{ Case = 'couldn''t be read'; SafetyStop = 'Unknown'; Text = 'until it''s stopped again: the nightly safety stop does that at the next auto-shutdown time if it''s in place, which couldn''t be read just now \(\./scripts/status\.ps1 shows it as STATUS\.SAFETYSTOP\)' }
+        @{ Case = 'couldn''t be read'; SafetyStop = 'Unknown'; Text = 'until it''s stopped again: the nightly safety stop does that within a day if it''s in place, which couldn''t be read just now \(\./scripts/status\.ps1 shows it as STATUS\.SAFETYSTOP\)' }
     ) {
         $script:t4.Sku = 'Standard_D2ds_v5'
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { @([pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'; skuName = 'vCore'; meterName = 'vCore'; retailPrice = 0.25; unitOfMeasure = '1 Hour' }) }
@@ -444,6 +444,29 @@ Describe 'Invoke-DemoT4PowerAction' {
         $stop.message | Should -Match 'Azure starts it again on its own at \d{4}-\d\d-\d\d \d\d:\d\d UTC, 7 days after the stop'
         $stop.message | Should -Match $Text
         $stop.message | Should -Not -Match 'stops it again, within a day\.'
+    }
+
+    It 'names the nightly safety stop''s run that stops a restarted T4: <Case> (2026-11-09, ADR 0024)' -ForEach @(
+        # Live: the stop of 2026-11-07 00:01Z ended at 00:03Z, so the restart comes 3 minutes after the stop of 2026-11-13
+        # 19:00 Eastern, which finds T4 still stopped; the T3 check at 19:30 stops it that evening.
+        @{ Case = 'just after the stop, the T3 check'; Restart = '2026-11-14T00:03:00Z'; CheckStopsT4 = $true; Text = 'until the nightly safety stop''s T3 check stops it again at 2026-11-14 00:30 UTC (19:30 Eastern Standard Time), about 27 minutes after it starts.' }
+        # The T3 check's own stop ends just after its time, so the next week's restart waits for the next evening's stop.
+        @{ Case = 'just after the T3 check, the next evening''s stop'; Restart = '2026-11-14T00:33:00Z'; CheckStopsT4 = $true; Text = 'until the nightly safety stop stops it again at 2026-11-15 00:00 UTC (19:00 Eastern Standard Time), about 23 hours after it starts.' }
+        @{ Case = 'without the T3 check, the next evening''s stop'; Restart = '2026-11-14T00:03:00Z'; CheckStopsT4 = $false; Text = 'until the nightly safety stop stops it again at 2026-11-15 00:00 UTC (19:00 Eastern Standard Time), about 24 hours after it starts.' }
+        @{ Case = 'during the day, that evening''s stop'; Restart = '2026-11-13T15:00:00Z'; CheckStopsT4 = $true; Text = 'until the nightly safety stop stops it again at 2026-11-14 00:00 UTC (19:00 Eastern Standard Time), about 9 hours after it starts.' }
+        @{ Case = 'an unknown restart, with the T3 check'; Restart = ''; CheckStopsT4 = $true; Text = 'until the nightly safety stop stops it again, within a day: its T3 check at 19:30 when it starts between 19:00 and then, otherwise its stop at the next 19:00 (Eastern Standard Time).' }
+        @{ Case = 'an unknown restart, without the T3 check'; Restart = ''; CheckStopsT4 = $false; Text = 'until the nightly safety stop stops it again, at the next auto-shutdown time (19:00 Eastern Standard Time).' }
+    ) {
+        $config = New-TestConfig
+        $config['autoShutdownTime'] = '1900'
+        $config['autoShutdownTimeZone'] = 'Eastern Standard Time'
+        $config['t3AutoPauseMinutes'] = 15
+        $restartUtc = if ($Restart) { [datetime]::Parse($Restart, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) } else { $null }
+        $said = InModuleScope DbHubDemo -Parameters @{ Config = $config; RestartUtc = $restartUtc; CheckStopsT4 = $CheckStopsT4 } { Format-DemoT4RestartText -RestartUtc $RestartUtc -SkuName 'Standard_D4ds_v5' -HourlyUsd 0.25 -SafetyStop Nightly -Config $Config -CheckStopsT4:$CheckStopsT4 }
+        $said | Should -BeLike ('Azure starts it again on its own * and it then bills compute at about 0.250 USD an hour (Standard_D4ds_v5, list price) {0}' -f $Text)
+        # Without the configuration's times, the general text.
+        $plain = InModuleScope DbHubDemo -Parameters @{ RestartUtc = $restartUtc } { Format-DemoT4RestartText -RestartUtc $RestartUtc -SkuName 'Standard_D4ds_v5' -HourlyUsd 0.25 -SafetyStop Nightly -CheckStopsT4 }
+        $plain | Should -BeLike '* until the nightly safety stop stops it again, at the next auto-shutdown time.'
     }
 
     It 'says a server is now running when this caller already requested its start (-Requested, Phase 25d)' {

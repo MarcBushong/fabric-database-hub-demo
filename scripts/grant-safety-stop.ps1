@@ -6,9 +6,9 @@ Assigns the nightly safety stop's one role (ADR 0024), for an Owner, once per de
 .DESCRIPTION
 Every deployment has a nightly safety stop: at the VMs' auto-shutdown time it deallocates the demo's VMs, stops T4 (a
 stopped PostgreSQL flexible server starts itself again after 7 days), and later checks that T3 paused, without waking
-it. Its runbook acts with the identity id-<prefix>-<environment>-safetystop, which needs the custom role
-"DbHub Demo Safety Stop" (read and stop only) at the demo resource group. deploy.ps1 assigns it when the person who runs
-it may; when not, it ends DONE with a Warning that names this command.
+it, and stops T4 again if it runs. Its runbook acts with the identity id-<prefix>-<environment>-safetystop, which needs
+the custom role "DbHub Demo Safety Stop" (read and stop only) at the demo resource group. deploy.ps1 assigns it when the
+person who runs it may; when not, it ends DONE with a Warning that names this command.
 
 This script, run by an Owner (or a User Access Administrator; a Role Based Access Control Administrator once the role
 exists):

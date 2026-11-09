@@ -285,16 +285,18 @@ function Get-DemoEnvironmentStatus {
             $hourly = Get-DemoT4HourlyPrice -Config $t4Config -SkuName $t4Sku
             $safety = Get-DemoT4RestartStopState -Config $Config
             $safetyStop = $safety.State -in 'Nightly', 'Scheduled'
+            # The nightly safety stop's T3 check stops T4 too, since 2026-11-09 (ADR 0024).
+            $checkStopsT4 = [bool](Get-DemoMemberValue -InputObject $safety -Name 'CheckStopsT4')
             $size = if ($t4GeneralPurpose) { ' It''s General Purpose {0}{1}.' -f $t4Sku, $t4Origin } else { '' }
             if ($null -ne $stopped) {
                 $restart = $stopped.AddDays($days)
                 $hoursLeft = ($restart - [DateTime]::SpecifyKind($NowUtc, [System.DateTimeKind]::Utc)).TotalHours
                 $soon = $hoursLeft -lt 24
-                $message = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0} is stopped since {1:yyyy-MM-dd HH:mm} UTC. ', $t4.Names.ServerName, $stopped.ToUniversalTime()) + (Format-DemoT4RestartText -RestartUtc $restart -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State) + $size
+                $message = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0} is stopped since {1:yyyy-MM-dd HH:mm} UTC. ', $t4.Names.ServerName, $stopped.ToUniversalTime()) + (Format-DemoT4RestartText -RestartUtc $restart -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State -Config $Config -CheckStopsT4:$checkStopsT4) + $size
                 $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status $(if ($soon) { 'Warning' } else { 'Pass' }) -Message $message -Evidence ([ordered]@{ state = $t4.State; stoppedUtc = $stopped.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); autoStartUtc = $restart.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); hourlyUsd = $hourly; skuName = $t4Sku; dailySafetyStop = $safetyStop; safetyStop = $safety.State }) -Remediation $(if ($soon) { 'Run stop-demo.ps1 again after it starts, or start-demo.ps1 for a session; the 7-day restart bills compute until the next stop.' } else { '' }) -DocUrl ([string]$t4Docs['stopServer'])))
             }
             else {
-                $message = ('{0} is stopped; the stop isn''t in the last 8 days of the activity log. ' -f $t4.Names.ServerName) + (Format-DemoT4RestartText -RestartUtc $null -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State) + $size
+                $message = ('{0} is stopped; the stop isn''t in the last 8 days of the activity log. ' -f $t4.Names.ServerName) + (Format-DemoT4RestartText -RestartUtc $null -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State -Config $Config -CheckStopsT4:$checkStopsT4) + $size
                 $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Pass' -Message $message -Evidence ([ordered]@{ state = $t4.State; hourlyUsd = $hourly; skuName = $t4Sku; dailySafetyStop = $safetyStop; safetyStop = $safety.State }) -DocUrl ([string]$t4Docs['stopServer'])))
             }
         }
