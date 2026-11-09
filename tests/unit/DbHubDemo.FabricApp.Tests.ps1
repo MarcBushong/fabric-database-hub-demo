@@ -97,15 +97,27 @@ Describe 'Fabric App source' {
         $overrides = if ($package.ContainsKey('overrides')) { $package['overrides'] } else { @{} }
         $recorded = if ($script:appSettings.ContainsKey('overrides')) { $script:appSettings['overrides'] } else { @{} }
         (@($overrides.Keys | Sort-Object) -join ', ') | Should -Be (@($recorded.Keys | Where-Object { $_ -ne 'note' } | Sort-Object) -join ', ') -Because 'config/versions.json records every override in fabricApp.overrides'
-        foreach ($name in $overrides.Keys) {
-            $overrides[$name] | Should -BeOfType [string] -Because "$name is overridden with one version for every parent"
-            $overrides[$name] | Should -Match '^\d+\.\d+\.\d+$' -Because "the $name override must be pinned exactly"
-            $overrides[$name] | Should -Be $recorded[$name]['version'] -Because $name
-            $recorded[$name]['advisory'] | Should -Match '^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$' -Because "an override exists only for an advisory ($name)"
-            @($recorded[$name]['requiredBy']).Count | Should -BeGreaterThan 0 -Because "the parents that declare $name's range are recorded"
+        foreach ($key in $overrides.Keys) {
+            # A key is a package name, or a name and the advisory's vulnerable range (>=x.y.z <x.y.z), so that copies a
+            # parent pins outside that range keep their version.
+            $key | Should -Match '^(@[a-z0-9-]+/)?[a-z0-9.-]+(@>=\d+\.\d+\.\d+ <\d+\.\d+\.\d+)?$' -Because "$key names a package and, optionally, the vulnerable range"
+            $name = $key -replace '(?<=.)@>=.*$', ''
+            $overrides[$key] | Should -BeOfType [string] -Because "$key is overridden with one version for every parent"
+            $overrides[$key] | Should -Match '^\d+\.\d+\.\d+$' -Because "the $key override must be pinned exactly"
+            $overrides[$key] | Should -Be $recorded[$key]['version'] -Because $key
+            $recorded[$key]['advisory'] | Should -Match '^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$' -Because "an override exists only for an advisory ($key)"
+            @($recorded[$key]['requiredBy']).Count | Should -BeGreaterThan 0 -Because "the parents that declare $key's range are recorded"
+            [version]$overrides[$key] | Should -BeGreaterOrEqual ([version]$recorded[$key]['fixedIn']) -Because "the $key override is at or after the fix"
             $copies = @($lock['packages'].GetEnumerator() | Where-Object { $_.Key -match ('(^|/)node_modules/{0}$' -f [regex]::Escape($name)) })
             $copies.Count | Should -BeGreaterThan 0 -Because "$name is in the lock file"
-            @($copies | Where-Object { $_.Value['version'] -ne $overrides[$name] } | ForEach-Object { '{0}@{1}' -f $_.Key, $_.Value['version'] }) | Should -BeNullOrEmpty
+            if ($key -match '@>=(\d+\.\d+\.\d+) <(\d+\.\d+\.\d+)$') {
+                $from = [version]$Matches[1]
+                $to = [version]$Matches[2]
+                $to | Should -Be ([version]$recorded[$key]['fixedIn']) -Because "the $key range ends at the fix"
+                $copies = @($copies | Where-Object { $_.Value['version'] -notmatch '^\d+\.\d+\.\d+$' -or (([version]$_.Value['version'] -ge $from) -and ([version]$_.Value['version'] -lt $to)) -or $_.Value['version'] -eq $overrides[$key] })
+                $copies.Count | Should -BeGreaterThan 0 -Because "$key resolves at least one copy"
+            }
+            @($copies | Where-Object { $_.Value['version'] -ne $overrides[$key] } | ForEach-Object { '{0}@{1}' -f $_.Key, $_.Value['version'] }) | Should -BeNullOrEmpty
         }
     }
 
