@@ -8,6 +8,10 @@ function Invoke-DemoPreflight {
     - Subscription guard (Assert-DemoAzContext): the configured subscription's Azure CLI account must reach
       the configured subscription and tenant through every authentication path, without the default
       subscription.
+    - The .NET SDK that builds the workload runner (Test-DemoDotNetSdk, PREFLIGHT.TOOLS.DOTNETSDK; 2026-11-09 live
+      finding): the dotnet the build runs, with --version in workload-generator, where global.json applies. A Fail
+      before anything is created says which dotnet ran, which SDKs it has, what global.json needs, and the exact fix.
+      Not selected with -SkipRunner. Local and read-only.
     - P1: Contributor-level permissions on the subscription (and role-assignment rights if assignRoles is set).
     - P2: resource providers; missing ones are registered unless -SkipProviderRegistration is set.
     - P3: region, VM sizes, nested-virtualization families, vCPU quota, and public IP quota; with a zone
@@ -67,6 +71,10 @@ function Invoke-DemoPreflight {
     Ignored with networkMode auto, which needs the inventory, and with public, whose conflict with a Modify policy that
     turns SQL public access off must stop the run before anything is created (review finding 7).
 
+    .PARAMETER SkipRunner
+    The run builds no workload runner (deploy.ps1 -SkipRunner), so it needs no .NET SDK: PREFLIGHT.TOOLS.DOTNETSDK is
+    Not selected, and no dotnet runs.
+
     .EXAMPLE
     Invoke-DemoPreflight -Config (Get-DemoConfig -Path ./config/demo.config.json)
     #>
@@ -85,7 +93,9 @@ function Invoke-DemoPreflight {
         [ValidateRange(0, 720)]
         [int] $PolicyCacheHours = 0,
 
-        [switch] $DeferPolicyInventory
+        [switch] $DeferPolicyInventory,
+
+        [switch] $SkipRunner
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -109,6 +119,15 @@ function Invoke-DemoPreflight {
     catch {
         Add-Check 'PREFLIGHT.GUARD.CONTEXT' 'subscription' 'Fail' $_.Exception.Message
         return $results.ToArray()
+    }
+
+    # The .NET SDK that builds the workload runner, before anything is created (2026-11-09 live finding: a runtime-only
+    # dotnet first on PATH failed the Artifacts step about 15 minutes into the run). Local and read-only.
+    if ($SkipRunner) {
+        Add-Check 'PREFLIGHT.TOOLS.DOTNETSDK' 'repo' 'Not selected' 'The workload runner isn''t built (-SkipRunner), so no .NET SDK is needed.'
+    }
+    else {
+        $results.Add((Test-DemoDotNetSdk))
     }
 
     # P1: permissions on the subscription.

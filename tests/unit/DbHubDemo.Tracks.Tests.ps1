@@ -3,6 +3,9 @@ BeforeAll {
     Import-Module -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1') -Force
     . (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Guard.Helpers.ps1')
     Initialize-GuardTestContext
+    # The .NET SDK that deploy.ps1 installs when it's missing (2026-11-09) has its own tests (DbHubDemo.DotNetSdk.Tests.ps1);
+    # here it's there, and adds no record, unless a test says otherwise.
+    Mock -ModuleName DbHubDemo -CommandName Initialize-DemoDotNetSdk -MockWith { }
 
     function New-TestConfig([switch] $WithT4) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
@@ -1797,6 +1800,63 @@ Describe 'Invoke-DemoParallelDeployment' {
         $script:calls | Should -Contain 'track T2: Telemetry'
     }
 
+    Context 'the .NET SDK that deploy.ps1 installs when it''s missing (2026-11-09)' {
+        BeforeEach {
+            $script:sdkStatus = 'Pass'
+            Mock -ModuleName DbHubDemo -CommandName Initialize-DemoDotNetSdk -MockWith {
+                $script:calls.Add('sdk')
+                New-DemoResult -CheckId 'DEPLOY.DOTNETSDK' -Area 'preflight' -Target 'repo' -Status $script:sdkStatus -Message ('sdk {0}' -f $script:sdkStatus)
+            }
+            Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { $script:calls.Add('bundle'); [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('a' * 64); SizeBytes = 10 } }
+            $script:progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+            InModuleScope DbHubDemo -Parameters @{ Path = $script:progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+            function Get-TestRow([string] $Id) {
+                $model = Get-Content -LiteralPath $script:progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+                foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq $Id) { return $item } } }
+            }
+        }
+
+        It 'makes sure of it once, before preflight and anything it creates, when the run builds the workload runner' {
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
+            @($script:calls | Where-Object { $_ -eq 'sdk' }).Count | Should -Be 1
+            $script:calls.IndexOf('sdk') | Should -BeLessThan $script:calls.IndexOf('preflight')
+            $script:calls.IndexOf('sdk') | Should -BeLessThan $script:calls.IndexOf('template disk=golden')
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.DOTNETSDK' }).status | Should -Be 'Pass'
+        }
+
+        It 'stops at its Fail before preflight, saying nothing was created on the status page' {
+            $script:sdkStatus = 'Fail'
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.DOTNETSDK' }).status | Should -Be 'Fail'
+            @($script:calls | Where-Object { $_ -match '^(preflight|template|track|safety stop)' }) | Should -BeNullOrEmpty
+            $script:calls | Should -Contain 'app sign-in check stop'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
+            $row = Get-TestRow -Id 'Preflight'
+            $row['state'] | Should -Be 'Failed'
+            $row['message'] | Should -Match 'Nothing was created: the \.NET SDK the workload runner needs couldn''t be installed'
+        }
+
+        It 'makes sure of it before a resume builds the runner to compare it, and only once' {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state.TrackFabric = 'Fabric'; $state }
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -Resume })
+            @($script:calls | Where-Object { $_ -eq 'sdk' }).Count | Should -Be 1
+            $script:calls.IndexOf('sdk') | Should -BeLessThan $script:calls.IndexOf('bundle')
+            Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -Times 1 -Exactly
+        }
+
+        It 'isn''t needed with -SkipRunner, a what-if, or a run that builds no runner, and the status page says why: <Case>' -ForEach @(
+            @{ Case = '-SkipRunner'; Run = @{ SkipRunner = $true }; Text = 'Not needed: -SkipRunner builds no workload runner.' }
+            @{ Case = '-WhatIf'; Run = @{ WhatIf = $true }; Text = 'What if: nothing is installed.' }
+            @{ Case = '-FromStage Validation'; Run = @{ FromStage = 'Validation' }; Text = 'Not needed: this run builds no workload runner.' }
+        ) {
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress; Run = $Run } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path @Run })
+            $script:calls | Should -Not -Contain 'sdk'
+            $row = Get-TestRow -Id 'DotNetSdk'
+            $row['state'] | Should -Be 'Skipped'
+            $row['message'] | Should -Be $Text
+        }
+    }
+
     Context 'track records across runs (Phase 28 live finding, 2026-10-30)' {
         BeforeEach {
             # The resource group's tags, kept across the runs of one test: what Set-DemoDeploymentState writes,
@@ -2257,6 +2317,27 @@ Describe 'Invoke-DemoParallelDeployment' {
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.PREFLIGHT' }).status | Should -Be 'Fail'
             Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoDeploymentTrackJob -Times 0 -Exactly
             Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
+        }
+
+        It 'gives DEPLOY.ARTIFACTS.BUILD the .NET SDK check''s diagnosis and fix when the build failed on the SDK, and preflight -SkipRunner (2026-11-09 live finding)' {
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoArtifactBuildJob -MockWith {
+                $script:calls.Add('build')
+                $value = [pscustomobject]@{ Bundle = $null; Runner = $null; Error = 'dotnet publish failed with exit code -2147450725: The command could not be loaded, possibly because: * You intended to execute a .NET SDK command: A compatible .NET SDK was ...' }
+                [System.IO.File]::WriteAllText((Join-Path -Path $HandoffPath -ChildPath 'artifacts.xml'), [System.Management.Automation.PSSerializer]::Serialize($value, 5))
+                Start-ThreadJob -Name 'dbhub-build-artifacts' -ScriptBlock { }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDotNetSdkStatus -MockWith {
+                [pscustomobject]@{ Ok = $false; Message = 'The dotnet first on PATH, C:\Program Files\dotnet\dotnet.exe, has no .NET SDK, only runtimes.'; Fix = 'Install the .NET SDK 10.0.403 or later: winget install Microsoft.DotNet.SDK.10.' }
+            }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config })
+            $build = $results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.BUILD' }
+            $build.status | Should -Be 'Fail'
+            $build.remediation | Should -BeExactly 'The dotnet first on PATH, C:\Program Files\dotnet\dotnet.exe, has no .NET SDK, only runtimes. Install the .NET SDK 10.0.403 or later: winget install Microsoft.DotNet.SDK.10.'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -Times 1 -Exactly -ParameterFilter { -not $SkipRunner }
+
+            $script:received = @{}
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -SkipRunner })
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -Times 1 -Exactly -ParameterFilter { [bool]$SkipRunner }
         }
 
         It 'doesn''t start an early T2 restore when the T2 source isn''t a new golden host' {

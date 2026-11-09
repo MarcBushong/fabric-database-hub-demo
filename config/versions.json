@@ -303,6 +303,26 @@
     "releaseMetadata": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
     "verifiedOn": "2026-11-09"
   },
+  "dotnetSdkInstall": {
+    "note": "The .NET SDK that deploy.ps1 installs for the user when no dotnet it finds has one that workload-generator/global.json accepts (2026-11-09, the owner's decision): Microsoft's SDK zip for Windows, never the installer, into %LOCALAPPDATA%\\DbHubDemo\\dotnet\\<version>, with no administrator rights and no change to PATH (Initialize-DemoDotNetSdk). 'version' matches tools.dotnetSdk and global.json (a Pester test checks). Each file's 'sha512' is the hash Microsoft publishes in the release metadata (releaseMetadata), checked on 2026-11-09, and also by downloading both zips and hashing them (win-arm64's through deploy.ps1's own install on an ARM64 PC); 'sizeBytes' is the zip's size, which deploy.ps1 shows before it downloads. deploy.ps1 checks the SHA-512, then dotnet.exe's Authenticode signature, then 'dotnet --version' in workload-generator, before it uses the SDK. Update it with the SDK: from the release whose sdks list contains tools.dotnetSdk, that SDK's files dotnet-sdk-win-x64.zip and dotnet-sdk-win-arm64.zip.",
+    "version": "10.0.403",
+    "releaseMetadata": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
+    "verifiedOn": "2026-11-09",
+    "files": {
+      "win-x64": {
+        "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.403/dotnet-sdk-10.0.403-win-x64.zip",
+        "fileName": "dotnet-sdk-10.0.403-win-x64.zip",
+        "sizeBytes": 300745255,
+        "sha512": "7a114c318fa7f1d9822991b534b2814d0e78386ceda816b371f5141acefe741d87ccb606ede06cadac8f9ac5070e32b708a67bbd1619ff5e5a7858a27874ef48"
+      },
+      "win-arm64": {
+        "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.403/dotnet-sdk-10.0.403-win-arm64.zip",
+        "fileName": "dotnet-sdk-10.0.403-win-arm64.zip",
+        "sizeBytes": 291061166,
+        "sha512": "f78ecd8b48e24fd72ee604687b75f1bbb81505e8343f7d52e4baf9ea32372557eb30e88facaaad195bf2646fcce117fd941e49da0d5bdee1d60d63d836968429"
+      }
+    }
+  },
   "databaseHub": {
     "note": "Database Hub (preview) validation settings (Phase 9). Hub has no public API or ARM resource, so the validators use only these documented interfaces; the repo never calls private Hub routes. The telemetry endpoint and schema can change during the preview: re-read docUrl before you change a value. KQL templates live in scripts/modules/DbHubDemo/Kql.",
     "telemetry": {

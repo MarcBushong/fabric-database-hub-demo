@@ -16,9 +16,10 @@ function Invoke-DemoValidationPreflight {
         [int] $PolicyCacheHours = 0
     )
 
-    # validate.ps1 has already run the subscription guard; preflight runs it again, and its record is dropped.
-    $results = @(Invoke-DemoPreflight -Config $Context.Config -SkipProviderRegistration -SkipWhatIf -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours |
-            Where-Object { $_.checkId -ne 'PREFLIGHT.GUARD.CONTEXT' })
+    # validate.ps1 has already run the subscription guard; preflight runs it again, and its record is dropped. It builds
+    # nothing, so it needs no .NET SDK (-SkipRunner), and that check's Not selected record is dropped too.
+    $results = @(Invoke-DemoPreflight -Config $Context.Config -SkipProviderRegistration -SkipWhatIf -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipRunner |
+            Where-Object { $_.checkId -notin 'PREFLIGHT.GUARD.CONTEXT', 'PREFLIGHT.TOOLS.DOTNETSDK' })
     $sqlPublic = $results | Where-Object { $_.checkId -eq 'PREFLIGHT.POLICY.SQLPUBLIC' } | Select-Object -First 1
     if ($sqlPublic -and -not [bool](Get-DemoMemberValue -InputObject $sqlPublic.evidence -Name 'assumed')) {
         $mode = [string](Get-DemoMemberValue -InputObject $sqlPublic.evidence -Name 'effectiveNetworkMode')
