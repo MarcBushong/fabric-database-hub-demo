@@ -83,8 +83,43 @@ A **Warning** on the guard means `azureAccount` isn't set: the evidence names th
 | `-WaitForT2` | Wait for T2 in GitHub Actions or another CI system too. Elsewhere it's the default since Phase 28, so the switch is accepted but redundant. |
 | `-NoStatusPage`, `-NoBrowser` | Write no progress model and no status page (the guided stop's prompt, reminders, and `HUMAN ACTION REQUIRED` line still come in the console, from the T2 track's process); or write them but open nothing in a browser (the page's path and the portal link are printed). |
 | `-PolicyCacheHours` | Reuse preflight's last complete policy inventory while the policy assignments that apply are unchanged and it's at most this old (168 by default; the reused results say so). `0` reads every policy definition again (7–13 minutes measured). |
+| `-NoSelfUpdate` | Don't check whether this copy is behind GitHub's main, and don't update it ([below](#updates-from-github-2026-11-09)); `DBHUB_NO_SELF_UPDATE=1` does the same. |
 
 **The machine that runs `deploy.ps1` must stay awake.** Its tracks poll Azure from your machine; if it sleeps (Modern Standby included), every process freezes until it wakes, and the run takes that much longer (live, 2026-10-23: 35 minutes). Since Phase 28, `deploy.ps1` keeps a Windows PC and its display awake until it ends, and releases that in a `finally` ([SetThreadExecutionState](https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate), with `ES_SYSTEM_REQUIRED`, `ES_DISPLAY_REQUIRED`, and `ES_CONTINUOUS`; Phase 25a found the display flag necessary). It can't stop a lid close or a shutdown, so plug a laptop in and leave it open. On macOS and Linux it changes nothing: keep the machine awake with its own settings.
+
+### Updates from GitHub (2026-11-09)
+
+`deploy.ps1` runs the code in its own folder. Before 2026-11-09 it never asked GitHub whether that code was current, so a tester's assistant that re-ran an older demo from a clone pulled earlier the same day hit a problem that was already fixed on `main`. The owner chose: "Update itself: fast-forward a clean checkout to the latest main, then run".
+
+**What it does.** First, before the transcript, the configuration, or any Azure call, `deploy.ps1` fetches origin's `main` (`git fetch`, at most 20 seconds, never a credential prompt). It updates only a checkout where all of these hold:
+
+- Git is installed, and this folder is a git checkout.
+- The branch is `main`, and it tracks `origin/main`.
+- No tracked file is modified or staged. Your configuration in `config/` and the run's files in `out/` are Git-ignored, so they never count.
+- `HEAD` is an ancestor of `origin/main`, with commits to take.
+
+Then `git merge --ff-only` moves it to the fetched commit ([git merge](https://git-scm.com/docs/git-merge#Documentation/git-merge.txt---ff-only)). One line says from which commit to which, and how many commits came from GitHub. `deploy.ps1` then starts again in a fresh `pwsh`, in the same console, with exactly the same parameters (a `-ConfigPath` with spaces included), and exits with that run's exit code. The old code goes no further. The restarted run carries `DBHUB_SELF_UPDATED`, so it never checks or restarts again, and it shows the update as the first note in the banner and on the status page (`DEPLOY.SELFUPDATE`, **Pass**).
+
+**When it doesn't update**, `DEPLOY.SELFUPDATE` is a **Warning** with the reason and the exact command (on the console, in the banner, and on the status page), and the run goes on with the code in this folder. A check that fails never stops the run.
+
+| Case | Command the Warning gives |
+|---|---|
+| Tracked files have local changes | `git stash; git pull --ff-only; git stash pop` (or commit them first) |
+| Another branch, or a detached `HEAD` | `git switch main; git pull --ff-only` |
+| `main` tracks a branch other than `origin/main`, or none | `git branch --set-upstream-to=origin/main main; git pull --ff-only` |
+| Diverged: local commits on `main` that GitHub's `main` doesn't have | `git merge origin/main` (keeps them), or `git reset --hard origin/main` (discards them) |
+| The fetch fails or takes longer than 20 seconds (offline) | `git pull --ff-only`, once GitHub can be reached |
+| Git isn't installed, or the folder isn't a git checkout (a downloaded zip) | `git clone https://github.com/MarcBushong/fabric-database-hub-demo.git`, then copy `config/demo.config.json` into the new folder |
+| `-WhatIf`, which changes nothing, this checkout included | A run without `-WhatIf` updates it first |
+| The fast-forward itself fails | `git status`, then `git pull --ff-only` |
+
+A checkout that already has everything on GitHub's `main` is a **Pass**, even on another branch, with local changes, or with local commits on top: there's nothing to take.
+
+**Opting out:** `-NoSelfUpdate`, or the environment variable `DBHUB_NO_SELF_UPDATE=1` (`true` works too; `0` doesn't opt out), for example while you test a change of your own on `main`. CI (`GITHUB_ACTIONS`, `CI`, or `TF_BUILD`) skips the check: a workflow runs the commit it checked out. Both are **Not selected**, with no git call.
+
+**On a resume**, the usual case for someone who runs `deploy.ps1` again: the restarted run continues the unfinished deployment as any plain run does. When the update changed what runs on the VMs (`vm/`, the bootstrap, or the workload runner), the run's existing check sends the new bundle to the VMs that lack it and runs their tracks again from their Artifacts step ([update an existing environment](#update-an-existing-environment); `DEPLOY.ARTIFACTS.CHANGED_*`). So one `./scripts/deploy.ps1` takes both the new code on this PC and the new code on the VMs.
+
+**What it fetches:** origin's `main`. A copy made with **Use this template**, or a fork, has its own `main` as origin, so it gets that copy's code, not this repository's fixes. Bring those in with your own `git pull` from this repository.
 
 ### One command, one guided stop (Phase 28)
 

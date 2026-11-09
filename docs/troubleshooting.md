@@ -80,6 +80,25 @@ az login --tenant <tenantId>                                  # once, as the acc
 
 ## Deployment
 
+### deploy.ps1's update from GitHub (`DEPLOY.SELFUPDATE`, 2026-11-09)
+
+Before anything else, `deploy.ps1` checks whether this copy is behind GitHub's `main`. A clean `main` that tracks `origin/main` fast-forwards, and the run starts again with the new code ([updates from GitHub](deployment.md#updates-from-github-2026-11-09)). Otherwise it's one **Warning**, and the run goes on with the code in this folder: nothing is changed, and nothing is blocked. To run the latest code, end the run (Ctrl+C), run the command the Warning gives, then run `./scripts/deploy.ps1` again; it continues where it stopped.
+
+| The Warning says | What it means | Fix |
+|---|---|---|
+| "tracked files have local changes (...)" | You changed files that Git tracks, and GitHub's `main` has newer commits. Updating could mix the two, so it doesn't | `git stash; git pull --ff-only; git stash pop`, or commit your changes first. Your configuration (`config/`) and `out/` are Git-ignored and never count |
+| "on branch ..., not main" or "on a detached HEAD" | This checkout isn't on `main`, and lacks commits that `main` has | `git switch main; git pull --ff-only` |
+| "its main tracks ..., not origin/main" | `main` tracks another remote's branch, or none | `git branch --set-upstream-to=origin/main main; git pull --ff-only` |
+| "local commit(s) that GitHub's main doesn't" | `main` has diverged: commits of your own, and commits from GitHub | `git merge origin/main` keeps yours; `git reset --hard origin/main` discards them |
+| "GitHub couldn't be reached to check for newer code" | Offline, a proxy, or the fetch took longer than 20 seconds. A fork that needs a credential fails too: the check never prompts for one | When GitHub can be reached: `git pull --ff-only` |
+| "Git isn't installed" or "this folder isn't a git checkout" | A downloaded zip, or no Git on this PC, so nothing can be compared | Install [Git](https://git-scm.com/downloads), `git clone https://github.com/MarcBushong/fabric-database-hub-demo.git`, and copy `config/demo.config.json` into the new folder |
+| "-WhatIf changes nothing, this checkout included" | A `-WhatIf` run never updates | A run without `-WhatIf` updates it first |
+| "the fast-forward failed (...)" | Usually an untracked file in the way of one that GitHub's `main` adds | `git status`, move that file away, then `git pull --ff-only` |
+
+To turn the check off, for example while you test a change of your own on `main`: `./scripts/deploy.ps1 -NoSelfUpdate`, or set `DBHUB_NO_SELF_UPDATE=1` (`$env:DBHUB_NO_SELF_UPDATE = '1'` in PowerShell). CI skips it. If the run printed "This copy was updated, but deploy.ps1 couldn't start again", the folder already has the new code: run `./scripts/deploy.ps1` again.
+
+### Other deployment problems
+
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | A template deployment is denied | A tenant policy; the error names it | Change the option the policy denies. Preflight's what-if usually catches this first |

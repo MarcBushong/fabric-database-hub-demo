@@ -161,6 +161,13 @@ Where to write the results as JSON lines.
 .PARAMETER TreatManualAsError
 In GitHub Actions: exit with code 2 when a result is Manual action required.
 
+.PARAMETER NoSelfUpdate
+Don't check whether this copy is behind GitHub's main, and don't update it (also DBHUB_NO_SELF_UPDATE=1). By default,
+before anything else, a clean checkout of main that's behind origin's main fast-forwards (git merge --ff-only) and
+deploy.ps1 starts again with the new code and the same parameters; anything else (local changes, another branch,
+diverged, offline, no Git, a downloaded zip) is a Warning with the exact command, and the run goes on with the code in
+this folder (DEPLOY.SELFUPDATE, 2026-11-09). CI skips the check.
+
 .EXAMPLE
 ./scripts/deploy.ps1
 
@@ -214,7 +221,9 @@ param(
 
     [string] $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '../out/deploy.jsonl'),
 
-    [switch] $TreatManualAsError
+    [switch] $TreatManualAsError,
+
+    [switch] $NoSelfUpdate
 )
 
 Set-StrictMode -Version Latest
@@ -229,6 +238,13 @@ foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
     $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
+# 2026-11-09, the owner's choice: before anything else (no transcript, no configuration, no Azure call), a clean main
+# that's behind GitHub's main fast-forwards and this script runs again with the new code and the same parameters; the
+# old code goes no further. Anything else is a Warning with the exact command, and the run goes on (DEPLOY.SELFUPDATE).
+$selfUpdate = Invoke-DemoSelfUpdate -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters -RepositoryRoot (Join-Path -Path $PSScriptRoot -ChildPath '..') -NoSelfUpdate:$NoSelfUpdate -Nested:$entryNested -WhatIf:([bool]$WhatIfPreference)
+if ($selfUpdate.Restarted) {
+    exit ([int]$selfUpdate.ExitCode)
+}
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
@@ -271,8 +287,8 @@ try {
     $waitForT2Now = -not $NoWaitForT2 -and (-not $environment.Ci -or $WaitForT2) -and -not $Sequential
     # A Ctrl+C while the run's experience starts still lets the PC sleep again (the outer finally block below).
     $awake = 'starting'
-    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -WhatIf:$whatIf -Confirm:$false
-    $results = @()
+    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -Note @($selfUpdate.Note) -WhatIf:$whatIf -Confirm:$false
+    $results = @($selfUpdate.Result | Where-Object { $null -ne $_ })
     $outcome = $null
     $finished = $false
     $stopped = $false
@@ -308,7 +324,7 @@ try {
             $parameters['PagePath'] = [string]$run.PagePath
         }
         try {
-            $results = @(Invoke-DemoDeployment @parameters)
+            $results = @($results) + @(Invoke-DemoDeployment @parameters)
         }
         catch [System.OperationCanceledException] {
             # Ctrl+C that the wait for the tracks noticed itself (Phase 28 live finding): the ending below says so.
