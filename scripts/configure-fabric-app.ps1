@@ -17,10 +17,12 @@ tenant, and azureAccount) must pass; the Fabric token then comes from the Azure 
 2026-11-09 (user-directed: "They should sign into Az login and then have everything deployed"), the Rayfin CLI uses the
 Azure CLI's sign-in too: each of its commands gets a token for its own audience, as RAYFIN_TOKEN in its own process only
 (Invoke-DemoRayfinCli, Get-DemoRayfinTokenAudience): the Fabric API for 'rayfin up' and 'rayfin up status', the Power BI
-API for the connector's queries. When Fabric refuses that token, FABRIC.APP.TOKEN is a Warning with the reason, and the
-Rayfin CLI's own cached sign-in deploys instead; with -SignIn, its browser sign-in runs in this console when it's missing
-(the CLI's service principal sign-in isn't supported yet). out/fabric-app-auth.json records which way worked, for
-deploy.ps1. -RayfinSignIn skips the Azure CLI's tokens. The script never signs in to Azure, never changes the Azure CLI
+API for the app's queries. When the connector's direct route refuses the Power BI token, the queries run through Power
+BI's Execute Queries with the same token (2026-11-09 live finding), never with the Rayfin CLI's own sign-in. When Fabric
+refuses the Fabric token for 'rayfin up', FABRIC.APP.TOKEN is a Warning with the reason, and the Rayfin CLI's own cached
+sign-in deploys instead; with -SignIn, its browser sign-in runs in this console when it's missing (the CLI's service
+principal sign-in isn't supported yet). out/fabric-app-auth.json records which way 'rayfin up' worked, for deploy.ps1.
+-RayfinSignIn skips the Azure CLI's tokens. The script never signs in to Azure, never changes the Azure CLI
 context, and never pauses, resumes, or scales the capacity.
 
 1. Source: rayfin/rayfin.yml holds only ${...} placeholders for IDs, protected asset access, and the pinned CLI
@@ -39,12 +41,13 @@ context, and never pauses, resumes, or scales the capacity.
 6. Deploy: Invoke-DemoFabricAppDeployment runs 'rayfin up --yes --json' and 'rayfin up status'
    (FABRIC.APP.DEPLOY, FABRIC.APP.STATUS); when Fabric refuses the Azure CLI's token, FABRIC.APP.TOKEN says why and the
    Rayfin CLI's own sign-in deploys instead.
-7. Checks: Test-DemoFabricApp runs every DAX query the app uses through the connector, confirms that the hosted
-   assets refuse anonymous requests, and adds the browser check (FABRIC.APP.CONNECTOR, .QUERIES, .HOSTING,
-   .BROWSER): a note when the queries ran (2026-11-09), Manual action required otherwise. The supported way to open
-   the app is its item in the Fabric workspace (embedded); opening the hosted URL directly is a known preview
-   limitation. Without -FabricAdmin, a passing deploy proves the Fabric Apps setting and a passing connector check
-   proves the Execute Queries setting, so both become a Pass.
+7. Checks: Test-DemoFabricApp runs every DAX query the app uses under the operator's identity, through the
+   connector's direct route or, when that route refuses the Azure CLI's token, Power BI's Execute Queries, confirms
+   that the hosted assets refuse anonymous requests, and adds the browser check (FABRIC.APP.CONNECTOR, .QUERIES,
+   .HOSTING, .BROWSER): a note when the app is deployed and its queries ran (2026-11-09), Manual action required
+   otherwise. The supported way to open the app is its item in the Fabric workspace (embedded); opening the hosted URL
+   directly is a known preview limitation. Without -FabricAdmin, a passing deploy proves the Fabric Apps setting and a
+   passing connector check proves the Execute Queries setting, so both become a Pass.
 
 -WhatIf validates the source and lists the plan without a token, a network call, or a write. -DryRun runs steps 1
 to 5 and 'rayfin up --dry-run'. -CheckOnly runs step 7 against the deployed app, without deploying.
@@ -81,20 +84,22 @@ Check the deployed app (connector, hosting, browser steps) without deploying.
 Don't run npm ci in the stage.
 
 .PARAMETER Queries
-All runs every query the app uses through the connector (about 14 CLI calls); Probe runs only the connector check.
+All runs every query the app uses (14: connector calls, or Execute Queries requests); Probe runs only the connector
+check.
 
 .PARAMETER FabricAdmin
 The caller is a Fabric administrator, so read the Fabric Apps (preview) tenant setting through the admin API.
 
 .PARAMETER SignIn
-When the Rayfin CLI needs its own sign-in (with -RayfinSignIn, or when Fabric refuses the Azure CLI's token) and it
-isn't signed in to the demo's tenant (FABRIC.APP.SIGNIN), sign it in now, interactively: the stage's pinned CLI runs
-'rayfin login --tenant <tenantId>' in this console and opens a browser, then the sign-in is checked again
-(Connect-DemoRayfinCli; prerequisite P14). Only in an interactive session: in CI it's Not supported, and nothing is
-deployed until a person signs in. The script never sees or keeps the sign-in.
+When the Rayfin CLI needs its own sign-in (with -RayfinSignIn, or when Fabric refuses the Azure CLI's token for
+'rayfin up') and it isn't signed in to the demo's tenant (FABRIC.APP.SIGNIN), sign it in now, interactively: the
+stage's pinned CLI runs 'rayfin login --tenant <tenantId>' in this console and opens a browser, then the sign-in is
+checked again (Connect-DemoRayfinCli; prerequisite P14). Only in an interactive session: in CI it's Not supported, and
+nothing is deployed until a person signs in. The script never sees or keeps the sign-in.
 
 .PARAMETER RayfinSignIn
-Use only the Rayfin CLI's own cached sign-in, as before 2026-11-09, not the Azure CLI's tokens.
+Use only the Rayfin CLI's own cached sign-in, as before 2026-11-09, not the Azure CLI's tokens: for 'rayfin up' and
+for the app's queries, which then run only through the connector.
 
 .PARAMETER TimeoutSeconds
 How long 'rayfin up' and npm ci may each run.
@@ -339,10 +344,11 @@ if ($modelId -notmatch $guidPattern) {
 #endregion Step 2-3: guard, workspace, and items
 
 # The Azure CLI's tokens for the Rayfin CLI (2026-11-09, user-directed: "They should sign into Az login and then have
-# everything deployed"): the Fabric API for 'rayfin up' and 'rayfin up status', the Power BI API for the connector's
-# queries, each as RAYFIN_TOKEN in that command's process only (Get-DemoRayfinTokenAudience). -RayfinSignIn uses the
-# CLI's own sign-in instead. The Power BI token needs the subscription guard this script ran; with a -FabricToken the
-# caller passed, the connector's queries use the CLI's own sign-in.
+# everything deployed"): the Fabric API for 'rayfin up' and 'rayfin up status', the Power BI API for the app's queries,
+# each as RAYFIN_TOKEN in that command's process only (Get-DemoRayfinTokenAudience), and the Power BI one for Execute
+# Queries too when the connector's direct route refuses it (2026-11-09 live finding). -RayfinSignIn uses the CLI's own
+# sign-in instead. The Power BI token needs the subscription guard this script ran; with a -FabricToken the caller passed,
+# there's none, and the app's queries are checked only with -RayfinSignIn (Test-DemoFabricApp warns).
 $rayfinToken = @{ Fabric = $null; PowerBI = $null }
 if (-not $RayfinSignIn) {
     $rayfinToken.Fabric = $FabricToken
@@ -351,7 +357,7 @@ if (-not $RayfinSignIn) {
             $rayfinToken.PowerBI = Get-DemoPowerBIToken -SubscriptionId ([string]$config['subscriptionId'])
         }
         catch {
-            Write-DemoLog -Level Warning -Message ('The Azure CLI gave no Power BI token, so the Insights app''s queries are checked with the Rayfin CLI''s own sign-in: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+            Write-DemoLog -Level Warning -Message ('The Azure CLI gave no Power BI token, so the Insights app''s queries can''t be checked (FABRIC.APP.CONNECTOR says so; -RayfinSignIn checks them with the Rayfin CLI''s own sign-in): {0}' -f (Protect-DemoText -Text $_.Exception.Message))
         }
     }
 }
@@ -451,7 +457,9 @@ elseif ($deployed -or $CheckOnly) {
         & $skip 'FABRIC.APP.CONNECTOR' 'The Rayfin CLI isn''t signed in to the demo''s tenant, so the connector wasn''t checked.'
     }
     else {
-        $results.AddRange([object[]]@(Test-DemoFabricApp -StagePath $stage -HostingUrl $hostingUrl -ItemUrl $itemUrl -Queries $Queries -Token $rayfinToken.PowerBI))
+        # The workspace and model for Execute Queries, and whether this run deployed the app, for the browser check's note.
+        $check = @{ StagePath = $stage; HostingUrl = $hostingUrl; ItemUrl = $itemUrl; Queries = $Queries; Token = $rayfinToken.PowerBI; WorkspaceId = $targetWorkspaceId; SemanticModelId = $modelId; Deployed = $deployed; RayfinSignIn = [bool]$RayfinSignIn }
+        $results.AddRange([object[]]@(Test-DemoFabricApp @check))
     }
 }
 else {

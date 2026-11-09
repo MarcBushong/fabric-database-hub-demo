@@ -594,22 +594,37 @@ Describe 'Test-DemoFabricApp' {
     BeforeEach {
         $script:checkStage = Join-Path -Path $TestDrive -ChildPath ('check-' + [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $script:checkStage -Force
-        # npm run queries:export writes the payloads and their index into the stage.
+        # The row bound each payload carries (resultSetRowCountLimit), as the catalog sets it; a test can lower one.
+        $script:rowLimits = @{ 'connector-check' = 1; 'history-meta' = 1; 'estate-targets' = 50; 'replay-T3' = 500 }
+        # npm run queries:export writes the payloads ({ query, resultSetRowCountLimit }) and their index into the stage.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -MockWith {
             $folder = Join-Path -Path $WorkingDirectory -ChildPath $ArgumentList[3]
             $null = New-Item -ItemType Directory -Path $folder -Force
-            $index = @{ latestDay = '2026-10-21'; queries = @(
-                    @{ id = 'connector-check'; file = 'connector-check.json' }
-                    @{ id = 'history-meta'; file = 'history-meta.json' }
-                    @{ id = 'estate-targets'; file = 'estate-targets.json' }
-                    @{ id = 'replay-T3'; file = 'replay-T3.json' }
-                ) }
+            $ids = @('connector-check', 'history-meta', 'estate-targets', 'replay-T3')
+            foreach ($id in $ids) {
+                @{ query = ('EVALUATE /* {0} */ ROW("x", 1)' -f $id); resultSetRowCountLimit = $script:rowLimits[$id] } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath ($id + '.json')) -Encoding utf8NoBOM
+            }
+            $index = @{ latestDay = '2026-10-21'; queries = @($ids | ForEach-Object { @{ id = $_; file = ($_ + '.json'); rowLimit = $script:rowLimits[$_] } }) }
             $index | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath 'index.json') -Encoding utf8NoBOM
             [pscustomobject]@{ ExitCode = 0; StdOut = 'Wrote 4 queries'; StdErr = '' }
         }
+        # Power BI's Execute Queries runs only when the connector's direct route refuses the token; a test says so.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -MockWith { throw 'Execute Queries isn''t expected here.' }
+        # The refusal of the connector's route is never recorded as the deploy token's (2026-11-09).
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoRayfinAuthRecord -MockWith { throw 'Test-DemoFabricApp must never record a token refusal.' }
+        # The connector's direct route as it answered live for the Azure CLI's token (2026-11-09: Power BI's
+        # executeDaxQueries, HTTP 401), and Execute Queries' rows for each query, by the query's text.
+        $script:refusedRun = New-CliResult @{ status = 'error'; error = 'Request failed with status code 401'; recovery = 'Check the token.'; connectorError = @{ category = 'api'; code = 'Unauthorized'; message = '{"error":{"code":"Unauthorized","pbi.error":{"code":"Unauthorized","parameters":{},"details":[],"exceptionCulprit":1}}}' } } -ExitCode 1
+        $script:daxRows = @{
+            'connector-check' = @([pscustomobject]@{ '[ValidationRows]' = 12; '[SnapshotRows]' = 2293; '[Incidents]' = 4 })
+            'history-meta'    = @([pscustomobject]@{ '[LatestDay]' = [datetime]::new(2026, 10, 21, 0, 0, 0, [System.DateTimeKind]::Unspecified) })
+            'estate-targets'  = @([pscustomobject]@{ 'Target[Target Key]' = 'T1' }, [pscustomobject]@{ 'Target[Target Key]' = 'T3' })
+            'replay-T3'       = @()
+        }
+        $script:daxAnswer = { param([string] $Query) $id = [regex]::Match($Query, '/\* (\S+) \*/').Groups[1].Value; [pscustomobject]@{ StatusCode = 200; Rows = @($script:daxRows[$id]); Error = '' } }
     }
 
-    It 'passes when every query returns rows and anonymous requests are refused, and makes the browser check a note: the queries verified the app''s connector (2026-11-09)' {
+    It 'passes when every query returns rows and anonymous requests are refused, and makes the browser check a note that says exactly what was verified (2026-11-09)' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith {
             $file = $ArgumentList[[array]::IndexOf($ArgumentList, '--file') + 1]
             $table = if ($file -match 'connector-check') { @{ columns = @(@{ name = '[ValidationRows]' }, @{ name = '[SnapshotRows]' }, @{ name = '[Incidents]' }); rows = @(, @(12, 2293, 4)) } }
@@ -618,20 +633,24 @@ Describe 'Test-DemoFabricApp' {
             New-CliResult @{ status = 'ok'; connector = 'history'; operation = 'executeQuery'; output = @{ status = 'success'; table = $table } }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '{"error":"Authentication required."}' } }
-        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -ItemUrl 'https://app.fabric.microsoft.com/groups/x/appbackends/y')
+        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -ItemUrl 'https://app.fabric.microsoft.com/groups/x/appbackends/y' -Token $script:token -Deployed)
         $connector = $results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR'
         $connector.status | Should -Be 'Pass'
-        $connector.message | Should -Match 'Connector check passed: .* 12 validation checks, 2293 telemetry rows, and 4 incident windows'
+        $connector.message | Should -BeExactly 'Connector check passed with the Azure CLI''s Power BI token: the history connector returned 12 validation checks, 2293 telemetry rows, and 4 incident windows from SM_DatabaseHub_History.'
+        $connector.evidence['route'] | Should -Be 'connector'
+        $connector.evidence['auth'] | Should -Be 'azureCli'
         ($results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES').status | Should -Be 'Pass'
         ($results | Where-Object checkId -EQ 'FABRIC.APP.HOSTING').status | Should -Be 'Pass'
         $browser = $results | Where-Object checkId -EQ 'FABRIC.APP.BROWSER'
         $browser.status | Should -Be 'Not selected' -Because 'nobody needs to open the app to finish the deployment (user-directed: no user steps)'
-        $browser.message | Should -Match '^Not needed: every query the app runs worked through its connector'
-        $browser.message | Should -Match 'appbackends'
-        $browser.evidence['verifiedBy'] | Should -Be 'FABRIC.APP.QUERIES'
-        $browser.evidence['inAppSignInChecked'] | Should -BeFalse -Because 'the app''s own sign-in in the browser isn''t checked by a script'
-        $connector.evidence['auth'] | Should -Be 'rayfinSignIn' -Because 'no token was passed'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 0 -Exactly -ParameterFilter { $null -ne $PesterBoundParameters['Token'] }
+        $browser.message | Should -Match '^Not needed: the app is deployed \(FABRIC\.APP\.DEPLOY\), and its hosting is protected: the hosted app refuses anonymous requests \(FABRIC\.APP\.HOSTING\); and every query it runs \(4\) returned data from SM_DatabaseHub_History under your identity \(FABRIC\.APP\.QUERIES, through the connector''s direct route\)\. '
+        $browser.message | Should -Match 'What no script can check is the app''s own route in the browser: its embedded sign-in, then its backend, User Data Functions, and a delegated on-behalf-of call to the model'
+        $browser.message | Should -Match 'open its item page \(https://app\.fabric\.microsoft\.com/groups/x/appbackends/y\) in the Fabric portal'
+        $browser.message | Should -Not -Match 'the one the app uses' -Because 'the direct route never crosses the app''s own route (review, 2026-11-09)'
+        @($browser.evidence['verifiedBy']) | Should -Be @('FABRIC.APP.DEPLOY', 'FABRIC.APP.HOSTING', 'FABRIC.APP.CONNECTOR', 'FABRIC.APP.QUERIES')
+        $browser.evidence['inAppRouteChecked'] | Should -BeFalse -Because 'the app''s own route in the browser isn''t checked by a script'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 0 -Exactly -ParameterFilter { $null -eq $PesterBoundParameters['Token'] }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -Times 0 -Exactly
         # The catalog was exported again for the newest telemetry day.
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains '2026-10-21' }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-WebRequest -Times 1 -Exactly -ParameterFilter { $Headers['Accept'] -eq 'application/json' -and -not $Authentication }
@@ -648,7 +667,7 @@ Describe 'Test-DemoFabricApp' {
             New-CliResult @{ status = 'ok'; output = @{ status = 'success'; table = $table } }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '' } }
-        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting)
+        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Token $script:token)
         ($results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES').status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -Times 1 -Exactly -ParameterFilter {
             ($ArgumentList -join ' ') -match '2026-10-23 --t3-incident-start 2026-10-23T20:13:00Z --t3-incident-end 2026-10-23T20:34:00Z$'
@@ -675,12 +694,13 @@ Describe 'Test-DemoFabricApp' {
             New-CliResult @{ status = 'ok'; output = @{ status = 'success'; table = $table } }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 200; Content = '<html></html>' } }
-        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting)
+        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Token $script:token -Deployed)
         ($results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES').status | Should -Be 'Fail'
         ($results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES').message | Should -Match 'estate-targets'
         ($results | Where-Object checkId -EQ 'FABRIC.APP.HOSTING').status | Should -Be 'Fail'
         $browser = $results | Where-Object checkId -EQ 'FABRIC.APP.BROWSER'
         $browser.status | Should -Be 'Manual action required' -Because 'a query failed, so the queries didn''t verify the app'
+        $browser.message | Should -Match 'its queries didn''t all run here'
         $browser.remediation | Should -Match 'Connector check passed'
         $browser.remediation | Should -Match 'Page not accessible directly'
     }
@@ -693,35 +713,178 @@ Describe 'Test-DemoFabricApp' {
         $connector.status | Should -Be 'Pass'
         $connector.message | Should -Match '^Connector check passed with the Azure CLI''s Power BI token: '
         $connector.evidence['auth'] | Should -Be 'azureCli'
+        $connector.evidence['route'] | Should -Be 'connector'
+        $connector.evidence.Contains('connectorRefusal') | Should -BeFalse
         $connector.evidence.Contains('tokenRefused') | Should -BeFalse
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 0 -Exactly -ParameterFilter { $null -eq $PesterBoundParameters['Token'] }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -ParameterFilter { [object]::ReferenceEquals($PesterBoundParameters['Token'], $script:token) -and $TokenAudience -eq 'PowerBI' -and $ArgumentList[0] -eq 'connector' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -Times 0 -Exactly -Because 'the connector''s route took the token'
     }
 
-    It 'goes on with the Rayfin CLI''s own sign-in when Fabric refuses the Power BI token, and says so (2026-11-09)' {
-        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+    Context 'when the connector''s direct route refuses the Azure CLI''s token (live, 2026-11-09)' {
+        BeforeEach {
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith {
+                if ($null -eq $PesterBoundParameters['Token']) {
+                    throw 'The Rayfin CLI''s own sign-in must never run without -RayfinSignIn.'
+                }
+                $script:refusedRun
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -MockWith { & $script:daxAnswer $Query }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '' } }
+        }
+
+        It 'runs the connector check and every query through Execute Queries with the same token: no Rayfin sign-in, nothing recorded, and the browser check a note' {
+            $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -ItemUrl 'https://app.fabric.microsoft.com/groups/x/appbackends/y' -Token $script:token -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Deployed)
+            $connector = $results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR'
+            $connector.status | Should -Be 'Pass'
+            $connector.message | Should -BeExactly 'Connector check passed through Power BI''s Execute Queries with the Azure CLI''s Power BI token, because the history connector''s direct route refused that token (HTTP 401): SM_DatabaseHub_History returned 12 validation checks, 2293 telemetry rows, and 4 incident windows. No Rayfin sign-in was needed.'
+            $connector.evidence['route'] | Should -Be 'executeQueries'
+            $connector.evidence['auth'] | Should -Be 'azureCli'
+            $connector.evidence['connectorRefusal'] | Should -Match '401'
+            $connector.docUrl | Should -Be 'https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group'
+            $queries = $results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES'
+            $queries.status | Should -Be 'Warning' -Because 'replay-T3 has no rows, as incident-windows and readiness-checks had live'
+            $queries.message | Should -BeExactly 'All 4 app queries ran through Power BI''s Execute Queries with the Azure CLI''s Power BI token (the history connector''s direct route refused it); 1 returned no rows for the newest telemetry day 2026-10-21: replay-T3.'
+            $queries.evidence['route'] | Should -Be 'executeQueries'
+            @($queries.evidence['queries'] | ForEach-Object { $_['route'] }) | Should -Be @('executeQueries', 'executeQueries', 'executeQueries', 'executeQueries')
+            @($queries.evidence['queries'] | ForEach-Object { $_['rows'] }) | Should -Be @(1, 1, 2, 0)
+            $queries.evidence['rowBound'] | Should -Match 'one query per request and has no resultSetRowCountLimit'
+            # The deploy accepted the token, so this isn't an auth refusal: no record says so, and nothing is kept for a
+            # later run, which would open a browser.
+            $results.checkId | Should -Not -Contain 'FABRIC.APP.TOKEN'
+            foreach ($record in $results) {
+                @($record.evidence.Keys) | Should -Not -Contain 'tokenRefused' -Because $record.checkId
+                @($record.evidence.Keys) | Should -Not -Contain 'signInNeeded' -Because $record.checkId
+            }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoRayfinAuthRecord -Times 0 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly -ParameterFilter { $PesterBoundParameters['Level'] -in 'Warning', 'Error' }
+            # One connector call, the refused probe; then Execute Queries for each query, one per request, with the same token.
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 1 -Exactly
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -Times 4 -Exactly -ParameterFilter { $WorkspaceId -eq $script:workspaceId -and $SemanticModelId -eq $script:modelId -and [object]::ReferenceEquals($Token, $script:token) }
+            $browser = $results | Where-Object checkId -EQ 'FABRIC.APP.BROWSER'
+            $browser.status | Should -Be 'Not selected'
+            $browser.message | Should -Match '^Not needed: the app is deployed \(FABRIC\.APP\.DEPLOY\), and its hosting is protected: the hosted app refuses anonymous requests \(FABRIC\.APP\.HOSTING\); and every query it runs \(4\) ran on SM_DatabaseHub_History under your identity, and 3 returned data; the other one has no history for its window yet \(FABRIC\.APP\.QUERIES, through Power BI''s Execute Queries\)\. '
+            $browser.message | Should -Match 'which none of these checks crosses\. To see it, open its item page \(https://app\.fabric\.microsoft\.com/groups/x/appbackends/y\) in the Fabric portal; it opens embedded and signs in by itself\.$'
+            $browser.evidence['route'] | Should -Be 'executeQueries'
+        }
+
+        It 'reads the workspace and the model from the stage''s rayfin/.env when they aren''t passed, and fails clearly without them' {
+            $null = New-Item -ItemType Directory -Path (Join-Path -Path $script:checkStage -ChildPath 'rayfin') -Force
+            Set-Content -LiteralPath (Join-Path -Path $script:checkStage -ChildPath 'rayfin/.env') -Value @('RAYFIN_PUBLIC_URL=https://app-example.invalid', ('DBHUB_FABRIC_WORKSPACE_ID={0}' -f $script:workspaceId), ('DBHUB_SEMANTIC_MODEL_ID={0}' -f $script:modelId)) -Encoding utf8NoBOM
+            $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Queries Probe -Token $script:token)
+            ($results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR').status | Should -Be 'Pass'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq $script:workspaceId -and $SemanticModelId -eq $script:modelId }
+
+            Remove-Item -LiteralPath (Join-Path -Path $script:checkStage -ChildPath 'rayfin/.env')
+            $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Queries Probe -Token $script:token)
+            $connector = $results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR'
+            $connector.status | Should -Be 'Fail'
+            $connector.message | Should -Match 'Power BI''s Execute Queries couldn''t run: the workspace and the semantic model aren''t known'
+            $connector.remediation | Should -Match '^Pass -WorkspaceId and -SemanticModelId, or deploy the app first'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -Times 1 -Exactly -Because 'without the IDs, Execute Queries isn''t called'
+        }
+
+        It 'fails with the fix for what Power BI answered when Execute Queries refuses the token too: HTTP <Code>' -ForEach @(
+            @{ Code = 401; Fix = 'sign in again with az login --tenant <tenantId> as the configured azureAccount' }
+            @{ Code = 403; Fix = 'needs Read and Build on SM_DatabaseHub_History .* Dataset Execute Queries REST API must be on for them \(FABRIC\.APP\.EXECUTEQUERIES\)' }
+            @{ Code = 404; Fix = 'SM_DatabaseHub_History wasn''t found in the workspace: deploy it with \./scripts/configure-powerbi\.ps1' }
+            @{ Code = 503; Fix = 'Power BI didn''t answer the check \(HTTP 503\): check again with -CheckOnly in a few minutes' }
+        ) {
+            $script:failCode = $Code
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -MockWith { [pscustomobject]@{ StatusCode = $script:failCode; Rows = @(); Error = ('HTTP {0} Unauthorized' -f $script:failCode) } }
+            $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Token $script:token -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Deployed)
+            $connector = $results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR'
+            $connector.status | Should -Be 'Fail'
+            $connector.message | Should -BeExactly ('The connector check failed on both routes: the history connector''s direct route refused the Azure CLI''s Power BI token (HTTP 401), and Power BI''s Execute Queries answered HTTP {0} Unauthorized' -f $Code)
+            $connector.remediation | Should -Match $Fix
+            $connector.remediation | Should -Not -Match 'configure-fabric-app\.ps1' -Because 'deploy.ps1''s summary keeps only a fix that doesn''t name the script'
+            $connector.evidence['statusCode'] | Should -Be $Code
+            $connector.evidence['route'] | Should -Be 'executeQueries'
+            ($results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES').status | Should -Be 'Not selected'
+            ($results | Where-Object checkId -EQ 'FABRIC.APP.BROWSER').status | Should -Be 'Manual action required'
+            $results.checkId | Should -Not -Contain 'FABRIC.APP.TOKEN'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 1 -Exactly -Because 'the Rayfin CLI''s own sign-in is no fallback'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoRayfinAuthRecord -Times 0 -Exactly
+        }
+
+        It 'fails a query over the app''s row bound, as the app''s connector would (overflow): Execute Queries has none' {
+            $script:rowLimits['estate-targets'] = 1
+            $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Token $script:token -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Deployed)
+            $queries = $results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES'
+            $queries.status | Should -Be 'Fail'
+            $queries.message | Should -Match ([regex]::Escape('estate-targets (overflow: 2 rows, over the app''s bound of 1 (resultSetRowCountLimit), which its connector refuses)'))
+            $queries.remediation | Should -Match 'A query over its row bound \(overflow\) needs a narrower window, or a larger rowLimit'
+            ($results | Where-Object checkId -EQ 'FABRIC.APP.BROWSER').status | Should -Be 'Manual action required'
+        }
+    }
+
+    It 'runs the queries through the connector with the Rayfin CLI''s own sign-in only with -RayfinSignIn, as before, and never through Execute Queries' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith {
             if ($null -ne $PesterBoundParameters['Token']) {
-                return (New-CliResult @{ status = 'error'; error = 'Request failed with status code 403: Forbidden' } -ExitCode 1)
+                throw 'No token with -RayfinSignIn.'
             }
             New-CliResult @{ status = 'ok'; output = @{ status = 'success'; table = @{ columns = @(@{ name = '[ValidationRows]' }, @{ name = '[SnapshotRows]' }, @{ name = '[Incidents]' }); rows = @(, @(12, 2293, 4)) } } }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '' } }
-        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Queries Probe -Token $script:token)
+        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Queries Probe -RayfinSignIn)
         $connector = $results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR'
         $connector.status | Should -Be 'Pass'
-        $connector.message | Should -Match 'with the Rayfin CLI''s own sign-in, because Fabric refused the Azure CLI''s Power BI token: .*403'
+        $connector.message | Should -Match '^Connector check passed with the Rayfin CLI''s own sign-in \(-RayfinSignIn\): the history connector returned 12 validation checks'
         $connector.evidence['auth'] | Should -Be 'rayfinSignIn'
-        $connector.evidence['tokenRefused'] | Should -BeTrue
-        $connector.evidence['refusal'] | Should -Match '403'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 1 -Exactly -ParameterFilter { $null -ne $PesterBoundParameters['Token'] } -Because 'after the refusal, every call uses the CLI''s own sign-in'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'Fabric refused the Azure CLI''s Power BI token' }
+        $connector.evidence['route'] | Should -Be 'connector'
+
+        # Not signed in: a Fail that says how to sign in, and still no Execute Queries.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { New-CliResult @{ status = 'error'; error = 'Not logged in. Run rayfin login.' } -ExitCode 1 }
+        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Queries Probe -RayfinSignIn -Token $script:token)
+        $connector = $results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR'
+        $connector.status | Should -Be 'Fail'
+        $connector.message | Should -Match '^The history connector didn''t return the connector check with the Rayfin CLI''s own sign-in: Not logged in'
+        $connector.remediation | Should -Match '-SignIn signs it in'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -Times 0 -Exactly -ParameterFilter { $null -ne $PesterBoundParameters['Token'] } -Because '-RayfinSignIn passes no token, even when one is given'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -Times 0 -Exactly
+    }
+
+    It 'warns, runs no query, and leaves the browser check to a person without a token or -RayfinSignIn: the Rayfin CLI''s own sign-in is never a fallback' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { throw 'No Rayfin CLI call is expected without a token or -RayfinSignIn.' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '' } }
+        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Deployed)
+        $connector = $results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR'
+        $connector.status | Should -Be 'Warning'
+        $connector.message | Should -Match 'the Rayfin CLI''s own sign-in runs them only with -RayfinSignIn, never as a fallback'
+        $connector.remediation | Should -Match '-CheckOnly -RayfinSignIn'
+        ($results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES').status | Should -Be 'Not selected'
+        ($results | Where-Object checkId -EQ 'FABRIC.APP.HOSTING').status | Should -Be 'Pass'
+        ($results | Where-Object checkId -EQ 'FABRIC.APP.BROWSER').status | Should -Be 'Manual action required'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -Times 0 -Exactly -Because 'nothing exports queries no route can run'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDaxQuery -Times 0 -Exactly
+    }
+
+    It 'says only what was verified in the browser check''s note, and asks a person when the deployment wasn''t confirmed: <Case>' -ForEach @(
+        @{ Case = 'deployed in this run, hosting unconfirmed'; Deployed = $true; Code = 302; Hosting = $true; Status = 'Not selected'; Text = '^Not needed: the app is deployed \(FABRIC\.APP\.DEPLOY\), though its hosting''s protection wasn''t confirmed \(FABRIC\.APP\.HOSTING says why\); and every query it runs \(4\) returned data' }
+        @{ Case = 'a check of an earlier deploy, hosting protected'; Deployed = $false; Code = 401; Hosting = $true; Status = 'Not selected'; Text = '^Not needed: the app is deployed, and its hosting is protected: the hosted app refuses anonymous requests \(FABRIC\.APP\.HOSTING\); and every query' }
+        @{ Case = 'a check without a deployment record'; Deployed = $false; Code = 401; Hosting = $false; Status = 'Manual action required'; Text = '^A person must confirm the app in the browser: that it''s deployed wasn''t confirmed here \(no deploy in this run, and FABRIC\.APP\.HOSTING didn''t pass\), and its own route there' }
+    ) {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith {
+            $file = $ArgumentList[[array]::IndexOf($ArgumentList, '--file') + 1]
+            $table = if ($file -match 'connector-check') { @{ columns = @(@{ name = '[ValidationRows]' }, @{ name = '[SnapshotRows]' }, @{ name = '[Incidents]' }); rows = @(, @(12, 2293, 4)) } }
+            elseif ($file -match 'history-meta') { @{ columns = @(@{ name = '[LatestDay]' }); rows = @(, @('2026-10-21T00:00:00')) } }
+            else { @{ columns = @(@{ name = 'Target[Target Key]' }); rows = @(, @('T3')) } }
+            New-CliResult @{ status = 'ok'; output = @{ status = 'success'; table = $table } }
+        }
+        $script:hostingCode = $Code
+        Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = $script:hostingCode; Content = '' } }
+        $hostingUrl = if ($Hosting) { $script:hosting } else { '' }
+        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $hostingUrl -Token $script:token -Deployed:$Deployed)
+        $browser = $results | Where-Object checkId -EQ 'FABRIC.APP.BROWSER'
+        $browser.status | Should -Be $Status
+        $browser.message | Should -Match $Text
     }
 
     It 'reports a blank count as 0: DAX COUNTROWS over an empty table, as in a new lakehouse, is blank' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { New-CliResult @{ status = 'ok'; output = @{ status = 'success'; table = @{ columns = @(@{ name = '[ValidationRows]' }, @{ name = '[SnapshotRows]' }, @{ name = '[Incidents]' }); rows = @(, @($null, 2598, 22)) } } } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '' } }
-        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Queries Probe)
+        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -Queries Probe -Token $script:token)
         $connector = $results | Where-Object checkId -EQ 'FABRIC.APP.CONNECTOR'
         $connector.status | Should -Be 'Pass'
         $connector.message | Should -Match 'returned 0 validation checks, 2598 telemetry rows, and 22 incident windows'
@@ -733,7 +896,7 @@ Describe 'Test-DemoFabricApp' {
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path -Path $script:checkStage -ChildPath 'rayfin/.deployments.json') -Encoding utf8NoBOM
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinCli -MockWith { New-CliResult @{ status = 'ok'; output = @{ status = 'success'; table = @{ columns = @(@{ name = '[ValidationRows]' }); rows = @(, @(12)) } } } }
         Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { [pscustomobject]@{ StatusCode = 401; Content = '' } }
-        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -Queries Probe)
+        $results = @(Test-DemoFabricApp -StagePath $script:checkStage -Queries Probe -Token $script:token)
         ($results | Where-Object checkId -EQ 'FABRIC.APP.HOSTING').status | Should -Be 'Pass'
         ($results | Where-Object checkId -EQ 'FABRIC.APP.BROWSER').remediation | Should -Match 'appbackends'
         ($results | ConvertTo-Json -Depth 10) | Should -Not -Match ([regex]::Escape($script:fakeKey))
@@ -948,10 +1111,10 @@ Describe 'configure-fabric-app.ps1' {
             $records.checkId | Should -Not -Contain 'FABRIC.APP.TOKEN'
             Should -Invoke -CommandName Test-DemoFabricAppPrerequisite -Times 1 -Exactly -ParameterFilter { -not $UseAzureCliToken }
             Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 1 -Exactly -ParameterFilter { $null -eq $PesterBoundParameters['Token'] }
-            Should -Invoke -CommandName Test-DemoFabricApp -Times 1 -Exactly -ParameterFilter { $null -eq $PesterBoundParameters['Token'] }
+            Should -Invoke -CommandName Test-DemoFabricApp -Times 1 -Exactly -ParameterFilter { $null -eq $PesterBoundParameters['Token'] -and $RayfinSignIn }
         }
 
-        It 'asks the Azure CLI for a Power BI token for the connector''s queries after its own subscription guard, and goes on without one' {
+        It 'asks the Azure CLI for a Power BI token for the app''s queries after its own subscription guard, and goes on without one' {
             $pass = $script:passResult
             $testFabricToken = $script:token
             $testPowerBIToken = ConvertTo-HubSecureString ('pbi' + ('y' * 40))
@@ -966,11 +1129,39 @@ Describe 'configure-fabric-app.ps1' {
             Should -Invoke -CommandName Get-DemoPowerBIToken -Times 1 -Exactly
             Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 1 -Exactly -ParameterFilter { [object]::ReferenceEquals($PesterBoundParameters['Token'], $testFabricToken) }
             Should -Invoke -CommandName Test-DemoFabricApp -Times 1 -Exactly -ParameterFilter { [object]::ReferenceEquals($PesterBoundParameters['Token'], $testPowerBIToken) }
+            # The workspace and model for Execute Queries, and the deploy that just ran, for the browser check's note (2026-11-09).
+            Should -Invoke -CommandName Test-DemoFabricApp -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq $script:workspaceId -and $SemanticModelId -eq $script:modelId -and $Deployed -and -not $RayfinSignIn }
 
             Mock -CommandName Get-DemoPowerBIToken -MockWith { throw 'az account get-access-token failed.' }
             $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
             $LASTEXITCODE | Should -Be 0
-            Should -Invoke -CommandName Test-DemoFabricApp -Times 1 -Exactly -ParameterFilter { $null -eq $PesterBoundParameters['Token'] }
+            Should -Invoke -CommandName Test-DemoFabricApp -Times 1 -Exactly -ParameterFilter { $null -eq $PesterBoundParameters['Token'] -and -not $RayfinSignIn }
+        }
+
+        It 'adds no FABRIC.APP.TOKEN and opens no browser when only the connector''s direct route refused the token: Execute Queries checked the app and proves its tenant setting (2026-11-09 live finding)' {
+            $pass = $script:passResult
+            $testFabricToken = $script:token
+            $testPowerBIToken = ConvertTo-HubSecureString ('pbi' + ('y' * 40))
+            Mock -CommandName Assert-DemoAzContext -MockWith { & $pass 'PREFLIGHT.GUARD.CONTEXT' }
+            Mock -CommandName Get-DemoFabricToken -MockWith { $testFabricToken }
+            Mock -CommandName Get-DemoPowerBIToken -MockWith { $testPowerBIToken }
+            Mock -CommandName Test-DemoFabricAppPrerequisite -MockWith {
+                @((& $pass 'FABRIC.APP.NODE'), (& $pass 'FABRIC.APP.SIGNIN' @{ auth = 'azureCli' }), (New-DemoResult -CheckId 'FABRIC.APP.EXECUTEQUERIES' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'Confirm it.'))
+            }
+            # rayfin up took the Azure CLI's token; only the connector's direct route refused the Power BI one.
+            Mock -CommandName Invoke-DemoFabricAppDeployment -MockWith { @((& $pass 'FABRIC.APP.DEPLOY' @{ itemId = $itemId; hostingUrl = $hosting; auth = 'azureCli' }), (& $pass 'FABRIC.APP.STATUS')) }
+            Mock -CommandName Test-DemoFabricApp -MockWith {
+                @((& $pass 'FABRIC.APP.CONNECTOR' @{ route = 'executeQueries'; auth = 'azureCli'; connectorRefusal = 'Request failed with status code 401' }), (& $pass 'FABRIC.APP.QUERIES' @{ route = 'executeQueries' }), (& $pass 'FABRIC.APP.HOSTING'), (New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'Not needed: ...'))
+            }
+            $output = Join-Path -Path $TestDrive -ChildPath 'connector-refused.jsonl'
+            $null = & $script:configureApp -ConfigPath (New-TestConfigFile) -OutputPath $output 6>&1
+            $LASTEXITCODE | Should -Be 0
+            $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
+            $records.checkId | Should -Not -Contain 'FABRIC.APP.TOKEN'
+            @($records | Where-Object { $_.checkId -like 'FABRIC.APP.*' -and $_.status -in 'Fail', 'Manual action required' }) | Should -BeNullOrEmpty
+            ($records | Where-Object checkId -EQ 'FABRIC.APP.EXECUTEQUERIES').status | Should -Be 'Pass' -Because 'Execute Queries is the API that setting gates'
+            Should -Invoke -CommandName Invoke-DemoFabricAppDeployment -Times 1 -Exactly
+            Should -Invoke -CommandName Connect-DemoRayfinCli -Times 0 -Exactly
         }
     }
 
