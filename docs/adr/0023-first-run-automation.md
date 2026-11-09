@@ -1,6 +1,6 @@
 # ADR 0023: First-run automation
 
-- **Status:** Accepted (amended 2026-10-29 for Phase 28: `deploy.ps1` runs the first run itself; and 2026-11-05: `JumpstartImage` is T2's default mode, see the [amendment](#amendment-jumpstartimage-first-in-the-first-run-2026-11-05))
+- **Status:** Accepted (amended 2026-10-29 for Phase 28: `deploy.ps1` runs the first run itself; 2026-11-05: `JumpstartImage` is T2's default mode, see the [amendment](#amendment-jumpstartimage-first-in-the-first-run-2026-11-05); and 2026-11-09: the Rayfin CLI deploys with the Azure CLI's tokens, see the [amendment](#amendment-the-azure-clis-tokens-for-the-rayfin-cli-2026-11-09-user-directed))
 - **Date:** 2026-10-27
 - **Decision source:** User-directed (2026-10-26: "automate as much as possible for other folks using the repo"; 2026-10-27: a colleague in another tenant tests the seamless first run), with the coordinator's decisions on the approved plan
 - **Related:** [ADR 0008](0008-identity-rbac-abac.md), [ADR 0009](0009-secrets-handling.md), [ADR 0011](0011-control-surface-priority.md), [ADR 0012](0012-validation-model.md), [ADR 0014](0014-notebook-role-and-capacity.md), [deployment](../deployment.md#first-run-initps1), [prerequisites](../prerequisites.md)
@@ -102,6 +102,36 @@ Three changes:
 
 Decision 3's rules stand. Unit-tested in `tests/unit/DbHubDemo.FabricAppSignIn.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`.
 
+## Amendment: the Azure CLI's tokens for the Rayfin CLI (2026-11-09, user-directed)
+
+The owner asked: "It should always do a one click and never have a user do their own sign in", then refined it: "Yes keep Az login, I am more concerned about the SQL set up. They should not need to manually do a wizard. They should sign into Az login and then have everything deployed. It is okay if rayfin needs another sign in but prefer not to." So the Insights app now deploys with the deployer's `az login`, and the Rayfin CLI's browser sign-in is only the fallback.
+
+1. **Each Rayfin command gets an Azure CLI token for its own audience.** The pinned CLI 1.36.2 takes an ambient `RAYFIN_TOKEN`: "When `RAYFIN_TOKEN` is set the ambient token is returned immediately, bypassing MSAL entirely" (`dist/auth/index.js`), for every command, whatever scopes it asks for (`dist/auth/token-audience.js`). The [CLI reference](https://learn.microsoft.com/fabric/apps/cli-reference) doesn't document it (checked 2026-11-09), so, like `BROWSER` above, it's read from the pinned package's code. `configure-fabric-app.ps1` gets the tokens from the Azure CLI after its subscription guard, and maps each command it runs to the audience the CLI's code asks for (`Get-DemoRayfinTokenAudience`):
+   - `rayfin up`, with `--dry-run` too, and `rayfin up status`: the Fabric API (`Get-DemoFabricToken`; the CLI's default scope is `https://api.fabric.microsoft.com/.default`).
+   - `rayfin connector invoke` on the semantic model connector: the Power BI API (`Get-DemoPowerBIToken`); the CLI checks the token's `aud` claim against `https://analysis.windows.net/powerbi/api` itself.
+   - `rayfin login status` doesn't run: with `RAYFIN_TOKEN` it reports an external identity and checks nothing. `FABRIC.APP.SIGNIN` is **Pass**, with evidence `auth` `azureCli`.
+
+   The token is set in that command's process environment only ([Start-Process](https://learn.microsoft.com/powershell/module/microsoft.powershell.management/start-process) `-Environment`, which already removed an ambient one), it's registered for redaction, and it's never logged or written to a file. A token for another audience than the command needs throws before anything runs (`Invoke-DemoRayfinCli -TokenAudience`), and `rayfin login` and `rayfin logout` never get one.
+2. **A refused token falls back to the Rayfin CLI's own sign-in.** A command that had the token and failed with an authorization error (HTTP 401 or 403, an invalid, expired, or wrong-audience token, or an Entra `AADSTS` error) counts as refused (`Get-DemoRayfinTokenRefusal`):
+   - For `rayfin up`, **`FABRIC.APP.TOKEN`** is a **Warning** with the reason, and the CLI's own cached sign-in deploys the app instead. Without one, the app isn't created in that run (`FABRIC.APP.DEPLOY` **Not selected**, evidence `signInNeeded`), which never blocks **DONE**, since the app's step is non-blocking; `-SignIn` opens the browser sign-in right there.
+   - The outcome goes to the Git-ignored `out/fabric-app-auth.json`: `Accepted` or `Refused`, the reason, the tenant, and the time, never a token. Only after a refusal for the demo's tenant does the next `deploy.ps1` start the CLI's browser sign-in at its start, as the amendments above describe (`Test-DemoRayfinSignInWanted`). Each run tries the Azure CLI's token first again, so a later acceptance records `Accepted`, and the browser stops opening.
+   - The connector's queries go on with the CLI's own sign-in after a refusal, and `FABRIC.APP.CONNECTOR` says so (evidence `tokenRefused` and `refusal`).
+   - `-RayfinSignIn` uses only the CLI's own sign-in, as before.
+
+   This change leaves the run's orchestration files as they were, because another change to them was in flight, so a refusal doesn't open a browser later in the same run. A proposed follow-up: the app's step asks `deploy.ps1`'s main process to start the sign-in when the service refuses the token.
+3. **By default nothing starts at the beginning of `deploy.ps1`.** `DEPLOY.FABRIC.APPSIGNIN` is **Not selected**, "Not needed: the Insights app's step gives the Rayfin CLI your Azure CLI sign-in (az login)": no window, no `BROWSER` handling, no read of the CLI's status, and no wait. CI and assistants get the same, instead of **Not supported**.
+4. **Never `npx`.** Every Rayfin command runs from the app's stage, which `npm ci` installs from `fabric/app/package-lock.json` with its npm overrides (MSAL Node 7.2.1, for [GHSA-xcx6-jx8p-x3h5](https://github.com/advisories/GHSA-xcx6-jx8p-x3h5)). `npx --package=@microsoft/rayfin-cli@<version>` resolved the CLI's dependencies from the registry without them. So the start's sign-in and its status read start only when a stage exists, which an earlier run's app step installs, and remediations name `./scripts/configure-fabric-app.ps1 -SignIn` or `./out/fabric-app/node_modules/.bin/rayfin`. This supersedes the `npx` reads in the amendments above.
+5. **The browser check becomes a note.** `FABRIC.APP.BROWSER` is **Not selected**, "Not needed", when the connector check passed and every query the app runs ran (`FABRIC.APP.QUERIES` **Pass** or **Warning**): they go through the same connector and model as the app. So **DONE** no longer lists it under "Please confirm". Otherwise it stays **Manual action required**. **Not selected** here stretches [ADR 0012](0012-validation-model.md)'s "the operator turned it off": it's the one status that's neither a check that ran nor one that's open, and the message says "Not needed".
+
+Consequences:
+
+- **When Fabric accepts the Azure CLI's token, `deploy.ps1` needs nobody after `az login`:** no browser, no window, and no wait. MSAL Node's auth-code flow, which GHSA-xcx6-jx8p-x3h5 covers, never runs in the deploy, because with `RAYFIN_TOKEN` the CLI calls no MSAL at all.
+- **Unknown until a live check:** whether the Fabric Apps (preview) backend accepts the Azure CLI's delegated token for `rayfin up`'s calls, including the `appBackends` routes it calls, and for the semantic model connector. If it doesn't, the first run gets the Warning and, without a cached Rayfin sign-in, no app; the next run opens the browser at its start, or `-SignIn` adds the app at once.
+- **`RAYFIN_TOKEN` is undocumented,** so a CLI upgrade can change it. The pin in `config/versions.json` and the unit tests guard it.
+- **No script checks the app's own embedded sign-in in the browser, or its deployed transport,** which `FABRIC.APP.BROWSER` asked a person to look at.
+
+Unit-tested in `tests/unit/DbHubDemo.FabricApp.Tests.ps1` (each command's audience, the token in the child's environment only, refusals, the record, the fallback, and the note) and `tests/unit/DbHubDemo.FabricAppSignIn.Tests.ps1` (no browser and no read by default; the start's sign-in through the stage's CLI after a refusal).
+
 ## Sources
 
 Checked 2026-10-27:
@@ -110,6 +140,7 @@ Checked 2026-10-27:
 - Microsoft Graph: [Get user (/me)](https://learn.microsoft.com/graph/api/user-get), [List groups](https://learn.microsoft.com/graph/api/group-list), [Create group](https://learn.microsoft.com/graph/api/group-post-groups), [Add owners](https://learn.microsoft.com/graph/api/group-post-owners), [List owners](https://learn.microsoft.com/graph/api/group-list-owners), and [self-service group management](https://learn.microsoft.com/entra/identity/users/groups-self-service-management)
 - Fabric REST: [List Capacities](https://learn.microsoft.com/rest/api/fabric/core/capacities/list-capacities), [List Workspaces](https://learn.microsoft.com/rest/api/fabric/core/workspaces/list-workspaces), [Run On Demand Item Job](https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/run-on-demand-item-job)
 - Azure Resource Manager, API version 2023-11-01: [Fabric Capacities - Resume](https://learn.microsoft.com/rest/api/microsoftfabric/fabric-capacities/resume), [Suspend](https://learn.microsoft.com/rest/api/microsoftfabric/fabric-capacities/suspend), [Get](https://learn.microsoft.com/rest/api/microsoftfabric/fabric-capacities/get), and [List By Subscription](https://learn.microsoft.com/rest/api/microsoftfabric/fabric-capacities/list-by-subscription); [pause and resume a capacity](https://learn.microsoft.com/fabric/enterprise/pause-resume)
-- [Rayfin CLI reference](https://learn.microsoft.com/fabric/apps/cli-reference) (`rayfin login --tenant`, `rayfin login status`)
+- [Rayfin CLI reference](https://learn.microsoft.com/fabric/apps/cli-reference) (`rayfin login --tenant`, `rayfin login status`; checked again 2026-11-09: it doesn't document `RAYFIN_TOKEN`)
+- [Get access tokens with the Azure CLI](https://learn.microsoft.com/cli/azure/account#az-account-get-access-token) (`az account get-access-token --resource`, checked 2026-11-09)
 - [Start-Process -Environment](https://learn.microsoft.com/powershell/module/microsoft.powershell.management/start-process) (PowerShell 7.4)
 - Dev containers: [hostRequirements](https://containers.dev/implementors/json_reference/) and [GitHub Codespaces](https://docs.github.com/codespaces/setting-up-your-project-for-codespaces/adding-a-dev-container-configuration/introduction-to-dev-containers)

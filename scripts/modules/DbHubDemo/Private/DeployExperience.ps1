@@ -359,7 +359,7 @@ function Get-DemoInsightsAppSummary {
     if ($records.Count -eq 0) {
         return $null
     }
-    $signIn = 'run ./scripts/configure-fabric-app.ps1 -SignIn, which opens a browser for your own sign-in (an assistant can''t do that sign-in for you), then deploys the app'
+    $signIn = 'run ./scripts/configure-fabric-app.ps1 -SignIn, which deploys the app with your Azure CLI sign-in and opens a browser for the Rayfin CLI''s own sign-in only if Fabric refuses that (an assistant can''t do that sign-in for you)'
     $deployed = @($records | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' -and [string]$_.status -eq 'Pass' }).Count -gt 0
     $open = @($records | Where-Object { [string]$_.status -in 'Fail', 'Manual action required' })
     $blocking = @($open | Where-Object { [string]$_.checkId -ne 'FABRIC.APP.BROWSER' })

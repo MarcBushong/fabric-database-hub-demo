@@ -416,7 +416,8 @@ Describe 'Connect-DemoRayfinCli (configure-fabric-app.ps1 -SignIn)' {
         $result = Connect-DemoRayfinCli -Config $script:config -StagePath $TestDrive -Confirm:$false
         $result.checkId | Should -Be 'FABRIC.APP.SIGNIN'
         $result.status | Should -Be 'Not supported'
-        $result.remediation | Should -Match 'rayfin login --tenant'
+        $result.remediation | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
+        $result.remediation | Should -Not -Match 'npx' -Because 'npx resolves the CLI''s dependencies without the lock file''s npm overrides (2026-11-09)'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRayfinInteractive -Times 0 -Exactly
     }
 

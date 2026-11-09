@@ -104,7 +104,7 @@ fabric/app/
 
 Remove an override once a pinned Rayfin release depends on a fixed version: `@azure/msal-node` 7.1.0 or later, or zod 4.6.6 or later.
 
-The `@azure/msal-node` override reaches everything installed from the lock file, so the stage's CLI, which `rayfin up` and `configure-fabric-app.ps1 -SignIn` run. It doesn't reach a CLI that `npx` installs: npx resolves the CLI's dependencies from the registry, without this project's overrides, so `deploy.ps1`'s browser sign-in and the one-time command in step 3 below still get MSAL Node 5.6.0. The advisory concerns apps that pass the authorization response to `acquireTokenByCode`, and the CLI never does: its browser sign-in goes through MSAL's `acquireTokenInteractive`, which passes only the code (the advisory's workaround). Until `deploy.ps1` no longer runs the CLI through npx, that's the remaining exposure ([R540](../../docs/implementation-report.md#risk-register)). With the override, `npm audit` reports no high advisory; the production dependencies have none at all (`npm audit --omit=dev`).
+The `@azure/msal-node` override reaches everything installed from the lock file, so the stage's CLI. Since 2026-11-09 every Rayfin command the scripts run comes from it: `rayfin up`, the connector's queries, `configure-fabric-app.ps1 -SignIn`, and `deploy.ps1`'s browser sign-in. None of them runs the CLI through `npx`, which resolves the CLI's dependencies from the registry without this project's overrides (before, `deploy.ps1`'s browser sign-in and the one-time command in step 3 below did, and got MSAL Node 5.6.0). With the Azure CLI's tokens (`RAYFIN_TOKEN`, step 3), a deploy calls no MSAL at all. The advisory concerns apps that pass the authorization response to `acquireTokenByCode`, and the CLI never does: its browser sign-in goes through MSAL's `acquireTokenInteractive`, which passes only the code (the advisory's workaround) ([R540](../../docs/implementation-report.md#risk-register)). With the override, `npm audit` reports no high advisory; the production dependencies have none at all (`npm audit --omit=dev`).
 
 ## Deploy
 
@@ -112,21 +112,21 @@ The `@azure/msal-node` override reaches everything installed from the lock file,
 ./scripts/configure-fabric-app.ps1
 ```
 
-`./scripts/deploy.ps1` runs it in its Fabric track, after the history report, as part of every deployment (2026-11-05). When the Rayfin CLI isn't signed in to the demo's tenant, `deploy.ps1` starts its browser sign-in (step 3 below) at the beginning of the run, in a session that can take keyboard input, and the rest of the run goes on; only this step waits for it, at most 15 minutes from the start. When the app can't be created, the deployment goes on and still ends **DONE**: the status page shows the app's step as **Failed**, with the actual error and the fix ([deployment](../../docs/deployment.md#the-insights-app-part-of-every-deployment-2026-11-05)).
+`./scripts/deploy.ps1` runs it in its Fabric track, after the history report, as part of every deployment (2026-11-05). Since 2026-11-09 it deploys with the deployer's Azure CLI sign-in (step 3), so no browser opens. Only when Fabric refused that token for the demo's tenant in an earlier run does `deploy.ps1` start the Rayfin CLI's own browser sign-in at the beginning of the run, in a session that can take keyboard input, and the rest of the run goes on; only this step waits for it, at most 15 minutes from the start. When the app can't be created, the deployment goes on and still ends **DONE**: the status page shows the app's step as **Failed**, with the actual error and the fix ([deployment](../../docs/deployment.md#the-insights-app-part-of-every-deployment-2026-11-05)).
 
 The script is unattended and idempotent; it deploys to the item named `APP_DatabaseHub_Insights` and updates it in place on every run. It never deletes anything. It needs:
 
 1. `SM_DatabaseHub_History` deployed (`./scripts/configure-powerbi.ps1`), and the workspace on an **Active** Fabric capacity: `rayfin up` can start a trial or assign a capacity when a workspace has none, so the script deploys only on an Active one.
 2. Node.js 20, 22, or 24 (the CLI's supported versions; it also ran on 26 with npm's EBADENGINE warning).
-3. **A one-time sign-in of the Rayfin CLI**, as the demo's Fabric user, in a terminal on the operator's machine:
+3. **The sign-in the Rayfin CLI uses.** By default, your Azure CLI sign-in (`az login`, 2026-11-09): after its subscription guard, the script gets a token for each command's audience, the Fabric API for `rayfin up` and `rayfin up status` and the Power BI API for `rayfin connector invoke`, and gives it to that command alone as `RAYFIN_TOKEN`, which the pinned CLI uses instead of its own sign-in. That variable is read in the CLI's code; the [CLI reference](https://learn.microsoft.com/fabric/apps/cli-reference) doesn't document it. When Fabric refuses the token, `FABRIC.APP.TOKEN` is a **Warning** with the reason, and the CLI's own one-time sign-in, as the demo's Fabric user, deploys instead. Make that sign-in with `-SignIn` (below), or, once the stage exists, from the repository root:
 
    ```powershell
-   npx --yes --package=@microsoft/rayfin-cli@1.36.2 -- rayfin login --tenant <tenantId>
+   ./out/fabric-app/node_modules/.bin/rayfin login --tenant <tenantId>
    ```
 
-   It opens a browser once. The CLI keeps its own token cache and renews it silently; without `-SignIn` (below), the script only reads it (`rayfin login status --json`) and never signs in or out. Service principal sign-in is listed in the [CLI reference](https://learn.microsoft.com/fabric/apps/cli-reference) but isn't supported yet, so there's no unattended CI deploy.
+   It opens a browser once. The CLI keeps its own token cache and renews it silently; without `-SignIn`, the script only reads it (`rayfin login status --json`) and never signs in or out. Don't sign in through `npx`: it installs the CLI without this project's npm overrides. Service principal sign-in is listed in the [CLI reference](https://learn.microsoft.com/fabric/apps/cli-reference) but isn't supported yet. `-RayfinSignIn` uses only the CLI's own sign-in, as before 2026-11-09.
 
-   Or run `./scripts/configure-fabric-app.ps1 -SignIn` (Phase 26b): when the CLI isn't signed in to the demo's tenant, it runs that same sign-in in your console, checks it, and deploys. It runs only in an interactive session; in CI it's **Not supported**, and nothing is deployed.
+   Or run `./scripts/configure-fabric-app.ps1 -SignIn` (Phase 26b): when the CLI's own sign-in is needed and it isn't signed in to the demo's tenant, it runs that same sign-in in your console, checks it, and deploys. It runs only in an interactive session; in CI it's **Not supported**.
 
    If no browser opens, check your terminal's `BROWSER`: when it's set, the CLI opens its sign-in page with `"<BROWSER>" "<url>"` and doesn't check the result, so a command line such as `"<path>\msedge.exe" --inprivate %s`, set for `az login`, opens nothing. `-SignIn` and `deploy.ps1` remove such a value for the CLI's process only (2026-11-06); for the command above, remove it from that terminal first ([troubleshooting](../../docs/troubleshooting.md#the-insights-app-fabric-app)).
 
@@ -138,14 +138,14 @@ What it does, as ADR 0012 results in `out/configure-fabric-app.jsonl`:
 | The subscription guard, then the workspace role and an Active capacity | `PREFLIGHT.GUARD.CONTEXT`, `FABRIC.P5.WORKSPACE`, `FABRIC.P5.CAPACITY` |
 | Find the model, the dashboard, and the report by name; build the new-tab links from their IDs | `FABRIC.APP.ITEMS` |
 | Mirror `fabric/app` into the Git-ignored stage `out/fabric-app`, write `rayfin/.env` (connector IDs) and `public/dbhub-app.json` (links, the expected account, and the resource group name for the agent prompts), and run `npm ci` when the lock file changed | `FABRIC.APP.STAGE`, `FABRIC.APP.DEPENDENCIES` |
-| Node.js, the CLI's sign-in to the demo's tenant, and the two tenant settings | `FABRIC.APP.NODE`, `.SIGNIN`, `.TENANTSETTING`, `.EXECUTEQUERIES` |
-| `rayfin up --workspace-id <id> --item-name APP_DatabaseHub_Insights --tenant <id> --yes --json`, then `rayfin up status --json` | `FABRIC.APP.DEPLOY`, `FABRIC.APP.STATUS` |
+| Node.js, the sign-in the CLI uses (the Azure CLI's tokens, or its own sign-in to the demo's tenant), and the two tenant settings | `FABRIC.APP.NODE`, `.SIGNIN`, `.TENANTSETTING`, `.EXECUTEQUERIES` |
+| `rayfin up --workspace-id <id> --item-name APP_DatabaseHub_Insights --tenant <id> --yes --json`, then `rayfin up status --json`; when Fabric refuses the Azure CLI's token, the CLI's own sign-in deploys instead | `FABRIC.APP.DEPLOY`, `FABRIC.APP.STATUS`, `FABRIC.APP.TOKEN` (only after a refusal) |
 | Every query in the app's catalog through the connector (`rayfin connector invoke`), anchored to the newest telemetry day; the hosted app refuses anonymous requests | `FABRIC.APP.CONNECTOR`, `.QUERIES`, `.HOSTING` |
-| The browser check, which only a person can do | `FABRIC.APP.BROWSER` (**Manual action required**) |
+| The browser check: a note once every query worked through the connector the app uses (2026-11-09); otherwise only a person can do it | `FABRIC.APP.BROWSER` (**Not selected**, "Not needed"; otherwise **Manual action required**) |
 
 Without `-FabricAdmin`, the tenant settings can't be read; a passing deploy proves **Fabric Apps (preview)** and a passing connector check proves **Dataset Execute Queries REST API** (the connector's runtime calls the [Execute Queries API](https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group)), so both become a **Pass**. With `-FabricAdmin`, they're read through the [admin API](https://learn.microsoft.com/rest/api/fabric/admin/tenants/list-tenant-settings).
 
-Options: `-WhatIf` validates the source and lists the plan with no token, network call, or write. `-DryRun` runs everything up to `rayfin up --dry-run`. `-CheckOnly` checks the deployed app without deploying. `-Queries Probe` runs only the connection check. `-TreatManualAsError` exits with code 2 while the browser check is pending.
+Options: `-WhatIf` validates the source and lists the plan with no token, network call, or write. `-DryRun` runs everything up to `rayfin up --dry-run`. `-CheckOnly` checks the deployed app without deploying. `-Queries Probe` runs only the connection check. `-TreatManualAsError` exits with code 2 while the browser check is pending. `-RayfinSignIn` uses only the Rayfin CLI's own sign-in, not the Azure CLI's tokens.
 
 The CLI's `connector invoke --transport deployed` needs an app session the CLI can't create yet (HTTP 401 in the live check), so the in-app path is the browser check. Measured on 2026-10-22 (F16, West US 3): the first deploy of the item took 53 s; redeploys of the real app took 37 s and 57 s; the whole script took 175 s and 278 s (about 45 s of it the subscription guard, and about 2 minutes the 13 connector calls), and `-CheckOnly` took 124 s. With the Database Agent prompts (14 queries), the redeploy took 47 s and the whole script 265 s.
 
@@ -180,7 +180,8 @@ To run the app locally against the deployed backend, work in the stage (`out/fab
 | Symptom | Fix |
 |---|---|
 | "Page not accessible directly" | Open the app from its workspace item (see above) |
-| `FABRIC.APP.SIGNIN` is Manual action required | Run the one-time `rayfin login` command in the remediation, then the script again |
+| `FABRIC.APP.SIGNIN` is Manual action required | The CLI's own sign-in is needed and missing: run `./scripts/configure-fabric-app.ps1 -SignIn`, or the stage's `rayfin login` command in the remediation, then the script again |
+| `FABRIC.APP.TOKEN` is a Warning | Fabric refused the Azure CLI's token. When the app deployed with the CLI's own sign-in, nothing; otherwise run `./scripts/configure-fabric-app.ps1 -SignIn` |
 | `FABRIC.APP.DEPLOY` says not signed in or the token expired | The CLI's session lapsed; sign in again with the same command |
 | `FABRIC.APP.ITEMS` is Manual action required | Deploy the model first: `./scripts/configure-powerbi.ps1` |
 | A visual says Fabric refused the query | The viewer needs Read and Build on `SM_DatabaseHub_History`, and the Execute Queries tenant setting |

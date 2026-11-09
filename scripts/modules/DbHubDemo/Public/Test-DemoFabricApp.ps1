@@ -18,10 +18,14 @@ function Test-DemoFabricApp {
     2. Hosting: an anonymous GET of the hosted app with Accept: application/json must be refused (HTTP 401), because
        rayfin.yml sets staticHosting.assetAccess to protected (https://learn.microsoft.com/fabric/apps/hosting).
        HTTP 200 with app content would mean public assets: Fail.
-    3. Browser: Manual action required. Open the app from its item in the Fabric workspace (the supported entry
-       point: it runs embedded and signs in with initEmbeddedAuth, https://learn.microsoft.com/fabric/apps/fabric-authentication)
-       and confirm the Live links page shows the connector check. Opening the hosted URL directly is a known preview
-       limitation: the sign-in pop-up stops at "Page not accessible directly".
+    3. Browser: when the connector check passed and every query the app runs ran (FABRIC.APP.QUERIES Pass or Warning),
+       Not selected, as a note: the queries go through the same connector and model the app uses, so nobody needs to
+       open the app to finish the deployment (2026-11-09, user-directed: no user steps). Otherwise Manual action
+       required: open the app from its item in the Fabric workspace (the supported entry point: it runs embedded and
+       signs in with initEmbeddedAuth, https://learn.microsoft.com/fabric/apps/fabric-authentication) and confirm the
+       Live links page shows the connector check. Either way, the app's own sign-in in the browser and its deployed
+       transport aren't checked by a script. Opening the hosted URL directly is a known preview limitation: the
+       sign-in pop-up stops at "Page not accessible directly".
 
     .PARAMETER StagePath
     The deploy stage (out/fabric-app) with the pinned CLI installed.
@@ -37,6 +41,11 @@ function Test-DemoFabricApp {
 
     .PARAMETER TimeoutSeconds
     How long each connector call may run.
+
+    .PARAMETER Token
+    A Power BI API token from the Azure CLI (Get-DemoPowerBIToken), which 'rayfin connector invoke' gets as
+    RAYFIN_TOKEN instead of the CLI's own sign-in (2026-11-09; Get-DemoRayfinTokenAudience). When the service refuses
+    it, the calls go on with the CLI's own sign-in, and FABRIC.APP.CONNECTOR says so (evidence tokenRefused, refusal).
 
     .EXAMPLE
     Test-DemoFabricApp -StagePath ./out/fabric-app -HostingUrl $hosting -ItemUrl $item
@@ -57,7 +66,9 @@ function Test-DemoFabricApp {
         [string] $Queries = 'All',
 
         [ValidateRange(30, 1800)]
-        [int] $TimeoutSeconds = 300
+        [int] $TimeoutSeconds = 300,
+
+        [securestring] $Token
     )
 
     $settings = Get-DemoFabricAppSetting
@@ -96,9 +107,18 @@ function Test-DemoFabricApp {
         }
         return (Get-Content -LiteralPath $indexPath -Raw | ConvertFrom-Json -AsHashtable)
     }
+    # The Power BI token for the connector's calls, until the service refuses it (then the CLI's own sign-in; 2026-11-09).
+    $auth = @{ Token = $Token; Refusal = '' }
     $invoke = {
         param([string] $File)
-        $call = Invoke-DemoRayfinCli -StagePath $stage -ArgumentList @('connector', 'invoke', '--name', $connector, '--operation', 'executeQuery', '--file', ($queryFolder + '/' + $File), '--max-inline-bytes', '0', '--json') -TimeoutSeconds $callTimeout
+        $call = Invoke-DemoRayfinCli -StagePath $stage -ArgumentList @('connector', 'invoke', '--name', $connector, '--operation', 'executeQuery', '--file', ($queryFolder + '/' + $File), '--max-inline-bytes', '0', '--json') -TimeoutSeconds $callTimeout -Token $auth.Token -TokenAudience 'PowerBI'
+        $refusal = if ($null -ne $auth.Token) { Get-DemoRayfinTokenRefusal -Run $call } else { '' }
+        if ($refusal) {
+            $auth.Token = $null
+            $auth.Refusal = $refusal
+            Write-DemoLog -Level Warning -Message ('Fabric refused the Azure CLI''s Power BI token for the Insights app''s connector ({0}), so its queries run with the Rayfin CLI''s own sign-in.' -f $refusal)
+            $call = Invoke-DemoRayfinCli -StagePath $stage -ArgumentList @('connector', 'invoke', '--name', $connector, '--operation', 'executeQuery', '--file', ($queryFolder + '/' + $File), '--max-inline-bytes', '0', '--json') -TimeoutSeconds $callTimeout
+        }
         $data = $call.Data
         $output = if ($data -and $data['output'] -is [System.Collections.IDictionary]) { $data['output'] } else { @{} }
         $table = if ($output['table'] -is [System.Collections.IDictionary]) { $output['table'] } else { @{} }
@@ -125,11 +145,23 @@ function Test-DemoFabricApp {
             }
             # COUNTROWS over an empty table is blank in DAX, which a new lakehouse has until a notebook writes rows.
             $count = { param($Value) if ($null -eq $Value -or [string]$Value -eq '') { 0 } else { $Value } }
-            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.CONNECTOR' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('Connector check passed: the {0} connector returned {1} validation checks, {2} telemetry rows, and {3} incident windows from {4}.' -f $connector, (& $count $values['ValidationRows']), (& $count $values['SnapshotRows']), (& $count $values['Incidents']), $settings['semanticModelName']) -Evidence ([ordered]@{ connector = $connector; row = $values }) -DocUrl $connectorDoc))
+            $through = if ($auth.Refusal) { ' with the Rayfin CLI''s own sign-in, because Fabric refused the Azure CLI''s Power BI token: {0}' -f $auth.Refusal } elseif ($null -ne $Token) { ' with the Azure CLI''s Power BI token' } else { '' }
+            $connectorEvidence = [ordered]@{ connector = $connector; row = $values; auth = $(if ($null -ne $auth.Token) { 'azureCli' } else { 'rayfinSignIn' }) }
+            if ($auth.Refusal) {
+                $connectorEvidence['tokenRefused'] = $true
+                $connectorEvidence['refusal'] = $auth.Refusal
+            }
+            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.CONNECTOR' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('Connector check passed{5}: the {0} connector returned {1} validation checks, {2} telemetry rows, and {3} incident windows from {4}.' -f $connector, (& $count $values['ValidationRows']), (& $count $values['SnapshotRows']), (& $count $values['Incidents']), $settings['semanticModelName'], $through) -Evidence $connectorEvidence -DocUrl $connectorDoc))
         }
         else {
             $why = if ($probe.Error) { $probe.Error } else { 'the query returned no rows' }
-            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.CONNECTOR' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('The {0} connector didn''t return the connector check: {1}' -f $connector, $why) -Evidence @{ connector = $connector } -Remediation ('The signed-in user needs Read and Build on {0}; check that the model is deployed and refreshed (configure-powerbi.ps1 -CheckModelData).' -f $settings['semanticModelName']) -DocUrl $connectorDoc))
+            $failEvidence = [ordered]@{ connector = $connector }
+            if ($auth.Refusal) {
+                $why = '{0} (Fabric refused the Azure CLI''s Power BI token first: {1}; the Rayfin CLI''s own sign-in ran it then)' -f $why, $auth.Refusal
+                $failEvidence['tokenRefused'] = $true
+                $failEvidence['refusal'] = $auth.Refusal
+            }
+            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.CONNECTOR' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('The {0} connector didn''t return the connector check: {1}' -f $connector, $why) -Evidence $failEvidence -Remediation ('The signed-in user needs Read and Build on {0}; check that the model is deployed and refreshed (configure-powerbi.ps1 -CheckModelData). When Fabric refused the Azure CLI''s token and the Rayfin CLI isn''t signed in, ./scripts/configure-fabric-app.ps1 -SignIn signs it in.' -f $settings['semanticModelName']) -DocUrl $connectorDoc))
         }
 
         if ($Queries -eq 'All' -and $probe.Ok) {
@@ -219,6 +251,13 @@ function Test-DemoFabricApp {
     }
 
     $where = if ($ItemUrl) { 'its item page ({0})' -f $ItemUrl } else { 'the demo workspace, then select the item {0}' -f $settings['itemName'] }
+    # No person needed when the app's own queries ran through its connector (2026-11-09, user-directed: no user steps).
+    $connectorPassed = @($results | Where-Object { $_.checkId -eq 'FABRIC.APP.CONNECTOR' -and $_.status -eq 'Pass' }).Count -gt 0
+    $queriesRan = @($results | Where-Object { $_.checkId -eq 'FABRIC.APP.QUERIES' -and $_.status -in 'Pass', 'Warning' }).Count -gt 0
+    if ($connectorPassed -and $queriesRan) {
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message ('Not needed: every query the app runs worked through its connector (FABRIC.APP.QUERIES), the one the app uses, so nobody has to open the app. To see it, open {0} in the Fabric portal; it opens embedded and signs in by itself.' -f $where) -Evidence @{ entryPoint = 'workspace item page (embedded)'; verifiedBy = 'FABRIC.APP.QUERIES'; inAppSignInChecked = $false } -DocUrl 'https://learn.microsoft.com/fabric/apps/fabric-authentication'))
+        return $results.ToArray()
+    }
     $results.Add((New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'A person must confirm the app in the browser: sign-in and the connector in the app can''t be checked from a script.' -Evidence @{ entryPoint = 'workspace item page (embedded)' } -Remediation ('In the Fabric portal, signed in as a user with access to the workspace, open {0}. The app opens embedded and signs in by itself. On Live links it shows "Connector check passed" with the validation, telemetry, and incident counts. Don''t open the hosted URL directly: that is a known preview limitation (the sign-in pop-up stops at "Page not accessible directly").' -f $where) -DocUrl 'https://learn.microsoft.com/fabric/apps/fabric-authentication'))
     return $results.ToArray()
 }
