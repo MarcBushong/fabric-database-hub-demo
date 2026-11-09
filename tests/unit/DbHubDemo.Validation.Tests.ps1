@@ -65,6 +65,52 @@ BeforeAll {
             New-DemoValidationContext -Config $C -Target $T
         }
     }
+
+    function New-RunnerStatus([int] $Runs, [string] $Target = 'T2', [string] $ProfileName = 'business-day') {
+        # The runner's 'status --json' as it writes it, indented: the profile near the top, one node per run (each with its
+        # own "profile" string), and the host node last (CommandLine.cs). 2 runs make 2,128 characters, 5 make 3,584, with
+        # the line breaks the runner writes on the Windows VMs (System.Text.Json's indented output uses Environment.NewLine).
+        $scenarios = 'cpu-pressure', 'missing-index', 'io-pressure', 'inefficient-query', 'healthy-baseline'
+        $runNodes = foreach ($index in 1..$Runs) {
+            $scenario = $scenarios[($index - 1) % $scenarios.Count]
+            $start = [datetime]::new(2026, 11, 3, 13, 5, 0, [System.DateTimeKind]::Utc).AddMinutes(15 * ($index - 1))
+            [ordered]@{
+                runId              = ('{0:yyyyMMddTHHmmss}-{1}' -f $start, $scenario)
+                scenario           = $scenario
+                target             = $Target
+                status             = $(if ($index -eq $Runs) { 'Running' } else { 'Completed' })
+                startedAt          = $start.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+                deadlineAt         = $start.AddMinutes(8).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+                stoppedAt          = $(if ($index -eq $Runs) { $null } else { $start.AddMinutes(8).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') })
+                maxDurationSeconds = 600
+                concurrency        = 8
+                intensity          = 5
+                profile            = $ProfileName
+                requestedBy        = 'profile-host'
+                outcome            = $(if ($index -eq $Runs) { $null } else { 'Completed' })
+            }
+        }
+        $document = [ordered]@{
+            target         = $Target
+            profile        = [ordered]@{ name = $ProfileName; setAt = '2026-11-03T13:01:12.000Z'; setBy = 'deploy'; expiresAt = '2099-11-03T21:01:12.000Z'; description = 'business-day: incidents at :05, :20, :35, and :50 past each UTC hour.' }
+            runs           = @($runNodes)
+            stopRequests   = @()
+            demoSessions   = @()
+            dataHeadroomMb = 1834
+            logHeadroomMb  = 912
+            host           = [ordered]@{ status = 'Fail'; message = ('The {0} lane keeps failing: the host restarted it 3 times in the last hour.' -f $Target); file = 'C:\ProgramData\DbHubDemo\host-lanes.json'; processId = 4312; hostStartedAt = '2026-11-03T12:58:40.000Z'; heartbeatAt = '2026-11-03T14:06:58.000Z'; heartbeatAgeSeconds = 2; processAlive = $true; stoppedAt = $null; stopReason = $null; lane = [ordered]@{ state = 'Serving'; generation = 4; restarts = 3; restartsLastHour = 3; lastRestartReason = 'no poll finished for 301 s'; lastPollAt = '2026-11-03T14:06:50.000Z'; lastPollAgeSeconds = 10; operation = 'polling'; consecutiveFailures = 0; lastError = $null; runningRuns = 1 } }
+        }
+        return (($document | ConvertTo-Json -Depth 8) -replace '\r?\n', "`r`n")
+    }
+
+    function Get-RelayTail([string] $Text) {
+        # What the VM's relay keeps of the runner's output (Get-DemoControlTail -Length 1800).
+        $value = $Text.Trim()
+        if ($value.Length -gt 1800) {
+            return ('...' + $value.Substring($value.Length - 1800))
+        }
+        return $value
+    }
 }
 
 AfterAll {
@@ -270,13 +316,28 @@ Describe 'Stopped VMs are expected (validation areas)' {
         }
         $context = New-TestContext -Target T1, T2
         $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X; Invoke-DemoValidationT2 -Context $X })
-        foreach ($id in 'INFRA.HEALTH.SQLVM01', 'INFRA.HEALTH.ARCHOST01', 'T2.GUEST.ISOLATION') {
+        foreach ($id in 'INFRA.HEALTH.SQLVM01', 'INFRA.HEALTH.ARCHOST01', 'T2.GUEST.STATE', 'T2.GUEST.ISOLATION') {
             $result = $results | Where-Object { $_.checkId -eq $id }
             $result.status | Should -Be 'Warning' -Because $id
             $result.message | Should -Match 'tried twice, a minute apart' -Because $id
             $result.message | Should -Not -Match 'MDE\.Windows' -Because $id
         }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $RunCommandName -eq 'DbHubDemo-ValidateProbe' }
+    }
+
+    It 'reports T2.GUEST.STATE from the health read the Infrastructure area made, while archost01 runs (live, 2026-11-03)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcCheck -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Pass'; message = 'Ready.'; currentStep = ''; guestState = 'Running'; t2Guest = [pscustomobject]@{ present = $true; state = 'Off'; heartbeat = ''; startAction = 'Nothing'; adapters = 1; connected = 0; golden = [pscustomobject]@{ released = $false; reset = $false; role = 'Source' } } }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith { throw 'The guest isn''t running.' }
+        $context = New-TestContext -Target T2
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X; Invoke-DemoValidationT2 -Context $X })
+        $guest = $results | Where-Object { $_.checkId -eq 'T2.GUEST.STATE' }
+        $guest.status | Should -Be 'Fail'
+        $guest.message | Should -Match 'air-gapped by a golden capture'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 1 -Exactly -ParameterFilter { $VmName -eq 'archost01' }
     }
 
     It 'reads T1''s associated services from unified inventory while sqlvm01 is deallocated: a Warning while SSAS or SSIS are listed, a Pass with only the engine' {
@@ -474,25 +535,211 @@ Describe 'Workload host' {
     }
 }
 
+Describe 'Validation during business-day''s incidents (2026-11-03)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI call expected' }
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Pass'; message = 'Ready.' } }
+        # One incident due now, on $script:incidentTarget only; the schedule itself has its own tests.
+        $script:incidentTarget = 'T2'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -MockWith {
+            if ($script:incidentTarget -in $Target) {
+                [pscustomobject]@{ Target = $script:incidentTarget; Scenario = 'cpu-pressure'; StartUtc = [datetime]::new(2026, 11, 3, 14, 5, 0, [System.DateTimeKind]::Utc); EndUtc = [datetime]::new(2026, 11, 3, 14, 13, 0, [System.DateTimeKind]::Utc); ClearUtc = [datetime]::new(2026, 11, 3, 14, 16, 0, [System.DateTimeKind]::Utc) }
+            }
+        }
+    }
+
+    It 'turns a status read that failed on a target with an incident due into a Warning, and keeps a Fail on the others' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $vm = if ($Target -eq 'T2') { 'archost01' } else { 'sqlvm01' }
+            [pscustomobject]@{ Target = $Target; Status = 'Fail'; StdOut = ''; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Fail' -Message ('The Run Command on {0} failed: the runner timed out' -f $vm) -Remediation 'Run the command again.') }
+        }
+        $context = New-TestContext -Target T1, T2
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X })
+        $t2 = $results | Where-Object { $_.checkId -eq 'WORKLOAD.T2.COMMAND' }
+        $t2.status | Should -Be 'Warning'
+        $t2.message | Should -Match ([regex]::Escape('the runner timed out. It failed the way load makes a read fail (a time-out or a busy VM) during business-day''s cpu-pressure incident on T2 (14:05 to 14:13 UTC)'))
+        $t2.remediation | Should -Match ([regex]::Escape('Run ./scripts/validate.ps1 -Area Workload -Target T2 again after 14:16 UTC'))
+        $t2.evidence['downgrade'] | Should -Be 'loadFailure'
+        ($results | Where-Object { $_.checkId -eq 'WORKLOAD.T1.COMMAND' }).status | Should -Be 'Fail' -Because 'no incident is due on T1'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -ParameterFilter { (@($Target) -join ',') -eq 'T2' }
+        @($results | Where-Object { $_.checkId -like 'WORKLOAD.*.HOST' }) | Should -BeNullOrEmpty -Because 'a failed status read has no host state'
+    }
+
+    It 'reads T3''s and T4''s status through sqlvm01, so an incident due on T1 counts for them too; and a host lane that fails during one is a Warning' {
+        $script:incidentTarget = 'T1'
+        $script:hostFail = '{"target":"T3","profile":{"name":"business-day"},"runs":[],"demoSessions":[],"host":{"status":"Fail","message":"The T3 lane keeps failing: the host restarted it 3 times in the last hour.","lane":{"state":"Serving","generation":4}}}'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:hostFail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status') }
+        }
+        $context = New-TestContext -Target T3
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X })
+        $lane = $results | Where-Object { $_.checkId -eq 'WORKLOAD.T3.HOST' }
+        $lane.status | Should -Be 'Warning'
+        $lane.message | Should -Match 'keeps failing.*T3 runs business-day, as its status says, and its cpu-pressure incident on T1 \(14:05 to 14:13 UTC\) can slow this lane'
+        $lane.evidence['downgrade'] | Should -Be 'profileOnVm'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -ParameterFilter { (@($Target) -join ',') -eq 'T3,T1' -and $ProfileName -ceq 'business-day' }
+    }
+
+    It 'keeps a fault no incident causes a Fail during one, and makes a failure load causes a Warning (review of PR 16): <Case>' -ForEach @(
+        @{ Case = 'settings.json missing'; Message = 'settings.json is missing; the bootstrap loader has not run on this VM.'; StdErr = ''; Status = 'Fail' }
+        @{ Case = 'no runner'; Message = 'The workload runner is not installed in the guest yet.'; StdErr = ''; Status = 'Fail' }
+        @{ Case = 'a refused login'; Message = 'runner status --json --target T2 failed with exit code 1: Microsoft.Data.SqlClient.SqlException (0x80131904): Login failed for user ''NT AUTHORITY\SYSTEM''.'; StdErr = ''; Status = 'Fail' }
+        @{ Case = 'a VM that isn''t running'; Message = 'The Run Command on archost01 failed: archost01 isn''t running (deallocated), so Run Command can''t reach it; start it first (start-demo.ps1).'; StdErr = ''; Status = 'Fail' }
+        @{ Case = 'a failure it doesn''t know'; Message = 'archost01 returned no workload result: no result line'; StdErr = ''; Status = 'Fail' }
+        @{ Case = 'the runner''s time-out'; Message = 'The runner (status --json --runs 5 --target T2) did not finish within 180 seconds and was stopped.'; StdErr = ''; Status = 'Warning' }
+        @{ Case = 'a busy VM (409)'; Message = 'The Run Command on archost01 failed: ERROR: (Conflict) Run command extension execution is in progress. Please wait for completion before invoking a run command.'; StdErr = ''; Status = 'Warning' }
+        @{ Case = 'a SQL time-out in the runner''s error output'; Message = 'runner status --json --target T2 failed with exit code 1.'; StdErr = 'Microsoft.Data.SqlClient.SqlException (0x80131904): Execution Timeout Expired. The timeout period elapsed prior to completion of the operation or the server is not responding.'; Status = 'Warning' }
+    ) {
+        $script:commandResult = New-DemoResult -CheckId 'WORKLOAD.T2.COMMAND' -Area 'workload' -Target 'T2' -Status 'Fail' -Message $Message -Evidence @{ stderr = $StdErr; exitCode = 1 } -Remediation 'Run the command again.'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { [pscustomobject]@{ Target = $Target; Status = 'Fail'; StdOut = ''; Result = $script:commandResult } }
+        $context = New-TestContext -Target T2
+        $command = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.COMMAND' }
+        $command.status | Should -Be $Status
+        if ($Status -eq 'Fail') {
+            $command.message | Should -Be $Message
+        }
+    }
+
+    It 'keeps a host lane a Fail when the target''s own status says it doesn''t run business-day, or its host ended (review of PR 16): <Case>' -ForEach @(
+        @{ Case = 'off'; Profile = '"profile":{"name":"off"},'; Alive = 'true' }
+        @{ Case = 'baseline'; Profile = '"profile":{"name":"baseline","expiresAt":"2999-01-01T00:00:00Z"},'; Alive = 'true' }
+        @{ Case = 'an expired business-day'; Profile = '"profile":{"name":"business-day","expiresAt":"2026-11-03T09:00:00Z"},'; Alive = 'true' }
+        @{ Case = 'no profile in a tail cut by the Run Command'; Profile = ''; Alive = 'true' }
+        @{ Case = 'business-day on a host that ended'; Profile = '"profile":{"name":"business-day","expiresAt":"2999-01-01T00:00:00Z"},'; Alive = 'false' }
+    ) {
+        $script:hostFail = '{"target":"T2",' + $Profile + '"runs":[],"demoSessions":[],"host":{"status":"Fail","message":"The profile host (process 7132) ended without a clean stop.","processAlive":' + $Alive + ',"lane":{"state":"Serving","generation":4}}}'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:hostFail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status') }
+        }
+        $context = New-TestContext -Target T2
+        $lane = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }
+        $lane.status | Should -Be 'Fail' -Because $Case
+        $lane.message | Should -Be 'T2: The profile host (process 7132) ended without a clean stop.'
+    }
+
+    It 'goes by the profile the target runs, not the configured one, for a host lane (review of PR 16)' {
+        # The configuration says baseline, but the VM still runs an earlier session's business-day.
+        $script:hostFail = '{"target":"T2","profile":{"name":"business-day","expiresAt":"2999-01-01T00:00:00Z"},"runs":[],"demoSessions":[],"host":{"status":"Fail","message":"The T2 lane keeps failing: the host restarted it 3 times in the last hour.","processAlive":true,"lane":{"state":"Serving","generation":4}}}'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:hostFail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status') }
+        }
+        $context = New-TestContext -Target T2
+        $context.Config['activityProfile'] = 'baseline'
+        $lane = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }
+        $lane.status | Should -Be 'Warning'
+        $lane.evidence['downgrade'] | Should -Be 'profileOnVm'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -Times 1 -Exactly -ParameterFilter { $ProfileName -ceq 'business-day' }
+    }
+
+    It 'reads the profile the VM''s relay kept for a status with <Runs> runs (<Size> characters), whose kept tail no longer has it (re-review of PR 16)' -ForEach @(
+        @{ Runs = 2; Size = 2128 }
+        @{ Runs = 5; Size = 3584 }
+    ) {
+        # Reviewer: the relay keeps the last 1,800 characters, so with two or more runs the status's own profile was gone, and
+        # a host lane during an incident stayed a Fail.
+        $status = New-RunnerStatus -Runs $Runs
+        $status.Length | Should -Be $Size
+        $script:tail = Get-RelayTail $status
+        $script:tail | Should -Not -Match '"description"' -Because 'the kept tail has the runs'' "profile" strings, not the status''s own profile'
+        $script:relayProfile = [ordered]@{ name = 'business-day'; expiresAt = '2099-11-03T21:01:12.000Z' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $evidence = [ordered]@{ exitCode = 0; stdout = $script:tail }
+            if ($null -ne $script:relayProfile) {
+                $evidence['profile'] = $script:relayProfile
+            }
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:tail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status' -Evidence $evidence) }
+        }
+        $context = New-TestContext -Target T2
+        $lane = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }
+        $lane.status | Should -Be 'Warning'
+        $lane.evidence['downgrade'] | Should -Be 'profileOnVm'
+
+        # A VM whose bundle predates the relay's profile: the tail can't say what runs, so the lane stays a Fail, as before.
+        $script:relayProfile = $null
+        (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Fail'
+        # And a VM whose relay says it runs baseline stays a Fail.
+        $script:relayProfile = [ordered]@{ name = 'baseline'; expiresAt = '2099-11-03T21:01:12.000Z' }
+        (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Fail'
+    }
+
+    It 'still reads a status with one run, which the relay keeps whole, without the relay''s profile' {
+        $status = New-RunnerStatus -Runs 1
+        $status.Length | Should -BeLessOrEqual 1800
+        $script:whole = Get-RelayTail $status
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:whole; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status' -Evidence ([ordered]@{ exitCode = 0; stdout = $script:whole })) }
+        }
+        $context = New-TestContext -Target T2
+        (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Warning'
+    }
+
+    It 'turns a T3.PROPERTY check that couldn''t run during an incident into a Warning, and keeps a property that''s read and wrong a Fail' {
+        $script:incidentTarget = 'T3'
+        $script:property = New-DemoResult -CheckId 'T3.PROPERTY' -Area 't3' -Target 'T3' -Status 'Fail' -Message 'The extended property couldn''t be checked: the T-SQL timed out.' -Evidence @{ reason = 'Failed' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT3 -MockWith {
+            New-DemoResult -CheckId 'T3.EXISTS' -Area 't3' -Target 'T3' -Status 'Pass' -Message 'T3 exists.'
+            $script:property
+        }
+        $context = New-TestContext -Target T3
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationT3 -Context $X })
+        @($results | ForEach-Object { $_.checkId }) | Should -Be @('T3.EXISTS', 'T3.PROPERTY')
+        $property = $results | Where-Object { $_.checkId -eq 'T3.PROPERTY' }
+        $property.status | Should -Be 'Warning'
+        $property.remediation | Should -Match ([regex]::Escape('Run ./scripts/validate.ps1 -Area T3 -Target T3 again after 14:16 UTC'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoScheduledIncident -Times 1 -Exactly -ParameterFilter { (@($Target) -join ',') -eq 'T3,T1' }
+
+        $script:property = New-DemoResult -CheckId 'T3.PROPERTY' -Area 't3' -Target 'T3' -Status 'Fail' -Message 'MS_EnablePerformanceMonitoringPreview is missing on ContosoCare.' -Evidence @{ reason = ''; value = '' }
+        $wrong = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationT3 -Context $X }) | Where-Object { $_.checkId -eq 'T3.PROPERTY' }
+        $wrong.status | Should -Be 'Fail' -Because 'an incident can''t make a property that was read wrong'
+    }
+
+    It 'keeps a T3.PROPERTY whose T-SQL failed for a reason no load causes a Fail during an incident (review of PR 16): <Case>' -ForEach @(
+        @{ Case = 'a refused login'; Message = 'The extended property couldn''t be checked: T-SQL from T1 on T3 azuresql01-abc123/ContosoCare failed after 0 of 1 batches: Login failed for user ''<token-identified principal>''.'; Reason = 'SqlFailed'; Status = 'Fail' }
+        @{ Case = 'a missing server'; Message = 'The extended property couldn''t be checked: T3''s logical server azuresql01-abc123 wasn''t found.'; Reason = 'ServerNotFound'; Status = 'Fail' }
+        @{ Case = 'the request limit (resource-governance)'; Message = 'The extended property couldn''t be checked: T-SQL from T1 on T3 azuresql01-abc123/ContosoCare failed after 0 of 1 batches: Resource ID : 1. The request limit for the database is 30 and has been reached.'; Reason = 'SqlFailed'; Status = 'Warning' }
+        @{ Case = 'a Run Command that didn''t finish'; Message = 'The extended property couldn''t be checked: The Run Command on T1 failed: The Azure CLI did not finish within 600 seconds and was stopped.'; Reason = 'RunCommandFailed'; Status = 'Warning' }
+    ) {
+        $script:incidentTarget = 'T3'
+        $script:property = New-DemoResult -CheckId 'T3.PROPERTY' -Area 't3' -Target 'T3' -Status 'Fail' -Message $Message -Evidence @{ reason = $Reason }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT3 -MockWith { $script:property }
+        $context = New-TestContext -Target T3
+        $property = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationT3 -Context $X }) | Where-Object { $_.checkId -eq 'T3.PROPERTY' }
+        $property.status | Should -Be $Status
+    }
+
+    It 'leaves DONE''s requirements to checks that read Database Hub, Azure, and Fabric, never a target through its load' {
+        foreach ($mode in 'PaygWizard', 'Developer') {
+            $ids = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Mode = $mode } { Get-DemoDoneRequirement -InstallMode $Mode })
+            @($ids | Where-Object { $_ -like 'WORKLOAD.*' -or $_ -eq 'T3.PROPERTY' }) | Should -BeNullOrEmpty -Because $mode
+        }
+    }
+}
+
 Describe 'Cost area' {
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI call expected' }
         $script:schedule = @{ properties = @{ status = 'Enabled'; dailyRecurrence = @{ time = '1900' }; timeZoneId = 'Pacific Standard Time' } }
         $script:costResponse = Get-TestAzResponse
-        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '250.0'; timeGrain = 'Monthly' })
+        # The budget at monthlyCeilingUsd's default, 375 since 2026-11-04 (ADR 0016).
+        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '375.0'; timeGrain = 'Monthly' })
         $script:costResponse['^resource show --resource-group rg-dbhub-demo --name shutdown-computevm-.* --resource-type Microsoft\.DevTestLab/schedules'] = Get-TestAzOk $script:schedule
         $script:costResponse['^resource list .*bastionHosts'] = Get-TestAzOk @()
         $script:costResponse['^network public-ip list'] = Get-TestAzOk @()
         Set-TestAzResponse $script:costResponse
+        # The nightly safety stop's own check (ADR 0024), which tests/unit/DbHubDemo.SafetyStop.Tests.ps1 covers.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopStatus -MockWith { New-DemoResult -CheckId $CheckId -Area $Area -Target 'subscription' -Status 'Pass' -Message 'in place' }
     }
 
-    It 'reuses preflight''s estimate and passes the budget, the schedules, and no Bastion' {
+    It 'reuses preflight''s estimate and passes the budget, the schedules, the nightly safety stop, and no Bastion' {
         $context = New-TestContext
         $context.Results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'estimate'))
         Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith { throw 'should not run' }
         $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationCost -Context $X })
-        ($results | ForEach-Object { '{0}={1}' -f $_.checkId, $_.status }) | Should -Be @('COST.BUDGET=Pass', 'COST.AUTOSHUTDOWN=Pass', 'COST.BASTION=Pass')
+        ($results | ForEach-Object { '{0}={1}' -f $_.checkId, $_.status }) | Should -Be @('COST.BUDGET=Pass', 'COST.AUTOSHUTDOWN=Pass', 'COST.SAFETYSTOP=Pass', 'COST.BASTION=Pass')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopStatus -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'COST.SAFETYSTOP' -and $Area -eq 'cost' }
         @($script:TestAzCalls | Where-Object { $_ -match '^resource show .*shutdown-computevm-' }).Count | Should -Be 2
         @($script:TestAzCalls | Where-Object { $_ -match '(^| )--ids( |$)' }).Count | Should -Be 0 -Because 'Invoke-DemoAz adds --subscription, which --ids would bypass'
     }

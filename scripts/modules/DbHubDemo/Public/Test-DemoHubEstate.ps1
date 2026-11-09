@@ -51,7 +51,7 @@ function Test-DemoHubEstate {
 
     $docUrl = 'https://learn.microsoft.com/fabric/database/hub/overview'
     $evaluationOnly = [string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm'
-    $installMode = if ($Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ($Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $manualCheck = 'Seeing it on the Hub Estate page is a manual check.'
     $byTarget = [ordered]@{ T1 = $null; T2 = $null; T3 = $null; T4 = $null }
     if ('T4' -in $Target -and -not (Test-DemoT4Enabled -Config $Config)) {

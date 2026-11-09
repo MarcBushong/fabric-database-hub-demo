@@ -226,9 +226,10 @@ function Invoke-DemoValidationT1 {
 function Invoke-DemoValidationT2 {
     <#
     .SYNOPSIS
-    The T2 area: the Arc checks (Get-DemoArcCheck) and, while the host runs, T2.GUEST.ISOLATION from the
-    read-only onboarding probe: the guest can't reach IMDS or the wire server, and resolves names through the
-    host (ADR 0004). Internal.
+    The T2 area: the Arc checks (Get-DemoArcCheck) and, while the host runs, T2.GUEST.STATE (the guest as the host
+    sees it now: air-gapped by a golden capture, off, or cut off from its switch; Get-DemoT2GuestStateResult) and
+    T2.GUEST.ISOLATION from the read-only onboarding probe: the guest can't reach IMDS or the wire server, and
+    resolves names through the host (ADR 0004). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -248,6 +249,14 @@ function Invoke-DemoValidationT2 {
     if (-not $state.Running) {
         $results.Add((New-DemoValidationStoppedResult -CheckId 'T2.GUEST.ISOLATION' -Area 't2' -Target 'T2' -VmState $state -Context $Context -Checks 'the guest isolation probe (ADR 0004)' -EvaluationOnly:$arc.EvaluationOnly))
         return $results.ToArray()
+    }
+    if (-not $arc.EvaluationOnly) {
+        # The guest as the host sees it now (2026-11-03), from the health read the Infrastructure area shares.
+        $read = Get-DemoValidationHealth -Context $Context -VmName $arc.HostVmName
+        $guestState = if ($null -ne $read.Health) { Get-DemoT2GuestStateResult -Config $Context.Config -Health $read.Health } else { New-DemoResult -CheckId 'T2.GUEST.STATE' -Area 't2' -Target 'T2' -Status 'Warning' -Message ('The guest''s state couldn''t be read on {0}: {1} {2}' -f $arc.HostVmName, $read.Error, (Get-DemoValidationRunCommandNote -ErrorText $read.Error)) -Remediation 'Run validate.ps1 -Area T2 again in about 10 minutes.' -DocUrl 'https://learn.microsoft.com/powershell/module/hyper-v/get-vm' }
+        if ($null -ne $guestState) {
+            $results.Add($guestState)
+        }
     }
     $probe = $null
     $probeError = ''
@@ -293,7 +302,10 @@ function Invoke-DemoValidationT3 {
     <#
     .SYNOPSIS
     The T3 area: Test-DemoT3 with the effective network mode and the free-offer decision. T3.PROPERTY runs
-    its T-SQL through T1, so it's a Warning while sqlvm01 is deallocated, and it resumes a paused T3. Internal.
+    its T-SQL through T1, so it's a Warning while sqlvm01 is deallocated, and it resumes a paused T3. A T3.PROPERTY whose
+    T-SQL failed the way load makes it fail (a time-out, a 409, a lock, or a resource limit) while one of business-day's
+    incidents is due on T3 or T1 is a Warning, not a Fail; a refused login or any other fault stays a Fail
+    (ConvertTo-DemoIncidentAwareResult, 2026-11-03; review of PR 16, 2026-11-04). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -310,14 +322,23 @@ function Invoke-DemoValidationT3 {
         $parameters['T3UseFreeLimit'] = [bool]$Context.T3UseFreeLimit
     }
     Write-DemoLog -Message ('T3 checks use network mode {0}, from {1}.' -f $parameters['NetworkMode'], $Context.NetworkModeSource)
-    @(Test-DemoT3 @parameters)
+    # A T-SQL check that failed because business-day's incidents load T3 (or sqlvm01, which runs it) is a Warning, not a
+    # Fail (2026-11-03); a property that's read and wrong, and a failure no load causes, stay a Fail (review of PR 16).
+    foreach ($item in @(Test-DemoT3 @parameters)) {
+        if ([string]$item.checkId -eq 'T3.PROPERTY' -and -not ($item.evidence -is [System.Collections.IDictionary] -and $item.evidence.Contains('value'))) {
+            ConvertTo-DemoIncidentAwareResult -Result $item -Config $Context.Config -IncidentTarget 'T3', 'T1' -ValidationArea 'T3'
+        }
+        else {
+            $item
+        }
+    }
 }
 
 function Invoke-DemoValidationT4 {
     <#
     .SYNOPSIS
     The T4 area (Phase 24, ADR 0019): Test-DemoT4 -IncludeMetrics, read-only, with the size T4's fallback recorded in the
-    group's DbHubT4Sku tag (Phase 28 follow-up), or, when the fallback left T4 out, one Not selected that says why; but a
+    group's DbHubT4Size tag (ADR 0019), or, when the fallback left T4 out, one Not selected that says why; but a
     server that exists although the record says T4 is off (None or Refused) is a T4.SERVER Warning that it bills (review
     of 64c28b2; New-DemoT4RecordedOffResult). A stopped T4 is a Warning (it sends no metrics), never a Fail. Internal.
     #>
@@ -464,7 +485,12 @@ function Invoke-DemoValidationWorkload {
     The Workload area: the runner's status on each selected target (Invoke-DemoWorkloadCommand status --json,
     read-only), the scenario bounds from it, and the profile host lane that serves the target (WORKLOAD.<target>.HOST,
     Phase 25b). With control.enabled, the on-demand activity control's CONTROL.* checks (Test-DemoActivityControl, ADR 0020). T1 and T3 run on sqlvm01, and T2 through the host into the guest, so each needs that VM running; T2
-    also needs the host's last step, after the setup wizard. Internal.
+    also needs the host's last step, after the setup wizard. A status read that fails the way load makes it fail (a
+    time-out, a 409, a lock, or a resource limit) while one of business-day's incidents is due on the target (or on T1,
+    whose sqlvm01 runs T3's and T4's commands), and a host lane that fails while the target's own status says it runs
+    business-day and an incident is due, are a Warning that names the incident and when to check again, not a Fail; a
+    fault no incident causes (settings.json missing, no runner, a host that ended) stays a Fail
+    (ConvertTo-DemoIncidentAwareResult, 2026-11-03; review of PR 16, 2026-11-04). Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -482,6 +508,8 @@ function Invoke-DemoValidationWorkload {
             continue
         }
         $vmName = if ($target -eq 'T2') { $Context.Arc.HostVmName } else { 'sqlvm01' }
+        # The load a status read goes through: the target's own, and sqlvm01's, which runs the commands for T1, T3, and T4.
+        $incidentTargets = @($target) + @(if ($target -in 'T3', 'T4') { 'T1' })
         $state = Get-DemoValidationVmState -Context $Context -VmName $vmName
         if (-not $state.Running) {
             $results.Add((New-DemoValidationStoppedResult -CheckId $checkId -Area 'workload' -Target $target -VmState $state -Context $Context -Checks ('the {0} workload checks' -f $target)))
@@ -529,10 +557,17 @@ function Invoke-DemoValidationWorkload {
             $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Warning' -Message ('The runner''s status on {0} couldn''t be read: {1} {2}' -f $target, $message, (Get-DemoValidationRunCommandNote -ErrorText $message)) -Remediation 'Run validate.ps1 -Area Workload again in about 10 minutes.' -DocUrl $docUrl))
             continue
         }
-        $results.Add($run.Result)
+        $commandResult = $run.Result
+        if ($null -ne $commandResult) {
+            $commandResult = ConvertTo-DemoIncidentAwareResult -Result $commandResult -Config $Context.Config -IncidentTarget $incidentTargets -ValidationArea 'Workload'
+        }
+        $results.Add($commandResult)
         if ($run.Status -in 'Pass', 'Warning') {
             $results.Add((Test-DemoValidationWorkloadBound -Target $target -StdOut $run.StdOut))
-            $results.Add((Test-DemoValidationWorkloadHost -Target $target -StdOut $run.StdOut -VmName $vmName))
+            # The relay reads the profile from the runner's whole output, which the cut stdout no longer shows once the status
+            # lists two or more runs (re-review of PR 16, 2026-11-04).
+            $runnerProfile = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $run -Name 'Result') -Name 'evidence') -Name 'profile'
+            $results.Add((ConvertTo-DemoIncidentAwareResult -Result (Test-DemoValidationWorkloadHost -Target $target -StdOut $run.StdOut -VmName $vmName) -Config $Context.Config -IncidentTarget $incidentTargets -ValidationArea 'Workload' -Kind Host -RunnerStdOut $run.StdOut -RunnerProfile $runnerProfile))
         }
     }
     # The optional on-demand activity control (ADR 0020): CONTROL.*, read-only, or one Not selected when it's off.
@@ -655,6 +690,9 @@ function Invoke-DemoValidationCost {
     elseif ($checked.Count -gt 0) {
         $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Pass' -Message ('Auto-shutdown is enabled at {0} {1} for {2}.' -f $time, $zone, (@($Context.VmNames.Values) -join ' and ')) -Evidence $evidence -DocUrl $scheduleDoc))
     }
+
+    # The nightly safety stop (ADR 0024) behind the auto-shutdown: its schedules, its role, and its last runs. Read-only.
+    $results.Add((Get-DemoSafetyStopStatus -Config $config -CheckId 'COST.SAFETYSTOP' -Area 'cost'))
 
     # On-demand Bastion and public IPs (C8). An interrupted Bastion delete can leave its public IP (live finding, 2026-10-20).
     $bastionDoc = 'https://learn.microsoft.com/azure/bastion/bastion-overview'

@@ -19,7 +19,9 @@ function Invoke-DemoPreflight {
       Phase 28 live finding), and the Fabric workspace and lakehouse by
       name, read-only (Test-DemoFabricResolution, Phase 26a): your role and the capacity of a workspace that exists,
       or the capacity deploy.ps1 would create it on; the optional P11, Power BI viewer licensing on the workspace's
-      capacity (Test-DemoFabricViewerLicense, a Warning below F64).
+      capacity (Test-DemoFabricViewerLicense, a Warning below F64); and P12 and P13, the tenant settings the Insights
+      app needs, which never block the run (Test-DemoFabricAppTenantSetting, PREFLIGHT.FABRIC.APPSETTINGS: a Pass, or a
+      Warning when one is off or can't be read; 2026-11-05).
     - P6: the T3 Entra admin group exists and the caller owns it, read from Microsoft Graph with a token
       verified for the configured tenant (Invoke-DemoRestRequest). The group's display name is in the
       evidence (groupDisplayName), for T3's administrator login.
@@ -261,17 +263,20 @@ function Invoke-DemoPreflight {
         Add-Check 'PREFLIGHT.P3.SECURITYTYPE_T2HOST' 'subscription' 'Pass' 'The T2 host uses the Standard security type for nested virtualization (ADR 0003).'
     }
 
-    # T4 (Phase 24, ADR 0019): the region offers the configured size in its tier's edition (Burstable, or General
-    # Purpose for D2ds_v5) and the pinned PostgreSQL major version, read with 'az postgres flexible-server list-skus'
-    # (Phase 28, brief item 10), or the documented Location Based Capabilities API when the Azure CLI can't answer. When
-    # the configuration doesn't set t4SkuName and T4 doesn't exist yet, the fallback applies (Phase 28 and its follow-up:
-    # B1ms, then B2s, then General Purpose D2ds_v5 after its cost check, then no T4), so a size the region doesn't list
-    # isn't a Fail: the furthest step any check found is where deploy.ps1 starts (PREFLIGHT.T4.FALLBACK's startSku, with
-    # the cost check below). An existing server keeps its own size, so the fallback doesn't apply to it.
+    # T4 (Phase 24, ADR 0019): the region offers the configured size in its tier's edition (General Purpose for the D
+    # sizes, Burstable for the B sizes) and the pinned PostgreSQL major version, read with 'az postgres flexible-server
+    # list-skus' (Phase 28, brief item 10), or the documented Location Based Capabilities API when the Azure CLI can't
+    # answer. When the configuration doesn't set t4SkuName and T4 doesn't exist yet, the fallback applies (since T4's
+    # 4-vCore default, 2026-11-04: Standard_D4ds_v5, once more in another zone, Standard_D4ads_v5, then Standard_D2ds_v5
+    # with autonomous tuning off after its cost check, then no T4), so a size the region doesn't list isn't a Fail: the
+    # furthest step any check found is where deploy.ps1 starts (PREFLIGHT.T4.FALLBACK's startSku, with the cost check
+    # below). An existing server keeps its own size, or moves to the default once (PREFLIGHT.T4.SIZE), so the fallback
+    # doesn't apply to it. PREFLIGHT.T4.TUNING says whether the size T4 gets runs autonomous tuning.
     $t4On = Test-DemoT4Enabled -Config $Config
     $t4Explicit = Test-DemoT4SkuExplicit -Config $Config
     $t4Exists = $false
     $t4ServerSku = ''
+    $t4Scale = $false
     $t4Starts = [System.Collections.Generic.List[string]]::new()
     if ($t4On) {
         $postgres = Get-DemoPostgresSetting
@@ -281,13 +286,17 @@ function Invoke-DemoPreflight {
             $t4Exists = [bool](Get-DemoMemberValue -InputObject $t4Current -Name 'Exists')
             $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4Current -Name 'Server')
         }
-        $t4Sku = if ($t4ServerSku) { $t4ServerSku } else { Get-DemoT4SkuName -Config $Config }
+        $t4Planned = Get-DemoT4SkuName -Config $Config
+        $t4Default = Get-DemoT4DefaultSkuName -Config $Config
+        # An existing server that no record keeps moves to the default at deploy.ps1's run (2026-11-04).
+        $t4Scale = $t4Exists -and [bool]$t4ServerSku -and $t4ServerSku -cne $t4Default -and $t4Planned -ceq $t4Default
+        $t4Sku = if ($t4ServerSku -and -not $t4Scale) { $t4ServerSku } else { $t4Planned }
         $t4Tier = (Get-DemoT4SkuSpec -SkuName $t4Sku).Tier
         $t4Ladder = -not $t4Explicit -and -not $t4Exists
-        if ($t4Ladder -and $t4Tier -eq 'GeneralPurpose') {
-            # An earlier run's record (DbHubT4Sku None, then a run that deploys the template, or Standard_D2ds_v5 for a
-            # server that wasn't created): the General Purpose fallback, which its cost check below decides.
-            $t4Starts.Add('Standard_D2ds_v5')
+        if ($t4Ladder -and $t4Sku -cin 'Standard_D4ads_v5', 'Standard_D2ds_v5') {
+            # An earlier run's record (DbHubT4Size Standard_D4ads_v5, Standard_D2ds_v5, or None for a run that deploys the
+            # template) for a server that wasn't created: the fallback starts there, and its cost check below decides.
+            $t4Starts.Add($t4Sku)
         }
         $capabilitySource = 'az postgres flexible-server list-skus'
         $listed = @(Invoke-Az -Arguments @('postgres', 'flexible-server', 'list-skus', '--location', $location, '--output', 'json') -Json -AllowFailure | Where-Object { $null -ne $_ })
@@ -320,6 +329,11 @@ function Invoke-DemoPreflight {
         if ($null -eq $capability) {
             Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('The PostgreSQL flexible server sizes of {0} couldn''t be read, so T4''s size and version weren''t checked.' -f $location) -Evidence $t4Evidence -Remediation 'Run preflight again once Microsoft.DBforPostgreSQL is registered.' -DocUrl $capabilityDoc
         }
+        elseif ($t4Exists -and $t4Scale) {
+            $scaleStatus = if (& $offers $t4Sku) { 'Pass' } else { 'Warning' }
+            $scaleMessage = if ($scaleStatus -eq 'Pass') { 'T4 exists as {0}, and {1} offers the default it moves to, {2} {3} ({4}; PREFLIGHT.T4.SIZE).' -f $t4ServerSku, $location, $t4Tier, $t4Sku, $capabilitySource } else { 'T4 exists as {0}, and {1} doesn''t list the default it would move to, {2} {3} ({4}): deploy.ps1 tries the scale, and if Azure refuses it, T4 keeps {0} (PREFLIGHT.T4.SIZE).' -f $t4ServerSku, $location, $t4Tier, $t4Sku, $capabilitySource }
+            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' $scaleStatus $scaleMessage -Evidence $t4Evidence -Remediation $(if ($scaleStatus -eq 'Pass') { '' } else { ('To keep T4 as it is, set t4SkuName to {0}.' -f $t4ServerSku) }) -DocUrl $capabilityDoc
+        }
         elseif ($t4Exists) {
             Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Pass' ('T4 exists as {0} {1}, and deploy.ps1 keeps its size, so the sizes {2} lists matter only for a new server.' -f $t4Tier, $t4Sku, $location) -Evidence $t4Evidence -DocUrl $capabilityDoc
         }
@@ -328,41 +342,42 @@ function Invoke-DemoPreflight {
         }
         elseif ($t4Ladder -and $versionOffered) {
             # The fallback's next sizes after this one, in its order; the first one the region lists is where it starts.
-            $steps = @('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5')
+            $steps = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
             $next = @($steps | Select-Object -Skip ([array]::IndexOf($steps, $t4Sku) + 1) | Where-Object { & $offers $_ }) | Select-Object -First 1
             $start = if ($next) { [string]$next } else { 'None' }
             $t4Evidence['startSku'] = $start
             $t4Starts.Add($start)
             switch ($start) {
-                'Standard_B2s' {
-                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} doesn''t list T4''s default Standard_B1ms, so deploy.ps1 starts with Standard_B2s, the same Burstable class (Phase 28''s fallback; estimate-cost.ps1 prices it).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $capabilityDoc
+                'Standard_D4ads_v5' {
+                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} doesn''t list T4''s default Standard_D4ds_v5, so deploy.ps1 starts with Standard_D4ads_v5, General Purpose with 4 vCores too, so autonomous tuning stays on (estimate-cost.ps1 prices it).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $capabilityDoc
                 }
                 'Standard_D2ds_v5' {
-                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists neither of T4''s Burstable sizes (Standard_B1ms, Standard_B2s), so deploy.ps1 goes to the General Purpose fallback, Standard_D2ds_v5, once its cost check passes (PREFLIGHT.T4.FALLBACK).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do: PREFLIGHT.T4.FALLBACK gives its price and worst case. To choose T4''s size yourself, set t4SkuName, or set t4Enabled to false to leave T4 out.' -DocUrl $capabilityDoc
+                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists neither of T4''s 4-vCore sizes (Standard_D4ds_v5, Standard_D4ads_v5), so deploy.ps1 goes to the 2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off, once its cost check passes (PREFLIGHT.T4.FALLBACK).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do: PREFLIGHT.T4.FALLBACK gives its price and worst case. To choose T4''s size yourself, set t4SkuName, or set t4Enabled to false to leave T4 out.' -DocUrl $capabilityDoc
                 }
                 default {
-                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists none of the sizes T4''s fallback tries (Standard_B1ms, Standard_B2s, Standard_D2ds_v5), so deploy.ps1 finishes without T4, and DONE says so.' -f $location) -Evidence $t4Evidence -Remediation 'Pick a region that offers one of them, or set t4Enabled to false to leave T4 out on purpose.' -DocUrl $capabilityDoc
+                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists none of the sizes T4''s fallback tries (Standard_D4ds_v5, Standard_D4ads_v5, Standard_D2ds_v5), so deploy.ps1 finishes without T4, and DONE says so.' -f $location) -Evidence $t4Evidence -Remediation 'Pick a region that offers one of them, or set t4Enabled to false to leave T4 out on purpose.' -DocUrl $capabilityDoc
                 }
             }
         }
         else {
-            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Fail' ('{0} doesn''t offer T4''s {1} {2} with PostgreSQL {3}.' -f $location, $t4Tier, $t4Sku, $postgres['majorVersion']) -Evidence $t4Evidence -Remediation 'Pick a region that offers it, or set t4Enabled to false (Phase 24, ADR 0019).' -DocUrl 'https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-compute'
+            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Fail' ('{0} doesn''t offer T4''s {1} {2} with PostgreSQL {3}.' -f $location, $t4Tier, $t4Sku, $postgres['majorVersion']) -Evidence $t4Evidence -Remediation 'Pick a region that offers it, or set t4Enabled to false (Phase 24, ADR 0019).' -DocUrl 'https://learn.microsoft.com/azure/postgresql/compute-storage/concepts-compute'
         }
         # The capability list doesn't show a size that's temporarily unavailable: Azure refused B1ms with
         # SkuNotAvailable on 2026-10-26 while the list included it. A refusal on record for this size and zone is a
-        # Fail for a size the configuration sets; otherwise deploy.ps1's fallback starts one step on, a Warning: B1ms
-        # to B2s, B2s to the General Purpose fallback (after its cost check), and D2ds_v5 to no T4 (Phase 28 follow-up).
+        # Fail for a size the configuration sets; otherwise deploy.ps1's fallback starts one step on, a Warning:
+        # Standard_D4ds_v5 to Standard_D4ads_v5, Standard_D4ads_v5 to Standard_D2ds_v5 (after its cost check), and
+        # Standard_D2ds_v5 to no T4 (ADR 0019). The retry in another zone happens only in deploy.ps1, right after a refusal.
         if (-not $t4Exists) {
             $refused = Get-DemoT4CreateFailure -Config $Config
             if ($null -ne $refused -and $refused.Sku -eq $t4Sku) {
                 $t4Zone = Get-DemoT4AvailabilityZone -Config $Config
                 $otherZone = $t4Zone -and $t4Zone -ne $refused.Zone
                 if (-not $otherZone -and $t4Ladder) {
-                    $start = switch ($t4Sku) { 'Standard_B1ms' { 'Standard_B2s' } 'Standard_B2s' { 'Standard_D2ds_v5' } default { 'Refused' } }
+                    $start = switch ($t4Sku) { 'Standard_D4ds_v5' { 'Standard_D4ads_v5' } 'Standard_D4ads_v5' { 'Standard_D2ds_v5' } default { 'Refused' } }
                     $t4Starts.Add($start)
                     $what = switch ($start) {
-                        'Standard_B2s' { 'starts with Standard_B2s, the same Burstable class' }
-                        'Standard_D2ds_v5' { 'goes to the General Purpose fallback, Standard_D2ds_v5, once its cost check passes (PREFLIGHT.T4.FALLBACK)' }
+                        'Standard_D4ads_v5' { 'starts with Standard_D4ads_v5, General Purpose with 4 vCores too' }
+                        'Standard_D2ds_v5' { 'goes to the 2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off, once its cost check passes (PREFLIGHT.T4.FALLBACK)' }
                         default { 'finishes without T4: it was the last size the fallback tries, and later runs don''t try again on their own' }
                     }
                     $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $what) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation $(if ($start -eq 'Refused') { 'Ask for access with a Region access request (Learn: Resolve capacity errors), then set t4SkuName; or set t4Enabled to false to leave T4 out on purpose.' } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
@@ -378,10 +393,37 @@ function Invoke-DemoPreflight {
         Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Not selected' 'T4 is off in this configuration (t4Enabled is false).'
     }
     $t4Start = Select-DemoT4StartSku -Sku $t4Starts.ToArray()
+    if ($t4On) {
+        # The one-time move of an existing T4 to the default (2026-11-04), and whether the size T4 gets runs autonomous
+        # tuning: the configured or recorded size, the server's own, or where the fallback starts.
+        if ($t4Scale) {
+            $results.Add((New-DemoT4SizeResult -CheckPrefix PREFLIGHT -ServerSku $t4ServerSku -SkuName $t4Sku -Outcome Scale))
+        }
+        if ($t4Start -in 'None', 'Refused') {
+            $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.TUNING' -Area 'preflight' -Target 'T4' -Status 'Not selected' -Message 'This run leaves T4 out (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU says why), so autonomous tuning doesn''t apply.' -DocUrl ([string]$postgres['autonomousTuning']['docUrls']['autonomousTuning'])))
+        }
+        else {
+            $tuningSku = if ($t4Start) { $t4Start } else { $t4Sku }
+            $tuningWhy = if ($t4Start -eq 'Standard_D2ds_v5') { 'deploy.ps1''s fallback uses Standard_D2ds_v5 because the 4-vCore sizes are ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' } elseif ($t4Explicit) { ('t4SkuName sets {0}.' -f $tuningSku) } else { '' }
+            $results.Add((New-DemoT4TuningResult -Config $Config -SkuName $tuningSku -Why $tuningWhy -CheckPrefix PREFLIGHT))
+        }
+    }
+    else {
+        $results.Add((New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT))
+    }
 
-    # T2 mode (ADR 0006). The evaluation-only fallback is opt-in, and everything about it is labeled.
-    if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
+    # T2 mode (ADR 0006). The evaluation-only fallback is opt-in, and everything about it is labeled. The Jumpstart image
+    # is a Hyper-V guest disk, so it needs the nested host; an existing guest's source is checked on the host itself
+    # (its GuestSource step), which refuses a mode the guest wasn't made for.
+    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
+    if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm' -and $installMode -eq 'JumpstartImage') {
+        Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Fail' 't2SqlInstallMode JumpstartImage needs the nested Hyper-V host: Arc Jumpstart''s image is a Hyper-V guest disk, but t2Mode EvaluationOnlyAzureVm makes T2 an Azure VM.' -Remediation 'Use t2Mode Nested with a nested-virtualization size, or, for the evaluation-only Azure VM, set t2SqlInstallMode to PaygWizard, ProductKey, or Developer (ADR 0006).' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine'
+    }
+    elseif ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T2.MODE' -Area 'preflight' -Target 'T2' -Status 'Warning' -Message 't2Mode is EvaluationOnlyAzureVm: T2 is the Azure VM arcsql01, onboarded to Azure Arc with Microsoft''s evaluation procedure, which is for evaluation and testing only. Use it only when the nested-virtualization checks fail (ADR 0006).' -Remediation 'Set t2Mode to Nested when a nested-virtualization size is available.' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine' -EvaluationOnly))
+    }
+    elseif ($installMode -eq 'JumpstartImage') {
+        Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Pass' 'T2 is the nested Hyper-V guest arcsql01 on archost01 (t2Mode Nested), made from Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest (t2SqlInstallMode JumpstartImage): no T2 step needs a person (ADR 0006).'
     }
     else {
         Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Pass' 'T2 is the nested Hyper-V guest arcsql01 on archost01 (t2Mode Nested, ADR 0006).'
@@ -421,10 +463,13 @@ function Invoke-DemoPreflight {
     $networkUsage = @(Invoke-Az -Arguments @('network', 'list-usages', '--location', $location) -Json)
     $ipRow = $networkUsage | Where-Object { $_.name.value -eq 'PublicIPAddresses' } | Select-Object -First 1
     if ($ipRow -and ([int]$ipRow.limit - [int]$ipRow.currentValue) -ge 1) {
-        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Pass' 'Public IP quota allows on-demand Bastion.'
+        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Pass' 'Public IP quota allows on-demand Bastion (the PaygWizard guided stop, or optional interactive access).'
+    }
+    elseif ($installMode -eq 'PaygWizard') {
+        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so on-demand Bastion, which the PaygWizard guided stop needs, cannot be created.' -Remediation 'Request a public IP quota increase, or choose t2SqlInstallMode JumpstartImage, which needs no Bastion.'
     }
     else {
-        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so on-demand Bastion cannot be created.' -Remediation 'Request a public IP quota increase if you need interactive access.'
+        Add-Check 'PREFLIGHT.P3.PUBLICIP' 'subscription' 'Warning' 'No public IP quota is left, so optional on-demand Bastion cannot be created; the deployment itself doesn''t need it.' -Remediation 'Request a public IP quota increase if you need interactive access.'
     }
 
     # P4 and P5: Fabric. P4 (Phase 28 live finding, 2026-10-30): the Hub setting is read through the Fabric admin API,
@@ -436,6 +481,9 @@ function Invoke-DemoPreflight {
     $results.Add($fabricCheck.Result)
     # P11 (optional, Phase 18): Power BI viewer licensing on the workspace's capacity; a Warning below F64.
     $results.Add((Test-DemoFabricViewerLicense -Config $fabricCheck.Config -CapacityResult $fabricCheck.CapacityResult))
+    # P12 and P13 (2026-11-05): the tenant settings the Insights app needs, which is part of every deployment but never
+    # blocks it; read through the Fabric admin API, and never more than a Warning.
+    $results.Add((Test-DemoFabricAppTenantSetting -Config $Config))
 
     # P6: the T3 admin group exists and the caller owns it. Microsoft Graph is read with a token verified for
     # the configured tenant; 'az ad' would answer for the Azure CLI's default account, which can be in another
@@ -561,14 +609,21 @@ function Invoke-DemoPreflight {
     }
 
     # Cost: live retail prices against the ceilings, with the subscription's Defender for Cloud plans. T4 is priced at the
-    # size it starts with (Phase 28 follow-up): an existing server's own size, the step the fallback starts at, or none
-    # when the fallback leaves T4 out, so a fallback whose worst case is over a ceiling leaves T4 out instead of stopping
-    # the run. The estimates share one price cache, so the fallback's own estimate reads only the prices it adds.
+    # size it gets (ADR 0019): an existing server's own size or the default it moves to (PREFLIGHT.T4.SIZE), the step the
+    # fallback starts at, or none when the fallback leaves T4 out, so a fallback whose worst case is over a ceiling leaves
+    # T4 out instead of stopping the run. The estimates share one price cache, so the fallback's own estimate reads only
+    # the prices it adds. The
+    # activity profile's T3 incidents count (business-day by default since 2026-11-03), and a configuration that doesn't
+    # set activityProfile gets one notice (PREFLIGHT.ACTIVITYPROFILE).
+    $notice = New-DemoActivityProfileNotice -ActivityProfile (Get-DemoActivityProfile -Config $Config) -CheckPrefix 'PREFLIGHT'
+    if ($null -ne $notice) {
+        $results.Add($notice)
+    }
     $costConfig = $Config
-    if ($t4On -and $t4Exists -and $t4ServerSku -and $t4ServerSku -cne (Get-DemoT4SkuName -Config $Config)) {
+    if ($t4On -and $t4Exists -and $t4ServerSku -and -not $t4Scale -and $t4ServerSku -cne (Get-DemoT4SkuName -Config $Config)) {
         $costConfig = Copy-DemoT4Config -Config $Config -Source server -SkuName $t4ServerSku
     }
-    elseif ($t4On -and $t4Start -in 'Standard_B2s', 'Standard_D2ds_v5') {
+    elseif ($t4On -and $t4Start -in 'Standard_D4ads_v5', 'Standard_D2ds_v5') {
         $costConfig = Copy-DemoT4Config -Config $Config -Source fallback -SkuName $t4Start
     }
     elseif ($t4On -and $t4Start -in 'None', 'Refused') {
@@ -587,6 +642,14 @@ function Invoke-DemoPreflight {
     catch {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots could not be listed, so the cost estimate leaves them out: {0}' -f $_.Exception.Message)
     }
+    # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where a safety stop
+    # is fully in place (the nightly safety stop, ADR 0024: its schedule, its role, and a last run that didn't fail; or the
+    # control's); otherwise the rest of the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART). On
+    # a first deployment the nightly safety stop doesn't exist yet: this run sets it up after the template.
+    if ($t4On) {
+        $costParameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
+    }
+    $results.Add((New-DemoT4RestartCoverageResult -Config $Config -Coverage $(if ($t4On) { $costParameters['T4RestartCoverage'] } else { $null }) -CheckPrefix 'PREFLIGHT'))
     $estimate = $null
     try {
         $estimate = Get-DemoCostEstimate @costParameters
@@ -597,7 +660,7 @@ function Invoke-DemoPreflight {
     if ($null -ne $estimate) {
         $costResults = @($estimate.Results)
         if ($t4On) {
-            # The General Purpose fallback's cost check, and where the fallback starts (Phase 28 follow-up). Its failure never
+            # The 2-vCore fallback's cost check, and where the fallback starts (ADR 0019). Its failure never
             # drops the run's own cost checks, a monthly-ceiling Fail included (review of 20e855c).
             try {
                 $fallback = Get-DemoT4FallbackPreflight -Config $Config -CostParameters $costParameters -Estimate $estimate -Start $t4Start -Explicit:$t4Explicit -Exists:$t4Exists -ServerSku $t4ServerSku
@@ -608,7 +671,7 @@ function Invoke-DemoPreflight {
             }
             catch {
                 $problem = Protect-DemoText -Text $_.Exception.Message
-                $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.FALLBACK' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('T4''s General Purpose fallback couldn''t be priced in preflight: {0}. PREFLIGHT.COST.* are the run''s own estimate; deploy.ps1 prices the fallback again right before it would create anything.' -f $problem) -Evidence ([ordered]@{ startSku = $t4Start; skipReason = 'Price'; priceError = $problem }) -Remediation 'Nothing to do: run preflight again later to see the fallback''s price.' -DocUrl 'https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices'))
+                $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.FALLBACK' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('T4''s 2-vCore fallback couldn''t be priced in preflight: {0}. PREFLIGHT.COST.* are the run''s own estimate; deploy.ps1 prices the fallback again right before it would create anything.' -f $problem) -Evidence ([ordered]@{ startSku = $t4Start; skipReason = 'Price'; priceError = $problem }) -Remediation 'Nothing to do: run preflight again later to see the fallback''s price.' -DocUrl 'https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices'))
             }
         }
         foreach ($result in $costResults) {

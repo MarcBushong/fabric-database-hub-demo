@@ -6,11 +6,15 @@ Stops the demo's compute after a session (plan section 9.4, ADR 0016).
 .DESCRIPTION
 - Default: removes on-demand Bastion and then its public IP (also a public IP that an interrupted delete left
   behind), rotates the T2 host's one-time password, sets every activity profile to off so a later boot
-  doesn't keep T3 awake, shuts the T2 guest down cleanly, and deallocates the T2 VM and sqlvm01. T3
+  doesn't keep T3 awake (both VMs at once, waited for about 3 minutes at most: an incident in progress can keep a VM's
+  Run Commands waiting, so a profile that isn't off in time is a Warning, and the VM is deallocated anyway, which stops
+  the incident with it), shuts the T2 guest down cleanly (within the same bound; the host's deallocation shuts it down
+  otherwise), and deallocates the T2 VM and sqlvm01. T3
   persists; serverless auto-pause stops its compute. T4, the PostgreSQL flexible server, is stopped; Azure starts it
   again on its own after seven days, so STOP.T4.STOP says when (the stop time plus seven days), what it then bills at
-  its size (the Azure Retail Prices API), and whether the on-demand control's daily safety stop stops it again or
-  nothing does (Phase 28 follow-up). Its storage and the Defender plans a tenant policy enables are billed while it's
+  its size (the Azure Retail Prices API), and whether the nightly safety stop (ADR 0024), part of every deployment,
+  stops it again or nothing does (Phase 28 follow-up). The nightly safety stop also deallocates the VMs and stops T4 at
+  the auto-shutdown time on its own. Its storage and the Defender plans a tenant policy enables are billed while it's
   stopped (Phase 24, ADR 0019).
 - -ParkT2: only the T2 side (its profile, the guest, and the host), for demos on T1 and T3.
 - -RemoveBastionOnly: only Bastion and the password rotation; with -IfExpired, a Bastion host goes only after
@@ -80,10 +84,16 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-# Reuse DbHubDemo when it's already loaded (for example by a test); otherwise load it.
-if (-not (Get-Module -Name 'DbHubDemo')) {
-    Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
+# This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
+# that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
+# another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
+# guard's validated context, the redaction's registered values, or a test's mocks.
+$entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+$entryNested = $false
+foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
+    $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath

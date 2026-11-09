@@ -65,13 +65,77 @@ Describe 'Repository layout' {
     It 'has the script scripts/<_>.ps1 with #Requires and comment-based help' -ForEach @(
         'init', 'deploy', 'preflight', 'configure-fabric', 'configure-powerbi', 'configure-fabric-app', 'configure-arc', 'configure-monitoring', 'validate',
         'start-demo', 'stop-demo', 'reset-demo', 'status', 'estimate-cost', 'destroy', 'setup-github-oidc', 'setup-github-repo', 'setup-activity-control',
-        'collect-diagnostics'
+        'grant-safety-stop', 'collect-diagnostics'
     ) {
         $path = Join-Path -Path $repoRoot -ChildPath "scripts/$_.ps1"
         Test-Path -LiteralPath $path | Should -BeTrue
         $text = Get-Content -LiteralPath $path -Raw
         $text | Should -Match '(?m)^#Requires -Version 7\.4'
         $text | Should -Match '\.SYNOPSIS'
+    }
+}
+
+Describe 'Entry scripts load this checkout''s DbHubDemo on every run (live finding, 2026-11-06)' {
+    # Live: deploy.ps1 -Resume, run again in the terminal of an earlier run after a pull, reused the DbHubDemo that the
+    # earlier run had loaded (its import skipped a module already loaded), so the run's own code was the old one: it never
+    # checked the changed bootstrap bundle. The track processes, which import the module themselves, ran the new code.
+    BeforeAll {
+        $script:entryScripts = @(Get-ChildItem -Path (Join-Path -Path $repoRoot -ChildPath 'scripts') -Filter '*.ps1' -File |
+                Where-Object { (Get-Content -LiteralPath $_.FullName -Raw).Contains('modules/DbHubDemo/DbHubDemo.psd1') })
+        $script:entryLines = @(
+            '$entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath ''..'')).TrimEnd(''\'', ''/'') + [System.IO.Path]::DirectorySeparatorChar'
+            '$entryNested = $false'
+            'foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {'
+            '    $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))'
+            '}'
+            'Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath ''modules/DbHubDemo/DbHubDemo.psd1'') -Force:(-not $entryNested)'
+        ) -join "`n"
+    }
+
+    It 'finds the entry scripts that import DbHubDemo' {
+        $script:entryScripts.Count | Should -BeGreaterOrEqual 20
+        @($script:entryScripts | ForEach-Object { $_.Name }) | Should -Contain 'deploy.ps1'
+    }
+
+    It 'imports it with -Force unless the repository''s own code runs the script, and never reuses a module that''s loaded already' {
+        $wrong = foreach ($file in $script:entryScripts) {
+            $text = (Get-Content -LiteralPath $file.FullName -Raw) -replace "`r`n", "`n"
+            $imports = @([regex]::Matches($text, '(?m)^.*Import-Module\b.*DbHubDemo\.psd1.*$') | ForEach-Object { $_.Value.Trim() })
+            if (-not $text.Contains($script:entryLines)) {
+                '{0}: lacks the shared lines that load the module again' -f $file.Name
+            }
+            if ($imports.Count -ne 1 -or $imports[0] -notmatch '-Force:\(-not \$entryNested\)$') {
+                '{0}: imports DbHubDemo {1} time(s), not once with -Force:(-not $entryNested)' -f $file.Name, $imports.Count
+            }
+            if ($text -match "if \(-not \(Get-Module -Name 'DbHubDemo'\)\)") {
+                '{0}: reuses a DbHubDemo that''s loaded already' -f $file.Name
+            }
+        }
+        $wrong | Should -BeNullOrEmpty
+    }
+
+    It 'replaces a module that an earlier run loaded, and keeps it, with its state, when DbHubDemo''s own code runs the script' {
+        $pwsh = (Get-Process -Id $PID).Path
+        $missing = Join-Path -Path $TestDrive -ChildPath 'missing.json'
+        $probe = Join-Path -Path $TestDrive -ChildPath 'probe.ps1'
+        # Outside the repository, as a terminal or a workflow step runs a script.
+        [System.IO.File]::WriteAllText($probe, @'
+param([string] $Repo, [string] $Missing)
+$ErrorActionPreference = 'Stop'
+$status = Join-Path -Path $Repo -ChildPath 'scripts/status.ps1'
+Import-Module -Name (Join-Path -Path $Repo -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')
+$mark = { & (Get-Module -Name 'DbHubDemo') { $script:StaleMarker = 'earlier run' } }
+$read = { [string](& (Get-Module -Name 'DbHubDemo') { Get-Variable -Name 'StaleMarker' -Scope Script -ValueOnly -ErrorAction SilentlyContinue }) }
+& $mark
+try { & $status -ConfigPath $Missing *> $null } catch { $null = $_ }
+'TOP [{0}]' -f (& $read)
+& $mark
+try { & (Get-Module -Name 'DbHubDemo') { param($Path, $Config) Invoke-DemoRepositoryScript -Path $Path -Argument @{ ConfigPath = $Config } } $status $Missing *> $null } catch { $null = $_ }
+'NESTED [{0}]' -f (& $read)
+'@)
+        $output = @(& $pwsh -NoProfile -NonInteractive -File $probe -Repo $repoRoot -Missing $missing 2>&1 | ForEach-Object { [string]$_ })
+        $output | Should -Contain 'TOP []' -Because ('a run from outside the repository loads the module again: {0}' -f ($output -join ' | '))
+        $output | Should -Contain 'NESTED [earlier run]' -Because 'a script that the module runs keeps the module and its state'
     }
 }
 
@@ -84,6 +148,25 @@ Describe 'PowerShell files' {
             }
         }
         $nonAscii | Should -BeNullOrEmpty
+    }
+
+    It 'never pass [type]$value as a command argument, where it is a string, not a cast (live finding, 2026-11-06)' {
+        # In argument mode, [string]$x is the text "[string]" followed by the value: the first boot's cleanup got
+        # "[string]System.Collections.Hashtable[jumpstartFolder]" as its folder and never deleted C:\Jumpstart. Write
+        # ([string]$x). A bare type name with no variable, such as Should -BeOfType [string], is fine.
+        $offenders = foreach ($file in Get-RepoFile -Include '*.ps1', '*.psm1') {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            $found = $ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
+                    $node.StringConstantType -eq [System.Management.Automation.Language.StringConstantType]::BareWord -and
+                    $node.Extent.Text -match '^\[[A-Za-z_][\w.,\[\]]*\]\$'
+                }, $true)
+            foreach ($node in $found) {
+                '{0}:{1}: {2}' -f $file.FullName.Substring($repoRoot.Length), $node.Extent.StartLineNumber, $node.Extent.Text
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
     }
 }
 
@@ -370,7 +453,7 @@ Describe 'Configuration files' {
 
     It 'media pins use HTTPS and a SHA-256 or null (trust on first use)' {
         $versions = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
-        foreach ($name in 'windowsServer2022Eval', 'sqlServer2022', 'sqlServer2022Developer') {
+        foreach ($name in 'windowsServer2022Eval', 'sqlServer2022', 'sqlServer2022Developer', 'jumpstartArcBoxSqlStd') {
             $pin = $versions.media[$name]
             $pin.url | Should -Match '^https://'
             $pin.fileName | Should -Be ([System.IO.Path]::GetFileName(([uri]$pin.url).AbsolutePath))
@@ -417,6 +500,28 @@ Describe 'VM-side files' {
                     ($node -is [System.Management.Automation.Language.BinaryExpressionAst] -and $node.Operator -eq 'QuestionQuestion') -or
                     ($node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Operator -eq 'QuestionQuestionEquals') -or
                     ($node -is [System.Management.Automation.Language.CommandParameterAst] -and $node.ParameterName -in @('AsHashtable', 'Parallel'))
+                }, $true)
+            foreach ($node in $found) {
+                '{0}:{1}' -f $file.FullName.Substring($repoRoot.Length), $node.Extent.StartLineNumber
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
+
+    It 'VM-side PowerShell and the runbooks declare no mandatory [byte[]] parameter, which Windows PowerShell 5.1 walks on every call (live finding, 2026-11-06)' {
+        # Windows PowerShell 5.1 checks a mandatory array argument for null elements one by one (PowerShell 6 and later skip
+        # value types, PowerShell/PowerShell#5432): a hash function given the 4 MiB buffer per network read held the
+        # Jumpstart image's download to 0.2 MB/s. Call .NET methods in such loops, or take the parameter as optional.
+        $offenders = foreach ($file in Get-ChildItem -Path (Join-Path -Path $repoRoot -ChildPath 'vm'), (Join-Path -Path $repoRoot -ChildPath 'automation') -Recurse -File -Include '*.ps1', '*.psm1') {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            $found = $ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.ParameterAst] -and $node.StaticType -eq [byte[]] -and
+                    @($node.Attributes | Where-Object {
+                            $_ -is [System.Management.Automation.Language.AttributeAst] -and
+                            $_.TypeName.GetReflectionAttributeType() -eq [System.Management.Automation.ParameterAttribute] -and
+                            @($_.NamedArguments | Where-Object { $_.ArgumentName -eq 'Mandatory' -and $_.Argument.Extent.Text -ne '$false' }).Count -gt 0
+                        }).Count -gt 0
                 }, $true)
             foreach ($node in $found) {
                 '{0}:{1}' -f $file.FullName.Substring($repoRoot.Length), $node.Extent.StartLineNumber

@@ -16,7 +16,8 @@ function Invoke-DemoActivityControlSetup {
        tenant whose policy would make the vault private is a Fail, and the policy's exclusion tag is never added.
     2. Microsoft.Automation registered, and rg-<prefix>-control created when it doesn't exist.
     3. infra/control/control.bicep: id-<prefix>-automation, aa-<prefix>-control, and kv-<prefix>-ctl-<suffix> in that mode.
-    4. The runbooks DbHub-Control and DbHub-Stop (Windows PowerShell 5.1), published with the current scenario catalog.
+    4. The runbooks DbHub-Control, DbHub-Stop, and DbHub-Monitor (Windows PowerShell 5.1), published with the current
+       scenario catalog.
     5. The daily T4 safety stop (DbHub-Stop -Scope T4).
     6. A webhook for DbHub-Control and its URL in the secret dbhub-activity-webhook, when there's no valid one (or with
        -RotateWebhook): created through infra/control/webhook.bicep with the URL as a secure parameter only.

@@ -11,7 +11,9 @@ Without a data disk (settings dataDiskTier None, the lowest-cost default), the D
 and ContosoCare uses SQL Server's default data and log folders on the OS disk. The WorkloadRunner step
 installs the .NET runtime and the runner that deploy.ps1 delivers in Run Command chunks, applies the demo
 objects to T1 (and to T3 once Enable-DemoT3Workload has run), and registers the DbHubDemo-Workload task
-that hosts the activity profiles for T1 and T3.
+that hosts the activity profiles for T1 and T3. The AutoLogonSecret step, last, deletes the LSA secret
+DefaultPassword that Azure's Windows provisioning leaves with automatic sign-in off (ADR 0009); health.json reports
+it (details.signIn), and DEPLOY.T1.READY adds it as a note.
 
 .PARAMETER Root
 State folder. Defaults to C:\ProgramData\DbHubDemo.
@@ -26,6 +28,8 @@ $ErrorActionPreference = 'Stop'
 
 $script:SqlVmBundleRoot = Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Vm.psd1') -Force
+# The sign-in data sweep (ADR 0009); dot-sourcing only defines its functions. T1 uses only its automatic sign-in check.
+. (Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-DemoSignInResidue.ps1')
 
 function Get-DemoSqlVmContext {
     [CmdletBinding()]
@@ -581,6 +585,64 @@ function Disable-DemoSqlVmAssociatedService {
     }
 }
 
+function Test-DemoSqlVmAutoLogonSecret {
+    # True when Windows automatic sign-in is off and no LSA DefaultPassword secret is stored (ADR 0009). Reads automatic
+    # sign-in only (Invoke-DemoSignInSweep -AutoLogonOnly), never a value. Never throws: false when it can't be read.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    try {
+        return [bool](Invoke-DemoSignInSweep -AutoLogonOnly $true).pass
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('Automatic sign-in check: {0}' -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Clear-DemoSqlVmAutoLogonSecret {
+    <#
+    .SYNOPSIS
+    Deletes the LSA secret DefaultPassword that Azure's Windows provisioning leaves on the VM with automatic sign-in off
+    (live finding, 2026-11-06), so sqlvm01 keeps no stored password it doesn't need (ADR 0009). If automatic sign-in was
+    armed, which nothing in the demo does on T1, it turns it off and deletes its Winlogon values too. Only automatic sign-in
+    is touched (Invoke-DemoSignInSweep -Clean -AutoLogonOnly); the secret's value is never read, logged, or returned.
+    Records what it did in sign-in-secret.json, which health.json reports (details.signIn): a note for the lone secret, a
+    warning when automatic sign-in was armed. Throws when anything is left (fail closed).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    $sweep = Invoke-DemoSignInSweep -Clean $true -AutoLogonOnly $true
+    $left = $sweep.remaining
+    if (-not [bool]$sweep.pass) {
+        throw ('Automatic sign-in data is left on this VM after the cleanup (fail closed): enabled {0}, LSA secret {1}, Winlogon DefaultPassword {2}, unreadable {3}.' -f [int]$left.autoLogonEnabled, ([int]$left.autoLogonSecrets + [int]$left.autoLogonLoneSecrets), [int]$left.autoLogonPasswords, [int]$left.autoLogonUnverified)
+    }
+    $found = $sweep.found
+    $kind = ''
+    $note = ''
+    if ([int]$found.autoLogonEnabled + [int]$found.autoLogonSecrets + [int]$found.autoLogonPasswords -gt 0) {
+        $kind = 'Armed'
+        $note = 'Windows automatic sign-in was armed on sqlvm01, which nothing in the demo does; the cleanup turned it off and deleted its LSA secret and Winlogon values.'
+    }
+    elseif ([int]$sweep.actions.loneSecretDeleted -gt 0) {
+        $kind = 'LoneSecret'
+        $note = 'Deleted the LSA secret DefaultPassword that Azure''s provisioning leaves; automatic sign-in was off.'
+    }
+    if (-not $kind) {
+        return
+    }
+    Write-DemoVmJsonFile -Path (Join-Path -Path $Context.Root -ChildPath 'sign-in-secret.json') -InputObject ([ordered]@{ schemaVersion = 1; found = $kind; note = $note; updatedUtc = (Get-DemoVmUtcNow) })
+    Write-DemoVmLog -Message $note
+    if ($kind -eq 'Armed') {
+        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $note)
+    }
+}
+
 function Get-DemoSqlVmStepPlan {
     [CmdletBinding()]
     [OutputType([System.Collections.IDictionary[]])]
@@ -617,6 +679,10 @@ function Get-DemoSqlVmStepPlan {
             NotSelectedMessage = 'No workload runner came with this deployment: deploy.ps1 publishes it, sends it with Send-DemoWorkloadRunner, and passes its SHA-256 to the template (ADR 0010).'
             Test = { param($Step) Test-DemoSqlVmWorkload -Context $Step.Context }
             Set = { param($Step) Install-DemoSqlVmWorkload -Context $Step.Context } }
+        # Last, so it never holds up the database: the LSA secret Azure's provisioning leaves (ADR 0009).
+        @{ Name = 'AutoLogonSecret'
+            Test = { Test-DemoSqlVmAutoLogonSecret }
+            Set = { param($Step) Clear-DemoSqlVmAutoLogonSecret -Context $Step.Context } }
     )
     foreach ($step in $plan) {
         $step['Context'] = $Context
@@ -646,6 +712,16 @@ function Get-DemoSqlVmHealthDetail {
     }
     if ($Context.Workload.Selected) {
         $detail.workload = Get-DemoVmWorkloadHealth -Root $Context.Root
+    }
+    # What the AutoLogonSecret step deleted, for DEPLOY.T1.READY (health summary signInFound and signInNote).
+    try {
+        $signIn = Read-DemoVmJsonFile -Path (Join-Path -Path $Context.Root -ChildPath 'sign-in-secret.json')
+        if ($null -ne $signIn) {
+            $detail.signIn = [ordered]@{ found = [string]$signIn['found']; note = [string]$signIn['note']; updatedUtc = [string]$signIn['updatedUtc'] }
+        }
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('sign-in-secret.json couldn''t be read: {0}' -f $_.Exception.Message)
     }
     return $detail
 }

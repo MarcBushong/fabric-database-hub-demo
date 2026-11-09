@@ -6,15 +6,17 @@ function Test-DemoActivityControl {
 
     .DESCRIPTION
     With control.enabled false, one CONTROL.SETUP result that's Not selected. Otherwise:
-    - CONTROL.SETUP: the Automation account, both runbooks published, and the vault (its network access in the
-      evidence).
+    - CONTROL.SETUP: the Automation account, its three runbooks published (DbHub-Control, DbHub-Stop, and
+      DbHub-Monitor), and the vault (its network access in the evidence). A runbook that's missing, such as
+      DbHub-Monitor before setup-activity-control.ps1 runs again after an update, is Manual action required.
     - CONTROL.WEBHOOK: the newest webhook and its secret: Pass with more than 14 days left, Warning within 14 days
       (setup-activity-control.ps1 -RotateWebhook), Manual action required when it has expired or is missing.
     - CONTROL.ROLE.A1, CONTROL.ROLE.A2, CONTROL.ROLE.A3: Pass when present; Manual action required with the exact
       -GrantRole command when missing (a redeploy deletes A1 with the demo resource group).
     - CONTROL.AUTOSTOP: Pass with no pending auto-stop or one in the future (a run is active); Warning for one that
       should have run more than an hour ago.
-    - CONTROL.SAFETYSTOP: the daily T4 safety stop's schedule and its link to DbHub-Stop.
+    - CONTROL.SAFETYSTOP: the daily T4 safety stop's schedule and its link to DbHub-Stop; Pass without it too while the
+      nightly safety stop (ADR 0024), part of every deployment, is in place, because it stops T4 every night.
     Metadata only: no secret value is read.
 
     .PARAMETER Config
@@ -58,7 +60,7 @@ function Test-DemoActivityControl {
         return $results.ToArray()
     }
     $states = [ordered]@{}
-    foreach ($runbook in $name.ControlRunbook, $name.StopRunbook) {
+    foreach ($runbook in $name.ControlRunbook, $name.StopRunbook, $name.MonitorRunbook) {
         $read = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/runbooks/{1}' -f $name.AutomationAccountId, $runbook) -ApiVersion $version)
         $states[$runbook] = if ($read.Ok) { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $read.Value -Name 'properties') -Name 'state') } else { 'Missing' }
     }
@@ -70,7 +72,7 @@ function Test-DemoActivityControl {
         $results.Add((New-DemoResult -CheckId 'CONTROL.SETUP' -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message ('The control is incomplete: {0}.' -f ((@($unpublished | ForEach-Object { '{0} is {1}' -f $_, $states[$_] }) + @(if (-not $vault.Ok) { '{0} is missing' -f $name.KeyVault })) -join '; ')) -Evidence $evidence -Remediation ('Run {0}.' -f $setup) -DocUrl $doc))
     }
     else {
-        $results.Add((New-DemoResult -CheckId 'CONTROL.SETUP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('{0} has {1} and {2} published; {3} has public network access {4}.' -f $name.AutomationAccount, $name.ControlRunbook, $name.StopRunbook, $name.KeyVault, $access) -Evidence $evidence -DocUrl $doc))
+        $results.Add((New-DemoResult -CheckId 'CONTROL.SETUP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('{0} has {1}, {2}, and {3} published; {4} has public network access {5}.' -f $name.AutomationAccount, $name.ControlRunbook, $name.StopRunbook, $name.MonitorRunbook, $name.KeyVault, $access) -Evidence $evidence -DocUrl $doc))
     }
 
     $hooks = Get-DemoActivityControlWebhook -Name $name
@@ -112,11 +114,16 @@ function Test-DemoActivityControl {
     }
 
     # The same read stop-demo.ps1 and status.ps1 make to say whether anything stops a T4 Azure started again (Phase 28
-    # follow-up).
+    # follow-up). The nightly safety stop (ADR 0024), part of every deployment, stops T4 too, so a control schedule that's
+    # missing then leaves nothing uncovered.
     $safety = Get-DemoT4SafetyStopState -Config $Config
     $safetyDoc = 'https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server'
+    $nightly = if ($safety.State -ne 'Scheduled') { Get-DemoSafetyStopState -Config $Config } else { $null }
     if ($safety.State -eq 'Scheduled') {
         $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The daily T4 safety stop is scheduled{0}.' -f $(if ($null -ne $safety.NextRunUtc) { ' (next {0:yyyy-MM-dd HH:mm} UTC)' -f $safety.NextRunUtc } else { '' })) -DocUrl $safetyDoc))
+    }
+    elseif ($null -ne $nightly -and $nightly.State -eq 'InPlace') {
+        $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The control''s daily T4 safety stop {0}, but the nightly safety stop stops T4 every night{1} (ADR 0024).' -f $(if ($safety.State -eq 'Unknown') { 'couldn''t be read' } else { 'isn''t scheduled' }), $(if ($null -ne $nightly.NextRunUtc) { ' (next {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$nightly.NextRunUtc) } else { '' })) -Remediation $(if ($safety.State -eq 'Unknown') { '' } else { ('To have both, run {0}.' -f $setup) }) -DocUrl $safetyDoc))
     }
     elseif ($safety.State -eq 'Unknown') {
         $results.Add((New-DemoResult -CheckId 'CONTROL.SAFETYSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'The daily T4 safety stop''s schedule couldn''t be read, so it may not stop a T4 that starts itself after 7 days.' -Remediation ('Run validate.ps1 again; if it stays unread, run {0}.' -f $setup) -DocUrl $safetyDoc))

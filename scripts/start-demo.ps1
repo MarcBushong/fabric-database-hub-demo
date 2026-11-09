@@ -16,9 +16,16 @@ sections 9.4, 9.6).
   Graph, the extended property, and fresh telemetry, and reports a Warning with the measured lag otherwise;
   T1's monitoring is checked again after that template deployment, waiting while the SQL IaaS extension
   updates.
-- Sets the activity profile (-ActivityProfile, or the configured activityProfile) on T1, T3, and T2 until
-  the next auto-shutdown. The VMs don't set it at boot unless activityProfileOnBoot is true, so a VM that
-  starts some other way doesn't keep T3 awake (ADR 0016).
+- Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
+  2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown. business-day is the steady mix plus bounded incidents
+  at fixed minutes past each UTC hour, which fill Database Hub's Performance page; set activityProfile to baseline for
+  the quieter demo. A profile with incidents is set as baseline first and switched once this start's own Run Commands
+  are done, at the warm-up's start (START.INCIDENTS_*), so no incident slows them; with -Interactive
+  -ResetAdminPassword, archost01's switch comes after the host password. A VM this start boots gets baseline as soon as
+  its SQL Server, or T2's guest, answers, and this start's own Run Commands there wait for it, at most about 12.5
+  minutes (START.INTERIM_*). A start that ends before its switch (Ctrl+C, an error) sends it without waiting. A
+  configuration that doesn't set activityProfile gets one notice. The VMs don't set a profile at boot unless
+  activityProfileOnBoot is true, so a VM that starts some other way doesn't keep T3 awake (ADR 0016).
 - -WarmUpMinutes: the activity keeps running in the background and the script returns once the profiles are
   set (ADR 0018); START.WARMUP says when to check the telemetry. -WaitForWarmUp waits that long and checks
   that telemetry arrives (the scheduled warm-up workflows use 30).
@@ -74,6 +81,9 @@ Exit with code 2 when a result is Manual action required.
 ./scripts/start-demo.ps1 -WarmUpMinutes 30
 
 .EXAMPLE
+./scripts/start-demo.ps1 -ActivityProfile baseline
+
+.EXAMPLE
 ./scripts/start-demo.ps1 -Interactive -ResetAdminPassword
 #>
 [CmdletBinding(SupportsShouldProcess)]
@@ -104,10 +114,16 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-# Reuse DbHubDemo when it's already loaded (for example by a test); otherwise load it.
-if (-not (Get-Module -Name 'DbHubDemo')) {
-    Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
+# This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
+# that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
+# another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
+# guard's validated context, the redaction's registered values, or a test's mocks.
+$entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+$entryNested = $false
+foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
+    $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
@@ -116,85 +132,104 @@ $config = Get-DemoConfig -Path $ConfigPath
 # Preference variables don't reach module functions, so -WhatIf is passed on explicitly.
 $whatIf = [bool]$WhatIfPreference
 $results = [System.Collections.Generic.List[object]]::new()
-$results.AddRange([object[]]@(Start-DemoEnvironment -Config $config -ActivityProfile $ActivityProfile -WarmUpMinutes $WarmUpMinutes -WaitForWarmUp:$WaitForWarmUp -SkipT3:$SkipT3 -SkipT4:$SkipT4 -SkipCostCheck:$SkipCostCheck -Interactive:$Interactive -WhatIf:$whatIf -Confirm:$false))
+$module = Get-Module -Name 'DbHubDemo'
+# With -Interactive -ResetAdminPassword this script still sets the host password on archost01 afterward, so its switch
+# from the interim baseline waits for that (2026-11-03, ADR 0010).
+$holdSwitch = @(if ($Interactive -and $ResetAdminPassword -and -not $whatIf -and [string]$config['t2Mode'] -ne 'EvaluationOnlyAzureVm') { 'archost01' })
+$activityDone = $false
+try {
+    $results.AddRange([object[]]@(Start-DemoEnvironment -Config $config -ActivityProfile $ActivityProfile -WarmUpMinutes $WarmUpMinutes -WaitForWarmUp:$WaitForWarmUp -SkipT3:$SkipT3 -SkipT4:$SkipT4 -SkipCostCheck:$SkipCostCheck -Interactive:$Interactive -HoldActivitySwitchVm $holdSwitch -WhatIf:$whatIf -Confirm:$false))
 
-$keyVaultSection = $config['keyVault']
-$useVault = ($keyVaultSection -is [System.Collections.IDictionary]) -and [bool]$keyVaultSection['enabled']
-$noFail = @($results | Where-Object { $_.status -eq 'Fail' }).Count -eq 0
-if ($ResetAdminPassword -and -not $Interactive) {
-    $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Not selected' -Message '-ResetAdminPassword works with -Interactive only, so no password was set.'))
-}
-elseif ($Interactive -and $ResetAdminPassword -and -not $whatIf -and $noFail -and $useVault) {
-    # The opt-in vault replaces the clipboard (ADR 0009). The password is stored before it's set on the VM, so
-    # a password nobody can read is never set.
-    $hostVm = if ([string]$config['t2Mode'] -eq 'EvaluationOnlyAzureVm') { 'arcsql01' } else { 'archost01' }
-    $vaultResults = @(Initialize-DemoKeyVault -Config $config -EnsureOnly -Confirm:$false)
-    $results.AddRange([object[]]$vaultResults)
-    if (@($vaultResults | Where-Object { $_.status -eq 'Fail' }).Count -eq 0) {
-        $expires = ''
-        $bastion = @($results | Where-Object { $_.checkId -eq 'START.BASTION' -and $_.status -eq 'Pass' }) | Select-Object -First 1
-        if ($bastion -and $bastion.evidence -is [System.Collections.IDictionary]) {
-            # Result evidence goes through JSON, which turns an ISO 8601 string into a DateTime.
-            $value = $bastion.evidence['expiresUtc']
-            $expires = if ($value -is [datetime]) { $value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } else { [string]$value }
-            if ($expires -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$') {
-                $expires = ''
-            }
-        }
-        $oneTime = New-DemoAdminPassword
-        try {
-            $stored = Set-DemoHostPasswordSecret -Config $config -VmName $hostVm -Password $oneTime -ExpiresUtc $expires -Confirm:$false
-            $results.Add($stored)
-            if ($stored.status -eq 'Pass') {
-                $applied = Set-DemoVmLocalPassword -Config $config -VmName $hostVm -Password $oneTime -Confirm:$false
-                $results.Add($applied)
-                if ($applied.status -notin 'Pass', 'Warning') {
-                    # The stored password never reached the VM, so nobody should read it.
-                    $results.Add((Disable-DemoHostPasswordSecret -Config $config -VmName $hostVm -CheckId 'START.KEYVAULT.CLEANUP' -Confirm:$false))
+    $keyVaultSection = $config['keyVault']
+    $useVault = ($keyVaultSection -is [System.Collections.IDictionary]) -and [bool]$keyVaultSection['enabled']
+    $noFail = @($results | Where-Object { $_.status -eq 'Fail' }).Count -eq 0
+    if ($ResetAdminPassword -and -not $Interactive) {
+        $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Not selected' -Message '-ResetAdminPassword works with -Interactive only, so no password was set.'))
+    }
+    elseif ($Interactive -and $ResetAdminPassword -and -not $whatIf -and $noFail -and $useVault) {
+        # The opt-in vault replaces the clipboard (ADR 0009). The password is stored before it's set on the VM, so
+        # a password nobody can read is never set.
+        $hostVm = if ([string]$config['t2Mode'] -eq 'EvaluationOnlyAzureVm') { 'arcsql01' } else { 'archost01' }
+        $vaultResults = @(Initialize-DemoKeyVault -Config $config -EnsureOnly -Confirm:$false)
+        $results.AddRange([object[]]$vaultResults)
+        if (@($vaultResults | Where-Object { $_.status -eq 'Fail' }).Count -eq 0) {
+            $expires = ''
+            $bastion = @($results | Where-Object { $_.checkId -eq 'START.BASTION' -and $_.status -eq 'Pass' }) | Select-Object -First 1
+            if ($bastion -and $bastion.evidence -is [System.Collections.IDictionary]) {
+                # Result evidence goes through JSON, which turns an ISO 8601 string into a DateTime.
+                $value = $bastion.evidence['expiresUtc']
+                $expires = if ($value -is [datetime]) { $value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } else { [string]$value }
+                if ($expires -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$') {
+                    $expires = ''
                 }
             }
-        }
-        finally {
-            $oneTime.Dispose()
+            $oneTime = New-DemoAdminPassword
+            try {
+                $stored = Set-DemoHostPasswordSecret -Config $config -VmName $hostVm -Password $oneTime -ExpiresUtc $expires -Confirm:$false
+                $results.Add($stored)
+                if ($stored.status -eq 'Pass') {
+                    $applied = Set-DemoVmLocalPassword -Config $config -VmName $hostVm -Password $oneTime -Confirm:$false
+                    $results.Add($applied)
+                    if ($applied.status -notin 'Pass', 'Warning') {
+                        # The stored password never reached the VM, so nobody should read it.
+                        $results.Add((Disable-DemoHostPasswordSecret -Config $config -VmName $hostVm -CheckId 'START.KEYVAULT.CLEANUP' -Confirm:$false))
+                    }
+                }
+            }
+            finally {
+                $oneTime.Dispose()
+            }
         }
     }
-}
-elseif ($Interactive -and $ResetAdminPassword -and -not $whatIf -and $noFail) {
-    $hostVm = if ([string]$config['t2Mode'] -eq 'EvaluationOnlyAzureVm') { 'arcsql01' } else { 'archost01' }
-    $portalSteps = 'In the Azure portal, open {0}, then Help, then Reset password, and set a password you''ll use once; stop-demo.ps1 rotates it afterward.' -f $hostVm
-    # The clipboard is checked before anything changes: the password is never displayed, so without a
-    # clipboard there'd be no way to hand it over. Set-Clipboard doesn't fail where there's none (Linux without xclip
-    # or a display, GitHub Codespaces, an SSH session, Cloud Shell), so the module's check decides (Phase 28).
-    $clipboard = [bool](& (Get-Module -Name 'DbHubDemo') { Test-DemoClipboard })
-    if (-not $clipboard) {
-        $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'This session has no working clipboard, so no one-time password was set: it''s never displayed.' -Remediation $portalSteps -DocUrl 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'))
-        # The person may now set a password in the portal: the state records the handover, so stop-demo.ps1 rotates it
-        # (Phase 28, ADR 0009).
-        try {
-            Set-DemoDeploymentState -Config $config -Value @{ HostPasswordSet = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
-        }
-        catch {
-            Write-DemoLog -Level Warning -Message ('The handover wasn''t recorded, so after you reset the password in the portal, reset it again to a random value you don''t keep: {0}' -f $_.Exception.Message)
-        }
-    }
-    else {
-        $password = New-DemoAdminPassword
-        try {
-            $set = Set-DemoVmLocalPassword -Config $config -VmName $hostVm -Password $password -Confirm:$false
-            $results.Add($set)
-            if ($set.status -in 'Pass', 'Warning') {
-                try {
-                    Set-Clipboard -Value ([System.Net.NetworkCredential]::new('', $password).Password)
-                    Write-DemoLog -Message ('The one-time password for {0} on {1} is on your clipboard. It isn''t shown or stored; stop-demo.ps1 rotates it.' -f $set.evidence['userName'], $hostVm)
-                }
-                catch {
-                    $results.Add((New-DemoResult -CheckId 'START.CLIPBOARD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'The one-time password was set but couldn''t be copied to the clipboard, and it''s never displayed.' -Remediation $portalSteps))
-                }
+    elseif ($Interactive -and $ResetAdminPassword -and -not $whatIf -and $noFail) {
+        $hostVm = if ([string]$config['t2Mode'] -eq 'EvaluationOnlyAzureVm') { 'arcsql01' } else { 'archost01' }
+        $portalSteps = 'In the Azure portal, open {0}, then Help, then Reset password, and set a password you''ll use once; stop-demo.ps1 rotates it afterward.' -f $hostVm
+        # The clipboard is checked before anything changes: the password is never displayed, so without a
+        # clipboard there'd be no way to hand it over. Set-Clipboard doesn't fail where there's none (Linux without xclip
+        # or a display, GitHub Codespaces, an SSH session, Cloud Shell), so the module's check decides (Phase 28).
+        $clipboard = [bool](& (Get-Module -Name 'DbHubDemo') { Test-DemoClipboard })
+        if (-not $clipboard) {
+            $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'This session has no working clipboard, so no one-time password was set: it''s never displayed.' -Remediation $portalSteps -DocUrl 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'))
+            # The person may now set a password in the portal: the state records the handover, so stop-demo.ps1 rotates it
+            # (Phase 28, ADR 0009).
+            try {
+                Set-DemoDeploymentState -Config $config -Value @{ HostPasswordSet = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('The handover wasn''t recorded, so after you reset the password in the portal, reset it again to a random value you don''t keep: {0}' -f $_.Exception.Message)
             }
         }
-        finally {
-            $password.Dispose()
+        else {
+            $password = New-DemoAdminPassword
+            try {
+                $set = Set-DemoVmLocalPassword -Config $config -VmName $hostVm -Password $password -Confirm:$false
+                $results.Add($set)
+                if ($set.status -in 'Pass', 'Warning') {
+                    try {
+                        Set-Clipboard -Value ([System.Net.NetworkCredential]::new('', $password).Password)
+                        Write-DemoLog -Message ('The one-time password for {0} on {1} is on your clipboard. It isn''t shown or stored; stop-demo.ps1 rotates it.' -f $set.evidence['userName'], $hostVm)
+                    }
+                    catch {
+                        $results.Add((New-DemoResult -CheckId 'START.CLIPBOARD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'The one-time password was set but couldn''t be copied to the clipboard, and it''s never displayed.' -Remediation $portalSteps))
+                    }
+                }
+            }
+            finally {
+                $password.Dispose()
+            }
         }
+    }
+
+    # The switch for a VM this script sent Run Commands to after Start-DemoEnvironment (the host password), now that they're
+    # done; nothing when Start-DemoEnvironment switched everything.
+    $results.AddRange([object[]]@(& $module { param($Settings, $Known, $Requested) Send-DemoPendingActivitySwitch -Config $Settings -ActivityProfile (Get-DemoActivityProfile -Config $Settings -Requested $Requested) -Result $Known -CheckPrefix 'START' -RequestedBy 'start-demo' } $config $results.ToArray() $ActivityProfile))
+    $activityDone = $true
+}
+finally {
+    # A start that ends before its switch (Ctrl+C, an error) sends it now, without waiting, so no VM stays on the interim
+    # baseline (2026-11-03).
+    if (-not $activityDone) {
+        & $module { param($Settings, $Requested) $null = Send-DemoPendingActivitySwitch -Config $Settings -ActivityProfile (Get-DemoActivityProfile -Config $Settings -Requested $Requested) -CheckPrefix 'START' -RequestedBy 'start-demo' -NoWait } $config $ActivityProfile
     }
 }
 

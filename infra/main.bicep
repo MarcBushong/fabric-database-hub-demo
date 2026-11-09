@@ -60,9 +60,9 @@ param autoShutdownTimeZone string = 'Pacific Standard Time'
 @maxLength(10)
 param expiresOn string = ''
 
-@description('Monthly budget amount in USD: the hard monthly ceiling (ADR 0016, C2).')
+@description('Monthly budget amount in USD: the hard monthly ceiling, 375 by default since 2026-11-04 (user-directed, for the 4-core T4; ADR 0016, C2).')
 @minValue(1)
-param monthlyCeilingUsd int = 250
+param monthlyCeilingUsd int = 375
 
 @description('First day of the budget period (yyyy-MM-01). deploy.ps1 passes the existing value on re-runs.')
 @minLength(10)
@@ -145,13 +145,14 @@ param sqlHybridBenefit bool = false
 @description('I attest that I hold the licenses that Azure Hybrid Benefit requires (ADR 0006, C6).')
 param hybridBenefitAttested bool = false
 
-@description('How SQL Server is installed in the T2 guest (ADR 0006).')
+@description('How SQL Server gets into the T2 guest (ADR 0006): JumpstartImage (default) uses Arc Jumpstart\'s prebuilt SQL Server 2022 Standard guest disk, unattended.')
 @allowed([
+  'JumpstartImage'
   'PaygWizard'
   'ProductKey'
   'Developer'
 ])
-param t2SqlInstallMode string = 'PaygWizard'
+param t2SqlInstallMode string = 'JumpstartImage'
 
 @description('Nested: T2 is the nested Hyper-V guest arcsql01 on archost01 (default). EvaluationOnlyAzureVm: the opt-in fallback when the nested preflight fails; arcsql01 is an Azure VM onboarded to Arc with Microsoft\'s evaluation procedure, labeled evaluation only everywhere (ADR 0006).')
 @allowed([
@@ -199,7 +200,7 @@ param workloadRunnerSha256 string = ''
 @maxValue(999)
 param workloadRunnerChunkCount int = 0
 
-@description('Activity profile that deploy.ps1 and start-demo.ps1 set until the next auto-shutdown: off, baseline, business-day, or incident:<scenario> (ADR 0010). While T3 has an active profile, the runner keeps its serverless database awake (ADR 0016).')
+@description('Activity profile the VMs set by themselves after a runner install, and at every boot with activityProfileOnBoot: off, baseline, business-day, or incident:<scenario> (ADR 0010). deploy.ps1 passes baseline in place of a profile with incidents, business-day included, and sets that profile once its own Run Commands on a VM are done. While T3 has an active profile, the runner keeps its serverless database awake (ADR 0016).')
 @minLength(3)
 @maxLength(57)
 param activityProfile string = 'baseline'
@@ -225,16 +226,21 @@ param t3AutoPauseMinutes int = 0
 @description('T3 uses the Azure SQL Database free offer with "continue using database for additional charges" (ADR 0016, C7). Preflight decides; deploy.ps1 redeploys T3 without it if Azure rejects the offer.')
 param t3UseFreeLimit bool = true
 
-@description('Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId>: Burstable Standard_B1ms, Entra-only with the P6 group as administrator, virtual network integration in snet-pg (Phase 24, ADR 0019).')
+@description('Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId>: General Purpose Standard_D4ds_v5 by default (since 2026-11-04), Entra-only with the P6 group as administrator, virtual network integration in snet-pg (Phase 24, ADR 0019).')
 param t4Enabled bool = true
 
-@description('T4\'s compute size: Standard_B1ms, the smallest Burstable size (default); Standard_B2s, the fallback when Azure answers SkuNotAvailable for B1ms in the region; or Standard_D2ds_v5, General Purpose (2 vCores, 8 GiB), the fallback when Azure refuses both Burstable sizes and its cost check passes. The tier follows the size, and storage, backups, and high availability are the same on both tiers (Phase 24, Phase 28 and its follow-up, ADR 0019). deploy.ps1 never resizes an existing server on its own.')
+@description('T4\'s compute size: Standard_D4ds_v5, General Purpose with 4 vCores and 16 GiB (default since 2026-11-04, user-directed, for autonomous tuning); Standard_D4ads_v5 (4 vCores) and Standard_D2ds_v5 (2 vCores, autonomous tuning off), the fallback when Azure answers SkuNotAvailable, the second only after its cost check; or Standard_B1ms or Standard_B2s, Burstable, which a configuration sets to keep the month cheap (autonomous tuning off). The tier follows the size, and storage, backups, and high availability are the same on both tiers (ADR 0019). deploy.ps1 moves an existing server whose size the configuration doesn\'t set to the default once, which restarts it.')
 @allowed([
+  'Standard_D4ds_v5'
+  'Standard_D4ads_v5'
+  'Standard_D2ds_v5'
   'Standard_B1ms'
   'Standard_B2s'
-  'Standard_D2ds_v5'
 ])
-param t4SkuName string = 'Standard_B1ms'
+param t4SkuName string = 'Standard_D4ds_v5'
+
+@description('T4\'s autonomous tuning (2026-11-04, user-directed; ADR 0019): Query Store capturing the top queries and index tuning in REPORT mode every 60 minutes, set only on a size that runs it (General Purpose or Memory Optimized with at least 4 vCores). deploy.ps1 decides from t4AutonomousTuning and the size (Get-DemoT4Tuning). When false, those parameters are left as they are, except that Query Store is turned off on a Burstable size.')
+param t4AutonomousTuning bool = false
 
 @description('T4\'s availability zone when it is created: empty for no preference, or 1, 2, or 3. A server keeps its zone, so deploy.ps1 passes it only while T4 doesn\'t exist (Phase 24, ADR 0019).')
 @allowed([
@@ -317,6 +323,7 @@ module demo 'modules/demo.bicep' = {
     t3UseFreeLimit: t3UseFreeLimit
     t4Enabled: t4Enabled
     t4SkuName: t4SkuName
+    t4AutonomousTuning: t4AutonomousTuning
     t4AvailabilityZone: t4AvailabilityZone
     diskSkuOverrides: diskSkuOverrides
   }

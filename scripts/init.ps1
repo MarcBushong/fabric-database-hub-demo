@@ -25,9 +25,10 @@ What it does, in order:
 3. Finds the Microsoft Entra security group for T3's and T4's administrators (P6) by name, by default
    <prefix>-<environment>-sql-admins. With -CreateAdminGroup it creates it with you as the owner when it's missing; a
    tenant that doesn't allow that gets Manual action required with the steps for an administrator.
-4. Asks how T2 installs SQL Server: PaygWizard (the default: Hub Performance on T2; once per guest build, deploy.ps1
-   stops for about 10 minutes of pre-filled SQL Server setup through Bastion, the guided stop) or Developer (no stop;
-   T2 in Hub's Estate only).
+4. Asks how T2 gets SQL Server: JumpstartImage (the default: Arc Jumpstart's prebuilt SQL Server 2022 Standard guest;
+   no stop, and Hub Performance on T2), PaygWizard (Hub Performance on T2; once per guest build, deploy.ps1 stops for
+   about 10 minutes of pre-filled SQL Server setup through Bastion, the guided stop), or Developer (no stop; T2 in
+   Hub's Estate only).
 5. Writes the configuration, validated against config/environment.schema.json. Git ignores the file, and it holds no
    secrets. An existing file is replaced only with -Force, after a copy to out/config-backup. -WhatIf writes nothing
    and creates no group.
@@ -52,7 +53,7 @@ The Azure region (default westus3). Preflight checks that Database Hub supports 
 The resource name prefix (default dbhub).
 
 .PARAMETER T2SqlInstallMode
-PaygWizard or Developer; without it, init.ps1 asks (PaygWizard with -NonInteractive).
+JumpstartImage, PaygWizard, or Developer; without it, init.ps1 asks (JumpstartImage with -NonInteractive).
 
 .PARAMETER WorkspaceName
 The Fabric workspace's name (default "Database Hub Demo"). deploy.ps1 creates it when it's missing.
@@ -112,7 +113,7 @@ param(
 
     [string] $Prefix = '',
 
-    [ValidateSet('', 'PaygWizard', 'Developer')]
+    [ValidateSet('', 'JumpstartImage', 'PaygWizard', 'Developer')]
     [string] $T2SqlInstallMode = '',
 
     [string] $WorkspaceName = '',
@@ -141,10 +142,16 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-# Reuse DbHubDemo when it's already loaded (for example by a test); otherwise load it.
-if (-not (Get-Module -Name 'DbHubDemo')) {
-    Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
+# This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
+# that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
+# another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
+# guard's validated context, the redaction's registered values, or a test's mocks.
+$entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+$entryNested = $false
+foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
+    $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath

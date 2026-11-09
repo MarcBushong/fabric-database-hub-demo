@@ -6,8 +6,13 @@ Estimates demo cost per profile from live Azure retail prices (ADR 0016).
 .DESCRIPTION
 Queries the public Azure Retail Prices API. For each profile it reports running cost per hour, one
 demo-day session, idle cost per month, and a light-use month, and compares them with the ceilings in the
-configuration. The monthly ceiling (monthlyCeilingUsd, 250 USD by default) is hard: a light-use month
+configuration. The monthly ceiling (monthlyCeilingUsd, 375 USD by default since 2026-11-04) is hard: a light-use month
 above it is Fail and the script exits with code 1. A session above sessionCeilingUsd is a Warning.
+
+T4's 7-day automatic restart: when signed in, the script also reads whether a safety stop is fully in place
+(Get-DemoT4RestartCoverage, read-only): the nightly safety stop that every deployment sets up (its schedule, its role, and
+its last run; ADR 0024), or the on-demand control's daily T4 safety stop. Then each restart counts as about a day;
+otherwise, and when not signed in, the worst case counts the rest of the month.
 Prices are list prices in USD on the day you run it: estimates, not quotes.
 
 Microsoft Defender for Cloud: when the Azure CLI is already signed in to the configured subscription, the
@@ -78,7 +83,16 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force
+# This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
+# that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
+# another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
+# guard's validated context, the redaction's registered values, or a test's mocks.
+$entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+$entryNested = $false
+foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
+    $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
+}
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
@@ -94,6 +108,7 @@ $config = Get-DemoConfig -Path $ConfigPath
 $defenderPlans = $null
 $t3UseFreeLimit = $null
 $goldenSnapshots = @()
+$t4RestartCoverage = $null
 if ($config['subscriptionId'] -eq '00000000-0000-0000-0000-000000000000') {
     Write-DemoLog -Level Warning -Message 'The configuration has no subscription yet, so the estimate excludes Defender for Cloud and prices T3 as regular serverless.'
 }
@@ -107,6 +122,10 @@ else {
         Write-DemoLog -Message ('T3 free offer: {0} ({1})' -f $freeOffer.Result.status, $freeOffer.Result.message)
         $goldenSnapshots = @(Get-DemoT2GoldenSnapshot -Config $config)
         Write-DemoLog -Message ('T2 golden snapshots in the golden resource group: {0} (ADR 0018).' -f $goldenSnapshots.Count)
+        if (Test-DemoT4Enabled -Config $config) {
+            $t4RestartCoverage = Get-DemoT4RestartCoverage -Config $config -ConfigPath $ConfigPath
+            Write-DemoLog -Message ('T4''s automatic restart: {0} (2026-11-04, ADR 0016).' -f $(if ($t4RestartCoverage.Counts) { 'about a day each, ' + $t4RestartCoverage.Reason } else { 'the rest of the month, because ' + $t4RestartCoverage.Reason }))
+        }
     }
     catch {
         Write-DemoLog -Level Warning -Message ('The Defender for Cloud plans, the T3 free offer, or the golden snapshots weren''t read, so the estimate may exclude Defender and the snapshots and prices T3 as regular serverless. {0}' -f $_.Exception.Message)
@@ -127,6 +146,9 @@ $summary = foreach ($name in $profileNames) {
         $parameters['T3UseFreeLimit'] = $t3UseFreeLimit
     }
     $parameters['GoldenSnapshots'] = $goldenSnapshots
+    if ($null -ne $t4RestartCoverage) {
+        $parameters['T4RestartCoverage'] = $t4RestartCoverage
+    }
     $estimate = Get-DemoCostEstimate @parameters
     foreach ($result in $estimate.Results) {
         $results.Add($result)

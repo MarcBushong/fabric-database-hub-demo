@@ -61,9 +61,10 @@ Describe 'T2 host step plan' {
     It 'follows the ADR 0003 order' {
         $plan = Get-DemoHostStepPlan -Context (New-TestHostContext -Mode 'PaygWizard')
         $plan.Name | Should -Be @(
-            'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'DataDisk', 'GuestOsMedia',
-            'GuestVhdx', 'GuestVm', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall', 'ArcOnboarding',
-            'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner')
+            'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'GuestSource', 'DataDisk', 'GuestOsMedia',
+            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall',
+            'JumpstartImageCheck', 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql',
+            'SeedDatabase', 'WorkloadRunner')
     }
 
     It 'reads guest sizing from settings.json and the network from vm/dsc/host.psd1' {
@@ -325,6 +326,68 @@ Describe 'Host helpers' {
     It 'calls bcdboot with Get-DemoBcdbootArgument in the guest VHDX build' {
         $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/hyperv-guest/GuestVhdx.ps1') -Raw
         $text | Should -Match 'Invoke-DemoVmNativeCommand -FilePath \$bcdboot -ArgumentList \(Get-DemoBcdbootArgument '
+    }
+
+    Context 'A build that was stopped part way (2026-11-06)' {
+        # The loader now stops an earlier bundle's run that's still going, and a run stopped inside Build-DemoGuestVhdx
+        # never reaches the finally block that detaches the ISO and the VHDX.
+        BeforeAll {
+            # Stubs with the parameters the build uses, so Pester can mock these cmdlets where Hyper-V or Storage is absent.
+            foreach ($stub in @(@{ Name = 'Get-VHD'; Parameter = 'Path' }, @{ Name = 'Dismount-VHD'; Parameter = 'Path' }, @{ Name = 'Get-DiskImage'; Parameter = 'ImagePath' }, @{ Name = 'Dismount-DiskImage'; Parameter = 'ImagePath' })) {
+                if (-not (Get-Command -Name $stub.Name -ErrorAction SilentlyContinue)) {
+                    New-Item -Path ('function:global:{0}' -f $stub.Name) -Value ([scriptblock]::Create(('[CmdletBinding()] param([string] ${0})' -f $stub.Parameter))) | Out-Null
+                }
+            }
+        }
+
+        BeforeEach {
+            $script:media = Join-Path -Path $TestDrive -ChildPath ('media-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $script:media -Force | Out-Null
+            $script:iso = Join-Path -Path $script:media -ChildPath 'server.iso'
+            $script:vhdx = Join-Path -Path $script:media -ChildPath 'arcsql01.vhdx'
+            $script:vmLog = [System.Collections.Generic.List[string]]::new()
+            Mock -CommandName Write-DemoVmLog -MockWith { $script:vmLog.Add($Message) }
+            Mock -CommandName Dismount-VHD -MockWith { }
+            Mock -CommandName Dismount-DiskImage -MockWith { }
+        }
+
+        It 'detaches the VHDX and the ISO it left attached, and says so' {
+            Set-Content -LiteralPath $script:iso -Value 'iso'
+            Set-Content -LiteralPath $script:vhdx -Value 'vhdx'
+            Mock -CommandName Get-VHD -MockWith { [pscustomobject]@{ Path = $Path; Attached = $true } }
+            Mock -CommandName Get-DiskImage -MockWith { [pscustomobject]@{ ImagePath = $ImagePath; Attached = $true } }
+
+            Dismount-DemoGuestBuildMedia -IsoPath $script:iso -VhdxPath $script:vhdx
+
+            Should -Invoke -CommandName Dismount-VHD -Times 1 -Exactly -ParameterFilter { $Path -eq $script:vhdx }
+            Should -Invoke -CommandName Dismount-DiskImage -Times 1 -Exactly -ParameterFilter { $ImagePath -eq $script:iso }
+            ($script:vmLog -join "`n") | Should -Match 'arcsql01\.vhdx is still attached from a build that stopped part way; it''s detached first\.'
+            ($script:vmLog -join "`n") | Should -Match 'server\.iso is still attached from a build that stopped part way; it''s detached first\.'
+        }
+
+        It 'leaves media that isn''t attached, or isn''t there, alone' {
+            Set-Content -LiteralPath $script:iso -Value 'iso'
+            Set-Content -LiteralPath $script:vhdx -Value 'vhdx'
+            Mock -CommandName Get-VHD -MockWith { [pscustomobject]@{ Path = $Path; Attached = $false } }
+            Mock -CommandName Get-DiskImage -MockWith { [pscustomobject]@{ ImagePath = $ImagePath; Attached = $false } }
+
+            Dismount-DemoGuestBuildMedia -IsoPath $script:iso -VhdxPath $script:vhdx
+            Dismount-DemoGuestBuildMedia -IsoPath (Join-Path -Path $script:media -ChildPath 'none.iso') -VhdxPath (Join-Path -Path $script:media -ChildPath 'none.vhdx')
+
+            Should -Invoke -CommandName Get-VHD -Times 1 -Exactly
+            Should -Invoke -CommandName Get-DiskImage -Times 1 -Exactly
+            Should -Invoke -CommandName Dismount-VHD -Times 0 -Exactly
+            Should -Invoke -CommandName Dismount-DiskImage -Times 0 -Exactly
+            $script:vmLog.Count | Should -Be 0
+        }
+
+        It 'detaches them before the build deletes the half-built disk' {
+            $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/hyperv-guest/GuestVhdx.ps1') -Raw
+            $build = $text.Substring($text.IndexOf('function Build-DemoGuestVhdx'))
+            $dismount = $build.IndexOf('Dismount-DemoGuestBuildMedia -IsoPath $IsoPath -VhdxPath $VhdxPath')
+            $dismount | Should -BeGreaterThan 0
+            $dismount | Should -BeLessThan $build.IndexOf('Remove-Item -LiteralPath $path -Force')
+        }
     }
 }
 

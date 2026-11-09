@@ -43,7 +43,10 @@ function Invoke-DemoFabricNotebookRun {
     Seconds between reads of the job instance.
 
     .EXAMPLE
-    Invoke-DemoFabricNotebookRun -Config $config -Name NB_DatabaseHub_LiveActivity -Parameter @{ SAVE_RESULTS = $true; WINDOW_MINUTES = 1440 }
+    Invoke-DemoFabricNotebookRun -Config $config -Name NB_DatabaseHub_LiveActivity -Parameter @{ CONFIRM = $false; STOP_ACTIVITY = $false; SAVE_RESULTS = $true; WINDOW_MINUTES = 1440; RESOURCE_GROUP = 'rg-dbhub-demo' }
+
+    Analyze-only (CONFIRM false: no activity request), scoped to the demo's resource group, which the notebook's queries
+    filter on.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]

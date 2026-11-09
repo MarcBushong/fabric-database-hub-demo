@@ -68,6 +68,7 @@
         'Invoke-DemoHubReadiness'
         'Invoke-DemoHubTelemetryQuery'
         'Invoke-DemoPreflight'
+        'Invoke-DemoSafetyStopSetup'
         'Invoke-DemoSemanticModelRefresh'
         'Invoke-DemoT3SqlFromT1'
         'Invoke-DemoT3WarmUp'

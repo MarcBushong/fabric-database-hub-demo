@@ -19,7 +19,7 @@ BeforeAll {
         ConvertTo-Json -InputObject (Get-DemoActivityControlRunbookSetting -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -IdentityClientId '99999999-9999-9999-9999-999999999999') -Depth 16 -Compress
     }
     $settings = $script:settingsJson | ConvertFrom-Json -AsHashtable
-    $script:catalogJson = ConvertTo-Json -InputObject ([ordered]@{ targets = @($settings['targets'].Keys); scenarios = $settings['scenarios']; minDurationMinutes = $settings['minDurationMinutes']; maxDurationMinutes = $settings['maxDurationMinutes'] }) -Depth 8 -Compress
+    $script:catalogJson = ConvertTo-Json -InputObject ([ordered]@{ targets = @($settings['targets'].Keys); scenarios = $settings['scenarios']; profiles = $settings['profiles']; minDurationMinutes = $settings['minDurationMinutes']; maxDurationMinutes = $settings['maxDurationMinutes'] }) -Depth 8 -Compress
     . (Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1')
     $script:runbookSettings = ConvertFrom-DbHubSetting -Json $script:settingsJson
 
@@ -72,13 +72,20 @@ Describe 'NB_DatabaseHub_Control' {
         }
     }
 
-    It 'has one parameters cell, first among the code cells, with every switch off and the environment values empty in the repository' {
+    It 'has one parameters cell, first among the code cells: Run all runs the showcase, the other switches are off, and the environment values are empty in the repository' {
         $script:parameters.Count | Should -Be 1
         $script:code[0].Id | Should -Be $script:parameters[0].Id
         $source = $script:parameters[0].Source
-        foreach ($switchName in 'CONFIRM', 'STOP_NOW', 'RESET_NOW') {
+        # The owner's choice (2026-11-04): Run all starts the showcase on every target, with no dry run first.
+        $source | Should -Match '(?m)^CONFIRM = True\s*$'
+        foreach ($switchName in 'STOP_NOW', 'RESET_NOW') {
             $source | Should -Match ('(?m)^{0} = False\s*$' -f $switchName)
         }
+        foreach ($target in 'T1', 'T2', 'T3', 'T4') {
+            $source | Should -Match ('(?m)^\s+\{{"target": "{0}", "scenario": "showcase"\}},\s*$' -f $target)
+        }
+        $source | Should -Match '(?m)^DURATION_MINUTES = 90\s'
+        $source | Should -Match '(?m)^WATCH_MINUTES = 30\s'
         $source | Should -Match '(?m)^KEY_VAULT_URL = ""'
         $source | Should -Match '(?m)^CATALOG_JSON = ""'
         $source | Should -Match '(?m)^WEBHOOK_SECRET_NAME = "dbhub-activity-webhook"'
@@ -201,6 +208,11 @@ cases = [
     ("run", dict(activities="T1 cpu-pressure", duration_minutes=10)),
     ("run", dict(activities='{"target": "T1", "scenario": "baseline"}', duration_minutes=10)),
     ("run", dict(activities='["T1"]', duration_minutes=10)),
+    ("run", dict(activities=[{"target": t, "scenario": "showcase"} for t in ("T1", "T2", "T3", "T4")], duration_minutes=90)),
+    ("run", dict(activities=[{"target": "T1", "scenario": "showcase"}, {"target": "T2", "scenario": "off"}], duration_minutes=120)),
+    ("run", dict(activities=[{"target": "T1", "scenario": "showcase", "intensity": 5}], duration_minutes=90)),
+    ("run", dict(activities=[{"target": "T1", "scenario": "off"}], duration_minutes=20)),
+    ("run", dict(activities=[{"target": "T1", "scenario": "business-day"}], duration_minutes=20)),
 ]
 out = []
 for action, kwargs in cases:
@@ -214,7 +226,7 @@ print(json.dumps(out))
         $output = & $script:python $driver $helpers $catalogFile 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
         $results = ($output | Select-Object -Last 1) | ConvertFrom-Json
-        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $true, $true, $true, $true, $false, $false, $false)
+        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $true, $false, $false, $false, $false, $false, $false, $false, $true, $true, $true, $true, $false, $false, $false, $true, $true, $false, $false, $false)
         # A list parameter passed as JSON text, as the Fabric job API and pipelines pass it, builds the same request.
         $results[13].body | Should -BeExactly $results[12].body
         $results[14].body | Should -BeExactly '{"action":"reset","requestedBy":"notebook","targets":["T1","T3"]}'
@@ -222,6 +234,10 @@ print(json.dumps(out))
         $results[16].error | Should -Match 'ACTIVITIES must be a list, or a JSON array as text'
         $results[17].error | Should -Match 'ACTIVITIES must be a list, or a JSON array as text'
         $results[18].error | Should -Match 'Each activity is an object'
+        $results[19].body | Should -BeExactly '{"action":"run","requestedBy":"notebook","durationMinutes":90,"activities":[{"target":"T1","scenario":"showcase"},{"target":"T2","scenario":"showcase"},{"target":"T3","scenario":"showcase"},{"target":"T4","scenario":"showcase"}]}'
+        $results[21].error | Should -Match 'don''t apply to showcase'
+        $results[22].error | Should -Match 'at least one activity that isn''t off'
+        $results[23].error | Should -Match 'isn''t in the catalog: use showcase, baseline, off'
         foreach ($result in @($results | Where-Object ok)) {
             $request = Test-DbHubControlRequest -WebhookData ([pscustomobject]@{ RequestBody = $result.body }) -Settings $script:runbookSettings
             $request.Reason | Should -BeNullOrEmpty -Because $result.body
@@ -236,6 +252,9 @@ print(json.dumps(out))
                 '{"action":"run","activities":[{"target":"T1","scenario":"blocking-chain","concurrency":5}],"durationMinutes":20}'
                 '{"action":"run","activities":[{"target":"T1","scenario":"baseline","sql":"select 1"}],"durationMinutes":20}'
                 '{"action":"reset","targets":["T1","T1"]}'
+                '{"action":"run","activities":[{"target":"T1","scenario":"showcase","intensity":5}],"durationMinutes":90}'
+                '{"action":"run","activities":[{"target":"T1","scenario":"off"}],"durationMinutes":20}'
+                '{"action":"run","activities":[{"target":"T1","scenario":"business-day"}],"durationMinutes":20}'
             )) {
             (Test-DbHubControlRequest -WebhookData ([pscustomobject]@{ RequestBody = $body }) -Settings $script:runbookSettings).Valid | Should -BeFalse -Because $body
         }
@@ -282,6 +301,50 @@ print(json.dumps(report))
         @($report.stop.sent) | Should -BeNullOrEmpty
         $report.stop.printed | Should -Match 'Stop now or Reset is set, so this cell sends no run request'
         @($report.reset.sent) | Should -BeNullOrEmpty
+    }
+
+    It 'sends the showcase on T1 to T4 for 90 minutes when Run all runs with the repository''s parameters, and the runbook accepts it' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $parametersCell = Join-Path -Path $TestDrive -ChildPath 'parameters_cell.py'
+        Set-Content -LiteralPath $parametersCell -Encoding utf8NoBOM -Value $script:parameters[0].Source
+        $helpers = Join-Path -Path $TestDrive -ChildPath 'helpers_part1_all.py'
+        Set-Content -LiteralPath $helpers -Encoding utf8NoBOM -Value (Get-Cell '# Helpers, part 1')
+        $runCell = Join-Path -Path $TestDrive -ChildPath 'run_cell_all.py'
+        Set-Content -LiteralPath $runCell -Encoding utf8NoBOM -Value (Get-Cell '# Resource-changing: starts the activity')
+        $stopCell = Join-Path -Path $TestDrive -ChildPath 'stop_cell_all.py'
+        Set-Content -LiteralPath $stopCell -Encoding utf8NoBOM -Value (Get-Cell '# Resource-changing: Stop now and Reset')
+        $catalogFile = Join-Path -Path $TestDrive -ChildPath 'catalog_all.json'
+        Set-Content -LiteralPath $catalogFile -Encoding utf8NoBOM -Value $script:catalogJson
+        $driver = Join-Path -Path $TestDrive -ChildPath 'run_all_driver.py'
+        Set-Content -LiteralPath $driver -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, sys
+namespace = {}
+exec(open(sys.argv[1], encoding="utf-8").read(), namespace)
+namespace["CATALOG_JSON"] = open(sys.argv[5], encoding="utf-8").read()
+exec(open(sys.argv[2], encoding="utf-8").read(), namespace)
+sent = []
+namespace["send_request"] = lambda body: sent.append(body) or ["job"]
+buffer = io.StringIO()
+with contextlib.redirect_stdout(buffer):
+    exec(open(sys.argv[3], encoding="utf-8").read(), namespace)
+    exec(open(sys.argv[4], encoding="utf-8").read(), namespace)
+print(json.dumps({"sent": [json.dumps(body, separators=(",", ":")) for body in sent], "printed": buffer.getvalue()}))
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $script:python $driver $parametersCell $helpers $runCell $stopCell $catalogFile 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        @($report.sent).Count | Should -Be 1
+        $report.sent[0] | Should -BeExactly '{"action":"run","requestedBy":"notebook","durationMinutes":90,"activities":[{"target":"T1","scenario":"showcase"},{"target":"T2","scenario":"showcase"},{"target":"T3","scenario":"showcase"},{"target":"T4","scenario":"showcase"}]}'
+        foreach ($target in 'T1', 'T2', 'T3', 'T4') {
+            $report.printed | Should -Match ('{0}: showcase for 90 minutes' -f $target)
+        }
+        $request = Test-DbHubControlRequest -WebhookData ([pscustomobject]@{ RequestBody = $report.sent[0] }) -Settings $script:runbookSettings
+        $request.Reason | Should -BeNullOrEmpty
+        $request.Valid | Should -BeTrue
     }
 
     It 'prints the job ID, never the webhook URL, whatever the webhook answers (needs pandas)' {
@@ -380,13 +443,15 @@ Describe 'The notebook setup-activity-control.ps1 imports' {
         $source | Should -Match ('(?m)^KEY_VAULT_URL = "{0}"\s+#' -f [regex]::Escape($name.KeyVaultUri))
         $source | Should -Match '(?m)^RESOURCE_GROUP = "rg-dbhub-demo"'
         $source | Should -Match '(?m)^T2_MACHINE_NAME = "arcsql01"'
-        $source | Should -Match '(?m)^CONFIRM = False'
+        $source | Should -Match '(?m)^CONFIRM = True'
         $catalogLine = [regex]::Match($source, '(?m)^CATALOG_JSON = (".*")$').Groups[1].Value
         $catalog = ($catalogLine | ConvertFrom-Json) | ConvertFrom-Json -AsHashtable
         @($catalog['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4')
         $catalog['scenarios'].Contains('blocking-chain') | Should -BeTrue
         $catalog['scenarios'].Contains('idle-in-transaction') | Should -BeTrue
         $catalog['maxDurationMinutes'] | Should -Be 120
+        $catalog['profiles']['showcase']['maxMinutes'] | Should -Be 120
+        @($catalog['profiles']['showcase']['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4')
         $text | Should -Not -Match '(?i)webhooks\?token='
         @($filled['cells'] | Where-Object { $_['cell_type'] -eq 'code' } | ForEach-Object { @($_['outputs']).Count } | Where-Object { $_ -gt 0 }) | Should -BeNullOrEmpty
     }

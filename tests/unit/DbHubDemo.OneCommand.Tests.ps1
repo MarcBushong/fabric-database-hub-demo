@@ -64,13 +64,32 @@ Describe 'What a run can expect (brief goal 7, items 3 and 13)' {
         $expect.HumanText | Should -Match 'Bastion'
     }
 
-    It 'says no step needs a person in ProductKey and Developer modes' {
+    It 'says no T2 step needs a person in ProductKey and Developer modes' {
         foreach ($mode in 'ProductKey', 'Developer') {
             $expect = InModuleScope DbHubDemo -Parameters @{ Mode = $mode } { Get-DemoDeploymentExpectation -InstallMode $Mode -WaitForT2 }
             $expect.GuidedStop | Should -BeFalse
-            ($expect.Lines -join ' ') | Should -Match 'No step needs a person'
+            ($expect.Lines -join ' ') | Should -Match 'No T2 step needs a person'
             $expect.HumanText | Should -BeNullOrEmpty
         }
+    }
+
+    It 'says no T2 step needs a person in JumpstartImage mode, the default, and gives the first deployment''s measured time (2026-11-06)' {
+        $expect = InModuleScope DbHubDemo { Get-DemoDeploymentExpectation -WaitForT2 }
+        $expect.GuidedStop | Should -BeFalse
+        $text = $expect.Lines -join ' '
+        $text | Should -Match 'No T2 step needs a person'
+        $text | Should -Match 'about 1\.5 hours in all: 91 minutes when measured on 2026-11-06'
+        $text | Should -Match 'host build, with the Jumpstart image''s download and first boot, took about 27'
+        $text | Should -Not -Match 'not measured yet'
+        $expect.Lines[0] | Should -Match 'measured on 2026-11-06; the rest are estimates'
+        $expect.Text | Should -Match '91 minutes, measured on 2026-11-06'
+        $expect.HumanText | Should -BeNullOrEmpty
+        $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
+        $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' }
+        @($notice | Where-Object { $_ -notlike 'The Insights app''s browser sign-in*' }) | Should -BeNullOrEmpty -Because 'a session without keyboard input needs no T2 warning when no T2 step needs a person'
+        @($notice | Where-Object { $_ -like 'The Insights app''s browser sign-in*' }).Count | Should -Be 1 -Because 'the Insights app''s sign-in still doesn''t start in such a session (2026-11-05)'
+        $quiet = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' -SkipFabric }
+        @($quiet) | Should -BeNullOrEmpty -Because 'without Fabric, nothing in JumpstartImage mode needs a person'
     }
 
     It 'warns a session that can''t take keyboard input before anything is spent, with the alternatives and the plan for a person' {
@@ -231,7 +250,7 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         ($lines -join ' ') | Should -Match 'capture-t2-golden\.ps1 to make future redeploys skip the build and the guided stop'
     }
 
-    It 'is DONE with the optional Insights app listed and how to add it later, when its prerequisites aren''t met' {
+    It 'is DONE, naming the Insights app as a failure that doesn''t block DONE with its reason and fix, when its prerequisites aren''t met (2026-11-05)' {
         $config = New-TestConfig -WithT4
         $result = @(New-DoneResult -WithT4) + @(
             (New-DemoResult -CheckId 'FABRIC.APP.TENANTSETTING' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Fabric tenant setting "Fabric Apps (preview)" is disabled.' -Remediation 'Ask a Fabric administrator.')
@@ -239,15 +258,24 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         )
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $outcome.Kind | Should -Be 'Done'
-        @($outcome.Optional).Count | Should -Be 2
-        $lines = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join ' '
-        $lines | Should -Match 'Optional, not needed for the demo: the Insights app'
-        $lines | Should -Match 'Fabric Apps \(preview\) and Dataset Execute Queries REST API'
-        $lines | Should -Match 'configure-fabric-app\.ps1 -SignIn'
-        $lines | Should -Match 'an assistant can''t do that sign-in for you'
+        $outcome.ExitCode | Should -Be 0
+        @($outcome.NonBlocking).Count | Should -Be 2
+        $outcome.NonBlocking[0]['state'] | Should -Be 'Failed'
+        $outcome.NonBlocking[1]['state'] | Should -Be 'Action needed'
+        $outcome.Reason | Should -Match 'the Real-Time Dashboard, and the history report\.' -Because 'the app wasn''t created, so DONE doesn''t claim it'
+        $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
+        $text = $lines -join ' '
+        $text | Should -Match ([regex]::Escape('Failed (doesn''t block DONE): the Insights app. It wasn''t created: FABRIC.APP.TENANTSETTING: The Fabric tenant setting "Fabric Apps (preview)" is disabled.'))
+        $text | Should -Match ([regex]::Escape('Action needed (doesn''t block DONE): the history report''s data check.'))
+        $text | Should -Match 'Fabric Apps \(preview\) and Dataset Execute Queries REST API'
+        $text | Should -Match 'configure-fabric-app\.ps1 -SignIn'
+        $text | Should -Match 'an assistant can''t do that sign-in for you'
+        $text | Should -Not -Match '(?i)optional'
+        # Right after the reason, before "Where to look", so it isn't missed.
+        [array]::IndexOf($lines, @($lines | Where-Object { $_ -like 'Failed (doesn''t block DONE)*' })[0]) | Should -BeLessThan ([array]::IndexOf($lines, @($lines | Where-Object { $_ -like 'Where to look*' })[0]))
     }
 
-    It 'is DONE when the optional app''s own workspace lookup failed, and says that, not a tenant setting, is why (Phase 28 live finding)' {
+    It 'is DONE when the app''s own workspace lookup failed, and says that, not a tenant setting, is why (Phase 28 live finding)' {
         # Live: the app's step failed FABRIC.RESOLVE.WORKSPACE, a check ID that isn't the app's own, so it would have
         # counted as a Fail of the demo, and the page blamed tenant settings that were on.
         $config = New-TestConfig -WithT4
@@ -256,17 +284,33 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
                     (New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'Your Fabric workspaces couldn''t be listed: HTTP 429.' -Remediation 'Check your Fabric access, then run the script again.')
                     (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'The Fabric workspace isn''t resolved, so nothing was deployed.')
                 )) {
-                ConvertTo-DemoOptionalAppRecord -Record $record
+                ConvertTo-DemoInsightsAppRecord -Record $record
             }
         }
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult -WithT4) + @($appRecords)); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $outcome.Kind | Should -Be 'Done'
         $outcome.ExitCode | Should -Be 0
-        @($outcome.Optional).Count | Should -Be 1
-        $outcome.Optional[0]['message'] | Should -Match ([regex]::Escape('FABRIC.RESOLVE.WORKSPACE: Your Fabric workspaces couldn''t be listed'))
-        $outcome.Optional[0]['howTo'] | Should -Not -Match 'tenant settings'
+        @($outcome.NonBlocking).Count | Should -Be 1
+        $outcome.NonBlocking[0]['message'] | Should -Match ([regex]::Escape('FABRIC.RESOLVE.WORKSPACE: Your Fabric workspaces couldn''t be listed'))
+        $outcome.NonBlocking[0]['howTo'] | Should -Not -Match 'tenant settings'
         $lines = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join ' '
-        $lines | Should -Match ([regex]::Escape('Optional, not needed for the demo: the Insights app (Fabric Apps preview). It wasn''t added: FABRIC.RESOLVE.WORKSPACE'))
+        $lines | Should -Match ([regex]::Escape('Failed (doesn''t block DONE): the Insights app. It wasn''t created: FABRIC.RESOLVE.WORKSPACE'))
+    }
+
+    It 'says DONE includes the Insights app when this run deployed it (2026-11-05)' {
+        $config = New-TestConfig -WithT4
+        $appRecords = InModuleScope DbHubDemo {
+            foreach ($record in @(
+                    (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Deployed.')
+                    (New-DemoResult -CheckId 'FABRIC.APP.QUERIES' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Every query returned rows.')
+                )) {
+                ConvertTo-DemoInsightsAppRecord -Record $record
+            }
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult -WithT4) + @($appRecords)); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done'
+        $outcome.Reason | Should -Match 'the Real-Time Dashboard, the history report, and the Insights app\.'
+        @($outcome.NonBlocking).Count | Should -Be 0
     }
 
     It 'says T4 isn''t deployed and why: off in the configuration, or after the Burstable fallback' {
@@ -277,7 +321,7 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $fallback = New-TestConfig -WithT4
         $after = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = (New-FinishedState -T4Sku 'None'); Config = $fallback } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $after.Kind | Should -Be 'Done'
-        ($after.Notes -join ' ') | Should -Match 'Azure refused both Burstable sizes'
+        ($after.Notes -join ' ') | Should -Match 'Azure refused both 4-vCore sizes'
         ($after.Notes -join ' ') | Should -Match 'Standard_D2ds_v5'
         $after.Reason | Should -Match 'T1, T2, and T3 in Estate'
     }
@@ -290,7 +334,7 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $outcome.Kind | Should -Be 'NotDone' -Because 'a T4 that''s on must show in Database Hub'
         $outcome.Missing | Should -Contain 'HUB.ESTATE.T4'
         $outcome.Missing | Should -Contain 'METRICS.T4'
-        ($outcome.Notes -join ' ') | Should -Not -Match 'Azure refused both Burstable sizes'
+        ($outcome.Notes -join ' ') | Should -Not -Match 'Azure refused both 4-vCore sizes'
 
         # t4Enabled false in the file is the reason, whatever an earlier fallback recorded.
         (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4OffReason -Config $Config -State ([pscustomobject]@{ T4Sku = 'None' }) }) | Should -Match 't4Enabled is false in your configuration'
@@ -409,6 +453,121 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
     }
 }
 
+Describe 'NOT DONE names the exact command its fix needs, with the run''s -ConfigPath (live finding, 2026-11-06)' {
+    BeforeAll {
+        # The T2 track's remediation for a host step that failed, as TrackHelpers.ps1 writes it.
+        $script:hostFix = 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full) and C:\ProgramData\DbHubDemo\logs on it, fix the cause, then run ./scripts/deploy.ps1 -FromStage Artifacts: a failed step is tried again only in a new bootstrap generation, which that starts (a plain rerun resumes and finds the same step failed, unless your fix changed the bootstrap bundle, which a plain rerun then sends again, starting one too).'
+        $script:own = './scripts/deploy.ps1 -ConfigPath "./config/livetest.local.json"'
+    }
+
+    It 'gives the same command in Next and on the Run line, built from the run''s own command' {
+        # Live (15:05Z): Next said -FromStage Artifacts, the Run line gave the plain command, and neither kept -ConfigPath.
+        $config = New-TestConfig
+        $result = @(New-DoneResult) + @(New-DemoResult -CheckId 'DEPLOY.T2.HOST' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'archost01 failed at step JumpstartImageCheck: SQL Server is Developer Edition.' -Remediation $script:hostFix)
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.ExitCode | Should -Be 1
+        $outcome.NextCommand | Should -Be './scripts/deploy.ps1 -ConfigPath "./config/livetest.local.json" -FromStage Artifacts'
+        $outcome.Next | Should -Match ([regex]::Escape('then run ./scripts/deploy.ps1 -ConfigPath "./config/livetest.local.json" -FromStage Artifacts: a failed step is tried again only in a new bootstrap generation'))
+        $outcome.Next | Should -Match 'unless your fix changed the bootstrap bundle' -Because 'the common case, a transient failure or a fix outside the bundle, needs the new generation that -FromStage Artifacts starts'
+        $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
+        $lines | Should -Contain 'Run: ./scripts/deploy.ps1 -ConfigPath "./config/livetest.local.json" -FromStage Artifacts'
+
+        # The default configuration: the same command without -ConfigPath.
+        $plain = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $plain.NextCommand | Should -Be './scripts/deploy.ps1 -FromStage Artifacts'
+    }
+
+    It 'takes a requirement''s own fix the same way, and keeps the plain command when the fix names none' {
+        $config = New-TestConfig
+        $missing = @(New-DoneResult | Where-Object { $_.checkId -ne 'T2.ARC.MONITORING' }) + @(New-DemoResult -CheckId 'T2.ARC.MONITORING' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'Monitoring is off.' -Remediation 'Fix T2''s monitoring, then run deploy.ps1 -FromStage T2.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $missing; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.Missing | Should -Be @('T2.ARC.MONITORING')
+        $outcome.NextCommand | Should -Be ('{0} -FromStage T2' -f $script:own)
+        $outcome.Next | Should -Be ('Fix T2''s monitoring, then run {0} -FromStage T2.' -f $script:own)
+
+        $other = @(New-DoneResult) + @(New-DemoResult -CheckId 'FABRIC.P4.HUBSETTING' -Area 'fabric' -Target 'tenant' -Status 'Fail' -Message 'Off.' -Remediation 'A Fabric administrator turns it on.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $other; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.NextCommand | Should -Be $script:own
+        $outcome.Next | Should -Be ('A Fabric administrator turns it on. Then run {0}.' -f $script:own)
+    }
+
+    It 'names the plain command for a fix that says deploy.ps1 -Resume, which starts over when the stage reached Validation (review finding)' {
+        # A rerun after DONE starts over; when its template then fails, the recorded stage stays Validation, where -Resume
+        # would skip preflight and the template and run every track against the failed deployment's outputs.
+        $config = New-TestConfig
+        $templateFix = 'Fix the cause in the message, then run deploy.ps1 -Resume. A 409 Conflict while a policy installs an extension clears within minutes.'
+        $failed = @(New-DoneResult) + @(New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message 'The deployment failed: Conflict.' -Remediation $templateFix)
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $failed; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.NextCommand | Should -Be $script:own
+        $outcome.Next | Should -Be ('Fix the cause in the message, then run {0}. A 409 Conflict while a policy installs an extension clears within minutes.' -f $script:own)
+        # deploy.ps1 resumes by itself only while the recorded stage isn't Validation (-AutoResume); there, -Resume would skip
+        # the template, and the plain command's plan runs it.
+        $state = [pscustomobject]@{ Stage = 'Validation' }
+        (InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State }).Infrastructure | Should -BeFalse
+        $plain = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -State $State }
+        $plain.Preflight | Should -BeTrue
+        $plain.Infrastructure | Should -BeTrue
+    }
+
+    It 'gives a script that the fix names the run''s -ConfigPath too, when the fix names no deploy.ps1' {
+        $config = New-TestConfig
+        $vmStart = @(New-DoneResult) + @(New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'archost01 didn''t start.' -Remediation 'Start it in the portal, or run ./scripts/start-demo.ps1.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $vmStart; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.NextCommand | Should -Be $script:own
+        $outcome.Next | Should -Be ('Start it in the portal, or run ./scripts/start-demo.ps1 -ConfigPath "./config/livetest.local.json". Then run {0}.' -f $script:own)
+
+        $missing = @(New-DoneResult | Where-Object { $_.checkId -ne 'T2.ARC.MONITORING' }) + @(New-DemoResult -CheckId 'T2.ARC.MONITORING' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'Monitoring is off.' -Remediation 'Run ./scripts/configure-monitoring.ps1 -Target T2.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $missing; State = (New-FinishedState); Config = $config; Command = $script:own } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -Command $Command }
+        $outcome.NextCommand | Should -Be $script:own
+        $outcome.Next | Should -Be ('Run ./scripts/configure-monitoring.ps1 -ConfigPath "./config/livetest.local.json" -Target T2. Then run {0}.' -f $script:own)
+    }
+
+    It 'writes each deploy.ps1 to run as the run''s command, gives the other scripts its -ConfigPath, and leaves mentions in passing alone' {
+        $named = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'Set t2SqlInstallMode back, then run ./scripts/deploy.ps1 -FromStage Infrastructure; or rebuild T2: ./scripts/destroy.ps1, then ./scripts/deploy.ps1.' -Command $Command }
+        $named.Command | Should -Be ('{0} -FromStage Infrastructure' -f $script:own)
+        $named.Text | Should -Be ('Set t2SqlInstallMode back, then run {0} -FromStage Infrastructure; or rebuild T2: ./scripts/destroy.ps1 -ConfigPath "./config/livetest.local.json", then {0}.' -f $script:own)
+
+        $passing = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'deploy.ps1''s watchdog restarts the VM once; the next deploy.ps1 does the rest.' -Command $Command }
+        $passing.Command | Should -BeNullOrEmpty
+        $passing.Text | Should -Be 'deploy.ps1''s watchdog restarts the VM once; the next deploy.ps1 does the rest.'
+
+        $resume = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'Run deploy.ps1 -Resume later; it keeps converging. Then run deploy.ps1 again.' -Command $Command }
+        $resume.Command | Should -Be $script:own -Because 'a plain run resumes by itself, and after a run whose stage reached Validation it starts over, where -Resume would run only the validation'
+        $resume.Text | Should -Be ('Run {0} later; it keeps converging. Then run {0} again.' -f $script:own)
+
+        $switch = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'Run deploy.ps1 -SkipRunner now; the VMs keep their runner.' -Command $Command }
+        $switch.Command | Should -Be ('{0} -SkipRunner' -f $script:own) -Because 'a switch takes no value: "now" stays text'
+        $switch.Text | Should -Be ('Run {0} -SkipRunner now; the VMs keep their runner.' -f $script:own)
+
+        # A command that already names its configuration keeps it; the default configuration adds nothing to other scripts.
+        $already = InModuleScope DbHubDemo -Parameters @{ Command = $script:own } { Resolve-DemoDeployCommandText -Text 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly -ConfigPath "./config/a.json". Then go on.' -Command $Command }
+        $already.Text | Should -Be 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly -ConfigPath "./config/a.json". Then go on.'
+        $default = InModuleScope DbHubDemo { Resolve-DemoDeployCommandText -Text 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly, then deploy.ps1 -FromStage T2.' -Command './scripts/deploy.ps1' }
+        $default.Text | Should -Be 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly, then ./scripts/deploy.ps1 -FromStage T2.'
+        $default.Command | Should -Be './scripts/deploy.ps1 -FromStage T2'
+    }
+
+    It 'logs every remediation with the run''s command in deploy.ps1''s report; the results stay as they are' {
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add($Message) }
+        $results = @(
+            (New-DemoResult -CheckId 'DEPLOY.T2.HOST' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'failed' -Remediation 'Fix it, then run ./scripts/deploy.ps1 -FromStage Artifacts.')
+            (New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'waits' -Remediation 'Run ./scripts/deploy.ps1 again when you have about 15 minutes.')
+        )
+        Write-DemoResultReport -Result $results -Title 'deploy.ps1' -DeployCommand $script:own 6>$null
+        $script:logged | Should -Contain ('DEPLOY.T2.HOST: Fix it, then run {0} -FromStage Artifacts.' -f $script:own)
+        $script:logged | Should -Contain ('  DEPLOY.T2.GUIDEDSTOP: Run {0} again when you have about 15 minutes.' -f $script:own)
+        $results[0].remediation | Should -Be 'Fix it, then run ./scripts/deploy.ps1 -FromStage Artifacts.'
+    }
+
+    It 'says after Ctrl+C that the rerun sends a bootstrap bundle or workload runner that changed meanwhile' {
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result @() -State $null -Config $Config -Stopped }
+        $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+        $outcome.Next | Should -Be 'Run ./scripts/deploy.ps1 again when you''re ready: it continues where it stopped, and when the bootstrap bundle or the workload runner changed meanwhile (a fix you pulled, for example), it sends them to the VMs again first.'
+    }
+}
+
 Describe 'What only a person can confirm never keeps the run from DONE (Phase 28 live finding, 2026-10-30)' {
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
@@ -418,7 +577,7 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
                         (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'The app is deployed.')
                         (New-DemoResult -CheckId 'FABRIC.APP.BROWSER' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'A person must confirm the app in the browser: sign-in and the connector in the app can''t be checked from a script.' -Remediation 'In the Fabric portal, open the app''s item in the workspace; it shows "Connector check passed".')
                     )) {
-                    ConvertTo-DemoOptionalAppRecord -Record $record
+                    ConvertTo-DemoInsightsAppRecord -Record $record
                 }
             })
     }
@@ -431,15 +590,16 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
         $outcome.Kind | Should -Be 'Done'
         $outcome.ExitCode | Should -Be 0
         @($outcome.Confirm).Count | Should -Be 2
-        @($outcome.Optional).Count | Should -Be 0 -Because 'the deployed app''s browser check is to confirm, not optional work left'
+        @($outcome.NonBlocking).Count | Should -Be 0 -Because 'the deployed app''s browser check is to confirm, not something that didn''t work'
         $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })
         $text = $lines -join "`n"
         @($lines | Where-Object { $_ -like 'Please confirm*' }).Count | Should -Be 1
         @($lines | Where-Object { $_ -match 'Fabric tenant setting' }).Count | Should -Be 1 -Because 'the setting is one line, whichever check reported it'
         $lines | Should -Contain '- Couldn''t check the Fabric tenant setting "Users can access the Database hub (preview)" (needs a Fabric administrator; HTTP 403): please confirm it''s enabled.'
-        $text | Should -Match '- The optional Insights app is deployed; confirm it once in the browser\.'
+        $text | Should -Match '- The Insights app is deployed; confirm it once in the browser\.'
+        $text | Should -Not -Match '(?i)optional'
         $text | Should -Not -Match 'is disabled|not enabled|System\.String\[\]'
-        @($lines | Where-Object { $_ -match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both Burstable sizes' }).Count | Should -Be 1 -Because 'the T4 note is its own line'
+        @($lines | Where-Object { $_ -match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both 4-vCore sizes' }).Count | Should -Be 1 -Because 'the T4 note is its own line'
     }
 
     It 'is NOT DONE, with the true wording, only when the Hub setting was read and is disabled, and never asks to confirm a setting it read' {
@@ -563,6 +723,78 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
         $confirmOnly = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + $confirmItems) } { Get-DemoDeploySummary -Result $Result -FinishedText 'Every track and the validation finished.' }
         $confirmOnly.Message | Should -Match '^Every track and the validation finished\. Nothing else needs you for DONE\. Please confirm \(none of these keeps the run from DONE\): Couldn''t check the Fabric tenant setting'
         @($confirmOnly.Evidence['manual']).Count | Should -Be 0
+    }
+}
+
+Describe 'The Insights app is part of every deployment, and nothing about it keeps the run from DONE (2026-11-05)' {
+    BeforeAll {
+        # The app's records as the Fabric track reports them (ConvertTo-DemoInsightsAppRecord), for each way it can fail.
+        function New-AppRecord([string] $CheckId, [string] $Status, [string] $Message, [string] $Remediation = '', [System.Collections.IDictionary] $Evidence = @{}) {
+            InModuleScope DbHubDemo -Parameters @{ CheckId = $CheckId; Status = $Status; Message = $Message; Remediation = $Remediation; Evidence = $Evidence } {
+                ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Remediation $Remediation -Evidence $Evidence)
+            }
+        }
+        $script:appFailures = [ordered]@{
+            exception = @(InModuleScope DbHubDemo { ConvertTo-DemoInsightsAppErrorRecord -Exception ([System.InvalidOperationException]::new('The stage folder is locked by another process.')) })
+            timeout   = @(New-AppRecord 'FABRIC.APP.DEPLOY' 'Fail' 'rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code -1, 1200 s): node did not finish within 1200 seconds and was stopped.' 'Fix the reported problem and run the script again; nothing is deleted, and a re-run reuses the item.')
+            network   = @(New-AppRecord 'DEPLOY.FABRIC.APP' 'Fail' 'configure-fabric-app.ps1 stopped: A network error reached api.fabric.microsoft.com on each of 4 attempts: The SSL connection could not be established.' 'Run ./scripts/deploy.ps1 again: it resumes where it stopped. A network error stopped it (requests that are safe to repeat were retried).' ([ordered]@{ networkError = $true }))
+            signIn    = @(
+                (New-AppRecord 'FABRIC.APP.SIGNIN' 'Manual action required' 'The Rayfin CLI isn''t signed in, so the app can''t be deployed unattended.' 'Sign in once as the demo''s Fabric user, from any folder.')
+                (New-AppRecord 'FABRIC.APP.DEPLOY' 'Not selected' 'Not deployed: FABRIC.APP.SIGNIN needs attention first.')
+            )
+        }
+        $script:appReasons = @{
+            exception = 'The stage folder is locked by another process'
+            timeout   = 'did not finish within 1200 seconds'
+            network   = 'A network error reached api\.fabric\.microsoft\.com'
+            signIn    = 'FABRIC\.APP\.SIGNIN: The Rayfin CLI isn''t signed in'
+        }
+        # What the run's own sign-in left: skipped in a session that can't answer it, or a sign-in that didn't finish.
+        $script:signInRecords = @(
+            (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Not supported' -Message 'This session can''t answer a browser sign-in.')
+            (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message 'Nobody finished the Rayfin CLI''s sign-in within 15 minutes, so it was stopped.')
+        )
+    }
+
+    It 'is DONE, exit code 0, after <_> in the app''s step, with the app named as failed with its real error' -ForEach @('exception', 'timeout', 'network', 'signIn') {
+        $kind = $_
+        $records = @(New-DoneResult -WithT4) + @($script:signInRecords) + @($script:appFailures[$kind])
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $records; State = (New-FinishedState -WithT4); Config = (New-TestConfig -WithT4) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done' -Because $kind
+        $outcome.ExitCode | Should -Be 0
+        $outcome.NextCommand | Should -BeNullOrEmpty -Because 'DONE asks for no rerun, whatever the app''s records say'
+        @($outcome.NonBlocking).Count | Should -Be 1
+        $outcome.NonBlocking[0]['name'] | Should -Be 'the Insights app'
+        $outcome.NonBlocking[0]['state'] | Should -Be 'Failed'
+        $outcome.NonBlocking[0]['message'] | Should -Match $script:appReasons[$kind]
+        $outcome.NonBlocking[0]['howTo'] | Should -Not -Match 'deploy\.ps1' -Because 'the fix is the app''s own command, never a rerun of the whole deployment'
+        $outcome.NonBlocking[0]['howTo'] | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
+        $text = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n"
+        $text | Should -Match '##  DONE'
+        $text | Should -Match ('Failed \(doesn''t block DONE\): the Insights app\. It wasn''t created: .*' + $script:appReasons[$kind])
+        # DEPLOY.SUMMARY and the exit code in GitHub Actions never see a Fail from the app.
+        @($records | Where-Object { $_.status -eq 'Fail' }).Count | Should -Be 0
+        (Get-DemoExitCode -Result $records) | Should -Be 0
+        $summary = InModuleScope DbHubDemo -Parameters @{ Result = $records } { Get-DemoDeploySummary -Result $Result -FinishedText 'Every track and the validation finished.' }
+        $summary.Status | Should -Not -Be 'Fail'
+        $summary.Message | Should -Match 'Nothing else needs you for DONE\.'
+        $summary.Message | Should -Match ([regex]::Escape('Doesn''t block DONE: the Insights app (failed).'))
+        @($summary.Evidence['manual']).Count | Should -Be 0
+    }
+
+    It 'names only what blocks DONE when something else failed too, never the app''s network error or its rerun' {
+        $records = @(New-DoneResult) + @(New-TestResult 'DEPLOY.EXTENSIONS_SQLVM01' 'Fail') + @($script:appFailures['network'])
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $records; State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.ExitCode | Should -Be 1
+        $outcome.Reason | Should -Match '^DEPLOY\.EXTENSIONS_SQLVM01'
+        $outcome.Next | Should -Not -Match 'network error'
+        $text = (InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n"
+        $text | Should -Match 'Failed \(doesn''t block DONE\): the Insights app\.'
+
+        # The app's network error alone: DONE, and no rerun.
+        $alone = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($script:appFailures['network'])); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $alone.Kind | Should -Be 'Done'
     }
 }
 
@@ -810,7 +1042,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $outcome.ExitCode | Should -Be 0
         $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
         $model['run']['state'] | Should -Be 'Done'
-        $model['run']['reason'] | Should -Match 'Azure refused both Burstable sizes'
+        $model['run']['reason'] | Should -Match 'Azure refused both 4-vCore sizes'
         $model['run']['reason'] | Should -Not -Match 'System\.String\[\]|tenant setting'
         @($model['confirm']).Count | Should -Be 1
         $model['confirm'][0] | Should -Be 'Couldn''t check the Fabric tenant setting "Users can access the Database hub (preview)" (needs a Fabric administrator; HTTP 403): please confirm it''s enabled.'
@@ -833,7 +1065,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $result -State (New-FinishedState -WithT4 -T4Sku 'None')
         $outcome.Kind | Should -Be 'NotDone'
         $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
-        $model['run']['reason'] | Should -Match '^TELEMETRY\.T1: No performance telemetry from T1 \(sqlvm01\) in the last 60 minutes\. T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both Burstable sizes'
+        $model['run']['reason'] | Should -Match '^TELEMETRY\.T1: No performance telemetry from T1 \(sqlvm01\) in the last 60 minutes\. T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both 4-vCore sizes'
         $model['run']['reason'] | Should -Not -Match 'System\.String\[\]'
         Get-Content -LiteralPath $run.PagePath -Raw | Should -Not -Match 'System\.String\[\]'
 
@@ -1349,10 +1581,15 @@ Describe 'Invoke-DemoT2GuidedStop: the stop, then the run continues on its own' 
     }
 
     It 'knows the host''s phases, and the host''s step list matches the VM side''s plan' {
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestVhdx' }) }).Phase | Should -Be 'Build'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard' }) }).Phase | Should -Be 'GuidedStop'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestVhdx' }) -InstallMode PaygWizard }).Phase | Should -Be 'Build'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard' }) -InstallMode PaygWizard }).Phase | Should -Be 'GuidedStop'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'ConfigureSql' }) -InstallMode PaygWizard }).Phase | Should -Be 'AfterSetup'
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'Failed'; currentStep = 'GuestOnline' }) -InstallMode PaygWizard }).Phase | Should -Be 'Failed'
+        $jumpstart = InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestImage' }) }
+        $jumpstart.Phase | Should -Be 'Build' -Because 'JumpstartImage is the default, and the image download is part of the build'
+        $jumpstart.RemainingHigh | Should -BeLessOrEqual 60
+        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'JumpstartImageCheck' }) }).Phase | Should -Be 'Build'
         (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'ConfigureSql' }) }).Phase | Should -Be 'AfterSetup'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'Failed'; currentStep = 'GuestOnline' }) }).Phase | Should -Be 'Failed'
         $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-HostBootstrap.ps1') -Raw
         $vmOrder = @([regex]::Matches($text, "@\{ Name = '([A-Za-z0-9]+)'") | ForEach-Object { $_.Groups[1].Value })
         $vmOrder | Should -Be @(InModuleScope DbHubDemo { Get-DemoHostStepOrder })

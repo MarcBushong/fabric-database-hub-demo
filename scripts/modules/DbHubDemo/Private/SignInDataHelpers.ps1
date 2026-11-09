@@ -124,6 +124,7 @@ function Get-DemoSignInDataSummary {
         if ((& $count $remaining 'unverified') -gt 0) { $left.Add(('{0} file(s) that couldn''t be read' -f (& $count $remaining 'unverified'))) }
         if ((& $count $remaining 'autologon') -gt 0) { $left.Add('Windows automatic sign-in left armed (AutoAdminLogon, the LSA DefaultPassword secret, or the Winlogon DefaultPassword value)') }
         if ((& $count $remaining 'logonName') -gt 0) { $left.Add('the Winlogon DefaultUserName value') }
+        if ((& $count $remaining 'loneSecret') -gt 0) { $left.Add('the LSA secret DefaultPassword, a stored password nothing needs (automatic sign-in is off; Azure''s provisioning leaves it)') }
     }
     $appTokens = 0
     $security = 0
@@ -138,19 +139,20 @@ function Get-DemoSignInDataSummary {
     $foundAt = Get-DemoMemberValue -InputObject $Part -Name 'found_at'
     $leftAt = Get-DemoMemberValue -InputObject $Part -Name 'left_at'
     return [pscustomobject]@{
-        Label     = $Label
-        Reachable = $reachable
-        Pass      = $reachable -and [bool](Get-DemoMemberValue -InputObject $Part -Name 'pass')
-        Found     = $found
-        Remaining = $remaining
-        Left      = $left.ToArray()
-        AppTokens = $appTokens
-        Security  = $security
-        Cleared   = @($cleared | Where-Object { $_ })
-        Actions   = $actions
-        EventLogs = @($eventLogs | Where-Object { $null -ne $_ })
-        FoundAt   = @($foundAt | Where-Object { $null -ne $_ })
-        LeftAt    = @($leftAt | Where-Object { $null -ne $_ })
+        Label      = $Label
+        Reachable  = $reachable
+        Pass       = $reachable -and [bool](Get-DemoMemberValue -InputObject $Part -Name 'pass')
+        Found      = $found
+        Remaining  = $remaining
+        Left       = $left.ToArray()
+        AppTokens  = $appTokens
+        Security   = $security
+        Cleared    = @($cleared | Where-Object { $_ })
+        LoneSecret = [int](Get-DemoMemberValue -InputObject $actions -Name 'loneSecret')
+        Actions    = $actions
+        EventLogs  = @($eventLogs | Where-Object { $null -ne $_ })
+        FoundAt    = @($foundAt | Where-Object { $null -ne $_ })
+        LeftAt     = @($leftAt | Where-Object { $null -ne $_ })
     }
 }
 
@@ -166,6 +168,9 @@ function Get-DemoSignInDataResult {
     - Warning when the cleanup turned off Windows automatic sign-in that was left armed (Phase 28), cleared an event log
       (endpoint protection may report that), or only an application's or a managed identity's token was found;
     - Pass otherwise.
+    The LSA secret DefaultPassword alone, with automatic sign-in off (Azure's Windows provisioning leaves one on every VM;
+    live finding, 2026-11-06), isn't automatic sign-in left armed: a cleanup that deleted it adds a note (evidence note)
+    and keeps the status. A read-only scan that finds it fails, because it's a stored password nothing needs.
     Evidence holds counts and locations only. Internal.
     #>
     [CmdletBinding()]
@@ -233,23 +238,36 @@ function Get-DemoSignInDataResult {
         $command = './scripts/check-sign-in-data.ps1 -VmName {0} -Clean -ClearSecurityLog' -f $VmName
         return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Manual action required' -Message $message -Evidence $evidence -Remediation ('After you review it, clear it with: {0} (or, on the VM in an elevated prompt: wevtutil clear-log Security), then check again.' -f $command) -DocUrl 'https://learn.microsoft.com/windows-server/administration/windows-commands/wevtutil')
     }
+    # A lone LSA secret the cleanup deleted keeps the status and adds a note. Azure's provisioning leaves it on its VMs;
+    # the nested guest isn't one, so the note there doesn't name where it came from.
+    $loneLabels = @($parts | Where-Object { $_.LoneSecret -gt 0 } | ForEach-Object { $_.Label })
+    $note = ''
+    if ($loneLabels.Count -gt 0) {
+        $what = if ($GuestName -and $loneLabels -contains ('{0} (guest)' -f $GuestName)) { 'a leftover LSA secret DefaultPassword' } else { 'the LSA secret DefaultPassword that Azure''s provisioning leaves' }
+        $note = 'The cleanup deleted {0} on {1}; automatic sign-in was off.' -f $what, ($loneLabels -join ' and ')
+        $evidence['note'] = $note
+    }
+    $withNote = {
+        param([string] $Text)
+        if ($note) { '{0} {1}' -f $Text, $note } else { $Text }
+    }
     $autoLogon = @($parts | Where-Object { [int](Get-DemoMemberValue -InputObject $_.Actions -Name 'autologon') -gt 0 })
     if ($autoLogon.Count -gt 0) {
         $message = 'Windows automatic sign-in was left armed on {0}, and the cleanup turned it off and deleted its LSA secret and Winlogon values; no sign-in data is left on {1}.' -f (($autoLogon | ForEach-Object { $_.Label }) -join ' and '), $names
-        return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'The PaygWizard guided stop''s own cleanup hadn''t finished. Nothing more to do; if it happens again, read docs/troubleshooting.md (the guided stop).' -DocUrl 'https://learn.microsoft.com/windows/win32/secauthn/protecting-the-automatic-logon-password')
+        return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Warning' -Message (& $withNote $message) -Evidence $evidence -Remediation 'The PaygWizard guided stop''s own cleanup hadn''t finished. Nothing more to do; if it happens again, read docs/troubleshooting.md (the guided stop).' -DocUrl 'https://learn.microsoft.com/windows/win32/secauthn/protecting-the-automatic-logon-password')
     }
     $cleared = @($parts | ForEach-Object { foreach ($log in @($_.Cleared)) { '{0} on {1}' -f $log, $_.Label } })
     if ($cleared.Count -gt 0) {
         $message = 'Sign-in data was removed from {0}, and none is left; the cleanup cleared {1}, which endpoint protection may report as a cleared event log.' -f $names, ($cleared -join ', ')
-        return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'Nothing to do if your security team expects it; the logs held token-shaped values, which the cleanup must remove.' -DocUrl $docUrl)
+        return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Warning' -Message (& $withNote $message) -Evidence $evidence -Remediation 'Nothing to do if your security team expects it; the logs held token-shaped values, which the cleanup must remove.' -DocUrl $docUrl)
     }
     $apps = @($parts | Where-Object { $_.AppTokens -gt 0 })
     if ($apps.Count -gt 0) {
         $message = 'No sign-in data from a person is left on {0}; {1} token(s) of an application or a managed identity were found{2}.' -f $names, (($apps | Measure-Object -Property AppTokens -Sum).Sum), $(if ($cleaned) { ' and removed' } else { '' })
-        return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'An extension or agent logged its own token. Nothing from your sign-in is involved; run ./scripts/check-sign-in-data.ps1 -Clean to remove it.' -DocUrl $docUrl)
+        return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Warning' -Message (& $withNote $message) -Evidence $evidence -Remediation 'An extension or agent logged its own token. Nothing from your sign-in is involved; run ./scripts/check-sign-in-data.ps1 -Clean to remove it.' -DocUrl $docUrl)
     }
     $message = if ($cleaned) { 'Sign-in data was removed from {0}, and none is left.' -f $names } else { 'No sign-in data is left on {0}.' -f $names }
-    return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Pass' -Message $message -Evidence $evidence -DocUrl $docUrl)
+    return (New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status 'Pass' -Message (& $withNote $message) -Evidence $evidence -DocUrl $docUrl)
 }
 
 function Invoke-DemoDiskWipeAction {

@@ -447,6 +447,8 @@ Describe 'Invoke-DemoArcOnboarding' {
         $script:machine = $null
         $script:hostState = 'WaitingForArcOnboarding'
         $script:sweepPart = [ordered]@{ computer = 'VM'; reachable = $true; pass = $true; found = [ordered]@{ user = 1; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 1; logApp = 0 }; remaining = [ordered]@{ user = 0; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 0; logApp = 0 }; eventLogs = @('Windows PowerShell|u1 a0 o0|..'); found_at = @(); left_at = @(); seconds = 9 }
+        # The guest's part when a test sets it; the host's otherwise.
+        $script:sweepGuest = $null
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ state = $script:hostState; message = 'host message' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -MockWith { $script:machine }
@@ -470,7 +472,7 @@ Describe 'Invoke-DemoArcOnboarding' {
                 foreach ($key in $PesterBoundParameters['Parameter'].Keys) { $parameterCopy[$key] = $PesterBoundParameters['Parameter'][$key] }
             }
             $script:runs.Add([pscustomobject]@{ Name = $RunCommandName; Parameter = $parameterCopy; Protected = $protectedCopy; VmName = $PesterBoundParameters['VmName'] })
-            $output = if ($RunCommandName -eq 'DbHubDemo-ArcProbe') { $script:probe | ConvertTo-Json -Compress } elseif ($RunCommandName -eq 'DbHubDemo-SignInData') { [ordered]@{ action = 'Clean'; succeeded = $true; pass = [bool]$script:sweepPart.pass; local = $script:sweepPart; guest = $script:sweepPart } | ConvertTo-Json -Compress -Depth 6 } else { '{"succeeded":true,"outcome":"Onboarded","resourceId":"' + $script:machineId + '"}' }
+            $output = if ($RunCommandName -eq 'DbHubDemo-ArcProbe') { $script:probe | ConvertTo-Json -Compress } elseif ($RunCommandName -eq 'DbHubDemo-SignInData') { [ordered]@{ action = 'Clean'; succeeded = $true; pass = [bool]$script:sweepPart.pass; local = $script:sweepPart; guest = $(if ($null -ne $script:sweepGuest) { $script:sweepGuest } else { $script:sweepPart }) } | ConvertTo-Json -Compress -Depth 6 } else { '{"succeeded":true,"outcome":"Onboarded","resourceId":"' + $script:machineId + '"}' }
             [pscustomobject]@{ Succeeded = $true; ExecutionState = 'Succeeded'; ExitCode = 0; Output = $output; Error = '' }
         }
     }
@@ -558,6 +560,18 @@ Describe 'Invoke-DemoArcOnboarding' {
         $failed.message | Should -Match 'traces couldn''t be removed and verified'
         $failed.message | Should -Match '2 sign-in token\(s\) in event logs'
         ($failed | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($script:fakeToken))
+    }
+
+    It 'passes with a note when the sweep after onboarding deleted only the LSA secret Azure''s provisioning leaves on the host (live finding, 2026-11-06)' {
+        $script:machine = New-TestMachine -Status 'Disconnected'
+        $script:sweepPart.found['loneSecret'] = 1
+        $script:sweepPart['actions'] = [ordered]@{ redacted = 0; deleted = 0; failed = 0; caches = 0; broker = 0; logsCleared = @(); logsNotCleared = @(); autologon = 0; loneSecret = 1 }
+        $script:sweepGuest = [ordered]@{ computer = 'VM'; reachable = $true; pass = $true; found = [ordered]@{ user = 0; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 0; logApp = 0 }; remaining = [ordered]@{ user = 0; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 0; logApp = 0 }; eventLogs = @(); found_at = @(); left_at = @(); seconds = 9 }
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Be 'arcsql01 is onboarded and Connected; the host continues its bootstrap. The cleanup deleted the LSA secret DefaultPassword that Azure''s provisioning leaves on archost01; automatic sign-in was off.'
+        $result.evidence.signInData.status | Should -Be 'Pass'
+        $result.evidence.signInData.note | Should -Match 'on archost01;'
     }
 
     It 'clears the host''s Windows PowerShell log after onboarding with the caller''s token, warns, and passes the check that follows' {
@@ -858,10 +872,20 @@ Describe 'Invoke-DemoArcConfiguration' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcOnboarding -MockWith { New-DemoResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'Connected.' -Evidence @{ azureStatus = 'Connected' } }
         foreach ($case in $cases) {
             $script:health = [pscustomobject]$case
-            $results = @(Invoke-DemoArcConfiguration -Config (New-TestConfig) -WaitMinutes 1)
+            $results = @(Invoke-DemoArcConfiguration -Config (New-TestConfig -Override @{ t2SqlInstallMode = 'PaygWizard' }) -WaitMinutes 1)
             ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Manual action required' -Because ('{0} at {1}' -f $case.state, $case.currentStep)
         }
         Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoArcSqlConfiguration -Times 0 -Exactly
+    }
+
+    It 'doesn''t wait for a setup check in JumpstartImage mode (the default): nothing needs a person' {
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { [pscustomobject]@{ Health = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboarding'; sqlEdition = 'Standard Edition (64-bit)'; guidedArmed = $false }; Polls = 0 } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcOnboarding -MockWith { New-DemoResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'Connected.' -Evidence @{ azureStatus = 'Connected' } }
+        $config = New-TestConfig
+        $config['t2SqlInstallMode'] | Should -Be 'JumpstartImage'
+        $results = @(Invoke-DemoArcConfiguration -Config $config -WaitMinutes 1)
+        ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoArcSqlConfiguration -Times 1 -Exactly
     }
 
     It 'checks an evaluation-only VM through Azure once its guest agent is disabled' {
@@ -924,7 +948,9 @@ Describe 'T2 Arc checks' {
         (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine) -Extension (New-TestExtension -State 'Creating'))).status | Should -Be 'Warning'
         (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine) -Extension (New-TestExtension -LicenseType 'LicenseOnly'))).status | Should -Be 'Fail'
         (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine) -Extension $null)).status | Should -Be 'Fail'
-        (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine -SqlDetected $false) -Extension $null)).status | Should -Be 'Manual action required'
+        $wizard = New-TestConfig -Override @{ t2SqlInstallMode = 'PaygWizard' }
+        (Invoke-Check 'Extension' (New-TestState -Config $wizard -Machine (New-TestMachine -SqlDetected $false) -Extension $null)).status | Should -Be 'Manual action required'
+        (Invoke-Check 'Extension' (New-TestState -Config $config -Machine (New-TestMachine -SqlDetected $false) -Extension $null)).status | Should -Be 'Warning'
     }
 
     It 'checks the instance''s edition and license type per install mode, and records billable cores' {
@@ -938,7 +964,12 @@ Describe 'T2 Arc checks' {
         (Invoke-Check 'Instance' (New-TestState -Config $developer -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Developer' -LicenseType 'LicenseOnly'))).status | Should -Be 'Pass'
         $productKey = New-TestConfig -Override @{ t2SqlInstallMode = 'ProductKey' }
         (Invoke-Check 'Instance' (New-TestState -Config $productKey -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Enterprise' -LicenseType 'Paid'))).status | Should -Be 'Pass'
-        (Invoke-Check 'Instance' (New-TestState -Config $config -Machine (New-TestMachine -SqlDetected $false))).status | Should -Be 'Manual action required'
+        $wizard = New-TestConfig -Override @{ t2SqlInstallMode = 'PaygWizard' }
+        (Invoke-Check 'Instance' (New-TestState -Config $wizard -Machine (New-TestMachine) -Instances @(New-TestInstance))).status | Should -Be 'Pass'
+        (Invoke-Check 'Instance' (New-TestState -Config $wizard -Machine (New-TestMachine -SqlDetected $false))).status | Should -Be 'Manual action required'
+        (Invoke-Check 'Instance' (New-TestState -Config $config -Machine (New-TestMachine -SqlDetected $false))).status | Should -Be 'Warning'
+        (Invoke-Check 'Instance' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Enterprise' -LicenseType 'PAYG'))).status | Should -Be 'Fail'
+        (Invoke-Check 'Instance' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -LicenseType 'Paid'))).status | Should -Be 'Fail'
     }
 
     It 'reports monitoring as Not supported in Developer mode' {
@@ -973,6 +1004,22 @@ Describe 'T2 Arc checks' {
         $running = New-TestState -Config $config -Machine (New-TestMachine -Status 'Disconnected' -LastStatusChange '2026-10-19T12:00:00Z') -HostPowerState 'PowerState/running'
         (Invoke-Check 'Connected' $running).status | Should -Be 'Fail'
         (Invoke-Check 'Connected' (New-TestState -Config $config -Machine $null)).status | Should -Be 'Fail'
+    }
+
+    It 'gives a running host 10 minutes from its start or the last status change, whichever is later, then fails (live, 2026-11-03)' -ForEach @(
+        @{ Case = 'the host started 4 minutes ago'; HostMinutes = 4; ChangeMinutes = 6000; Status = 'Warning' }
+        @{ Case = 'the host started 12 minutes ago'; HostMinutes = 12; ChangeMinutes = 6000; Status = 'Fail' }
+        @{ Case = 'it went Disconnected 8 minutes ago on a host running for an hour'; HostMinutes = 60; ChangeMinutes = 8; Status = 'Warning' }
+        @{ Case = 'it went Disconnected 11 minutes ago on a host running for an hour'; HostMinutes = 60; ChangeMinutes = 11; Status = 'Fail' }
+    ) {
+        $state = New-TestState -Config $config -Machine (New-TestMachine -Status 'Disconnected' -LastStatusChange $script:now.AddMinutes(-$ChangeMinutes).ToString('o')) -HostPowerState 'PowerState/running'
+        $state | Add-Member -NotePropertyName 'HostSinceUtc' -NotePropertyValue $script:now.AddMinutes(-$HostMinutes)
+        $result = Invoke-Check 'Connected' $state
+        $result.status | Should -Be $Status
+        if ($Status -eq 'Fail') {
+            $result.message | Should -Match ('archost01 has been running for {0} minutes' -f $HostMinutes)
+            $result.remediation | Should -Match 'T2\.GUEST\.STATE'
+        }
     }
 
     It 'applies the disconnected-days thresholds: <Days> days is <Status>' -TestCases @(
@@ -1067,6 +1114,15 @@ Describe 'T1 SQL VM performance monitoring' {
         $pending = & $convert (New-SqlVmState -Settings $flag -Message 'DatabaseMonitorArcPlugin: {"State":"NotRunning","MetricsUploadStatus":""}')
         $pending.status | Should -Be 'Warning'
         $pending.evidence.pending | Should -BeTrue
+        # Live, 2026-11-03: the plugin stopped and T1 sent nothing; the remediation restarts its agent, which
+        # configure-monitoring.ps1 never does.
+        $pending.message | Should -Match 'reports ''NotRunning'''
+        $pending.remediation | Should -Match 'start-demo\.ps1, which restarts the SQL IaaS Agent service'
+        $pending.remediation | Should -Match ([regex]::Escape("--name sqlvm01 --command-id RunPowerShellScript --scripts 'Restart-Service -Name SQLIaaSExtension -Force'"))
+        $pending.remediation | Should -Not -Match 'configure-monitoring'
+        $noStatus = & $convert (New-SqlVmState -Settings $flag -Message 'SqlIaasAgent: OK')
+        $noStatus.status | Should -Be 'Warning'
+        $noStatus.remediation | Should -Match 'check again later'
         (& $convert (New-SqlVmState -Settings $flag -Message 'DatabaseMonitorArcPlugin: {"State":"Running","MetricsUploadStatus":"HTTP 403 Forbidden"}')).status | Should -Be 'Fail'
         (& $convert (New-SqlVmState -Settings $flag -Version '2.0.228.0' -Message $script:running)).status | Should -Be 'Fail'
         (& $convert (New-SqlVmState -Settings $flag -Identity 'None' -Message $script:running)).status | Should -Be 'Fail'

@@ -12,7 +12,8 @@ function Enable-DemoT3Workload {
        the 0nn scripts);
     2. records C:\ProgramData\DbHubDemo\t3-workload.json, which tells the WorkloadRunner step and
        Start-DemoWorkload.ps1 that T1's identity reaches T3;
-    3. sets T3's activity profile (activityProfile, baseline by default) until the next auto-shutdown; and
+    3. sets T3's activity profile (the one the VMs set by themselves: activityProfile, with baseline in place of a
+       profile with incidents, business-day included, which the run switches to at its end) until the next auto-shutdown; and
     4. restarts DbHubDemo-Workload, whose host then drives T1 and T3.
     The marker exists so that nothing on T1 asks for an Azure SQL token before T1 is in the P6 group: managed
     identity tokens are cached for up to about 24 hours (Phase 8, R80). While T3 has an active profile, the

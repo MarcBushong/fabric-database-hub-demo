@@ -2,7 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "connection-surge",
   "title": "Connection surge (capacity maxed)",
-  "summary": "A burst of application connections fills the server's connection slots: the runner opens a few connections a second until only headroom slots stay free below max_connections, holds them (each pings now and then, so most sit idle), then tries overshoot more that the server refuses as too many connections. It releases them all, pauses, and repeats until the run ends. PostgreSQL (T4) only.",
+  "summary": "A burst of application connections fills the server's connection slots: the runner opens a few connections a second until only headroom slots stay free below max_connections, fills that headroom for a few seconds at most so overshoot more attempts are past the limit, which the server refuses as too many connections, frees the headroom again, and holds the rest (each pings now and then, so most sit idle). It releases them all, pauses, and repeats until the run ends. PostgreSQL (T4) only.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_connection_surge",
   "duration": { "defaultSeconds": 300, "maxSeconds": 900 },
@@ -12,12 +12,12 @@
     "applicable": ["T4"],
     "default": ["T4"],
     "notes": {
-      "T4": "The Burstable B1ms tier allows about 50 connections; superuser_reserved_connections and reserved_connections are always left free, plus headroom, so reset and an administrator can still connect."
+      "T4": "The template sets max_connections to 50 on every T4 size (Standard_B1ms's own default; ADR 0019, 2026-11-03), 35 of them for the runner after the 15 reserved ones, so every size refuses the overshoot. superuser_reserved_connections and reserved_connections are never used, and the headroom only for a few seconds at most, so reset and an administrator can still connect; the other T4 lanes retry a refusal they meet meanwhile."
     }
   },
   "parameters": {
-    "headroom": { "type": "integer", "default": 2, "minimum": 1, "maximum": 20, "description": "Connection slots left free below max_connections, after the reserved ones." },
-    "overshoot": { "type": "integer", "default": 2, "minimum": 0, "maximum": 5, "description": "Connection attempts past the limit in each wave; the server refuses them (SQLSTATE 53300), which Database Hub counts as failed connections." },
+    "headroom": { "type": "integer", "default": 2, "minimum": 1, "maximum": 20, "description": "Connection slots left free below max_connections, after the reserved ones, while a wave holds its connections. A wave that overshoots fills them for 5 seconds at most, then frees them again." },
+    "overshoot": { "type": "integer", "default": 2, "minimum": 0, "maximum": 5, "description": "Connection attempts past the limit in each wave, once the headroom is filled; the server refuses them as too many connections (SQLSTATE 53300, never a failed sign-in), which Database Hub counts as failed connections. Fixed caps, whatever this is set to: at most 5 refused attempts in any minute and 30 in a run; a sign-in failure ends the surge." },
     "maxConnections": { "type": "integer", "default": 60, "minimum": 5, "maximum": 400, "description": "A hard cap on the connections a wave holds, whatever the server allows." },
     "holdSeconds": { "type": "integer", "default": 120, "minimum": 10, "maximum": 600, "description": "How long each wave holds its connections (never past the run's deadline)." },
     "pauseSeconds": { "type": "integer", "default": 30, "minimum": 0, "maximum": 300, "description": "Quiet time between waves." }

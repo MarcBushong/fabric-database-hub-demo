@@ -16,7 +16,11 @@ A disk created from the snapshot proves it's usable.
 
 - The guest's Windows evaluation keeps counting inside the snapshot: the snapshot is tagged with its end,
   and preflight and status.ps1 warn 30 and 7 days before it.
-- The source host stays air-gapped until the next start-demo.ps1 or deploy.ps1 releases it.
+- The source host doesn't stay air-gapped: once its guest is prepared, whatever happens next, the capture starts
+  the host if needed, releases the guest (network back, automatic start Start, started), waits until arcsql01
+  reads Connected again, and returns the host to the power state it found (GOLDEN.CAPTURE.SOURCE).
+- It captures nothing while an on-demand run from the Fabric control is active (GOLDEN.CAPTURE.CONTROL), and
+  a start of T2 from the Fabric control leaves the guest alone while the capture runs.
 - Prove the snapshot boots before you rely on it: ./scripts/test-t2-golden.ps1 -Onboard.
 - This PC and its display stay awake until it finishes (Enter-DemoKeepAwake).
 - It never signs in or changes the Azure CLI context. Exit code: 0 Pass or Warning, 1 Fail.
@@ -73,10 +77,16 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-# Reuse DbHubDemo when it's already loaded (for example by a test); otherwise load it.
-if (-not (Get-Module -Name 'DbHubDemo')) {
-    Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
+# This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
+# that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
+# another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
+# guard's validated context, the redaction's registered values, or a test's mocks.
+$entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+$entryNested = $false
+foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
+    $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath

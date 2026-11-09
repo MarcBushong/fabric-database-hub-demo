@@ -83,7 +83,8 @@ AS $$
         ('locking-blocking', 1800),
         ('io-pressure', 1800),
         ('connection-surge', 900),
-        ('idle-in-transaction', 1800)
+        ('idle-in-transaction', 1800),
+        ('missing-index', 1800)
     ) AS c (scenario_id, max_duration_seconds);
 $$;
 -- @batch

@@ -166,15 +166,33 @@
     "statusPlugin": "DatabaseMonitorArcPlugin"
   },
   "postgresql": {
-    "note": "T4 (Phase 24, ADR 0019): Azure Database for PostgreSQL flexible server, Burstable Standard_B1ms (config/profiles.json t4). majorVersion is a generally available major version (version policy and supported versions on Learn, checked 2026-10-23: 11 to 18, with 18 GA; West US 3's capabilities list 11 to 18). The server and its child resources use the apiVersions entries above: 2025-08-01 is the newest version Bicep 0.47.16 has types for (2026-10-01 is published but has no Bicep types yet). The runner's PostgreSQL provider, Npgsql, is pinned in workload-generator/Directory.Packages.props, and the optional local test server in workloadRunner.localTestPostgresImage.",
+    "note": "T4 (Phase 24, ADR 0019): Azure Database for PostgreSQL flexible server, General Purpose Standard_D4ds_v5 by default since 2026-11-04 (config/profiles.json t4; user-directed, for autonomous tuning, which needs at least 4 vCores; it was Burstable Standard_B1ms). majorVersion is a generally available major version (version policy and supported versions on Learn, checked 2026-10-23: 11 to 18, with 18 GA; West US 3's capabilities list 11 to 18). The server and its child resources use the apiVersions entries above: 2025-08-01 is the newest version Bicep 0.47.16 has types for (2026-10-01 is published but has no Bicep types yet). The runner's PostgreSQL provider, Npgsql, is pinned in workload-generator/Directory.Packages.props, and the optional local test server in workloadRunner.localTestPostgresImage.",
     "majorVersion": "18",
     "serverNamePrefix": "pgflex01",
     "databaseName": "contosocare",
     "runnerRole": "contosocare_runner",
     "tokenResource": "https://ossrdbms-aad.database.windows.net",
     "enhancedMetricsParameter": "metrics.collector_database_activity",
+    "maxConnections": 50,
+    "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_D4ds_v5 and Standard_D4ads_v5 (default 1,718), Standard_D2ds_v5 (859), and Standard_B2s (429) refuse the surge's overshoot too, and Database Hub's Failed connections fill on every size. Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
     "autoStartAfterStoppedDays": 7,
     "capabilitiesApiVersion": "2025-08-01",
+    "autonomousTuning": {
+      "note": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): set by the template only when Get-DemoT4Tuning allows it, on a General Purpose or Memory Optimized size with at least minVCores vCores ('supported on any currently supported compute SKU with at least 4 vCores'; Query Store, which it needs, shouldn't run on Burstable). Query Store captures the top queries, with the first sample of each parameterized query's parameters (the runner's queries are parameterized), and index tuning runs in report mode every 60 minutes, its minimum, because T4 runs only during demos; the interval is set before the mode, because the first session is scheduled from the interval in effect when tuning is turned on. All four parameters are dynamic (no restart; checked 2026-11-04). The recommendations show in the Azure portal (the server's Intelligent Performance > Autonomous tuning) and through az postgres flexible-server autonomous-tuning, not in Database Hub.",
+      "minVCores": 4,
+      "queryCaptureMode": "top",
+      "parametersCaptureMode": "capture_first_sample",
+      "analysisIntervalMinutes": 60,
+      "mode": "report",
+      "docUrls": {
+        "autonomousTuning": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning",
+        "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
+        "queryStoreParameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-query-store",
+        "tuningParameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-autonomous-tuning",
+        "cli": "https://learn.microsoft.com/cli/azure/postgres/flexible-server/autonomous-tuning",
+        "scaling": "https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources"
+      }
+    },
     "metrics": {
       "note": "Azure Monitor metrics T4 shows (Database Hub's PostgreSQL dashboard uses the first six; the enhanced metrics need metricsParameter on). Read by status.ps1 and validate.ps1 with az monitor metrics list.",
       "hub": [ "cpu_percent", "memory_percent", "storage_percent", "iops", "active_connections", "connections_failed" ],
@@ -189,7 +207,10 @@
       "monitoring": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-monitoring",
       "stopServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server",
       "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
-      "versionPolicy": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-version-policy"
+      "versionPolicy": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-version-policy",
+      "serverParameters": "https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings",
+      "limits": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits",
+      "restartServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-restart-server"
     },
     "verifiedOn": "2026-10-23"
   },
@@ -226,6 +247,45 @@
       "sizeBytes": 1163053056,
       "sha256": "80d2cd75dd2b28098c0182f50ad86bd44f9b3a9f357c30ff617480a1497daffd",
       "verifiedOn": "2026-10-19"
+    },
+    "jumpstartArcBoxSqlStd": {
+      "description": "Arc Jumpstart ArcBox's prebuilt SQL Server Standard guest disk, the JumpstartImage install mode's T2 guest (ADR 0006, 2026-11-05 amendment). Read on 2026-11-05 with HTTP range requests, without downloading it: a dynamic Generation 2 VHDX (GPT: EFI, MSR, Windows, WinRE) with a 100 GiB maximum and 34.13 GiB allocated; Windows Server 2022 Standard (EditionID ServerStandard, build 20348.3932), not an evaluation, specialized (not sysprepped), computer name ARCBOX-SQL; SQL Server 2022 Standard Edition 16.0.1140.6 (GDR) on the default instance MSSQLSERVER, mixed-mode authentication, sysadmin ARCBOX-SQL-STD\\Administrator, with Integration Services, the sample database AdventureWorksLT2022, and SQL Server Standard media in C:\\Jumpstart. The host verifies every download against the blob's own Content-MD5 and length (fail closed); when Jumpstart publishes a newer image at the same URL (another etag), it's used once the guest passes the image checks, with a Warning that names it (user decision, 2026-11-05). sha256 is null until a streamed hash is pinned; the host records the SHA-256 of what it downloaded.",
+      "sourceUrl": "https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md",
+      "url": "https://jumpstartprodsg.blob.core.windows.net/arcbox/prod/ArcBox-SQL-STD.vhdx",
+      "fileName": "ArcBox-SQL-STD.vhdx",
+      "sizeBytes": 36645634048,
+      "sha256": null,
+      "etag": "0x8DDD21BE1292CD1",
+      "contentMd5": "5g1R6mb40rKCJPN8Zm+WZQ==",
+      "lastModified": "2025-08-02T23:25:34Z",
+      "virtualSizeBytes": 107374182400,
+      "expected": {
+        "sqlEdition": "Standard",
+        "sqlMajorVersion": 16,
+        "instanceName": "MSSQLSERVER",
+        "computerName": "ARCBOX-SQL",
+        "sampleDatabases": ["AdventureWorksLT2022"],
+        "jumpstartFolder": "C:\\Jumpstart"
+      },
+      "credentialSource": {
+        "description": "The image's published default credential (Jumpstart's ITPro docs list it under 'Windows virtual machine credentials'). Never stored in this repository (user decision, 2026-11-05): the host reads it at run time from Jumpstart's own script at this commit, checks the file's SHA-256, takes the two values with these patterns, keeps them only in memory, uses them once over PowerShell Direct while the guest has no network, and replaces the password with a random one.",
+        "url": "https://raw.githubusercontent.com/microsoft/azure_arc/e2c114eed98d18105dcf3a718bef965d5112781b/azure_jumpstart_arcbox/artifacts/ArcServersLogonScript.ps1",
+        "sha256": "1442c2d5a306dcde19fdfe9111a7fdf88ac91431d2b77af4d8d6430a484d6026",
+        "userNamePattern": "(?m)^\\s*\\$nestedWindowsUsername\\s*=\\s*'(?<value>[^']+)'\\s*$",
+        "passwordPattern": "(?m)^\\s*\\$nestedWindowsPassword\\s*=\\s*'(?<value>[^']+)'\\s*$"
+      },
+      "docUrls": {
+        "arcBoxItPro": "https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md",
+        "jumpstartFaq": "https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/FAQ/_index.md",
+        "arcBoxLogonScript": "https://github.com/microsoft/azure_arc/blob/e2c114eed98d18105dcf3a718bef965d5112781b/azure_jumpstart_arcbox/artifacts/ArcServersLogonScript.ps1",
+        "hubPrerequisites": "https://learn.microsoft.com/fabric/database/hub/add-sql#prerequisites-for-sql-server-enabled-by-azure-arc",
+        "licenseTypes": "https://learn.microsoft.com/sql/sql-server/azure-arc/manage-license-billing",
+        "renameSqlServerHost": "https://learn.microsoft.com/sql/database-engine/install-windows/rename-a-computer-that-hosts-a-stand-alone-instance-of-sql-server",
+        "uninstallFeature": "https://learn.microsoft.com/sql/sql-server/install/uninstall-an-existing-instance-of-sql-server-setup",
+        "powerShellDirect": "https://learn.microsoft.com/virtualization/hyper-v-on-windows/user-guide/powershell-direct",
+        "slmgr": "https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options"
+      },
+      "verifiedOn": "2026-11-05"
     }
   },
   "dotnetRuntime": {

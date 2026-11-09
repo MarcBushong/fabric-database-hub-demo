@@ -107,7 +107,7 @@ Describe 'T1 associated services (Analysis Services and Integration Services)' {
 
     It 'runs right after SqlService, before any database work' {
         $names = @(Get-DemoSqlVmStepPlan -Context (New-TestSqlVmContext -DataDiskTier 'None')).Name
-        $names | Should -Be @('DataDisk', 'SqlService', 'AssociatedServices', 'SqlAdminAccess', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner')
+        $names | Should -Be @('DataDisk', 'SqlService', 'AssociatedServices', 'SqlAdminAccess', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner', 'AutoLogonSecret')
     }
 
     It 'reads its settings from vm/dsc/sqlvm.psd1' {
@@ -260,5 +260,74 @@ Describe 'SQL Server setup summary' {
         Set-Content -LiteralPath $summary -Value @('Overall summary:', '  Final result:                  Passed', '  Exit code (Decimal):           0')
         Get-DemoSqlVmSetupFinalResult -Path $summary | Should -Be 'Passed'
         Get-DemoSqlVmSetupFinalResult -Path (Join-Path -Path $TestDrive -ChildPath 'missing.txt') | Should -Be ''
+    }
+}
+
+Describe 'T1 automatic sign-in secret (ADR 0009, live finding 2026-11-06)' {
+    BeforeAll {
+        function New-TestAutoLogonSweep {
+            # The parts of Invoke-DemoSignInSweep's result the step reads: counts only, never a value.
+            param([bool] $Pass = $true, [int] $Lone = 0, [int] $Armed = 0, [int] $Left = 0)
+            $counts = { param([int] $L, [int] $A) [pscustomobject]@{ autoLogonEnabled = $A; autoLogonSecrets = $A; autoLogonLoneSecrets = $L; autoLogonPasswords = 0; autoLogonUnverified = 0 } }
+            [pscustomobject]@{
+                pass      = $Pass
+                found     = & $counts $Lone $Armed
+                remaining = & $counts $Left 0
+                actions   = [pscustomobject]@{ loneSecretDeleted = [int]($Lone -gt 0 -and $Armed -eq 0); autoLogonCleared = [int]($Armed -gt 0) }
+            }
+        }
+    }
+
+    BeforeEach {
+        $script:context = New-TestSqlVmContext -DataDiskTier 'None'
+        $script:record = Join-Path -Path $script:context.Root -ChildPath 'sign-in-secret.json'
+        Mock -CommandName Get-Service -MockWith { $null }
+    }
+
+    It 'runs last, so it never holds up the database' {
+        @(Get-DemoSqlVmStepPlan -Context $script:context)[-1].Name | Should -Be 'AutoLogonSecret'
+    }
+
+    It 'checks automatic sign-in only, never the files or event logs, and treats an unreadable state as not clean' {
+        Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestAutoLogonSweep -Pass $false -Lone 1 -Left 1 }
+        Test-DemoSqlVmAutoLogonSecret | Should -BeFalse
+        Should -Invoke -CommandName Invoke-DemoSignInSweep -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['AutoLogonOnly'] -and -not $PesterBoundParameters['Clean'] }
+        Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestAutoLogonSweep }
+        Test-DemoSqlVmAutoLogonSecret | Should -BeTrue
+        Mock -CommandName Invoke-DemoSignInSweep -MockWith { throw 'access denied' }
+        Test-DemoSqlVmAutoLogonSecret | Should -BeFalse
+    }
+
+    It 'deletes the lone LSA secret with a note in health.json, and no warning' {
+        $script:secret = 1
+        Mock -CommandName Invoke-DemoSignInSweep -MockWith {
+            if ($PesterBoundParameters['Clean']) {
+                $script:secret = 0
+                return (New-TestAutoLogonSweep -Lone 1)
+            }
+            New-TestAutoLogonSweep -Pass ($script:secret -eq 0) -Lone $script:secret -Left $script:secret
+        }
+        $step = @(Get-DemoSqlVmStepPlan -Context $script:context | Where-Object Name -EQ 'AutoLogonSecret')
+        Invoke-DemoVmStateMachine -Step $step -Generation 'g1' | Should -Be 'Ready'
+        (Get-DemoVmState)['steps']['AutoLogonSecret']['status'] | Should -Be 'Succeeded'
+        @((Get-DemoVmState)['warnings']).Count | Should -Be 0 -Because 'automatic sign-in was off, so the lone secret isn''t a warning'
+        Should -Invoke -CommandName Invoke-DemoSignInSweep -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['Clean'] -and $PesterBoundParameters['AutoLogonOnly'] }
+        $saved = [System.IO.File]::ReadAllText($script:record) | ConvertFrom-Json
+        $saved.found | Should -Be 'LoneSecret'
+        $saved.note | Should -Be 'Deleted the LSA secret DefaultPassword that Azure''s provisioning leaves; automatic sign-in was off.'
+        $detail = Get-DemoSqlVmHealthDetail -Context $script:context
+        $detail.signIn.found | Should -Be 'LoneSecret'
+        $detail.signIn.note | Should -Be $saved.note
+    }
+
+    It 'warns when automatic sign-in was armed, and fails closed when anything is left' {
+        Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestAutoLogonSweep -Armed 1 }
+        $armed = Clear-DemoSqlVmAutoLogonSecret -Context $script:context
+        $armed.Outcome | Should -Be 'Done'
+        @($armed.WarningMessage)[0] | Should -Match 'automatic sign-in was armed on sqlvm01'
+        ([System.IO.File]::ReadAllText($script:record) | ConvertFrom-Json).found | Should -Be 'Armed'
+
+        Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestAutoLogonSweep -Pass $false -Lone 1 -Left 1 }
+        { Clear-DemoSqlVmAutoLogonSecret -Context $script:context } | Should -Throw '*fail closed*'
     }
 }

@@ -43,19 +43,60 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         $productKey = New-TestModel -InstallMode 'ProductKey'
         @(($productKey['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] }) | Should -Not -Contain 'T2.GuidedStop'
         @($productKey['tracks'] | ForEach-Object { $_['name'] }) | Should -Not -Contain 'T4'
-        # Phase 28 live finding: a rerun starts the VMs that were stopped first, and the page says so.
-        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Preflight' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('StartVms', 'Preflight')
+        # Phase 28 live finding: a rerun starts the VMs that were stopped first, and the page says so; the Insights app's
+        # sign-in runs alongside the deployment from the start (2026-11-05), so its row is under Preflight.
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Preflight' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('StartVms', 'Fabric.AppSignIn', 'Preflight')
         (Get-TestStep -Model $model -Id 'StartVms')['label'] | Should -Match 'VMs that were stopped'
+        $skipFabric = InModuleScope DbHubDemo { New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -SkipFabric) }
+        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Preflight' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('StartVms', 'Preflight')
     }
 
-    It 'marks the Insights app optional, and every step starts Pending' {
+    It 'shows the Insights app as part of the deployment, never optional, and marks it and its sign-in as not blocking DONE; every step starts Pending (2026-11-05)' {
         $model = New-TestModel
         $app = Get-TestStep -Model $model -Id 'Fabric.App'
-        $app['optional'] | Should -BeTrue
-        $app['label'] | Should -Match 'optional'
+        $app['label'] | Should -Be 'Insights app'
+        $app['nonBlocking'] | Should -BeTrue
+        $app.Contains('optional') | Should -BeFalse
+        (Get-TestStep -Model $model -Id 'Fabric.AppSignIn')['nonBlocking'] | Should -BeTrue
+        (Get-TestStep -Model $model -Id 'Fabric.Items')['nonBlocking'] | Should -BeFalse
+        @($model['tracks'] | ForEach-Object { $_['steps'] } | Where-Object { [string]$_['label'] -match '(?i)optional' }).Count | Should -Be 0
         @($model['tracks'] | ForEach-Object { $_['steps'] } | Where-Object { $_['state'] -ne 'Pending' }).Count | Should -Be 0
+        @($model['nonBlocking']).Count | Should -Be 0
+        $model.Contains('optional') | Should -BeFalse
         $model['run']['state'] | Should -Be 'Running'
         $model['guidedStop']['state'] | Should -Be 'Pending'
+    }
+
+    It 'shows the history report''s snapshot after the validation, where it happens, as not blocking DONE, and leaves it out with -SkipFabric (2026-11-06)' {
+        $model = New-TestModel
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History')
+        $history = Get-TestStep -Model $model -Id 'Fabric.History'
+        $history['nonBlocking'] | Should -BeTrue
+        $history['state'] | Should -Be 'Pending'
+        $history['label'] | Should -Be 'History report''s snapshot (NB_DatabaseHub_LiveActivity, once, analyze-only)'
+        (InModuleScope DbHubDemo { Get-DemoProgressStepLabel -Id 'Fabric.History' }) | Should -Be 'history report''s snapshot'
+        $skipFabric = InModuleScope DbHubDemo { New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -SkipFabric) }
+        Get-TestStep -Model $skipFabric -Id 'Fabric.History' | Should -BeNullOrEmpty
+        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation')
+    }
+
+    It 'takes the snapshot again on a resumed run that has nothing left to do, never "finished in an earlier run", and skips it on a run without the validation (2026-11-06)' {
+        $path = New-TestModelFile
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+            $state = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            Set-DemoProgressPlan -Path $Path -Plan (Resolve-DemoTrackPlan -Resume -State $state -SkipT4) -Resume
+        }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        (Get-TestStep -Model $model -Id 'Fabric.Items')['message'] | Should -Be 'Finished in an earlier run.'
+        $history = Get-TestStep -Model $model -Id 'Fabric.History'
+        $history['state'] | Should -Be 'Pending'
+        $history['message'] | Should -BeNullOrEmpty
+
+        $path = New-TestModelFile
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } { Set-DemoProgressPlan -Path $Path -Plan (Resolve-DemoTrackPlan -StopAfter 'Infrastructure') }
+        $history = Get-TestStep -Model (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20) -Id 'Fabric.History'
+        $history['state'] | Should -Be 'Skipped'
+        $history['message'] | Should -Be 'Not part of this run.'
     }
 
     It 'maps each ADR 0012 status onto one friendly state, and keeps the status underneath' -ForEach @(
@@ -163,6 +204,26 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
         @($model['tracks'] | ForEach-Object { $_['steps'] } | Where-Object { [string]$_['message'] -match 'previous run' }) | Should -BeNullOrEmpty
     }
+
+    It 'says on a resent track''s Artifacts row why it runs again, instead of saying it didn''t finish (live finding, 2026-11-06)' {
+        $path = New-TestModelFile
+        $note = 'The bootstrap bundle changed since the last run (archost01 has aaaaaaaaaaaa; this checkout builds cccccccccccc), so it''s sent again, and the loader runs again.'
+        InModuleScope DbHubDemo -Parameters @{ Path = $path; Note = $note } {
+            $state = [pscustomobject]@{ Stage = 'Infrastructure'; TrackT1 = 'Monitoring'; TrackT2 = 'Bootstraps'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            $plan = Resolve-DemoTrackPlan -Resume -State $state -SkipT4 -Resend 'T2'
+            Set-DemoProgressPlan -Path $Path -Plan $plan -Resume -T2Source 'existing-build' -ResendNote @{ T2 = $Note }
+        }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        (Get-TestStep -Model $model -Id 'T2.Artifacts')['state'] | Should -Be 'Pending'
+        (Get-TestStep -Model $model -Id 'T2.Artifacts')['message'] | Should -Be $note
+        (Get-TestStep -Model $model -Id 'T2.Restore')['message'] | Should -Be 'Finished in an earlier run.'
+        (Get-TestStep -Model $model -Id 'T2.Bootstraps')['state'] | Should -Be 'Pending'
+        (Get-TestStep -Model $model -Id 'T2.Bootstraps')['message'] | Should -BeNullOrEmpty
+        (Get-TestStep -Model $model -Id 'T2.HostBuild')['message'] | Should -BeNullOrEmpty -Because 'the track runs again from its Artifacts step, not from where it stopped'
+        # A track without a note reads as before.
+        (Get-TestStep -Model $model -Id 'T1.Telemetry')['message'] | Should -Be 'Didn''t finish in the previous run; running it again.'
+        (Get-TestStep -Model $model -Id 'T1.Artifacts')['message'] | Should -Be 'Finished in an earlier run.'
+    }
 }
 
 Describe 'The status page''s banner: exactly one of four states' {
@@ -190,16 +251,17 @@ Describe 'The status page''s banner: exactly one of four states' {
         ($banner.Lines -join ' ') | Should -Match 'Help, then Reset password'
     }
 
-    It 'is Done with where to look and the optional items, and Stopped, not done, with the exact command' {
+    It 'is Done with where to look and, apart from its lines, what didn''t work but doesn''t block DONE; and Stopped, not done, with the exact command (2026-11-05)' {
         $model = New-TestModel
         $model['run']['state'] = 'Done'
         $model['run']['reason'] = 'Database Hub shows every target.'
-        $model['optional'] = @(@{ name = 'the Insights app (Fabric Apps preview)'; message = 'It wasn''t added.'; howTo = 'Run ./scripts/configure-fabric-app.ps1 -SignIn.' })
+        $model['nonBlocking'] = @(@{ name = 'the Insights app'; state = 'Failed'; message = 'It wasn''t created: FABRIC.APP.DEPLOY: rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code 1, 42 s): Capacity is paused.'; howTo = 'To add it: run ./scripts/configure-fabric-app.ps1 -SignIn.' })
         $done = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
         $done.Kind | Should -Be 'Done'
         ($done.Lines -join ' ') | Should -Match 'The demo is complete'
-        ($done.Lines -join ' ') | Should -Match 'Optional, not needed for the demo: the Insights app'
         ($done.Lines -join ' ') | Should -Match 'capture-t2-golden\.ps1'
+        ($done.Lines -join ' ') | Should -Not -Match '(?i)optional'
+        @($done.Problems) | Should -Be @('Failed (doesn''t block DONE): the Insights app. It wasn''t created: FABRIC.APP.DEPLOY: rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code 1, 42 s): Capacity is paused. To add it: run ./scripts/configure-fabric-app.ps1 -SignIn.')
 
         $model['run']['state'] = 'NotDone'
         $model['run']['reason'] = 'TELEMETRY.T2 hasn''t passed yet.'
@@ -211,6 +273,31 @@ Describe 'The status page''s banner: exactly one of four states' {
         $stopped.Command | Should -Be './scripts/deploy.ps1'
         ($stopped.Lines -join ' ') | Should -Match 'run \./scripts/deploy\.ps1 again; it continues where it stopped'
         ($stopped.Lines -join ' ') | Should -Match 'collect-diagnostics\.ps1'
+        @($stopped.Problems).Count | Should -Be 1 -Because 'NOT DONE names what didn''t work too'
+    }
+
+    It 'names a non-blocking step that failed while the run goes on, and only that kind of step (2026-11-05)' {
+        $model = New-TestModel
+        $app = Get-TestStep -Model $model -Id 'Fabric.App'
+        $app['state'] = 'Failed'
+        $app['message'] = 'It wasn''t created: FABRIC.APP.SIGNIN: The Rayfin CLI isn''t signed in.'
+        # A blocking step that failed is in the table and the console's own failure line, not in "Needs attention".
+        (Get-TestStep -Model $model -Id 'T1.Artifacts')['state'] = 'Failed'
+        # A sign-in that didn't finish is "Action needed": the app's own row says what it means for the app.
+        (Get-TestStep -Model $model -Id 'Fabric.AppSignIn')['state'] = 'Action needed'
+        $banner = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
+        $banner.Kind | Should -Be 'Deploying'
+        @($banner.Problems) | Should -Be @('Failed (doesn''t block DONE): Insights app. It wasn''t created: FABRIC.APP.SIGNIN: The Rayfin CLI isn''t signed in.')
+    }
+
+    It 'shows nothing to look at, and doesn''t throw, for a model written before the nonBlocking section existed' {
+        $model = New-TestModel
+        $model.Remove('nonBlocking')
+        $model['run']['state'] = 'Done'
+        $banner = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
+        @($banner.Problems).Count | Should -Be 0
+        $html = InModuleScope DbHubDemo -Parameters @{ Model = $model } { ConvertTo-DemoProgressHtml -Model $Model -NowUnix 1793000060 }
+        $html | Should -Not -Match 'class="problems"'
     }
 
     It 'is Stopped, not done, when deploy.ps1 stopped updating a running model (its window closed, or the PC slept)' {
@@ -295,6 +382,53 @@ Describe 'The status page''s HTML' {
         ($lines -join "`n") | Should -Match 'DEPLOYING, NO ACTION NEEDED'
         ($lines -join "`n") | Should -Match 'T2: Arc-enabled SQL Server'
         ($lines -join "`n") | Should -Match '\[ \] Pending'
+    }
+
+    It 'puts the Insights app''s actual error right under the banner, in red and HTML-encoded, while DONE stays DONE; the console shows the same (2026-11-05)' {
+        $model = New-TestModel
+        $app = Get-TestStep -Model $model -Id 'Fabric.App'
+        $app['state'] = 'Failed'
+        $app['status'] = 'Fail'
+        $app['message'] = 'It wasn''t created: FABRIC.APP.DEPLOY: rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code 1, 42 s): <Workspace> & "capacity" is paused. To add it: run ./scripts/configure-fabric-app.ps1 -SignIn.'
+        $model['run']['state'] = 'Done'
+        $model['run']['reason'] = 'Database Hub shows every target.'
+        $model['nonBlocking'] = @(@{ name = 'the Insights app'; state = 'Failed'; message = 'It wasn''t created: FABRIC.APP.DEPLOY: rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code 1, 42 s): <Workspace> & "capacity" is paused.'; howTo = 'To add it: run ./scripts/configure-fabric-app.ps1 -SignIn.' })
+        $html = InModuleScope DbHubDemo -Parameters @{ Model = $model } { ConvertTo-DemoProgressHtml -Model $Model -NowUnix 1793000060 }
+        $html | Should -Match '<h1>Done</h1>'
+        $html | Should -Match '<div class="problems">'
+        $html | Should -Match '<h2>Needs attention</h2>'
+        $html | Should -Match ([regex]::Escape('<p>Failed (doesn&#39;t block DONE): the Insights app. It wasn&#39;t created: FABRIC.APP.DEPLOY: rayfin up didn&#39;t deploy APP_DatabaseHub_Insights (exit code 1, 42 s): &lt;Workspace&gt; &amp; &quot;capacity&quot; is paused. To add it: run ./scripts/configure-fabric-app.ps1 -SignIn.</p>'))
+        $html | Should -Not -Match '<Workspace>'
+        # Right under the banner: before the run's times and the table.
+        $html.IndexOf('class="problems"') | Should -BeGreaterThan $html.IndexOf('class="banner Done"')
+        $html.IndexOf('class="problems"') | Should -BeLessThan $html.IndexOf('<table>')
+        # The app's row: Failed in red, its reported status, the note that it doesn't block DONE, and the error.
+        $html | Should -Match ([regex]::Escape('<tr><td>Insights app <span class="meta">(doesn''t block DONE)</span></td><td class="state s-Failed">Failed <span class="meta">(Fail)</span></td>'))
+        $html | Should -Match ([regex]::Escape('.s-Failed{color:#b91c1c}'))
+        $html | Should -Not -Match '(?i)optional'
+        $lines = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Format-DemoProgressConsole -Model $Model -NowUnix 1793000060 -Width 400 }
+        $text = $lines -join "`n"
+        $text | Should -Match '  NEEDS ATTENTION:'
+        $text | Should -Match ([regex]::Escape('  ! Failed (doesn''t block DONE): the Insights app. It wasn''t created: FABRIC.APP.DEPLOY'))
+        $text | Should -Match ([regex]::Escape('[X] Failed'))
+        $text | Should -Match ([regex]::Escape('Insights app (doesn''t block DONE) - It wasn''t created'))
+    }
+
+    It 'keeps a long message whole with -MaxLength, and a nonBlocking section clean and redacted (2026-11-05)' {
+        $path = New-TestModelFile
+        $fakeToken = 'eyJ' + ('a' * 24) + '.' + ('b' * 24) + '.' + ('c' * 24)
+        $long = 'It wasn''t created: ' + ('the step said so ' * 40).Trim() + '. To add it: run ./scripts/configure-fabric-app.ps1 -SignIn.'
+        InModuleScope DbHubDemo -Parameters @{ Path = $path; Text = $long; Token = $fakeToken } {
+            Set-DemoProgressStep -Path $Path -Id 'Fabric.App' -State 'Failed' -Status 'Fail' -Message $Text -MaxLength 1200
+            Set-DemoProgressStep -Path $Path -Id 'Fabric.Items' -State 'Done' -Message $Text
+            Set-DemoProgressValue -Path $Path -Section 'nonBlocking' -Value @([ordered]@{ name = 'the Insights app'; state = 'Unknown'; message = ('token {0}' -f $Token); howTo = 'Run it.' })
+        }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        (Get-TestStep -Model $model -Id 'Fabric.App')['message'] | Should -Be $long
+        (Get-TestStep -Model $model -Id 'Fabric.Items')['message'].Length | Should -Be 400
+        @($model['nonBlocking']).Count | Should -Be 1
+        $model['nonBlocking'][0]['state'] | Should -Be 'Failed'
+        $model['nonBlocking'][0]['message'] | Should -Not -Match ([regex]::Escape($fakeToken))
     }
 }
 

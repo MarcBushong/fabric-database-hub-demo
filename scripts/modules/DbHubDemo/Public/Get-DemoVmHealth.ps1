@@ -9,7 +9,8 @@ function Get-DemoVmHealth {
     afterward) and returns the parsed JSON. -View Summary (the default) returns only role, state, status,
     message, currentStep, generation, updatedUtc, installMode, arcOnboarded, guestState, and sqlEdition, plus
     the PaygWizard guided stop's guidedArmed, guidedRequest, guidedLast, and guidedLeft (Phase 28), which
-    always fits in the 4 KB the instance view keeps. Under -WhatIf nothing runs and the result is $null. Throws
+    always fits in the 4 KB the instance view keeps. On the T2 host, both views add t2Guest, the guest as Hyper-V
+    sees it now (2026-11-03; T2.GUEST.STATE reads it). Under -WhatIf nothing runs and the result is $null. Throws
     when the Run Command fails or its output doesn't parse.
 
     .PARAMETER Config

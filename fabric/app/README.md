@@ -111,6 +111,8 @@ Remove the override once a pinned Rayfin release depends on zod 4.6.6 or later.
 ./scripts/configure-fabric-app.ps1
 ```
 
+`./scripts/deploy.ps1` runs it in its Fabric track, after the history report, as part of every deployment (2026-11-05). When the Rayfin CLI isn't signed in to the demo's tenant, `deploy.ps1` starts its browser sign-in (step 3 below) at the beginning of the run, in a session that can take keyboard input, and the rest of the run goes on; only this step waits for it, at most 15 minutes from the start. When the app can't be created, the deployment goes on and still ends **DONE**: the status page shows the app's step as **Failed**, with the actual error and the fix ([deployment](../../docs/deployment.md#the-insights-app-part-of-every-deployment-2026-11-05)).
+
 The script is unattended and idempotent; it deploys to the item named `APP_DatabaseHub_Insights` and updates it in place on every run. It never deletes anything. It needs:
 
 1. `SM_DatabaseHub_History` deployed (`./scripts/configure-powerbi.ps1`), and the workspace on an **Active** Fabric capacity: `rayfin up` can start a trial or assign a capacity when a workspace has none, so the script deploys only on an Active one.
@@ -124,6 +126,8 @@ The script is unattended and idempotent; it deploys to the item named `APP_Datab
    It opens a browser once. The CLI keeps its own token cache and renews it silently; without `-SignIn` (below), the script only reads it (`rayfin login status --json`) and never signs in or out. Service principal sign-in is listed in the [CLI reference](https://learn.microsoft.com/fabric/apps/cli-reference) but isn't supported yet, so there's no unattended CI deploy.
 
    Or run `./scripts/configure-fabric-app.ps1 -SignIn` (Phase 26b): when the CLI isn't signed in to the demo's tenant, it runs that same sign-in in your console, checks it, and deploys. It runs only in an interactive session; in CI it's **Not supported**, and nothing is deployed.
+
+   If no browser opens, check your terminal's `BROWSER`: when it's set, the CLI opens its sign-in page with `"<BROWSER>" "<url>"` and doesn't check the result, so a command line such as `"<path>\msedge.exe" --inprivate %s`, set for `az login`, opens nothing. `-SignIn` and `deploy.ps1` remove such a value for the CLI's process only (2026-11-06); for the command above, remove it from that terminal first ([troubleshooting](../../docs/troubleshooting.md#the-insights-app-fabric-app)).
 
 What it does, as ADR 0012 results in `out/configure-fabric-app.jsonl`:
 

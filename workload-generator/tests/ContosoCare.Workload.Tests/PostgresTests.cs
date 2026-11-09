@@ -76,6 +76,35 @@ public sealed partial class PostgresTests
         }
     }
 
+    [Theory]
+    [InlineData(1, 0, "care.claims WHERE payer_code = @payer AND submitted_on >= @since", "payer", "FABRIKAM-PPO")]
+    [InlineData(2, 4, "care.claims WHERE payer_code = @payer AND submitted_on >= @since", "payer", "TAILSPIN-INS")]
+    [InlineData(1, 1, "care.appointments WHERE reason_code = @reason AND facility_id = @facility", "reason", "R008")]
+    [InlineData(3, 7, "care.appointments WHERE reason_code = @reason AND facility_id = @facility", "reason", "R002")]
+    public void T4sMissingIndexLookupsAreTopLevelParameterizedStatements(int worker, int turn, string predicate, string name, string value)
+    {
+        // 2026-11-04: Query Store (top) captures only top-level statements, and autonomous tuning recommends indexes for
+        // the queries it captured, so the lookups are the runner's own parameterized statements on unindexed columns.
+        var now = new DateTimeOffset(2026, 11, 4, 15, 0, 0, TimeSpan.Zero);
+        var (sql, parameters) = PgScenarioRunner.MissingIndexLookup(worker, turn, now);
+
+        Assert.StartsWith("SELECT count(*)::bigint AS rows_found FROM ", sql, StringComparison.Ordinal);
+        Assert.Contains(predicate, sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("demo.", sql, StringComparison.Ordinal);
+        Assert.Equal(value, parameters.Single(p => p.Name == name).Value);
+        if (name == "payer")
+        {
+            Assert.Equal(new DateOnly(2026, 10, 5), parameters.Single(p => p.Name == "since").Value);
+        }
+        else
+        {
+            Assert.InRange((int)parameters.Single(p => p.Name == "facility").Value, 1, 20);
+        }
+
+        var schema = PgScripts.Read("010-schema.sql");
+        Assert.DoesNotMatch(@"CREATE INDEX[^;]*\((payer_code|reason_code)", schema);
+    }
+
     [Fact]
     public void EveryScenarioStepAssertsItsRunFirst()
     {
@@ -259,8 +288,9 @@ public sealed partial class PostgresTests
 
         Assert.Equal(900, plan.DurationSeconds);
         Assert.Throws<ScenarioRequestException>(() => RunBounds.Plan(surge, new RunRequest { ScenarioId = surge.Id, Target = DemoTarget.T1 }, DateTimeOffset.UtcNow));
-        var missingIndex = ScenarioCatalog.Default.Get("missing-index");
-        Assert.Throws<ScenarioRequestException>(() => RunBounds.Plan(missingIndex, new RunRequest { ScenarioId = missingIndex.Id, Target = DemoTarget.T4 }, DateTimeOffset.UtcNow));
+        // A SQL Server scenario T4 has no step for (missing-index runs on T4 since 2026-11-04).
+        var blockingChain = ScenarioCatalog.Default.Get("blocking-chain");
+        Assert.Throws<ScenarioRequestException>(() => RunBounds.Plan(blockingChain, new RunRequest { ScenarioId = blockingChain.Id, Target = DemoTarget.T4 }, DateTimeOffset.UtcNow));
         Assert.Equal(1024, ScenarioCatalog.ResolveParameters(ScenarioCatalog.Default.Get("io-pressure"), DemoTarget.T4, new Dictionary<string, string>())["scratchMb"].Integer);
     }
 

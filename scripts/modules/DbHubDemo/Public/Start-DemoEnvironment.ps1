@@ -10,13 +10,24 @@ function Start-DemoEnvironment {
     2. The cost guardrail (Test-DemoStartCost): the live estimate against sessionCeilingUsd and
        monthlyCeilingUsd, and the month-to-date actual cost plus one session against monthlyCeilingUsd. A Fail
        stops here, before anything starts; -SkipCostCheck skips it.
-    3. Requests both VM starts at once, then waits until sqlvm01 and the T2 VM run (START.VM_*; ADR 0018). The
+    3. Requests both VM starts at once, then waits until sqlvm01 and the T2 VM run (START.VM_*; ADR 0018). With a
+       profile with incidents, a VM that was already running gets the interim baseline before the starts are waited for,
+       and a VM this start booted gets it as soon as it runs (review of PR 16, 2026-11-04): its profile host resumes the
+       profile stored there about 2 minutes after the boot. The first is sent without waiting (Invoke-DemoActivityQuiet).
+       The second is retried on the VM every 15 seconds while its SQL Server, or T2's guest, starts, and this start's own
+       Run Commands there wait for it, at most until its 10-minute bound; one not set by then is a START.INTERIM_<target>
+       Warning with the commands (Wait-DemoActivityInterim, re-review of PR 16). The
        bootstraps resume on their own. A golden snapshot's source host gets its air-gapped guest back
-       (T2.GOLDEN.SOURCE, Invoke-DemoGoldenSourceRelease). T1's monitoring plugin, which can stay NotRunning
+       (T2.GOLDEN.SOURCE, Invoke-DemoGoldenSourceRelease) as soon as it runs, before its interim baseline; when the
+       release leaves the guest off (a capture in progress there, or a release that failed), START.INTERIM_T2 is Not
+       selected and nothing waits for it, and a T2 guest the relay holds for a golden capture, or one that isn't running,
+       ends the VM's retries at once (review of PR 17, 2026-11-04). T1's monitoring plugin, which can stay NotRunning
        after a deallocation (live, 2026-10-22), gets the SQL IaaS Agent service restarted
-       (START.T1.MONITORING, Restore-DemoSqlVmMonitoringPlugin): first it waits up to 5 minutes for the agent to
-       report the plugin's status, because a restart right after boot, before that, left it NotRunning (live,
-       2026-10-26), then restarts the service only when the plugin isn't Running, and checks for Running and OK.
+       (START.T1.MONITORING, Restore-DemoSqlVmMonitoringPlugin): first it waits up to 8 minutes for the agent to
+       report a fresh status, one reported after the VM's latest start (live, 2026-11-04: right after a cold start the
+       instance view still said Running and OK from before the stop), because a restart right after boot, before the agent
+       reports, left it NotRunning (live, 2026-10-26); then it restarts the service once when the fresh status isn't
+       Running, or when no fresh status comes, and checks for Running and OK.
        A one-time host password left from an earlier session that couldn't be rotated is rotated now, unless
        -Interactive; with the Key Vault opt-in, the vault's copy is disabled too (START.KEYVAULT.CLEANUP).
        Before the VMs start, with the on-demand activity control (control.enabled, ADR 0020), a pending auto-stop
@@ -39,13 +50,20 @@ function Start-DemoEnvironment {
        -Target T1 does, then the agent's restart at once for a NotRunning plugin).
     4a. T4, the PostgreSQL flexible server (Phase 24, ADR 0019): its start is requested with the VMs
        (Servers - Start) and confirmed before its profile is set (START.T4.START). -SkipT4 leaves it stopped.
-    5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, baseline by default)
-       on T1, T3, T4, and T2 until the next auto-shutdown (START.PROFILE_*). The VMs don't set it at boot unless
+    5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
+       2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown (START.PROFILE_*). A profile with incidents is set
+       as its interim, baseline, first. The VMs don't set it at boot unless
        activityProfileOnBoot is true, so this is what starts the demo's activity. T2's guest needs a few
        minutes after the host starts, so its profile is retried. Then the on-demand activity control's finished
        Run Commands (DbHubControl-*) on the VMs that run are deleted without waiting (START.CONTROL.RUNCOMMANDS,
        Phase 28 follow-up; Remove-DemoControlRunCommand): the control's stop path never touches Run Command (ADR
        0020), so a VM keeps the last run's until then. A delete that fails is a Warning the next start retries.
+    5a. The switch (2026-11-03, ADR 0010): this start's own Run Commands are done, so the targets on the interim baseline
+       get the profile with incidents, one managed Run Command per VM, both VMs within 3 minutes (START.INCIDENTS_*;
+       Send-DemoPendingActivitySwitch), and the console says what runs and how to choose the quieter baseline. A VM in
+       -HoldActivitySwitchVm keeps the interim for the caller, which still sends it Run Commands: start-demo.ps1 switches
+       it after the host password of -Interactive -ResetAdminPassword. A configuration that doesn't set activityProfile
+       gets one notice (START.ACTIVITYPROFILE), with or without the cost guardrail.
     6. -WarmUpMinutes: the activity keeps running in the background, and START.WARMUP says when to check the
        telemetry (ADR 0018). With -WaitForWarmUp it waits that long, then checks that telemetry arrives for
        each started target (Test-DemoHubTelemetry), so Hub charts have history when the presenter joins.
@@ -83,13 +101,21 @@ function Start-DemoEnvironment {
 
     .PARAMETER T2ProfileRetrySeconds
     Seconds between profile attempts while T2's guest boots, and while T1's SQL Server starts (both VMs boot
-    at once).
+    at once). T1's and T2's three attempts share one readiness budget of twice this (4 minutes by default): the VM
+    side waits for its target within it, so a target that stays down costs about that once, plus the Run Commands'
+    own time, and never a wait per attempt (Set-DemoTargetProfile). A target whose interim baseline this start waited
+    for and that stayed down through it gets one attempt without a wait, so that wait and this budget don't add up
+    (review of PR 17, 2026-11-04).
 
     .PARAMETER SkipT4
     Leave T4, the PostgreSQL flexible server, stopped.
 
     .PARAMETER T4StartMinutes
     How long to wait for T4 to be Ready before its activity profile is set.
+
+    .PARAMETER HoldActivitySwitchVm
+    VMs whose switch from the interim baseline the caller makes itself, after Run Commands it still sends them
+    (start-demo.ps1 with -Interactive -ResetAdminPassword holds archost01 for the host password).
 
     .EXAMPLE
     Start-DemoEnvironment -Config $config -WarmUpMinutes 30
@@ -126,10 +152,19 @@ function Start-DemoEnvironment {
         [switch] $SkipT4,
 
         [ValidateRange(1, 30)]
-        [int] $T4StartMinutes = 15
+        [int] $T4StartMinutes = 15,
+
+        [AllowEmptyCollection()]
+        [ValidateSet('sqlvm01', 'archost01')]
+        [string[]] $HoldActivitySwitchVm = @()
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
+    # The run's activity profile (business-day by default since 2026-11-03): set as its interim first, then switched once
+    # this start's own Run Commands are done (ADR 0010). A start that ends before the switch is caught by start-demo.ps1.
+    $activity = Get-DemoActivityProfile -Config $Config -Requested $ActivityProfile
+    $switchTo = if ($activity.HasIncidents) { $activity.Name } else { '' }
+    Clear-DemoActivitySwitch
     try {
         $results.Add((Assert-DemoAzContext -SubscriptionId ([string]$Config['subscriptionId']) -TenantId ([string]$Config['tenantId']) -Account ([string]$Config['azureAccount'])))
     }
@@ -145,12 +180,17 @@ function Start-DemoEnvironment {
     }
     $networkMode = if ($state.NetworkMode -in 'public', 'private') { $state.NetworkMode } else { (Resolve-DemoNetworkMode -ConfiguredMode ([string]$Config['networkMode']) -PolicyUnknown).EffectiveMode }
 
+    # Once, with or without the cost guardrail: a configuration that doesn't set activityProfile gets the default.
+    $notice = New-DemoActivityProfileNotice -ActivityProfile $activity -CheckPrefix 'START'
+    if ($null -ne $notice) {
+        $results.Add($notice)
+    }
     if ($SkipCostCheck) {
         $results.Add((New-DemoResult -CheckId 'START.COST' -Area 'preflight' -Target 'subscription' -Status 'Not selected' -Message 'The cost guardrail was skipped (-SkipCostCheck).'))
     }
     else {
         # T4 at the size the fallback recorded (Phase 28 follow-up), so a General Purpose T4 is priced as such.
-        $cost = @(Test-DemoStartCost -Config (Resolve-DemoEffectiveConfig -Config $Config -State $state) -NetworkMode $networkMode -T3UseFreeLimit $state.T3UseFreeLimit)
+        $cost = @(Test-DemoStartCost -Config (Resolve-DemoEffectiveConfig -Config $Config -State $state) -NetworkMode $networkMode -T3UseFreeLimit $state.T3UseFreeLimit -ActivityProfile $activity.Name)
         foreach ($item in $cost) {
             $results.Add($item)
         }
@@ -188,22 +228,62 @@ function Start-DemoEnvironment {
     foreach ($vm in 'sqlvm01', $hostVm) {
         $startRequested[$vm] = [bool](Request-DemoVmStart -Config $Config -VmName $vm)
     }
+    # With activityProfileOnBoot, a VM this start starts sets the interim baseline itself at boot (2026-11-03), so its
+    # targets are switched with the others.
+    if ($activity.HasIncidents -and $Config.Contains('activityProfileOnBoot') -and [bool]$Config['activityProfileOnBoot']) {
+        foreach ($vm in @('sqlvm01', $hostVm)) {
+            if ($vm -in 'sqlvm01', 'archost01' -and $startRequested[$vm]) {
+                Register-DemoActivitySwitch -VmName $vm
+            }
+        }
+    }
     $t4On = -not $SkipT4 -and (Test-DemoT4Enabled -Config $Config)
     $t4Request = if ($t4On) { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 0 -CheckPrefix START } else { $null }
+    # A VM that was already running may still serve an earlier run's incidents: the targets this start sets get the
+    # interim baseline before its own Run Commands reach that VM, and its switch brings the profile back (2026-11-03).
+    $quietTargets = @('T1') + @(if (-not $SkipT3) { 'T3' }) + @(if ($t4On) { 'T4' }) + @('T2')
+    $quieted = @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @(@('sqlvm01', $hostVm) | Where-Object { -not $startRequested[$_] }) -Target $quietTargets -RequestedBy 'start-demo' -PassThru | Where-Object { $_.Outcome -eq 'Sent' } | ForEach-Object { [string]$_.VmName } | Select-Object -Unique)
+    $interimSent = [System.Collections.Generic.List[object]]::new()
     foreach ($vm in 'sqlvm01', $hostVm) {
-        $results.Add((Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:$startRequested[$vm]))
+        $startResult = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:$startRequested[$vm]
+        $results.Add($startResult)
+        if ([string]$startResult.status -ne 'Pass') {
+            continue
+        }
+        # A golden snapshot's source host has an air-gapped guest until the first start after the capture: it's released as
+        # soon as the host runs, before its interim baseline, which would otherwise wait up to 10 minutes for a guest that
+        # stays off. When the release leaves it off (a capture in progress there, or a release that failed), the interim
+        # is Not selected and nothing waits for it (review of PR 16 and PR 17, 2026-11-04).
+        $held = $null
+        if ($vm -eq $hostVm) {
+            $sourceRelease = Invoke-DemoGoldenSourceRelease -Config $Config
+            if ($null -ne $sourceRelease) {
+                $results.Add($sourceRelease)
+                $held = Get-DemoGoldenHeldInterimResult -ActivityProfile $activity -Release $sourceRelease -CheckPrefix 'START'
+            }
+        }
+        if ($vm -in $quieted) {
+            continue
+        }
+        # A VM this start booted resumes the profile stored there about 2 minutes after the boot (business-day lasts 8 hours
+        # from its switch, or until 2 minutes before the next auto-shutdown, so it can outlive a stop), so it gets the
+        # interim baseline as soon as it runs, before this start's own Run Commands there (review of PR 16, 2026-11-04).
+        if ($null -ne $held) {
+            $results.Add($held)
+            continue
+        }
+        foreach ($sentItem in @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName $vm -Target $quietTargets -RequestedBy 'start-demo' -Started -PassThru)) {
+            $interimSent.Add($sentItem)
+        }
+    }
+    # Its SQL Server, or T2's guest, can still be starting, so the VM retries the interim baseline, and this start's own
+    # Run Commands there wait for it, at most until its 10-minute bound (re-review of PR 16, 2026-11-04).
+    foreach ($item in @(Wait-DemoActivityInterim -Config $Config -ActivityProfile $activity -Record $interimSent.ToArray() -CheckPrefix 'START')) {
+        $results.Add($item)
     }
     $running = @{}
     foreach ($vm in 'sqlvm01', $hostVm) {
         $running[$vm] = @($results | Where-Object { $_.checkId -eq ('START.VM_{0}' -f $vm.ToUpperInvariant()) -and $_.status -eq 'Pass' }).Count -gt 0
-    }
-
-    # A golden snapshot's source host has an air-gapped guest until the first start after the capture.
-    if ($running[$hostVm]) {
-        $sourceRelease = Invoke-DemoGoldenSourceRelease -Config $Config
-        if ($null -ne $sourceRelease) {
-            $results.Add($sourceRelease)
-        }
     }
 
     # After a deallocation, T1's monitoring plugin can stay NotRunning, so T1 sends no performance telemetry
@@ -286,9 +366,16 @@ function Start-DemoEnvironment {
         $t4Ready = $t4Start.status -eq 'Pass' -and [string](Get-DemoMemberValue -InputObject $t4Start.evidence -Name 'stateAfter') -eq 'Ready'
     }
 
-    $profileName = if ($ActivityProfile) { $ActivityProfile } elseif ($Config['activityProfile']) { [string]$Config['activityProfile'] } else { 'baseline' }
     $t3Enabled = $t3Ready -and ((Test-DemoDeploymentStageReached -Recorded $state.Stage -Stage 'T3') -or @($results | Where-Object { $_.checkId -like 'WORKLOAD.T3*' -and $_.status -in 'Pass', 'Warning' }).Count -gt 0)
     $profileTargets = @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @('T2')
+    # A target whose interim baseline this start waited for has had that wait's readiness bound already: its VM tried it
+    # every 15 seconds for up to 10 minutes. One that never answered then (TimedOut, or Failed after several attempts) gets
+    # one more attempt below without another wait, so the two waits don't add up (review of PR 17, 2026-11-04).
+    $stayedDown = @($results | Where-Object { [string]$_.checkId -match '^START\.INTERIM_T[12]$' -and [string]$_.status -eq 'Warning' } | Where-Object {
+            $interimEvidence = Get-DemoMemberValue -InputObject $_ -Name 'evidence'
+            $interimOutcome = [string](Get-DemoMemberValue -InputObject $interimEvidence -Name 'outcome')
+            $interimOutcome -eq 'TimedOut' -or ($interimOutcome -eq 'Failed' -and [int](Get-DemoMemberValue -InputObject $interimEvidence -Name 'attempts') -gt 1)
+        } | ForEach-Object { ([string]$_.checkId).Substring(([string]$_.checkId).Length - 2) })
     foreach ($target in $profileTargets) {
         $skip = ''
         if (-not $state.RunnerSha256) {
@@ -319,9 +406,17 @@ function Start-DemoEnvironment {
             $skip = ('{0} isn''t running.' -f $hostVm)
         }
         # T2's guest boots after its host, and T1's SQL Server can still be starting because both VMs boot at once
-        # (live, 2026-10-22: T1's first attempt found no server), so both retry.
-        $attempts = if ($target -in 'T1', 'T2') { 3 } else { 1 }
-        $results.Add((Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $profileName -CheckPrefix 'START' -SkipReason $skip -RequestedBy 'start-demo' -Attempts $attempts -RetrySeconds $T2ProfileRetrySeconds))
+        # (live, 2026-10-22: T1's first attempt found no server), so both retry, within one readiness budget that the
+        # VM side waits in (2 x T2ProfileRetrySeconds; review, 2026-11-04: a wait per attempt took 34 to 64 minutes),
+        # except one that already stayed down through its interim's wait (above).
+        # A profile with incidents is set as its interim, baseline, and switched below once this start's own Run
+        # Commands are done (2026-11-03).
+        $attempts = if ($target -in 'T1', 'T2' -and $target -notin $stayedDown) { 3 } else { 1 }
+        $set = Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $activity.Interim -CheckPrefix 'START' -SkipReason $skip -RequestedBy 'start-demo' -Attempts $attempts -RetrySeconds $T2ProfileRetrySeconds -SwitchTo $switchTo
+        $results.Add($set)
+        if ($switchTo -and [string]$set.status -in 'Pass', 'Warning') {
+            Register-DemoActivitySwitch -VmName $(if ($target -eq 'T2') { 'archost01' } else { 'sqlvm01' })
+        }
     }
 
     # The on-demand control's finished Run Commands on the VMs that run (ADR 0020: its stop path leaves the last run's),
@@ -333,6 +428,18 @@ function Start-DemoEnvironment {
             $results.Add($cleanup)
         }
     }
+
+    # The switch (2026-11-03, ADR 0010): this start's own Run Commands are done, so what runs the interim baseline gets the
+    # profile with incidents now, at the warm-up's start, except a VM the caller still sends Run Commands to.
+    if ($switchTo) {
+        $switchVms = @(Get-DemoActivitySwitchVm | Where-Object { $_ -notin $HoldActivitySwitchVm })
+        if ($switchVms.Count -gt 0) {
+            foreach ($item in @(Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile $activity -Result $results.ToArray() -CheckPrefix 'START' -RequestedBy 'start-demo' -VmName $switchVms)) {
+                $results.Add($item)
+            }
+        }
+    }
+    Write-DemoLog -Message (Get-DemoActivitySummaryLine -ActivityProfile $activity)
 
     if ($WarmUpMinutes -gt 0 -and -not $WaitForWarmUp) {
         # The warm-up runs in the background (ADR 0018): the profiles keep the activity going until the next

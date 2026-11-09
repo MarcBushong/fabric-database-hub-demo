@@ -19,12 +19,13 @@ BeforeAll {
     }
 
     function New-TestSnapshot {
-        param([int] $DaysLeft = 179, [bool] $BootVerified = $true, [string] $Location = 'westus3')
+        param([int] $DaysLeft = 179, [bool] $BootVerified = $true, [string] $Location = 'westus3', [string] $InstallMode = 'PaygWizard', [bool] $Evaluation = $true)
         [pscustomobject]@{
             Name = 'snap-dbhub-t2golden-202610221306'; Id = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-golden/providers/Microsoft.Compute/snapshots/snap-dbhub-t2golden-202610221306'
-            Location = $Location; NetworkAccessPolicy = 'DenyAll'; ProvisioningState = 'Succeeded'; InstallMode = 'PaygWizard'; SecurityType = 'Standard'
+            Location = $Location; NetworkAccessPolicy = 'DenyAll'; ProvisioningState = 'Succeeded'; InstallMode = $InstallMode; SecurityType = 'Standard'
             CapturedUtc = [datetime]::new(2026, 10, 22, 13, 6, 0, [System.DateTimeKind]::Utc); BootVerifiedUtc = $(if ($BootVerified) { [datetime]::new(2026, 10, 22, 14, 30, 0, [System.DateTimeKind]::Utc) } else { $null })
-            OnboardVerifiedUtc = $null; EvalExpiresUtc = [datetime]::new(2027, 4, 19, 13, 46, 0, [System.DateTimeKind]::Utc); EvalDaysLeft = $DaysLeft
+            OnboardVerifiedUtc = $null; Evaluation = $Evaluation
+            EvalExpiresUtc = $(if ($Evaluation) { [datetime]::new(2027, 4, 19, 13, 46, 0, [System.DateTimeKind]::Utc) } else { $null }); EvalDaysLeft = $(if ($Evaluation) { $DaysLeft } else { $null })
         }
     }
 
@@ -102,6 +103,57 @@ Describe 'Resolve-DemoTrackPlan' {
         $plan.Tracks['T4'] | Should -Be @('Telemetry')
         @($plan.Tracks['Fabric']).Count | Should -Be 0
     }
+
+    It 'names the VM tracks a resume continues past their Artifacts step, and sends a -Resend track back to it (live finding, 2026-11-06)' {
+        # Live: T2 had recorded Bootstraps when a fix to the host's bootstrap was pulled; the plain rerun resumed at T2's T2
+        # step, so archost01 kept the old bundle.
+        $state = New-TestState
+        $state.Stage = 'Infrastructure'
+        $state.TrackT1 = 'Telemetry'
+        $state.TrackT2 = 'Bootstraps'
+        $state.TrackFabric = 'Fabric'
+        $plan = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State }
+        $plan.PastArtifacts | Should -Be @('T1', 'T2')
+        @($plan.Resend).Count | Should -Be 0
+        $plan.Tracks['T2'] | Should -Be @('T2', 'Telemetry')
+
+        $resent = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State -Resend 'T2' }
+        $resent.Resend | Should -Be @('T2')
+        $resent.Tracks['T2'] | Should -Be @('Artifacts', 'Bootstraps', 'T2', 'Telemetry')
+        @($resent.Tracks['T1']).Count | Should -Be 0 -Because 'only the tracks in -Resend go back'
+        $resent.Preflight | Should -BeFalse
+        $resent.Infrastructure | Should -BeFalse
+
+        # T1's finished track goes back to its Artifacts step too, with every step after it; T3Setup stays done.
+        $both = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State -Resend 'T1', 'T2' }
+        $both.Tracks['T1'] | Should -Be @('Artifacts', 'Bootstraps', 'T3', 'T4', 'Activity', 'Monitoring', 'Telemetry')
+        $both.Resend | Should -Be @('T1', 'T2')
+        @($both.Tracks['Fabric']).Count | Should -Be 0
+    }
+
+    It 'changes nothing with -Resend for a track whose Artifacts step runs anyway, a range, or a stop before the artifacts' {
+        $state = New-TestState
+        $state.Stage = 'Infrastructure'
+        $state.TrackT1 = 'T3Setup'
+        $state.TrackT2 = 'Restore'
+        $plan = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State -Resend 'T1', 'T2' }
+        @($plan.PastArtifacts).Count | Should -Be 0
+        @($plan.Resend).Count | Should -Be 0
+        $plan.Tracks['T1'][0] | Should -Be 'Artifacts'
+        $plan.Tracks['T2'][0] | Should -Be 'Artifacts'
+
+        $state.TrackT2 = 'Telemetry'
+        foreach ($case in @(
+                @{ FromStage = 'T2'; StopAfter = '' }
+                @{ FromStage = ''; StopAfter = 'Infrastructure' }
+            )) {
+            $other = InModuleScope DbHubDemo -Parameters @{ State = $state; Case = $case } { Resolve-DemoTrackPlan -FromStage $Case.FromStage -StopAfter $Case.StopAfter -Resume -State $State -Resend 'T2' }
+            @($other.PastArtifacts).Count | Should -Be 0 -Because ('-FromStage {0} -StopAfter {1}' -f $case.FromStage, $case.StopAfter)
+            @($other.Tracks['T2']) | Should -Not -Contain 'Artifacts'
+        }
+        # Without -Resume nothing is past its Artifacts step: a run from the start sends what's missing anyway.
+        @((InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -State $State -Resend 'T2' }).PastArtifacts).Count | Should -Be 0
+    }
 }
 
 Describe 'Get-DemoTrackRecordReset: a resume trusts only what was recorded since the last fresh start (Phase 28 live finding, 2026-10-30)' {
@@ -142,6 +194,16 @@ Describe 'Get-DemoTrackRecordReset: a resume trusts only what was recorded since
         $reset.Count | Should -Be 0
     }
 
+    It 'lowers the record of a resumed track that goes back to its Artifacts step, so a stop before it finishes sends them again (2026-11-06)' {
+        $state = New-TestState
+        $state.Stage = 'Monitoring'
+        $state.TrackT1 = 'Monitoring'
+        $state.TrackT2 = 'Bootstraps'
+        $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -Resume -State $State -Resend 'T2') -State $State }
+        $reset['TrackT2'] | Should -Be 'Restore'
+        $reset.Contains('TrackT1') | Should -BeFalse
+    }
+
     It 'lowers a record to the step before where -FromStage starts its track, and never raises one' {
         $state = New-DoneState
         $reset = InModuleScope DbHubDemo -Parameters @{ State = $state } { Get-DemoTrackRecordReset -Plan (Resolve-DemoTrackPlan -FromStage 'T4') -State $State }
@@ -163,9 +225,120 @@ Describe 'Get-DemoTrackRecordReset: a resume trusts only what was recorded since
     }
 }
 
+Describe 'A resume sends a VM''s artifacts again when this checkout builds other ones (live finding, 2026-11-06)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:built = @{ Bundle = ('a' * 64); Runner = ('b' * 64) }
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = $script:built.Bundle; SizeBytes = 10 } }
+        Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { [pscustomobject]@{ Path = 'runner.zip'; Sha256 = $script:built.Runner; SizeBytes = 20 } }
+        $script:state = New-TestState
+        $script:state.Stage = 'Infrastructure'
+        $script:state.TrackT1 = 'Telemetry'
+        $script:state.TrackT2 = 'Bootstraps'
+    }
+
+    It 'finds nothing when both VMs have what this checkout builds' {
+        $changes = @(InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Get-DemoArtifactChange -State $State -Bundle ([pscustomobject]@{ Sha256 = ('A' * 64) }) -Runner ([pscustomobject]@{ Sha256 = ('b' * 64) }) })
+        $changes.Count | Should -Be 0
+    }
+
+    It 'says what changed, what the VM has, and what this checkout builds, for the console and for the status page' {
+        $changes = @(InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Get-DemoArtifactChange -State $State -Bundle ([pscustomobject]@{ Sha256 = ('c' * 64) }) -Runner ([pscustomobject]@{ Sha256 = ('b' * 64) }) -Track 'T2' })
+        $changes.Count | Should -Be 1
+        $changes[0].Track | Should -Be 'T2'
+        $changes[0].VmName | Should -Be 'archost01'
+        $changes[0].Kinds | Should -Be @('Bundle')
+        $changes[0].Note | Should -Be ('The bootstrap bundle changed since the last run (archost01 has {0}; this checkout builds {1}), so it''s sent again, and the loader runs again.' -f ('a' * 12), ('c' * 12))
+        $changes[0].Message | Should -Be ('T2: the bootstrap bundle changed since the last run (archost01 has {0}; this checkout builds {1}), so this run sends it to archost01 again and runs T2''s Artifacts and Bootstraps steps again, with the steps after them.' -f ('a' * 12), ('c' * 12))
+        $changes[0].Evidence['bundle']['onVm'] | Should -BeTrue
+        $changes[0].Evidence.Contains('runner') | Should -BeFalse
+    }
+
+    It 'counts a VM the record doesn''t list, the runner, and both together; a runner it doesn''t compare never counts' {
+        # The earlier run sent the new bundle to sqlvm01 before it was stopped: archost01 isn't listed for it.
+        $script:state.BundleSha256 = ('c' * 64)
+        $script:state.BundleSentTo = @('sqlvm01')
+        $changes = @(InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Get-DemoArtifactChange -State $State -Bundle ([pscustomobject]@{ Sha256 = ('c' * 64) }) -Runner ([pscustomobject]@{ Sha256 = ('d' * 64) }) })
+        @($changes | ForEach-Object { $_.Track }) | Should -Be @('T1', 'T2')
+        $changes[0].Kinds | Should -Be @('Runner')
+        $changes[0].Note | Should -Match '^The workload runner changed since the last run \(sqlvm01 has bbbbbbbbbbbb; this checkout builds dddddddddddd\), so it''s sent again'
+        $changes[1].Kinds | Should -Be @('Bundle', 'Runner')
+        $changes[1].Note | Should -Match '^The bootstrap bundle this checkout builds \(cccccccccccc\) isn''t recorded as sent to archost01, and the workload runner changed since the last run .*, so they''re sent again, and the loader runs again\.$'
+        @(InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Get-DemoArtifactChange -State $State -Bundle ([pscustomobject]@{ Sha256 = ('c' * 64) }) -Runner $null -Track 'T1' }).Count | Should -Be 0
+    }
+
+    It 'builds nothing when no VM track resumes past its Artifacts step' {
+        $script:state.TrackT1 = 'T3Setup'
+        $script:state.TrackT2 = 'Restore'
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        @($resend.Tracks).Count | Should -Be 0
+        @($resend.Results).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -Times 0 -Exactly
+    }
+
+    It 'resumes as recorded when nothing changed, and says it checked' {
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        @($resend.Tracks).Count | Should -Be 0
+        @($resend.Results).Count | Should -Be 0
+        $resend.Notes.Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq 'sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout builds, so each track continues where it stopped.' }
+    }
+
+    It 'sends a changed bundle again to every VM that resumes past its Artifacts step, says why, and returns each track''s note' {
+        $script:built.Bundle = ('c' * 64)
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        $resend.Tracks | Should -Be @('T1', 'T2')
+        $resend.Notes['T2'] | Should -Match '^The bootstrap bundle changed since the last run \(archost01 has aaaaaaaaaaaa; this checkout builds cccccccccccc\), so it''s sent again'
+        $changed = @($resend.Results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.CHANGED_ARCHOST01' })
+        $changed.Count | Should -Be 1
+        $changed[0].status | Should -Be 'Pass'
+        $changed[0].target | Should -Be 'T2'
+        $changed[0].message | Should -Match 'so this run sends it to archost01 again and runs T2''s Artifacts and Bootstraps steps again'
+        ($resend.Results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.CHANGED_SQLVM01' }).status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'T2: the bootstrap bundle changed since the last run*' }
+    }
+
+    It 'compares no runner with -SkipRunner or when the record has none' {
+        $script:built.Runner = ('d' * 64)
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) -SkipRunner }
+        @($resend.Tracks).Count | Should -Be 0
+        $script:state.RunnerSha256 = ''
+        $script:state.RunnerSentTo = @()
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        @($resend.Tracks).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -Times 0 -Exactly
+    }
+
+    It 'resumes as recorded with a Warning when the bundle can''t be built, and still compares the bundle when only the runner can''t' {
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { throw 'disk full' }
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        @($resend.Tracks).Count | Should -Be 0
+        $warning = @($resend.Results)
+        $warning.Count | Should -Be 1
+        $warning[0].checkId | Should -Be 'DEPLOY.ARTIFACTS.CHANGED'
+        $warning[0].status | Should -Be 'Warning'
+        $warning[0].message | Should -Match 'disk full'
+        $warning[0].remediation | Should -Match 'deploy\.ps1 -FromStage Artifacts'
+
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
+        Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { throw 'The .NET SDK was not found.' }
+        $resend = InModuleScope DbHubDemo -Parameters @{ State = $script:state } { Resolve-DemoArtifactResend -State $State -Plan (Resolve-DemoTrackPlan -Resume -State $State) }
+        $resend.Tracks | Should -Be @('T1', 'T2')
+        $runnerWarning = @($resend.Results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.CHANGED' })
+        $runnerWarning.Count | Should -Be 1
+        $runnerWarning[0].message | Should -Match 'The workload runner couldn''t be built'
+        $runnerWarning[0].remediation | Should -Match '-SkipRunner'
+    }
+}
+
 Describe 'Resolve-DemoT2Source' {
     BeforeEach {
         $config = New-TestConfig
+        # The snapshots below keep a PaygWizard guest (a Windows evaluation); a snapshot is used only for its own mode.
+        $config['t2SqlInstallMode'] = 'PaygWizard'
         $script:vm = $null
         $script:snapshots = @(New-TestSnapshot)
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
@@ -222,6 +395,23 @@ Describe 'Resolve-DemoT2Source' {
         $source.Result.status | Should -Be 'Warning'
         $source.Result.message | Should -Match 're-capture now'
     }
+
+    It 'restores a JumpstartImage host from its own snapshot, whose guest has no evaluation to end (2026-11-05)' {
+        $config['t2SqlInstallMode'] = 'JumpstartImage'
+        $script:snapshots = @(New-TestSnapshot -InstallMode 'JumpstartImage' -Evaluation $false)
+        $source = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoT2Source -Config $Config }
+        $source.Source | Should -Be 'golden'
+        $source.Result.status | Should -Be 'Pass'
+        $source.Result.message | Should -Match 'isn''t a Windows evaluation'
+    }
+
+    It 'never restores a snapshot of another install mode: a JumpstartImage configuration makes its guest from the image' {
+        $config['t2SqlInstallMode'] = 'JumpstartImage'
+        $source = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoT2Source -Config $Config }
+        $source.Source | Should -Be 'build'
+        $source.Result.message | Should -Match 'install mode PaygWizard'
+        $source.Result.message | Should -Match 'Arc Jumpstart'
+    }
 }
 
 Describe 'Invoke-DemoBootstrapLoaderRun' {
@@ -256,6 +446,22 @@ Describe 'Invoke-DemoBootstrapLoaderRun' {
         $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName 'archost01' -BundleSha256 ('a' * 64) -ChunkCount 1 -Settings @{ role = 'ArcHost' } }
         $result.status | Should -Be 'Fail'
         $result.message | Should -Match 'chunk 1 missing'
+        # A plain rerun runs the loader again, and sends the bundle again first when its chunks were unusable (2026-11-06).
+        $result.remediation | Should -Match 'run \./scripts/deploy\.ps1 again: it runs the loader again, and when the loader found the bundle''s chunks missing or damaged, it sends the bundle again first'
+    }
+
+    It 'says when the loader stopped an earlier bundle''s bootstrap run that was still going (live finding, 2026-11-06)' {
+        $script:run = [pscustomobject]@{ Succeeded = $true; Output = ("2026-11-06T15:00:00Z [INFO] Loader started.`nDbHubDemo loader finished: role ArcHost, bundle {0}.`nDbHubDemo loader took over: stopped bundle {1}'s bootstrap run, which was still going (process 4242); bundle {0}'s run starts now." -f ('c' * 12), ('a' * 12)); Error = '' }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName 'archost01' -BundleSha256 ('c' * 64) -ChunkCount 1 -Settings @{ role = 'ArcHost' } }
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match ('a new bootstrap generation is running\. It stopped bundle {0}''s bootstrap run, which was still going \(process 4242\); bundle {1}''s run starts now\.$' -f ('a' * 12), ('c' * 12))
+        $result.evidence['tookOver'] | Should -Match '^stopped bundle '
+
+        # Nothing stopped: the message stays as it was.
+        $script:run = [pscustomobject]@{ Succeeded = $true; Output = 'DbHubDemo loader finished: role ArcHost'; Error = '' }
+        $quiet = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName 'archost01' -BundleSha256 ('c' * 64) -ChunkCount 1 -Settings @{ role = 'ArcHost' } }
+        $quiet.message | Should -Match 'a new bootstrap generation is running\.$'
+        $quiet.evidence.Contains('tookOver') | Should -BeFalse
     }
 }
 
@@ -318,6 +524,50 @@ Describe 'Invoke-DemoDeploymentTrack' {
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add('monitoring'); New-TestResult 'T1.SQLVM.MONITORING' }
         # Phase 28: the VM's extensions settle before its artifacts and its loader (brief item 14); its own tests are in DbHubDemo.OneCommand.Tests.ps1.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith { [pscustomobject]@{ Settled = $true; Results = @() } }
+    }
+
+    It 'says on the console and the status page why a resumed run sends a VM''s artifacts again (live finding, 2026-11-06)' {
+        $script:state.BundleSentTo = @('sqlvm01')
+        $script:state.RunnerSentTo = @('sqlvm01')
+        $note = 'The bootstrap bundle changed since the last run (archost01 has aaaaaaaaaaaa; this checkout builds cccccccccccc), so it''s sent again, and the loader runs again.'
+        $script:context['ResendNote'] = @{ T2 = $note }
+        $script:context['ProgressPath'] = Join-Path -Path $TestDrive -ChildPath 'progress-resend.json'
+        $script:context['T2Source'] = 'build'
+        $script:progressSteps = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:progressSteps.Add([pscustomobject]@{ Id = @($Id) -join ','; State = $State; Message = $Message }) }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts', 'Bootstraps') }
+        $outcome.Status | Should -Be 'Pass'
+        $script:calls | Should -Contain 'chunks archost01 bootstrap bundle+workload runner 8'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq ('Track T2: Artifacts. {0}' -f $note) }
+        $artifacts = @($script:progressSteps | Where-Object { $_.Id -eq 'T2.Artifacts' })
+        $artifacts[0].State | Should -Be 'Running'
+        $artifacts[0].Message | Should -Be $note
+        $artifacts[-1].State | Should -Be 'Done'
+        $artifacts[-1].Message | Should -Match ('^{0} Done in ' -f [regex]::Escape($note))
+        # Only the Artifacts step says it; the loader's step reads as before.
+        @($script:progressSteps | Where-Object { $_.Id -eq 'T2.Bootstraps' -and $_.State -eq 'Running' })[0].Message | Should -BeNullOrEmpty
+    }
+
+    It 'takes a VM off the bundle''s record when its loader found the chunks unusable, so the next run sends them again (2026-11-06)' {
+        $script:removed = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith {
+            if ($PesterBoundParameters['RemoveBundleVm']) {
+                $script:removed.Add([string]$PesterBoundParameters['RemoveBundleVm'])
+            }
+        }
+        $script:context['T2Source'] = 'build'
+        foreach ($case in @(
+                @{ Error = 'DbHubDemo loader failed: The bundle in C:\ProgramData\DbHubDemo\downloads\aaaaaaaaaaaa is incomplete (2 expected): missing chunk(s) 2.'; Removed = @('archost01') }
+                @{ Error = 'DbHubDemo loader failed: Bundle SHA-256 mismatch: expected aaaa, got bbbb. The joined file and the chunks were deleted and nothing was installed.'; Removed = @('archost01') }
+                @{ Error = 'DbHubDemo loader failed: icacls failed with exit code 5.'; Removed = @() }
+            )) {
+            $script:removed.Clear()
+            $script:loaderError = $case.Error
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoBootstrapLoaderRun -MockWith { New-DemoResult -CheckId 'INFRA.BOOTSTRAP.LOADER_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('The bootstrap loader on archost01 failed: {0}' -f $script:loaderError) -Evidence @{ notStarted = $false; error = $script:loaderError } }
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+            $outcome.Status | Should -Be 'Fail'
+            @($script:removed) | Should -Be $case.Removed -Because $case.Error
+        }
     }
 
     It 'restores a golden T2 host: passwords and the reset first, then its artifacts, loader, onboarding with -Force, profile, and telemetry' {
@@ -465,7 +715,9 @@ Describe 'Invoke-DemoDeploymentTrack' {
 
     It 'cleans up what an earlier guided stop left open at the end of the T2 step: after -NoWaitForT2, on a golden redeploy, and once when the guided stop isn''t needed (Phase 28 review)' {
         # The review: a rerun after a Ctrl+C at the guided stop, with setup finished meanwhile, could end DONE with Bastion
-        # up and the handed-over host password valid.
+        # up and the handed-over host password valid. Only PaygWizard mode has a guided stop (JumpstartImage, the default
+        # since 2026-11-05, has none; checked at the end).
+        $config['t2SqlInstallMode'] = 'PaygWizard'
         Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); $script:state.HostPasswordUtc = ''; @() }
         $cleanups = { @($script:calls | Where-Object { $_ -eq 'cleanup' }).Count }
 
@@ -505,6 +757,12 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
         & $cleanups | Should -Be 0
         $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' } | Should -BeNullOrEmpty
+
+        # JumpstartImage: the same wait has no guided stop at all.
+        $config['t2SqlInstallMode'] = 'JumpstartImage'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Pass'
+        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' } | Should -BeNullOrEmpty
     }
 
     It 'runs the Fabric track: notebooks and dashboard, the history report, then the Fabric app step' {
@@ -556,9 +814,10 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:warned[0] | Should -Match '^The monitoring step failed: Track T1 stopped at Monitoring: A network error reached'
     }
 
-    It 'gives the optional Insights app the workspace the Fabric step resolved, and shows its actual reason, never a Fail, on the status page (Phase 28 live finding)' {
+    It 'gives the Insights app the workspace the Fabric step resolved, and shows its actual reason as Failed, while the track passes (Phase 28 live finding; 2026-11-05)' {
         # Live: the app's own lookup by name of the workspace just created failed, and the page showed Skipped with a
-        # status of Fail and a generic message about tenant settings that were on.
+        # status of Fail and a generic message about tenant settings that were on. Since 2026-11-05 the app is part of
+        # every deployment: when it isn't created, its row is Failed with the actual reason, never Skipped or Optional.
         $workspaceId = '44444444-4444-4444-4444-444444444444'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith {
             New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Created the Fabric workspace.' -Evidence ([ordered]@{ workspaceId = '44444444-4444-4444-4444-444444444444'; source = 'created' })
@@ -574,15 +833,87 @@ Describe 'Invoke-DemoDeploymentTrack' {
         InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
         $script:context['ProgressPath'] = $progress
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
-        $outcome.Status | Should -Be 'Pass' -Because 'the optional app never stops the track'
+        $outcome.Status | Should -Be 'Pass' -Because 'the app never stops the track'
         $script:appWorkspace | Should -Be $workspaceId
         $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
         $app = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Fabric.App') { $item } } })[0]
-        $app['state'] | Should -Be 'Skipped'
+        $app['state'] | Should -Be 'Failed'
         $app['status'] | Should -Be 'Manual action required'
-        $app['message'] | Should -Match ([regex]::Escape('FABRIC.APP.SIGNIN: The Rayfin CLI isn''t signed in'))
+        $app['message'] | Should -Match ([regex]::Escape('It wasn''t created: FABRIC.APP.SIGNIN: The Rayfin CLI isn''t signed in'))
         $app['message'] | Should -Match ([regex]::Escape('./scripts/configure-fabric-app.ps1 -SignIn'))
         $app['message'] | Should -Not -Match 'tenant settings' -Because 'nothing says the tenant settings are the cause'
+        $app['message'] | Should -Not -Match '(?i)optional'
+    }
+
+    It 'keeps the Fabric track''s outcome and the other steps'' rows whatever the Insights app''s step does: <Name> (2026-11-05)' -ForEach @(
+        @{ Name = 'an exception'; Expected = 'The Insights app step stopped: The stage folder is locked by another process'; Network = $false }
+        @{ Name = 'a network error'; Expected = 'A network error reached api\.fabric\.microsoft\.com'; Network = $true }
+        @{ Name = 'a timeout'; Expected = 'node did not finish within 1200 seconds'; Network = $false }
+        @{ Name = 'a sign-in that didn''t happen'; Expected = 'FABRIC\.APP\.SIGNIN: The Rayfin CLI isn''t signed in'; Network = $false }
+        @{ Name = 'an error in the workspace''s lookup around it'; Expected = 'The workspace ID couldn''t be read'; Network = $false }
+    ) {
+        $script:warned = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ($PesterBoundParameters['Level'] -eq 'Warning') { $script:warned.Add([string]$PesterBoundParameters['Message']) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.REPORT' }
+        $script:appCase = $Name
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResolvedWorkspaceId -MockWith {
+            if ($script:appCase -eq 'an error in the workspace''s lookup around it') {
+                throw [System.FormatException]::new('The workspace ID couldn''t be read.')
+            }
+            ''
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith {
+            switch ($script:appCase) {
+                'an exception' { throw [System.InvalidOperationException]::new('The stage folder is locked by another process.') }
+                'a network error' {
+                    $failure = [System.Net.Http.HttpRequestException]::new('A network error reached api.fabric.microsoft.com on each of 4 attempts: The SSL connection could not be established.')
+                    throw $failure
+                }
+                'a timeout' {
+                    & (Get-Module -Name DbHubDemo) { ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code -1, 1200 s): node did not finish within 1200 seconds and was stopped.') }
+                }
+                default {
+                    & (Get-Module -Name DbHubDemo) {
+                        ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Rayfin CLI isn''t signed in, so the app can''t be deployed unattended.')
+                        ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'Not deployed: FABRIC.APP.SIGNIN needs attention first.')
+                    }
+                }
+            }
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $script:context['ProgressPath'] = $progress
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Pass' -Because ('{0} in the app''s step never stops the track' -f $Name)
+        $outcome.Steps | Should -Be @('Fabric')
+        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.TRACK.FABRIC' } | Should -BeNullOrEmpty
+        @($outcome.Results | Where-Object { $_.status -eq 'Fail' }).Count | Should -Be 0
+        $app = @($outcome.Results | Where-Object { InModuleScope DbHubDemo -Parameters @{ R = $_ } { Test-DemoInsightsAppRecord -Result $R } })
+        $app.Count | Should -BeGreaterThan 0
+        @($app | Where-Object { [string]$_.evidence.nonBlocking -ne 'insightsApp' -and $_.checkId -notlike 'FABRIC.APP.*' }).Count | Should -Be 0
+        if ($Network) {
+            @($app | Where-Object { [bool]$_.evidence.networkError }).Count | Should -Be 1
+            @($app | ForEach-Object { [string]$_.remediation }) -join ' ' | Should -Not -Match 'deploy\.ps1'
+        }
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $rows = @{}
+        foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { $rows[[string]$item['id']] = $item } }
+        $rows['Fabric.App']['state'] | Should -Be 'Failed'
+        $rows['Fabric.App']['message'] | Should -Match $Expected
+        $rows['Fabric.Items']['state'] | Should -Be 'Done'
+        $rows['Fabric.Report']['state'] | Should -Be 'Done'
+        # The console says so at once, and that the run goes on; no line says the Fabric step failed.
+        @($script:warned | Where-Object { $_ -like 'The Insights app step failed; it doesn''t block DONE, and the deployment goes on.*' }).Count | Should -Be 1
+        @($script:warned | Where-Object { $_ -like 'The Fabric step failed*' }).Count | Should -Be 0
+    }
+
+    It 'still fails the Fabric track when the history report fails, whatever the Insights app''s step does' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.SEMANTICMODEL.REFRESH' 'Fail' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Deployed.' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Fail'
     }
     It 'reconnects a golden snapshot''s source host on an existing image-built archost01' {
         $script:context['T2Source'] = 'existing-build'
@@ -678,6 +1009,27 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps', 'Monitoring') }
         $outcome.Status | Should -Be 'Pass'
         @($script:calls | Where-Object { $_ -like 'monitoring*' }) | Should -Be @('monitoring wait 0 grace ', 'monitoring wait 20 grace 5')
+    }
+
+    It 'adds the AutoLogonSecret step''s note to DEPLOY.T1.READY: Pass for the lone LSA secret, Warning when automatic sign-in was armed (ADR 0009)' {
+        $script:state.BundleSentTo = @('sqlvm01')
+        $script:t1Health = [pscustomobject]@{ state = 'Ready'; message = 'Every step is in the desired state.'; signInFound = 'LoneSecret'; signInNote = 'Deleted the LSA secret DefaultPassword that Azure''s provisioning leaves; automatic sign-in was off.' }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { [pscustomobject]@{ Health = $script:t1Health; Polls = 1 } }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps') }
+        $ready = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T1.READY' }
+        $ready.status | Should -Be 'Pass'
+        $ready.message | Should -Be 'T1''s bootstrap is Ready: Every step is in the desired state. Deleted the LSA secret DefaultPassword that Azure''s provisioning leaves; automatic sign-in was off.'
+
+        $script:t1Health = [pscustomobject]@{ state = 'Ready'; message = 'Every step is in the desired state.'; signInFound = 'Armed'; signInNote = 'Windows automatic sign-in was armed on sqlvm01, which nothing in the demo does; the cleanup turned it off and deleted its LSA secret and Winlogon values.' }
+        $armed = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps') }
+        $warned = $armed.Results | Where-Object { $_.checkId -eq 'DEPLOY.T1.READY' }
+        $warned.status | Should -Be 'Warning'
+        $warned.message | Should -Match 'was armed on sqlvm01'
+
+        # A bundle from before the step (no signIn in health.json): as before.
+        $script:t1Health = [pscustomobject]@{ state = 'Ready'; message = 'Every step is in the desired state.' }
+        $plain = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Bootstraps') }
+        ($plain.Results | Where-Object { $_.checkId -eq 'DEPLOY.T1.READY' }).message | Should -Be 'T1''s bootstrap is Ready: Every step is in the desired state.'
     }
 
     It 'checks T1''s missing telemetry again, after checking its plugin once, before the Telemetry step fails (Phase 28 live finding, 2026-10-30)' {
@@ -900,15 +1252,21 @@ Describe 'Invoke-DemoParallelDeployment' {
             [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true }
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoKeyVaultSetting -MockWith { [pscustomobject]@{ Enabled = $false } }
-        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
-        Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { [pscustomobject]@{ Path = 'runner.zip'; Sha256 = ('d' * 64); SizeBytes = 20 } }
+        # The nightly safety stop's setup (ADR 0024), on every run that isn't -WhatIf.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -MockWith { $script:calls.Add('safety stop'); New-TestResult 'SAFETYSTOP.SCHEDULE' }
+        # What this checkout builds is what New-TestState records for both VMs: a resume sends nothing again unless a test
+        # changes it (2026-11-06).
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('a' * 64); SizeBytes = 10 } }
+        Mock -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -MockWith { [pscustomobject]@{ Path = 'runner.zip'; Sha256 = ('b' * 64); SizeBytes = 20 } }
+        # What the Fabric track's app step adds to its records; nothing unless a test says so.
+        $script:fabricAppRecords = @()
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
             $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
             $ready = switch ($Track) { 'T1' { [ordered]@{ T1 = '2026-10-22T15:00:00Z'; T3 = '2026-10-22T15:01:00Z' } } 'T2' { [ordered]@{ T2 = '2026-10-22T15:10:00Z' } } default { [ordered]@{} } }
             $trackResults = switch ($Track) {
                 'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) }
                 'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2')) }
-                default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') }
+                default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') + @($script:fabricAppRecords) }
             }
             [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = $ready; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
         }
@@ -930,6 +1288,37 @@ Describe 'Invoke-DemoParallelDeployment' {
         # Phase 28 live finding: what's stopped starts before anything needs it; here both VMs run unless a test says not.
         $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power[$VmName] }
+        # The activity profiles' Run Command (2026-11-03): the interim baseline on VMs that already run, and the switch.
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            $wait = [int]$PesterBoundParameters['WaitSeconds']
+            $script:calls.Add(('switch {0}={1} wait={2}' -f (@($Target) -join ','), $ProfileName, $wait))
+            foreach ($item in $Target) { [pscustomobject]@{ Target = $item; VmName = $(if ($item -eq 'T2') { 'archost01' } else { 'sqlvm01' }); Outcome = $(if ($wait -eq 0) { 'Sent' } else { 'Set' }); Detail = ''; Data = $null; Seconds = 9 } }
+        }
+        # The wait for the interim baseline on a VM this run started (re-review of PR 16, 2026-11-04).
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoProfileRunCommand -MockWith {
+            $script:calls.Add(('interim {0}' -f (@($Record | ForEach-Object { $_.Target }) -join ',')))
+            foreach ($item in $Record) { [pscustomobject]@{ Target = $item.Target; VmName = $item.VmName; Outcome = 'Set'; Detail = ''; Data = $null; Seconds = 30 } }
+        }
+        # The Insights app's sign-in (2026-11-05) never starts for real here: already signed in.
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith {
+            $script:calls.Add('app sign-in')
+            [pscustomobject]@{ Process = $null; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes(15); TimeoutMinutes = 15; Done = $true; Reported = $false; Result = (New-TestResult 'DEPLOY.FABRIC.APPSIGNIN') }
+        }
+        # Nor does the read of its sign-in that starts before the guard (2026-11-06).
+        $script:signInCheck = [pscustomobject]@{ TenantId = '66666666-7777-8888-9999-000000000000'; Via = 'npx'; Run = $null; Result = $null }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignInCheck -MockWith { $script:calls.Add('app sign-in check'); $script:signInCheck }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoRayfinSignInStatus -MockWith {
+            if ($null -ne $Status) {
+                $script:calls.Add('app sign-in check stop')
+            }
+        }
+        # The history report's snapshot at the end of the run (2026-11-06) has its own tests (DbHubDemo.HistorySnapshot.Tests.ps1);
+        # here it notes when it ran and what it was given, and never reaches Fabric.
+        $script:historyStatus = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -MockWith {
+            $script:calls.Add(('history done={0} skipFabric={1} whatIf={2}' -f [bool]$PesterBoundParameters['DoneChecked'], [bool]$PesterBoundParameters['SkipFabric'], [bool]$PesterBoundParameters['WhatIfRun']))
+            New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status $script:historyStatus -Message ('history {0}' -f $script:historyStatus) -Evidence @{ nonBlocking = 'historySnapshot' }
+        }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -948,6 +1337,160 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         @($script:calls | Where-Object { $_ -match '^state .*Stage' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'starts the Insights app''s sign-in before preflight, lets nothing wait for it, and settles it once the tracks are done (2026-11-05)' {
+        # The user: "Make sure a failure doesn't stop the deployment of everything. It should move on and continue."
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith {
+            $script:calls.Add('app sign-in')
+            [pscustomobject]@{ Process = $null; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes(15); TimeoutMinutes = 15; Done = $false; Reported = $false; Result = $null }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoFabricAppSignIn -MockWith {
+            if ($Final) {
+                $script:calls.Add('app sign-in final')
+                return (New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message 'Nobody finished the Rayfin CLI''s sign-in within 15 minutes, so it was stopped.')
+            }
+            $script:calls.Add('app sign-in tick')
+        }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoFabricAppSignIn -MockWith { $script:calls.Add('app sign-in stop') }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $calls = @($script:calls)
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeGreaterOrEqual 0
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeLessThan ([array]::IndexOf($calls, 'preflight'))
+        # Preflight, the template, and every track ran while it was still open.
+        $calls | Should -Contain 'template disk=golden'
+        $calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        $calls | Should -Contain 'track Fabric: Fabric'
+        [array]::IndexOf($calls, 'app sign-in final') | Should -BeGreaterThan ([array]::IndexOf($calls, 'track Fabric: Fabric'))
+        $calls | Should -Contain 'app sign-in stop'
+        $signIn = @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' })
+        $signIn.Count | Should -Be 1
+        $signIn[0].status | Should -Be 'Warning'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass' -Because 'a sign-in that didn''t finish never fails the run'
+    }
+
+    It 'settles the sign-in''s Warning from the Fabric track''s app records, so its row and the app''s agree (live, 2026-11-06)' {
+        # The live run: nobody answered the window, the read at its deadline said "not signed in", and the app's step,
+        # starting at the same moment, found the CLI signed in and deployed the app.
+        $newState = { [pscustomobject]@{ Process = $null; TenantId = '66666666-7777-8888-9999-000000000000'; StartedUtc = [DateTime]::UtcNow; DeadlineUtc = [DateTime]::UtcNow.AddMinutes(15); TimeoutMinutes = 15; Done = $false; Reported = $false; Result = $null } }
+        $script:appSignInState = & $newState
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:calls.Add('app sign-in'); $script:appSignInState }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoFabricAppSignIn -MockWith {
+            if ($Final -and -not $SignIn.Done) {
+                $SignIn.Result = New-DemoResult -CheckId 'DEPLOY.FABRIC.APPSIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Warning' -Message 'Nobody finished the Rayfin CLI''s sign-in within 15 minutes, so it was stopped. The deployment went on; without the sign-in the Insights app isn''t created, and its step says why.'
+                $SignIn.Done = $true
+                $SignIn.Reported = $true
+                return $SignIn.Result
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoFabricAppSignIn -MockWith { }
+        $script:fabricAppRecords = @((New-TestResult 'FABRIC.APP.SIGNIN'), (New-TestResult 'FABRIC.APP.DEPLOY'))
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $signIn = @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' })
+        $signIn.Count | Should -Be 1
+        $signIn[0].status | Should -Be 'Pass'
+        $signIn[0].message | Should -Match 'the Insights app''s step found it signed in and used that sign-in'
+        $signIn[0].evidence['earlierStatus'] | Should -Be 'Warning'
+        [object]::ReferenceEquals($signIn[0], $script:appSignInState.Result) | Should -BeTrue
+
+        # An app step that found no sign-in either leaves the Warning as it was.
+        $script:appSignInState = & $newState
+        $script:fabricAppRecords = @(New-TestResult 'FABRIC.APP.SIGNIN' 'Manual action required')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APPSIGNIN' }).status | Should -Be 'Warning'
+    }
+
+    It 'starts no sign-in for a run without the Fabric track, or a what-if' {
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -MockWith { $script:calls.Add('app sign-in') }
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -SkipFabric })
+        $script:calls | Should -Not -Contain 'app sign-in'
+        $script:calls | Should -Not -Contain 'app sign-in check' -Because 'nothing reads the sign-in either'
+        $script:calls | Should -Contain 'preflight'
+    }
+
+    It 'reads the Rayfin CLI''s sign-in from before the subscription guard, so the read runs alongside it, and the sign-in''s start takes that read (2026-11-06)' {
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { $script:calls.Add('guard'); New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $calls = @($script:calls)
+        [array]::IndexOf($calls, 'app sign-in check') | Should -Be 0 -Because 'it starts first'
+        [array]::IndexOf($calls, 'guard') | Should -Be 1
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeGreaterThan 1
+        [array]::IndexOf($calls, 'app sign-in') | Should -BeLessThan ([array]::IndexOf($calls, 'preflight'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignInCheck -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppSignIn -Times 1 -Exactly -ParameterFilter { [object]::ReferenceEquals($Check, $script:signInCheck) }
+        $calls | Should -Not -Contain 'app sign-in check stop'
+    }
+
+    It 'reads nothing when the Fabric track can''t run, and ends the read when the guard stops the run (2026-11-06)' {
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -StopAfter 'Infrastructure' })
+        $script:calls | Should -Not -Contain 'app sign-in check'
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { throw 'Subscription guard: check ''account'' failed: the Azure CLI has no sign-in for the subscription. Nothing was changed.' }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        ($results | Where-Object { $_.checkId -eq 'PREFLIGHT.GUARD.CONTEXT' }).status | Should -Be 'Fail'
+        @($script:calls | Where-Object { $_ -eq 'app sign-in check' }).Count | Should -Be 1
+        $script:calls | Should -Contain 'app sign-in check stop'
+        $script:calls | Should -Not -Contain 'app sign-in'
+    }
+
+    It 'switches what the tracks left on the interim baseline to business-day only after DONE''s reads, and keeps an explicit baseline (2026-11-03)' {
+        # The tracks set baseline first and note the VMs; this process switches them once its own Run Commands are done.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
+            $vm = switch ($Track) { 'T1' { 'sqlvm01' } 'T2' { 'archost01' } default { '' } }
+            if ($vm) {
+                & (Get-Module -Name 'DbHubDemo') { param($Name) Register-DemoActivitySwitch -VmName $Name } $vm
+            }
+            $ready = switch ($Track) { 'T1' { [ordered]@{ T1 = '2026-10-22T15:00:00Z'; T3 = '2026-10-22T15:01:00Z' } } 'T2' { [ordered]@{ T2 = '2026-10-22T15:10:00Z' } } default { [ordered]@{} } }
+            $trackResults = switch ($Track) {
+                'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3'), (New-TestResult 'DEPLOY.PROFILE_T1'), (New-TestResult 'DEPLOY.PROFILE_T3')) }
+                'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2'), (New-TestResult 'DEPLOY.PROFILE_T2')) }
+                default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') }
+            }
+            [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = $ready; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            $wait = [int]$PesterBoundParameters['WaitSeconds']
+            $script:calls.Add(('switch {0}={1} wait={2}' -f (@($Target) -join ','), $ProfileName, $wait))
+            foreach ($item in $Target) { [pscustomobject]@{ Target = $item; VmName = $(if ($item -eq 'T2') { 'archost01' } else { 'sqlvm01' }); Outcome = $(if ($wait -eq 0) { 'Sent' } else { 'Set' }); Detail = ''; Data = $null; Seconds = 9 } }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $calls = @($script:calls)
+        # Both VMs already ran, so they got the interim baseline before the tracks' Run Commands, without waiting.
+        $quiet = [array]::IndexOf($calls, 'switch T1,T3,T2=baseline wait=0')
+        $quiet | Should -BeGreaterOrEqual 0
+        $quiet | Should -BeLessThan ([array]::IndexOf($calls, 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'))
+        $switch = [array]::IndexOf($calls, 'switch T1,T3,T2=business-day wait=180')
+        $switch | Should -BeGreaterThan ([array]::IndexOf($calls, 'fabric items')) -Because 'DONE''s reads come first'
+        [array]::IndexOf($calls, 'fabric items') | Should -BeGreaterOrEqual 0
+        @($calls | Where-Object { $_ -like 'switch *' }).Count | Should -Be 2
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        foreach ($target in 'T1', 'T3', 'T2') {
+            ($results | Where-Object { $_.checkId -eq ('DEPLOY.INCIDENTS_{0}' -f $target) }).status | Should -Be 'Pass'
+        }
+        [array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.TIMING'))
+        [array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+
+        # An explicit baseline is what the tracks set, so there's nothing to switch.
+        $script:calls.Clear()
+        $quiet = New-TestConfig
+        $quiet['activityProfile'] = 'baseline'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $quiet } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        @($script:calls | Where-Object { $_ -like 'switch *' }) | Should -BeNullOrEmpty
+        @($results | Where-Object { $_.checkId -like 'DEPLOY.INCIDENTS_*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'says once that a resumed run without preflight uses the default, business-day, for a configuration without activityProfile (2026-11-03)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Bootstraps'; $state }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        $unset = New-TestConfig
+        $unset.Remove('activityProfile')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $unset } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+        $script:calls | Should -Not -Contain 'preflight'
+        $notice = @($results | Where-Object { $_.checkId -eq 'DEPLOY.ACTIVITYPROFILE' })
+        $notice.Count | Should -Be 1
+        $notice[0].message | Should -Match '^activityProfile isn''t set, so this run uses the new default, business-day \(incidents every hour\); set it to baseline for the quieter demo\.'
     }
 
     It 'reads T3''s extended property from T1 for the gate when the run has no T3.PROPERTY (a resumed run)' {
@@ -985,6 +1528,17 @@ Describe 'Invoke-DemoParallelDeployment' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -StopAfter 'Infrastructure' -InProcess })
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).message | Should -Match 'Infrastructure'
+        # The nightly safety stop comes with what the template deployed, as in a full run (ADR 0024).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
+        ($results | Where-Object { $_.checkId -eq 'SAFETYSTOP.SCHEDULE' }).status | Should -Be 'Pass'
+    }
+
+    It 'sets up the nightly safety stop once, after the template''s handoff and before the tracks (ADR 0024)' {
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
+        $script:calls.IndexOf('safety stop') | Should -BeGreaterThan $script:calls.IndexOf('template disk=golden')
+        $script:calls.IndexOf('safety stop') | Should -BeLessThan $script:calls.IndexOf(@($script:calls | Where-Object { $_ -like 'track *' })[0])
+        ($results | Where-Object { $_.checkId -eq 'SAFETYSTOP.SCHEDULE' }).status | Should -Be 'Pass'
     }
 
     It 'leaves the clock running when T2 builds in the background' {
@@ -1015,6 +1569,120 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Validation'; $state }
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
         $script:calls | Should -Contain 'preflight'
+    }
+
+    It 'takes the history report''s snapshot last: after DONE''s checks and the switch, before DEPLOY.SUMMARY, and as the deploying run''s own step (2026-11-06)' {
+        # The tracks set baseline and note the VMs, so the switch to business-day comes after DONE's reads (2026-11-03).
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
+            $vm = switch ($Track) { 'T1' { 'sqlvm01' } 'T2' { 'archost01' } default { '' } }
+            if ($vm) {
+                & (Get-Module -Name 'DbHubDemo') { param($Name) Register-DemoActivitySwitch -VmName $Name } $vm
+            }
+            $trackResults = switch ($Track) {
+                'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) }
+                'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2')) }
+                default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') }
+            }
+            [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath 'progress.json' })
+        $calls = @($script:calls)
+        $history = [array]::IndexOf($calls, 'history done=True skipFabric=False whatIf=False')
+        $history | Should -BeGreaterThan ([array]::IndexOf($calls, 'fabric items')) -Because 'DONE''s checks come first'
+        $history | Should -BeGreaterThan ([array]::IndexOf($calls, 'switch T1,T3,T2=business-day wait=180')) -Because 'the notebook never touches the VMs, so their incidents don''t wait for Spark'
+        [array]::IndexOf($calls, 'switch T1,T3,T2=business-day wait=180') | Should -BeGreaterOrEqual 0
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.TIMING'))
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 1 -Exactly -ParameterFilter {
+            [bool]$PesterBoundParameters['DoneChecked'] -and -not [bool]$PesterBoundParameters['SkipFabric'] -and -not [bool]$PesterBoundParameters['WhatIfRun'] -and $ProgressPath -eq 'progress.json' -and [string]$ActivityProfile.Name -eq 'business-day' -and
+            @($Requirement) -contains 'TELEMETRY.T2' -and @($Requirement) -contains 'FABRIC.ITEMS.REQUIRED' -and
+            @($Result | Where-Object { [string]$_.checkId -eq 'TELEMETRY.T1' -and [string]$_.status -eq 'Pass' }).Count -eq 1 -and
+            @($Result | Where-Object { [string]$_.checkId -like 'DEPLOY.INCIDENTS_*' }).Count -gt 0
+        }
+    }
+
+    It 'never lets the snapshot change the summary or the clock: a Warning stays a Warning (2026-11-06)' {
+        $script:historyStatus = 'Warning'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.HISTORY' }).status | Should -Be 'Warning'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+    }
+
+    It 'tells the snapshot when DONE''s checks didn''t run, passes -SkipFabric on, and takes none on a run that stops before its validation (2026-11-06)' {
+        # T2 builds in the background: the tracks aren't all finished, so DONE's checks don't run.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $status = if ($Track -eq 'T2') { 'Background' } else { 'Pass' }
+            $trackResults = if ($Track -eq 'T2') { @(New-DemoResult -CheckId 'DEPLOY.T2.BACKGROUND' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'building' -Remediation 'deploy.ps1 -FromStage T2') } elseif ($Track -eq 'T1') { @((New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) } else { @() }
+            [pscustomobject]@{ Track = $Track; Status = $status; Steps = @(); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
+        }
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $script:calls | Should -Contain 'history done=False skipFabric=False whatIf=False'
+
+        $script:calls.Clear()
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -SkipFabric })
+        $script:calls | Should -Contain 'history done=False skipFabric=True whatIf=False'
+
+        $script:calls.Clear()
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -StopAfter 'Monitoring' })
+        @($script:calls | Where-Object { $_ -like 'history *' }) | Should -BeNullOrEmpty
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TRACK.T1' }) | Should -Not -BeNullOrEmpty -Because 'the tracks ran; only the validation, and the snapshot after it, didn''t'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 2 -Exactly -Because 'only the two runs above took it'
+    }
+
+    It 'reports the snapshot Not selected with -WhatIf, at the template''s what-if, and runs nothing after it (2026-11-06)' {
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -WhatIf })
+        $script:calls | Should -Contain 'history done=False skipFabric=False whatIf=True'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $ids[-1] | Should -Be 'DEPLOY.FABRIC.HISTORY'
+        [array]::IndexOf($ids, 'DEPLOY.STAGE.INFRASTRUCTURE') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY'))
+    }
+
+    It 'sends a VM''s changed artifacts again on a plain rerun, with its loader and the steps after them, and says why (live finding, 2026-11-06)' {
+        # Live: a fix to the host's bootstrap was pulled while T2 built its guest, and the plain rerun that NOT DONE named
+        # resumed T2 at its T2 step, so archost01 kept the old bundle.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state.TrackFabric = 'Fabric'; $state }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
+        $script:resendNotes = @{}
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
+            $script:calls.Add(('track {0}: {1}' -f $Track, ($Step -join ',')))
+            $script:resendNotes[$Track] = [string](@($Context['ResendNote']) | ForEach-Object { $_[$Track] })
+            [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = @() }
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume -ProgressPath $Path })
+        $script:calls | Should -Not -Contain 'preflight'
+        $script:calls | Should -Contain 'track T1: Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
+        $script:calls | Should -Contain 'track T2: Artifacts,Bootstraps,T2,Telemetry'
+        @($script:calls | Where-Object { $_ -like 'track Fabric*' }) | Should -BeNullOrEmpty -Because 'the Fabric track has nothing to do with the bundle'
+        # The records go back before any track writes, so a stop before the Artifacts step sends them again next time.
+        @($script:calls | Where-Object { $_ -match '^state .*TrackT2' }).Count | Should -BeGreaterThan 0
+        foreach ($vm in 'SQLVM01', 'ARCHOST01') {
+            ($results | Where-Object { $_.checkId -eq ('DEPLOY.ARTIFACTS.CHANGED_{0}' -f $vm) }).status | Should -Be 'Pass'
+        }
+        $script:resendNotes['T2'] | Should -Match '^The bootstrap bundle changed since the last run \(archost01 has aaaaaaaaaaaa; this checkout builds cccccccccccc\), so it''s sent again'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'T2: the bootstrap bundle changed since the last run*' }
+        # The status page says why on the Artifacts row, and what ran before it as finished.
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $rows = @{}
+        foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { $rows[[string]$item['id']] = $item } }
+        $rows['T2.Artifacts']['state'] | Should -Be 'Pending'
+        $rows['T2.Artifacts']['message'] | Should -Be $script:resendNotes['T2']
+        $rows['T2.HostBuild']['message'] | Should -Not -Match 'previous run'
+    }
+
+    It 'checks the artifacts only on a resume, never with -FromStage' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state }
+        Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('c' * 64); SizeBytes = 10 } }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Validation' } | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -Times 0 -Exactly
+        $script:calls | Should -Contain 'track T2: Telemetry'
     }
 
     Context 'track records across runs (Phase 28 live finding, 2026-10-30)' {
@@ -1185,7 +1853,7 @@ Describe 'Invoke-DemoParallelDeployment' {
             New-DemoResult -CheckId 'PREFLIGHT.T4.CAPABILITY' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message 'westus3 lists neither Burstable size.' -Evidence @{ startSku = 'Standard_D2ds_v5' }
             New-DemoResult -CheckId 'PREFLIGHT.T4.FALLBACK' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message 'The fallback fits both ceilings.' -Evidence @{ startSku = 'Standard_D2ds_v5' }
         }
-        $script:note = 'T4 created as General Purpose Standard_D2ds_v5 because Burstable sizes were refused here; about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API).'
+        $script:note = 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API).'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
             $script:calls.Add(('template start={0}' -f (Get-Variable -Name 'T4StartSku' -ValueOnly -ErrorAction SilentlyContinue)))
             [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $true; T4SkuName = 'Standard_D2ds_v5'; T4Note = $script:note }
@@ -1288,6 +1956,13 @@ Describe 'Invoke-DemoParallelDeployment' {
             @($calls | Where-Object { $_ -like 'running archost01*' }) | Should -BeNullOrEmpty -Because 'a running VM is only read'
             $calls | Should -Not -Contain 'source release' -Because 'archost01 wasn''t started'
             $calls | Should -Not -Contain 't1 monitoring' -Because 'T1''s own Monitoring step runs in this run'
+            # sqlvm01, which this run started, gets the interim baseline as soon as it runs, and the run waits for it; then
+            # archost01, which already ran: all before the template and the tracks (review of PR 16, and its re-review).
+            $calls.IndexOf('switch T1,T3=baseline wait=0') | Should -Be ($calls.IndexOf('running sqlvm01 requested=True') + 1)
+            $calls.IndexOf('interim T1,T3') | Should -Be ($calls.IndexOf('switch T1,T3=baseline wait=0') + 1)
+            $calls.IndexOf('switch T2=baseline wait=0') | Should -Be ($calls.IndexOf('interim T1,T3') + 1)
+            $calls.IndexOf('switch T2=baseline wait=0') | Should -BeLessThan $calls.IndexOf('template disk=golden')
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.INTERIM_T1' }).status | Should -Be 'Pass'
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).status | Should -Be 'Pass'
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
         }

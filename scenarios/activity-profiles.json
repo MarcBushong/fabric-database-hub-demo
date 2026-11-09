@@ -39,6 +39,39 @@
         { "target": "T4", "scenario": "cpu-pressure", "startMinute": 42, "durationMinutes": 6 }
       ]
     },
+    "showcase": {
+      "description": "Run all in the control notebook: the baseline plus a 30-minute rotation of bounded incidents on every target, at most two at a time per target, staggered across targets, to fill the Database Hub visuals that can fill within one session (README: What fills each Database Hub visual, and when). T1: blocking, log flushes, deadlocks, and CPU. T2: CPU, memory grants, IO, and parallelism or tempdb. T3: the CPU cap, blocking or deadlocks, network, a missing index, or a plan regression, and log rate. T4: a connection surge, CPU (shorter on Burstable), idle-in-transaction or locking, IO, and, on General Purpose, the missing-index lookups autonomous tuning can recommend indexes for. Each target's cycle starts when its profile is set; some slots run in odd or even cycles, or in one cycle only.",
+      "defaultDurationMinutes": 90,
+      "maxDurationMinutes": 120,
+      "baseline": true,
+      "anchor": "profileStart",
+      "cycleMinutes": 30,
+      "incidents": [
+        { "target": "T1", "scenario": "blocking-chain", "startMinute": 0, "durationMinutes": 10, "concurrency": 2, "intensity": 5, "parameters": { "depth": "4", "escalation": "true" } },
+        { "target": "T1", "scenario": "log-flush-waits", "startMinute": 2, "durationMinutes": 8, "concurrency": 8, "intensity": 8 },
+        { "target": "T1", "scenario": "deadlock-storm", "startMinute": 11, "durationMinutes": 10, "concurrency": 2, "intensity": 6, "parameters": { "shape": "mixed" } },
+        { "target": "T1", "scenario": "cpu-pressure", "startMinute": 22, "durationMinutes": 7, "concurrency": 2, "intensity": 6 },
+        { "target": "T2", "scenario": "cpu-pressure", "startMinute": 2, "durationMinutes": 12, "concurrency": 3, "intensity": 7 },
+        { "target": "T2", "scenario": "memory-grant-pressure", "startMinute": 10, "durationMinutes": 8, "concurrency": 8, "intensity": 6, "parameters": { "grantPercent": "100" } },
+        { "target": "T2", "scenario": "io-pressure", "startMinute": 18, "durationMinutes": 8, "concurrency": 2, "intensity": 6, "parameters": { "scratchMb": "2048" } },
+        { "target": "T2", "scenario": "parallel-scans", "startMinute": 22, "durationMinutes": 7, "concurrency": 4, "intensity": 6, "cycles": "odd", "parameters": { "maxdop": "2" } },
+        { "target": "T2", "scenario": "tempdb-contention", "startMinute": 22, "durationMinutes": 7, "concurrency": 16, "intensity": 8, "cycles": "even" },
+        { "target": "T3", "scenario": "resource-governance", "startMinute": 1, "durationMinutes": 12, "concurrency": 4, "intensity": 7 },
+        { "target": "T3", "scenario": "locking-blocking", "startMinute": 13, "durationMinutes": 10, "concurrency": 3, "intensity": 5, "cycles": "odd" },
+        { "target": "T3", "scenario": "slow-consumer", "startMinute": 15, "durationMinutes": 10, "concurrency": 4, "intensity": 5, "cycles": "1" },
+        { "target": "T3", "scenario": "plan-regression", "startMinute": 15, "durationMinutes": 10, "concurrency": 2, "intensity": 6, "cycles": "3" },
+        { "target": "T3", "scenario": "deadlock-storm", "startMinute": 13, "durationMinutes": 12, "concurrency": 2, "intensity": 7, "cycles": "even" },
+        { "target": "T3", "scenario": "missing-index", "startMinute": 15, "durationMinutes": 9, "concurrency": 2, "intensity": 6, "cycles": "even" },
+        { "target": "T3", "scenario": "log-rate-pressure", "startMinute": 25, "durationMinutes": 5, "concurrency": 2, "intensity": 5, "parameters": { "maxLogMb": "1024" } },
+        { "target": "T4", "scenario": "connection-surge", "startMinute": 0, "durationMinutes": 8, "concurrency": 5, "intensity": 5, "parameters": { "holdSeconds": "90", "overshoot": "2" } },
+        { "target": "T4", "scenario": "cpu-pressure", "startMinute": 8, "durationMinutes": 12, "concurrency": 3, "intensity": 7, "tier": "GeneralPurpose" },
+        { "target": "T4", "scenario": "cpu-pressure", "startMinute": 8, "durationMinutes": 6, "concurrency": 2, "intensity": 6, "tier": "Burstable", "cycles": "odd" },
+        { "target": "T4", "scenario": "idle-in-transaction", "startMinute": 10, "durationMinutes": 10, "concurrency": 3, "intensity": 5, "cycles": "odd" },
+        { "target": "T4", "scenario": "locking-blocking", "startMinute": 10, "durationMinutes": 10, "concurrency": 3, "intensity": 5, "cycles": "even" },
+        { "target": "T4", "scenario": "io-pressure", "startMinute": 20, "durationMinutes": 9, "concurrency": 2, "intensity": 6, "parameters": { "scratchMb": "1024" } },
+        { "target": "T4", "scenario": "missing-index", "startMinute": 20, "durationMinutes": 9, "concurrency": 2, "intensity": 5, "tier": "GeneralPurpose" }
+      ]
+    },
     "incident": {
       "description": "incident:<scenario>: one bounded run of the scenario from the moment the profile is set, with the baseline beside it unless --with-baseline false. The duration defaults to the scenario's default.",
       "defaultDurationMinutes": 10,

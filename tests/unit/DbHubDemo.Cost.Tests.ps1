@@ -67,6 +67,9 @@ BeforeAll {
             @{ productName = 'Azure Database for PostgreSQL Flexible Server Burstable BS Series Compute'; skuName = 'B2S'; meterName = 'B2S'; retailPrice = 0.07; unitOfMeasure = '1 Hour' }
             @{ productName = 'Azure Database for PostgreSQL Flexible Server Burstable BS Series Compute'; skuName = 'B1MS'; meterName = 'B1MS'; retailPrice = 0.02; unitOfMeasure = '1 Hour' }
         )
+        'Flexible Server General Purpose Dadsv5 Series Compute'                               = @(
+            @{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Dadsv5 Series Compute'; skuName = 'vCore'; meterName = 'vCore'; retailPrice = 0.09; unitOfMeasure = '1 Hour' }
+        )
         'Flexible Server General Purpose Ddsv5 Series Compute'                                = @(
             @{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'; skuName = 'vCore'; meterName = 'vCore'; retailPrice = 520.0; unitOfMeasure = '1 Year' }
             @{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'; skuName = 'vCore'; meterName = 'vCore'; retailPrice = 0.09; unitOfMeasure = '1 Hour' }
@@ -135,7 +138,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T4: Burstable compute while running, and storage, its DNS zone, and its Defender plans all month, with the 7-day restart counted' {
         $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'OpenSourceRelationalDatabases'; pricingTier = 'Standard'; subPlan = $null })
-        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_B1ms' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans
         $t4 = @($estimate.Components | Where-Object { $_.Name -match 'T4' })
         ($t4 | Where-Object Name -EQ 'T4 compute (Standard_B1ms)').UnitPrice | Should -Be 0.02 -Because 'the B1MS meter, not another Burstable size'
         ($t4 | Where-Object Name -EQ 'T4 compute (Standard_B1ms)').Basis | Should -Be 'running'
@@ -149,9 +152,23 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.T4AutoRestartWorstCaseMonthly | Should -Be ([System.Math]::Round(0.02 * (730 - 10), 2))
         $monthly = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
         $monthly.message | Should -Match 'T4 \(PostgreSQL, Standard_B1ms\) costs 27\.46 USD a month even while stopped'
-        $monthly.message | Should -Match 'counts against the ceiling until a scheduled daily stop of T4 caps it'
+        $monthly.message | Should -Match 'whether the nightly safety stop is in place wasn''t checked, so the worst case counts it running for the rest of the month: 720 hours, 14\.40 USD of T4 compute'
+        $monthly.message | Should -Match 'To keep the month cheaper: set t4SkuName to Standard_B1ms \(which turns autonomous tuning off\), set t4Enabled to false, or set a lower monthlyCeilingUsd\.'
+        $estimate.T4RestartAssumption | Should -Be 'RestOfMonth'
+        $estimate.T4RestartHours | Should -Be 720
         ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.DEFENDER').message | Should -Match 'OpenSourceRelationalDatabases'
         @($estimate.MissingPrices) | Should -BeNullOrEmpty
+    }
+
+    It 'prices T4''s default, General Purpose Standard_D4ds_v5, as 4 vCore-hours, and the fallback''s Standard_D4ads_v5 from its own series (2026-11-04)' {
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $compute = $estimate.Components | Where-Object Name -EQ 'T4 compute (Standard_D4ds_v5)'
+        $compute.UnitPrice | Should -Be 0.09 -Because 'the hourly vCore meter, not the yearly one'
+        $compute.Quantity | Should -Be 4
+        $estimate.T4AutoRestartWorstCaseMonthly | Should -Be ([System.Math]::Round(0.09 * 4 * (730 - 10), 2))
+        $amd = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D4ads_v5' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        ($amd.Components | Where-Object Name -EQ 'T4 compute (Standard_D4ads_v5)').UnitPrice | Should -Be 0.09
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -ParameterFilter { [uri]::UnescapeDataString($Uri) -match "productName eq 'Azure Database for PostgreSQL Flexible Server General Purpose Dadsv5 Series Compute'" }
     }
 
     It 'prices the T4 size actually configured: the documented B2s fallback, with its own 7-day restart worst case (Phase 24)' {
@@ -175,6 +192,32 @@ Describe 'Get-DemoCostEstimate' {
         @($estimate.MissingPrices) | Should -BeNullOrEmpty
     }
 
+    It 'counts each 7-day restart as about a day where a safety stop is in place, and the rest of the month otherwise (2026-11-04, ADR 0024)' {
+        $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }
+        $counted = [pscustomobject]@{ Counts = $true; Missing = ''; Reason = 'the nightly safety stop is scheduled, its role is assigned, and its last run didn''t fail'; Fix = ''; Evidence = [ordered]@{ counts = $true } }
+        $capped = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $counted
+        # 4 restarts a month (7 days stopped, then up to a day running) of 24 hours each, at 2 vCores x 0.09.
+        $capped.T4RestartHours | Should -Be 96
+        $capped.T4RestartAssumption | Should -Be 'SafetyStop'
+        $capped.T4AutoRestartWorstCaseMonthly | Should -Be ([System.Math]::Round(0.18 * 96, 2))
+        $monthly = $capped.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.message | Should -Match 'and the nightly safety stop is scheduled, its role is assigned, and its last run didn''t fail, so the worst case counts up to 4 restarts a month of about a day each, until the next safety stop: 96 hours, 17\.28 USD of T4 compute, against the ceiling\.'
+        $monthly.evidence.t4RestartAssumption | Should -Be 'SafetyStop'
+        $monthly.evidence.t4RestartHours | Should -Be 96
+
+        $missing = [pscustomobject]@{ Counts = $false; Missing = 'Role'; Reason = 'the nightly safety stop can''t stop T4: its role isn''t assigned (id-dbhub-demo-safetystop doesn''t hold "DbHub Demo Safety Stop" at rg-dbhub-demo)'; Fix = 'An Owner of the subscription runs ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json once; deploy.ps1 assigns it when the person who runs it may.'; Evidence = [ordered]@{ counts = $false; missing = 'Role' } }
+        $config['monthlyCeilingUsd'] = 100
+        $uncapped = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T4RestartCoverage $missing
+        $uncapped.T4RestartHours | Should -Be 720
+        $uncapped.T4RestartAssumption | Should -Be 'RestOfMonth'
+        $uncapped.T4AutoRestartWorstCaseMonthly | Should -Be ([System.Math]::Round(0.18 * 720, 2))
+        $monthly = $uncapped.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.status | Should -Be 'Fail'
+        $monthly.message | Should -Match 'and the nightly safety stop can''t stop T4: its role isn''t assigned \(.*\), so the worst case counts it running for the rest of the month: 720 hours, 129\.60 USD of T4 compute'
+        $monthly.evidence.t4RestartMissing | Should -Be 'Role'
+        # The three ways to stay cheaper, the ceiling that keeps this T4, and the fix that caps the restart.
+        $monthly.remediation | Should -Match '^To keep the month cheaper: set t4SkuName to Standard_B1ms \(which turns autonomous tuning off\), set t4Enabled to false, or set a lower monthlyCeilingUsd\. To keep this T4, raise monthlyCeilingUsd to at least \d+ \(the budget follows it at the next deploy\.ps1 -FromStage Infrastructure\)\. Or put the nightly safety stop fully in place, so each restart counts as about a day: An Owner of the subscription runs \./scripts/grant-safety-stop\.ps1'
+    }
     It 'fails the monthly ceiling when T4''s restart worst case pushes the estimate over it' {
         $first = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         # A ceiling above the light-use month but below it plus the 14.40 USD worst case.
@@ -227,7 +270,7 @@ Describe 'Get-DemoCostEstimate' {
             [pscustomobject]@{ Items = $items; NextPageLink = $null }
         }
         $cache = @{}
-        Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -NetworkMode public -PriceCache $cache | Out-Null
+        Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_B1ms' }) -NetworkMode public -PriceCache $cache | Out-Null
         $first = $script:priceUris.Count
         $generalPurpose = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }) -NetworkMode public -PriceCache $cache
         @($script:priceUris | Select-Object -Skip $first).Count | Should -Be 1 -Because 'only T4''s General Purpose compute is new'
@@ -254,6 +297,59 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.Components.Name | Should -Not -Match 'cache|data disk'
     }
 
+    It 'counts business-day''s T3 incidents, which the shipped share already prices at T3''s maximum, so both ceilings hold as before (2026-11-03)' {
+        $unset = New-TestConfig
+        $unset.Remove('activityProfile')
+        $default = Get-DemoCostEstimate -Config $unset -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $quiet = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ activityProfile = 'baseline' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $default.ActivityProfile | Should -Be 'business-day'
+        $quiet.ActivityProfile | Should -Be 'baseline'
+        # T3 at its maximum, 1 vCore x 0.50, for every running hour already (t3ActiveShareOfMaxVcores 1.0): nothing to add.
+        $default.T3BusinessDaySession | Should -Be 0
+        $default.T3BusinessDayMonthly | Should -Be 0
+        $default.SessionCost | Should -Be $quiet.SessionCost
+        $default.LightUseMonthly | Should -Be $quiet.LightUseMonthly
+        @($default.Components | Where-Object Name -Match 'business-day') | Should -BeNullOrEmpty
+        $session = $default.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION'
+        $session.status | Should -Be 'Pass'
+        $session.message | Should -Match 'With activityProfile business-day, T3''s incidents run at its maximum vCores 10 of every 60 minutes; the estimate already prices T3 at its maximum for every running hour, so they add nothing\.'
+        $monthly = $default.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.status | Should -Be 'Pass'
+        $monthly.message | Should -Match 'they add nothing'
+        $session.evidence.activityProfile | Should -Be 'business-day'
+        $session.evidence.activityProfileSource | Should -Be 'default'
+        $session.evidence.t3IncidentShare | Should -Be 0.1667
+        ($quiet.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Not -Match 'business-day'
+    }
+
+    It 'adds the T3 increment from the retail price when the assumed share is below the maximum, and -ActivityProfile picks the profile (2026-11-03)' {
+        $catalog = Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath '../../config/profiles.json') -Raw | ConvertFrom-Json -AsHashtable
+        $catalog['assumptions']['t3ActiveShareOfMaxVcores'] = 0.5
+        $script:halfShare = $catalog
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoProfile -MockWith { $script:halfShare }
+        $businessDay = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $baseline = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -ActivityProfile 'baseline'
+        # 1 vCore x (1 - 0.5) x 10/60 of each hour at the fixture's 0.50 per vCore-hour: about 0.0417 an hour.
+        $increment = $businessDay.Components | Where-Object Name -EQ 'T3 compute, business-day incidents (10 of every 60 minutes at the maximum vCores)'
+        $increment.UnitPrice | Should -Be 0.5
+        [System.Math]::Round([double]$increment.Quantity, 4) | Should -Be 0.0833
+        $businessDay.T3BusinessDaySession | Should -Be 0.21 -Because '0.0833 x 5 hours x 0.50'
+        $businessDay.T3BusinessDayMonthly | Should -Be 0.42 -Because '0.0833 x 10 hours x 0.50'
+        [System.Math]::Round($businessDay.SessionCost - $baseline.SessionCost, 2) | Should -Be 0.21
+        [System.Math]::Round($businessDay.LightUseMonthly - $baseline.LightUseMonthly, 2) | Should -Be 0.42
+        @($baseline.Components | Where-Object Name -Match 'business-day') | Should -BeNullOrEmpty
+        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Match 'adds 0\.21 USD to a session and 0\.42 USD to the light-use month before the free allowance'
+        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').status | Should -Be 'Pass'
+        ($businessDay.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -ParameterFilter { [uri]::UnescapeDataString($Uri) -match 'Serverless - Compute Gen5' }
+
+        # The free offer's allowance covers the increment too, and is used faster.
+        $free = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $true
+        $freeBaseline = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $true -ActivityProfile 'baseline'
+        $free.T3FreeOfferCreditMonthly | Should -BeGreaterThan $freeBaseline.T3FreeOfferCreditMonthly
+        $free.LightUseMonthly | Should -Be $freeBaseline.LightUseMonthly -Because 'at light use the allowance covers T3 either way'
+    }
+
     It 'prices T2 golden snapshots per GB-month on their provisioned size, as Standard HDD when incremental (ADR 0018)' {
         $snapshot = [pscustomobject]@{ Name = 'snap-dbhub-t2golden-202610221306'; Sku = 'Standard_LRS'; SizeGiB = 128; UsedGiB = 37; Incremental = $true }
         $without = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
@@ -268,6 +364,17 @@ Describe 'Get-DemoCostEstimate' {
         $with.MissingPrices | Should -BeNullOrEmpty
     }
 
+    It 'adds the nightly safety stop''s job minutes to every estimate, at the included tier (ADR 0024)' {
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $minutes = $estimate.Components | Where-Object { $_.Name -like 'Nightly safety stop job minutes*' }
+        @($minutes).Count | Should -Be 1
+        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced, so it adds nothing.
+        $minutes.UnitPrice | Should -Be 0
+        $minutes.Quantity | Should -Be 120
+        $minutes.Basis | Should -Be 'idle'
+        $minutes.Cost | Should -Be 0
+        $estimate.MissingPrices | Should -BeNullOrEmpty
+    }
     It 'adds the on-demand activity control''s vault operations and job minutes only when control.enabled is true (ADR 0020)' {
         $without = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         $without.Components.Name | Should -Not -Match 'Activity control'
@@ -492,9 +599,9 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.remediation | Should -Match 'raise monthlyCeilingUsd'
     }
 
-    It 'uses a 250 USD monthly ceiling and a 15 USD session ceiling by default' {
+    It 'uses a 375 USD monthly ceiling and a 15 USD session ceiling by default (375 since 2026-11-04)' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DefenderPlans $defenderPlans
-        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'hard ceiling of 250\.00 USD'
+        ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'hard ceiling of 375\.00 USD'
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.SESSION').message | Should -Match 'ceiling of 15\.00 USD'
     }
 

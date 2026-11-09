@@ -14,18 +14,25 @@ function Get-DemoEnvironmentStatus {
     - STATUS.T2.AUTOSIGNIN (Phase 28, Get-DemoGuidedSignInStatus), only when there's something to say: Pass while the
       guest's one-time automatic sign-in waits for a guided stop; a Warning when it's armed with no guided stop
       waiting or its last cleanup didn't finish (archost01's next pass removes the leftovers; status stays read-only).
+    - T2.GUEST.STATE (2026-11-03, Get-DemoT2GuestStateResult) while archost01 runs: the nested guest as the host sees
+      it now, from the same health read. Fail when a golden capture left it air-gapped, or it's off or cut off from
+      its NAT switch; a Warning when it won't start with the host next time; each with the exact command.
+    - STATUS.T2.DISKSPACE (2026-11-05, Get-DemoT2DiskSpaceResult) while archost01 runs: free space on the drive that holds
+      the guest's dynamic disk, a Warning below the host's threshold. STATUS.T2.IMAGE (Get-DemoT2ImageResult), in
+      JumpstartImage mode: Pass for the tested Arc Jumpstart image, a Warning naming a newer one.
     - STATUS.DISKS: each VM's disks against the profile. STATUS.RUNCOMMANDS (Phase 28 follow-up,
       Get-DemoRunCommandStatus): managed Run Commands the demo left on its VMs, the on-demand control's DbHubControl-*
-      and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap, as a Warning with the commands
+      and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap and the activity profiles'
+      DbHubDemo-Profile (both stay by design), as a Warning with the commands
       that delete them; Pass when there's none. Read-only.
     - STATUS.T3: whether T3 exists and its status (Online, Paused); Not selected after stop-demo.ps1 -RemoveT3.
     - STATUS.T4 (Phase 24, ADR 0019): T4's state; while it runs, its live Azure Monitor metrics from the last
       15 minutes (CPU, memory, connections, CPU credits, and the enhanced metrics: sessions by state and by
       wait event type, the oldest transaction, deadlocks); while it's stopped, when Azure starts it again on its own (seven
       days after the stop in the activity log; a Warning within a day), what it then bills at its own size (the Retail
-      Prices API), and whether the on-demand control's daily safety stop stops it again or nothing does (Phase 28
-      follow-up); a General Purpose T4 says so, and when the fallback chose it, with its hourly list price. A server that
-      exists although the record says T4 is off (DbHubT4Sku None or Refused) is a Warning that it bills, and what keeps or
+      Prices API), and whether the nightly safety stop (ADR 0024), or else the on-demand control's daily safety stop, stops
+      it again or nothing does (Phase 28 follow-up; Get-DemoT4RestartStopState); a General Purpose T4 says so, and when the fallback chose it, with its hourly list price. A server that
+      exists although the record says T4 is off (DbHubT4Size None or Refused) is a Warning that it bills, and what keeps or
       removes it (review of 64c28b2; New-DemoT4RecordedOffResult).
       STATUS.PROFILE_T4 is its activity
       profile, and with -Detail STATUS.T4.LIVE is T1's runner's live view of T4 (connections against
@@ -34,11 +41,15 @@ function Get-DemoEnvironmentStatus {
       T1, Pass with the engine only and a Warning while associated services are still listed; and T1.SQLVM.MONITORING while sqlvm01
       runs (an extension that's Updating after a redeployment is a Warning).
     - STATUS.PROFILE_T1 and STATUS.PROFILE_T3 (sqlvm01 running): the active activity profile and its end,
-      read with 'profile get' (a Run Command each; the T3 profile is a file on T1, so T3 isn't woken).
+      read with 'profile get' (a Run Command each; the T3 profile is a file on T1, so T3 isn't woken), with what it does
+      and how to choose the other (Get-DemoProfileStatusNote, 2026-11-03): business-day's incidents for that target and
+      the quieter baseline, or, for baseline, business-day; a baseline that a run hasn't switched yet says so.
       STATUS.PROFILE_T2 with -Detail. Each takes on the Warning or Fail of the profile host lane that serves the
       target (Phase 25b, from host-lanes.json): a stalled, restarting, or failing lane, or an active profile that
       nothing runs.
-    - STATUS.ARC: Arc's connection and days disconnected (Get-DemoArcCheck).
+    - STATUS.ARC: Arc's connection and days disconnected (Get-DemoArcCheck). T2.ARC.CONNECTED fails once arcsql01
+      has been Disconnected for 10 minutes while archost01 runs (counted from the later of its last status change and
+      the host's start).
     - STATUS.BASTION: on-demand Bastion and its public IP, with their list price per hour from the Azure
       Retail Prices API; a Warning while either exists, including a public IP left over after an interrupted
       delete (stop-demo.ps1 -RemoveBastionOnly removes it).
@@ -55,6 +66,9 @@ function Get-DemoEnvironmentStatus {
     - STATUS.COST: month-to-date actual cost of the resource group, plus rg-<prefix>-golden while it holds a
       snapshot (Cost Management Query API), against monthlyCeilingUsd; Warning above 80%.
     - STATUS.SHUTDOWN: the next auto-shutdown.
+    - STATUS.SAFETYSTOP (ADR 0024, Get-DemoSafetyStopStatus): the nightly safety stop's times, whether its role is
+      assigned, what its last run stopped, and what its last T3 check found; a Warning that names the fix when it isn't
+      set up, can't act (its role; T4 isn't covered then), didn't finish, or found T3 still online past its auto-pause.
     - STATUS.FABRIC.CAPACITY, with fabric.manageCapacity true or a DbHubFabricCapacityResumed record only (Phase 26b,
       Get-DemoFabricCapacityStatus): the capacity's state, and whether start-demo.ps1 resumed it (the record, which
       stop-demo.ps1 pauses and clears). Read-only: a stale record is shown, and stop-demo.ps1 clears it.
@@ -170,6 +184,18 @@ function Get-DemoEnvironmentStatus {
                 if ($null -ne $autoSignIn) {
                     $results.Add($autoSignIn)
                 }
+                # The guest as the host sees it now (2026-11-03): air-gapped by a golden capture, off, or cut off from
+                # its switch, any of which keeps T2 out of Database Hub.
+                $guestState = Get-DemoT2GuestStateResult -Config $Config -Health $health
+                if ($null -ne $guestState) {
+                    $results.Add($guestState)
+                }
+                # Free space for the guest's dynamic disk, and which Jumpstart image it came from (2026-11-05).
+                foreach ($t2Result in @((Get-DemoT2DiskSpaceResult -Config $Config -Health $health), (Get-DemoT2ImageResult -Health $health))) {
+                    if ($null -ne $t2Result) {
+                        $results.Add($t2Result)
+                    }
+                }
             }
         }
         catch {
@@ -209,7 +235,7 @@ function Get-DemoEnvironmentStatus {
     if (-not (Test-DemoT4Enabled -Config $t4Config)) {
         $t4OffResult = $null
         if (Test-DemoT4Enabled -Config $Config) {
-            # The record says T4 is off (DbHubT4Sku None or Refused), but a server bills whatever the record says, and a run
+            # The record says T4 is off (DbHubT4Size None or Refused), but a server bills whatever the record says, and a run
             # before the review of 64c28b2 could record None for a server that a failed template attempt had created: one that
             # exists is a Warning, never hidden.
             $t4Recorded = [string](Get-DemoMemberValue -InputObject $state -Name 'T4Sku')
@@ -232,7 +258,7 @@ function Get-DemoEnvironmentStatus {
         $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4 -Name 'Server')
         $t4Sku = if ($t4ServerSku) { $t4ServerSku } else { Get-DemoT4SkuName -Config $t4Config }
         $t4GeneralPurpose = (Get-DemoT4SkuSpec -SkuName $t4Sku).Tier -eq 'GeneralPurpose'
-        $t4Origin = if (Test-DemoT4FallbackSize -Config $Config -State $state) { ', which the fallback chose because Azure refused the Burstable sizes here' } else { '' }
+        $t4Origin = if (-not (Test-DemoT4FallbackSize -Config $Config -State $state)) { '' } elseif ([string](Get-DemoMemberValue -InputObject $state -Name 'T4Sku') -ceq 'Standard_D4ads_v5') { ', which the fallback chose because Azure refused Standard_D4ds_v5 here' } else { ', which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off' }
         if (-not $t4.Exists) {
             # A size the fallback chose but didn't create yet is said as that, never as created (review of 20e855c).
             $chosen = if ($t4Origin) { ' as General Purpose {0}{1}, after checking its price against the ceilings again' -f $t4Sku, $t4Origin } else { '' }
@@ -254,21 +280,23 @@ function Get-DemoEnvironmentStatus {
         elseif ($t4.State -eq 'Stopped') {
             $days = [int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays']
             $stopped = Get-DemoT4StoppedUtc -Config $Config -ServerId $t4.Names.ServerId -NowUtc $NowUtc
-            # What the restart bills, priced at run time (ADR 0016), and whether the on-demand control's daily safety stop
-            # stops it again: its schedule, not only control.enabled (review of 20e855c).
+            # What the restart bills, priced at run time (ADR 0016), and whether anything stops it again: the nightly safety
+            # stop (ADR 0024), or the on-demand control's daily one, by their schedules and roles (review of 20e855c).
             $hourly = Get-DemoT4HourlyPrice -Config $t4Config -SkuName $t4Sku
-            $safety = Get-DemoT4SafetyStopState -Config $Config
-            $safetyStop = $safety.State -eq 'Scheduled'
+            $safety = Get-DemoT4RestartStopState -Config $Config
+            $safetyStop = $safety.State -in 'Nightly', 'Scheduled'
+            # The nightly safety stop's T3 check stops T4 too, since 2026-11-09 (ADR 0024).
+            $checkStopsT4 = [bool](Get-DemoMemberValue -InputObject $safety -Name 'CheckStopsT4')
             $size = if ($t4GeneralPurpose) { ' It''s General Purpose {0}{1}.' -f $t4Sku, $t4Origin } else { '' }
             if ($null -ne $stopped) {
                 $restart = $stopped.AddDays($days)
                 $hoursLeft = ($restart - [DateTime]::SpecifyKind($NowUtc, [System.DateTimeKind]::Utc)).TotalHours
                 $soon = $hoursLeft -lt 24
-                $message = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0} is stopped since {1:yyyy-MM-dd HH:mm} UTC. ', $t4.Names.ServerName, $stopped.ToUniversalTime()) + (Format-DemoT4RestartText -RestartUtc $restart -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State) + $size
+                $message = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0} is stopped since {1:yyyy-MM-dd HH:mm} UTC. ', $t4.Names.ServerName, $stopped.ToUniversalTime()) + (Format-DemoT4RestartText -RestartUtc $restart -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State -Config $Config -CheckStopsT4:$checkStopsT4) + $size
                 $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status $(if ($soon) { 'Warning' } else { 'Pass' }) -Message $message -Evidence ([ordered]@{ state = $t4.State; stoppedUtc = $stopped.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); autoStartUtc = $restart.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); hourlyUsd = $hourly; skuName = $t4Sku; dailySafetyStop = $safetyStop; safetyStop = $safety.State }) -Remediation $(if ($soon) { 'Run stop-demo.ps1 again after it starts, or start-demo.ps1 for a session; the 7-day restart bills compute until the next stop.' } else { '' }) -DocUrl ([string]$t4Docs['stopServer'])))
             }
             else {
-                $message = ('{0} is stopped; the stop isn''t in the last 8 days of the activity log. ' -f $t4.Names.ServerName) + (Format-DemoT4RestartText -RestartUtc $null -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State) + $size
+                $message = ('{0} is stopped; the stop isn''t in the last 8 days of the activity log. ' -f $t4.Names.ServerName) + (Format-DemoT4RestartText -RestartUtc $null -SkuName $t4Sku -HourlyUsd $hourly -Days $days -SafetyStop $safety.State -Config $Config -CheckStopsT4:$checkStopsT4) + $size
                 $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Pass' -Message $message -Evidence ([ordered]@{ state = $t4.State; hourlyUsd = $hourly; skuName = $t4Sku; dailySafetyStop = $safetyStop; safetyStop = $safety.State }) -DocUrl ([string]$t4Docs['stopServer'])))
             }
         }
@@ -279,6 +307,7 @@ function Get-DemoEnvironmentStatus {
 
     if ($running['sqlvm01'] -and $state.RunnerSha256) {
         # The active profile (plan section 9.6). The T3 profile is a file on T1, so reading it doesn't wake T3.
+        $configuredActivity = Get-DemoActivityProfile -Config $Config
         $profileTargets = @('T1') + @(if ($t3.Exists) { 'T3' }) + @(if ($null -ne $t4 -and $t4.Exists) { 'T4' })
         if ($Detail -and $hostVm -eq 'archost01' -and $running[$hostVm] -and 'archost01' -in $state.RunnerSentTo) {
             $profileTargets += 'T2'
@@ -344,6 +373,9 @@ function Get-DemoEnvironmentStatus {
                     $remediation = 'The host replaces a stalled or failed lane by itself within about 5 minutes; run status.ps1 again. If it stays, run validate.ps1 -Area Workload for WORKLOAD.{0}.HOST, or stop-demo.ps1 and then start-demo.ps1, which restart the VM and its DbHubDemo-Workload task.' -f $target
                 }
             }
+            # What the active profile does, and how to choose the other (2026-11-03): business-day's incidents fill the
+            # Performance page, and a baseline that a run hasn't switched yet says so.
+            $message += Get-DemoProfileStatusNote -Target $target -ActiveName $name -ActivityProfile $configuredActivity
             $results.Add((New-DemoResult -CheckId ('STATUS.PROFILE_{0}' -f $target) -Area 'workload' -Target $target -Status $profileStatus -Message $message -Evidence $profileEvidence -Remediation $remediation))
         }
         if ($Detail -and $t4Ready) {
@@ -435,5 +467,7 @@ function Get-DemoEnvironmentStatus {
 
     $shutdown = Get-DemoNextShutdownUtc -Config $Config -NowUtc $NowUtc
     $results.Add((New-DemoResult -CheckId 'STATUS.SHUTDOWN' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('Next auto-shutdown: {0:yyyy-MM-dd HH:mm} UTC ({1} {2}).' -f $shutdown, $Config['autoShutdownTime'], $Config['autoShutdownTimeZone'])))
+    # The nightly safety stop (ADR 0024): its times, its role, and what its last stop and T3 check did. Read-only.
+    $results.Add((Get-DemoSafetyStopStatus -Config $Config -NowUtc $NowUtc))
     return $results.ToArray()
 }

@@ -100,9 +100,9 @@
       "default": "Nested"
     },
     "t2SqlInstallMode": {
-      "description": "PaygWizard: one documented setup-wizard step per guest build. ProductKey: unattended, needs prerequisite P10. Developer: unattended, Estate only (ADR 0006).",
-      "enum": ["PaygWizard", "ProductKey", "Developer"],
-      "default": "PaygWizard"
+      "description": "JumpstartImage (default): T2's guest is Arc Jumpstart's prebuilt SQL Server 2022 Standard disk (config/versions.json media.jumpstartArcBoxSqlStd), made arcsql01 at first boot; unattended, with Hub Performance. PaygWizard: one documented setup-wizard step per guest build. ProductKey: unattended, needs prerequisite P10. Developer: unattended, Estate only (ADR 0006).",
+      "enum": ["JumpstartImage", "PaygWizard", "ProductKey", "Developer"],
+      "default": "JumpstartImage"
     },
     "t2ArcBillableCores": {
       "description": "Billable cores used by estimate-cost.ps1 for Arc SQL PAYG. Defaults to the larger of the guest vCPU count and the documented minimum of four cores per OSE when omitted; configure-arc.ps1 records the instance's actual cores as evidence.",
@@ -131,14 +131,18 @@
       "default": "auto"
     },
     "t4Enabled": {
-      "description": "Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId> (Burstable B1ms, PostgreSQL 18, Microsoft Entra only, virtual network integration; Phase 24, ADR 0019). Its fixed monthly cost (storage, and the Defender plans a tenant policy enables) is billed even while it is stopped, and a stopped server starts on its own after seven days.",
+      "description": "Deploy T4, the Azure Database for PostgreSQL flexible server pgflex01-<deploymentId> (General Purpose Standard_D4ds_v5 by default since 2026-11-04, with autonomous tuning; PostgreSQL 18, Microsoft Entra only, virtual network integration; Phase 24, ADR 0019). Its fixed monthly cost (storage, and the Defender plans a tenant policy enables) is billed even while it is stopped, and a stopped server starts on its own after seven days. Set it to false to leave T4 out, one of the ways to keep the month cheap.",
       "type": "boolean",
       "default": true
     },
     "t4SkuName": {
-      "description": "T4's compute size. Leave it unset for the default, Standard_B1ms, the smallest Burstable size: when Azure refuses a size with SkuNotAvailable, deploy.ps1 then falls back on its own, to Standard_B2s (2 vCores, 4 GiB; the same Burstable class), and when that's refused too, to General Purpose Standard_D2ds_v5 (2 vCores, 8 GiB), but only when its cost check passes: its hourly price from the Azure Retail Prices API, and the demo's worst-case month (T4 running every hour, because Azure starts a stopped server again after 7 days, with its storage and Defender plans) within monthlyCeilingUsd, and a session within sessionCeilingUsd; otherwise it finishes without T4 (DONE says so). What it used is recorded in the resource group's DbHubT4Sku tag for later runs, and an existing server is never resized (Phase 28 and its follow-up, ADR 0019). Set it to choose the size yourself: Standard_B1ms, Standard_B2s, or Standard_D2ds_v5. A size you set never changes on its own, with no fallback. The tier follows the size. B2s lists at about four times B1ms's hourly price and D2ds_v5 at about ten times; estimate-cost.ps1 prices the size, including the 7-day automatic restart's worst case (Phase 24, ADR 0019).",
+      "description": "T4's compute size. Leave it unset for the default, Standard_D4ds_v5 (General Purpose, 4 vCores, 16 GiB; since 2026-11-04, user-directed, because autonomous tuning needs at least 4 vCores and Query Store shouldn't run on Burstable): when Azure refuses it with SkuNotAvailable, deploy.ps1 tries it once more in another zone the region lists, then Standard_D4ads_v5 (4 vCores, the same price per vCore), then Standard_D2ds_v5 (2 vCores, autonomous tuning off) once its cost check passes (its hourly price from the Azure Retail Prices API, and the demo's worst-case month within monthlyCeilingUsd and a session within sessionCeilingUsd), and otherwise finishes without T4 (DONE says so). What it used is recorded in the resource group's DbHubT4Size tag for later runs; an existing server whose size this doesn't set moves to the default once, at the next deploy.ps1 while it runs, which restarts it. Set it to choose the size yourself: Standard_D4ds_v5, Standard_D4ads_v5, Standard_D2ds_v5, or the Burstable Standard_B1ms or Standard_B2s, which keep the month cheaper and turn autonomous tuning off (with a Warning). A size you set never changes on its own, with no fallback. The tier follows the size; estimate-cost.ps1 prices it, including the 7-day automatic restart's worst case (ADR 0016, ADR 0019).",
       "type": "string",
-      "enum": ["Standard_B1ms", "Standard_B2s", "Standard_D2ds_v5"]
+      "enum": ["Standard_D4ds_v5", "Standard_D4ads_v5", "Standard_D2ds_v5", "Standard_B1ms", "Standard_B2s"]
+    },
+    "t4AutonomousTuning": {
+      "description": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): Query Store captures the top queries and index tuning runs in REPORT mode every 60 minutes, so the Azure portal (the server's Intelligent Performance > Autonomous tuning) and az postgres flexible-server autonomous-tuning list its index and table recommendations; Database Hub's PostgreSQL view doesn't show them. Unset means on. It needs a General Purpose or Memory Optimized size with at least 4 vCores: with a Burstable or smaller t4SkuName (or the fallback's Standard_D2ds_v5), unset turns it off with a Warning, and true is a preflight Fail. false turns it off and leaves those parameters as they are. Sources: https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning, https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
+      "type": "boolean"
     },
     "t4AvailabilityZone": {
       "description": "Availability zone T4 is created in: empty for no preference (default), or 1, 2, or 3 (a zone the region's PostgreSQL capabilities list). It applies only when T4 is created; a server keeps its zone (Phase 24, ADR 0019).",
@@ -147,13 +151,13 @@
       "default": ""
     },
     "activityProfile": {
-      "description": "Activity profile that deploy.ps1 and start-demo.ps1 set on the targets, until the next auto-shutdown: off, baseline (default; the steady Contoso Care mix), business-day (the baseline plus scheduled, bounded incidents), or incident:<scenario> (ADR 0010). demo-control.yml, start-demo.ps1 -ActivityProfile, and the live-activity notebook change it while the VMs run, and stop-demo.ps1 sets it to off. While T3 has an active profile, the runner keeps its serverless database from auto-pausing, which bills compute (ADR 0016).",
+      "description": "Activity profile that deploy.ps1 and start-demo.ps1 set on the targets, until the next auto-shutdown: off, baseline (the steady Contoso Care mix), business-day (default since 2026-11-03: the baseline plus bounded incidents at fixed minutes past each UTC hour, so Database Hub's Performance page has problems to show), or incident:<scenario> (ADR 0010). A profile with incidents starts as baseline, and the run switches to it once its own Run Commands on a VM are done; the VMs set baseline in its place by themselves (after a runner install, and at a boot with activityProfileOnBoot). demo-control.yml, start-demo.ps1 -ActivityProfile, and the live-activity notebook change it while the VMs run, and stop-demo.ps1 sets it to off. While T3 has an active profile, the runner keeps its serverless database from auto-pausing, which bills compute (ADR 0016).",
       "type": "string",
       "pattern": "^(off|baseline|business-day|incident:[a-z0-9][a-z0-9-]{0,47})$",
-      "default": "baseline"
+      "default": "business-day"
     },
     "activityProfileOnBoot": {
-      "description": "Whether the VMs also set activityProfile at every boot (a manual start, a scheduled start, a restart). False (default): a VM that starts serves only the profile someone set, so T3 can auto-pause unless a demo needs it (ADR 0016, R183).",
+      "description": "Whether the VMs also set activityProfile at every boot (a manual start, a scheduled start, a restart); a profile with incidents, business-day included, is set as its baseline, which deploy.ps1, start-demo.ps1, or demo-control.yml then switch. False (default): a VM that starts serves only the profile someone set, so T3 can auto-pause unless a demo needs it (ADR 0016, R183).",
       "type": "boolean",
       "default": false
     },
@@ -176,10 +180,10 @@
       "default": "demo"
     },
     "monthlyCeilingUsd": {
-      "description": "Hard monthly ceiling for idle plus light use: preflight and estimate-cost.ps1 fail when the estimate is above it. Also the Azure budget amount (ADR 0016).",
+      "description": "Hard monthly ceiling for idle plus light use: preflight, start-demo.ps1, and estimate-cost.ps1 fail when the estimate is above it. Its worst case includes T4's 7-day automatic restart: about a day per restart where the on-demand control's daily T4 safety stop is fully in place, otherwise the rest of the month. 375 by default since 2026-11-04 (user-directed, for the 4-core T4 with autonomous tuning; it was 250). Also the Azure budget amount, with alerts at 50, 80, and 100 percent; deploy.ps1 -FromStage Infrastructure updates the budget. To keep the month cheaper, set t4SkuName to Standard_B1ms (autonomous tuning then turns off), set t4Enabled to false, or set a lower value here (ADR 0016).",
       "type": "number",
       "exclusiveMinimum": 0,
-      "default": 250
+      "default": 375
     },
     "sessionCeilingUsd": {
       "description": "Ceiling for one demo-day session.",

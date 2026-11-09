@@ -5,15 +5,19 @@ function New-DemoT2GoldenSnapshot {
     and 5). capture-t2-golden.ps1 calls it.
 
     .DESCRIPTION
-    1. The subscription guard. The nested T2 mode with PaygWizard, and a host without data disks (the guest
-       lives on the OS disk); anything else is Not supported.
+    1. The subscription guard. The nested T2 mode with PaygWizard (the snapshot keeps the setup-wizard state) or
+       JumpstartImage (a speed-up only: a redeploy skips the image's download and first boot), and a host without data
+       disks (the guest lives on the OS disk); anything else is Not supported.
     2. Policy: the read-only inventory must not deny snapshots or disks (unless -SkipPolicyInventory).
+       Then no on-demand run may be active (GOLDEN.CAPTURE.CONTROL, Get-DemoGoldenCaptureControlResult): no
+       DbHub-Control or DbHub-Stop job queued or running, and no pending auto-stop, because a run starts and
+       deallocates archost01; otherwise nothing changes (review, 2026-11-04).
     3. Starts archost01 when it's deallocated, and releases an air gap that an interrupted capture left (the
        host's Azure VM ID matches the capture record, so only the guest's network and start action return).
     4. Inspects the host and guest (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Inspect, read-only) and
        checks: the host's health is Ready, no SQL Server product key file, SQL Server Standard running, the
-       guest's Arc agent connected to this environment's arcsql01, and the guest's Windows evaluation more
-       than 7 days from its end (a Warning within 30 days).
+       guest's Arc agent connected to this environment's arcsql01, and, for a guest whose Windows is an evaluation,
+       its evaluation more than 7 days from its end (a Warning within 30 days).
     5. Turns T2's activity profile off and rotates the host administrator's password to a value nobody keeps.
        Then the sign-in data gate (ADR 0009): vm/bootstrap/Invoke-DemoSignInResidue.ps1 removes the sign-in data
        left on the host and in the guest and scans again; anything left (GOLDEN.CAPTURE.SIGNIN Fail, or Manual
@@ -21,7 +25,9 @@ function New-DemoT2GoldenSnapshot {
        With -WipeFreeSpace (ADR 0009, Phase 26d), vm/bootstrap/Invoke-DemoDiskWipe.ps1 -WipeAction GuestFill then
        checks that the host's C: has at least -MinHostFreeGB free, runs the TRIM pass in the guest, overwrites the
        guest's free space with zeros, deletes that file, and trims again (GOLDEN.CAPTURE.WIPE).
-    6. Prepare: removes the sign-in data that setup leaves on the VM again and checks that none remains, turns IE
+    6. Prepare: writes the capture marker first (T2's control relay leaves the guest alone while it's there; the
+       capture's own Release removes it, at step 3 and in step 9), removes the sign-in data that setup leaves on the
+       VM again and checks that none remains, turns IE
        ESC on, writes the capture record, applies the air gap (the guest's automatic start action Nothing, its
        network adapter disconnected), and shuts the guest down cleanly. With -WipeFreeSpace, HostCompact then
        compacts the guest's VHDX (Optimize-VHD -Mode Full, mounted read-only), overwrites the host's free space
@@ -33,8 +39,17 @@ function New-DemoT2GoldenSnapshot {
     8. Creates a disk from it in the golden group (DenyAll), deletes it, and tags the snapshot disk-verified.
        Older snapshots stay until the new one is boot-verified (test-t2-golden.ps1).
 
-    The air gap stays on the source host until the next start-demo.ps1 or deploy.ps1 releases it. Nothing is
-    deleted. -WhatIf runs steps 1 and 2 only.
+    9. Returns the source to service once Prepare has run, whatever happened after it (GOLDEN.CAPTURE.SOURCE,
+       Restore-DemoGoldenCaptureSource): starts archost01 when it's deallocated, releases its guest (reconnects its
+       adapter, automatic start Start, starts it; Invoke-DemoGoldenSourceRelease, which also tags the snapshot
+       dbhubSourceReleasedUtc), waits up to 30 minutes until arcsql01 reads Connected after the air gap, then
+       returns the host to the power state the capture found it in (a clean guest shutdown first, never by force).
+       A Fabric start therefore never finds T2 cut off (live, 2026-11-03).
+
+    Nothing is deleted. -WhatIf runs steps 1 and 2 only. An interrupted capture (Ctrl+C) may leave the air gap and its
+    marker: the next capture releases it at once (its first step ends the marker), start-demo.ps1 and deploy.ps1 once
+    its snapshot exists (they end the marker then), and a Fabric start of T2 once the marker no longer counts (6 hours);
+    status.ps1 reports it (T2.GUEST.STATE).
 
     Sources (checked 2026-10-21):
     - az snapshot create: https://learn.microsoft.com/cli/azure/snapshot#az-snapshot-create
@@ -112,8 +127,8 @@ function New-DemoT2GoldenSnapshot {
         & $add 'GOLDEN.CAPTURE.MODE' 'Not supported' 'The evaluation-only T2 is an Azure VM, not a nested guest; golden snapshots keep a nested guest''s setup-wizard state.'
         return $results.ToArray()
     }
-    if ([string]$Config['t2SqlInstallMode'] -ne 'PaygWizard') {
-        & $add 'GOLDEN.CAPTURE.MODE' 'Not supported' ('Golden snapshots keep the PaygWizard setup-wizard state; t2SqlInstallMode is {0}, which installs unattended on every build.' -f $Config['t2SqlInstallMode'])
+    if ([string]$Config['t2SqlInstallMode'] -notin 'PaygWizard', 'JumpstartImage') {
+        & $add 'GOLDEN.CAPTURE.MODE' 'Not supported' ('Golden snapshots keep the PaygWizard setup-wizard state or speed up a JumpstartImage redeploy; t2SqlInstallMode is {0}, which installs unattended on every build.' -f $Config['t2SqlInstallMode'])
         return $results.ToArray()
     }
     $vm = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'show', '--resource-group', $resourceGroupName, '--name', 'archost01') -AsJson -AllowFailure
@@ -166,13 +181,23 @@ function New-DemoT2GoldenSnapshot {
         return $results.ToArray()
     }
 
-    # 3. The host running, with a guest an interrupted capture left air-gapped released.
+    # 2b. No on-demand run: it would start or deallocate archost01 during the capture (review, 2026-11-04).
+    $control = Get-DemoGoldenCaptureControlResult -Config $Config
+    $results.Add($control)
+    if ($control.status -eq 'Fail') {
+        return $results.ToArray()
+    }
+
+    # 3. The host running, with a guest an interrupted capture left air-gapped released. The power state it was
+    # found in is what GOLDEN.CAPTURE.SOURCE returns it to.
+    $foundPower = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName 'archost01'
     $power = Invoke-DemoVmPowerAction -Config $Config -VmName 'archost01' -Action Start
     $results.Add($power)
     if ($power.status -ne 'Pass') {
         return $results.ToArray()
     }
-    $release = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -TimeoutSeconds 1800
+    # EndCapture: this capture's own Release, so it also removes the marker an interrupted capture left.
+    $release = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Release' -Parameter @{ EndCapture = 'true' } -TimeoutSeconds 1800
     if (-not $release.Succeeded) {
         & $add 'GOLDEN.CAPTURE.RELEASE' 'Fail' ('The guest couldn''t be made ready: {0}' -f $release.Error) @{} 'Read the Run Command error, fix the cause, and run capture-t2-golden.ps1 again.'
         return $results.ToArray()
@@ -198,9 +223,12 @@ function New-DemoT2GoldenSnapshot {
     $guest = Get-DemoMemberValue -InputObject $inspect.Data -Name 'guest'
     $agent = Get-DemoMemberValue -InputObject $guest -Name 'agent'
     $expires = [string](Get-DemoMemberValue -InputObject $guest -Name 'evaluationExpiresUtc')
+    # Only an evaluation (the TIMEBASED_EVAL channel) expires; the Jumpstart image's Windows Server 2022 Standard doesn't.
+    $licenseDescription = [string](Get-DemoMemberValue -InputObject $guest -Name 'licenseDescription')
+    $isEvaluation = -not $licenseDescription -or $licenseDescription -match 'TIMEBASED_EVAL'
     $expiresUtc = [datetime]::MinValue
     $daysLeft = $null
-    if ([datetime]::TryParse($expires, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$expiresUtc)) {
+    if ($isEvaluation -and [datetime]::TryParse($expires, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$expiresUtc)) {
         $daysLeft = [int][System.Math]::Floor(($expiresUtc - $NowUtc.ToUniversalTime()).TotalDays)
     }
     $agentKeys = Get-DemoMemberValue -InputObject $agent -Name 'keys'
@@ -215,8 +243,9 @@ function New-DemoT2GoldenSnapshot {
         sqlVersion             = [string](Get-DemoMemberValue -InputObject $guest -Name 'sqlVersion')
         sqlUpdateLevel         = [string](Get-DemoMemberValue -InputObject $guest -Name 'sqlUpdateLevel')
         sqlUpdateReference     = [string](Get-DemoMemberValue -InputObject $guest -Name 'sqlUpdateReference')
-        evaluationExpiresUtc   = $expires
+        evaluationExpiresUtc   = $(if ($isEvaluation) { $expires } else { 'none' })
         evaluationDaysLeft     = $daysLeft
+        licenseDescription     = $licenseDescription
         agentStatus            = [string](Get-DemoMemberValue -InputObject $agent -Name 'status')
         agentResourceName      = [string](Get-DemoMemberValue -InputObject $agent -Name 'resourceName')
         agentResourceGroup     = [string](Get-DemoMemberValue -InputObject $agent -Name 'resourceGroup')
@@ -233,14 +262,14 @@ function New-DemoT2GoldenSnapshot {
     if ($facts.agentStatus -ne 'Connected' -or $facts.agentResourceName -ne 'arcsql01' -or ($facts.agentResourceGroup -and $facts.agentResourceGroup -ne $resourceGroupName)) {
         $problems.Add(('the guest''s Arc agent reports {0} for {1} in {2}, not Connected for arcsql01 in {3}' -f $facts.agentStatus, $facts.agentResourceName, $facts.agentResourceGroup, $resourceGroupName))
     }
-    if ($null -eq $daysLeft) { $problems.Add('the guest''s Windows evaluation expiry couldn''t be read') }
-    elseif ($daysLeft -le 7) { $problems.Add(('the guest''s Windows evaluation ends in {0} days' -f $daysLeft)) }
+    if ($isEvaluation -and $null -eq $daysLeft) { $problems.Add('the guest''s Windows evaluation expiry couldn''t be read') }
+    elseif ($isEvaluation -and $daysLeft -le 7) { $problems.Add(('the guest''s Windows evaluation ends in {0} days' -f $daysLeft)) }
     if ($problems.Count -gt 0) {
         & $add 'GOLDEN.CAPTURE.INSPECT' 'Fail' ('Not captured: {0}.' -f ($problems -join '; ')) $facts 'Fix each item (deploy.ps1 -Resume converges the host), then run capture-t2-golden.ps1 again.'
         return $results.ToArray()
     }
-    $inspectStatus = if ($daysLeft -le 30) { 'Warning' } else { 'Pass' }
-    $inspectMessage = 'The host is Ready, SQL Server Standard runs, the guest is connected to arcsql01, and its Windows evaluation ends on {0} ({1} days).' -f $expiresUtc.ToString('yyyy-MM-dd'), $daysLeft
+    $inspectStatus = if ($isEvaluation -and $daysLeft -le 30) { 'Warning' } else { 'Pass' }
+    $inspectMessage = if ($isEvaluation) { 'The host is Ready, SQL Server Standard runs, the guest is connected to arcsql01, and its Windows evaluation ends on {0} ({1} days).' -f $expiresUtc.ToString('yyyy-MM-dd'), $daysLeft } else { 'The host is Ready, SQL Server Standard runs, the guest is connected to arcsql01, and its Windows isn''t an evaluation ({0}).' -f $licenseDescription }
     if ($inspectStatus -eq 'Warning') {
         $inspectMessage += ' Re-capture after a fresh build within 30 days.'
     }
@@ -280,109 +309,127 @@ function New-DemoT2GoldenSnapshot {
         $results.Add((New-DemoResult -CheckId 'GOLDEN.CAPTURE.WIPE' -Area 't2' -Target 'T2' -Status 'Pass' -Message ('The guest''s free space was overwritten with zeros ({0:N1} GB in {1:N0} minutes) and trimmed.' -f ([double]$fillEvidence['guestBytes'] / 1GB), ($fill.Seconds / 60)) -Evidence $fillEvidence -DocUrl $wipeDoc))
     }
 
-    # 6. Clean, air-gap, and shut the guest down.
-    $prepare = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Prepare' -Parameter @{ SnapshotName = $snapshotName } -TimeoutSeconds 2400
-    if (-not $prepare.Succeeded) {
-        & $add 'GOLDEN.CAPTURE.PREPARE' 'Fail' ('The guest wasn''t prepared: {0}' -f $prepare.Error) @{} 'Run capture-t2-golden.ps1 again: it releases a half-prepared guest first.'
-        return $results.ToArray()
-    }
-    $prepared = $prepare.Data
-    $prepareEvidence = [ordered]@{}
-    foreach ($name in 'cachesRemoved', 'logFilesRedacted', 'signInCachesLeft', 'setupLogFilesWithToken', 'ieEsc', 'airGap', 'guestState', 'guestShutdownSeconds') {
-        $prepareEvidence[$name] = Get-DemoMemberValue -InputObject $prepared -Name $name
-    }
-    $record = Get-DemoMemberValue -InputObject $prepared -Name 'record'
-    & $add 'GOLDEN.CAPTURE.PREPARE' 'Pass' ('The guest passed its own sign-in check again (caches removed: {0}, log files redacted: {1}), and is air-gapped and shut down in {2} seconds.' -f $prepareEvidence['cachesRemoved'], $prepareEvidence['logFilesRedacted'], $prepareEvidence['guestShutdownSeconds']) $prepareEvidence
-    if ($WipeFreeSpace) {
-        # 6b. With the guest off: its VHDX compacted, then the host's free space zeroed and trimmed.
-        $compact = Invoke-DemoDiskWipeAction -Config $Config -Action 'HostCompact'
-        $hostPart = Get-DemoMemberValue -InputObject $compact.Data -Name 'host'
-        $compactEvidence = [ordered]@{ seconds = $compact.Seconds; disks = Get-DemoMemberValue -InputObject $hostPart -Name 'disks'; hostBytes = Get-DemoMemberValue -InputObject $hostPart -Name 'bytes'; hostFreeAfter = Get-DemoMemberValue -InputObject $hostPart -Name 'freeAfter'; trim = Get-DemoMemberValue -InputObject $hostPart -Name 'trim' }
-        if (-not $compact.Succeeded) {
-            $results.Add((New-DemoResult -CheckId 'GOLDEN.CAPTURE.COMPACT' -Area 't2' -Target 'T2' -Status 'Fail' -Message ('The guest''s disk wasn''t compacted or the host''s free space wasn''t overwritten, so nothing was captured: {0}' -f $compact.Error) -Evidence $compactEvidence -Remediation 'Run capture-t2-golden.ps1 -WipeFreeSpace again: it releases the air-gapped guest first.' -DocUrl $wipeDoc))
-            return $results.ToArray()
+    # 6 to 8 in one block: once Prepare has run, GOLDEN.CAPTURE.SOURCE returns the source to service whatever happens
+    # next (ADR 0018, section 4, item 9), so no start ever finds T2 cut off (live, 2026-11-03).
+    $capture = @{ Prepared = $false; AirGapUtc = $null }
+    $captureSteps = {
+        # 6. Clean, air-gap, and shut the guest down.
+        $capture['Prepared'] = $true
+        $prepare = Invoke-DemoGoldenGuestAction -Config $Config -Action 'Prepare' -Parameter @{ SnapshotName = $snapshotName } -TimeoutSeconds 2400
+        $capture['AirGapUtc'] = [DateTime]::UtcNow
+        if (-not $prepare.Succeeded) {
+            & $add 'GOLDEN.CAPTURE.PREPARE' 'Fail' ('The guest wasn''t prepared: {0}' -f $prepare.Error) @{} 'Fix the cause and run capture-t2-golden.ps1 again; GOLDEN.CAPTURE.SOURCE says whether the source is back in service.'
+            return
         }
-        $results.Add((New-DemoResult -CheckId 'GOLDEN.CAPTURE.COMPACT' -Area 't2' -Target 'T2' -Status 'Pass' -Message ('The guest''s disk was compacted, and the host''s free space was overwritten with zeros ({0:N1} GB) and trimmed, in {1:N0} minutes.' -f ([double]$compactEvidence['hostBytes'] / 1GB), ($compact.Seconds / 60)) -Evidence $compactEvidence -DocUrl $wipeDoc))
-    }
+        $prepared = $prepare.Data
+        $prepareEvidence = [ordered]@{}
+        foreach ($name in 'cachesRemoved', 'logFilesRedacted', 'signInCachesLeft', 'setupLogFilesWithToken', 'ieEsc', 'airGap', 'guestState', 'guestShutdownSeconds') {
+            $prepareEvidence[$name] = Get-DemoMemberValue -InputObject $prepared -Name $name
+        }
+        $record = Get-DemoMemberValue -InputObject $prepared -Name 'record'
+        & $add 'GOLDEN.CAPTURE.PREPARE' 'Pass' ('The guest passed its own sign-in check again (caches removed: {0}, log files redacted: {1}), and is air-gapped and shut down in {2} seconds.' -f $prepareEvidence['cachesRemoved'], $prepareEvidence['logFilesRedacted'], $prepareEvidence['guestShutdownSeconds']) $prepareEvidence
+        if ($WipeFreeSpace) {
+            # 6b. With the guest off: its VHDX compacted, then the host's free space zeroed and trimmed.
+            $compact = Invoke-DemoDiskWipeAction -Config $Config -Action 'HostCompact'
+            $hostPart = Get-DemoMemberValue -InputObject $compact.Data -Name 'host'
+            $compactEvidence = [ordered]@{ seconds = $compact.Seconds; disks = Get-DemoMemberValue -InputObject $hostPart -Name 'disks'; hostBytes = Get-DemoMemberValue -InputObject $hostPart -Name 'bytes'; hostFreeAfter = Get-DemoMemberValue -InputObject $hostPart -Name 'freeAfter'; trim = Get-DemoMemberValue -InputObject $hostPart -Name 'trim' }
+            if (-not $compact.Succeeded) {
+                $results.Add((New-DemoResult -CheckId 'GOLDEN.CAPTURE.COMPACT' -Area 't2' -Target 'T2' -Status 'Fail' -Message ('The guest''s disk wasn''t compacted or the host''s free space wasn''t overwritten, so nothing was captured: {0}' -f $compact.Error) -Evidence $compactEvidence -Remediation 'Free space on the host''s C: when it''s short, then run capture-t2-golden.ps1 -WipeFreeSpace again; GOLDEN.CAPTURE.SOURCE says whether the source is back in service.' -DocUrl $wipeDoc))
+                return
+            }
+            $results.Add((New-DemoResult -CheckId 'GOLDEN.CAPTURE.COMPACT' -Area 't2' -Target 'T2' -Status 'Pass' -Message ('The guest''s disk was compacted, and the host''s free space was overwritten with zeros ({0:N1} GB) and trimmed, in {1:N0} minutes.' -f ([double]$compactEvidence['hostBytes'] / 1GB), ($compact.Seconds / 60)) -Evidence $compactEvidence -DocUrl $wipeDoc))
+        }
 
-    # 7. Deallocate, then the snapshot.
-    $stop = Invoke-DemoVmPowerAction -Config $Config -VmName 'archost01' -Action Deallocate
-    $results.Add($stop)
-    if ($stop.status -ne 'Pass') {
-        return $results.ToArray()
+        # 7. Deallocate, then the snapshot.
+        $stop = Invoke-DemoVmPowerAction -Config $Config -VmName 'archost01' -Action Deallocate
+        $results.Add($stop)
+        if ($stop.status -ne 'Pass') {
+            return
+        }
+        $standardTags = Get-DemoGoldenStandardTag -Config $Config
+        $groupExists = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('group', 'exists', '--name', $goldenGroup) -AllowFailure
+        if (([string]$groupExists.StdOut).Trim() -ne 'true') {
+            $create = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList (@('group', 'create', '--name', $goldenGroup, '--location', $location, '--tags') + (ConvertTo-DemoTagArgument -Tag $standardTags)) -AllowFailure
+            if ($create.ExitCode -ne 0) {
+                & $add 'GOLDEN.CAPTURE.GROUP' 'Fail' ('{0} couldn''t be created: {1}' -f $goldenGroup, (Get-DemoDeploymentErrorText -Text $create.StdErr -MaxLength 400))
+                return
+            }
+        }
+        $names = Get-DemoGoldenTagName
+        $snapshotTags = [ordered]@{}
+        foreach ($key in $standardTags.Keys) {
+            $snapshotTags[$key] = $standardTags[$key]
+        }
+        $snapshotTags[$names['Role']] = 't2-golden'
+        $snapshotTags[$names['CapturedUtc']] = $NowUtc.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+        $snapshotTags[$names['EvalExpiresUtc']] = if ($isEvaluation) { $expiresUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } else { 'none' }
+        $snapshotTags[$names['BundleSha256']] = $facts.bundleSha256
+        $snapshotTags[$names['RunnerSha256']] = $facts.runnerSha256
+        $snapshotTags[$names['SqlEdition']] = 'Standard'
+        $snapshotTags[$names['SqlVersion']] = $facts.sqlVersion
+        $snapshotTags[$names['SqlUpdateLevel']] = if ($facts.sqlUpdateLevel) { '{0}-{1}' -f $facts.sqlUpdateLevel, $facts.sqlUpdateReference } else { 'RTM' }
+        $snapshotTags[$names['InstallMode']] = [string]$Config['t2SqlInstallMode']
+        $snapshotTags[$names['HostSize']] = $hostSize
+        $snapshotTags[$names['SecurityType']] = $securityType
+        $snapshotTags[$names['UsedGiB']] = [string]$facts.usedGiB
+        $snapshotTags[$names['SourceGroup']] = $resourceGroupName
+        $snapshotTags[$names['SourceAzureVmId']] = [string](Get-DemoMemberValue -InputObject $record -Name 'sourceAzureVmId')
+        $snapshotTags[$names['ArcIdentity']] = '{0}/{1}' -f $resourceGroupName, 'arcsql01'
+        $clean = [ordered]@{}
+        foreach ($key in $snapshotTags.Keys) {
+            # Tag values pass through az.cmd, which can't carry quotes or percent signs; spaces aren't needed.
+            $value = ([string]$snapshotTags[$key]) -replace '[^A-Za-z0-9._:/@+=,_-]', '-'
+            if ($value) {
+                $clean[$key] = $value
+            }
+        }
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $created = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList (@('snapshot', 'create', '--resource-group', $goldenGroup, '--name', $snapshotName, '--location', $location, '--source', $osDiskId, '--incremental', 'true', '--network-access-policy', 'DenyAll', '--public-network-access', 'Disabled', '--output', 'json', '--tags') + (ConvertTo-DemoTagArgument -Tag $clean)) -AllowFailure
+        $snapshot = if ($created.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$created.StdOut)) { [string]$created.StdOut | ConvertFrom-Json -Depth 32 } else { $null }
+        if ($null -eq $snapshot -or [string](Get-DemoMemberValue -InputObject $snapshot -Name 'provisioningState') -ne 'Succeeded') {
+            & $add 'GOLDEN.CAPTURE.SNAPSHOT' 'Fail' ('The snapshot {0} wasn''t created: {1}' -f $snapshotName, (Get-DemoDeploymentErrorText -Text $created.StdErr -MaxLength 600)) @{} 'A policy deny names the policy. The source is returned to service either way (GOLDEN.CAPTURE.SOURCE).'
+            return
+        }
+        $parsed = ConvertFrom-DemoGoldenSnapshot -Snapshot $snapshot -NowUtc $NowUtc
+        $snapshotEvidence = [ordered]@{ name = $parsed.Name; sku = $parsed.Sku; sizeGiB = $parsed.SizeGiB; usedGiB = $facts.usedGiB; incremental = $parsed.Incremental; networkAccessPolicy = $parsed.NetworkAccessPolicy; seconds = [int]$watch.Elapsed.TotalSeconds; evalExpiresUtc = $snapshotTags[$names['EvalExpiresUtc']] }
+        if (-not $parsed.Incremental -or $parsed.NetworkAccessPolicy -ne 'DenyAll') {
+            & $add 'GOLDEN.CAPTURE.SNAPSHOT' 'Fail' ('The snapshot {0} exists, but it isn''t incremental with network access DenyAll.' -f $snapshotName) $snapshotEvidence
+            return
+        }
+        & $add 'GOLDEN.CAPTURE.SNAPSHOT' 'Pass' ('Snapshot {0}: incremental, {1}, DenyAll, {2} GiB provisioned and about {3} GiB used, in {4:N0} seconds.' -f $parsed.Name, $parsed.Sku, $parsed.SizeGiB, $facts.usedGiB, $watch.Elapsed.TotalSeconds) $snapshotEvidence
+
+        # 8. A disk from it must succeed.
+        $diskName = '{0}-verify' -f $snapshotName
+        $watch.Restart()
+        $diskCreate = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList (@('disk', 'create', '--resource-group', $goldenGroup, '--name', $diskName, '--location', $location, '--source', $parsed.Id, '--sku', 'Standard_LRS', '--network-access-policy', 'DenyAll', '--public-network-access', 'Disabled', '--output', 'json', '--tags') + (ConvertTo-DemoTagArgument -Tag $standardTags)) -AllowFailure
+        $disk = if ($diskCreate.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$diskCreate.StdOut)) { [string]$diskCreate.StdOut | ConvertFrom-Json -Depth 32 } else { $null }
+        $diskState = [string](Get-DemoMemberValue -InputObject $disk -Name 'provisioningState')
+        $diskSeconds = [int]$watch.Elapsed.TotalSeconds
+        $deleted = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('disk', 'delete', '--resource-group', $goldenGroup, '--name', $diskName, '--yes') -AllowFailure
+        if ($diskState -ne 'Succeeded') {
+            & $add 'GOLDEN.CAPTURE.DISKVERIFY' 'Fail' ('A disk couldn''t be created from {0} (state ''{1}''): {2}' -f $snapshotName, $diskState, (Get-DemoDeploymentErrorText -Text $diskCreate.StdErr -MaxLength 400)) @{ seconds = $diskSeconds } 'Don''t rely on this snapshot; capture again.'
+            return
+        }
+        $verifiedUtc = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+        $tagged = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('tag', 'update', '--resource-id', $parsed.Id, '--operation', 'Merge', '--tags', ('{0}={1}' -f $names['DiskVerifiedUtc'], $verifiedUtc)) -AllowFailure
+        $diskStatus = if ($tagged.ExitCode -eq 0 -and $deleted.ExitCode -eq 0) { 'Pass' } else { 'Warning' }
+        & $add 'GOLDEN.CAPTURE.DISKVERIFY' $diskStatus ('A disk created from {0} succeeded in {1} seconds{2}.' -f $snapshotName, $diskSeconds, $(if ($deleted.ExitCode -ne 0) { '; its test disk wasn''t deleted, so delete it by hand' } elseif ($tagged.ExitCode -ne 0) { '; the disk-verified tag wasn''t written' } else { ' and was deleted' })) @{ seconds = $diskSeconds; testDisk = $diskName }
+
+        $older = @(Get-DemoT2GoldenSnapshot -Config $Config -NowUtc $NowUtc | Where-Object { $_.Name -ne $snapshotName })
+        $olderStatus = if ($older.Count -gt 0) { 'Pass' } else { 'Not selected' }
+        & $add 'GOLDEN.CAPTURE.PREVIOUS' $olderStatus $(if ($older.Count -gt 0) { '{0} older golden snapshot(s) stay until {1} is boot-verified: {2}.' -f $older.Count, $snapshotName, (($older | ForEach-Object { $_.Name }) -join ', ') } else { 'No older golden snapshot.' })
+        & $add 'GOLDEN.CAPTURE' 'Pass' ('{0} is captured and disk-verified. Prove it boots before relying on it: ./scripts/test-t2-golden.ps1 -SnapshotName {0} -Onboard.' -f $snapshotName) ([ordered]@{ snapshot = $snapshotName; group = $goldenGroup })
     }
-    $standardTags = Get-DemoGoldenStandardTag -Config $Config
-    $groupExists = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('group', 'exists', '--name', $goldenGroup) -AllowFailure
-    if (([string]$groupExists.StdOut).Trim() -ne 'true') {
-        $create = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList (@('group', 'create', '--name', $goldenGroup, '--location', $location, '--tags') + (ConvertTo-DemoTagArgument -Tag $standardTags)) -AllowFailure
-        if ($create.ExitCode -ne 0) {
-            & $add 'GOLDEN.CAPTURE.GROUP' 'Fail' ('{0} couldn''t be created: {1}' -f $goldenGroup, (Get-DemoDeploymentErrorText -Text $create.StdErr -MaxLength 400))
-            return $results.ToArray()
+    try {
+        $null = & $captureSteps
+    }
+    finally {
+        if ($capture['Prepared']) {
+            $airGap = if ($null -ne $capture['AirGapUtc']) { $capture['AirGapUtc'] } else { [DateTime]::UtcNow }
+            $source = Restore-DemoGoldenCaptureSource -Config $Config -FoundPowerState $foundPower -AirGapUtc $airGap
+            $results.Add($source)
+            Write-DemoLog -Level $(if ($source.status -eq 'Pass') { 'Info' } else { 'Warning' }) -Message ('GOLDEN.CAPTURE.SOURCE {0}: {1}' -f $source.status, $source.message)
         }
     }
-    $names = Get-DemoGoldenTagName
-    $snapshotTags = [ordered]@{}
-    foreach ($key in $standardTags.Keys) {
-        $snapshotTags[$key] = $standardTags[$key]
-    }
-    $snapshotTags[$names['Role']] = 't2-golden'
-    $snapshotTags[$names['CapturedUtc']] = $NowUtc.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
-    $snapshotTags[$names['EvalExpiresUtc']] = $expiresUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
-    $snapshotTags[$names['BundleSha256']] = $facts.bundleSha256
-    $snapshotTags[$names['RunnerSha256']] = $facts.runnerSha256
-    $snapshotTags[$names['SqlEdition']] = 'Standard'
-    $snapshotTags[$names['SqlVersion']] = $facts.sqlVersion
-    $snapshotTags[$names['SqlUpdateLevel']] = if ($facts.sqlUpdateLevel) { '{0}-{1}' -f $facts.sqlUpdateLevel, $facts.sqlUpdateReference } else { 'RTM' }
-    $snapshotTags[$names['InstallMode']] = 'PaygWizard'
-    $snapshotTags[$names['HostSize']] = $hostSize
-    $snapshotTags[$names['SecurityType']] = $securityType
-    $snapshotTags[$names['UsedGiB']] = [string]$facts.usedGiB
-    $snapshotTags[$names['SourceGroup']] = $resourceGroupName
-    $snapshotTags[$names['SourceAzureVmId']] = [string](Get-DemoMemberValue -InputObject $record -Name 'sourceAzureVmId')
-    $snapshotTags[$names['ArcIdentity']] = '{0}/{1}' -f $resourceGroupName, 'arcsql01'
-    $clean = [ordered]@{}
-    foreach ($key in $snapshotTags.Keys) {
-        # Tag values pass through az.cmd, which can't carry quotes or percent signs; spaces aren't needed.
-        $value = ([string]$snapshotTags[$key]) -replace '[^A-Za-z0-9._:/@+=,_-]', '-'
-        if ($value) {
-            $clean[$key] = $value
-        }
-    }
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $created = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList (@('snapshot', 'create', '--resource-group', $goldenGroup, '--name', $snapshotName, '--location', $location, '--source', $osDiskId, '--incremental', 'true', '--network-access-policy', 'DenyAll', '--public-network-access', 'Disabled', '--output', 'json', '--tags') + (ConvertTo-DemoTagArgument -Tag $clean)) -AllowFailure
-    $snapshot = if ($created.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$created.StdOut)) { [string]$created.StdOut | ConvertFrom-Json -Depth 32 } else { $null }
-    if ($null -eq $snapshot -or [string](Get-DemoMemberValue -InputObject $snapshot -Name 'provisioningState') -ne 'Succeeded') {
-        & $add 'GOLDEN.CAPTURE.SNAPSHOT' 'Fail' ('The snapshot {0} wasn''t created: {1}' -f $snapshotName, (Get-DemoDeploymentErrorText -Text $created.StdErr -MaxLength 600)) @{} 'A policy deny names the policy. The source host stays deallocated and air-gapped until start-demo.ps1 releases it.'
-        return $results.ToArray()
-    }
-    $parsed = ConvertFrom-DemoGoldenSnapshot -Snapshot $snapshot -NowUtc $NowUtc
-    $snapshotEvidence = [ordered]@{ name = $parsed.Name; sku = $parsed.Sku; sizeGiB = $parsed.SizeGiB; usedGiB = $facts.usedGiB; incremental = $parsed.Incremental; networkAccessPolicy = $parsed.NetworkAccessPolicy; seconds = [int]$watch.Elapsed.TotalSeconds; evalExpiresUtc = $snapshotTags[$names['EvalExpiresUtc']] }
-    if (-not $parsed.Incremental -or $parsed.NetworkAccessPolicy -ne 'DenyAll') {
-        & $add 'GOLDEN.CAPTURE.SNAPSHOT' 'Fail' ('The snapshot {0} exists, but it isn''t incremental with network access DenyAll.' -f $snapshotName) $snapshotEvidence
-        return $results.ToArray()
-    }
-    & $add 'GOLDEN.CAPTURE.SNAPSHOT' 'Pass' ('Snapshot {0}: incremental, {1}, DenyAll, {2} GiB provisioned and about {3} GiB used, in {4:N0} seconds.' -f $parsed.Name, $parsed.Sku, $parsed.SizeGiB, $facts.usedGiB, $watch.Elapsed.TotalSeconds) $snapshotEvidence
-
-    # 8. A disk from it must succeed.
-    $diskName = '{0}-verify' -f $snapshotName
-    $watch.Restart()
-    $diskCreate = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList (@('disk', 'create', '--resource-group', $goldenGroup, '--name', $diskName, '--location', $location, '--source', $parsed.Id, '--sku', 'Standard_LRS', '--network-access-policy', 'DenyAll', '--public-network-access', 'Disabled', '--output', 'json', '--tags') + (ConvertTo-DemoTagArgument -Tag $standardTags)) -AllowFailure
-    $disk = if ($diskCreate.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$diskCreate.StdOut)) { [string]$diskCreate.StdOut | ConvertFrom-Json -Depth 32 } else { $null }
-    $diskState = [string](Get-DemoMemberValue -InputObject $disk -Name 'provisioningState')
-    $diskSeconds = [int]$watch.Elapsed.TotalSeconds
-    $deleted = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('disk', 'delete', '--resource-group', $goldenGroup, '--name', $diskName, '--yes') -AllowFailure
-    if ($diskState -ne 'Succeeded') {
-        & $add 'GOLDEN.CAPTURE.DISKVERIFY' 'Fail' ('A disk couldn''t be created from {0} (state ''{1}''): {2}' -f $snapshotName, $diskState, (Get-DemoDeploymentErrorText -Text $diskCreate.StdErr -MaxLength 400)) @{ seconds = $diskSeconds } 'Don''t rely on this snapshot; capture again.'
-        return $results.ToArray()
-    }
-    $verifiedUtc = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
-    $tagged = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('tag', 'update', '--resource-id', $parsed.Id, '--operation', 'Merge', '--tags', ('{0}={1}' -f $names['DiskVerifiedUtc'], $verifiedUtc)) -AllowFailure
-    $diskStatus = if ($tagged.ExitCode -eq 0 -and $deleted.ExitCode -eq 0) { 'Pass' } else { 'Warning' }
-    & $add 'GOLDEN.CAPTURE.DISKVERIFY' $diskStatus ('A disk created from {0} succeeded in {1} seconds{2}.' -f $snapshotName, $diskSeconds, $(if ($deleted.ExitCode -ne 0) { '; its test disk wasn''t deleted, so delete it by hand' } elseif ($tagged.ExitCode -ne 0) { '; the disk-verified tag wasn''t written' } else { ' and was deleted' })) @{ seconds = $diskSeconds; testDisk = $diskName }
-
-    $older = @(Get-DemoT2GoldenSnapshot -Config $Config -NowUtc $NowUtc | Where-Object { $_.Name -ne $snapshotName })
-    $olderStatus = if ($older.Count -gt 0) { 'Pass' } else { 'Not selected' }
-    & $add 'GOLDEN.CAPTURE.PREVIOUS' $olderStatus $(if ($older.Count -gt 0) { '{0} older golden snapshot(s) stay until {1} is boot-verified: {2}.' -f $older.Count, $snapshotName, (($older | ForEach-Object { $_.Name }) -join ', ') } else { 'No older golden snapshot.' })
-    & $add 'GOLDEN.CAPTURE' 'Pass' ('{0} is captured and disk-verified. Prove it boots before relying on it: ./scripts/test-t2-golden.ps1 -SnapshotName {0} -Onboard.' -f $snapshotName) ([ordered]@{ snapshot = $snapshotName; group = $goldenGroup })
     return $results.ToArray()
 }

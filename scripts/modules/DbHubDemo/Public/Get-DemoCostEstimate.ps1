@@ -58,8 +58,25 @@ function Get-DemoCostEstimate {
 
     .PARAMETER PriceCache
     A hashtable that several estimates in one run share, so each Retail Prices query runs once: preflight prices the
-    demo, and then T4's General Purpose fallback, with the same prices (Phase 28 follow-up). Without it, each estimate
+    demo, and then T4's 2-vCore fallback, with the same prices (ADR 0019). Without it, each estimate
     reads its own prices.
+
+    .PARAMETER ActivityProfile
+    The activity profile the run uses (start-demo.ps1 -ActivityProfile); empty uses the configuration's, or the default,
+    business-day (Get-DemoActivityProfile). business-day's T3 incidents (resource-governance and log-rate-pressure, 10 of
+    every 60 minutes in scenarios/activity-profiles.json) drive T3 to its maximum vCores, so its running hour is priced at
+    the maximum for those minutes and at t3ActiveShareOfMaxVcores for the rest. Serverless bills each second the larger
+    of the CPU and the memory used (3 GB a vCore), never above the maximum vCores
+    (https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-overview), so the shipped share, 1.0, already
+    covers them: the increment is then 0, and the messages say so (2026-11-03, ADR 0016). The VMs and a provisioned T4
+    bill the same whatever the load.
+
+    .PARAMETER T4RestartCoverage
+    Whether a safety stop caps T4's 7-day automatic restart (Get-DemoT4RestartCoverage; 2026-11-04, ADR 0016): the nightly
+    safety stop, part of every deployment (ADR 0024), or the on-demand control's daily T4 safety stop. When it Counts, each
+    restart counts as about a day, until the next safety stop: at most 4 a month, 96 hours (Get-DemoT4RestartWorstCase).
+    Otherwise, or without it, the worst case counts T4 running for the rest of the month. PREFLIGHT.COST.MONTHLY says which
+    one applies and why.
 
     .EXAMPLE
     Get-DemoCostEstimate -Config (Get-DemoConfig -Path ./config/demo.config.json)
@@ -99,7 +116,14 @@ function Get-DemoCostEstimate {
         [AllowEmptyCollection()]
         [object[]] $GoldenSnapshots = @(),
 
-        [hashtable] $PriceCache
+        [hashtable] $PriceCache,
+
+        [AllowEmptyString()]
+        [ValidatePattern('^((off|baseline|business-day|incident:[a-z0-9][a-z0-9-]{0,47}))?$')]
+        [string] $ActivityProfile = '',
+
+        [AllowNull()]
+        [object] $T4RestartCoverage = $null
     )
 
     $catalog = Get-DemoProfile
@@ -209,7 +233,13 @@ function Get-DemoCostEstimate {
         Add-Component 'T2 Arc SQL Standard PAYG' 'running' $arcItem $cores 'core-hour'
     }
 
-    $t3Vcores = [double]$sizing.t3.maxVcores * [double]$assumptions.t3ActiveShareOfMaxVcores
+    $t3Share = [double]$assumptions.t3ActiveShareOfMaxVcores
+    $t3Vcores = [double]$sizing.t3.maxVcores * $t3Share
+    # business-day (the default since 2026-11-03): T3's incidents run at its maximum vCores for their minutes of each hour,
+    # read from scenarios/activity-profiles.json; the rest of the hour stays at the assumed share. 0 with the shipped share.
+    $activity = Get-DemoActivityProfile -Config $Config -Requested $ActivityProfile
+    $t3IncidentShare = if ($activity.Name -ceq 'business-day') { Get-DemoT3IncidentShare } else { 0.0 }
+    $t3IncrementVcores = [double]$sizing.t3.maxVcores * [System.Math]::Max(0.0, 1.0 - $t3Share) * $t3IncidentShare
     # Azure SQL Database free offer: each database gets 100,000 vCore-seconds of compute and 32 GB of data a
     # month (https://learn.microsoft.com/azure/azure-sql/database/free-offer, checked 2026-10-20). With
     # 'continue using database for additional charges', usage above that bills at serverless rates.
@@ -225,6 +255,9 @@ function Get-DemoCostEstimate {
     $t3VcoreItem = $t3Items | Where-Object { $_.meterName -eq 'vCore' } | Select-Object -First 1
     # The session stays at list price (an upper bound); the light-use month subtracts the free allowance.
     Add-Component 'T3 compute (serverless)' 'running' $t3VcoreItem $t3Vcores 'vCore-hour'
+    if ($t3IncrementVcores -gt 0) {
+        Add-Component ('T3 compute, business-day incidents ({0:N0} of every 60 minutes at the maximum vCores)' -f ($t3IncidentShare * 60)) 'running' $t3VcoreItem $t3IncrementVcores 'vCore-hour'
+    }
 
     # Interactive access (per session)
     $bastionItems = Get-CachedPrice "serviceName eq 'Azure Bastion' and armRegionName eq '$location' and skuName eq 'Basic' and priceType eq 'Consumption'"
@@ -276,16 +309,18 @@ function Get-DemoCostEstimate {
     $t3BillableGB = if ($t3UsesFreeOffer) { [System.Math]::Max(0.0, [double]$sizing.t3.maxSizeGB - 32.0) } else { [double]$sizing.t3.maxSizeGB }
     Add-Component 'T3 storage' 'idle' ($t3StorageItems | Where-Object { $_.meterName -eq 'General Purpose Data Stored' } | Select-Object -First 1) $t3BillableGB 'GB-month'
 
-    # T4 (Phase 24, ADR 0019): the Burstable flexible server's compute while the demo runs, and its storage and
+    # T4 (Phase 24, ADR 0019): the flexible server's compute while the demo runs, and its storage and
     # private DNS zone (virtual network integration in both network modes) all month, stopped or not. Its
     # backups stay within the free allowance (backup storage up to the provisioned size). A stopped server
     # starts on its own after seven days, so the worst case adds the rest of the month's compute.
     $t4On = Test-DemoT4Enabled -Config $Config
     $t4ComputeItem = $null
     $t4WorstCase = $null
+    $t4Restart = $null
     if ($t4On -and $null -ne $sizing.t4) {
-        # The size actually deployed: the t4SkuName setting (B1ms, the B2s fallback, or the General Purpose D2ds_v5
-        # option, priced per vCore-hour; Phase 24).
+        # The size actually deployed: the t4SkuName setting or the default (General Purpose Standard_D4ds_v5 since
+        # 2026-11-04), the fallback's D4ads_v5 or D2ds_v5 (General Purpose, priced per vCore-hour), or a Burstable size
+        # (one meter per server-hour; ADR 0019).
         $t4SkuName = Get-DemoT4SkuName -Config $Config
         $t4Spec = Get-DemoT4SkuSpec -SkuName $t4SkuName
         $t4ComputeItems = Get-CachedPrice "serviceName eq 'Azure Database for PostgreSQL' and armRegionName eq '$location' and productName eq '$($t4Spec.Product)' and priceType eq 'Consumption'"
@@ -297,7 +332,11 @@ function Get-DemoCostEstimate {
         $t4DnsItems = Get-CachedPrice "serviceName eq 'Azure DNS' and skuName eq 'Private' and meterName eq 'Private Zone' and priceType eq 'Consumption'"
         Add-Component 'T4 private DNS zone' 'idle' ($t4DnsItems | Where-Object { $_.armRegionName -notmatch 'Gov' } | Sort-Object -Property tierMinimumUnits, armRegionName | Select-Object -First 1) 1 'zone-month'
         if ($t4ComputeItem) {
-            $t4WorstCase = [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * ($hoursPerMonth - $LightUseHoursPerMonth), 2)
+            # T4's 7-day automatic restart (2026-11-04, ADR 0016): with a safety stop in place (-T4RestartCoverage: the nightly
+            # safety stop, ADR 0024, or the control's), each restart counts as about a day; otherwise the rest of the month.
+            $t4Capped = $null -ne $T4RestartCoverage -and [bool](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Counts')
+            $t4Restart = Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $t4Capped -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])
+            $t4WorstCase = [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $t4Restart.Hours, 2)
         }
     }
 
@@ -329,14 +368,21 @@ function Get-DemoCostEstimate {
         Add-Component 'NAT gateway public IP' 'idle' $ipItem $hoursPerMonth 'hour'
     }
 
+    # Azure Automation includes the first 500 job minutes a month (https://azure.microsoft.com/pricing/details/automation/),
+    # so the tier that starts at 0 is the one priced.
+    $automationItems = Get-CachedPrice "serviceName eq 'Automation' and armRegionName eq '$location' and skuName eq 'Basic' and meterName eq 'Basic Runtime' and priceType eq 'Consumption'"
+    $automationItem = $automationItems | Sort-Object -Property { [double]$_.tierMinimumUnits } | Select-Object -First 1
+    # The nightly safety stop (ADR 0024), part of every deployment: two short jobs a night, the stop and its T3 check, about
+    # 2 to 4 minutes, more on a night it waits up to 10 minutes for a T4 that's starting. A ceiling: 120 job minutes a month.
+    Add-Component 'Nightly safety stop job minutes (the first 500 a month are included)' 'idle' $automationItem 120 'minute'
+
     # The optional on-demand activity control (ADR 0020), in rg-<prefix>-control: the vault bills per 10,000 operations
     # and an on-demand run reads its one secret once, and Automation includes the first 500 job minutes a month, while
     # a run's jobs take a few minutes. So these are ceilings: one block of operations, and 60 job minutes a month.
     if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
         $vaultItems = Get-CachedPrice "serviceName eq 'Key Vault' and armRegionName eq '$location' and skuName eq 'Standard' and priceType eq 'Consumption'"
         Add-Component 'Activity control vault operations' 'idle' ($vaultItems | Where-Object { $_.meterName -eq 'Operations' } | Select-Object -First 1) 1 '10K operations'
-        $automationItems = Get-CachedPrice "serviceName eq 'Automation' and armRegionName eq '$location' and skuName eq 'Basic' and meterName eq 'Basic Runtime' and priceType eq 'Consumption'"
-        Add-Component 'Activity control job minutes (the first 500 a month are included)' 'idle' ($automationItems | Sort-Object -Property { [double]$_.tierMinimumUnits } | Select-Object -First 1) 60 'minute'
+        Add-Component 'Activity control job minutes (the first 500 a month are included)' 'idle' $automationItem 60 'minute'
     }
 
     # Microsoft Defender for Cloud, from the subscription's plans.
@@ -413,9 +459,13 @@ function Get-DemoCostEstimate {
     $idleMonthly = [System.Math]::Round($idle, 2)
     $t3FreeCredit = 0.0
     if ($t3UsesFreeOffer -and $t3VcoreItem) {
-        $t3FreeCredit = [System.Math]::Min($t3Vcores * $LightUseHoursPerMonth, 100000.0 / 3600.0) * [double]$t3VcoreItem.retailPrice
+        $t3FreeCredit = [System.Math]::Min(($t3Vcores + $t3IncrementVcores) * $LightUseHoursPerMonth, 100000.0 / 3600.0) * [double]$t3VcoreItem.retailPrice
     }
     $t3FreeCreditMonthly = [System.Math]::Round($t3FreeCredit, 2)
+    # business-day's T3 increment, before the free allowance (which it uses faster), for the messages and the evidence.
+    $t3IncrementPrice = if ($t3VcoreItem) { [double]$t3VcoreItem.retailPrice } else { 0.0 }
+    $t3IncrementSession = [System.Math]::Round($t3IncrementVcores * $DemoHours * $t3IncrementPrice, 2)
+    $t3IncrementMonthly = [System.Math]::Round($t3IncrementVcores * $LightUseHoursPerMonth * $t3IncrementPrice, 2)
     $sessionCost = [System.Math]::Round($running * $DemoHours + $bastion * $BastionHours, 2)
     $lightUseMonthly = [System.Math]::Round($idle + $running * $LightUseHoursPerMonth + $bastion * $BastionHours - $t3FreeCredit, 2)
     $defenderSession = [System.Math]::Round($defenderRunning * $DemoHours, 2)
@@ -441,10 +491,20 @@ function Get-DemoCostEstimate {
         t3FreeOfferUnchecked = $t3FreeOfferUnchecked
         t3FreeOfferCredit    = $t3FreeCreditMonthly
         t4Enabled            = [bool]$t4On
+        activityProfile      = $activity.Name
+        activityProfileSource = $activity.Source
+        t3IncidentShare      = [System.Math]::Round($t3IncidentShare, 4)
+        t3ActiveShareOfMax   = $t3Share
+        t3BusinessDayVcoreHoursPerHour = [System.Math]::Round($t3IncrementVcores, 4)
+        t3BusinessDaySession = $t3IncrementSession
+        t3BusinessDayMonthly = $t3IncrementMonthly
     }
     if ($t4On) {
         $evidence['t4FixedMonthly'] = $t4FixedMonthly
         $evidence['t4AutoRestartWorstCaseMonthly'] = $t4WorstCase
+        $evidence['t4RestartAssumption'] = if ($null -ne $t4Restart -and $t4Restart.Restarts -gt 0) { 'SafetyStop' } else { 'RestOfMonth' }
+        $evidence['t4RestartHours'] = if ($null -ne $t4Restart) { $t4Restart.Hours } else { $null }
+        $evidence['t4RestartMissing'] = if ($null -eq $T4RestartCoverage) { 'NotChecked' } else { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Missing') }
     }
     if ($defenderIncluded) {
         $evidence['defenderSession'] = $defenderSession
@@ -459,7 +519,8 @@ function Get-DemoCostEstimate {
         $sessionCeiling = [double]$Config['sessionCeilingUsd']
         $monthlyCeiling = [double]$Config['monthlyCeilingUsd']
         $sessionStatus = if ($sessionCost -le $sessionCeiling) { 'Pass' } else { 'Warning' }
-        # T4's 7-day automatic restart counts against the ceiling until a scheduled daily stop covers it.
+        # T4's 7-day automatic restart counts against the ceiling: about a day per restart where a safety stop is in place,
+        # otherwise the rest of the month (2026-11-04).
         $monthlyStatus = if ($lightUseMonthly + [double]$t4WorstCase -le $monthlyCeiling) { 'Pass' } else { 'Fail' }
         $sessionDefender = if ($defenderIncluded) { ' (of which Defender for Cloud: {0:N2} USD)' -f $defenderSession } else { '' }
         $monthlyDefender = if ($defenderIncluded) { ' (of which Defender for Cloud: {0:N2} USD)' -f $defenderMonthly } else { '' }
@@ -467,8 +528,30 @@ function Get-DemoCostEstimate {
         if ($null -ne $arcSqlWorstCase) {
             $monthlyMessage += ' If Defender for SQL also bills the Arc SQL instance while it''s disconnected (not documented), add up to {0:N2} USD.' -f $arcSqlWorstCase
         }
+        $monthlyRemediation = 'Pick a cheaper profile or options (lowest-cost, Spot, or parking T2 between demos), or raise monthlyCeilingUsd in the configuration (ADR 0016).'
         if ($t4On) {
-            $monthlyMessage += ' T4 (PostgreSQL, {2}) costs {0:N2} USD a month even while stopped (storage, its private DNS zone, and its Defender plans); a stopped T4 starts on its own after 7 days, so the worst case adds up to {1:N2} USD of T4 compute at its size, which counts against the ceiling until a scheduled daily stop of T4 caps it.' -f $t4FixedMonthly, [double]$t4WorstCase, (Get-DemoT4SkuName -Config $Config)
+            $t4Sku = Get-DemoT4SkuName -Config $Config
+            $culture = [System.Globalization.CultureInfo]::InvariantCulture
+            $restartText = if ($null -eq $t4Restart) {
+                ' Its compute price couldn''t be read, so its automatic restart isn''t counted.'
+            }
+            elseif ($t4Restart.Restarts -gt 0) {
+                [string]::Format($culture, ' Azure starts a stopped T4 again on its own after 7 days, and {0}, so the worst case counts up to {1} restarts a month of about a day each, until the next safety stop: {2:N0} hours, {3:N2} USD of T4 compute, against the ceiling.', [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Reason'), $t4Restart.Restarts, $t4Restart.Hours, [double]$t4WorstCase)
+            }
+            else {
+                $why = if ($null -eq $T4RestartCoverage) { 'whether the nightly safety stop is in place wasn''t checked' } else { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Reason') }
+                [string]::Format($culture, ' Azure starts a stopped T4 again on its own after 7 days, and {0}, so the worst case counts it running for the rest of the month: {1:N0} hours, {2:N2} USD of T4 compute, against the ceiling.', $why, $t4Restart.Hours, [double]$t4WorstCase)
+            }
+            $monthlyMessage += [string]::Format($culture, ' T4 (PostgreSQL, {0}) costs {1:N2} USD a month even while stopped (storage, its private DNS zone, and its Defender plans).{2}', $t4Sku, $t4FixedMonthly, $restartText)
+            # The three ways to keep the month cheaper (the owner's decision, 2026-11-04).
+            $cheaper = 'To keep the month cheaper: set t4SkuName to Standard_B1ms (which turns autonomous tuning off), set t4Enabled to false, or set a lower monthlyCeilingUsd.'
+            $monthlyMessage += ' ' + $cheaper
+            $safetyFix = if ($null -ne $t4Restart -and $t4Restart.Restarts -eq 0) {
+                $fix = if ($null -ne $T4RestartCoverage) { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Fix') } else { '' }
+                if ($fix) { ' Or put the nightly safety stop fully in place, so each restart counts as about a day: {0}' -f $fix } else { ' Or run ./scripts/deploy.ps1, which sets up the nightly safety stop, so each restart counts as about a day.' }
+            }
+            else { '' }
+            $monthlyRemediation = [string]::Format($culture, '{0} To keep this T4, raise monthlyCeilingUsd to at least {1:N0} (the budget follows it at the next deploy.ps1 -FromStage Infrastructure).{2}', $cheaper, [System.Math]::Ceiling($lightUseMonthly + [double]$t4WorstCase), $safetyFix)
         }
         if ($networkModeAssumed) {
             $monthlyMessage += ' networkMode auto isn''t resolved yet, so the estimate assumes private mode (private endpoint and private DNS zone).'
@@ -479,11 +562,24 @@ function Get-DemoCostEstimate {
         elseif ($t3FreeOfferUnchecked) {
             $monthlyMessage += ' The Azure SQL Database free offer wasn''t checked, so T3 is priced as regular serverless; preflight checks it.'
         }
+        # business-day's T3 incidents (2026-11-03): counted in both checks, with what they add.
+        $sessionActivity = ''
+        if ($activity.Name -ceq 'business-day') {
+            $incidentMinutes = [int][System.Math]::Round($t3IncidentShare * 60)
+            if ($t3IncrementVcores -gt 0) {
+                $activityText = ' With activityProfile business-day, T3''s incidents run at its maximum vCores {0} of every 60 minutes, which adds {1:N2} USD to a session and {2:N2} USD to the light-use month before the free allowance.' -f $incidentMinutes, $t3IncrementSession, $t3IncrementMonthly
+            }
+            else {
+                $activityText = ' With activityProfile business-day, T3''s incidents run at its maximum vCores {0} of every 60 minutes; the estimate already prices T3 at its maximum for every running hour, so they add nothing.' -f $incidentMinutes
+            }
+            $monthlyMessage += $activityText
+            $sessionActivity = $activityText
+        }
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.SESSION' -Area 'preflight' -Target 'subscription' -Status $sessionStatus `
-                    -Message ('{0}: a {1}-hour demo session is estimated at {2:N2} USD{3} against a ceiling of {4:N2} USD.' -f $ProfileName, $DemoHours, $sessionCost, $sessionDefender, $sessionCeiling) `
+                    -Message ('{0}: a {1}-hour demo session is estimated at {2:N2} USD{3} against a ceiling of {4:N2} USD.{5}' -f $ProfileName, $DemoHours, $sessionCost, $sessionDefender, $sessionCeiling, $sessionActivity) `
                     -Evidence $evidence -Remediation 'Shorten the session, choose a smaller profile, or opt in to Spot (ADR 0016).' -DocUrl $retailPricesDoc))
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status $monthlyStatus `
-                    -Message $monthlyMessage -Evidence $evidence -Remediation 'Pick a cheaper profile or options (lowest-cost, Spot, or parking T2 between demos), or raise monthlyCeilingUsd in the configuration (ADR 0016).' -DocUrl $retailPricesDoc))
+                    -Message $monthlyMessage -Evidence $evidence -Remediation $monthlyRemediation -DocUrl $retailPricesDoc))
     }
 
     if (-not $defenderIncluded) {
@@ -544,9 +640,14 @@ function Get-DemoCostEstimate {
         ArcSqlDefenderWorstCaseMonthly = $arcSqlWorstCase
         T4FixedMonthly                 = $t4FixedMonthly
         T4AutoRestartWorstCaseMonthly  = $t4WorstCase
+        T4RestartHours                 = $(if ($null -ne $t4Restart) { $t4Restart.Hours } else { $null })
+        T4RestartAssumption            = $(if ($null -ne $t4Restart -and $t4Restart.Restarts -gt 0) { 'SafetyStop' } elseif ($null -ne $t4Restart) { 'RestOfMonth' } else { '' })
         T3FreeOffer                    = [bool]$t3UsesFreeOffer
         T3FreeOfferUnchecked           = $t3FreeOfferUnchecked
         T3FreeOfferCreditMonthly       = $t3FreeCreditMonthly
+        ActivityProfile                = $activity.Name
+        T3BusinessDaySession           = $t3IncrementSession
+        T3BusinessDayMonthly           = $t3IncrementMonthly
         Components                     = $components.ToArray()
         MissingPrices                  = $missing.ToArray()
         Results                        = $results.ToArray()

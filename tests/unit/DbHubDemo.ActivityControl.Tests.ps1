@@ -146,7 +146,7 @@ BeforeAll {
                 }
                 return (New-AzResult -StdOut '{"name":"aa-dbhub-control"}')
             }
-            '/runbooks/(DbHub-Control|DbHub-Stop)$' {
+            '/runbooks/(DbHub-Control|DbHub-Stop|DbHub-Monitor)$' {
                 return (New-AzResult -StdOut '{"properties":{"state":"Published"}}')
             }
             '/privateEndpointConnections$' {
@@ -225,8 +225,17 @@ BeforeAll {
                 $value = @(
                     if ($script:safetyStop -and $script:safetyStopLinked) { @{ properties = @{ jobScheduleId = 'ffffffff-0000-0000-0000-000000000006'; schedule = @{ name = 'dbhub-t4-safety-stop' }; runbook = @{ name = 'DbHub-Stop' } } } }
                     if ($script:autoStop) { @{ properties = @{ jobScheduleId = 'ffffffff-0000-0000-0000-000000000007'; schedule = @{ name = 'dbhub-autostop' }; runbook = @{ name = 'DbHub-Stop' } } } }
+                    foreach ($recheck in @($script:monitorSchedules)) { @{ properties = @{ jobScheduleId = ('ffffffff-0000-0000-0000-00000000010{0}' -f $recheck.Substring($recheck.Length - 1)); schedule = @{ name = $recheck }; runbook = @{ name = 'DbHub-Monitor' } } } }
                 )
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ value = $value } -Depth 6))
+            }
+            '/automationAccounts/aa-dbhub-control/schedules$' {
+                $value = @(
+                    @{ name = 'dbhub-t4-safety-stop' }
+                    if ($script:autoStop) { @{ name = 'dbhub-autostop' } }
+                    foreach ($recheck in @($script:monitorSchedules)) { @{ name = $recheck } }
+                )
+                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ value = $value } -Depth 4))
             }
             '/deletedVaults/.+/purge$' {
                 return (New-AzResult -StdOut '{}')
@@ -262,6 +271,7 @@ BeforeAll {
         $script:webhookUrl = ''
         $script:autoStop = $null
         $script:autoStopDeleteFails = $false
+        $script:monitorSchedules = @()
         $script:stopJobStates = @()
         $script:jobReads = 0
         $script:jobsReadFailAt = 0
@@ -478,11 +488,29 @@ Describe 'The runbooks'' settings' {
         $setting['scenarios'].Contains('healthy-baseline') | Should -BeFalse
         $folders = @(Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scenarios') -Directory | Where-Object Name -NE 'healthy-baseline' | ForEach-Object Name)
         @($setting['scenarios'].Keys | Sort-Object) | Should -Be @($folders | Sort-Object)
+        # Run all's showcase (2026-11-04): its bounds from scenarios/activity-profiles.json.
+        @($setting['profiles'].Keys) | Should -Be @('showcase')
+        $setting['profiles']['showcase']['maxMinutes'] | Should -Be 120
+        $setting['profiles']['showcase']['defaultMinutes'] | Should -Be 90
+        @($setting['profiles']['showcase']['targets']) | Should -Be @('T1', 'T2', 'T3', 'T4')
         $setting['minDurationMinutes'] | Should -Be 5
         $setting['maxDurationMinutes'] | Should -Be 120
         $setting['maxBodyBytes'] | Should -Be 4096
         $setting['autoStopBufferMinutes'] | Should -Be 10
         $setting['shutdownMarginMinutes'] | Should -Be 2
+        # Live, 2026-11-03: T2's guest takes minutes to come up after its host, so its wait is longer (ADR 0020).
+        $setting['readySeconds']['T1'] | Should -Be 600
+        $setting['readySeconds']['T2'] | Should -Be 1200
+        $setting['readySeconds']['T3'] | Should -Be 600
+        $setting['readySeconds']['T4'] | Should -Be 600
+        $setting['monitorRunbook'] | Should -Be 'DbHub-Monitor'
+        $setting['monitorSchedulePrefix'] | Should -Be 'dbhub-monitor-'
+        $setting['monitorRecheckMinutes'] | Should -Be 30
+        $setting['monitoring']['featureFlag'] | Should -Be 'DatabaseWatcheronAzureVM'
+        $setting['monitoring']['statusPlugin'] | Should -Be 'DatabaseMonitorArcPlugin'
+        # 8 since 2026-11-04 (5 before): the look waits for a status reported after sqlvm01's start, not the one from before the stop.
+        $setting['monitoring']['settleMinutes'] | Should -Be 8
+        $setting['monitoring']['verifyMinutes'] | Should -Be 5
         foreach ($type in $setting['apiVersions'].Keys) {
             $setting['apiVersions'][$type] | Should -Match '^\d{4}-\d{2}-\d{2}(-preview)?$' -Because $type
         }
@@ -1036,6 +1064,16 @@ Describe 'stop-demo.ps1, start-demo.ps1, and a pending auto-stop (Clear-DemoActi
         $result.checkId | Should -Be 'STOP.CONTROL.AUTOSTOP'
         $result.status | Should -Be 'Pass'
         Get-Deleted | Should -Be @('ffffffff-0000-0000-0000-000000000007', 'dbhub-autostop')
+    }
+
+    It '<Purpose> removes the run''s monitoring re-checks and their links to DbHub-Monitor with the auto-stop' -ForEach @(
+        @{ Purpose = 'Stop' }
+        @{ Purpose = 'Start' }
+    ) {
+        $script:autoStop = $script:now.AddMinutes(90)
+        $script:monitorSchedules = @('dbhub-monitor-1', 'dbhub-monitor-2')
+        $null = Invoke-Clear -Purpose $Purpose
+        Get-Deleted | Should -Be @('ffffffff-0000-0000-0000-000000000007', 'ffffffff-0000-0000-0000-000000000101', 'ffffffff-0000-0000-0000-000000000102', 'dbhub-monitor-1', 'dbhub-monitor-2', 'dbhub-autostop')
     }
 
     It 'has nothing to do when no run is pending, and changes nothing with -WhatIf' {

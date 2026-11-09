@@ -319,7 +319,11 @@ function Invoke-DemoParallelDeployment {
        the template deploys (Wait-DemoStoppedStart, DEPLOY.VMSTART; Phase 28 live finding). Running VMs are only read.
        Then, on a run that ends with the validation and has no T1 Monitoring step of its own, T1's monitoring plugin is
        checked, and restarted when it isn't running, beside the tracks (Start-DemoT1MonitoringJob, DEPLOY.T1.MONITORING;
-       Phase 28 live finding, 2026-10-30).
+       Phase 28 live finding, 2026-10-30). When the Fabric track runs, the Insights app's sign-in starts too
+       (Start-DemoFabricAppSignIn, DEPLOY.FABRIC.APPSIGNIN; 2026-11-05): alongside everything else, which never waits for
+       it; it's settled while the tracks run (Complete-DemoFabricAppSignIn) and stopped when they're done, and only the
+       app's own step waits for it, until its deadline. Whether it's needed is read from the run's start, before the
+       subscription guard, so the read runs alongside the guard (Start-DemoFabricAppSignInCheck; 2026-11-06).
     1. The subscription guard; then the bootstrap bundle and the workload runner start building in their own
        process (Start-DemoArtifactBuildJob), which hands them over through a private handoff directory.
        Preflight (Invoke-DemoPreflight) and the T2 source (Resolve-DemoT2Source, PREFLIGHT.T2.SOURCE). Any
@@ -342,12 +346,27 @@ function Invoke-DemoParallelDeployment {
        out when T4 is off; Developer mode leaves out T2's telemetry, PAYG, and monitoring. A target whose telemetry
        didn't come gets its monitoring checked, and its telemetry once more, before the run is judged
        (Invoke-DemoTelemetryCheck, in the tracks' telemetry steps and in DONE's checks; Phase 28 live finding).
+    6. The switch (2026-11-03, ADR 0010): the tracks set a profile with incidents (business-day, the default) as its
+       interim, baseline, and note the VMs they set it on, in the handoff directory; once DONE's checks have read what they
+       need, this run's own Run Commands are done, so those VMs' targets get the profile, both VMs within 3 minutes,
+       whether the run is DONE or not (DEPLOY.INCIDENTS_*, Send-DemoPendingActivitySwitch), never a Fail. A run that's
+       stopped or fails before it sends it without waiting (Complete-DemoDeploymentRun). A run without preflight says
+       once when the configuration doesn't set activityProfile (DEPLOY.ACTIVITYPROFILE).
+    7. The history report's snapshot (2026-11-06, ADR 0014's amendment; Invoke-DemoHistorySnapshotStep,
+       DEPLOY.FABRIC.HISTORY): on a run that reaches its validation, once DONE's telemetry checks have passed,
+       NB_DatabaseHub_LiveActivity runs once, analyze-only (CONFIRM false), and the history model is refreshed, at most
+       about 15 minutes; a resumed run with nothing left to do runs it again. Never a Fail: a paused capacity or a job that
+       outlives its wait is a Warning, and -WhatIf, -SkipFabric, GitHub Actions, or checks that didn't pass are Not
+       selected. The status page's Fabric.History row shows it.
 
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
-    does; -ProgressPath is the status page's model, which each stage and track updates; with networkMode private the
+    does; a resume first checks that sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout
+    builds, and a VM track whose VM doesn't goes back to its Artifacts step, with the steps after it, and says why
+    (Resolve-DemoArtifactResend, DEPLOY.ARTIFACTS.CHANGED_<VM>; live finding, 2026-11-06); -ProgressPath is the status
+    page's model, which each stage and track updates; with networkMode private the
     policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
     its results replace preflight's placeholders at the end; preflight's T4 startSku says where T4's fallback starts
-    (Standard_B2s, General Purpose Standard_D2ds_v5 after its cost check, or no T4; Phase 28 follow-up), and a "no T4"
+    (Standard_D4ads_v5, Standard_D2ds_v5 after its cost check, or no T4; ADR 0019), and a "no T4"
     record gets that fallback again when this run deploys the template;
     and this process prompts the person at the guided stop when the T2 track process reports it Ready in the progress
     model; without one (-NoStatusPage), the T2 track process prompts the person itself.
@@ -424,10 +443,20 @@ function Invoke-DemoParallelDeployment {
     $phase = [ordered]@{}
     $mark = { param([string] $Name, [System.Diagnostics.Stopwatch] $Watch) $phase[$Name] = [int]$Watch.Elapsed.TotalSeconds }
 
+    # The Insights app's sign-in (2026-11-06 live finding): reading whether the Rayfin CLI is already signed in took about
+    # 9 seconds warm and 44 cold, so the read starts now, alongside the subscription guard and the run's first steps, and
+    # the sign-in's start below takes its answer (Start-DemoFabricAppSignInCheck). Not in a what-if, when the Fabric track
+    # can't run, or where nobody could sign in.
+    $signInCheck = $null
+    if (-not $whatIf -and @((Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -SkipFabric:$SkipFabric).Tracks['Fabric']) -contains 'Fabric') {
+        $signInCheck = Start-DemoFabricAppSignInCheck -Config $Config
+    }
+
     try {
         $results.Add((Assert-DemoAzContext -SubscriptionId ([string]$Config['subscriptionId']) -TenantId ([string]$Config['tenantId']) -Account ([string]$Config['azureAccount'])))
     }
     catch {
+        Stop-DemoRayfinSignInStatus -Status $signInCheck
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing ran. Sign in yourself and select nothing else: the scripts pass --subscription on every call.'))
         Set-DemoProgressStep -Path $ProgressPath -Id 'Preflight' -State 'Failed' -Status 'Fail' -Message $_.Exception.Message
         return $results.ToArray()
@@ -440,17 +469,36 @@ function Invoke-DemoParallelDeployment {
         $Resume = [switch]::new($true)
         Write-DemoLog -Message ('An unfinished deployment is on record (its last finished stage is {0}), so this run continues it, as deploy.ps1 -Resume does. To start over from preflight instead: ./scripts/deploy.ps1 -FromStage Preflight.' -f $state.Stage)
     }
+    # A resume sends a VM's artifacts again, with its loader and the steps after them, when the bootstrap bundle or the
+    # workload runner this checkout builds isn't what the resource group's state records for that VM, so a fix pulled since
+    # the last run reaches it (live finding, 2026-11-06). With nothing changed, each track resumes as recorded.
+    $resend = [pscustomobject]@{ Tracks = @(); Notes = @{}; Results = @() }
+    if ($Resume -and -not $FromStage -and -not $whatIf) {
+        $resend = Resolve-DemoArtifactResend -State $state -Plan (Resolve-DemoTrackPlan -StopAfter $StopAfter -Resume -State $state -SkipFabric:$SkipFabric) -SkipRunner:$SkipRunner
+        & $addAll @($resend.Results)
+    }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28): a "no T4" record
-    # (None) gets the General Purpose fallback, and its cost check, again when this run deploys the template (Phase 28
+    # (None) gets the 2-vCore fallback, and its cost check, again when this run deploys the template (Phase 28
     # follow-up).
-    $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric).Infrastructure
+    $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -Resend @($resend.Tracks)).Infrastructure
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:$templateRuns
     $skipT4 = -not (Test-DemoT4Enabled -Config $Config)
-    $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4
+    $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4 -Resend @($resend.Tracks)
     if ($whatIf) {
         $plan = Resolve-DemoTrackPlan -StopAfter 'Infrastructure'
     }
-    Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume
+    Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -ResendNote $resend.Notes
+    # The run's activity profile (2026-11-03, ADR 0010): the tracks set its interim, and this process switches the VMs they
+    # noted once its own Run Commands are done; Complete-DemoDeploymentRun sends the switch when the run ends before that.
+    # A run without preflight says the default here.
+    $activity = Get-DemoActivityProfile -Config $Config
+    Clear-DemoActivitySwitch
+    if (-not $plan.Preflight -and -not $whatIf) {
+        $notice = New-DemoActivityProfileNotice -ActivityProfile $activity -CheckPrefix 'DEPLOY'
+        if ($null -ne $notice) {
+            $results.Add($notice)
+        }
+    }
     # The tracks run for as long as the T2 wait, the guided stop (at least 45 minutes for the person, plus about 20 to
     # prepare), and what follows it can take (Phase 28).
     if ($WaitForT2) {
@@ -478,6 +526,8 @@ function Invoke-DemoParallelDeployment {
         ProgressPath          = $ProgressPath
         PagePath              = $PagePath
         PromptInParent        = $false
+        # Why a resumed track sends its VM's artifacts again, by track; its Artifacts step says it (2026-11-06).
+        ResendNote            = $resend.Notes
     }
     $ensureContext = {
         if (-not $context.NetworkMode) {
@@ -516,6 +566,18 @@ function Invoke-DemoParallelDeployment {
     $policyJob = $null
     $policy = @{ Collected = $false; Applied = $false; Items = @() }
     $t4StartSku = ''
+    # The Insights app's sign-in (2026-11-05): started before preflight, alongside everything else (Start-DemoFabricAppSignIn).
+    $appSignIn = $null
+    # Settles it once it ended or its deadline passed, and adds its record once; never throws. Once the Fabric track's
+    # records are in, its app step's records, which prove whether the CLI was signed in, settle a Warning that they
+    # contradict (2026-11-06 live finding: Update-DemoFabricAppSignInFromApp).
+    $signInTick = {
+        param([switch] $Final)
+        & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -ProgressPath $ProgressPath -Final:$Final)
+        if ($trackResults.Contains('Fabric')) {
+            $null = Update-DemoFabricAppSignInFromApp -SignIn $appSignIn -AppResult @($trackResults['Fabric']) -Results $results -ProgressPath $ProgressPath
+        }
+    }
     # T1's monitoring plugin, checked on a run that ends with the validation and has no T1 Monitoring step of its own
     # (Phase 28 live finding, 2026-10-30), in its own process while the tracks run (Start-DemoT1MonitoringJob).
     $checkT1Monitoring = -not $whatIf -and [bool](Get-DemoMemberValue -InputObject $state -Name 'Exists') -and [bool]$plan.Validation -and 'Monitoring' -notin @($plan.Tracks['T1'])
@@ -663,9 +725,10 @@ function Invoke-DemoParallelDeployment {
                 & $guidedTick
                 & $collectPolicy 0
                 & $collectMonitoring 0
+                & $signInTick
             }
             catch {
-                Write-DemoLog -Level Warning -Message ('The guided stop''s prompt, the policy inventory, or T1''s monitoring check couldn''t be read this time: {0}' -f $_.Exception.Message)
+                Write-DemoLog -Level Warning -Message ('The guided stop''s prompt, the policy inventory, T1''s monitoring check, or the Insights app''s sign-in couldn''t be read this time: {0}' -f $_.Exception.Message)
             }
             if ($null -ne $buildJob -and $buildJob.State -notin 'NotStarted', 'Running' -and -not (Test-Path -LiteralPath (Join-Path -Path $handoff -ChildPath 'artifacts.xml'))) {
                 # A build process that died without a word: the tracks get its error instead of waiting.
@@ -733,6 +796,20 @@ function Invoke-DemoParallelDeployment {
             Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -State 'Skipped' -Message $(if ([bool](Get-DemoMemberValue -InputObject $state -Name 'Exists')) { 'Not part of this run.' } else { 'Not needed: nothing is deployed yet.' })
         }
 
+        # The Insights app's sign-in (2026-11-05): when the Fabric track runs, it starts now, while the person is still at
+        # the keyboard, and runs alongside preflight, the template, and the tracks, none of which waits for it. Only the
+        # app's own step waits for it, until its deadline; one that's cancelled, times out, or fails leaves that step to
+        # say why, and the run goes on. Whether it's needed comes from the read that started before the guard
+        # ($signInCheck; 2026-11-06), which a run without the Fabric track ends here.
+        if (-not $whatIf -and @($plan.Tracks['Fabric']) -contains 'Fabric') {
+            $appSignIn = Start-DemoFabricAppSignIn -Config $Config -ProgressPath $ProgressPath -Check $signInCheck -Confirm:$false
+            & $signInTick
+        }
+        else {
+            Stop-DemoRayfinSignInStatus -Status $signInCheck
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.AppSignIn' -State 'Skipped' -Message $(if ($whatIf) { 'What if: nothing signs in.' } else { 'Not needed: the Fabric track isn''t part of this run.' })
+        }
+
         # 1. Preflight and the T2 source.
         if ($plan.Preflight) {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -776,10 +853,11 @@ function Invoke-DemoParallelDeployment {
             & $ensureContext
             $mark.Invoke('Preflight', $watch)
             & $stageResult 'Preflight' 'Pass' (Get-DemoPreflightPassText -NetworkMode ([string]$context.NetworkMode) -T3UseFreeLimit ([bool]$context.T3UseFreeLimit) -T2Source ([string]$context.T2Source))
+            & $signInTick
         }
         if (-not $whatIf) {
             & $ensureContext
-            Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -T2Source ([string]$context.T2Source)
+            Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -T2Source ([string]$context.T2Source) -ResendNote $resend.Notes
             # The tracks' records describe this run before any track writes, and before the template reads the group's tags
             # (Phase 28 live finding, 2026-10-30: a fresh run's failed Fabric step kept an earlier run's record, and the next
             # plain deploy.ps1 resumed past it). A run that starts over clears them all; any other run lowers those of the
@@ -805,11 +883,16 @@ function Invoke-DemoParallelDeployment {
         # The VMs that were stopped run before anything needs them: the tracks' Run Commands, and the template's
         # extensions. A VM that doesn't start stops the run here, with the next action (DEPLOY.VMSTART).
         if ($null -ne $stoppedStart) {
-            $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -ProgressPath $ProgressPath)
+            $started = @(Wait-DemoStoppedStart -Config $Config -Request $stoppedStart -ProgressPath $ProgressPath -ActivityProfile $activity)
             & $addAll $started
             if (@($started | Where-Object { [string]$_.checkId -eq 'DEPLOY.VMSTART' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
                 return $results.ToArray()
             }
+            # A VM that was already running may still serve an earlier run's incidents: its targets get the interim
+            # baseline before the tracks' Run Commands reach it, and the switch below brings the profile back (2026-11-03).
+            # One this run started got it as soon as it ran (Wait-DemoStoppedStart; review of PR 16, 2026-11-04).
+            $alreadyRunning = Get-DemoMemberValue -InputObject $stoppedStart -Name 'Running'
+            Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @($alreadyRunning) -RequestedBy 'deploy'
         }
 
         # 2. The track processes, a few seconds apart, so their guards run while the template deploys.
@@ -861,6 +944,8 @@ function Invoke-DemoParallelDeployment {
                 NetworkMode             = $context.NetworkMode
                 T3UseFreeLimit          = [bool]$context.T3UseFreeLimit
                 T3AdminGroupDisplayName = [string]$context.T3AdminGroupName
+                # An existing T4 whose size the configuration doesn't set moves to the default (2026-11-04, ADR 0019).
+                ScaleT4                 = $true
             }
             if ($context.T2Source -eq 'golden' -and $context.T2SnapshotId) {
                 $deployArguments['T2OsDiskSourceId'] = $context.T2SnapshotId
@@ -881,6 +966,8 @@ function Invoke-DemoParallelDeployment {
             & $addAll $deployment.Results
             if ($whatIf) {
                 & $stageResult 'Infrastructure' 'Not selected' 'What if: the template''s what-if ran; nothing was deployed, and the tracks were skipped.'
+                # Nor is the history report's snapshot taken, which a deployment takes at its end (2026-11-06).
+                $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -WhatIfRun -SkipFabric:$SkipFabric -ProgressPath $ProgressPath))
                 return $results.ToArray()
             }
             if (-not $deployment.Succeeded) {
@@ -933,6 +1020,11 @@ function Invoke-DemoParallelDeployment {
             & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
         }
         if ($StopAfter -in 'Preflight', 'Infrastructure') {
+            # The nightly safety stop (ADR 0024) comes with what the template deployed, as in a full run.
+            if ($StopAfter -eq 'Infrastructure' -and $plan.Infrastructure -and -not $whatIf) {
+                Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
+                & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+            }
             & $applyPolicy 15
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
             return $results.ToArray()
@@ -958,6 +1050,12 @@ function Invoke-DemoParallelDeployment {
                 return $results.ToArray()
             }
         }
+        # The nightly safety stop (ADR 0024), on every run, a resumed one too: here, after the tracks got the template's
+        # handoff, so none of them waits for it. Its problems are Warnings, never a Fail.
+        if (-not $whatIf) {
+            Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
+            & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+        }
 
         # 4. The tracks.
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -976,6 +1074,9 @@ function Invoke-DemoParallelDeployment {
                 $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f $buildError) -Remediation 'Run New-DemoBootstrapBundle and Publish-DemoWorkloadRunner yourself to see the error (the runner needs the .NET SDK, or use -SkipRunner).'))
             }
         }
+        # The tracks are done, the Insights app's step with them: a sign-in still open is stopped now, and its record (never
+        # a Fail) is added.
+        & $signInTick -Final
         # The deferred policy inventory has had the whole run; it gets up to 5 more minutes.
         & $applyPolicy 5
         # T1's monitoring check matters to DONE's telemetry checks, which run once every track finished: it gets up to 20
@@ -999,6 +1100,13 @@ function Invoke-DemoParallelDeployment {
         $ended = @(Stop-DemoRunJob -Job $runJobs)
         if ($ended.Count -gt 0) {
             Write-DemoLog -Level Warning -Message ('Stopped: {0} ended at once; the next ./scripts/deploy.ps1 continues their work.' -f ($ended -join ', '))
+        }
+        # The Insights app's sign-in, when the run ended or was stopped before it settled.
+        Stop-DemoFabricAppSignIn -SignIn $appSignIn
+        # The VMs the track processes may have left on the interim baseline, noted in this process before their handoff
+        # directory goes: the switch below, or Complete-DemoDeploymentRun's when the run stops before it (2026-11-03).
+        foreach ($vm in @(Get-DemoActivitySwitchVm -HandoffPath $handoff)) {
+            Register-DemoActivitySwitch -VmName $vm
         }
         if ($handoff) {
             Remove-DemoPrivateDirectory -Path $handoff -Confirm:$false | Out-Null
@@ -1031,9 +1139,11 @@ function Invoke-DemoParallelDeployment {
         return ([string](Get-DemoMemberValue -InputObject $state -Name ('Track{0}' -f $Track)) -eq $LastStep)
     }
     $allTracksDone = (& $trackFinished 'T1' 'Telemetry') -and (& $trackFinished 'T2' 'Telemetry') -and ($skipT4 -or (& $trackFinished 'T4' 'Telemetry')) -and ($SkipFabric -or (& $trackFinished 'Fabric' 'Fabric'))
-    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'PaygWizard' }
+    $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:$skipT4 -SkipFabric:$SkipFabric
     $validationStart = $results.Count
+    # Whether DONE's checks ran, which the history report's snapshot at the end needs (2026-11-06).
+    $doneChecked = $false
     if ($plan.Validation) {
         Set-DemoProgressStep -Path $ProgressPath -Id 'Validation' -State 'Running' -Message 'Checking Database Hub''s estate, telemetry, and metrics, and the Fabric items.'
         # T4's estate only when it's deployed: the Burstable fallback can leave it out of this run (Phase 28).
@@ -1074,6 +1184,7 @@ function Invoke-DemoParallelDeployment {
         # and its telemetry once more, before the run is judged (Invoke-DemoTelemetryCheck; Phase 28 live finding).
         if ($allTracksDone -and -not (& $hasStatus $results.ToArray() 'Fail')) {
             & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
+            $doneChecked = $true
         }
         try {
             Set-DemoDeploymentState -Config $Config -Value @{ Stage = $(if ($allTracksDone) { 'Validation' } elseif ($t1Done) { 'Monitoring' } else { 'Infrastructure' }) } -Confirm:$false
@@ -1081,10 +1192,10 @@ function Invoke-DemoParallelDeployment {
         catch {
             Write-DemoLog -Level Warning -Message ('The validation ran, but the stage wasn''t recorded: {0}' -f $_.Exception.Message)
         }
-        # What only a person can confirm, and the optional parts, don't make this step look blocked (Phase 28 live finding);
-        # the Hub tenant setting by its latest read (Phase 28 review).
+        # What only a person can confirm, and the non-blocking parts (the Insights app), don't make this step look blocked
+        # (Phase 28 live finding); the Hub tenant setting by its latest read (Phase 28 review).
         $runSoFar = $results.ToArray()
-        $validationStatus = Get-DemoWorstStatus -Status @($results | Select-Object -Skip $validationStart | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_ -Context $runSoFar) -and -not (Test-DemoOptionalResult -Result $_) } | ForEach-Object { [string]$_.status })
+        $validationStatus = Get-DemoWorstStatus -Status @($results | Select-Object -Skip $validationStart | Where-Object { -not (Test-DemoConfirmOnlyResult -Result $_ -Context $runSoFar) -and -not (Test-DemoNonBlockingResult -Result $_) } | ForEach-Object { [string]$_.status })
         Set-DemoProgressStep -Path $ProgressPath -Id 'Validation' -Status $(if ($validationStatus) { $validationStatus } else { 'Pass' }) -Message $(if ($allTracksDone) { 'Database Hub''s estate, telemetry, and metrics checked for every target.' } else { 'Checked what finished; the rest waits for the unfinished tracks.' })
     }
     $mark.Invoke('Validation', $validationWatch)
@@ -1110,6 +1221,21 @@ function Invoke-DemoParallelDeployment {
     $timing = [ordered]@{ startUtc = $startUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); endUtc = [DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture); minutes = $minutes; phases = $phase; tracks = $trackTiming; targetReadyUtc = $ready; t2Source = $context.T2Source; clockStopped = $clockStopped; withinThirtyMinutes = ($clockStopped -and $minutes -le 30) }
     $timingMessage = if ($clockStopped) { 'Everything is deployed and populated in {0} minutes: Database Hub''s estate for every target, {1}{2}, T1''s inventory with only the engine{3}.' -f $minutes, $(if ($skipT4) { 'T1, T2, and T3 telemetry' } else { 'T1, T2, and T3 telemetry, T4''s metrics' }), $(if ($installMode -eq 'Developer') { '' } else { ', T2''s PAYG and monitoring' }), $(if ($SkipFabric) { '' } else { ', and the required Fabric items' }) } else { 'The run took {0} minutes; not every DONE requirement passed yet, so the clock didn''t stop (see DEPLOY.SUMMARY).' -f $minutes }
     $results.Add((New-DemoResult -CheckId 'DEPLOY.TIMING' -Area 'infra' -Target 'subscription' -Status $(if ($clockStopped) { 'Pass' } else { 'Warning' }) -Message $timingMessage -Evidence $timing))
+
+    # 7. The switch (2026-11-03, ADR 0010): once DONE's checks have read what they need, this run's own Run Commands are
+    # done, so the VMs the tracks left on the interim baseline get the run's activity profile, whether the run is DONE or
+    # not, at most 3 minutes for both VMs together. Never a Fail.
+    if (-not $whatIf -and $activity.HasIncidents) {
+        & $addAll @(Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile $activity -Result $results.ToArray() -CheckPrefix 'DEPLOY' -RequestedBy 'deploy')
+    }
+
+    # 8. The history report's snapshot (2026-11-06, ADR 0014's amendment): once DONE's telemetry checks have passed,
+    # NB_DatabaseHub_LiveActivity runs once, analyze-only, and the history model is refreshed, so the report has this run's
+    # data. After the switch, which the VMs' incidents wait for: the notebook never touches the VMs. On every run that
+    # reaches its validation, a resumed one with nothing left to do included; never a Fail, and never in DONE's way.
+    if ($plan.Validation) {
+        $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
+    }
 
     $all = $results.ToArray()
     # Phase 28 live finding (2026-10-30): what only a person can confirm is listed once each, apart from what needs you.

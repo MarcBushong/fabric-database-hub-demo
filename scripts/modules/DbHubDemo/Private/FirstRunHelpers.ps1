@@ -9,8 +9,9 @@ function Invoke-DemoRayfinInteractive {
 
     .DESCRIPTION
     Start-Process -NoNewWindow -Wait gives the CLI this console's input and output, which a sign-in needs; its output
-    isn't captured or logged. The CLI's telemetry is off and an ambient RAYFIN_TOKEN is removed for the child only
-    (Start-Process -Environment), so the operator's session doesn't change. Sources (checked 2026-10-27):
+    isn't captured or logged. The CLI's telemetry is off, and an ambient RAYFIN_TOKEN and a BROWSER the CLI can't start
+    are removed, for the child only (Start-Process -Environment; Get-DemoRayfinSignInEnvironment), so the operator's
+    session doesn't change. Sources (checked 2026-10-27):
     https://learn.microsoft.com/fabric/apps/cli-reference and
     https://learn.microsoft.com/powershell/module/microsoft.powershell.management/start-process
     #>
@@ -32,7 +33,7 @@ function Invoke-DemoRayfinInteractive {
     )
 
     $arguments = @(('"{0}"' -f $CliPath.Replace('"', ''))) + $ArgumentList
-    $environment = @{ RAYFIN_TELEMETRY_OPTOUT = '1'; RAYFIN_TOKEN = $null; NO_COLOR = '1' }
+    $environment = Get-DemoRayfinSignInEnvironment -WorkingDirectory $WorkingDirectory
     $process = Start-Process -FilePath $NodePath -ArgumentList $arguments -WorkingDirectory $WorkingDirectory -NoNewWindow -Wait -PassThru -Environment $environment -WhatIf:$false
     return [int]$process.ExitCode
 }

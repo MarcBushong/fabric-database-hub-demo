@@ -10,7 +10,7 @@ Checks:
   tests/PSScriptAnalyzerSettings.Tests.psd1.
 - Pester: the unit tests in tests/unit, including schema, notebook, link, workflow-pin, and convention tests.
 - Bicep: build, lint, and the azuredeploy.json sync check, plus build and lint of the standalone templates in
-  infra/control (ADR 0020). Not selected until infra/main.bicep exists.
+  infra/control (ADR 0020) and infra/safetystop (ADR 0024). Not selected until infra/main.bicep exists.
 - PSRule: PSRule for Azure (Well-Architected rules) on infra/main.bicepparam, with the suppressions in ps-rule.yaml.
 - DotNet: restore (locked mode), build, and test the workload generator.
 - FabricApp: install the Fabric App (fabric/app) from its lock file, then typecheck, lint, test, check the production
@@ -132,8 +132,11 @@ if ('Bicep' -in $Check) {
         $built = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('azuredeploy-{0}.json' -f [guid]::NewGuid())
         $buildExit = Invoke-Native -FilePath 'az' -ArgumentList @('bicep', 'build', '--file', $mainBicep, '--outfile', $built)
         $lintExit = Invoke-Native -FilePath 'az' -ArgumentList @('bicep', 'lint', '--file', $mainBicep)
-        # The on-demand activity control's templates (ADR 0020) aren't modules of main.bicep: build and lint each one.
-        $standalone = @(Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/control') -Filter '*.bicep' -File -ErrorAction SilentlyContinue)
+        # The standalone templates (ADR 0020's on-demand activity control, ADR 0024's nightly safety stop) aren't modules
+        # of main.bicep: build and lint each one.
+        $standalone = @(foreach ($folder in 'infra/control', 'infra/safetystop') {
+                Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath $folder) -Filter '*.bicep' -File -ErrorAction SilentlyContinue
+            })
         $standaloneFailures = [System.Collections.Generic.List[string]]::new()
         foreach ($file in $standalone) {
             $standaloneBuilt = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('{0}-{1}.json' -f $file.BaseName, [guid]::NewGuid())
@@ -141,7 +144,7 @@ if ('Bicep' -in $Check) {
             $standaloneLint = Invoke-Native -FilePath 'az' -ArgumentList @('bicep', 'lint', '--file', $file.FullName)
             Remove-Item -LiteralPath $standaloneBuilt -Force -ErrorAction SilentlyContinue
             if ($standaloneBuild -ne 0 -or $standaloneLint -ne 0) {
-                $standaloneFailures.Add(('infra/control/{0}: build exit {1}, lint exit {2}' -f $file.Name, $standaloneBuild, $standaloneLint))
+                $standaloneFailures.Add(('{0}: build exit {1}, lint exit {2}' -f $file.FullName.Substring($repoRoot.Length + 1).Replace('\', '/'), $standaloneBuild, $standaloneLint))
             }
         }
         if ($buildExit -ne 0 -or $lintExit -ne 0) {
@@ -157,7 +160,7 @@ if ('Bicep' -in $Check) {
                 Add-StaticResult -CheckId 'STATIC.BICEP' -Status 'Fail' -Message 'azuredeploy.json is out of sync with infra/main.bicep. Rebuild it with the pinned Bicep version.'
             }
             else {
-                Add-StaticResult -CheckId 'STATIC.BICEP' -Status 'Pass' -Message ('Bicep builds and lints cleanly (infra/main.bicep and {0} standalone template(s) in infra/control), and azuredeploy.json is in sync.' -f $standalone.Count)
+                Add-StaticResult -CheckId 'STATIC.BICEP' -Status 'Pass' -Message ('Bicep builds and lints cleanly (infra/main.bicep and {0} standalone template(s) in infra/control and infra/safetystop), and azuredeploy.json is in sync.' -f $standalone.Count)
             }
         }
         Remove-Item -LiteralPath $built -Force -ErrorAction SilentlyContinue

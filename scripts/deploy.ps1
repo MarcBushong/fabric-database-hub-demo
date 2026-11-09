@@ -21,6 +21,12 @@ One command, one guided stop (Phase 28):
 - Run it again with no parameters and it continues an unfinished deployment (the resource group's state tags), as
   -Resume does. It starts VMs that were stopped, for example by the nightly auto-shutdown or stop-demo.ps1, and a
   stopped T4, while preflight runs; running VMs are only read.
+- The Insights app (APP_DatabaseHub_Insights) is part of every deployment. Its Rayfin CLI needs one browser sign-in
+  (P14), which starts at the beginning, while you're still at the keyboard, when the CLI isn't signed in yet: on
+  Windows in a window of its own, elsewhere in this terminal. Nothing waits for it but the app's own step, and that only
+  until its deadline (15 minutes after the start). In CI, or a session that can't take keyboard input, it isn't started.
+  When the app isn't created, or doesn't work, the run still goes on and can still end DONE; the status page shows the
+  app's step Failed with the actual error and how to fix it, and the banner says so.
 - It ends with one banner: DONE (Database Hub shows every target, and where to look) or NOT DONE (why, the single next
   action, and the exact command). The exit code is 0 only when it's DONE (and for a -WhatIf with no Fail).
 - Ctrl+C stops it within seconds, track processes included: their slow Azure cleanups are left to the next run or
@@ -35,7 +41,7 @@ has deployed archost01 and is released first: passwords rotated and the copy's A
 artifacts sent meanwhile; then its loader, Arc onboarding and configuration with PAYG and monitoring, and
 telemetry), T4 (the PostgreSQL flexible server's checks and its Azure Monitor metrics; T1's track sets it
 up through the P6 group, and a stopped T4 is started before the template; Phase 24, ADR 0019), and Fabric
-(the notebooks, the Real-Time Dashboard, the history report, and the optional Insights app).
+(the notebooks, the Real-Time Dashboard, the history report, and the Insights app).
 The bundle and the runner are built while Preflight runs. With networkMode private, the policy inventory runs
 alongside the deployment instead of before it (with public or auto it stays in preflight). The validation then checks
 Database Hub's estate for every target, the runner, the Hub checklist with the T3 gate, and the dashboard's tiles, and
@@ -45,10 +51,30 @@ DEPLOY.TIMING records each track's steps and the total.
 (the bootstrap bundle and the workload runner, in Run Command chunks), Bootstraps (the loaders, then T1
 Ready), T3 (the group membership, the setup from T1, the runner on T3), T4 (the PostgreSQL flexible
 server's checks, its setup from T1 through the P6 group, and its Azure Monitor metrics), Activity (the
-configured activityProfile on T1, T3, and T4), Monitoring (T1, waiting while the SQL IaaS extension updates after the
+configured activityProfile on T1, T3, and T4, business-day by default: as baseline until the run's switch), Monitoring
+(T1, waiting while the SQL IaaS extension updates after the
 template), T2 (Arc onboarding and configuration, then T2's profile), Fabric (the Hub checklist and, on
 request, the notebook import), and Validation (telemetry for each ready target, the runner's status, and a
-summary). It has no guided stop.
+summary), then DONE's checks and the history report's snapshot. It has no guided stop.
+
+- The activity profile (2026-11-03, ADR 0010): business-day by default, the steady mix plus bounded incidents at fixed
+  minutes past each UTC hour, which fill Database Hub's Performance page; set activityProfile to baseline for the
+  quieter demo. The run sets baseline first and switches to a profile with incidents once its own Run Commands on each
+  VM are done, after DONE's checks (DEPLOY.INCIDENTS_*), so no incident slows them; when it ends before that (Ctrl+C,
+  an error), the switch is sent without waiting. A VM the run starts gets baseline as soon as its SQL Server, or T2's
+  guest, answers, and the run's own Run Commands there wait for it, at most about 12.5 minutes (DEPLOY.INTERIM_*). A
+  configuration that doesn't set activityProfile gets one notice.
+
+- The history report's snapshot (2026-11-06, ADR 0014): last, once DONE's telemetry checks have passed and the switch is
+  sent, NB_DatabaseHub_LiveActivity runs once in Fabric, analyze-only (CONFIRM false, so it sends no activity request
+  of its own), saves the last 24 hours to the lakehouse, and the history model is refreshed, so the history report has
+  data; about 2 to 5 minutes, at most about 15 (DEPLOY.FABRIC.HISTORY, the status page's last row). It runs as you,
+  with the Azure CLI's Fabric token; it never resumes, pauses, or scales the capacity, and it never keeps the run from
+  DONE: a paused capacity or a job that outlives the wait is a Warning, and -WhatIf, -SkipFabric, GitHub Actions, or a
+  run whose telemetry checks didn't pass take none (Not selected). The data is partial: incidents start only at the end
+  of the run, so incident measures stay blank until incidents have run and the notebook runs again
+  (./scripts/stop-demo.ps1 -SaveHistory, or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport
+  -RunLiveActivity).
 
 - Every step is idempotent. The last step each track finished is recorded in the resource group's tags, so
   a later run continues from there on any machine, and GitHub Actions (deploy.yml) runs the same tracks.
@@ -82,7 +108,7 @@ Stop after this stage. Infrastructure provisions what the Deploy to Azure button
 Deploy without the workload runner (no .NET SDK needed); the activity profiles don't run.
 
 .PARAMETER SkipFabric
-Skip the Fabric stage.
+Skip the Fabric stage, and the history report's snapshot at the end (Not selected).
 
 .PARAMETER ImportNotebooks
 Import or update both notebooks in the Fabric workspace (also fabric.importNotebooks).
@@ -188,10 +214,16 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-# Reuse DbHubDemo when it's already loaded (for example by a test); otherwise load it.
-if (-not (Get-Module -Name 'DbHubDemo')) {
-    Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
+# This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
+# that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
+# another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
+# guard's validated context, the redaction's registered values, or a test's mocks.
+$entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+$entryNested = $false
+foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
+    $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
@@ -297,7 +329,8 @@ try {
         }
     }
 
-    Write-DemoResultReport -Result $results -Title 'deploy.ps1' -OutcomeDone:($null -ne $outcome -and [string]$outcome.Kind -eq 'Done')
+    # A remediation that says to run deploy.ps1 names this run's own command, with its -ConfigPath (2026-11-06).
+    Write-DemoResultReport -Result $results -Title 'deploy.ps1' -OutcomeDone:($null -ne $outcome -and [string]$outcome.Kind -eq 'Done') -DeployCommand ([string]$run.Command)
     Export-DemoResult -Result $results -Path $OutputPath
     Write-DemoDeploymentOutcome -Outcome $outcome -WorkspaceName $workspaceName
     if ($environment.GitHubActions) {

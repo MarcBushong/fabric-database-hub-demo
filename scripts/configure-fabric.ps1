@@ -167,8 +167,10 @@ With -ImportDashboard, skip step 4.
 .PARAMETER RunLiveActivity
 Also run step 5: NB_DatabaseHub_LiveActivity on demand with SAVE_RESULTS true (Invoke-DemoFabricNotebookRun), so
 the lakehouse tables the history report reads (incident windows, telemetry snapshots, validation results) are
-current. It waits up to -TimeoutSeconds (at least 5 minutes) for the job. Step 5 also runs once by itself when
-step 2 created the notebook, or bound it to a lakehouse that step 0 created, so a new lakehouse gets the tables.
+current. It runs analyze-only (CONFIRM and STOP_ACTIVITY false), scoped to the demo's resource group
+(RESOURCE_GROUP, rg-<prefix>-<environment>). It waits up to -TimeoutSeconds (at least 5 minutes) for the job. Step 5
+also runs once by itself when step 2 created the notebook, or bound it to a lakehouse that step 0 created, so a new
+lakehouse gets the tables.
 
 .PARAMETER LiveActivityWindowMinutes
 With -RunLiveActivity: the notebook's WINDOW_MINUTES and TELEMETRY_LOOKBACK_MINUTES (default 1440, one day).
@@ -262,10 +264,16 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-# Reuse DbHubDemo when it's already loaded (for example by deploy.ps1 or a test); otherwise load it.
-if (-not (Get-Module -Name 'DbHubDemo')) {
-    Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1')
+# This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
+# that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
+# another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
+# guard's validated context, the redaction's registered values, or a test's mocks.
+$entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+$entryNested = $false
+foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
+    $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
@@ -598,6 +606,10 @@ if ($RunLiveActivity -or $firstRun) {
             WINDOW_MINUTES             = $LiveActivityWindowMinutes
             TELEMETRY_LOOKBACK_MINUTES = $LiveActivityWindowMinutes
             KEY_VAULT_URL              = ''
+            # The demo's resource group, which scopes the notebook's queries, as stop-demo.ps1 -SaveHistory and deploy.ps1's
+            # snapshot send it. Without it the notebook kept its default, rg-dbhub-demo, so another environment's run saved
+            # no telemetry snapshots (live, 2026-11-06).
+            RESOURCE_GROUP             = ('rg-{0}-{1}' -f $config['prefix'], $config['environment'])
         }
         $results.Add((Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes ([Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0)))))
     }

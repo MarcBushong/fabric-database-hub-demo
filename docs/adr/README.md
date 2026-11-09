@@ -25,7 +25,7 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | [0005](0005-arc-onboarding-authentication.md) | Arc onboarding authentication | Engineering (§9.1) | Accepted; validated live with the operator's token |
 | [0006](0006-sql-editions-and-licensing.md) | SQL Server editions, guest OS, and licensing | User-directed (Q1, Q2, §9.2; the guided stop, 2026-10-29) | Accepted; Phase 28 amendment (one command, one guided stop) not yet run live |
 | [0007](0007-networking-modes-and-egress.md) | Networking modes and egress strictness | User-directed (Q4b, Q5) | Accepted |
-| [0008](0008-identity-rbac-abac.md) | Identity and permissions: the Contributor-only model | User-directed (§9.1, Q4d) | Accepted |
+| [0008](0008-identity-rbac-abac.md) | Identity and permissions: the Contributor-only model | User-directed (§9.1, Q4d; the nightly safety stop's exception, 2026-11-05) | Accepted; amended 2026-11-05 ([ADR 0024](0024-nightly-safety-stop.md)) |
 | [0009](0009-secrets-handling.md) | Secrets handling | Engineering (§9.1); the guest's one automatic sign-in, owner-approved 2026-10-29 | Accepted; Phase 28 amendment not yet run live |
 | [0010](0010-workload-generator-technology.md) | Workload generator technology and delivery | Engineering | Accepted |
 | [0011](0011-control-surface-priority.md) | One orchestrator and the demo control surface | Engineering (§9.2) | Accepted |
@@ -41,6 +41,7 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | [0021](0021-fabric-resources-by-name.md) | Fabric resources by name, resolved at run time, and created when missing | User-directed (2026-10-26), with the coordinator's decisions | Accepted; the create path's live check runs after the merge |
 | [0022](0022-public-repository-and-github-actions-hardening.md) | A public repository, and GitHub Actions hardened for it | User-directed (2026-10-26, 2026-10-27), with the coordinator's decisions | Accepted; the GitHub settings and a live Actions run pending until the public repository exists |
 | [0023](0023-first-run-automation.md) | First-run automation: `init.ps1`, the P6 group, the Rayfin sign-in, and opt-in capacity and history steps | User-directed (2026-10-26, 2026-10-27), with the coordinator's decisions | Accepted; live check of `init.ps1` read-only, the rest pending; Phase 28: `deploy.ps1` runs the first run |
+| [0024](0024-nightly-safety-stop.md) | The nightly safety stop: every database stopped or checked each night, with a stop-only role | User-directed (2026-11-05, 2026-11-09), with engineering detail; an owner-approved exception to ADR 0008 | Accepted; ran live from 2026-11-06; amended 2026-11-09 (each link's scope read by its ID, and T4 stopped at the T3 check), unit-tested |
 
 ## Template
 

@@ -1,9 +1,10 @@
 function Write-DemoDeploymentOutcome {
     <#
     .SYNOPSIS
-    Prints deploy.ps1's one ending (Phase 28, brief item 1): DONE, with where to look in Database Hub and the optional
-    parts and how to add them later, or NOT DONE, with why, the single next action, the exact command, how to resume, and
-    the diagnostics bundle. Every line is redacted.
+    Prints deploy.ps1's one ending (Phase 28, brief item 1): DONE, with where to look in Database Hub and what didn't
+    work but never blocks DONE (the Insights app, with its actual error and how to fix it; 2026-11-05), or NOT DONE,
+    with why, the single next action, the exact command, how to resume, and the diagnostics bundle. Every line is
+    redacted.
 
     .PARAMETER Outcome
     What Complete-DemoDeploymentRun returned.

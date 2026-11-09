@@ -4,22 +4,27 @@ function Test-DemoT4 {
     Checks T4, the Azure Database for PostgreSQL flexible server (Phase 24, ADR 0019): the server and its
     state, its pinned version and size, Microsoft Entra-only authentication with the P6 group as its
     administrator, virtual network integration without public access, the contosocare database, the enhanced
-    metrics, and with -IncludeMetrics whether Azure Monitor has fresh metrics (METRICS.T4).
+    metrics, max_connections, and with -IncludeMetrics whether Azure Monitor has fresh metrics (METRICS.T4).
 
     .DESCRIPTION
     Reads only, with the documented REST APIs through 'az rest --method get' (they work while T4 is stopped).
-    Results: T4.SERVER, T4.CONFIG, T4.ENTRAONLY, T4.NETWORK, T4.ADMIN, T4.DATABASE, T4.ENHANCEDMETRICS, and
-    METRICS.T4. Database Hub's PostgreSQL monitoring reads the same Azure Monitor metrics (it's metrics-only,
+    Results: T4.SERVER, T4.CONFIG, T4.ENTRAONLY, T4.NETWORK, T4.ADMIN, T4.DATABASE, T4.ENHANCEDMETRICS,
+    T4.MAXCONNECTIONS, and METRICS.T4. Database Hub's PostgreSQL monitoring reads the same Azure Monitor metrics (it's metrics-only,
     with no query-level diagnostics), so METRICS.T4 passing is what the Hub's PostgreSQL dashboard needs;
     seeing T4 on the Estate page stays a manual check (HUB.ESTATE.T4 checks Resource Graph).
+    T4.MAXCONNECTIONS (2026-11-03): the template sets max_connections to config/versions.json's postgresql.maxConnections
+    on every size, so connection-surge reaches the limit and Database Hub's Failed connections fill; a static parameter,
+    so a new value waits for a restart (isConfigPendingRestart), which deploy.ps1 does before T1 sets T4 up.
     T4 turned off (t4Enabled false) is Not selected.
 
-    Sources (checked 2026-10-23):
+    Sources (checked 2026-10-23; the server parameter pages 2026-11-03):
     - https://learn.microsoft.com/fabric/database/hub/monitor-postgresql
     - https://learn.microsoft.com/azure/postgresql/network/concepts-networking-private
     - https://learn.microsoft.com/azure/postgresql/security/security-manage-entra-users
     - https://learn.microsoft.com/azure/postgresql/monitor/concepts-monitoring
     - https://learn.microsoft.com/rest/api/monitor/metrics/list
+    - https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings
+    - https://learn.microsoft.com/rest/api/postgresql/configurations/get
 
     .PARAMETER DeploymentId
     The deployment's six-character suffix. Read from the resource group's deploymentId tag when omitted.
@@ -53,7 +58,7 @@ function Test-DemoT4 {
         $area = if ($CheckId -like 'METRICS.*') { 'hub' } else { 't4' }
         $results.Add((New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $DocUrl))
     }
-    $later = @('T4.CONFIG', 'T4.ENTRAONLY', 'T4.NETWORK', 'T4.ADMIN', 'T4.DATABASE', 'T4.ENHANCEDMETRICS') + @(if ($IncludeMetrics) { 'METRICS.T4' })
+    $later = @('T4.CONFIG', 'T4.ENTRAONLY', 'T4.NETWORK', 'T4.ADMIN', 'T4.DATABASE', 'T4.ENHANCEDMETRICS', 'T4.MAXCONNECTIONS') + @(if ($IncludeMetrics) { 'METRICS.T4' })
 
     $names = Get-DemoT4Name -Config $Config -DeploymentId $DeploymentId
     if (-not $names.Enabled) {
@@ -151,6 +156,23 @@ function Test-DemoT4 {
     }
     else {
         & $add 'T4.ENHANCEDMETRICS' 'Warning' ('Enhanced metrics are off ({0} = {1}), so the waits, sessions, and oldest-transaction metrics are missing.' -f $parameterName, $(if ($value) { $value } else { 'unknown' })) ([ordered]@{ parameter = $parameterName; value = $value }) 'Redeploy with scripts/deploy.ps1 -Resume, which sets it.' $docs['monitoring']
+    }
+
+    # max_connections on every size (2026-11-03): a static parameter, so a new value waits for a restart.
+    $wantedConnections = [string]$postgres['maxConnections']
+    $connections = Get-DemoT4ParameterState -Config $Config -ServerId $names.ServerId -Name 'max_connections'
+    $connectionEvidence = [ordered]@{ parameter = 'max_connections'; value = $connections.Value; wanted = $wantedConnections; pendingRestart = $connections.PendingRestart; source = $connections.Source }
+    if (-not $connections.Found) {
+        & $add 'T4.MAXCONNECTIONS' 'Warning' ('T4''s max_connections couldn''t be read: {0}' -f $connections.Error) $connectionEvidence 'Run the check again.' $docs['serverParameters']
+    }
+    elseif ($connections.Value -ne $wantedConnections) {
+        & $add 'T4.MAXCONNECTIONS' 'Warning' ('max_connections is {0}, not {1}, so connection-surge may not reach the limit on this size, and Database Hub''s Failed connections may stay empty.' -f $connections.Value, $wantedConnections) $connectionEvidence 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template sets it, and the T4 setup restarts T4 to apply it.' $docs['serverParameters']
+    }
+    elseif ($connections.PendingRestart) {
+        & $add 'T4.MAXCONNECTIONS' 'Warning' ('max_connections {0} is set but waits for a restart (a static parameter), so the old limit still applies.' -f $connections.Value) $connectionEvidence 'deploy.ps1 restarts T4 before T1 sets it up (DEPLOY.T4.RESTART), or restart it yourself (az postgres flexible-server restart).' $docs['restartServer']
+    }
+    else {
+        & $add 'T4.MAXCONNECTIONS' 'Pass' ('max_connections is {0} and in effect, so connection-surge reaches the limit and Database Hub''s Failed connections fill on this size.' -f $connections.Value) $connectionEvidence
     }
 
     if ($IncludeMetrics) {

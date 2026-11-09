@@ -769,8 +769,9 @@ function Get-DemoVmRunCommandLeftover {
     <#
     .SYNOPSIS
     The demo's managed Run Commands left on one VM, read-only: the on-demand control's DbHubControl-* and the scripts'
-    DbHubDemo-*, except the bootstrap loader DbHubDemo-Bootstrap, which the template (or deploy.ps1) keeps on each VM
-    (ADR 0003). Internal.
+    DbHubDemo-*, except the two that stay on each VM by design: the bootstrap loader DbHubDemo-Bootstrap, which the template
+    (or deploy.ps1) keeps (ADR 0003), and DbHubDemo-Profile, the activity profiles' one Run Command, which each profile
+    change replaces and whose script does nothing once it has expired (Send-DemoProfileRunCommand, 2026-11-03). Internal.
 
     .DESCRIPTION
     One read: Virtual Machine Run Commands - List By Virtual Machine with $expand=instanceView
@@ -809,7 +810,7 @@ function Get-DemoVmRunCommandLeftover {
     $items = [System.Collections.Generic.List[object]]::new()
     foreach ($item in @($values)) {
         $name = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
-        $kind = if ($name.StartsWith('DbHubControl-', [System.StringComparison]::Ordinal)) { 'Control' } elseif ($name.StartsWith('DbHubDemo-', [System.StringComparison]::Ordinal) -and $name -ne 'DbHubDemo-Bootstrap') { 'Demo' } else { '' }
+        $kind = if ($name.StartsWith('DbHubControl-', [System.StringComparison]::Ordinal)) { 'Control' } elseif ($name.StartsWith('DbHubDemo-', [System.StringComparison]::Ordinal) -and $name -notin 'DbHubDemo-Bootstrap', 'DbHubDemo-Profile') { 'Demo' } else { '' }
         if (-not $kind) {
             continue
         }
@@ -966,5 +967,5 @@ function Get-DemoRunCommandStatus {
     if ($errors.Count -gt 0) {
         return (New-DemoResult -CheckId 'STATUS.RUNCOMMANDS' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('The Run Commands on the demo VMs couldn''t all be listed: {0}' -f ($errors -join '; ')) -Evidence $evidence -Remediation 'Run status.ps1 again; listing Run Commands needs Reader or higher on the resource group.' -DocUrl $doc)
     }
-    return (New-DemoResult -CheckId 'STATUS.RUNCOMMANDS' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('No leftover Run Command on {0}; the bootstrap loader DbHubDemo-Bootstrap stays by design.' -f $vmText) -Evidence $evidence -DocUrl $doc)
+    return (New-DemoResult -CheckId 'STATUS.RUNCOMMANDS' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('No leftover Run Command on {0}; the bootstrap loader DbHubDemo-Bootstrap and the activity profiles'' DbHubDemo-Profile stay by design.' -f $vmText) -Evidence $evidence -DocUrl $doc)
 }

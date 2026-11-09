@@ -286,20 +286,25 @@ Describe 'Lifecycle scripts' {
                     param([string] $ModulePath, [string] $Deploy, [string] $ConfigFile, [string] $OutputFile, [string] $LogFile)
                     Import-Module -Name $ModulePath
                     # Stand-ins for the deployment's commands. Simple functions: the parameters they don't name land in $args.
+                    # deploy.ps1 loads DbHubDemo again, as a run from a terminal does (2026-11-06), which replaces global
+                    # functions of the module's names, so the stand-ins are reached through global aliases, which come first.
                     . ([scriptblock]::Create(("function global:Write-StopTestLog([string] `$Text) {{ [System.IO.File]::AppendAllText('{0}', `$Text + [System.Environment]::NewLine) }}" -f ($LogFile -replace "'", "''"))))
-                    function global:Get-DemoRunEnvironment { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+                    function global:Get-StopTestRunEnvironment { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
                     function global:Start-Transcript { }
                     function global:Stop-Transcript { }
-                    function global:Initialize-DemoFirstRun { [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = ''; NextSteps = @(); Outcome = $null } }
-                    function global:Start-DemoDeploymentRun { [pscustomobject]@{ ProgressPath = ''; PagePath = ''; Writer = $null; KeepAwake = $true; StartedUtc = [DateTime]::UtcNow; Command = './scripts/deploy.ps1'; Environment = $null; InstallMode = 'PaygWizard'; WaitForT2 = $true } }
-                    function global:Invoke-DemoDeployment { Write-StopTestLog 'deploying'; Start-Sleep -Seconds 60; Write-StopTestLog 'not stopped' }
-                    function global:Complete-DemoDeploymentRun {
+                    function global:Initialize-StopTestFirstRun { [pscustomobject]@{ Ran = $false; Ready = $true; Results = @(); Path = ''; NextSteps = @(); Outcome = $null } }
+                    function global:Start-StopTestDeploymentRun { [pscustomobject]@{ ProgressPath = ''; PagePath = ''; Writer = $null; KeepAwake = $true; StartedUtc = [DateTime]::UtcNow; Command = './scripts/deploy.ps1'; Environment = $null; InstallMode = 'PaygWizard'; WaitForT2 = $true } }
+                    function global:Invoke-StopTestDeployment { Write-StopTestLog 'deploying'; Start-Sleep -Seconds 60; Write-StopTestLog 'not stopped' }
+                    function global:Complete-StopTestDeploymentRun {
                         param([switch] $Stopped)
                         Write-StopTestLog ('complete stopped={0}' -f [bool]$Stopped)
                         [pscustomobject]@{ Kind = 'NotDone'; ExitCode = 2; Minutes = 1; Reason = 'stopped'; Next = 'continue'; NextCommand = './scripts/deploy.ps1'; Optional = @(); Notes = @(); Resume = '' }
                     }
-                    function global:Exit-DemoKeepAwake { Write-StopTestLog 'awake released'; $true }
-                    function global:Write-DemoDeploymentOutcome { param($Outcome) Write-StopTestLog ('banner {0}' -f $Outcome.Kind) }
+                    function global:Exit-StopTestKeepAwake { Write-StopTestLog 'awake released'; $true }
+                    function global:Write-StopTestDeploymentOutcome { param($Outcome) Write-StopTestLog ('banner {0}' -f $Outcome.Kind) }
+                    foreach ($name in 'Get-DemoRunEnvironment', 'Initialize-DemoFirstRun', 'Start-DemoDeploymentRun', 'Invoke-DemoDeployment', 'Complete-DemoDeploymentRun', 'Exit-DemoKeepAwake', 'Write-DemoDeploymentOutcome') {
+                        Set-Alias -Name $name -Value ($name -replace '-Demo', '-StopTest') -Scope Global
+                    }
                     & $Deploy -ConfigPath $ConfigFile -OutputPath $OutputFile
                 }).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')).AddArgument((Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1')).AddArgument($configPath).AddArgument($outputPath).AddArgument($log)
             $null = $runner.BeginInvoke()
@@ -489,6 +494,47 @@ Describe 'Lifecycle scripts' {
         $capture['sent'] | Should -Not -Be 'System.Security.SecureString'
         $capture['clipboard'] | Should -Not -Contain 'System.Security.SecureString'
         ($capture['exported'] | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($capture['sent']))
+    }
+
+    It 'start-demo.ps1 holds archost01''s switch to business-day until after the host password, its own last Run Command there (2026-11-03)' {
+        $capture['order'] = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Start-DemoEnvironment -MockWith {
+            $capture['hold'] = @($HoldActivitySwitchVm)
+            # Start-DemoEnvironment set archost01's interim baseline and left its switch to the script.
+            & (Get-Module -Name 'DbHubDemo') { Clear-DemoActivitySwitch; Register-DemoActivitySwitch -VmName 'archost01' }
+            New-DemoResult -CheckId 'START.PROFILE_T2' -Area 'workload' -Target 'T2' -Status 'Pass' -Message 'baseline for now'
+        }
+        Mock -CommandName Export-DemoResult -MockWith { $capture['exported'] = $Result }
+        Mock -CommandName Set-Clipboard -MockWith { $capture['clipboard'].Add([string]$Value) }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoClipboard -MockWith { $true }
+        Mock -CommandName Set-DemoVmLocalPassword -MockWith { $capture['order'].Add('Password'); New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'set' -Evidence @{ userName = 'demoadmin' } }
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            $capture['order'].Add(('Switch:{0}={1}:{2}' -f (@($Target) -join ','), $ProfileName, $WaitSeconds))
+            foreach ($item in $Target) { [pscustomobject]@{ Target = $item; VmName = 'archost01'; Outcome = 'Set'; Detail = ''; Data = $null; Seconds = 2 } }
+        }
+        & (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -ConfigPath $configPath -Interactive -ResetAdminPassword -OutputPath $outputPath
+        $capture['hold'] | Should -Be @('archost01')
+        $capture['order'] | Should -Be @('Password', 'Switch:T2=business-day:180')
+        ($capture['exported'] | Where-Object { $_.checkId -eq 'START.INCIDENTS_T2' }).status | Should -Be 'Pass'
+
+        # Without the password, Start-DemoEnvironment holds nothing back.
+        & (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -ConfigPath $configPath -OutputPath $outputPath
+        $capture['hold'] | Should -BeNullOrEmpty
+    }
+
+    It 'start-demo.ps1 sends the switch without waiting when the start ends before it (an error, or Ctrl+C), so no VM stays on the interim baseline' {
+        $capture['order'] = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Start-DemoEnvironment -MockWith {
+            & (Get-Module -Name 'DbHubDemo') { Clear-DemoActivitySwitch; Register-DemoActivitySwitch -VmName 'sqlvm01' }
+            throw 'the start was stopped'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -MockWith {
+            $capture['order'].Add(('Switch:{0}={1}:{2}' -f (@($Target) -join ','), $ProfileName, $WaitSeconds))
+            foreach ($item in $Target) { [pscustomobject]@{ Target = $item; VmName = 'sqlvm01'; Outcome = 'Sent'; Detail = ''; Data = $null; Seconds = 1 } }
+        }
+        { & (Join-Path -Path $repoRoot -ChildPath 'scripts/start-demo.ps1') -ConfigPath $configPath -OutputPath $outputPath } | Should -Throw '*the start was stopped*'
+        $capture['order'] | Should -Be @('Switch:T1,T3,T4=business-day:0')
     }
 
     It 'start-demo.ps1 with the Key Vault opt-in stores the password before it sets it, and never uses the clipboard' {

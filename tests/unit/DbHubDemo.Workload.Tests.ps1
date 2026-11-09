@@ -324,11 +324,16 @@ Describe 'Get-DemoDeploymentParameter with the workload runner' {
         { Get-DemoDeploymentParameter -Config $config -NetworkMode private -T3UseFreeLimit $true -WorkloadRunnerSha256 $sha -WorkloadRunnerChunkCount 3 } | Should -Throw '*needs -BootstrapBundleSha256*'
     }
 
-    It 'passes the activity profile from the configuration, baseline by default' {
+    It 'passes an incident-free install profile: baseline in place of business-day or an incident, so the bootstrap never runs under incidents' {
         (Get-DemoDeploymentParameter -Config $config -NetworkMode private -T3UseFreeLimit $true).parameters.activityProfile.value | Should -Be 'baseline'
+        $unset = $config.Clone()
+        $unset.Remove('activityProfile')
+        (Get-DemoDeploymentParameter -Config $unset -NetworkMode private -T3UseFreeLimit $true).parameters.activityProfile.value | Should -Be 'baseline'
         $custom = $config.Clone()
         $custom['activityProfile'] = 'incident:locking-blocking'
-        (Get-DemoDeploymentParameter -Config $custom -NetworkMode private -T3UseFreeLimit $true).parameters.activityProfile.value | Should -Be 'incident:locking-blocking'
+        (Get-DemoDeploymentParameter -Config $custom -NetworkMode private -T3UseFreeLimit $true).parameters.activityProfile.value | Should -Be 'baseline'
+        $custom['activityProfile'] = 'off'
+        (Get-DemoDeploymentParameter -Config $custom -NetworkMode private -T3UseFreeLimit $true).parameters.activityProfile.value | Should -Be 'off'
     }
 
     It 'sets the profile at boot only when activityProfileOnBoot is true (R183)' {
@@ -353,16 +358,16 @@ Describe 'Runner settings in the configuration schema and the template' {
         $template = $templateText | ConvertFrom-Json -AsHashtable
     }
 
-    It 'accepts the runner''s activity profiles, baseline by default' {
+    It 'accepts the runner''s activity profiles, business-day by default (the owner''s decision of 2026-11-03)' {
         $property = $schema.properties.activityProfile
-        $property.default | Should -Be 'baseline'
+        $property.default | Should -Be 'business-day'
         foreach ($valid in 'off', 'baseline', 'business-day', 'incident:locking-blocking', 'incident:cpu-pressure') {
             $valid | Should -MatchExactly $property.pattern
         }
         foreach ($invalid in 'Baseline', 'fast', 'incident:', 'incident:Locking', 'baseline; drop') {
             $invalid | Should -Not -MatchExactly $property.pattern
         }
-        (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json') -Raw | ConvertFrom-Json).activityProfile | Should -Be 'baseline'
+        (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json') -Raw | ConvertFrom-Json).activityProfile | Should -Be 'business-day'
     }
 
     It 'doesn''t set the profile at boot by default, so a VM that starts can''t keep T3 awake on its own' {

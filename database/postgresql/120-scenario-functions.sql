@@ -288,6 +288,20 @@ END;
 $$;
 -- @batch
 
+-- missing-index (2026-11-04): the step only checks that its run still runs; the runner then sends the lookup itself, a
+-- top-level parameterized statement on a column with no index (care.claims.payer_code, care.appointments.reason_code),
+-- so Query Store captures it for autonomous tuning. A statement inside this function would be nested, which
+-- pg_qs.query_capture_mode top doesn't capture.
+CREATE OR REPLACE FUNCTION demo.usp_scenario_missing_index(p_run_id varchar)
+RETURNS TABLE (checked integer)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM demo.usp_run_assert_running(p_run_id);
+    RETURN QUERY SELECT 1;
+END;
+$$;
+-- @batch
 -- idle-in-transaction: each idle session locks its own slice of Submitted claims, then the runner leaves it idle in
 -- that transaction; blocked writers update the same claims and wait (wait event Lock/transactionid).
 CREATE OR REPLACE FUNCTION demo.fn_idle_rows(p_worker integer, p_rows integer)

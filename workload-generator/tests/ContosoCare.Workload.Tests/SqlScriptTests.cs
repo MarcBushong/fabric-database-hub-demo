@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.SqlServer.TransactSql.ScriptDom;
 using Xunit;
 
@@ -184,6 +186,60 @@ public sealed class SqlScriptTests
 
         Assert.Contains("sql/010-schema.sql", assembly.GetManifestResourceNames());
         Assert.DoesNotContain("sql/900-status.sql", assembly.GetManifestResourceNames());
+    }
+
+    [Fact]
+    public void TheProfileSetIsACompareAndSetThatAllowsTheShowcase()
+    {
+        // The showcase's supersede guard (ADR 0020): a stamped set writes only when no newer request is stored, read and
+        // written under one update lock; an unstamped set keeps the stamp.
+        var sql = File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql"));
+        var procedure = sql[sql.IndexOf("CREATE OR ALTER PROCEDURE demo.usp_profile_set", StringComparison.Ordinal)..];
+        procedure = procedure[..procedure.IndexOf("\nGO", StringComparison.Ordinal)];
+
+        Assert.Contains("'off', 'baseline', 'business-day', 'showcase'", procedure, StringComparison.Ordinal);
+        Assert.Contains("WITH (UPDLOCK, HOLDLOCK)", procedure, StringComparison.Ordinal);
+        Assert.Contains("IF @stored_at > @requested_at", procedure, StringComparison.Ordinal);
+        Assert.Contains("@stored_id COLLATE Latin1_General_BIN2 > @request_id COLLATE Latin1_General_BIN2", procedure, StringComparison.Ordinal);
+        Assert.Contains("requested_at = CASE WHEN @requested_at IS NULL THEN requested_at ELSE @requested_at END", procedure, StringComparison.Ordinal);
+        Assert.Contains("THROW 50118", procedure, StringComparison.Ordinal);
+        Assert.Contains("IF COL_LENGTH(N'demo.activity_profile', N'requested_at') IS NULL", sql, StringComparison.Ordinal);
+        Assert.Contains("IF COL_LENGTH(N'demo.activity_profile', N'request_id') IS NULL", sql, StringComparison.Ordinal);
+        var get = sql[sql.IndexOf("CREATE OR ALTER PROCEDURE demo.usp_profile_get", StringComparison.Ordinal)..];
+        Assert.Matches(@"is_active = [^\n]+,\s+requested_at,\s+request_id\s", get[..get.IndexOf("\nGO", StringComparison.Ordinal)]);
+    }
+
+    [Fact]
+    public void TheProfileCheckAllowsEveryProfileTheSetAccepts()
+    {
+        // The table's check must allow every name the procedure accepts, both in a new database (010-schema.sql) and in
+        // one from before the showcase (110's migration): the live check of 2026-11-04 found the showcase refused with
+        // error 547 on T1 and T2, where only the procedure had it. The profiles file holds what the control sends.
+        static string[] Names(string list) => [.. Regex.Matches(list, "'([a-z-]+)'").Select(m => m.Groups[1].Value).Order(StringComparer.Ordinal)];
+
+        var schema = File.ReadAllText(RepositoryPaths.Combine("database", "common", "010-schema.sql"));
+        var control = File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql"));
+        var created = Regex.Match(schema, @"CONSTRAINT ck_activity_profile_name CHECK \(profile_name IN \(([^)]*)\) OR profile_name LIKE 'incident:%'\)");
+        var widened = Regex.Match(control, @"ADD CONSTRAINT ck_activity_profile_name\s+CHECK \(profile_name IN \(([^)]*)\) OR profile_name LIKE 'incident:%'\)");
+        var accepted = Regex.Match(control, @"@profile_name NOT IN \(([^)]*)\)");
+        Assert.True(created.Success, "010-schema.sql creates ck_activity_profile_name with a list of names.");
+        Assert.True(widened.Success, "110-demo-control.sql widens ck_activity_profile_name with a list of names.");
+        Assert.True(accepted.Success, "demo.usp_profile_set checks the name against a list.");
+
+        var names = Names(accepted.Groups[1].Value);
+        Assert.Contains("showcase", names);
+        Assert.Equal(names, Names(created.Groups[1].Value));
+        Assert.Equal(names, Names(widened.Groups[1].Value));
+
+        // The migration replaces a check that lacks any of the names, so a second run changes nothing and a name added
+        // later reaches a database that already ran it (the review of PR 29).
+        var guard = Regex.Match(control, @"AND \(definition NOT LIKE N'%''[a-z-]+''%'(?:\s+OR definition NOT LIKE N'%''[a-z-]+''%')*\)");
+        Assert.True(guard.Success, "The migration's guard checks the definition for each name.");
+        Assert.Equal(names, Names(guard.Value));
+
+        using var profiles = JsonDocument.Parse(File.ReadAllText(RepositoryPaths.Combine("scenarios", "activity-profiles.json")));
+        var sent = profiles.RootElement.GetProperty("profiles").EnumerateObject().Select(p => p.Name).Where(name => name != "incident").Append("off");
+        Assert.All(sent, name => Assert.Contains(name, names));
     }
 
     [Fact]

@@ -1,8 +1,8 @@
 # ADR 0008: Identity and permissions: the Contributor-only model
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-11-05: one owner-approved exception, the nightly safety stop's role assignment, [ADR 0024](0024-nightly-safety-stop.md))
 - **Date:** 2026-10-19 (revised the same day for plan §9, Revision 2; revised 2026-10-21 for the Key Vault opt-in, Phase 13)
-- **Decision source:** Plan §9.1 (supersedes Q4a "Owner" and plan §4.4 where they conflict); user decision Q4d (Entra group as T3 admin); owner decision 2026-10-21 (user-directed) for the Key Vault opt-in
+- **Decision source:** Plan §9.1 (supersedes Q4a "Owner" and plan §4.4 where they conflict); user decision Q4d (Entra group as T3 admin); owner decision 2026-10-21 (user-directed) for the Key Vault opt-in; owner decision 2026-11-05 (user-directed) for the nightly safety stop's exception
 - **Related:** [ADR 0005](0005-arc-onboarding-authentication.md), [ADR 0009](0009-secrets-handling.md), [permissions](../permissions.md), [prerequisites](../prerequisites.md), [security model](../security-model.md)
 
 ## Context
@@ -28,6 +28,7 @@
 ### Default: no role assignments (`assignRoles = false`)
 
 - The templates and scripts create **no role assignments** unless `assignRoles = true` and the caller has `Microsoft.Authorization/roleAssignments/write`. Preflight checks that permission before honoring the flag.
+- **The one exception (owner-approved, 2026-11-05, [ADR 0024](0024-nightly-safety-stop.md)):** `deploy.ps1` creates the stop-only custom role "DbHub Demo Safety Stop" and assigns it to the nightly safety stop's own identity at the demo resource group whenever the caller may (role definitions need `Microsoft.Authorization/roleDefinitions/write`; the assignment, `Microsoft.Authorization/roleAssignments/write`), whatever `assignRoles` says. When the caller may not, nothing is assigned: `SAFETYSTOP.ROLE` is a **Warning** with the one command for an Owner (`./scripts/grant-safety-stop.ps1`), and the run still ends **DONE**, so Contributor alone still deploys, operates, and destroys the demo.
 - No Key Vault is deployed (ADR 0009), so no data-plane role is needed. The Key Vault opt-in (`keyVault.enabled`, Phase 13) is the exception, and it requires `assignRoles = true` (below).
 
 ### Prerequisites
