@@ -141,7 +141,7 @@ function Get-DemoProgressCatalog {
     $preflight.Add((& $step 'StartVms' 'Start the VMs that were stopped (the nightly auto-shutdown, stop-demo.ps1)' @('StartVms')))
     if (-not $SkipFabric) {
         # Displayed under Preflight, when it happens; deploy.ps1 itself sets it (Start-DemoFabricAppSignIn).
-        $preflight.Add((& $step 'Fabric.AppSignIn' 'Sign-in for the Insights app (the Rayfin CLI; a browser opens once, alongside the deployment)' @('Fabric/Fabric') $true))
+        $preflight.Add((& $step 'Fabric.AppSignIn' 'Sign-in for the Insights app (the Rayfin CLI; only when Fabric refuses your Azure CLI''s token)' @('Fabric/Fabric') $true))
     }
     # deploy.ps1 itself sets it, with the download's size and progress when it installs the SDK (Initialize-DemoDotNetSdk,
     # 2026-11-09).

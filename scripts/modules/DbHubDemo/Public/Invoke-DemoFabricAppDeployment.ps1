@@ -39,6 +39,12 @@ function Invoke-DemoFabricAppDeployment {
     .PARAMETER TimeoutSeconds
     How long 'rayfin up' may run (build, upload, and service provisioning).
 
+    .PARAMETER Token
+    A Fabric API token from the Azure CLI (Get-DemoFabricToken), which 'rayfin up' and 'rayfin up status' get as
+    RAYFIN_TOKEN instead of the CLI's own sign-in (2026-11-09; Invoke-DemoRayfinCli). When the service refuses it,
+    FABRIC.APP.DEPLOY is a Warning whose evidence says so (tokenRefused, refusal), so the caller can deploy again with
+    the CLI's own sign-in. Without it, the CLI's own sign-in deploys, as before.
+
     .EXAMPLE
     Invoke-DemoFabricAppDeployment -StagePath ./out/fabric-app -WorkspaceId $ws -TenantId $tenant -ItemName APP_DatabaseHub_Insights
     #>
@@ -63,13 +69,16 @@ function Invoke-DemoFabricAppDeployment {
         [switch] $DryRun,
 
         [ValidateRange(60, 7200)]
-        [int] $TimeoutSeconds = 1200
+        [int] $TimeoutSeconds = 1200,
+
+        [securestring] $Token
     )
 
-    $settings = Get-DemoFabricAppSetting
     $cliReference = 'https://learn.microsoft.com/fabric/apps/cli-reference'
     $deployDoc = 'https://learn.microsoft.com/fabric/apps/deploy-app'
-    $loginCommand = 'npx --yes --package={0}@{1} -- rayfin login --tenant {2}' -f $settings['cliPackage'], $settings['cliVersion'], $TenantId
+    # The Rayfin CLI's own sign-in, from the stage installed from the lock file (never npx; 2026-11-09).
+    $signInHint = './scripts/configure-fabric-app.ps1 -SignIn'
+    $through = if ($null -ne $Token) { 'the Azure CLI''s token' } else { 'the Rayfin CLI''s own sign-in' }
     $arguments = [System.Collections.Generic.List[string]]::new([string[]]@('up', '--workspace-id', $WorkspaceId, '--item-name', $ItemName, '--tenant', $TenantId, '--yes', '--json'))
     if ($DryRun) {
         $arguments.Add('--dry-run')
@@ -83,7 +92,7 @@ function Invoke-DemoFabricAppDeployment {
     }
 
     $started = [System.Diagnostics.Stopwatch]::StartNew()
-    $up = Invoke-DemoRayfinCli -StagePath $StagePath -ArgumentList $arguments.ToArray() -TimeoutSeconds $TimeoutSeconds
+    $up = Invoke-DemoRayfinCli -StagePath $StagePath -ArgumentList $arguments.ToArray() -TimeoutSeconds $TimeoutSeconds -Token $Token -TokenAudience 'Fabric'
     $seconds = [int]$started.Elapsed.TotalSeconds
     $data = $up.Data
     $status = if ($data) { [string]$data['status'] } else { '' }
@@ -92,13 +101,23 @@ function Invoke-DemoFabricAppDeployment {
         $errorText = $errorText.Substring(0, 800)
     }
     $authProblem = $errorText -match '(?i)not signed in|sign in|signed in|login|re-?authenticate|interaction_required|AADSTS|token (has )?expired|expired token'
+    # The Azure CLI's token refused: the caller deploys again with the CLI's own sign-in (2026-11-09).
+    $refusal = if ($null -ne $Token) { Get-DemoRayfinTokenRefusal -Run $up } else { '' }
+    if ($refusal) {
+        if (-not $DryRun) {
+            Set-DemoRayfinAuthRecord -Outcome 'Refused' -Reason $refusal -TenantId $TenantId
+        }
+        $refused = [ordered]@{ tokenRefused = $true; refusal = $refusal; exitCode = $up.ExitCode; seconds = $seconds; dryRun = [bool]$DryRun }
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('Fabric refused the Azure CLI''s token for rayfin up{0}: {1}' -f $(if ($DryRun) { ' --dry-run' } else { '' }), $refusal) -Evidence $refused -Remediation ('The Rayfin CLI''s own sign-in deploys the app instead: {0}' -f $signInHint) -DocUrl $cliReference))
+        return $results.ToArray()
+    }
 
     if ($DryRun) {
         if ($up.ExitCode -eq 0 -and $status -ne 'error') {
             $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message ('Dry run: rayfin up validated the project and resolved the workspace in {0} s; nothing was deployed.' -f $seconds) -Evidence @{ plannedCommand = $planned; seconds = $seconds } -DocUrl $cliReference))
         }
         else {
-            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status $(if ($authProblem) { 'Manual action required' } else { 'Fail' }) -Message ('Dry run: rayfin up --dry-run failed: {0}' -f $errorText) -Evidence @{ exitCode = $up.ExitCode; seconds = $seconds } -Remediation $(if ($authProblem) { 'Sign in again: {0}' -f $loginCommand } else { 'Fix the reported problem in fabric/app and run the script again.' }) -DocUrl $cliReference))
+            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status $(if ($authProblem) { 'Manual action required' } else { 'Fail' }) -Message ('Dry run: rayfin up --dry-run failed: {0}' -f $errorText) -Evidence @{ exitCode = $up.ExitCode; seconds = $seconds } -Remediation $(if ($authProblem) { 'Sign the Rayfin CLI in again: {0}' -f $signInHint } else { 'Fix the reported problem in fabric/app and run the script again.' }) -DocUrl $cliReference))
         }
         return $results.ToArray()
     }
@@ -114,9 +133,14 @@ function Invoke-DemoFabricAppDeployment {
         seconds          = $seconds
         failedConnectors = @(if ($data) { $data['failedConnectors'] | Where-Object { $_ } })
         steps            = @(if ($data -and $data['steps'] -is [System.Collections.IDictionary]) { $data['steps'].Keys | Sort-Object })
+        auth             = $(if ($null -ne $Token) { 'azureCli' } else { 'rayfinSignIn' })
     }
     if ($status -eq 'success' -and $itemId) {
-        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('rayfin up deployed the Fabric app item {0} in {1} s (created or updated in place).' -f $ItemName, $seconds) -Evidence $evidence -DocUrl $deployDoc))
+        if ($null -ne $Token) {
+            # deploy.ps1 then starts no browser sign-in at the start of a run (Get-DemoRayfinAuthRecord; 2026-11-09).
+            Set-DemoRayfinAuthRecord -Outcome 'Accepted' -TenantId $TenantId
+        }
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('rayfin up deployed the Fabric app item {0} in {1} s (created or updated in place), with {2}.' -f $ItemName, $seconds, $through) -Evidence $evidence -DocUrl $deployDoc))
     }
     elseif ($status -eq 'partial') {
         $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('rayfin up deployed {0}, but these connectors failed to apply: {1}.' -f $ItemName, ($evidence['failedConnectors'] -join ', ')) -Evidence $evidence -Remediation 'Check that the semantic model exists and that rayfin/.env in the stage has its IDs, then run the script again.' -DocUrl 'https://learn.microsoft.com/fabric/apps/connectors'))
@@ -124,12 +148,12 @@ function Invoke-DemoFabricAppDeployment {
     }
     else {
         $state = if ($authProblem) { 'Manual action required' } else { 'Fail' }
-        $remediation = if ($authProblem) { 'Sign in again as the demo''s Fabric user, then run the script again: {0}' -f $loginCommand } else { 'Fix the reported problem and run the script again; nothing is deleted, and a re-run reuses the item.' }
+        $remediation = if ($authProblem) { 'Sign the Rayfin CLI in again as the demo''s Fabric user, and run the script again: {0} does both' -f $signInHint } else { 'Fix the reported problem and run the script again; nothing is deleted, and a re-run reuses the item.' }
         $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status $state -Message ('rayfin up didn''t deploy {0} (exit code {1}, {2} s): {3}' -f $ItemName, $up.ExitCode, $seconds, $errorText) -Evidence $evidence -Remediation $remediation -DocUrl $deployDoc))
         return $results.ToArray()
     }
 
-    $check = Invoke-DemoRayfinCli -StagePath $StagePath -ArgumentList @('up', 'status', '--json') -TimeoutSeconds 300
+    $check = Invoke-DemoRayfinCli -StagePath $StagePath -ArgumentList @('up', 'status', '--json') -TimeoutSeconds 300 -Token $Token -TokenAudience 'Fabric'
     $view = $check.Data
     $health = if ($view -and $view['endpointHealth'] -is [System.Collections.IDictionary]) { $view['endpointHealth'] } else { @{} }
     $statusEvidence = [ordered]@{

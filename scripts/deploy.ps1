@@ -26,10 +26,12 @@ One command, one guided stop (Phase 28):
 - Run it again with no parameters and it continues an unfinished deployment (the resource group's state tags), as
   -Resume does. It starts VMs that were stopped, for example by the nightly auto-shutdown or stop-demo.ps1, and a
   stopped T4, while preflight runs; running VMs are only read.
-- The Insights app (APP_DatabaseHub_Insights) is part of every deployment. Its Rayfin CLI needs one browser sign-in
-  (P14), which starts at the beginning, while you're still at the keyboard, when the CLI isn't signed in yet: on
-  Windows in a window of its own, elsewhere in this terminal. Nothing waits for it but the app's own step, and that only
-  until its deadline (15 minutes after the start). In CI, or a session that can't take keyboard input, it isn't started.
+- The Insights app (APP_DatabaseHub_Insights) is part of every deployment. It deploys with your Azure CLI sign-in
+  (az login, since 2026-11-09): each Rayfin CLI command gets a token for its own audience, so no browser opens. Only
+  after Fabric refused that token in an earlier run does the Rayfin CLI's own browser sign-in (P14) start at the
+  beginning, while you're still at the keyboard: on Windows in a window of its own, elsewhere in this terminal. Nothing
+  waits for it but the app's own step, and that only until its deadline (15 minutes after the start). In CI, or a
+  session that can't take keyboard input, it isn't started.
   When the app isn't created, or doesn't work, the run still goes on and can still end DONE; the status page shows the
   app's step Failed with the actual error and how to fix it, and the banner says so.
 - It ends with one banner: DONE (Database Hub shows every target, and where to look) or NOT DONE (why, the single next

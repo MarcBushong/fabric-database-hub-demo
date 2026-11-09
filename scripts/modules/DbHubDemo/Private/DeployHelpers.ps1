@@ -938,9 +938,10 @@ function Invoke-DemoFabricAppStage {
     script's own workspace and capacity checks, for example) say they're the app's. The status page shows the step as
     Failed with the actual reason (Get-DemoInsightsAppSummary), and DONE or NOT DONE names it. -WorkspaceId is the
     workspace the Fabric step resolved or created, so the script doesn't look it up by name again (Phase 28 live
-    finding). The Rayfin CLI's sign-in, which only a person can do, starts at the beginning of the run, alongside
-    everything else (Start-DemoFabricAppSignIn); this step runs in the Fabric track's own process, which can't open a
-    browser, and waits for that sign-in only until its deadline (Wait-DemoFabricAppSignIn, in the track).
+    finding). Since 2026-11-09 the script gives the Rayfin CLI the Azure CLI's tokens, so it needs no sign-in of its
+    own; only after Fabric refused them does the Rayfin CLI's own sign-in, which only a person can do, start at the
+    beginning of the run (Start-DemoFabricAppSignIn). This step runs in the Fabric track's own process, which can't
+    open a browser, and waits for such a sign-in only until its deadline (Wait-DemoFabricAppSignIn, in the track).
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
