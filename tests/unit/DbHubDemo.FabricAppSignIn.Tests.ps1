@@ -67,6 +67,43 @@ Describe 'Start-DemoFabricAppSignIn: the Insights app''s sign-in starts alongsid
         Mock -ModuleName DbHubDemo -CommandName Test-DemoRayfinSignInStatusRunning -MockWith { $script:stillReading }
         Mock -ModuleName DbHubDemo -CommandName Receive-DemoRayfinSignInStatus -MockWith { $script:rowWhileReading = Get-TestRow -Path $script:progress -Id 'Fabric.AppSignIn'; $script:cli }
         Mock -ModuleName DbHubDemo -CommandName Stop-DemoRayfinSignInStatus -MockWith { }
+        # Fabric refused the Azure CLI's token for the demo's tenant in an earlier run (out/fabric-app-auth.json), so the
+        # CLI's own sign-in starts at the run's start; the default since 2026-11-09, no sign-in, is tested on its own.
+        $script:record = [pscustomobject]@{ Outcome = 'Refused'; Reason = 'HTTP 401 Unauthorized'; TenantId = '66666666-7777-8888-9999-000000000000'; CheckedUtc = '2026-11-09T12:00:00.0000000Z' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinAuthRecord -MockWith { $script:record }
+    }
+
+    It 'opens no browser, reads nothing, and says it''s not needed by default: the app''s step uses your az login (2026-11-09, user-directed): <Case>' -ForEach @(
+        @{ Case = 'nothing recorded (a first run)'; Outcome = ''; Tenant = ''; Accepted = $false }
+        @{ Case = 'Fabric accepted the Azure CLI''s token'; Outcome = 'Accepted'; Tenant = '66666666-7777-8888-9999-000000000000'; Accepted = $true }
+        @{ Case = 'a refusal for another tenant'; Outcome = 'Refused'; Tenant = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'; Accepted = $false }
+    ) {
+        $script:record = [pscustomobject]@{ Outcome = $Outcome; Reason = ''; TenantId = $Tenant; CheckedUtc = '' }
+        $early = New-TestStatusRead
+        $state = InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress; Check = $early } { Start-DemoFabricAppSignIn -Config $Config -ProgressPath $Path -Check $Check -Confirm:$false }
+        $script:started | Should -Be 0 -Because 'no browser opens by default'
+        $state.Done | Should -BeTrue
+        $state.Process | Should -BeNullOrEmpty
+        $state.Result.checkId | Should -Be 'DEPLOY.FABRIC.APPSIGNIN'
+        $state.Result.status | Should -Be 'Not selected'
+        $state.Result.message | Should -Match '^Not needed: the Insights app''s step gives the Rayfin CLI your Azure CLI sign-in \(az login\)'
+        ($state.Result.message -match 'Fabric accepted it in the last deployment') | Should -Be $Accepted
+        (Get-TestRow -Path $script:progress -Id 'Fabric.AppSignIn')['state'] | Should -Be 'Skipped'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoRayfinSignInStatus -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Receive-DemoRayfinSignInStatus -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoRayfinSignInStatus -Times 1 -Exactly -ParameterFilter { [object]::ReferenceEquals($Status, $early) }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoConsoleBlock -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAttention -Times 0 -Exactly
+        $model = Get-Content -LiteralPath $script:progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        [long]$model['run']['appSignInUntil'] | Should -Be 0 -Because 'the app''s step waits for no sign-in'
+    }
+
+    It 'needs no interactive session by default: CI and assistants get Not selected, not Not supported' {
+        $script:record = [pscustomobject]@{ Outcome = ''; Reason = ''; TenantId = ''; CheckedUtc = '' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoInteractiveSession -MockWith { $false }
+        $state = InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress } { Start-DemoFabricAppSignIn -Config $Config -ProgressPath $Path -Confirm:$false }
+        $state.Result.status | Should -Be 'Not selected'
+        $script:started | Should -Be 0
     }
 
     It 'starts nothing in a session that can''t answer a browser sign-in, and says why' {
@@ -119,15 +156,15 @@ Describe 'Start-DemoFabricAppSignIn: the Insights app''s sign-in starts alongsid
         $script:fake.Killed | Should -BeTrue -Because 'the run''s end stops a sign-in that''s still open'
     }
 
-    It 'gives a Warning, never a Fail, without a tenant or when the sign-in can''t start' {
+    It 'gives a Warning, never a Fail, when the sign-in can''t start, and needs none without a tenant' {
         $noTenant = New-TestConfig
         $noTenant['tenantId'] = ''
         $state = InModuleScope DbHubDemo -Parameters @{ Config = $noTenant } { Start-DemoFabricAppSignIn -Config $Config -Confirm:$false }
-        $state.Result.status | Should -Be 'Warning'
-        Mock -ModuleName DbHubDemo -CommandName Start-DemoRayfinSignInProcess -MockWith { throw 'npx wasn''t found on PATH. Install Node.js 20, 22, 24 (LTS), which includes npm and npx.' }
+        $state.Result.status | Should -Be 'Not selected' -Because 'a refusal is recorded for a tenant, and there''s none'
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoRayfinSignInProcess -MockWith { throw 'The Insights app''s stage (out/fabric-app) has no Rayfin CLI yet; the app''s step installs it from the lock file.' }
         $state = InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress } { Start-DemoFabricAppSignIn -Config $Config -ProgressPath $Path -Confirm:$false }
         $state.Result.status | Should -Be 'Warning'
-        $state.Result.message | Should -Match 'npx wasn''t found on PATH'
+        $state.Result.message | Should -Match 'has no Rayfin CLI yet'
         (Get-TestRow -Path $script:progress -Id 'Fabric.AppSignIn')['state'] | Should -Be 'Action needed'
     }
 
@@ -138,7 +175,7 @@ Describe 'Start-DemoFabricAppSignIn: the Insights app''s sign-in starts alongsid
     }
 
     It 'takes the answer of the read the run started before its guard, without reading again (2026-11-06)' {
-        $script:cli = [pscustomobject]@{ State = 'SignedIn'; Detail = 'signed in to the demo''s tenant'; Seconds = 9; Via = 'npx' }
+        $script:cli = [pscustomobject]@{ State = 'SignedIn'; Detail = 'signed in to the demo''s tenant'; Seconds = 9; Via = 'the stage''s CLI' }
         $early = New-TestStatusRead
         $state = InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress; Check = $early } { Start-DemoFabricAppSignIn -Config $Config -ProgressPath $Path -Check $Check -Confirm:$false }
         $state.Result.status | Should -Be 'Pass'
@@ -164,10 +201,10 @@ Describe 'Start-DemoFabricAppSignIn: the Insights app''s sign-in starts alongsid
     }
 
     It 'says why a browser opens, at Info, when the CLI <Case>' -ForEach @(
-        @{ Case = 'isn''t signed in'; Detail = 'not signed in'; Line = 'Info: The Rayfin CLI is not signed in (rayfin login status through npx, 9 seconds), so its sign-in for the Insights app starts: a browser opens.' }
-        @{ Case = 'is signed in to another tenant'; Detail = 'signed in to another tenant than the demo''s'; Line = 'Info: The Rayfin CLI is signed in to another tenant than the demo''s (rayfin login status through npx, 9 seconds), so its sign-in for the Insights app starts: a browser opens.' }
+        @{ Case = 'isn''t signed in'; Detail = 'not signed in'; Line = 'Info: The Rayfin CLI is not signed in (rayfin login status through the stage''s CLI, 9 seconds), so its sign-in for the Insights app starts: a browser opens.' }
+        @{ Case = 'is signed in to another tenant'; Detail = 'signed in to another tenant than the demo''s'; Line = 'Info: The Rayfin CLI is signed in to another tenant than the demo''s (rayfin login status through the stage''s CLI, 9 seconds), so its sign-in for the Insights app starts: a browser opens.' }
     ) {
-        $script:cli = [pscustomobject]@{ State = 'NotSignedIn'; Detail = $Detail; Seconds = 9; Via = 'npx' }
+        $script:cli = [pscustomobject]@{ State = 'NotSignedIn'; Detail = $Detail; Seconds = 9; Via = 'the stage''s CLI' }
         $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress } { Start-DemoFabricAppSignIn -Config $Config -ProgressPath $Path -Confirm:$false }
         $script:started | Should -Be 1
         $script:logged | Should -Contain $Line
@@ -182,10 +219,9 @@ Describe 'Start-DemoFabricAppSignIn: the Insights app''s sign-in starts alongsid
         $script:cli = [pscustomobject]@{ State = 'Unknown'; Detail = $Detail; Seconds = 90; Via = 'the stage''s CLI' }
         $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress } { Start-DemoFabricAppSignIn -Config $Config -ProgressPath $Path -Confirm:$false }
         $script:started | Should -Be 1
-        $settings = InModuleScope DbHubDemo { Get-DemoFabricAppSetting }
         $warnings = @($script:logged | Where-Object { $_ -like 'Warning:*' })
         $warnings.Count | Should -Be 1
-        $warnings[0] | Should -BeExactly ('Warning: Whether the Rayfin CLI is already signed in couldn''t be read ({0}; rayfin login status through the stage''s CLI), so its sign-in for the Insights app starts: a browser opens, even if it''s signed in. To read it yourself: npx --yes --package={1}@{2} -- rayfin login status' -f $Detail, $settings['cliPackage'], $settings['cliVersion'])
+        $warnings[0] | Should -BeExactly ('Warning: Whether the Rayfin CLI is already signed in couldn''t be read ({0}; rayfin login status through the stage''s CLI), so its sign-in for the Insights app starts: a browser opens, even if it''s signed in. To read it yourself, from the repository root: ./out/fabric-app/node_modules/.bin/rayfin login status' -f $Detail)
     }
 
     It 'reads the CLI''s status itself when the run started no read, or one for another tenant, which it ends' {
@@ -322,7 +358,7 @@ Describe 'Start- and Receive-DemoRayfinSignInStatus: the CLI''s own status, neve
 
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
-        $script:stageCli = ''
+        $script:stageCli = 'C:\stage\node_modules\@microsoft\rayfin-cli\bin\rayfin.js'
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinCliPath -MockWith { $script:stageCli }
         # The process layer (Start- and Receive-DemoFabricAppProcess, tested with real processes in DbHubDemo.FabricApp.Tests.ps1).
         $script:out = '{"status":"ok","command":"login status","identityType":"user","tenant":"66666666-7777-8888-9999-000000000000","verification":"endpoint-not-verified"}'
@@ -344,18 +380,13 @@ Describe 'Start- and Receive-DemoRayfinSignInStatus: the CLI''s own status, neve
         }
     }
 
-    It 'reads the same pinned CLI through npx without a stage (a first run, from a fresh clone too), from npm''s cache (2026-11-06)' {
-        # npm can print warnings before the CLI's JSON.
-        $script:out = "npm warn exec The following package was not found and will be installed`n" + $script:out
+    It 'reads nothing without a stage, never through npx, which ignores the lock file''s npm overrides: Unknown, saying why (2026-11-09)' {
+        $script:stageCli = ''
         $answer = & $script:readStatus
-        $answer.State | Should -Be 'SignedIn'
-        $answer.Via | Should -Be 'npx'
-        $settings = InModuleScope DbHubDemo { Get-DemoFabricAppSetting }
-        $expected = '--yes --prefer-offline --package={0}@{1} -- rayfin login status --json' -f $settings['cliPackage'], $settings['cliVersion']
-        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -Times 1 -Exactly -ParameterFilter {
-            $Tool -eq 'npx' -and ($ArgumentList -join ' ') -eq $expected -and $TimeoutSeconds -eq 90 -and
-            $Environment['RAYFIN_TELEMETRY_OPTOUT'] -eq '1' -and $Environment.Contains('RAYFIN_TOKEN') -and $null -eq $Environment['RAYFIN_TOKEN']
-        }
+        $answer.State | Should -Be 'Unknown'
+        $answer.Detail | Should -Be 'it couldn''t start: the Insights app''s stage (out/fabric-app) has no Rayfin CLI yet'
+        $answer.Via | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -Times 0 -Exactly
     }
 
     It 'is NotSignedIn, saying why, when <Case>' -ForEach @(
@@ -370,7 +401,7 @@ Describe 'Start- and Receive-DemoRayfinSignInStatus: the CLI''s own status, neve
 
     It 'is Unknown, saying why, when <Case>' -ForEach @(
         @{ Case = 'it ran out of time (the live finding''s 30 seconds were too few)'; Out = ''; ExitCode = -1; StdErr = 'node did not finish within 90 seconds and was stopped.'; TimedOut = $true; Detail = 'no answer within 90 seconds' }
-        @{ Case = 'the output isn''t JSON'; Out = 'npm error code ENOTCACHED'; ExitCode = 1; StdErr = ''; TimedOut = $false; Detail = 'exit code 1: npm error code ENOTCACHED' }
+        @{ Case = 'the output isn''t JSON'; Out = 'Error: Cannot find module ''keytar'''; ExitCode = 1; StdErr = ''; TimedOut = $false; Detail = 'exit code 1: Error: Cannot find module ''keytar''' }
         @{ Case = 'the CLI reports an error'; Out = '{"status":"error","error":"Sign-in tenant differs from the configured tenant."}'; ExitCode = 1; StdErr = ''; TimedOut = $false; Detail = 'exit code 1: Sign-in tenant differs from the configured tenant.' }
         @{ Case = 'only its error output says why'; Out = ''; ExitCode = 1; StdErr = "first line`nsecond line"; TimedOut = $false; Detail = 'exit code 1: first line' }
         @{ Case = 'it says nothing'; Out = ''; ExitCode = 3; StdErr = ''; TimedOut = $false; Detail = 'exit code 3: no output' }
@@ -383,12 +414,12 @@ Describe 'Start- and Receive-DemoRayfinSignInStatus: the CLI''s own status, neve
     }
 
     It 'is Unknown, without an exception, when it can''t start or be read: <Case>' -ForEach @(
-        @{ Case = 'npx isn''t on PATH'; Breaks = 'Start'; Detail = 'it couldn''t start: npx was not found on PATH.*' }
+        @{ Case = 'node isn''t on PATH'; Breaks = 'Start'; Detail = 'it couldn''t start: node was not found on PATH.*' }
         @{ Case = 'the stage can''t be read'; Breaks = 'Stage'; Detail = 'it couldn''t start: the stage''s package.json is damaged' }
         @{ Case = 'reading it throws'; Breaks = 'Receive'; Detail = 'it couldn''t be read: the read broke' }
     ) {
         switch ($Breaks) {
-            'Start' { Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -MockWith { throw 'npx was not found on PATH. Install Node.js 20, 22, 24, which includes npm.' } }
+            'Start' { Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -MockWith { throw 'node was not found on PATH. Install Node.js 20, 22, 24, which includes npm.' } }
             'Stage' { Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinCliPath -MockWith { throw 'the stage''s package.json is damaged' } }
             'Receive' { Mock -ModuleName DbHubDemo -CommandName Receive-DemoFabricAppProcess -MockWith { throw 'the read broke' } }
         }
@@ -472,7 +503,7 @@ Describe 'Get-DemoRayfinSignInState: a second read when the first finds no sign-
     It 'doesn''t read again when a second read can''t change it: <Case>' -ForEach @(
         @{ Case = 'signed in at once'; State = 'SignedIn'; Detail = 'signed in to the demo''s tenant' }
         @{ Case = 'the read ran out of time, which another 90 seconds would only repeat'; State = 'Unknown'; Detail = 'no answer within 90 seconds' }
-        @{ Case = 'the read couldn''t start'; State = 'Unknown'; Detail = 'it couldn''t start: npx was not found on PATH.' }
+        @{ Case = 'the read couldn''t start'; State = 'Unknown'; Detail = 'it couldn''t start: node was not found on PATH.' }
         @{ Case = 'signed in to another tenant, which a renewal doesn''t cause'; State = 'NotSignedIn'; Detail = 'signed in to another tenant than the demo''s' }
     ) {
         $script:answers = @(@{ State = $State; Detail = $Detail }, @{ State = 'SignedIn'; Detail = 'signed in to the demo''s tenant' })
@@ -611,7 +642,10 @@ Describe 'Start-DemoFabricAppSignInCheck: the read starts before the guard, and 
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         $script:interactive = $true
         Mock -ModuleName DbHubDemo -CommandName Test-DemoInteractiveSession -MockWith { $script:interactive }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinCliPath -MockWith { '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinCliPath -MockWith { 'C:\stage\node_modules\@microsoft\rayfin-cli\bin\rayfin.js' }
+        # Fabric refused the Azure CLI's token for the demo's tenant before, so the CLI's own sign-in may start (2026-11-09).
+        $script:record = [pscustomobject]@{ Outcome = 'Refused'; Reason = 'HTTP 401 Unauthorized'; TenantId = '66666666-7777-8888-9999-000000000000'; CheckedUtc = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinAuthRecord -MockWith { $script:record }
         # A process stand-in whose Kill and Dispose record that they ran.
         Mock -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -MockWith {
             $process = [pscustomobject]@{ HasExited = $false; Killed = $null; Disposed = 0 }
@@ -628,18 +662,22 @@ Describe 'Start-DemoFabricAppSignInCheck: the read starts before the guard, and 
     }
 
     It 'starts nothing where no sign-in could start: <Case>' -ForEach @(
-        @{ Case = 'a session that can''t answer one'; Interactive = $false; Tenant = '66666666-7777-8888-9999-000000000000' }
-        @{ Case = 'no tenant'; Interactive = $true; Tenant = '' }
+        @{ Case = 'a session that can''t answer one'; Interactive = $false; Tenant = '66666666-7777-8888-9999-000000000000'; Outcome = 'Refused' }
+        @{ Case = 'no tenant'; Interactive = $true; Tenant = ''; Outcome = 'Refused' }
+        @{ Case = 'no refusal recorded, the default since 2026-11-09: the app''s step uses the Azure CLI''s token'; Interactive = $true; Tenant = '66666666-7777-8888-9999-000000000000'; Outcome = '' }
+        @{ Case = 'Fabric accepted the Azure CLI''s token'; Interactive = $true; Tenant = '66666666-7777-8888-9999-000000000000'; Outcome = 'Accepted' }
     ) {
         $script:interactive = $Interactive
+        $script:record = [pscustomobject]@{ Outcome = $Outcome; Reason = ''; TenantId = '66666666-7777-8888-9999-000000000000'; CheckedUtc = '' }
         (InModuleScope DbHubDemo -Parameters @{ Config = @{ tenantId = $Tenant } } { Start-DemoFabricAppSignInCheck -Config $Config }) | Should -BeNullOrEmpty
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -Times 0 -Exactly
     }
 
-    It 'starts the read at once, for 90 seconds, through npx without a stage, and keeps it for the run''s end; one at a time' {
+    It 'starts the read at once, for 90 seconds, through the stage''s CLI, and keeps it for the run''s end; one at a time' {
         $first = InModuleScope DbHubDemo -Parameters @{ Config = $script:config } { Start-DemoFabricAppSignInCheck -Config $Config }
         $first.TimeoutSeconds | Should -Be 90
-        $first.Via | Should -Be 'npx'
+        $first.Via | Should -Be 'the stage''s CLI'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoFabricAppProcess -Times 1 -Exactly -ParameterFilter { $Tool -eq 'node' }
         $first.Run.Process.Killed | Should -BeNullOrEmpty -Because 'nothing waits for it or ends it yet'
         (InModuleScope DbHubDemo -Parameters @{ Check = $first } { [object]::ReferenceEquals($script:DemoFabricAppSignInCheck, $Check) }) | Should -BeTrue
         $second = InModuleScope DbHubDemo -Parameters @{ Config = $script:config } { Start-DemoFabricAppSignInCheck -Config $Config }
@@ -658,7 +696,7 @@ Describe 'Start-DemoFabricAppSignInCheck: the read starts before the guard, and 
         (InModuleScope DbHubDemo { $null -eq $script:DemoFabricAppSignInCheck }) | Should -BeTrue
         # One that answered keeps its answer, and anything else is left alone without an exception.
         $answered = New-TestStatusRead
-        $answered.Result = [pscustomobject]@{ State = 'SignedIn'; Detail = 'signed in to the demo''s tenant'; Seconds = 9; Via = 'npx' }
+        $answered.Result = [pscustomobject]@{ State = 'SignedIn'; Detail = 'signed in to the demo''s tenant'; Seconds = 9; Via = 'the stage''s CLI' }
         { InModuleScope DbHubDemo -Parameters @{ Status = $answered } { Stop-DemoRayfinSignInStatus -Status $Status; Stop-DemoRayfinSignInStatus -Status $null; Stop-DemoRayfinSignInStatus -Status ([pscustomobject]@{ Name = 'not a read' }) } } | Should -Not -Throw
         $answered.Result.State | Should -Be 'SignedIn'
     }
@@ -763,24 +801,31 @@ Describe 'Start-DemoRayfinSignInProcess' {
         [System.Environment]::SetEnvironmentVariable('BROWSER', $script:browserOutside)
     }
 
-    It 'runs the pinned CLI''s sign-in through npx, in a window of its own on Windows, with the telemetry off and no ambient token' {
+    It 'runs the stage''s pinned CLI''s sign-in with node, never npx, from the stage, in a window of its own on Windows, with the telemetry off and no ambient token (2026-11-09)' {
         $script:startArguments = $null
-        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'npx' } -MockWith { [pscustomobject]@{ Source = 'C:\nodejs\npx.cmd' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'node' } -MockWith { [pscustomobject]@{ Source = 'C:\nodejs\node.exe' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinCliPath -MockWith { 'C:\repo\out\fabric-app\node_modules\@microsoft\rayfin-cli\bin\rayfin.js' }
         Mock -ModuleName DbHubDemo -CommandName Start-Process -MockWith { $script:startArguments = $PesterBoundParameters; [pscustomobject]@{ Handle = [System.IntPtr]::Zero; HasExited = $false } }
         $null = InModuleScope DbHubDemo { Start-DemoRayfinSignInProcess -TenantId '66666666-7777-8888-9999-000000000000' }
-        $settings = InModuleScope DbHubDemo { Get-DemoFabricAppSetting }
-        $script:startArguments['FilePath'] | Should -Be 'C:\nodejs\npx.cmd'
-        @($script:startArguments['ArgumentList']) | Should -Be @('--yes', ('--package={0}@{1}' -f $settings['cliPackage'], $settings['cliVersion']), '--', 'rayfin', 'login', '--tenant', '66666666-7777-8888-9999-000000000000')
+        $script:startArguments['FilePath'] | Should -Be 'C:\nodejs\node.exe'
+        @($script:startArguments['ArgumentList']) | Should -Be @('"C:\repo\out\fabric-app\node_modules\@microsoft\rayfin-cli\bin\rayfin.js"', 'login', '--tenant', '66666666-7777-8888-9999-000000000000')
+        $script:startArguments['WorkingDirectory'] | Should -BeLike '*fabric-app'
         $script:startArguments['Environment']['RAYFIN_TELEMETRY_OPTOUT'] | Should -Be '1'
         $script:startArguments['Environment'].Contains('RAYFIN_TOKEN') | Should -BeTrue
         $script:startArguments['Environment']['RAYFIN_TOKEN'] | Should -BeNullOrEmpty
         $script:startArguments.ContainsKey('Wait') | Should -BeFalse -Because 'nothing waits for it'
         $script:startArguments.ContainsKey('NoNewWindow') | Should -Be (-not $IsWindows)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-Command -Times 0 -Exactly -ParameterFilter { $Name -eq 'npx' }
     }
 
-    It 'throws, naming Node.js, when npx isn''t on PATH' {
-        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'npx' } -MockWith { }
-        { InModuleScope DbHubDemo { Start-DemoRayfinSignInProcess -TenantId '66666666-7777-8888-9999-000000000000' } } | Should -Throw '*npx wasn''t found on PATH*'
+    It 'throws, naming Node.js, when node isn''t on PATH, and the stage when it has no CLI yet, starting nothing' {
+        Mock -ModuleName DbHubDemo -CommandName Start-Process -MockWith { throw 'nothing starts' }
+        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'node' } -MockWith { }
+        { InModuleScope DbHubDemo { Start-DemoRayfinSignInProcess -TenantId '66666666-7777-8888-9999-000000000000' } } | Should -Throw '*node wasn''t found on PATH*'
+        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'node' } -MockWith { [pscustomobject]@{ Source = 'C:\nodejs\node.exe' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinCliPath -MockWith { '' }
+        { InModuleScope DbHubDemo { Start-DemoRayfinSignInProcess -TenantId '66666666-7777-8888-9999-000000000000' } } | Should -Throw '*stage (out/fabric-app) has no Rayfin CLI yet*'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Process -Times 0 -Exactly
     }
 }
 
@@ -864,7 +909,8 @@ Describe 'The Rayfin CLI''s sign-in and BROWSER: one the CLI can''t start is rem
 
     It 'is what both sign-ins give the CLI: deploy.ps1''s (Start-DemoRayfinSignInProcess) and -SignIn''s (Invoke-DemoRayfinInteractive)' {
         $script:starts = [System.Collections.Generic.List[object]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'npx' } -MockWith { [pscustomobject]@{ Source = 'C:\nodejs\npx.cmd' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-Command -ParameterFilter { $Name -eq 'node' } -MockWith { [pscustomobject]@{ Source = 'C:\nodejs\node.exe' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRayfinCliPath -MockWith { 'C:\stage\node_modules\@microsoft\rayfin-cli\bin\rayfin.js' }
         Mock -ModuleName DbHubDemo -CommandName Start-Process -MockWith { $script:starts.Add($PesterBoundParameters); [pscustomobject]@{ Handle = [System.IntPtr]::Zero; HasExited = $true; ExitCode = 0 } }
         $tenant = '66666666-7777-8888-9999-000000000000'
         $rayfinSignIn = @('login', '--tenant', $tenant)
