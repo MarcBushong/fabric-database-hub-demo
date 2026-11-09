@@ -445,6 +445,15 @@ Describe 'Configuration files' {
         $runtime.releaseMetadata | Should -Match '^https://builds\.dotnet\.microsoft\.com/dotnet/release-metadata/10\.0/releases\.json$'
     }
 
+    It 'the workload generator''s global.json pins the SDK that config/versions.json records, so nobody needs a newer one than the documented pin (2026-11-09)' {
+        $versions = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
+        $globalJson = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'workload-generator/global.json') -Raw | ConvertFrom-Json -AsHashtable
+        # rollForward picks a later SDK, never an earlier one, so a global.json above the pin would fail the build with it.
+        $globalJson['sdk']['version'] | Should -Be $versions['tools']['dotnetSdk']
+        $globalJson['sdk']['rollForward'] | Should -Be 'latestFeature'
+        $globalJson['sdk']['allowPrerelease'] | Should -BeFalse
+    }
+
     It 'every resource API version in infra/ matches config/versions.json' {
         $versions = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
         $declarations = Get-RepoFile -Include '*.bicep' | Select-String -Pattern "^\s*resource\s+\w+\s+'([^'@]+)@([^']+)'"

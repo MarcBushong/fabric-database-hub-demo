@@ -88,22 +88,23 @@ fabric/app/
   src/visuals/                 the seven custom visuals and their pure layout code (layout.ts)
   src/pages/                   Estate, Incidents, Readiness, and Live links
   src/theme/                   the three themes and their contrast tests
-  src/test/                    the test setup, and the test of the npm override with Rayfin's code
+  src/test/                    the test setup, and the tests of the npm overrides with Rayfin's code (its sign-in harness too)
   scripts/export-queries.ts    writes the catalog as connector payloads for the deploy-time check
   scripts/check-licenses.mjs   the production license check
 ```
 
 ### Overrides and known advisories
 
-`package.json` has one npm override, for a security advisory in a package that the pinned Rayfin packages bring in. No Rayfin release declares a fixed version yet, not even the newest prerelease (checked 2026-10-28), so the override is outside its parent's declared range. `config/versions.json` (`fabricApp.overrides`) records it and why, and a Pester test keeps that record, `package.json`, and the lock file in sync (Phase 27).
+`package.json` has two npm overrides, for security advisories in packages that the pinned Rayfin packages bring in. No Rayfin release declares a fixed version yet, not even the newest prerelease (checked 2026-10-28 for zod, and 2026-11-09 for `@azure/msal-node`), so each override is outside its parent's declared range. `config/versions.json` (`fabricApp.overrides`) records them and why, and a Pester test keeps that record, `package.json`, and the lock file in sync (Phase 27).
 
 | Package | Override | Advisory | Declared by | Proof |
 |---|---|---|---|---|
+| `@azure/msal-node` | 7.2.1 | [GHSA-xcx6-jx8p-x3h5](https://github.com/advisories/GHSA-xcx6-jx8p-x3h5) (high), fixed in 7.1.0 | `@microsoft/rayfin-cli` 1.36.2 (`^5.5.0`); `@azure/identity` 4.14.1, through `tedious` 19.2.2 (`^7.1.0`) | `src/test/overrides.test.ts` runs the CLI's own `rayfin login` and `rayfin login status` against a stand-in for Microsoft Entra ID and the browser (`src/test/rayfin-sign-in-harness.mjs`), offline: the browser sign-in with PKCE and `form_post`, the code redeemed alone, a response with another request's state refused (MSAL Node 5.6.0 took it), and the cached sign-in read and renewed. A sign-in cached by 5.6.0 reads with 7.2.1, and the other way round (checked by hand, 2026-11-09) |
 | `zod` | 4.6.7 | [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), fixed in 4.6.6 | `@microsoft/rayfin-tools-common` 1.36.2 (`~4.3.6`), through the SDK's connectors and the CLI; `eslint-plugin-react-hooks` (`^3.25.0 \|\| ^4.0.0`) | `src/test/overrides.test.ts` runs Rayfin's template manifest validation (`rayfin init`), its only use of zod: the same results as with 4.3.6, but for one message that now names the closest match. The app's browser bundle has no zod |
 
-Remove the override once a pinned Rayfin release depends on zod 4.6.6 or later.
+Remove an override once a pinned Rayfin release depends on a fixed version: `@azure/msal-node` 7.1.0 or later, or zod 4.6.6 or later.
 
-**Not overridden:** [GHSA-xcx6-jx8p-x3h5](https://github.com/advisories/GHSA-xcx6-jx8p-x3h5) in `@azure/msal-node` (high), so `npm audit` still reports it, for `@azure/msal-node`, `@azure/identity`, and `@microsoft/rayfin-cli`. It's a dev dependency of the Rayfin CLI 1.36.2, which declares `^5.5.0` (and `^6.0.0` through `tedious` and `@azure/identity`), and it's fixed only in 7.1.0, two major versions on. The advisory concerns apps that pass the authorization response to `acquireTokenByCode`; its workaround is to pass only the authorization code. The CLI never calls `acquireTokenByCode`: its browser sign-in goes through MSAL's `acquireTokenInteractive`, which in the installed versions (5.6.0, and 6.0.1 under `@azure/identity`) passes only the code, and its silent, device code, and client credential sign-ins use no authorization code. So the vulnerable pattern isn't reached through the CLI's sign-in as installed. Nothing offline can prove the CLI's interactive sign-in with MSAL Node 7, so this waits for a Rayfin release that accepts MSAL Node 7.1 or later ([R540](../../docs/implementation-report.md#risk-register)). The production dependencies have no known advisory: `npm audit --omit=dev` reports none.
+The `@azure/msal-node` override reaches everything installed from the lock file, so the stage's CLI, which `rayfin up` and `configure-fabric-app.ps1 -SignIn` run. It doesn't reach a CLI that `npx` installs: npx resolves the CLI's dependencies from the registry, without this project's overrides, so `deploy.ps1`'s browser sign-in and the one-time command in step 3 below still get MSAL Node 5.6.0. The advisory concerns apps that pass the authorization response to `acquireTokenByCode`, and the CLI never does: its browser sign-in goes through MSAL's `acquireTokenInteractive`, which passes only the code (the advisory's workaround). Until `deploy.ps1` no longer runs the CLI through npx, that's the remaining exposure ([R540](../../docs/implementation-report.md#risk-register)). With the override, `npm audit` reports no high advisory; the production dependencies have none at all (`npm audit --omit=dev`).
 
 ## Deploy
 
