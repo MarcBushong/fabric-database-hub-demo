@@ -15,7 +15,7 @@
       "version": "7.4"
     },
     "ghcr.io/devcontainers/features/dotnet:2": {
-      "version": "10.0.402"
+      "version": "10.0.403"
     },
     "ghcr.io/devcontainers/features/node:2": {
       "version": "24"
