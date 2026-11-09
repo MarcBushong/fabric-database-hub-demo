@@ -127,13 +127,22 @@ function New-DemoT2GoldenSnapshot {
         & $add 'GOLDEN.CAPTURE.MODE' 'Not supported' 'The evaluation-only T2 is an Azure VM, not a nested guest; golden snapshots keep a nested guest''s setup-wizard state.'
         return $results.ToArray()
     }
-    if ([string]$Config['t2SqlInstallMode'] -notin 'PaygWizard', 'JumpstartImage') {
-        & $add 'GOLDEN.CAPTURE.MODE' 'Not supported' ('Golden snapshots keep the PaygWizard setup-wizard state or speed up a JumpstartImage redeploy; t2SqlInstallMode is {0}, which installs unattended on every build.' -f $Config['t2SqlInstallMode'])
+    # The guest's own mode (2026-11-09): a kept PaygWizard guest under the default JumpstartImage mode is captured as what it is.
+    $guestState = $null
+    try {
+        $guestState = Get-DemoDeploymentState -Config $Config
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The deployment state couldn''t be read, so the snapshot is tagged with t2SqlInstallMode: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    $guestMode = Get-DemoT2GuestInstallMode -Config $Config -State $guestState
+    if ($guestMode -notin 'PaygWizard', 'JumpstartImage') {
+        & $add 'GOLDEN.CAPTURE.MODE' 'Not supported' ('Golden snapshots keep the PaygWizard setup-wizard state or speed up a JumpstartImage redeploy; T2''s guest is in {0} mode, which installs unattended on every build.' -f $guestMode)
         return $results.ToArray()
     }
     $vm = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'show', '--resource-group', $resourceGroupName, '--name', 'archost01') -AsJson -AllowFailure
     if ($null -eq $vm) {
-        & $add 'GOLDEN.CAPTURE.HOST' 'Fail' ('archost01 wasn''t found in {0}.' -f $resourceGroupName) @{} 'Deploy T2 first (deploy.ps1), finish the setup-wizard step, then capture.'
+        & $add 'GOLDEN.CAPTURE.HOST' 'Fail' ('archost01 wasn''t found in {0}.' -f $resourceGroupName) @{} 'Deploy T2 first (deploy.ps1), then capture.'
         return $results.ToArray()
     }
     $storage = Get-DemoMemberValue -InputObject $vm -Name 'storageProfile'
@@ -368,7 +377,7 @@ function New-DemoT2GoldenSnapshot {
         $snapshotTags[$names['SqlEdition']] = 'Standard'
         $snapshotTags[$names['SqlVersion']] = $facts.sqlVersion
         $snapshotTags[$names['SqlUpdateLevel']] = if ($facts.sqlUpdateLevel) { '{0}-{1}' -f $facts.sqlUpdateLevel, $facts.sqlUpdateReference } else { 'RTM' }
-        $snapshotTags[$names['InstallMode']] = [string]$Config['t2SqlInstallMode']
+        $snapshotTags[$names['InstallMode']] = $guestMode
         $snapshotTags[$names['HostSize']] = $hostSize
         $snapshotTags[$names['SecurityType']] = $securityType
         $snapshotTags[$names['UsedGiB']] = [string]$facts.usedGiB

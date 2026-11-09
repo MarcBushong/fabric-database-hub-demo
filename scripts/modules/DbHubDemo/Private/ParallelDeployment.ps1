@@ -488,6 +488,16 @@ function Invoke-DemoParallelDeployment {
         Stop-DemoRayfinSignInStatus -Status $signInCheck
         Set-DemoProgressStep -Path $ProgressPath -Id 'Preflight' -State 'Failed' -Status 'Fail' -Message 'Nothing was created: the .NET SDK the workload runner needs couldn''t be installed (DEPLOY.DOTNETSDK says why).'
     }
+    # 2026-11-09: T4 that's on, with no fallback record, but whose server doesn't exist (a demo from before T4): a resume
+    # would skip preflight, the template that creates it, and T1's step that sets it up, so this run starts from preflight.
+    if ($Resume -and -not $FromStage -and -not $whatIf) {
+        $missingT4 = Get-DemoT4MissingResult -Config (Resolve-DemoEffectiveConfig -Config $Config -State $state) -State $state
+        if ($null -ne $missingT4) {
+            $results.Add($missingT4)
+            Write-DemoLog -Message $missingT4.message
+            $Resume = [switch]::new($false)
+        }
+    }
     # A resume sends a VM's artifacts again, with its loader and the steps after them, when the bootstrap bundle or the
     # workload runner this checkout builds isn't what the resource group's state records for that VM, so a fix pulled since
     # the last run reaches it (live finding, 2026-11-06). With nothing changed, each track resumes as recorded.
@@ -503,9 +513,9 @@ function Invoke-DemoParallelDeployment {
         $resend = Resolve-DemoArtifactResend -State $state -Plan $resumePlan -SkipRunner:$SkipRunner
         & $addAll @($resend.Results)
     }
-    # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28): a "no T4" record
-    # (None) gets the 2-vCore fallback, and its cost check, again when this run deploys the template (Phase 28
-    # follow-up).
+    # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28). T4 is part of every
+    # deployment (2026-11-09): a "no T4" record (None or Refused) has the fallback try every size again when this run
+    # deploys the template.
     $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -Resend @($resend.Tracks)).Infrastructure
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:$templateRuns
     $skipT4 = -not (Test-DemoT4Enabled -Config $Config)
@@ -514,6 +524,17 @@ function Invoke-DemoParallelDeployment {
         $plan = Resolve-DemoTrackPlan -StopAfter 'Infrastructure'
     }
     Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -ResendNote $resend.Notes
+    # T4 out of this run is said on its own rows, with why and the fix (2026-11-09); DEPLOY.T4.OFF, a Fail, says it at the end.
+    $showT4Off = {
+        $offResult = New-DemoT4OffResult -Config $Config -State $state -Result $results.ToArray()
+        if ($null -ne $offResult) {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'T4.Server', 'T4.Setup', 'T4.Telemetry' -State 'Skipped' -Status ([string]$offResult.status) -Message ([string]$offResult.message)
+        }
+        $offResult
+    }
+    if ($skipT4 -and -not $whatIf) {
+        $null = & $showT4Off
+    }
     # The run's activity profile (2026-11-03, ADR 0010): the tracks set its interim, and this process switches the VMs they
     # noted once its own Run Commands are done; Complete-DemoDeploymentRun sends the switch when the run ends before that.
     # A run without preflight says the default here.
@@ -1177,7 +1198,7 @@ function Invoke-DemoParallelDeployment {
     }
     $allTracksDone = (& $trackFinished 'T1' 'Telemetry') -and (& $trackFinished 'T2' 'Telemetry') -and ($skipT4 -or (& $trackFinished 'T4' 'Telemetry')) -and ($SkipFabric -or (& $trackFinished 'Fabric' 'Fabric'))
     $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
-    $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:$skipT4 -SkipFabric:$SkipFabric
+    $requirement = Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric
     $validationStart = $results.Count
     # Whether DONE's checks ran, which the history report's snapshot at the end needs (2026-11-06).
     $doneChecked = $false
@@ -1220,7 +1241,10 @@ function Invoke-DemoParallelDeployment {
         # target and not only the ones it worked on. A target whose telemetry didn't come gets its monitoring checked,
         # and its telemetry once more, before the run is judged (Invoke-DemoTelemetryCheck; Phase 28 live finding).
         if ($allTracksDone -and -not (& $hasStatus $results.ToArray() 'Fail')) {
-            & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
+            # A T4 this run's template didn't create (Azure refused every size) isn't checked: its requirements stay unmet,
+            # so the run isn't DONE and the clock doesn't stop (2026-11-09: T4 is part of every deployment).
+            $gateRequirement = if ($skipT4) { @($requirement | Where-Object { $_ -notin 'HUB.ESTATE.T4', 'METRICS.T4' }) } else { $requirement }
+            & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $gateRequirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
             $doneChecked = $true
         }
         try {
@@ -1275,6 +1299,23 @@ function Invoke-DemoParallelDeployment {
     }
 
     $all = $results.ToArray()
+    # 2026-11-09: T4 out of this deployment is never silent (DEPLOY.T4.OFF): a Fail, because DONE needs T4, with the reason
+    # and the fix, when Azure refused every size its fallback tries. The state is read again, because this run's template
+    # may have recorded what its fallback found.
+    if ($skipT4 -and -not $whatIf) {
+        try {
+            $state = Get-DemoDeploymentState -Config $Config
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The deployment state couldn''t be read again for T4''s line: {0}' -f $_.Exception.Message)
+        }
+        $offResult = & $showT4Off
+        if ($null -ne $offResult) {
+            $results.Add($offResult)
+            Write-DemoLog -Level Warning -Message ([string]$offResult.message)
+            $all = $results.ToArray()
+        }
+    }
     # Phase 28 live finding (2026-10-30): what only a person can confirm is listed once each, apart from what needs you.
     $summary = Get-DemoDeploySummary -Result $all -FinishedText 'Every track and the validation finished.'
     $summaryEvidence = $summary.Evidence

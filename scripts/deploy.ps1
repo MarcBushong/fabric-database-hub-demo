@@ -7,7 +7,12 @@ again (plan section 9.2, ADR 0011, Phase 28).
 .DESCRIPTION
 One command, one guided stop (Phase 28):
 - No configuration yet: it writes one first, as init.ps1 does (Initialize-DemoFirstRun: the same prompts, and the P6
-  admin group created when it's missing and you may create it), then deploys. init.ps1 still works on its own.
+  admin group created when it's missing and you may create it), then deploys. init.ps1 still works on its own. Since
+  2026-11-09 neither asks how T2 gets SQL Server: a first deployment gets JumpstartImage, which needs nobody.
+- An existing environment is upgraded in place (2026-11-09): a T2 guest built in PaygWizard mode whose SQL Server setup
+  was never finished is rebuilt from Arc Jumpstart's image (about 27 minutes; DEPLOY.T2.REBUILD), a finished guest keeps
+  its mode when the configuration doesn't name t2SqlInstallMode (DEPLOY.T2.MODE), and a missing T4 is created
+  (DEPLOY.T4.MISSING), or the run says why not (DEPLOY.T4.OFF).
 - It keeps this PC awake while it runs (Windows), writes the progress model out/deploy-progress.json and the live status
   page out/deploy-status.html, opens the page (in GitHub Codespaces it says how to preview it), and prints what to
   expect: the timeline, and in PaygWizard mode when a person is needed and for how long. ./scripts/status.ps1 -Watch

@@ -34,7 +34,9 @@ Describe 'Evaluation-only T2 bootstrap (EvalArcVm)' {
         [bool](& $step.Test $step) | Should -BeFalse
         $result = & $step.Set $step
         $result.Outcome | Should -Be 'Failed'
-        $result.Message | Should -Match 't2Mode Nested'
+        $result.Message | Should -Match 'Set t2SqlInstallMode to ProductKey or Developer, both unattended here, or use t2Mode Nested'
+        # PaygWizard is retired (2026-11-09): no fix names it (review of 849d4c2).
+        $result.Message | Should -Not -Match 'PaygWizard'
         foreach ($mode in 'PaygWizard', 'ProductKey', 'Developer') {
             $other = Get-DemoEvalArcStepPlan -Context (New-TestEvalContext -Mode $mode) | Where-Object { $_.Name -eq 'InstallMode' }
             [bool](& $other.Test $other) | Should -BeTrue -Because $mode

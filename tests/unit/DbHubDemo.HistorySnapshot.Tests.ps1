@@ -14,7 +14,8 @@ BeforeAll {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
-        $config['t4Enabled'] = [bool]$WithT4
+        # T4 is part of every deployment (2026-11-09).
+        $config['t4Enabled'] = $true
         return $config
     }
 
@@ -24,14 +25,14 @@ BeforeAll {
 
     # Every DONE requirement passing (brief item 16), for the default JumpstartImage mode without T4.
     function New-DoneResult {
-        $ids = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'JumpstartImage' -T4Off }
+        $ids = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'JumpstartImage' }
         foreach ($id in $ids) {
             New-TestResult $id
         }
     }
 
     function New-FinishedState {
-        [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric'; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '' }
+        [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = 'Telemetry'; TrackFabric = 'Fabric'; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '' }
     }
 
     function New-HistoryRecord([string] $Status, [string] $Reported = '') {
@@ -137,7 +138,7 @@ Describe 'Invoke-DemoHistorySnapshotStep (2026-11-06)' {
 
         $script:progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
         InModuleScope DbHubDemo -Parameters @{ Path = $script:progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
-        $script:requirement = @(InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'JumpstartImage' -T4Off })
+        $script:requirement = @(InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'JumpstartImage' })
         $script:done = @(New-DoneResult)
         $script:invoke = {
             param([hashtable] $Extra = @{})

@@ -543,15 +543,17 @@ function Get-DemoCostEstimate {
                 [string]::Format($culture, ' Azure starts a stopped T4 again on its own after 7 days, and {0}, so the worst case counts it running for the rest of the month: {1:N0} hours, {2:N2} USD of T4 compute, against the ceiling.', $why, $t4Restart.Hours, [double]$t4WorstCase)
             }
             $monthlyMessage += [string]::Format($culture, ' T4 (PostgreSQL, {0}) costs {1:N2} USD a month even while stopped (storage, its private DNS zone, and its Defender plans).{2}', $t4Sku, $t4FixedMonthly, $restartText)
-            # The three ways to keep the month cheaper (the owner's decision, 2026-11-04).
-            $cheaper = 'To keep the month cheaper: set t4SkuName to Standard_B1ms (which turns autonomous tuning off), set t4Enabled to false, or set a lower monthlyCeilingUsd.'
+            # The ways to keep the month cheaper (the owner's decision, 2026-11-04). T4 is part of every deployment since
+            # 2026-11-09, so leaving it out isn't one of them.
+            $cheaper = 'To keep the month cheaper: set t4SkuName to Standard_B1ms (which turns autonomous tuning off), or set a lower monthlyCeilingUsd.'
             $monthlyMessage += ' ' + $cheaper
             $safetyFix = if ($null -ne $t4Restart -and $t4Restart.Restarts -eq 0) {
                 $fix = if ($null -ne $T4RestartCoverage) { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Fix') } else { '' }
                 if ($fix) { ' Or put the nightly safety stop fully in place, so each restart counts as about a day: {0}' -f $fix } else { ' Or run ./scripts/deploy.ps1, which sets up the nightly safety stop, so each restart counts as about a day.' }
             }
             else { '' }
-            $monthlyRemediation = [string]::Format($culture, '{0} To keep this T4, raise monthlyCeilingUsd to at least {1:N0} (the budget follows it at the next deploy.ps1 -FromStage Infrastructure).{2}', $cheaper, [System.Math]::Ceiling($lightUseMonthly + [double]$t4WorstCase), $safetyFix)
+            # The ceiling to raise first: NOT DONE's next step comes from here (2026-11-09).
+            $monthlyRemediation = [string]::Format($culture, 'Raise monthlyCeilingUsd to at least {0:N0} in your configuration (the budget follows it at the next deploy.ps1 -FromStage Infrastructure).{1} Or, to keep the month cheaper, set t4SkuName to Standard_B1ms, which turns autonomous tuning off.', [System.Math]::Ceiling($lightUseMonthly + [double]$t4WorstCase), $safetyFix)
         }
         if ($networkModeAssumed) {
             $monthlyMessage += ' networkMode auto isn''t resolved yet, so the estimate assumes private mode (private endpoint and private DNS zone).'

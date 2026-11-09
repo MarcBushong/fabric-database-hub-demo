@@ -24,10 +24,11 @@ function Initialize-DemoConfig {
        <prefix>-<environment>-sql-admins), and whether you own it. With -CreateAdminGroup, a missing group is created
        with you as its owner (Microsoft Graph Create group and Add owners, the calls behind 'az ad group create' and
        'az ad group owner add'). A tenant that forbids it is Manual action required with the Entra steps.
-    8. T2's SQL Server install mode: JumpstartImage (the default: Arc Jumpstart's prebuilt SQL Server 2022 Standard
-       guest, no stop, Hub Performance on T2), PaygWizard (Hub Performance on T2; once per guest build, deploy.ps1
-       stops for about 10 minutes of pre-filled SQL Server setup through Bastion, the guided stop), or Developer (no
-       stop; T2 in Hub's Estate only). It asks unless -T2SqlInstallMode or -NonInteractive.
+    8. T2's SQL Server install mode, without a question since 2026-11-09 (user-directed, so a first deployment never needs
+       anyone to sign in to a VM): -T2SqlInstallMode when it's given, otherwise JumpstartImage (the default: Arc Jumpstart's
+       prebuilt SQL Server 2022 Standard guest, no stop, Hub Performance on T2), with one line that says so and how to pick
+       another on purpose: Developer (no stop; T2 in Hub's Estate only). PaygWizard is retired from the one-click
+       deployment: deploy.ps1 runs a configuration's PaygWizard as JumpstartImage.
     9. The file (INIT.CONFIG): the example configuration with these values, validated against
        config/environment.schema.json, then written (not with -WhatIf). fabric.manageCapacity stays false unless
        -ManageCapacity.
@@ -62,7 +63,8 @@ function Initialize-DemoConfig {
     The resource name prefix (default dbhub).
 
     .PARAMETER T2SqlInstallMode
-    JumpstartImage, PaygWizard, or Developer; empty asks (or JumpstartImage with -NonInteractive).
+    JumpstartImage or Developer, to choose T2's mode on purpose; empty gives JumpstartImage, the default, without a
+    question (2026-11-09). PaygWizard is retired from the one-click deployment.
 
     .PARAMETER WorkspaceName
     The Fabric workspace's name (default "Database Hub Demo").
@@ -127,7 +129,7 @@ function Initialize-DemoConfig {
         [string] $Prefix = '',
 
         [AllowEmptyString()]
-        [ValidateSet('', 'JumpstartImage', 'PaygWizard', 'Developer')]
+        [ValidateSet('', 'JumpstartImage', 'Developer')]
         [string] $T2SqlInstallMode = '',
 
         [AllowEmptyString()]
@@ -515,17 +517,15 @@ function Initialize-DemoConfig {
     #endregion 7. P6
 
     #region 8. T2's SQL Server install mode
+    # 2026-11-09 (user-directed): no question. A first deployment is one click, so T2 gets the default, JumpstartImage, which
+    # needs nobody; -T2SqlInstallMode picks another mode on purpose.
     $mode = $T2SqlInstallMode
     if (-not $mode) {
         $mode = 'JumpstartImage'
-        if ($interactive) {
-            $options = @(
-                'JumpstartImage (default): no stop, unattended. T2 is Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest, and Database Hub shows its performance and the agent''s findings.'
-                'PaygWizard: Database Hub shows T2''s performance and the agent''s findings. Once per guest build, deploy.ps1 stops for about 10 minutes: through Bastion you choose pay-as-you-go and Standard in a pre-filled SQL Server setup.'
-                'Developer: no stop, unattended. T2 shows in Database Hub''s Estate only, with no T2 performance data or agent findings; T1, T3, and T4 still show performance.'
-            )
-            $mode = @('JumpstartImage', 'PaygWizard', 'Developer')[(Read-DemoChoice -Title 'How should T2 (the Arc-enabled SQL Server) get SQL Server?' -Option $options -Default 0)]
-        }
+        Write-DemoLog -Message 'T2 gets SQL Server from Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest (t2SqlInstallMode JumpstartImage, the default): unattended, so nobody signs in to a VM. To choose another mode on purpose, run init.ps1 -Force -T2SqlInstallMode Developer (T2 in Database Hub''s Estate only), or set ProductKey in the configuration (prerequisite P10).'
+    }
+    else {
+        Write-DemoLog -Message ('T2 gets SQL Server in t2SqlInstallMode {0}, as -T2SqlInstallMode asked.' -f $mode)
     }
     #endregion 8. T2
 
@@ -623,10 +623,7 @@ function Initialize-DemoConfig {
         $nextSteps.Add(('Fix what''s listed under Manual action required above ({0}), then run init.ps1 -Force again.' -f (($open | ForEach-Object { $_.checkId }) -join ', ')))
     }
     $nextSteps.Add(('./scripts/preflight.ps1{0}   # checks P1-P6, quota, policies, and the cost; registers missing providers' -f $configArgument))
-    if ($mode -eq 'PaygWizard') {
-        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 2 to 3 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); about 60 to 90 minutes in, it asks you for about 10 minutes (the guided stop), then finishes by itself' -f $configArgument))
-    }
-    elseif ($mode -eq 'JumpstartImage') {
+    if ($mode -eq 'JumpstartImage') {
         $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 hours (91 minutes, measured on 2026-11-06) and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))
     }
     else {

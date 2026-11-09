@@ -19,3 +19,7 @@ This repo deploys a low-cost, repeatable customer demo of **Microsoft Fabric Dat
 - Pin every version in `config/versions.json` and every GitHub Action by full commit SHA.
 - Run `./tests/Invoke-StaticValidation.ps1` before you open a pull request.
 - One pull request per implementation phase; record work summary, changed files, validation results, and risks in `docs/implementation-report.md`.
+
+## Setting up the demo for someone
+
+To deploy, upgrade, or try the demo rather than change its code, follow [AGENTS.md](../AGENTS.md): `./scripts/init.ps1` when there's no configuration, then `./scripts/deploy.ps1`, which also upgrades an older demo. Never assemble a partial setup by hand or leave a target out, and report **DONE** or **NOT DONE** with its reason and the exact next command.
