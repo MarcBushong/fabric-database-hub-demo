@@ -178,7 +178,7 @@ function Invoke-DemoValidationInfrastructure {
         $stepText = if ($step) { ' (step {0})' -f $step } else { '' }
         $text = if ($healthMessage) { '{0} reports {1}{2}: {3}' -f $vmName, $healthState, $stepText, $healthMessage } else { '{0} reports {1}{2}.' -f $vmName, $healthState, $stepText }
         $remediation = switch ($healthStatus) {
-            'Manual action required' { 'Follow the instructions in health.json (Get-DemoVmHealth -Config $config -VmName {0} -View Full). The T2 setup-wizard step is in docs/deployment.md.' -f $vmName }
+            'Manual action required' { 'Follow the instructions in health.json (Get-DemoVmHealth -Config $config -VmName {0} -View Full).' -f $vmName }
             'Fail' { 'Read health.json and C:\ProgramData\DbHubDemo\logs on {0} (through Bastion), fix the cause, then run deploy.ps1 -Resume.' -f $vmName }
             'Warning' { 'The bootstrap is still working or waiting; run validate.ps1 again later.' }
             default { '' }
@@ -541,7 +541,7 @@ function Invoke-DemoValidationWorkload {
                 continue
             }
             if ($hostState -eq 'ManualActionRequired') {
-                $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Manual action required' -Message ('The T2 runner is installed in the host''s last step, after the manual step health.json reports: {0}' -f [string](Get-DemoMemberValue -InputObject $read.Health -Name 'message')) -Evidence @{ hostState = $hostState } -Remediation 'Finish the setup-wizard step in docs/deployment.md; the host then configures SQL Server, seeds ContosoCare, and installs the runner.' -DocUrl $docUrl))
+                $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Manual action required' -Message ('The T2 runner is installed in the host''s last step, after the manual step health.json reports: {0}' -f [string](Get-DemoMemberValue -InputObject $read.Health -Name 'message')) -Evidence @{ hostState = $hostState } -Remediation ('Follow the instructions in health.json (Get-DemoVmHealth -Config $config -VmName {0} -View Full); the host then configures SQL Server, seeds ContosoCare, and installs the runner.' -f $vmName) -DocUrl $docUrl))
                 continue
             }
             if ($hostState -ne 'Ready') {

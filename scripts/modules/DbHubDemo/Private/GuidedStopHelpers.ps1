@@ -195,7 +195,11 @@ function Wait-DemoT2HostBuild {
     Waits, bounded by -DeadlineUtc, for the T2 host to stop building: until it waits for the product key or for Arc
     onboarding, needs a person, is Ready, or Failed. Every poll updates the status page's T2.HostBuild step and prints a
     progress line with the elapsed time, the host's step (n of N), and a rough estimate of when the guided stop comes.
-    Returns Health, TimedOut, and Failed. Internal.
+    Since 2026-11-09, a host that rebuilds an unfinished PaygWizard guest from Arc Jumpstart's image is followed up once
+    (Complete-DemoT2GuestRebuild: the old guest's Arc resources go, and the console and the status page say so, with the
+    measured time), the estimate follows the mode the host runs, and a report from the bundle before this run's
+    (-BundlePrefix) doesn't end the wait for up to 20 minutes. Returns Health, TimedOut, Failed, Rebuilt, and Results.
+    Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -211,13 +215,23 @@ function Wait-DemoT2HostBuild {
         [ValidateRange(10, 1800)]
         [int] $PollSeconds = 300,
 
-        [System.Nullable[datetime]] $StartedUtc = $null
+        [System.Nullable[datetime]] $StartedUtc = $null,
+
+        # The first 12 characters of the bootstrap bundle this run sent to archost01 (2026-11-09): a health whose generation
+        # belongs to another bundle is the last run's, from before the loader started this one, so its state doesn't end the
+        # wait for up to 20 minutes, and neither its mode nor its guest is taken from it.
+        [AllowEmptyString()]
+        [string] $BundlePrefix = ''
     )
 
     $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
     $stopStates = @('WaitingForProductKey', 'WaitingForArcOnboarding', 'ManualActionRequired', 'Ready', 'Failed')
     $started = if ($null -ne $StartedUtc) { [datetime]$StartedUtc } else { [System.DateTime]::UtcNow }
+    $waitStarted = [System.DateTime]::UtcNow
     $health = $null
+    # 2026-11-09: the host's rebuild of an unfinished guest, followed up once (Complete-DemoT2GuestRebuild).
+    $followUp = [System.Collections.Generic.List[object]]::new()
+    $rebuilding = $false
     while ($true) {
         try {
             $read = Get-DemoVmHealth -Config $Config -VmName 'archost01' -View Summary
@@ -227,6 +241,21 @@ function Wait-DemoT2HostBuild {
         }
         catch {
             Write-DemoLog -Level Warning -Message ('Reading archost01''s health failed (it may be restarting); reading it again later: {0}' -f $_.Exception.Message)
+        }
+        if (-not $rebuilding) {
+            $rebuild = @(Complete-DemoT2GuestRebuild -Config $Config -Health $health -ProgressPath $ProgressPath -Confirm:$false)
+            if ($rebuild.Count -gt 0) {
+                $rebuilding = $true
+                $installMode = 'JumpstartImage'
+                $followUp.AddRange([object[]]$rebuild)
+            }
+        }
+        # The mode the host runs, which can be the existing guest's own (2026-11-09), shapes the estimate.
+        $generation = [string](Get-DemoMemberValue -InputObject $health -Name 'generation')
+        $stale = [bool]$BundlePrefix -and $null -ne $health -and -not $generation.StartsWith($BundlePrefix, [System.StringComparison]::OrdinalIgnoreCase) -and ([System.DateTime]::UtcNow - $waitStarted).TotalMinutes -lt 20
+        $hostMode = [string](Get-DemoMemberValue -InputObject $health -Name 'installMode')
+        if (-not $rebuilding -and -not $stale -and $hostMode -in 'JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer') {
+            $installMode = $hostMode
         }
         $state = [string](Get-DemoMemberValue -InputObject $health -Name 'state')
         $phase = Get-DemoT2HostPhase -Health $health -InstallMode $installMode
@@ -240,17 +269,19 @@ function Wait-DemoT2HostBuild {
         else {
             ''
         }
-        $message = 'archost01 builds its guest: step {0} ({1} of {2}), {3} minutes so far.{4}' -f $(if ($phase.Step) { $phase.Step } else { 'starting' }), $phase.Index, $phase.Count, $elapsed, $estimate
+        $what = if ($rebuilding) { 'makes T2 again from Arc Jumpstart''s image (about 27 minutes in all, measured on 2026-11-06, with the 34 GiB download at about 51 MiB/s)' } elseif ($stale) { 'starts this run''s bootstrap (its last report is from the bundle before)' } else { 'builds its guest' }
+        $message = 'archost01 {5}: step {0} ({1} of {2}), {3} minutes so far.{4}' -f $(if ($phase.Step) { $phase.Step } else { 'starting' }), $phase.Index, $phase.Count, $elapsed, $estimate, $what
         Set-DemoProgressStep -Path $ProgressPath -Id 'T2.HostBuild' -State 'Running' -Message $message
         Write-DemoLog -Message ('T2: {0}' -f $message)
-        if ($state -in $stopStates) {
-            return [pscustomobject]@{ Health = $health; TimedOut = $false; Failed = ($state -eq 'Failed') }
+        if ($state -in $stopStates -and -not $stale) {
+            return [pscustomobject]@{ Health = $health; TimedOut = $false; Failed = ($state -eq 'Failed'); Rebuilt = $rebuilding; Results = $followUp.ToArray() }
         }
         $left = ($DeadlineUtc - [System.DateTime]::UtcNow).TotalSeconds
         if ($left -le 0) {
-            return [pscustomobject]@{ Health = $health; TimedOut = $true; Failed = $false }
+            return [pscustomobject]@{ Health = $health; TimedOut = $true; Failed = $false; Rebuilt = $rebuilding; Results = $followUp.ToArray() }
         }
-        Start-Sleep -Seconds ([int][System.Math]::Max(5, [System.Math]::Min($PollSeconds, $left)))
+        $poll = if ($stale) { [System.Math]::Min($PollSeconds, 60) } else { $PollSeconds }
+        Start-Sleep -Seconds ([int][System.Math]::Max(5, [System.Math]::Min($poll, $left)))
     }
 }
 

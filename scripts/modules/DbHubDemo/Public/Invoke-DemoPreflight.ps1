@@ -344,7 +344,9 @@ function Invoke-DemoPreflight {
             # The fallback's next sizes after this one, in its order; the first one the region lists is where it starts.
             $steps = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
             $next = @($steps | Select-Object -Skip ([array]::IndexOf($steps, $t4Sku) + 1) | Where-Object { & $offers $_ }) | Select-Object -First 1
-            $start = if ($next) { [string]$next } else { 'None' }
+            # 2026-11-09 (user-directed): T4 is part of every deployment, so a region that lists none of the fallback's sizes
+            # still gets every size tried (the list can lag); only Azure's refusal of them all ends the run NOT DONE.
+            $start = if ($next) { [string]$next } else { '' }
             $t4Evidence['startSku'] = $start
             $t4Starts.Add($start)
             switch ($start) {
@@ -352,15 +354,15 @@ function Invoke-DemoPreflight {
                     Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} doesn''t list T4''s default Standard_D4ds_v5, so deploy.ps1 starts with Standard_D4ads_v5, General Purpose with 4 vCores too, so autonomous tuning stays on (estimate-cost.ps1 prices it).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $capabilityDoc
                 }
                 'Standard_D2ds_v5' {
-                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists neither of T4''s 4-vCore sizes (Standard_D4ds_v5, Standard_D4ads_v5), so deploy.ps1 goes to the 2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off, once its cost check passes (PREFLIGHT.T4.FALLBACK).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do: PREFLIGHT.T4.FALLBACK gives its price and worst case. To choose T4''s size yourself, set t4SkuName, or set t4Enabled to false to leave T4 out.' -DocUrl $capabilityDoc
+                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists neither of T4''s 4-vCore sizes (Standard_D4ds_v5, Standard_D4ads_v5), so deploy.ps1 goes to the 2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off (PREFLIGHT.T4.FALLBACK gives its price).' -f $location) -Evidence $t4Evidence -Remediation 'Nothing to do: PREFLIGHT.T4.FALLBACK gives its price and worst case. To choose T4''s size yourself, set t4SkuName.' -DocUrl $capabilityDoc
                 }
                 default {
-                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists none of the sizes T4''s fallback tries (Standard_D4ds_v5, Standard_D4ads_v5, Standard_D2ds_v5), so deploy.ps1 finishes without T4, and DONE says so.' -f $location) -Evidence $t4Evidence -Remediation 'Pick a region that offers one of them, or set t4Enabled to false to leave T4 out on purpose.' -DocUrl $capabilityDoc
+                    Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Warning' ('{0} lists none of the sizes T4''s fallback tries (Standard_D4ds_v5, Standard_D4ads_v5, Standard_D2ds_v5). T4 is part of every deployment, so deploy.ps1 tries them anyway, and if Azure refuses them all, the run ends NOT DONE with the fix.' -f $location) -Evidence $t4Evidence -Remediation 'Pick a region that offers one of them, ask for access with a Region access request (Learn: Resolve capacity errors), or set t4SkuName to a size the region offers.' -DocUrl $capabilityDoc
                 }
             }
         }
         else {
-            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Fail' ('{0} doesn''t offer T4''s {1} {2} with PostgreSQL {3}.' -f $location, $t4Tier, $t4Sku, $postgres['majorVersion']) -Evidence $t4Evidence -Remediation 'Pick a region that offers it, or set t4Enabled to false (Phase 24, ADR 0019).' -DocUrl 'https://learn.microsoft.com/azure/postgresql/compute-storage/concepts-compute'
+            Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' 'Fail' ('{0} doesn''t offer T4''s {1} {2} with PostgreSQL {3}.' -f $location, $t4Tier, $t4Sku, $postgres['majorVersion']) -Evidence $t4Evidence -Remediation 'Pick a region that offers it, or set t4SkuName to a size the region offers (Phase 24, ADR 0019). T4 is part of every deployment.' -DocUrl 'https://learn.microsoft.com/azure/postgresql/compute-storage/concepts-compute'
         }
         # The capability list doesn't show a size that's temporarily unavailable: Azure refused B1ms with
         # SkuNotAvailable on 2026-10-26 while the list included it. A refusal on record for this size and zone is a
@@ -373,14 +375,15 @@ function Invoke-DemoPreflight {
                 $t4Zone = Get-DemoT4AvailabilityZone -Config $Config
                 $otherZone = $t4Zone -and $t4Zone -ne $refused.Zone
                 if (-not $otherZone -and $t4Ladder) {
-                    $start = switch ($t4Sku) { 'Standard_D4ds_v5' { 'Standard_D4ads_v5' } 'Standard_D4ads_v5' { 'Standard_D2ds_v5' } default { 'Refused' } }
+                    # The last size refused: every run tries the sizes again from the default (2026-11-09, T4 is required).
+                    $start = switch ($t4Sku) { 'Standard_D4ds_v5' { 'Standard_D4ads_v5' } 'Standard_D4ads_v5' { 'Standard_D2ds_v5' } default { '' } }
                     $t4Starts.Add($start)
                     $what = switch ($start) {
                         'Standard_D4ads_v5' { 'starts with Standard_D4ads_v5, General Purpose with 4 vCores too' }
-                        'Standard_D2ds_v5' { 'goes to the 2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off, once its cost check passes (PREFLIGHT.T4.FALLBACK)' }
-                        default { 'finishes without T4: it was the last size the fallback tries, and later runs don''t try again on their own' }
+                        'Standard_D2ds_v5' { 'goes to the 2-vCore fallback, Standard_D2ds_v5, with autonomous tuning off (PREFLIGHT.T4.FALLBACK gives its price)' }
+                        default { 'tries every size again from the default, because T4 is part of every deployment and Azure''s regional capacity changes; if Azure refuses them all, the run ends NOT DONE with the fix' }
                     }
-                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $what) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation $(if ($start -eq 'Refused') { 'Ask for access with a Region access request (Learn: Resolve capacity errors), then set t4SkuName; or set t4Enabled to false to leave T4 out on purpose.' } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+                    $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.SKU' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message ('Azure refused T4''s {0} at {1} (SkuNotAvailable), so deploy.ps1 {2}.' -f $t4Sku, $refused.TimeUtc, $what) -Evidence ([ordered]@{ refusedSku = $refused.Sku; refusedUtc = $refused.TimeUtc; startSku = $start }) -Remediation $(if (-not $start) { 'If Azure keeps refusing them, ask for access with a Region access request (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you here.' } else { 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
                 }
                 else {
                     $skuStatus = if ($otherZone) { 'Warning' } else { 'Fail' }
@@ -417,7 +420,15 @@ function Invoke-DemoPreflight {
     # (its GuestSource step), which refuses a mode the guest wasn't made for.
     $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm' -and $installMode -eq 'JumpstartImage') {
-        Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Fail' 't2SqlInstallMode JumpstartImage needs the nested Hyper-V host: Arc Jumpstart''s image is a Hyper-V guest disk, but t2Mode EvaluationOnlyAzureVm makes T2 an Azure VM.' -Remediation 'Use t2Mode Nested with a nested-virtualization size, or, for the evaluation-only Azure VM, set t2SqlInstallMode to PaygWizard, ProductKey, or Developer (ADR 0006).' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine'
+        # 2026-11-09: no SQL Server setup wizard anywhere, so the fix names only the unattended modes this VM runs. An older
+        # configuration's PaygWizard (its default before 2026-11-05) runs as JumpstartImage, which it can't.
+        $unattended = 'Set t2SqlInstallMode to ProductKey (your own SQL Server Standard product key, prerequisite P10) or Developer (T2 in Database Hub''s Estate only); both install unattended on the evaluation-only Azure VM (ADR 0006).'
+        if ((Get-DemoT2InstallModeSource -Config $Config) -eq 'legacy') {
+            Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Fail' 't2SqlInstallMode PaygWizard in your configuration is retired: the one-click deployment has no SQL Server setup wizard, so it runs as JumpstartImage, and Arc Jumpstart''s image is a Hyper-V guest disk, which t2Mode EvaluationOnlyAzureVm can''t use: it makes T2 an Azure VM.' -Remediation $unattended -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine'
+        }
+        else {
+            Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Fail' 't2SqlInstallMode JumpstartImage needs the nested Hyper-V host: Arc Jumpstart''s image is a Hyper-V guest disk, but t2Mode EvaluationOnlyAzureVm makes T2 an Azure VM.' -Remediation ($unattended + ' Or, to keep Arc Jumpstart''s image, use t2Mode Nested with a nested-virtualization size.') -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine'
+        }
     }
     elseif ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T2.MODE' -Area 'preflight' -Target 'T2' -Status 'Warning' -Message 't2Mode is EvaluationOnlyAzureVm: T2 is the Azure VM arcsql01, onboarded to Azure Arc with Microsoft''s evaluation procedure, which is for evaluation and testing only. Use it only when the nested-virtualization checks fail (ADR 0006).' -Remediation 'Set t2Mode to Nested when a nested-virtualization size is available.' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine' -EvaluationOnly))

@@ -72,7 +72,7 @@ function Start-DemoDeploymentRun {
     $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
     $paths = Get-DemoProgressPath -Directory $OutputDirectory
     $command = Get-DemoDeployCommand -ConfigPath $ConfigPath
-    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -WaitForT2:$WaitForT2 -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric
+    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -WaitForT2:$WaitForT2 -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric -Note @((Get-DemoT2LegacyModeText -Config $Config), (Get-DemoT4IgnoredText -Config $Config))
     $run = [pscustomobject]@{
         ProgressPath = ''
         PagePath     = ''
@@ -92,7 +92,8 @@ function Start-DemoDeploymentRun {
         $run.KeepAwake = Enter-DemoKeepAwake
         $pageLine = ''
         if (-not $NoStatusPage -and -not $environment.GitHubActions) {
-            $catalog = Get-DemoProgressCatalog -InstallMode $installMode -T4Enabled:(Test-DemoT4Enabled -Config $Config) -SkipFabric:$SkipFabric
+            # T4's rows are always there (2026-11-09): a run without T4 says on them why, and how to add it (DEPLOY.T4.OFF).
+            $catalog = Get-DemoProgressCatalog -InstallMode $installMode -T4Enabled -SkipFabric:$SkipFabric
             $model = New-DemoProgressModel -Catalog $catalog -Environment ([string]$Config['environment']) -ResourceGroup (Get-DemoResourceGroupName -Config $Config) -Command $command -PagePath $paths.Page -Expect @{ text = $expect.Text; humanText = $expect.HumanText; guidedStop = $expect.GuidedStop } -GuidedStop $(if ($expect.GuidedStop) { 'Pending' } else { 'NotSelected' })
             try {
                 Initialize-DemoProgress -Path $paths.Model -Model $model -Confirm:$false

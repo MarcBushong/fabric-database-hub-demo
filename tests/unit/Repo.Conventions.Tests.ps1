@@ -56,10 +56,18 @@ Describe 'Repository layout' {
         'README.md', 'LICENSE', 'SECURITY.md', 'CONTRIBUTING.md', 'CHANGELOG.md', 'CODE_OF_CONDUCT.md',
         'config/environment.schema.json', 'config/demo.config.example.json', 'config/versions.json',
         'workload-generator/Dockerfile', 'workload-generator/README.md', 'fabric/README.md',
-        '.github/copilot-instructions.md', '.github/dependabot.yml',
+        '.github/copilot-instructions.md', '.github/dependabot.yml', 'AGENTS.md',
         '.github/workflows/validate.yml', '.github/workflows/deploy.yml', '.github/workflows/demo-control.yml', '.github/workflows/destroy.yml'
     ) {
         Test-Path -LiteralPath (Join-Path -Path $repoRoot -ChildPath $_) -PathType Leaf | Should -BeTrue
+    }
+
+    It 'tells an AI agent to set the demo up with init.ps1 and deploy.ps1, never by hand, and to report DONE or NOT DONE (2026-11-09)' {
+        $agents = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'AGENTS.md') -Raw
+        foreach ($phrase in './scripts/init.ps1', './scripts/deploy.ps1', "Don't assemble a partial setup by hand", "Don't leave a target out on your own", 'T4 (PostgreSQL)', '**NOT DONE**', 'az login', './scripts/estimate-cost.ps1', 'no setup wizard') {
+            $agents | Should -BeLike ('*{0}*' -f $phrase) -Because $phrase
+        }
+        Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath '.github/copilot-instructions.md') -Raw | Should -Match '\[AGENTS\.md\]\(\.\./AGENTS\.md\)'
     }
 
     It 'has the script scripts/<_>.ps1 with #Requires and comment-based help' -ForEach @(
