@@ -3,7 +3,10 @@ BeforeAll {
     # Dot-sourcing defines the host bootstrap's functions without running it.
     . (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-HostBootstrap.ps1')
 
-    # Hyper-V's and the task scheduler's cmdlets exist only on Windows hosts; elsewhere these stand-ins let Pester mock them.
+    # Stand-ins for Hyper-V's and the task scheduler's cmdlets, with the parameters Remove-DemoHostGuest passes, defined in
+    # this file's own scope (function:local:), so Pester mocks the same commands on every OS: they shadow a real cmdlet and
+    # any global stand-in an earlier test file left behind (Vm.GoldenGuest's Stop-VM has no -TurnOff: CI on Ubuntu,
+    # 2026-11-09), and they don't reach later files.
     $stubs = @{
         'Get-VM'                   = '[CmdletBinding()] param([string] $Name)'
         'Stop-VM'                  = '[CmdletBinding()] param([string] $Name, [switch] $TurnOff, [switch] $Force)'
@@ -12,9 +15,7 @@ BeforeAll {
         'Unregister-ScheduledTask' = '[CmdletBinding(SupportsShouldProcess = $true)] param([string] $TaskName)'
     }
     foreach ($name in $stubs.Keys) {
-        if (-not (Get-Command -Name $name -ErrorAction SilentlyContinue)) {
-            New-Item -Path ('function:global:' + $name) -Value ([scriptblock]::Create($stubs[$name])) | Out-Null
-        }
+        Set-Item -Path ('function:local:' + $name) -Value ([scriptblock]::Create($stubs[$name]))
     }
 
     function New-TestHostContext {
@@ -75,6 +76,39 @@ BeforeAll {
 
 AfterAll {
     Remove-Module -Name DbHubDemo.Vm -ErrorAction SilentlyContinue
+}
+
+Describe 'The stand-ins for Hyper-V''s and the task scheduler''s cmdlets' {
+    It 'take the parameters Remove-DemoHostGuest passes, even over a global stand-in an earlier test file left without them (CI on Ubuntu, 2026-11-09)' {
+        $saved = Get-Item -Path 'function:global:Stop-VM' -ErrorAction SilentlyContinue
+        try {
+            # What Vm.GoldenGuest.Tests.ps1 leaves behind in a full run.
+            Set-Item -Path 'function:global:Stop-VM' -Value ([scriptblock]::Create('[CmdletBinding()] param([string] $Name, [switch] $Force, [switch] $AsJob)'))
+            $expected = [ordered]@{
+                'Get-VM'                   = @('Name')
+                'Stop-VM'                  = @('Name', 'TurnOff', 'Force')
+                'Remove-VM'                = @('Name', 'Force')
+                'Get-ScheduledTask'        = @('TaskName')
+                'Unregister-ScheduledTask' = @('TaskName', 'Confirm')
+            }
+            foreach ($name in $expected.Keys) {
+                $command = Get-Command -Name $name
+                $command.CommandType | Should -Be 'Function' -Because ('{0} is this file''s stand-in, not a real cmdlet or another file''s' -f $name)
+                $command.ModuleName | Should -BeNullOrEmpty -Because ('{0} is this file''s stand-in, not a module''s command' -f $name)
+                foreach ($parameter in $expected[$name]) {
+                    $command.Parameters.Keys | Should -Contain $parameter -Because $name
+                }
+            }
+        }
+        finally {
+            if ($null -ne $saved) {
+                Set-Item -Path 'function:global:Stop-VM' -Value $saved.ScriptBlock
+            }
+            else {
+                Remove-Item -Path 'function:global:Stop-VM' -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 Describe 'The mode the T2 host runs (2026-11-09)' {

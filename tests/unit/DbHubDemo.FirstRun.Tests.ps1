@@ -220,7 +220,12 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
         $written.Contains('t2PaygWizardOptIn') | Should -BeFalse
         $written.Contains('t4Enabled') | Should -BeFalse -Because 'T4 is part of every deployment'
         Should -Invoke -ModuleName DbHubDemo -CommandName Read-DemoChoice -Times 0 -Exactly -ParameterFilter { $Title -like '*T2*' -or $Title -like '*SQL Server*' }
-        (Get-Command -Name Initialize-DemoConfig).Parameters['T2SqlInstallMode'].Attributes.ValidValues | Should -Not -Contain 'PaygWizard' -Because 'no first run leads to the setup wizard'
+        # The ValidateSet by its type: the parameter has other attributes too, and strict mode (as in CI) refuses
+        # ValidValues on them.
+        $set = @((Get-Command -Name Initialize-DemoConfig).Parameters['T2SqlInstallMode'].Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] })
+        $set.Count | Should -Be 1
+        $set[0].ValidValues | Should -Not -Contain 'PaygWizard' -Because 'no first run leads to the setup wizard'
+        $set[0].ValidValues | Should -Contain 'Developer'
     }
 
     It 'never guesses without asking: several subscriptions with -NonInteractive are Manual action required, and nothing is written' {
