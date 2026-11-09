@@ -75,6 +75,11 @@ BeforeAll {
             New-DemoResult -CheckId 'PREFLIGHT.FABRIC.APPSETTINGS' -Area 'preflight' -Target 'tenant' -Status $script:appSettingsStatus -Message 'The tenant settings the Insights app needs.'
         }
         $script:appSettingsStatus = 'Pass'
+        # The .NET SDK check (2026-11-09) has its own tests (DbHubDemo.DotNetSdk.Tests.ps1); here it runs no dotnet.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -MockWith {
+            New-DemoResult -CheckId 'PREFLIGHT.TOOLS.DOTNETSDK' -Area 'preflight' -Target 'repo' -Status $script:dotnetSdkStatus -Message 'The .NET SDK that builds the workload runner.'
+        }
+        $script:dotnetSdkStatus = 'Pass'
     }
 
     # One policy assignment whose definition turns off public network access on SQL servers (fake data).
@@ -97,6 +102,40 @@ Describe 'Invoke-DemoPreflight' {
         $script:pgCapabilitiesJson = '{}'
         $script:pgDeploymentJson = '{}'
         $script:pgOperationsJson = '[]'
+        # No test here runs a real dotnet (DbHubDemo.DotNetSdk.Tests.ps1 tests the check).
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -MockWith {
+            New-DemoResult -CheckId 'PREFLIGHT.TOOLS.DOTNETSDK' -Area 'preflight' -Target 'repo' -Status $script:dotnetSdkStatus -Message 'The .NET SDK that builds the workload runner.'
+        }
+        $script:dotnetSdkStatus = 'Pass'
+    }
+
+    It 'checks the .NET SDK that builds the workload runner right after the guard, and a Fail there fails preflight before anything is created (2026-11-09 live finding)' {
+        Set-HappyAzMock
+        $script:dotnetSdkStatus = 'Fail'
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $ids[0] | Should -Be 'PREFLIGHT.GUARD.CONTEXT'
+        $ids[1] | Should -Be 'PREFLIGHT.TOOLS.DOTNETSDK'
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.TOOLS.DOTNETSDK').status | Should -Be 'Fail'
+        (Get-DemoExitCode -Result $results) | Should -Not -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -Times 1 -Exactly
+    }
+
+    It 'needs no .NET SDK with -SkipRunner: Not selected, and no dotnet runs' {
+        Set-HappyAzMock
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory -SkipRunner)
+        $sdk = $results | Where-Object checkId -EQ 'PREFLIGHT.TOOLS.DOTNETSDK'
+        $sdk.status | Should -Be 'Not selected'
+        $sdk.message | Should -Match '-SkipRunner'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -Times 0 -Exactly
+    }
+
+    It 'checks nothing when the guard fails, the .NET SDK included' {
+        Set-HappyAzMock
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { throw 'wrong tenant' }
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        @($results.checkId) | Should -Be @('PREFLIGHT.GUARD.CONTEXT')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -Times 0 -Exactly
     }
 
     It 'says once that a configuration without activityProfile uses the new default, business-day, before the cost checks that count it (2026-11-03)' {

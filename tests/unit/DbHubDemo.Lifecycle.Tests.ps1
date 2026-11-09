@@ -4,6 +4,9 @@ BeforeAll {
     . (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Guard.Helpers.ps1')
     # Writes and token requests need the context the subscription guard validates; this is the unit-test hook.
     Initialize-GuardTestContext
+    # The .NET SDK that deploy.ps1 installs when it's missing (2026-11-09) has its own tests (DbHubDemo.DotNetSdk.Tests.ps1);
+    # here it's there, and adds no record, unless a test says otherwise.
+    Mock -ModuleName DbHubDemo -CommandName Initialize-DemoDotNetSdk -MockWith { }
 
     function New-TestConfig([switch] $WithT4) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
@@ -993,6 +996,34 @@ Describe 'Invoke-DemoDeployment' {
         $warning = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
         $warning.status | Should -Be 'Warning'
         $warning.message | Should -Match 'This run started sqlvm01 and archost01 while preflight ran; it keeps running until \./scripts/stop-demo\.ps1'
+    }
+
+    It 'makes sure of the .NET SDK before preflight when the run builds the workload runner, and stops at its Fail before anything is created (-Sequential, 2026-11-09)' {
+        $script:sdkStatus = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Initialize-DemoDotNetSdk -MockWith {
+            $script:order.Add('Sdk')
+            New-DemoResult -CheckId 'DEPLOY.DOTNETSDK' -Area 'preflight' -Target 'repo' -Status $script:sdkStatus -Message ('sdk {0}' -f $script:sdkStatus)
+        }
+        $results = @(Invoke-DemoDeployment -Config $config)
+        $script:order[0..1] | Should -Be @('Sdk', 'Preflight')
+        @($script:order | Where-Object { $_ -eq 'Sdk' }).Count | Should -Be 1
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.DOTNETSDK' }).status | Should -Be 'Pass'
+
+        # It couldn't be installed: nothing else runs, and the Insights app's sign-in read stops.
+        $script:order.Clear()
+        $script:signInCalls.Clear()
+        $script:sdkStatus = 'Fail'
+        $results = @(Invoke-DemoDeployment -Config $config)
+        @($script:order) | Should -Be @('Sdk')
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.DOTNETSDK' }).status | Should -Be 'Fail'
+        $script:signInCalls | Should -Contain 'stop'
+
+        # Not with -SkipRunner, a run that stops before the Artifacts stage, or one that starts after it.
+        foreach ($run in @(@{ SkipRunner = $true }, @{ StopAfter = 'Infrastructure' }, @{ FromStage = 'Validation' })) {
+            $script:order.Clear()
+            $null = @(Invoke-DemoDeployment -Config $config @run)
+            $script:order | Should -Not -Contain 'Sdk'
+        }
     }
 
     It 'imports the Real-Time Dashboard and the history model and report in the Fabric stage, as the parallel Fabric track does (review follow-up)' {

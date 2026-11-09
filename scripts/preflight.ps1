@@ -4,9 +4,10 @@
 Checks every prerequisite before anything is deployed.
 
 .DESCRIPTION
-Runs the subscription guard, then checks P1-P6 (ADR 0008), the region, VM sizes and nested-virtualization
-families, vCPU and public IP quota, a read-only inventory of the Azure Policy rules that apply to the
-subscription, Azure Policy through a subscription what-if, and the cost estimate against the ceilings,
+Runs the subscription guard, then checks the .NET SDK that builds the workload runner (the dotnet first on PATH,
+in workload-generator, where global.json applies; unless -SkipRunner), P1-P6 (ADR 0008), the region, VM sizes and
+nested-virtualization families, vCPU and public IP quota, a read-only inventory of the Azure Policy rules that apply
+to the subscription, Azure Policy through a subscription what-if, and the cost estimate against the ceilings,
 including the subscription's Defender for Cloud plans. The policy inventory resolves networkMode auto to
 public or private; the result is in the evidence of PREFLIGHT.POLICY.SQLPUBLIC. Missing resource providers
 are registered unless -SkipProviderRegistration is set; that is the only change preflight makes. It never
@@ -31,6 +32,10 @@ Reuse the last complete policy inventory when it's at most this many hours old a
 that apply to the subscription are unchanged (default 168, one week; the assignments are listed every time,
 and the reused results say so). 0 reads every policy definition again.
 
+.PARAMETER SkipRunner
+Don't check the .NET SDK (PREFLIGHT.TOOLS.DOTNETSDK is Not selected), for a deployment with deploy.ps1 -SkipRunner,
+which builds no workload runner.
+
 .PARAMETER OutputPath
 Where to write the results as JSON lines.
 
@@ -49,6 +54,8 @@ param(
 
     [ValidateRange(0, 720)]
     [int] $PolicyCacheHours = 168,
+
+    [switch] $SkipRunner,
 
     [string] $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '../out/preflight.jsonl')
 )
@@ -70,7 +77,7 @@ $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
 
 $config = Get-DemoConfig -Path $ConfigPath
-$results = @(Invoke-DemoPreflight -Config $config -SkipProviderRegistration:$SkipProviderRegistration -SkipWhatIf:$SkipWhatIf -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours)
+$results = @(Invoke-DemoPreflight -Config $config -SkipProviderRegistration:$SkipProviderRegistration -SkipWhatIf:$SkipWhatIf -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipRunner:$SkipRunner)
 
 $results | Format-Table -Property checkId, status, message -AutoSize -Wrap | Out-String -Width 220 | Write-Output
 foreach ($item in $results | Where-Object { $_.status -in 'Fail', 'Manual action required' -and $_.remediation }) {

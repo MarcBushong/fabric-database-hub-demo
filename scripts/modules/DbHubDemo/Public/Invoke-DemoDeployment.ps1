@@ -270,6 +270,22 @@ function Invoke-DemoDeployment {
         $startIndex = [array]::IndexOf($stages, 'Validation')
         Write-DemoLog -Message 'Every stage finished earlier; running the validation again.'
     }
+    # The .NET SDK the workload runner's build needs, before anything is created (2026-11-09): the dotnet on PATH, the SDK
+    # installed for the user earlier, or the pinned SDK, installed now (Initialize-DemoDotNetSdk), when the run builds it.
+    $artifactsIndex = [array]::IndexOf($stages, 'Artifacts')
+    if (-not $whatIf -and -not $SkipRunner -and $startIndex -le $artifactsIndex -and $artifactsIndex -le $stopIndex) {
+        $sdkRecord = Initialize-DemoDotNetSdk -ProgressPath $ProgressPath -Confirm:$false
+        if ($null -ne $sdkRecord) {
+            $results.Add($sdkRecord)
+            if ([string]$sdkRecord.status -eq 'Fail') {
+                Stop-DemoRayfinSignInStatus -Status $signInCheck
+                return $results.ToArray()
+            }
+        }
+    }
+    else {
+        Set-DemoProgressStep -Path $ProgressPath -Id 'DotNetSdk' -State 'Skipped' -Message $(if ($whatIf) { 'What if: nothing is installed.' } elseif ($SkipRunner) { 'Not needed: -SkipRunner builds no workload runner.' } else { 'Not needed: this run builds no workload runner.' })
+    }
     # The run's activity profile (2026-11-03, ADR 0010): the Activity and T2 stages set its interim, baseline in place of a
     # profile with incidents, and the run switches the VMs it noted once its own Run Commands are done, also when it stops
     # at a Fail; Complete-DemoDeploymentRun sends the switch when the run ends before that. A run without preflight says
@@ -423,7 +439,7 @@ function Invoke-DemoDeployment {
         }
         switch ($stage) {
             'Preflight' {
-                $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf)
+                $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf -SkipRunner:$SkipRunner)
                 & $addAll $preflight
                 if (& $hasStatus $preflight 'Fail') {
                     & $stageResult 'Preflight' 'Fail' 'Preflight has at least one Fail, so nothing was deployed.' 'Fix each Fail above (its remediation says how), then run deploy.ps1 again.'
