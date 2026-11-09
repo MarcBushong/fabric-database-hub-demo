@@ -469,12 +469,38 @@ function Invoke-DemoParallelDeployment {
         $Resume = [switch]::new($true)
         Write-DemoLog -Message ('An unfinished deployment is on record (its last finished stage is {0}), so this run continues it, as deploy.ps1 -Resume does. To start over from preflight instead: ./scripts/deploy.ps1 -FromStage Preflight.' -f $state.Stage)
     }
+    # The .NET SDK the workload runner's build needs (2026-11-09, the owner's decision: "Install it automatically"): before
+    # anything is created, the dotnet on PATH, the SDK installed for the user earlier, or the pinned SDK, installed now,
+    # per user, with no prompt (Initialize-DemoDotNetSdk). Once per run, when the run builds the runner: here for a resume's
+    # comparison of the runner, below for the Artifacts step and its build. A failure ends the run here.
+    $sdk = @{ Done = $false; Record = $null }
+    $ensureSdk = {
+        if (-not $sdk.Done) {
+            $sdk.Done = $true
+            $sdk.Record = Initialize-DemoDotNetSdk -ProgressPath $ProgressPath -Confirm:$false
+            if ($null -ne $sdk.Record) {
+                $results.Add($sdk.Record)
+            }
+        }
+        return ($null -ne $sdk.Record -and [string]$sdk.Record.status -eq 'Fail')
+    }
+    $sdkFailed = {
+        Stop-DemoRayfinSignInStatus -Status $signInCheck
+        Set-DemoProgressStep -Path $ProgressPath -Id 'Preflight' -State 'Failed' -Status 'Fail' -Message 'Nothing was created: the .NET SDK the workload runner needs couldn''t be installed (DEPLOY.DOTNETSDK says why).'
+    }
     # A resume sends a VM's artifacts again, with its loader and the steps after them, when the bootstrap bundle or the
     # workload runner this checkout builds isn't what the resource group's state records for that VM, so a fix pulled since
     # the last run reaches it (live finding, 2026-11-06). With nothing changed, each track resumes as recorded.
     $resend = [pscustomobject]@{ Tracks = @(); Notes = @{}; Results = @() }
     if ($Resume -and -not $FromStage -and -not $whatIf) {
-        $resend = Resolve-DemoArtifactResend -State $state -Plan (Resolve-DemoTrackPlan -StopAfter $StopAfter -Resume -State $state -SkipFabric:$SkipFabric) -SkipRunner:$SkipRunner
+        $resumePlan = Resolve-DemoTrackPlan -StopAfter $StopAfter -Resume -State $state -SkipFabric:$SkipFabric
+        $past = Get-DemoMemberValue -InputObject $resumePlan -Name 'PastArtifacts'
+        $comparesRunner = -not $SkipRunner -and [string](Get-DemoMemberValue -InputObject $state -Name 'RunnerSha256') -and @(@($past) | Where-Object { [string]$_ -in 'T1', 'T2' }).Count -gt 0
+        if ($comparesRunner -and (& $ensureSdk)) {
+            & $sdkFailed
+            return $results.ToArray()
+        }
+        $resend = Resolve-DemoArtifactResend -State $state -Plan $resumePlan -SkipRunner:$SkipRunner
         & $addAll @($resend.Results)
     }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28): a "no T4" record
@@ -551,6 +577,17 @@ function Invoke-DemoParallelDeployment {
 
     $order = @('T1', 'T2', 'T4', 'Fabric') | Where-Object { @($plan.Tracks[$_]).Count -gt 0 }
     $needsArtifacts = @(@($plan.Tracks['T1']) + @($plan.Tracks['T2']) | Where-Object { $_ -in 'Artifacts', 'Bootstraps' }).Count -gt 0
+    # The .NET SDK, before the build process starts and before preflight (2026-11-09); the status page's row says so when
+    # this run needs none.
+    if ($needsArtifacts -and -not $SkipRunner -and -not $whatIf) {
+        if (& $ensureSdk) {
+            & $sdkFailed
+            return $results.ToArray()
+        }
+    }
+    elseif (-not $sdk.Done) {
+        Set-DemoProgressStep -Path $ProgressPath -Id 'DotNetSdk' -State 'Skipped' -Message $(if ($whatIf) { 'What if: nothing is installed.' } elseif ($SkipRunner) { 'Not needed: -SkipRunner builds no workload runner.' } else { 'Not needed: this run builds no workload runner.' })
+    }
     # Track processes start before the template and take what it returns from a private handoff directory.
     $useJobs = -not $InProcess -and -not $whatIf -and @($order).Count -gt 0
     $handoff = ''

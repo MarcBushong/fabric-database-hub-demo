@@ -87,7 +87,7 @@ flowchart TB
 | For the Insights app: the Fabric tenant settings **Fabric Apps (preview)** and **Dataset Execute Queries REST API**. Without them, the app isn't created, but the run still ends **DONE**, and the status page says why | Your Fabric administrator |
 | Quota for about **8 vCPUs** of VM sizes with nested virtualization in the region | The subscription; preflight checks it |
 | Outbound HTTPS from the VMs, as for their other downloads. In the default T2 mode, the T2 host also downloads its guest's disk from Arc Jumpstart's public storage (`jumpstartprodsg.blob.core.windows.net`) and Jumpstart's pinned script from GitHub (`raw.githubusercontent.com`) | The demo's network allows it; where your tenant's firewall or proxy restricts outbound traffic, its network administrator |
-| PowerShell 7.4, the Azure CLI with Bicep, the .NET SDK, Node.js 24, and Git, or a codespace that has them | You |
+| PowerShell 7.4, the Azure CLI with Bicep, Node.js 24, and Git, or a codespace that has them. The .NET SDK too, which `deploy.ps1` installs for you on Windows when it's missing | You |
 
 **Steps** (91 minutes the first time, measured on 2026-11-06, most of it T2: its host build, about 27 minutes, then its Arc onboarding, about 33; after `az login`, you're needed only for the Insights app's browser sign-in at the start, about a minute, an estimate, and, when you aren't an Owner, an Owner runs one command once for the nightly safety stop's role):
 
@@ -241,7 +241,7 @@ Contributor on an existing Azure subscription is the only Azure role the default
 
 - **Viewer licensing (P11):** "On F SKUs smaller than F64, each user viewing Power BI content must have Pro, PPU, or an individual trial" ([Fabric licenses](https://learn.microsoft.com/fabric/enterprise/licenses)). The demo's capacity is an F16 (2026-10-21), so everyone who opens the Power BI report needs one. A presenter who shares their screen needs only their own. Database Hub and the Real-Time Dashboard aren't Power BI content, so a Fabric Free license is enough for them. Learn doesn't list a Fabric App as Power BI content, but the Insights app reads the model as each viewer, so plan for the report's rule until that's verified. Its viewers also need access to the app item, **Read** and **Build** on `SM_DatabaseHub_History`, and P12 and P13.
 - **The Real-Time Dashboard needs Azure read access:** it queries the telemetry endpoint as each viewer, so every viewer needs Reader on the subscription (P8; Contributors have it), and viewers who are only Readers also need the Arc telemetry role to see T2. Sharing the dashboard doesn't grant that access: a viewer without it sees empty tiles.
-- **Tools:** PowerShell 7.4, the Azure CLI with Bicep, and the .NET SDK pinned in `config/versions.json`, or Azure Cloud Shell (without the SDK, `deploy.ps1 -SkipRunner` skips the workload runner). The Fabric App also needs Node.js 20, 22, or 24 with npm (P14); 26 also worked, with npm's warning. The repository's [dev container](.devcontainer/devcontainer.json) has all of them at the pinned versions, locally or in GitHub Codespaces; sign in there with `az login --use-device-code`.
+- **Tools:** PowerShell 7.4, the Azure CLI with Bicep, and the .NET SDK pinned in `config/versions.json`, which `deploy.ps1` installs for you on Windows when it's missing (per user, verified, with no administrator rights), or Azure Cloud Shell (without the SDK, `deploy.ps1 -SkipRunner` skips the workload runner). The Fabric App also needs Node.js 20, 22, or 24 with npm (P14); 26 also worked, with npm's warning. The repository's [dev container](.devcontainer/devcontainer.json) has all of them at the pinned versions, locally or in GitHub Codespaces; sign in there with `az login --use-device-code`.
 - **Region:** West US 3 by default. Any region you choose must be in Database Hub's performance-monitoring list and the SQL VM unified-inventory list; preflight checks both.
 
 ## Screenshots
@@ -320,7 +320,7 @@ The shortest correct path from a clone to a running demo, in your own subscripti
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/MarcBushong/fabric-database-hub-demo?quickstart=1)
 
-Every tool is in the repository's [dev container](.devcontainer/devcontainer.json), on your machine or in GitHub Codespaces (a 4-core machine). Without it, you need PowerShell 7.4, the Azure CLI with Bicep, the .NET SDK, Node.js 24, and Git ([tools](docs/prerequisites.md#tools)).
+Every tool is in the repository's [dev container](.devcontainer/devcontainer.json), on your machine or in GitHub Codespaces (a 4-core machine). Without it, you need PowerShell 7.4, the Azure CLI with Bicep, the .NET SDK (on Windows, `deploy.ps1` installs it for you), Node.js 24, and Git ([tools](docs/prerequisites.md#tools)).
 
 ```powershell
 # Once: clone (a codespace already has the clone) and sign in

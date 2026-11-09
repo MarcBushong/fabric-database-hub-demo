@@ -446,6 +446,21 @@ Describe 'Configuration files' {
         $globalJson['sdk']['allowPrerelease'] | Should -BeFalse
     }
 
+    It 'the .NET SDK that deploy.ps1 installs for the user is the pin, from Microsoft, with a SHA-512 for each Windows architecture (2026-11-09)' {
+        $versions = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
+        $install = $versions['dotnetSdkInstall']
+        $install['version'] | Should -Be $versions['tools']['dotnetSdk'] -Because 'deploy.ps1 installs the SDK that global.json pins'
+        $install['releaseMetadata'] | Should -Match '^https://builds\.dotnet\.microsoft\.com/dotnet/release-metadata/10\.0/releases\.json$'
+        @($install['files'].Keys | Sort-Object) | Should -Be @('win-arm64', 'win-x64')
+        foreach ($rid in $install['files'].Keys) {
+            $file = $install['files'][$rid]
+            $file['url'] | Should -BeExactly ('https://builds.dotnet.microsoft.com/dotnet/Sdk/{0}/dotnet-sdk-{0}-{1}.zip' -f $install['version'], $rid)
+            $file['fileName'] | Should -Be ([System.IO.Path]::GetFileName(([uri]$file['url']).AbsolutePath))
+            $file['sha512'] | Should -Match '^[0-9a-f]{128}$' -Because $rid
+            $file['sizeBytes'] | Should -BeGreaterThan 100MB -Because ('deploy.ps1 says the download''s size before it starts ({0})' -f $rid)
+        }
+    }
+
     It 'every resource API version in infra/ matches config/versions.json' {
         $versions = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
         $declarations = Get-RepoFile -Include '*.bicep' | Select-String -Pattern "^\s*resource\s+\w+\s+'([^'@]+)@([^']+)'"
