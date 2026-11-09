@@ -293,10 +293,9 @@ function Invoke-DemoDeployment {
         & $switchActivity
         $results.ToArray()
     }
-    # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28 and its follow-up): a
-    # "no T4" record gets the 2-vCore fallback, and its cost check, again when this run deploys the template.
-    # DONE's T4 reason reads the configuration as the file has it.
-    $userConfig = $Config
+    # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28 and its follow-up). T4 is
+    # part of every deployment (2026-11-09): a "no T4" record has the fallback try every size again when this run deploys
+    # the template.
     $infrastructureIndex = [array]::IndexOf($stages, 'Infrastructure')
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:(-not $whatIf -and $startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex)
 
@@ -845,7 +844,7 @@ function Invoke-DemoDeployment {
     if ($validated -and -not $context.OpenStage -and -not (& $hasStatus $results.ToArray() 'Fail')) {
         $current = Get-DemoDeploymentState -Config $Config
         $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
-        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool](Get-DemoT4OffReason -Config $userConfig -State $current)) -SkipFabric:$SkipFabric
+        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric
         & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
         $doneChecked = $true
     }

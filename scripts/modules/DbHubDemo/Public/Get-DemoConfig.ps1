@@ -7,7 +7,11 @@ function Get-DemoConfig {
     Defaults come from the schema itself, so they're defined in one place. An invalid file stops the
     script with every validation error listed. activityProfile's default (business-day since 2026-11-03) is resolved
     where a run uses it (Get-DemoActivityProfile), not merged here, so a run can tell that the file doesn't set it and
-    say so once, and a configuration written back from this one still inherits the default.
+    say so once, and a configuration written back from this one still inherits the default. t2SqlInstallMode's default
+    (JumpstartImage) is merged, and a file that doesn't name it is marked t2SqlInstallModeSource default; PaygWizard, retired
+    from the one-click deployment, becomes JumpstartImage, marked legacy. t4Enabled is always true: T4 is part of every
+    deployment, and a file's false is marked t4EnabledIgnored (2026-11-09, ADR 0006 and ADR 0019).
+    ConvertTo-DemoConfigFileText leaves the marks out.
 
     .EXAMPLE
     $config = Get-DemoConfig -Path ./config/demo.config.json
@@ -41,6 +45,25 @@ function Get-DemoConfig {
     $values.Remove('$schema')
 
     $config = Merge-DemoHashtable -Base $defaults -Override $values
+    # Whether the file names t2SqlInstallMode (2026-11-09): when it doesn't, the default applies to a new T2. PaygWizard is
+    # retired from the one-click deployment (user-directed: "They should not need to manually do a wizard"): it was the
+    # default an older init.ps1 wrote (before 2026-11-05), so it runs as JumpstartImage, with one line that says so, and no
+    # configuration value leads to the setup wizard. An existing PaygWizard guest with SQL Server set up is kept as it is
+    # (the T2 host decides). The schema doesn't allow these marks in the file (additionalProperties false), so they're
+    # never mistaken for settings; ConvertTo-DemoConfigFileText leaves them out.
+    if (-not $values.Contains('t2SqlInstallMode') -or [string]::IsNullOrWhiteSpace([string]$values['t2SqlInstallMode'])) {
+        $config['t2SqlInstallModeSource'] = 'default'
+    }
+    elseif ([string]$values['t2SqlInstallMode'] -ceq 'PaygWizard') {
+        $config['t2SqlInstallMode'] = 'JumpstartImage'
+        $config['t2SqlInstallModeSource'] = 'legacy'
+    }
+    # T4 is part of every deployment (2026-11-09, user-directed: "making sure postgres is deployed with the deployment and
+    # not being an optional component"): t4Enabled false is ignored, with one line that says so.
+    if ($values.Contains('t4Enabled') -and $values['t4Enabled'] -eq $false) {
+        $config['t4EnabledIgnored'] = $true
+    }
+    $config['t4Enabled'] = $true
     # In GitHub Actions only: mask the configuration's IDs and accounts in the job log (ADR 0022).
     Register-DemoLogMask -Config $config
     return $config

@@ -25,14 +25,21 @@ Install modes (t2SqlInstallMode, ADR 0006):
   checks what was installed (Standard, the default instance, the Azure extension), shows the documented fix when it's
   wrong, and once it's right cleans up: automatic sign-in off, its LSA secret and Winlogon values gone, the guest
   password rotated, the console signed out. Invoke-DemoHostGuidedSetupGuard runs that cleanup before every pass when no
-  person is expected any more.
+  person is expected any more; since 2026-11-09 in any mode while an earlier guided stop's records are on this host
+  (Test-DemoHostGuidedSetupLeftover), because a guest built in PaygWizard mode now runs as JumpstartImage.
 In every mode, GuestSignInCleanup then removes the sign-in data that Arc onboarding and, in PaygWizard mode, the
 setup wizard's interactive sign-in leave in the guest and on the host, and verifies that none remains; the build
 stops there if any remains (ADR 0009). It runs again whenever a new bundle generation arrives.
 Then the database is configured and seeded, and the WorkloadRunner step installs the runner and the .NET
 runtime in the guest and starts its activity host for T2 (ADR 0010), once the guest's SQL Server is ready.
 In every mode, the GuestSource step first refuses a mode whose source (the Jumpstart image or the build) differs from an
-existing guest's, and after a pass that finds the host Ready, Invoke-DemoHostEvaluationGuard extends an evaluation
+existing guest's, with two exceptions in JumpstartImage mode since 2026-11-09: a guest built in PaygWizard mode whose SQL
+Server setup was never finished (no SQL Server instance in it, the wizard never completed, no setup running, no guided
+stop waiting) is deleted with its disk and records, and the image's steps make a new one; and a build guest with SQL
+Server set up is kept as it is, in the mode it was built in (guest-source.json sqlSetUp). The rebuild's record
+(guest-rebuild.json) is marked Done once the new guest passes ArcOnboarding (Complete-DemoHostGuestRebuild, after every
+pass). After a pass that finds the host
+Ready, Invoke-DemoHostEvaluationGuard extends an evaluation
 guest's Windows evaluation when it runs low (slmgr.vbs /rearm, at most once a day, never while an activity profile runs).
 
 .PARAMETER Root
@@ -83,10 +90,18 @@ function Get-DemoHostContext {
     if ($guestSettings.Contains('name') -and $guestSettings['name']) {
         $guestName = [string]$guestSettings['name']
     }
-    $mode = [string]$Settings['t2SqlInstallMode']
-    if (-not $mode) {
-        $mode = 'JumpstartImage'
+    $configuredMode = [string]$Settings['t2SqlInstallMode']
+    if (-not $configuredMode) {
+        $configuredMode = 'JumpstartImage'
     }
+    # Whether the configuration names the mode (2026-11-09: configuration, default, or legacy for an older configuration's
+    # PaygWizard, which deploy.ps1 runs as JumpstartImage). Reported in health.json; a finished guest keeps its mode either
+    # way. Without the setting (the template's own loader, deploy.ps1 -Sequential), it counts as configuration.
+    $modeSource = [string]$Settings['t2SqlInstallModeSource']
+    if ($modeSource -notin 'default', 'legacy') {
+        $modeSource = 'configuration'
+    }
+    $effective = Get-DemoHostEffectiveMode -ConfiguredMode $configuredMode -Record (Read-DemoVmJsonFile -Path (Join-Path -Path $StateRoot -ChildPath 'guest-source.json'))
     $context = @{
         Root           = $StateRoot
         BundleRoot     = $BundleRoot
@@ -94,7 +109,10 @@ function Get-DemoHostContext {
         Host           = $hostConfig
         Guest          = $guestConfig
         GuestName      = $guestName
-        Mode           = $mode
+        Mode           = $effective.Mode
+        ConfiguredMode = $configuredMode
+        ModeSource     = $modeSource
+        ModeAdopted    = $effective.Adopted
         DataDiskTier   = [string]$Settings['dataDiskTier']
         VCpu           = [int]$guestSettings['vcpus']
         MemoryGiB      = [int]$guestSettings['memoryGiB']
@@ -162,9 +180,9 @@ function Get-DemoHostStepPlan {
         @{ Name = 'DnsForwarder'
             Test = { param($Step) Test-DemoHostDnsForwarder -HostConfig $Step.Context.Host }
             Set = { param($Step) Initialize-DemoHostDnsForwarder -HostConfig $Step.Context.Host } }
-        @{ Name = 'GuestSource'
+        @{ Name = 'GuestSource'; MaxAttempts = 3
             Test = { param($Step) (Get-DemoHostGuestSourceState -Context $Step.Context).Ok }
-            Set = { param($Step) Get-DemoHostGuestSourceFailure -Context $Step.Context } }
+            Set = { param($Step) Invoke-DemoHostGuestSourceStep -Context $Step.Context } }
         @{ Name = 'DataDisk'
             Test = { param($Step) Test-DemoHostStorage -Context $Step.Context }
             Set = { param($Step) Initialize-DemoHostStorage -Context $Step.Context } }
@@ -328,16 +346,23 @@ function Get-DemoHostHealthDetail {
     )
 
     $detail = [ordered]@{
-        installMode  = $Context.Mode
-        dataDiskTier = $Context.DataDiskTier
-        host         = Get-DemoHostInstanceInfo
-        storage      = Get-DemoHostStorageDetail -Context $Context
-        arcOnboarded = Test-DemoArcOnboarded -MarkerPath $Context.ArcMarkerPath -MachineName $Context.GuestName -GuestVmId (Get-DemoHostGuestVmId -Name $Context.GuestName)
-        guest        = [ordered]@{ name = $Context.GuestName; state = 'NotCreated' }
+        installMode           = $Context.Mode
+        configuredInstallMode = $Context.ConfiguredMode
+        installModeSource     = $Context.ModeSource
+        installModeAdopted    = [bool]$Context.ModeAdopted
+        dataDiskTier          = $Context.DataDiskTier
+        host                  = Get-DemoHostInstanceInfo
+        storage               = Get-DemoHostStorageDetail -Context $Context
+        arcOnboarded          = Test-DemoArcOnboarded -MarkerPath $Context.ArcMarkerPath -MachineName $Context.GuestName -GuestVmId (Get-DemoHostGuestVmId -Name $Context.GuestName)
+        guest                 = [ordered]@{ name = $Context.GuestName; state = 'NotCreated' }
     }
     $source = Read-DemoVmJsonFile -Path (Get-DemoHostGuestSourcePath -Context $Context)
     if ($null -ne $source) {
-        $detail.guestSource = [ordered]@{ source = $source['source']; installMode = $source['installMode'] }
+        $detail.guestSource = [ordered]@{ source = $source['source']; installMode = $source['installMode']; sqlSetUp = [bool]$source['sqlSetUp'] }
+    }
+    $rebuild = Get-DemoHostGuestRebuildDetail -Context $Context
+    if ($null -ne $rebuild) {
+        $detail.guestRebuild = $rebuild
     }
     if ($Context.Mode -eq 'JumpstartImage') {
         $detail.jumpstart = Get-DemoJumpstartHealthDetail -Context $Context
@@ -414,11 +439,15 @@ function Invoke-DemoHostBootstrap {
         # The operator's clipboard helper for the PaygWizard step lives next to the state files.
         Copy-Item -LiteralPath ([System.IO.Path]::Combine($BundleRoot, 'vm', 'hyperv-guest', 'Copy-GuestCredential.ps1')) -Destination (Join-Path -Path $StateRoot -ChildPath 'Copy-GuestCredential.ps1') -Force
         $plan = Get-DemoHostStepPlan -Context $context
-        if ($context.Mode -eq 'PaygWizard') {
-            # The guided stop's cleanup always runs: armed automatic sign-in goes once no person is expected (Phase 28).
+        if ($context.Mode -eq 'PaygWizard' -or (Test-DemoHostGuidedSetupLeftover -Context $context)) {
+            # The guided stop's cleanup always runs: armed automatic sign-in goes once no person is expected (Phase 28). In
+            # any mode while an earlier guided stop's records are here (2026-11-09): a guest built in PaygWizard mode runs as
+            # JumpstartImage now, and its signed-in setup or a stopped password rotation would keep GuestSource waiting.
             Invoke-DemoHostGuidedSetupGuard -Context $context
         }
         $outcome = Invoke-DemoVmStateMachine -Step $plan -Generation ([string]$settings['generation']) -HealthDetail { Get-DemoHostHealthDetail -Context $context }
+        # A rebuilt guest that passed ArcOnboarding ends its rebuild record, so deploy.ps1 stops following it (2026-11-09).
+        Complete-DemoHostGuestRebuild -Context $context -Confirm:$false
         if ($outcome -eq 'Ready') {
             # An evaluation guest's Windows evaluation, checked at most once a day; health.json shows it after the next pass.
             Invoke-DemoHostEvaluationGuard -Context $context

@@ -337,8 +337,9 @@ Describe 'A resume sends a VM''s artifacts again when this checkout builds other
 Describe 'Resolve-DemoT2Source' {
     BeforeEach {
         $config = New-TestConfig
-        # The snapshots below keep a PaygWizard guest (a Windows evaluation); a snapshot is used only for its own mode.
+        # The snapshots below keep a PaygWizard guest (a Windows evaluation), chosen on purpose here.
         $config['t2SqlInstallMode'] = 'PaygWizard'
+        $config['t2PaygWizardOptIn'] = $true
         $script:vm = $null
         $script:snapshots = @(New-TestSnapshot)
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
@@ -405,12 +406,36 @@ Describe 'Resolve-DemoT2Source' {
         $source.Result.message | Should -Match 'isn''t a Windows evaluation'
     }
 
-    It 'never restores a snapshot of another install mode: a JumpstartImage configuration makes its guest from the image' {
+    It 'restores a finished PaygWizard guest''s snapshot in JumpstartImage mode, as it keeps such a guest, with no setup wizard (2026-11-09)' {
         $config['t2SqlInstallMode'] = 'JumpstartImage'
+        $config.Remove('t2PaygWizardOptIn')
+        $source = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoT2Source -Config $Config }
+        $source.Source | Should -Be 'golden'
+        $source.SnapshotName | Should -Be 'snap-dbhub-t2golden-202610221306'
+        $source.Result.status | Should -Be 'Pass'
+    }
+
+    It 'prefers a JumpstartImage snapshot to a PaygWizard one in JumpstartImage mode, whichever is newer' {
+        $config['t2SqlInstallMode'] = 'JumpstartImage'
+        $own = New-TestSnapshot -InstallMode 'JumpstartImage' -Evaluation $false
+        $own.Name = 'snap-dbhub-t2golden-202610201000'
+        $own.Id = $own.Id -replace 'snap-dbhub-t2golden-202610221306$', $own.Name
+        $script:snapshots = @((New-TestSnapshot), $own)
+        $source = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoT2Source -Config $Config }
+        $source.Source | Should -Be 'golden'
+        $source.SnapshotName | Should -Be 'snap-dbhub-t2golden-202610201000'
+    }
+
+    It 'never restores a snapshot of another install mode otherwise: <Mode> with a <SnapshotMode> snapshot builds' -ForEach @(
+        @{ Mode = 'PaygWizard'; SnapshotMode = 'JumpstartImage'; Evaluation = $false }
+        @{ Mode = 'Developer'; SnapshotMode = 'PaygWizard'; Evaluation = $true }
+        @{ Mode = 'JumpstartImage'; SnapshotMode = 'Developer'; Evaluation = $true }
+    ) {
+        $config['t2SqlInstallMode'] = $Mode
+        $script:snapshots = @(New-TestSnapshot -InstallMode $SnapshotMode -Evaluation $Evaluation)
         $source = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoT2Source -Config $Config }
         $source.Source | Should -Be 'build'
-        $source.Result.message | Should -Match 'install mode PaygWizard'
-        $source.Result.message | Should -Match 'Arc Jumpstart'
+        $source.Result.message | Should -Match ('install mode {0}' -f $SnapshotMode)
     }
 }
 
@@ -439,6 +464,25 @@ Describe 'Invoke-DemoBootstrapLoaderRun' {
         $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName 'archost01' -BundleSha256 ('a' * 64) -ChunkCount 1 -Settings @{ role = 'SqlVm' } }
         $result.status | Should -Be 'Fail'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
+    }
+
+    It 'never sends the T2 host PaygWizard from a configuration, so no host builds a guest for the setup wizard (2026-11-09): <Case>' -ForEach @(
+        @{ Case = 'PaygWizard'; Mode = 'PaygWizard'; Source = ''; Expected = 'JumpstartImage'; ExpectedSource = 'legacy' }
+        @{ Case = 'an older configuration''s PaygWizard, as Get-DemoConfig reads it'; Mode = 'JumpstartImage'; Source = 'legacy'; Expected = 'JumpstartImage'; ExpectedSource = 'legacy' }
+        @{ Case = 'no mode in the file'; Mode = 'JumpstartImage'; Source = 'default'; Expected = 'JumpstartImage'; ExpectedSource = 'default' }
+        @{ Case = 'Developer, a deliberate choice'; Mode = 'Developer'; Source = ''; Expected = 'Developer'; ExpectedSource = 'configuration' }
+    ) {
+        $config['t2SqlInstallMode'] = $Mode
+        if ($Source) {
+            $config['t2SqlInstallModeSource'] = $Source
+        }
+        $script:run = [pscustomobject]@{ Succeeded = $true; Output = 'DbHubDemo loader finished: role ArcHost'; Error = '' }
+        $settings = @{ role = 'ArcHost'; t2SqlInstallMode = 'PaygWizard'; workload = @{} }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config; Settings = $settings } { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName 'archost01' -BundleSha256 ('a' * 64) -ChunkCount 1 -Settings $Settings }
+        $result.status | Should -Be 'Pass'
+        $decoded = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($script:runParameter['SettingsJson'])) | ConvertFrom-Json
+        $decoded.t2SqlInstallMode | Should -Be $Expected -Because 'the template''s last output may still hold PaygWizard'
+        $decoded.t2SqlInstallModeSource | Should -Be $ExpectedSource
     }
 
     It 'reports a failed loader' {
@@ -701,6 +745,68 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:calls | Should -Not -Contain 'password'
     }
 
+    It 'takes the host build''s follow-up results as they are, none or one rebuild, under strict mode (live, 2026-11-09)' {
+        # Live (849d4c2): a fresh deployment's T2 step stopped at WaitingForArcOnboarding with "The property 'checkId' cannot be
+        # found on this object": Wait-DemoT2HostBuild returns Results as an array, always, and the step read it with
+        # Get-DemoMemberValue, which returns an array whole, so an empty one became one item that's an empty array. The mock
+        # returns the function's real shape (Results = $followUp.ToArray()); the module runs under Set-StrictMode -Version Latest.
+        $script:context['T2Source'] = 'build'
+        $script:context['WaitForT2'] = $true
+        $script:followUp = @()
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith {
+            $followUp = [System.Collections.Generic.List[object]]::new()
+            foreach ($item in $script:followUp) {
+                $followUp.Add($item)
+            }
+            [pscustomobject]@{ Health = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboarding'; message = 'Waiting for the orchestrator to onboard arcsql01 to Azure Arc.' }; TimedOut = $false; Failed = $false; Rebuilt = ($followUp.Count -gt 0); Results = $followUp.ToArray() }
+        }
+
+        # None, as in every fresh deployment.
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Results | Where-Object { [string]$_.checkId -like 'DEPLOY.TRACK.*' } | Should -BeNullOrEmpty
+        $outcome.Status | Should -Be 'Pass'
+        $script:calls | Should -Contain 'arc force=False'
+
+        # One: the rebuild's own result lands in the track's results, as that result, not as an array that holds it.
+        $script:calls.Clear()
+        $script:followUp = @(New-DemoResult -CheckId 'DEPLOY.T2.REBUILD' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01 makes T2 again from Arc Jumpstart''s image.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Results | Where-Object { [string]$_.checkId -like 'DEPLOY.TRACK.*' } | Should -BeNullOrEmpty
+        @($outcome.Results | Where-Object { $_ -is [System.Array] }).Count | Should -Be 0
+        $rebuild = @($outcome.Results | Where-Object { $_ -isnot [System.Array] -and [string]$_.checkId -eq 'DEPLOY.T2.REBUILD' })
+        $rebuild.Count | Should -Be 1
+        $rebuild[0].status | Should -Be 'Warning'
+    }
+
+    It 'clears what an earlier guided stop left open before the T2 host''s loader starts a new generation, and nothing without it (review of 849d4c2, 2026-11-09)' {
+        # The T2 host runs a guest built in PaygWizard mode as JumpstartImage now, so an earlier guided stop's request there
+        # would keep that guest waiting for a person: it goes before the loader, with Bastion and a handed-over host password.
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); $script:state.HostPasswordUtc = ''; @() }
+        $script:context['T2Source'] = 'build'
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:calls | Where-Object { $_ -in 'cleanup', 'loader archost01' }) | Should -Be @('cleanup', 'loader archost01')
+        ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).status | Should -Be 'Pass'
+
+        # Nothing recorded, as in a fresh deployment: the loader alone.
+        $script:calls.Clear()
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+        $script:calls | Should -Not -Contain 'cleanup'
+        $script:calls | Should -Contain 'loader archost01'
+        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' } | Should -BeNullOrEmpty
+
+        # A cleanup that fails doesn't stop the loader: a Warning names the command that finishes it.
+        $script:calls.Clear()
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        Mock -ModuleName DbHubDemo -CommandName Clear-DemoGuidedStopLeftover -MockWith { throw 'The Run Command failed.' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+        $script:calls | Should -Contain 'loader archost01'
+        $leftover = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }
+        $leftover.status | Should -Be 'Warning'
+        $leftover.remediation | Should -Match 'stop-demo\.ps1 -RemoveBastionOnly'
+    }
+
     It 'reports a T2 that builds its guest as running in the background, without waiting' {
         $script:context['T2Source'] = 'build'
         $script:arcConnected = $false
@@ -715,9 +821,10 @@ Describe 'Invoke-DemoDeploymentTrack' {
 
     It 'cleans up what an earlier guided stop left open at the end of the T2 step: after -NoWaitForT2, on a golden redeploy, and once when the guided stop isn''t needed (Phase 28 review)' {
         # The review: a rerun after a Ctrl+C at the guided stop, with setup finished meanwhile, could end DONE with Bastion
-        # up and the handed-over host password valid. Only PaygWizard mode has a guided stop (JumpstartImage, the default
-        # since 2026-11-05, has none; checked at the end).
+        # up and the handed-over host password valid. Only PaygWizard mode, chosen on purpose (t2PaygWizardOptIn, 2026-11-09),
+        # has a guided stop (JumpstartImage, the default since 2026-11-05, has none; checked at the end).
         $config['t2SqlInstallMode'] = 'PaygWizard'
+        $config['t2PaygWizardOptIn'] = $true
         Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); $script:state.HostPasswordUtc = ''; @() }
         $cleanups = { @($script:calls | Where-Object { $_ -eq 'cleanup' }).Count }
 
@@ -745,7 +852,7 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:context['T2Source'] = 'build'
         $script:context['WaitForT2'] = $true
         $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
-        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Failed = $false; TimedOut = $false; Health = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.' } } }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Failed = $false; TimedOut = $false; Rebuilt = $false; Results = [System.Collections.Generic.List[object]]::new().ToArray(); Health = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.' } } }
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
         $outcome.Status | Should -Be 'Pass'
         & $cleanups | Should -Be 1
@@ -1233,7 +1340,11 @@ Describe 'Invoke-DemoDeploymentTrack' {
 
 Describe 'Invoke-DemoParallelDeployment' {
     BeforeEach {
-        $config = New-TestConfig
+        # T4 is part of every deployment (2026-11-09, user-directed), so the run's own configuration always has it.
+        $config = New-TestConfig -WithT4
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-TestResult 'DEPLOY.T4.START' 'Not selected' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Exists = $true; Names = [pscustomobject]@{ ServerName = 'pgflex01-abc123'; ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4MetricFlow -MockWith { New-TestResult 'METRICS.T4' }
         $script:calls = [System.Collections.Generic.List[string]]::new()
         $script:source = 'golden'
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
@@ -1266,6 +1377,7 @@ Describe 'Invoke-DemoParallelDeployment' {
             $trackResults = switch ($Track) {
                 'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) }
                 'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2')) }
+                'T4' { @((New-TestResult 'T4.SERVER'), (New-TestResult 'METRICS.T4')) }
                 default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') + @($script:fabricAppRecords) }
             }
             [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = $ready; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
@@ -1327,7 +1439,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         $script:calls | Should -Contain 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'
         $script:calls | Should -Contain 'track T2: Restore,Artifacts,Bootstraps,T2,Telemetry'
         $script:calls | Should -Contain 'track Fabric: Fabric'
-        $script:calls | Should -Contain 'estate T1,T3,T2'
+        $script:calls | Should -Contain 'estate T1,T3,T2,T4'
         $script:calls | Should -Contain 'fabric check=True'
         # T1's track read T3's extended property, so the gate reuses it instead of asking for a manual check.
         $script:calls | Should -Contain 'fabric property=Pass'
@@ -1457,10 +1569,10 @@ Describe 'Invoke-DemoParallelDeployment' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
         $calls = @($script:calls)
         # Both VMs already ran, so they got the interim baseline before the tracks' Run Commands, without waiting.
-        $quiet = [array]::IndexOf($calls, 'switch T1,T3,T2=baseline wait=0')
+        $quiet = [array]::IndexOf($calls, 'switch T1,T3,T4,T2=baseline wait=0')
         $quiet | Should -BeGreaterOrEqual 0
         $quiet | Should -BeLessThan ([array]::IndexOf($calls, 'track T1: T3Setup,Artifacts,Bootstraps,T3,T4,Activity,Monitoring,Telemetry'))
-        $switch = [array]::IndexOf($calls, 'switch T1,T3,T2=business-day wait=180')
+        $switch = [array]::IndexOf($calls, 'switch T1,T3,T4,T2=business-day wait=180')
         $switch | Should -BeGreaterThan ([array]::IndexOf($calls, 'fabric items')) -Because 'DONE''s reads come first'
         [array]::IndexOf($calls, 'fabric items') | Should -BeGreaterOrEqual 0
         @($calls | Where-Object { $_ -like 'switch *' }).Count | Should -Be 2
@@ -1551,7 +1663,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.TRACK.T2' }).status | Should -Be 'Manual action required'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).status | Should -Be 'Warning'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Manual action required'
-        $script:calls | Should -Contain 'estate T1,T3'
+        $script:calls | Should -Contain 'estate T1,T3,T4'
         # DONE's read-only checks wait until every track finished (Phase 28).
         $script:calls | Should -Not -Contain 'fabric items'
     }
@@ -1590,8 +1702,8 @@ Describe 'Invoke-DemoParallelDeployment' {
         $calls = @($script:calls)
         $history = [array]::IndexOf($calls, 'history done=True skipFabric=False whatIf=False')
         $history | Should -BeGreaterThan ([array]::IndexOf($calls, 'fabric items')) -Because 'DONE''s checks come first'
-        $history | Should -BeGreaterThan ([array]::IndexOf($calls, 'switch T1,T3,T2=business-day wait=180')) -Because 'the notebook never touches the VMs, so their incidents don''t wait for Spark'
-        [array]::IndexOf($calls, 'switch T1,T3,T2=business-day wait=180') | Should -BeGreaterOrEqual 0
+        $history | Should -BeGreaterThan ([array]::IndexOf($calls, 'switch T1,T3,T4,T2=business-day wait=180')) -Because 'the notebook never touches the VMs, so their incidents don''t wait for Spark'
+        [array]::IndexOf($calls, 'switch T1,T3,T4,T2=business-day wait=180') | Should -BeGreaterOrEqual 0
         $ids = @($results | ForEach-Object { [string]$_.checkId })
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.TIMING'))
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
@@ -1743,6 +1855,7 @@ Describe 'Invoke-DemoParallelDeployment' {
             $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
             $calls = @($script:calls)
             $calls | Should -Contain 'track Fabric: Fabric'
+            # T4's record was empty already, so only the others are cleared.
             $reset = [array]::IndexOf($calls, 'state TrackFabric=,TrackT1=,TrackT2=')
             $reset | Should -BeGreaterThan ([array]::IndexOf($calls, 'preflight')) -Because 'a run that starts over clears every record once preflight passed'
             $reset | Should -BeLessThan ([array]::IndexOf($calls, 'template disk=golden')) -Because 'the template carries the group''s tags it reads at its start'
@@ -1810,7 +1923,7 @@ Describe 'Invoke-DemoParallelDeployment' {
             # -FromStage Preflight starts over, as a plain deploy.ps1 does after a DONE run.
             $script:calls.Clear()
             $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Preflight' -SkipFabric }
-            $script:calls | Should -Contain 'state TrackFabric=,TrackT1=,TrackT2='
+            $script:calls | Should -Contain 'state TrackFabric=,TrackT1=,TrackT2=,TrackT4='
             $script:tags['TrackFabric'] | Should -Be '' -Because 'a run that starts over trusts nothing an earlier run recorded, even for a track it skips'
         }
     }
@@ -1841,7 +1954,9 @@ Describe 'Invoke-DemoParallelDeployment' {
         $script:calls | Should -Contain 'template start=None'
         $script:t4InTracks | Should -Contain 'T1:False'
         $script:calls | Should -Contain 'estate T1,T3,T2'
-        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeTrue -Because 'T4 isn''t deployed, so DONE doesn''t need its estate or metrics'
+        # 2026-11-09: T4 is part of every deployment, so a run whose template deployed without it isn't DONE, and says why.
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeFalse -Because 'DONE needs T4''s estate and metrics'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.OFF' }).status | Should -Be 'Fail'
     }
 
     It 'starts T4''s General Purpose fallback where preflight says, says what it did on the Infrastructure step, and gives the tracks that size (Phase 28 follow-up)' {
@@ -1958,9 +2073,9 @@ Describe 'Invoke-DemoParallelDeployment' {
             $calls | Should -Not -Contain 't1 monitoring' -Because 'T1''s own Monitoring step runs in this run'
             # sqlvm01, which this run started, gets the interim baseline as soon as it runs, and the run waits for it; then
             # archost01, which already ran: all before the template and the tracks (review of PR 16, and its re-review).
-            $calls.IndexOf('switch T1,T3=baseline wait=0') | Should -Be ($calls.IndexOf('running sqlvm01 requested=True') + 1)
-            $calls.IndexOf('interim T1,T3') | Should -Be ($calls.IndexOf('switch T1,T3=baseline wait=0') + 1)
-            $calls.IndexOf('switch T2=baseline wait=0') | Should -Be ($calls.IndexOf('interim T1,T3') + 1)
+            $calls.IndexOf('switch T1,T3,T4=baseline wait=0') | Should -Be ($calls.IndexOf('running sqlvm01 requested=True') + 1)
+            $calls.IndexOf('interim T1,T3,T4') | Should -Be ($calls.IndexOf('switch T1,T3,T4=baseline wait=0') + 1)
+            $calls.IndexOf('switch T2=baseline wait=0') | Should -Be ($calls.IndexOf('interim T1,T3,T4') + 1)
             $calls.IndexOf('switch T2=baseline wait=0') | Should -BeLessThan $calls.IndexOf('template disk=golden')
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.INTERIM_T1' }).status | Should -Be 'Pass'
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).status | Should -Be 'Pass'
@@ -2015,9 +2130,9 @@ Describe 'Invoke-DemoParallelDeployment' {
             Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -Times 0 -Exactly
             $script:calls | Should -Not -Contain 'request sqlvm01'
             $calls = @($script:calls)
-            @($calls | Where-Object { $_ -like 'billing*' }) | Should -Be @('billing sqlvm01,archost01')
-            $calls.IndexOf('billing sqlvm01,archost01') | Should -BeGreaterThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'template*' })) -Because 'only a template that succeeded created them'
-            $calls.IndexOf('billing sqlvm01,archost01') | Should -BeLessThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'track *' })) -Because 'a stop during the tracks still leaves the VMs it created'
+            @($calls | Where-Object { $_ -like 'billing*' }) | Should -Be @('billing sqlvm01,archost01,T4')
+            $calls.IndexOf('billing sqlvm01,archost01,T4') | Should -BeGreaterThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'template*' })) -Because 'only a template that succeeded created them'
+            $calls.IndexOf('billing sqlvm01,archost01,T4') | Should -BeLessThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'track *' })) -Because 'a stop during the tracks still leaves the VMs it created'
         }
 
         It 'records T4 for a first deployment only when the template deployed it: the Burstable fallback can leave it out (Phase 28 review)' {
@@ -2113,7 +2228,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         It 'builds the artifacts and starts the track processes before the template, then hands them its result' {
             $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config })
             $order = @($script:calls | Where-Object { $_ -match '^(build|preflight|job|template)' })
-            $order | Should -Be @('build', 'preflight', 'job T1 delay=0 earlyT2=True bundle=False', 'job T2 delay=5 earlyT2=True bundle=False', 'job Fabric delay=10 earlyT2=True bundle=False', 'template handoff=False')
+            $order | Should -Be @('build', 'preflight', 'job T1 delay=0 earlyT2=True bundle=False', 'job T2 delay=5 earlyT2=True bundle=False', 'job T4 delay=10 earlyT2=True bundle=False', 'job Fabric delay=15 earlyT2=True bundle=False', 'template handoff=False')
             $script:handoffSeen.Succeeded | Should -BeTrue
             $script:handoffSeen.LoaderSettings['host']['role'] | Should -Be 'ArcHost'
             $script:handoffSeen.T3UseFreeLimit | Should -BeTrue

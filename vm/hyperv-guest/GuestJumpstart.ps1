@@ -1118,7 +1118,7 @@ function Invoke-DemoJumpstartImageCheck {
     $fatal = @($problems | Where-Object { $_.Fatal })
     if ($fatal.Count -gt 0) {
         $text = ($fatal | ForEach-Object { $_.Message }) -join '; '
-        return (New-DemoVmStepResult -Outcome 'Failed' -Message ('T2 can''t use this Jumpstart image: {0}. Nothing switches by itself. To check the guest again, run ./scripts/deploy.ps1 -FromStage Artifacts, which starts a new bootstrap generation; or choose another t2SqlInstallMode (PaygWizard, ProductKey, or Developer) in config/demo.config.json, then ./scripts/destroy.ps1 and ./scripts/deploy.ps1 (docs/troubleshooting.md).' -f $text))
+        return (New-DemoVmStepResult -Outcome 'Failed' -Message ('T2 can''t use this Jumpstart image: {0}. Nothing switches by itself. To check the guest again, run ./scripts/deploy.ps1 -FromStage Artifacts, which starts a new bootstrap generation. Or choose another t2SqlInstallMode in config/demo.config.json, then ./scripts/destroy.ps1 and ./scripts/deploy.ps1 (docs/troubleshooting.md): ProductKey (your own SQL Server Standard key) or Developer (Estate only), both unattended.' -f $text))
     }
     if (@($problems | Where-Object { $_.Code -eq 'SqlNotRunning' }).Count -gt 0) {
         $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName

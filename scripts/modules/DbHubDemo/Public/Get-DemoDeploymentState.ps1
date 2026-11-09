@@ -17,7 +17,8 @@ function Get-DemoDeploymentState {
     on, in the DbHubT4Size tag: Standard_D4ads_v5, Standard_D2ds_v5, a size an existing server kept, None, or Refused;
     ADR 0019, Resolve-DemoEffectiveConfig),
     T2BuildUtc (when the T2 host's loader started a bootstrap generation that nobody has seen finish; empty when none
-    runs; Phase 28 review follow-up), and Tags (every tag on the group). Read-only.
+    runs; Phase 28 review follow-up), T2InstallMode (the T2 guest's own install mode as its host reported it, in the
+    DbHubT2InstallMode tag; 2026-11-09, Get-DemoT2GuestInstallMode), and Tags (every tag on the group). Read-only.
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -67,6 +68,7 @@ function Get-DemoDeploymentState {
         GuidedStopUtc     = & $read 'GuidedStopUtc'
         T4Sku             = & $read 'T4Sku'
         T2BuildUtc        = & $read 'T2BuildUtc'
+        T2InstallMode     = & $read 'T2InstallMode'
         Tags              = $tags
     }
 }
