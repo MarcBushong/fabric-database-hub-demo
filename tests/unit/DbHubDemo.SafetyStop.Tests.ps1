@@ -177,9 +177,23 @@ BeforeAll {
                 }
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ value = @($script:jobs) } -Depth 6))
             }
-            '/jobs/(?<job>[0-9a-f-]{36})/output$' {
+            '/jobs/(?<job>[^/]+)/output$' {
+                # Job - Get Output answers for a job's ID and for its name alike (live, 2026-11-09).
+                $key = $Matches['job']
                 $script:outputReads++
-                return (New-AzResult -StdOut ([string]$script:outputs[$Matches['job']]))
+                $script:outputKeys.Add($key)
+                $id = if ($script:jobNames.ContainsKey($key)) { $script:jobNames[$key] } else { $key }
+                return (New-AzResult -StdOut ([string]$script:outputs[$id]))
+            }
+            '/automationAccounts/aa-dbhub-demo-safetystop/jobs/(?<job>[^/]+)$' {
+                # Job - Get returns the job's parameters; the list doesn't.
+                $key = $Matches['job']
+                $script:jobReads.Add($key)
+                if ($script:jobReadFails) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (InternalServerError) The service is unavailable.')
+                }
+                $id = if ($script:jobNames.ContainsKey($key)) { $script:jobNames[$key] } else { $key }
+                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ name = $key; properties = @{ jobId = $id; parameters = @{ Scope = [string]$script:jobScopes[$id] } } } -Depth 6))
             }
         }
         return (New-AzResult -ExitCode 1 -StdErr ('ERROR: the fake has no answer for {0} {1}' -f $Method, $path))
@@ -207,6 +221,11 @@ BeforeAll {
         $script:jobsReadFails = $false
         $script:outputs = @{}
         $script:outputReads = 0
+        $script:outputKeys = [System.Collections.Generic.List[string]]::new()
+        $script:jobNames = @{}
+        $script:jobScopes = @{}
+        $script:jobReads = [System.Collections.Generic.List[string]]::new()
+        $script:jobReadFails = $false
         $script:linkReads = 0
         $script:linkReadFails = $false
     }
@@ -266,9 +285,18 @@ BeforeAll {
         $script:deployments.Clear()
     }
 
-    # A job of the safety stop's runbook and its output's result line.
-    function Add-FakeJob([string] $Id, [string] $Status, [string] $Created, [hashtable] $Result) {
-        $script:jobs = @($script:jobs) + @(@{ name = $Id; properties = @{ jobId = $Id; status = $Status; creationTime = $Created; runbook = @{ name = 'DbHub-Stop' } } })
+    # A job of the safety stop's runbook and its output's result line. -JobName is the job's name when it isn't its ID: a
+    # schedule's job is named SCH_<guid>_<guid>_<ticks> (live, 2026-11-09). -NoJobId leaves properties.jobId out. -Scope is
+    # the job's parameter, which only Job - Get returns.
+    function Add-FakeJob([string] $Id, [string] $Status, [string] $Created, [hashtable] $Result, [string] $JobName = '', [switch] $NoJobId, [string] $Scope = '') {
+        $name = if ($JobName) { $JobName } else { $Id }
+        $properties = @{ status = $Status; creationTime = $Created; runbook = @{ name = 'DbHub-Stop' } }
+        if (-not $NoJobId) {
+            $properties['jobId'] = $Id
+        }
+        $script:jobs = @($script:jobs) + @(@{ name = $name; properties = $properties })
+        $script:jobNames[$name] = $Id
+        $script:jobScopes[$Id] = $Scope
         if ($null -ne $Result) {
             $script:outputs[$Id] = "[03:00:01Z] a log line`nDBHUB-STOP {0}`n" -f (ConvertTo-Json -InputObject $Result -Compress -Depth 6)
         }
@@ -558,6 +586,69 @@ Describe 'The nightly safety stop''s state, runs, and status (ADR 0024)' {
         if ($Case -match 'by its ID') {
             $read.Error | Should -Match 'the job schedule [0-9a-f-]{36} \(dbhub-safety-stop\) couldn''t be read'
         }
+    }
+
+    It 'reads the scheduled runs, whose jobs are named SCH_ with two GUIDs and a time, by their job IDs (live, 2026-11-09)' {
+        Set-FakeInPlace
+        $stopId = 'bbbbbbbb-0000-0000-0000-000000000001'
+        $checkId = 'bbbbbbbb-0000-0000-0000-000000000002'
+        Add-FakeJob -Id $stopId -JobName 'SCH_cccccccc-0000-0000-0000-000000000001_dddddddd-0000-0000-0000-000000000001_639297810000000000' -Status 'Completed' -Created '2026-11-09T00:00:12Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; message = 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped.' }
+        Add-FakeJob -Id $checkId -JobName 'SCH_cccccccc-0000-0000-0000-000000000002_dddddddd-0000-0000-0000-000000000001_639297828000000000' -Status 'Completed' -Created '2026-11-09T00:30:09Z' -Result @{ action = 'check-t3'; status = 'Checked'; t3 = 'Paused'; t4 = 'T4 already stopped'; failed = @(); message = 'T3 (azuresql01-abc123/ContosoCare) is Paused, 30 minutes after the safety stop: it bills no compute until something connects. T4 already stopped.' }
+        $status = & $script:status
+        $status.status | Should -Be 'Pass'
+        $status.message | Should -Not -Match 'hasn''t run yet'
+        $status.message | Should -Match 'Last run 2026-11-09 00:00 UTC \(job Completed\): Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped\. T3 check 2026-11-09 00:30 UTC: .* T4 already stopped\.$'
+        $status.evidence.lastStopJobId | Should -Be $stopId
+        $status.evidence.lastT3CheckJobId | Should -Be $checkId
+        @($script:outputKeys) | Should -Be @($checkId, $stopId) -Because 'each output is read by its job''s ID, newest first, never by a schedule''s job name'
+    }
+
+    It 'reads a job whose name isn''t its ID by its ID, and a name only for a job without an ID, when it''s a GUID or a schedule''s job name' {
+        Set-FakeInPlace
+        # Started by name (PUT jobs/{name}): its ID differs from its name (live, 2026-11-09).
+        Add-FakeJob -Id 'dddddddd-0000-0000-0000-000000000002' -JobName 'eeeeeeee-0000-0000-0000-000000000001' -Status 'Completed' -Created '2026-11-09T14:40:00Z' -Result @{ action = 'check-t3'; status = 'Checked'; t3 = 'Paused'; t4 = 'T4 already stopped'; failed = @(); message = 'T3 is Paused. T4 already stopped.' }
+        # Without an ID: its name, a schedule's job name.
+        $scheduled = 'SCH_cccccccc-0000-0000-0000-000000000001_dddddddd-0000-0000-0000-000000000001_639297810000000000'
+        Add-FakeJob -Id 'dddddddd-0000-0000-0000-000000000003' -JobName $scheduled -NoJobId -Status 'Completed' -Created '2026-11-09T00:00:12Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; message = 'Nightly safety stop: T4 already stopped.' }
+        # Never read: an ID that isn't a GUID (no fallback to its name), and, without an ID, a name of another form.
+        Add-FakeJob -Id 'not-a-guid' -JobName 'ffffffff-0000-0000-0000-000000000001' -Status 'Completed' -Created '2026-11-09T14:50:00Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; message = 'never read' }
+        Add-FakeJob -Id 'ffffffff-0000-0000-0000-000000000002' -JobName 'job/../other' -NoJobId -Status 'Completed' -Created '2026-11-09T14:55:00Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; message = 'never read' }
+        $runs = InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoSafetyStopLastRun -Name (Get-DemoSafetyStopName -Config $Config) }
+        $runs.Ok | Should -BeTrue
+        $runs.Check.JobId | Should -Be 'dddddddd-0000-0000-0000-000000000002'
+        $runs.Check.Name | Should -Be 'eeeeeeee-0000-0000-0000-000000000001'
+        $runs.Stop.JobId | Should -Be $scheduled
+        $runs.Stop.Result['message'] | Should -Be 'Nightly safety stop: T4 already stopped.'
+        @($script:outputKeys) | Should -Be @('dddddddd-0000-0000-0000-000000000002', $scheduled)
+    }
+
+    It 'counts a job that failed before its result line as the run its own Scope names (Job - Get): <Case>' -ForEach @(
+        @{ Case = 'the T3 check'; Scope = 'T3Check'; ReadFails = $false; Match = 'Last run 2026-11-09 00:00 UTC \(job Completed\): Nightly safety stop: T4 already stopped\. T3 check 2026-11-09 00:30 UTC: its output had no result line\. To check: its last T3 check didn''t read T3\.$' }
+        @{ Case = 'the stop'; Scope = 'Nightly'; ReadFails = $false; Match = 'Last run 2026-11-09 00:30 UTC \(job Failed\): its output had no result line\. To check: its last run didn''t finish its work\.$' }
+        @{ Case = 'one whose parameters can''t be read, taken as the stop'; Scope = 'T3Check'; ReadFails = $true; Match = 'Last run 2026-11-09 00:30 UTC \(job Failed\): its output had no result line\. To check: its last run didn''t finish its work\.$' }
+    ) {
+        Set-FakeInPlace
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000011' -JobName 'SCH_cccccccc-0000-0000-0000-000000000001_dddddddd-0000-0000-0000-000000000001_639297810000000000' -Status 'Completed' -Created '2026-11-09T00:00:12Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; message = 'Nightly safety stop: T4 already stopped.' }
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000012' -JobName 'SCH_cccccccc-0000-0000-0000-000000000002_dddddddd-0000-0000-0000-000000000001_639297828000000000' -Status 'Failed' -Created '2026-11-09T00:30:09Z' -Result $null -Scope $Scope
+        $script:jobReadFails = $ReadFails
+        $status = & $script:status
+        $status.status | Should -Be 'Warning'
+        $status.message | Should -Match $Match
+        @($script:jobReads) | Should -Be @('aaaaaaaa-0000-0000-0000-000000000012') -Because 'only a job without its result line is read again, by its ID'
+    }
+
+    It 'lets the cost estimate count about a day per restart after a scheduled stop that completed, and not after one that failed' {
+        Set-FakeInPlace
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000021' -JobName 'SCH_cccccccc-0000-0000-0000-000000000001_dddddddd-0000-0000-0000-000000000001_639296946000000000' -Status 'Completed' -Created '2026-11-08T00:00:12Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; message = 'Nightly safety stop: T4 already stopped.' }
+        $coverage = InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoT4RestartCoverage -Config $Config }
+        $coverage.Counts | Should -BeTrue
+        $coverage.Reason | Should -Match 'its last run didn''t fail$'
+        $coverage.Evidence['nightlyLastRun'] | Should -Be 'Completed (Stopped)'
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000022' -JobName 'SCH_cccccccc-0000-0000-0000-000000000001_dddddddd-0000-0000-0000-000000000001_639297810000000000' -Status 'Failed' -Created '2026-11-09T00:00:12Z' -Result @{ action = 'stop-nightly'; status = 'Partial'; message = 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated; failed: T4 (HTTP 409).' }
+        $failed = InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoT4RestartCoverage -Config $Config }
+        $failed.Counts | Should -BeFalse
+        $failed.Missing | Should -Be 'StopJob'
+        $failed.Reason | Should -Match 'didn''t finish its work \(job Failed\)'
     }
 
     It 'finds the newest stop and T3 check by their result lines, reading as few outputs as it can' {

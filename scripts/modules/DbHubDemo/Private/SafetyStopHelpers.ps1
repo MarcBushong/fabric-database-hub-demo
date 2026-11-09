@@ -277,8 +277,9 @@ function Get-DemoSafetyStopRunbookSetting {
 }
 
 function Get-DemoSafetyStopLinkScope {
-    # A job schedule's Scope parameter, whatever case Azure gives the parameter's name in; empty without one. Only Job
-    # Schedule - Get returns the parameters (Get-DemoSafetyStopLink). Internal.
+    # A job schedule's or a job's Scope parameter, whatever case Azure gives the parameter's name in; empty without one.
+    # Only Job Schedule - Get and Job - Get return the parameters (Get-DemoSafetyStopLink, Get-DemoSafetyStopLastRun).
+    # Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -843,7 +844,8 @@ function Get-DemoSafetyStopState {
 
 function Get-DemoSafetyStopJobResult {
     # The result line DbHub-Stop wrote in a job's output ('DBHUB-STOP <json>'), parsed, or $null (Job - Get Output:
-    # https://learn.microsoft.com/rest/api/automation/job/get-output). Internal.
+    # https://learn.microsoft.com/rest/api/automation/job/get-output). -JobName is the job's ID (properties.jobId), which
+    # Job - Get Output answers for as for the job's name (live, 2026-11-09). Internal.
     [CmdletBinding()]
     [OutputType([object])]
     param(
@@ -876,10 +878,18 @@ function Get-DemoSafetyStopLastRun {
     .SYNOPSIS
     The nightly safety stop's newest finished runs (ADR 0024): its account's DbHub-Stop jobs that ended (Job - List By
     Automation Account), newest first, each one's result line read from its output until it has the newest of each
-    kind, at most MaxOutputs reads. Returns Ok, Error, Stop, and Check: each $null, or JobId, Status (the job's),
-    CreatedUtc, and Result (the parsed DBHUB-STOP line, or $null). An account that doesn't exist has none. Never throws.
-    Internal.
-    https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
+    kind, at most MaxOutputs reads. Returns Ok, Error, Stop, and Check: each $null, or JobId (the ID its output was read
+    by), Name (the job's name), Status (the job's), CreatedUtc, and Result (the parsed DBHUB-STOP line, or $null). An
+    account that doesn't exist has none. Never throws. Internal.
+
+    .DESCRIPTION
+    A job's output is read by its ID, properties.jobId, a GUID. A job that a schedule starts is named
+    SCH_<guid>_<guid>_<ticks>, not by its ID, and the ID of a job started by name can differ from its name too (live,
+    2026-11-09); before, only a job whose name was a GUID was read, so the scheduled runs never were and the status said
+    "It hasn't run yet." The name is used only for a job without an ID, and only when it's a GUID or that schedule form.
+    A job that ended without its result line is the stop or the check by its own Scope parameter (Job - Get).
+    - Job - List By Automation Account: https://learn.microsoft.com/rest/api/automation/job/list-by-automation-account
+    - Job - Get: https://learn.microsoft.com/rest/api/automation/job/get
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -891,6 +901,7 @@ function Get-DemoSafetyStopLastRun {
         [int] $MaxOutputs = 4
     )
 
+    $guid = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
     $answer = [pscustomobject]@{ Ok = $true; Error = ''; Stop = $null; Check = $null }
     try {
         $jobs = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/jobs' -f $Name.AutomationAccountId) -Query ([ordered]@{ '$filter' = ("properties/runbook/name eq '{0}'" -f $Name.Runbook); 'api-version' = $script:SafetyStopAutomationApiVersion })
@@ -907,18 +918,17 @@ function Get-DemoSafetyStopLastRun {
                 if ($status -notin $script:T4StopJobEndedStatuses) {
                     continue
                 }
+                $jobId = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobId')
                 $jobName = [string](Get-DemoMemberValue -InputObject $job -Name 'name')
-                if (-not $jobName) {
-                    $jobName = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobId')
-                }
-                [pscustomobject]@{ JobId = $jobName; Status = $status; CreatedUtc = (ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'creationTime')); Result = $null }
+                $readAs = if ($jobId -match ('^{0}$' -f $guid)) { $jobId } elseif (-not $jobId -and $jobName -match ('^(?:{0}|SCH_{0}_{0}_[0-9]{{1,20}})$' -f $guid)) { $jobName } else { '' }
+                [pscustomobject]@{ JobId = $readAs; Name = $jobName; Status = $status; CreatedUtc = (ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $properties -Name 'creationTime')); Result = $null }
             }) | Sort-Object -Property { if ($null -ne $_.CreatedUtc) { $_.CreatedUtc } else { [datetime]::MinValue } } -Descending
         $reads = 0
         foreach ($job in $ended) {
             if (($null -ne $answer.Stop -and $null -ne $answer.Check) -or $reads -ge $MaxOutputs) {
                 break
             }
-            if ($job.JobId -notmatch '^[0-9a-fA-F-]{36}$') {
+            if (-not $job.JobId) {
                 continue
             }
             $reads++
@@ -930,9 +940,20 @@ function Get-DemoSafetyStopLastRun {
             elseif ($action -eq 'check-t3' -and $null -eq $answer.Check) {
                 $answer.Check = $job
             }
-            elseif (-not $action -and $null -eq $answer.Stop -and $job.Status -ne 'Completed') {
-                # A job that failed before it wrote its line (the sandbox, the token) counts as the stop that didn't run.
-                $answer.Stop = $job
+            elseif (-not $action -and $job.Status -ne 'Completed') {
+                # A job that failed before it wrote its line (the sandbox, the token) is the run that didn't happen. Which
+                # one, its own parameters say (Job - Get; the list doesn't return them); one that can't be read counts as
+                # the stop, as before.
+                $read = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobs/{1}' -f $Name.AutomationAccountId, $job.JobId) -ApiVersion $script:SafetyStopAutomationApiVersion)
+                $scope = if ($read.Ok) { Get-DemoSafetyStopLinkScope -Link $read.Value } else { '' }
+                if ($scope -eq 'T3Check') {
+                    if ($null -eq $answer.Check) {
+                        $answer.Check = $job
+                    }
+                }
+                elseif ($null -eq $answer.Stop) {
+                    $answer.Stop = $job
+                }
             }
         }
         return $answer
@@ -1019,6 +1040,7 @@ function Get-DemoSafetyStopStatus {
             }
             $evidence['lastStopUtc'] = $runs.Stop.CreatedUtc
             $evidence['lastStopJob'] = $runs.Stop.Status
+            $evidence['lastStopJobId'] = $runs.Stop.JobId
             $evidence['lastStop'] = $stopStatus
             $parts.Add(('Last run {0:yyyy-MM-dd HH:mm} UTC (job {1}): {2}' -f ([datetime]$runs.Stop.CreatedUtc), $runs.Stop.Status, $stopText.TrimEnd('.') + '.'))
             if ($runs.Stop.Status -ne 'Completed' -or $stopStatus -ne 'Stopped') {
@@ -1033,6 +1055,7 @@ function Get-DemoSafetyStopStatus {
                 $checkText = 'its output had no result line'
             }
             $evidence['lastT3CheckUtc'] = $runs.Check.CreatedUtc
+            $evidence['lastT3CheckJobId'] = $runs.Check.JobId
             $evidence['lastT3Check'] = $verdict
             $parts.Add(('T3 check {0:yyyy-MM-dd HH:mm} UTC: {1}' -f ([datetime]$runs.Check.CreatedUtc), $checkText.TrimEnd('.') + '.'))
             $t3Problem = switch ($verdict) {
