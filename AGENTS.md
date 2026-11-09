@@ -25,8 +25,8 @@ These are for an agent asked to **set up, deploy, upgrade, or try** this demo fo
 ## Steps only a person can do
 
 - `az login`.
-- **The Insights app's one-time sign-in** (the Rayfin CLI, in a browser). `deploy.ps1` doesn't start it under an assistant, so ask the person to run `./scripts/configure-fabric-app.ps1 -SignIn` in their own terminal, before or after the deployment.
-- **The Insights app's one-time browser confirmation,** listed under **Please confirm**.
+- **The Insights app's browser sign-in, only if Fabric refuses the Azure CLI's token** (`FABRIC.APP.TOKEN`, a **Warning**, and the run says the app wasn't created). Since 2026-11-09 the app deploys with the person's `az login`, so usually there's nothing to do. `deploy.ps1` doesn't start that sign-in under an assistant, so ask the person to run `./scripts/configure-fabric-app.ps1 -SignIn` in their own terminal.
+- **The Insights app's browser confirmation, only when it's listed under Please confirm.** When the app is deployed and every query it runs returned its data, `FABRIC.APP.BROWSER` is a note instead (since 2026-11-09).
 - **Nothing for T2 or T4:** no setup wizard, and no step for PostgreSQL. T4 is part of every deployment; when Azure refuses every T4 size, the run ends **NOT DONE** with the fix (a Region access request, or `t4SkuName`), which only the person can act on.
 - **When the person isn't an Owner:** an Owner runs `./scripts/grant-safety-stop.ps1` once, which **DONE** prints.
 

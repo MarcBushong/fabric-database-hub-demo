@@ -149,6 +149,8 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
         $config['github']['repository'] | Should -Be 'contoso/fabric-database-hub-demo'
         (Get-Content -LiteralPath $script:path -Raw) | Should -Not -Match '"(workspaceId|lakehouseId)"'
         @($init.NextSteps) -join "`n" | Should -Match 'preflight\.ps1(.|\n)*deploy\.ps1'
+        @($init.NextSteps) -join "`n" | Should -Match 'nothing needs you: the Insights app deploys with your az login too' -Because 'the app''s Rayfin CLI needs no browser sign-in by default (2026-11-09)'
+        @($init.NextSteps) -join "`n" | Should -Not -Match 'one browser sign-in'
     }
 
     It 'calls nothing but az account list before the subscription guard, and runs the guard for the chosen subscription' {
