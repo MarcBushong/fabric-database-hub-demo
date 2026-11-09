@@ -745,6 +745,39 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:calls | Should -Not -Contain 'password'
     }
 
+    It 'takes the host build''s follow-up results as they are, none or one rebuild, under strict mode (live, 2026-11-09)' {
+        # Live (849d4c2): a fresh deployment's T2 step stopped at WaitingForArcOnboarding with "The property 'checkId' cannot be
+        # found on this object": Wait-DemoT2HostBuild returns Results as an array, always, and the step read it with
+        # Get-DemoMemberValue, which returns an array whole, so an empty one became one item that's an empty array. The mock
+        # returns the function's real shape (Results = $followUp.ToArray()); the module runs under Set-StrictMode -Version Latest.
+        $script:context['T2Source'] = 'build'
+        $script:context['WaitForT2'] = $true
+        $script:followUp = @()
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith {
+            $followUp = [System.Collections.Generic.List[object]]::new()
+            foreach ($item in $script:followUp) {
+                $followUp.Add($item)
+            }
+            [pscustomobject]@{ Health = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboarding'; message = 'Waiting for the orchestrator to onboard arcsql01 to Azure Arc.' }; TimedOut = $false; Failed = $false; Rebuilt = ($followUp.Count -gt 0); Results = $followUp.ToArray() }
+        }
+
+        # None, as in every fresh deployment.
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Results | Where-Object { [string]$_.checkId -like 'DEPLOY.TRACK.*' } | Should -BeNullOrEmpty
+        $outcome.Status | Should -Be 'Pass'
+        $script:calls | Should -Contain 'arc force=False'
+
+        # One: the rebuild's own result lands in the track's results, as that result, not as an array that holds it.
+        $script:calls.Clear()
+        $script:followUp = @(New-DemoResult -CheckId 'DEPLOY.T2.REBUILD' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01 makes T2 again from Arc Jumpstart''s image.')
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Results | Where-Object { [string]$_.checkId -like 'DEPLOY.TRACK.*' } | Should -BeNullOrEmpty
+        @($outcome.Results | Where-Object { $_ -is [System.Array] }).Count | Should -Be 0
+        $rebuild = @($outcome.Results | Where-Object { $_ -isnot [System.Array] -and [string]$_.checkId -eq 'DEPLOY.T2.REBUILD' })
+        $rebuild.Count | Should -Be 1
+        $rebuild[0].status | Should -Be 'Warning'
+    }
+
     It 'reports a T2 that builds its guest as running in the background, without waiting' {
         $script:context['T2Source'] = 'build'
         $script:arcConnected = $false
@@ -790,7 +823,7 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:context['T2Source'] = 'build'
         $script:context['WaitForT2'] = $true
         $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
-        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Failed = $false; TimedOut = $false; Health = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.' } } }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Failed = $false; TimedOut = $false; Rebuilt = $false; Results = [System.Collections.Generic.List[object]]::new().ToArray(); Health = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.' } } }
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
         $outcome.Status | Should -Be 'Pass'
         & $cleanups | Should -Be 1

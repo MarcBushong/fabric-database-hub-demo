@@ -1359,7 +1359,9 @@ function Invoke-DemoDeploymentTrack {
                         $sent = Get-DemoDeploymentState -Config $Config
                         $bundlePrefix = if ([string]$sent.BundleSha256 -and 'archost01' -in @($sent.BundleSentTo)) { ([string]$sent.BundleSha256).Substring(0, [System.Math]::Min(12, ([string]$sent.BundleSha256).Length)) } else { '' }
                         $build = Wait-DemoT2HostBuild -Config $Config -DeadlineUtc $t2Deadline -ProgressPath $progress -PollSeconds ([int](& $option 'HostPollSeconds' 300)) -StartedUtc $firstStepUtc -BundlePrefix $bundlePrefix
-                        & $addAll @(Get-DemoMemberValue -InputObject $build -Name 'Results')
+                        # Results is always an array (Wait-DemoT2HostBuild); Get-DemoMemberValue would return it whole, so an
+                        # empty one became one item, an empty array, whose checkId threw under strict mode (live, 2026-11-09).
+                        & $addAll @($build.Results)
                         if ($build.Failed) {
                             Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Failed' -Status 'Fail' -Message ([string](Get-DemoMemberValue -InputObject $build.Health -Name 'message'))
                             & $note 'DEPLOY.T2.HOST' 'T2' 'Fail' ('archost01 failed at step {0}: {1}' -f [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep'), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'message')) 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full) and C:\ProgramData\DbHubDemo\logs on it, fix the cause, then run ./scripts/deploy.ps1 -FromStage Artifacts: a failed step is tried again only in a new bootstrap generation, which that starts (a plain rerun resumes and finds the same step failed, unless your fix changed the bootstrap bundle, which a plain rerun then sends again, starting one too).'
