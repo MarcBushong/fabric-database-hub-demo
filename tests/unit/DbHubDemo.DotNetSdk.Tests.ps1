@@ -186,6 +186,15 @@ Describe 'deploy.ps1 installs the pinned .NET SDK for the user when none is foun
             InModuleScope DbHubDemo -Parameters @{ Root = $script:root; WhatIfRun = [bool]$WhatIfRun } { Initialize-DemoDotNetSdk -ProgressPath 'progress.json' -RepositoryRoot $Root -Confirm:$false -WhatIf:$WhatIfRun }
         }
 
+        # Linux and macOS hide a file or folder whose name starts with a dot, as the install's '.partial-' download and
+        # extract do, and cmdlets skip a hidden item without -Force (CI on Ubuntu, 2026-11-09: Get-Item said "Could not find
+        # item"). This marks such an item hidden on Windows too, so every OS runs the install the way Linux sees it.
+        function Set-TestDotItemHidden([string] $Path) {
+            if ($IsWindows -and (Split-Path -Path $Path -Leaf).StartsWith('.')) {
+                [System.IO.File]::SetAttributes($Path, [System.IO.File]::GetAttributes($Path) -bor [System.IO.FileAttributes]::Hidden)
+            }
+        }
+
         # What another deploy.ps1 that installed it leaves: the SDK, then its record.
         function New-TestInstall([string] $Sha512 = $script:fakeSha512) {
             $null = New-Item -ItemType Directory -Path $script:pin.Folder -Force
@@ -223,9 +232,10 @@ Describe 'deploy.ps1 installs the pinned .NET SDK for the user when none is foun
         # Microsoft's zip is 287 MB: the stand-in's progress is told in its terms.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDotNetSdkDownload -MockWith {
             Copy-Item -LiteralPath $script:fakeZip -Destination $Path
+            Set-TestDotItemHidden -Path $Path
             & $OnProgress ([long]150372628) ([long]300745255)
             & $OnProgress ([long]300745255) ([long]300745255)
-            [long](Get-Item -LiteralPath $Path).Length
+            [long](Get-Item -LiteralPath $Path -Force).Length
         }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoDotNetSignature -MockWith {
             if ($script:signatureOk) {
@@ -333,6 +343,9 @@ Describe 'deploy.ps1 installs the pinned .NET SDK for the user when none is foun
         $null = New-Item -ItemType Directory -Path $script:pin.Root -Force
         Set-Content -LiteralPath (Join-Path -Path $script:pin.Root -ChildPath '.partial-0badc0de-dotnet-sdk-10.0.403-win-x64.zip') -Value 'half a download'
         $null = New-Item -ItemType Directory -Path (Join-Path -Path $script:pin.Root -ChildPath '.partial-0badc0de-10.0.403/sdk') -Force
+        foreach ($name in '.partial-0badc0de-dotnet-sdk-10.0.403-win-x64.zip', '.partial-0badc0de-10.0.403') {
+            Set-TestDotItemHidden -Path (Join-Path -Path $script:pin.Root -ChildPath $name)
+        }
         Set-Content -LiteralPath (Join-Path -Path $script:pin.Root -ChildPath 'install.lock') -Value ''
         if ($Record) {
             New-TestInstall -Sha512 $Record
