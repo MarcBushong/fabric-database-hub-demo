@@ -25,7 +25,8 @@ Install modes (t2SqlInstallMode, ADR 0006):
   checks what was installed (Standard, the default instance, the Azure extension), shows the documented fix when it's
   wrong, and once it's right cleans up: automatic sign-in off, its LSA secret and Winlogon values gone, the guest
   password rotated, the console signed out. Invoke-DemoHostGuidedSetupGuard runs that cleanup before every pass when no
-  person is expected any more.
+  person is expected any more; since 2026-11-09 in any mode while an earlier guided stop's records are on this host
+  (Test-DemoHostGuidedSetupLeftover), because a guest built in PaygWizard mode now runs as JumpstartImage.
 In every mode, GuestSignInCleanup then removes the sign-in data that Arc onboarding and, in PaygWizard mode, the
 setup wizard's interactive sign-in leave in the guest and on the host, and verifies that none remains; the build
 stops there if any remains (ADR 0009). It runs again whenever a new bundle generation arrives.
@@ -35,7 +36,9 @@ In every mode, the GuestSource step first refuses a mode whose source (the Jumps
 existing guest's, with two exceptions in JumpstartImage mode since 2026-11-09: a guest built in PaygWizard mode whose SQL
 Server setup was never finished (no SQL Server instance in it, the wizard never completed, no setup running, no guided
 stop waiting) is deleted with its disk and records, and the image's steps make a new one; and a build guest with SQL
-Server set up is kept as it is, in the mode it was built in (guest-source.json sqlSetUp). After a pass that finds the host
+Server set up is kept as it is, in the mode it was built in (guest-source.json sqlSetUp). The rebuild's record
+(guest-rebuild.json) is marked Done once the new guest passes ArcOnboarding (Complete-DemoHostGuestRebuild, after every
+pass). After a pass that finds the host
 Ready, Invoke-DemoHostEvaluationGuard extends an evaluation
 guest's Windows evaluation when it runs low (slmgr.vbs /rearm, at most once a day, never while an activity profile runs).
 
@@ -436,11 +439,15 @@ function Invoke-DemoHostBootstrap {
         # The operator's clipboard helper for the PaygWizard step lives next to the state files.
         Copy-Item -LiteralPath ([System.IO.Path]::Combine($BundleRoot, 'vm', 'hyperv-guest', 'Copy-GuestCredential.ps1')) -Destination (Join-Path -Path $StateRoot -ChildPath 'Copy-GuestCredential.ps1') -Force
         $plan = Get-DemoHostStepPlan -Context $context
-        if ($context.Mode -eq 'PaygWizard') {
-            # The guided stop's cleanup always runs: armed automatic sign-in goes once no person is expected (Phase 28).
+        if ($context.Mode -eq 'PaygWizard' -or (Test-DemoHostGuidedSetupLeftover -Context $context)) {
+            # The guided stop's cleanup always runs: armed automatic sign-in goes once no person is expected (Phase 28). In
+            # any mode while an earlier guided stop's records are here (2026-11-09): a guest built in PaygWizard mode runs as
+            # JumpstartImage now, and its signed-in setup or a stopped password rotation would keep GuestSource waiting.
             Invoke-DemoHostGuidedSetupGuard -Context $context
         }
         $outcome = Invoke-DemoVmStateMachine -Step $plan -Generation ([string]$settings['generation']) -HealthDetail { Get-DemoHostHealthDetail -Context $context }
+        # A rebuilt guest that passed ArcOnboarding ends its rebuild record, so deploy.ps1 stops following it (2026-11-09).
+        Complete-DemoHostGuestRebuild -Context $context -Confirm:$false
         if ($outcome -eq 'Ready') {
             # An evaluation guest's Windows evaluation, checked at most once a day; health.json shows it after the next pass.
             Invoke-DemoHostEvaluationGuard -Context $context

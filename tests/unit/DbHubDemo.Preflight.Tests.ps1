@@ -140,7 +140,18 @@ Describe 'Invoke-DemoPreflight' {
         $evaluation['t2SqlInstallMode'] | Should -Be 'JumpstartImage'
         $check = Invoke-DemoPreflight -Config $evaluation -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE'
         $check.status | Should -Be 'Fail'
+        $check.remediation | Should -Match '^Set t2SqlInstallMode to ProductKey \(.*\) or Developer \(.*\); both install unattended on the evaluation-only Azure VM'
         $check.remediation | Should -Match 't2Mode Nested'
+        $check.remediation | Should -Not -Match 'PaygWizard'
+        # An older configuration's PaygWizard (its default before 2026-11-05) runs as JumpstartImage, which this VM can't run:
+        # the fix names only the unattended modes, never the retired one (review of 849d4c2, 2026-11-09).
+        $evaluation['t2SqlInstallModeSource'] = 'legacy'
+        $legacy = Invoke-DemoPreflight -Config $evaluation -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE'
+        $legacy.status | Should -Be 'Fail'
+        $legacy.message | Should -Match '^t2SqlInstallMode PaygWizard in your configuration is retired: the one-click deployment has no SQL Server setup wizard'
+        $legacy.remediation | Should -Match '^Set t2SqlInstallMode to ProductKey \(.*\) or Developer \(.*\); both install unattended'
+        $legacy.remediation | Should -Not -Match 'PaygWizard|t2Mode Nested'
+        $evaluation.Remove('t2SqlInstallModeSource')
         $evaluation['t2SqlInstallMode'] = 'Developer'
         (Invoke-DemoPreflight -Config $evaluation -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T2.MODE').status | Should -Be 'Warning'
     }

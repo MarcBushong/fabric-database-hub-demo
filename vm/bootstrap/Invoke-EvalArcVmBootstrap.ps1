@@ -442,7 +442,7 @@ function Get-DemoEvalArcStepPlan {
     $plan = @(
         @{ Name = 'InstallMode'
             Test = { param($Step) $Step.Context.Mode -ne 'JumpstartImage' }
-            Set = { New-DemoVmStepResult -Outcome 'Failed' -Message 't2SqlInstallMode JumpstartImage needs the nested Hyper-V host: Arc Jumpstart''s image is a Hyper-V guest disk, and this evaluation-only Azure VM isn''t one. Use t2Mode Nested, or set t2SqlInstallMode to ProductKey or Developer, both unattended, or PaygWizard, which needs a person in Bastion for SQL Server setup, then ./scripts/destroy.ps1 and ./scripts/deploy.ps1 (ADR 0006).' } }
+            Set = { New-DemoVmStepResult -Outcome 'Failed' -Message 't2SqlInstallMode JumpstartImage needs the nested Hyper-V host: Arc Jumpstart''s image is a Hyper-V guest disk, and this evaluation-only Azure VM isn''t one. Set t2SqlInstallMode to ProductKey or Developer, both unattended here, or use t2Mode Nested for Arc Jumpstart''s image; then ./scripts/destroy.ps1 and ./scripts/deploy.ps1 (ADR 0006).' } }
         @{ Name = 'ArcEvaluationPrep'
             Test = { param($Step) Test-DemoEvalArcPrep -Context $Step.Context }
             Set = { param($Step) Initialize-DemoEvalArcPrep -Context $Step.Context } }

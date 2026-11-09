@@ -273,7 +273,7 @@ function Resolve-DemoT2Source {
         return (& $decide 'existing-build' 'Pass' 'archost01 exists and was built from the image; it keeps its disk.')
     }
     if ($configured -eq 'build') {
-        $makes = if ([string]$Config['t2SqlInstallMode'] -eq 'JumpstartImage') { 'makes its guest from Arc Jumpstart''s image' } else { 'builds its guest from the image, then waits for the setup-wizard step in PaygWizard mode' }
+        $makes = if ([string]$Config['t2SqlInstallMode'] -eq 'JumpstartImage') { 'makes its guest from Arc Jumpstart''s image' } else { 'builds its guest, with SQL Server installed unattended' }
         return (& $decide 'build' 'Pass' ('t2Source is build: a new archost01 {0}.' -f $makes))
     }
 
@@ -313,8 +313,8 @@ function Resolve-DemoT2Source {
         }
         $expired = @($snapshots | Where-Object { (Test-DemoGoldenIsEvaluation -Snapshot $_) -and $null -ne $_.EvalDaysLeft -and $_.EvalDaysLeft -lt 1 })
         $status = if ($expired.Count -gt 0) { 'Warning' } else { 'Pass' }
-        $makes = if ($installMode -eq 'JumpstartImage') { 'makes its guest from Arc Jumpstart''s image' } else { 'builds its guest from the image, then waits for the setup-wizard step in PaygWizard mode' }
-        return (& $decide 'build' $status ('No usable golden snapshot{0}: a new archost01 {1}.' -f $reasons, $makes) $evidence $(if ($expired.Count -gt 0) { 'After this build and the wizard, capture again: ./scripts/capture-t2-golden.ps1.' } else { '' }))
+        $makes = if ($installMode -eq 'JumpstartImage') { 'makes its guest from Arc Jumpstart''s image' } else { 'builds its guest, with SQL Server installed unattended' }
+        return (& $decide 'build' $status ('No usable golden snapshot{0}: a new archost01 {1}.' -f $reasons, $makes) $evidence $(if ($expired.Count -gt 0) { 'After this build, capture again: ./scripts/capture-t2-golden.ps1.' } else { '' }))
     }
 
     $chosen = @($usable | Where-Object { $_.InstallMode -eq $installMode }) + @($usable | Where-Object { $_.InstallMode -ne $installMode }) | Select-Object -First 1
@@ -342,7 +342,7 @@ function Resolve-DemoT2Source {
     }
     $lifetime = if ($isEvaluation) { 'its guest''s evaluation ends {0:yyyy-MM-dd}, in {1} days' -f $chosen.EvalExpiresUtc, $chosen.EvalDaysLeft } else { 'its guest isn''t a Windows evaluation' }
     $message = 'A new archost01 restores from {0} (captured {1:yyyy-MM-dd}, boot-verified {2:yyyy-MM-dd}; {3}){4}.' -f $chosen.Name, $chosen.CapturedUtc, $chosen.BootVerifiedUtc, $lifetime, $(if ($notes.Count) { ': ' + ($notes -join '; ') } else { '' })
-    return (& $decide 'golden' $status $message $evidence $(if ($status -eq 'Warning') { 'Plan a fresh build (t2Source build), the setup-wizard step, and a new capture (capture-t2-golden.ps1, then test-t2-golden.ps1 -Onboard).' } else { '' }) $chosen)
+    return (& $decide 'golden' $status $message $evidence $(if ($status -eq 'Warning') { 'Plan a fresh build (t2Source build) and a new capture (capture-t2-golden.ps1, then test-t2-golden.ps1 -Onboard).' } else { '' }) $chosen)
 }
 
 function Test-DemoGoldenIsEvaluation {
@@ -407,12 +407,12 @@ function Get-DemoT2GoldenStatus {
     }
     $all = @($Snapshot | Where-Object { $null -ne $_ })
     if ($all.Count -eq 0) {
-        return (& $new 'Not selected' ('No T2 golden snapshot in {0}: a redeploy builds T2 and, in PaygWizard mode, waits for the setup-wizard step.' -f $group) @{} 'To keep the current T2 for fast redeploys: ./scripts/capture-t2-golden.ps1, then ./scripts/test-t2-golden.ps1 -Onboard.')
+        return (& $new 'Not selected' ('No T2 golden snapshot in {0}: a redeploy builds T2 again.' -f $group) @{} 'To keep the current T2 for fast redeploys: ./scripts/capture-t2-golden.ps1, then ./scripts/test-t2-golden.ps1 -Onboard.')
     }
     $usable = @($all | Where-Object { $null -ne $_.BootVerifiedUtc -and (Test-DemoGoldenEvaluationOk -Snapshot $_) })
     if ($usable.Count -eq 0) {
         $why = ($all | ForEach-Object { '{0}: {1}' -f $_.Name, $(if ($null -eq $_.BootVerifiedUtc) { 'not boot-verified' } else { 'its guest''s evaluation is over' }) }) -join '; '
-        return (& $new 'Warning' ('{0} golden snapshot(s) in {1}, none usable ({2}); a redeploy builds T2.' -f $all.Count, $group, $why) ([ordered]@{ snapshots = $all.Count }) 'Prove a new capture with ./scripts/test-t2-golden.ps1 -Onboard, or, after the evaluation ends, build T2 fresh, do the setup-wizard step, and capture again.')
+        return (& $new 'Warning' ('{0} golden snapshot(s) in {1}, none usable ({2}); a redeploy builds T2.' -f $all.Count, $group, $why) ([ordered]@{ snapshots = $all.Count }) 'Prove a new capture with ./scripts/test-t2-golden.ps1 -Onboard, or, after the evaluation ends, build T2 fresh and capture again.')
     }
     $chosen = $usable[0]
     $evidence = [ordered]@{
@@ -444,7 +444,7 @@ function Get-DemoT2GoldenStatus {
     }
     $lifetime = if ($isEvaluation) { 'its guest''s evaluation ends {0:yyyy-MM-dd}, in {1} days' -f $chosen.EvalExpiresUtc, $chosen.EvalDaysLeft } else { 'its guest isn''t a Windows evaluation' }
     $message = '{0}: captured {1:yyyy-MM-dd}, boot-verified {2:yyyy-MM-dd}; {3}; about {4:N0} of {5} GiB used{6}.' -f $chosen.Name, $chosen.CapturedUtc, $chosen.BootVerifiedUtc, $lifetime, $chosen.UsedGiB, $chosen.SizeGiB, $(if ($notes.Count) { ': ' + ($notes -join '; ') } else { '' })
-    return (& $new $status $message $evidence $(if ($status -eq 'Warning') { 'Build T2 fresh (t2Source build), do the setup-wizard step, then ./scripts/capture-t2-golden.ps1 and ./scripts/test-t2-golden.ps1 -Onboard.' } else { '' }))
+    return (& $new $status $message $evidence $(if ($status -eq 'Warning') { 'Build T2 fresh (t2Source build), then ./scripts/capture-t2-golden.ps1 and ./scripts/test-t2-golden.ps1 -Onboard.' } else { '' }))
 }
 
 function Invoke-DemoGoldenSourceRelease {

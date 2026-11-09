@@ -142,7 +142,7 @@ function New-DemoT2GoldenSnapshot {
     }
     $vm = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'show', '--resource-group', $resourceGroupName, '--name', 'archost01') -AsJson -AllowFailure
     if ($null -eq $vm) {
-        & $add 'GOLDEN.CAPTURE.HOST' 'Fail' ('archost01 wasn''t found in {0}.' -f $resourceGroupName) @{} 'Deploy T2 first (deploy.ps1), finish the setup-wizard step, then capture.'
+        & $add 'GOLDEN.CAPTURE.HOST' 'Fail' ('archost01 wasn''t found in {0}.' -f $resourceGroupName) @{} 'Deploy T2 first (deploy.ps1), then capture.'
         return $results.ToArray()
     }
     $storage = Get-DemoMemberValue -InputObject $vm -Name 'storageProfile'

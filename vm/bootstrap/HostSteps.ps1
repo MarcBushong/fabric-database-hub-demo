@@ -1015,8 +1015,86 @@ function Get-DemoHostGuestRebuildDetail {
         state         = [string]$record['state']
         startedUtc    = [string]$record['startedUtc']
         removedUtc    = [string]$record['removedUtc']
+        doneUtc       = [string]$record['doneUtc']
         oldMode       = [string]$record['oldMode']
         arcResourceId = [string]$record['arcResourceId']
+    }
+}
+
+function Complete-DemoHostGuestRebuild {
+    <#
+    .SYNOPSIS
+    Marks the rebuild of an unfinished guest Done (guest-rebuild.json, 2026-11-09) once the guest that exists now, whose
+    Hyper-V VM ID isn't the old guest's (oldGuestVmId), has passed ArcOnboarding: the Arc marker is Connected and names that
+    VM ID. deploy.ps1 then stops following the rebuild up (Complete-DemoT2GuestRebuild), so it never touches the new
+    guest's Arc resources. Runs after every pass; changes nothing without a record in state Removed, or without that
+    evidence. Never throws.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    try {
+        $path = Get-DemoHostGuestRebuildPath -Context $Context
+        $record = Read-DemoVmJsonFile -Path $path
+        if ($null -eq $record -or [string]$record['state'] -ne 'Removed') {
+            return
+        }
+        $vmId = Get-DemoHostGuestVmId -Name $Context.GuestName
+        if (-not $vmId -or $vmId -eq [string]$record['oldGuestVmId']) {
+            return
+        }
+        $marker = Read-DemoVmJsonFile -Path $Context.ArcMarkerPath
+        if ($null -eq $marker -or [string]$marker['status'] -ne 'Connected' -or [string]$marker['guestVmId'] -ne $vmId) {
+            return
+        }
+        if (-not $PSCmdlet.ShouldProcess($Context.GuestName, 'Mark the rebuild of its guest done')) {
+            return
+        }
+        $record['state'] = 'Done'
+        $record['doneUtc'] = Get-DemoVmUtcNow
+        $record['newGuestVmId'] = $vmId
+        Write-DemoVmJsonFile -Path $path -InputObject $record
+        Write-DemoVmLog -Message ('The rebuild of {0} is done: its new guest (VM ID {1}) is onboarded to Azure Arc.' -f $Context.GuestName, $vmId)
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('The rebuild record couldn''t be checked: {0}' -f $_.Exception.Message)
+    }
+}
+
+function Test-DemoHostGuidedSetupLeftover {
+    <#
+    .SYNOPSIS
+    Whether an earlier guided stop left something on this host for its cleanup (2026-11-09): the guest's armed automatic
+    sign-in (guided-setup-armed.json), setup's prepared sign-in (guided-setup-signin.json), or, for a guest not made from
+    the Jumpstart image, a guest password rotation that stopped midway (guest-administrator.bin.pending; the image's first
+    boot resolves its own). Then Invoke-DemoHostGuidedSetupGuard runs before the pass outside PaygWizard mode too: a guest
+    built in PaygWizard mode now runs as JumpstartImage, and its signed-in setup or an unusable password would keep the
+    GuestSource step waiting. False on an error, as before. Never throws.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    try {
+        $path = Get-DemoGuidedSetupPath -Root $Context.Root
+        if ((Test-Path -LiteralPath $path.HostArmed -PathType Leaf) -or (Test-Path -LiteralPath $path.HostSignIn -PathType Leaf)) {
+            return $true
+        }
+        if (-not (Test-Path -LiteralPath ($Context.SecretPath + '.pending') -PathType Leaf)) {
+            return $false
+        }
+        $record = Read-DemoVmJsonFile -Path (Get-DemoHostGuestSourcePath -Context $Context)
+        return (-not ($null -ne $record -and [string]$record['source'] -eq 'JumpstartImage'))
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('What an earlier guided stop left on this host couldn''t be checked: {0}' -f $_.Exception.Message)
+        return $false
     }
 }
 

@@ -425,7 +425,7 @@ function Get-DemoEnvironmentStatus {
         }
         else {
             $expiry = if ($bastion.ExpiresUtc) { 'until ' + $bastion.ExpiresUtc } else { 'with no expiry tag' }
-            $results.Add((New-DemoResult -CheckId 'STATUS.BASTION' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('{0} exists {1} and, with its public IP, bills {2}.' -f $bastion.Name, $expiry, $costText) -Evidence $evidence -Remediation 'When the setup-wizard step is done, run ./scripts/stop-demo.ps1 -RemoveBastionOnly; the bastion-cleanup workflow removes it after its expiry.' -DocUrl 'https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices'))
+            $results.Add((New-DemoResult -CheckId 'STATUS.BASTION' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('{0} exists {1} and, with its public IP, bills {2}.' -f $bastion.Name, $expiry, $costText) -Evidence $evidence -Remediation 'When nobody needs it any more, run ./scripts/stop-demo.ps1 -RemoveBastionOnly; the bastion-cleanup workflow removes it after its expiry.' -DocUrl 'https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices'))
         }
     }
 

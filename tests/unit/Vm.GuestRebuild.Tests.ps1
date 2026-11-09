@@ -384,6 +384,41 @@ Describe 'What the T2 host reports to deploy.ps1' {
         $summary.rebuildArcNew | Should -BeFalse -Because 'no Arc marker is there for the new guest yet'
     }
 
+    It 'says the Arc marker is the new guest''s only on evidence, and false only on evidence that it isn''t: <Case> (review of 849d4c2)' -ForEach @(
+        @{ Case = 'no marker yet'; State = 'Removed'; Marker = $false; MarkerVmId = ''; Current = 'new'; Expected = $false }
+        @{ Case = 'the old guest''s marker'; State = 'Removed'; Marker = $true; MarkerVmId = 'old'; Current = 'new'; Expected = $false }
+        @{ Case = 'the new guest''s marker'; State = 'Done'; Marker = $true; MarkerVmId = 'new'; Current = 'new'; Expected = $true }
+        @{ Case = 'a marker without a VM ID'; State = 'Removed'; Marker = $true; MarkerVmId = ''; Current = 'new'; Expected = $null }
+        @{ Case = 'a marker for another guest'; State = 'Removed'; Marker = $true; MarkerVmId = 'other'; Current = 'new'; Expected = $null }
+        @{ Case = 'a marker, but no guest'; State = 'Removed'; Marker = $true; MarkerVmId = 'new'; Current = ''; Expected = $null }
+    ) {
+        $ids = @{ old = 'aaaaaaaa-0000-4000-8000-000000000001'; new = 'aaaaaaaa-0000-4000-8000-000000000002'; other = 'aaaaaaaa-0000-4000-8000-000000000003' }
+        # The health script runs as its own script, where $script: in a mock's body is that script's scope: the VM ID goes in
+        # the body itself.
+        $body = if ($Current) { [scriptblock]::Create(('[pscustomobject]@{{ Name = ''arcsql01''; State = ''Running''; VMId = [guid]''{0}'' }}' -f $ids[$Current])) } else { { } }
+        Mock -CommandName Get-VM -MockWith $body
+        $root = Join-Path -Path $TestDrive -ChildPath ('health-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $root -Force
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), (ConvertTo-Json -InputObject ([ordered]@{ schemaVersion = 1; state = 'InProgress'; currentStep = 'ArcOnboarding'; message = 'Onboarding.' }) -Depth 4))
+        $rebuild = [ordered]@{ schemaVersion = 1; state = $State; startedUtc = '2026-11-09T10:00:00Z'; removedUtc = '2026-11-09T10:01:00Z'; oldMode = 'PaygWizard'; oldGuestVmId = $ids['old']; arcResourceId = '/subscriptions/x/resourceGroups/rg/providers/Microsoft.HybridCompute/machines/arcsql01'; removed = @('the guest VM arcsql01') }
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'guest-rebuild.json'), (ConvertTo-Json -InputObject $rebuild -Depth 6))
+        if ($Marker) {
+            $content = [ordered]@{ schemaVersion = 1; machineName = 'arcsql01'; status = 'Connected'; resourceId = $rebuild.arcResourceId; connectedUtc = '2026-11-09T11:00:00Z' }
+            if ($MarkerVmId) {
+                $content['guestVmId'] = $ids[$MarkerVmId]
+            }
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'arc-onboarded.json'), (ConvertTo-Json -InputObject $content -Depth 4))
+        }
+        $summary = (& (Join-Path -Path $repoRoot -ChildPath 'vm/health/Get-DemoHealth.ps1') -Root $root -View Summary) | ConvertFrom-Json
+        $summary.guestRebuild | Should -Be $State
+        if ($null -eq $Expected) {
+            $summary.rebuildArcNew | Should -BeNullOrEmpty -Because 'deploy.ps1 deletes nothing in Azure when the host can''t tell'
+        }
+        else {
+            $summary.rebuildArcNew | Should -Be $Expected
+        }
+    }
+
     It 'leaves the rebuild out of the summary when there''s none' {
         $root = Join-Path -Path $TestDrive -ChildPath ('health-' + [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $root -Force
@@ -391,5 +426,125 @@ Describe 'What the T2 host reports to deploy.ps1' {
         $summary = (& (Join-Path -Path $repoRoot -ChildPath 'vm/health/Get-DemoHealth.ps1') -Root $root -View Summary) | ConvertFrom-Json
         $summary.guestRebuild | Should -BeNullOrEmpty
         $summary.rebuildArcNew | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'The end of a rebuild (review of 849d4c2, 2026-11-09)' {
+    BeforeEach {
+        $script:context = New-TestHostContext
+        $script:ids = @{ old = 'aaaaaaaa-0000-4000-8000-000000000001'; new = 'aaaaaaaa-0000-4000-8000-000000000002' }
+        $script:currentVmId = $script:ids['new']
+        Mock -CommandName Get-VM -MockWith { if ($script:currentVmId) { [pscustomobject]@{ Name = 'arcsql01'; State = 'Running'; VMId = [guid]$script:currentVmId } } }
+        $script:writeRecord = {
+            param([string] $State)
+            Write-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $script:context) -InputObject ([ordered]@{ schemaVersion = 1; state = $State; reason = 'r'; startedUtc = '2026-11-09T10:00:00Z'; removedUtc = '2026-11-09T10:01:00Z'; oldMode = 'PaygWizard'; oldGuestVmId = $script:ids['old']; arcResourceId = '/subscriptions/x/resourceGroups/rg/providers/Microsoft.HybridCompute/machines/arcsql01'; removed = @('the guest VM arcsql01') })
+        }
+        $script:writeMarker = {
+            param([string] $Status, [string] $GuestVmId)
+            $marker = [ordered]@{ schemaVersion = 1; machineName = 'arcsql01'; status = $Status; resourceId = '/subscriptions/x/resourceGroups/rg/providers/Microsoft.HybridCompute/machines/arcsql01'; connectedUtc = '2026-11-09T11:00:00Z' }
+            if ($GuestVmId) {
+                $marker['guestVmId'] = $GuestVmId
+            }
+            Write-DemoVmJsonFile -Path $script:context.ArcMarkerPath -InputObject $marker
+        }
+    }
+
+    It 'marks the rebuild Done once a new guest passed ArcOnboarding, and keeps the rest of its record' {
+        & $script:writeRecord 'Removed'
+        & $script:writeMarker 'Connected' $script:ids['new']
+        Complete-DemoHostGuestRebuild -Context $script:context -Confirm:$false
+        $record = Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $script:context)
+        $record['state'] | Should -Be 'Done'
+        $record['newGuestVmId'] | Should -Be $script:ids['new']
+        $record['doneUtc'] | Should -Not -BeNullOrEmpty
+        $record['oldGuestVmId'] | Should -Be $script:ids['old']
+        @($record['removed']) | Should -Contain 'the guest VM arcsql01'
+        $detail = Get-DemoHostGuestRebuildDetail -Context $script:context
+        $detail.state | Should -Be 'Done'
+        $detail.doneUtc | Should -Not -BeNullOrEmpty
+    }
+
+    It 'leaves the record as it is when <Case>' -ForEach @(
+        @{ Case = 'the deletion isn''t finished'; State = 'Removing'; Marker = 'Connected'; MarkerVmId = 'new'; Current = 'new' }
+        @{ Case = 'the new guest isn''t onboarded yet'; State = 'Removed'; Marker = ''; MarkerVmId = ''; Current = 'new' }
+        @{ Case = 'the Arc marker is the old guest''s'; State = 'Removed'; Marker = 'Connected'; MarkerVmId = 'old'; Current = 'new' }
+        @{ Case = 'the Arc marker names no guest'; State = 'Removed'; Marker = 'Connected'; MarkerVmId = ''; Current = 'new' }
+        @{ Case = 'the Arc marker isn''t Connected'; State = 'Removed'; Marker = 'Pending'; MarkerVmId = 'new'; Current = 'new' }
+        @{ Case = 'the guest is still the old one'; State = 'Removed'; Marker = 'Connected'; MarkerVmId = 'old'; Current = 'old' }
+        @{ Case = 'there''s no guest'; State = 'Removed'; Marker = 'Connected'; MarkerVmId = 'new'; Current = '' }
+        @{ Case = 'it''s Done already'; State = 'Done'; Marker = 'Connected'; MarkerVmId = 'new'; Current = 'new' }
+    ) {
+        $script:currentVmId = if ($Current) { $script:ids[$Current] } else { '' }
+        & $script:writeRecord $State
+        if ($Marker) {
+            & $script:writeMarker $Marker $(if ($MarkerVmId) { $script:ids[$MarkerVmId] } else { '' })
+        }
+        Complete-DemoHostGuestRebuild -Context $script:context -Confirm:$false
+        $record = Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $script:context)
+        $record['state'] | Should -Be $State
+        $record.Contains('newGuestVmId') | Should -BeFalse
+        $record.Contains('doneUtc') | Should -BeFalse
+    }
+
+    It 'changes nothing without a record, and never throws' {
+        & $script:writeMarker 'Connected' $script:ids['new']
+        Complete-DemoHostGuestRebuild -Context $script:context -Confirm:$false
+        Test-Path -LiteralPath (Get-DemoHostGuestRebuildPath -Context $script:context) | Should -BeFalse
+        & $script:writeRecord 'Removed'
+        Mock -CommandName Get-VM -MockWith { throw 'Hyper-V isn''t answering.' }
+        { Complete-DemoHostGuestRebuild -Context $script:context -Confirm:$false } | Should -Not -Throw
+        (Read-DemoVmJsonFile -Path (Get-DemoHostGuestRebuildPath -Context $script:context))['state'] | Should -Be 'Removed'
+    }
+}
+
+Describe 'The guided stop''s cleanup outside PaygWizard mode (review of 849d4c2, 2026-11-09)' {
+    It 'finds what an earlier guided stop left on the host: <Case>' -ForEach @(
+        @{ Case = 'nothing'; Files = @(); Source = 'Build'; Expected = $false }
+        @{ Case = 'the armed automatic sign-in'; Files = @('HostArmed'); Source = 'Build'; Expected = $true }
+        @{ Case = 'setup''s prepared sign-in'; Files = @('HostSignIn'); Source = 'Build'; Expected = $true }
+        @{ Case = 'a stopped rotation of a built guest''s password'; Files = @('Pending'); Source = 'Build'; Expected = $true }
+        @{ Case = 'a stopped rotation, without a source record'; Files = @('Pending'); Source = ''; Expected = $true }
+        @{ Case = 'a stopped rotation in a guest made from the image, whose first boot resolves it'; Files = @('Pending'); Source = 'JumpstartImage'; Expected = $false }
+        @{ Case = 'the armed sign-in, whatever made the guest'; Files = @('HostArmed'); Source = 'JumpstartImage'; Expected = $true }
+    ) {
+        $record = if ($Source) { [ordered]@{ source = $Source; installMode = $(if ($Source -eq 'JumpstartImage') { 'JumpstartImage' } else { 'PaygWizard' }); recordedUtc = '2026-10-30T10:00:00Z' } } else { $null }
+        $context = New-TestHostContext -GuestSource $record
+        $guided = Get-DemoGuidedSetupPath -Root $context.Root
+        foreach ($file in $Files) {
+            New-TestFile -Path $(if ($file -eq 'Pending') { $context.SecretPath + '.pending' } else { $guided.$file })
+        }
+        Test-DemoHostGuidedSetupLeftover -Context $context | Should -Be $Expected
+    }
+
+    It 'says false, and never throws, when it can''t check' {
+        $context = New-TestHostContext
+        Mock -CommandName Get-DemoGuidedSetupPath -MockWith { throw 'The disk is busy.' }
+        Test-DemoHostGuidedSetupLeftover -Context $context | Should -BeFalse
+    }
+
+    It 'runs the guard before the pass in <Mode> mode when <Case>, and the rebuild''s end after it' -ForEach @(
+        @{ Mode = 'JumpstartImage'; Leftover = $true; Case = 'an earlier guided stop left something'; Expected = 'guard,pass,rebuild,unlock' }
+        @{ Mode = 'JumpstartImage'; Leftover = $false; Case = 'nothing is left'; Expected = 'pass,rebuild,unlock' }
+        @{ Mode = 'PaygWizard'; Leftover = $false; Case = 'it keeps a finished wizard guest'; Expected = 'guard,pass,rebuild,unlock' }
+    ) {
+        $script:calls = [System.Collections.Generic.List[string]]::new()
+        $script:mode = $Mode
+        $script:leftover = $Leftover
+        $root = Join-Path -Path $TestDrive -ChildPath ('pass-' + [guid]::NewGuid().ToString('N'))
+        Mock -CommandName Initialize-DemoVmContext -MockWith { }
+        $script:lockPath = Join-Path -Path $TestDrive -ChildPath ('lock-' + [guid]::NewGuid().ToString('N'))
+        Mock -CommandName Enter-DemoVmLock -MockWith { [System.IO.File]::Open($script:lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) }
+        Mock -CommandName Exit-DemoVmLock -MockWith { $Lock.Dispose(); $script:calls.Add('unlock') }
+        Mock -CommandName Get-DemoVmSetting -MockWith { [ordered]@{ generation = 'g1' } }
+        Mock -CommandName Get-DemoHostContext -MockWith { [ordered]@{ Mode = $script:mode; Root = 'unused' } }
+        Mock -CommandName Copy-Item -MockWith { }
+        Mock -CommandName Get-DemoHostStepPlan -MockWith { ,@([ordered]@{ Name = 'GuestSource' }) }
+        Mock -CommandName Test-DemoHostGuidedSetupLeftover -MockWith { $script:leftover }
+        Mock -CommandName Invoke-DemoHostGuidedSetupGuard -MockWith { $script:calls.Add('guard') }
+        Mock -CommandName Invoke-DemoVmStateMachine -MockWith { $script:calls.Add('pass'); 'InProgress' }
+        Mock -CommandName Complete-DemoHostGuestRebuild -MockWith { $script:calls.Add('rebuild') }
+        Mock -CommandName Invoke-DemoHostEvaluationGuard -MockWith { $script:calls.Add('evaluation') }
+        Invoke-DemoHostBootstrap -StateRoot $root -BundleRoot $repoRoot | Should -Be 'InProgress'
+        ($script:calls -join ',') | Should -Be $Expected
     }
 }

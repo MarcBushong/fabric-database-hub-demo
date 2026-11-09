@@ -778,6 +778,35 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $rebuild[0].status | Should -Be 'Warning'
     }
 
+    It 'clears what an earlier guided stop left open before the T2 host''s loader starts a new generation, and nothing without it (review of 849d4c2, 2026-11-09)' {
+        # The T2 host runs a guest built in PaygWizard mode as JumpstartImage now, so an earlier guided stop's request there
+        # would keep that guest waiting for a person: it goes before the loader, with Bastion and a handed-over host password.
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); $script:state.HostPasswordUtc = ''; @() }
+        $script:context['T2Source'] = 'build'
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:calls | Where-Object { $_ -in 'cleanup', 'loader archost01' }) | Should -Be @('cleanup', 'loader archost01')
+        ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).status | Should -Be 'Pass'
+
+        # Nothing recorded, as in a fresh deployment: the loader alone.
+        $script:calls.Clear()
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+        $script:calls | Should -Not -Contain 'cleanup'
+        $script:calls | Should -Contain 'loader archost01'
+        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' } | Should -BeNullOrEmpty
+
+        # A cleanup that fails doesn't stop the loader: a Warning names the command that finishes it.
+        $script:calls.Clear()
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        Mock -ModuleName DbHubDemo -CommandName Clear-DemoGuidedStopLeftover -MockWith { throw 'The Run Command failed.' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps') }
+        $script:calls | Should -Contain 'loader archost01'
+        $leftover = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }
+        $leftover.status | Should -Be 'Warning'
+        $leftover.remediation | Should -Match 'stop-demo\.ps1 -RemoveBastionOnly'
+    }
+
     It 'reports a T2 that builds its guest as running in the background, without waiting' {
         $script:context['T2Source'] = 'build'
         $script:arcConnected = $false

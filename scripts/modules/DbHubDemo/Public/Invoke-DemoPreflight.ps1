@@ -420,7 +420,15 @@ function Invoke-DemoPreflight {
     # (its GuestSource step), which refuses a mode the guest wasn't made for.
     $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm' -and $installMode -eq 'JumpstartImage') {
-        Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Fail' 't2SqlInstallMode JumpstartImage needs the nested Hyper-V host: Arc Jumpstart''s image is a Hyper-V guest disk, but t2Mode EvaluationOnlyAzureVm makes T2 an Azure VM.' -Remediation 'Use t2Mode Nested with a nested-virtualization size, or, for the evaluation-only Azure VM, set t2SqlInstallMode to ProductKey or Developer, both unattended, or PaygWizard, which needs a person in Bastion for SQL Server setup once per guest build (ADR 0006).' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine'
+        # 2026-11-09: no SQL Server setup wizard anywhere, so the fix names only the unattended modes this VM runs. An older
+        # configuration's PaygWizard (its default before 2026-11-05) runs as JumpstartImage, which it can't.
+        $unattended = 'Set t2SqlInstallMode to ProductKey (your own SQL Server Standard product key, prerequisite P10) or Developer (T2 in Database Hub''s Estate only); both install unattended on the evaluation-only Azure VM (ADR 0006).'
+        if ((Get-DemoT2InstallModeSource -Config $Config) -eq 'legacy') {
+            Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Fail' 't2SqlInstallMode PaygWizard in your configuration is retired: the one-click deployment has no SQL Server setup wizard, so it runs as JumpstartImage, and Arc Jumpstart''s image is a Hyper-V guest disk, which t2Mode EvaluationOnlyAzureVm can''t use: it makes T2 an Azure VM.' -Remediation $unattended -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine'
+        }
+        else {
+            Add-Check 'PREFLIGHT.T2.MODE' 'T2' 'Fail' 't2SqlInstallMode JumpstartImage needs the nested Hyper-V host: Arc Jumpstart''s image is a Hyper-V guest disk, but t2Mode EvaluationOnlyAzureVm makes T2 an Azure VM.' -Remediation ($unattended + ' Or, to keep Arc Jumpstart''s image, use t2Mode Nested with a nested-virtualization size.') -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine'
+        }
     }
     elseif ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T2.MODE' -Area 'preflight' -Target 'T2' -Status 'Warning' -Message 't2Mode is EvaluationOnlyAzureVm: T2 is the Azure VM arcsql01, onboarded to Azure Arc with Microsoft''s evaluation procedure, which is for evaluation and testing only. Use it only when the nested-virtualization checks fail (ADR 0006).' -Remediation 'Set t2Mode to Nested when a nested-virtualization size is available.' -DocUrl 'https://learn.microsoft.com/azure/azure-arc/servers/plan-evaluate-on-azure-virtual-machine' -EvaluationOnly))

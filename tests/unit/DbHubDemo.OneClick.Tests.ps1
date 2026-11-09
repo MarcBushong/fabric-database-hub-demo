@@ -151,3 +151,153 @@ Describe 'No record leaves T4 out: every run tries the sizes again (2026-11-09)'
         }
     }
 }
+
+Describe 'Following up a rebuilt T2 guest in Azure (review of 849d4c2, 2026-11-09)' {
+    BeforeEach {
+        $script:config = [ordered]@{ subscriptionId = '11111111-2222-3333-4444-555555555555'; location = 'westus3'; t2Mode = 'Nested' }
+        $script:machine = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcTarget -MockWith { [pscustomobject]@{ SubscriptionId = '11111111-2222-3333-4444-555555555555'; MachineUrl = 'https://management.azure.com/machines/arcsql01'; MachineName = 'arcsql01' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -MockWith { $script:machine }
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoArcStaleResource -MockWith { @('sqlServerInstances/arcsql01', 'machines/arcsql01') }
+        Mock -ModuleName DbHubDemo -CommandName Clear-DemoGuidedStopLeftover -MockWith { @() }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:follow = {
+            param([hashtable] $Health)
+            @(InModuleScope DbHubDemo -Parameters @{ Config = $script:config; Health = [pscustomobject]$Health } { Complete-DemoT2GuestRebuild -Config $Config -Health $Health -Confirm:$false })
+        }
+        $script:removed = @{ guestRebuild = 'Removed'; rebuildUtc = '2026-11-09T10:00:00Z'; rebuildMode = 'PaygWizard'; rebuildArcId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.HybridCompute/machines/arcsql01' }
+    }
+
+    It 'decides what happens to arcsql01''s Arc machine on evidence only: <Case>' -ForEach @(
+        @{ Case = 'no machine'; Json = ''; Action = 'None' }
+        @{ Case = 'Disconnected'; Json = '{"name":"arcsql01","properties":{"status":"Disconnected"},"systemData":{"createdAt":"2026-11-09T10:40:00Z"}}'; Action = 'Delete' }
+        @{ Case = 'Expired'; Json = '{"name":"arcsql01","properties":{"status":"Expired"}}'; Action = 'Delete' }
+        @{ Case = 'without a status'; Json = '{"name":"arcsql01","properties":{}}'; Action = 'Delete' }
+        @{ Case = 'Connected, created before the rebuild started'; Json = '{"name":"arcsql01","properties":{"status":"Connected"},"systemData":{"createdAt":"2026-10-30T09:00:00.1234567Z"}}'; Action = 'Delete' }
+        @{ Case = 'Connected, created after the rebuild started'; Json = '{"name":"arcsql01","properties":{"status":"Connected"},"systemData":{"createdAt":"2026-11-09T10:40:00Z"}}'; Action = 'Keep' }
+        @{ Case = 'Connected, without systemData'; Json = '{"name":"arcsql01","properties":{"status":"Connected"}}'; Action = 'Keep' }
+    ) {
+        $machine = if ($Json) { $Json | ConvertFrom-Json } else { $null }
+        # PowerShell 7's ConvertFrom-Json reads the health summary's time as a DateTime; the text form must decide the same.
+        foreach ($rebuildUtc in @('2026-11-09T10:00:00Z', [datetime]::new(2026, 11, 9, 10, 0, 0, [System.DateTimeKind]::Utc))) {
+            $decision = InModuleScope DbHubDemo -Parameters @{ Machine = $machine; RebuildUtc = $rebuildUtc } { Get-DemoT2RebuildArcDecision -Machine $Machine -RebuildUtc $RebuildUtc }
+            $decision.Action | Should -Be $Action
+            $decision.Reason | Should -Not -BeNullOrEmpty
+        }
+    }
+
+    It 'keeps a Connected machine when the rebuild''s start isn''t known' {
+        $machine = '{"name":"arcsql01","properties":{"status":"Connected"},"systemData":{"createdAt":"2026-10-30T09:00:00Z"}}' | ConvertFrom-Json
+        (InModuleScope DbHubDemo -Parameters @{ Machine = $machine } { Get-DemoT2RebuildArcDecision -Machine $Machine -RebuildUtc '' }).Action | Should -Be 'Keep'
+    }
+
+    It 'has nothing to follow up when <Case>' -ForEach @(
+        @{ Case = 'there''s no rebuild'; Health = @{} }
+        @{ Case = 'the rebuild is Done'; Health = @{ guestRebuild = 'Done'; rebuildArcNew = $true } }
+        @{ Case = 'the rebuild is Done, whatever the marker says'; Health = @{ guestRebuild = 'Done' } }
+        @{ Case = 'the new guest is onboarded'; Health = @{ guestRebuild = 'Removed'; rebuildArcNew = $true } }
+    ) {
+        & $script:follow $Health | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoArcStaleResource -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Clear-DemoGuidedStopLeftover -Times 0 -Exactly
+    }
+
+    It 'deletes nothing in Azure when the host can''t tell whether the new guest is onboarded (<Case>)' -ForEach @(
+        @{ Case = 'null'; Present = $true }
+        @{ Case = 'not reported'; Present = $false }
+    ) {
+        $health = $script:removed.Clone()
+        if ($Present) {
+            $health['rebuildArcNew'] = $null
+        }
+        $script:machine = '{"name":"arcsql01","properties":{"status":"Disconnected"}}' | ConvertFrom-Json
+        $results = & $script:follow $health
+        $rebuild = $results | Where-Object { $_.checkId -eq 'DEPLOY.T2.REBUILD' }
+        $rebuild.status | Should -Be 'Warning'
+        $rebuild.message | Should -Match 'In Azure, nothing was deleted: archost01 couldn''t tell whether its new guest is onboarded'
+        $rebuild.evidence.arcNew | Should -BeNullOrEmpty
+        $rebuild.evidence.arcAction | Should -Be 'Keep'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoArcStaleResource -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Clear-DemoGuidedStopLeftover -Times 1 -Exactly
+    }
+
+    It 'with the new guest not onboarded yet, acts on the machine Azure shows: <Case>' -ForEach @(
+        @{ Case = 'a Disconnected one is deleted'; Json = '{"name":"arcsql01","properties":{"status":"Disconnected"}}'; Action = 'Delete'; Removes = 1; Says = 'were deleted, because it''s Disconnected' }
+        @{ Case = 'a Connected one from before the rebuild is deleted'; Json = '{"name":"arcsql01","properties":{"status":"Connected"},"systemData":{"createdAt":"2026-10-30T09:00:00Z"}}'; Action = 'Delete'; Removes = 1; Says = 'before the rebuild started' }
+        @{ Case = 'a Connected one from after the rebuild is kept'; Json = '{"name":"arcsql01","properties":{"status":"Connected"},"systemData":{"createdAt":"2026-11-09T10:40:00Z"}}'; Action = 'Keep'; Removes = 0; Says = 'was kept, because it''s Connected' }
+        @{ Case = 'none is left'; Json = ''; Action = 'None'; Removes = 0; Says = 'had no Arc machine left' }
+    ) {
+        $script:machine = if ($Json) { $Json | ConvertFrom-Json } else { $null }
+        $health = $script:removed.Clone()
+        $health['rebuildArcNew'] = $false
+        $rebuild = & $script:follow $health | Where-Object { $_.checkId -eq 'DEPLOY.T2.REBUILD' }
+        $rebuild.status | Should -Be 'Warning'
+        $rebuild.message | Should -Match $Says
+        $rebuild.evidence.arcAction | Should -Be $Action
+        $rebuild.evidence.arcNew | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoArcStaleResource -Times $Removes -Exactly
+    }
+
+    It 'keeps going when Azure can''t be read, and deletes nothing' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -MockWith { throw 'Azure answered 503.' }
+        $health = $script:removed.Clone()
+        $health['rebuildArcNew'] = $false
+        $rebuild = & $script:follow $health | Where-Object { $_.checkId -eq 'DEPLOY.T2.REBUILD' }
+        $rebuild.message | Should -Match 'couldn''t be deleted now \(Azure answered 503\.\)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoArcStaleResource -Times 0 -Exactly
+    }
+}
+
+Describe 'No fix offers a retired value (review of 849d4c2, 2026-11-09)' {
+    It 'never names PaygWizard or t4Enabled as a fix, and the setup-wizard step only where PaygWizard is the mode' {
+        # NOT DONE's next step comes from these texts, so an agent that follows AGENTS.md would loop on a value deploy.ps1
+        # ignores. Text inside an if whose condition names PaygWizard stays: only that mode has the setup-wizard step.
+        $root = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../..'))
+        $retired = '(?i)\bset\s+t4Enabled\b|\bt4Enabled\s+to\s+false\b|\bor\s+PaygWizard\b|PaygWizard,\s+which\s+needs|t2SqlInstallMode\s+to\s+PaygWizard|-T2SqlInstallMode\s+PaygWizard'
+        $wizardStep = '(?i)\b(finish|do)\s+the\s+setup-wizard\s+step\b|setup-wizard step is in docs|When the setup-wizard step|build and the wizard'
+        $found = [System.Collections.Generic.List[string]]::new()
+        foreach ($file in Get-ChildItem -Path (Join-Path -Path $root -ChildPath 'scripts'), (Join-Path -Path $root -ChildPath 'vm') -Recurse -Include '*.ps1', '*.psm1') {
+            $tokens = $null
+            $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            $strings = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true)
+            foreach ($node in $strings) {
+                if ($node.Value -match $retired) {
+                    $found.Add(('{0}:{1}: {2}' -f $file.Name, $node.Extent.StartLineNumber, $Matches[0]))
+                    continue
+                }
+                if ($node.Value -notmatch $wizardStep) {
+                    continue
+                }
+                $guarded = $false
+                for ($parent = $node.Parent; $null -ne $parent -and -not $guarded; $parent = $parent.Parent) {
+                    if ($parent -is [System.Management.Automation.Language.IfStatementAst]) {
+                        foreach ($clause in $parent.Clauses) {
+                            if ($clause.Item1.Extent.Text -match 'PaygWizard' -and $node.Extent.StartOffset -ge $clause.Item2.Extent.StartOffset -and $node.Extent.EndOffset -le $clause.Item2.Extent.EndOffset) {
+                                $guarded = $true
+                            }
+                        }
+                    }
+                }
+                if (-not $guarded) {
+                    $found.Add(('{0}:{1}: {2}' -f $file.Name, $node.Extent.StartLineNumber, $Matches[0]))
+                }
+            }
+        }
+        $found | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'The evaluation-only T2 with an older configuration (review of 849d4c2, 2026-11-09)' {
+    It 'says PaygWizard is retired there, and names only the unattended modes' {
+        $config = Get-DemoConfig -Path (New-TestConfigFile -Values @{ t2Mode = 'EvaluationOnlyAzureVm'; t2SqlInstallMode = 'PaygWizard' })
+        $config['t2SqlInstallMode'] | Should -Be 'JumpstartImage'
+        $text = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT2LegacyModeText -Config $Config }
+        $text | Should -Match 'is retired: the one-click deployment has no SQL Server setup wizard, and t2Mode EvaluationOnlyAzureVm can''t use Arc Jumpstart''s image'
+        $text | Should -Match 'Set t2SqlInstallMode to ProductKey or Developer\.$'
+        $text | Should -Not -Match 'set t2SqlInstallMode to JumpstartImage'
+    }
+}

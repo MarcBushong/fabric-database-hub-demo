@@ -12,9 +12,10 @@ the first 500 characters of message, currentStep, generation, updatedUtc, and fr
 Arc onboarding, the guest's state, and its SQL Server edition. Since 2026-11-09 it also prints the configured install
 mode, whether the configuration names it (modeSource), whether the host kept an existing guest's mode (modeAdopted), the
 guest's own mode (guestMode) and whether a pass saw SQL Server set up in it (guestSetUp), and the last rebuild of an
-unfinished guest, read from guest-rebuild.json itself (guestRebuild,
-rebuildUtc, rebuildMode, rebuildArcId, the old guest's Arc machine, and rebuildArcNew, whether the Arc marker is already
-for the guest that exists now; the Full view adds them as t2Rebuild). Since Phase 28 it also prints the PaygWizard
+unfinished guest, read from guest-rebuild.json itself (guestRebuild: Removing, Removed, or Done once the new guest
+passed ArcOnboarding; rebuildUtc, rebuildMode, rebuildArcId, the old guest's Arc machine, and rebuildArcNew, whether
+the Arc marker is already for the guest that exists now: true, false only on positive evidence, or null when that
+can't be told; the Full view adds them as t2Rebuild). Since Phase 28 it also prints the PaygWizard
 guided stop's state (details.guidedSetup): whether automatic sign-in is armed in the guest, deploy.ps1's
 request (none, valid, expired, or invalid), setup's sign-in preparation (none, preparing, ready, or restoring:
 the WebView2 runtime, IE Enhanced Security Configuration off for administrators, and the Trusted sites entries;
@@ -146,18 +147,20 @@ function Get-DemoHealthGuestFact {
 function Get-DemoHealthRebuildFact {
     # The last rebuild of an unfinished T2 guest (2026-11-09), read from guest-rebuild.json itself, because health.json's
     # details are written only at the end of the host's pass, which a rebuild's download keeps going for about half an hour.
-    # arcCurrent: the Arc marker is for the guest that exists now (its guestVmId), so the Arc machine is the new guest's.
-    # $null without a record. Never throws.
+    # arcCurrent, three-state: $true when the Arc marker names the VM ID of the guest that exists now (the new guest is
+    # onboarded); $false only on positive evidence that it isn't (no marker, or the old guest's, oldGuestVmId); $null when
+    # that can't be told (a marker without a VM ID or for another guest, Hyper-V not answering, no guest, or an error),
+    # which deploy.ps1 takes as "delete nothing in Azure". $null without a record. Never throws.
     param([string] $StateRoot, [string] $Guest)
 
     $recordPath = Join-Path -Path $StateRoot -ChildPath 'guest-rebuild.json'
     if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
         return $null
     }
-    $facts = [ordered]@{ state = 'Unreadable'; startedUtc = ''; oldMode = ''; arcResourceId = ''; arcCurrent = $false }
+    $facts = [ordered]@{ state = 'Unreadable'; startedUtc = ''; oldMode = ''; arcResourceId = ''; oldGuestVmId = ''; arcCurrent = $null }
     try {
         $record = [System.IO.File]::ReadAllText($recordPath) | ConvertFrom-Json
-        foreach ($name in 'state', 'startedUtc', 'oldMode', 'arcResourceId') {
+        foreach ($name in 'state', 'startedUtc', 'oldMode', 'arcResourceId', 'oldGuestVmId') {
             $property = $record.PSObject.Properties[$name]
             if ($property -and $null -ne $property.Value) {
                 # PowerShell 7's ConvertFrom-Json reads an ISO time as a DateTime; Windows PowerShell 5.1 keeps the text.
@@ -170,16 +173,29 @@ function Get-DemoHealthRebuildFact {
             }
         }
         $markerPath = Join-Path -Path $StateRoot -ChildPath 'arc-onboarded.json'
-        if ((Test-Path -LiteralPath $markerPath -PathType Leaf) -and (Get-Command -Name 'Get-VM' -ErrorAction SilentlyContinue)) {
+        if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+            $facts['arcCurrent'] = $false
+        }
+        else {
             $marker = [System.IO.File]::ReadAllText($markerPath) | ConvertFrom-Json
-            $vm = Get-VM -Name $Guest -ErrorAction SilentlyContinue
-            $markerVmId = $marker.PSObject.Properties['guestVmId']
-            if ($vm -and $markerVmId -and [string]$markerVmId.Value -and [string]::Equals([string]$markerVmId.Value, [string]$vm.VMId, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $facts['arcCurrent'] = $true
+            $property = $marker.PSObject.Properties['guestVmId']
+            $markerVmId = ''
+            if ($property -and $null -ne $property.Value) {
+                $markerVmId = [string]$property.Value
+            }
+            if ($markerVmId -and $facts['oldGuestVmId'] -and [string]::Equals($markerVmId, [string]$facts['oldGuestVmId'], [System.StringComparison]::OrdinalIgnoreCase)) {
+                $facts['arcCurrent'] = $false
+            }
+            elseif ($markerVmId -and (Get-Command -Name 'Get-VM' -ErrorAction SilentlyContinue)) {
+                $vm = Get-VM -Name $Guest -ErrorAction SilentlyContinue
+                if ($vm -and [string]::Equals($markerVmId, [string]$vm.VMId, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $facts['arcCurrent'] = $true
+                }
             }
         }
     }
     catch {
+        $facts['arcCurrent'] = $null
         $facts['error'] = ([string]$_.Exception.Message) -replace '[\r\n]+', ' '
     }
     return $facts
@@ -236,7 +252,7 @@ if ($View -eq 'Summary') {
         rebuildUtc     = $(if ($null -ne $rebuildFacts) { $rebuildFacts['startedUtc'] } else { $null })
         rebuildMode    = $(if ($null -ne $rebuildFacts) { $rebuildFacts['oldMode'] } else { $null })
         rebuildArcId   = $(if ($null -ne $rebuildFacts) { $rebuildFacts['arcResourceId'] } else { $null })
-        rebuildArcNew  = $(if ($null -ne $rebuildFacts) { [bool]$rebuildFacts['arcCurrent'] } else { $null })
+        rebuildArcNew  = $(if ($null -ne $rebuildFacts) { $rebuildFacts['arcCurrent'] } else { $null })
         arcOnboarded   = & $read $health @('details', 'arcOnboarded')
         guestState     = & $read $health @('details', 'guest', 'state')
         sqlEdition     = & $read $health @('details', 'guest', 'sql', 'edition')

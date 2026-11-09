@@ -1,8 +1,9 @@
 # T2's guest on an existing host, on deploy.ps1's side (ADR 0006, amendment of 2026-11-09). The T2 host decides, because
 # only it can see the guest (vm/bootstrap/HostSteps.ps1, the GuestSource step): in JumpstartImage mode it rebuilds a guest
 # built in PaygWizard mode whose SQL Server setup was never finished, and keeps a guest whose SQL Server is set up in the
-# mode it was built in. deploy.ps1 follows what the host reports: it deletes the old guest's Arc resources in Azure, cleans
-# up what an earlier guided stop left open, says so on the console and the status page, and records the guest's mode
+# mode it was built in. deploy.ps1 follows what the host reports: it deletes the old guest's Arc resources in Azure when the
+# host and Azure both show they're the old guest's (Get-DemoT2RebuildArcDecision), cleans up what an earlier guided stop
+# left open, says so on the console and the status page, and records the guest's mode
 # (DbHubT2InstallMode). PaygWizard is retired from the one-click deployment (2026-11-09, user-directed): a configuration's
 # PaygWizard runs as JumpstartImage (Get-DemoConfig), and no run builds a guest that waits for the setup wizard.
 # Sources (checked 2026-11-09):
@@ -57,6 +58,9 @@ function Get-DemoT2LegacyModeText {
 
     if ((Get-DemoT2InstallModeSource -Config $Config) -ne 'legacy') {
         return ''
+    }
+    if ([string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm') {
+        return 't2SqlInstallMode PaygWizard in your configuration (the default init.ps1 wrote before 2026-11-05) is retired: the one-click deployment has no SQL Server setup wizard, and t2Mode EvaluationOnlyAzureVm can''t use Arc Jumpstart''s image instead, so preflight stops (PREFLIGHT.T2.MODE). Set t2SqlInstallMode to ProductKey or Developer.'
     }
     return 't2SqlInstallMode PaygWizard in your configuration (the default init.ps1 wrote before 2026-11-05) is ignored: T2 comes from Arc Jumpstart''s image (JumpstartImage), with no setup wizard and no sign-in to a VM, and a T2 guest whose SQL Server is already set up is kept as it is. To drop this note, set t2SqlInstallMode to JumpstartImage.'
 }
@@ -117,15 +121,52 @@ function Get-DemoT2RebuildText {
     return ('archost01''s guest arcsql01 was built in {0} mode, and its SQL Server setup was never finished, so it had nothing to keep: archost01 deleted it and makes T2 again from Arc Jumpstart''s image (t2SqlInstallMode JumpstartImage), with no step for a person. That takes about 27 minutes, measured on 2026-11-06, including the 34 GiB download at about 51 MiB/s, then about 33 for Arc onboarding. T1, T3, T4, Fabric, and archost01 itself are untouched.' -f $mode)
 }
 
+function Get-DemoT2RebuildArcDecision {
+    <#
+    .SYNOPSIS
+    What deploy.ps1 does with arcsql01's Arc machine after the T2 host deleted an unfinished guest (2026-11-09): Action None
+    (no machine), Delete, or Keep, with Reason. Delete only on evidence that it's the old guest's: it isn't Connected, so no
+    agent checks in as it, or it's still Connected but Azure created it before the rebuild started (systemData.createdAt),
+    so the new guest, made afterwards, can't be the one. Anything else keeps it: configure-arc.ps1 deletes a disconnected
+    machine, with its SQL Server instances, before it onboards the new guest. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $Machine,
+
+        [AllowNull()]
+        [object] $RebuildUtc
+    )
+
+    $decide = { param([string] $Action, [string] $Reason) [pscustomobject]@{ Action = $Action; Reason = $Reason } }
+    if ($null -eq $Machine) {
+        return (& $decide 'None' 'the old guest had no Arc machine left')
+    }
+    $status = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Machine -Name 'properties') -Name 'status')
+    if ($status -ne 'Connected') {
+        return (& $decide 'Delete' ('it''s {0}, so no guest checks in as it' -f $(if ($status) { $status } else { 'without a status' })))
+    }
+    $created = ConvertTo-DemoUtcDate -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Machine -Name 'systemData') -Name 'createdAt')
+    $started = ConvertTo-DemoUtcDate -Value $RebuildUtc
+    if ($null -ne $created -and $null -ne $started -and $created -lt $started) {
+        return (& $decide 'Delete' ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, 'it''s still Connected, but Azure created it at {0:yyyy-MM-dd HH:mm} UTC, before the rebuild started at {1:yyyy-MM-dd HH:mm} UTC, so it''s the old guest''s', $created, $started)))
+    }
+    return (& $decide 'Keep' 'it''s Connected, and nothing shows that it''s the old guest''s, so it may be the new guest''s')
+}
+
 function Complete-DemoT2GuestRebuild {
     <#
     .SYNOPSIS
     deploy.ps1's side of a rebuilt T2 guest (2026-11-09). When the host's health reports the rebuild of an unfinished guest
-    (guestRebuild Removing or Removed, read from its record) and the Arc marker isn't for the guest that exists now
-    (rebuildArcNew false, so the new guest isn't onboarded yet): the old guest's Arc resources in Azure go, its SQL Server
-    instances first, then the machine (Remove-DemoArcStaleResource, as destroy.ps1 deletes them), and what an earlier guided
-    stop left open goes too (Clear-DemoGuidedStopLeftover: on-demand Bastion, a handed-over host password). The console and
-    the status page say what happens and how long it takes. Returns DEPLOY.T2.REBUILD (a Warning: nothing to do, but worth
+    (guestRebuild Removing or Removed, read from its record; Done once the new guest passed ArcOnboarding ends it) and the
+    new guest isn't known to be onboarded (rebuildArcNew isn't true): the console and the status page say what happens and
+    how long it takes, and what an earlier guided stop left open goes (Clear-DemoGuidedStopLeftover: on-demand Bastion, a
+    handed-over host password). The old guest's Arc resources in Azure go, its SQL Server instances first, then the
+    machine (Remove-DemoArcStaleResource, as destroy.ps1 deletes them), only when the host positively says the new guest
+    isn't onboarded (rebuildArcNew false) and the machine is the old guest's (Get-DemoT2RebuildArcDecision); when the host
+    couldn't tell (null), nothing in Azure is deleted. Returns DEPLOY.T2.REBUILD (a Warning: nothing to do, but worth
     knowing) with the cleanup's results, or nothing when there's no rebuild to follow up. Never throws. Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
@@ -141,10 +182,16 @@ function Complete-DemoT2GuestRebuild {
     )
 
     $state = [string](Get-DemoMemberValue -InputObject $Health -Name 'guestRebuild')
-    if ($state -notin 'Removing', 'Removed' -or [bool](Get-DemoMemberValue -InputObject $Health -Name 'rebuildArcNew')) {
+    if ($state -notin 'Removing', 'Removed') {
         return @()
     }
-    if (-not $PSCmdlet.ShouldProcess('arcsql01', 'Delete the rebuilt guest''s old Arc resources')) {
+    # Three-state (vm/health/Get-DemoHealth.ps1): true once the new guest is onboarded, which ends the follow-up; null when
+    # the host couldn't tell, which deletes nothing in Azure.
+    $arcNew = Get-DemoMemberValue -InputObject $Health -Name 'rebuildArcNew'
+    if ($arcNew -is [bool] -and $arcNew) {
+        return @()
+    }
+    if (-not $PSCmdlet.ShouldProcess('arcsql01', 'Follow up the rebuild of its guest, and delete the old guest''s Arc resources')) {
         return @()
     }
     $results = [System.Collections.Generic.List[object]]::new()
@@ -152,22 +199,36 @@ function Complete-DemoT2GuestRebuild {
     $text = Get-DemoT2RebuildText -OldMode $oldMode
     Write-DemoLog -Level Warning -Message ('T2: {0}' -f $text)
     Set-DemoProgressStep -Path $ProgressPath -Id 'T2.HostBuild' -State 'Running' -Message $text
-    $evidence = [ordered]@{ oldMode = $(if ($oldMode) { $oldMode } else { 'PaygWizard' }); rebuildUtc = [string](Get-DemoMemberValue -InputObject $Health -Name 'rebuildUtc'); rebuildState = $state; arcResourceId = [string](Get-DemoMemberValue -InputObject $Health -Name 'rebuildArcId'); arcDeleted = @(); arcProblem = '' }
+    $rebuildUtc = Get-DemoMemberValue -InputObject $Health -Name 'rebuildUtc'
+    $evidence = [ordered]@{ oldMode = $(if ($oldMode) { $oldMode } else { 'PaygWizard' }); rebuildUtc = [string]$rebuildUtc; rebuildState = $state; arcResourceId = [string](Get-DemoMemberValue -InputObject $Health -Name 'rebuildArcId'); arcNew = $(if ($arcNew -is [bool]) { $arcNew } else { $null }); arcAction = 'Keep'; arcDeleted = @(); arcProblem = '' }
+    $later = ' configure-arc.ps1 deletes a disconnected Arc machine, with its SQL Server instances, before it onboards the new guest.'
     $arcText = ''
-    try {
-        $target = Get-DemoArcTarget -Config $Config
-        $machine = Get-DemoArcArmResource -SubscriptionId $target.SubscriptionId -Url $target.MachineUrl
-        if ($null -eq $machine) {
-            $arcText = 'In Azure, the old guest had no Arc machine left.'
-        }
-        else {
-            $evidence['arcDeleted'] = @(Remove-DemoArcStaleResource -Target $target -Confirm:$false)
-            $arcText = 'In Azure, the old guest''s Arc resources were deleted: {0}.' -f (@($evidence['arcDeleted']) -join ', ')
-        }
+    if ($arcNew -isnot [bool]) {
+        $arcText = 'In Azure, nothing was deleted: archost01 couldn''t tell whether its new guest is onboarded to Azure Arc yet.' + $later
     }
-    catch {
-        $evidence['arcProblem'] = Protect-DemoText -Text $_.Exception.Message
-        $arcText = 'In Azure, the old guest''s Arc machine couldn''t be deleted now ({0}); configure-arc.ps1 deletes a disconnected one, with its SQL Server instances, before it onboards the new guest.' -f $evidence['arcProblem']
+    else {
+        try {
+            $target = Get-DemoArcTarget -Config $Config
+            $machine = Get-DemoArcArmResource -SubscriptionId $target.SubscriptionId -Url $target.MachineUrl
+            $decision = Get-DemoT2RebuildArcDecision -Machine $machine -RebuildUtc $rebuildUtc
+            $evidence['arcAction'] = $decision.Action
+            switch ($decision.Action) {
+                'None' {
+                    $arcText = 'In Azure, the old guest had no Arc machine left.'
+                }
+                'Delete' {
+                    $evidence['arcDeleted'] = @(Remove-DemoArcStaleResource -Target $target -Confirm:$false)
+                    $arcText = 'In Azure, the old guest''s Arc resources were deleted, because {0}: {1}.' -f $decision.Reason, (@($evidence['arcDeleted']) -join ', ')
+                }
+                default {
+                    $arcText = ('In Azure, the Arc machine arcsql01 was kept, because {0}.' -f $decision.Reason) + $later
+                }
+            }
+        }
+        catch {
+            $evidence['arcProblem'] = Protect-DemoText -Text $_.Exception.Message
+            $arcText = 'In Azure, the old guest''s Arc machine couldn''t be deleted now ({0});{1}' -f $evidence['arcProblem'], $later
+        }
     }
     try {
         $results.AddRange([object[]]@(Clear-DemoGuidedStopLeftover -Config $Config))

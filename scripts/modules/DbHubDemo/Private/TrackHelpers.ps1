@@ -950,6 +950,17 @@ function Invoke-DemoDeploymentTrack {
         if (-not (& $settle $VmName $progressId)) {
             return $false
         }
+        if ($VmName -eq 'archost01' -and (Get-DemoGuidedStopLeftover -State $state)) {
+            # 2026-11-09: an earlier guided stop's request on the host would keep its guest waiting for a person, though the
+            # host now runs that guest as JumpstartImage, which keeps or rebuilds it. So the request goes before the loader
+            # starts a new bootstrap generation, with Bastion and a handed-over host password (Clear-DemoGuidedStopLeftover).
+            try {
+                & $addAll @(Clear-DemoGuidedStopLeftover -Config $Config)
+            }
+            catch {
+                & $note 'DEPLOY.T2.GUIDEDLEFTOVER' 'T2' 'Warning' ('What an earlier guided stop left open couldn''t be cleaned up before the loader: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly: it removes Bastion and rotates the host password, and leaves the VMs running.'
+            }
+        }
         $settings = Get-DemoMemberValue -InputObject (& $option 'LoaderSettings' $null) -Name $SettingsKey
         $runnerSha = if ($state.RunnerSha256 -and $VmName -in $state.RunnerSentTo) { $state.RunnerSha256 } else { '' }
         $runLoader = { Invoke-DemoBootstrapLoaderRun -Config $Config -VmName $VmName -BundleSha256 $state.BundleSha256 -ChunkCount $state.BundleChunkCount -Settings $settings -RunnerSha256 $runnerSha -RunnerChunkCount $(if ($runnerSha) { $state.RunnerChunkCount } else { 0 }) -StartTimeoutSeconds $loaderStartSeconds }
