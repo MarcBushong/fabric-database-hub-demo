@@ -402,7 +402,7 @@ function Remove-DemoEnvironment {
                 }
             }
             if ($goldenGone) {
-                $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN' -Area 'teardown' -Target 'subscription' -Status 'Pass' -Message ('Deleted {0} and its {1} golden snapshot(s) (-IncludeGolden). The next deploy builds T2 and, in PaygWizard mode, waits for the setup-wizard step again.' -f $goldenGroup, $goldenSnapshots.Count) -Evidence ([ordered]@{ snapshots = @($goldenSnapshots | ForEach-Object { $_.Name }) }) -DocUrl $docUrl))
+                $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN' -Area 'teardown' -Target 'subscription' -Status 'Pass' -Message ('Deleted {0} and its {1} golden snapshot(s) (-IncludeGolden). The next deploy builds T2 again.' -f $goldenGroup, $goldenSnapshots.Count) -Evidence ([ordered]@{ snapshots = @($goldenSnapshots | ForEach-Object { $_.Name }) }) -DocUrl $docUrl))
             }
             else {
                 $results.Add((New-DemoResult -CheckId 'DESTROY.GOLDEN' -Area 'teardown' -Target 'subscription' -Status 'Warning' -Message ('{0} wasn''t deleted within {1} minutes: {2}' -f $goldenGroup, $WaitMinutes, (Get-DemoDeploymentErrorText -Text ([string]$goldenDelete.StdErr) -MaxLength 400)).Trim() -Remediation 'Run destroy.ps1 -IncludeGolden again, or delete the group in the portal.' -DocUrl $docUrl))

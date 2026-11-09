@@ -153,7 +153,9 @@ Describe 'Get-DemoCostEstimate' {
         $monthly = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
         $monthly.message | Should -Match 'T4 \(PostgreSQL, Standard_B1ms\) costs 27\.46 USD a month even while stopped'
         $monthly.message | Should -Match 'whether the nightly safety stop is in place wasn''t checked, so the worst case counts it running for the rest of the month: 720 hours, 14\.40 USD of T4 compute'
-        $monthly.message | Should -Match 'To keep the month cheaper: set t4SkuName to Standard_B1ms \(which turns autonomous tuning off\), set t4Enabled to false, or set a lower monthlyCeilingUsd\.'
+        $monthly.message | Should -Match 'To keep the month cheaper: set t4SkuName to Standard_B1ms \(which turns autonomous tuning off\), or set a lower monthlyCeilingUsd\.'
+        # T4 is part of every deployment (2026-11-09), so leaving it out is never a way to keep the month cheaper.
+        $monthly.message | Should -Not -Match 't4Enabled'
         $estimate.T4RestartAssumption | Should -Be 'RestOfMonth'
         $estimate.T4RestartHours | Should -Be 720
         ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.DEFENDER').message | Should -Match 'OpenSourceRelationalDatabases'
@@ -215,8 +217,10 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.status | Should -Be 'Fail'
         $monthly.message | Should -Match 'and the nightly safety stop can''t stop T4: its role isn''t assigned \(.*\), so the worst case counts it running for the rest of the month: 720 hours, 129\.60 USD of T4 compute'
         $monthly.evidence.t4RestartMissing | Should -Be 'Role'
-        # The three ways to stay cheaper, the ceiling that keeps this T4, and the fix that caps the restart.
-        $monthly.remediation | Should -Match '^To keep the month cheaper: set t4SkuName to Standard_B1ms \(which turns autonomous tuning off\), set t4Enabled to false, or set a lower monthlyCeilingUsd\. To keep this T4, raise monthlyCeilingUsd to at least \d+ \(the budget follows it at the next deploy\.ps1 -FromStage Infrastructure\)\. Or put the nightly safety stop fully in place, so each restart counts as about a day: An Owner of the subscription runs \./scripts/grant-safety-stop\.ps1'
+        # The ceiling to raise first, since NOT DONE's next step comes from here, then the fix that caps the restart, then the
+        # cheaper size; never t4Enabled, which deploy.ps1 ignores (review of 849d4c2, 2026-11-09).
+        $monthly.remediation | Should -Match '^Raise monthlyCeilingUsd to at least \d+ in your configuration \(the budget follows it at the next deploy\.ps1 -FromStage Infrastructure\)\. Or put the nightly safety stop fully in place, so each restart counts as about a day: An Owner of the subscription runs \./scripts/grant-safety-stop\.ps1.* Or, to keep the month cheaper, set t4SkuName to Standard_B1ms, which turns autonomous tuning off\.$'
+        $monthly.remediation | Should -Not -Match 't4Enabled'
     }
     It 'fails the monthly ceiling when T4''s restart worst case pushes the estimate over it' {
         $first = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public

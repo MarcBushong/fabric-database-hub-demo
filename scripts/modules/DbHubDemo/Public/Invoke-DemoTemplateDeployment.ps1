@@ -34,7 +34,9 @@ function Invoke-DemoTemplateDeployment {
        on the fallback's behalf, and again after Azure refuses the T3 free offer, because it counted the offer's
        allowance (review of 20e855c), unless that attempt had already created the server (below); over either ceiling,
        or without a price, T4 is left out (DbHubT4Size None, checked again on the next run that deploys the template);
-       and a refused Standard_D2ds_v5 deploys again without T4 (Refused). With t4AutonomousTuning true, the 2-vCore step
+       and a refused Standard_D2ds_v5 deploys again without T4 (Refused; since 2026-11-09 the next run that deploys the
+       template tries the sizes again from the default, DEPLOY.T4.RETRY, because Azure's regional capacity changes). With
+       t4AutonomousTuning true, the 2-vCore step
        is skipped: a refused Standard_D4ads_v5 ends Refused. Each step is a DEPLOY.T4.SKU Warning, and a T4 the fallback
        created at another size also gets a console line and T4Note ("T4 created as General Purpose <size> because Azure
        refused ... here, with autonomous tuning on (or off); about <price> USD an hour while running"). -T4StartSku
@@ -319,8 +321,17 @@ function Invoke-DemoTemplateDeployment {
     $freeOfferTried = $false
     # The fallback works on $effective, only for a server that doesn't exist yet and a size the file doesn't set.
     $ladder = $t4On -and -not $t4Explicit -and -not $t4Exists -and $Action -eq 'Create'
-    # t4AutonomousTuning true rules out the 2-vCore step: the fallback stops after the 4-vCore sizes (2026-11-04).
-    $tuningRequired = (Get-DemoT4Tuning -Config $Config).Switch -eq $true
+    if ($ladder -and [string]$effective['t4SkuSource'] -ceq 'retry') {
+        # 2026-11-09 (user-directed: T4 is part of every deployment): an earlier run's fallback left T4 out (DbHubT4Size
+        # None, its cost check, or Refused, every size refused). No record leaves T4 out any more, so this run, which
+        # deploys the template, tries the sizes again from the default, because Azure's regional capacity changes; the
+        # record goes now.
+        $recordedOff = [string]$tags[$t4TagName]
+        $tags[$t4TagName] = ''
+        $retryText = 'An earlier run left T4 out (DbHubT4Size {0}). T4 is part of every deployment, so this run tries its sizes again: {1}, once more in another zone the region lists, then Standard_D4ads_v5, then Standard_D2ds_v5. Only if Azure refuses them all does the run end NOT DONE, with the fix.' -f $(if ($recordedOff) { $recordedOff } else { 'Refused' }), (Get-DemoT4SkuName -Config $effective)
+        $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.RETRY' -Area 't4' -Target 'T4' -Status 'Warning' -Message $retryText -Evidence ([ordered]@{ recorded = $recordedOff; startSku = (Get-DemoT4SkuName -Config $effective) }) -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+        Write-DemoLog -Message $retryText
+    }
     $t4Refused = [System.Collections.Generic.List[string]]::new()
     $zoneTried = $false
     $gpChecked = $false
@@ -359,32 +370,13 @@ function Invoke-DemoTemplateDeployment {
                 $tags[$t4TagName] = 'Standard_D4ads_v5'
                 $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message 'Preflight found that the region doesn''t offer, or refused, T4''s default Standard_D4ds_v5, so this deployment uses Standard_D4ads_v5, General Purpose with 4 vCores too (autonomous tuning stays on), and later runs keep it.' -Evidence ([ordered]@{ startSku = $T4StartSku }) -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $refusalDoc))
             }
-            'Standard_D2ds_v5' {
+            { $_ -in 'Standard_D2ds_v5', 'None' } {
+                # The 2-vCore fallback: its cost check runs right before the attempt, below, and only reports (2026-11-09:
+                # T4 is part of every deployment, so neither cost nor autonomous tuning leaves it out).
                 $t4Refused.AddRange([string[]]@('Standard_D4ds_v5', 'Standard_D4ads_v5'))
-                if ($tuningRequired) {
-                    # Preflight's PREFLIGHT.T4.TUNING fails this case first; a caller that skips preflight still never gets
-                    # a size that can't run autonomous tuning.
-                    $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
-                    $tags[$t4TagName] = 'Refused'
-                    $results.Add((New-DemoT4FallbackResult -Refused $null -Next 'Refused' -TuningRequired))
-                }
-                else {
-                    # The 2-vCore fallback: its cost check runs right before the attempt, below.
-                    $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D2ds_v5'
-                }
+                $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D2ds_v5'
             }
-            'None' {
-                $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
-                $t4Refused.AddRange([string[]]@('Standard_D4ds_v5', 'Standard_D4ads_v5'))
-                $tags[$t4TagName] = 'None'
-                $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message 'Preflight left T4 out of this deployment (PREFLIGHT.T4.FALLBACK or PREFLIGHT.T4.CAPABILITY says why): Azure refuses its 4-vCore sizes here, and the 2-vCore fallback, Standard_D2ds_v5, can''t be created now. t4Enabled stays as you configured it, and the next run that deploys the template checks the fallback again.' -Evidence ([ordered]@{ startSku = $T4StartSku }) -Remediation 'PREFLIGHT.T4.FALLBACK says what would add T4.' -DocUrl $refusalDoc))
-            }
-            'Refused' {
-                $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
-                $t4Refused.AddRange([string[]]@('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'))
-                $tags[$t4TagName] = 'Refused'
-                $results.Add((New-DemoT4FallbackResult -Refused $null -Next 'Refused' -TuningRequired:$tuningRequired))
-            }
+            # 'Refused' (a refusal of every size on record): every run tries the sizes again from the default (2026-11-09).
         }
     }
     # Review finding 5: any record no longer holds once the configuration sets t4SkuName and this deployment has T4 in it;
@@ -395,7 +387,8 @@ function Invoke-DemoTemplateDeployment {
     for ($attempt = 1; $attempt -le 6; $attempt++) {
         # Right before the fallback creates T4 at its 2-vCore size, its cost check runs (ADR 0019): the price from the Azure
         # Retail Prices API now, and the worst case with T4's 7-day automatic restart, against both ceilings. Over either,
-        # or without a price, T4 is left out instead. Never for a size the configuration sets.
+        # or without a price, it's a Warning, and T4 is created anyway (2026-11-09, user-directed: T4 is part of every
+        # deployment). Never for a size the configuration sets.
         if ($ladder -and -not $gpChecked -and (Test-DemoT4Enabled -Config $effective) -and (Get-DemoT4SkuName -Config $effective) -ceq 'Standard_D2ds_v5') {
             $gpChecked = $true
             $cost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit
@@ -407,11 +400,11 @@ function Invoke-DemoTemplateDeployment {
                 Write-DemoLog -Level Warning -Message ('Azure refused T4''s 4-vCore sizes here, so this run creates T4 as General Purpose Standard_D2ds_v5, with autonomous tuning off: {0}.' -f (Format-DemoT4FallbackCostText -Cost $cost))
             }
             else {
-                $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
-                & $record 'None'
-                $skip = New-DemoT4FallbackResult -Refused $gpRefusal -Next 'None' -Cost $cost
-                $results.Add($skip)
-                Write-DemoLog -Level Warning -Message ('T4 isn''t created: {0}' -f $skip.message)
+                & $record 'Standard_D2ds_v5'
+                $gpHourly = $cost.HourlyUsd
+                $gpResult = New-DemoT4FallbackResult -Refused $gpRefusal -Next 'None' -Cost $cost
+                $results.Add($gpResult)
+                Write-DemoLog -Level Warning -Message $gpResult.message
             }
         }
         if ($attempt -gt 1) {
@@ -625,25 +618,19 @@ function Invoke-DemoTemplateDeployment {
                 }
                 'Standard_D4ads_v5' {
                     $t4Refused.Add($current)
-                    if ($tuningRequired) {
-                        $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
-                        & $record 'Refused'
-                        $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused' -TuningRequired))
-                        Write-DemoLog -Level Warning -Message 'Azure refused T4''s Standard_D4ads_v5 too, and t4AutonomousTuning is true, which rules out the 2-vCore fallback; deploying again without T4.'
-                    }
-                    else {
-                        $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D2ds_v5'
-                        $gpRefusal = $t4Failure
-                        Write-DemoLog -Level Warning -Message 'Azure refused T4''s Standard_D4ads_v5 too; pricing the 2-vCore fallback, Standard_D2ds_v5, before deploying again.'
-                    }
+                    $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D2ds_v5'
+                    $gpRefusal = $t4Failure
+                    Write-DemoLog -Level Warning -Message 'Azure refused T4''s Standard_D4ads_v5 too; pricing the 2-vCore fallback, Standard_D2ds_v5, before deploying again.'
                 }
                 default {
-                    # Standard_D2ds_v5, the last size the fallback tries.
+                    # Standard_D2ds_v5, the last size the fallback tries. The rest of the environment is deployed without
+                    # T4, and the run ends NOT DONE (DEPLOY.T4.SKU, a Fail with the fix); nothing is recorded, so every run
+                    # tries the sizes again (2026-11-09).
                     $t4Refused.Add($current)
                     $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
-                    & $record 'Refused'
+                    & $record ''
                     $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused'))
-                    Write-DemoLog -Level Warning -Message 'Azure refused T4''s 2-vCore fallback, Standard_D2ds_v5, too; deploying again without T4.'
+                    Write-DemoLog -Level Warning -Message 'Azure refused T4''s 2-vCore fallback, Standard_D2ds_v5, too; deploying the rest again without T4, and the run ends NOT DONE.'
                 }
             }
             continue

@@ -76,3 +76,27 @@ function Merge-DemoHashtable {
 
     return $merged
 }
+
+function ConvertTo-DemoConfigFileText {
+    <#
+    .SYNOPSIS
+    The configuration as the JSON a script's -ConfigPath reads back with Get-DemoConfig: without the marks that only a
+    run's own configuration carries and the schema doesn't allow in the file (additionalProperties false):
+    t2SqlInstallModeSource and t4EnabledIgnored (Get-DemoConfig; 2026-11-09), t2PaygWizardOptIn (a run's own, never a
+    file's), and t4SkuSource (ADR 0019). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $copy = [ordered]@{}
+    foreach ($key in $Config.Keys) {
+        if ([string]$key -notin 't2SqlInstallModeSource', 't4EnabledIgnored', 't2PaygWizardOptIn', 't4SkuSource') {
+            $copy[$key] = $Config[$key]
+        }
+    }
+    return ($copy | ConvertTo-Json -Depth 20)
+}

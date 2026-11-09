@@ -4,12 +4,14 @@ BeforeAll {
     . (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Guard.Helpers.ps1')
     Initialize-GuardTestContext
 
-    function New-TestConfig([switch] $WithT4, [string] $InstallMode = 'PaygWizard') {
+    # T4 is part of every deployment since 2026-11-09 (user-directed), so a configuration always has it; -WithT4 stays for
+    # the tests that say so. -WithoutT4 is a run whose template deployed without T4 (Azure refused every size).
+    function New-TestConfig([switch] $WithT4, [string] $InstallMode = 'PaygWizard', [switch] $WithoutT4) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
         $config['t3AdminGroupObjectId'] = '77777777-7777-7777-7777-777777777777'
-        $config['t4Enabled'] = [bool]$WithT4
+        $config['t4Enabled'] = -not $WithoutT4
         $config['t2SqlInstallMode'] = $InstallMode
         return $config
     }
@@ -18,16 +20,16 @@ BeforeAll {
         New-DemoResult -CheckId $CheckId -Area 'infra' -Target 'subscription' -Status $Status -Message ('{0} {1}' -f $CheckId, $Status) -Remediation $(if ($Status -in 'Fail', 'Manual action required') { 'Fix it, then run ./scripts/deploy.ps1.' } else { '' })
     }
 
-    # Every DONE requirement passing (brief item 16), for the configuration's mode and T4.
+    # Every DONE requirement passing (brief item 16), for the configuration's mode; T4's always (2026-11-09).
     function New-DoneResult([switch] $WithT4, [string] $InstallMode = 'PaygWizard', [switch] $SkipFabric) {
-        $ids = InModuleScope DbHubDemo -Parameters @{ T4 = [bool]$WithT4; Mode = $InstallMode; Skip = [bool]$SkipFabric } { Get-DemoDoneRequirement -InstallMode $Mode -T4Off:(-not $T4) -SkipFabric:$Skip }
+        $ids = InModuleScope DbHubDemo -Parameters @{ Mode = $InstallMode; Skip = [bool]$SkipFabric } { Get-DemoDoneRequirement -InstallMode $Mode -SkipFabric:$Skip }
         foreach ($id in $ids) {
             New-TestResult $id
         }
     }
 
     function New-FinishedState([switch] $WithT4, [string] $T4Sku = '') {
-        [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = $(if ($WithT4) { 'Telemetry' } else { '' }); TrackFabric = 'Fabric'; T4Sku = $T4Sku; GuidedStopUtc = ''; HostPasswordUtc = '' }
+        [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = 'Telemetry'; TrackFabric = 'Fabric'; T4Sku = $T4Sku; GuidedStopUtc = ''; HostPasswordUtc = '' }
     }
 
     # The Hub checks' Fabric REST mocks (Initialize-HubFabricMock), for the tenant setting's real results.
@@ -186,11 +188,10 @@ Describe 'What DONE requires (brief item 16)' {
         $ids | Should -Not -Contain 'DEPLOY.FABRIC.APP'
     }
 
-    It 'leaves T4 out when it''s off, and T2''s performance, PAYG, and monitoring out in Developer mode' {
-        $off = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' -T4Off }
-        $off | Should -Not -Contain 'HUB.ESTATE.T4'
-        $off | Should -Not -Contain 'METRICS.T4'
-        $developer = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'Developer' -T4Off -SkipFabric }
+    It 'always needs T4 (2026-11-09), and leaves T2''s performance, PAYG, and monitoring out in Developer mode' {
+        $developer = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'Developer' -SkipFabric }
+        $developer | Should -Contain 'HUB.ESTATE.T4'
+        $developer | Should -Contain 'METRICS.T4'
         $developer | Should -Contain 'HUB.ESTATE.T2'
         $developer | Should -Not -Contain 'TELEMETRY.T2'
         $developer | Should -Not -Contain 'T2.ARC.SQLINSTANCE'
@@ -313,31 +314,33 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         @($outcome.NonBlocking).Count | Should -Be 0
     }
 
-    It 'says T4 isn''t deployed and why: off in the configuration, or after the Burstable fallback' {
-        $config = New-TestConfig
-        $off = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = (New-FinishedState); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
-        $off.Kind | Should -Be 'Done'
-        ($off.Notes -join ' ') | Should -Match 't4Enabled is false in your configuration'
-        $fallback = New-TestConfig -WithT4
-        $after = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = (New-FinishedState -T4Sku 'None'); Config = $fallback } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
-        $after.Kind | Should -Be 'Done'
-        ($after.Notes -join ' ') | Should -Match 'Azure refused both 4-vCore sizes'
-        ($after.Notes -join ' ') | Should -Match 'Standard_D2ds_v5'
-        $after.Reason | Should -Match 'T1, T2, and T3 in Estate'
+    It 'is NOT DONE when Azure refused every T4 size, with why and the fix, never DONE without T4 (2026-11-09)' {
+        $config = New-TestConfig -WithoutT4
+        $refusal = InModuleScope DbHubDemo { New-DemoT4FallbackResult -Refused $null -Next 'Refused' }
+        $result = @(New-DoneResult | Where-Object { $_.checkId -notin 'HUB.ESTATE.T4', 'METRICS.T4' }) + @($refusal)
+        $state = New-FinishedState
+        $state.TrackT4 = ''
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = $state; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.Done | Should -BeFalse
+        $outcome.Reason | Should -Match 'refused every size'
+        ($outcome.Notes -join ' ') | Should -Match 'DONE needs it'
+        ($outcome.Notes -join ' ') | Should -Match 'Region access request'
+        $outcome.Unfinished | Should -Contain 'T4'
     }
 
     It 'lets a t4SkuName the configuration sets win over a recorded "no T4", so DONE still needs T4 (review finding 5)' {
         $sized = New-TestConfig -WithT4
         $sized['t4SkuName'] = 'Standard_D2ds_v5'
         (InModuleScope DbHubDemo -Parameters @{ Config = $sized } { Get-DemoT4OffReason -Config $Config -State ([pscustomobject]@{ T4Sku = 'None' }) }) | Should -BeNullOrEmpty
-        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = (New-FinishedState -WithT4 -T4Sku 'None'); Config = $sized } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult | Where-Object { $_.checkId -notin 'HUB.ESTATE.T4', 'METRICS.T4' }); State = (New-FinishedState -WithT4 -T4Sku 'None'); Config = $sized } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $outcome.Kind | Should -Be 'NotDone' -Because 'a T4 that''s on must show in Database Hub'
         $outcome.Missing | Should -Contain 'HUB.ESTATE.T4'
         $outcome.Missing | Should -Contain 'METRICS.T4'
-        ($outcome.Notes -join ' ') | Should -Not -Match 'Azure refused both 4-vCore sizes'
+        ($outcome.Notes -join ' ') | Should -Not -Match 'Azure refused'
 
-        # t4Enabled false in the file is the reason, whatever an earlier fallback recorded.
-        (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4OffReason -Config $Config -State ([pscustomobject]@{ T4Sku = 'None' }) }) | Should -Match 't4Enabled is false in your configuration'
+        # 2026-11-09: no record turns T4 off any more, whatever an earlier fallback recorded.
+        (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4OffReason -Config $Config -State ([pscustomobject]@{ T4Sku = 'None' }) }) | Should -BeNullOrEmpty
     }
 
     It 'states plainly in Developer mode that T2 has no performance data or agent findings' {
@@ -365,7 +368,7 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
 
     It 'is NOT DONE, exit code 2, while a track is unfinished or a requirement hasn''t passed, never DONE by deployment success alone' {
         $config = New-TestConfig
-        $unfinished = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = ([pscustomobject]@{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'T2'; TrackT4 = ''; TrackFabric = 'Fabric'; T4Sku = '' }); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $unfinished = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult); State = ([pscustomobject]@{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'T2'; TrackT4 = 'Telemetry'; TrackFabric = 'Fabric'; T4Sku = '' }); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $unfinished.Kind | Should -Be 'NotDone'
         $unfinished.ExitCode | Should -Be 2
         $unfinished.Unfinished | Should -Be @('T2')
@@ -586,7 +589,7 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
         # Live: every DONE requirement passed, yet the run ended NOT DONE, exit 2, on FABRIC.P4.HUBSETTING's unread reminder,
         # which read as "the setting isn't enabled" (it was), followed by System.String[].
         $result = @(New-DoneResult) + @((New-HubSettingResult 'Forbidden' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Forbidden')) + @($script:appRecords)
-        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState -WithT4 -T4Sku 'None'); Config = (New-TestConfig -WithT4) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState -WithT4); Config = (New-TestConfig -InstallMode 'Developer') } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $outcome.Kind | Should -Be 'Done'
         $outcome.ExitCode | Should -Be 0
         @($outcome.Confirm).Count | Should -Be 2
@@ -599,7 +602,7 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
         $text | Should -Match '- The Insights app is deployed; confirm it once in the browser\.'
         $text | Should -Not -Match '(?i)optional'
         $text | Should -Not -Match 'is disabled|not enabled|System\.String\[\]'
-        @($lines | Where-Object { $_ -match '^T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both 4-vCore sizes' }).Count | Should -Be 1 -Because 'the T4 note is its own line'
+        @($lines | Where-Object { $_ -match '^T2 runs SQL Server Developer edition' }).Count | Should -Be 1 -Because 'a note is its own line'
     }
 
     It 'is NOT DONE, with the true wording, only when the Hub setting was read and is disabled, and never asks to confirm a setting it read' {
@@ -647,7 +650,7 @@ Describe 'What only a person can confirm never keeps the run from DONE (Phase 28
         $preflightOff = New-HubSettingResult 'Disabled' 'PREFLIGHT.P4.HUBSETTING'
         $fabricOn = New-HubSettingResult 'Enabled'
         $fabricOff = New-HubSettingResult 'Disabled'
-        $requirement = @(InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' -T4Off })
+        $requirement = @(InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' })
         $script:reread = $fabricOn
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricHubSetting -MockWith { $script:reread }
         $result = @(New-DoneResult) + @($preflightOff)
@@ -917,7 +920,7 @@ Describe 'A target''s missing telemetry gets its monitoring checked once more be
         Mock -ModuleName DbHubDemo -CommandName Test-DemoHubEstate -MockWith { $script:asked.Add('estate ' + ($Target -join ',')); foreach ($t in $Target) { New-TestResult ('HUB.ESTATE.{0}' -f $t) $script:estateStatus } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmAssociatedService -MockWith { New-TestResult 'T1.SQLVM.ASSOCIATEDSERVICES' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricRequiredItem -MockWith { New-TestResult 'FABRIC.ITEMS.REQUIRED' }
-        $requirement = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' -T4Off }
+        $requirement = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' }
         $seen = @(New-DoneResult | Where-Object { $_.checkId -notin 'TELEMETRY.T1', 'HUB.ESTATE.T1' })
         $script:estateStatus = 'Pass'
         $new = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Seen = $seen; Requirement = $requirement } { Invoke-DemoDoneGate -Config $Config -Result $Seen -Requirement $Requirement -TelemetryWaitMinutes 15 })
@@ -1037,12 +1040,12 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $config = New-TestConfig -WithT4
         $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
         $result = @(New-DoneResult) + @((New-HubSettingResult 'Forbidden' 'PREFLIGHT.P4.HUBSETTING'), (New-HubSettingResult 'Forbidden'))
-        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $result -State (New-FinishedState -WithT4 -T4Sku 'None')
+        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $result -State (New-FinishedState -WithT4)
         $outcome.Kind | Should -Be 'Done'
         $outcome.ExitCode | Should -Be 0
         $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
         $model['run']['state'] | Should -Be 'Done'
-        $model['run']['reason'] | Should -Match 'Azure refused both 4-vCore sizes'
+        $model['run']['reason'] | Should -Match 'T1, T2, T3, and T4 in Estate'
         $model['run']['reason'] | Should -Not -Match 'System\.String\[\]|tenant setting'
         @($model['confirm']).Count | Should -Be 1
         $model['confirm'][0] | Should -Be 'Couldn''t check the Fabric tenant setting "Users can access the Database hub (preview)" (needs a Fabric administrator; HTTP 403): please confirm it''s enabled.'
@@ -1065,12 +1068,12 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $result -State (New-FinishedState -WithT4 -T4Sku 'None')
         $outcome.Kind | Should -Be 'NotDone'
         $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
-        $model['run']['reason'] | Should -Match '^TELEMETRY\.T1: No performance telemetry from T1 \(sqlvm01\) in the last 60 minutes\. T4 \(Azure Database for PostgreSQL\) isn''t deployed: Azure refused both 4-vCore sizes'
+        $model['run']['reason'] | Should -Match '^TELEMETRY\.T1: No performance telemetry from T1 \(sqlvm01\) in the last 60 minutes\.'
         $model['run']['reason'] | Should -Not -Match 'System\.String\[\]'
         Get-Content -LiteralPath $run.PagePath -Raw | Should -Not -Match 'System\.String\[\]'
 
-        # Two notes, two lines.
-        $developer = New-TestConfig -InstallMode 'Developer'
+        # Two notes, two lines: T4 not deployed in this run (DONE needs it), and Developer mode.
+        $developer = New-TestConfig -InstallMode 'Developer' -WithoutT4
         $two = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -InstallMode 'Developer'); State = (New-FinishedState); Config = $developer } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         @($two.Notes).Count | Should -Be 2
         $lines = @(InModuleScope DbHubDemo -Parameters @{ Outcome = $two } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome })

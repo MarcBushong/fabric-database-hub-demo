@@ -562,7 +562,9 @@ Describe 'The image checks' {
         $result = Invoke-DemoJumpstartImageCheck -Context $context
         $result.Outcome | Should -Be 'Failed'
         $result.Message | Should -Match 'Nothing switches by itself'
-        $result.Message | Should -Match 'PaygWizard, ProductKey, or Developer'
+        # 2026-11-09: only the unattended modes; PaygWizard, retired, is never offered (review of 849d4c2).
+        $result.Message | Should -Match 'ProductKey .* or Developer .*, both unattended\.'
+        $result.Message | Should -Not -Match 'PaygWizard'
     }
 }
 

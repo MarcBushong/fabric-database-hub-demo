@@ -134,7 +134,8 @@ function Get-DemoDeploymentExpectation {
     and its first boot, and needs no person: a clean first deployment took 91 minutes when measured on 2026-11-06, of
     which T2's host build took about 27 and its Arc onboarding about 33. Without
     -SkipFabric, it says that the Insights app's Rayfin CLI sign-in may open a browser at the start, which the run doesn't
-    wait for (2026-11-05).
+    wait for (2026-11-05). -Note (2026-11-09) adds the lines that say what the run ignores in the configuration (its
+    PaygWizard, its t4Enabled false), to the banner and the status page.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -147,7 +148,10 @@ function Get-DemoDeploymentExpectation {
         [ValidateRange(0, 600)]
         [int] $T2WaitMinutes = 180,
 
-        [switch] $SkipFabric
+        [switch] $SkipFabric,
+
+        [AllowEmptyCollection()]
+        [string[]] $Note = @()
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -156,6 +160,11 @@ function Get-DemoDeploymentExpectation {
     }
     else {
         $lines.Add('What to expect (estimates from documented step times, not a measured run):')
+    }
+    $notes = @($Note | Where-Object { $_ })
+    foreach ($item in $notes) {
+        # 2026-11-09: what the run ignores in the configuration (Get-DemoT2LegacyModeText, Get-DemoT4IgnoredText).
+        $lines.Add(('- {0}' -f $item))
     }
     if ($InstallMode -eq 'PaygWizard') {
         $lines.Add('- A first deployment takes about 2 to 3 hours in all; the T2 guest build alone is 60 to 90 minutes.')
@@ -183,6 +192,9 @@ function Get-DemoDeploymentExpectation {
     $lines.Add('- This PC stays awake while deploy.ps1 runs (Windows); keep it plugged in, and don''t close this window.')
     $lines.Add('- If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.')
     $text = if ($InstallMode -eq 'PaygWizard') { 'A first deployment takes about 2 to 3 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' } elseif ($InstallMode -eq 'JumpstartImage') { 'A first deployment takes about 1.5 hours (91 minutes, measured on 2026-11-06); a redeploy from a golden snapshot about 30 to 45 minutes (estimate).' } else { 'A first deployment takes about 1.5 to 2.5 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' }
+    if ($notes.Count -gt 0) {
+        $text = '{0} {1}' -f $text, ($notes -join ' ')
+    }
     return [pscustomobject]@{
         Lines      = $lines.ToArray()
         Text       = $text
@@ -749,12 +761,12 @@ function Get-DemoBillingNote {
 
 function Get-DemoT4OffReason {
     <#
-    Why T4 isn't deployed, or '' when it is (brief item 16): t4Enabled false in the configuration, or T4's fallback (Phase
-    28 and its follow-up, ADR 0019) left it out. Azure refused both 4-vCore sizes, and the 2-vCore fallback,
-    Standard_D2ds_v5, was left out by its cost check or isn't deployed yet (DbHubT4Size None: with this run's reason and
-    fix from -Result's DEPLOY.T4.SKU or PREFLIGHT.T4.FALLBACK when it has one), or Azure refused it too (Refused). Decided
-    from the effective configuration, as the deployment decides (Resolve-DemoEffectiveConfig), so a t4SkuName the
-    configuration sets wins over a recorded "no T4" (review finding 5). Pure. Internal.
+    Why T4 isn't deployed, or '' when it is (brief item 16). Since 2026-11-09 (user-directed: "making sure postgres is
+    deployed with the deployment and not being an optional component") T4 is part of every deployment, and DONE needs it:
+    the configuration can't turn it off (Get-DemoConfig ignores t4Enabled false), no cost check or recorded fallback
+    leaves it out (Resolve-DemoEffectiveConfig), and a run leaves it out only when Azure refused every size its fallback
+    tries (DEPLOY.T4.SKU, a Fail with the fix, from -Result). Decided from the effective configuration, as the deployment
+    decides. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -768,36 +780,42 @@ function Get-DemoT4OffReason {
         [object[]] $Result = @()
     )
 
-    $resolved = $Config.Contains('t4SkuSource') -and -not [string]::IsNullOrWhiteSpace([string]$Config['t4SkuSource'])
-    if (-not (Test-DemoT4Enabled -Config $Config) -and -not $resolved) {
-        return 'T4 (Azure Database for PostgreSQL) isn''t deployed: t4Enabled is false in your configuration.'
+    $refused = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and [string]$_.status -eq 'Fail' }) | Select-Object -Last 1
+    if ($null -ne $refused) {
+        return ('T4 (Azure Database for PostgreSQL) isn''t deployed, and DONE needs it: {0} {1}' -f $refused.message, $refused.remediation).Trim()
     }
     if (Test-DemoT4Enabled -Config (Resolve-DemoEffectiveConfig -Config $Config -State $State)) {
         return ''
     }
-    $location = [string]$Config['location']
-    if ([string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') -ceq 'Refused') {
-        return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both 4-vCore sizes, Standard_D4ds_v5 and Standard_D4ads_v5, in {0} (SkuNotAvailable), and then the 2-vCore fallback, Standard_D2ds_v5, or t4AutonomousTuning true ruled that out, so nothing is tried again on its own. To add it, ask for access with a Region access request (Learn: Resolve capacity errors), then set t4SkuName and run ./scripts/deploy.ps1.' -f $location)
-    }
-    # The fallback's cost check left it out (Phase 28 follow-up): this run's own reason, with the numbers, when it has one.
-    $skipped = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -in 'DEPLOY.T4.SKU', 'PREFLIGHT.T4.FALLBACK' -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'skipReason') -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'startSku') -ceq 'None' }) | Select-Object -Last 1
-    if ($null -ne $skipped) {
-        $evidence = Get-DemoMemberValue -InputObject $skipped -Name 'evidence'
-        $cost = [pscustomobject]@{
-            SkipReason          = [string](Get-DemoMemberValue -InputObject $evidence -Name 'skipReason')
-            HourlyUsd           = Get-DemoMemberValue -InputObject $evidence -Name 'hourlyUsd'
-            MonthlyWorstCaseUsd = Get-DemoMemberValue -InputObject $evidence -Name 'monthlyWorstCaseUsd'
-            MonthlyCeilingUsd   = Get-DemoMemberValue -InputObject $evidence -Name 'monthlyCeilingUsd'
-            SessionUsd          = Get-DemoMemberValue -InputObject $evidence -Name 'sessionUsd'
-            SessionCeilingUsd   = Get-DemoMemberValue -InputObject $evidence -Name 'sessionCeilingUsd'
-            PriceError          = ''
-        }
-        $skip = Get-DemoT4SkipReason -Cost $cost
-        return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both 4-vCore sizes, Standard_D4ds_v5 and Standard_D4ads_v5, in {0} (SkuNotAvailable), and the 2-vCore fallback, Standard_D2ds_v5, wasn''t created: {1}. {2}' -f $location, $skip.Because, $skip.Remediation)
-    }
-    return ('T4 (Azure Database for PostgreSQL) isn''t deployed: Azure refused both 4-vCore sizes, Standard_D4ds_v5 and Standard_D4ads_v5, in {0} (SkuNotAvailable), and the 2-vCore fallback, Standard_D2ds_v5, isn''t deployed. deploy.ps1 checks it, price and ceilings first, whenever it deploys the template: run ./scripts/deploy.ps1 -FromStage Preflight.' -f $location)
+    return 'T4 (Azure Database for PostgreSQL) isn''t deployed in this run, and DONE needs it. Run ./scripts/deploy.ps1 again: it deploys the template, which creates T4, after preflight checks its cost.'
 }
 
+function New-DemoT4OffResult {
+    <#
+    .SYNOPSIS
+    DEPLOY.T4.OFF (2026-11-09): T4 is never out of a deployment silently. A Fail, because DONE needs T4, with the exact
+    reason and fix (Get-DemoT4OffReason: Azure refused every size, with a Region access request or t4SkuName as the fix).
+    $null when T4 is deployed. Pure. Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [System.Collections.IDictionary] $Config = @{},
+
+        [AllowNull()]
+        [object] $State,
+
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $reason = Get-DemoT4OffReason -Config $Config -State $State -Result $Result
+    if (-not $reason) {
+        return $null
+    }
+    return (New-DemoResult -CheckId 'DEPLOY.T4.OFF' -Area 't4' -Target 'T4' -Status 'Fail' -Message $reason -Evidence ([ordered]@{ recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku') }) -Remediation 'Ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), or set t4SkuName to a size Azure offers you in the region, then run ./scripts/deploy.ps1, which tries again.' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors')
+}
 function Get-DemoDoneRequirement {
     <#
     .SYNOPSIS
@@ -805,8 +823,8 @@ function Get-DemoDoneRequirement {
     every target. HUB.ESTATE.T1 to T4; TELEMETRY.T1, T2, and T3; METRICS.T4; T2.ARC.SQLINSTANCE (Standard with PAYG or
     Paid) and T2.ARC.MONITORING in JumpstartImage, PaygWizard, and ProductKey modes; T1.SQLVM.ASSOCIATEDSERVICES (T1's
     inventory); and FABRIC.ITEMS.REQUIRED (the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the
-    history model and report). T4's are left out when T4 is off; Developer mode (opt-in) leaves out T2's performance
-    telemetry and its PAYG and monitoring. The Insights app is part of every deployment, but DONE never needs it
+    history model and report). T4's are always in (2026-11-09, user-directed: T4 isn't optional); Developer mode (opt-in)
+    leaves out T2's performance telemetry and its PAYG and monitoring. The Insights app is part of every deployment, but DONE never needs it
     (2026-11-05): when it didn't work, DONE says so (Get-DemoNonBlockingItem). Pure. Internal.
     #>
     [CmdletBinding()]
@@ -815,26 +833,19 @@ function Get-DemoDoneRequirement {
         [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
         [string] $InstallMode = 'JumpstartImage',
 
-        [switch] $T4Off,
-
         [switch] $SkipFabric
     )
 
     $ids = [System.Collections.Generic.List[string]]::new()
-    foreach ($target in 'T1', 'T2', 'T3') {
+    foreach ($target in 'T1', 'T2', 'T3', 'T4') {
         $ids.Add(('HUB.ESTATE.{0}' -f $target))
-    }
-    if (-not $T4Off) {
-        $ids.Add('HUB.ESTATE.T4')
     }
     $ids.Add('TELEMETRY.T1')
     if ($InstallMode -ne 'Developer') {
         $ids.Add('TELEMETRY.T2')
     }
     $ids.Add('TELEMETRY.T3')
-    if (-not $T4Off) {
-        $ids.Add('METRICS.T4')
-    }
+    $ids.Add('METRICS.T4')
     if ($InstallMode -ne 'Developer') {
         $ids.Add('T2.ARC.SQLINSTANCE')
         $ids.Add('T2.ARC.MONITORING')
@@ -1297,10 +1308,8 @@ function Get-DemoDeploymentOutcome {
     $leftover = Get-DemoGuidedStopLeftover -State $State
     $stopCommand = Get-DemoStopDemoCommand -Command $Command
     $leftoverNext = 'Run {0}: it removes Bastion and rotates the host password, and leaves the VMs running. Then run {1} again.' -f $stopCommand, $Command
-    $expected = [ordered]@{ T1 = 'Telemetry'; T2 = 'Telemetry' }
-    if (-not $t4Off) {
-        $expected['T4'] = 'Telemetry'
-    }
+    # T4 is part of every deployment (2026-11-09): its track is always expected.
+    $expected = [ordered]@{ T1 = 'Telemetry'; T2 = 'Telemetry'; T4 = 'Telemetry' }
     if (-not $SkipFabric) {
         $expected['Fabric'] = 'Fabric'
     }
@@ -1334,16 +1343,16 @@ function Get-DemoDeploymentOutcome {
         }
     }
     $outcome.Unfinished = $unfinished.ToArray()
-    $evidence = Test-DemoDoneEvidence -Result $core -Requirement (Get-DemoDoneRequirement -InstallMode $installMode -T4Off:([bool]$t4Off) -SkipFabric:$SkipFabric)
+    $evidence = Test-DemoDoneEvidence -Result $core -Requirement (Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric)
     $outcome.Missing = @($evidence.Missing)
     if ($fails.Count -eq 0 -and $manual.Count -eq 0 -and $unfinished.Count -eq 0 -and $evidence.Complete -and -not $StopAfter -and -not $leftover) {
         $outcome.Kind = 'Done'
         $outcome.Done = $true
         $outcome.ExitCode = 0
         $outcome.NextCommand = ''
-        $targets = if ($t4Off) { 'T1, T2, and T3' } else { 'T1, T2, T3, and T4' }
+        $targets = 'T1, T2, T3, and T4'
         $performance = if ($installMode -eq 'Developer') { 'performance telemetry from T1 and T3' } else { 'performance telemetry from T1, T2, and T3' }
-        $metrics = if ($t4Off) { '' } else { ' and T4''s Azure Monitor metrics' }
+        $metrics = ' and T4''s Azure Monitor metrics'
         $t2 = if ($installMode -eq 'Developer') { '' } else { ' T2 runs SQL Server Standard with pay-as-you-go (or your license) and monitoring on.' }
         # The Insights app, part of every deployment, when this run's records show it deployed and working.
         $app = Get-DemoInsightsAppSummary -Result $all

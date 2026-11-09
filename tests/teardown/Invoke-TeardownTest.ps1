@@ -72,7 +72,10 @@ if ($Destroy) {
     if ($ConfirmEnvironment -ne $environment) {
         throw ('-Destroy deletes rg-{0}-{1}; pass -ConfirmEnvironment {1} to confirm.' -f $config['prefix'], $environment)
     }
-    if (($environment -eq 'demo' -or [string]$config['t2SqlInstallMode'] -eq 'PaygWizard') -and -not $IncludeDemoEnvironment) {
+    # An older configuration's PaygWizard runs as JumpstartImage (t2SqlInstallModeSource legacy, 2026-11-09), but its
+    # environment can still hold a finished PaygWizard guest, the owner's setup-wizard work, so it's refused too.
+    $wizard = [string]$config['t2SqlInstallMode'] -eq 'PaygWizard' -or ($config.Contains('t2SqlInstallModeSource') -and [string]$config['t2SqlInstallModeSource'] -eq 'legacy')
+    if (($environment -eq 'demo' -or $wizard) -and -not $IncludeDemoEnvironment) {
         throw ('{0} holds the owner''s setup-wizard work (environment demo or t2SqlInstallMode PaygWizard); destroying it needs the owner''s explicit go-ahead and -IncludeDemoEnvironment (docs/cleanup.md).' -f ('rg-{0}-{1}' -f $config['prefix'], $environment))
     }
     & (Join-Path -Path $repoRoot -ChildPath 'scripts/destroy.ps1') -ConfigPath $ConfigPath -Force -ManifestPath $ManifestPath -OutputPath $OutputPath

@@ -93,6 +93,10 @@ function Get-DemoDeploymentStateTagName {
         # Phase 28 review follow-up: when the T2 host's loader started a bootstrap generation that nobody has seen finish (empty
         # when none runs), so deploy.ps1's watchdog never restarts the host during its guest build (Get-DemoHostRestartBlocker).
         T2BuildUtc               = 'DbHubT2BuildUtc'
+        # 2026-11-09: the T2 guest's own install mode as its host reports it (JumpstartImage, PaygWizard, ProductKey, or
+        # Developer) once nothing is left to set up in it, so a golden capture tags its snapshot with the guest's real mode
+        # (Get-DemoT2GuestInstallMode).
+        T2InstallMode            = 'DbHubT2InstallMode'
     }
 }
 
@@ -729,7 +733,7 @@ function Invoke-DemoFabricStage {
     try {
         $path = $ConfigPath
         if (-not $path -or -not (Test-Path -LiteralPath $path)) {
-            $path = Write-DemoPrivateFile -Directory $directory -Name 'demo.config.json' -Content ($Config | ConvertTo-Json -Depth 20)
+            $path = Write-DemoPrivateFile -Directory $directory -Name 'demo.config.json' -Content (ConvertTo-DemoConfigFileText -Config $Config)
         }
         $output = Join-Path -Path $directory -ChildPath 'configure-fabric.jsonl'
         $arguments = @{
@@ -808,7 +812,7 @@ function Invoke-DemoFabricScriptStep {
     try {
         $path = $ConfigPath
         if (-not $path -or -not (Test-Path -LiteralPath $path)) {
-            $path = Write-DemoPrivateFile -Directory $directory -Name 'demo.config.json' -Content ($Config | ConvertTo-Json -Depth 20)
+            $path = Write-DemoPrivateFile -Directory $directory -Name 'demo.config.json' -Content (ConvertTo-DemoConfigFileText -Config $Config)
         }
         $output = Join-Path -Path $directory -ChildPath 'results.jsonl'
         $declared = (Get-Command -Name $ScriptPath -ErrorAction Stop).Parameters

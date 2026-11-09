@@ -760,11 +760,12 @@ Describe 'What stops T4 after its 7-day restart, and DONE (ADR 0024)' {
     }
 
     It 'adds no note to DONE when the safety stop is in place, and keeps a run with only its role missing DONE, with the note' {
+        # T4 is part of every deployment (2026-11-09), so DONE needs it too.
         $config = New-SafetyConfig
-        $config['t4Enabled'] = $false
-        $ids = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' -T4Off }
+        $config['t4Enabled'] = $true
+        $ids = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' }
         $done = @(foreach ($id in $ids) { New-TestResult $id }) + @((New-TestResult 'SAFETYSTOP.RESOURCES'), (New-TestResult 'SAFETYSTOP.ROLE'))
-        $state = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric'; T4Sku = 'None'; GuidedStopUtc = ''; HostPasswordUtc = '' }
+        $state = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = 'Telemetry'; TrackFabric = 'Fabric'; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '' }
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $done; State = $state; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $outcome.Kind | Should -Be 'Done'
         @($outcome.Notes | Where-Object { $_ -match 'safety stop' }) | Should -BeNullOrEmpty
