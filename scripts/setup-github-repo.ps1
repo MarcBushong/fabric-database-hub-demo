@@ -52,20 +52,22 @@ $ErrorActionPreference = 'Stop'
 # This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
 # that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
 # another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
-# guard's validated context, the redaction's registered values, or a test's mocks.
+# guard's validated context, the redaction's registered values, or a test's mocks. $module is the module object this
+# script imported, for the code that runs in its scope (& $module { ... }): a session that ran other checkouts' scripts
+# has their DbHubDemo loaded too, so Get-Module -Name 'DbHubDemo' returns every copy (live finding, 2026-11-10).
 $entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
 $entryNested = $false
 foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
     $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
-Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
+$module = Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested) -PassThru
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
 
 if (-not $Repository -and (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     $config = Get-DemoConfig -Path $ConfigPath
-    $Repository = [string](& (Get-Module -Name 'DbHubDemo') { param($Value) Get-DemoMemberValue -InputObject $Value -Name 'repository' } $config['github'])
+    $Repository = [string](& $module { param($Value) Get-DemoMemberValue -InputObject $Value -Name 'repository' } $config['github'])
 }
 $results = if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or $Repository -like 'your-org/*') {
     @(New-DemoResult -CheckId 'REPO.GITHUB' -Area 'security' -Target 'repo' -Status 'Fail' -Message 'No GitHub repository: pass -Repository owner/repo, or set github.repository in the configuration.')

@@ -62,9 +62,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../..'))
-if (-not (Get-Module -Name 'DbHubDemo')) {
-    Import-Module -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')
-}
+# This checkout's DbHubDemo, never another checkout's that the session loaded earlier (live finding, 2026-11-10). Without
+# -Force, a copy from this path that's loaded already stays as it is, with its state.
+Import-Module -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1')
 
 $config = Get-DemoConfig -Path $ConfigPath
 $subscriptionId = [string]$config['subscriptionId']

@@ -117,13 +117,16 @@ $ErrorActionPreference = 'Stop'
 # This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
 # that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
 # another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
-# guard's validated context, the redaction's registered values, or a test's mocks.
+# guard's validated context, the redaction's registered values, or a test's mocks. $module is the module object this
+# script imported, for the code that runs in its scope (& $module { ... }): a session that ran other checkouts' scripts
+# has their DbHubDemo loaded too, so Get-Module -Name 'DbHubDemo' returns every copy (live finding, 2026-11-10: "The term
+# 'DbHubDemo DbHubDemo DbHubDemo' is not recognized").
 $entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
 $entryNested = $false
 foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
     $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
-Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
+$module = Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested) -PassThru
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
@@ -132,7 +135,6 @@ $config = Get-DemoConfig -Path $ConfigPath
 # Preference variables don't reach module functions, so -WhatIf is passed on explicitly.
 $whatIf = [bool]$WhatIfPreference
 $results = [System.Collections.Generic.List[object]]::new()
-$module = Get-Module -Name 'DbHubDemo'
 # With -Interactive -ResetAdminPassword this script still sets the host password on archost01 afterward, so its switch
 # from the interim baseline waits for that (2026-11-03, ADR 0010).
 $holdSwitch = @(if ($Interactive -and $ResetAdminPassword -and -not $whatIf -and [string]$config['t2Mode'] -ne 'EvaluationOnlyAzureVm') { 'archost01' })
@@ -187,7 +189,7 @@ try {
         # The clipboard is checked before anything changes: the password is never displayed, so without a
         # clipboard there'd be no way to hand it over. Set-Clipboard doesn't fail where there's none (Linux without xclip
         # or a display, GitHub Codespaces, an SSH session, Cloud Shell), so the module's check decides (Phase 28).
-        $clipboard = [bool](& (Get-Module -Name 'DbHubDemo') { Test-DemoClipboard })
+        $clipboard = [bool](& $module { Test-DemoClipboard })
         if (-not $clipboard) {
             $results.Add((New-DemoResult -CheckId 'START.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'This session has no working clipboard, so no one-time password was set: it''s never displayed.' -Remediation $portalSteps -DocUrl 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'))
             # The person may now set a password in the portal: the state records the handover, so stop-demo.ps1 rotates it
