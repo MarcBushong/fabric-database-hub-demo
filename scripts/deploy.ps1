@@ -26,10 +26,12 @@ One command, one guided stop (Phase 28):
 - Run it again with no parameters and it continues an unfinished deployment (the resource group's state tags), as
   -Resume does. It starts VMs that were stopped, for example by the nightly auto-shutdown or stop-demo.ps1, and a
   stopped T4, while preflight runs; running VMs are only read.
-- The Insights app (APP_DatabaseHub_Insights) is part of every deployment. Its Rayfin CLI needs one browser sign-in
-  (P14), which starts at the beginning, while you're still at the keyboard, when the CLI isn't signed in yet: on
-  Windows in a window of its own, elsewhere in this terminal. Nothing waits for it but the app's own step, and that only
-  until its deadline (15 minutes after the start). In CI, or a session that can't take keyboard input, it isn't started.
+- The Insights app (APP_DatabaseHub_Insights) is part of every deployment. It deploys with your Azure CLI sign-in
+  (az login, since 2026-11-09): each Rayfin CLI command gets a token for its own audience, so no browser opens. Only
+  after Fabric refused that token in an earlier run does the Rayfin CLI's own browser sign-in (P14) start at the
+  beginning, while you're still at the keyboard: on Windows in a window of its own, elsewhere in this terminal. Nothing
+  waits for it but the app's own step, and that only until its deadline (15 minutes after the start). In CI, or a
+  session that can't take keyboard input, it isn't started.
   When the app isn't created, or doesn't work, the run still goes on and can still end DONE; the status page shows the
   app's step Failed with the actual error and how to fix it, and the banner says so.
 - It ends with one banner: DONE (Database Hub shows every target, and where to look) or NOT DONE (why, the single next
@@ -161,6 +163,13 @@ Where to write the results as JSON lines.
 .PARAMETER TreatManualAsError
 In GitHub Actions: exit with code 2 when a result is Manual action required.
 
+.PARAMETER NoSelfUpdate
+Don't check whether this copy is behind GitHub's main, and don't update it (also DBHUB_NO_SELF_UPDATE=1). By default,
+before anything else, a clean checkout of main that's behind origin's main fast-forwards (git merge --ff-only) and
+deploy.ps1 starts again with the new code and the same parameters; anything else (local changes, another branch,
+diverged, offline, no Git, a downloaded zip) is a Warning with the exact command, and the run goes on with the code in
+this folder (DEPLOY.SELFUPDATE, 2026-11-09). CI skips the check.
+
 .EXAMPLE
 ./scripts/deploy.ps1
 
@@ -214,7 +223,9 @@ param(
 
     [string] $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '../out/deploy.jsonl'),
 
-    [switch] $TreatManualAsError
+    [switch] $TreatManualAsError,
+
+    [switch] $NoSelfUpdate
 )
 
 Set-StrictMode -Version Latest
@@ -229,6 +240,13 @@ foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
     $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
+# 2026-11-09, the owner's choice: before anything else (no transcript, no configuration, no Azure call), a clean main
+# that's behind GitHub's main fast-forwards and this script runs again with the new code and the same parameters; the
+# old code goes no further. Anything else is a Warning with the exact command, and the run goes on (DEPLOY.SELFUPDATE).
+$selfUpdate = Invoke-DemoSelfUpdate -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters -RepositoryRoot (Join-Path -Path $PSScriptRoot -ChildPath '..') -NoSelfUpdate:$NoSelfUpdate -Nested:$entryNested -WhatIf:([bool]$WhatIfPreference)
+if ($selfUpdate.Restarted) {
+    exit ([int]$selfUpdate.ExitCode)
+}
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
@@ -271,8 +289,8 @@ try {
     $waitForT2Now = -not $NoWaitForT2 -and (-not $environment.Ci -or $WaitForT2) -and -not $Sequential
     # A Ctrl+C while the run's experience starts still lets the PC sleep again (the outer finally block below).
     $awake = 'starting'
-    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -WhatIf:$whatIf -Confirm:$false
-    $results = @()
+    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -Note @($selfUpdate.Note) -WhatIf:$whatIf -Confirm:$false
+    $results = @($selfUpdate.Result | Where-Object { $null -ne $_ })
     $outcome = $null
     $finished = $false
     $stopped = $false
@@ -308,7 +326,7 @@ try {
             $parameters['PagePath'] = [string]$run.PagePath
         }
         try {
-            $results = @(Invoke-DemoDeployment @parameters)
+            $results = @($results) + @(Invoke-DemoDeployment @parameters)
         }
         catch [System.OperationCanceledException] {
             # Ctrl+C that the wait for the tracks noticed itself (Phase 28 live finding): the ending below says so.

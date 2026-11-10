@@ -299,9 +299,15 @@ function Invoke-DemoRayfinCli {
 
     .DESCRIPTION
     Every Rayfin CLI call in the module goes through this function so tests can mock it. The CLI's telemetry is
-    turned off for the child (RAYFIN_TELEMETRY_OPTOUT=1) and an ambient RAYFIN_TOKEN is removed, so the CLI uses only
-    the operator's own cached sign-in. With --json the CLI never opens a browser: a missing or expired sign-in fails
-    instead (https://learn.microsoft.com/fabric/apps/cli-reference).
+    turned off for the child (RAYFIN_TELEMETRY_OPTOUT=1). With -Token, the child gets it as RAYFIN_TOKEN, which the
+    CLI uses instead of its own sign-in ("bypassing MSAL entirely", dist/auth/index.js in the pinned CLI; not on
+    Learn's CLI reference, checked 2026-11-09): only that process's environment holds it, and it's never logged or
+    written to a file (2026-11-09, ADR 0023). -TokenAudience says what the token is for, and it must be the audience
+    the command needs (Get-DemoRayfinTokenAudience), or this throws before anything runs: the CLI hands RAYFIN_TOKEN to
+    every command whatever it asks for, and a token for another audience fails only at the service. 'login' and
+    'logout' never get one. Without -Token, an ambient RAYFIN_TOKEN is removed, so the CLI uses only the operator's own
+    cached sign-in. With --json the CLI never opens a browser: a missing or expired sign-in fails instead
+    (https://learn.microsoft.com/fabric/apps/cli-reference).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -313,7 +319,14 @@ function Invoke-DemoRayfinCli {
         [string[]] $ArgumentList,
 
         [ValidateRange(1, 86400)]
-        [int] $TimeoutSeconds = 600
+        [int] $TimeoutSeconds = 600,
+
+        # An access token for the audience the command needs (Get-DemoRayfinTokenAudience), as the CLI's RAYFIN_TOKEN.
+        [securestring] $Token,
+
+        # The audience -Token is for: Fabric (Get-DemoFabricToken) or PowerBI (Get-DemoPowerBIToken).
+        [ValidateSet('Fabric', 'PowerBI')]
+        [string] $TokenAudience = 'Fabric'
     )
 
     $cli = Get-DemoRayfinCliPath -StagePath $StagePath
@@ -321,12 +334,199 @@ function Invoke-DemoRayfinCli {
         throw ('The Rayfin CLI isn''t installed in {0}. Run scripts/configure-fabric-app.ps1 without -SkipInstall first.' -f $StagePath)
     }
     $environment = @{ RAYFIN_TELEMETRY_OPTOUT = '1'; RAYFIN_TOKEN = $null; NO_COLOR = '1' }
+    $needed = Get-DemoRayfinTokenAudience -ArgumentList $ArgumentList
+    if ($null -ne $Token -and $needed -ne 'None') {
+        if ($needed -ne $TokenAudience) {
+            throw ('rayfin {0} needs a {1} token, not a {2} one (Get-DemoRayfinTokenAudience).' -f (@($ArgumentList | Where-Object { $_ -notlike '-*' } | Select-Object -First 2) -join ' '), $needed, $TokenAudience)
+        }
+        $plain = [System.Net.NetworkCredential]::new('', $Token).Password
+        # Redacted wherever the CLI might echo it; a token from the Azure CLI is registered already.
+        Register-DemoSecret -Value $plain
+        $environment['RAYFIN_TOKEN'] = $plain
+    }
     $run = Invoke-DemoFabricAppProcess -Tool 'node' -ArgumentList (@($cli) + $ArgumentList) -WorkingDirectory $StagePath -TimeoutSeconds $TimeoutSeconds -Environment $environment
     [pscustomobject]@{
         ExitCode = $run.ExitCode
         StdOut   = $run.StdOut
         StdErr   = $run.StdErr
         Data     = (ConvertFrom-DemoRayfinOutput -Text ([string]$run.StdOut))
+    }
+}
+
+function Get-DemoRayfinCommand {
+    <#
+    .SYNOPSIS
+    A Rayfin CLI command as a person runs it in PowerShell from the repository root, for remediations and log lines:
+    the stage's CLI (out/fabric-app/node_modules/.bin), which npm ci installed from fabric/app/package-lock.json with
+    its npm overrides. Never npx: it resolves the CLI's dependencies from the registry without them, and 'npx rayfin'
+    outside the stage looks up an unrelated package named rayfin (2026-11-09). 'login' gets --tenant (<tenantId>
+    without one). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [ValidateSet('login', 'login status', 'logout')]
+        [string] $Command = 'login',
+
+        [AllowEmptyString()]
+        [string] $TenantId = ''
+    )
+
+    $line = './out/fabric-app/node_modules/.bin/rayfin {0}' -f $Command
+    if ($Command -eq 'login') {
+        $line += ' --tenant {0}' -f $(if ($TenantId -match $script:GuidPattern) { $TenantId } else { '<tenantId>' })
+    }
+    return $line
+}
+
+function Get-DemoRayfinTokenAudience {
+    <#
+    .SYNOPSIS
+    The token audience a Rayfin CLI command needs when it gets a token through RAYFIN_TOKEN: Fabric, PowerBI, or None.
+    Pure. Internal.
+
+    .DESCRIPTION
+    The CLI passes RAYFIN_TOKEN through whatever scopes a command asks for (dist/auth/token-audience.js), so each
+    command gets a token for its own audience (2026-11-09; read in the pinned CLI 1.36.2):
+    - 'up', with --dry-run and 'up status' too: the Fabric API (ensureAuthenticated without scopes, getFabricScopes:
+      https://api.fabric.microsoft.com/.default; Get-DemoFabricToken).
+    - 'connector invoke' on the semantic model connector: the Power BI API, which it checks in the token's aud claim
+      (resolveDbTokenTarget: https://analysis.windows.net/powerbi/api; Get-DemoPowerBIToken).
+    - 'login' and 'login status': None. With RAYFIN_TOKEN, 'login status' reports an external identity and checks
+      nothing, so it isn't run with one.
+    - Anything else: the Fabric API, the CLI's default scope.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $ArgumentList
+    )
+
+    $words = @($ArgumentList | Where-Object { $_ -notlike '-*' })
+    $first = if ($words.Count -gt 0) { [string]$words[0] } else { '' }
+    $second = if ($words.Count -gt 1) { [string]$words[1] } else { '' }
+    if ($first -eq 'login' -or $first -eq 'logout') {
+        return 'None'
+    }
+    if ($first -eq 'connector' -and $second -eq 'invoke') {
+        return 'PowerBI'
+    }
+    return 'Fabric'
+}
+
+function Get-DemoRayfinTokenRefusal {
+    <#
+    .SYNOPSIS
+    Why the Fabric Apps service refused the token a Rayfin CLI command got through RAYFIN_TOKEN, from the command's
+    redacted output, or an empty string when it didn't fail that way. Pure. Internal.
+
+    .DESCRIPTION
+    A refusal is a failed run (exit code not 0, or status error) whose error names an authorization failure: HTTP 401
+    or 403, Unauthorized, Forbidden, an invalid or expired token, a wrong audience, an Entra error (AADSTS), or missing
+    permission. Other failures (a build error, a network error) aren't refusals. The reason is one line, at most 300
+    characters, and never holds the token: the output was redacted before it got here.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $Run
+    )
+
+    if ($null -eq $Run) {
+        return ''
+    }
+    $data = Get-DemoMemberValue -InputObject $Run -Name 'Data'
+    $status = [string](Get-DemoMemberValue -InputObject $data -Name 'status')
+    $exitCode = Get-DemoMemberValue -InputObject $Run -Name 'ExitCode'
+    if ([int]$exitCode -eq 0 -and $status -ne 'error') {
+        return ''
+    }
+    $said = Get-DemoMemberValue -InputObject $data -Name 'error'
+    if ($said -is [System.Collections.IDictionary]) {
+        $said = @($said['code'], $said['message']) -join ' '
+    }
+    $text = (@([string]$said, [string](Get-DemoMemberValue -InputObject $Run -Name 'StdErr'), [string](Get-DemoMemberValue -InputObject $Run -Name 'StdOut')) | Where-Object { $_ }) -join ' '
+    if ($text -notmatch '(?i)\b40[13]\b|unauthori[sz]ed|forbidden|invalid[_ ]?(auth(entication)?[_ ]?)?token|token (has )?expired|expired token|wrong audience|audience|AADSTS\d+|insufficient (privileges|permissions?)|not authori[sz]ed|access (is )?denied|permission') {
+        return ''
+    }
+    $line = (($text -replace '\s+', ' ').Trim())
+    if ($line.Length -gt 300) {
+        $line = $line.Substring(0, 300) + '...'
+    }
+    return $line
+}
+
+function Get-DemoRayfinAuthRecord {
+    <#
+    .SYNOPSIS
+    What the last Insights app deploy on this machine found about the Azure CLI's token for the Rayfin CLI (2026-11-09):
+    Outcome (Accepted, Refused, or '' when nothing's recorded), Reason, TenantId, and CheckedUtc, from the Git-ignored
+    out/fabric-app-auth.json. Never throws. Internal.
+
+    .DESCRIPTION
+    configure-fabric-app.ps1 writes it after 'rayfin up' ran with the token (Set-DemoRayfinAuthRecord). deploy.ps1
+    reads it at the start of a run: when Fabric refused the token for the demo's tenant before, the Rayfin CLI's
+    browser sign-in starts then, while the person is still at the keyboard, as it did before 2026-11-09. It holds no
+    token, no ID but the tenant's, and nothing secret.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [string] $Path = (Join-Path -Path $script:RepoRoot -ChildPath 'out/fabric-app-auth.json')
+    )
+
+    $record = [pscustomobject]@{ Outcome = ''; Reason = ''; TenantId = ''; CheckedUtc = '' }
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            $data = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable
+            if ([string]$data['azureCliToken'] -in 'Accepted', 'Refused') {
+                $record.Outcome = [string]$data['azureCliToken']
+                $record.Reason = [string]$data['reason']
+                $record.TenantId = [string]$data['tenantId']
+                $record.CheckedUtc = [string]$data['checkedUtc']
+            }
+        }
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('out/fabric-app-auth.json couldn''t be read: {0}' -f $_.Exception.Message)
+    }
+    return $record
+}
+
+function Set-DemoRayfinAuthRecord {
+    # Records whether Fabric accepted the Azure CLI's token for 'rayfin up' (Get-DemoRayfinAuthRecord reads it), in the
+    # Git-ignored out/fabric-app-auth.json: no token, and only the tenant's ID. Never throws. Internal.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes a Git-ignored local note under out/ only.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Accepted', 'Refused')]
+        [string] $Outcome,
+
+        [AllowEmptyString()]
+        [string] $Reason = '',
+
+        [AllowEmptyString()]
+        [string] $TenantId = '',
+
+        [string] $Path = (Join-Path -Path $script:RepoRoot -ChildPath 'out/fabric-app-auth.json')
+    )
+
+    try {
+        $null = New-Item -ItemType Directory -Path (Split-Path -Path $Path -Parent) -Force
+        $note = [ordered]@{
+            azureCliToken = $Outcome
+            reason        = (Protect-DemoText -Text $Reason)
+            tenantId      = $(if ($TenantId -match $script:GuidPattern) { $TenantId.ToLowerInvariant() } else { '' })
+            checkedUtc    = [System.DateTime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        [System.IO.File]::WriteAllText($Path, (($note | ConvertTo-Json) + "`n"), [System.Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('out/fabric-app-auth.json couldn''t be written: {0}' -f $_.Exception.Message)
     }
 }
 

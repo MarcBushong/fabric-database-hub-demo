@@ -39,6 +39,11 @@ function Test-DemoFabricAppPrerequisite {
     .PARAMETER SkipSignIn
     Don't check the CLI's sign-in (FABRIC.APP.SIGNIN is Not selected), for -WhatIf.
 
+    .PARAMETER UseAzureCliToken
+    The Rayfin CLI gets the Azure CLI's tokens for each command (RAYFIN_TOKEN, 2026-11-09), so its own sign-in isn't
+    needed: FABRIC.APP.SIGNIN is a Pass that says so, and 'rayfin login status' doesn't run (with RAYFIN_TOKEN it
+    checks nothing anyway).
+
     .EXAMPLE
     Test-DemoFabricAppPrerequisite -Config $config -StagePath ./out/fabric-app
     #>
@@ -55,14 +60,17 @@ function Test-DemoFabricAppPrerequisite {
 
         [securestring] $Token,
 
-        [switch] $SkipSignIn
+        [switch] $SkipSignIn,
+
+        [switch] $UseAzureCliToken
     )
 
     $settings = Get-DemoFabricAppSetting
     $supported = @($settings['supportedNodeMajors'] | ForEach-Object { [int]$_ })
     $cliReference = 'https://learn.microsoft.com/fabric/apps/cli-reference'
     $tenantId = [string]$Config['tenantId']
-    $loginCommand = 'npx --yes --package={0}@{1} -- rayfin login --tenant {2}' -f $settings['cliPackage'], $settings['cliVersion'], $(if ($tenantId) { $tenantId } else { '<tenantId>' })
+    # The Rayfin CLI's own sign-in: -SignIn, or the stage's CLI from the repository root (never npx; 2026-11-09).
+    $loginCommand = './scripts/configure-fabric-app.ps1 -SignIn, or from the repository root: {0}' -f (Get-DemoRayfinCommand -Command 'login' -TenantId $tenantId)
     $results = [System.Collections.Generic.List[object]]::new()
 
     # Node.js
@@ -98,6 +106,10 @@ function Test-DemoFabricAppPrerequisite {
     if ($SkipSignIn) {
         $results.Add((New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Not selected' -Message 'The Rayfin CLI''s sign-in wasn''t checked (dry run).' -DocUrl $cliReference))
     }
+    elseif ($UseAzureCliToken) {
+        # 2026-11-09 (user-directed): each Rayfin command gets the Azure CLI's token for its audience as RAYFIN_TOKEN.
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Pass' -Message 'The Rayfin CLI uses your Azure CLI sign-in (az login) for the demo''s tenant: each of its commands gets a token for its own audience, in its own process only, so no Rayfin sign-in is needed.' -Evidence ([ordered]@{ auth = 'azureCli' }) -DocUrl $cliReference))
+    }
     else {
         $status = $null
         $failure = ''
@@ -117,10 +129,10 @@ function Test-DemoFabricAppPrerequisite {
             $results.Add((New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Pass' -Message 'The Rayfin CLI is signed in to the demo''s tenant (its own cached sign-in; no browser was opened).' -Evidence $evidence -DocUrl $cliReference))
         }
         elseif ($state -eq 'ok') {
-            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Rayfin CLI is signed in to another tenant than the demo''s (tenantId).' -Evidence $evidence -Remediation ('Sign in once as the demo''s Fabric user, from any folder: {0}' -f $loginCommand) -DocUrl $cliReference))
+            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Rayfin CLI is signed in to another tenant than the demo''s (tenantId).' -Evidence $evidence -Remediation ('Sign in once as the demo''s Fabric user: {0}' -f $loginCommand) -DocUrl $cliReference))
         }
         elseif ($state -eq 'not-signed-in') {
-            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Rayfin CLI isn''t signed in, so the app can''t be deployed unattended.' -Evidence $evidence -Remediation ('Sign in once as the demo''s Fabric user (it opens a browser), then run the script again: {0}' -f $loginCommand) -DocUrl $cliReference))
+            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status 'Manual action required' -Message 'The Rayfin CLI isn''t signed in, so the app can''t be deployed unattended.' -Evidence $evidence -Remediation ('Sign in once as the demo''s Fabric user (it opens a browser), then run the script again; -SignIn does both: {0}' -f $loginCommand) -DocUrl $cliReference))
         }
         else {
             $why = if ($failure) { $failure } elseif ($data -and $data['error']) { [string]$data['error'] } elseif ($status) { ('exit code {0}: {1}' -f $status.ExitCode, (@($status.StdErr, $status.StdOut) | Where-Object { $_ } | Select-Object -First 1)) } else { 'no output' }

@@ -624,13 +624,13 @@ function Initialize-DemoConfig {
     }
     $nextSteps.Add(('./scripts/preflight.ps1{0}   # checks P1-P6, quota, policies, and the cost; registers missing providers' -f $configArgument))
     if ($mode -eq 'JumpstartImage') {
-        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 hours (91 minutes, measured on 2026-11-06) and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))
+        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 hours (91 minutes, measured on 2026-11-06) and keeps this PC awake; nothing needs you: the Insights app deploys with your az login too' -f $configArgument))
     }
     else {
-        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 to 2.5 hours and keeps this PC awake; at the start, one browser sign-in for the Insights app (the run goes on meanwhile); after that, nothing needs you' -f $configArgument))
+        $nextSteps.Add(('./scripts/deploy.ps1{0}      # a first deploy takes about 1.5 to 2.5 hours and keeps this PC awake; nothing needs you: the Insights app deploys with your az login too' -f $configArgument))
     }
     $nextSteps.Add(('./scripts/grant-safety-stop.ps1{0}   # only when DONE asks for it: an Owner, once, for the nightly safety stop''s role' -f $configArgument))
-    $nextSteps.Add(('./scripts/configure-fabric-app.ps1 -SignIn{0}   # only when deploy.ps1 says the Insights app wasn''t created: one browser sign-in, then it deploys' -f $configArgument))
+    $nextSteps.Add(('./scripts/configure-fabric-app.ps1 -SignIn{0}   # only when deploy.ps1 says the Insights app wasn''t created: it deploys with your az login, and opens a browser sign-in only if Fabric refuses that' -f $configArgument))
     $nextSteps.Add(('Each session: ./scripts/start-demo.ps1{0}, then ./scripts/stop-demo.ps1 -SaveHistory{0}' -f $configArgument))
     #endregion Next steps
 
