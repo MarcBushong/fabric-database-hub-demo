@@ -158,8 +158,10 @@ function Stop-DemoEnvironment {
     $t4On = Test-DemoT4Enabled -Config $Config
     $t4Missing = $false
     if ($t4On -and -not $ParkT2) {
-        # Only a server Azure says doesn't exist is skipped; one that couldn't be read is still stopped below.
-        $t4Missing = [string](Get-DemoT4State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])).State -eq 'NotFound'
+        # Only a server Azure says doesn't exist, or is deleting (Dropping: a server it refused, or one deleted by hand;
+        # 2026-11-09), is skipped; one that couldn't be read is still stopped below.
+        $t4Read = Get-DemoT4State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $t4Missing = [string]$t4Read.State -eq 'NotFound' -or [bool](Get-DemoMemberValue -InputObject $t4Read -Name 'Removing')
     }
     $profileTargets = if ($ParkT2) { @('T2') } else { @('T1', 'T3') + @(if ($t4On) { 'T4' }) + @('T2') }
     $offTargets = [System.Collections.Generic.List[string]]::new()

@@ -304,7 +304,8 @@ function Invoke-DemoPreflight {
         # a new server too (2026-11-09), so the server is read for it as well; its own size matters only without t4SkuName.
         $t4Current = Get-DemoT4State -Config $Config
         $t4Exists = [bool](Get-DemoMemberValue -InputObject $t4Current -Name 'Exists')
-        if (-not $t4Explicit) {
+        # A server Azure is deleting (Dropping, the shell of a size it refused: 2026-11-09) has no size to keep.
+        if (-not $t4Explicit -and $t4Exists) {
             $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4Current -Name 'Server')
         }
         $t4Planned = Get-DemoT4SkuName -Config $Config

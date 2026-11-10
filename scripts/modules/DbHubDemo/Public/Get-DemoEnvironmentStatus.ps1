@@ -242,14 +242,17 @@ function Get-DemoEnvironmentStatus {
     else {
         $t4 = Get-DemoT4State -Config $t4Config -DeploymentId ([string]$state.Tags['deploymentId'])
         $t4Docs = (Get-DemoPostgresSetting)['docUrls']
-        $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4 -Name 'Server')
+        # A server Azure is deleting (Dropping, 2026-11-09) isn't T4, so its size isn't T4's.
+        $t4ServerSku = if ($t4.Exists) { Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4 -Name 'Server') } else { '' }
         $t4Sku = if ($t4ServerSku) { $t4ServerSku } else { Get-DemoT4SkuName -Config $t4Config }
         $t4GeneralPurpose = (Get-DemoT4SkuSpec -SkuName $t4Sku).Tier -eq 'GeneralPurpose'
         $t4Origin = if (-not (Test-DemoT4FallbackSize -Config $Config -State $state)) { '' } elseif (Get-DemoT4PinnedSku -Config $t4Config) { ', which deploy.ps1''s fallback chose because Azure refused {0}, the size t4SkuName sets (STATUS.T4.SIZE)' -f (Get-DemoT4AskedSku -Config $t4Config) } elseif ([string](Get-DemoMemberValue -InputObject $state -Name 'T4Sku') -ceq 'Standard_D4ads_v5') { ', which the fallback chose because Azure refused Standard_D4ds_v5 here' } else { ', which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off' }
         if (-not $t4.Exists) {
-            # A size the fallback chose but didn't create yet is said as that, never as created (review of 20e855c).
-            $chosen = if ($t4Origin) { ' as General Purpose {0}{1}, after checking its price against the ceilings again' -f $t4Sku, $t4Origin } else { '' }
-            $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Not selected' -Message ('T4 ({0}) doesn''t exist; deploy.ps1 creates it{1}.' -f $t4.Names.ServerName, $chosen)))
+            # A size the fallback chose but didn't create yet is said as that, never as created (review of 20e855c); a server
+            # Azure is deleting (Dropping, 2026-11-09) isn't T4 either.
+            $chosen = if ($t4Origin) { ' as {0} {1}{2}, after checking its price against the ceilings again' -f $(if ($t4GeneralPurpose) { 'General Purpose' } else { 'Burstable' }), $t4Sku, $t4Origin } else { '' }
+            $absent = if ([bool](Get-DemoMemberValue -InputObject $t4 -Name 'Removing')) { 'is being deleted (Dropping: Azure removes a server it refused within minutes, and one deleted by hand too); once it''s gone, deploy.ps1 creates T4' } else { 'doesn''t exist; deploy.ps1 creates it' }
+            $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Not selected' -Message ('T4 ({0}) {1}{2}.' -f $t4.Names.ServerName, $absent, $chosen)))
         }
         elseif ($t4.State -eq 'Ready') {
             $t4Ready = $true

@@ -58,7 +58,9 @@ function Enable-DemoT4Workload {
     }
     $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
     if (-not $current.Exists) {
-        return New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T4' -Status 'Fail' -Message ('T4 ({0}) wasn''t found: {1}' -f $names.ServerName, $(if ($current.Error) { $current.Error } else { 'not deployed' })) -Remediation 'Deploy it with scripts/deploy.ps1 -Resume, then run this again.' -DocUrl $docUrl
+        # A server Azure is deleting (Dropping, 2026-11-09) isn't T4 any more.
+        $why = if ([bool](Get-DemoMemberValue -InputObject $current -Name 'Removing')) { 'Azure is deleting it (Dropping)' } elseif ($current.Error) { $current.Error } else { 'not deployed' }
+        return New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T4' -Status 'Fail' -Message ('T4 ({0}) wasn''t found: {1}' -f $names.ServerName, $why) -Remediation 'Deploy it with scripts/deploy.ps1 -Resume, then run this again.' -DocUrl $docUrl
     }
     if ($current.State -ne 'Ready') {
         return New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T4' -Status 'Manual action required' -Message ('T4 ({0}) is {1}, so T1 can''t set it up now.' -f $names.ServerName, $current.State) -Remediation 'Start it with start-demo.ps1 (or wait until it''s Ready), then run this again.' -DocUrl $docUrl

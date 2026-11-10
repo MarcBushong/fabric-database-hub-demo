@@ -2590,6 +2590,14 @@ Describe 'Get-DemoEnvironmentStatus' {
         $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
         $t4.status | Should -Be 'Not selected'
         $t4.message | Should -Be 'T4 (pgflex01-abc123) doesn''t exist; deploy.ps1 creates it as General Purpose Standard_D2ds_v5, which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off, after checking its price against the ceilings again.'
+
+        # A server Azure is deleting (Dropping: the shell of a size it refused, live 2026-11-09) isn't T4, so its size isn't
+        # read as T4's: here the refused Standard_D4ds_v5's shell, while the record holds the next size, Standard_D4ads_v5.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { New-TestState @{ Stage = 'Validation'; RunnerSha256 = $script:runnerSha; RunnerSentTo = @('sqlvm01', 'archost01'); T4Sku = 'Standard_D4ads_v5'; Tags = @{ deploymentId = 'abc123'; expiresOn = '2026-12-31' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = $script:t4Names; Exists = $false; Present = $true; Removing = $true; State = 'Dropping'; Server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5'; tier = 'GeneralPurpose' } }; Error = '' } }
+        $t4 = Get-DemoEnvironmentStatus -Config (New-TestConfig -WithT4) | Where-Object { $_.checkId -eq 'STATUS.T4' }
+        $t4.status | Should -Be 'Not selected'
+        $t4.message | Should -Be 'T4 (pgflex01-abc123) is being deleted (Dropping: Azure removes a server it refused within minutes, and one deleted by hand too); once it''s gone, deploy.ps1 creates T4 as General Purpose Standard_D4ads_v5, which the fallback chose because Azure refused Standard_D4ds_v5 here, after checking its price against the ceilings again.'
     }
 
     It 'reads T4 in STATUS.T4 as usual, metrics included, whatever the record says: <Record> (2026-11-09; review of 64c28b2)' -ForEach @(

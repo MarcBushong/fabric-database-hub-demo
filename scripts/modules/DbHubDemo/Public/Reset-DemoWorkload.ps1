@@ -117,6 +117,9 @@ function Reset-DemoWorkload {
             if (-not (Test-DemoT4Enabled -Config $Config)) {
                 $skip = 'T4 is off in this configuration (t4Enabled is false).'
             }
+            elseif ([bool](Get-DemoMemberValue -InputObject $t4 -Name 'Removing')) {
+                $skip = 'T4 is being deleted (Dropping), so there''s nothing to reset; the next ./scripts/deploy.ps1 creates it again once Azure has removed it.'
+            }
             elseif ($t4.State -ne 'Ready') {
                 $skip = 'T4 is {0}; start it with start-demo.ps1.' -f $t4.State
             }

@@ -13,6 +13,12 @@ $script:T4FallbackSizes = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D
 # ADR 0016), for the fallback of a size t4SkuName sets (2026-11-09). Standard_D4ds_v5 and Standard_D4ads_v5 share the
 # vCore price, and the default comes first.
 $script:T4CostOrder = @('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5')
+# The states of a server that's deployed, whatever it's doing (ServerState in Servers - Get, API 2025-08-01): not Dropping
+# ("Server is being deleted") and not Provisioning ("being created"). After a failed attempt, a server in another state is
+# checked against the T4 deployment's own operations before it counts as created: Azure keeps a server it refused as a
+# shell for a few minutes (live, 2026-11-09).
+# https://learn.microsoft.com/rest/api/postgresql/servers/get (checked 2026-11-09)
+$script:T4DeployedStates = @('Ready', 'Stopped', 'Starting', 'Stopping', 'Updating', 'Restarting', 'Disabled', 'Inaccessible')
 
 function Test-DemoT4Enabled {
     # True unless the configuration turns T4 off (t4Enabled false; Phase 24, ADR 0019). Internal.
@@ -1455,12 +1461,15 @@ function Get-DemoT4MissingResult {
         return $null
     }
     $current = Get-DemoT4State -Config $Config -DeploymentId $deploymentId
-    if ([string]$current.State -ne 'NotFound') {
+    # A server Azure is deleting (Dropping, 2026-11-09: a server it refused, or one deleted by hand) isn't T4 either.
+    $removing = [bool](Get-DemoMemberValue -InputObject $current -Name 'Removing')
+    if ([string]$current.State -ne 'NotFound' -and -not $removing) {
         return $null
     }
     $serverName = [string](Get-DemoMemberValue -InputObject $current.Names -Name 'ServerName')
-    $message = 'T4 (Azure Database for PostgreSQL) isn''t deployed yet: its server {0} doesn''t exist (a demo deployed before T4, or a server that was deleted). Resuming would skip it, so this run starts from preflight instead: preflight checks T4''s cost against your ceilings, the template creates it, and T1 sets it up. What earlier runs finished is checked again and kept.' -f $serverName
-    return (New-DemoResult -CheckId 'DEPLOY.T4.MISSING' -Area 't4' -Target 'T4' -Status 'Pass' -Message $message -Evidence ([ordered]@{ serverName = $serverName; recordedStage = [string](Get-DemoMemberValue -InputObject $State -Name 'Stage') }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/overview')
+    $why = if ($removing) { 'is being deleted (Dropping: Azure removes a server it refused within minutes, and one deleted by hand too)' } else { 'doesn''t exist (a demo deployed before T4, or a server that was deleted)' }
+    $message = 'T4 (Azure Database for PostgreSQL) isn''t deployed yet: its server {0} {1}. Resuming would skip it, so this run starts from preflight instead: preflight checks T4''s cost against your ceilings, the template creates it, and T1 sets it up. What earlier runs finished is checked again and kept.' -f $serverName, $why
+    return (New-DemoResult -CheckId 'DEPLOY.T4.MISSING' -Area 't4' -Target 'T4' -Status 'Pass' -Message $message -Evidence ([ordered]@{ serverName = $serverName; recordedStage = [string](Get-DemoMemberValue -InputObject $State -Name 'Stage'); state = [string]$current.State }) -DocUrl 'https://learn.microsoft.com/azure/postgresql/overview')
 }
 
 function Test-DemoT4FallbackSize {
@@ -2320,6 +2329,14 @@ function Get-DemoT4State {
     .SYNOPSIS
     T4's server state (Ready, Stopped, Starting, Stopping, Updating, ...), or NotFound or Unknown, with the
     server's properties when it exists. Internal.
+
+    .DESCRIPTION
+    Exists means T4 is deployed: the server is there and Azure isn't deleting it. A server in Dropping ("Server is being
+    deleted", ServerState in Servers - Get) isn't T4 any more, whatever deleted it: Removing is $true, Exists $false, and
+    Present $true (the resource is still there, so a new server with its name has to wait). Azure keeps a server it
+    refused with SkuNotAvailable as such a shell for a few minutes (live, 2026-11-09: Dropping for about 3 minutes after
+    the refusal), which a run must neither count as T4 nor try to create again before it's gone.
+    Source: https://learn.microsoft.com/rest/api/postgresql/servers/get (ServerState)
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -2332,14 +2349,15 @@ function Get-DemoT4State {
 
     $names = Get-DemoT4Name -Config $Config -DeploymentId $DeploymentId
     if (-not $names.ServerName) {
-        return [pscustomobject]@{ Names = $names; Exists = $false; State = 'NotFound'; Server = $null; Error = 'The resource group has no deploymentId tag.' }
+        return [pscustomobject]@{ Names = $names; Exists = $false; Present = $false; Removing = $false; State = 'NotFound'; Server = $null; Error = 'The resource group has no deploymentId tag.' }
     }
     $read = Get-DemoT4Resource -Config $Config -ServerId $names.ServerId
     if ($read.Found) {
         $state = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $read.Value -Name 'properties') -Name 'state')
-        return [pscustomobject]@{ Names = $names; Exists = $true; State = $(if ($state) { $state } else { 'Unknown' }); Server = $read.Value; Error = '' }
+        $removing = $state -eq 'Dropping'
+        return [pscustomobject]@{ Names = $names; Exists = (-not $removing); Present = $true; Removing = $removing; State = $(if ($state) { $state } else { 'Unknown' }); Server = $read.Value; Error = '' }
     }
-    return [pscustomobject]@{ Names = $names; Exists = $false; State = $(if ($read.NotFound) { 'NotFound' } else { 'Unknown' }); Server = $null; Error = $read.Error }
+    return [pscustomobject]@{ Names = $names; Exists = $false; Present = $false; Removing = $false; State = $(if ($read.NotFound) { 'NotFound' } else { 'Unknown' }); Server = $null; Error = $read.Error }
 }
 
 function Wait-DemoT4State {
@@ -2387,7 +2405,7 @@ function Invoke-DemoT4PowerAction {
     server that was already stopped, its stop in the activity log), what it then bills at its own size (the Retail Prices
     API), and whether the nightly safety stop (ADR 0024), or else the on-demand control's daily one, stops it again
     (Format-DemoT4RestartText). A missing
-    server, or T4 turned off (t4Enabled false), is Not selected.
+    server, one Azure is deleting (Dropping, 2026-11-09), or T4 turned off (t4Enabled false), is Not selected.
     -Requested says that the caller already sent this operation in an earlier call (-WaitMinutes 0), so a server
     that's in the wanted state by now "is now" running or stopped, not "was already" (Phase 25d).
     Sources: https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server,
@@ -2426,8 +2444,10 @@ function Invoke-DemoT4PowerAction {
     }
     $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
     if (-not $current.Exists) {
-        $status = if ($current.State -eq 'NotFound') { 'Not selected' } else { 'Warning' }
-        $message = if ($current.State -eq 'NotFound') { 'T4 isn''t deployed, so there''s nothing to {0}.' -f $Action.ToLowerInvariant() } else { 'T4''s state couldn''t be read: {0}' -f $current.Error }
+        # A server Azure is deleting (Dropping, 2026-11-09) isn't deployed, like one that doesn't exist.
+        $gone = $current.State -eq 'NotFound' -or [bool](Get-DemoMemberValue -InputObject $current -Name 'Removing')
+        $status = if ($gone) { 'Not selected' } else { 'Warning' }
+        $message = if ($current.State -eq 'NotFound') { 'T4 isn''t deployed, so there''s nothing to {0}.' -f $Action.ToLowerInvariant() } elseif ($gone) { 'T4''s server is being deleted (Dropping), so it isn''t deployed and there''s nothing to {0}.' -f $Action.ToLowerInvariant() } else { 'T4''s state couldn''t be read: {0}' -f $current.Error }
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $status -Message $message -Evidence @{ server = $names.ServerName } -DocUrl $docUrl)
     }
 
@@ -2768,6 +2788,10 @@ function Test-DemoT4MetricFlow {
     $docUrl = [string](Get-DemoPostgresSetting)['docUrls']['hubMonitor']
     if (-not $ServerId) {
         return (New-DemoResult -CheckId 'METRICS.T4' -Area 'hub' -Target 'T4' -Status 'Warning' -Message 'T4''s server isn''t known (the resource group has no deploymentId tag), so its metrics weren''t read.' -Remediation 'Deploy it with scripts/deploy.ps1.' -DocUrl $docUrl)
+    }
+    if ($State -eq 'Dropping') {
+        # A server Azure is deleting isn't T4 any more (2026-11-09), so start-demo.ps1 can't bring its metrics back.
+        return (New-DemoResult -CheckId 'METRICS.T4' -Area 'hub' -Target 'T4' -Status 'Warning' -Message 'T4''s server is being deleted (Dropping), so it isn''t deployed and sends no metrics.' -Evidence ([ordered]@{ state = $State }) -Remediation 'Run ./scripts/deploy.ps1 once Azure has removed it: it creates T4 again.' -DocUrl $docUrl)
     }
     if ($State -ne 'Ready') {
         return (New-DemoResult -CheckId 'METRICS.T4' -Area 'hub' -Target 'T4' -Status 'Warning' -Message ('T4 is {0}, so it sends no fresh metrics.' -f $State) -Evidence ([ordered]@{ state = $State }) -Remediation 'start-demo.ps1 starts it; metrics arrive within a few minutes.' -DocUrl $docUrl)
