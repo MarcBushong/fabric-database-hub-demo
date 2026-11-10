@@ -11,6 +11,7 @@ These are for an agent asked to **set up, deploy, upgrade, or try** this demo fo
 
 ## Don't
 
+- **Don't `git pull`, switch branches, stash, or reset yourself** before or between runs. `deploy.ps1` checks GitHub's `main` first: a clean checkout of `main` updates itself (fast-forward only) and starts again with the new code. When it can't (local changes, another branch, diverged, offline, no Git), it says so in a `DEPLOY.SELFUPDATE` **Warning** with the exact command, and runs the code it has; report that Warning to the person, and leave the command to them, because it touches their files ([updates from GitHub](docs/deployment.md#updates-from-github-2026-11-09)).
 - **Don't assemble a partial setup by hand** in place of `deploy.ps1`: no starting VMs, repairing monitoring, onboarding Arc, or creating resources piece by piece with `az` or the portal. `deploy.ps1` does each of them in order and checks them, and a hand-made state can keep it from finishing.
 - **Don't finish T2's SQL Server by hand,** and don't ask a person to: no Bastion sign-in to a VM and no setup wizard. `deploy.ps1` makes T2 from the Jumpstart image, and runs a configuration's `PaygWizard` as `JumpstartImage`. Don't change `t2SqlInstallMode` on your own.
 - **Don't leave a target out on your own:** not T1, T2, T3, T4 (PostgreSQL), or Fabric. When `deploy.ps1` leaves T4 out, it says why in `DEPLOY.T4.OFF`; report that.
@@ -20,13 +21,14 @@ These are for an agent asked to **set up, deploy, upgrade, or try** this demo fo
 
 - **The ending banner:** **DONE**, or **NOT DONE** with its reason and the exact next command it prints. Without **DONE**, the setup isn't finished; say so.
 - **What it changed in an existing environment,** when these lines appear: `DEPLOY.T2.REBUILD`, `DEPLOY.T2.MODE`, `DEPLOY.T4.MISSING`, `DEPLOY.T4.RETRY`, and `DEPLOY.T4.OFF`.
+- **Whether it updated itself from GitHub:** the first line, "Updated this copy from GitHub's main: ... to ...", or the `DEPLOY.SELFUPDATE` **Warning** with its command.
 - **What it lists under Please confirm:** for example the Database Hub tenant setting, which only a Fabric administrator can read, and Database Hub's own pages, which have no API.
 
 ## Steps only a person can do
 
 - `az login`.
-- **The Insights app's one-time sign-in** (the Rayfin CLI, in a browser). `deploy.ps1` doesn't start it under an assistant, so ask the person to run `./scripts/configure-fabric-app.ps1 -SignIn` in their own terminal, before or after the deployment.
-- **The Insights app's one-time browser confirmation,** listed under **Please confirm**.
+- **The Insights app's browser sign-in, only if Fabric refuses the Azure CLI's token** (`FABRIC.APP.TOKEN`, a **Warning**, and the run says the app wasn't created). Since 2026-11-09 the app deploys with the person's `az login`, so usually there's nothing to do. `deploy.ps1` doesn't start that sign-in under an assistant, so ask the person to run `./scripts/configure-fabric-app.ps1 -SignIn` in their own terminal.
+- **The Insights app's browser confirmation, only when it's listed under Please confirm.** When the app is deployed and every query it runs returned its data, `FABRIC.APP.BROWSER` is a note instead (since 2026-11-09).
 - **Nothing for T2 or T4:** no setup wizard, and no step for PostgreSQL. T4 is part of every deployment; when Azure refuses every T4 size, the run ends **NOT DONE** with the fix (a Region access request, or `t4SkuName`), which only the person can act on.
 - **When the person isn't an Owner:** an Owner runs `./scripts/grant-safety-stop.ps1` once, which **DONE** prints.
 

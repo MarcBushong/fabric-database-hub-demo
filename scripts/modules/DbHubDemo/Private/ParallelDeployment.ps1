@@ -433,9 +433,9 @@ function Invoke-DemoParallelDeployment {
     $stageResult = {
         param([string] $Name, [string] $Status, [string] $Message, [string] $Remediation = '')
         $results.Add((New-DemoResult -CheckId ('DEPLOY.STAGE.{0}' -f $Name.ToUpperInvariant()) -Area 'infra' -Target 'subscription' -Status $Status -Message $Message -Remediation $Remediation))
-        # The status page's Preflight and Infrastructure steps (Phase 28).
+        # The status page's Preflight and Infrastructure steps (Phase 28), with room for T4's size change notice (2026-11-09).
         if ($Name -in 'Preflight', 'Infrastructure') {
-            Set-DemoProgressStep -Path $ProgressPath -Id $Name -Status $Status -Message $Message
+            Set-DemoProgressStep -Path $ProgressPath -Id $Name -Status $Status -Message $Message -MaxLength 1200
         }
     }
     $phase = [ordered]@{}
@@ -467,6 +467,25 @@ function Invoke-DemoParallelDeployment {
         $Resume = [switch]::new($true)
         Write-DemoLog -Message ('An unfinished deployment is on record (its last finished stage is {0}), so this run continues it, as deploy.ps1 -Resume does. To start over from preflight instead: ./scripts/deploy.ps1 -FromStage Preflight.' -f $state.Stage)
     }
+    # The .NET SDK the workload runner's build needs (2026-11-09, the owner's decision: "Install it automatically"): before
+    # anything is created, the dotnet on PATH, the SDK installed for the user earlier, or the pinned SDK, installed now,
+    # per user, with no prompt (Initialize-DemoDotNetSdk). Once per run, when the run builds the runner: here for a resume's
+    # comparison of the runner, below for the Artifacts step and its build. A failure ends the run here.
+    $sdk = @{ Done = $false; Record = $null }
+    $ensureSdk = {
+        if (-not $sdk.Done) {
+            $sdk.Done = $true
+            $sdk.Record = Initialize-DemoDotNetSdk -ProgressPath $ProgressPath -Confirm:$false
+            if ($null -ne $sdk.Record) {
+                $results.Add($sdk.Record)
+            }
+        }
+        return ($null -ne $sdk.Record -and [string]$sdk.Record.status -eq 'Fail')
+    }
+    $sdkFailed = {
+        Stop-DemoRayfinSignInStatus -Status $signInCheck
+        Set-DemoProgressStep -Path $ProgressPath -Id 'Preflight' -State 'Failed' -Status 'Fail' -Message 'Nothing was created: the .NET SDK the workload runner needs couldn''t be installed (DEPLOY.DOTNETSDK says why).'
+    }
     # 2026-11-09: T4 that's on, with no fallback record, but whose server doesn't exist (a demo from before T4): a resume
     # would skip preflight, the template that creates it, and T1's step that sets it up, so this run starts from preflight.
     if ($Resume -and -not $FromStage -and -not $whatIf) {
@@ -482,7 +501,14 @@ function Invoke-DemoParallelDeployment {
     # the last run reaches it (live finding, 2026-11-06). With nothing changed, each track resumes as recorded.
     $resend = [pscustomobject]@{ Tracks = @(); Notes = @{}; Results = @() }
     if ($Resume -and -not $FromStage -and -not $whatIf) {
-        $resend = Resolve-DemoArtifactResend -State $state -Plan (Resolve-DemoTrackPlan -StopAfter $StopAfter -Resume -State $state -SkipFabric:$SkipFabric) -SkipRunner:$SkipRunner
+        $resumePlan = Resolve-DemoTrackPlan -StopAfter $StopAfter -Resume -State $state -SkipFabric:$SkipFabric
+        $past = Get-DemoMemberValue -InputObject $resumePlan -Name 'PastArtifacts'
+        $comparesRunner = -not $SkipRunner -and [string](Get-DemoMemberValue -InputObject $state -Name 'RunnerSha256') -and @(@($past) | Where-Object { [string]$_ -in 'T1', 'T2' }).Count -gt 0
+        if ($comparesRunner -and (& $ensureSdk)) {
+            & $sdkFailed
+            return $results.ToArray()
+        }
+        $resend = Resolve-DemoArtifactResend -State $state -Plan $resumePlan -SkipRunner:$SkipRunner
         & $addAll @($resend.Results)
     }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28). T4 is part of every
@@ -568,6 +594,17 @@ function Invoke-DemoParallelDeployment {
 
     $order = @('T1', 'T2', 'T4', 'Fabric') | Where-Object { @($plan.Tracks[$_]).Count -gt 0 }
     $needsArtifacts = @(@($plan.Tracks['T1']) + @($plan.Tracks['T2']) | Where-Object { $_ -in 'Artifacts', 'Bootstraps' }).Count -gt 0
+    # The .NET SDK, before the build process starts and before preflight (2026-11-09); the status page's row says so when
+    # this run needs none.
+    if ($needsArtifacts -and -not $SkipRunner -and -not $whatIf) {
+        if (& $ensureSdk) {
+            & $sdkFailed
+            return $results.ToArray()
+        }
+    }
+    elseif (-not $sdk.Done) {
+        Set-DemoProgressStep -Path $ProgressPath -Id 'DotNetSdk' -State 'Skipped' -Message $(if ($whatIf) { 'What if: nothing is installed.' } elseif ($SkipRunner) { 'Not needed: -SkipRunner builds no workload runner.' } else { 'Not needed: this run builds no workload runner.' })
+    }
     # Track processes start before the template and take what it returns from a private handoff directory.
     $useJobs = -not $InProcess -and -not $whatIf -and @($order).Count -gt 0
     $handoff = ''
@@ -778,7 +815,7 @@ function Invoke-DemoParallelDeployment {
         if ($plan.Preflight) {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
             Set-DemoProgressStep -Path $ProgressPath -Id 'Preflight' -State 'Running' -Message 'Checking access, quotas, sizes, Fabric, and policies before anything is created.'
-            $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf -DeferPolicyInventory:$deferPolicy)
+            $preflight = @(Invoke-DemoPreflight -Config $Config -SkipPolicyInventory:$SkipPolicyInventory -PolicyCacheHours $PolicyCacheHours -SkipProviderRegistration:$whatIf -DeferPolicyInventory:$deferPolicy -SkipRunner:$SkipRunner)
             & $addAll $preflight
             $source = Resolve-DemoT2Source -Config $Config
             $results.Add($source.Result)
@@ -809,7 +846,7 @@ function Invoke-DemoParallelDeployment {
             }
             # Where T4's fallback starts when preflight already ruled sizes out, or its cost check left T4 out (Phase 28 and
             # its follow-up): the furthest step any of its checks found.
-            $t4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') })
+            $t4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') }) -Order ([string[]]@(@('') + @(Get-DemoT4FallbackOrder -Config $Config)))
             if ($deferPolicy) {
                 Write-DemoLog -Message ('networkMode is {0}, so the policy inventory runs alongside the deployment instead of before it; its results come at the end.' -f [string]$Config['networkMode'])
                 $policyJob = Start-DemoPolicyInventoryJob -Config $Config -CacheHours $PolicyCacheHours -Confirm:$false
@@ -973,6 +1010,11 @@ function Invoke-DemoParallelDeployment {
             if ($t4NoteValue) {
                 $infrastructureText += ' ' + $t4NoteValue
             }
+            # T4's row on the status page says an automatic size change too (2026-11-09): its track gets the notice.
+            # Get-DemoMemberValue keeps an array whole, so the results are unrolled from a variable.
+            $deploymentResults = Get-DemoMemberValue -InputObject $deployment -Name 'Results'
+            $sizeChange = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.FALLBACK' }) | Select-Object -Last 1
+            $context['T4Notice'] = if ($null -ne $sizeChange) { [string]$sizeChange.message } else { '' }
             & $stageResult 'Infrastructure' 'Pass' $infrastructureText
             if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                 & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
@@ -999,7 +1041,7 @@ function Invoke-DemoParallelDeployment {
         }
         $context['LoaderSettings'] = $loaderSettings
         if ($useJobs) {
-            Write-DemoTrackHandoff -Path $handoff -Name 'infrastructure' -Value ([pscustomobject]@{ Succeeded = $true; LoaderSettings = $loaderSettings; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $Config); T4SkuName = $(if (Test-DemoT4Enabled -Config $Config) { Get-DemoT4SkuName -Config $Config } else { '' }); Message = '' }) -Confirm:$false
+            Write-DemoTrackHandoff -Path $handoff -Name 'infrastructure' -Value ([pscustomobject]@{ Succeeded = $true; LoaderSettings = $loaderSettings; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $Config); T4SkuName = $(if (Test-DemoT4Enabled -Config $Config) { Get-DemoT4SkuName -Config $Config } else { '' }); T4Notice = [string]$context['T4Notice']; Message = '' }) -Confirm:$false
         }
         elseif ($needsArtifacts) {
             try {
@@ -1007,7 +1049,7 @@ function Invoke-DemoParallelDeployment {
                 $context['Runner'] = if ($SkipRunner) { $null } else { Publish-DemoWorkloadRunner -Confirm:$false }
             }
             catch {
-                $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run New-DemoBootstrapBundle and Publish-DemoWorkloadRunner yourself to see the error (the runner needs the .NET SDK, or use -SkipRunner).'))
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation (Get-DemoArtifactBuildRemediation -Message $_.Exception.Message)))
                 return $results.ToArray()
             }
         }
@@ -1032,7 +1074,7 @@ function Invoke-DemoParallelDeployment {
             $built = if ($needsArtifacts -and $handoff) { Read-DemoTrackHandoff -Path $handoff -Name 'artifacts' } else { $null }
             $buildError = [string](Get-DemoMemberValue -InputObject $built -Name 'Error')
             if ($buildError) {
-                $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f $buildError) -Remediation 'Run New-DemoBootstrapBundle and Publish-DemoWorkloadRunner yourself to see the error (the runner needs the .NET SDK, or use -SkipRunner).'))
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.ARTIFACTS.BUILD' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message ('The bootstrap bundle or the workload runner couldn''t be built: {0}' -f $buildError) -Remediation (Get-DemoArtifactBuildRemediation -Message $buildError)))
             }
         }
         # The tracks are done, the Insights app's step with them: a sign-in still open is stopped now, and its record (never

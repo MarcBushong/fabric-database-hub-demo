@@ -303,3 +303,17 @@ Sources for this amendment (checked 2026-11-03):
 - Automatic tuning (SQL Server and Azure SQL): <https://learn.microsoft.com/sql/relational-databases/automatic-tuning/automatic-tuning>, <https://learn.microsoft.com/azure/azure-sql/database/automatic-tuning-overview>
 - Parameter-sensitive plan optimization: <https://learn.microsoft.com/sql/relational-databases/performance/parameter-sensitive-plan-optimization>
 - SQL Server 2022 editions and features: <https://learn.microsoft.com/sql/sql-server/editions-and-components-of-sql-server-2022>
+
+## The .NET SDK that builds the runner, installed for the user (2026-11-09)
+
+- **Why:** the runner is built where `deploy.ps1` runs (above), so that machine needs a .NET SDK that `workload-generator/global.json` accepts. A live run on 2026-11-09 failed its Artifacts steps about 15 minutes in on a PC whose first `dotnet` was a runtime-only install; preflight then checked the SDK before anything was created (`PREFLIGHT.TOOLS.DOTNETSDK`), but installing it stayed a manual step. The owner wants one click after `az login`, and chose "Install it automatically (Recommended)".
+- **Decision:** when no `dotnet` it finds has such an SDK, `deploy.ps1` installs the one `config/versions.json` pins (`dotnetSdkInstall`, the same version as `tools.dotnetSdk` and `global.json`) before it creates anything, with no prompt, no administrator rights, and no change to `PATH` (`Initialize-DemoDotNetSdk`, `DEPLOY.DOTNETSDK`). It downloads Microsoft's zip for the machine (`win-x64` or `win-arm64`) over HTTPS into `%LOCALAPPDATA%\DbHubDemo\dotnet\<version>`, and uses it only after three checks: the SHA-512 pinned from Microsoft's release metadata, `dotnet.exe`'s Authenticode signature from Microsoft Corporation, and `dotnet --version` in `workload-generator`. A failed check deletes what it downloaded and stops the run. The build runs that `dotnet` by its full path (`Resolve-DemoBuildDotNet`, in `Publish-DemoWorkloadRunner`), later runs reuse it after checking it again, and an install that didn't finish is removed and done again. An SDK on `PATH` that `global.json` accepts still comes first.
+- **Not chosen:** the installer or `winget`, which need elevation or a prompt; Microsoft's `dotnet-install.ps1`, a script fetched and run at deploy time; an opt-out switch, because `-SkipRunner` already builds no runner and needs no SDK. Linux and macOS (Azure Cloud Shell) keep the manual fix that `DEPLOY.DOTNETSDK` gives, before anything is created.
+- **Consequences:** about 290 MB to download once and about 800 MB on disk per user, which `destroy.ps1` leaves, as it leaves other tools; an earlier version that `deploy.ps1` installed is removed when the pin changes. The download needs `builds.dotnet.microsoft.com`.
+
+Sources for this amendment (checked 2026-11-09):
+
+- Install .NET on Windows, including the manual install from the zip: <https://learn.microsoft.com/dotnet/core/install/windows>
+- `global.json` and `rollForward`: <https://learn.microsoft.com/dotnet/core/tools/global-json>
+- The release metadata (`releases.json`): <https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json>
+- `Get-AuthenticodeSignature`: <https://learn.microsoft.com/powershell/module/microsoft.powershell.security/get-authenticodesignature>

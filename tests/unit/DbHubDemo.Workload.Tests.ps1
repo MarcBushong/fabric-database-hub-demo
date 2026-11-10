@@ -74,8 +74,11 @@ Describe 'Publish-DemoWorkloadRunner' {
         $script:publishCalls = [System.Collections.Generic.List[object]]::new()
         $script:fakeDll = 'runner dll v1'
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        # The dotnet that builds it, by its full path (2026-11-09): the one on PATH, or the SDK deploy.ps1 installed.
+        $script:buildDotNet = Join-Path -Path $TestDrive -ChildPath 'dotnet-for-tests/dotnet.exe'
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoBuildDotNet -MockWith { $script:buildDotNet }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDotNet -MockWith {
-            $script:publishCalls.Add([pscustomobject]@{ Arguments = $ArgumentList; WorkingDirectory = $WorkingDirectory })
+            $script:publishCalls.Add([pscustomobject]@{ Arguments = $ArgumentList; WorkingDirectory = $WorkingDirectory; DotNetPath = [string]$PesterBoundParameters['DotNetPath'] })
             $output = $ArgumentList[[array]::IndexOf($ArgumentList, '--output') + 1]
             New-Item -ItemType Directory -Path (Join-Path -Path $output -ChildPath 'runtimes') -Force | Out-Null
             Set-Content -LiteralPath (Join-Path -Path $output -ChildPath 'ContosoCare.Workload.dll') -Value $script:fakeDll -NoNewline
@@ -105,6 +108,26 @@ Describe 'Publish-DemoWorkloadRunner' {
         $script:publishCalls[0].WorkingDirectory | Should -Be (Join-Path -Path $fake -ChildPath 'workload-generator')
         $runner.RuntimeIdentifier | Should -Be 'win-x64'
         $runner.Reused | Should -BeFalse
+    }
+
+    It 'builds with the dotnet Resolve-DemoBuildDotNet names, by its full path: the SDK deploy.ps1 installed when none on PATH works (2026-11-09)' {
+        $fake = New-FakeRunnerRepository
+        $null = Publish-DemoWorkloadRunner -RepositoryRoot $fake -OutputDirectory (Join-Path -Path $TestDrive -ChildPath 'p1b')
+        $script:publishCalls[0].DotNetPath | Should -BeExactly $script:buildDotNet
+        Should -Invoke -ModuleName DbHubDemo -CommandName Resolve-DemoBuildDotNet -Times 1 -Exactly -ParameterFilter { $RepositoryRoot -eq $fake }
+    }
+
+    It 'builds nothing, and says why and the fix, when there''s no SDK global.json accepts; a reused zip needs none' {
+        $fake = New-FakeRunnerRepository
+        $output = Join-Path -Path $TestDrive -ChildPath 'p1c'
+        $first = Publish-DemoWorkloadRunner -RepositoryRoot $fake -OutputDirectory $output
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoBuildDotNet -MockWith { throw 'The dotnet first on PATH, C:\Program Files\dotnet\dotnet.exe, has no .NET SDK, only runtimes, ... so the workload runner can''t be built. Run ./scripts/deploy.ps1: ...' }
+        $again = Publish-DemoWorkloadRunner -RepositoryRoot $fake -OutputDirectory $output
+        $again.Reused | Should -BeTrue
+        $again.Sha256 | Should -Be $first.Sha256
+        { Publish-DemoWorkloadRunner -RepositoryRoot $fake -OutputDirectory $output -Force } | Should -Throw '*so the workload runner can''t be built*'
+        $script:publishCalls.Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $output -Directory -Filter 'publish-*').Count | Should -Be 0 -Because 'the staging folder goes too'
     }
 
     It 'zips the publish output deterministically, without program databases, with a manifest' {

@@ -46,11 +46,14 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         $productKey = New-TestModel -InstallMode 'ProductKey'
         @($productKey['tracks'] | ForEach-Object { $_['name'] }) | Should -Not -Contain 'T4'
         # Phase 28 live finding: a rerun starts the VMs that were stopped first, and the page says so; the Insights app's
-        # sign-in runs alongside the deployment from the start (2026-11-05), so its row is under Preflight.
-        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Preflight' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('StartVms', 'Fabric.AppSignIn', 'Preflight')
+        # sign-in runs alongside the deployment from the start (2026-11-05), so its row is under Preflight, and so is the
+        # .NET SDK that deploy.ps1 installs when it's missing, before anything is created (2026-11-09).
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Preflight' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('StartVms', 'Fabric.AppSignIn', 'DotNetSdk', 'Preflight')
         (Get-TestStep -Model $model -Id 'StartVms')['label'] | Should -Match 'VMs that were stopped'
+        (Get-TestStep -Model $model -Id 'DotNetSdk')['label'] | Should -Match 'installed for you when it''s missing'
+        (Get-TestStep -Model $model -Id 'DotNetSdk')['state'] | Should -Be 'Pending'
         $skipFabric = InModuleScope DbHubDemo { New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -SkipFabric) }
-        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Preflight' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('StartVms', 'Preflight')
+        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Preflight' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('StartVms', 'DotNetSdk', 'Preflight')
     }
 
     It 'shows the Insights app as part of the deployment, never optional, and marks it and its sign-in as not blocking DONE; every step starts Pending (2026-11-05)' {

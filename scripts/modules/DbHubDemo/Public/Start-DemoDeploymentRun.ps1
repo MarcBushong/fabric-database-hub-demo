@@ -38,6 +38,10 @@ function Start-DemoDeploymentRun {
     .PARAMETER OutputDirectory
     Where the model and the page go (default out/).
 
+    .PARAMETER Note
+    Lines that go first in the banner's notes and on the status page, before what the run ignores in the configuration:
+    deploy.ps1's self-update, the update it made or why it couldn't (Invoke-DemoSelfUpdate, 2026-11-09).
+
     .EXAMPLE
     $run = Start-DemoDeploymentRun -Config $config -WaitForT2
     #>
@@ -57,7 +61,10 @@ function Start-DemoDeploymentRun {
 
         [switch] $NoBrowser,
 
-        [string] $OutputDirectory = ''
+        [string] $OutputDirectory = '',
+
+        [AllowEmptyCollection()]
+        [string[]] $Note = @()
     )
 
     $environment = Get-DemoRunEnvironment
@@ -66,7 +73,7 @@ function Start-DemoDeploymentRun {
     $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
     $paths = Get-DemoProgressPath -Directory $OutputDirectory
     $command = Get-DemoDeployCommand -ConfigPath $ConfigPath
-    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -SkipFabric:$SkipFabric -Note @((Get-DemoT2LegacyModeText -Config $Config), (Get-DemoT4IgnoredText -Config $Config))
+    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -SkipFabric:$SkipFabric -Note @(@($Note) + @((Get-DemoT2LegacyModeText -Config $Config), (Get-DemoT4IgnoredText -Config $Config)))
     $run = [pscustomobject]@{
         ProgressPath = ''
         PagePath     = ''

@@ -30,8 +30,10 @@
     "cliVersion": "1.36.2",
     "sdkVersion": "1.36.2",
     "overrides": {
-      "note": "Phase 27: npm overrides in fabric/app/package.json, for a transitive package with a security advisory whose parents' newest releases still declare a vulnerable range. Each entry names the advisory and its parents' declared ranges. A Pester test checks that package.json's overrides match these exactly and that the lock file resolves every copy of the package to its override, and src/test/overrides.test.ts runs the Rayfin code that uses it. Remove an override once a pinned release of its parent depends on a fixed version. @azure/msal-node (2026-11-09): no Rayfin release accepts MSAL Node 7.1 or later, not even the newest prerelease (1.37.0-alpha.2159, checked 2026-11-09), so it's overridden to 7.2.1, which also binds the browser sign-in's response to its request's state (7.2.0); @azure/identity 4.14.1, which tedious 19.2.2 accepts, declares ^7.1.0 itself. src/test/overrides.test.ts runs the CLI's own rayfin login and rayfin login status with it, offline, against a stand-in for Entra ID and the browser. The override reaches what's installed from the lock file, the app's stage, whose CLI rayfin up and configure-fabric-app.ps1 -SignIn run, not a CLI that npx installs: deploy.ps1's browser sign-in, and its sign-in status read before a stage exists (risk R540 in docs/implementation-report.md).",
+      "note": "Phase 27: npm overrides in fabric/app/package.json, for a transitive package with a security advisory whose parents' newest releases still declare a vulnerable range. Each entry names the advisory and its parents' declared ranges. A key is the package name, or the name and the advisory's vulnerable range (name@>=x.y.z <fixedIn), so that a copy whose parent declares a range outside the advisory keeps its version. A Pester test checks that package.json's overrides match these exactly and that the lock file resolves every copy of the package (in the range, for a key with one) to its override, and src/test/overrides.test.ts runs the code that uses it. Remove an override once a pinned release of its parent depends on a fixed version. @azure/msal-node (2026-11-09): no Rayfin release accepts MSAL Node 7.1 or later, not even the newest prerelease (1.37.0-alpha.2159, checked 2026-11-09), so it's overridden to 7.2.1, which also binds the browser sign-in's response to its request's state (7.2.0); @azure/identity 4.14.1, which tedious 19.2.2 accepts, declares ^7.1.0 itself. src/test/overrides.test.ts runs the CLI's own rayfin login and rayfin login status with it, offline, against a stand-in for Entra ID and the browser. The override reaches what's installed from the lock file, the app's stage, whose CLI rayfin up and configure-fabric-app.ps1 -SignIn run, not a CLI that npx installs: deploy.ps1's browser sign-in, and its sign-in status read before a stage exists (risk R540 in docs/implementation-report.md). glob and minimatch (2026-11-09, risk R723): no release of ESLint (10.14.0), typescript-eslint (8.72.1), @eslint/config-array (0.23.5), archiver-utils (5.0.2), or the Rayfin CLI (1.36.2) declares a fixed glob (14.0.2 and later) or minimatch (11.0.1 and later), so each is overridden in the advisory's range to the newest release, glob 14.0.3 and minimatch 11.0.4, which glob 14 declares (^11.0.2). readdir-glob 1.1.3, through archiver 7.0.1, declares minimatch ^5.1.0, outside the advisory's range, and keeps 5.1.9. All are development dependencies, but the CLI's archiver packages the app for rayfin up on the presenter's PC; src/test/overrides.test.ts runs that packaging, the CLI's own glob calls, and ESLint's matching, offline.",
       "@azure/msal-node": { "version": "7.2.1", "advisory": "GHSA-xcx6-jx8p-x3h5", "fixedIn": "7.1.0", "requiredBy": [ "@microsoft/rayfin-cli 1.36.2: ^5.5.0", "@azure/identity 4.14.1, through tedious 19.2.2: ^7.1.0" ] },
+      "glob@>=9.0.0 <14.0.2": { "version": "14.0.3", "advisory": "GHSA-3g3m-2fjr-6pw4", "fixedIn": "14.0.2", "requiredBy": [ "@microsoft/rayfin-cli 1.36.2: ^13.0.6", "archiver-utils 5.0.2, through archiver 7.0.1 and @microsoft/rayfin-cli 1.36.2: ^10.0.0" ] },
+      "minimatch@>=7.0.0 <11.0.1": { "version": "11.0.4", "advisory": "GHSA-g3hv-75wg-m249", "fixedIn": "11.0.1", "requiredBy": [ "eslint 10.10.0: ^10.2.5", "@eslint/config-array 0.23.5, through eslint 10.10.0: ^10.2.4", "@typescript-eslint/typescript-estree 8.61.0, through typescript-eslint 8.61.0: ^10.2.2", "glob 13.0.6 (^10.2.2) and glob 10.5.0 (^9.0.4), replaced by the glob override, whose 14.0.3 declares ^11.0.2" ] },
       "zod": { "version": "4.6.7", "advisory": "GHSA-mrhx-c7xc-m3w5", "fixedIn": "4.6.6", "requiredBy": [ "@microsoft/rayfin-tools-common 1.36.2: ~4.3.6", "eslint-plugin-react-hooks 7.1.1: ^3.25.0 || ^4.0.0" ] }
     },
     "supportedNodeMajors": [20, 22, 24],
@@ -300,6 +302,26 @@
     "sha512": "a176095f1db69b42c81acc60940744078d6bf2d2ac643e418342aa9c81889f4bd13e42f4621b131f9e77e4bc781ad46e375956219df9a4f979031d2a5a8d93cd",
     "releaseMetadata": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
     "verifiedOn": "2026-11-09"
+  },
+  "dotnetSdkInstall": {
+    "note": "The .NET SDK that deploy.ps1 installs for the user when no dotnet it finds has one that workload-generator/global.json accepts (2026-11-09, the owner's decision): Microsoft's SDK zip for Windows, never the installer, into %LOCALAPPDATA%\\DbHubDemo\\dotnet\\<version>, with no administrator rights and no change to PATH (Initialize-DemoDotNetSdk). 'version' matches tools.dotnetSdk and global.json (a Pester test checks). Each file's 'sha512' is the hash Microsoft publishes in the release metadata (releaseMetadata), checked on 2026-11-09, and also by downloading both zips and hashing them (win-arm64's through deploy.ps1's own install on an ARM64 PC); 'sizeBytes' is the zip's size, which deploy.ps1 shows before it downloads. deploy.ps1 checks the SHA-512, then dotnet.exe's Authenticode signature, then 'dotnet --version' in workload-generator, before it uses the SDK. Update it with the SDK: from the release whose sdks list contains tools.dotnetSdk, that SDK's files dotnet-sdk-win-x64.zip and dotnet-sdk-win-arm64.zip.",
+    "version": "10.0.403",
+    "releaseMetadata": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
+    "verifiedOn": "2026-11-09",
+    "files": {
+      "win-x64": {
+        "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.403/dotnet-sdk-10.0.403-win-x64.zip",
+        "fileName": "dotnet-sdk-10.0.403-win-x64.zip",
+        "sizeBytes": 300745255,
+        "sha512": "7a114c318fa7f1d9822991b534b2814d0e78386ceda816b371f5141acefe741d87ccb606ede06cadac8f9ac5070e32b708a67bbd1619ff5e5a7858a27874ef48"
+      },
+      "win-arm64": {
+        "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.403/dotnet-sdk-10.0.403-win-arm64.zip",
+        "fileName": "dotnet-sdk-10.0.403-win-arm64.zip",
+        "sizeBytes": 291061166,
+        "sha512": "f78ecd8b48e24fd72ee604687b75f1bbb81505e8343f7d52e4baf9ea32372557eb30e88facaaad195bf2646fcce117fd941e49da0d5bdee1d60d63d836968429"
+      }
+    }
   },
   "databaseHub": {
     "note": "Database Hub (preview) validation settings (Phase 9). Hub has no public API or ARM resource, so the validators use only these documented interfaces; the repo never calls private Hub routes. The telemetry endpoint and schema can change during the preview: re-read docUrl before you change a value. KQL templates live in scripts/modules/DbHubDemo/Kql.",

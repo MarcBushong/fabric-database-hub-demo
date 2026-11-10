@@ -74,10 +74,12 @@ Describe 'What a run can expect (brief goal 7, items 3 and 13)' {
         $text | Should -Not -Match 'not measured yet'
         $expect.Lines[0] | Should -Match 'measured on 2026-11-06; the rest are estimates'
         $expect.Text | Should -Match '91 minutes, measured on 2026-11-06'
+        $text | Should -Match 'The Insights app deploys with your Azure CLI sign-in \(az login\), so no browser opens for it\. Only after Fabric refused that token in an earlier run' -Because 'the app''s Rayfin CLI needs no sign-in of its own by default (2026-11-09)'
         $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
         $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment }
-        @($notice | Where-Object { $_ -notlike 'The Insights app''s browser sign-in*' }) | Should -BeNullOrEmpty -Because 'a session without keyboard input needs no T2 warning when no T2 step needs a person'
-        @($notice | Where-Object { $_ -like 'The Insights app''s browser sign-in*' }).Count | Should -Be 1 -Because 'the Insights app''s sign-in still doesn''t start in such a session (2026-11-05)'
+        @($notice | Where-Object { $_ -notlike 'The Insights app deploys with your Azure CLI sign-in*' }) | Should -BeNullOrEmpty -Because 'a session without keyboard input needs no T2 warning when no T2 step needs a person'
+        @($notice | Where-Object { $_ -like 'The Insights app deploys with your Azure CLI sign-in*' }).Count | Should -Be 1 -Because 'its fallback, the Rayfin CLI''s browser sign-in, still doesn''t start in such a session (2026-11-05; 2026-11-09)'
+        ($notice -join ' ') | Should -Match 'Only if Fabric refuses that token does it need the Rayfin CLI''s browser sign-in, which isn''t started in a session like this one'
         $quiet = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -SkipFabric }
         @($quiet) | Should -BeNullOrEmpty -Because 'without Fabric, nothing in JumpstartImage mode needs a person'
     }

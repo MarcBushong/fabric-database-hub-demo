@@ -1,19 +1,25 @@
 // @vitest-environment node
-// package.json overrides two packages that the pinned Rayfin packages bring in, for security advisories, with releases
-// outside the ranges those packages declare, so this file runs Rayfin's own code with each override:
+// package.json overrides four packages that the pinned Rayfin packages and ESLint bring in, for security advisories,
+// with releases outside the ranges those packages declare, so this file runs their own code with each override:
 // - zod (GHSA-mrhx-c7xc-m3w5; @microsoft/rayfin-tools-common 1.36.2 wants ~4.3.6): the template manifest validation
 //   behind `rayfin init`, the only place Rayfin uses zod (the app's browser bundle has none). The expected results are
 //   what the same calls returned with zod 4.3.6, but for the one difference noted below (Phase 27).
 // - @azure/msal-node (GHSA-xcx6-jx8p-x3h5; @microsoft/rayfin-cli 1.36.2 wants ^5.5.0): the CLI's browser sign-in,
 //   `rayfin login`, then `rayfin login status`, run as processes against rayfin-sign-in-harness.mjs, which stands in for
 //   Microsoft Entra ID and the browser, offline (2026-11-09).
+// - glob (GHSA-3g3m-2fjr-6pw4) and minimatch (GHSA-g3hv-75wg-m249), overridden only where a parent declares a vulnerable
+//   range (archiver-utils 5.0.2 wants glob ^10.0.0, the CLI ^13.0.6; ESLint, @eslint/config-array, typescript-eslint,
+//   and glob 13 want minimatch ^10): the CLI's ZIP packaging for `rayfin up`, which loads archiver, archiver-utils, and
+//   glob; the CLI's own glob calls; and ESLint's file and config matching, offline (2026-11-09).
 // Remove a test with its override once a Rayfin release depends on a fixed version.
 import { parseManifestFromString, validateManifest } from "@microsoft/rayfin-tools-common/_internal/templates";
+import { ESLint } from "eslint";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { crc32, inflateRawSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 
 describe("the zod override with the pinned Rayfin packages", () => {
@@ -198,4 +204,117 @@ describe("the @azure/msal-node override with the pinned Rayfin CLI", () => {
         expect(tokenRequests()).toHaveLength(2);
         expect(events().filter((event) => event.kind === "blocked")).toEqual([]);
     }, 300_000);
+});
+
+type ZipEntry = { name: string; method: number; data: Buffer };
+
+// Reads a ZIP from its central directory and inflates each entry, checking its CRC-32, so the archive is checked without a
+// ZIP package (APPNOTE.TXT, sections 4.3.7, 4.3.12, and 4.3.16).
+const readZip = (zip: Buffer): ZipEntry[] => {
+    const end = zip.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+    expect(end).toBeGreaterThan(0);
+    const count = zip.readUInt16LE(end + 10);
+    let at = zip.readUInt32LE(end + 16);
+    const entries: ZipEntry[] = [];
+    for (let i = 0; i < count; i++) {
+        expect(zip.readUInt32LE(at)).toBe(0x02014b50);
+        const method = zip.readUInt16LE(at + 10);
+        const crc = zip.readUInt32LE(at + 16);
+        const size = zip.readUInt32LE(at + 20);
+        const nameLength = zip.readUInt16LE(at + 28);
+        const local = zip.readUInt32LE(at + 42);
+        const name = zip.toString("utf8", at + 46, at + 46 + nameLength);
+        expect(zip.readUInt32LE(local)).toBe(0x04034b50);
+        const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+        const raw = zip.subarray(start, start + size);
+        const data = method === 8 ? inflateRawSync(raw) : Buffer.from(raw);
+        expect(crc32(data) >>> 0, name).toBe(crc);
+        entries.push({ name, method, data });
+        at += 46 + nameLength + zip.readUInt16LE(at + 30) + zip.readUInt16LE(at + 32);
+    }
+    return entries;
+};
+
+describe("the glob and minimatch overrides with the pinned Rayfin CLI and ESLint", () => {
+    const appRoot = resolve(import.meta.dirname, "../..");
+    const cliRoot = join(appRoot, "node_modules/@microsoft/rayfin-cli");
+    const work = mkdtempSync(join(tmpdir(), "rayfin-packaging-"));
+    const versionOf = (path: string) => (JSON.parse(readFileSync(join(appRoot, "node_modules", path, "package.json"), "utf8")) as { version: string }).version;
+    const write = (path: string, content: string | Buffer) => {
+        mkdirSync(resolve(path, ".."), { recursive: true });
+        writeFileSync(path, content);
+    };
+
+    afterAll(() => rmSync(work, { recursive: true, force: true }));
+
+    it("are the versions package.json overrides, and leave readdir-glob's minimatch 5, outside the advisory's range", () => {
+        const overrides = (JSON.parse(readFileSync(join(appRoot, "package.json"), "utf8")) as { overrides: Record<string, string> }).overrides;
+        expect(versionOf("glob")).toBe(overrides["glob@>=9.0.0 <14.0.2"]);
+        expect(versionOf("minimatch")).toBe(overrides["minimatch@>=7.0.0 <11.0.1"]);
+        expect(versionOf("readdir-glob/node_modules/minimatch")).toMatch(/^5\./);
+    });
+
+    it("packages a static folder into the ZIP that rayfin up uploads, with archiver loading glob 14", async () => {
+        // The function behind rayfin up's static hosting step; the CLI's exports don't list it, so it's loaded by path.
+        const { packageStaticFolder } = (await import(pathToFileURL(join(cliRoot, "dist/utils/static-hosting-utils.js")).href)) as {
+            packageStaticFolder: (folder: string) => Promise<Buffer>;
+        };
+        const site = join(work, "dist");
+        const binary = Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 7919) % 256));
+        const files: Record<string, string | Buffer> = {
+            "index.html": "<!doctype html><title>Database Hub Insights</title><script type=\"module\" src=\"/assets/index.js\"></script>\n",
+            "assets/index.js": "console.log(\"Database Hub Insights\");\n",
+            "assets/index.css": "body { margin: 0; }\n",
+            "assets/fonts/space-grotesk.woff2": binary,
+            "dbhub-app.json": "{\"name\":\"APP_DatabaseHub_Insights\"}\n",
+        };
+        for (const [path, content] of Object.entries(files)) {
+            write(join(site, path), content);
+        }
+        const entries = readZip(await packageStaticFolder(site));
+        // archiver adds an entry for each folder, as it did with glob 10 and minimatch 9.
+        expect(entries.map((entry) => entry.name).sort()).toEqual(["assets/", "assets/fonts/", ...Object.keys(files)].sort());
+        for (const entry of entries) {
+            if (entry.name.endsWith("/")) {
+                expect(entry.data.length, entry.name).toBe(0);
+                continue;
+            }
+            expect(entry.method, entry.name).toBe(8);
+            expect(entry.data.equals(Buffer.from(files[entry.name])), entry.name).toBe(true);
+        }
+    });
+
+    it("finds the CLI's function sources with its own glob call and ignore patterns", async () => {
+        const { analyzeFunctionsProject } = (await import(pathToFileURL(join(cliRoot, "dist/utils/functions-metadata-generator.js")).href)) as {
+            analyzeFunctionsProject: (dir: string, options: { functionsProgram: null }) => Promise<{ functions: { functionName: string; scriptFile: string }[] }>;
+        };
+        const functions = join(work, "functions");
+        const register = (name: string) => `udf.func("${name}", async () => "${name}", []);\n`;
+        write(join(functions, "src/hello.ts"), register("hello"));
+        write(join(functions, "src/nested/deeper/goodbye.ts"), register("goodbye"));
+        for (const skipped of ["src/hello.test.ts", "src/hello.spec.ts", "src/types.ts", "src/nested/types.ts", "src/env.d.ts"]) {
+            write(join(functions, skipped), register(skipped.replace(/\W/g, "_")));
+        }
+        // No program, so the CLI takes its glob path rather than a TypeScript program's file list.
+        const analysis = await analyzeFunctionsProject(functions, { functionsProgram: null });
+        expect(analysis.functions.map((fn) => [fn.functionName, fn.scriptFile.replace(/\\/g, "/")])).toEqual([
+            ["hello", "src/hello.ts"],
+            ["goodbye", "src/nested/deeper/goodbye.ts"],
+        ]);
+    });
+
+    it("matches this app's files to ESLint's configuration and ignores", async () => {
+        const eslint = new ESLint({ cwd: appRoot });
+        expect(await eslint.isPathIgnored(join(appRoot, "dist/assets/index.js"))).toBe(true);
+        expect(await eslint.isPathIgnored(join(appRoot, "rayfin/.temp/connectors/history/dab-config.json"))).toBe(true);
+        expect(await eslint.isPathIgnored(join(appRoot, "src/App.tsx"))).toBe(false);
+        const app = (await eslint.calculateConfigForFile(join(appRoot, "src/App.tsx"))) as { rules: Record<string, unknown[]> };
+        const test = (await eslint.calculateConfigForFile(join(appRoot, "src/test/overrides.test.ts"))) as { rules: Record<string, unknown[]> };
+        expect(app.rules["react-refresh/only-export-components"]?.[0]).toBe(1);
+        expect(test.rules["react-refresh/only-export-components"]?.[0]).toBe(0);
+        expect(app.rules["react-hooks/rules-of-hooks"]?.[0]).toBe(2);
+        const results = await eslint.lintFiles(["src/test/*.ts"]);
+        expect(results.map((result) => result.filePath.replace(/\\/g, "/").replace(/^.*\/src\/test\//, "")).sort()).toEqual(["overrides.test.ts", "setup.ts"]);
+        expect(results.map((result) => result.errorCount + result.warningCount)).toEqual([0, 0]);
+    }, 120_000);
 });

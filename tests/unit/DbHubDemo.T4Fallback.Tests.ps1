@@ -37,14 +37,16 @@ BeforeAll {
     }
 
     # The cost check's verdict, in ConvertTo-DemoT4FallbackCost's shape.
-    function New-TestCost([string] $SkipReason = '', [object] $HourlyUsd = 0.5, [double] $MonthlyWorstCaseUsd = 220.0, [double] $SessionUsd = 8.0, [string] $SkuName = 'Standard_D2ds_v5', [string] $RestartAssumption = '') {
+    function New-TestCost([string] $SkipReason = '', [object] $HourlyUsd = 0.5, [double] $MonthlyWorstCaseUsd = 220.0, [double] $SessionUsd = 8.0, [string] $SkuName = 'Standard_D2ds_v5', [string] $RestartAssumption = '', [double] $T4LightUseMonthlyUsd = 25.0, [double] $T4MonthlyWorstCaseUsd = 385.0) {
         [pscustomobject]@{
             Allowed               = (-not $SkipReason)
             SkipReason            = $SkipReason
             SkuName               = $SkuName
             RestartAssumption     = $RestartAssumption
             HourlyUsd             = $HourlyUsd
-            T4MonthlyWorstCaseUsd = 385.0
+            T4LightUseMonthlyUsd  = $(if ($null -ne $HourlyUsd) { $T4LightUseMonthlyUsd } else { $null })
+            T4MonthlyWorstCaseUsd = $(if ($null -ne $HourlyUsd) { $T4MonthlyWorstCaseUsd } else { $null })
+            LightUseMonthlyUsd    = 100.0
             MonthlyWorstCaseUsd   = $MonthlyWorstCaseUsd
             SessionUsd            = $SessionUsd
             MonthlyCeilingUsd     = 250.0
@@ -69,8 +71,8 @@ BeforeAll {
         }
     }
 
-    function New-TestState([string] $T4Sku, [string] $TrackT4 = 'Telemetry') {
-        [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = $TrackT4; TrackFabric = 'Fabric'; T4Sku = $T4Sku; GuidedStopUtc = ''; HostPasswordUtc = '' }
+    function New-TestState([string] $T4Sku, [string] $TrackT4 = 'Telemetry', [string] $T4Refused = '') {
+        [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = $TrackT4; TrackFabric = 'Fabric'; T4Sku = $T4Sku; T4Refused = $T4Refused; GuidedStopUtc = ''; HostPasswordUtc = '' }
     }
 
     # A fake template step: Azure answers a T4 size with $script:codes[<size>] (SkuNotAvailable, or another error code)
@@ -96,7 +98,12 @@ BeforeAll {
         # The zones the region's capabilities list for Standard_D4ds_v5, for the fallback's retry in another zone; none by
         # default, so the fallback moves straight on to Standard_D4ads_v5.
         $script:zones = @()
+        # The zones the region lists for other sizes, by size, in their tier's edition (2026-11-09, a size t4SkuName sets).
+        $script:skuZones = @{}
         $script:sentZones = [System.Collections.Generic.List[string]]::new()
+        # What the fallback recorded in DbHubT4Refused, and each size's cost check (2026-11-09).
+        $script:recordedRefused = [System.Collections.Generic.List[string]]::new()
+        $script:costBySize = @{}
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -MockWith { throw 'The unit tests make no Retail Prices API call.' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { $true }
@@ -109,17 +116,18 @@ BeforeAll {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Exists = ($null -ne $script:server); State = $(if ($null -ne $script:server) { $script:serverState } else { 'NotFound' }); Server = $script:server } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -MockWith {
             if ([string]$script:codes[$script:currentSize] -eq 'SkuNotAvailable') {
-                [pscustomobject]@{ Sku = $script:currentSize; Zone = ''; TimeUtc = '2026-11-02T14:00:00Z' }
+                [pscustomobject]@{ Sku = $script:currentSize; Zone = $(if ($script:sentZones.Count -gt 0) { [string]$script:sentZones[-1] } else { '' }); TimeUtc = '2026-11-02T14:00:00Z' }
             }
         }
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recorded.Add([string]$Value['T4Sku']) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recorded.Add([string]$Value['T4Sku']); $script:recordedRefused.Add([string]$Value['T4Refused']) }
         # The sizes priced since the harness was set up (Should -Invoke counts a whole It's calls). The 2-vCore fallback calls
         # without -SkuName, as it always has, and Pester sets no variable for a parameter that isn't bound, which strict mode
         # refuses to read (CI on 413990f), so the size comes from $PesterBoundParameters, with the function's own default.
         $script:pricedSizes = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -MockWith {
-            $script:pricedSizes.Add($(if ($PesterBoundParameters.ContainsKey('SkuName')) { [string]$PesterBoundParameters['SkuName'] } else { 'Standard_D2ds_v5' }))
-            $script:cost
+            $pricedSize = if ($PesterBoundParameters.ContainsKey('SkuName')) { [string]$PesterBoundParameters['SkuName'] } else { 'Standard_D2ds_v5' }
+            $script:pricedSizes.Add($pricedSize)
+            if ($script:costBySize.ContainsKey($pricedSize)) { $script:costBySize[$pricedSize] } else { $script:cost }
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -MockWith {
             $script:currentSize = if (-not $Config['t4Enabled']) { 'none' } elseif ($Config.Contains('t4SkuName') -and $Config['t4SkuName']) { [string]$Config['t4SkuName'] } else { 'Standard_D4ds_v5' }
@@ -136,10 +144,17 @@ BeforeAll {
                 return (New-AzResult -StdOut '[]')
             }
             if ($joined -like 'postgres flexible-server list-skus *') {
-                if (@($script:zones).Count -eq 0) {
+                if (@($script:zones).Count -eq 0 -and $script:skuZones.Count -eq 0) {
                     return (New-AzResult -ExitCode 1 -StdErr 'ERROR: not faked')
                 }
-                return (New-AzResult -StdOut (ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'westus3'; supportedServerEditions = @(@{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5'; supportedZones = @($script:zones) }) }) })))
+                $listed = @{ Standard_D4ds_v5 = @($script:zones) }
+                foreach ($key in $script:skuZones.Keys) {
+                    $listed[$key] = @($script:skuZones[$key])
+                }
+                $editions = foreach ($edition in 'Burstable', 'GeneralPurpose') {
+                    @{ name = $edition; supportedServerSkus = @(foreach ($key in $listed.Keys) { if (($edition -eq 'Burstable') -eq ($key -like 'Standard_B*')) { @{ name = $key; supportedZones = @($listed[$key]) } } }) }
+                }
+                return (New-AzResult -StdOut (ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'westus3'; supportedServerEditions = @($editions) })))
             }
             if ($joined -like 'deployment sub create *') {
                 $file = [string]$ArgumentList[[array]::IndexOf([string[]]@($ArgumentList), '--parameters') + 1]
@@ -169,8 +184,8 @@ BeforeAll {
         Invoke-DemoTemplateDeployment -Config $Config -NetworkMode private -T3UseFreeLimit $false -T4StartSku $T4StartSku
     }
 
-    function Resolve-TestConfig([System.Collections.IDictionary] $Config, [string] $Record, [switch] $TemplateRuns) {
-        InModuleScope DbHubDemo -Parameters @{ Config = $Config; Record = $Record; TemplateRuns = [bool]$TemplateRuns } { Resolve-DemoEffectiveConfig -Config $Config -State ([pscustomobject]@{ T4Sku = $Record }) -TemplateRuns:$TemplateRuns }
+    function Resolve-TestConfig([System.Collections.IDictionary] $Config, [string] $Record, [switch] $TemplateRuns, [string] $Refused = '') {
+        InModuleScope DbHubDemo -Parameters @{ Config = $Config; Record = $Record; TemplateRuns = [bool]$TemplateRuns; Refused = $Refused } { Resolve-DemoEffectiveConfig -Config $Config -State ([pscustomobject]@{ T4Sku = $Record; T4Refused = $Refused }) -TemplateRuns:$TemplateRuns }
     }
 }
 
@@ -220,8 +235,11 @@ Describe 'Guardrail 1: only SkuNotAvailable for both 4-vCore sizes moves T4 to i
         @($script:sizes) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
         $deployment.T4Enabled | Should -BeTrue
         $deployment.T4SkuName | Should -Be 'Standard_D2ds_v5'
-        # The cost check ran once, right before the General Purpose attempt, with this run's network mode and free offer.
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $Config['t4SkuName'] -eq 'Standard_D2ds_v5' -and $NetworkMode -eq 'private' -and $T3UseFreeLimit -eq $false }
+        # The cost check ran once, right before the General Purpose attempt, with this run's network mode and free offer, and
+        # the size change's notice priced the default once, for the difference (2026-11-09).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') -and $Config['t4SkuName'] -eq 'Standard_D2ds_v5' -and $NetworkMode -eq 'private' -and $T3UseFreeLimit -eq $false }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['SkuName'] -eq 'Standard_D4ds_v5' }
+        ($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK').status | Should -Be 'Warning'
         $steps = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU')
         @($steps.status) | Should -Be @('Warning', 'Warning')
         $steps[0].evidence.next | Should -Be 'Standard_D4ads_v5'
@@ -297,18 +315,20 @@ Describe 'Guardrail 1: only SkuNotAvailable for both 4-vCore sizes moves T4 to i
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4OffReason -Config $Config -State ([pscustomobject]@{ T4Sku = 'Refused' }) } | Should -BeNullOrEmpty
     }
 
-    It 'never falls back, prices, or keeps another size for a t4SkuName the configuration sets' {
+    It 'falls back for a t4SkuName Azure refuses too (2026-11-09), and a record no longer holds once t4SkuName names another size (review finding 5)' {
+        # A 4-vCore size's peer comes first (the whole order is in its own Describe below).
         $script:codes = @{ Standard_D4ads_v5 = 'SkuNotAvailable' }
         $deployment = Invoke-TestTemplate -Config (New-TestConfig -SkuName 'Standard_D4ads_v5')
-        $deployment.Succeeded | Should -BeFalse
-        @($script:sizes) | Should -Be @('Standard_D4ads_v5')
-        $script:recorded.Count | Should -Be 0
-        $refusal = $deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU'
-        $refusal.status | Should -Be 'Fail'
-        $refusal.remediation | Should -Match 'A size you set is never changed on its own'
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D4ads_v5', 'Standard_D4ds_v5')
+        $deployment.T4SkuName | Should -Be 'Standard_D4ds_v5'
+        @($script:recorded) | Should -Be @('Standard_D4ds_v5')
+        @($deployment.Results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and [string]$_.status -eq 'Fail' }) | Should -BeNullOrEmpty
 
-        # Nor a record, preflight's start, or an existing server's own size: a size you set is what you asked for.
+        # A record for another size, preflight's start, and an existing server's own size don't hold for a size you set.
         $script:codes = @{}
+        $script:recorded.Clear()
+        $script:pricedSizes.Clear()
         $script:sizes.Clear()
         $script:groupTags = @{ deploymentId = 'abc123'; DbHubT4Size = 'Standard_D2ds_v5' }
         $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
@@ -317,7 +337,7 @@ Describe 'Guardrail 1: only SkuNotAvailable for both 4-vCore sizes moves T4 to i
         @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU').Count | Should -Be 0
         # Its record no longer holds (review finding 5).
         $script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Size'] | Should -Be ''
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 0 -Exactly
+        $script:pricedSizes.Count | Should -Be 0 -Because 'an existing server isn''t priced for a fallback'
         (Resolve-TestConfig -Config (New-TestConfig -SkuName 'Standard_D4ds_v5') -Record 'Standard_D2ds_v5' -TemplateRuns)['t4SkuName'] | Should -Be 'Standard_D4ds_v5'
     }
 
@@ -400,18 +420,18 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $deployment.T4SkuName | Should -Be 'Standard_D2ds_v5'
         @($script:recorded) | Should -Be @('Standard_D4ads_v5', 'Standard_D2ds_v5')
         $script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Size'] | Should -Be 'Standard_D2ds_v5'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') }
         $skip = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU')[-1]
         $skip.status | Should -Be 'Warning'
         $skip.evidence.next | Should -Be 'None'
-        $skip.evidence.startSku | Should -Be 'Standard_D2ds_v5' -Because 'the 2-vCore size over a ceiling is created anyway (2026-11-09)'
+        $skip.evidence.startSku | Should -Be 'Standard_D2ds_v5' -Because 'no step leaves T4 out, so a later run starts at the size, never at None (2026-11-09)'
         $skip.evidence.skipReason | Should -Be $Reason
         $skip.message | Should -Match 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: '
         $skip.message | Should -Match $Because
         $skip.message | Should -Match 'T4 is part of every deployment, so a ceiling never leaves it out\. Later runs keep this size\.'
         $skip.remediation | Should -Match $Fix
         $skip.remediation | Should -Not -Match 't4Enabled'
-        $deployment.T4Note | Should -Match '^T4 created as General Purpose Standard_D2ds_v5 \(2 vCores\) because Azure refused the 4-vCore sizes here'
+        $deployment.T4Note | Should -Match '^T4 was created as Standard_D2ds_v5 \(General Purpose, 2 vCores\) instead of Standard_D4ds_v5, T4''s default size, because Azure refused Standard_D4ds_v5 \(no zone preference\), then Standard_D4ads_v5 \(no zone preference\) with SkuNotAvailable\.'
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'although its cost check doesn''t pass' }
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Message -match '^T4 isn''t created' }
         # DONE has no missing T4 to explain: it's deployed, and this run's Warning says what it costs.
@@ -425,7 +445,7 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         @($script:sizes) | Should -Be @('Standard_D2ds_v5') -Because 'over a ceiling, it''s a Warning, and T4 is created anyway (2026-11-09)'
         $deployment.T4Enabled | Should -BeTrue
         @($script:recorded) | Should -Be @('Standard_D2ds_v5')
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') }
 
         # A record of Standard_D2ds_v5 for a server that doesn't exist (a run that stopped before the template finished).
         $script:cost = New-TestCost
@@ -434,7 +454,7 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $script:groupTags = @{ deploymentId = 'abc123'; DbHubT4Size = 'Standard_D2ds_v5' }
         Invoke-TestTemplate -Config (Resolve-TestConfig -Config (New-TestConfig) -Record 'Standard_D2ds_v5' -TemplateRuns) | Out-Null
         @($script:sizes) | Should -Be @('Standard_D2ds_v5')
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 2 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 2 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') }
         $script:recorded.Count | Should -Be 0 -Because 'the group already records it'
 
         # An earlier run's "no T4" record (DbHubT4Size None) makes the next run that deploys the template try T4's sizes
@@ -446,7 +466,7 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $deployment = Invoke-TestTemplate -Config (Resolve-TestConfig -Config (New-TestConfig) -Record 'None' -TemplateRuns)
         @($script:sizes) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
         @($script:recorded) | Should -Be @('Standard_D4ads_v5', 'Standard_D2ds_v5')
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 3 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 3 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') }
         $retry = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.RETRY')
         $retry.Count | Should -Be 1
         $retry[0].status | Should -Be 'Warning'
@@ -476,14 +496,14 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
             $deployment.T4Enabled | Should -BeTrue -Because 'without the free offer the worst case is over monthlyCeilingUsd: a Warning, never T4 left out (2026-11-09)'
             $deployment.T4SkuName | Should -Be 'Standard_D2ds_v5'
             @($script:sizes) | Should -Be @('Standard_D2ds_v5', 'Standard_D2ds_v5')
-            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 2 -Exactly
-            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $T3UseFreeLimit -eq $false }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 2 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') -and $T3UseFreeLimit -eq $false }
             $sku[0].status | Should -Be 'Warning'
             $sku[0].evidence.next | Should -Be 'None' -Because 'the second check''s result replaces the first one'
             $sku[0].evidence.skipReason | Should -Be 'MonthlyCeiling'
             $sku[0].message | Should -Match 'although its cost check doesn''t pass'
             @($script:recorded) | Should -Be @('Standard_D2ds_v5') -Because 'the second check keeps the size the group already records'
-            $deployment.T4Note | Should -Match '^T4 created as General Purpose Standard_D2ds_v5'
+            $deployment.T4Note | Should -Match '^T4 was created as Standard_D2ds_v5 \(General Purpose, 2 vCores\) instead of Standard_D4ds_v5, T4''s default size, because Standard_D4ds_v5 was unavailable here \(found by preflight or an earlier run\)\.'
             return
         }
         # The server exists, so it's kept as it is: no second check, never "None", and the next attempt deploys it as the
@@ -491,8 +511,8 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $deployment.T4Enabled | Should -BeTrue
         $deployment.T4SkuName | Should -Be 'Standard_D2ds_v5'
         @($script:sizes) | Should -Be @('Standard_D2ds_v5', 'Standard_D2ds_v5')
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 0 -Exactly -ParameterFilter { $T3UseFreeLimit -eq $false }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 0 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') -and $T3UseFreeLimit -eq $false }
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -Times 1 -Exactly -ParameterFilter { $T4Exists }
         @($script:recorded) | Should -Be @('Standard_D2ds_v5')
         $script:recorded | Should -Not -Contain 'None'
@@ -501,7 +521,7 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $sku[0].evidence.freeOfferCounted | Should -BeTrue
         $sku[0].message | Should -Match 'Azure then rejected the T3 free offer, whose allowance this check counted, but that attempt had already created T4''s server, so it isn''t priced again'
         ($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE').evidence.t4Fallback | Should -Be 'Standard_D2ds_v5'
-        $deployment.T4Note | Should -Be 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API).'
+        $deployment.T4Note | Should -Match '^T4 was created as Standard_D2ds_v5 \(General Purpose, 2 vCores\) instead of Standard_D4ds_v5, T4''s default size, because Standard_D4ds_v5 was unavailable here'
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match '^T4''s server exists after this failed attempt .+ it''s kept at Standard_D2ds_v5' }
         # DONE, with the record the group now has: T4 created, never "wasn't created".
         $state = New-TestState -T4Sku ([string]$script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Size']) -TrackT4 ''
@@ -537,15 +557,30 @@ Describe 'Guardrail 3: the console, DONE, and the status page say it, with the h
         $script:codes = @{ Standard_D4ds_v5 = 'SkuNotAvailable'; Standard_D4ads_v5 = 'SkuNotAvailable' }
     }
 
-    It 'logs a console line and returns it for the status page''s Infrastructure step, with the price the check read: <HourlyUsd>' -ForEach @(
-        @{ HourlyUsd = 0.5; Text = '0.500' }
-        @{ HourlyUsd = 0.75; Text = '0.750' }
+    It 'logs a console line and returns it for the status page''s Infrastructure step, with what was tried, what was deployed, and both estimates: <Light> USD at light use (2026-11-09)' -ForEach @(
+        @{ Light = 25.0; Text = '25.00 USD and 385.00 USD, so 35.00 USD less a month at light use and 315.00 USD less in the worst case' }
+        @{ Light = 75.0; Text = '75.00 USD and 385.00 USD, so 15.00 USD more a month at light use and 315.00 USD less in the worst case' }
     ) {
-        $script:cost = New-TestCost -HourlyUsd $HourlyUsd
+        $script:cost = New-TestCost -T4LightUseMonthlyUsd $Light
+        $script:costBySize = @{ Standard_D4ds_v5 = (New-TestCost -SkuName 'Standard_D4ds_v5' -HourlyUsd 1.0 -T4LightUseMonthlyUsd 60.0 -T4MonthlyWorstCaseUsd 700.0) }
         $deployment = Invoke-TestTemplate -Config (New-TestConfig)
-        $script:line = 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about {0} USD an hour while running (list price in westus3, Azure Retail Prices API).' -f $Text
-        $deployment.T4Note | Should -Be $script:line
+        $script:line = [string]$deployment.T4Note
+        $script:line | Should -Match '^T4 was created as Standard_D2ds_v5 \(General Purpose, 2 vCores\) instead of Standard_D4ds_v5, T4''s default size, because Azure refused Standard_D4ds_v5 \(no zone preference\), then Standard_D4ads_v5 \(no zone preference\) with SkuNotAvailable\. '
+        $script:line | Should -Match ('Estimated monthly cost of T4 alone \(list prices in westus3, Azure Retail Prices API, read now; estimates\): Standard_D4ds_v5 60\.00 USD at light use and 700\.00 USD in the worst case; Standard_D2ds_v5 {0}, which counts Azure starting a stopped T4 again on its own after 7 days\.' -f [regex]::Escape($Text))
+        $script:line | Should -Match 'Autonomous tuning is off at this size: it needs a General Purpose size with at least 4 vCores\.$'
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -eq $script:line }
+        $change = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK')
+        $change.Count | Should -Be 1
+        $change[0].status | Should -Be 'Warning'
+        $change[0].message | Should -Be $script:line
+        $change[0].evidence.askedSku | Should -Be 'Standard_D4ds_v5'
+        $change[0].evidence.deployedSku | Should -Be 'Standard_D2ds_v5'
+        @($change[0].evidence.refused | ForEach-Object { $_.sku }) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
+        $change[0].evidence.asked.t4LightUseMonthlyUsd | Should -Be 60.0
+        $change[0].evidence.deployed.t4LightUseMonthlyUsd | Should -Be $Light
+        $change[0].evidence.lightUseDifferenceUsd | Should -Be ([System.Math]::Round($Light - 60.0, 2))
+        $change[0].evidence.worstCaseDifferenceUsd | Should -Be (-315.0)
+        $change[0].remediation | Should -Match '^Nothing to do: later runs keep T4 at Standard_D2ds_v5\. To choose another size, set t4SkuName to it'
     }
 
     It 'puts it in DONE and NOT DONE, with the 7-day restart and whether anything stops T4 again' {
@@ -759,6 +794,8 @@ Describe 'Guardrail 4: the size is recorded, and an existing server is never res
         Invoke-TestTemplate -Config (New-TestConfig) | Out-Null
         @($script:recorded) | Should -Be @('Standard_D4ads_v5', 'Standard_D2ds_v5')
         $script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Size'] | Should -Be 'Standard_D2ds_v5'
+        # What Azure refused, the asked size first, with the zones tried and when (2026-11-09).
+        $script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Refused'] | Should -Be 'Standard_D4ds_v5@any;Standard_D4ads_v5@any;2026-11-02T14:00:00Z'
 
         # The redeploy: deploy.ps1 resolves the record, and the server exists as Standard_D2ds_v5.
         $script:sizes.Clear()
@@ -770,7 +807,7 @@ Describe 'Guardrail 4: the size is recorded, and an existing server is never res
         $script:recorded.Count | Should -Be 0
         @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU').Count | Should -Be 0
         $deployment.T4Note | Should -BeNullOrEmpty -Because 'the console said it when it was created; DONE keeps saying it'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -Because 'only the run that created it checked the cost'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') } -Because 'only the run that created it checked the cost'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoDeploymentParameter -Times 1 -Exactly -ParameterFilter { $T4Exists }
     }
 
@@ -858,9 +895,12 @@ Describe 'Guardrail 4: the size is recorded, and an existing server is never res
     It 'starts the fallback at the furthest step preflight found' {
         InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('', 'Standard_D4ads_v5') } | Should -Be 'Standard_D4ads_v5'
         InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('Standard_D2ds_v5', 'Standard_D4ads_v5', '') } | Should -Be 'Standard_D2ds_v5'
-        # No step leaves T4 out since 2026-11-09: an older None or Refused counts as the default.
-        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('Standard_D2ds_v5', 'None') } | Should -Be 'Standard_D2ds_v5'
-        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('None', 'Refused') } | Should -Be ''
+        # No step leaves T4 out since 2026-11-09: an older run's None counts as Standard_D2ds_v5, and Refused as the default.
+        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('Standard_D4ads_v5', 'None') } | Should -Be 'Standard_D2ds_v5'
+        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('Refused') } | Should -Be ''
+        # A size t4SkuName sets: its own order (2026-11-09).
+        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('Standard_B2s', '') -Order @('', 'Standard_B2s', 'Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5') } | Should -Be 'Standard_B2s'
+        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('Standard_B2s') } | Should -Be '' -Because 'without t4SkuName, a Burstable size is no step of the fallback'
         InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @() } | Should -Be ''
     }
 
@@ -931,9 +971,13 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         $steps[1].message | Should -Match 'so autonomous tuning stays on, and later runs keep it'
         @($script:recorded) | Should -Be @('Standard_D4ads_v5')
         $deployment.T4SkuName | Should -Be 'Standard_D4ads_v5'
-        $deployment.T4Note | Should -Match '^T4 created as General Purpose Standard_D4ads_v5 \(4 vCores\) because Azure refused Standard_D4ds_v5 here, with autonomous tuning on; its hourly list price couldn''t be read just now'
+        # The notice names both zones tried and the size deployed; both sizes are priced for it (2026-11-09).
+        $deployment.T4Note | Should -Match '^T4 was created as Standard_D4ads_v5 \(General Purpose, 4 vCores\) instead of Standard_D4ds_v5, T4''s default size, because Azure refused Standard_D4ds_v5 \(no zone preference, then zone 2\) with SkuNotAvailable\. Estimated monthly cost of T4 alone'
+        $deployment.T4Note | Should -Not -Match 'Autonomous tuning is off' -Because 'both 4-vCore sizes run it'
         ($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE').evidence.t4AutonomousTuning | Should -BeTrue
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 0 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') }
+        @($script:pricedSizes) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
+        @(($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK').evidence.refused[0].zones) | Should -Be @('any', '2')
     }
 
     It 'goes on to the 2-vCore size with autonomous tuning off when t4AutonomousTuning is true, after its cost check: tuning never leaves T4 out (2026-11-09)' {
@@ -946,14 +990,14 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         $deployment.T4Enabled | Should -BeTrue
         $deployment.T4SkuName | Should -Be 'Standard_D2ds_v5'
         @($script:recorded) | Should -Be @('Standard_D4ads_v5', 'Standard_D2ds_v5')
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('SkuName') }
         $step = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU')[-1]
         $step.status | Should -Be 'Warning'
         $step.evidence.next | Should -Be 'Standard_D2ds_v5'
         $step.evidence.Contains('tuningRequired') | Should -BeFalse
         @($deployment.Results | Where-Object status -EQ 'Fail') | Should -BeNullOrEmpty
         ($deployment.Results | Where-Object checkId -EQ 'DEPLOY.TEMPLATE').evidence.t4AutonomousTuning | Should -BeFalse
-        $deployment.T4Note | Should -Match '^T4 created as General Purpose Standard_D2ds_v5 \(2 vCores\) because Azure refused the 4-vCore sizes here, so autonomous tuning is off'
+        $deployment.T4Note | Should -Match '^T4 was created as Standard_D2ds_v5 \(General Purpose, 2 vCores\) instead of Standard_D4ds_v5, .+ Autonomous tuning is off at this size'
         # The fallback's size is a Warning that says why tuning is off; only a t4SkuName the file sets to a size that can't
         # run autonomous tuning is a Fail.
         $tuning = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4Tuning -Config $Config -SkuName 'Standard_D2ds_v5' }
@@ -1144,5 +1188,251 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         @($script:sizes) | Should -Be @('Standard_D4ds_v5')
         $script:deployCalls[-1].parameters.budgetTags.value.Contains('DbHubT4Sku') | Should -BeFalse
         $deployment.Succeeded | Should -BeTrue
+    }
+}
+
+Describe 'A size t4SkuName sets falls back too, cheapest first, and every automatic size change says what it cost (2026-11-09, user-directed)' {
+    BeforeEach {
+        Initialize-TemplateHarness
+        # Obviously fake estimates for T4 alone at each size (light use, worst case), never real prices (ADR 0016).
+        $script:costBySize = @{
+            Standard_B1ms     = (New-TestCost -SkuName 'Standard_B1ms' -HourlyUsd 0.1 -T4LightUseMonthlyUsd 10.0 -T4MonthlyWorstCaseUsd 30.0)
+            Standard_B2s      = (New-TestCost -SkuName 'Standard_B2s' -HourlyUsd 0.2 -T4LightUseMonthlyUsd 40.0 -T4MonthlyWorstCaseUsd 120.0)
+            Standard_D2ds_v5  = (New-TestCost -SkuName 'Standard_D2ds_v5' -HourlyUsd 0.3 -T4LightUseMonthlyUsd 50.0 -T4MonthlyWorstCaseUsd 200.0)
+            Standard_D4ds_v5  = (New-TestCost -SkuName 'Standard_D4ds_v5' -HourlyUsd 0.6 -T4LightUseMonthlyUsd 90.0 -T4MonthlyWorstCaseUsd 400.0)
+            Standard_D4ads_v5 = (New-TestCost -SkuName 'Standard_D4ads_v5' -HourlyUsd 0.6 -T4LightUseMonthlyUsd 90.0 -T4MonthlyWorstCaseUsd 400.0)
+        }
+    }
+
+    It 'orders the fallback by tier and vCores, never a price: <Name>' -ForEach @(
+        @{ Name = 'Standard_B1ms'; Pinned = 'Standard_B1ms'; Order = @('Standard_B2s', 'Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5') }
+        @{ Name = 'Standard_B2s'; Pinned = 'Standard_B2s'; Order = @('Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_B1ms') }
+        @{ Name = 'Standard_D2ds_v5'; Pinned = 'Standard_D2ds_v5'; Order = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_B2s', 'Standard_B1ms') }
+        @{ Name = 'a 4-vCore size, its peer first'; Pinned = 'Standard_D4ds_v5'; Order = @('Standard_D4ads_v5', 'Standard_D2ds_v5', 'Standard_B2s', 'Standard_B1ms') }
+        @{ Name = 'the other 4-vCore size'; Pinned = 'Standard_D4ads_v5'; Order = @('Standard_D4ds_v5', 'Standard_D2ds_v5', 'Standard_B2s', 'Standard_B1ms') }
+        @{ Name = 'no t4SkuName, as since 2026-11-04'; Pinned = ''; Order = @('Standard_D4ads_v5', 'Standard_D2ds_v5') }
+    ) {
+        $config = New-TestConfig -SkuName $Pinned
+        @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4FallbackOrder -Config $Config }) | Should -Be $Order
+        # A copy the fallback or a record made still knows the size t4SkuName set.
+        $copy = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Copy-DemoT4Config -Config $Config -Source fallback -SkuName 'Standard_D2ds_v5' }
+        InModuleScope DbHubDemo -Parameters @{ Config = $copy } { Get-DemoT4AskedSku -Config $Config } | Should -Be $(if ($Pinned) { $Pinned } else { 'Standard_D4ds_v5' })
+    }
+
+    It 'falls back from <Pinned> to <Deployed> when <Case>, on a <Run>' -ForEach @(
+        @{ Case = 'Azure refuses it in both zones'; Pinned = 'Standard_B1ms'; Codes = @('Standard_B1ms'); Sizes = @('Standard_B1ms', 'Standard_B1ms', 'Standard_B2s'); Deployed = 'Standard_B2s'; Refused = 'Standard_B1ms \(no zone preference, then zone 1\)'; Costs = 'Standard_B1ms 10\.00 USD at light use and 30\.00 USD in the worst case; Standard_B2s 40\.00 USD and 120\.00 USD, so 30\.00 USD more a month at light use and 90\.00 USD more in the worst case'; Light = 30.0; Worst = 90.0; Run = 'fresh deploy'; Fresh = $true }
+        @{ Case = 'Azure refuses it in both zones'; Pinned = 'Standard_B1ms'; Codes = @('Standard_B1ms'); Sizes = @('Standard_B1ms', 'Standard_B1ms', 'Standard_B2s'); Deployed = 'Standard_B2s'; Refused = 'Standard_B1ms \(no zone preference, then zone 1\)'; Costs = 'Standard_B2s 40\.00 USD and 120\.00 USD, so 30\.00 USD more'; Light = 30.0; Worst = 90.0; Run = 'resume'; Fresh = $false }
+        @{ Case = 'Azure refuses it and Standard_B2s'; Pinned = 'Standard_B1ms'; Codes = @('Standard_B1ms', 'Standard_B2s'); Sizes = @('Standard_B1ms', 'Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5'); Deployed = 'Standard_D2ds_v5'; Refused = 'Standard_B1ms \(no zone preference, then zone 1\), then Standard_B2s \(no zone preference\)'; Costs = 'Standard_D2ds_v5 50\.00 USD and 200\.00 USD, so 40\.00 USD more a month at light use and 170\.00 USD more in the worst case'; Light = 40.0; Worst = 170.0; Run = 'fresh deploy'; Fresh = $true }
+        @{ Case = 'Azure refuses it and Standard_B2s'; Pinned = 'Standard_B1ms'; Codes = @('Standard_B1ms', 'Standard_B2s'); Sizes = @('Standard_B1ms', 'Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5'); Deployed = 'Standard_D2ds_v5'; Refused = 'Standard_B1ms \(no zone preference, then zone 1\), then Standard_B2s \(no zone preference\)'; Costs = 'so 40\.00 USD more a month at light use'; Light = 40.0; Worst = 170.0; Run = 'resume'; Fresh = $false }
+        @{ Case = 'Azure refuses a 4-vCore size, which tries its peer first'; Pinned = 'Standard_D4ds_v5'; Codes = @('Standard_D4ds_v5'); Sizes = @('Standard_D4ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5'); Deployed = 'Standard_D4ads_v5'; Refused = 'Standard_D4ds_v5 \(no zone preference, then zone 1\)'; Costs = 'so 0\.00 USD more a month at light use and 0\.00 USD more in the worst case'; Light = 0.0; Worst = 0.0; Run = 'resume'; Fresh = $false }
+    ) {
+        $script:codes = @{}
+        foreach ($code in $Codes) {
+            $script:codes[$code] = 'SkuNotAvailable'
+        }
+        $script:skuZones = @{ $Pinned = @('1', '2') }
+        if ($Fresh) {
+            # A fresh deploy: no resource group yet, so what the fallback chose goes into the tags the template carries.
+            Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { $false }
+            $script:groupTags = @{}
+        }
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig -SkuName $Pinned)
+        $deployment.Succeeded | Should -BeTrue
+        $deployment.T4Enabled | Should -BeTrue -Because 'T4 is part of every deployment, so a refused t4SkuName never leaves it out'
+        $deployment.T4SkuName | Should -Be $Deployed
+        @($script:sizes) | Should -Be $Sizes
+        @($script:sentZones)[0..1] | Should -Be @('', '1') -Because 'the size t4SkuName sets is tried once more in another zone the region lists'
+        # Each step is a Warning; none is a Fail.
+        $steps = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU')
+        @($steps | Where-Object status -NE 'Warning') | Should -BeNullOrEmpty
+        $steps[0].evidence.next | Should -Be 'Zone'
+        $steps[0].evidence.pinnedSku | Should -Be $Pinned
+        $steps[-1].evidence.next | Should -Be $Deployed
+        $steps[-1].evidence.hourlyUsd | Should -Be $script:costBySize[$Deployed].HourlyUsd
+        $steps[-1].message | Should -Match ('so this run creates T4 as {0} \(' -f $Deployed)
+        # The notice: what was tried and refused, with the zones, what was deployed, and both estimates with the difference.
+        $change = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK')
+        $change.Count | Should -Be 1
+        $change[0].status | Should -Be 'Warning' -Because 'DONE stays reachable'
+        $change[0].message | Should -Match ('^T4 was created as {0} \(.+\) instead of {1}, the size t4SkuName sets, because Azure refused {2} with SkuNotAvailable\. ' -f $Deployed, $Pinned, $Refused)
+        $change[0].message | Should -Match 'Estimated monthly cost of T4 alone \(list prices in westus3, Azure Retail Prices API, read now; estimates\): '
+        $change[0].message | Should -Match $Costs
+        $change[0].evidence.askedSku | Should -Be $Pinned
+        $change[0].evidence.pinned | Should -BeTrue
+        $change[0].evidence.deployedSku | Should -Be $Deployed
+        $change[0].evidence.lightUseDifferenceUsd | Should -Be $Light
+        $change[0].evidence.worstCaseDifferenceUsd | Should -Be $Worst
+        $change[0].remediation | Should -Match ('^Nothing to do: later runs keep T4 at {0}, so nothing resizes or restarts it\. To choose another size, set t4SkuName to it' -f $Deployed)
+        $change[0].remediation | Should -Match 'Region access request'
+        $deployment.T4Note | Should -Be $change[0].message
+        $script:notice = $change[0].message
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -eq $script:notice }
+        # Each size after the asked one is priced right before it's tried, and the asked size once, for the difference.
+        @($script:pricedSizes | Where-Object { $_ -ceq $Pinned }).Count | Should -Be 1
+        @($script:pricedSizes | Where-Object { $_ -ceq $Deployed }).Count | Should -Be 1
+        # The record, carried by the template: the size used, and what Azure refused, the asked size first.
+        $carried = $script:deployCalls[-1].parameters.budgetTags.value
+        $carried['DbHubT4Size'] | Should -Be $Deployed
+        [string]$carried['DbHubT4Refused'] | Should -Match ('^{0}@any,1;' -f $Pinned)
+        # The group gets the record at once, so a later run starts from it: on a fresh deploy, once the first attempt created
+        # the group (the template creates it before anything else).
+        $script:recorded[-1] | Should -Be $Deployed
+        $script:recordedRefused[-1] | Should -Match ('^{0}@any,1;' -f $Pinned)
+
+    }
+
+    It 'ends NOT DONE with a Fail that names every size Azure refused for a t4SkuName, and records nothing' {
+        $script:codes = @{}
+        foreach ($size in 'Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5') {
+            $script:codes[$size] = 'SkuNotAvailable'
+        }
+        $script:skuZones = @{ Standard_B1ms = @('1') }
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig -SkuName 'Standard_B1ms')
+        $deployment.Succeeded | Should -BeTrue -Because 'the rest of the demo is deployed without T4'
+        $deployment.T4Enabled | Should -BeFalse
+        @($script:sizes) | Should -Be @('Standard_B1ms', 'Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5', 'none')
+        $refused = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU')[-1]
+        $refused.status | Should -Be 'Fail'
+        $refused.evidence.next | Should -Be 'Refused'
+        @($refused.evidence.tried) | Should -Be @('Standard_B1ms', 'Standard_B2s', 'Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5')
+        $refused.message | Should -Match '^Azure refused every size T4''s fallback tries for Standard_B1ms, the size t4SkuName sets: Standard_B1ms \(no zone preference, then zone 1\), Standard_B2s \(no zone preference\), '
+        $refused.message | Should -Match 'T4 is part of every deployment, so this run deploys the rest and ends NOT DONE'
+        $refused.remediation | Should -Match 'Region access request'
+        $refused.remediation | Should -Not -Match 't4SkuName' -Because 'every size was tried, so setting another one doesn''t help'
+        $script:recorded[-1] | Should -Be ''
+        [string]$script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Size'] | Should -BeNullOrEmpty
+        [string]$script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Refused'] | Should -BeNullOrEmpty
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK') | Should -BeNullOrEmpty
+        $off = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -SkuName 'Standard_B1ms'); Result = $deployment.Results } { New-DemoT4OffResult -Config $Config -State ([pscustomobject]@{ T4Sku = '' }) -Result $Result }
+        $off.status | Should -Be 'Fail'
+        $off.message | Should -Match 'Azure refused every size'
+    }
+
+    It 'keeps a server the fallback created at its size on later runs: no resize, no restart, no refusal again, and no cost check' {
+        $refusedRecord = 'Standard_B1ms@any,1;2026-11-02T14:00:00Z'
+        $script:groupTags = @{ deploymentId = 'abc123'; DbHubT4Size = 'Standard_B2s'; DbHubT4Refused = $refusedRecord }
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_B2s'; tier = 'Burstable' } }
+        # Azure still refuses Standard_B1ms: a resize to it would fail the template on every run.
+        $script:codes = @{ Standard_B1ms = 'SkuNotAvailable' }
+        $script:refusesExisting = $true
+        $pinned = New-TestConfig -SkuName 'Standard_B1ms'
+        $resolved = Resolve-TestConfig -Config $pinned -Record 'Standard_B2s' -Refused $refusedRecord -TemplateRuns
+        $resolved['t4SkuName'] | Should -Be 'Standard_B2s'
+        $resolved['t4SkuSource'] | Should -Be 'record'
+        $resolved['t4SkuPinned'] | Should -Be 'Standard_B1ms'
+        foreach ($config in @($resolved, $pinned)) {
+            # deploy.ps1's run (resolved, -ScaleT4) and start-demo.ps1's T3 recreation (as the file says, resolved inside).
+            $script:sizes.Clear()
+            $deployment = Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+            $deployment.Succeeded | Should -BeTrue
+            @($script:sizes) | Should -Be @('Standard_B2s')
+            $deployment.T4SkuName | Should -Be 'Standard_B2s'
+            @($deployment.Results | Where-Object { [string]$_.checkId -in 'DEPLOY.T4.SIZE', 'DEPLOY.T4.SKU', 'DEPLOY.T4.FALLBACK' }) | Should -BeNullOrEmpty
+            $script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Size'] | Should -Be 'Standard_B2s'
+            $script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Refused'] | Should -Be $refusedRecord
+        }
+        $script:pricedSizes.Count | Should -Be 0
+        $script:recorded.Count | Should -Be 0
+        # DONE and status.ps1 still say T4 runs at a size the fallback chose.
+        $state = New-TestState -T4Sku 'Standard_B2s' -T4Refused $refusedRecord
+        InModuleScope DbHubDemo -Parameters @{ Config = $pinned; State = $state } { Test-DemoT4FallbackSize -Config $Config -State $State } | Should -BeTrue
+        InModuleScope DbHubDemo -Parameters @{ Config = $pinned; State = $state } { Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.2 -Created $true } | Should -Match '^T4 runs as Burstable Standard_B2s because Azure refused Standard_B1ms, the size t4SkuName sets, here; about 0\.200 USD an hour while running'
+
+        # Setting another size is a choice: the record no longer holds, and T4 moves to it after its cost check.
+        $script:sizes.Clear()
+        $script:codes = @{}
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -SkuName 'Standard_D2ds_v5') -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        @($script:sizes) | Should -Be @('Standard_D2ds_v5')
+        ($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE').evidence.outcome | Should -Be 'Scale'
+        [string]$script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Size'] | Should -BeNullOrEmpty
+        [string]$script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Refused'] | Should -BeNullOrEmpty
+        (Resolve-TestConfig -Config (New-TestConfig -SkuName 'Standard_D2ds_v5') -Record 'Standard_B2s' -Refused $refusedRecord -TemplateRuns)['t4SkuName'] | Should -Be 'Standard_D2ds_v5'
+    }
+
+    It 'starts a resumed run at the size its record holds, when the server wasn''t created yet, and the notice says the earlier refusal' {
+        $refusedRecord = 'Standard_B1ms@any,1;2026-11-02T14:00:00Z'
+        $script:groupTags = @{ deploymentId = 'abc123'; DbHubT4Size = 'Standard_B2s'; DbHubT4Refused = $refusedRecord }
+        $deployment = Invoke-TestTemplate -Config (Resolve-TestConfig -Config (New-TestConfig -SkuName 'Standard_B1ms') -Record 'Standard_B2s' -Refused $refusedRecord -TemplateRuns)
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_B2s') -Because 'the size Azure refused isn''t tried again in this run'
+        @($script:pricedSizes) | Should -Be @('Standard_B2s', 'Standard_B1ms')
+        $notice = ($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK').message
+        $notice | Should -Match '^T4 was created as Standard_B2s \(Burstable, 2 vCores\) instead of Standard_B1ms, the size t4SkuName sets, because Azure refused Standard_B1ms \(no zone preference, then zone 1\) with SkuNotAvailable\.'
+        $script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Refused'] | Should -Be $refusedRecord
+    }
+
+    It 'starts where preflight found the size t4SkuName sets unavailable, and says so' {
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig -SkuName 'Standard_B1ms') -T4StartSku 'Standard_B2s'
+        @($script:sizes) | Should -Be @('Standard_B2s')
+        $step = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU')
+        $step.Count | Should -Be 1
+        $step[0].message | Should -Match '^Azure doesn''t offer Standard_B1ms, the size t4SkuName sets, here now \(SkuNotAvailable, on record or found by preflight\), so this run creates T4 as Standard_B2s \(Burstable, 2 vCores\)'
+        ($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK').message | Should -Match 'because Standard_B1ms was unavailable here \(found by preflight or an earlier run\)\.'
+        $script:recordedRefused[-1] | Should -Be 'Standard_B1ms' -Because 'the asked size comes first, so the record holds for t4SkuName Standard_B1ms'
+    }
+
+    It 'reads the record: <Value>' -ForEach @(
+        @{ Value = 'Standard_B1ms@any,1;Standard_B2s@any;2026-11-02T14:00:00Z'; Asked = 'Standard_B1ms'; Count = 2; Time = '2026-11-02T14:00:00Z' }
+        @{ Value = 'Standard_B1ms'; Asked = 'Standard_B1ms'; Count = 1; Time = '' }
+        @{ Value = ''; Asked = ''; Count = 0; Time = '' }
+        @{ Value = 'None'; Asked = ''; Count = 0; Time = '' }
+    ) {
+        $read = InModuleScope DbHubDemo -Parameters @{ Value = $Value } { ConvertFrom-DemoT4RefusedRecord -Value $Value }
+        $read.Asked | Should -Be $Asked
+        @($read.Refusals).Count | Should -Be $Count
+        $read.TimeUtc | Should -Be $Time
+        if ($Count -gt 0) {
+            InModuleScope DbHubDemo -Parameters @{ Read = $read; Time = $Time } { ConvertTo-DemoT4RefusedRecord -Refusal $Read.Refusals -TimeUtc $Time } | Should -Be $Value
+        }
+    }
+
+    Context 'the summary, the status page, and status.ps1' {
+        BeforeEach {
+            $script:out = Join-Path -Path $TestDrive -ChildPath ('out-' + [guid]::NewGuid().ToString('N'))
+            Mock -ModuleName DbHubDemo -CommandName Write-Host -MockWith { }
+            Mock -ModuleName DbHubDemo -CommandName Enter-DemoKeepAwake -MockWith { $true }
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoProgressPageWriter -MockWith { $null }
+            Mock -ModuleName DbHubDemo -CommandName Open-DemoProgressPage -MockWith { 'The status page is open in your browser.' }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { @() }
+        }
+
+        It 'puts the notice in DONE''s summary and on the status page, and DONE stays reachable' {
+            $script:codes = @{ Standard_B1ms = 'SkuNotAvailable' }
+            $config = New-TestConfig -SkuName 'Standard_B1ms'
+            $deployment = Invoke-TestTemplate -Config $config
+            $notice = [string]($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK').message
+            $notice | Should -Match 'instead of Standard_B1ms'
+            $state = New-TestState -T4Sku 'Standard_B2s' -T4Refused ([string]$script:deployCalls[-1].parameters.budgetTags.value['DbHubT4Refused'])
+            # DONE: the run's Warning never blocks it.
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; State = $state; Result = $deployment.Results; Notice = $notice } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -T4Created $true -T4Notice $Notice }
+            $note = @($outcome.Notes | Where-Object { $_ -match 'instead of Standard_B1ms' })
+            $note.Count | Should -Be 1
+            $note[0] | Should -Be ('{0} Azure starts a stopped T4 again on its own after 7 days; the nightly safety stop stops it again within a day when it''s in place, at its T3 check or at the next auto-shutdown time, and ./scripts/stop-demo.ps1 and ./scripts/status.ps1 show the date and whether it is.' -f $notice)
+            @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) | Should -Contain $note[0]
+            # The ending takes the notice from this run's results, and the status page's summary shows it whole.
+            $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+            $ended = Complete-DemoDeploymentRun -Run $run -Config $config -Result $deployment.Results -State $state
+            @($ended.Notes | Where-Object { $_ -match [regex]::Escape($notice) }).Count | Should -Be 1
+            $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+            $model['run']['reason'] | Should -Match ([regex]::Escape($notice))
+            $model['run']['reason'] | Should -Match 'so 30\.00 USD more a month at light use and 90\.00 USD more in the worst case'
+            Get-Content -LiteralPath $run.PagePath -Raw | Should -Match 'instead of Standard_B1ms, the size t4SkuName sets'
+        }
+
+        It 'gives status.ps1 the notice for a size an earlier run chose, with both estimates read now' {
+            $refusedRecord = 'Standard_B1ms@any,1;2026-11-02T14:00:00Z'
+            $state = [pscustomobject]@{ T4Sku = 'Standard_B2s'; T4Refused = $refusedRecord; NetworkMode = 'private'; T3UseFreeLimit = $false }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SizeChangeCost -MockWith { [pscustomobject]@{ Asked = $script:costBySize['Standard_B1ms']; Deployed = $script:costBySize['Standard_B2s'] } }
+            $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -SkuName 'Standard_B1ms'); State = $state } { Get-DemoT4RecordedSizeChange -Config $Config -State $State }
+            $result.checkId | Should -Be 'STATUS.T4.SIZE'
+            $result.status | Should -Be 'Warning'
+            $result.message | Should -Match '^T4 runs as Standard_B2s \(Burstable, 2 vCores\) instead of Standard_B1ms, the size t4SkuName sets: deploy\.ps1''s fallback created it at that size because Azure refused Standard_B1ms \(no zone preference, then zone 1\) with SkuNotAvailable, at 2026-11-02T14:00:00Z\.'
+            $result.message | Should -Match 'Standard_B1ms 10\.00 USD at light use and 30\.00 USD in the worst case; Standard_B2s 40\.00 USD and 120\.00 USD, so 30\.00 USD more a month at light use and 90\.00 USD more in the worst case'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4SizeChangeCost -Times 1 -Exactly -ParameterFilter { $Asked -eq 'Standard_B1ms' -and $Deployed -eq 'Standard_B2s' -and $NetworkMode -eq 'private' }
+            # Nothing when T4 runs at the size the configuration asks for, or the record no longer holds.
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -SkuName 'Standard_B2s'); State = $state } { Get-DemoT4RecordedSizeChange -Config $Config -State $State } | Should -BeNullOrEmpty
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -SkuName 'Standard_D2ds_v5'); State = $state } { Get-DemoT4RecordedSizeChange -Config $Config -State $State } | Should -BeNullOrEmpty
+        }
     }
 }

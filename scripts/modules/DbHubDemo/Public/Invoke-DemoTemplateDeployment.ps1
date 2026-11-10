@@ -21,11 +21,15 @@ function Invoke-DemoTemplateDeployment {
     5. Phase 24: an existing VM's disks whose type drifted from the profile (Get-DemoVmDiskDrift; the
        subscription's automation can switch a deallocated VM's disks to Standard HDD) keep their current type
        through diskSkuOverrides, with the DEPLOY.DISKS.DRIFT Warning; T4's availability zone goes only to a
-       server that doesn't exist yet; and a T4 size the configuration sets that Azure refuses with SkuNotAvailable
-       adds the DEPLOY.T4.SKU Fail, whose remediation names the next size (Get-DemoT4CreateFailure).
-    6. T4's fallback (ADR 0019; since T4's 4-vCore default, 2026-11-04), only when the configuration doesn't set t4SkuName
-       and T4 doesn't exist yet, and only for Azure's SkuNotAvailable (a quota, a policy denial, or a transient error
-       fails the template as before): a refused Standard_D4ds_v5 deploys again in another zone the region's capabilities
+       server that doesn't exist yet.
+    6. T4's fallback (ADR 0019; since T4's 4-vCore default, 2026-11-04), only when T4 doesn't exist yet, and only for
+       Azure's SkuNotAvailable (a quota, a policy denial, or a transient error fails the template as before). For a size
+       t4SkuName sets (2026-11-09, user-directed: "fall back automatically, cheapest first, with a Warning"): the size
+       once more in another zone the region lists for it, then the next size Azure accepts, cheapest first
+       (Get-DemoT4FallbackOrder: the sizes that cost as much or more, then the cheaper ones, nearest first), each after
+       its cost check, which only reports (DEPLOY.T4.SKU Warning), and, when Azure refused them all, the rest without T4
+       and the DEPLOY.T4.SKU Fail; up to 8 attempts. Without t4SkuName: a refused Standard_D4ds_v5 deploys again in
+       another zone the region's capabilities
        list for it (Get-DemoT4SkuZone), once; then with Standard_D4ads_v5, General Purpose with 4 vCores too, so
        autonomous tuning stays on; a refused Standard_D4ads_v5 moves to Standard_D2ds_v5 (2 vCores, autonomous tuning
        off), but only after its cost check (Get-DemoT4GeneralPurposeCost: its price from the Azure Retail Prices API now,
@@ -33,16 +37,18 @@ function Invoke-DemoTemplateDeployment {
        monthlyCeilingUsd, and a session against sessionCeilingUsd), which runs right before every creation at that size
        on the fallback's behalf, and again after Azure refuses the T3 free offer, because it counted the offer's
        allowance (review of 20e855c), unless that attempt had already created the server (below); over either ceiling,
-       or without a price, T4 is left out (DbHubT4Size None, checked again on the next run that deploys the template);
-       and a refused Standard_D2ds_v5 deploys again without T4 (Refused; since 2026-11-09 the next run that deploys the
-       template tries the sizes again from the default, DEPLOY.T4.RETRY, because Azure's regional capacity changes). With
-       t4AutonomousTuning true, the 2-vCore step
-       is skipped: a refused Standard_D4ads_v5 ends Refused. Each step is a DEPLOY.T4.SKU Warning, and a T4 the fallback
-       created at another size also gets a console line and T4Note ("T4 created as General Purpose <size> because Azure
-       refused ... here, with autonomous tuning on (or off); about <price> USD an hour while running"). -T4StartSku
-       starts further down when preflight already ruled sizes out. What was chosen goes into the resource group's
-       DbHubT4Size tag at once, and into the tags the template carries, for later runs (Resolve-DemoEffectiveConfig,
-       which this function applies to a configuration that isn't resolved yet); Phase 28's DbHubT4Sku tag is dropped. An
+       or without a price, it's a Warning, and T4 is created anyway (2026-11-09: T4 is part of every deployment); and a
+       refused Standard_D2ds_v5 deploys again without T4, the DEPLOY.T4.SKU Fail (every run tries the sizes again,
+       because Azure's regional capacity changes; an older run's None or Refused record gets DEPLOY.T4.RETRY). Each step
+       is a DEPLOY.T4.SKU Warning, and T4 created at another size than the one the configuration asks for gets
+       DEPLOY.T4.FALLBACK (2026-11-09, user-directed: "make sure to add a notification of it though to say what you tried
+       to deploy and what was deployed included cost difference"): a Warning, a console line, and T4Note, with the sizes
+       Azure refused and the zones tried, the size deployed, and T4's monthly estimate at both, light use and worst case,
+       with the difference (New-DemoT4SizeChangeResult). -T4StartSku starts further down when preflight already ruled
+       sizes out. What was chosen goes into the resource group's DbHubT4Size tag at once, with what Azure refused in
+       DbHubT4Refused, and into the tags the template carries, for later runs (Resolve-DemoEffectiveConfig, which this
+       function applies to a configuration that isn't resolved yet; a record holds while the configuration asks for the
+       size Azure refused, so a server the fallback created keeps its size); Phase 28's DbHubT4Sku tag is dropped. An
        existing server whose size the configuration doesn't set keeps its size when a record says so; otherwise, with
        -ScaleT4 (deploy.ps1) and T4 Ready, it scales to the default, Standard_D4ds_v5, which restarts it (DEPLOY.T4.SIZE
        Warning; a refused scale keeps its size and records it), and without -ScaleT4 (start-demo.ps1) or while T4 isn't
@@ -118,9 +124,9 @@ function Invoke-DemoTemplateDeployment {
     asks Azure to rebuild it from the image (ADR 0018).
 
     .PARAMETER T4StartSku
-    Where T4's fallback starts when preflight already ruled sizes out (ADR 0019): Standard_D4ads_v5, or Standard_D2ds_v5
-    (its cost check still runs right before the attempt, and only reports). Any other value starts at the default.
-    Ignored when the configuration sets t4SkuName or T4 exists.
+    Where T4's fallback starts when preflight already ruled sizes out (ADR 0019): without t4SkuName, Standard_D4ads_v5 or
+    Standard_D2ds_v5 (its cost check still runs right before the attempt, and only reports); for a size t4SkuName sets
+    (2026-11-09), a size in its fallback order (Get-DemoT4FallbackOrder). Ignored when T4 exists.
 
     .PARAMETER ScaleT4
     deploy.ps1's: an existing T4 whose size the configuration doesn't set, and no record keeps, scales to the default,
@@ -166,7 +172,7 @@ function Invoke-DemoTemplateDeployment {
 
         [string] $T2OsDiskSourceId = '',
 
-        [ValidateSet('', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'None', 'Refused')]
+        [ValidateSet('', 'Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'Standard_B1ms', 'Standard_B2s', 'None', 'Refused')]
         [string] $T4StartSku = '',
 
         [switch] $ScaleT4,
@@ -236,8 +242,9 @@ function Invoke-DemoTemplateDeployment {
     # record) gets what the fallback recorded in the group's tags; a size the file sets always wins. T4 keeps the zone it
     # was created in, so the configured zone goes only to a new server (Phase 24).
     $t4TagName = (Get-DemoDeploymentStateTagName)['T4Sku']
+    $t4RefusedTagName = (Get-DemoDeploymentStateTagName)['T4Refused']
     $t4Explicit = Test-DemoT4SkuExplicit -Config $Config
-    $effective = Resolve-DemoEffectiveConfig -Config $Config -State ([pscustomobject]@{ T4Sku = [string]$tags[$t4TagName] })
+    $effective = Resolve-DemoEffectiveConfig -Config $Config -State ([pscustomobject]@{ T4Sku = [string]$tags[$t4TagName]; T4Refused = [string]$tags[$t4RefusedTagName] })
     $t4On = Test-DemoT4Enabled -Config $effective
     $t4Exists = $false
     $t4ServerSku = ''
@@ -261,6 +268,7 @@ function Invoke-DemoTemplateDeployment {
         }
         if ($Action -eq 'Create' -and [string]$tags[$t4TagName] -and [string]$tags[$t4TagName] -cne $ServerSku) {
             $tags[$t4TagName] = ''
+            $tags[$t4RefusedTagName] = ''
         }
         return $Wanted
     }
@@ -319,8 +327,12 @@ function Invoke-DemoTemplateDeployment {
 
     $useFreeLimit = $T3UseFreeLimit
     $freeOfferTried = $false
-    # The fallback works on $effective, only for a server that doesn't exist yet and a size the file doesn't set.
-    $ladder = $t4On -and -not $t4Explicit -and -not $t4Exists -and $Action -eq 'Create'
+    # The fallback works on $effective, only for a server that doesn't exist yet: without t4SkuName (2026-11-04), and for a
+    # size t4SkuName sets (2026-11-09, user-directed: "fall back automatically, cheapest first, with a Warning").
+    $ladder = $t4On -and -not $t4Exists -and $Action -eq 'Create'
+    $t4New = $ladder
+    $t4Asked = Get-DemoT4AskedSku -Config $effective
+    $t4Pinned = Get-DemoT4PinnedSku -Config $effective
     if ($ladder -and [string]$effective['t4SkuSource'] -ceq 'retry') {
         # 2026-11-09 (user-directed: T4 is part of every deployment): an earlier run's fallback left T4 out (DbHubT4Size
         # None, its cost check, or Refused, every size refused). No record leaves T4 out any more, so this run, which
@@ -328,6 +340,7 @@ function Invoke-DemoTemplateDeployment {
         # record goes now.
         $recordedOff = [string]$tags[$t4TagName]
         $tags[$t4TagName] = ''
+        $tags[$t4RefusedTagName] = ''
         $retryText = 'An earlier run left T4 out (DbHubT4Size {0}). T4 is part of every deployment, so this run tries its sizes again: {1}, once more in another zone the region lists, then Standard_D4ads_v5, then Standard_D2ds_v5. Only if Azure refuses them all does the run end NOT DONE, with the fix.' -f $(if ($recordedOff) { $recordedOff } else { 'Refused' }), (Get-DemoT4SkuName -Config $effective)
         $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.RETRY' -Area 't4' -Target 'T4' -Status 'Warning' -Message $retryText -Evidence ([ordered]@{ recorded = $recordedOff; startSku = (Get-DemoT4SkuName -Config $effective) }) -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
         Write-DemoLog -Message $retryText
@@ -336,38 +349,81 @@ function Invoke-DemoTemplateDeployment {
     $zoneTried = $false
     $gpChecked = $false
     $gpRefusal = $null
-    $gpHourly = $null
     $gpResult = $null
     $t4Note = ''
+    # What Azure refused, with the zones tried (DbHubT4Refused, the asked size first), and the cost checks this run made,
+    # for the size change's notice (2026-11-09). A record this run starts from brings the refusals it recorded.
+    $t4Refusals = [ordered]@{}
+    $t4RefusalUtc = ''
+    $lastRefusal = $null
+    $t4Costs = @{}
+    $costCache = @{}
+    $stepResult = $null
+    if ($ladder -and [string]$effective['t4SkuSource'] -ceq 'record') {
+        $recordedRefusal = ConvertFrom-DemoT4RefusedRecord -Value ([string]$tags[$t4RefusedTagName])
+        foreach ($item in @($recordedRefusal.Refusals)) {
+            $t4Refusals[[string]$item.Sku] = [System.Collections.Generic.List[string]]::new([string[]]@($item.Zones))
+        }
+        $t4RefusalUtc = [string]$recordedRefusal.TimeUtc
+    }
+    $refusalList = {
+        $list = [System.Collections.Generic.List[object]]::new()
+        if (-not $t4Refusals.Contains($t4Asked)) {
+            $list.Add([pscustomobject]@{ Sku = $t4Asked; Zones = [string[]]@() })
+        }
+        foreach ($key in $t4Refusals.Keys) {
+            $list.Add([pscustomobject]@{ Sku = [string]$key; Zones = [string[]]@($t4Refusals[$key]) })
+        }
+        $list.ToArray()
+    }
     # The fallback's choice goes into the tags the template carries, which would otherwise put the old value back, and,
     # once the group exists, into the group's tags at once, so a later run (even after a stop) starts from it (Phase 28).
-    # A value the group already has isn't written again.
+    # A value the group already has isn't written again. With it goes what Azure refused (DbHubT4Refused, 2026-11-09), the
+    # asked size first, so the record holds while the configuration asks for that size; without a refusal and without
+    # t4SkuName (a start preflight or an older record gave), DbHubT4Refused stays as it is.
     $groupSeen = $tags.Count -gt 0
     $record = {
         param([string] $Value)
-        if ([string]$tags[$t4TagName] -ceq $Value) {
+        $refusedValue = if (-not $Value) { '' } elseif ($t4Pinned -or $t4Refusals.Count -gt 0) { ConvertTo-DemoT4RefusedRecord -Refusal @(& $refusalList) -TimeUtc $t4RefusalUtc } else { [string]$tags[$t4RefusedTagName] }
+        if ([string]$tags[$t4TagName] -ceq $Value -and [string]$tags[$t4RefusedTagName] -ceq $refusedValue) {
             return
         }
         $tags[$t4TagName] = $Value
+        $tags[$t4RefusedTagName] = $refusedValue
         if (-not $groupSeen) {
             return
         }
         try {
-            Set-DemoDeploymentState -Config $Config -Value @{ T4Sku = $Value } -Confirm:$false
+            Set-DemoDeploymentState -Config $Config -Value @{ T4Sku = $Value; T4Refused = $refusedValue } -Confirm:$false
         }
         catch {
             Write-DemoLog -Level Warning -Message ('T4''s fallback size wasn''t recorded on the resource group, so the next run may try it again: {0}' -f $_.Exception.Message)
         }
     }
-    if ($ladder -and $T4StartSku) {
+    # An older caller's None counts as Standard_D2ds_v5, and Refused as no start (2026-11-09: no step leaves T4 out).
+    $startSku = switch ($T4StartSku) { 'None' { 'Standard_D2ds_v5' } 'Refused' { '' } default { $T4StartSku } }
+    if ($ladder -and $startSku -and $t4Pinned) {
+        # Preflight found the size t4SkuName sets, and maybe the next ones, unavailable here (2026-11-09): the fallback starts
+        # at the first size it found, whose cost check and result come right before the first attempt (below).
+        $startOrder = [string[]]@(@($t4Asked) + @(Get-DemoT4FallbackOrder -Config $effective))
+        $startIndex = [array]::IndexOf($startOrder, [string]$startSku)
+        if ($startIndex -gt 0) {
+            foreach ($skipped in @($startOrder | Select-Object -First $startIndex)) {
+                $t4Refused.Add($skipped)
+            }
+            $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName $startSku
+        }
+    }
+    elseif ($ladder -and $startSku) {
         # Preflight already ruled sizes out (the region's capability list, a refusal on record, or the cost check); the
         # template carries the choice into the group's tags, as before (Phase 28).
         $refusalDoc = 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'
-        switch ($T4StartSku) {
+        switch ($startSku) {
             'Standard_D4ads_v5' {
                 $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D4ads_v5'
                 $t4Refused.Add('Standard_D4ds_v5')
                 $tags[$t4TagName] = 'Standard_D4ads_v5'
+                $tags[$t4RefusedTagName] = ''
                 $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message 'Preflight found that the region doesn''t offer, or refused, T4''s default Standard_D4ds_v5, so this deployment uses Standard_D4ads_v5, General Purpose with 4 vCores too (autonomous tuning stays on), and later runs keep it.' -Evidence ([ordered]@{ startSku = $T4StartSku }) -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $refusalDoc))
             }
             'Standard_D2ds_v5' {
@@ -378,29 +434,48 @@ function Invoke-DemoTemplateDeployment {
             }
         }
     }
-    # Review finding 5: any record no longer holds once the configuration sets t4SkuName and this deployment has T4 in it;
-    # the template carries the group's tags, so it's cleared in them.
-    if ([string]$tags[$t4TagName] -and $Action -eq 'Create' -and $t4Explicit -and (Test-DemoT4Enabled -Config $effective)) {
+    # Review finding 5, and 2026-11-09: a record no longer holds once the configuration asks for another size than the one
+    # Azure refused (Test-DemoT4RecordInEffect), such as a t4SkuName that names another size; the template carries the
+    # group's tags, so it's cleared in them. An older None or Refused goes the same way once t4SkuName is set.
+    $recordedNow = [string]$tags[$t4TagName]
+    if ($recordedNow -and $Action -eq 'Create' -and (Test-DemoT4Enabled -Config $effective) -and ($t4Explicit -or $recordedNow -cin $script:T4Sizes) -and -not (Test-DemoT4RecordInEffect -Config $Config -Recorded $recordedNow -Refused ([string]$tags[$t4RefusedTagName]))) {
         $tags[$t4TagName] = ''
+        $tags[$t4RefusedTagName] = ''
     }
-    for ($attempt = 1; $attempt -le 6; $attempt++) {
+    # One attempt for each size the fallback can try, the asked size's retry in another zone, one without T4 after Azure
+    # refused them all, and one after the T3 free offer's rejection: 6 without t4SkuName, as before, and up to 8 for a size
+    # it sets (2026-11-09).
+    $attemptLimit = 4 + @(Get-DemoT4FallbackOrder -Config $effective).Count
+    for ($attempt = 1; $attempt -le $attemptLimit; $attempt++) {
+        # A size t4SkuName sets (2026-11-09): right before the fallback creates T4 at another size, that size's cost check
+        # runs, as the 2-vCore one does, and only reports; its result says what this run tries, and why.
+        if ($ladder -and $t4Pinned -and (Test-DemoT4Enabled -Config $effective)) {
+            $stepSku = Get-DemoT4SkuName -Config $effective
+            if ($stepSku -cne $t4Asked -and -not $t4Costs.Contains($stepSku)) {
+                $stepCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $stepSku -Cache $costCache
+                $t4Costs[$stepSku] = $stepCost
+                & $record $stepSku
+                $stepResult = New-DemoT4FallbackResult -Refused $lastRefusal -Next $stepSku -Cost $stepCost -Pinned $t4Pinned
+                $results.Add($stepResult)
+                Write-DemoLog -Level Warning -Message $stepResult.message
+            }
+        }
         # Right before the fallback creates T4 at its 2-vCore size, its cost check runs (ADR 0019): the price from the Azure
         # Retail Prices API now, and the worst case with T4's 7-day automatic restart, against both ceilings. Over either,
         # or without a price, it's a Warning, and T4 is created anyway (2026-11-09, user-directed: T4 is part of every
         # deployment). Never for a size the configuration sets.
-        if ($ladder -and -not $gpChecked -and (Test-DemoT4Enabled -Config $effective) -and (Get-DemoT4SkuName -Config $effective) -ceq 'Standard_D2ds_v5') {
+        if ($ladder -and -not $t4Pinned -and -not $gpChecked -and (Test-DemoT4Enabled -Config $effective) -and (Get-DemoT4SkuName -Config $effective) -ceq 'Standard_D2ds_v5') {
             $gpChecked = $true
-            $cost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit
+            $cost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -Cache $costCache
+            $t4Costs['Standard_D2ds_v5'] = $cost
             if ($cost.Allowed) {
                 & $record 'Standard_D2ds_v5'
-                $gpHourly = $cost.HourlyUsd
                 $gpResult = New-DemoT4FallbackResult -Refused $gpRefusal -Next 'Standard_D2ds_v5' -Cost $cost
                 $results.Add($gpResult)
                 Write-DemoLog -Level Warning -Message ('Azure refused T4''s 4-vCore sizes here, so this run creates T4 as General Purpose Standard_D2ds_v5, with autonomous tuning off: {0}.' -f (Format-DemoT4FallbackCostText -Cost $cost))
             }
             else {
                 & $record 'Standard_D2ds_v5'
-                $gpHourly = $cost.HourlyUsd
                 $gpResult = New-DemoT4FallbackResult -Refused $gpRefusal -Next 'None' -Cost $cost
                 $results.Add($gpResult)
                 Write-DemoLog -Level Warning -Message $gpResult.message
@@ -501,12 +576,17 @@ function Invoke-DemoTemplateDeployment {
             # price from the API; an existing T4 scaled to the default; or T4 left out by the fallback. The status page's
             # Infrastructure step and DONE say it too.
             $location = [string]$Config['location']
-            if ($state -eq 'Succeeded' -and $t4Deployed -and $gpChecked -and $t4SkuName -ceq 'Standard_D2ds_v5') {
-                $t4Note = Format-DemoT4FallbackCreatedText -HourlyUsd $gpHourly -Location $location -SkuName 'Standard_D2ds_v5'
-                Write-DemoLog -Level Warning -Message $t4Note
-            }
-            elseif ($state -eq 'Succeeded' -and $t4Deployed -and $t4SkuName -ceq 'Standard_D4ads_v5' -and $t4Refused -contains 'Standard_D4ds_v5') {
-                $t4Note = Format-DemoT4FallbackCreatedText -HourlyUsd (Get-DemoT4HourlyPrice -Config $effective) -Location $location -SkuName 'Standard_D4ads_v5' -Tuning (Get-DemoT4Tuning -Config $effective).Enabled
+            if ($state -eq 'Succeeded' -and $t4Deployed -and $t4New -and $t4SkuName -and $t4SkuName -cne $t4Asked) {
+                # 2026-11-09 (user-directed: "make sure to add a notification of it though to say what you tried to deploy and
+                # what was deployed included cost difference"): every automatic size change says what was tried and refused,
+                # with the zones, what was deployed, and T4's monthly estimate at both with the difference, priced as the
+                # fallback's cost check is: on the console now, and through T4Note on the status page's Infrastructure and T4
+                # rows and at DONE or NOT DONE.
+                $askedCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4Asked -Cache $costCache
+                $deployedCost = if ($t4Costs.Contains($t4SkuName)) { $t4Costs[$t4SkuName] } else { Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4SkuName -Cache $costCache }
+                $change = New-DemoT4SizeChangeResult -Config $effective -Deployed $t4SkuName -Refusal @(& $refusalList) -AskedCost $askedCost -DeployedCost $deployedCost
+                $results.Add($change)
+                $t4Note = [string]$change.message
                 Write-DemoLog -Level Warning -Message $t4Note
             }
             elseif ($state -eq 'Succeeded' -and $t4Deployed -and $t4Scaling) {
@@ -571,6 +651,15 @@ function Invoke-DemoTemplateDeployment {
                 $gpResult.message += ' Azure then rejected the T3 free offer, whose allowance this check counted, but that attempt had already created T4''s server, so it isn''t priced again: it exists and bills.'
                 $gpResult.evidence['freeOfferCounted'] = $true
             }
+            # The same for a size t4SkuName sets (2026-11-09): the current size's cost check runs again before the next
+            # attempt, and its new result replaces the old one.
+            if ($ladder -and $t4Pinned -and $t4Costs.Count -gt 0) {
+                $t4Costs.Clear()
+                if ($null -ne $stepResult) {
+                    [void]$results.Remove($stepResult)
+                    $stepResult = $null
+                }
+            }
             continue
         }
         $t4Failure = $null
@@ -589,34 +678,56 @@ function Invoke-DemoTemplateDeployment {
             continue
         }
         # The fallback (ADR 0019, since T4's 4-vCore default, 2026-11-04): only Azure's SkuNotAvailable for the size this
-        # attempt sent, which the configuration doesn't set, moves it on, and only while T4's server doesn't exist (read
-        # above): Standard_D4ds_v5 once more in another zone the region lists for it, then Standard_D4ads_v5, then
-        # Standard_D2ds_v5 (after its cost check, at the top of the next attempt; not with t4AutonomousTuning true), and
-        # Standard_D2ds_v5 to no T4. A quota, a policy denial, or a transient error fails the template as before. What it
-        # chose is recorded for later runs.
+        # attempt sent moves it on, and only while T4's server doesn't exist (read above): the asked size once more in
+        # another zone the region lists for it, then, without t4SkuName, Standard_D4ads_v5, then Standard_D2ds_v5 (after its
+        # cost check, at the top of the next attempt), and Standard_D2ds_v5 to no T4; for a size t4SkuName sets (2026-11-09),
+        # the next size Azure accepts, cheapest first (Get-DemoT4NextSku), each after its cost check, and the last one to no
+        # T4. A quota, a policy denial, or a transient error fails the template as before. What it chose is recorded for
+        # later runs, with what Azure refused.
         if ($ladder -and $null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current -and $current -notin $t4Refused) {
+            if (-not $t4Refusals.Contains($current)) {
+                $t4Refusals[$current] = [System.Collections.Generic.List[string]]::new()
+            }
+            $t4Refusals[$current].Add($(if ([string]$t4Failure.Zone) { [string]$t4Failure.Zone } else { 'any' }))
+            $t4RefusalUtc = [string]$t4Failure.TimeUtc
+            $lastRefusal = $t4Failure
+            $retryZone = ''
+            if ($current -ceq $t4Asked -and -not $zoneTried) {
+                $zoneTried = $true
+                $retryZone = [string](@(Get-DemoT4SkuZone -Config $effective -SkuName $current) | Where-Object { $_ -ne [string]$t4Failure.Zone } | Select-Object -First 1)
+            }
+            if ($retryZone) {
+                $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName $current -Zone $retryZone
+                $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Zone' -Zone $retryZone -Pinned $t4Pinned))
+                Write-DemoLog -Level Warning -Message ('Azure refused T4''s {0}; deploying again in zone {1}, which the region lists for it.' -f $current, $retryZone)
+                continue
+            }
+            $t4Refused.Add($current)
+            if ($t4Pinned) {
+                $next = Get-DemoT4NextSku -Config $effective -Current $current
+                if ($next) {
+                    # Its cost check and its result come right before the next attempt (above).
+                    $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName $next -Zone (Get-DemoT4AvailabilityZone -Config $Config)
+                    Write-DemoLog -Level Warning -Message ('Azure refused T4''s {0}; pricing {1}, the next size of the fallback for {2}, before deploying again.' -f $current, $next, $t4Pinned)
+                }
+                else {
+                    # Every size refused: the rest is deployed without T4, and the run ends NOT DONE (DEPLOY.T4.SKU, a Fail with
+                    # the fix); nothing is recorded, so every run tries the sizes again.
+                    $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
+                    & $record ''
+                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused' -Pinned $t4Pinned -Tried @(& $refusalList)))
+                    Write-DemoLog -Level Warning -Message ('Azure refused every size T4''s fallback tries for {0}; deploying the rest again without T4, and the run ends NOT DONE.' -f $t4Pinned)
+                }
+                continue
+            }
             switch ($current) {
                 'Standard_D4ds_v5' {
-                    $retryZone = ''
-                    if (-not $zoneTried) {
-                        $zoneTried = $true
-                        $retryZone = [string](@(Get-DemoT4SkuZone -Config $effective -SkuName $current) | Where-Object { $_ -ne [string]$t4Failure.Zone } | Select-Object -First 1)
-                    }
-                    if ($retryZone) {
-                        $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D4ds_v5' -Zone $retryZone
-                        $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Zone' -Zone $retryZone))
-                        Write-DemoLog -Level Warning -Message ('Azure refused T4''s Standard_D4ds_v5; deploying again in zone {0}, which the region lists for it.' -f $retryZone)
-                    }
-                    else {
-                        $t4Refused.Add($current)
-                        $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D4ads_v5' -Zone (Get-DemoT4AvailabilityZone -Config $Config)
-                        & $record 'Standard_D4ads_v5'
-                        $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Standard_D4ads_v5'))
-                        Write-DemoLog -Level Warning -Message 'Azure refused T4''s Standard_D4ds_v5; deploying again with Standard_D4ads_v5, General Purpose with 4 vCores too.'
-                    }
+                    $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D4ads_v5' -Zone (Get-DemoT4AvailabilityZone -Config $Config)
+                    & $record 'Standard_D4ads_v5'
+                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Standard_D4ads_v5'))
+                    Write-DemoLog -Level Warning -Message 'Azure refused T4''s Standard_D4ds_v5; deploying again with Standard_D4ads_v5, General Purpose with 4 vCores too.'
                 }
                 'Standard_D4ads_v5' {
-                    $t4Refused.Add($current)
                     $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D2ds_v5'
                     $gpRefusal = $t4Failure
                     Write-DemoLog -Level Warning -Message 'Azure refused T4''s Standard_D4ads_v5 too; pricing the 2-vCore fallback, Standard_D2ds_v5, before deploying again.'
@@ -625,7 +736,6 @@ function Invoke-DemoTemplateDeployment {
                     # Standard_D2ds_v5, the last size the fallback tries. The rest of the environment is deployed without
                     # T4, and the run ends NOT DONE (DEPLOY.T4.SKU, a Fail with the fix); nothing is recorded, so every run
                     # tries the sizes again (2026-11-09).
-                    $t4Refused.Add($current)
                     $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
                     & $record ''
                     $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused'))

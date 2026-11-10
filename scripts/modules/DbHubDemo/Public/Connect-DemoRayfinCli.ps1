@@ -41,21 +41,22 @@ function Connect-DemoRayfinCli {
     $settings = Get-DemoFabricAppSetting
     $cliReference = 'https://learn.microsoft.com/fabric/apps/cli-reference'
     $tenantId = [string]$Config['tenantId']
-    $loginCommand = 'npx --yes --package={0}@{1} -- rayfin login --tenant {2}' -f $settings['cliPackage'], $settings['cliVersion'], $(if ($tenantId) { $tenantId } else { '<tenantId>' })
+    # The stage's CLI, installed from the lock file with its npm overrides, run from the repository root (never npx).
+    $loginCommand = Get-DemoRayfinCommand -Command 'login' -TenantId $tenantId
     $result = {
         param([string] $Status, [string] $Message, [string] $Remediation = '')
         New-DemoResult -CheckId 'FABRIC.APP.SIGNIN' -Area 'fabric' -Target 'tenant' -Status $Status -Message $Message -Remediation $Remediation -DocUrl $cliReference
     }
 
     if (-not (Test-DemoInteractiveSession)) {
-        return (& $result 'Not supported' '-SignIn needs a person at an interactive console: the Rayfin CLI''s sign-in opens a browser, and its service principal sign-in isn''t supported yet, so it doesn''t run in CI or a non-interactive session.' ('On your own machine, sign in once as the demo''s Fabric user, then run configure-fabric-app.ps1 again: {0}' -f $loginCommand))
+        return (& $result 'Not supported' '-SignIn needs a person at an interactive console: the Rayfin CLI''s sign-in opens a browser, and its service principal sign-in isn''t supported yet, so it doesn''t run in CI or a non-interactive session.' 'On your own machine, in a terminal at the repository root, run ./scripts/configure-fabric-app.ps1 -SignIn: it installs the pinned CLI from the app''s lock file, opens a browser for your sign-in as the demo''s Fabric user, and deploys the app.')
     }
     if ($tenantId -notmatch $script:GuidPattern) {
         return (& $result 'Manual action required' 'No tenant (tenantId) is configured, so the Rayfin CLI can''t be signed in to it.' 'Run ./scripts/init.ps1, or set tenantId in the configuration.')
     }
     $cli = Get-DemoRayfinCliPath -StagePath $StagePath
     if (-not $cli) {
-        return (& $result 'Manual action required' ('The pinned Rayfin CLI isn''t installed in {0} yet, so -SignIn couldn''t run it.' -f $StagePath) ('Run configure-fabric-app.ps1 without -SkipInstall, or sign in yourself: {0}' -f $loginCommand))
+        return (& $result 'Manual action required' ('The pinned Rayfin CLI isn''t installed in {0} yet, so -SignIn couldn''t run it.' -f $StagePath) 'Run configure-fabric-app.ps1 -SignIn without -SkipInstall: it installs the pinned CLI from the app''s lock file first.')
     }
     $node = Get-Command -Name 'node' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $node) {
@@ -76,7 +77,7 @@ function Connect-DemoRayfinCli {
     }
     $check = @(Test-DemoFabricAppPrerequisite -Config $Config -StagePath $StagePath | Where-Object { $_.checkId -eq 'FABRIC.APP.SIGNIN' }) | Select-Object -First 1
     if ($null -eq $check) {
-        return (& $result 'Manual action required' ('The Rayfin CLI''s sign-in ended with exit code {0}, and its status couldn''t be read.' -f $exitCode) ('Check it with: npx --yes --package={0}@{1} -- rayfin login status' -f $settings['cliPackage'], $settings['cliVersion']))
+        return (& $result 'Manual action required' ('The Rayfin CLI''s sign-in ended with exit code {0}, and its status couldn''t be read.' -f $exitCode) ('Check it from the repository root: {0}' -f (Get-DemoRayfinCommand -Command 'login status')))
     }
     if ($check.status -eq 'Pass') {
         return (& $result 'Pass' 'The Rayfin CLI is signed in to the demo''s tenant (-SignIn; checked with rayfin login status). It renews its own token; the script never sees it.')

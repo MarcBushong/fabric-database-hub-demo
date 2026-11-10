@@ -838,5 +838,11 @@ Describe 'T4 autonomous tuning (2026-11-04)' {
         $result.status | Should -Be 'Warning'
         $result.message | Should -Match $Pattern
         $result.remediation | Should -Match 't4SkuName'
+        # 2026-11-09: a size you set falls back too when T4 is created, so no fix says it never changes or has no fallback;
+        # after a refused scale, the access request comes before the move, so that move isn't simply refused again.
+        $result.remediation | Should -Not -Match 'a size you set (is never changed|has no fallback)'
+        if ($Outcome -eq 'Refused') {
+            $result.remediation | Should -Match '^Nothing to do: T4 works at its size\. To have the default, first ask for access with a Region access request for Azure Database for PostgreSQL flexible server \(Learn: Resolve capacity errors\), then set t4SkuName to Standard_D4ds_v5 and run \./scripts/deploy\.ps1'
+        }
     }
 }

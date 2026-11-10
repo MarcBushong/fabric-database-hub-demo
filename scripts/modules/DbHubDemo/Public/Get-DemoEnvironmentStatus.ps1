@@ -32,7 +32,10 @@ function Get-DemoEnvironmentStatus {
       days after the stop in the activity log; a Warning within a day), what it then bills at its own size (the Retail
       Prices API), and whether the nightly safety stop (ADR 0024), or else the on-demand control's daily safety stop, stops
       it again or nothing does (Phase 28 follow-up; Get-DemoT4RestartStopState); a General Purpose T4 says so, and when
-      the fallback chose it, with its hourly list price. STATUS.PROFILE_T4 is its activity
+      the fallback chose it, with its hourly list price. STATUS.T4.SIZE (2026-11-09, user-directed): a Warning while T4
+      runs at a size deploy.ps1's fallback chose instead of the one the configuration asks for, with the sizes Azure
+      refused and the zones tried, the size deployed, and T4's monthly estimate at both, light use and worst case, with
+      the difference (Get-DemoT4RecordedSizeChange). STATUS.PROFILE_T4 is its activity
       profile, and with -Detail STATUS.T4.LIVE is T1's runner's live view of T4 (connections against
       max_connections, sessions by state, blockers, the oldest transaction, deadlocks).
     - T1.SQLVM.ASSOCIATEDSERVICES (Phase 7, read-only): the SQL Server instances unified inventory lists for
@@ -241,7 +244,7 @@ function Get-DemoEnvironmentStatus {
         $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4 -Name 'Server')
         $t4Sku = if ($t4ServerSku) { $t4ServerSku } else { Get-DemoT4SkuName -Config $t4Config }
         $t4GeneralPurpose = (Get-DemoT4SkuSpec -SkuName $t4Sku).Tier -eq 'GeneralPurpose'
-        $t4Origin = if (-not (Test-DemoT4FallbackSize -Config $Config -State $state)) { '' } elseif ([string](Get-DemoMemberValue -InputObject $state -Name 'T4Sku') -ceq 'Standard_D4ads_v5') { ', which the fallback chose because Azure refused Standard_D4ds_v5 here' } else { ', which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off' }
+        $t4Origin = if (-not (Test-DemoT4FallbackSize -Config $Config -State $state)) { '' } elseif (Get-DemoT4PinnedSku -Config $t4Config) { ', which deploy.ps1''s fallback chose because Azure refused {0}, the size t4SkuName sets (STATUS.T4.SIZE)' -f (Get-DemoT4AskedSku -Config $t4Config) } elseif ([string](Get-DemoMemberValue -InputObject $state -Name 'T4Sku') -ceq 'Standard_D4ads_v5') { ', which the fallback chose because Azure refused Standard_D4ds_v5 here' } else { ', which the fallback chose because Azure refused the 4-vCore sizes here, so autonomous tuning is off' }
         if (-not $t4.Exists) {
             # A size the fallback chose but didn't create yet is said as that, never as created (review of 20e855c).
             $chosen = if ($t4Origin) { ' as General Purpose {0}{1}, after checking its price against the ceilings again' -f $t4Sku, $t4Origin } else { '' }
@@ -285,6 +288,14 @@ function Get-DemoEnvironmentStatus {
         }
         else {
             $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Warning' -Message ('{0} is {1}.' -f $t4.Names.ServerName, $t4.State) -Evidence ([ordered]@{ state = $t4.State }) -Remediation 'Check again in a few minutes.'))
+        }
+        # 2026-11-09 (user-directed): T4 at a size deploy.ps1's fallback chose instead of the one the configuration asks for
+        # says so here too, with what was tried and refused, what was deployed, and both monthly estimates.
+        if ($t4.Exists) {
+            $sizeChange = Get-DemoT4RecordedSizeChange -Config $Config -State $state -CheckId 'STATUS.T4.SIZE'
+            if ($null -ne $sizeChange) {
+                $results.Add($sizeChange)
+            }
         }
     }
 

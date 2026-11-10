@@ -9,7 +9,9 @@ function Publish-DemoWorkloadRunner {
     framework-dependent (--self-contained false), English resources only, and without the Windows broker's
     native runtime, with locked-mode restore, and without a program database (-p:DebugType=none). The VMs run
     it with the pinned .NET runtime zip (config/versions.json dotnetRuntime), which they download from Microsoft
-    and check against its SHA-512.
+    and check against its SHA-512. The dotnet that builds it is the first on PATH when workload-generator/global.json
+    accepts its SDK, otherwise the SDK deploy.ps1 installed for the user, run by its full path (Resolve-DemoBuildDotNet;
+    2026-11-09).
 
     The same source builds the same runner in any checkout (live, 2026-10-22): a program database's Source Link
     data holds the checkout's path and the commit, and the assembly records the program database's checksum, so
@@ -124,9 +126,12 @@ function Publish-DemoWorkloadRunner {
     }
     $staging = Join-Path -Path $output -ChildPath ('publish-{0}' -f [guid]::NewGuid().ToString('N'))
     try {
+        # The dotnet that builds it, by its full path: the first on PATH when global.json accepts its SDK, otherwise the SDK
+        # deploy.ps1 installed for the user (Resolve-DemoBuildDotNet, 2026-11-09); without either, this throws the fix.
+        $dotnet = Resolve-DemoBuildDotNet -RepositoryRoot $root
         $arguments = @('publish', $project, '--configuration', 'Release', '--runtime', $rid, '--self-contained', 'false', '--output', $staging) + $publishProperties + @('--nologo')
         Write-DemoLog -Message ('Publishing the workload runner {0} for {1} (framework-dependent).' -f $version, $rid)
-        $build = Invoke-DemoDotNet -ArgumentList $arguments -WorkingDirectory (Join-Path -Path $root -ChildPath 'workload-generator')
+        $build = Invoke-DemoDotNet -DotNetPath $dotnet -ArgumentList $arguments -WorkingDirectory (Join-Path -Path $root -ChildPath 'workload-generator')
         if ($build.ExitCode -ne 0) {
             $detail = (([string]$build.StdOut) + "`n" + ([string]$build.StdErr)).Trim()
             if ($detail.Length -gt 1500) {

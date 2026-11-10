@@ -3,6 +3,9 @@ BeforeAll {
     Import-Module -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1') -Force
     . (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Guard.Helpers.ps1')
     Initialize-GuardTestContext
+    # The .NET SDK that deploy.ps1 installs when it's missing (2026-11-09) has its own tests (DbHubDemo.DotNetSdk.Tests.ps1);
+    # here it's there, and adds no record, unless a test says otherwise.
+    Mock -ModuleName DbHubDemo -CommandName Initialize-DemoDotNetSdk -MockWith { }
 
     function New-TestConfig([switch] $WithT4) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
@@ -1349,6 +1352,43 @@ Describe 'Invoke-DemoDeploymentTrack' {
     }
 }
 
+Describe 'T4''s row on the status page says an automatic size change (2026-11-09)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Stage = 'Infrastructure'; TrackT4 = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4 -MockWith { New-TestResult 'T4.SERVER' }
+    }
+
+    It 'shows the notice on T4''s row as a Warning, whole, and never fails the track: <Name>' -ForEach @(
+        @{ Name = 'with a size change'; Notice = 'T4 was created as Standard_B2s (Burstable, 2 vCores) instead of Standard_B1ms, the size t4SkuName sets, because Azure refused Standard_B1ms (no zone preference, then zone 1) with SkuNotAvailable. Estimated monthly cost of T4 alone (list prices in westus3, Azure Retail Prices API, read now; estimates): Standard_B1ms 10.00 USD at light use and 30.00 USD in the worst case; Standard_B2s 40.00 USD and 120.00 USD, so 30.00 USD more a month at light use and 90.00 USD more in the worst case, which counts Azure starting a stopped T4 again on its own after 7 days.' }
+        @{ Name = 'without one'; Notice = '' }
+    ) {
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -T4Enabled)) -Confirm:$false }
+        $context = @{ NetworkMode = 'private'; T3UseFreeLimit = $true; T2Source = 'golden'; ConfigPath = ''; NoState = $false; ProgressPath = $progress }
+        if ($Notice) {
+            $context['T4Notice'] = $Notice
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -WithT4); Context = $context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T4' -Context $Context -Step @('Server') }
+        $outcome.Status | Should -Be 'Pass' -Because 'a size change is a Warning, never a block'
+        $size = @($outcome.Results | Where-Object { $_.checkId -eq 'T4.SIZE' })
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $row = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'T4.Server') { $item } } })[0]
+        if (-not $Notice) {
+            $size | Should -BeNullOrEmpty
+            $row['status'] | Should -Be 'Pass'
+            return
+        }
+        $size.Count | Should -Be 1
+        $size[0].status | Should -Be 'Warning'
+        $size[0].message | Should -Be $Notice
+        $row['state'] | Should -Be 'Done'
+        $row['status'] | Should -Be 'Warning'
+        $row['message'] | Should -Be $Notice -Because 'T4''s row keeps the whole notice, with both estimates'
+    }
+}
 Describe 'Invoke-DemoParallelDeployment' {
     BeforeEach {
         # T4 is part of every deployment (2026-11-09, user-directed), so the run's own configuration always has it.
@@ -1808,6 +1848,63 @@ Describe 'Invoke-DemoParallelDeployment' {
         $script:calls | Should -Contain 'track T2: Telemetry'
     }
 
+    Context 'the .NET SDK that deploy.ps1 installs when it''s missing (2026-11-09)' {
+        BeforeEach {
+            $script:sdkStatus = 'Pass'
+            Mock -ModuleName DbHubDemo -CommandName Initialize-DemoDotNetSdk -MockWith {
+                $script:calls.Add('sdk')
+                New-DemoResult -CheckId 'DEPLOY.DOTNETSDK' -Area 'preflight' -Target 'repo' -Status $script:sdkStatus -Message ('sdk {0}' -f $script:sdkStatus)
+            }
+            Mock -ModuleName DbHubDemo -CommandName New-DemoBootstrapBundle -MockWith { $script:calls.Add('bundle'); [pscustomobject]@{ Path = 'bundle.zip'; Sha256 = ('a' * 64); SizeBytes = 10 } }
+            $script:progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+            InModuleScope DbHubDemo -Parameters @{ Path = $script:progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+            function Get-TestRow([string] $Id) {
+                $model = Get-Content -LiteralPath $script:progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+                foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq $Id) { return $item } } }
+            }
+        }
+
+        It 'makes sure of it once, before preflight and anything it creates, when the run builds the workload runner' {
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
+            @($script:calls | Where-Object { $_ -eq 'sdk' }).Count | Should -Be 1
+            $script:calls.IndexOf('sdk') | Should -BeLessThan $script:calls.IndexOf('preflight')
+            $script:calls.IndexOf('sdk') | Should -BeLessThan $script:calls.IndexOf('template disk=golden')
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.DOTNETSDK' }).status | Should -Be 'Pass'
+        }
+
+        It 'stops at its Fail before preflight, saying nothing was created on the status page' {
+            $script:sdkStatus = 'Fail'
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
+            ($results | Where-Object { $_.checkId -eq 'DEPLOY.DOTNETSDK' }).status | Should -Be 'Fail'
+            @($script:calls | Where-Object { $_ -match '^(preflight|template|track|safety stop)' }) | Should -BeNullOrEmpty
+            $script:calls | Should -Contain 'app sign-in check stop'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
+            $row = Get-TestRow -Id 'Preflight'
+            $row['state'] | Should -Be 'Failed'
+            $row['message'] | Should -Match 'Nothing was created: the \.NET SDK the workload runner needs couldn''t be installed'
+        }
+
+        It 'makes sure of it before a resume builds the runner to compare it, and only once' {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Telemetry'; $state.TrackT2 = 'Bootstraps'; $state.TrackFabric = 'Fabric'; $state }
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -Resume })
+            @($script:calls | Where-Object { $_ -eq 'sdk' }).Count | Should -Be 1
+            $script:calls.IndexOf('sdk') | Should -BeLessThan $script:calls.IndexOf('bundle')
+            Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoWorkloadRunner -Times 1 -Exactly
+        }
+
+        It 'isn''t needed with -SkipRunner, a what-if, or a run that builds no runner, and the status page says why: <Case>' -ForEach @(
+            @{ Case = '-SkipRunner'; Run = @{ SkipRunner = $true }; Text = 'Not needed: -SkipRunner builds no workload runner.' }
+            @{ Case = '-WhatIf'; Run = @{ WhatIf = $true }; Text = 'What if: nothing is installed.' }
+            @{ Case = '-FromStage Validation'; Run = @{ FromStage = 'Validation' }; Text = 'Not needed: this run builds no workload runner.' }
+        ) {
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $script:progress; Run = $Run } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path @Run })
+            $script:calls | Should -Not -Contain 'sdk'
+            $row = Get-TestRow -Id 'DotNetSdk'
+            $row['state'] | Should -Be 'Skipped'
+            $row['message'] | Should -Be $Text
+        }
+    }
+
     Context 'track records across runs (Phase 28 live finding, 2026-10-30)' {
         BeforeEach {
             # The resource group's tags, kept across the runs of one test: what Set-DemoDeploymentState writes,
@@ -1970,11 +2067,11 @@ Describe 'Invoke-DemoParallelDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeFalse -Because 'DONE needs T4''s estate and metrics'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.OFF' }).status | Should -Be 'Fail'
 
-        # An older None counts as the default (2026-11-09: nothing leaves T4 out): no start goes to the template.
+        # An older run's None start counts as Standard_D2ds_v5 (2026-11-09: no step leaves T4 out).
         $script:calls.Clear()
         $script:startSku = 'None'
         $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
-        $script:calls | Should -Contain 'template start='
+        $script:calls | Should -Contain 'template start=Standard_D2ds_v5'
     }
 
     It 'starts T4''s General Purpose fallback where preflight says, says what it did on the Infrastructure step, and gives the tracks that size (Phase 28 follow-up)' {
@@ -1987,22 +2084,35 @@ Describe 'Invoke-DemoParallelDeployment' {
             New-DemoResult -CheckId 'PREFLIGHT.T4.FALLBACK' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message 'The fallback fits both ceilings.' -Evidence @{ startSku = 'Standard_D2ds_v5' }
         }
         $script:note = 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API).'
+        # 2026-11-09: the template's notice of an automatic size change (DEPLOY.T4.FALLBACK) is the Infrastructure row's note,
+        # and the T4 track gets it for T4's row.
+        $script:change = New-DemoResult -CheckId 'DEPLOY.T4.FALLBACK' -Area 't4' -Target 'T4' -Status 'Warning' -Message $script:note
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
             $script:calls.Add(('template start={0}' -f (Get-Variable -Name 'T4StartSku' -ValueOnly -ErrorAction SilentlyContinue)))
-            [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $true; T4SkuName = 'Standard_D2ds_v5'; T4Note = $script:note }
+            [pscustomobject]@{ Succeeded = $true; Results = @((New-TestResult 'DEPLOY.TEMPLATE'), $script:change); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $true; T4SkuName = 'Standard_D2ds_v5'; T4Note = $script:note }
         }
         $script:t4InTracks = [System.Collections.Generic.List[string]]::new()
+        $script:noticeInTracks = @{}
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
             $script:t4InTracks.Add(('{0}:{1}:{2}' -f $Track, [string]$Config['t4SkuName'], [string]$Config['t4SkuSource']))
+            $script:noticeInTracks[$Track] = [string]$Context['T4Notice']
             [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = @() }
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Names = [pscustomobject]@{ ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' } } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoT4MetricFlow -MockWith { New-TestResult 'METRICS.T4' }
-        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
         $script:calls | Should -Contain 'template start=Standard_D2ds_v5'
         $script:t4InTracks | Should -Contain 'T1:Standard_D2ds_v5:deployed'
         $script:t4InTracks | Should -Contain 'T4:Standard_D2ds_v5:deployed'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.INFRASTRUCTURE' }).message | Should -BeLike ('The infrastructure is deployed (*). {0}' -f $script:note)
+        $script:noticeInTracks['T4'] | Should -Be $script:note
+        # The status page's Infrastructure row keeps the whole note.
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $infrastructure = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Infrastructure') { $item } } })[0]
+        $infrastructure['message'] | Should -BeLike ('The infrastructure is deployed (*). {0}' -f $script:note)
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.FALLBACK' }).Count | Should -Be 1
     }
 
     It 'stops the clock only when T4''s estate and metrics passed too, when T4 is on (ADR 0018 as amended)' {
@@ -2275,6 +2385,27 @@ Describe 'Invoke-DemoParallelDeployment' {
             ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.PREFLIGHT' }).status | Should -Be 'Fail'
             Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoDeploymentTrackJob -Times 0 -Exactly
             Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
+        }
+
+        It 'gives DEPLOY.ARTIFACTS.BUILD the .NET SDK check''s diagnosis and fix when the build failed on the SDK, and preflight -SkipRunner (2026-11-09 live finding)' {
+            Mock -ModuleName DbHubDemo -CommandName Start-DemoArtifactBuildJob -MockWith {
+                $script:calls.Add('build')
+                $value = [pscustomobject]@{ Bundle = $null; Runner = $null; Error = 'dotnet publish failed with exit code -2147450725: The command could not be loaded, possibly because: * You intended to execute a .NET SDK command: A compatible .NET SDK was ...' }
+                [System.IO.File]::WriteAllText((Join-Path -Path $HandoffPath -ChildPath 'artifacts.xml'), [System.Management.Automation.PSSerializer]::Serialize($value, 5))
+                Start-ThreadJob -Name 'dbhub-build-artifacts' -ScriptBlock { }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDotNetSdkStatus -MockWith {
+                [pscustomobject]@{ Ok = $false; Message = 'The dotnet first on PATH, C:\Program Files\dotnet\dotnet.exe, has no .NET SDK, only runtimes.'; Fix = 'Install the .NET SDK 10.0.403 or later: winget install Microsoft.DotNet.SDK.10.' }
+            }
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config })
+            $build = $results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.BUILD' }
+            $build.status | Should -Be 'Fail'
+            $build.remediation | Should -BeExactly 'The dotnet first on PATH, C:\Program Files\dotnet\dotnet.exe, has no .NET SDK, only runtimes. Install the .NET SDK 10.0.403 or later: winget install Microsoft.DotNet.SDK.10.'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -Times 1 -Exactly -ParameterFilter { -not $SkipRunner }
+
+            $script:received = @{}
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -SkipRunner })
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -Times 1 -Exactly -ParameterFilter { [bool]$SkipRunner }
         }
 
         It 'doesn''t start an early T2 restore when the T2 source isn''t a new golden host' {

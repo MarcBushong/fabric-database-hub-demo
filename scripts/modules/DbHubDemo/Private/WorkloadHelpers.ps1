@@ -6,7 +6,8 @@ function Invoke-DemoDotNet {
 
     .DESCRIPTION
     The working directory matters: the SDK reads workload-generator/global.json from it, which pins the SDK
-    version (config/versions.json tools.dotnetSdk). Output is returned redacted.
+    version (config/versions.json tools.dotnetSdk). Output is returned redacted. -DotNetPath runs that dotnet instead
+    of the first one on PATH (Get-DemoDotNetPath), as the .NET SDK check does for other well-known folders.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -15,18 +16,22 @@ function Invoke-DemoDotNet {
         [string[]] $ArgumentList,
 
         [Parameter(Mandatory)]
-        [string] $WorkingDirectory
+        [string] $WorkingDirectory,
+
+        [string] $DotNetPath = ''
     )
 
-    $dotnet = Get-Command -Name 'dotnet' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $dotnet) {
+    if (-not $DotNetPath) {
+        $DotNetPath = Get-DemoDotNetPath
+    }
+    if (-not $DotNetPath) {
         throw 'The .NET SDK (dotnet) was not found on PATH. Install the SDK pinned in config/versions.json (tools.dotnetSdk), or use the devcontainer or Cloud Shell.'
     }
     $PSNativeCommandUseErrorActionPreference = $false
     $errorFile = [System.IO.Path]::GetTempFileName()
     Push-Location -LiteralPath $WorkingDirectory
     try {
-        $stdout = & $dotnet.Source @ArgumentList 2> $errorFile
+        $stdout = & $DotNetPath @ArgumentList 2> $errorFile
         $exitCode = $LASTEXITCODE
         $stderr = Get-Content -LiteralPath $errorFile -Raw -ErrorAction SilentlyContinue
     }

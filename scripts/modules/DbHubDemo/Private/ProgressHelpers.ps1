@@ -113,8 +113,9 @@ function Get-DemoProgressCatalog {
     The status page's ordered steps per track (Phase 28, brief item 11). Pure. Internal.
 
     .DESCRIPTION
-    Preflight, with the start of the VMs that were stopped (StartVms; Phase 28 live finding) and the Insights app's
-    sign-in, which runs alongside everything else (Fabric.AppSignIn, 2026-11-05; not with -SkipFabric); Infrastructure;
+    Preflight, with the start of the VMs that were stopped (StartVms; Phase 28 live finding), the Insights app's
+    sign-in, which runs alongside everything else (Fabric.AppSignIn, 2026-11-05; not with -SkipFabric), and the .NET SDK
+    for the workload runner, which deploy.ps1 installs for the user when it's missing (DotNetSdk, 2026-11-09); Infrastructure;
     T1 (artifacts, bootstrap, activity, monitoring, telemetry); T3; T4; Fabric (the Insights app included, marked
     non-blocking: it's part of every deployment, but it never blocks DONE); T2 (a golden restore, or the host build,
     which in JumpstartImage mode is the Jumpstart image's download and first boot, then the sign-in cleanup, Arc
@@ -140,8 +141,11 @@ function Get-DemoProgressCatalog {
     $preflight.Add((& $step 'StartVms' 'Start the VMs that were stopped (the nightly auto-shutdown, stop-demo.ps1)' @('StartVms')))
     if (-not $SkipFabric) {
         # Displayed under Preflight, when it happens; deploy.ps1 itself sets it (Start-DemoFabricAppSignIn).
-        $preflight.Add((& $step 'Fabric.AppSignIn' 'Sign-in for the Insights app (the Rayfin CLI; a browser opens once, alongside the deployment)' @('Fabric/Fabric') $true))
+        $preflight.Add((& $step 'Fabric.AppSignIn' 'Sign-in for the Insights app (the Rayfin CLI; only when Fabric refuses your Azure CLI''s token)' @('Fabric/Fabric') $true))
     }
+    # deploy.ps1 itself sets it, with the download's size and progress when it installs the SDK (Initialize-DemoDotNetSdk,
+    # 2026-11-09).
+    $preflight.Add((& $step 'DotNetSdk' 'The .NET SDK for the workload runner (installed for you when it''s missing)' @()))
     $preflight.Add((& $step 'Preflight' 'Checks before anything is created' @('Preflight')))
     $tracks.Add([ordered]@{ name = 'Preflight'; label = 'Preflight'; steps = $preflight.ToArray() })
     $tracks.Add([ordered]@{ name = 'Infrastructure'; label = 'Infrastructure'; steps = @(& $step 'Infrastructure' 'Azure resources (the template)' @('Infrastructure')) })
@@ -852,7 +856,7 @@ function Set-DemoProgressValue {
         $clean = [ordered]@{}
         foreach ($key in $Value.Keys) {
             $item = $Value[$key]
-            $clean[[string]$key] = if ($item -is [string] -and [string]$key -notin 'url', 'state', 'credential', 'hostVm', 'hostUser', 'nextCommand') { Protect-DemoProgressText -Text $item -MaxLength 1200 } else { $item }
+            $clean[[string]$key] = if ($item -is [string] -and [string]$key -notin 'url', 'state', 'credential', 'hostVm', 'hostUser', 'nextCommand') { Protect-DemoProgressText -Text $item -MaxLength $(if ([string]$key -eq 'reason') { 2400 } else { 1200 }) } else { $item }
         }
     }
     elseif ($Section -eq 'nonBlocking') {

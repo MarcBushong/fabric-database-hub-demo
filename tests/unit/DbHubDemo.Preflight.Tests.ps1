@@ -75,6 +75,11 @@ BeforeAll {
             New-DemoResult -CheckId 'PREFLIGHT.FABRIC.APPSETTINGS' -Area 'preflight' -Target 'tenant' -Status $script:appSettingsStatus -Message 'The tenant settings the Insights app needs.'
         }
         $script:appSettingsStatus = 'Pass'
+        # The .NET SDK check (2026-11-09) has its own tests (DbHubDemo.DotNetSdk.Tests.ps1); here it runs no dotnet.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -MockWith {
+            New-DemoResult -CheckId 'PREFLIGHT.TOOLS.DOTNETSDK' -Area 'preflight' -Target 'repo' -Status $script:dotnetSdkStatus -Message 'The .NET SDK that builds the workload runner.'
+        }
+        $script:dotnetSdkStatus = 'Pass'
     }
 
     # One policy assignment whose definition turns off public network access on SQL servers (fake data).
@@ -97,6 +102,40 @@ Describe 'Invoke-DemoPreflight' {
         $script:pgCapabilitiesJson = '{}'
         $script:pgDeploymentJson = '{}'
         $script:pgOperationsJson = '[]'
+        # No test here runs a real dotnet (DbHubDemo.DotNetSdk.Tests.ps1 tests the check).
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -MockWith {
+            New-DemoResult -CheckId 'PREFLIGHT.TOOLS.DOTNETSDK' -Area 'preflight' -Target 'repo' -Status $script:dotnetSdkStatus -Message 'The .NET SDK that builds the workload runner.'
+        }
+        $script:dotnetSdkStatus = 'Pass'
+    }
+
+    It 'checks the .NET SDK that builds the workload runner right after the guard, and a Fail there fails preflight before anything is created (2026-11-09 live finding)' {
+        Set-HappyAzMock
+        $script:dotnetSdkStatus = 'Fail'
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $ids[0] | Should -Be 'PREFLIGHT.GUARD.CONTEXT'
+        $ids[1] | Should -Be 'PREFLIGHT.TOOLS.DOTNETSDK'
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.TOOLS.DOTNETSDK').status | Should -Be 'Fail'
+        (Get-DemoExitCode -Result $results) | Should -Not -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -Times 1 -Exactly
+    }
+
+    It 'needs no .NET SDK with -SkipRunner: Not selected, and no dotnet runs' {
+        Set-HappyAzMock
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory -SkipRunner)
+        $sdk = $results | Where-Object checkId -EQ 'PREFLIGHT.TOOLS.DOTNETSDK'
+        $sdk.status | Should -Be 'Not selected'
+        $sdk.message | Should -Match '-SkipRunner'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -Times 0 -Exactly
+    }
+
+    It 'checks nothing when the guard fails, the .NET SDK included' {
+        Set-HappyAzMock
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { throw 'wrong tenant' }
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        @($results.checkId) | Should -Be @('PREFLIGHT.GUARD.CONTEXT')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoDotNetSdk -Times 0 -Exactly
     }
 
     It 'says once that a configuration without activityProfile uses the new default, business-day, before the cost checks that count it (2026-11-03)' {
@@ -169,13 +208,18 @@ Describe 'Invoke-DemoPreflight' {
         $check.message | Should -Match 'starts with Standard_D4ads_v5, General Purpose with 4 vCores too'
         $check.evidence.startSku | Should -Be 'Standard_D4ads_v5'
 
-        # A size the configuration sets never changes on its own: that refusal is still a Fail.
+        # A size the configuration sets falls back too since 2026-11-09 (user-directed): deploy.ps1 tries it again, since
+        # Azure's regional capacity changes, and then the next size Azure accepts, cheapest first. A Warning, never a Fail,
+        # and no fix that asks for another size.
         $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
         $pinned['t4SkuName'] = 'Standard_D4ds_v5'
         $check = Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
-        $check.status | Should -Be 'Fail'
-        $check.remediation | Should -Match 'Set t4SkuName to Standard_D4ads_v5 \(General Purpose, 4 vCores on AMD processors'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Match 'so deploy\.ps1 tries it again, since Azure''s regional capacity changes, once more in another zone the region lists, and then the next size Azure accepts, cheapest first \(Standard_D4ads_v5, Standard_D2ds_v5, Standard_B2s, Standard_B1ms\)\.'
+        $check.evidence.startSku | Should -Be ''
+        $check.evidence.pinnedSku | Should -Be 'Standard_D4ds_v5'
+        $check.remediation | Should -Not -Match 'Set t4SkuName'
 
         $zoned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $zoned[$key] = $config[$key] }
@@ -191,10 +235,9 @@ Describe 'Invoke-DemoPreflight' {
         $script:pgDeploymentJson = & $refused 'Standard_D4ads_v5' ''
         $check = Invoke-DemoPreflight -Config $zoned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
         $check.status | Should -Be 'Warning' -Because 'this configuration pins zone 2, and the refusal had no zone'
-        $check.remediation | Should -Match 'Set t4SkuName to Standard_D4ds_v5 \(or remove it'
-        $check.remediation | Should -Match 'Region access request'
-        $check.remediation | Should -Match 'Standard_D2ds_v5 \(2 vCores; autonomous tuning turns off'
-        $check.remediation | Should -Not -Match 'Set t4SkuName to Standard_D4ads_v5'
+        $check.message | Should -Match 'tries Standard_D4ads_v5 once more in zone 2, as t4AvailabilityZone says; if Azure refuses it again, deploy\.ps1''s fallback moves on to its next size by itself'
+        $check.remediation | Should -Match '^Nothing to do'
+        $check.remediation | Should -Not -Match 't4SkuName' -Because 'the fallback chooses the size, so no fix asks for one (2026-11-09)'
 
         $script:pgDeploymentJson = '{"name":"pgflex01","properties":{"provisioningState":"Succeeded"}}'
         @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU').Count | Should -Be 0
@@ -223,7 +266,11 @@ Describe 'Invoke-DemoPreflight' {
         $check.evidence.tier | Should -Be 'GeneralPurpose'
         $gp['t4SkuName'] = 'Standard_B2s'
         $script:pgCapabilitiesJson = ConvertTo-Json -Depth 10 -InputObject @{ value = @(@{ supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_B2s' }) }); supportedServerVersions = @(@{ name = '18' }) }) }
-        (Invoke-DemoPreflight -Config $gp -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').status | Should -Be 'Fail' -Because 'a Burstable size listed under another edition isn''t offered as Burstable'
+        # A Burstable size listed under another edition isn't offered as Burstable; since 2026-11-09 the fallback for a size
+        # t4SkuName sets starts at the next size the region lists, here Standard_B1ms, a Warning.
+        $check = Invoke-DemoPreflight -Config $gp -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $check.status | Should -Be 'Warning'
+        $check.evidence.startSku | Should -Be 'Standard_B1ms'
 
         $script:pgCapabilitiesJson = '{}'
         (Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').status | Should -Be 'Warning'
@@ -288,12 +335,30 @@ Describe 'Invoke-DemoPreflight' {
         $check.remediation | Should -Not -Match 't4Enabled'
         (InModuleScope DbHubDemo -Parameters @{ Results = $results } { Select-DemoT4StartSku -Sku @($Results | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'startSku') }) }) | Should -Be '' -Because 'deploy.ps1 starts from the default size'
 
-        # A size the configuration sets that the region doesn't list is a Fail before anything is created.
+        # A size the configuration sets that the region doesn't list: since 2026-11-09 (user-directed) deploy.ps1 starts at
+        # the next size the region lists in its fallback order, a 4-vCore size's peer first, with a Warning, never a Fail.
         $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
         $pinned['t4SkuName'] = 'Standard_D4ds_v5'
         $script:listSkusJson = & $script:listSkus @('Standard_D4ads_v5')
-        (Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').status | Should -Be 'Fail'
+        $results = Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory
+        $check = $results | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $check.status | Should -Be 'Warning'
+        $check.evidence.startSku | Should -Be 'Standard_D4ads_v5'
+        $check.message | Should -Match 'doesn''t list Standard_D4ds_v5, the size t4SkuName sets, so deploy\.ps1 creates T4 as Standard_D4ads_v5, the next size the region lists in the fallback''s order, cheapest first; a Warning then names the size and both monthly estimates'
+        (InModuleScope DbHubDemo -Parameters @{ Results = $results; Config = $pinned } { Select-DemoT4StartSku -Sku @($Results | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'startSku') }) -Order ([string[]]@(@('') + @(Get-DemoT4FallbackOrder -Config $Config))) }) | Should -Be 'Standard_D4ads_v5'
+        $fallback = $results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
+        $fallback.status | Should -Be 'Pass'
+        $fallback.message | Should -Match '^t4SkuName sets Standard_D4ds_v5 \(deploy\.ps1 starts at Standard_D4ads_v5: PREFLIGHT\.T4\.CAPABILITY or PREFLIGHT\.T4\.SKU says why\)\. If Azure refuses it when it creates T4 \(SkuNotAvailable\), deploy\.ps1 tries it once more in another zone the region lists, then the next size Azure accepts, cheapest first: Standard_D4ads_v5, Standard_D2ds_v5, Standard_B2s, Standard_B1ms\.'
+        @($fallback.evidence.order) | Should -Be @('Standard_D4ads_v5', 'Standard_D2ds_v5', 'Standard_B2s', 'Standard_B1ms')
+
+        # Standard_B1ms, the size the tester's configuration set (2026-11-09), in a region that lists only General Purpose
+        # sizes: the fallback starts at the cheapest of them, Standard_D2ds_v5.
+        $pinned['t4SkuName'] = 'Standard_B1ms'
+        $script:listSkusJson = ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5' }, @{ name = 'Standard_D4ads_v5' }, @{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '18' }) })
+        $check = Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $check.status | Should -Be 'Warning'
+        $check.evidence.startSku | Should -Be 'Standard_D2ds_v5'
     }
 
     It 'says once that an existing T4 that no record keeps moves to the default, prices it at the default, and checks the region offers it (2026-11-04)' {
@@ -385,8 +450,8 @@ Describe 'Invoke-DemoPreflight' {
         $fallback.remediation | Should -Not -Match 't4Enabled'
 
         # The region lists neither 4-vCore size: the run starts at the 2-vCore size, so the run's own estimate prices it. Over
-        # a ceiling, the fallback's check says so (startSku Standard_D2ds_v5, never None any more) but never
-        # leaves T4 out: there's no estimate without T4, and the run's own cost checks stay (2026-11-09).
+        # a ceiling, the fallback's check says so (its start stays Standard_D2ds_v5, never None any more) but never leaves T4
+        # out: there's no estimate without T4, and the run's own cost checks stay (2026-11-09).
         $script:listSkusJson = & $script:listSkus @('Standard_D2ds_v5')
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
         $fallback = $results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
@@ -404,13 +469,16 @@ Describe 'Invoke-DemoPreflight' {
         $fallback.evidence.startSku | Should -Be 'Standard_D2ds_v5'
         $fallback.message | Should -Match 'so this run creates T4 as General Purpose Standard_D2ds_v5'
 
-        # A size the configuration sets has no fallback to price, and a configuration with T4 off in memory (Get-DemoConfig
-        # never gives one since 2026-11-09) has nothing to price.
+        # A size the configuration sets has its own fallback since 2026-11-09, which this check names (a Pass; each size is
+        # priced right before it's tried), and a configuration with T4 off in memory (Get-DemoConfig never gives one since
+        # 2026-11-09) has nothing to price.
         $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
         foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
         $pinned['t4SkuName'] = 'Standard_B1ms'
         $script:listSkusJson = & $script:listSkus @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
-        (Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK').status | Should -Be 'Not selected'
+        $pinnedFallback = Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
+        $pinnedFallback.status | Should -Be 'Pass'
+        $pinnedFallback.message | Should -Match '^t4SkuName sets Standard_B1ms\. If Azure refuses it when it creates T4 \(SkuNotAvailable\), deploy\.ps1 tries it once more in another zone the region lists, then the next size Azure accepts, cheapest first: Standard_B2s, Standard_D2ds_v5, Standard_D4ds_v5, Standard_D4ads_v5\.'
         $pinned.Remove('t4SkuName')
         $pinned['t4Enabled'] = $false
         @(Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK').Count | Should -Be 0

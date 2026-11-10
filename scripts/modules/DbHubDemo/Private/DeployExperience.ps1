@@ -132,8 +132,9 @@ function Get-DemoDeploymentExpectation {
     JumpstartImage mode (the default since 2026-11-05) replaces the guest build with the Jumpstart image's 34 GiB download
     and its first boot, and needs no person: a clean first deployment took 91 minutes when measured on 2026-11-06, of
     which T2's host build took about 27 and its Arc onboarding about 33. Without
-    -SkipFabric, it says that the Insights app's Rayfin CLI sign-in may open a browser at the start, which the run doesn't
-    wait for (2026-11-05). -Note (2026-11-09) adds the lines that say what the run ignores in the configuration (its
+    -SkipFabric, it says that the Insights app deploys with the Azure CLI's sign-in (2026-11-09), and that the Rayfin
+    CLI's own sign-in opens a browser at the start only after Fabric refused that token, which the run doesn't wait for
+    (2026-11-05). -Note (2026-11-09) adds the lines that say what the run ignores in the configuration (its
     PaygWizard, its t4Enabled false), to the banner and the status page.
     #>
     [CmdletBinding()]
@@ -168,7 +169,7 @@ function Get-DemoDeploymentExpectation {
     }
     $lines.Add('- A redeploy from a golden snapshot (./scripts/capture-t2-golden.ps1) takes about 30 to 45 minutes, with no T2 build.')
     if (-not $SkipFabric) {
-        $lines.Add('- The Insights app needs its Rayfin CLI signed in once: when it isn''t yet, a browser opens for your sign-in right at the start. The run goes on meanwhile; only the app waits for it, and without it the app isn''t created, which doesn''t keep the run from DONE.')
+        $lines.Add('- The Insights app deploys with your Azure CLI sign-in (az login), so no browser opens for it. Only after Fabric refused that token in an earlier run does a browser open for the Rayfin CLI''s own sign-in right at the start; the run goes on meanwhile, only the app waits for it, and without it the app isn''t created, which doesn''t keep the run from DONE.')
     }
     $lines.Add('- This PC stays awake while deploy.ps1 runs (Windows); keep it plugged in, and don''t close this window.')
     $lines.Add('- If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.')
@@ -186,8 +187,8 @@ function Get-DemoDeploymentNotice {
     <#
     .SYNOPSIS
     The start banner's notices (brief items 7, 8, 13): in a session that can't take keyboard input (an assistant, a
-    script, or CI), that the Insights app's browser sign-in isn't started there (2026-11-05); and a GitHub Codespaces idle
-    timeout. Pure. Internal.
+    script, or CI), that the Insights app's browser sign-in, needed only when Fabric refuses the Azure CLI's token
+    (2026-11-09), isn't started there (2026-11-05); and a GitHub Codespaces idle timeout. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
@@ -200,7 +201,7 @@ function Get-DemoDeploymentNotice {
 
     $lines = [System.Collections.Generic.List[string]]::new()
     if (-not $SkipFabric -and -not [bool]$Environment.Interactive) {
-        $lines.Add('The Insights app''s browser sign-in (the Rayfin CLI) isn''t started in a session like this one. When this machine''s Rayfin CLI isn''t signed in yet, the app isn''t created; the run still finishes, and ./scripts/configure-fabric-app.ps1 -SignIn, which you run yourself in a terminal, adds it later.')
+        $lines.Add('The Insights app deploys with your Azure CLI sign-in (az login). Only if Fabric refuses that token does it need the Rayfin CLI''s browser sign-in, which isn''t started in a session like this one: the run still finishes, and ./scripts/configure-fabric-app.ps1 -SignIn, which you run yourself in a terminal, adds the app later.')
     }
     if ([bool]$Environment.Codespaces) {
         $lines.Add('GitHub Codespaces stops a codespace after 30 minutes without activity by default, and always after 12 hours. Terminal output counts as activity, and deploy.ps1 prints progress at least every 5 minutes, but raise the idle timeout to be safe: GitHub Settings > Codespaces > Default idle timeout (up to 240 minutes; it applies to codespaces you create afterward), or gh codespace create --idle-timeout 240m. An organization policy can lower it.')
@@ -330,7 +331,7 @@ function Get-DemoInsightsAppSummary {
     if ($records.Count -eq 0) {
         return $null
     }
-    $signIn = 'run ./scripts/configure-fabric-app.ps1 -SignIn, which opens a browser for your own sign-in (an assistant can''t do that sign-in for you), then deploys the app'
+    $signIn = 'run ./scripts/configure-fabric-app.ps1 -SignIn, which deploys the app with your Azure CLI sign-in and opens a browser for the Rayfin CLI''s own sign-in only if Fabric refuses that (an assistant can''t do that sign-in for you)'
     $deployed = @($records | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' -and [string]$_.status -eq 'Pass' }).Count -gt 0
     $open = @($records | Where-Object { [string]$_.status -in 'Fail', 'Manual action required' })
     $blocking = @($open | Where-Object { [string]$_.checkId -ne 'FABRIC.APP.BROWSER' })
@@ -1206,7 +1207,11 @@ function Get-DemoDeploymentOutcome {
         [AllowNull()]
         [object] $T4Created = $null,
 
-        [string] $T4Why = ''
+        [string] $T4Why = '',
+
+        # The size change's notice (2026-11-09; Format-DemoT4SizeChangeText): what was tried and refused, what was deployed,
+        # and both monthly estimates, which the caller made, so this stays pure.
+        [string] $T4Notice = ''
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
@@ -1227,7 +1232,7 @@ function Get-DemoDeploymentOutcome {
     # Said loudly (ADR 0019): T4 runs at a fallback size, with whether autonomous tuning is on and its price; "created" only with
     # evidence that the server exists (review of 20e855c).
     $t4Created = if ($null -ne $T4Created) { [bool]$T4Created } else { Get-DemoT4ServerEvidence -Result $all -State $State }
-    $t4Fallback = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd $T4HourlyUsd -Created $t4Created -Why $T4Why
+    $t4Fallback = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd $T4HourlyUsd -Created $t4Created -Why $T4Why -Notice $T4Notice
     if ($t4Fallback) {
         $notes.Add($t4Fallback)
     }

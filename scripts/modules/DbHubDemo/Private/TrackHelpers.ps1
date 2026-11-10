@@ -827,6 +827,11 @@ function Invoke-DemoDeploymentTrack {
                 if ($t4Sku) {
                     $Config['t4SkuName'] = $t4Sku
                 }
+                # T4's automatic size change, for its row on the status page (2026-11-09).
+                $t4Notice = [string](Get-DemoMemberValue -InputObject $value -Name 'T4Notice')
+                if ($t4Notice) {
+                    $Context['T4Notice'] = $t4Notice
+                }
             }
         }
         return [bool](Get-DemoMemberValue -InputObject $shared['Infrastructure'] -Name 'Succeeded')
@@ -1486,6 +1491,12 @@ function Invoke-DemoDeploymentTrack {
                 'T4/Server' {
                     $checks = @(Test-DemoT4 -Config $Config)
                     & $addAll $checks
+                    # 2026-11-09 (user-directed): T4's row says an automatic size change too, with what was tried and refused,
+                    # what was deployed, and both monthly estimates (DEPLOY.T4.FALLBACK's notice); a Warning, never a block.
+                    $sizeNotice = [string](& $option 'T4Notice' '')
+                    if ($sizeNotice) {
+                        & $note 'T4.SIZE' 'T4' 'Warning' $sizeNotice 'Nothing to do: later runs keep this size. DEPLOY.T4.FALLBACK says how to change it.'
+                    }
                     if (& $hasStatus $checks 'Fail') {
                         $outcome = 'Fail'
                     }
@@ -1562,7 +1573,8 @@ function Invoke-DemoDeploymentTrack {
             $stepState = switch ($outcome) { 'Pass' { 'Done' } 'Background' { 'Skipped' } 'Open' { 'Action needed' } default { 'Failed' } }
             $first = @($stepResults | Where-Object { [string]$_.status -notin 'Pass', 'Not selected' } | Select-Object -First 1)
             $stepMessage = if ($first.Count -gt 0) { [string]$first[0].message } else { '{0}Done in {1}.' -f $(if ($stepNote) { $stepNote + ' ' } else { '' }), (Format-DemoProgressDuration -Seconds ([long]$timing[$name])) }
-            Set-DemoProgressStep -Path $progress -Id $stepIds -State $stepState -Status $worst -Message $stepMessage
+            # T4's rows keep a size change's whole notice (2026-11-09).
+            Set-DemoProgressStep -Path $progress -Id $stepIds -State $stepState -Status $worst -Message $stepMessage -MaxLength $(if ($Track -eq 'T4') { 1200 } else { 400 })
         }
         elseif ($ownProgress -and $outcome -eq 'Fail') {
             # A step that reports its own parts ended in an exception: the part still running shows it.
