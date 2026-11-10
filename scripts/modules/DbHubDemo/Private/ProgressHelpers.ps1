@@ -864,7 +864,7 @@ function Set-DemoProgressValue {
         $clean = [ordered]@{}
         foreach ($key in $Value.Keys) {
             $item = $Value[$key]
-            $clean[[string]$key] = if ($item -is [string] -and [string]$key -notin 'url', 'state', 'credential', 'hostVm', 'hostUser', 'nextCommand') { Protect-DemoProgressText -Text $item -MaxLength 1200 } else { $item }
+            $clean[[string]$key] = if ($item -is [string] -and [string]$key -notin 'url', 'state', 'credential', 'hostVm', 'hostUser', 'nextCommand') { Protect-DemoProgressText -Text $item -MaxLength $(if ([string]$key -eq 'reason') { 2400 } else { 1200 }) } else { $item }
         }
     }
     elseif ($Section -eq 'nonBlocking') {

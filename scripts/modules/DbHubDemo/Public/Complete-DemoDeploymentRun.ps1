@@ -123,6 +123,7 @@ function Complete-DemoDeploymentRun {
         $t4Hourly = $null
         $t4Created = $null
         $t4Why = ''
+        $t4Notice = ''
         if (-not $wasStopped -and -not $WhatIfRun -and (Test-DemoT4FallbackSize -Config $Config -State $judgedState)) {
             $priced = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SKU' -and $null -ne (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'hourlyUsd') }) | Select-Object -Last 1
             $t4Hourly = if ($null -ne $priced) { [double](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $priced -Name 'evidence') -Name 'hourlyUsd') } else { Get-DemoT4HourlyPrice -Config $Config -SkuName ([string](Get-DemoMemberValue -InputObject $judgedState -Name 'T4Sku')) }
@@ -146,8 +147,15 @@ function Complete-DemoDeploymentRun {
             if ($t4Created -is [bool] -and -not $t4Created -and @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.TEMPLATE' -and [string]$_.status -eq 'Fail' }).Count -gt 0) {
                 $t4Why = 'this run''s template deployment failed (DEPLOY.TEMPLATE says why)'
             }
+            # The size change's notice (2026-11-09, user-directed): what was tried and refused, what was deployed, and both
+            # monthly estimates with their difference, from this run's DEPLOY.T4.FALLBACK. A later run keeps the shorter
+            # note, and status.ps1 gives the whole notice for it (STATUS.T4.SIZE).
+            $change = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.FALLBACK' }) | Select-Object -Last 1
+            if ($null -ne $change) {
+                $t4Notice = [string]$change.message
+            }
         }
-        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen -StartedVm $startedVms -T4HourlyUsd $t4Hourly -T4Created $t4Created -T4Why $t4Why
+        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen -StartedVm $startedVms -T4HourlyUsd $t4Hourly -T4Created $t4Created -T4Why $t4Why -T4Notice $t4Notice
     }
     catch {
         $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; NonBlocking = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }
