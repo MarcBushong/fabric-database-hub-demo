@@ -461,10 +461,11 @@ function Save-DemoFabricHistory {
 
     .DESCRIPTION
     The workspace and lakehouse are resolved by name, read-only (Resolve-DemoFabricConfig without -Create). A capacity
-    that isn't running is Manual action required (FABRIC.P5.CAPACITY). The run (Invoke-DemoFabricNotebookRun) uses the
-    notebook's safe switches: SAVE_RESULTS true, CONFIRM and STOP_ACTIVITY false, no Key Vault, so it writes only the
-    lakehouse's history tables. Returns Result and StillRunning (the run hadn't finished when the wait ended, so the
-    capacity mustn't be paused under it).
+    that isn't running is Manual action required (FABRIC.P5.CAPACITY), also when Fabric refused the lakehouse list because
+    of it (evidence capacityInactive; live finding, 2026-11-10), which doesn't mean the lakehouse is missing. The run
+    (Invoke-DemoFabricNotebookRun) uses the notebook's safe switches: SAVE_RESULTS true, CONFIRM and STOP_ACTIVITY false,
+    no Key Vault, so it writes only the lakehouse's history tables. Returns Result and StillRunning (the run hadn't
+    finished when the wait ended, so the capacity mustn't be paused under it).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -497,7 +498,15 @@ function Save-DemoFabricHistory {
         return (& $answer 'Manual action required' ('The session''s history wasn''t saved: no Fabric token ({0}).' -f (Protect-DemoText -Text $_.Exception.Message)) @{} $manualRun)
     }
     $resolution = Resolve-DemoFabricConfig -Config $Config -Token $token
+    $capacityFix = 'Resume the capacity (or set fabric.manageCapacity for a capacity that''s yours alone, so start-demo.ps1 resumes it), then: {0}' -f $manualRun
     if (-not $resolution.Resolved) {
+        # A lakehouse list that Fabric refused because the capacity is paused isn't a missing lakehouse (live finding,
+        # 2026-11-10): it's the capacity, as below.
+        $paused = @($resolution.Results | Where-Object { (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'capacityInactive') -eq $true }) | Select-Object -First 1
+        if ($null -ne $paused) {
+            $listError = ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $paused -Name 'evidence') -Name 'error')).TrimEnd('.', ' ')
+            return (& $answer 'Manual action required' ('The session''s history wasn''t saved: the workspace''s capacity is paused or inactive, so notebooks can''t run{0}.' -f $(if ($listError) { ' ({0})' -f $listError } else { '' })) @{ capacityInactive = $true } $capacityFix)
+        }
         $why = (@($resolution.Results | Where-Object { $_.status -ne 'Pass' -and $_.status -ne 'Not selected' } | ForEach-Object { '{0}: {1}' -f $_.checkId, $_.message }) -join ' ')
         return (& $answer 'Manual action required' ('The session''s history wasn''t saved: the Fabric workspace or lakehouse isn''t resolved. {0}' -f $why).Trim() @{} 'Run ./scripts/configure-fabric.ps1 (it creates what''s missing), then the notebook.')
     }
@@ -505,7 +514,7 @@ function Save-DemoFabricHistory {
     $capacity = @(Test-DemoFabricWorkspace -Config $resolved -Token $token | Where-Object { $_.checkId -eq 'FABRIC.P5.CAPACITY' }) | Select-Object -First 1
     $capacityState = if ($capacity) { [string](Get-DemoMemberValue -InputObject $capacity.evidence -Name 'state') } else { '' }
     if ($capacity -and $capacity.status -eq 'Manual action required' -and $capacityState -and $capacityState -ine 'Active') {
-        return (& $answer 'Manual action required' ('The session''s history wasn''t saved: the workspace''s capacity is {0}, so notebooks can''t run.' -f $capacityState) @{ capacityState = $capacityState } ('Resume the capacity (or set fabric.manageCapacity for a capacity that''s yours alone, so start-demo.ps1 resumes it), then: {0}' -f $manualRun))
+        return (& $answer 'Manual action required' ('The session''s history wasn''t saved: the workspace''s capacity is {0}, so notebooks can''t run.' -f $capacityState) @{ capacityState = $capacityState } $capacityFix)
     }
     $parameters = [ordered]@{
         CONFIRM        = $false

@@ -212,6 +212,130 @@ Describe 'What DONE requires (brief item 16)' {
         $fail.status | Should -Be 'Fail'
         $fail.message | Should -Match 'RTD_DatabaseHub_LiveView'
     }
+
+    Context 'a list that didn''t answer isn''t a missing item (live finding, 2026-11-10)' {
+        BeforeEach {
+            $script:itemConfig = New-TestConfig
+            $script:itemConfig['fabric']['workspaceName'] = 'Database Hub Demo Final Test'
+            $script:itemWorkspaceId = '22222222-2222-2222-2222-222222222222'
+            # What List Lakehouses answered live while the capacity's owner had paused it.
+            $script:capacityNotActive = 'HTTP 404: CapacityNotActive: Internal error CapacityNotActive.Capacity is not active.'
+            $script:resumeFix = 'Resume the capacity, or ask its administrator to (Azure portal: Microsoft Fabric, the capacity, Resume; that resumes its billing too).'
+            $script:lakehouseRecord = $null
+            $script:itemAnswer = @{}
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -MockWith { $token = [System.Security.SecureString]::new(); foreach ($character in 'not-a-real-token'.ToCharArray()) { $token.AppendChar($character) }; $token }
+            Mock -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -MockWith {
+                $copy = @{ subscriptionId = '11111111-2222-3333-4444-555555555555'; fabric = @{ workspaceName = 'Database Hub Demo Final Test'; workspaceId = $script:itemWorkspaceId } }
+                $lakehouse = if ($null -ne $script:lakehouseRecord) { $script:lakehouseRecord } else { New-DemoResult -CheckId 'FABRIC.RESOLVE.LAKEHOUSE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Found the lakehouse.' }
+                $records = @((New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Found the workspace.'), $lakehouse)
+                [pscustomobject]@{ Resolved = ($null -eq $script:lakehouseRecord); Config = $copy; WorkspaceId = $script:itemWorkspaceId; WorkspaceName = 'Database Hub Demo Final Test'; LakehouseId = $(if ($null -eq $script:lakehouseRecord) { '33333333-3333-3333-3333-333333333333' } else { '' }); Results = $records }
+            }
+            # The workspace's item list still answers on a paused capacity, as it did live.
+            Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith {
+                if ($script:itemAnswer.ContainsKey($DisplayName)) {
+                    return $script:itemAnswer[$DisplayName]
+                }
+                [pscustomobject]@{ StatusCode = 200; Items = @([pscustomobject]@{ id = '44444444-4444-4444-4444-444444444444'; displayName = $DisplayName }); Error = '' }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -MockWith {
+                New-DemoResult -CheckId 'FABRIC.P5.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'You have Contributor or higher.'
+                New-DemoResult -CheckId 'FABRIC.P5.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The capacity "fabricmbprod" (F4) of the Fabric workspace "Database Hub Demo Final Test" is Inactive, so notebooks can''t run.' -Evidence ([ordered]@{ capacityName = 'fabricmbprod'; sku = 'F4'; state = 'Inactive' }) -Remediation $script:resumeFix
+            }
+            # The capacity is its owner's: nothing here may resume, pause, or scale it.
+            Mock -ModuleName DbHubDemo -CommandName Resume-DemoFabricCapacity -MockWith { throw 'resumed a capacity' }
+            Mock -ModuleName DbHubDemo -CommandName Suspend-DemoFabricCapacity -MockWith { throw 'paused a capacity' }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricCapacityTransition -MockWith { throw 'changed a capacity' }
+        }
+
+        It 'calls a lakehouse that Fabric doesn''t list for a paused capacity unchecked, never missing, and names the capacity first in NOT DONE, with its resume as the next step' {
+            $script:lakehouseRecord = New-DemoResult -CheckId 'FABRIC.RESOLVE.LAKEHOUSE' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message ('The lakehouses in the workspace "Database Hub Demo Final Test" couldn''t be listed, because its capacity is paused or inactive: {0}' -f $script:capacityNotActive) -Evidence ([ordered]@{ lakehouseName = 'LH_DatabaseHub'; statusCode = 404; listed = $false; error = $script:capacityNotActive; capacityInactive = $true }) -Remediation ('{0} Then run the script again.' -f $script:resumeFix)
+            $records = @(InModuleScope DbHubDemo -Parameters @{ Config = $script:itemConfig } { Test-DemoFabricRequiredItem -Config $Config })
+            $records.checkId | Should -Be @('FABRIC.P5.CAPACITY', 'FABRIC.ITEMS.REQUIRED') -Because 'the capacity''s own record comes first, so the run names it'
+            $items = $records[1]
+            $items.status | Should -Be 'Manual action required'
+            $items.message | Should -Be ('The required Fabric items couldn''t all be checked: the capacity "fabricmbprod" (F4) of the workspace "Database Hub Demo Final Test" is Inactive, so Fabric didn''t list the lakehouse LH_DatabaseHub ({0}). That doesn''t mean it''s missing: Fabric lists it again once the capacity is resumed.' -f $script:capacityNotActive.TrimEnd('.'))
+            $items.message | Should -Not -Match 'is missing'
+            $items.evidence['capacityInactive'] | Should -Be $true
+            @($items.evidence['missing']).Count | Should -Be 0
+            $items.evidence['unchecked'][0]['statusCode'] | Should -Be 404
+            $items.remediation | Should -Be ('{0} Then run ./scripts/deploy.ps1 again.' -f $script:resumeFix)
+            $items.remediation | Should -Not -Match 'start-demo|stop-demo|manageCapacity|imports what'
+            $items.docUrl | Should -Be 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
+
+            # The live run's order: the Insights app's capacity check passed (00:32), then the validation's lakehouse list
+            # and capacity check (00:47), then DONE's checks.
+            $earlier = New-DemoResult -CheckId 'FABRIC.P5.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'The Fabric workspace "Database Hub Demo Final Test" is on the Active Fabric capacity "fabricmbprod" (F4, West US 3).' -Evidence ([ordered]@{ capacityName = 'fabricmbprod'; sku = 'F4'; state = 'Active' })
+            $result = @(New-DoneResult | Where-Object { $_.checkId -ne 'FABRIC.ITEMS.REQUIRED' }) + @($earlier, $script:lakehouseRecord, $records[0]) + @($records)
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $script:itemConfig } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+            $outcome.Kind | Should -Be 'NotDone'
+            $outcome.Reason | Should -Be 'FABRIC.P5.CAPACITY: The capacity "fabricmbprod" (F4) of the Fabric workspace "Database Hub Demo Final Test" is Inactive, so notebooks can''t run.'
+            $outcome.Next | Should -Be ('{0} Then run ./scripts/deploy.ps1.' -f $script:resumeFix)
+            $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+            ('{0} {1}' -f $outcome.Reason, $outcome.Next) | Should -Not -Match 'missing'
+            $lines = InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }
+            ($lines -join "`n") | Should -Match 'Why: FABRIC\.P5\.CAPACITY: The capacity "fabricmbprod" \(F4\)'
+            ($lines -join "`n") | Should -Match ([regex]::Escape(('Next: {0} Then run ./scripts/deploy.ps1.' -f $script:resumeFix)))
+        }
+
+        It 'calls an item that Fabric throttled or didn''t answer unchecked, with the HTTP status, and the fix is to run again in a few minutes: HTTP <Code>' -ForEach @(
+            @{ Code = 429; Fix = 'Fabric is throttling requests (HTTP 429), even after retries: run ./scripts/deploy.ps1 again in a few minutes.' }
+            @{ Code = 503; Fix = 'Fabric didn''t answer the list (HTTP 503), even after retries: run ./scripts/deploy.ps1 again in a few minutes.' }
+        ) {
+            $script:itemAnswer = @{ 'RTD_DatabaseHub_LiveView' = [pscustomobject]@{ StatusCode = $Code; Items = @(); Error = ('HTTP {0} RequestBlocked Try again later.' -f $Code) } }
+            $records = @(InModuleScope DbHubDemo -Parameters @{ Config = $script:itemConfig } { Test-DemoFabricRequiredItem -Config $Config })
+            $records.Count | Should -Be 1
+            $records[0].status | Should -Be 'Warning'
+            $records[0].message | Should -Be ('The required Fabric items couldn''t all be checked: Fabric didn''t list RTD_DatabaseHub_LiveView (HTTP {0} RequestBlocked Try again later). That doesn''t mean it''s missing.' -f $Code)
+            $records[0].remediation | Should -Be $Fix
+            $records[0].evidence['unchecked'][0]['statusCode'] | Should -Be $Code
+            @($records[0].evidence['missing']).Count | Should -Be 0
+            Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -Times 0 -Exactly -Because 'only a paused capacity is read again'
+
+            $result = @(New-DoneResult | Where-Object { $_.checkId -ne 'FABRIC.ITEMS.REQUIRED' }) + @($records)
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $script:itemConfig } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+            $outcome.Kind | Should -Be 'NotDone'
+            $outcome.Reason | Should -Match ('^FABRIC\.ITEMS\.REQUIRED hasn''t passed yet \(Warning\): The required Fabric items couldn''t all be checked: Fabric didn''t list RTD_DatabaseHub_LiveView \(HTTP {0} ' -f $Code)
+            $outcome.Next | Should -Be $Fix
+            $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+        }
+
+        It 'still calls an item missing when its list answered without it, with the rerun that imports it, and names what couldn''t be checked besides' {
+            $script:lakehouseRecord = New-DemoResult -CheckId 'FABRIC.RESOLVE.LAKEHOUSE' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The lakehouse "LH_DatabaseHub" isn''t in the workspace "Database Hub Demo Final Test".' -Evidence ([ordered]@{ lakehouseName = 'LH_DatabaseHub'; createIfMissing = $true })
+            $records = @(InModuleScope DbHubDemo -Parameters @{ Config = $script:itemConfig } { Test-DemoFabricRequiredItem -Config $Config })
+            $records.Count | Should -Be 1
+            $records[0].status | Should -Be 'Fail'
+            $records[0].message | Should -Be 'The workspace "Database Hub Demo Final Test" is missing: the lakehouse LH_DatabaseHub.'
+            $records[0].remediation | Should -Be 'Run ./scripts/deploy.ps1 again: its Fabric track imports what''s missing (configure-fabric.ps1 and configure-powerbi.ps1).'
+            @($records[0].evidence['missing']) | Should -Be @('the lakehouse LH_DatabaseHub')
+            Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -Times 0 -Exactly
+
+            $script:itemAnswer = @{ 'RTD_DatabaseHub_LiveView' = [pscustomobject]@{ StatusCode = 503; Items = @(); Error = 'HTTP 503 ServiceUnavailable' } }
+            $both = @(InModuleScope DbHubDemo -Parameters @{ Config = $script:itemConfig } { Test-DemoFabricRequiredItem -Config $Config })
+            $both[0].status | Should -Be 'Fail'
+            $both[0].message | Should -Be 'The workspace "Database Hub Demo Final Test" is missing: the lakehouse LH_DatabaseHub. Fabric didn''t list RTD_DatabaseHub_LiveView (HTTP 503 ServiceUnavailable), so that one couldn''t be checked.'
+        }
+
+        It 'names a paused capacity first only while it''s the latest word on it, ahead of a Fail elsewhere' {
+            $inactive = New-DemoResult -CheckId 'FABRIC.P5.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The capacity "fabricmbprod" (F4) of the Fabric workspace "Database Hub Demo Final Test" is Inactive, so notebooks can''t run.' -Evidence ([ordered]@{ sku = 'F4'; state = 'Inactive' }) -Remediation $script:resumeFix
+            $active = New-DemoResult -CheckId 'FABRIC.P5.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Active.' -Evidence ([ordered]@{ sku = 'F4'; state = 'Active' })
+            $sign = New-DemoResult -CheckId 'FABRIC.ITEMS.REQUIRED' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The required Fabric items couldn''t all be checked: the capacity of the workspace "Database Hub Demo Final Test" is paused or inactive.' -Evidence ([ordered]@{ capacityInactive = $true }) -Remediation ('{0} Then run ./scripts/deploy.ps1 again.' -f $script:resumeFix)
+            $telemetry = New-TestResult 'TELEMETRY.T1' 'Fail'
+            $block = { param([object[]] $Items) InModuleScope DbHubDemo -Parameters @{ Items = $Items } { Get-DemoFabricCapacityBlock -Result $Items } }
+            (& $block @($telemetry, $sign, $inactive)).checkId | Should -Be 'FABRIC.P5.CAPACITY'
+            & $block @($sign, $inactive, $active) | Should -BeNullOrEmpty -Because 'the capacity was Active when it was last read'
+            (& $block @($active, $sign)).checkId | Should -Be 'FABRIC.ITEMS.REQUIRED' -Because 'it paused after the last read'
+            & $block @($telemetry) | Should -BeNullOrEmpty
+
+            $result = @(New-DoneResult | Where-Object { $_.checkId -notin 'TELEMETRY.T1', 'FABRIC.ITEMS.REQUIRED' }) + @($telemetry, $inactive, $sign)
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $script:itemConfig } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+            $outcome.Reason | Should -Match '^FABRIC\.P5\.CAPACITY: '
+            $outcome.ExitCode | Should -Be 1 -Because 'a Fail is still a Fail'
+            $resumed = @(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T1' }) + @($inactive, $active, $telemetry)
+            $later = InModuleScope DbHubDemo -Parameters @{ Result = $resumed; State = (New-FinishedState); Config = $script:itemConfig } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+            $later.Reason | Should -Match '^TELEMETRY\.T1: ' -Because 'a capacity Active when it was last read isn''t the reason'
+        }
+    }
 }
 
 Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {

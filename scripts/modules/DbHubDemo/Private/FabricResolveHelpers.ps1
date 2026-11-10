@@ -14,6 +14,82 @@ $script:FabricResolveDoc = [ordered]@{
     CapacityUsers    = 'https://learn.microsoft.com/power-bi/enterprise/service-admin-premium-manage#manage-user-permissions'
     PauseResume      = 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
 }
+# A capacity that isn't running, as Fabric and Power BI answer it: the error codes CapacityNotActive and
+# CapacityNotAvailable, or words such as "the capacity is paused". "Pausing a capacity can prevent Microsoft Fabric content
+# from being available" (Pause and resume your Fabric capacity, checked 2026-11-10); live on 2026-11-10, List Lakehouses
+# answered HTTP 404 CapacityNotActive for a paused F4 while Items - List Items still listed the workspace's items.
+$script:FabricCapacityInactivePattern = '(?i)CapacityNotActive|CapacityNotAvailable|capacity\b.{0,60}\b(?:is |was )?(?:paused|inactive|not active|suspended)'
+
+function Test-DemoFabricCapacityInactiveText {
+    <#
+    .SYNOPSIS
+    True when a Fabric or Power BI answer says the workspace's capacity isn't running ($script:FabricCapacityInactivePattern):
+    a list that failed for that reason says nothing about whether an item exists (live finding, 2026-11-10). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Text
+    )
+
+    return ([string]$Text -match $script:FabricCapacityInactivePattern)
+}
+
+function Get-DemoFabricListFailureKind {
+    <#
+    .SYNOPSIS
+    Why a Fabric list call failed (live finding, 2026-11-10: a failed list isn't a missing item): CapacityInactive (the
+    workspace's capacity is paused or inactive, Test-DemoFabricCapacityInactiveText), Access (HTTP 401 or 403), Throttled
+    (429), Unavailable (408, any 5xx, or no answer, status 0), or Other. Invoke-DemoFabricRequest has already retried 408,
+    429, 502, 503, and 504 by then. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [int] $StatusCode,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $ErrorText
+    )
+
+    if (Test-DemoFabricCapacityInactiveText -Text $ErrorText) {
+        return 'CapacityInactive'
+    }
+    if ($StatusCode -in 401, 403) {
+        return 'Access'
+    }
+    if ($StatusCode -eq 429) {
+        return 'Throttled'
+    }
+    if ($StatusCode -eq 0 -or $StatusCode -eq 408 -or $StatusCode -ge 500) {
+        return 'Unavailable'
+    }
+    return 'Other'
+}
+
+function Get-DemoFabricCapacityResumeFix {
+    <#
+    .SYNOPSIS
+    The fix for a paused or inactive capacity: its owner resumes it, or asks its administrator to; then -Then, when given.
+    deploy.ps1 never resumes, pauses, or scales a capacity, and no script is named as the fix (live finding, 2026-11-10: the
+    owner manages the capacity). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $Then = ''
+    )
+
+    $fix = 'Resume the capacity, or ask its administrator to (Azure portal: Microsoft Fabric, the capacity, Resume; that resumes its billing too).'
+    if ($Then) {
+        return ('{0} Then {1}' -f $fix, $Then)
+    }
+    return $fix
+}
 
 function Test-DemoFabricIdOverride {
     <#
@@ -369,8 +445,10 @@ function Get-DemoFabricStatus {
 
     .DESCRIPTION
     Pass when the workspace and the lakehouse are there, whatever the capacity's state: a capacity paused between
-    sessions is normal, and its administrator resumes it. Otherwise the status, message, and steps of what
-    Resolve-DemoFabricConfig found (a Warning when deploy.ps1 or configure-fabric.ps1 would create it). Uses Get
+    sessions is normal, and its administrator resumes it. Fabric then refuses the lakehouse list (List Lakehouses, HTTP
+    404 CapacityNotActive) while the workspace's own item list still answers (live finding, 2026-11-10), so the lakehouse
+    is looked up there by name instead (Items - List Items, type Lakehouse). Otherwise the status, message, and steps of
+    what Resolve-DemoFabricConfig found (a Warning when deploy.ps1 or configure-fabric.ps1 would create it). Uses Get
     Workspace and List Capacities (https://learn.microsoft.com/rest/api/fabric/core/capacities/list-capacities).
     #>
     [CmdletBinding()]
@@ -397,7 +475,21 @@ function Get-DemoFabricStatus {
     }
 
     $resolution = Resolve-DemoFabricConfig -Config $Config -Token $Token
-    if (-not $resolution.Resolved) {
+    $lakehouseId = [string]$resolution.LakehouseId
+    $lakehouseName = [string]$resolution.LakehouseName
+    $resolved = [bool]$resolution.Resolved
+    $lakehouseRecord = @($resolution.Results | Where-Object { [string]$_.checkId -eq 'FABRIC.RESOLVE.LAKEHOUSE' }) | Select-Object -Last 1
+    if (-not $resolved -and $resolution.WorkspaceId -and (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $lakehouseRecord -Name 'evidence') -Name 'capacityInactive') -eq $true) {
+        # The capacity is paused: the workspace's item list still answers, so the lakehouse is looked up there.
+        $found = Find-DemoFabricItem -WorkspaceId ([string]$resolution.WorkspaceId) -DisplayName $setting.LakehouseName -Type 'Lakehouse' -Token $Token
+        $match = @(Select-DemoFabricNamed -Items @($found.Items) -Name $setting.LakehouseName)
+        if ($found.StatusCode -eq 200 -and $match.Count -eq 1) {
+            $lakehouseId = ([string](Get-DemoMemberValue -InputObject $match[0] -Name 'id')).ToLowerInvariant()
+            $lakehouseName = [string](Get-DemoMemberValue -InputObject $match[0] -Name 'displayName')
+            $resolved = [bool]$lakehouseId
+        }
+    }
+    if (-not $resolved) {
         $rank = @{ 'Fail' = 5; 'Manual action required' = 4; 'Warning' = 3; 'Pass' = 2; 'Not supported' = 1; 'Not selected' = 0 }
         $worst = @($resolution.Results | Sort-Object -Property { $rank[[string]$_.status] } -Descending) | Select-Object -First 1
         $status = if ($null -ne $worst -and $worst.status -in 'Fail', 'Manual action required', 'Warning') { [string]$worst.status } else { 'Warning' }
@@ -406,7 +498,7 @@ function Get-DemoFabricStatus {
         return (& $record $status ('Fabric: {0}' -f $message).Trim() ([ordered]@{ workspaceName = $setting.WorkspaceName; lakehouseName = $setting.LakehouseName }) $remediation $doc)
     }
 
-    $evidence = [ordered]@{ workspaceId = $resolution.WorkspaceId; lakehouseId = $resolution.LakehouseId; workspaceName = $resolution.WorkspaceName; lakehouseName = $resolution.LakehouseName }
+    $evidence = [ordered]@{ workspaceId = $resolution.WorkspaceId; lakehouseId = $lakehouseId; workspaceName = $resolution.WorkspaceName; lakehouseName = $lakehouseName }
     $workspace = Invoke-DemoHubFabricGet -Uri ('{0}/workspaces/{1}' -f $script:FabricApiBaseUri, $resolution.WorkspaceId) -Token $Token
     if ($workspace.StatusCode -ne 200) {
         # An ID override isn't looked up by the resolver, so this is where a stale one shows.
@@ -440,5 +532,5 @@ function Get-DemoFabricStatus {
             }
         }
     }
-    & $record 'Pass' ('Fabric: the workspace "{0}" and the lakehouse "{1}" are there; {2}.' -f $name, $resolution.LakehouseName, $capacityText) $evidence '' $doc
+    & $record 'Pass' ('Fabric: the workspace "{0}" and the lakehouse "{1}" are there; {2}.' -f $name, $lakehouseName, $capacityText) $evidence '' $doc
 }

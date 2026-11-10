@@ -117,8 +117,10 @@ function Invoke-DemoHistorySnapshotRun {
     .DESCRIPTION
     As whoever ran deploy.ps1: the Azure CLI's Fabric token after the subscription guard (Get-DemoFabricToken).
     1. The workspace and the lakehouse by name, read-only (Resolve-DemoFabricConfig without -Create), and the notebook by
-       name (Find-DemoFabricItem). One that isn't there is Not selected (Outcome NotSelected): the Fabric track didn't
-       create or import it. One that couldn't be read is a Warning with the error (Outcome Failed).
+       name (Find-DemoFabricItem). One that a list that answered doesn't have is Not selected (Outcome NotSelected): the
+       Fabric track didn't create or import it. One whose list Fabric refused because the capacity is paused or inactive
+       is the Warning below (Outcome CapacityPaused; live finding, 2026-11-10), and one that couldn't be read otherwise is
+       a Warning with the error (Outcome Failed).
     2. The capacity (Test-DemoFabricWorkspace, FABRIC.P5.CAPACITY): a capacity that isn't Active runs nothing, and the
        Warning says so (Outcome CapacityPaused), as does a submit that Fabric refuses with CapacityNotActive. Nothing here
        resumes, pauses, or scales it.
@@ -168,8 +170,8 @@ function Invoke-DemoHistorySnapshotRun {
         [pscustomobject]@{ Status = $Status; Outcome = $Outcome; Message = $Message; Remediation = $Remediation; ReportedStatus = $ReportedStatus; Evidence = $evidence }
     }
     # A paused capacity, as Fabric and Power BI answer it (Invoke-DemoSemanticModelRefresh reads it the same way).
-    $paused = '(?i)CapacityNotActive|CapacityNotAvailable|capacity\b.{0,60}\b(?:is |was )?(?:paused|inactive|not active|suspended)'
-    $resumeFix = 'Resume the capacity, or ask its administrator to (Azure portal: Microsoft Fabric, the capacity, Resume; that resumes its billing too). Then run {0}, or ./scripts/stop-demo.ps1 -SaveHistory at the end of the session.' -f $again
+    $paused = $script:FabricCapacityInactivePattern
+    $resumeFix = Get-DemoFabricCapacityResumeFix -Then ('run {0}, or ./scripts/stop-demo.ps1 -SaveHistory at the end of the session.' -f $again)
     $laterFix = 'Check the run in the workspace''s Monitor hub. Once it''s done, the history report shows its snapshots after Direct Lake''s automatic update, or after ./scripts/configure-powerbi.ps1 refreshes the model.'
 
     $token = Get-DemoFabricToken -SubscriptionId ([string]$Config['subscriptionId'])
@@ -178,7 +180,16 @@ function Invoke-DemoHistorySnapshotRun {
     if (-not $resolution.Resolved) {
         $open = @($resolution.Results | Where-Object { [string]$_.status -notin 'Pass', 'Not selected' })
         $why = (@($open | ForEach-Object { '{0}: {1}' -f [string]$_.checkId, [string]$_.message }) -join ' ').Trim()
-        if (@($open | Where-Object { [string]$_.status -eq 'Fail' }).Count -gt 0) {
+        # A list that didn't answer says nothing about whether the workspace or the lakehouse exists (evidence listed
+        # $false; live finding, 2026-11-10: a paused capacity's lakehouse list was taken for a lakehouse the Fabric track
+        # didn't create).
+        $unlisted = @($open | Where-Object { (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'listed') -eq $false })
+        $inactive = @($unlisted | Where-Object { (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'capacityInactive') -eq $true }) | Select-Object -First 1
+        if ($null -ne $inactive) {
+            $listError = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $inactive -Name 'evidence') -Name 'error')
+            return (& $answer 'Warning' 'CapacityPaused' ('The history report got no snapshot: the workspace''s capacity isn''t running ({0}), so {1} couldn''t run. deploy.ps1 never resumes, pauses, or scales a capacity.' -f $(if ($listError) { $listError.TrimEnd('.', ' ') } else { 'the lakehouses couldn''t be listed' }), $notebook) $resumeFix)
+        }
+        if (@($open | Where-Object { [string]$_.status -eq 'Fail' }).Count -gt 0 -or $unlisted.Count -gt 0) {
             return (& $answer 'Warning' 'Failed' ('The history report got no snapshot: the Fabric workspace and lakehouse couldn''t be read. {0}' -f $why).Trim() ('Run {0} once Fabric answers.' -f $again) 'Fail')
         }
         return (& $answer 'Not selected' 'NotSelected' ('The Fabric track didn''t create the workspace or the lakehouse, so {0} didn''t run. {1}' -f $notebook, $why).Trim() ('./scripts/deploy.ps1 creates them (its Fabric track), then runs {0} at its end.' -f $notebook))

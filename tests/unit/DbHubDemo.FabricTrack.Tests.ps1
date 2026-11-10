@@ -375,6 +375,22 @@ Describe 'Invoke-DemoFabricNotebookRun' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -Times 0 -Exactly
     }
 
+    It 'says a notebook list that failed isn''t a missing notebook: a paused capacity is Manual action required with the resume, anything else a rerun (live finding, 2026-11-10)' {
+        Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith { [pscustomobject]@{ StatusCode = 404; Items = @(); Error = 'HTTP 404 CapacityNotActive The capacity is not active.' } }
+        $paused = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity'
+        $paused.status | Should -Be 'Manual action required'
+        $paused.message | Should -Be 'NB_DatabaseHub_LiveActivity didn''t run: the workspace''s capacity is paused or inactive (HTTP 404 CapacityNotActive The capacity is not active).'
+        $paused.remediation | Should -Be 'Resume the capacity, or ask its administrator to (Azure portal: Microsoft Fabric, the capacity, Resume; that resumes its billing too). Then run it again.'
+
+        Mock -ModuleName DbHubDemo -CommandName Find-DemoFabricItem -MockWith { [pscustomobject]@{ StatusCode = 503; Items = @(); Error = 'HTTP 503 ServiceUnavailable' } }
+        $unanswered = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity'
+        $unanswered.status | Should -Be 'Fail'
+        $unanswered.message | Should -Be 'NB_DatabaseHub_LiveActivity didn''t run: the workspace couldn''t be read (HTTP 503 ServiceUnavailable).'
+        $unanswered.remediation | Should -Be 'Run it again in a few minutes: the workspace''s notebooks couldn''t be listed.'
+        $unanswered.remediation | Should -Not -Match 'Import the notebooks'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -Times 0 -Exactly
+    }
+
     It 'warns, and leaves the job running, when the wait runs out' {
         $script:states.Clear()
         foreach ($i in 1..200) { $script:states.Enqueue([pscustomobject]@{ status = 'InProgress'; startTimeUtc = '2026-10-22T16:00:00Z'; endTimeUtc = $null }) }

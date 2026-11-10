@@ -157,7 +157,7 @@ Two colleagues' first runs took more than 2 hours and never finished: preflight'
 - `TELEMETRY.T1`, `TELEMETRY.T2`, and `TELEMETRY.T3`, and T4's Azure Monitor metrics, `METRICS.T4`;
 - in `JumpstartImage`, `PaygWizard`, and `ProductKey` modes, T2's instance at Standard with PAYG (or Paid) and monitoring on: `T2.ARC.SQLINSTANCE` and `T2.ARC.MONITORING`;
 - T1's inventory, `T1.SQLVM.ASSOCIATEDSERVICES`;
-- the required Fabric items, `FABRIC.ITEMS.REQUIRED`: the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the history model and report (left out with `-SkipFabric`).
+- the required Fabric items, `FABRIC.ITEMS.REQUIRED`: the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the history model and report (left out with `-SkipFabric`). Only a list that answered without an item makes it missing (live finding, 2026-11-10). An item whose list Fabric didn't answer couldn't be checked: with a paused or inactive capacity (HTTP 404 `CapacityNotActive`), **NOT DONE** names the capacity first (`FABRIC.P5.CAPACITY`), with its resume, by its owner or its administrator, as the next step, since `deploy.ps1` never resumes, pauses, or scales it; throttling (HTTP 429) or a service error (5xx) is a **Warning** with the status, whose next step is to run `./scripts/deploy.ps1` again in a few minutes.
 
 Two cases have their own words:
 

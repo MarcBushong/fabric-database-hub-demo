@@ -32,8 +32,15 @@ function Resolve-DemoFabricConfig {
     - Warning: missing, and the caller only reads (no -Create): deploy.ps1 and configure-fabric.ps1 create it.
     - Manual action required, with the exact steps: missing while createIfMissing is false; fabric.capacityName
       not set, not one you can assign, or not Active; no right to create workspaces (a Fabric tenant setting) or
-      items; a name that a workspace you can't access already uses; more than one match; no Fabric token.
+      items; a name that a workspace you can't access already uses; more than one match; no Fabric token; the
+      lakehouses that Fabric doesn't list because the workspace's capacity is paused or inactive (CapacityNotActive),
+      whose fix is to resume it (evidence capacityInactive).
     - Fail: any other error from the Fabric REST API.
+
+    A record whose list didn't answer (no token, an error, a paused capacity) has evidence listed $false: whether the
+    workspace or the lakehouse exists is then unknown, not missing (live finding, 2026-11-10). Throttling (HTTP 429)
+    and a service error (408, 5xx, no answer) say to run the script again in a few minutes, after
+    Invoke-DemoFabricRequest's own retries.
 
     Messages name the workspace, the lakehouse, and the capacity, never their IDs; the IDs are in the evidence and
     in the returned copy. -WhatIf creates nothing, and without -Token it sends no request at all. The token comes
@@ -149,6 +156,12 @@ function Resolve-DemoFabricConfig {
         }
     }
     $createWorkspaceSteps = 'Creating a workspace needs the Fabric tenant setting "Create workspaces" for you (a Fabric administrator turns it on: Admin portal > Tenant settings > Workspace settings), and a contributor or administrator role on the capacity. Or a workspace administrator creates the workspace "{0}" on an F or Trial capacity and adds you as Contributor or higher. Then run the script again.' -f $setting.WorkspaceName
+    # A list that Fabric throttled or didn't answer, after Invoke-DemoFabricRequest's retries (live finding, 2026-11-10).
+    $tryLater = {
+        param([int] $StatusCode, [string] $Kind)
+        $what = if ($Kind -eq 'Throttled') { 'Fabric is throttling requests (HTTP 429)' } elseif ($StatusCode -gt 0) { 'Fabric didn''t answer the list (HTTP {0})' -f $StatusCode } else { 'Fabric didn''t answer the list' }
+        '{0}, even after retries: run the script again in a few minutes.' -f $what
+    }
 
     $workspaceLookup = -not $setting.WorkspaceId
     $lakehouseLookup = -not $SkipLakehouse -and -not $setting.LakehouseId
@@ -179,10 +192,10 @@ function Resolve-DemoFabricConfig {
             $message = 'The Fabric resources couldn''t be resolved: {0}' -f $access.Error
             $remediation = 'Sign in once with ''az login --tenant <tenantId>'' as the account in azureAccount (you don''t need to change the default subscription), then run the script again.'
             if ($workspaceLookup) {
-                & $add 'FABRIC.RESOLVE.WORKSPACE' 'Manual action required' $message ([ordered]@{ workspaceName = $setting.WorkspaceName }) $remediation $doc['ListWorkspaces']
+                & $add 'FABRIC.RESOLVE.WORKSPACE' 'Manual action required' $message ([ordered]@{ workspaceName = $setting.WorkspaceName; listed = $false }) $remediation $doc['ListWorkspaces']
             }
             if ($lakehouseLookup) {
-                & $add 'FABRIC.RESOLVE.LAKEHOUSE' 'Manual action required' $message ([ordered]@{ lakehouseName = $setting.LakehouseName }) $remediation $doc['ListLakehouses']
+                & $add 'FABRIC.RESOLVE.LAKEHOUSE' 'Manual action required' $message ([ordered]@{ lakehouseName = $setting.LakehouseName; listed = $false }) $remediation $doc['ListLakehouses']
             }
             return (& $finish)
         }
@@ -194,7 +207,9 @@ function Resolve-DemoFabricConfig {
         $list = Read-DemoHubFabricList -Uri ('{0}/workspaces' -f $base) -Token $Token -MaxPages $MaxPages
         if (-not $list.Succeeded) {
             $status = if ($list.StatusCode -in 401, 403) { 'Manual action required' } else { 'Fail' }
-            & $add 'FABRIC.RESOLVE.WORKSPACE' $status ('Your Fabric workspaces couldn''t be listed: {0}' -f $list.Error) ([ordered]@{ workspaceName = $setting.WorkspaceName; statusCode = $list.StatusCode }) 'Check your Fabric access (sign in again with ''az login --tenant <tenantId>'' if the session expired), then run the script again.' $doc['ListWorkspaces']
+            $kind = Get-DemoFabricListFailureKind -StatusCode $list.StatusCode -ErrorText $list.Error
+            $remediation = if ($kind -in 'Throttled', 'Unavailable') { & $tryLater $list.StatusCode $kind } else { 'Check your Fabric access (sign in again with ''az login --tenant <tenantId>'' if the session expired), then run the script again.' }
+            & $add 'FABRIC.RESOLVE.WORKSPACE' $status ('Your Fabric workspaces couldn''t be listed: {0}' -f $list.Error) ([ordered]@{ workspaceName = $setting.WorkspaceName; statusCode = $list.StatusCode; listed = $false; error = [string]$list.Error }) $remediation $doc['ListWorkspaces']
         }
         else {
             $shared = @($list.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'type') -ine 'Personal' })
@@ -341,8 +356,19 @@ function Resolve-DemoFabricConfig {
         $workspaceLabel = if ($state['WorkspaceName'] -and -not $setting.WorkspaceId) { 'the workspace "{0}"' -f $state['WorkspaceName'] } else { 'the workspace' }
         $list = Read-DemoHubFabricList -Uri ('{0}/workspaces/{1}/lakehouses' -f $base, $state['WorkspaceId']) -Token $Token -MaxPages $MaxPages
         if (-not $list.Succeeded) {
-            $status = if ($list.StatusCode -in 401, 403, 404) { 'Manual action required' } else { 'Fail' }
-            & $add 'FABRIC.RESOLVE.LAKEHOUSE' $status ('The lakehouses in {0} couldn''t be listed: {1}' -f $workspaceLabel, $list.Error) ([ordered]@{ lakehouseName = $setting.LakehouseName; statusCode = $list.StatusCode }) 'Listing lakehouses needs a role in the workspace; a workspace administrator adds you as Contributor or higher (Manage access). Then run the script again.' $doc['ListLakehouses']
+            # A list that failed says nothing about whether the lakehouse exists (live finding, 2026-11-10: List Lakehouses
+            # answered HTTP 404 CapacityNotActive for a paused capacity, and the run called the lakehouse missing).
+            $kind = Get-DemoFabricListFailureKind -StatusCode $list.StatusCode -ErrorText $list.Error
+            $evidence = [ordered]@{ lakehouseName = $setting.LakehouseName; statusCode = $list.StatusCode; listed = $false; error = [string]$list.Error }
+            if ($kind -eq 'CapacityInactive') {
+                $evidence['capacityInactive'] = $true
+                & $add 'FABRIC.RESOLVE.LAKEHOUSE' 'Manual action required' ('The lakehouses in {0} couldn''t be listed, because its capacity is paused or inactive: {1}. That doesn''t mean the lakehouse "{2}" is missing: Fabric lists it again once the capacity is resumed.' -f $workspaceLabel, ([string]$list.Error).TrimEnd('.', ' '), $setting.LakehouseName) $evidence (Get-DemoFabricCapacityResumeFix -Then 'run the script again.') $doc['PauseResume']
+            }
+            else {
+                $status = if ($list.StatusCode -in 401, 403, 404) { 'Manual action required' } else { 'Fail' }
+                $remediation = if ($kind -in 'Throttled', 'Unavailable') { & $tryLater $list.StatusCode $kind } else { 'Listing lakehouses needs a role in the workspace; a workspace administrator adds you as Contributor or higher (Manage access). Then run the script again.' }
+                & $add 'FABRIC.RESOLVE.LAKEHOUSE' $status ('The lakehouses in {0} couldn''t be listed: {1}' -f $workspaceLabel, $list.Error) $evidence $remediation $doc['ListLakehouses']
+            }
         }
         else {
             $found = @(Select-DemoFabricNamed -Items @($list.Items) -Name $setting.LakehouseName)
