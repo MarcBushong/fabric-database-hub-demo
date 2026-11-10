@@ -7,10 +7,10 @@ $script:SelfUpdateMarkerVariable = 'DBHUB_SELF_UPDATED'
 $script:SelfUpdateOptOutVariable = 'DBHUB_NO_SELF_UPDATE'
 $script:SelfUpdateCloneUrl = 'https://github.com/MarcBushong/fabric-database-hub-demo.git'
 
-function Get-DemoGitPath {
+function Get-DemoGitOnPath {
     <#
     .SYNOPSIS
-    The git executable on PATH, or '' when Git isn't installed. Internal; tests mock it.
+    The git executable on PATH, or ''. Internal; tests mock it.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -21,6 +21,170 @@ function Get-DemoGitPath {
         return [string]$command.Source
     }
     return ''
+}
+
+function Invoke-DemoVsWhere {
+    <#
+    .SYNOPSIS
+    The installation folders of Visual Studio that vswhere lists (every instance, prereleases included), or none when
+    vswhere isn't there. Internal; tests mock it.
+
+    .DESCRIPTION
+    vswhere.exe is at a fixed place that the Visual Studio Installer keeps
+    (https://github.com/microsoft/vswhere/wiki/Installing): %ProgramFiles(x86)%\Microsoft Visual Studio\Installer.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    $programFilesX86 = [System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    if (-not $programFilesX86) {
+        return
+    }
+    $vswhere = Join-Path -Path $programFilesX86 -ChildPath 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+        return
+    }
+    try {
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $vswhere -all -prerelease -products '*' -property installationPath 2>$null
+        return @($output | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('vswhere couldn''t list Visual Studio: {0}' -f $_.Exception.Message)
+        return
+    }
+}
+
+function Get-DemoGitCandidatePath {
+    <#
+    .SYNOPSIS
+    Where Git is usually installed when it isn't on PATH, in the order deploy.ps1 tries them (2026-11-09 live finding: a
+    clone made where the only git was an app's bundled one never updated itself). Internal.
+
+    .DESCRIPTION
+    Returns Path and Source (who installed it) for each candidate that could exist; Get-DemoGitLocation keeps the ones
+    that are files and runs them.
+    - Windows: Git for Windows for all users (%ProgramFiles%, then %ProgramFiles(x86)%) and per user
+      (%LOCALAPPDATA%\Programs\Git), each git.exe in its cmd folder (https://gitforwindows.org/); GitHub Desktop's bundled
+      Git, in %LOCALAPPDATA%\GitHubDesktop\app-<version>\resources\app\git\cmd, the newest version first; and Visual
+      Studio's bundled Git, in each installation that vswhere lists (Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\
+      Team Explorer\Git\cmd).
+    - macOS and Linux: /usr/bin/git, /usr/local/bin/git, and /opt/homebrew/bin/git (Homebrew on Apple silicon).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [bool] $Windows = [bool]$IsWindows
+    )
+
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    $add = { param([string] $Path, [string] $Source) if ($Path) { $candidates.Add([pscustomobject]@{ Path = $Path; Source = $Source }) } }
+    if (-not $Windows) {
+        & $add '/usr/bin/git' 'the system''s Git'
+        & $add '/usr/local/bin/git' 'Git in /usr/local'
+        & $add '/opt/homebrew/bin/git' 'Homebrew''s Git'
+        return $candidates.ToArray()
+    }
+    $under = { param([string] $Variable, [string] $Child) $base = [System.Environment]::GetEnvironmentVariable($Variable); if ($base) { Join-Path -Path $base -ChildPath $Child } else { '' } }
+    & $add (& $under 'ProgramFiles' 'Git\cmd\git.exe') 'Git for Windows'
+    & $add (& $under 'ProgramFiles(x86)' 'Git\cmd\git.exe') 'Git for Windows (32-bit)'
+    & $add (& $under 'LOCALAPPDATA' 'Programs\Git\cmd\git.exe') 'Git for Windows, installed for this user'
+    $desktop = & $under 'LOCALAPPDATA' 'GitHubDesktop'
+    if ($desktop -and (Test-Path -LiteralPath $desktop -PathType Container)) {
+        $versionOf = {
+            param([string] $Name)
+            $parsed = $null
+            if ([System.Version]::TryParse(($Name -replace '^app-', ''), [ref]$parsed)) { $parsed } else { [System.Version]::new(0, 0) }
+        }
+        $apps = @(Get-ChildItem -LiteralPath $desktop -Directory -Filter 'app-*' -ErrorAction SilentlyContinue | Sort-Object -Property @{ Expression = { & $versionOf $_.Name }; Descending = $true }, @{ Expression = 'LastWriteTimeUtc'; Descending = $true })
+        foreach ($app in $apps) {
+            & $add (Join-Path -Path $app.FullName -ChildPath 'resources\app\git\cmd\git.exe') ('GitHub Desktop''s Git ({0})' -f $app.Name)
+        }
+    }
+    foreach ($installation in @(Invoke-DemoVsWhere)) {
+        & $add (Join-Path -Path $installation -ChildPath 'Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe') 'Visual Studio''s Git'
+    }
+    return $candidates.ToArray()
+}
+
+function Test-DemoGitExecutable {
+    <#
+    .SYNOPSIS
+    Whether a git executable runs: 'git --version' within 10 seconds, answering 'git version ...'. Internal; tests mock it.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path
+    )
+
+    try {
+        $run = Invoke-DemoGit -GitPath $Path -ArgumentList @('--version') -WorkingDirectory ([System.IO.Path]::GetTempPath()) -TimeoutSeconds 10
+        return ($run.ExitCode -eq 0 -and $run.StdOut -like 'git version*')
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-DemoGitLocation {
+    <#
+    .SYNOPSIS
+    The git that deploy.ps1's self-update uses: the one on PATH, or else the first well-known one that runs
+    (Get-DemoGitCandidatePath, Test-DemoGitExecutable). Returns Path ('' when there's none), OnPath, and Source. PATH
+    itself is never changed. Internal; tests mock it.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    $onPath = Get-DemoGitOnPath
+    if ($onPath) {
+        return [pscustomobject]@{ Path = $onPath; OnPath = $true; Source = 'PATH' }
+    }
+    foreach ($candidate in @(Get-DemoGitCandidatePath)) {
+        if ((Test-Path -LiteralPath $candidate.Path -PathType Leaf) -and (Test-DemoGitExecutable -Path $candidate.Path)) {
+            return [pscustomobject]@{ Path = [string]$candidate.Path; OnPath = $false; Source = [string]$candidate.Source }
+        }
+    }
+    return [pscustomobject]@{ Path = ''; OnPath = $false; Source = '' }
+}
+
+function Get-DemoGitPath {
+    <#
+    .SYNOPSIS
+    The git executable to run (Get-DemoGitLocation's Path), or '' when Git can't be found. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    return [string](Get-DemoGitLocation).Path
+}
+
+function Format-DemoGitUsedText {
+    <#
+    .SYNOPSIS
+    ' It used the git at <path> (<source>), which isn't on PATH.' for a git found off PATH, '' otherwise. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $Path = '',
+
+        [bool] $OnPath = $true,
+
+        [AllowEmptyString()]
+        [string] $Source = ''
+    )
+
+    if (-not $Path -or $OnPath) {
+        return ''
+    }
+    return (' It used the git at {0}{1}, which isn''t on PATH.' -f $Path, $(if ($Source) { ' ({0})' -f $Source } else { '' }))
 }
 
 function Invoke-DemoGit {
@@ -46,12 +210,14 @@ function Invoke-DemoGit {
         [string] $WorkingDirectory,
 
         [ValidateRange(1, 3600)]
-        [int] $TimeoutSeconds = 30
+        [int] $TimeoutSeconds = 30,
+
+        [string] $GitPath = ''
     )
 
-    $git = Get-DemoGitPath
+    $git = if ($GitPath) { $GitPath } else { Get-DemoGitPath }
     if (-not $git) {
-        throw 'git was not found on PATH.'
+        throw 'git was not found on PATH or where Git is usually installed.'
     }
     $info = [System.Diagnostics.ProcessStartInfo]::new($git)
     foreach ($argument in $ArgumentList) {
@@ -107,9 +273,11 @@ function Get-DemoCheckoutState {
     changes. Reads only, but for the fetch, which updates refs/remotes/origin/main. Internal.
 
     .DESCRIPTION
-    Stops at the first thing it can't learn, with Problem set: NoGit, NotCheckout, or FetchFailed (FetchError says why;
-    TimedOut when the fetch outlived -FetchTimeoutSeconds). Branch is '' for a detached HEAD. Dirty lists tracked files
+    Stops at the first thing it can't learn, with Problem set: NoGit (no Git found, and no .git here), NoGitCheckout (no
+    Git found, but a .git here), NotCheckout, or FetchFailed (FetchError says why; TimedOut when the fetch outlived
+    -FetchTimeoutSeconds). Branch is '' for a detached HEAD. Dirty lists tracked files
     that are modified or staged (git status --untracked-files=no), so the Git-ignored config/ and out/ files never count.
+    GitPath, GitOnPath, and GitSource say which git ran every call (Get-DemoGitLocation).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -134,12 +302,22 @@ function Get-DemoCheckoutState {
         Behind     = 0
         Ahead      = 0
         Dirty      = @()
+        GitPath    = ''
+        GitOnPath  = $true
+        GitSource  = ''
     }
     $done = { param([string] $Problem) $state.Problem = $Problem; return [pscustomobject]$state }
-    if (-not (Get-DemoGitPath)) {
-        return (& $done 'NoGit')
+    $location = Get-DemoGitLocation
+    if (-not $location.Path) {
+        # A .git folder (or a worktree's .git file) says it's a checkout even without Git: then git pull is the fix, not a
+        # fresh clone (2026-11-09 live finding).
+        return (& $done $(if (Test-Path -LiteralPath (Join-Path -Path $root -ChildPath '.git')) { 'NoGitCheckout' } else { 'NoGit' }))
     }
-    $git = { param([string[]] $Arguments, [int] $Seconds = 15) Invoke-DemoGit -ArgumentList $Arguments -WorkingDirectory $root -TimeoutSeconds $Seconds }
+    $state.GitPath = [string]$location.Path
+    $state.GitOnPath = [bool]$location.OnPath
+    $state.GitSource = [string]$location.Source
+    $gitPath = $state.GitPath
+    $git = { param([string[]] $Arguments, [int] $Seconds = 15) Invoke-DemoGit -GitPath $gitPath -ArgumentList $Arguments -WorkingDirectory $root -TimeoutSeconds $Seconds }
 
     # A downloaded zip has no .git; a folder inside some other checkout has a prefix there. The prefix needs no path
     # comparison, which a short (8.3) or differently cased path would fool.
@@ -302,15 +480,40 @@ function Get-DemoSelfUpdateWarning {
 
         [pscustomobject] $State = $null,
 
-        [string] $Detail = ''
+        [string] $Detail = '',
+
+        [AllowEmptyString()]
+        [string] $ConfigPath = '',
+
+        [AllowEmptyString()]
+        [string] $RepositoryRoot = ''
     )
 
     $behind = if ($State) { [int]$State.Behind } else { 0 }
     $lag = '{0} commit(s) behind GitHub''s main' -f $behind
-    $clone = 'git clone {0}, then copy config/demo.config.json into the new folder and run ./scripts/deploy.ps1 there' -f $script:SelfUpdateCloneUrl
+    # The clone advice names the configuration this run used (2026-11-09 live finding: it always said
+    # config/demo.config.json): one inside this folder is copied to the same place in the new one; one outside it stays.
+    $root = if ($RepositoryRoot) { [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/') } else { '' }
+    $relative = ''
+    if ($ConfigPath -and $root -and $ConfigPath.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $relative = $ConfigPath.Substring($root.Length + 1) -replace '\\', '/'
+    }
+    $clone = if (-not $ConfigPath -or $relative -eq 'config/demo.config.json') {
+        'git clone {0}, then copy config/demo.config.json, this run''s configuration, to config/ in the new folder and run ./scripts/deploy.ps1 there' -f $script:SelfUpdateCloneUrl
+    }
+    elseif ($relative) {
+        'git clone {0}, then copy {1}, this run''s configuration, to the same place in the new folder and run ./scripts/deploy.ps1 -ConfigPath "./{1}" there' -f $script:SelfUpdateCloneUrl, $relative
+    }
+    else {
+        'git clone {0}, then run ./scripts/deploy.ps1 -ConfigPath "{1}" in the new folder (this run''s configuration stays where it is)' -f $script:SelfUpdateCloneUrl, $ConfigPath
+    }
     switch ($Case) {
         'NoGit' {
-            return [pscustomobject]@{ Reason = 'Git isn''t installed, so deploy.ps1 can''t tell whether this copy is behind GitHub''s main'; Command = ('Install Git (https://git-scm.com/downloads), then {0}' -f $clone) }
+            return [pscustomobject]@{ Reason = 'Git isn''t installed (it isn''t on PATH or where Git is usually installed), and this folder isn''t a git checkout, so deploy.ps1 can''t tell whether this copy is behind GitHub''s main'; Command = ('Install Git (https://git-scm.com/downloads), then {0}' -f $clone) }
+        }
+        'NoGitCheckout' {
+            $where = if ($root) { $root } else { 'this folder' }
+            return [pscustomobject]@{ Reason = 'Git isn''t installed (it isn''t on PATH or where Git is usually installed), so deploy.ps1 can''t tell whether this checkout is behind GitHub''s main or update it'; Command = ('Install Git (https://git-scm.com/downloads), then run git pull --ff-only in {0}' -f $where) }
         }
         'NotCheckout' {
             return [pscustomobject]@{ Reason = 'this folder isn''t a git checkout (a downloaded zip, for example), so deploy.ps1 can''t tell whether it''s behind GitHub''s main or update it'; Command = $clone }
