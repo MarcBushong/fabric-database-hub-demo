@@ -15,8 +15,8 @@ $script:T2InstallModes = @('JumpstartImage', 'PaygWizard', 'ProductKey', 'Develo
 
 function Get-DemoT2InstallModeSource {
     # Where the run's t2SqlInstallMode comes from (2026-11-09): configuration (the file names it), default (it doesn't), or
-    # legacy (the file says PaygWizard without t2PaygWizardOptIn, the default an older init.ps1 wrote, so the run uses
-    # JumpstartImage; Get-DemoConfig). Pure. Internal.
+    # legacy (the file says PaygWizard, the default an older init.ps1 wrote, so the run uses JumpstartImage; Get-DemoConfig).
+    # Pure. Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -29,21 +29,6 @@ function Get-DemoT2InstallModeSource {
         return $source
     }
     return 'configuration'
-}
-
-function Test-DemoT2PaygWizardOptIn {
-    # True only when a run's own configuration carries t2PaygWizardOptIn true with t2SqlInstallMode PaygWizard. No file can:
-    # the schema doesn't allow the key, and Get-DemoConfig runs a file's PaygWizard as JumpstartImage (2026-11-09,
-    # user-directed: no configuration value leads to the setup wizard). So no deploy.ps1 run builds a guest that waits for a
-    # person or starts the guided stop; the guided stop's code stays for an existing environment's leftovers. Pure. Internal.
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param(
-        [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Config
-    )
-
-    return ([string]$Config['t2SqlInstallMode'] -ceq 'PaygWizard' -and $Config.Contains('t2PaygWizardOptIn') -and $Config['t2PaygWizardOptIn'] -eq $true)
 }
 
 function Get-DemoT2LegacyModeText {

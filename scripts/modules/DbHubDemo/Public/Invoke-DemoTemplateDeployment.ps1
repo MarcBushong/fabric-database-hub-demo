@@ -134,8 +134,8 @@ function Invoke-DemoTemplateDeployment {
 
     .PARAMETER T4StartSku
     Where T4's fallback starts when preflight already ruled sizes out (ADR 0019): without t4SkuName, Standard_D4ads_v5 or
-    Standard_D2ds_v5 (its cost check still runs right before the attempt); for a size t4SkuName sets (2026-11-09), a size
-    in its fallback order (Get-DemoT4FallbackOrder). Ignored when T4 exists.
+    Standard_D2ds_v5 (its cost check still runs right before the attempt, and only reports); for a size t4SkuName sets
+    (2026-11-09), a size in its fallback order (Get-DemoT4FallbackOrder). Ignored when T4 exists.
 
     .PARAMETER ScaleT4
     deploy.ps1's: an existing T4 whose size the configuration doesn't set, and no record keeps, scales to the default,

@@ -16,7 +16,7 @@ function Get-DemoDeploymentState {
     may be up, so DONE waits: Get-DemoGuidedStopLeftover, Phase 28 review) and T4Sku (the size T4's fallback settled
     on, in the DbHubT4Size tag: Standard_D4ads_v5, Standard_D2ds_v5, a size an existing server kept, or, since 2026-11-09,
     any documented size the fallback chose for a size t4SkuName sets; an older run's None or Refused no longer leaves T4
-    out; ADR 0019, Resolve-DemoEffectiveConfig), T4Refused (2026-11-09: the sizes Azure refused, the one the
+    out, and start-demo.ps1 or the next deploy.ps1 clears it; ADR 0019, Resolve-DemoEffectiveConfig), T4Refused (2026-11-09: the sizes Azure refused, the one the
     configuration asks for first, with the zones tried and when, in the DbHubT4Refused tag; ConvertFrom-DemoT4RefusedRecord),
     T2BuildUtc (when the T2 host's loader started a bootstrap generation that nobody has seen finish; empty when none
     runs; Phase 28 review follow-up), T2InstallMode (the T2 guest's own install mode as its host reported it, in the

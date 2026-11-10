@@ -7,7 +7,7 @@ BeforeAll {
         param([long] $Now = 1793000000, [string] $InstallMode = 'PaygWizard', [switch] $T4)
         InModuleScope DbHubDemo -Parameters @{ Now = $Now; Mode = $InstallMode; T4 = [bool]$T4 } {
             $catalog = Get-DemoProgressCatalog -InstallMode $Mode -T4Enabled:$T4
-            $model = New-DemoProgressModel -Catalog $catalog -Environment 'demo' -ResourceGroup 'rg-dbhub-demo' -PagePath 'out/deploy-status.html' -Expect @{ text = 'A first deployment takes about 2 to 3 hours (estimate).'; humanText = 'about 60 to 90 minutes after the start, for about 10 minutes.'; guidedStop = $true } -GuidedStop 'Pending' -NowUnix $Now
+            $model = New-DemoProgressModel -Catalog $catalog -Environment 'demo' -ResourceGroup 'rg-dbhub-demo' -PagePath 'out/deploy-status.html' -Expect @{ text = 'A first deployment takes about 1.5 to 2.5 hours (estimate).' } -NowUnix $Now
             ConvertTo-Json -InputObject $model -Depth 20 | ConvertFrom-Json -AsHashtable -Depth 20
         }
     }
@@ -16,7 +16,7 @@ BeforeAll {
         param([long] $Now = 0)
         $path = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
         InModuleScope DbHubDemo -Parameters @{ Path = $path; Now = $Now } {
-            $model = New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -InstallMode 'PaygWizard') -Environment 'demo' -ResourceGroup 'rg-dbhub-demo' -GuidedStop 'Pending' -NowUnix $(if ($Now -gt 0) { $Now } else { Get-DemoUnixTime })
+            $model = New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -InstallMode 'PaygWizard') -Environment 'demo' -ResourceGroup 'rg-dbhub-demo' -NowUnix $(if ($Now -gt 0) { $Now } else { Get-DemoUnixTime })
             Initialize-DemoProgress -Path $Path -Model $model -Confirm:$false
         }
         return $path
@@ -35,13 +35,15 @@ BeforeAll {
 }
 
 Describe 'The progress model (Phase 28, brief item 11)' {
-    It 'lists the steps per track in the brief''s order, with the guided stop and the setup check only in PaygWizard mode' {
+    It 'lists the steps per track in the brief''s order, with no guided stop in any mode (retired, 2026-11-09)' {
         $model = New-TestModel -T4
         @($model['tracks'] | ForEach-Object { $_['name'] }) | Should -Be @('Preflight', 'Infrastructure', 'T1', 'T3', 'T4', 'Fabric', 'T2', 'Validation')
-        $t2 = @(($model['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] })
-        $t2 | Should -Be @('T2.Restore', 'T2.Artifacts', 'T2.Bootstraps', 'T2.HostBuild', 'T2.GuidedStop', 'T2.SetupCheck', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring', 'T2.Telemetry')
+        $t2Steps = @('T2.Restore', 'T2.Artifacts', 'T2.Bootstraps', 'T2.HostBuild', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring', 'T2.Telemetry')
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be $t2Steps
+        foreach ($mode in 'JumpstartImage', 'ProductKey', 'Developer') {
+            @(((New-TestModel -InstallMode $mode)['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be $t2Steps -Because $mode
+        }
         $productKey = New-TestModel -InstallMode 'ProductKey'
-        @(($productKey['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] }) | Should -Not -Contain 'T2.GuidedStop'
         @($productKey['tracks'] | ForEach-Object { $_['name'] }) | Should -Not -Contain 'T4'
         # Phase 28 live finding: a rerun starts the VMs that were stopped first, and the page says so; the Insights app's
         # sign-in runs alongside the deployment from the start (2026-11-05), so its row is under Preflight, and so is the
@@ -67,7 +69,8 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         @($model['nonBlocking']).Count | Should -Be 0
         $model.Contains('optional') | Should -BeFalse
         $model['run']['state'] | Should -Be 'Running'
-        $model['guidedStop']['state'] | Should -Be 'Pending'
+        $model.Contains('guidedStop') | Should -BeFalse
+        $model['expect'].Contains('guidedStop') | Should -BeFalse
     }
 
     It 'shows the history report''s snapshot after the validation, where it happens, as not blocking DONE, and leaves it out with -SkipFabric (2026-11-06)' {
@@ -162,7 +165,7 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         (Get-TestStep -Model $model -Id 'T1.Telemetry')['state'] | Should -Be 'Pending'
         (Get-TestStep -Model $model -Id 'T1.Telemetry')['message'] | Should -BeNullOrEmpty
         (Get-TestStep -Model $model -Id 'T2.HostBuild')['state'] | Should -Be 'Skipped'
-        (Get-TestStep -Model $model -Id 'T2.GuidedStop')['message'] | Should -Match 'golden snapshot'
+        (Get-TestStep -Model $model -Id 'T2.SignInCleanup')['message'] | Should -Match 'golden snapshot'
         (Get-TestStep -Model $model -Id 'T2.Restore')['state'] | Should -Be 'Pending'
         # Where each resumed track picks up (Phase 28 live finding, 2026-10-30).
         (Get-TestStep -Model $model -Id 'T3.Checks')['state'] | Should -Be 'Pending'
@@ -229,29 +232,16 @@ Describe 'The progress model (Phase 28, brief item 11)' {
     }
 }
 
-Describe 'The status page''s banner: exactly one of four states' {
-    It 'is Deploying, no action needed, while nothing waits for a person, with the estimate and when a person is needed' {
+Describe 'The status page''s banner: exactly one of three states' {
+    It 'is Deploying, no action needed, with the estimate, and never asks for a person, whatever an older run''s model says' {
         $model = New-TestModel
+        $model['guidedStop'] = @{ state = 'Ready'; url = 'https://portal.azure.com/#resource/x'; deadlineAt = 1793000000 + 2700 }
         $banner = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
         $banner.Kind | Should -Be 'Deploying'
         $banner.Title | Should -Be 'Deploying, no action needed'
         ($banner.Lines -join ' ') | Should -Match 'step away'
-        ($banner.Lines -join ' ') | Should -Match '60 to 90 minutes after the start'
-    }
-
-    It 'is Waiting for you at the guided stop, with the steps, the portal link, and a countdown' {
-        $model = New-TestModel
-        $model['guidedStop']['state'] = 'Ready'
-        $model['guidedStop']['url'] = 'https://portal.azure.com/#@contoso.example/resource/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/archost01'
-        $model['guidedStop']['deadlineAt'] = 1793000000 + 2700
-        $model['guidedStop']['credential'] = 'portalReset'
-        $banner = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
-        $banner.Kind | Should -Be 'Waiting'
-        $banner.Title | Should -Be 'Waiting for you'
-        $banner.Countdown | Should -Match '44m 00s left'
-        $banner.Link | Should -Match '^https://portal\.azure\.com/'
-        ($banner.Lines -join ' ') | Should -Match 'pay-as-you-go'
-        ($banner.Lines -join ' ') | Should -Match 'Help, then Reset password'
+        ($banner.Lines -join ' ') | Should -Match 'about 1\.5 to 2\.5 hours'
+        ($banner.Lines -join ' ') | Should -Not -Match '(?i)a person is needed|guided stop'
     }
 
     It 'is Done with where to look and, apart from its lines, what didn''t work but doesn''t block DONE; and Stopped, not done, with the exact command (2026-11-05)' {
@@ -313,7 +303,7 @@ Describe 'The status page''s banner: exactly one of four states' {
 }
 
 Describe 'Stale detection' {
-    It 'warns when no step changed for 20 minutes while nobody is asked for anything, but not at the guided stop' {
+    It 'warns when no step changed for 20 minutes, whatever an older run''s model says about a guided stop' {
         $model = New-TestModel
         $model['updatedAt'] = 1793000000
         $model['heartbeatAt'] = 1793000000 + 1500
@@ -321,8 +311,8 @@ Describe 'Stale detection' {
         $stale.Progress | Should -BeTrue
         $stale.Heartbeat | Should -BeFalse
         $stale.StepMinutes | Should -Be 25
-        $model['guidedStop']['state'] = 'Ready'
-        (InModuleScope DbHubDemo -Parameters @{ Model = $model } { Test-DemoProgressStale -Model $Model -NowUnix (1793000000 + 1510) }).Progress | Should -BeFalse
+        $model['guidedStop'] = @{ state = 'Ready' }
+        (InModuleScope DbHubDemo -Parameters @{ Model = $model } { Test-DemoProgressStale -Model $Model -NowUnix (1793000000 + 1510) }).Progress | Should -BeTrue
     }
 
     It 'is never stale once the run ended' {
@@ -351,10 +341,9 @@ Describe 'The status page''s HTML' {
         $html | Should -Match 'Deploying, no action needed'
     }
 
-    It 'stops refreshing once the run ended, and links only to the Azure portal' {
+    It 'stops refreshing once the run ended, and has no link, whatever an older run''s model says about a guided stop' {
         $model = New-TestModel
-        $model['guidedStop']['state'] = 'Ready'
-        $model['guidedStop']['url'] = 'javascript:alert(1)'
+        $model['guidedStop'] = @{ state = 'Ready'; url = 'javascript:alert(1)'; hostVm = 'archost01' }
         $html = InModuleScope DbHubDemo -Parameters @{ Model = $model } { ConvertTo-DemoProgressHtml -Model $Model -NowUnix 1793000060 }
         $html | Should -Not -Match 'href='
         $model['run']['state'] = 'Done'
@@ -432,71 +421,6 @@ Describe 'The status page''s HTML' {
         @($model['nonBlocking']).Count | Should -Be 1
         $model['nonBlocking'][0]['state'] | Should -Be 'Failed'
         $model['nonBlocking'][0]['message'] | Should -Not -Match ([regex]::Escape($fakeToken))
-    }
-}
-
-Describe 'The guided stop''s steps' {
-    It 'give the clipboard, Key Vault, and portal Reset password ways in, and never a password' {
-        $clipboard = InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -HostUser 'demoadmin' -SignInWay 'clipboard' }
-        ($clipboard -join ' ') | Should -Match 'on your clipboard'
-        $portal = InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -HostUser 'demoadmin' -SignInWay 'portalReset' }
-        ($portal -join ' ') | Should -Match 'no password was set or shown'
-        ($portal -join ' ') | Should -Match 'open archost01, then Help, then Reset password'
-        ($portal -join ' ') | Should -Match 'keep the user name demoadmin'
-        ($portal -join ' ') | Should -Match 'Use pay-as-you-go billing through Microsoft Azure'
-        ($portal -join ' ') | Should -Match 'Use Azure Login'
-        $vault = InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -SignInWay 'keyVault' -SignInText 'It''s the secret archost01-admin in kv-dbhub.' }
-        ($vault -join ' ') | Should -Match 'kv-dbhub'
-    }
-
-    It 'tell the person what to do when the Azure Login window stays blank or Internet Explorer blocks it, on the console and the status page (the owner, 2026-10-30)' {
-        $steps = @(InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -HostUser 'demoadmin' -SignInWay 'clipboard' })
-        $azure = @($steps | Where-Object { $_ -like '5. On the Azure Extension for SQL Server page*' })
-        $azure.Count | Should -Be 1
-        $azure[0] | Should -Match 'If the Azure Login window stays blank, or Internet Explorer says content from https://login\.microsoftonline\.com is blocked, follow the dialog''s directions'
-        $azure[0] | Should -Match ([regex]::Escape('select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close. Then select "Use Azure Login" again. Repeat for any other sign-in site it names.'))
-        $azure[0] | Should -Match ([regex]::Escape('(Confirmed live on 2026-10-30; turning IE Enhanced Security Configuration off while setup is open doesn''t help.)'))
-        ($steps -join ' ') | Should -Not -Match 'WebView2'
-
-        # The status page's Waiting banner shows the same steps.
-        $model = New-TestModel
-        $model['guidedStop']['state'] = 'Ready'
-        $model['guidedStop']['deadlineAt'] = 1793000000 + 2700
-        $model['guidedStop']['credential'] = 'clipboard'
-        $banner = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
-        ($banner.Lines -join ' ') | Should -Match ([regex]::Escape('select Add..., then Add, to put the Microsoft sign-in page in Trusted sites'))
-
-        # The console's WAITING FOR YOU banner too.
-        $script:printed = [System.Collections.Generic.List[string]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Write-DemoConsoleBlock -MockWith { foreach ($line in @($Line)) { $script:printed.Add([string]$line) } }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAttention -MockWith { }
-        InModuleScope DbHubDemo { Show-DemoGuidedStopPrompt -Url 'https://portal.azure.com/#resource/x' -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(45)) -HostUser 'demoadmin' -SignInWay 'clipboard' -NoBrowser }
-        ($script:printed -join ' ') | Should -Match 'WAITING FOR YOU'
-        ($script:printed -join ' ') | Should -Match ([regex]::Escape('select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close.'))
-    }
-
-    It 'lead with Add... and say the automatic preparation didn''t finish, when the host asks anyway (Phase 28 review)' {
-        $steps = @(InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -HostUser 'demoadmin' -SignInWay 'clipboard' -SignInFallback })
-        $steps[0] | Should -Match '^First: the automatic preparation of setup''s Azure sign-in didn''t finish, so Internet Explorer may block it\.'
-        $steps[0] | Should -Match ([regex]::Escape('select Add..., then Add, then Close, and select "Use Azure Login" again'))
-        $steps[1] | Should -Match '^1\. Sign in to archost01 through Bastion'
-        @(InModuleScope DbHubDemo { Get-DemoGuidedStopInstruction -HostUser 'demoadmin' -SignInWay 'clipboard' })[0] | Should -Match '^1\. ' -Because 'without the fallback, the steps start as before'
-
-        # The status page's Waiting banner, from the model the T2 track writes.
-        $model = New-TestModel
-        $model['guidedStop']['state'] = 'Ready'
-        $model['guidedStop']['deadlineAt'] = 1793000000 + 2700
-        $model['guidedStop']['credential'] = 'clipboard'
-        $model['guidedStop']['signInFallback'] = $true
-        $banner = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
-        @($banner.Lines)[1] | Should -Match '^First: the automatic preparation of setup''s Azure sign-in didn''t finish'
-
-        # The console's WAITING FOR YOU banner too.
-        $script:printed = [System.Collections.Generic.List[string]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Write-DemoConsoleBlock -MockWith { foreach ($line in @($Line)) { $script:printed.Add([string]$line) } }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAttention -MockWith { }
-        InModuleScope DbHubDemo { Show-DemoGuidedStopPrompt -Url 'https://portal.azure.com/#resource/x' -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(45)) -HostUser 'demoadmin' -SignInWay 'clipboard' -NoBrowser -SignInFallback }
-        ($script:printed -join ' ') | Should -Match 'First: the automatic preparation of setup''s Azure sign-in didn''t finish'
     }
 }
 

@@ -192,7 +192,9 @@ function Invoke-DemoArcOnboarding {
         foreach ($name in 'guestReachable', 'imdsReachable', 'wireServerReachable', 'dnsResolves', 'agentInstalled', 'agentStatus', 'agentVersion', 'guestVmId', 'markerStatus') {
             $evidence[$name] = Get-DemoMemberValue -InputObject $probe -Name $name
         }
-        $evidence['agentKeys'] = @(Get-DemoMemberValue -InputObject $probe -Name 'agentKeys')
+        # Get-DemoMemberValue returns an array whole, so @() around the call would nest it: [[...]] in the evidence.
+        $agentKeys = Get-DemoMemberValue -InputObject $probe -Name 'agentKeys'
+        $evidence['agentKeys'] = @($agentKeys)
     }
     try {
         $machine = Get-DemoArcArmResource -SubscriptionId $target.SubscriptionId -Url $target.MachineUrl

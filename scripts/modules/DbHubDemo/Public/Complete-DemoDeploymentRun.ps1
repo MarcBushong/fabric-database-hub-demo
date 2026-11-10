@@ -101,17 +101,14 @@ function Complete-DemoDeploymentRun {
             $judgedState = $null
         }
     }
-    # Whether the guided stop was open when the run stopped, and what this run started or created: the model says so
-    # without an Azure call.
-    $guidedOpen = $false
+    # What this run started or created: the model says so without an Azure call.
     $model = $null
     if ($Run.ProgressPath) {
         try {
             $model = Read-DemoProgress -Path ([string]$Run.ProgressPath)
-            $guidedOpen = $wasStopped -and $null -ne $model -and [string]$model['guidedStop']['state'] -in 'Preparing', 'Ready'
         }
         catch {
-            $guidedOpen = $false
+            $model = $null
         }
     }
     try {
@@ -155,7 +152,7 @@ function Complete-DemoDeploymentRun {
                 $t4Notice = [string]$change.message
             }
         }
-        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -GuidedStopOpen:$guidedOpen -StartedVm $startedVms -T4HourlyUsd $t4Hourly -T4Created $t4Created -T4Why $t4Why -T4Notice $t4Notice
+        $outcome = Get-DemoDeploymentOutcome -Result @($Result) -State $judgedState -Config $Config -Command ([string]$Run.Command) -WhatIfRun:$WhatIfRun -StopAfter $StopAfter -SkipFabric:$SkipFabric -Sequential:$Sequential -Stopped:$wasStopped -StartedVm $startedVms -T4HourlyUsd $t4Hourly -T4Created $t4Created -T4Why $t4Why -T4Notice $t4Notice
     }
     catch {
         $outcome = [pscustomobject]@{ Kind = 'NotDone'; Done = $false; Reason = ('The run couldn''t be judged: {0}' -f (Protect-DemoText -Text $_.Exception.Message)); Next = ('Run {0} again.' -f $Run.Command); NextCommand = [string]$Run.Command; NonBlocking = @(); Unfinished = @(); ExitCode = 2; Resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.' }

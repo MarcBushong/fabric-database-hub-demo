@@ -2,7 +2,7 @@ function Show-DemoDeploymentProgress {
     <#
     .SYNOPSIS
     Shows deploy.ps1's live status in the console, from the same progress model as the status page (Phase 28, brief
-    item 11): the banner (Deploying, no action needed; Waiting for you; Done; or Stopped, not done), then each track's
+    item 11): the banner (Deploying, no action needed; Done; or Stopped, not done), then each track's
     steps with their state, elapsed time, and message. status.ps1 -Watch calls it.
 
     .DESCRIPTION
@@ -12,7 +12,7 @@ function Show-DemoDeploymentProgress {
     anywhere deploy.ps1 runs, GitHub Codespaces included, and calls nothing in Azure. Every line comes from the model,
     which holds no secrets, and is redacted again before it's written.
 
-    Returns the banner's kind when it stops (Deploying, Waiting, Done, or Stopped), or None when there's no model on
+    Returns the banner's kind when it stops (Deploying, Done, or Stopped), or None when there's no model on
     this machine: status.ps1 then reads Azure instead.
 
     .PARAMETER Path
@@ -76,7 +76,7 @@ function Show-DemoDeploymentProgress {
                 Write-Debug -Message 'The console couldn''t be cleared.'
             }
         }
-        $color = switch ($banner.Kind) { 'Waiting' { 'Yellow' } 'Done' { 'Green' } 'Stopped' { 'Red' } default { 'Cyan' } }
+        $color = switch ($banner.Kind) { 'Done' { 'Green' } 'Stopped' { 'Red' } default { 'Cyan' } }
         # The banner is everything up to the second rule line; the steps follow in the default color.
         $rules = 0
         foreach ($line in $lines) {

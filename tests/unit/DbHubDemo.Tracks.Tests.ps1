@@ -340,9 +340,8 @@ Describe 'A resume sends a VM''s artifacts again when this checkout builds other
 Describe 'Resolve-DemoT2Source' {
     BeforeEach {
         $config = New-TestConfig
-        # The snapshots below keep a PaygWizard guest (a Windows evaluation), chosen on purpose here.
+        # The snapshots below keep a PaygWizard guest (a Windows evaluation); the run's mode matches it here.
         $config['t2SqlInstallMode'] = 'PaygWizard'
-        $config['t2PaygWizardOptIn'] = $true
         $script:vm = $null
         $script:snapshots = @(New-TestSnapshot)
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
@@ -411,7 +410,6 @@ Describe 'Resolve-DemoT2Source' {
 
     It 'restores a finished PaygWizard guest''s snapshot in JumpstartImage mode, as it keeps such a guest, with no setup wizard (2026-11-09)' {
         $config['t2SqlInstallMode'] = 'JumpstartImage'
-        $config.Remove('t2PaygWizardOptIn')
         $source = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoT2Source -Config $Config }
         $source.Source | Should -Be 'golden'
         $source.SnapshotName | Should -Be 'snap-dbhub-t2golden-202610221306'
@@ -810,6 +808,26 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $leftover.remediation | Should -Match 'stop-demo\.ps1 -RemoveBastionOnly'
     }
 
+    It 'leaves the final word to the T2 step''s own cleanup: what stays open before the loader is a Warning there (review of 27396a4)' {
+        # The review: a Manual action required from the cleanup before the loader (Bastion's removal failing once, say)
+        # outvoted the T2 step's later Pass, so the run ended NOT DONE, naming stop-demo.ps1, with nothing open.
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith {
+            $script:calls.Add('cleanup')
+            # The first try leaves the handed-over host password; the second works.
+            if (@($script:calls | Where-Object { $_ -eq 'cleanup' }).Count -gt 1) {
+                $script:state.HostPasswordUtc = ''
+            }
+            @()
+        }
+        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Bootstraps', 'T2') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:calls | Where-Object { $_ -in 'cleanup', 'loader archost01' }) | Should -Be @('cleanup', 'loader archost01', 'cleanup')
+        $leftover = @($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' })
+        @($leftover | ForEach-Object { [string]$_.status }) | Should -Be @('Warning', 'Pass')
+        $leftover[0].message | Should -Match 'still open after this cleanup; the T2 step tries again at its end, and DONE waits until nothing is open'
+    }
+
     It 'reports a T2 that builds its guest as running in the background, without waiting' {
         $script:context['T2Source'] = 'build'
         $script:arcConnected = $false
@@ -822,12 +840,9 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:calls | Should -Not -Contain 'telemetry T2'
     }
 
-    It 'cleans up what an earlier guided stop left open at the end of the T2 step: after -NoWaitForT2, on a golden redeploy, and once when the guided stop isn''t needed (Phase 28 review)' {
+    It 'cleans up what an earlier guided stop left open at the end of the T2 step: after -NoWaitForT2, on a golden redeploy, and after the wait, which starts no guided stop (Phase 28 review)' {
         # The review: a rerun after a Ctrl+C at the guided stop, with setup finished meanwhile, could end DONE with Bastion
-        # up and the handed-over host password valid. Only PaygWizard mode, chosen on purpose (t2PaygWizardOptIn, 2026-11-09),
-        # has a guided stop (JumpstartImage, the default since 2026-11-05, has none; checked at the end).
-        $config['t2SqlInstallMode'] = 'PaygWizard'
-        $config['t2PaygWizardOptIn'] = $true
+        # up and the handed-over host password valid. The guided stop itself is retired (2026-11-09): no run starts one.
         Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); $script:state.HostPasswordUtc = ''; @() }
         $cleanups = { @($script:calls | Where-Object { $_ -eq 'cleanup' }).Count }
 
@@ -849,30 +864,26 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $outcome.Status | Should -Be 'Pass'
         & $cleanups | Should -Be 1
 
-        # The default wait: setup finished after the Ctrl+C, so the guided stop isn't needed; it cleans up, and the step
-        # doesn't again.
-        $script:calls.Clear()
-        $script:context['T2Source'] = 'build'
-        $script:context['WaitForT2'] = $true
-        $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
-        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Failed = $false; TimedOut = $false; Rebuilt = $false; Results = [System.Collections.Generic.List[object]]::new().ToArray(); Health = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.' } } }
-        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
-        $outcome.Status | Should -Be 'Pass'
-        & $cleanups | Should -Be 1
-        @($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).Count | Should -Be 1
-        ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }).status | Should -Be 'Not selected'
+        # The default wait: the step cleans up once, at its end, and no guided stop starts, whatever the run's mode says.
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Failed = $false; TimedOut = $false; Rebuilt = $false; Results = [System.Collections.Generic.List[object]]::new().ToArray(); Health = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.'; installMode = 'PaygWizard' } } }
+        foreach ($mode in 'JumpstartImage', 'PaygWizard') {
+            $config['t2SqlInstallMode'] = $mode
+            $script:calls.Clear()
+            $script:context['T2Source'] = 'build'
+            $script:context['WaitForT2'] = $true
+            $script:state.HostPasswordUtc = '2026-10-29T15:00:00Z'
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+            $outcome.Status | Should -Be 'Pass' -Because $mode
+            & $cleanups | Should -Be 1 -Because $mode
+            @($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).Count | Should -Be 1 -Because $mode
+            $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' } | Should -BeNullOrEmpty -Because $mode
+        }
 
         # Nothing open: nothing to clean up.
         $script:calls.Clear()
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
         & $cleanups | Should -Be 0
         $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' } | Should -BeNullOrEmpty
-
-        # JumpstartImage: the same wait has no guided stop at all.
-        $config['t2SqlInstallMode'] = 'JumpstartImage'
-        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
-        $outcome.Status | Should -Be 'Pass'
-        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' } | Should -BeNullOrEmpty
     }
 
     It 'runs the Fabric track: notebooks and dashboard, the history report, then the Fabric app step' {
@@ -2499,42 +2510,23 @@ Describe 'Invoke-DemoParallelDeployment' {
             }
         }
 
-        It 'lets the T2 track process prompt the person itself when there''s no progress model (-NoStatusPage; review finding 2)' {
-            $script:promptInParent = @{}
+        It 'prompts nobody, even when an older run''s progress model says a guided stop is ready (the guided stop is retired, 2026-11-09)' {
+            $script:contexts = @{}
             Mock -ModuleName DbHubDemo -CommandName Start-DemoDeploymentTrackJob -MockWith {
-                $script:promptInParent[$Track] = [bool]$Context['PromptInParent']
+                $script:contexts[$Track] = $Context
                 $script:handoffDir = [string]$Context['HandoffPath']
                 Start-ThreadJob -Name ('dbhub-track-{0}' -f $Track) -ScriptBlock { }
             }
-            InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -WaitForT2 } | Out-Null
-            $script:promptInParent['T2'] | Should -BeFalse -Because 'only a progress model tells this process that the guided stop is ready'
-
-            $script:received = @{}
-            $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
-            InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog) -GuidedStop 'Pending') -Confirm:$false }
-            InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -WaitForT2 -ProgressPath $Path } | Out-Null
-            $script:promptInParent['T2'] | Should -BeTrue
-        }
-
-        It 'prompts the person in this process when the T2 track process reports the guided stop ready (Phase 28)' {
             $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
             InModuleScope DbHubDemo -Parameters @{ Path = $progress } {
-                $model = New-DemoProgressModel -Catalog (Get-DemoProgressCatalog) -GuidedStop 'Pending'
-                $model['guidedStop']['state'] = 'Ready'
-                $model['guidedStop']['url'] = 'https://portal.azure.com/#@contoso.example/resource/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/archost01'
-                $model['guidedStop']['deadlineAt'] = Get-DemoUnixTime -Value ([DateTime]::UtcNow.AddMinutes(45))
+                $model = New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)
+                $model.Contains('guidedStop') | Should -BeFalse
+                $model['guidedStop'] = [ordered]@{ state = 'Ready'; url = 'https://portal.azure.com/#resource/x'; deadlineAt = (Get-DemoUnixTime -Value ([DateTime]::UtcNow.AddMinutes(45))) }
                 Initialize-DemoProgress -Path $Path -Model $model -Confirm:$false
             }
-            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGuidedStopCredential -MockWith { $script:calls.Add('credential'); [pscustomobject]@{ Mode = 'portalReset'; UserName = 'demoadmin'; Text = ''; Results = @(New-TestResult 'DEPLOY.T2.HOSTPASSWORD') } }
-            Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopPrompt -MockWith { $script:calls.Add(('prompt {0}' -f $SignInWay)) }
-            Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopReminder -MockWith { $script:calls.Add('reminder') }
-            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -ProgressPath $Path })
-            @($script:calls | Where-Object { $_ -eq 'credential' }).Count | Should -Be 1
-            $script:calls | Should -Contain 'prompt portalReset'
-            ($results | Where-Object { $_.checkId -eq 'DEPLOY.T2.HOSTPASSWORD' }).status | Should -Be 'Pass'
-            $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
-            $model['guidedStop']['credential'] | Should -Be 'portalReset'
-            $model['guidedStop']['hostUser'] | Should -Be 'demoadmin'
+            $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -WaitForT2 -ProgressPath $Path })
+            $script:contexts['T2'].Contains('PromptInParent') | Should -BeFalse
+            $results | Where-Object { $_.checkId -in 'DEPLOY.T2.HOSTPASSWORD', 'DEPLOY.T2.GUIDEDSTOP' } | Should -BeNullOrEmpty
         }
     }
 }

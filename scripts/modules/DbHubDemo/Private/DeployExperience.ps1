@@ -119,17 +119,16 @@ function Resolve-DemoDeployCommandText {
 function Get-DemoDeploymentExpectation {
     <#
     .SYNOPSIS
-    What a deploy.ps1 run can expect: the whole first run, a redeploy from a golden snapshot, and in PaygWizard mode
-    when a person is needed and for how long. In JumpstartImage mode, the default, the first run is the one measured
-    live on 2026-11-06; the rest are estimates from documented step times, not a measured run. Pure. Internal.
+    What a deploy.ps1 run can expect: the whole first run and a redeploy from a golden snapshot; no T2 step needs a
+    person in any mode (the guided stop is retired, 2026-11-09). In JumpstartImage mode, the default, the first run is
+    the one measured live on 2026-11-06; the rest are estimates from documented step times, not a measured run. Pure.
+    Internal.
 
     .DESCRIPTION
-    The T2 guest build to the setup step takes 60 to 90 minutes (an ADR 0018 estimate; Phase 16 measured about 35
-    minutes for a whole Developer guest build); before it, preflight takes 2 to 13 minutes (the policy inventory is 7 to
-    13 of them on a first run with networkMode auto), the template 7 to 9, and the artifacts and the loader about 5. So
-    the person is needed about 60 to 90 minutes after the start (it can be later; the run waits for them): about 10
-    minutes of clicks, then 10 to 15 minutes while setup installs. Afterward, the sign-in cleanup, the database, Arc's
-    PAYG and monitoring, and telemetry take about 30 to 45 minutes.
+    A T2 guest build takes 60 to 90 minutes (an ADR 0018 estimate; Phase 16 measured about 35 minutes for a whole
+    Developer guest build); before it, preflight takes 2 to 13 minutes (the policy inventory is 7 to 13 of them on a
+    first run with networkMode auto), the template 7 to 9, and the artifacts and the loader about 5. Afterward, the
+    sign-in cleanup, the database, Arc's PAYG and monitoring, and telemetry take about 30 to 45 minutes.
     JumpstartImage mode (the default since 2026-11-05) replaces the guest build with the Jumpstart image's 34 GiB download
     and its first boot, and needs no person: a clean first deployment took 91 minutes when measured on 2026-11-06, of
     which T2's host build took about 27 and its Arc onboarding about 33. Without
@@ -143,11 +142,6 @@ function Get-DemoDeploymentExpectation {
     param(
         [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
         [string] $InstallMode = 'JumpstartImage',
-
-        [switch] $WaitForT2,
-
-        [ValidateRange(0, 600)]
-        [int] $T2WaitMinutes = 180,
 
         [switch] $SkipFabric,
 
@@ -167,50 +161,34 @@ function Get-DemoDeploymentExpectation {
         # 2026-11-09: what the run ignores in the configuration (Get-DemoT2LegacyModeText, Get-DemoT4IgnoredText).
         $lines.Add(('- {0}' -f $item))
     }
-    if ($InstallMode -eq 'PaygWizard') {
-        $lines.Add('- A first deployment takes about 2 to 3 hours in all; the T2 guest build alone is 60 to 90 minutes.')
-    }
-    elseif ($InstallMode -eq 'JumpstartImage') {
+    if ($InstallMode -eq 'JumpstartImage') {
         $lines.Add('- A first deployment takes about 1.5 hours in all: 91 minutes when measured on 2026-11-06, of which T2''s host build, with the Jumpstart image''s download and first boot, took about 27 and its Arc onboarding about 33. No T2 step needs a person.')
     }
     else {
         $lines.Add('- A first deployment takes about 1.5 to 2.5 hours in all; the T2 guest build alone is 60 to 90 minutes. No T2 step needs a person.')
     }
-    $lines.Add('- A redeploy from a golden snapshot (./scripts/capture-t2-golden.ps1) takes about 30 to 45 minutes, with no build and no guided stop.')
+    $lines.Add('- A redeploy from a golden snapshot (./scripts/capture-t2-golden.ps1) takes about 30 to 45 minutes, with no T2 build.')
     if (-not $SkipFabric) {
         $lines.Add('- The Insights app deploys with your Azure CLI sign-in (az login), so no browser opens for it. Only after Fabric refused that token in an earlier run does a browser open for the Rayfin CLI''s own sign-in right at the start; the run goes on meanwhile, only the app waits for it, and without it the app isn''t created, which doesn''t keep the run from DONE.')
     }
-    $human = ''
-    if ($InstallMode -eq 'PaygWizard') {
-        $human = 'about 60 to 90 minutes after the start (an estimate; it can be later, and the run waits), for about 10 minutes, plus 10 to 15 minutes while SQL Server setup installs: you sign in to archost01 through Bastion, choose pay-as-you-go and Standard in the pre-filled setup, and sign in to Azure on its Azure page.'
-        if ($WaitForT2) {
-            $lines.Add(('- The run asks a person for one step after the T2 guest build, {0} Keep this window open: the run waits up to {1} minutes for the build and the step, and at least 45 minutes once it asks.' -f $human, $T2WaitMinutes))
-        }
-        else {
-            $lines.Add('- T2 builds in the background (-NoWaitForT2): this run finishes T1, T3, T4, and Fabric, and a later ./scripts/deploy.ps1 guides you through T2''s one step.')
-        }
-    }
     $lines.Add('- This PC stays awake while deploy.ps1 runs (Windows); keep it plugged in, and don''t close this window.')
     $lines.Add('- If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.')
-    $text = if ($InstallMode -eq 'PaygWizard') { 'A first deployment takes about 2 to 3 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' } elseif ($InstallMode -eq 'JumpstartImage') { 'A first deployment takes about 1.5 hours (91 minutes, measured on 2026-11-06); a redeploy from a golden snapshot about 30 to 45 minutes (estimate).' } else { 'A first deployment takes about 1.5 to 2.5 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' }
+    $text = if ($InstallMode -eq 'JumpstartImage') { 'A first deployment takes about 1.5 hours (91 minutes, measured on 2026-11-06); a redeploy from a golden snapshot about 30 to 45 minutes (estimate).' } else { 'A first deployment takes about 1.5 to 2.5 hours (estimate); a redeploy from a golden snapshot about 30 to 45 minutes.' }
     if ($notes.Count -gt 0) {
         $text = '{0} {1}' -f $text, ($notes -join ' ')
     }
     return [pscustomobject]@{
-        Lines      = $lines.ToArray()
-        Text       = $text
-        HumanText  = $human
-        GuidedStop = ($InstallMode -eq 'PaygWizard' -and [bool]$WaitForT2)
+        Lines = $lines.ToArray()
+        Text  = $text
     }
 }
 
 function Get-DemoDeploymentNotice {
     <#
     .SYNOPSIS
-    The start banner's notices (brief items 7, 8, 13): a session that can't take keyboard input (an assistant, a script,
-    or CI) and what the guided stop then needs, with the alternatives, and that the Insights app's browser sign-in, needed
-    only when Fabric refuses the Azure CLI's token (2026-11-09), isn't started there (2026-11-05); a GitHub Codespaces idle
-    timeout; and the plain line an assistant can relay ahead of the guided stop. Pure. Internal.
+    The start banner's notices (brief items 7, 8, 13): in a session that can't take keyboard input (an assistant, a
+    script, or CI), that the Insights app's browser sign-in, needed only when Fabric refuses the Azure CLI's token
+    (2026-11-09), isn't started there (2026-11-05); and a GitHub Codespaces idle timeout. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
@@ -218,34 +196,15 @@ function Get-DemoDeploymentNotice {
         [Parameter(Mandatory)]
         [pscustomobject] $Environment,
 
-        [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
-        [string] $InstallMode = 'JumpstartImage',
-
-        [switch] $WaitForT2,
-
-        [string] $PagePath = '',
-
         [switch] $SkipFabric
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
-    $guided = $InstallMode -eq 'PaygWizard' -and $WaitForT2
-    if ($guided -and -not [bool]$Environment.Interactive) {
-        $lines.Add('This session doesn''t take keyboard input (its input is redirected, or it runs in an automation shell or under an assistant). That''s fine, but the PaygWizard guided stop needs a person at a browser for about 10 minutes, about 60 to 90 minutes from now, and no assistant can do its sign-ins. If nobody will be there, stop now (Ctrl+C) and choose one:')
-        $lines.Add('  t2SqlInstallMode JumpstartImage (the default): fully unattended with Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest; T2 gets performance data and the agent''s findings.')
-        $lines.Add('  -NoWaitForT2: T1, T3, T4, and Fabric now; T2 builds in the background, and a later ./scripts/deploy.ps1 guides you through its step.')
-        $lines.Add('  t2SqlInstallMode ProductKey: fully unattended with your own SQL Server Standard product key; T2 gets performance data and the agent''s findings.')
-        $lines.Add('  t2SqlInstallMode Developer: fully unattended, but T2 shows in Database Hub''s Estate only, with no T2 performance data or findings.')
-    }
     if (-not $SkipFabric -and -not [bool]$Environment.Interactive) {
         $lines.Add('The Insights app deploys with your Azure CLI sign-in (az login). Only if Fabric refuses that token does it need the Rayfin CLI''s browser sign-in, which isn''t started in a session like this one: the run still finishes, and ./scripts/configure-fabric-app.ps1 -SignIn, which you run yourself in a terminal, adds the app later.')
     }
     if ([bool]$Environment.Codespaces) {
         $lines.Add('GitHub Codespaces stops a codespace after 30 minutes without activity by default, and always after 12 hours. Terminal output counts as activity, and deploy.ps1 prints progress at least every 5 minutes, but raise the idle timeout to be safe: GitHub Settings > Codespaces > Default idle timeout (up to 240 minutes; it applies to codespaces you create afterward), or gh codespace create --idle-timeout 240m. An organization policy can lower it.')
-    }
-    if ($guided) {
-        $page = if ($PagePath) { $PagePath } else { 'out/deploy-status.html' }
-        $lines.Add(('PLAN FOR A PERSON: DEPLOY.T2.GUIDEDSTOP - about 60 to 90 minutes after the start, a person signs in to archost01 through Bastion and finishes SQL Server setup in arcsql01 (about 10 minutes, plus setup''s install). The run waits for them. Status page: {0}.' -f $page))
     }
     return $lines.ToArray()
 }
@@ -1197,8 +1156,8 @@ function Get-DemoDeploymentOutcome {
     confirm". Without a state, this run's DEPLOY.TRACK results stand in. -Sequential (deploy.ps1
     -Sequential, which records stages and no tracks) needs the recorded stage Validation instead of the tracks (or,
     without a state, this run's DEPLOY.STAGE.VALIDATION Pass), and the same DONE requirements, which its validation
-    checks (review finding 4). -Stopped (Ctrl+C) is NOT DONE with the resume command, and -GuidedStopOpen adds what the
-    open guided stop leaves until then (Phase 28 live finding). DONE also never comes while the state records what a
+    checks (review finding 4). -Stopped (Ctrl+C) is NOT DONE with the resume command (Phase 28 live finding). DONE also
+    never comes while the state records what a
     guided stop or session left open (Get-DemoGuidedStopLeftover: the guided stop's Bastion, a handed-over host password
     that isn't rotated): that's NOT DONE naming stop-demo.ps1 -RemoveBastionOnly (Phase 28 review). A NOT DONE's reason
     names only what blocks DONE, and its next step is that item's own fix (a requirement's latest result included),
@@ -1231,8 +1190,6 @@ function Get-DemoDeploymentOutcome {
         [switch] $Sequential,
 
         [switch] $Stopped,
-
-        [switch] $GuidedStopOpen,
 
         # What this run started or created (Get-DemoStartedVm): a NOT DONE or stopped run names it, since it bills until
         # a stop (Phase 28).
@@ -1285,7 +1242,7 @@ function Get-DemoDeploymentOutcome {
         $notes.Add($safetyStop)
     }
     if ($installMode -eq 'Developer') {
-        $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default), PaygWizard, or ProductKey mode gives them.')
+        $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default) or ProductKey mode gives them.')
     }
     $outcome = [ordered]@{ Kind = 'NotDone'; Done = $false; Reason = ''; Next = ''; NextCommand = $Command; Notes = $notes.ToArray(); NonBlocking = $nonBlocking; Confirm = $confirm; Unfinished = @(); Missing = @(); ExitCode = 2; Resume = $resume }
     if ($WhatIfRun) {
@@ -1301,9 +1258,6 @@ function Get-DemoDeploymentOutcome {
         # (Resolve-DemoArtifactResend; live finding, 2026-11-06).
         $outcome.Reason = 'You stopped deploy.ps1 (Ctrl+C) before it finished. What it finished is kept, and the resource group''s state records where it stopped.'
         $outcome.Next = 'Run {0} again when you''re ready: it continues where it stopped, and when the bootstrap bundle or the workload runner changed meanwhile (a fix you pulled, for example), it sends them to the VMs again first.' -f $Command
-        if ($GuidedStopOpen) {
-            $outcome.Next += ' It stopped at the guided stop: on-demand Bastion stays up, and the host password from the guided stop stays valid, until the next run cleans them up when it gets to T2, whether or not setup finished meanwhile (it isn''t DONE before), or ./scripts/stop-demo.ps1 does. Stopping for the day? Run ./scripts/stop-demo.ps1 now.'
-        }
         if ($billing) {
             $outcome.Notes = @($outcome.Notes) + @($billing)
         }
@@ -1403,7 +1357,7 @@ function Get-DemoDeploymentOutcome {
     }
     elseif ($unfinished.Count -gt 0 -and $Sequential) {
         $outcome.Reason = 'Not every stage finished: the last one recorded is {0}.' -f $(if ($lastStage) { $lastStage } else { 'none' })
-        $outcome.Next = 'Run {0}: it continues after the last stage that finished, with the guided stop that -Sequential doesn''t have.' -f $Command
+        $outcome.Next = 'Run {0}: it continues after the last stage that finished.' -f $Command
     }
     elseif ($unfinished.Count -gt 0) {
         $outcome.Reason = 'Not every target finished: {0}.' -f ($unfinished -join ', ')
@@ -1490,7 +1444,7 @@ function Get-DemoDeploymentOutcomeLine {
                 $lines.Add($activityLine)
             }
             $lines.Add('Each session: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.')
-            $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip the build and the guided stop.')
+            $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip T2''s build.')
         }
         'WhatIf' {
             foreach ($line in (Get-DemoBannerLine -Title 'WHAT IF: NOTHING WAS DEPLOYED')) { $lines.Add($line) }

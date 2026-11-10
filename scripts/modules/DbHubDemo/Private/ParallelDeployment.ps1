@@ -208,7 +208,7 @@ function Start-DemoT1MonitoringJob {
     Live: the plugin was NotRunning again less than 90 minutes after start-demo.ps1 found it Running, and the resumed run,
     whose T1 track had finished in an earlier run, ended NOT DONE on TELEMETRY.T1. A plugin that isn't running gets the
     SQL IaaS Agent service restarted, which takes minutes, so it runs beside the tracks and this process stays free to
-    prompt the person at the guided stop. The job writes DEPLOY.T1.MONITORING as one DBHUB-RESULT line, as a track does
+    read them. The job writes DEPLOY.T1.MONITORING as one DBHUB-RESULT line, as a track does
     (Receive-DemoDeploymentTrackOutput reads it), and updates the status page's T1 Monitoring step itself. -HandoffPath
     gives it the run's cancel marker and private directory, as the tracks have.
     #>
@@ -366,10 +366,8 @@ function Invoke-DemoParallelDeployment {
     page's model, which each stage and track updates; with networkMode private the
     policy inventory runs in its own process alongside the deployment (Start-DemoPolicyInventoryJob), and
     its results replace preflight's placeholders at the end; preflight's T4 startSku says where T4's fallback starts
-    (Standard_D4ads_v5, Standard_D2ds_v5 after its cost check, or no T4; ADR 0019), and a "no T4"
-    record gets that fallback again when this run deploys the template;
-    and this process prompts the person at the guided stop when the T2 track process reports it Ready in the progress
-    model; without one (-NoStatusPage), the T2 track process prompts the person itself.
+    (Standard_D4ads_v5, or Standard_D2ds_v5, whose cost check only reports; ADR 0019), and an older "no T4" record
+    has every size tried again when this run deploys the template.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([object[]])]
@@ -546,8 +544,8 @@ function Invoke-DemoParallelDeployment {
             $results.Add($notice)
         }
     }
-    # The tracks run for as long as the T2 wait, the guided stop (at least 45 minutes for the person, plus about 20 to
-    # prepare), and what follows it can take (Phase 28).
+    # The tracks run for as long as the T2 wait and what follows it can take (Phase 28), with the 65 minutes the guided
+    # stop had (retired 2026-11-09) kept as a margin: this is only an upper bound for a process that hangs.
     if ($WaitForT2) {
         $TrackTimeoutMinutes = [System.Math]::Min(600, [System.Math]::Max($TrackTimeoutMinutes, $T2WaitMinutes + 65 + 30 + $ArcWaitMinutes + 30 + $TelemetryWaitMinutes + 15))
     }
@@ -568,11 +566,9 @@ function Invoke-DemoParallelDeployment {
         WaitForT2             = [bool]$WaitForT2
         ImportNotebooks       = [bool]$ImportNotebooks
         ImportDashboard       = $true
-        # Phase 28: the status page's model, and who prompts the person at the guided stop: this process, which owns
-        # the console, the clipboard, and the browser, when the tracks run in their own processes and the model exists.
+        # Phase 28: the status page's model.
         ProgressPath          = $ProgressPath
         PagePath              = $PagePath
-        PromptInParent        = $false
         # Why a resumed track sends its VM's artifacts again, by track; its Artifacts step says it (2026-11-06).
         ResendNote            = $resend.Notes
     }
@@ -710,58 +706,6 @@ function Invoke-DemoParallelDeployment {
         & $addAll $kept
         & $addAll @($policy.Items)
     }
-    # The guided stop's prompt, in this process (Phase 28): the T2 track process turns the model's guidedStop Ready, and
-    # this process, which has the console, the clipboard, and the browser, hands over the credential and prompts the
-    # person, then reminds them every 5 minutes until the host's setup check passes or the time limit passes.
-    $guided = @{ Prompted = $false; NextReminder = [DateTime]::MinValue; Closed = $false }
-    $guidedTick = {
-        if (-not $ProgressPath -or $guided.Closed) {
-            return
-        }
-        $model = Read-DemoProgress -Path $ProgressPath
-        if ($null -eq $model) {
-            return
-        }
-        $stop = $model['guidedStop']
-        $stopState = [string]$stop['state']
-        if ($stopState -eq 'Ready' -and [long]$stop['deadlineAt'] -gt 0) {
-            $deadline = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$stop['deadlineAt']).UtcDateTime
-            if (-not $guided.Prompted) {
-                $guided.Prompted = $true
-                try {
-                    $credential = Invoke-DemoGuidedStopCredential -Config $Config -ExpiresUtc $deadline
-                }
-                catch {
-                    Write-DemoLog -Level Warning -Message ('The host credential for the guided stop couldn''t be prepared: {0}' -f $_.Exception.Message)
-                    $credential = [pscustomobject]@{ Mode = 'unknown'; UserName = ''; Text = ''; Results = @() }
-                    try {
-                        # The person may reset the password in the portal now; the state makes sure it's rotated afterward.
-                        Set-DemoDeploymentState -Config $Config -Value @{ HostPasswordSet = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
-                    }
-                    catch {
-                        Write-DemoLog -Level Warning -Message ('The handover wasn''t recorded, so if you reset archost01''s password in the portal, reset it again afterward to a random value you don''t keep: {0}' -f $_.Exception.Message)
-                    }
-                }
-                & $addAll @($credential.Results)
-                Set-DemoProgressValue -Path $ProgressPath -Section 'guidedStop' -Value @{ credential = $credential.Mode; credentialText = $credential.Text; hostUser = $credential.UserName }
-                Show-DemoGuidedStopPrompt -Url ([string]$stop['url']) -DeadlineUtc $deadline -HostVm ([string]$stop['hostVm']) -HostUser $credential.UserName -SignInWay $credential.Mode -SignInText $credential.Text -PagePath $PagePath -SignInFallback:([bool]$stop['signInFallback'])
-                $guided.NextReminder = [DateTime]::UtcNow.AddMinutes(5)
-            }
-            elseif ([DateTime]::UtcNow -ge $guided.NextReminder) {
-                Show-DemoGuidedStopReminder -DeadlineUtc $deadline -PagePath $PagePath -Status ([string]$stop['message']) -HostVm ([string]$stop['hostVm'])
-                $guided.NextReminder = [DateTime]::UtcNow.AddMinutes(5)
-            }
-        }
-        elseif ($guided.Prompted -and $stopState -in 'Done', 'TimedOut', 'Failed') {
-            $guided.Closed = $true
-            $closing = switch ($stopState) {
-                'Done' { 'The guided stop is done: SQL Server setup passed the host''s check. Nothing else needs you; deploy.ps1 finishes T2 on its own.' }
-                'TimedOut' { 'The guided stop''s time limit passed. deploy.ps1 finishes the rest; run ./scripts/deploy.ps1 again when you have about 15 minutes, and it guides you through the step again.' }
-                default { 'The guided stop couldn''t go on; the summary at the end says why and what to run.' }
-            }
-            Write-DemoLog -Message $closing
-        }
-    }
     # Reads what each track process wrote since the last read.
     $collect = {
         foreach ($track in $jobs.Keys) {
@@ -780,13 +724,12 @@ function Invoke-DemoParallelDeployment {
         while ($true) {
             & $collect
             try {
-                & $guidedTick
                 & $collectPolicy 0
                 & $collectMonitoring 0
                 & $signInTick
             }
             catch {
-                Write-DemoLog -Level Warning -Message ('The guided stop''s prompt, the policy inventory, T1''s monitoring check, or the Insights app''s sign-in couldn''t be read this time: {0}' -f $_.Exception.Message)
+                Write-DemoLog -Level Warning -Message ('The policy inventory, T1''s monitoring check, or the Insights app''s sign-in couldn''t be read this time: {0}' -f $_.Exception.Message)
             }
             if ($null -ne $buildJob -and $buildJob.State -notin 'NotStarted', 'Running' -and -not (Test-Path -LiteralPath (Join-Path -Path $handoff -ChildPath 'artifacts.xml'))) {
                 # A build process that died without a word: the tracks get its error instead of waiting.
@@ -901,8 +844,8 @@ function Invoke-DemoParallelDeployment {
             if ($group) {
                 $context.T3AdminGroupName = $group
             }
-            # Where T4's fallback starts when preflight already ruled sizes out, or its cost check left T4 out (Phase 28 and
-            # its follow-up): the furthest step any of its checks found.
+            # Where T4's fallback starts when preflight already ruled sizes out (Phase 28 and its follow-up; for a size
+            # t4SkuName sets, since 2026-11-09): the furthest step any of its checks found.
             $t4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') }) -Order ([string[]]@(@('') + @(Get-DemoT4FallbackOrder -Config $Config)))
             if ($deferPolicy) {
                 Write-DemoLog -Message ('networkMode is {0}, so the policy inventory runs alongside the deployment instead of before it; its results come at the end.' -f [string]$Config['networkMode'])
@@ -958,10 +901,7 @@ function Invoke-DemoParallelDeployment {
             & $ensureContext
             $context['HandoffPath'] = $handoff
             $context['HandoffTimeoutMinutes'] = $TrackTimeoutMinutes
-            # This process prompts the person at the guided stop ($guidedTick) when the T2 track process can tell it, through
-            # the progress model, that the stop is ready; without a model (-NoStatusPage, or a page that couldn't be set
-            # up) the T2 track process prompts the person itself, and its console lines reach this console.
-            $context['PromptInParent'] = [bool]$ProgressPath
+
             # A golden T2 starts its Restore once the template has deployed archost01 in this run; a deployment
             # record older than two minutes before now belongs to an earlier run.
             $context['EarlyT2'] = [bool]$plan.Infrastructure -and [string]$context.T2Source -eq 'golden'
@@ -978,7 +918,7 @@ function Invoke-DemoParallelDeployment {
         # Phase 28 live finding (2026-10-30): T1's monitoring plugin can stop after a restart, hours after start-demo.ps1
         # found it running, and a run whose T1 track has no Monitoring step (it finished in an earlier run) didn't notice
         # until DONE's telemetry check failed. Once the VMs run, it's checked on every run that ends with the validation:
-        # beside the tracks in its own process, so the guided stop's prompt never waits for it, or here without one.
+        # beside the tracks in its own process, so reading them never waits for it, or here without one.
         if ($checkT1Monitoring) {
             $occasion = if ($null -ne $stoppedStart -and $stoppedStart.Vms.Contains('sqlvm01')) { 'the start' } else { 'the deployment' }
             if ($useJobs) {
@@ -1151,8 +1091,8 @@ function Invoke-DemoParallelDeployment {
     finally {
         # Finished, failed, or stopped (Ctrl+C): no job process outlives deploy.ps1, within seconds, and the handoff
         # directory goes, with the tracks' private files in it. A job still running gets the cancel marker first, so its
-        # slow Azure cleanups (Run Command deletes, the guided stop's Bastion removal and password rotation) are left to
-        # the next deploy.ps1 or stop-demo.ps1 instead of holding the stop for minutes (Phase 28 live finding).
+        # slow Azure cleanups (Run Command deletes, a leftover Bastion's removal, the host password's rotation) are left
+        # to the next deploy.ps1 or stop-demo.ps1 instead of holding the stop for minutes (Phase 28 live finding).
         $runJobs = @(@($jobs.Values) + @($buildJob) + @($policyJob) + @($monitorCheck.Job) | Where-Object { $null -ne $_ })
         if ($handoff -and @($runJobs | Where-Object { $_.State -in 'NotStarted', 'Running', 'Stopping' }).Count -gt 0) {
             try {

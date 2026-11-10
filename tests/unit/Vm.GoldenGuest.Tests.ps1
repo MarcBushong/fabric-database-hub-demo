@@ -85,25 +85,17 @@ Describe 'The capture marker (review, 2026-11-04)' {
         function New-Marker([datetime] $StartedUtc, [string] $Source = 'source-vm') {
             [pscustomobject]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611040100'; startedUtc = $StartedUtc.ToString("yyyy-MM-dd'T'HH':'mm':'ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture); sourceAzureVmId = $Source }
         }
-        # Hyper-V's cmdlets exist only on a Hyper-V host; elsewhere these stand-ins let Pester mock them.
+        # Stand-ins for Hyper-V's cmdlets, which exist only on a Hyper-V host, defined in this block's own scope
+        # (function:local:) so Pester mocks the same commands on every OS and they don't reach later test files, as global
+        # ones did (a Stop-VM without -TurnOff broke Vm.GuestRebuild on Ubuntu, 2026-11-09).
         $stubs = @{
             'Get-VM'   = 'param([string] $Name)'
             'Stop-VM'  = 'param([string] $Name, [switch] $Force, [switch] $AsJob)'
             'Set-VM'   = 'param([string] $Name, [string] $AutomaticStartAction, [int] $AutomaticStartDelay)'
             'Start-VM' = 'param([string] $Name)'
         }
-        $script:addedStubs = @()
         foreach ($name in $stubs.Keys) {
-            if (-not (Get-Command -Name $name -ErrorAction SilentlyContinue)) {
-                New-Item -Path ('function:global:' + $name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stubs[$name])) | Out-Null
-                $script:addedStubs += $name
-            }
-        }
-    }
-
-    AfterAll {
-        foreach ($name in $script:addedStubs) {
-            Remove-Item -Path ('function:global:' + $name) -ErrorAction SilentlyContinue
+            Set-Item -Path ('function:local:' + $name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stubs[$name]))
         }
     }
 

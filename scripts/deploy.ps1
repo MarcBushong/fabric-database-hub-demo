@@ -132,8 +132,8 @@ every time, and the reused results say so). 0 reads every policy definition agai
 How long to wait for T1's bootstrap to be Ready (default 45).
 
 .PARAMETER T2WaitMinutes
-How long to wait for T2's guest build and, in PaygWizard mode, its guided stop (default 180: the build takes about
-60 to 90 minutes, and the guided stop waits at least 45 minutes for a person once it asks). 0 checks once.
+How long to wait for T2's guest (default 180: made from Arc Jumpstart's image, it takes about 27 minutes, and a build
+mode's guest about 60 to 90). 0 checks once.
 
 .PARAMETER MonitoringWaitMinutes
 How long to wait for T1's monitoring, including the SQL IaaS extension's update after a deployment.
@@ -142,14 +142,14 @@ How long to wait for T1's monitoring, including the SQL IaaS extension's update 
 How long the validation waits for fresh telemetry.
 
 .PARAMETER Sequential
-Run the stages one after another, as before the parallel tracks (ADR 0018). It has no guided stop.
+Run the stages one after another, as before the parallel tracks (ADR 0018).
 
 .PARAMETER WaitForT2
 Wait for T2 in GitHub Actions or another CI system too. Elsewhere it's the default.
 
 .PARAMETER NoWaitForT2
-Don't wait for T2's guest build: T1, T3, T4, and Fabric finish now, T2 builds in the background, and a later
-./scripts/deploy.ps1 finishes it (with the guided stop in PaygWizard mode).
+Don't wait for T2's guest: T1, T3, T4, and Fabric finish now, T2's guest is made in the background, and a later
+./scripts/deploy.ps1 finishes it.
 
 .PARAMETER NoStatusPage
 Write no progress model and no status page.
@@ -289,7 +289,7 @@ try {
     $waitForT2Now = -not $NoWaitForT2 -and (-not $environment.Ci -or $WaitForT2) -and -not $Sequential
     # A Ctrl+C while the run's experience starts still lets the PC sleep again (the outer finally block below).
     $awake = 'starting'
-    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -Note @($selfUpdate.Note) -WhatIf:$whatIf -Confirm:$false
+    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -Note @($selfUpdate.Note) -WhatIf:$whatIf -Confirm:$false
     $results = @($selfUpdate.Result | Where-Object { $null -ne $_ })
     $outcome = $null
     $finished = $false

@@ -318,8 +318,8 @@ function Invoke-DemoPreflight {
         $t4Pinned = Get-DemoT4PinnedSku -Config $Config
         $t4Order = @(@(Get-DemoT4AskedSku -Config $Config) + @(Get-DemoT4FallbackOrder -Config $Config))
         if ($t4Ladder -and -not $t4Pinned -and $t4Sku -cin 'Standard_D4ads_v5', 'Standard_D2ds_v5') {
-            # An earlier run's record (DbHubT4Size Standard_D4ads_v5, Standard_D2ds_v5, or None for a run that deploys the
-            # template) for a server that wasn't created: the fallback starts there, and its cost check below decides.
+            # An earlier run's record (DbHubT4Size Standard_D4ads_v5 or Standard_D2ds_v5) for a server that wasn't created:
+            # the fallback starts there, and its cost check below reports.
             $t4Starts.Add($t4Sku)
         }
         $capabilitySource = 'az postgres flexible-server list-skus'
@@ -400,9 +400,10 @@ function Invoke-DemoPreflight {
         }
         # The capability list doesn't show a size that's temporarily unavailable: Azure refused B1ms with
         # SkuNotAvailable on 2026-10-26 while the list included it. A refusal on record for this size and zone is a
-        # Fail for a size the configuration sets; otherwise deploy.ps1's fallback starts one step on, a Warning:
-        # Standard_D4ds_v5 to Standard_D4ads_v5, Standard_D4ads_v5 to Standard_D2ds_v5 (after its cost check), and
-        # Standard_D2ds_v5 to no T4 (ADR 0019). The retry in another zone happens only in deploy.ps1, right after a refusal.
+        # Warning, since T4 is part of every deployment (2026-11-09): for a size t4SkuName sets, deploy.ps1 tries it
+        # again, then its fallback; otherwise the fallback starts one step on, Standard_D4ds_v5 to Standard_D4ads_v5,
+        # Standard_D4ads_v5 to Standard_D2ds_v5 (after its cost check), and after Standard_D2ds_v5, every size again
+        # from the default. The retry in another zone happens only in deploy.ps1, right after a refusal.
         if (-not $t4Exists) {
             $refused = Get-DemoT4CreateFailure -Config $Config
             if ($null -ne $refused -and $refused.Sku -eq $t4Sku) {
@@ -658,10 +659,9 @@ function Invoke-DemoPreflight {
     }
 
     # Cost: live retail prices against the ceilings, with the subscription's Defender for Cloud plans. T4 is priced at the
-    # size it gets (ADR 0019): an existing server's own size or the default it moves to (PREFLIGHT.T4.SIZE), the step the
-    # fallback starts at, or none when the fallback leaves T4 out, so a fallback whose worst case is over a ceiling leaves
-    # T4 out instead of stopping the run. The estimates share one price cache, so the fallback's own estimate reads only
-    # the prices it adds. The
+    # size it gets (ADR 0019): an existing server's own size or the default it moves to (PREFLIGHT.T4.SIZE), or the step the
+    # fallback starts at; nothing leaves T4 out since 2026-11-09. The estimates share one price cache, so the fallback's
+    # own estimate reads only the prices it adds. The
     # activity profile's T3 incidents count (business-day by default since 2026-11-03), and a configuration that doesn't
     # set activityProfile gets one notice (PREFLIGHT.ACTIVITYPROFILE).
     $notice = New-DemoActivityProfileNotice -ActivityProfile (Get-DemoActivityProfile -Config $Config) -CheckPrefix 'PREFLIGHT'

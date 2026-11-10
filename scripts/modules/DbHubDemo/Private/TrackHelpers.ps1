@@ -101,11 +101,11 @@ function Invoke-DemoBootstrapLoaderRun {
     $tree['workload']['runnerChunkCount'] = $RunnerChunkCount
     if ($role -eq 'ArcHost') {
         # The run's own install mode and where it comes from (2026-11-09); the template's last output may hold an earlier
-        # run's mode. PaygWizard reaches the host only when chosen on purpose (t2PaygWizardOptIn): it builds a guest that
-        # waits for a person at the setup wizard.
+        # run's mode. PaygWizard never reaches the host: it builds a guest that waits for a person at the setup wizard, which
+        # is retired.
         $mode = (Get-DemoArcTarget -Config $Config).InstallMode
         $source = Get-DemoT2InstallModeSource -Config $Config
-        if ($mode -eq 'PaygWizard' -and -not (Test-DemoT2PaygWizardOptIn -Config $Config)) {
+        if ($mode -eq 'PaygWizard') {
             $mode = 'JumpstartImage'
             $source = 'legacy'
         }
@@ -959,8 +959,10 @@ function Invoke-DemoDeploymentTrack {
             # 2026-11-09: an earlier guided stop's request on the host would keep its guest waiting for a person, though the
             # host now runs that guest as JumpstartImage, which keeps or rebuilds it. So the request goes before the loader
             # starts a new bootstrap generation, with Bastion and a handed-over host password (Clear-DemoGuidedStopLeftover).
+            # Provisional: the T2 step's own cleanup, at its end, and DONE, from the state, give the final word (review of
+            # 27396a4: a Manual action required here outvoted a later cleanup that worked).
             try {
-                & $addAll @(Clear-DemoGuidedStopLeftover -Config $Config)
+                & $addAll @(Clear-DemoGuidedStopLeftover -Config $Config -Provisional)
             }
             catch {
                 & $note 'DEPLOY.T2.GUIDEDLEFTOVER' 'T2' 'Warning' ('What an earlier guided stop left open couldn''t be cleaned up before the loader: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly: it removes Bastion and rotates the host password, and leaves the VMs running.'
@@ -1361,14 +1363,13 @@ function Invoke-DemoDeploymentTrack {
                     $source = [string](& $option 'T2Source' '')
                     $golden = $source -in 'golden', 'existing-golden'
                     $waiting = -not $golden -and [bool](& $option 'WaitForT2' $false)
-                    $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
                     $arcArguments = @{ Config = $Config; WaitMinutes = [int](& $option 'ArcWaitMinutes' 45); Confirm = $false }
                     if ($golden) {
                         $arcArguments['Force'] = $true
                     }
                     elseif ($waiting) {
-                        # Phase 28: wait for the build (bounded by T2WaitMinutes) with progress, then, in PaygWizard mode, the
-                        # guided stop; then configure-arc's sequence waits for the host to finish after setup.
+                        # Phase 28: wait for the build (bounded by T2WaitMinutes) with progress; then configure-arc's sequence
+                        # waits for the host to finish.
                         $t2Deadline = [DateTime]::UtcNow.AddMinutes([int](& $option 'T2WaitMinutes' 180))
                         # 2026-11-09: a report from the bundle before this run's doesn't end the wait, and a rebuilt guest is
                         # followed up while it waits (Wait-DemoT2HostBuild).
@@ -1392,33 +1393,15 @@ function Invoke-DemoDeploymentTrack {
                         }
                         Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Done' -Status 'Pass' -Message $(if ([bool](Get-DemoMemberValue -InputObject $build -Name 'Rebuilt')) { 'The host made T2 again from Arc Jumpstart''s image (DEPLOY.T2.REBUILD says why).' } else { 'The host and its guest are built.' })
                         # 2026-11-09: a host that kept its existing finished guest in its own mode says so, and its setup is
-                        # done; the guided stop runs only when the configuration chooses PaygWizard on purpose
-                        # (t2PaygWizardOptIn), never for an older configuration's default or a kept guest.
-                        $adopted = [bool](Get-DemoMemberValue -InputObject $build.Health -Name 'modeAdopted')
-                        if ($adopted) {
-                            $installMode = [string](Get-DemoMemberValue -InputObject $build.Health -Name 'installMode')
+                        # done; no guest waits for a person (the guided stop is retired).
+                        if ([bool](Get-DemoMemberValue -InputObject $build.Health -Name 'modeAdopted')) {
                             $modeResult = Get-DemoT2ModeResult -Health $build.Health
                             if ($null -ne $modeResult) {
                                 $results.Add($modeResult)
                                 Write-DemoLog -Message ('T2: {0}' -f $modeResult.message)
                             }
                         }
-                        elseif ([bool](Get-DemoMemberValue -InputObject $build -Name 'Rebuilt')) {
-                            $installMode = 'JumpstartImage'
-                        }
                         Update-DemoT2InstallModeRecord -Config $Config -Health $build.Health -State $sent -Confirm:$false
-                        if ($installMode -eq 'PaygWizard' -and -not $adopted -and (Test-DemoT2PaygWizardOptIn -Config $Config)) {
-                            $guided = Invoke-DemoT2GuidedStop -Config $Config -Context $Context -Health $build.Health -DeadlineUtc $t2Deadline
-                            & $addAll @($guided.Results)
-                            if ($guided.Status -eq 'Failed') {
-                                $outcome = 'Fail'
-                                break
-                            }
-                            if ($guided.Status -in 'TimedOut', 'Stopped') {
-                                $outcome = 'Open'
-                                break
-                            }
-                        }
                         $left = [int][System.Math]::Max(30, ($t2Deadline - [DateTime]::UtcNow).TotalMinutes)
                         $arcArguments['WaitForHostMinutes'] = [System.Math]::Min(360, $left)
                         Set-DemoProgressStep -Path $progress -Id 'T2.SignInCleanup' -State 'Running' -Message 'archost01 removes the sign-in data setup and Arc onboarding leave, then configures and seeds the database.'
@@ -1520,7 +1503,7 @@ function Invoke-DemoDeploymentTrack {
                 }
                 'T4/Telemetry' {
                     if (-not (Test-DemoT4Enabled -Config $Config)) {
-                        # Phase 28's Burstable fallback left T4 out of this deployment (DEPLOY.T4.SKU says why).
+                        # T4 isn't deployed in this run: Azure refused every size its fallback tries (DEPLOY.T4.SKU says why).
                         & $note 'METRICS.T4' 'T4' 'Not selected' 'T4 isn''t deployed in this run (DEPLOY.T4.SKU says why), so it has no metrics.'
                         break
                     }
@@ -1573,9 +1556,9 @@ function Invoke-DemoDeploymentTrack {
             $outcome = 'Fail'
         }
         if ($Track -eq 'T2' -and $name -eq 'T2' -and @($results | Select-Object -Skip $resultsBefore | Where-Object { [string]$_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).Count -eq 0) {
-            # Whatever the step reached (-NoWaitForT2, a golden redeploy, a failure), and unless the guided stop's NotNeeded
-            # already did: what an earlier guided stop or session left open goes, so DONE never comes with it (Phase 28
-            # review). Nothing while deploy.ps1 is being stopped.
+            # Whatever the step reached (-NoWaitForT2, a golden redeploy, a failure), and unless a rebuild's follow-up
+            # (Complete-DemoT2GuestRebuild) already did: what an earlier guided stop or session left open goes, so DONE
+            # never comes with it (Phase 28 review). Nothing while deploy.ps1 is being stopped.
             try {
                 & $addAll @(Clear-DemoGuidedStopLeftover -Config $Config)
             }

@@ -118,8 +118,8 @@ function Get-DemoProgressCatalog {
     for the workload runner, which deploy.ps1 installs for the user when it's missing (DotNetSdk, 2026-11-09); Infrastructure;
     T1 (artifacts, bootstrap, activity, monitoring, telemetry); T3; T4; Fabric (the Insights app included, marked
     non-blocking: it's part of every deployment, but it never blocks DONE); T2 (a golden restore, or the host build,
-    which in JumpstartImage mode is the Jumpstart image's download and first boot, and in PaygWizard mode the guided stop
-    and the setup check, then the sign-in cleanup, Arc onboarding, PAYG and monitoring, and telemetry;
+    which in JumpstartImage mode is the Jumpstart image's download and first boot, then the sign-in cleanup, Arc
+    onboarding, PAYG and monitoring, and telemetry;
     Set-DemoProgressPlan skips what the T2 source doesn't use); Validation, with the history report's snapshot after it
     (Fabric.History, 2026-11-06; marked non-blocking, not with -SkipFabric). Each step has an id, a label, the track steps
     (Get-DemoTrackStep) it belongs to, and nonBlocking.
@@ -187,10 +187,6 @@ function Get-DemoProgressCatalog {
         $hostBuild = 'Host, then the Jumpstart image''s download and first boot (about 27 minutes, measured on 2026-11-06)'
     }
     $t2.Add((& $step 'T2.HostBuild' $hostBuild @('T2/T2')))
-    if ($InstallMode -eq 'PaygWizard') {
-        $t2.Add((& $step 'T2.GuidedStop' 'Guided stop: you choose pay-as-you-go and Standard (about 10 minutes)' @('T2/T2')))
-        $t2.Add((& $step 'T2.SetupCheck' 'Setup check: Standard, the default instance, the Azure extension' @('T2/T2')))
-    }
     $t2.Add((& $step 'T2.SignInCleanup' 'Sign-in data cleanup' @('T2/T2')))
     $t2.Add((& $step 'T2.ArcOnboarding' 'Arc onboarding' @('T2/T2')))
     $t2.Add((& $step 'T2.Monitoring' 'PAYG and monitoring' @('T2/T2')))
@@ -231,7 +227,7 @@ function Get-DemoProgressStepId {
         'T2/Restore' { return @('T2.Restore') }
         'T2/Artifacts' { return @('T2.Artifacts') }
         'T2/Bootstraps' { return @('T2.Bootstraps') }
-        'T2/T2' { return @('T2.HostBuild', 'T2.GuidedStop', 'T2.SetupCheck', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring') }
+        'T2/T2' { return @('T2.HostBuild', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring') }
         'T2/Telemetry' { return @('T2.Telemetry') }
         'T4/Server' { return @('T4.Server') }
         'T4/Telemetry' { return @('T4.Telemetry') }
@@ -245,8 +241,8 @@ function Get-DemoProgressStepLabel {
     .SYNOPSIS
     A status-page step's label (Get-DemoProgressCatalog) as it reads in a console sentence: without its parenthetical or
     its colon's detail, lowercased unless it starts with an abbreviation, and with T3 or T4 in front of their steps,
-    which T1's track runs. The install mode's catalog comes first, then PaygWizard's, the only one with the guided
-    stop's steps, so every step id has a label. Pure. Internal.
+    which T1's track runs. Every install mode's catalog has the same step ids since the guided stop's retirement
+    (2026-11-09). Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -258,7 +254,7 @@ function Get-DemoProgressStepLabel {
         [string] $InstallMode = 'JumpstartImage'
     )
 
-    foreach ($track in @(@($InstallMode, 'PaygWizard') | Select-Object -Unique | ForEach-Object { Get-DemoProgressCatalog -T4Enabled -InstallMode $_ })) {
+    foreach ($track in @(Get-DemoProgressCatalog -T4Enabled -InstallMode $InstallMode)) {
         foreach ($item in @($track['steps'])) {
             if ([string]$item['id'] -ne $Id) {
                 continue
@@ -308,8 +304,8 @@ function Set-DemoProgressPlan {
     .SYNOPSIS
     Marks the progress model's steps by this run's plan (Resolve-DemoTrackPlan): a step a resumed run picks up after is
     Done (an earlier run finished it), the step it picks up at says it didn't finish in the previous run and runs again,
-    a step outside the run is Skipped, and the T2 steps its source doesn't use are Skipped (a golden restore has no build
-    or guided stop; a build has no restore). A track in -ResendNote, which a resumed run sends back to its Artifacts step
+    a step outside the run is Skipped, and the T2 steps its source doesn't use are Skipped (a golden restore has no build;
+    a build has no restore). A track in -ResendNote, which a resumed run sends back to its Artifacts step
     because its VM's artifacts changed since the last run (Resolve-DemoArtifactResend), shows that note on its Artifacts
     step instead. Internal.
     #>
@@ -336,7 +332,7 @@ function Set-DemoProgressPlan {
     }
     # The T2 steps its source doesn't use.
     $unused = if ($T2Source -in 'golden', 'existing-golden') {
-        @{ 'T2.HostBuild' = 'Golden'; 'T2.GuidedStop' = 'Golden'; 'T2.SetupCheck' = 'Golden'; 'T2.SignInCleanup' = 'Golden' }
+        @{ 'T2.HostBuild' = 'Golden'; 'T2.SignInCleanup' = 'Golden' }
     }
     elseif ($T2Source) {
         @{ 'T2.Restore' = 'Build' }
@@ -399,7 +395,7 @@ function Set-DemoProgressPlan {
                     'Again' { 'Didn''t finish in the previous run; running it again.' }
                     'Resend' { [string]$Change['Notes'][[string]$item['id']] }
                     'Skip' { 'Not part of this run.' }
-                    'Golden' { 'Restored from the golden snapshot: no build and no guided stop.' }
+                    'Golden' { 'Restored from the golden snapshot: no build.' }
                     'Build' { 'No golden snapshot: the host builds its guest instead.' }
                     default { '' }
                 }
@@ -447,9 +443,6 @@ function New-DemoProgressModel {
 
         [System.Collections.IDictionary] $Expect = @{},
 
-        [ValidateSet('NotSelected', 'Pending')]
-        [string] $GuidedStop = 'NotSelected',
-
         [long] $NowUnix = 0
     )
 
@@ -480,7 +473,7 @@ function New-DemoProgressModel {
         }
         $tracks.Add([ordered]@{ name = [string]$track['name']; label = [string]$track['label']; steps = $steps.ToArray() })
     }
-    $expectation = [ordered]@{ firstRun = $false; minutesLow = 0; minutesHigh = 0; guidedStop = ($GuidedStop -eq 'Pending'); humanText = ''; text = '' }
+    $expectation = [ordered]@{ firstRun = $false; minutesLow = 0; minutesHigh = 0; text = '' }
     foreach ($key in $Expect.Keys) {
         $expectation[[string]$key] = $Expect[$key]
     }
@@ -497,7 +490,6 @@ function New-DemoProgressModel {
         heartbeatAt   = $NowUnix
         expect        = $expectation
         run           = [ordered]@{ state = 'Running'; endedAt = 0; reason = ''; next = ''; nextCommand = ''; exitCode = $null; diagnostics = ''; startedVms = @(); activity = '' }
-        guidedStop    = [ordered]@{ state = $GuidedStop; message = ''; url = ''; deadlineAt = 0; promptedAt = 0; hostVm = 'archost01'; hostUser = ''; credential = ''; credentialText = ''; signInFallback = $false }
         nonBlocking   = @()
         confirm       = @()
         tracks        = $tracks.ToArray()
@@ -838,7 +830,7 @@ function Add-DemoProgressStartedVm {
 }
 
 function Set-DemoProgressValue {
-    # Merges -Value into one section of the progress model: run, guidedStop, or expect; or replaces nonBlocking (what
+    # Merges -Value into one section of the progress model: run or expect; or replaces nonBlocking (what
     # didn't work but never blocks DONE, Get-DemoNonBlockingItem; 2026-11-05), or confirm (the lines DONE lists under
     # "Please confirm"; Phase 28 live finding). Internal.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
@@ -848,7 +840,7 @@ function Set-DemoProgressValue {
         [string] $Path,
 
         [Parameter(Mandatory)]
-        [ValidateSet('run', 'guidedStop', 'expect', 'nonBlocking', 'confirm')]
+        [ValidateSet('run', 'expect', 'nonBlocking', 'confirm')]
         [string] $Section,
 
         [Parameter(Mandatory)]
@@ -959,64 +951,12 @@ function Test-DemoProgressStale {
     $running = [string]$Model['run']['state'] -eq 'Running'
     $quietBeat = $NowUnix - [long]$Model['heartbeatAt']
     $quietStep = $NowUnix - [long]$Model['updatedAt']
-    $waiting = [string]$Model['guidedStop']['state'] -eq 'Ready'
     return [pscustomobject]@{
         Heartbeat        = $running -and $quietBeat -gt ($HeartbeatMinutes * 60)
-        Progress         = $running -and -not $waiting -and $quietStep -gt ($StepMinutes * 60)
+        Progress         = $running -and $quietStep -gt ($StepMinutes * 60)
         HeartbeatMinutes = [int][System.Math]::Floor([System.Math]::Max(0, $quietBeat) / 60)
         StepMinutes      = [int][System.Math]::Floor([System.Math]::Max(0, $quietStep) / 60)
     }
-}
-
-function Get-DemoGuidedStopInstruction {
-    <#
-    .SYNOPSIS
-    The person's steps at the PaygWizard guided stop, for the console prompt, the status page, and the reminders: the
-    Bastion sign-in to the host with the credential's way in, then the pre-filled setup's two choices and the Azure
-    sign-in. Pure. Internal.
-    #>
-    [CmdletBinding()]
-    [OutputType([string[]])]
-    param(
-        [string] $HostVm = 'archost01',
-
-        [string] $GuestName = 'arcsql01',
-
-        [AllowEmptyString()]
-        [string] $HostUser = '',
-
-        [ValidateSet('', 'clipboard', 'keyVault', 'portalReset', 'unknown')]
-        [string] $SignInWay = '',
-
-        [AllowEmptyString()]
-        [string] $SignInText = '',
-
-        # The host's automatic preparation of setup's sign-in didn't finish in time (Phase 28 review): the steps lead
-        # with Add... in Internet Explorer's dialog, the way past a blocked sign-in that worked live.
-        [switch] $SignInFallback
-    )
-
-    $user = if ($HostUser) { $HostUser } else { 'the VM''s administrator (Azure portal: {0}, Settings, Reset password shows its user name)' -f $HostVm }
-    $password = switch ($SignInWay) {
-        'clipboard' { 'The one-time password is on your clipboard: paste it into the Password field. It''s never shown or saved, and it''s rotated afterward.' }
-        'keyVault' { if ($SignInText) { $SignInText } else { 'The one-time password is in the demo''s key vault; see the console for where.' } }
-        'portalReset' { 'This session has no working clipboard, so no password was set or shown. First, in the Azure portal, open {0}, then Help, then Reset password: keep the user name {1}, type a password of your own choosing twice, and select Update (about a minute). Use that password. It''s rotated afterward.' -f $HostVm, $user }
-        default { 'If you don''t have its password, set one of your own: in the Azure portal, open {0}, then Help, then Reset password (keep the user name). ./scripts/stop-demo.ps1 rotates it afterward.' -f $HostVm }
-    }
-    $steps = @(
-        ('1. Sign in to {0} through Bastion: in the Azure portal, open {0}, select Connect, then Bastion (the browser opens {0}''s page). User name: {1}. {2}' -f $HostVm, $user, $password)
-        ('2. {0} opens Virtual Machine Connection to {1} by itself. {1} is already signed in, and SQL Server setup is open and pre-filled.' -f $HostVm, $GuestName)
-        '3. On the Edition page, select "Use pay-as-you-go billing through Microsoft Azure", then Standard. Select Next.'
-        '4. Accept the license terms, then select Next.'
-        '5. On the Azure Extension for SQL Server page, select "Use Azure Login" and sign in with your own Azure account. Never enter a service principal secret. If the Azure Login window stays blank, or Internet Explorer says content from https://login.microsoftonline.com is blocked, follow the dialog''s directions: select Add..., then Add, to put the Microsoft sign-in page in Trusted sites, and Close. Then select "Use Azure Login" again. Repeat for any other sign-in site it names. (Confirmed live on 2026-10-30; turning IE Enhanced Security Configuration off while setup is open doesn''t help.)'
-        '6. Select Next on the pre-filled pages, then Install (about 10 to 15 minutes). When setup says Complete, select Close.'
-        ('7. Close the Bastion tab. deploy.ps1 checks what was installed (Standard, the default instance, the Azure extension) and continues on its own; if something''s wrong, the host''s message here says how to fix it.')
-    )
-    if ($SignInFallback) {
-        $first = 'First: the automatic preparation of setup''s Azure sign-in didn''t finish, so Internet Explorer may block it. On the Azure Extension for SQL Server page, if the Azure Login window stays blank, or Internet Explorer says content from https://login.microsoftonline.com is blocked, select Add..., then Add, then Close, and select "Use Azure Login" again; repeat for any other sign-in site it names.'
-        return @(@($first) + $steps)
-    }
-    return $steps
 }
 
 function Get-DemoProgressProblem {
@@ -1051,8 +991,9 @@ function Get-DemoProgressProblem {
 function Get-DemoProgressBanner {
     <#
     .SYNOPSIS
-    The status page's top banner, in exactly one of four states (brief item 11): Deploying (no action needed), Waiting
-    (for you, at the guided stop), Done, or Stopped (not done). A running model whose heartbeat went quiet is Stopped:
+    The status page's top banner, in exactly one of three states (brief item 11): Deploying (no action needed), Done, or
+    Stopped (not done); Waiting, for a person at the guided stop, is retired with it (2026-11-09). A running model whose
+    heartbeat went quiet is Stopped:
     deploy.ps1 isn't running any more. Problems are the "Needs attention" lines, what didn't work but never blocks DONE
     (Get-DemoProgressProblem; 2026-11-05), in every state. Pure. Internal.
     #>
@@ -1072,7 +1013,6 @@ function Get-DemoProgressBanner {
         $NowUnix = Get-DemoUnixTime
     }
     $run = $Model['run']
-    $guided = $Model['guidedStop']
     $command = if ([string]$run['nextCommand']) { [string]$run['nextCommand'] } elseif ([string]$Model['command']) { [string]$Model['command'] } else { './scripts/deploy.ps1' }
     $resume = 'If this window closes or the PC restarts, run ./scripts/deploy.ps1 again; it continues where it stopped.'
     $state = [string]$run['state']
@@ -1096,8 +1036,8 @@ function Get-DemoProgressBanner {
         if ([string]$run['activity']) {
             $lines.Add([string]$run['activity'])
         }
-        $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip the build and the guided stop.')
-        return [pscustomobject]@{ Kind = 'Done'; Title = 'Done'; Lines = $lines.ToArray(); Problems = $problems; Command = ''; Link = ''; Countdown = '' }
+        $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip T2''s build.')
+        return [pscustomobject]@{ Kind = 'Done'; Title = 'Done'; Lines = $lines.ToArray(); Problems = $problems; Command = '' }
     }
     $stale = Test-DemoProgressStale -Model $Model -NowUnix $NowUnix -HeartbeatMinutes $HeartbeatMinutes
     if ($state -eq 'NotDone' -or $stale.Heartbeat) {
@@ -1116,24 +1056,7 @@ function Get-DemoProgressBanner {
         $lines.Add(('Run: {0}' -f $command))
         $lines.Add($resume)
         $lines.Add('For help, attach the redacted bundle from ./scripts/collect-diagnostics.ps1 to a Deployment problem issue.')
-        return [pscustomobject]@{ Kind = 'Stopped'; Title = 'Stopped, not done'; Lines = $lines.ToArray(); Problems = $problems; Command = $command; Link = ''; Countdown = '' }
-    }
-    if ([string]$guided['state'] -eq 'Ready') {
-        $lines = [System.Collections.Generic.List[string]]::new()
-        $lines.Add('One step needs you now, for about 10 minutes: SQL Server setup in the T2 guest, through Bastion. Nothing else needs you.')
-        foreach ($line in @(Get-DemoGuidedStopInstruction -HostVm ([string]$guided['hostVm']) -HostUser ([string]$guided['hostUser']) -SignInWay ([string]$guided['credential']) -SignInText ([string]$guided['credentialText']) -SignInFallback:([bool]$guided['signInFallback']))) {
-            $lines.Add($line)
-        }
-        if ([string]$guided['message']) {
-            $lines.Add(('Now: {0}' -f [string]$guided['message']))
-        }
-        $countdown = ''
-        $deadline = [long]$guided['deadlineAt']
-        if ($deadline -gt 0) {
-            $left = [System.Math]::Max(0, $deadline - $NowUnix)
-            $countdown = 'Time limit: {0} left (until {1}). After that, deploy.ps1 stops; run ./scripts/deploy.ps1 again and it waits for this step again.' -f (Format-DemoProgressDuration -Seconds $left), (Format-DemoProgressClock -Unix $deadline)
-        }
-        return [pscustomobject]@{ Kind = 'Waiting'; Title = 'Waiting for you'; Lines = $lines.ToArray(); Problems = $problems; Command = ''; Link = [string]$guided['url']; Countdown = $countdown }
+        return [pscustomobject]@{ Kind = 'Stopped'; Title = 'Stopped, not done'; Lines = $lines.ToArray(); Problems = $problems; Command = $command }
     }
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add('You can step away. Keep this PC on and this window open; deploy.ps1 keeps the PC awake while it runs.')
@@ -1141,18 +1064,12 @@ function Get-DemoProgressBanner {
     if ([string]$expect['text']) {
         $lines.Add([string]$expect['text'])
     }
-    if ([bool]$expect['guidedStop'] -and [string]$guided['state'] -in 'Pending', 'Preparing') {
-        $lines.Add(('A person is needed once: {0}' -f $(if ([string]$expect['humanText']) { [string]$expect['humanText'] } else { 'about 60 to 90 minutes after the start, for about 10 minutes.' })))
-    }
-    if ([string]$guided['state'] -eq 'Preparing' -and [string]$guided['message']) {
-        $lines.Add(('Guided stop: {0}' -f [string]$guided['message']))
-    }
     $active = @(foreach ($track in @($Model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['state'] -eq 'Running') { $item } } })
     foreach ($item in $active) {
         $side = if ([bool]$item['azureSide']) { ' (Azure-side, no action needed)' } else { '' }
         $lines.Add(('Running: {0}{1}{2}' -f [string]$item['label'], $side, $(if ([string]$item['message']) { ': ' + [string]$item['message'] } else { '' })))
     }
-    return [pscustomobject]@{ Kind = 'Deploying'; Title = 'Deploying, no action needed'; Lines = $lines.ToArray(); Problems = $problems; Command = ''; Link = ''; Countdown = '' }
+    return [pscustomobject]@{ Kind = 'Deploying'; Title = 'Deploying, no action needed'; Lines = $lines.ToArray(); Problems = $problems; Command = '' }
 }
 
 function ConvertTo-DemoHtmlText {
@@ -1174,8 +1091,8 @@ function ConvertTo-DemoProgressHtml {
     The status page for a progress model: the banner, the "Needs attention" box of what didn't work but never blocks
     DONE (the Insights app, with its actual error and fix; 2026-11-05), the steps per track with their state, elapsed
     time, and message, the last update time, and a stale warning. Every text is HTML-encoded; the page has inline CSS
-    only, no script, and no external resource, and while the run goes on it refreshes itself every -RefreshSeconds.
-    Only an https://portal.azure.com link is ever made a link. Pure. Internal.
+    only, no script, no external resource, and no link, and while the run goes on it refreshes itself every
+    -RefreshSeconds. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -1209,8 +1126,8 @@ function ConvertTo-DemoProgressHtml {
     $null = $html.AppendLine('body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1b1b1b;background:#fafafa}')
     $null = $html.AppendLine('.banner{padding:16px 20px;border-radius:6px;margin-bottom:16px;color:#fff}')
     $null = $html.AppendLine('.banner h1{margin:0 0 8px 0;font-size:28px}.banner p{margin:4px 0}.banner a{color:#fff;font-weight:bold}')
-    $null = $html.AppendLine('.Deploying{background:#0b5cad}.Waiting{background:#b45309}.Done{background:#15803d}.Stopped{background:#b91c1c}')
-    $null = $html.AppendLine('.countdown{font-size:20px;font-weight:bold}.command{font-family:Consolas,monospace;background:rgba(0,0,0,.25);padding:2px 6px;border-radius:4px}')
+    $null = $html.AppendLine('.Deploying{background:#0b5cad}.Done{background:#15803d}.Stopped{background:#b91c1c}')
+    $null = $html.AppendLine('.command{font-family:Consolas,monospace;background:rgba(0,0,0,.25);padding:2px 6px;border-radius:4px}')
     $null = $html.AppendLine('table{border-collapse:collapse;width:100%;background:#fff}th,td{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}')
     $null = $html.AppendLine('tr.track th{background:#eef2f7;font-size:15px}.state{font-weight:bold;white-space:nowrap}')
     $null = $html.AppendLine('.s-Pending{color:#6b7280}.s-Running{color:#0b5cad}.s-Done{color:#15803d}.s-Action{color:#b45309}.s-Failed{color:#b91c1c}.s-Skipped{color:#9ca3af}')
@@ -1221,12 +1138,6 @@ function ConvertTo-DemoProgressHtml {
     $null = $html.AppendLine('<body>')
     $null = $html.AppendLine(('<div class="banner {0}">' -f $banner.Kind))
     $null = $html.AppendLine(('<h1>{0}</h1>' -f (& $e $banner.Title)))
-    if ($banner.Countdown) {
-        $null = $html.AppendLine(('<p class="countdown">{0}</p>' -f (& $e $banner.Countdown)))
-    }
-    if ($banner.Link -and $banner.Link -match '^https://portal\.azure\.com/[^\s"<>]*$') {
-        $null = $html.AppendLine(('<p><a href="{0}">Open {1} in the Azure portal, then select Connect, then Bastion</a></p>' -f (& $e $banner.Link), (& $e $Model['guidedStop']['hostVm'])))
-    }
     foreach ($line in @($banner.Lines)) {
         $null = $html.AppendLine(('<p>{0}</p>' -f (& $e $line)))
     }
@@ -1304,12 +1215,6 @@ function Format-DemoProgressConsole {
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add($rule)
     $lines.Add((& $cut ('  {0}' -f $banner.Title.ToUpperInvariant())))
-    if ($banner.Countdown) {
-        $lines.Add((& $cut ('  {0}' -f $banner.Countdown)))
-    }
-    if ($banner.Link) {
-        $lines.Add((& $cut ('  {0}' -f $banner.Link)))
-    }
     foreach ($line in @($banner.Lines)) {
         $lines.Add((& $cut ('  {0}' -f $line)))
     }

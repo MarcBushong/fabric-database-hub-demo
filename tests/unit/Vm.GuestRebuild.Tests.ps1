@@ -80,9 +80,12 @@ AfterAll {
 
 Describe 'The stand-ins for Hyper-V''s and the task scheduler''s cmdlets' {
     It 'take the parameters Remove-DemoHostGuest passes, even over a global stand-in an earlier test file left without them (CI on Ubuntu, 2026-11-09)' {
-        $saved = Get-Item -Path 'function:global:Stop-VM' -ErrorAction SilentlyContinue
+        # A module's scope sees the global scope, not this file's stand-ins. Get-Item and Remove-Item ignore a
+        # 'function:global:' path, silently (checked 2026-11-09), so the global one is read and removed from there.
+        $globalScope = New-Module -ScriptBlock { }
+        $saved = & $globalScope { Get-Item -Path 'function:Stop-VM' -ErrorAction SilentlyContinue }
         try {
-            # What Vm.GoldenGuest.Tests.ps1 leaves behind in a full run.
+            # What Vm.GoldenGuest.Tests.ps1 left behind in a full run, until 2026-11-09.
             Set-Item -Path 'function:global:Stop-VM' -Value ([scriptblock]::Create('[CmdletBinding()] param([string] $Name, [switch] $Force, [switch] $AsJob)'))
             $expected = [ordered]@{
                 'Get-VM'                   = @('Name')
@@ -105,9 +108,12 @@ Describe 'The stand-ins for Hyper-V''s and the task scheduler''s cmdlets' {
                 Set-Item -Path 'function:global:Stop-VM' -Value $saved.ScriptBlock
             }
             else {
-                Remove-Item -Path 'function:global:Stop-VM' -ErrorAction SilentlyContinue
+                & $globalScope { Remove-Item -Path 'function:Stop-VM' -ErrorAction SilentlyContinue }
             }
         }
+        # Nothing of it is left behind for later files: the global scope holds what it held before.
+        $after = & $globalScope { Get-Item -Path 'function:Stop-VM' -ErrorAction SilentlyContinue }
+        ($null -eq $after) | Should -Be ($null -eq $saved)
     }
 }
 
