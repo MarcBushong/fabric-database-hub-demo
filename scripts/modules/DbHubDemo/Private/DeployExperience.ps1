@@ -1250,7 +1250,11 @@ function Get-DemoDeploymentOutcome {
         [AllowNull()]
         [object] $T4Created = $null,
 
-        [string] $T4Why = ''
+        [string] $T4Why = '',
+
+        # The size change's notice (2026-11-09; Format-DemoT4SizeChangeText): what was tried and refused, what was deployed,
+        # and both monthly estimates, which the caller made, so this stays pure.
+        [string] $T4Notice = ''
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
@@ -1271,7 +1275,7 @@ function Get-DemoDeploymentOutcome {
     # Said loudly (ADR 0019): T4 runs at a fallback size, with whether autonomous tuning is on and its price; "created" only with
     # evidence that the server exists (review of 20e855c).
     $t4Created = if ($null -ne $T4Created) { [bool]$T4Created } else { Get-DemoT4ServerEvidence -Result $all -State $State }
-    $t4Fallback = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd $T4HourlyUsd -Created $t4Created -Why $T4Why
+    $t4Fallback = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd $T4HourlyUsd -Created $t4Created -Why $T4Why -Notice $T4Notice
     if ($t4Fallback) {
         $notes.Add($t4Fallback)
     }

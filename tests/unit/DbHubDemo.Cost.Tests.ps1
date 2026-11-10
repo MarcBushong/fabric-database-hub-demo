@@ -153,9 +153,10 @@ Describe 'Get-DemoCostEstimate' {
         $monthly = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
         $monthly.message | Should -Match 'T4 \(PostgreSQL, Standard_B1ms\) costs 27\.46 USD a month even while stopped'
         $monthly.message | Should -Match 'whether the nightly safety stop is in place wasn''t checked, so the worst case counts it running for the rest of the month: 720 hours, 14\.40 USD of T4 compute'
-        $monthly.message | Should -Match 'To keep the month cheaper: set t4SkuName to Standard_B1ms \(which turns autonomous tuning off\), or set a lower monthlyCeilingUsd\.'
-        # T4 is part of every deployment (2026-11-09), so leaving it out is never a way to keep the month cheaper.
+        # T4 is part of every deployment (2026-11-09), so leaving it out is never a way to keep the month cheaper, and no text
+        # asks for a size to be set: an agent that pinned Standard_B1ms from it left T4 out when Azure refused that size.
         $monthly.message | Should -Not -Match 't4Enabled'
+        $monthly.message | Should -Not -Match 'set t4SkuName'
         $estimate.T4RestartAssumption | Should -Be 'RestOfMonth'
         $estimate.T4RestartHours | Should -Be 720
         ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.DEFENDER').message | Should -Match 'OpenSourceRelationalDatabases'
@@ -217,10 +218,62 @@ Describe 'Get-DemoCostEstimate' {
         $monthly.status | Should -Be 'Fail'
         $monthly.message | Should -Match 'and the nightly safety stop can''t stop T4: its role isn''t assigned \(.*\), so the worst case counts it running for the rest of the month: 720 hours, 129\.60 USD of T4 compute'
         $monthly.evidence.t4RestartMissing | Should -Be 'Role'
-        # The ceiling to raise first, since NOT DONE's next step comes from here, then the fix that caps the restart, then the
-        # cheaper size; never t4Enabled, which deploy.ps1 ignores (review of 849d4c2, 2026-11-09).
-        $monthly.remediation | Should -Match '^Raise monthlyCeilingUsd to at least \d+ in your configuration \(the budget follows it at the next deploy\.ps1 -FromStage Infrastructure\)\. Or put the nightly safety stop fully in place, so each restart counts as about a day: An Owner of the subscription runs \./scripts/grant-safety-stop\.ps1.* Or, to keep the month cheaper, set t4SkuName to Standard_B1ms, which turns autonomous tuning off\.$'
+        # The ceiling to raise, since NOT DONE's next step comes from here, then the fix that caps the restart; never
+        # t4Enabled, which deploy.ps1 ignores (review of 849d4c2), and never a size to set (2026-11-09).
+        $monthly.remediation | Should -Match '^Raise monthlyCeilingUsd to at least \d+ in your configuration \(the budget follows it at the next deploy\.ps1 -FromStage Infrastructure\)\. Or put the nightly safety stop fully in place, so each restart counts as about a day: An Owner of the subscription runs \./scripts/grant-safety-stop\.ps1.+once; deploy\.ps1 assigns it when the person who runs it may\.$'
         $monthly.remediation | Should -Not -Match 't4Enabled'
+        $monthly.remediation | Should -Not -Match 't4SkuName'
+    }
+
+    It 'keeps today''s monthly ceiling at <Ceiling> USD: a Warning only for init''s old 250 when only T4''s default size puts the month over it (R727, 2026-11-09)' -ForEach @(
+        @{ Ceiling = 250; Legacy = $true }
+        @{ Ceiling = 249; Legacy = $false }
+        @{ Ceiling = 300; Legacy = $false }
+    ) {
+        # T4's default since 2026-11-04, Standard_D4ds_v5, with its 7-day restart's worst case for the rest of the month.
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; monthlyCeilingUsd = $Ceiling }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $month = [System.Math]::Round($estimate.LightUseMonthly + $estimate.T4AutoRestartWorstCaseMonthly, 2)
+        $month | Should -BeGreaterThan 300 -Because 'the fixtures put the default size over every ceiling here'
+        # Standard_B1ms, T4's default when init.ps1 wrote 250 (2026-10-27 to 2026-11-04), fits 250.
+        $old = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_B1ms'; monthlyCeilingUsd = 250 }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        ($old.LightUseMonthly + $old.T4AutoRestartWorstCaseMonthly) | Should -BeLessOrEqual 250
+        $monthly = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        if (-not $Legacy) {
+            $monthly.status | Should -Be 'Fail'
+            $monthly.message | Should -Not -Match 'This is a Warning'
+            $monthly.evidence.Contains('ceilingReference') | Should -BeFalse
+            return
+        }
+        $monthly.status | Should -Be 'Warning'
+        $monthly.message | Should -Match ([regex]::Escape(' This is a Warning, not a Fail: monthlyCeilingUsd is 250, which init.ps1 wrote by default from 2026-10-27 to 2026-11-04, when T4''s default size was Standard_B1ms; with T4 at that size the month would be '))
+        $monthly.message | Should -Match ('T4 at Standard_D4ds_v5 brings it to {0} USD\.' -f [regex]::Escape($month.ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)))
+        $monthly.remediation | Should -Match ('^Raise monthlyCeilingUsd to at least {0} in your configuration \(the budget follows it at the next deploy\.ps1 -FromStage Infrastructure\), or keep it: deploy\.ps1 and start-demo\.ps1 go on, the Azure budget alerts at 50, 80, and 100 percent of it, and start-demo\.ps1 stops starting the demo once this month''s actual cost reaches it\.' -f [System.Math]::Ceiling($month))
+        $monthly.remediation | Should -Not -Match 't4SkuName'
+        $monthly.evidence.ceilingReference.skuName | Should -Be 'Standard_B1ms'
+        $monthly.evidence.ceilingReference.reason | Should -Be 'init250'
+        # Only the default size: a t4SkuName you set keeps the Fail.
+        $pinned = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D4ds_v5'; monthlyCeilingUsd = 250 }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        ($pinned.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Fail'
+    }
+
+    It 'makes the monthly ceiling a Warning when only a size the fallback chose for t4SkuName puts the month over it, and a Fail otherwise (2026-11-09)' {
+        $config = New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_B1ms'; monthlyCeilingUsd = 150 }
+        # Azure refused Standard_B1ms, and the fallback created Standard_D2ds_v5, which the record stands in with.
+        $resolved = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Resolve-DemoEffectiveConfig -Config $Config -State ([pscustomobject]@{ T4Sku = 'Standard_D2ds_v5'; T4Refused = 'Standard_B1ms@any;2026-11-09T21:25:00Z' }) }
+        $resolved['t4SkuName'] | Should -Be 'Standard_D2ds_v5'
+        $estimate = Get-DemoCostEstimate -Config $resolved -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        ($estimate.LightUseMonthly + $estimate.T4AutoRestartWorstCaseMonthly) | Should -BeGreaterThan 150
+        $monthly = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.status | Should -Be 'Warning'
+        $monthly.message | Should -Match ' This is a Warning, not a Fail: T4 runs as Standard_D2ds_v5 only because Azure refused Standard_B1ms, the size t4SkuName sets \(deploy\.ps1''s fallback chose Standard_D2ds_v5\), and with T4 at Standard_B1ms the month would be \d+\.\d\d USD, within the ceiling; Standard_D2ds_v5 brings it to \d+\.\d\d USD\.'
+        $monthly.evidence.ceilingReference.reason | Should -Be 'fallback'
+        # The same size set on purpose is over the ceiling: a Fail, as before.
+        $chosen = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5'; monthlyCeilingUsd = 150 }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        ($chosen.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Fail'
+        # And a month over the ceiling even at the asked size stays a Fail.
+        $tight = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_B1ms'; monthlyCeilingUsd = 20 }) } { Resolve-DemoEffectiveConfig -Config $Config -State ([pscustomobject]@{ T4Sku = 'Standard_D2ds_v5'; T4Refused = 'Standard_B1ms@any' }) }
+        $strict = Get-DemoCostEstimate -Config $tight -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        ($strict.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Fail'
     }
     It 'fails the monthly ceiling when T4''s restart worst case pushes the estimate over it' {
         $first = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
@@ -722,5 +775,19 @@ Describe 'Get-DemoDefenderPlan' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 1 -Exactly -ParameterFilter {
             ($ArgumentList -join ' ') -match '^security pricing list --subscription 11111111-2222-3333-4444-555555555555 --output json$'
         }
+    }
+}
+
+Describe 'No fix text asks for a cheaper T4 size (2026-11-09)' {
+    It 'names no Burstable size to set, in the module''s scripts or the configuration schema' {
+        # A tester's configuration pinned Standard_B1ms, most likely after an agent followed PREFLIGHT.COST.MONTHLY's old fix
+        # "set t4SkuName to Standard_B1ms"; Azure then refused that size. Raising monthlyCeilingUsd is the fix for a cost Fail,
+        # and the fallback chooses T4's size when Azure refuses one (ADR 0019).
+        $repoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../..'))
+        $files = @(Get-ChildItem -Path (Join-Path -Path $repoRoot -ChildPath 'scripts') -Recurse -File -Include '*.ps1', '*.psm1')
+        $files += Get-Item -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/environment.schema.json')
+        $files.Count | Should -BeGreaterThan 50
+        $hits = @($files | Select-String -Pattern 'set t4SkuName to Standard_B(1ms|2s)' | ForEach-Object { '{0}:{1}' -f $_.Path, $_.LineNumber })
+        $hits | Should -BeNullOrEmpty
     }
 }

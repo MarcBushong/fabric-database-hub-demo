@@ -90,6 +90,10 @@ function Get-DemoDeploymentStateTagName {
         # when Azure refused to scale it to the default, None (left out; the 2-vCore step is checked again), or Refused.
         GuidedStopUtc            = 'DbHubGuidedStopUtc'
         T4Sku                    = 'DbHubT4Size'
+        # 2026-11-09: the sizes Azure refused for T4, the one the configuration asks for first, with the zones tried and when
+        # (ConvertTo-DemoT4RefusedRecord), so DbHubT4Size holds only while the configuration asks for that size, and the
+        # size change's notice can say what was tried.
+        T4Refused                = 'DbHubT4Refused'
         # Phase 28 review follow-up: when the T2 host's loader started a bootstrap generation that nobody has seen finish (empty
         # when none runs), so deploy.ps1's watchdog never restarts the host during its guest build (Get-DemoHostRestartBlocker).
         T2BuildUtc               = 'DbHubT2BuildUtc'

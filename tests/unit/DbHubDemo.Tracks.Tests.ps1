@@ -1341,6 +1341,43 @@ Describe 'Invoke-DemoDeploymentTrack' {
     }
 }
 
+Describe 'T4''s row on the status page says an automatic size change (2026-11-09)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Stage = 'Infrastructure'; TrackT4 = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4 -MockWith { New-TestResult 'T4.SERVER' }
+    }
+
+    It 'shows the notice on T4''s row as a Warning, whole, and never fails the track: <Name>' -ForEach @(
+        @{ Name = 'with a size change'; Notice = 'T4 was created as Standard_B2s (Burstable, 2 vCores) instead of Standard_B1ms, the size t4SkuName sets, because Azure refused Standard_B1ms (no zone preference, then zone 1) with SkuNotAvailable. Estimated monthly cost of T4 alone (list prices in westus3, Azure Retail Prices API, read now; estimates): Standard_B1ms 10.00 USD at light use and 30.00 USD in the worst case; Standard_B2s 40.00 USD and 120.00 USD, so 30.00 USD more a month at light use and 90.00 USD more in the worst case, which counts Azure starting a stopped T4 again on its own after 7 days.' }
+        @{ Name = 'without one'; Notice = '' }
+    ) {
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -T4Enabled)) -Confirm:$false }
+        $context = @{ NetworkMode = 'private'; T3UseFreeLimit = $true; T2Source = 'golden'; ConfigPath = ''; NoState = $false; ProgressPath = $progress }
+        if ($Notice) {
+            $context['T4Notice'] = $Notice
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -WithT4); Context = $context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T4' -Context $Context -Step @('Server') }
+        $outcome.Status | Should -Be 'Pass' -Because 'a size change is a Warning, never a block'
+        $size = @($outcome.Results | Where-Object { $_.checkId -eq 'T4.SIZE' })
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $row = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'T4.Server') { $item } } })[0]
+        if (-not $Notice) {
+            $size | Should -BeNullOrEmpty
+            $row['status'] | Should -Be 'Pass'
+            return
+        }
+        $size.Count | Should -Be 1
+        $size[0].status | Should -Be 'Warning'
+        $size[0].message | Should -Be $Notice
+        $row['state'] | Should -Be 'Done'
+        $row['status'] | Should -Be 'Warning'
+        $row['message'] | Should -Be $Notice -Because 'T4''s row keeps the whole notice, with both estimates'
+    }
+}
 Describe 'Invoke-DemoParallelDeployment' {
     BeforeEach {
         # T4 is part of every deployment (2026-11-09, user-directed), so the run's own configuration always has it.
@@ -1994,8 +2031,9 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPreflight -MockWith {
             $script:calls.Add('preflight')
             New-TestResult 'PREFLIGHT.P1.SUBSCRIPTION'
-            New-DemoResult -CheckId 'PREFLIGHT.T4.CAPABILITY' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message 'westus3 lists neither Burstable size.' -Evidence @{ startSku = 'None' }
+            New-DemoResult -CheckId 'PREFLIGHT.T4.CAPABILITY' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message 'westus3 lists neither 4-vCore size.' -Evidence @{ startSku = $script:startSku }
         }
+        $script:startSku = 'Standard_D2ds_v5'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
             $script:calls.Add(('template start={0}' -f (Get-Variable -Name 'T4StartSku' -ValueOnly -ErrorAction SilentlyContinue)))
             [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $false; T4SkuName = '' }
@@ -2011,12 +2049,18 @@ Describe 'Invoke-DemoParallelDeployment' {
             [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }
         }
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
-        $script:calls | Should -Contain 'template start=None'
+        $script:calls | Should -Contain 'template start=Standard_D2ds_v5'
         $script:t4InTracks | Should -Contain 'T1:False'
         $script:calls | Should -Contain 'estate T1,T3,T2'
         # 2026-11-09: T4 is part of every deployment, so a run whose template deployed without it isn't DONE, and says why.
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.TIMING' }).evidence.clockStopped | Should -BeFalse -Because 'DONE needs T4''s estate and metrics'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.OFF' }).status | Should -Be 'Fail'
+
+        # An older run's None start counts as Standard_D2ds_v5 (2026-11-09: no step leaves T4 out).
+        $script:calls.Clear()
+        $script:startSku = 'None'
+        $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $script:calls | Should -Contain 'template start=Standard_D2ds_v5'
     }
 
     It 'starts T4''s General Purpose fallback where preflight says, says what it did on the Infrastructure step, and gives the tracks that size (Phase 28 follow-up)' {
@@ -2029,22 +2073,35 @@ Describe 'Invoke-DemoParallelDeployment' {
             New-DemoResult -CheckId 'PREFLIGHT.T4.FALLBACK' -Area 'preflight' -Target 'T4' -Status 'Warning' -Message 'The fallback fits both ceilings.' -Evidence @{ startSku = 'Standard_D2ds_v5' }
         }
         $script:note = 'T4 created as General Purpose Standard_D2ds_v5 (2 vCores) because Azure refused the 4-vCore sizes here, so autonomous tuning is off (it needs 4 vCores); about 0.500 USD an hour while running (list price in westus3, Azure Retail Prices API).'
+        # 2026-11-09: the template's notice of an automatic size change (DEPLOY.T4.FALLBACK) is the Infrastructure row's note,
+        # and the T4 track gets it for T4's row.
+        $script:change = New-DemoResult -CheckId 'DEPLOY.T4.FALLBACK' -Area 't4' -Target 'T4' -Status 'Warning' -Message $script:note
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
             $script:calls.Add(('template start={0}' -f (Get-Variable -Name 'T4StartSku' -ValueOnly -ErrorAction SilentlyContinue)))
-            [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $true; T4SkuName = 'Standard_D2ds_v5'; T4Note = $script:note }
+            [pscustomobject]@{ Succeeded = $true; Results = @((New-TestResult 'DEPLOY.TEMPLATE'), $script:change); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $true; T4SkuName = 'Standard_D2ds_v5'; T4Note = $script:note }
         }
         $script:t4InTracks = [System.Collections.Generic.List[string]]::new()
+        $script:noticeInTracks = @{}
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -MockWith {
             $script:t4InTracks.Add(('{0}:{1}:{2}' -f $Track, [string]$Config['t4SkuName'], [string]$Config['t4SkuSource']))
+            $script:noticeInTracks[$Track] = [string]$Context['T4Notice']
             [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = [ordered]@{}; StartedUtc = ''; EndedUtc = ''; Results = @() }
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Names = [pscustomobject]@{ ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' } } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoT4MetricFlow -MockWith { New-TestResult 'METRICS.T4' }
-        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -ProgressPath $Path })
         $script:calls | Should -Contain 'template start=Standard_D2ds_v5'
         $script:t4InTracks | Should -Contain 'T1:Standard_D2ds_v5:deployed'
         $script:t4InTracks | Should -Contain 'T4:Standard_D2ds_v5:deployed'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.INFRASTRUCTURE' }).message | Should -BeLike ('The infrastructure is deployed (*). {0}' -f $script:note)
+        $script:noticeInTracks['T4'] | Should -Be $script:note
+        # The status page's Infrastructure row keeps the whole note.
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $infrastructure = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Infrastructure') { $item } } })[0]
+        $infrastructure['message'] | Should -BeLike ('The infrastructure is deployed (*). {0}' -f $script:note)
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.FALLBACK' }).Count | Should -Be 1
     }
 
     It 'stops the clock only when T4''s estate and metrics passed too, when T4 is on (ADR 0018 as amended)' {

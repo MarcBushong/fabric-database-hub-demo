@@ -435,9 +435,9 @@ function Invoke-DemoParallelDeployment {
     $stageResult = {
         param([string] $Name, [string] $Status, [string] $Message, [string] $Remediation = '')
         $results.Add((New-DemoResult -CheckId ('DEPLOY.STAGE.{0}' -f $Name.ToUpperInvariant()) -Area 'infra' -Target 'subscription' -Status $Status -Message $Message -Remediation $Remediation))
-        # The status page's Preflight and Infrastructure steps (Phase 28).
+        # The status page's Preflight and Infrastructure steps (Phase 28), with room for T4's size change notice (2026-11-09).
         if ($Name -in 'Preflight', 'Infrastructure') {
-            Set-DemoProgressStep -Path $ProgressPath -Id $Name -Status $Status -Message $Message
+            Set-DemoProgressStep -Path $ProgressPath -Id $Name -Status $Status -Message $Message -MaxLength 1200
         }
     }
     $phase = [ordered]@{}
@@ -903,7 +903,7 @@ function Invoke-DemoParallelDeployment {
             }
             # Where T4's fallback starts when preflight already ruled sizes out, or its cost check left T4 out (Phase 28 and
             # its follow-up): the furthest step any of its checks found.
-            $t4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') })
+            $t4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') }) -Order ([string[]]@(@('') + @(Get-DemoT4FallbackOrder -Config $Config)))
             if ($deferPolicy) {
                 Write-DemoLog -Message ('networkMode is {0}, so the policy inventory runs alongside the deployment instead of before it; its results come at the end.' -f [string]$Config['networkMode'])
                 $policyJob = Start-DemoPolicyInventoryJob -Config $Config -CacheHours $PolicyCacheHours -Confirm:$false
@@ -1070,6 +1070,11 @@ function Invoke-DemoParallelDeployment {
             if ($t4NoteValue) {
                 $infrastructureText += ' ' + $t4NoteValue
             }
+            # T4's row on the status page says an automatic size change too (2026-11-09): its track gets the notice.
+            # Get-DemoMemberValue keeps an array whole, so the results are unrolled from a variable.
+            $deploymentResults = Get-DemoMemberValue -InputObject $deployment -Name 'Results'
+            $sizeChange = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.FALLBACK' }) | Select-Object -Last 1
+            $context['T4Notice'] = if ($null -ne $sizeChange) { [string]$sizeChange.message } else { '' }
             & $stageResult 'Infrastructure' 'Pass' $infrastructureText
             if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                 & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
@@ -1096,7 +1101,7 @@ function Invoke-DemoParallelDeployment {
         }
         $context['LoaderSettings'] = $loaderSettings
         if ($useJobs) {
-            Write-DemoTrackHandoff -Path $handoff -Name 'infrastructure' -Value ([pscustomobject]@{ Succeeded = $true; LoaderSettings = $loaderSettings; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $Config); T4SkuName = $(if (Test-DemoT4Enabled -Config $Config) { Get-DemoT4SkuName -Config $Config } else { '' }); Message = '' }) -Confirm:$false
+            Write-DemoTrackHandoff -Path $handoff -Name 'infrastructure' -Value ([pscustomobject]@{ Succeeded = $true; LoaderSettings = $loaderSettings; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $Config); T4SkuName = $(if (Test-DemoT4Enabled -Config $Config) { Get-DemoT4SkuName -Config $Config } else { '' }); T4Notice = [string]$context['T4Notice']; Message = '' }) -Confirm:$false
         }
         elseif ($needsArtifacts) {
             try {

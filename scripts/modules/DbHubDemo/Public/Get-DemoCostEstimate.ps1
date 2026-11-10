@@ -29,7 +29,8 @@ function Get-DemoCostEstimate {
 
     Returns hourly running cost, one demo-day session, idle monthly cost, and a light-use month, plus
     validation results that compare them with the configured ceilings. The monthly ceiling is hard: a
-    light-use month above monthlyCeilingUsd is Fail. A session above sessionCeilingUsd is a Warning. A
+    light-use month above monthlyCeilingUsd is Fail, or a Warning when only a T4 size the person didn't choose puts it
+    over (2026-11-09; -SkipCeilingReference says when). A session above sessionCeilingUsd is a Warning. A
     missing price is reported as a Warning and left out of the totals, never guessed. Data disk tiers
     follow the template through Resolve-DemoDataDiskTier (ADR 0016): an explicit dataDiskSku wins;
     otherwise a zone selects Premium SSD v2 (capacity per GiB-hour; the baseline IOPS and throughput are
@@ -78,6 +79,12 @@ function Get-DemoCostEstimate {
     Otherwise, or without it, the worst case counts T4 running for the rest of the month. PREFLIGHT.COST.MONTHLY says which
     one applies and why.
 
+    .PARAMETER SkipCeilingReference
+    Internal (2026-11-09): skips the reference size's estimate behind PREFLIGHT.COST.MONTHLY's Warning instead of a Fail
+    when only a T4 size the person didn't choose puts the month over monthlyCeilingUsd: monthlyCeilingUsd at exactly 250,
+    which init.ps1 wrote from 2026-10-27 to 2026-11-04 (R727), without t4SkuName, priced at Standard_B1ms; or a size the
+    fallback chose instead of the one t4SkuName sets, priced at that size. The estimate passes it to itself.
+
     .EXAMPLE
     Get-DemoCostEstimate -Config (Get-DemoConfig -Path ./config/demo.config.json)
 
@@ -123,7 +130,9 @@ function Get-DemoCostEstimate {
         [string] $ActivityProfile = '',
 
         [AllowNull()]
-        [object] $T4RestartCoverage = $null
+        [object] $T4RestartCoverage = $null,
+
+        [switch] $SkipCeilingReference
     )
 
     $catalog = Get-DemoProfile
@@ -543,17 +552,54 @@ function Get-DemoCostEstimate {
                 [string]::Format($culture, ' Azure starts a stopped T4 again on its own after 7 days, and {0}, so the worst case counts it running for the rest of the month: {1:N0} hours, {2:N2} USD of T4 compute, against the ceiling.', $why, $t4Restart.Hours, [double]$t4WorstCase)
             }
             $monthlyMessage += [string]::Format($culture, ' T4 (PostgreSQL, {0}) costs {1:N2} USD a month even while stopped (storage, its private DNS zone, and its Defender plans).{2}', $t4Sku, $t4FixedMonthly, $restartText)
-            # The ways to keep the month cheaper (the owner's decision, 2026-11-04). T4 is part of every deployment since
-            # 2026-11-09, so leaving it out isn't one of them.
-            $cheaper = 'To keep the month cheaper: set t4SkuName to Standard_B1ms (which turns autonomous tuning off), or set a lower monthlyCeilingUsd.'
-            $monthlyMessage += ' ' + $cheaper
+
             $safetyFix = if ($null -ne $t4Restart -and $t4Restart.Restarts -eq 0) {
                 $fix = if ($null -ne $T4RestartCoverage) { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Fix') } else { '' }
                 if ($fix) { ' Or put the nightly safety stop fully in place, so each restart counts as about a day: {0}' -f $fix } else { ' Or run ./scripts/deploy.ps1, which sets up the nightly safety stop, so each restart counts as about a day.' }
             }
             else { '' }
-            # The ceiling to raise first: NOT DONE's next step comes from here (2026-11-09).
-            $monthlyRemediation = [string]::Format($culture, 'Raise monthlyCeilingUsd to at least {0:N0} in your configuration (the budget follows it at the next deploy.ps1 -FromStage Infrastructure).{1} Or, to keep the month cheaper, set t4SkuName to Standard_B1ms, which turns autonomous tuning off.', [System.Math]::Ceiling($lightUseMonthly + [double]$t4WorstCase), $safetyFix)
+            # The ceiling to raise: NOT DONE's next step comes from here (2026-11-09), so it never asks for a size to be set
+            # (an agent that pinned a size from it left T4 out when Azure refused that size).
+            $monthlyRemediation = [string]::Format($culture, 'Raise monthlyCeilingUsd to at least {0:N0} in your configuration (the budget follows it at the next deploy.ps1 -FromStage Infrastructure).{1}', [System.Math]::Ceiling($lightUseMonthly + [double]$t4WorstCase), $safetyFix)
+            # 2026-11-09: a T4 size the person didn't choose never makes the hard ceiling a Fail by itself, when the month at
+            # the reference size fits: (a) R727, monthlyCeilingUsd at exactly 250, which init.ps1 wrote from 2026-10-27 to
+            # 2026-11-04, when T4's default was Standard_B1ms, and no t4SkuName; (b) a size the fallback chose instead of
+            # the one t4SkuName sets, because Azure refused it (Resolve-DemoEffectiveConfig). Then it's a Warning that names
+            # the amount, the configured value stays, and the budget keeps alerting at it.
+            if ($monthlyStatus -eq 'Fail' -and -not $SkipCeilingReference) {
+                $asked = Get-DemoT4AskedSku -Config $Config
+                $pinnedSku = Get-DemoT4PinnedSku -Config $Config
+                $reference = if (-not $pinnedSku -and $monthlyCeiling -eq 250) { 'Standard_B1ms' } elseif ($t4Sku -cne $asked) { $asked } else { '' }
+                if ($reference) {
+                    $again = @{}
+                    foreach ($key in $PSBoundParameters.Keys) {
+                        $again[$key] = $PSBoundParameters[$key]
+                    }
+                    $again['Config'] = Copy-DemoT4Config -Config $Config -Source fallback -SkuName $reference
+                    $again['PriceCache'] = $priceCache
+                    $again['SkipCeilingReference'] = $true
+                    $referenceMonth = $null
+                    try {
+                        $referenceEstimate = Get-DemoCostEstimate @again
+                        $referenceMonth = [System.Math]::Round([double]$referenceEstimate.LightUseMonthly + [double]$referenceEstimate.T4AutoRestartWorstCaseMonthly, 2)
+                    }
+                    catch {
+                        Write-DemoLog -Level Warning -Message ('The month at {0} couldn''t be estimated, so the monthly ceiling stays a Fail: {1}' -f $reference, $_.Exception.Message)
+                    }
+                    if ($null -ne $referenceMonth -and $referenceMonth -le $monthlyCeiling) {
+                        $monthlyStatus = 'Warning'
+                        $month = [System.Math]::Round($lightUseMonthly + [double]$t4WorstCase, 2)
+                        $evidence['ceilingReference'] = [ordered]@{ skuName = $reference; monthlyUsd = $referenceMonth; reason = $(if ($reference -ceq $asked -and $pinnedSku) { 'fallback' } else { 'init250' }) }
+                        $monthlyMessage += if ($evidence['ceilingReference']['reason'] -eq 'fallback') {
+                            [string]::Format($culture, ' This is a Warning, not a Fail: T4 runs as {0} only because Azure refused {1}, the size t4SkuName sets (deploy.ps1''s fallback chose {0}), and with T4 at {1} the month would be {2:N2} USD, within the ceiling; {0} brings it to {3:N2} USD.', $t4Sku, $reference, $referenceMonth, $month)
+                        }
+                        else {
+                            [string]::Format($culture, ' This is a Warning, not a Fail: monthlyCeilingUsd is 250, which init.ps1 wrote by default from 2026-10-27 to 2026-11-04, when T4''s default size was Standard_B1ms; with T4 at that size the month would be {0:N2} USD, within it, and T4 at {1} brings it to {2:N2} USD.', $referenceMonth, $t4Sku, $month)
+                        }
+                        $monthlyRemediation = [string]::Format($culture, 'Raise monthlyCeilingUsd to at least {0:N0} in your configuration (the budget follows it at the next deploy.ps1 -FromStage Infrastructure), or keep it: deploy.ps1 and start-demo.ps1 go on, the Azure budget alerts at 50, 80, and 100 percent of it, and start-demo.ps1 stops starting the demo once this month''s actual cost reaches it.{1}', [System.Math]::Ceiling($month), $safetyFix)
+                    }
+                }
+            }
         }
         if ($networkModeAssumed) {
             $monthlyMessage += ' networkMode auto isn''t resolved yet, so the estimate assumes private mode (private endpoint and private DNS zone).'
