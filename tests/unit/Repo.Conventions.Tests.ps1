@@ -98,6 +98,22 @@ Describe 'Entry scripts load this checkout''s DbHubDemo on every run (live findi
             '}'
             'Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath ''modules/DbHubDemo/DbHubDemo.psd1'') -Force:(-not $entryNested)'
         ) -join "`n"
+        # The same lines for a script that runs code in the module's scope (& $module { ... }): it keeps the module object it
+        # imported (live finding, 2026-11-10).
+        $script:entryLinesModule = $script:entryLines.Replace("`nImport-Module -Name", "`n`$module = Import-Module -Name") + ' -PassThru'
+        # Get-Module -Name 'DbHubDemo' (or Get-Command -Module DbHubDemo): every checkout's copy that the session loaded.
+        $script:isNameLookup = {
+            param($Node)
+            $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.GetCommandName() -in 'Get-Module', 'gmo', 'Get-Command', 'gcm' -and
+            @($Node.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $_.Value -eq 'DbHubDemo' }).Count -gt 0 -and
+            ($Node.GetCommandName() -in 'Get-Module', 'gmo' -or @($Node.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Module' }).Count -gt 0)
+        }
+        # & <target> { ... }: code that runs in a module's scope.
+        $script:isModuleCall = {
+            param($Node)
+            $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand -and
+            $Node.CommandElements.Count -ge 2 -and $Node.CommandElements[1] -is [System.Management.Automation.Language.ScriptBlockExpressionAst]
+        }
     }
 
     It 'finds the entry scripts that import DbHubDemo' {
@@ -109,10 +125,10 @@ Describe 'Entry scripts load this checkout''s DbHubDemo on every run (live findi
         $wrong = foreach ($file in $script:entryScripts) {
             $text = (Get-Content -LiteralPath $file.FullName -Raw) -replace "`r`n", "`n"
             $imports = @([regex]::Matches($text, '(?m)^.*Import-Module\b.*DbHubDemo\.psd1.*$') | ForEach-Object { $_.Value.Trim() })
-            if (-not $text.Contains($script:entryLines)) {
+            if (-not ($text.Contains($script:entryLines) -or $text.Contains($script:entryLinesModule))) {
                 '{0}: lacks the shared lines that load the module again' -f $file.Name
             }
-            if ($imports.Count -ne 1 -or $imports[0] -notmatch '-Force:\(-not \$entryNested\)$') {
+            if ($imports.Count -ne 1 -or $imports[0] -notmatch '-Force:\(-not \$entryNested\)( -PassThru)?$') {
                 '{0}: imports DbHubDemo {1} time(s), not once with -Force:(-not $entryNested)' -f $file.Name, $imports.Count
             }
             if ($text -match "if \(-not \(Get-Module -Name 'DbHubDemo'\)\)") {
@@ -120,6 +136,170 @@ Describe 'Entry scripts load this checkout''s DbHubDemo on every run (live findi
             }
         }
         $wrong | Should -BeNullOrEmpty
+    }
+
+    It 'never looks DbHubDemo up by name in an entry script or a tool, since that finds every checkout''s copy that the session loaded (live finding, 2026-11-10)' {
+        # Live: start-demo.ps1 -WarmUpMinutes 10, in a window that had imported DbHubDemo from three clones, crashed after
+        # the environment had started: "The term 'DbHubDemo DbHubDemo DbHubDemo' is not recognized", since
+        # Get-Module -Name 'DbHubDemo' returned all three and & $module { ... } got the array.
+        $tools = @(Get-RepoFile -Include '*.ps1' | Where-Object { $_.FullName.StartsWith((Join-Path -Path $repoRoot -ChildPath 'tests'), [System.StringComparison]::OrdinalIgnoreCase) -and $_.FullName -notmatch '[\\/]tests[\\/]unit[\\/]' })
+        $tools.Count | Should -BeGreaterThan 0
+        $found = foreach ($file in @($script:entryScripts) + $tools) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            foreach ($node in $ast.FindAll($script:isNameLookup, $true)) {
+                '{0}:{1}: {2}' -f $file.FullName.Substring($repoRoot.Length), $node.Extent.StartLineNumber, $node.Extent.Text
+            }
+        }
+        $found | Should -BeNullOrEmpty -Because 'the module object comes from Import-Module -PassThru, and commands resolve to the copy the script imported last'
+    }
+
+    It 'runs code in the module''s scope only through the module object it imported (live finding, 2026-11-10)' {
+        $wrong = foreach ($file in $script:entryScripts) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            $calls = @($ast.FindAll($script:isModuleCall, $true))
+            if ($calls.Count -eq 0) {
+                continue
+            }
+            foreach ($call in $calls) {
+                $target = $call.CommandElements[0]
+                if ($target -isnot [System.Management.Automation.Language.VariableExpressionAst] -or $target.VariablePath.UserPath -ne 'module') {
+                    '{0}:{1}: runs module code through {2}, not $module' -f $file.Name, $call.Extent.StartLineNumber, $target.Extent.Text
+                }
+            }
+            $assignments = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.Left.VariablePath.UserPath -eq 'module' }, $true))
+            if ($assignments.Count -ne 1 -or $assignments[0].Right.Extent.Text -notmatch '^Import-Module -Name .*DbHubDemo\.psd1.* -PassThru$') {
+                '{0}: $module is assigned {1} time(s), not once from its own Import-Module -PassThru' -f $file.Name, $assignments.Count
+            }
+        }
+        $wrong | Should -BeNullOrEmpty
+        @($script:entryScripts | Where-Object { (Get-Content -LiteralPath $_.FullName -Raw).Contains('& $module {') } | ForEach-Object { $_.Name }) | Should -Contain 'start-demo.ps1'
+    }
+
+    It 'looks DbHubDemo up by name only in a job''s own process or runspace, after importing it there (live finding, 2026-11-10)' {
+        # A Start-Job process or a Start-ThreadJob runspace has only the copy it imported by path, from the module's own
+        # checkout ($script:RepoRoot), so Get-Module -Name 'DbHubDemo' finds exactly that one there.
+        $moduleRoot = Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo'
+        $checked = 0
+        $wrong = foreach ($file in Get-ChildItem -LiteralPath $moduleRoot -Recurse -Include '*.ps1', '*.psm1' -File -Force) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            foreach ($lookup in $ast.FindAll($script:isNameLookup, $true)) {
+                $checked++
+                $where = '{0}:{1}' -f $file.FullName.Substring($repoRoot.Length), $lookup.Extent.StartLineNumber
+                $block = $lookup.Parent
+                while ($null -ne $block -and $block -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+                    $block = $block.Parent
+                }
+                $assignment = if ($null -ne $block -and $null -ne $block.Parent) { $block.Parent.Parent } else { $null }
+                if ($assignment -isnot [System.Management.Automation.Language.AssignmentStatementAst] -or $assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
+                    '{0}: not in a scriptblock assigned to a variable' -f $where
+                    continue
+                }
+                $name = $assignment.Left.VariablePath.UserPath
+                $function = $assignment.Parent
+                while ($null -ne $function -and $function -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                    $function = $function.Parent
+                }
+                $starts = @(if ($null -ne $function) {
+                        $function.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -in 'Start-Job', 'Start-ThreadJob' }, $true) | Where-Object {
+                            $elements = @($_.CommandElements)
+                            $at = [array]::FindIndex($elements, [System.Predicate[object]] { param($e) $e -is [System.Management.Automation.Language.CommandParameterAst] -and $e.ParameterName -eq 'ScriptBlock' })
+                            $at -ge 0 -and $at + 1 -lt $elements.Count -and $elements[$at + 1] -is [System.Management.Automation.Language.VariableExpressionAst] -and $elements[$at + 1].VariablePath.UserPath -eq $name
+                        }
+                    })
+                if ($starts.Count -eq 0) {
+                    '{0}: ${1} isn''t started with Start-Job or Start-ThreadJob -ScriptBlock in the same function' -f $where, $name
+                }
+                $imported = @($block.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Import-Module' }, $true) | Where-Object { $_.Extent.StartOffset -lt $lookup.Extent.StartOffset })
+                if ($imported.Count -eq 0) {
+                    '{0}: the job doesn''t import the module before it looks it up' -f $where
+                }
+            }
+        }
+        $wrong | Should -BeNullOrEmpty
+        $checked | Should -BeGreaterThan 0 -Because 'the track, build, policy, monitoring, and status page jobs look it up'
+    }
+
+    It 'uses the copy it imported in a session that loaded DbHubDemo from another checkout too, top-level or nested (live finding, 2026-11-10)' {
+        # Two copies of the module under the test drive, as two checkouts. The child process loads the "two" copy, then the
+        # "one" copy, last, as a window that ran scripts from both. Then each entry script's own selection runs from "two"'s
+        # scripts folder: the statement that imports DbHubDemo, the statements that assign the variables it runs module code
+        # through, and those targets (& <target> { ... }), taken from the script's text; first as a run from a terminal,
+        # then as the repository's own code runs it ($entryNested).
+        $pwsh = (Get-Process -Id $PID).Path
+        $source = Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo'
+        foreach ($checkout in 'one', 'two') {
+            $modules = Join-Path -Path $TestDrive -ChildPath ('{0}/scripts/modules' -f $checkout)
+            $null = New-Item -ItemType Directory -Path $modules -Force
+            Copy-Item -LiteralPath $source -Destination $modules -Recurse -Force
+        }
+        $scriptsTwo = Join-Path -Path $TestDrive -ChildPath 'two/scripts'
+        $probes = [ordered]@{}
+        foreach ($file in $script:entryScripts) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            $import = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Import-Module' -and $n.Extent.Text.Contains('DbHubDemo.psd1') }, $true)
+            $statement = $import.Parent
+            if ($statement.Parent -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+                $statement = $statement.Parent
+            }
+            $targets = @($ast.FindAll($script:isModuleCall, $true) | ForEach-Object { $_.CommandElements[0] } | Group-Object -Property { $_.Extent.Text } | ForEach-Object { $_.Group[0] })
+            $variables = @($targets | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] } | ForEach-Object { $_.VariablePath.UserPath })
+            $assignments = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.Left.VariablePath.UserPath -in $variables }, $true) |
+                    Where-Object { $_.Extent.StartOffset -ne $statement.Extent.StartOffset } | ForEach-Object { $_.Extent.Text })
+            $lines = [System.Collections.Generic.List[string]]::new()
+            $lines.Add('$entryNested = $Nested')
+            $lines.Add($statement.Extent.Text)
+            $lines.AddRange([string[]]$assignments)
+            foreach ($target in $targets) {
+                $text = $target.Extent.Text
+                $lines.Add(('$found = @({0})' -f $text))
+                $lines.Add(('$root = try {{ [string](& ({0}) {{ $script:ModuleRoot }}) }} catch {{ ''ERROR: '' + $_.Exception.Message }}' -f $text))
+                $lines.Add(('''RESULT '' + ([ordered]@{{ target = ''{0}''; modules = $found.Count; bases = @($found | ForEach-Object {{ [string]$_.ModuleBase }}); root = $root }} | ConvertTo-Json -Compress)' -f $text.Replace("'", "''")))
+            }
+            $lines.Add('''RESOLVED '' + [string](Get-Command -Name ''Get-DemoConfig'' -CommandType Function).Module.ModuleBase')
+            $key = $lines -join "`n"
+            if (-not $probes.Contains($key)) {
+                $probes[$key] = [System.Collections.Generic.List[string]]::new()
+            }
+            $probes[$key].Add($file.Name)
+        }
+        $index = 0
+        foreach ($key in $probes.Keys) {
+            $index++
+            [System.IO.File]::WriteAllText((Join-Path -Path $scriptsTwo -ChildPath ('probe-{0}.ps1' -f $index)), ("param([bool] `$Nested)`n'PROBE {0}'`n{1}`n" -f ($probes[$key] -join ', '), $key))
+        }
+        $runner = Join-Path -Path $TestDrive -ChildPath 'runner.ps1'
+        [System.IO.File]::WriteAllText($runner, @'
+param([string] $Root)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path -Path $Root -ChildPath 'two/scripts/modules/DbHubDemo/DbHubDemo.psd1') -Force
+Import-Module -Name (Join-Path -Path $Root -ChildPath 'one/scripts/modules/DbHubDemo/DbHubDemo.psd1') -Force
+'LOADED {0}' -f @(Get-Module -Name 'DbHubDemo').Count
+foreach ($probe in Get-ChildItem -LiteralPath (Join-Path -Path $Root -ChildPath 'two/scripts') -Filter 'probe-*.ps1' -File | Sort-Object -Property Name) {
+    foreach ($nested in $false, $true) {
+        'NESTED {0}' -f $nested
+        & $probe.FullName -Nested $nested
+    }
+}
+'@)
+        $output = @(& $pwsh -NoProfile -NonInteractive -File $runner -Root $TestDrive 2>&1 | ForEach-Object { [string]$_ })
+        $because = $output -join ' | '
+        $output | Should -Contain 'LOADED 2' -Because $because
+        $own = '[\\/]two[\\/]scripts[\\/]modules[\\/]DbHubDemo$'
+        @($output | Where-Object { $_ -like 'PROBE *' }).Count | Should -Be (2 * $probes.Count) -Because $because
+        $resolved = @($output | Where-Object { $_ -like 'RESOLVED *' })
+        $resolved.Count | Should -Be (2 * $probes.Count) -Because $because
+        foreach ($line in $resolved) {
+            $line.Substring(9) | Should -Match $own -Because ('commands resolve to the copy the script imported: {0}' -f $because)
+        }
+        $results = @($output | Where-Object { $_ -like 'RESULT *' } | ForEach-Object { $_.Substring(7) | ConvertFrom-Json })
+        $results.Count | Should -BeGreaterOrEqual 2 -Because ('start-demo.ps1 and setup-github-repo.ps1 run module code: {0}' -f $because)
+        foreach ($result in $results) {
+            $result.root | Should -Match $own -Because ('& {0} {{ ... }} runs in the copy it imported, not "The term ''DbHubDemo DbHubDemo'' is not recognized"' -f $result.target)
+            $result.modules | Should -Be 1 -Because ('{0} must be the one module the script imported, not every loaded copy' -f $result.target)
+            @($result.bases)[0] | Should -Match $own -Because $result.target
+        }
+        @($probes.Values | ForEach-Object { $_ }) | Should -Contain 'start-demo.ps1'
     }
 
     It 'replaces a module that an earlier run loaded, and keeps it, with its state, when DbHubDemo''s own code runs the script' {
