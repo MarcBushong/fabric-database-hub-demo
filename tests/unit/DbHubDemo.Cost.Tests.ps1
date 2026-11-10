@@ -777,3 +777,17 @@ Describe 'Get-DemoDefenderPlan' {
         }
     }
 }
+
+Describe 'No fix text asks for a cheaper T4 size (2026-11-09)' {
+    It 'names no Burstable size to set, in the module''s scripts or the configuration schema' {
+        # A tester's configuration pinned Standard_B1ms, most likely after an agent followed PREFLIGHT.COST.MONTHLY's old fix
+        # "set t4SkuName to Standard_B1ms"; Azure then refused that size. Raising monthlyCeilingUsd is the fix for a cost Fail,
+        # and the fallback chooses T4's size when Azure refuses one (ADR 0019).
+        $repoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../..'))
+        $files = @(Get-ChildItem -Path (Join-Path -Path $repoRoot -ChildPath 'scripts') -Recurse -File -Include '*.ps1', '*.psm1')
+        $files += Get-Item -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/environment.schema.json')
+        $files.Count | Should -BeGreaterThan 50
+        $hits = @($files | Select-String -Pattern 'set t4SkuName to Standard_B(1ms|2s)' | ForEach-Object { '{0}:{1}' -f $_.Path, $_.LineNumber })
+        $hits | Should -BeNullOrEmpty
+    }
+}

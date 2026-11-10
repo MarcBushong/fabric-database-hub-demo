@@ -579,7 +579,7 @@ function New-DemoT4SizeResult {
     $docUrl = 'https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources'
     $from = '{0} ({1})' -f $ServerSku, $(if ((Get-DemoT4SkuSpec -SkuName $ServerSku).Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' })
     $evidence = [ordered]@{ serverSku = $ServerSku; skuName = $SkuName; outcome = $Outcome; explicit = [bool]$Explicit }
-    $keep = 'To keep T4 at {0}, set t4SkuName to {0} in your configuration (autonomous tuning then stays off on a size under 4 vCores); a size you set is never changed.' -f $ServerSku
+    $keep = 'To keep T4 at {0}, set t4SkuName to {0} in your configuration (autonomous tuning then stays off on a size under 4 vCores); an existing server keeps a size you set.' -f $ServerSku
     $culture = [System.Globalization.CultureInfo]::InvariantCulture
     if ($null -ne $Cost) {
         foreach ($name in 'SkipReason', 'MonthlyWorstCaseUsd', 'SessionUsd', 'MonthlyCeilingUsd', 'SessionCeilingUsd', 'RestartAssumption') {
@@ -634,7 +634,7 @@ function New-DemoT4SizeResult {
                 $evidence['refusedUtc'] = $Failure.TimeUtc
             }
             $message = 'Azure refused to scale T4 to {0} (SkuNotAvailable{1}), so T4 keeps {2}, and later runs keep it too (the resource group''s DbHubT4Size records it); autonomous tuning stays off on a size under 4 vCores.' -f $SkuName, $(if ($null -ne $Failure) { ', at ' + $Failure.TimeUtc } else { '' }), $from
-            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('To try the default again, set t4SkuName to {0} (a size you set has no fallback: a refusal is then a Fail), or ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors).' -f $SkuName) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors')
+            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('Nothing to do: T4 works at its size. To have the default, first ask for access with a Region access request for Azure Database for PostgreSQL flexible server (Learn: Resolve capacity errors), then set t4SkuName to {0} and run ./scripts/deploy.ps1, which moves T4 after checking its cost; the fallback only chooses a size for a new server, so a refusal of that move is a Fail.' -f $SkuName) -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors')
         }
     }
 }
