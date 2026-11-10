@@ -382,7 +382,9 @@ Describe 'Finding git when it isn''t on PATH (2026-11-09 live finding: GitHub De
             $null = New-Item -ItemType Directory -Path (Join-Path -Path $desktop -ChildPath $app) -Force
         }
         $null = New-Item -ItemType File -Path (Join-Path -Path $desktop -ChildPath 'app-9.9.9.txt') -Force
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVsWhere -MockWith { 'C:\VS\2026\Enterprise', 'C:\VS\2026\Preview' }
+        # Installations under TestDrive, not C:\: PowerShell on Linux and macOS has no C: drive for Join-Path to resolve.
+        $script:vsInstallations = @((Join-Path -Path $script:fake -ChildPath 'VS\2026\Enterprise'), (Join-Path -Path $script:fake -ChildPath 'VS\2026\Preview'))
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVsWhere -MockWith { $script:vsInstallations }
         $candidates = @(InModuleScope DbHubDemo { Get-DemoGitCandidatePath -Windows $true })
         $vsGit = 'Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe'
         $candidates.Path | Should -Be @(
@@ -392,8 +394,8 @@ Describe 'Finding git when it isn''t on PATH (2026-11-09 live finding: GitHub De
             (Join-Path -Path $desktop -ChildPath 'app-3.10.1\resources\app\git\cmd\git.exe')
             (Join-Path -Path $desktop -ChildPath 'app-3.4.9\resources\app\git\cmd\git.exe')
             (Join-Path -Path $desktop -ChildPath 'app-preview\resources\app\git\cmd\git.exe')
-            (Join-Path -Path 'C:\VS\2026\Enterprise' -ChildPath $vsGit)
-            (Join-Path -Path 'C:\VS\2026\Preview' -ChildPath $vsGit)
+            (Join-Path -Path $script:vsInstallations[0] -ChildPath $vsGit)
+            (Join-Path -Path $script:vsInstallations[1] -ChildPath $vsGit)
         )
         $candidates.Source | Should -Be @('Git for Windows', 'Git for Windows (32-bit)', 'Git for Windows, installed for this user', 'GitHub Desktop''s Git (app-3.10.1)', 'GitHub Desktop''s Git (app-3.4.9)', 'GitHub Desktop''s Git (app-preview)', 'Visual Studio''s Git', 'Visual Studio''s Git')
     }
@@ -406,8 +408,14 @@ Describe 'Finding git when it isn''t on PATH (2026-11-09 live finding: GitHub De
         )
     }
 
-    It 'on macOS and Linux, tries /usr/bin/git, /usr/local/bin/git, and /opt/homebrew/bin/git' {
+    It 'on macOS and Linux, tries /usr/bin/git, /usr/local/bin/git, and /opt/homebrew/bin/git, and evaluates none of the Windows lookups' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVsWhere -MockWith { throw 'not expected off Windows' }
+        Mock -ModuleName DbHubDemo -CommandName Get-ChildItem -MockWith { throw 'not expected off Windows' }
+        Mock -ModuleName DbHubDemo -CommandName Test-Path -MockWith { throw 'not expected off Windows' }
         @(InModuleScope DbHubDemo { Get-DemoGitCandidatePath -Windows $false }).Path | Should -Be @('/usr/bin/git', '/usr/local/bin/git', '/opt/homebrew/bin/git')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVsWhere -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-ChildItem -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-Path -Times 0 -Exactly
     }
 
     It 'vswhere: nothing when it isn''t installed' {
