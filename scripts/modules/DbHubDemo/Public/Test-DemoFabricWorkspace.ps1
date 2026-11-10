@@ -145,7 +145,8 @@ function Test-DemoFabricWorkspace {
     $capacityEvidence['state'] = $state
     $capacityEvidence['capacityName'] = $capacityName
     if ($state -ine 'Active') {
-        $results.Add((ConvertTo-WorkspaceResult 'FABRIC.P5.CAPACITY' 'Manual action required' ('The capacity "{0}" ({1}) of the Fabric workspace "{2}" is {3}, so notebooks can''t run.' -f $capacityName, $sku, $displayName, $state) $capacityEvidence 'A capacity administrator resumes the capacity in the Azure portal or the Fabric admin portal.' $capacityDoc))
+        # The owner resumes it, or its administrator (live finding, 2026-11-10); the scripts never do it for them.
+        $results.Add((ConvertTo-WorkspaceResult 'FABRIC.P5.CAPACITY' 'Manual action required' ('The capacity "{0}" ({1}) of the Fabric workspace "{2}" is {3}, so notebooks can''t run.' -f $capacityName, $sku, $displayName, $state) $capacityEvidence (Get-DemoFabricCapacityResumeFix) 'https://learn.microsoft.com/fabric/enterprise/pause-resume'))
     }
     elseif ($skuPattern -and $sku -match $skuPattern) {
         $results.Add((ConvertTo-WorkspaceResult 'FABRIC.P5.CAPACITY' 'Pass' ('The Fabric workspace "{0}" is on the Active Fabric capacity "{1}" ({2}, {3}).' -f $displayName, $capacityName, $sku, $capacityRegion) $capacityEvidence '' $capacityDoc))

@@ -676,6 +676,21 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 0 -Exactly
     }
 
+    It 'says it''s the capacity, not a lakehouse to create, when Fabric refused the lakehouse list because the capacity is paused (live finding, 2026-11-10)' {
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -MockWith {
+            $copy = @{ subscriptionId = $script:subA; tenantId = $script:tenant; prefix = 'dbhub'; environment = 'demo'; fabric = @{ workspaceId = '13131313-1313-1313-1313-131313131313' } }
+            $refused = New-DemoResult -CheckId 'FABRIC.RESOLVE.LAKEHOUSE' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The lakehouses in the workspace "Database Hub Demo" couldn''t be listed, because its capacity is paused or inactive.' -Evidence ([ordered]@{ lakehouseName = 'LH_DatabaseHub'; statusCode = 404; listed = $false; error = 'HTTP 404: CapacityNotActive: Internal error CapacityNotActive.Capacity is not active.'; capacityInactive = $true })
+            [pscustomobject]@{ Resolved = $false; Config = $copy; Results = @($refused) }
+        }
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C }
+        $saved.Result.status | Should -Be 'Manual action required'
+        $saved.Result.message | Should -Be 'The session''s history wasn''t saved: the workspace''s capacity is paused or inactive, so notebooks can''t run (HTTP 404: CapacityNotActive: Internal error CapacityNotActive.Capacity is not active).'
+        $saved.Result.remediation | Should -Match '^Resume the capacity'
+        $saved.Result.remediation | Should -Not -Match 'creates what''s missing'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -Times 0 -Exactly
+    }
+
     It 'says the run is still going when the 15 minutes pass, so the capacity isn''t paused under it' {
         $script:runStatus = 'Warning'
         $script:jobStatus = 'InProgress'

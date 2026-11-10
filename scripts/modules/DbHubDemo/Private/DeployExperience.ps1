@@ -851,9 +851,23 @@ function Test-DemoFabricRequiredItem {
     FABRIC.ITEMS.REQUIRED (brief item 16): the required Fabric items exist by name, read-only: the workspace and the
     lakehouse (Resolve-DemoFabricConfig without -Create), the notebooks in fabric/notebooks, the Real-Time Dashboard,
     and the history model and report (Items - List Items). The Insights app isn't a DONE requirement. Internal.
+
+    .DESCRIPTION
+    Only a list that answered without an item makes it missing: a Fail, whose fix is the rerun that imports it. A list
+    that failed says nothing about whether an item exists, so that item couldn't be checked (live finding, 2026-11-10:
+    List Lakehouses answered HTTP 404 CapacityNotActive while the capacity's owner had paused it, and the run called the
+    lakehouse missing, with a rerun as the fix):
+    - Fabric answered that the workspace's capacity is paused or inactive (Get-DemoFabricListFailureKind): Manual action
+      required, with evidence capacityInactive. The capacity is read then (Test-DemoFabricWorkspace), and its
+      FABRIC.P5.CAPACITY record comes first in the output when it says so too, so the run names it
+      (Get-DemoFabricCapacityBlock). The fix is to resume it, or have its administrator resume it, then run deploy.ps1
+      again: deploy.ps1 never resumes, pauses, or scales a capacity, and importing what's missing needs it running too.
+    - HTTP 401 or 403: Manual action required, with the access fix.
+    - Anything else, throttling (HTTP 429) and service errors (5xx) included: a Warning with the HTTP status, whose fix
+      is to run deploy.ps1 again in a few minutes; a Fail when other items are missing besides.
     #>
     [CmdletBinding()]
-    [OutputType([pscustomobject])]
+    [OutputType([object[]])]
     param(
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config
@@ -861,20 +875,47 @@ function Test-DemoFabricRequiredItem {
 
     $checkId = 'FABRIC.ITEMS.REQUIRED'
     $docUrl = 'https://learn.microsoft.com/rest/api/fabric/core/items/list-items'
+    $rerun = 'Run ./scripts/deploy.ps1 again: its Fabric track imports what''s missing (configure-fabric.ps1 and configure-powerbi.ps1).'
     try {
         $token = Get-DemoFabricToken -SubscriptionId ([string]$Config['subscriptionId'])
         $resolution = Resolve-DemoFabricConfig -Config $Config -Token $token -Confirm:$false
+        # Assigned before it's enumerated: Get-DemoMemberValue returns an array whole.
+        $resolveValue = Get-DemoMemberValue -InputObject $resolution -Name 'Results'
+        $resolveRecords = @($resolveValue | Where-Object { $null -ne $_ })
+        $setting = Get-DemoFabricResolveSetting -Config $Config
         $settings = Get-DemoFabricAppSetting
-        $fabric = $Config['fabric']
-        $workspaceName = [string](Get-DemoMemberValue -InputObject $fabric -Name 'workspaceName')
-        $lakehouseName = [string](Get-DemoMemberValue -InputObject $fabric -Name 'lakehouseName')
-        if (-not $resolution.WorkspaceId) {
-            return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('The Fabric workspace "{0}" isn''t there.' -f $workspaceName) -Remediation 'Run ./scripts/deploy.ps1 again: its Fabric track creates the workspace, the lakehouse, and the items.' -DocUrl $docUrl)
+        $workspaceName = $setting.WorkspaceName
+        $workspaceId = [string](Get-DemoMemberValue -InputObject $resolution -Name 'WorkspaceId')
+        # What couldn't be checked, each with the list's answer: Name, StatusCode, Error, and Kind.
+        $unchecked = [System.Collections.Generic.List[object]]::new()
+        $addUnchecked = {
+            param([string] $Name, [int] $StatusCode, [string] $ErrorText, [string] $Kind = '')
+            if (-not $Kind) {
+                $Kind = Get-DemoFabricListFailureKind -StatusCode $StatusCode -ErrorText $ErrorText
+            }
+            $unchecked.Add([pscustomobject]@{ Name = $Name; StatusCode = $StatusCode; Error = ([string]$ErrorText).TrimEnd('.', ' '); Kind = $Kind })
+        }
+        # The resolver's record of a list that didn't answer (evidence listed $false), as StatusCode, Error, and Kind; or $null.
+        $unlisted = {
+            param([string] $Id)
+            $record = @($resolveRecords | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq $Id }) | Select-Object -Last 1
+            $evidence = Get-DemoMemberValue -InputObject $record -Name 'evidence'
+            if ($null -eq $record -or (Get-DemoMemberValue -InputObject $evidence -Name 'listed') -ne $false) {
+                return $null
+            }
+            $code = Get-DemoMemberValue -InputObject $evidence -Name 'statusCode'
+            $text = [string](Get-DemoMemberValue -InputObject $evidence -Name 'error')
+            $kind = if ((Get-DemoMemberValue -InputObject $evidence -Name 'capacityInactive') -eq $true) { 'CapacityInactive' } elseif ($null -eq $code) { 'Access' } else { '' }
+            return [pscustomobject]@{ StatusCode = [int]$code; Error = $(if ($text) { $text } else { [string](Get-DemoMemberValue -InputObject $record -Name 'message') }); Kind = $kind }
+        }
+        if (-not $workspaceId) {
+            $failure = & $unlisted 'FABRIC.RESOLVE.WORKSPACE'
+            if ($null -eq $failure) {
+                return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('The Fabric workspace "{0}" isn''t there.' -f $workspaceName) -Remediation 'Run ./scripts/deploy.ps1 again: its Fabric track creates the workspace, the lakehouse, and the items.' -DocUrl $docUrl)
+            }
+            & $addUnchecked ('the workspace "{0}"' -f $workspaceName) $failure.StatusCode $failure.Error $failure.Kind
         }
         $missing = [System.Collections.Generic.List[string]]::new()
-        if (-not $resolution.LakehouseId) {
-            $missing.Add(('the lakehouse {0}' -f $(if ($lakehouseName) { $lakehouseName } else { 'LH_DatabaseHub' })))
-        }
         $wanted = @(
             foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'fabric/notebooks') -Filter '*.ipynb' -File)) {
                 @{ Name = $file.BaseName; Type = 'Notebook' }
@@ -883,20 +924,103 @@ function Test-DemoFabricRequiredItem {
             @{ Name = [string]$settings['semanticModelName']; Type = 'SemanticModel' }
             @{ Name = [string]$settings['reportName']; Type = 'Report' }
         )
-        foreach ($item in $wanted) {
-            $found = Find-DemoFabricItem -WorkspaceId ([string]$resolution.WorkspaceId) -DisplayName $item.Name -Type $item.Type -Token $token
-            if ($found.StatusCode -ne 200 -or @($found.Items).Count -eq 0) {
-                $missing.Add($item.Name)
+        if ($workspaceId) {
+            $lakehouseLabel = 'the lakehouse {0}' -f $setting.LakehouseName
+            if (-not [string](Get-DemoMemberValue -InputObject $resolution -Name 'LakehouseId')) {
+                $failure = & $unlisted 'FABRIC.RESOLVE.LAKEHOUSE'
+                if ($null -ne $failure) {
+                    & $addUnchecked $lakehouseLabel $failure.StatusCode $failure.Error $failure.Kind
+                }
+                else {
+                    $missing.Add($lakehouseLabel)
+                }
+            }
+            foreach ($item in $wanted) {
+                $found = Find-DemoFabricItem -WorkspaceId $workspaceId -DisplayName $item.Name -Type $item.Type -Token $token
+                if ($found.StatusCode -ne 200) {
+                    & $addUnchecked $item.Name $found.StatusCode ([string]$found.Error)
+                }
+                elseif (@($found.Items).Count -eq 0) {
+                    $missing.Add($item.Name)
+                }
             }
         }
-        $names = @(@($wanted | ForEach-Object { $_.Name }) + @($(if ($lakehouseName) { $lakehouseName } else { 'LH_DatabaseHub' })))
-        if ($missing.Count -gt 0) {
-            return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('The workspace "{0}" is missing: {1}.' -f $workspaceName, ($missing -join ', ')) -Evidence ([ordered]@{ missing = $missing.ToArray() }) -Remediation 'Run ./scripts/deploy.ps1 again: its Fabric track imports what''s missing (configure-fabric.ps1 and configure-powerbi.ps1).' -DocUrl $docUrl)
+        if ($missing.Count -eq 0 -and $unchecked.Count -eq 0) {
+            $names = @(@($wanted | ForEach-Object { $_.Name }) + @($setting.LakehouseName))
+            return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('The workspace "{0}" has the lakehouse, the notebooks, the Real-Time Dashboard, and the history model and report.' -f $workspaceName) -Evidence ([ordered]@{ items = $names }) -DocUrl $docUrl)
         }
-        return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('The workspace "{0}" has the lakehouse, the notebooks, the Real-Time Dashboard, and the history model and report.' -f $workspaceName) -Evidence ([ordered]@{ items = $names }) -DocUrl $docUrl)
+        $evidence = [ordered]@{ missing = $missing.ToArray() }
+        if ($unchecked.Count -eq 0) {
+            return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('The workspace "{0}" is missing: {1}.' -f $workspaceName, ($missing -join ', ')) -Evidence $evidence -Remediation $rerun -DocUrl $docUrl)
+        }
+
+        # What couldn't be checked isn't missing (live finding, 2026-11-10).
+        $evidence['unchecked'] = @($unchecked | ForEach-Object { [ordered]@{ name = $_.Name; statusCode = $_.StatusCode; error = $_.Error } })
+        $one = $unchecked.Count -eq 1
+        $names = (@($unchecked | ForEach-Object { $_.Name }) -join ', ')
+        $how = if ($workspaceId) { 'couldn''t all be checked' } else { 'couldn''t be checked' }
+        $besides = if ($missing.Count -gt 0) { ' Missing besides, from lists that answered: {0}.' -f ($missing -join ', ') } else { '' }
+        $paused = @($unchecked | Where-Object { $_.Kind -eq 'CapacityInactive' })
+        if ($paused.Count -gt 0) {
+            # The capacity's own record, so the run names it first (Get-DemoFabricCapacityBlock).
+            $evidence['capacityInactive'] = $true
+            $capacityRecord = $null
+            $resolvedConfig = Get-DemoMemberValue -InputObject $resolution -Name 'Config'
+            $whose = 'the capacity of the workspace "{0}" is paused or inactive' -f $workspaceName
+            if ($null -ne $resolvedConfig -and $workspaceId) {
+                $read = @(Test-DemoFabricWorkspace -Config $resolvedConfig -Token $token | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq 'FABRIC.P5.CAPACITY' }) | Select-Object -First 1
+                $readEvidence = Get-DemoMemberValue -InputObject $read -Name 'evidence'
+                $state = [string](Get-DemoMemberValue -InputObject $readEvidence -Name 'state')
+                if ($null -ne $read -and $state -and $state -ine 'Active') {
+                    $capacityRecord = $read
+                    $capacityName = [string](Get-DemoMemberValue -InputObject $readEvidence -Name 'capacityName')
+                    $sku = [string](Get-DemoMemberValue -InputObject $readEvidence -Name 'sku')
+                    $evidence['capacityName'] = $capacityName
+                    $evidence['capacityState'] = $state
+                    $whose = 'the capacity "{0}"{1} of the workspace "{2}" is {3}' -f $capacityName, $(if ($sku) { ' ({0})' -f $sku } else { '' }), $workspaceName, $state
+                }
+            }
+            $message = 'The required Fabric items {0}: {1}, so Fabric didn''t list {2} ({3}). That doesn''t mean {4} missing: Fabric lists {5} again once the capacity is resumed.{6}' -f $how, $whose, $names, $paused[0].Error, $(if ($one) { 'it''s' } else { 'they''re' }), $(if ($one) { 'it' } else { 'them' }), $besides
+            $items = New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message $message -Evidence $evidence -Remediation (Get-DemoFabricCapacityResumeFix -Then 'run ./scripts/deploy.ps1 again.') -DocUrl 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
+            if ($null -ne $capacityRecord) {
+                return @($capacityRecord, $items)
+            }
+            return $items
+        }
+
+        $detail = (@($unchecked | ForEach-Object { '{0} ({1})' -f $_.Name, $(if ($_.Error) { $_.Error } else { 'HTTP {0}' -f $_.StatusCode }) }) -join '; ')
+        $kinds = @($unchecked | ForEach-Object { $_.Kind })
+        $codes = (@($unchecked | Where-Object { $_.StatusCode -gt 0 } | ForEach-Object { 'HTTP {0}' -f $_.StatusCode } | Select-Object -Unique) -join ', ')
+        $status = if ($missing.Count -gt 0) { 'Fail' } elseif ('Access' -in $kinds) { 'Manual action required' } else { 'Warning' }
+        $remediation = if ($missing.Count -gt 0) {
+            $rerun
+        }
+        elseif ('Access' -in $kinds) {
+            'Check your role in the workspace "{0}" (Contributor or higher; a workspace administrator adds you in Manage access) and your Azure CLI sign-in (az login --tenant <tenantId>), then run ./scripts/deploy.ps1 again.' -f $workspaceName
+        }
+        elseif ('Other' -in $kinds) {
+            'Run ./scripts/deploy.ps1 again; if Fabric answers the same, look at the workspace "{0}" in the Fabric portal.' -f $workspaceName
+        }
+        elseif ('Unavailable' -in $kinds) {
+            'Fabric didn''t answer the list{0}, even after retries: run ./scripts/deploy.ps1 again in a few minutes.' -f $(if ($codes) { ' ({0})' -f $codes } else { '' })
+        }
+        else {
+            'Fabric is throttling requests (HTTP 429), even after retries: run ./scripts/deploy.ps1 again in a few minutes.'
+        }
+        $message = if ($missing.Count -gt 0) {
+            'The workspace "{0}" is missing: {1}. Fabric didn''t list {2}, so {3} couldn''t be checked.' -f $workspaceName, ($missing -join ', '), $detail, $(if ($one) { 'that one' } else { 'those' })
+        }
+        else {
+            'The required Fabric items {0}: Fabric didn''t list {1}. That doesn''t mean {2} missing.' -f $how, $detail, $(if ($one) { 'it''s' } else { 'they''re' })
+        }
+        return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status $status -Message $message -Evidence $evidence -Remediation $remediation -DocUrl $docUrl)
     }
     catch {
-        return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The Fabric items couldn''t be checked: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run ./scripts/deploy.ps1 again once Fabric answers (a paused capacity answers nothing).' -DocUrl $docUrl)
+        $text = Protect-DemoText -Text $_.Exception.Message
+        if (Test-DemoFabricCapacityInactiveText -Text $text) {
+            return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message ('The Fabric items couldn''t be checked: the workspace''s capacity is paused or inactive ({0}). That doesn''t mean they''re missing.' -f $text.TrimEnd('.', ' ')) -Evidence ([ordered]@{ capacityInactive = $true }) -Remediation (Get-DemoFabricCapacityResumeFix -Then 'run ./scripts/deploy.ps1 again.') -DocUrl 'https://learn.microsoft.com/fabric/enterprise/pause-resume')
+        }
+        return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The Fabric items couldn''t be checked: {0}' -f $text) -Remediation 'Run ./scripts/deploy.ps1 again in a few minutes, once Fabric answers.' -DocUrl $docUrl)
     }
 }
 
@@ -1120,7 +1244,8 @@ function Invoke-DemoDoneGate {
         $results.Add((Test-DemoSqlVmAssociatedService -Config $Config -WaitMinutes 10 -ListedStatus 'Fail'))
     }
     if ('FABRIC.ITEMS.REQUIRED' -in $missing) {
-        $results.Add((Test-DemoFabricRequiredItem -Config $Config))
+        # Its FABRIC.P5.CAPACITY first when the workspace's capacity is paused (live finding, 2026-11-10).
+        $results.AddRange([object[]]@(Test-DemoFabricRequiredItem -Config $Config | Where-Object { $null -ne $_ }))
     }
     if ($telemetry.Count -gt 0) {
         # The recovery only when everything else DONE needs passed: otherwise the run isn't DONE whatever the telemetry shows.
@@ -1130,6 +1255,53 @@ function Invoke-DemoDoneGate {
         $results.AddRange([object[]]@(Invoke-DemoTelemetryCheck -Config $Config -Target $telemetry -WaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath -ProgressStepId 'Validation' -NoRecovery:$blocked))
     }
     return $results.ToArray()
+}
+
+function Get-DemoFabricCapacityBlock {
+    <#
+    .SYNOPSIS
+    The record that says the Fabric workspace's capacity is paused or inactive, when that's the latest word on it in
+    -Result, or $null (live finding, 2026-11-10). Get-DemoDeploymentOutcome names it first among what blocks DONE: the
+    Fabric records a paused capacity causes, which can come earlier in the run (a lakehouse list that Fabric refuses,
+    FABRIC.RESOLVE.LAKEHOUSE; the required items that couldn't be checked, FABRIC.ITEMS.REQUIRED), share its fix, which
+    only its owner or administrator can do. Pure. Internal.
+
+    .DESCRIPTION
+    In the results' order: FABRIC.P5.CAPACITY as a Fail or Manual action required that read a state other than Active is
+    the capacity's own record, and preferred; a Pass of it (Active when read) settles every earlier sign; any other Fail
+    or Manual action required with evidence capacityInactive is a sign, named when no capacity record says so.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $capacity = $null
+    $sign = $null
+    foreach ($item in @($Result | Where-Object { $null -ne $_ })) {
+        $status = [string](Get-DemoMemberValue -InputObject $item -Name 'status')
+        $evidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
+        if ([string](Get-DemoMemberValue -InputObject $item -Name 'checkId') -eq 'FABRIC.P5.CAPACITY') {
+            $state = [string](Get-DemoMemberValue -InputObject $evidence -Name 'state')
+            if ($status -eq 'Pass') {
+                $capacity = $null
+                $sign = $null
+            }
+            elseif ($status -in 'Fail', 'Manual action required' -and $state -and $state -ine 'Active') {
+                $capacity = $item
+            }
+            continue
+        }
+        if ($status -in 'Fail', 'Manual action required' -and (Get-DemoMemberValue -InputObject $evidence -Name 'capacityInactive') -eq $true) {
+            $sign = $item
+        }
+    }
+    if ($null -ne $capacity) {
+        return $capacity
+    }
+    return $sign
 }
 
 function Get-DemoDeploymentOutcome {
@@ -1321,7 +1493,10 @@ function Get-DemoDeploymentOutcome {
         return [pscustomobject]$outcome
     }
     $leftoverShown = $false
-    $blocking = @($fails) + @($manual) | Select-Object -First 1
+    # A paused or inactive Fabric capacity comes first (live finding, 2026-11-10): the Fabric records it causes, earlier in
+    # the run or not, share its fix, which only its owner or administrator can do (Get-DemoFabricCapacityBlock).
+    $capacityBlock = Get-DemoFabricCapacityBlock -Result $core
+    $blocking = if ($null -ne $capacityBlock -and -not (Test-DemoConfirmOnlyResult -Result $capacityBlock -Context $all)) { $capacityBlock } else { @($fails) + @($manual) | Select-Object -First 1 }
     if ($null -ne $blocking) {
         $message = ConvertTo-DemoPlainText -Value $blocking.message
         if ($message.Length -gt 400) {

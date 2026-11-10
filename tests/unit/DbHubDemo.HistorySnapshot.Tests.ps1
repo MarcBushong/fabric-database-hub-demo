@@ -101,6 +101,8 @@ Describe 'Invoke-DemoHistorySnapshotStep (2026-11-06)' {
         $script:runRemediation = ''
         $script:refreshStatus = 'Pass'
         $script:refreshMessage = 'Refreshed the semantic model (Direct Lake framing) in about 5 seconds.'
+        # The resolver's lakehouse record when it isn't resolved; by default, a list that answered without it.
+        $script:lakehouseRecord = $null
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ($PesterBoundParameters['Level'] -eq 'Warning') { $script:warned.Add([string]$PesterBoundParameters['Message']) } }
         # Nothing reaches Azure or Fabric: a call these mocks don't cover fails the test that expects a Pass.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
@@ -114,9 +116,10 @@ Describe 'Invoke-DemoHistorySnapshotStep (2026-11-06)' {
                 return [pscustomobject]@{ Resolved = $true; Config = $copy; WorkspaceId = $script:workspaceId; WorkspaceName = 'Database Hub Demo'; LakehouseId = $script:lakehouseId; Results = @() }
             }
             $copy['fabric']['workspaceId'] = $script:workspaceId
+            $lakehouse = if ($null -ne $script:lakehouseRecord) { $script:lakehouseRecord } else { New-DemoResult -CheckId 'FABRIC.RESOLVE.LAKEHOUSE' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The lakehouse "LH_DatabaseHub" isn''t in the workspace "Database Hub Demo".' }
             [pscustomobject]@{ Resolved = $false; Config = $copy; WorkspaceId = $script:workspaceId; WorkspaceName = 'Database Hub Demo'; LakehouseId = ''; Results = @(
                     (New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Found the workspace.')
-                    (New-DemoResult -CheckId 'FABRIC.RESOLVE.LAKEHOUSE' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The lakehouse "LH_DatabaseHub" isn''t in the workspace "Database Hub Demo".')
+                    $lakehouse
                 ) }
         }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -MockWith {
@@ -227,6 +230,38 @@ Describe 'Invoke-DemoHistorySnapshotStep (2026-11-06)' {
         $record.message | Should -Match 'capacity isn''t running, so NB_DatabaseHub_LiveActivity couldn''t start\. NB_DatabaseHub_LiveActivity wasn''t started: HTTP 404, CapacityNotActive'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSemanticModelRefresh -Times 0 -Exactly
         (Get-TestRow -Path $script:progress)['state'] | Should -Be 'Action needed'
+    }
+
+    It 'is the same Warning, never "didn''t create", when Fabric refused the lakehouse list because the capacity is paused (live finding, 2026-11-10)' {
+        $script:resolved = $false
+        $error404 = 'HTTP 404: CapacityNotActive: Internal error CapacityNotActive.Capacity is not active.'
+        $script:lakehouseRecord = New-DemoResult -CheckId 'FABRIC.RESOLVE.LAKEHOUSE' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message ('The lakehouses in the workspace "Database Hub Demo" couldn''t be listed, because its capacity is paused or inactive: {0}' -f $error404) -Evidence ([ordered]@{ lakehouseName = 'LH_DatabaseHub'; statusCode = 404; listed = $false; error = $error404; capacityInactive = $true })
+        $record = & $script:invoke
+        $record.status | Should -Be 'Warning'
+        $record.evidence.outcome | Should -Be 'CapacityPaused'
+        $record.evidence.ContainsKey('reportedStatus') | Should -BeFalse
+        $record.message | Should -Be 'The history report got no snapshot: the workspace''s capacity isn''t running (HTTP 404: CapacityNotActive: Internal error CapacityNotActive.Capacity is not active), so NB_DatabaseHub_LiveActivity couldn''t run. deploy.ps1 never resumes, pauses, or scales a capacity.'
+        $record.message | Should -Not -Match 'didn''t create'
+        $record.remediation | Should -Match '^Resume the capacity, or ask its administrator to'
+        foreach ($command in 'Invoke-DemoFabricNotebookRun', 'Invoke-DemoSemanticModelRefresh', 'Resume-DemoFabricCapacity', 'Suspend-DemoFabricCapacity', 'Invoke-DemoFabricCapacityTransition') {
+            Should -Invoke -ModuleName DbHubDemo -CommandName $command -Times 0 -Exactly
+        }
+        (Get-TestRow -Path $script:progress)['state'] | Should -Be 'Action needed'
+    }
+
+    It 'says the Fabric items couldn''t be read, never "didn''t create", when the lakehouse list failed otherwise: <Case>' -ForEach @(
+        @{ Case = 'HTTP 503'; Status = 'Fail'; Code = 503; ListError = 'HTTP 503: ServiceUnavailable: Try again later.' }
+        @{ Case = 'HTTP 403'; Status = 'Manual action required'; Code = 403; ListError = 'HTTP 403: InsufficientPrivileges: The caller does not have sufficient permissions.' }
+    ) {
+        $script:resolved = $false
+        $script:lakehouseRecord = New-DemoResult -CheckId 'FABRIC.RESOLVE.LAKEHOUSE' -Area 'fabric' -Target 'fabric' -Status $Status -Message ('The lakehouses in the workspace "Database Hub Demo" couldn''t be listed: {0}' -f $ListError) -Evidence ([ordered]@{ lakehouseName = 'LH_DatabaseHub'; statusCode = $Code; listed = $false; error = $ListError })
+        $record = & $script:invoke
+        $record.status | Should -Be 'Warning'
+        $record.evidence.outcome | Should -Be 'Failed'
+        $record.evidence.reportedStatus | Should -Be 'Fail'
+        $record.message | Should -Match ('^The history report got no snapshot: the Fabric workspace and lakehouse couldn''t be read\. FABRIC\.RESOLVE\.LAKEHOUSE: .*HTTP {0}' -f $Code)
+        $record.message | Should -Not -Match 'didn''t create'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 0 -Exactly
     }
 
     It 'stops waiting at its timeout: a job still running is a Warning, it keeps running in Fabric, and the model isn''t framed' {

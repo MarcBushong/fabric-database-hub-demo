@@ -14,7 +14,9 @@ function Invoke-DemoFabricNotebookRun {
     Returns FABRIC.NOTEBOOKRUN.<NAME>: Pass when the job completed; Fail when it failed or was cancelled, with the
     failure reason; Warning when another run was already in progress (Deduped) or the wait ran out (the job keeps
     running; the evidence has its start time). Not selected without a configured workspace. It never pauses, resumes,
-    or scales the capacity; a paused capacity fails the submit, and the message says so.
+    or scales the capacity; a paused capacity fails the submit, and the message says so. When the notebook couldn't be
+    looked up, the list's error isn't a missing notebook (live finding, 2026-11-10): a paused or inactive capacity is
+    Manual action required, with the resume as the fix, and any other error a Fail whose fix is to run it again.
 
     The token comes from the Azure CLI after the subscription guard (Get-DemoFabricToken), unless -Token is passed.
 
@@ -85,9 +87,14 @@ function Invoke-DemoFabricNotebookRun {
     }
 
     $found = Find-DemoFabricItem -WorkspaceId $workspaceId -DisplayName $Name -Type 'Notebook' -Token $Token
+    if ($found.StatusCode -ne 200 -and (Test-DemoFabricCapacityInactiveText -Text ([string]$found.Error))) {
+        # A list that failed isn't a missing notebook (live finding, 2026-11-10): a paused capacity is resumed by its owner.
+        return (& $result 'Manual action required' ('{0} didn''t run: the workspace''s capacity is paused or inactive ({1}).' -f $Name, ([string]$found.Error).TrimEnd('.', ' ')) @{} (Get-DemoFabricCapacityResumeFix -Then 'run it again.'))
+    }
     if ($found.StatusCode -ne 200 -or @($found.Items).Count -ne 1) {
         $why = if ($found.StatusCode -ne 200) { 'the workspace couldn''t be read ({0})' -f $found.Error } else { 'it isn''t in the workspace' }
-        return (& $result 'Fail' ('{0} didn''t run: {1}.' -f $Name, $why) @{} 'Import the notebooks first: ./scripts/configure-fabric.ps1 -SkipHubChecks.')
+        $fix = if ($found.StatusCode -ne 200) { 'Run it again in a few minutes: the workspace''s notebooks couldn''t be listed.' } else { 'Import the notebooks first: ./scripts/configure-fabric.ps1 -SkipHubChecks.' }
+        return (& $result 'Fail' ('{0} didn''t run: {1}.' -f $Name, $why) @{} $fix)
     }
     $itemId = [string](Get-DemoMemberValue -InputObject @($found.Items)[0] -Name 'id')
 

@@ -319,6 +319,64 @@ Describe 'Resolve-DemoFabricConfig' {
         @($requests | Where-Object { $_.Method -ne 'Get' }).Count | Should -Be 0
     }
 
+    It 'says a lakehouse list that Fabric refuses for a paused capacity (CapacityNotActive) isn''t a missing lakehouse, with the resume as the fix (live finding, 2026-11-10)' {
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($demoWorkspace) }) }
+            @{ Method = 'Get'; Match = $lakehousesUri; Responses = @(New-FabricResponse -Status 404 -Body @{ errorCode = 'CapacityNotActive'; message = 'Internal error CapacityNotActive.Capacity is not active.' }) }
+        )
+        foreach ($create in $false, $true) {
+            $resolution = Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token -Create:$create -Confirm:$false
+            $resolution.Resolved | Should -BeFalse
+            $record = Get-Record $resolution 'FABRIC.RESOLVE.LAKEHOUSE'
+            $record.status | Should -Be 'Manual action required'
+            $record.message | Should -Be 'The lakehouses in the workspace "Database Hub Demo" couldn''t be listed, because its capacity is paused or inactive: HTTP 404: CapacityNotActive: Internal error CapacityNotActive.Capacity is not active. That doesn''t mean the lakehouse "LH_DatabaseHub" is missing: Fabric lists it again once the capacity is resumed.'
+            $record.remediation | Should -Be 'Resume the capacity, or ask its administrator to (Azure portal: Microsoft Fabric, the capacity, Resume; that resumes its billing too). Then run the script again.'
+            $record.remediation | Should -Not -Match 'Contributor|Manage access|start-demo|manageCapacity'
+            $record.docUrl | Should -Be 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
+            $record.evidence['listed'] | Should -Be $false
+            $record.evidence['capacityInactive'] | Should -Be $true
+            $record.evidence['statusCode'] | Should -Be 404
+            $record.evidence['error'] | Should -Match '^HTTP 404: CapacityNotActive'
+        }
+        @($requests | Where-Object { $_.Method -ne 'Get' }).Count | Should -Be 0 -Because 'a list that didn''t answer creates nothing, and never touches the capacity'
+    }
+
+    It 'says to run again in a few minutes when Fabric throttles the lakehouse list or doesn''t answer it: HTTP <Code>' -ForEach @(
+        @{ Code = 429; Fix = 'Fabric is throttling requests (HTTP 429), even after retries: run the script again in a few minutes.' }
+        @{ Code = 503; Fix = 'Fabric didn''t answer the list (HTTP 503), even after retries: run the script again in a few minutes.' }
+    ) {
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($demoWorkspace) }) }
+            @{ Method = 'Get'; Match = $lakehousesUri; Responses = @(New-FabricResponse -Status $Code -Body @{ errorCode = 'RequestBlocked'; message = 'Try again later.' } -Headers @{ 'Retry-After' = '1' }) }
+        )
+        $record = Get-Record (Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token) 'FABRIC.RESOLVE.LAKEHOUSE'
+        $record.status | Should -Be 'Fail'
+        $record.message | Should -Match ('^The lakehouses in the workspace "Database Hub Demo" couldn''t be listed: HTTP {0}: RequestBlocked' -f $Code)
+        $record.remediation | Should -Be $Fix
+        $record.evidence['listed'] | Should -Be $false
+        $record.evidence['statusCode'] | Should -Be $Code
+        $record.evidence.Contains('capacityInactive') | Should -BeFalse
+    }
+
+    It 'says a lakehouse list your role doesn''t allow needs a role, and marks every list that didn''t answer' {
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $workspacesUri; Responses = @(
+                    New-FabricResponse -Status 200 -Body @{ value = @($demoWorkspace) }
+                    New-FabricResponse -Status 503 -Body @{ errorCode = 'ServiceUnavailable'; message = 'Try again later.' }
+                ) }
+            @{ Method = 'Get'; Match = $lakehousesUri; Responses = @(New-FabricResponse -Status 403 -Body @{ errorCode = 'InsufficientPrivileges'; message = 'The caller does not have sufficient permissions.' }) }
+        )
+        $forbidden = Get-Record (Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token) 'FABRIC.RESOLVE.LAKEHOUSE'
+        $forbidden.status | Should -Be 'Manual action required'
+        $forbidden.remediation | Should -Match '^Listing lakehouses needs a role in the workspace'
+        $forbidden.evidence['listed'] | Should -Be $false
+        $forbidden.evidence.Contains('capacityInactive') | Should -BeFalse
+        $workspaces = Get-Record (Resolve-DemoFabricConfig -Config (New-TestConfig) -Token $token) 'FABRIC.RESOLVE.WORKSPACE'
+        $workspaces.status | Should -Be 'Fail'
+        $workspaces.remediation | Should -Be 'Fabric didn''t answer the list (HTTP 503), even after retries: run the script again in a few minutes.'
+        $workspaces.evidence['listed'] | Should -Be $false
+    }
+
     It 'is Manual action required when the tenant doesn''t let you create workspaces, or the name is taken' {
         Set-FabricMock -Routes @(
             @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @() }) }
@@ -446,6 +504,50 @@ Describe 'Get-DemoFabricStatus (status.ps1)' {
         $paused = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Token = $token } { Get-DemoFabricStatus -Config $Config -Token $Token }
         $paused.status | Should -Be 'Pass'
         $paused.message | Should -Match 'is Inactive: its administrator resumes it'
+        @($requests | Where-Object { $_.Method -ne 'Get' }).Count | Should -Be 0
+    }
+
+    It 'still passes on a paused capacity whose lakehouse list Fabric refuses, by finding the lakehouse among the workspace''s items (live finding, 2026-11-10)' {
+        # Not named $routes: Set-FabricMock's Invoke-WebRequest mock reads that name.
+        $statusRoutes = {
+            param([object[]] $LakehouseItems)
+            @(
+                @{ Method = 'Get'; Match = $workspacesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($demoWorkspace) }) }
+                @{ Method = 'Get'; Match = $lakehousesUri; Responses = @(New-FabricResponse -Status 404 -Body @{ errorCode = 'CapacityNotActive'; message = 'Internal error CapacityNotActive.Capacity is not active.' }) }
+                @{ Method = 'Get'; Match = [regex]::Escape("/workspaces/$workspaceId/items?type=Lakehouse"); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($LakehouseItems) }) }
+                @{ Method = 'Get'; Match = $workspaceUri; Responses = @(New-FabricResponse -Status 200 -Body @{ id = $workspaceId; displayName = 'Database Hub Demo'; capacityId = $capacityId }) }
+                @{ Method = 'Get'; Match = $capacitiesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $capacityId; displayName = 'demo-capacity'; sku = 'F4'; state = 'Inactive' }) }) }
+            )
+        }
+        Set-FabricMock -Routes (& $statusRoutes @(@{ id = $lakehouseId; displayName = 'LH_DatabaseHub'; type = 'Lakehouse' }))
+        $token = $script:token
+        $status = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Token = $token } { Get-DemoFabricStatus -Config $Config -Token $Token }
+        $status.status | Should -Be 'Pass'
+        $status.message | Should -Be 'Fabric: the workspace "Database Hub Demo" and the lakehouse "LH_DatabaseHub" are there; its capacity "demo-capacity" (F4) is Inactive: its administrator resumes it before a session (the scripts never do).'
+        $status.evidence['lakehouseId'] | Should -Be $lakehouseId
+        @($requests | Where-Object { $_.Method -ne 'Get' }).Count | Should -Be 0
+
+        # When the workspace's items don't show it either, it says what the lakehouse list said, never that it passed.
+        Set-FabricMock -Routes (& $statusRoutes @())
+        $unknown = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Token = $token } { Get-DemoFabricStatus -Config $Config -Token $Token }
+        $unknown.status | Should -Be 'Manual action required'
+        $unknown.message | Should -Match 'couldn''t be listed, because its capacity is paused or inactive'
+        $unknown.remediation | Should -Match '^Resume the capacity, or ask its administrator to'
+    }
+
+    It 'gives FABRIC.P5.CAPACITY on a paused capacity the resume as its fix, never a script that resumes it (live finding, 2026-11-10)' {
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $workspaceUri; Responses = @(New-FabricResponse -Status 200 -Body @{ id = $workspaceId; displayName = 'Database Hub Demo'; capacityId = $capacityId; capacityRegion = 'West US 3' }) }
+            @{ Method = 'Get'; Match = [regex]::Escape("$api/workspaces?roles="); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @($demoWorkspace) }) }
+            @{ Method = 'Get'; Match = $capacitiesUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $capacityId; displayName = 'demo-capacity'; sku = 'F4'; state = 'Inactive' }) }) }
+        )
+        $token = $script:token
+        $config = New-TestConfig -Fabric @{ workspaceId = $workspaceId }
+        $capacity = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $token } { Test-DemoFabricWorkspace -Config $Config -Token $Token }) | Where-Object { $_.checkId -eq 'FABRIC.P5.CAPACITY' }
+        $capacity.status | Should -Be 'Manual action required'
+        $capacity.message | Should -Be 'The capacity "demo-capacity" (F4) of the Fabric workspace "Database Hub Demo" is Inactive, so notebooks can''t run.'
+        $capacity.remediation | Should -Be 'Resume the capacity, or ask its administrator to (Azure portal: Microsoft Fabric, the capacity, Resume; that resumes its billing too).'
+        $capacity.docUrl | Should -Be 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
         @($requests | Where-Object { $_.Method -ne 'Get' }).Count | Should -Be 0
     }
 
