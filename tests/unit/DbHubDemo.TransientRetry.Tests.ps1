@@ -269,8 +269,9 @@ throw $failure
     It 'logs one console line as soon as a track step fails: what failed, why, and that a rerun resumes it' {
         InModuleScope DbHubDemo { Get-DemoStepFailureLine -Label (Get-DemoProgressStepLabel -Id 'Fabric.Report') -Message 'configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts.' } |
             Should -Be 'The history report step failed: configure-powerbi.ps1 stopped: A network error reached api.powerbi.com on each of 4 attempts. The other tracks continue; the run ends NOT DONE, and ./scripts/deploy.ps1 resumes it.'
-        InModuleScope DbHubDemo { (Get-DemoProgressStepLabel -Id 'T1.Monitoring'), (Get-DemoProgressStepLabel -Id 'T3.Setup'), (Get-DemoProgressStepLabel -Id 'T2.GuidedStop'), (Get-DemoProgressStepLabel -Id 'T2.Monitoring') } |
-            Should -Be @('monitoring', 'T3 setup from T1', 'guided stop', 'PAYG and monitoring')
+        # The guided stop's step is gone with the guided stop (retired, 2026-11-09).
+        InModuleScope DbHubDemo { (Get-DemoProgressStepLabel -Id 'T1.Monitoring'), (Get-DemoProgressStepLabel -Id 'T3.Setup'), (Get-DemoProgressStepLabel -Id 'T2.Monitoring') } |
+            Should -Be @('monitoring', 'T3 setup from T1', 'PAYG and monitoring')
     }
 }
 

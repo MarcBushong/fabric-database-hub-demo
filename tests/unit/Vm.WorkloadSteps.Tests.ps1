@@ -576,7 +576,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
 
     It '<Action>: starts no activity when the next auto-shutdown is less than 10 minutes away (CI, 2026-11-09)' -ForEach @(
         @{ Action = 'EnableT3'; Target = 'T3'; Request = @{ serverFqdn = 'azuresql01-abc123.database.windows.net' } }
-        @{ Action = 'EnableT4'; Target = 'T4'; Request = @{ serverFqdn = 'pgflex01-abc123.postgres.database.azure.com'; adminRole = 'DbHub T3 admins'; runnerRole = 'contosocare_runner'; runnerObjectId = '0f0e0d0c-0b0a-0908-0706-050403020100'; seedScale = 2 } }
+        @{ Action = 'EnableT4'; Target = 'T4'; Request = @{ serverFqdn = 'pgflex01-abc123.postgres.database.azure.com'; adminRole = 'DbHub T3 admins'; runnerRole = 'contosocare_runner'; runnerObjectId = '11111111-2222-3333-4444-555555555555'; seedScale = 2 } }
     ) {
         $root = New-ControlRoot
         Mock -CommandName Test-DemoVmNameResolve -MockWith { $true }

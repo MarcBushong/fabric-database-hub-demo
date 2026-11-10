@@ -428,7 +428,7 @@ Describe 'Invoke-DemoTemplateDeployment' {
 
         $script:sizes.Clear()
         $withT4['t4SkuName'] = 'Standard_D2ds_v5'
-        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'Standard_D4ads_v5'
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'None'
         $script:sizes | Should -Be @('Standard_D2ds_v5')
         @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).Count | Should -Be 0
     }
@@ -1976,6 +1976,7 @@ Describe 'Start-DemoEnvironment' {
         ($results | Where-Object { $_.checkId -eq 'START.T4.RECORD' }).status | Should -Be 'Warning'
         $script:order | Should -Contain 'Start:sqlvm01'
     }
+
     It 'uses business-day for a configuration without activityProfile, says so once, and checks the cost with it (2026-11-03)' {
         $unset = New-TestConfig
         $unset.Remove('activityProfile')
