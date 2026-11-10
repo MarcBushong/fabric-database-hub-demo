@@ -391,6 +391,23 @@ Describe 'Invoke-DemoPreflight' {
         ($results | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING').message | Should -Match 't4SkuName sets Standard_B1ms\.$'
     }
 
+    It 'reads a T4 server Azure is deleting as no server, so its size neither moves the fallback''s start nor counts as T4''s (live, 2026-11-09)' {
+        Set-HappyAzMock
+        $script:listSkusJson = ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5' }, @{ name = 'Standard_D4ads_v5' }, @{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '18' }) })
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:listSkusJson; StdErr = '' } }
+        # The shell of a Standard_D4ads_v5 that Azure refused: Dropping, with the size it was begun at.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Exists = $false; Present = $true; Removing = $true; State = 'Dropping'; Server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ads_v5'; tier = 'GeneralPurpose' } }; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith { [pscustomobject]@{ LightUseMonthly = 10.0; SessionCost = 1.0; T4AutoRestartWorstCaseMonthly = 1.0; T4FixedMonthly = 1.0; DefenderIncluded = $true; MissingPrices = @(); Components = @(); Results = @() } }
+        $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
+        @($results | Where-Object checkId -eq 'PREFLIGHT.T4.SIZE').Count | Should -Be 0
+        $capability = $results | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY'
+        $capability.status | Should -Be 'Pass'
+        $capability.message | Should -Match 'offers T4''s GeneralPurpose Standard_D4ds_v5 and PostgreSQL'
+        $capability.evidence.sku | Should -Be 'Standard_D4ds_v5'
+        $capability.evidence.exists | Should -BeFalse
+        $capability.evidence.startSku | Should -BeNullOrEmpty
+    }
+
     It 'prices T4''s General Purpose fallback before anything is created, with its full-month worst case against both ceilings (Phase 28 follow-up)' {
         Set-HappyAzMock
         # Its numbers are set against a 250 USD ceiling, kept here (the default is 375 since 2026-11-04).

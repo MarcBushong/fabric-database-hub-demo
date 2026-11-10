@@ -477,6 +477,8 @@ function Invoke-DemoDeployment {
                     T3AdminGroupDisplayName = [string]$context.T3AdminGroupName
                     # An existing T4 whose size the configuration doesn't set moves to the default (2026-11-04, ADR 0019).
                     ScaleT4                 = $true
+                    # The wait for a T4 server Azure refused shows on the status page (2026-11-09).
+                    ProgressPath            = $ProgressPath
                 }
                 if ($context.T4StartSku) {
                     $deployArguments['T4StartSku'] = $context.T4StartSku
@@ -594,6 +596,7 @@ function Invoke-DemoDeployment {
                     BootstrapBundleSha256   = $current.BundleSha256
                     BootstrapChunkCount     = $current.BundleChunkCount
                     ScaleT4                 = $true
+                    ProgressPath            = $ProgressPath
                 }
                 if ($current.RunnerSha256 -and @($runnerVms | Where-Object { $_ -notin $current.RunnerSentTo }).Count -eq 0) {
                     $deployArguments['WorkloadRunnerSha256'] = $current.RunnerSha256

@@ -67,7 +67,7 @@ function Test-DemoT4 {
     }
     $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
     if (-not $current.Exists) {
-        $message = if (-not $names.ServerName) { 'T4''s server name isn''t known: the resource group has no deploymentId tag.' } elseif ($current.State -eq 'NotFound') { 'T4 ({0}) doesn''t exist in {1}.' -f $names.ServerName, $names.ResourceGroup } else { 'T4 ({0}) couldn''t be read: {1}' -f $names.ServerName, $current.Error }
+        $message = if (-not $names.ServerName) { 'T4''s server name isn''t known: the resource group has no deploymentId tag.' } elseif ($current.State -eq 'NotFound') { 'T4 ({0}) doesn''t exist in {1}.' -f $names.ServerName, $names.ResourceGroup } elseif ([bool](Get-DemoMemberValue -InputObject $current -Name 'Removing')) { 'T4 ({0}) is being deleted (Dropping): Azure removes a server it refused within minutes, and one deleted by hand too, so it isn''t T4 any more.' -f $names.ServerName } else { 'T4 ({0}) couldn''t be read: {1}' -f $names.ServerName, $current.Error }
         & $add 'T4.SERVER' 'Fail' $message @{ server = $names.ServerName } 'Deploy it with scripts/deploy.ps1 (or -Resume); the template creates pgflex01-<deploymentId>.' $docs['networkingPrivate']
         foreach ($checkId in $later) {
             & $add $checkId 'Not selected' 'T4 doesn''t exist, so this wasn''t checked.'
