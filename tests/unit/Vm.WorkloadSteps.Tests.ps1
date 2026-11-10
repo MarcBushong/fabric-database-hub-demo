@@ -473,6 +473,8 @@ Describe 'Start-DemoWorkload.ps1' {
 Describe 'Invoke-DemoWorkloadControl.ps1' {
     BeforeAll {
         . (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoWorkloadControl.ps1')
+        # The real function, before any mock replaces it (BeforeEach runs it with a fixed clock).
+        $script:realNextShutdown = ${function:Get-DemoVmNextShutdown}
 
         function New-ControlRoot([string] $Role = 'SqlVm', [switch] $NoInstall) {
             $root = Join-Path -Path $TestDrive -ChildPath ('control-' + [guid]::NewGuid().ToString('N'))
@@ -539,6 +541,14 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         Mock -CommandName Stop-DemoVmWorkload -MockWith { }
         Mock -CommandName Start-DemoVmWorkload -MockWith { }
         Mock -CommandName Start-Sleep -MockWith { }
+        # The next auto-shutdown from a fixed clock ($script:controlNowUtc, noon UTC unless a test moves it), through the
+        # real function: workload-install.json's 23:59 UTC shutdown is then 719 minutes away. On the real clock, from 23:49
+        # UTC the 10 minutes EnableT3 and EnableT4 need to set a profile weren't left, and their tests failed (CI, 2026-11-09).
+        $script:controlNowUtc = [datetime]::new(2026, 11, 4, 12, 0, 0, [System.DateTimeKind]::Utc)
+        Mock -CommandName Get-DemoVmNextShutdown -MockWith {
+            $zone = if ($PesterBoundParameters.ContainsKey('TimeZoneId')) { [string]$PesterBoundParameters['TimeZoneId'] } else { 'UTC' }
+            & $script:realNextShutdown -Time ([string]$PesterBoundParameters['Time']) -TimeZoneId $zone -NowUtc $script:controlNowUtc
+        }
 
         function Get-ControlResult {
             $script:lines.Count | Should -Be 1
@@ -562,6 +572,25 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         Should -Invoke -CommandName Start-DemoVmWorkload -Times 1 -Exactly
         (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 't3-workload.json') -Raw | ConvertFrom-Json).serverFqdn | Should -Be 'azuresql01-abc123.database.windows.net'
         (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'workload-install.json') -Raw | ConvertFrom-Json).setup.T3.status | Should -Be 'Pass'
+    }
+
+    It '<Action>: starts no activity when the next auto-shutdown is less than 10 minutes away (CI, 2026-11-09)' -ForEach @(
+        @{ Action = 'EnableT3'; Target = 'T3'; Request = @{ serverFqdn = 'azuresql01-abc123.database.windows.net' } }
+        @{ Action = 'EnableT4'; Target = 'T4'; Request = @{ serverFqdn = 'pgflex01-abc123.postgres.database.azure.com'; adminRole = 'DbHub T3 admins'; runnerRole = 'contosocare_runner'; runnerObjectId = '0f0e0d0c-0b0a-0908-0706-050403020100'; seedScale = 2 } }
+    ) {
+        $root = New-ControlRoot
+        Mock -CommandName Test-DemoVmNameResolve -MockWith { $true }
+        Mock -CommandName Invoke-DemoVmRunnerSetup -MockWith { [pscustomobject]@{ Status = 'Pass'; ExitCode = 0; Message = 'setup: Pass'; Records = @() } }
+        Mock -CommandName Set-DemoVmActivityProfile -MockWith { [pscustomobject]@{ Status = 'Pass'; ExitCode = 0; Message = 'profile set: Pass'; Records = @() } }
+        $script:controlNowUtc = [datetime]::new(2026, 11, 4, 23, 52, 0, [System.DateTimeKind]::Utc)
+        Invoke-DemoWorkloadControl -ActionName $Action -Request (ConvertTo-Request $Request) -StateRoot $root
+        $script:lines[0] | Should -Match ([regex]::Escape('"notAfter":"2026-11-04T23:59:00+00:00"'))
+        $result = Get-ControlResult
+        $result.status | Should -Be 'Pass'
+        $result.evidence.profileSet | Should -Be 'Not selected'
+        $result.message | Should -Match ('The next auto-shutdown is 7 minutes away, so no {0} activity was started\.' -f $Target)
+        Should -Invoke -CommandName Set-DemoVmActivityProfile -Times 0
+        Should -Invoke -CommandName Start-DemoVmWorkload -Times 1 -Exactly
     }
 
     It 'EnableT3: records nothing when the setup on T3 fails' {

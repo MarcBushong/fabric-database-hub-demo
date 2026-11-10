@@ -518,10 +518,19 @@ Describe 'Invoke-DemoArcOnboarding' {
         $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
         $result.status | Should -Be 'Pass'
         $result.evidence.decision | Should -Be 'AlreadyConnected'
+        # The probe's agent keys, as a flat list (not an array inside an array).
+        , $result.evidence.agentKeys | Should -BeOfType [object[]]
+        $result.evidence.agentKeys.Count | Should -Be 0
         $script:runs[1].Parameter['Action'] | Should -Be 'WriteMarker'
         $script:runs[1].Protected.Count | Should -Be 0
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmAccessToken -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoArcStaleResource -Times 0 -Exactly
+
+        $script:probe.agentKeys = @('status', 'resourceName')
+        $script:runs.Clear()
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $result.evidence.agentKeys.Count | Should -Be 2
+        $result.evidence.agentKeys[0] | Should -Be 'status'
     }
 
     It 'deletes a stale machine first, then onboards with the token only as a protected parameter' {

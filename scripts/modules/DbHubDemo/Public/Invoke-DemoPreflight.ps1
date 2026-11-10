@@ -268,7 +268,7 @@ function Invoke-DemoPreflight {
     # list-skus' (Phase 28, brief item 10), or the documented Location Based Capabilities API when the Azure CLI can't
     # answer. When the configuration doesn't set t4SkuName and T4 doesn't exist yet, the fallback applies (since T4's
     # 4-vCore default, 2026-11-04: Standard_D4ds_v5, once more in another zone, Standard_D4ads_v5, then Standard_D2ds_v5
-    # with autonomous tuning off after its cost check, then no T4), so a size the region doesn't list isn't a Fail: the
+    # with autonomous tuning off, whose cost check only reports), so a size the region doesn't list isn't a Fail: the
     # furthest step any check found is where deploy.ps1 starts (PREFLIGHT.T4.FALLBACK's startSku, with the cost check
     # below). An existing server keeps its own size, or moves to the default once (PREFLIGHT.T4.SIZE), so the fallback
     # doesn't apply to it. PREFLIGHT.T4.TUNING says whether the size T4 gets runs autonomous tuning.
@@ -294,8 +294,8 @@ function Invoke-DemoPreflight {
         $t4Tier = (Get-DemoT4SkuSpec -SkuName $t4Sku).Tier
         $t4Ladder = -not $t4Explicit -and -not $t4Exists
         if ($t4Ladder -and $t4Sku -cin 'Standard_D4ads_v5', 'Standard_D2ds_v5') {
-            # An earlier run's record (DbHubT4Size Standard_D4ads_v5, Standard_D2ds_v5, or None for a run that deploys the
-            # template) for a server that wasn't created: the fallback starts there, and its cost check below decides.
+            # An earlier run's record (DbHubT4Size Standard_D4ads_v5 or Standard_D2ds_v5) for a server that wasn't
+            # created: the fallback starts there, and its cost check below reports.
             $t4Starts.Add($t4Sku)
         }
         $capabilitySource = 'az postgres flexible-server list-skus'
@@ -368,7 +368,8 @@ function Invoke-DemoPreflight {
         # SkuNotAvailable on 2026-10-26 while the list included it. A refusal on record for this size and zone is a
         # Fail for a size the configuration sets; otherwise deploy.ps1's fallback starts one step on, a Warning:
         # Standard_D4ds_v5 to Standard_D4ads_v5, Standard_D4ads_v5 to Standard_D2ds_v5 (after its cost check), and
-        # Standard_D2ds_v5 to no T4 (ADR 0019). The retry in another zone happens only in deploy.ps1, right after a refusal.
+        # after Standard_D2ds_v5, every size again from the default, since T4 is part of every deployment
+        # (2026-11-09). The retry in another zone happens only in deploy.ps1, right after a refusal.
         if (-not $t4Exists) {
             $refused = Get-DemoT4CreateFailure -Config $Config
             if ($null -ne $refused -and $refused.Sku -eq $t4Sku) {
@@ -402,14 +403,9 @@ function Invoke-DemoPreflight {
         if ($t4Scale) {
             $results.Add((New-DemoT4SizeResult -CheckPrefix PREFLIGHT -ServerSku $t4ServerSku -SkuName $t4Sku -Outcome Scale))
         }
-        if ($t4Start -in 'None', 'Refused') {
-            $results.Add((New-DemoResult -CheckId 'PREFLIGHT.T4.TUNING' -Area 'preflight' -Target 'T4' -Status 'Not selected' -Message 'This run leaves T4 out (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU says why), so autonomous tuning doesn''t apply.' -DocUrl ([string]$postgres['autonomousTuning']['docUrls']['autonomousTuning'])))
-        }
-        else {
-            $tuningSku = if ($t4Start) { $t4Start } else { $t4Sku }
-            $tuningWhy = if ($t4Start -eq 'Standard_D2ds_v5') { 'deploy.ps1''s fallback uses Standard_D2ds_v5 because the 4-vCore sizes are ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' } elseif ($t4Explicit) { ('t4SkuName sets {0}.' -f $tuningSku) } else { '' }
-            $results.Add((New-DemoT4TuningResult -Config $Config -SkuName $tuningSku -Why $tuningWhy -CheckPrefix PREFLIGHT))
-        }
+        $tuningSku = if ($t4Start) { $t4Start } else { $t4Sku }
+        $tuningWhy = if ($t4Start -eq 'Standard_D2ds_v5') { 'deploy.ps1''s fallback uses Standard_D2ds_v5 because the 4-vCore sizes are ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' } elseif ($t4Explicit) { ('t4SkuName sets {0}.' -f $tuningSku) } else { '' }
+        $results.Add((New-DemoT4TuningResult -Config $Config -SkuName $tuningSku -Why $tuningWhy -CheckPrefix PREFLIGHT))
     }
     else {
         $results.Add((New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT))
@@ -620,10 +616,9 @@ function Invoke-DemoPreflight {
     }
 
     # Cost: live retail prices against the ceilings, with the subscription's Defender for Cloud plans. T4 is priced at the
-    # size it gets (ADR 0019): an existing server's own size or the default it moves to (PREFLIGHT.T4.SIZE), the step the
-    # fallback starts at, or none when the fallback leaves T4 out, so a fallback whose worst case is over a ceiling leaves
-    # T4 out instead of stopping the run. The estimates share one price cache, so the fallback's own estimate reads only
-    # the prices it adds. The
+    # size it gets (ADR 0019): an existing server's own size or the default it moves to (PREFLIGHT.T4.SIZE), or the step the
+    # fallback starts at; nothing leaves T4 out since 2026-11-09. The estimates share one price cache, so the fallback's
+    # own estimate reads only the prices it adds. The
     # activity profile's T3 incidents count (business-day by default since 2026-11-03), and a configuration that doesn't
     # set activityProfile gets one notice (PREFLIGHT.ACTIVITYPROFILE).
     $notice = New-DemoActivityProfileNotice -ActivityProfile (Get-DemoActivityProfile -Config $Config) -CheckPrefix 'PREFLIGHT'
@@ -637,9 +632,7 @@ function Invoke-DemoPreflight {
     elseif ($t4On -and $t4Start -in 'Standard_D4ads_v5', 'Standard_D2ds_v5') {
         $costConfig = Copy-DemoT4Config -Config $Config -Source fallback -SkuName $t4Start
     }
-    elseif ($t4On -and $t4Start -in 'None', 'Refused') {
-        $costConfig = Copy-DemoT4Config -Config $Config -Source fallback -Off
-    }
+
     $costParameters = @{ Config = $costConfig; NetworkMode = $effectiveNetworkMode; T3UseFreeLimit = $t3UseFreeLimit; PriceCache = @{} }
     try {
         $costParameters['DefenderPlans'] = @(Get-DemoDefenderPlan -SubscriptionId $subscriptionId)

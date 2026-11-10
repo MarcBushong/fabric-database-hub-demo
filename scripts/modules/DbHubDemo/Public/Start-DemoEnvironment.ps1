@@ -49,7 +49,9 @@ function Start-DemoEnvironment {
        (Invoke-DemoSqlVmMonitoringWait -RestartAtOnce: Enable-DemoSqlVmMonitoring -WaitMinutes, as configure-monitoring.ps1
        -Target T1 does, then the agent's restart at once for a NotRunning plugin).
     4a. T4, the PostgreSQL flexible server (Phase 24, ADR 0019): its start is requested with the VMs
-       (Servers - Start) and confirmed before its profile is set (START.T4.START). -SkipT4 leaves it stopped.
+       (Servers - Start) and confirmed before its profile is set (START.T4.START). -SkipT4 leaves it stopped. An
+       earlier run's record that left T4 out (DbHubT4Size None or Refused) is cleared, since no record leaves T4 out
+       any more (2026-11-09): the next deploy.ps1 creates T4 when it doesn't exist (START.T4.RECORD).
     5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
        2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown (START.PROFILE_*). A profile with incidents is set
        as its interim, baseline, first. The VMs don't set it at boot unless
@@ -215,6 +217,18 @@ function Start-DemoEnvironment {
         }
         catch {
             $results.Add((New-DemoResult -CheckId 'START.CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('A pending on-demand auto-stop couldn''t be checked: {0}. If one is pending, it deallocates the VMs at its time; the start carried on.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'status.ps1 shows whether one is pending (STATUS.CONTROL). To cancel it, delete the schedule dbhub-autostop in the control Automation account aa-<prefix>-control (Shared resources > Schedules) in the Azure portal, or run start-demo.ps1 again.' -DocUrl 'https://learn.microsoft.com/rest/api/automation/schedule/delete'))
+        }
+    }
+    # 2026-11-09 (user-directed: T4 is part of every deployment): an earlier run's "no T4" record doesn't hold any more, so
+    # it goes here too, not only at the next deploy.ps1 that deploys the template.
+    $recordedOff = [string](Get-DemoMemberValue -InputObject $state -Name 'T4Sku')
+    if ($recordedOff -cin 'None', 'Refused') {
+        try {
+            Set-DemoDeploymentState -Config $Config -Value @{ T4Sku = '' } -Confirm:$false
+            $results.Add((New-DemoResult -CheckId 'START.T4.RECORD' -Area 't4' -Target 'T4' -Status 'Pass' -Message ('Cleared an earlier run''s record that left T4 out (DbHubT4Size {0}): T4 is part of every deployment since 2026-11-09, and ./scripts/deploy.ps1 creates it when it doesn''t exist.' -f $recordedOff) -Evidence ([ordered]@{ recorded = $recordedOff })))
+        }
+        catch {
+            $results.Add((New-DemoResult -CheckId 'START.T4.RECORD' -Area 't4' -Target 'T4' -Status 'Warning' -Message ('An earlier run''s record that left T4 out (DbHubT4Size {0}) couldn''t be cleared: {1}' -f $recordedOff, (Protect-DemoText -Text $_.Exception.Message)) -Evidence ([ordered]@{ recorded = $recordedOff }) -Remediation 'Nothing to do: no record leaves T4 out any more, and the next ./scripts/deploy.ps1 that deploys the template clears it.'))
         }
     }
     $hostVm = Get-DemoHostVmName -Config $Config

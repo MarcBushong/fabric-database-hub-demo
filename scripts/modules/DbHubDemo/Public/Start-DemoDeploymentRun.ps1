@@ -24,10 +24,7 @@ function Start-DemoDeploymentRun {
     The configuration file deploy.ps1 read; a path other than config/demo.config.json goes into every command printed.
 
     .PARAMETER WaitForT2
-    Whether this run waits for T2's build and the guided stop.
-
-    .PARAMETER T2WaitMinutes
-    How long it waits for them.
+    Whether this run waits for T2's build.
 
     .PARAMETER SkipFabric
     The run skips the Fabric track.
@@ -54,9 +51,6 @@ function Start-DemoDeploymentRun {
 
         [switch] $WaitForT2,
 
-        [ValidateRange(0, 600)]
-        [int] $T2WaitMinutes = 180,
-
         [switch] $SkipFabric,
 
         [switch] $NoStatusPage,
@@ -72,7 +66,7 @@ function Start-DemoDeploymentRun {
     $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
     $paths = Get-DemoProgressPath -Directory $OutputDirectory
     $command = Get-DemoDeployCommand -ConfigPath $ConfigPath
-    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -WaitForT2:$WaitForT2 -T2WaitMinutes $T2WaitMinutes -SkipFabric:$SkipFabric -Note @((Get-DemoT2LegacyModeText -Config $Config), (Get-DemoT4IgnoredText -Config $Config))
+    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -SkipFabric:$SkipFabric -Note @((Get-DemoT2LegacyModeText -Config $Config), (Get-DemoT4IgnoredText -Config $Config))
     $run = [pscustomobject]@{
         ProgressPath = ''
         PagePath     = ''
@@ -94,7 +88,7 @@ function Start-DemoDeploymentRun {
         if (-not $NoStatusPage -and -not $environment.GitHubActions) {
             # T4's rows are always there (2026-11-09): a run without T4 says on them why, and how to add it (DEPLOY.T4.OFF).
             $catalog = Get-DemoProgressCatalog -InstallMode $installMode -T4Enabled -SkipFabric:$SkipFabric
-            $model = New-DemoProgressModel -Catalog $catalog -Environment ([string]$Config['environment']) -ResourceGroup (Get-DemoResourceGroupName -Config $Config) -Command $command -PagePath $paths.Page -Expect @{ text = $expect.Text; humanText = $expect.HumanText; guidedStop = $expect.GuidedStop } -GuidedStop $(if ($expect.GuidedStop) { 'Pending' } else { 'NotSelected' })
+            $model = New-DemoProgressModel -Catalog $catalog -Environment ([string]$Config['environment']) -ResourceGroup (Get-DemoResourceGroupName -Config $Config) -Command $command -PagePath $paths.Page -Expect @{ text = $expect.Text }
             try {
                 Initialize-DemoProgress -Path $paths.Model -Model $model -Confirm:$false
                 Write-DemoProgressPage -ModelPath $paths.Model -PagePath $paths.Page
@@ -107,7 +101,7 @@ function Start-DemoDeploymentRun {
                 Write-DemoLog -Level Warning -Message ('The status page couldn''t be set up, so the console is the only view: {0}' -f $_.Exception.Message)
             }
         }
-        $notices = Get-DemoDeploymentNotice -Environment $environment -InstallMode $installMode -WaitForT2:$WaitForT2 -PagePath $run.PagePath -SkipFabric:$SkipFabric
+        $notices = Get-DemoDeploymentNotice -Environment $environment -SkipFabric:$SkipFabric
         Write-DemoConsoleBlock -Color 'Cyan' -Line (Get-DemoBannerLine -Title ('deploy.ps1: environment {0}, resource group {1}' -f $Config['environment'], (Get-DemoResourceGroupName -Config $Config)))
         Write-DemoConsoleBlock -Color 'White' -Line $expect.Lines
         $more = @(

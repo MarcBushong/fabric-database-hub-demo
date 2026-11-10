@@ -629,8 +629,8 @@ function Format-DemoT4FallbackCostText {
 
 function Select-DemoT4StartSku {
     # Where T4's fallback starts, from what preflight's checks found (their startSku evidence): the furthest step wins, in
-    # the fallback's order: '' (the default size), Standard_D4ads_v5, Standard_D2ds_v5, None, Refused (ADR 0019). Pure.
-    # Internal.
+    # the fallback's order: '' (the default size), Standard_D4ads_v5, Standard_D2ds_v5 (ADR 0019). Nothing leaves T4 out
+    # since 2026-11-09, so any other value, such as an older None or Refused, counts as the default. Pure. Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -639,7 +639,7 @@ function Select-DemoT4StartSku {
         [string[]] $Sku = @()
     )
 
-    $order = @('', 'Standard_D4ads_v5', 'Standard_D2ds_v5', 'None', 'Refused')
+    $order = @('', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
     $best = 0
     foreach ($item in @($Sku)) {
         $rank = [array]::IndexOf($order, [string]$item)
@@ -883,7 +883,10 @@ function New-DemoT4FallbackResult {
     $docUrl = 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'
     $area = if ($CheckId -like 'PREFLIGHT.*') { 'preflight' } else { 't4' }
     $where = ''
-    $evidence = [ordered]@{ next = $Next; startSku = $(if ($Next -eq 'Zone') { '' } else { $Next }) }
+    # startSku is where deploy.ps1's fallback starts. None is the 2-vCore size over a ceiling, which T4 gets anyway, and after
+    # a refusal of every size, every run starts again from the default (2026-11-09: T4 is part of every deployment).
+    $startSku = switch ($Next) { 'Zone' { '' } 'None' { 'Standard_D2ds_v5' } 'Refused' { '' } default { $Next } }
+    $evidence = [ordered]@{ next = $Next; startSku = $startSku }
     $refusal = 'SkuNotAvailable, on record or found by preflight'
     if ($null -ne $Refused) {
         $where = if ($Refused.Zone) { 'zone {0}' -f $Refused.Zone } else { 'no zone preference' }
@@ -986,17 +989,16 @@ function Get-DemoT4FallbackPreflight {
 
     .DESCRIPTION
     - -Start Standard_D2ds_v5 (the 4-vCore sizes are ruled out, or an earlier run's record): -Estimate already prices T4
-      at that size, so its verdict (ConvertTo-DemoT4FallbackCost) decides. Within both ceilings, the start stays, with a
-      Warning that gives the price and the worst case; otherwise the start is None, with a Warning that says why, and the
-      ceilings are checked again without T4 (CostResults), which this run leaves out.
+      at that size, and its verdict (ConvertTo-DemoT4FallbackCost) only reports (2026-11-09: T4 is part of every
+      deployment): a Warning that gives the price and the worst case, or that says which ceiling it's over. The start
+      stays Standard_D2ds_v5 either way.
     - A T4 that doesn't exist yet and a size the configuration doesn't set, starting at a 4-vCore size: Azure can still
       refuse it at creation although the region lists it (live, West US 3, 2026-10-26, for Standard_B1ms), so the 2-vCore
       step is priced now too, with the same parameters and price cache (only its compute price is read again): a Pass
       within both ceilings, otherwise a Warning that T4 would be left out. deploy.ps1 prices it again right before it
       would create it.
-    - Otherwise Not selected: T4 exists (deploy.ps1 keeps it, or scales it to the default), the configuration sets
-      t4SkuName (no fallback), t4AutonomousTuning is true (the fallback stops after the 4-vCore sizes), or the start is
-      None or Refused (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU says why).
+    - Otherwise Not selected: T4 exists (deploy.ps1 keeps it, or scales it to the default), or the configuration sets
+      t4SkuName (no fallback).
     Its own estimates never throw (review of 20e855c): the 4-vCore start's that fails is a Warning with skipReason Price,
     and when the estimate without T4 fails, CostResults stays $null, so the run's own cost checks, a monthly-ceiling Fail
     included, are what preflight reports.
@@ -1041,9 +1043,6 @@ function Get-DemoT4FallbackPreflight {
     }
     if ($Exists) {
         return (& $notSelected ('T4 exists{0}, so the fallback doesn''t apply: deploy.ps1 keeps its size, or scales it to the default (PREFLIGHT.T4.SIZE says when).' -f $(if ($ServerSku) { ' as ' + $ServerSku } else { '' })))
-    }
-    if ($Start -in 'None', 'Refused') {
-        return (& $notSelected 'This run leaves T4 out (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU says why), so the 2-vCore fallback isn''t priced.')
     }
 
     # A 4-vCore start: the 2-vCore step, priced now for the record.
@@ -1318,50 +1317,6 @@ function Get-DemoT4FallbackNote {
         return ('T4 isn''t created yet: the fallback chose General Purpose {0} {1}, {2}, but {3}. The next ./scripts/deploy.ps1 that deploys the template creates it, after checking its price against the ceilings again.' -f $sku, $origin, $hourly, $because)
     }
     return ('The fallback chose General Purpose {0} for T4 {1}, {2}; whether the server exists couldn''t be confirmed just now, and ./scripts/status.ps1 shows it.' -f $sku, $origin, $hourly)
-}
-
-function New-DemoT4RecordedOffResult {
-    <#
-    The Warning that status.ps1 (STATUS.T4) and validate.ps1 (T4.SERVER) give for a T4 server that exists although the
-    resource group's record says T4 is off, DbHubT4Size None or Refused (review of 64c28b2): a run before that review could
-    record None for a server that a template attempt which failed for another resource had created, and a server bills
-    whatever the record says. The next deploy.ps1 keeps it, at its own size, and clears a None record
-    (Invoke-DemoTemplateDeployment keeps an existing server's size), while Refused leaves it out of the demo until
-    t4SkuName sets its size; stop-demo.ps1 stops it whatever the record says. -Server is Get-DemoT4State's answer for the
-    server that exists. The record itself isn't changed (status.ps1 and validate.ps1 are read-only). Internal.
-    #>
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory)]
-        [ValidateSet('STATUS.T4', 'T4.SERVER')]
-        [string] $CheckId,
-
-        [Parameter(Mandatory)]
-        [pscustomobject] $Server,
-
-        [Parameter(Mandatory)]
-        [ValidateSet('None', 'Refused')]
-        [string] $Recorded
-    )
-
-    $serverName = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Server -Name 'Names') -Name 'ServerName')
-    $state = [string](Get-DemoMemberValue -InputObject $Server -Name 'State')
-    $sku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $Server -Name 'Server')
-    $size = ''
-    if ($sku) {
-        $size = ', {0} {1}' -f $(if ((Get-DemoT4SkuSpec -SkuName $sku).Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' }), $sku
-    }
-    $message = 'T4 ({0}) exists and bills, although the resource group''s record says T4 is off (DbHubT4Size {1}): it''s {2}{3}.' -f $serverName, $Recorded, $(if ($state) { $state } else { 'Unknown' }), $size
-    $keep = if ($Recorded -ceq 'None') {
-        'The next ./scripts/deploy.ps1 keeps it at its own size and clears the record.'
-    }
-    else {
-        'The next ./scripts/deploy.ps1 keeps it as it is, but leaves it out of the demo while the record says Refused; set t4SkuName to its size{0} to bring it back.' -f $(if ($sku) { ', ' + $sku + ',' } else { '' })
-    }
-    $remediation = '{0} Meanwhile ./scripts/stop-demo.ps1 stops it with the rest of the demo, and ./scripts/destroy.ps1 removes everything.' -f $keep
-    return (New-DemoResult -CheckId $CheckId -Area 't4' -Target 'T4' -Status 'Warning' -Message $message -Evidence ([ordered]@{ server = $serverName; state = $state; skuName = $sku; recorded = $Recorded }) -Remediation $remediation -DocUrl ([string](Get-DemoPostgresSetting)['docUrls']['stopServer']))
 }
 
 function Format-DemoT4RestartText {

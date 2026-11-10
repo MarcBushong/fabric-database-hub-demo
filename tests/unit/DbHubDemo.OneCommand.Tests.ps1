@@ -52,32 +52,21 @@ BeforeAll {
 }
 
 Describe 'What a run can expect (brief goal 7, items 3 and 13)' {
-    It 'gives the first-run and golden-redeploy times, and when a person is needed in PaygWizard mode' {
-        $expect = InModuleScope DbHubDemo { Get-DemoDeploymentExpectation -InstallMode 'PaygWizard' -WaitForT2 -T2WaitMinutes 180 }
-        $expect.GuidedStop | Should -BeTrue
-        $text = $expect.Lines -join ' '
-        $text | Should -Match 'about 2 to 3 hours'
-        $text | Should -Match 'golden snapshot \(\./scripts/capture-t2-golden\.ps1\) takes about 30 to 45 minutes'
-        $text | Should -Match 'about 60 to 90 minutes after the start'
-        $text | Should -Match 'about 10 minutes'
-        $text | Should -Match 'waits up to 180 minutes'
-        $text | Should -Match 'stays awake'
-        $text | Should -Match 'If this window closes or the PC restarts, run \./scripts/deploy\.ps1 again; it continues where it stopped\.'
-        $expect.HumanText | Should -Match 'Bastion'
-    }
-
-    It 'says no T2 step needs a person in ProductKey and Developer modes' {
-        foreach ($mode in 'ProductKey', 'Developer') {
-            $expect = InModuleScope DbHubDemo -Parameters @{ Mode = $mode } { Get-DemoDeploymentExpectation -InstallMode $Mode -WaitForT2 }
-            $expect.GuidedStop | Should -BeFalse
-            ($expect.Lines -join ' ') | Should -Match 'No T2 step needs a person'
-            $expect.HumanText | Should -BeNullOrEmpty
+    It 'gives the first-run and golden-redeploy times, and says no T2 step needs a person in any mode (the guided stop is retired, 2026-11-09)' {
+        foreach ($mode in 'PaygWizard', 'ProductKey', 'Developer') {
+            $expect = InModuleScope DbHubDemo -Parameters @{ Mode = $mode } { Get-DemoDeploymentExpectation -InstallMode $Mode }
+            $text = $expect.Lines -join ' '
+            $text | Should -Match 'No T2 step needs a person' -Because $mode
+            $text | Should -Match 'golden snapshot \(\./scripts/capture-t2-golden\.ps1\) takes about 30 to 45 minutes'
+            $text | Should -Match 'stays awake'
+            $text | Should -Match 'If this window closes or the PC restarts, run \./scripts/deploy\.ps1 again; it continues where it stopped\.'
+            $text | Should -Not -Match '(?i)guided stop|Bastion|a person is needed' -Because $mode
+            @($expect.PSObject.Properties.Name) | Should -Be @('Lines', 'Text')
         }
     }
 
     It 'says no T2 step needs a person in JumpstartImage mode, the default, and gives the first deployment''s measured time (2026-11-06)' {
-        $expect = InModuleScope DbHubDemo { Get-DemoDeploymentExpectation -WaitForT2 }
-        $expect.GuidedStop | Should -BeFalse
+        $expect = InModuleScope DbHubDemo { Get-DemoDeploymentExpectation }
         $text = $expect.Lines -join ' '
         $text | Should -Match 'No T2 step needs a person'
         $text | Should -Match 'about 1\.5 hours in all: 91 minutes when measured on 2026-11-06'
@@ -85,31 +74,17 @@ Describe 'What a run can expect (brief goal 7, items 3 and 13)' {
         $text | Should -Not -Match 'not measured yet'
         $expect.Lines[0] | Should -Match 'measured on 2026-11-06; the rest are estimates'
         $expect.Text | Should -Match '91 minutes, measured on 2026-11-06'
-        $expect.HumanText | Should -BeNullOrEmpty
         $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
-        $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' }
+        $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment }
         @($notice | Where-Object { $_ -notlike 'The Insights app''s browser sign-in*' }) | Should -BeNullOrEmpty -Because 'a session without keyboard input needs no T2 warning when no T2 step needs a person'
         @($notice | Where-Object { $_ -like 'The Insights app''s browser sign-in*' }).Count | Should -Be 1 -Because 'the Insights app''s sign-in still doesn''t start in such a session (2026-11-05)'
-        $quiet = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -WaitForT2 -PagePath 'out/deploy-status.html' -SkipFabric }
+        $quiet = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -SkipFabric }
         @($quiet) | Should -BeNullOrEmpty -Because 'without Fabric, nothing in JumpstartImage mode needs a person'
-    }
-
-    It 'warns a session that can''t take keyboard input before anything is spent, with the alternatives and the plan for a person' {
-        $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
-        $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -InstallMode 'PaygWizard' -WaitForT2 -PagePath 'out/deploy-status.html' }
-        $text = $notice -join ' '
-        $text | Should -Match 'doesn''t take keyboard input'
-        $text | Should -Match '-NoWaitForT2'
-        $text | Should -Match 'ProductKey'
-        $text | Should -Match 'Developer'
-        $text | Should -Match 'no T2 performance data or findings'
-        @($notice | Where-Object { $_ -like 'PLAN FOR A PERSON: DEPLOY.T2.GUIDEDSTOP*' }).Count | Should -Be 1
-        $text | Should -Match 'out/deploy-status\.html'
     }
 
     It 'warns about the GitHub Codespaces idle timeout and the setting that raises it' {
         $environment = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $true; Windows = $false }
-        $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment -InstallMode 'Developer' -WaitForT2 }
+        $notice = InModuleScope DbHubDemo -Parameters @{ Environment = $environment } { Get-DemoDeploymentNotice -Environment $Environment }
         ($notice -join ' ') | Should -Match '30 minutes without activity'
         ($notice -join ' ') | Should -Match 'Default idle timeout'
         ($notice -join ' ') | Should -Match 'gh codespace create --idle-timeout 240m'
@@ -248,7 +223,7 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         ($lines -join ' ') | Should -Match '##  DONE'
         ($lines -join ' ') | Should -Match 'The demo is complete\.'
         ($lines -join ' ') | Should -Match 'Where to look: open Database Hub'
-        ($lines -join ' ') | Should -Match 'capture-t2-golden\.ps1 to make future redeploys skip the build and the guided stop'
+        ($lines -join ' ') | Should -Match 'capture-t2-golden\.ps1 to make future redeploys skip T2''s build'
     }
 
     It 'is DONE, naming the Insights app as a failure that doesn''t block DONE with its reason and fix, when its prerequisites aren''t met (2026-11-05)' {
@@ -380,15 +355,6 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $notYet.Next | Should -Match 'Wait about 10 minutes'
     }
 
-    It 'counts a guided stop that timed out as NOT DONE with the command that continues it' {
-        $config = New-TestConfig
-        $result = @(New-DoneResult) + @(New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message 'Nobody finished SQL Server setup by 14:05.' -Remediation 'Run ./scripts/deploy.ps1 again when you have about 15 minutes.')
-        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
-        $outcome.Kind | Should -Be 'NotDone'
-        $outcome.Reason | Should -Match 'DEPLOY\.T2\.GUIDEDSTOP'
-        $outcome.Next | Should -Match 'deploy\.ps1 again when you have about 15 minutes'
-    }
-
     It 'is never DONE while a guided stop''s Bastion or a handed-over host password is still open, and names stop-demo.ps1 (Phase 28 review)' {
         # The review: after a Ctrl+C at the guided stop, setup finished anyway, and the next run ended DONE with Bastion up
         # and the handed-over password valid.
@@ -421,6 +387,25 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         $step = InModuleScope DbHubDemo -Parameters @{ Result = $leftover; State = $password; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $step.Reason | Should -Match 'DEPLOY\.T2\.GUIDEDLEFTOVER'
         $step.NextCommand | Should -Be './scripts/stop-demo.ps1 -RemoveBastionOnly'
+
+        # The T2 track's cleanup before the loader is provisional (review of 27396a4): what's still open there is a Warning,
+        # and the T2 step's own cleanup, and the state DONE reads, give the final word.
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $script:leftState }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { @() }
+        $script:leftState = New-FinishedState
+        $script:leftState.HostPasswordUtc = '2026-10-29T15:00:00Z'
+        $early = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Clear-DemoGuidedStopLeftover -Config $Config -Provisional -Confirm:$false }) | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }
+        $early.status | Should -Be 'Warning'
+        (@(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Clear-DemoGuidedStopLeftover -Config $Config -Confirm:$false }) | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }).status | Should -Be 'Manual action required' -Because 'the T2 step''s own cleanup has the final word'
+        $later = New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDLEFTOVER' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'Cleaned up what an earlier guided stop or session left open; none of it is left.'
+        $cleaned = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult) + @($early, $later); State = (New-FinishedState); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $cleaned.Kind | Should -Be 'Done'
+        $cleaned.ExitCode | Should -Be 0
+        # The state still records it: NOT DONE, naming stop-demo.ps1, whatever the run's results say.
+        $stillOpen = InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult) + @($early); State = $script:leftState; Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $stillOpen.Kind | Should -Be 'NotDone'
+        $stillOpen.NextCommand | Should -Be './scripts/stop-demo.ps1 -RemoveBastionOnly'
 
         # Another reason first: the leftover is still said.
         $unfinished = [pscustomobject]@{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'T2'; TrackT4 = ''; TrackFabric = 'Fabric'; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '2026-10-29T15:00:00Z' }
@@ -856,7 +841,7 @@ Describe 'A target''s missing telemetry gets its monitoring checked once more be
     It 'restarts T1''s stopped plugin once, says so on the status page, waits, and replaces the miss with the new check' {
         # Live: T1's plugin was NotRunning hours after start-demo.ps1 found it running; the restart brought it back in 161 s.
         $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
-        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog) -GuidedStop 'Pending') -Confirm:$false }
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Path = $progress } { Invoke-DemoTelemetryCheck -Config $Config -Target 'T1', 'T3' -WaitMinutes 15 -ProgressPath $Path -ProgressStepId 'Validation' })
         $script:asked | Should -Be @('telemetry T1,T3 wait=15', 'restore DEPLOY.T1.MONITORING the deployment', 'telemetry T1 wait=15')
         @($results | Where-Object { $_.checkId -eq 'TELEMETRY.T1' }).status | Should -Be @('Pass') -Because 'the new check replaces the miss'
@@ -1013,8 +998,8 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         Test-Path -LiteralPath $run.ProgressPath | Should -BeTrue
         Get-Content -LiteralPath $run.PagePath -Raw | Should -Match 'Deploying, no action needed'
         $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
-        $model['guidedStop']['state'] | Should -Be 'Pending'
-        $model['expect']['humanText'] | Should -Match '60 to 90 minutes'
+        $model.Contains('guidedStop') | Should -BeFalse -Because 'the guided stop is retired (2026-11-09)'
+        $model['expect'].Contains('humanText') | Should -BeFalse
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-Host -ParameterFilter { [string]$Object -match 'stays awake' }
     }
 
@@ -1088,8 +1073,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         InModuleScope DbHubDemo -Parameters @{ Path = $run.ProgressPath } {
             Set-DemoProgressStep -Path $Path -Id 'Preflight' -State 'Done' -Status 'Pass' -Message 'Passed.'
             Set-DemoProgressStep -Path $Path -Id 'T1.Bootstraps' -State 'Running' -Message 'The loader runs.'
-            Set-DemoProgressStep -Path $Path -Id 'T2.GuidedStop' -State 'Action needed' -Message 'Waiting for you.'
-            Set-DemoProgressValue -Path $Path -Section 'guidedStop' -Value @{ state = 'Ready' }
+            Set-DemoProgressStep -Path $Path -Id 'T2.HostBuild' -State 'Action needed' -Message 'The build didn''t finish within the wait.'
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { throw 'a stopped run makes no Azure call' }
         $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @() -Stopped
@@ -1098,8 +1082,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $outcome.ExitCode | Should -Be 2
         $outcome.Reason | Should -Match 'Ctrl\+C'
         $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
-        $outcome.Next | Should -Match ([regex]::Escape('./scripts/stop-demo.ps1')) -Because 'it stopped at the guided stop, which leaves Bastion up and the password unrotated'
-        $outcome.Next | Should -Match 'until the next run cleans them up when it gets to T2, whether or not setup finished meanwhile' -Because 'the next run cleans up even when setup finished after the stop (Phase 28 review)'
+        $outcome.Next | Should -Not -Match '(?i)guided stop' -Because 'no run stops at a guided stop any more (2026-11-09)'
         $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
         $model['run']['state'] | Should -Be 'NotDone'
         $model['run']['nextCommand'] | Should -Be './scripts/deploy.ps1'
@@ -1108,7 +1091,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $steps['Preflight']['state'] | Should -Be 'Done'
         $steps['T1.Bootstraps']['state'] | Should -Be 'Pending'
         $steps['T1.Bootstraps']['message'] | Should -Match 'Stopped here \(Ctrl\+C\)'
-        $steps['T2.GuidedStop']['state'] | Should -Be 'Pending'
+        $steps['T2.HostBuild']['state'] | Should -Be 'Pending'
         $page = Get-Content -LiteralPath $run.PagePath -Raw
         $page | Should -Match 'Stopped, not done'
         $page | Should -Match ([regex]::Escape('Run: ./scripts/deploy.ps1'))
@@ -1188,67 +1171,7 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
     }
 }
 
-Describe 'The guided stop''s prompt (brief items 4 and 13)' {
-    BeforeEach {
-        $script:printed = [System.Collections.Generic.List[string]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Write-Host -MockWith { $script:printed.Add([string]$Object) }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAttention -MockWith { $script:printed.Add('ATTENTION') }
-        Mock -ModuleName DbHubDemo -CommandName Start-Process -MockWith { $script:printed.Add('BROWSER ' + $FilePath + ' ' + (@($PesterBoundParameters['ArgumentList']) -join ' ')) }
-        $script:url = 'https://portal.azure.com/#@contoso.example/resource/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/archost01'
-    }
-
-    It 'shows a large banner, the time limit, the steps, the link, opens the browser, draws attention, and prints the handoff line' {
-        $saved = $env:CODESPACES
-        try {
-            $env:CODESPACES = $null
-            InModuleScope DbHubDemo -Parameters @{ Url = $script:url } { Show-DemoGuidedStopPrompt -Url $Url -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(45)) -HostUser 'demoadmin' -SignInWay 'portalReset' -PagePath 'out/deploy-status.html' }
-        }
-        finally {
-            $env:CODESPACES = $saved
-        }
-        $text = $script:printed -join "`n"
-        $text | Should -Match 'WAITING FOR YOU: one step, about 10 minutes'
-        $text | Should -Match 'Time limit: 4[45] minutes'
-        $text | Should -Match 'Use pay-as-you-go billing through Microsoft Azure'
-        $text | Should -Match 'Help, then Reset password'
-        # In GitHub Actions the module's log masking writes the subscription's GUID as *** (Phase 26c).
-        $text | Should -Match 'Portal: https://portal\.azure\.com/#@contoso\.example/resource/subscriptions/[^/]+/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Compute/virtualMachines/archost01'
-        $script:printed | Should -Contain 'ATTENTION'
-        # A Linux machine without xdg-open (some CI images) has no way to open a browser, and says so instead.
-        $canOpen = $IsWindows -or $IsMacOS -or $null -ne (Get-Command -Name 'xdg-open' -ErrorAction SilentlyContinue)
-        @($script:printed | Where-Object { $_ -match '^BROWSER ' }).Count -gt 0 | Should -Be $canOpen
-        @($script:printed | Where-Object { $_ -like 'HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP - *out/deploy-status.html*' }).Count | Should -Be 1
-    }
-
-    It 'doesn''t open a browser in GitHub Codespaces' {
-        $saved = $env:CODESPACES
-        try {
-            $env:CODESPACES = 'true'
-            InModuleScope DbHubDemo -Parameters @{ Url = $script:url } { Show-DemoGuidedStopPrompt -Url $Url -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(45)) -SignInWay 'portalReset' }
-        }
-        finally {
-            $env:CODESPACES = $saved
-        }
-        @($script:printed | Where-Object { $_ -match '^BROWSER ' }).Count | Should -Be 0
-        ($script:printed -join ' ') | Should -Match 'Open the portal link above'
-    }
-
-    It 'reminds with the handoff line' {
-        InModuleScope DbHubDemo { Show-DemoGuidedStopReminder -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(30)) -PagePath 'out/deploy-status.html' -Status 'Setup is open in arcsql01.' }
-        ($script:printed -join ' ') | Should -Match 'Reminder: the guided stop still waits for you'
-        @($script:printed | Where-Object { $_ -like 'HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP*' }).Count | Should -Be 1
-    }
-
-    It 'points the handoff line at the console, not a page that doesn''t exist, without a status page (review finding 2)' {
-        $line = InModuleScope DbHubDemo { Get-DemoHumanActionLine -PagePath '' -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(30)) }
-        $line | Should -BeLike 'HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP - *'
-        $line | Should -Not -Match 'deploy-status\.html'
-        $line | Should -Match 'printed above in deploy\.ps1''s console'
-        (InModuleScope DbHubDemo { Get-DemoHumanActionLine -PagePath 'out/deploy-status.html' }) | Should -Match 'Steps and link: out/deploy-status\.html \(or \./scripts/status\.ps1 -Watch\)\.$'
-    }
-}
-
-Describe 'The host credential at the guided stop (ADR 0009)' {
+Describe 'The host credential an earlier guided stop handed over, rotated and cleaned up (ADR 0009)' {
     BeforeEach {
         $config = New-TestConfig
         $script:order = [System.Collections.Generic.List[string]]::new()
@@ -1258,27 +1181,6 @@ Describe 'The host credential at the guided stop (ADR 0009)' {
         Mock -ModuleName DbHubDemo -CommandName Set-Clipboard -MockWith { $script:order.Add('clipboard') }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:order.Add('state ' + (@($Value.Keys) -join ',')) }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = "demoadmin`n"; StdErr = '' } }
-    }
-
-    It 'puts a one-time password on a working clipboard, never in a result' {
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoClipboard -MockWith { $true }
-        $credential = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoGuidedStopCredential -Config $Config }
-        $credential.Mode | Should -Be 'clipboard'
-        $credential.UserName | Should -Be 'demoadmin'
-        $script:order | Should -Be @('set', 'clipboard')
-    }
-
-    It 'without a clipboard or the Key Vault opt-in: sets and shows no password, records the handover for the rotation, and points to the portal' {
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoClipboard -MockWith { $false }
-        $credential = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoGuidedStopCredential -Config $Config }
-        $credential.Mode | Should -Be 'portalReset'
-        $credential.UserName | Should -Be 'demoadmin'
-        $script:order | Should -Be @('state HostPasswordSet')
-        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoVmLocalPassword -Times 0 -Exactly
-        Should -Invoke -ModuleName DbHubDemo -CommandName Set-Clipboard -Times 0 -Exactly
-        $result = @($credential.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.HOSTPASSWORD' })[0]
-        $result.status | Should -Be 'Pass'
-        $result.docUrl | Should -Be 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'
     }
 
     It 'rotates the handed-over password at the end, and a rotation that fails is a Warning with the portal''s way' {
@@ -1387,215 +1289,6 @@ Describe 'Test-DemoClipboard: only a clipboard the person can paste from (review
         (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'Windows' }) | Should -BeTrue
         Mock -ModuleName DbHubDemo -CommandName Set-Clipboard -MockWith { throw 'The clipboard is in use.' }
         (InModuleScope DbHubDemo { Test-DemoClipboard -Platform 'Windows' }) | Should -BeFalse
-    }
-
-    It 'sends a session whose Set-Clipboard only pretends (an SSH session here) to the portal''s Reset password, with no password set' {
-        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoKeyVaultSetting -MockWith { [pscustomobject]@{ Enabled = $false } }
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoVmLocalPassword -MockWith { throw 'no password may be set' }
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = "demoadmin`n"; StdErr = '' } }
-        $env:SSH_TTY = '/dev/pts/0'
-        $credential = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoGuidedStopCredential -Config $Config }
-        $credential.Mode | Should -Be 'portalReset'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoVmLocalPassword -Times 0 -Exactly
-    }
-}
-
-Describe 'Invoke-DemoT2GuidedStop: the stop, then the run continues on its own' {
-    BeforeEach {
-        $config = New-TestConfig
-        $script:calls = [System.Collections.Generic.List[string]]::new()
-        $script:health = [System.Collections.Generic.Queue[object]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
-        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoGuidedStopRequest -MockWith { $script:calls.Add('request ' + $Action); New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDREQUEST' -Area 'infra' -Target 'T2' -Status 'Pass' -Message $Action }
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { $script:calls.Add('state ' + (@($Value.Keys) -join ',')) }
-        Mock -ModuleName DbHubDemo -CommandName New-DemoBastion -MockWith { $script:calls.Add('bastion nowait=' + [bool]$NoWait); New-DemoResult -CheckId 'START.BASTION' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'being deployed' }
-        Mock -ModuleName DbHubDemo -CommandName Wait-DemoBastionDeployment -MockWith { [pscustomobject]@{ Succeeded = $true; State = 'Succeeded' } }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcConfiguration -MockWith { $script:calls.Add('onboard skipConfiguration=' + [bool]$SkipConfiguration); New-DemoResult -CheckId 'T2.ARC.CONNECTED' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'connected' }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { if ($script:health.Count -gt 1) { $script:health.Dequeue() } else { $script:health.Peek() } }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGuidedStopCredential -MockWith { $script:calls.Add('credential'); [pscustomobject]@{ Mode = 'portalReset'; UserName = 'demoadmin'; Text = ''; Results = @() } }
-        Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopPrompt -MockWith { $script:calls.Add('prompt') }
-        Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopReminder -MockWith { $script:calls.Add('reminder') }
-        Mock -ModuleName DbHubDemo -CommandName Complete-DemoGuidedStop -MockWith { $script:calls.Add('cleanup'); @() }
-        # The deployment state that Clear-DemoGuidedStopLeftover reads: nothing open unless a test queues more.
-        $script:states = [System.Collections.Generic.Queue[object]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { if ($script:states.Count -gt 0) { $script:states.Dequeue() } else { [pscustomobject]@{ HostPasswordUtc = ''; GuidedStopUtc = '' } } }
-        $script:waitingArc = [pscustomobject]@{ state = 'WaitingForArcOnboarding'; currentStep = 'ArcOnboardingBeforeWizard'; message = 'waiting for Arc' }
-        $script:wizard = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'SQL Server setup is open in arcsql01.'; guidedSignIn = 'ready' }
-        $script:after = [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup'; message = 'Cleaning up.' }
-    }
-
-    It 'asks nobody while the host prepares setup''s Azure sign-in, and shows that as Azure-side preparation (Phase 28 live finding, 2026-10-30)' {
-        # Live, IE Enhanced Security Configuration blocked setup's sign-in. The host now turns it off, and checks
-        # WebView2, before it opens setup; its health says guidedSignIn ready only then.
-        $preparing = [pscustomobject]@{ state = 'InProgress'; currentStep = 'SqlSetupWizard'; message = 'Preparing setup''s Azure sign-in in arcsql01 (Azure-side, no action needed): the WebView2 runtime isn''t installed in the guest yet; the host tries again within about 5 minutes.'; guidedSignIn = 'preparing' }
-        # Before the host has seen the request: the step still waits for deploy.ps1, and nothing is prepared.
-        $stale = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'Arc is connected. The SQL Server setup step waits for you: run ./scripts/deploy.ps1.'; guidedSignIn = 'none' }
-        foreach ($item in @($stale, $preparing, $script:wizard, $script:after)) {
-            $script:health.Enqueue($item)
-        }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:calls.Add('health'); if ($script:health.Count -gt 1) { $script:health.Dequeue() } else { $script:health.Peek() } }
-        $script:pages = [System.Collections.Generic.List[string]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressValue -MockWith { if ($Value.Contains('message')) { $script:pages.Add([string]$Value['message']) } }
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { if ($PesterBoundParameters['AzureSide']) { $script:pages.Add('Azure-side step: ' + $PesterBoundParameters['Message']) } }
-        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:waitingArc } { Invoke-DemoT2GuidedStop -Config $Config -Context @{ ProgressPath = 'progress.json' } -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
-        $stop.Status | Should -Be 'Done'
-        $asked = $script:calls.IndexOf('credential')
-        $asked | Should -BeGreaterThan 0
-        @($script:calls[0..$asked] | Where-Object { $_ -eq 'health' }).Count | Should -Be 3 -Because 'nobody is asked before the host says its sign-in preparation is ready'
-        $script:calls[$asked + 1] | Should -Be 'prompt'
-        @($script:pages | Where-Object { $_ -match '^Preparing setup''s Azure sign-in in arcsql01 \(Azure-side, no action needed\)' }).Count | Should -BeGreaterThan 0
-        @($script:pages | Where-Object { $_ -match '^Azure-side step: Preparing setup''s Azure sign-in' }).Count | Should -BeGreaterThan 0
-
-        # A host whose bundle predates the field (no guidedSignIn): ready at its step, as before.
-        $script:calls.Clear()
-        $script:health.Clear()
-        $old = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'SQL Server setup is open in arcsql01.' }
-        foreach ($item in @($old, $script:after)) {
-            $script:health.Enqueue($item)
-        }
-        $again = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $old } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
-        $again.Status | Should -Be 'Done'
-        $script:calls | Should -Contain 'prompt'
-    }
-
-    It 'asks for the person anyway when the host''s preparation didn''t finish in time, says so, and leads with Add... (Phase 28 review)' {
-        # The host gives up waiting for its preparation after about 15 minutes or 3 passes (guidedSignIn fallback), so a
-        # preparation that never finishes can't keep a person from being asked.
-        $fallback = [pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard'; message = 'Setup''s Azure sign-in wasn''t prepared automatically, so Internet Explorer may block it. The guest is signed in, and SQL Server setup opens there now.'; guidedSignIn = 'fallback' }
-        foreach ($item in @($fallback, $script:after)) {
-            $script:health.Enqueue($item)
-        }
-        $script:values = [System.Collections.Generic.List[object]]::new()
-        $script:steps = [System.Collections.Generic.List[string]]::new()
-        $script:warnings = [System.Collections.Generic.List[string]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressValue -MockWith { $script:values.Add($Value) }
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:steps.Add([string]$PesterBoundParameters['Message']) }
-        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { if ([string]$PesterBoundParameters['Level'] -eq 'Warning') { $script:warnings.Add([string]$PesterBoundParameters['Message']) } }
-        Mock -ModuleName DbHubDemo -CommandName Show-DemoGuidedStopPrompt -MockWith { $script:calls.Add('prompt fallback=' + [bool]$PesterBoundParameters['SignInFallback']) }
-        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:waitingArc } { Invoke-DemoT2GuidedStop -Config $Config -Context @{ ProgressPath = 'progress.json' } -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
-        $stop.Status | Should -Be 'Done'
-        $script:calls | Should -Contain 'prompt fallback=True'
-        @($script:values | Where-Object { $_.Contains('signInFallback') -and [bool]$_['signInFallback'] }).Count | Should -Be 1
-        @($script:steps | Where-Object { $_ -match 'The automatic preparation of setup''s Azure sign-in didn''t finish: if Internet Explorer blocks the sign-in, select Add\.\.\.' }).Count | Should -Be 1
-        @($script:warnings | Where-Object { $_ -match 'couldn''t prepare setup''s Azure sign-in automatically' }).Count | Should -Be 1
-        ($stop.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }).message | Should -Match 'The automatic preparation of setup''s Azure sign-in didn''t finish, so the person was asked anyway'
-    }
-
-    It 'requests the stop, starts Bastion without waiting, onboards Arc first, prompts once, and continues when the host''s check passes' {
-        foreach ($item in @($script:wizard, $script:wizard, $script:after)) {
-            $script:health.Enqueue($item)
-        }
-        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:waitingArc } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
-        $stop.Status | Should -Be 'Done'
-        $script:calls | Should -Be @('request Set', 'state GuidedStopUtc', 'bastion nowait=True', 'onboard skipConfiguration=True', 'credential', 'prompt', 'cleanup')
-        ($stop.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }).status | Should -Be 'Pass'
-    }
-
-    It 'lets deploy.ps1''s own process prompt when the tracks run in their own processes' {
-        foreach ($item in @($script:wizard, $script:after)) {
-            $script:health.Enqueue($item)
-        }
-        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:wizard } { Invoke-DemoT2GuidedStop -Config $Config -Context @{ PromptInParent = $true } -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
-        $stop.Status | Should -Be 'Done'
-        $script:calls | Should -Not -Contain 'prompt'
-        $script:calls | Should -Not -Contain 'credential'
-    }
-
-    It 'times out as Manual action required, reminds the person meanwhile, and still cleans up' {
-        $script:health.Enqueue($script:wizard)
-        # Each read of the clock is 10 minutes later: the person's window (at least 45 minutes) passes without setup.
-        $script:clock = [DateTime]::UtcNow
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:clock = $script:clock.AddMinutes(10); $script:clock }
-        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:wizard } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow) -PollSeconds 10 }
-        $stop.Status | Should -Be 'TimedOut'
-        $timedOut = $stop.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }
-        $timedOut.status | Should -Be 'Manual action required'
-        $timedOut.remediation | Should -Match 'Run \./scripts/deploy\.ps1 again'
-        $script:calls | Should -Contain 'reminder'
-        $script:calls[-1] | Should -Be 'cleanup'
-    }
-
-    It 'fails, and cleans up, when the host fails during the stop' {
-        foreach ($item in @($script:wizard, ([pscustomobject]@{ state = 'Failed'; currentStep = 'SqlSetupWizard'; message = 'Setup failed.' }))) {
-            $script:health.Enqueue($item)
-        }
-        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:wizard } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) -PollSeconds 10 }
-        $stop.Status | Should -Be 'Failed'
-        ($stop.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }).status | Should -Be 'Fail'
-        $script:calls[-1] | Should -Be 'cleanup'
-    }
-
-    It 'isn''t needed when SQL Server is already set up' {
-        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:after } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) }
-        $stop.Status | Should -Be 'NotNeeded'
-        $script:calls.Count | Should -Be 0
-    }
-
-    It 'removes what an earlier guided stop left open when setup finished after a Ctrl+C, so the run isn''t DONE with it (Phase 28 review)' {
-        # The review: Ctrl+C at the guided stop skipped its cleanup, setup finished in the guest anyway, and the next run's
-        # guided stop returned NotNeeded and ended DONE with Bastion up and the handed-over password valid.
-        $ready = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.' }
-        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '2026-10-29T16:00:00Z' })
-        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = ''; GuidedStopUtc = '' })
-        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $ready } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) }
-        $stop.Status | Should -Be 'NotNeeded'
-        $script:calls | Should -Be @('cleanup')
-        $cleaned = $stop.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }
-        $cleaned.status | Should -Be 'Pass'
-        $cleaned.message | Should -Match 'host''s password, handed over at 2026-10-29T15:00:00Z'
-
-        # A password that's still valid afterward (the rotation failed): Manual action required, naming stop-demo.ps1.
-        $script:calls.Clear()
-        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '' })
-        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '' })
-        $left = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:after } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) }
-        $script:calls | Should -Be @('cleanup')
-        $open = $left.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }
-        $open.status | Should -Be 'Manual action required'
-        $open.remediation | Should -Match ([regex]::Escape('./scripts/stop-demo.ps1 -RemoveBastionOnly'))
-
-        # While deploy.ps1 is being stopped, nothing: the next run does it.
-        $script:calls.Clear()
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
-        $script:states.Enqueue([pscustomobject]@{ HostPasswordUtc = '2026-10-29T15:00:00Z'; GuidedStopUtc = '2026-10-29T16:00:00Z' })
-        $stopped = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $ready } { Invoke-DemoT2GuidedStop -Config $Config -Context @{} -Health $Health -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(120)) }
-        $script:calls.Count | Should -Be 0
-        $stopped.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' } | Should -BeNullOrEmpty
-    }
-
-    It 'leaves its Azure cleanup to the next run, and the status page to deploy.ps1, when deploy.ps1 was stopped (Phase 28 live finding)' {
-        # Live, Ctrl+C here seemed to do nothing: stopping this track ran its cleanup first, minutes of Azure calls.
-        $script:health.Enqueue($script:wizard)
-        $script:clock = [DateTime]::UtcNow
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:clock = $script:clock.AddMinutes(10); $script:clock }
-        Mock -ModuleName DbHubDemo -CommandName Test-DemoRunCancelled -MockWith { $true }
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressValue -MockWith { $script:calls.Add(('page {0} {1}' -f $Section, [string]$Value['state'])) }
-        $stop = InModuleScope DbHubDemo -Parameters @{ Config = $config; Health = $script:wizard } { Invoke-DemoT2GuidedStop -Config $Config -Context @{ ProgressPath = 'progress.json' } -Health $Health -DeadlineUtc ([DateTime]::UtcNow) -PollSeconds 10 }
-        $stop.Status | Should -Be 'Stopped'
-        $script:calls | Should -Not -Contain 'cleanup'
-        $script:calls | Should -Not -Contain 'page guidedStop TimedOut'
-        $stopped = $stop.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.GUIDEDSTOP' }
-        $stopped.status | Should -Be 'Manual action required'
-        $stopped.message | Should -Match 'Bastion stays up'
-        $stopped.remediation | Should -Match ([regex]::Escape('./scripts/stop-demo.ps1'))
-    }
-
-    It 'knows the host''s phases, and the host''s step list matches the VM side''s plan' {
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestVhdx' }) -InstallMode PaygWizard }).Phase | Should -Be 'Build'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'ManualActionRequired'; currentStep = 'SqlSetupWizard' }) -InstallMode PaygWizard }).Phase | Should -Be 'GuidedStop'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'ConfigureSql' }) -InstallMode PaygWizard }).Phase | Should -Be 'AfterSetup'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'Failed'; currentStep = 'GuestOnline' }) -InstallMode PaygWizard }).Phase | Should -Be 'Failed'
-        $jumpstart = InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestImage' }) }
-        $jumpstart.Phase | Should -Be 'Build' -Because 'JumpstartImage is the default, and the image download is part of the build'
-        $jumpstart.RemainingHigh | Should -BeLessOrEqual 60
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'JumpstartImageCheck' }) }).Phase | Should -Be 'Build'
-        (InModuleScope DbHubDemo { Get-DemoT2HostPhase -Health ([pscustomobject]@{ state = 'InProgress'; currentStep = 'ConfigureSql' }) }).Phase | Should -Be 'AfterSetup'
-        $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-HostBootstrap.ps1') -Raw
-        $vmOrder = @([regex]::Matches($text, "@\{ Name = '([A-Za-z0-9]+)'") | ForEach-Object { $_.Groups[1].Value })
-        $vmOrder | Should -Be @(InModuleScope DbHubDemo { Get-DemoHostStepOrder })
     }
 }
 

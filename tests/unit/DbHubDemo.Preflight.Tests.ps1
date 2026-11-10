@@ -385,19 +385,19 @@ Describe 'Invoke-DemoPreflight' {
         $fallback.remediation | Should -Not -Match 't4Enabled'
 
         # The region lists neither 4-vCore size: the run starts at the 2-vCore size, so the run's own estimate prices it. Over
-        # a ceiling, the fallback's check says so (startSku None, which deploy.ps1 takes as Standard_D2ds_v5) but never
+        # a ceiling, the fallback's check says so (startSku Standard_D2ds_v5, never None any more) but never
         # leaves T4 out: there's no estimate without T4, and the run's own cost checks stay (2026-11-09).
         $script:listSkusJson = & $script:listSkus @('Standard_D2ds_v5')
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
         $fallback = $results | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
         $fallback.status | Should -Be 'Warning'
-        $fallback.evidence.startSku | Should -Be 'None'
+        $fallback.evidence.startSku | Should -Be 'Standard_D2ds_v5'
         $fallback.evidence.skipReason | Should -Be 'MonthlyCeiling'
         $fallback.message | Should -Match 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: .*brings the demo''s month to 288\.00 USD, over monthlyCeilingUsd \(250\.00 USD\)\. T4 is part of every deployment, so a ceiling never leaves it out\.'
         $fallback.remediation | Should -Match '^To keep the month within your ceilings, raise monthlyCeilingUsd to at least 288 in your configuration \(the budget follows it\), and stop T4 between sessions with \./scripts/stop-demo\.ps1\.$'
         @($results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Be @('Priced with T4 at Standard_D2ds_v5.')
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 0 -Exactly -ParameterFilter { $Config['t4Enabled'] -eq $false }
-        (InModuleScope DbHubDemo -Parameters @{ Results = $results } { Select-DemoT4StartSku -Sku @($Results | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'startSku') }) }) | Should -Be 'None'
+        (InModuleScope DbHubDemo -Parameters @{ Results = $results } { Select-DemoT4StartSku -Sku @($Results | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'startSku') }) }) | Should -Be 'Standard_D2ds_v5'
         $script:lightUse = 60.0
         $fallback = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.FALLBACK'
         $fallback.status | Should -Be 'Warning' -Because 'a General Purpose T4 is said loudly'
@@ -420,7 +420,7 @@ Describe 'Invoke-DemoPreflight' {
         @{ Case = 'a 4-vCore start, the 2-vCore estimate refused (HTTP 429)'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'fallback'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D4ds_v5.'; Match = 'deploy\.ps1 prices its 2-vCore fallback, Standard_D2ds_v5, right before it would create it; right now, its price couldn''t be read from the Azure Retail Prices API \(HTTP 429' }
         # 2026-11-09: T4 is part of every deployment, so a 2-vCore start over a ceiling is a Warning, T4 is created anyway,
         # and no estimate without T4 is made (one would throw here).
-        @{ Case = 'a 2-vCore start over a ceiling, which still creates T4 and makes no estimate without it (2026-11-09)'; GeneralPurpose = @('Standard_D2ds_v5'); Throws = 'off'; StartSku = 'None'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D2ds_v5.'; Match = 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: .*brings the demo''s month to 398\.00 USD, over monthlyCeilingUsd \(375\.00 USD\)\. T4 is part of every deployment, so a ceiling never leaves it out\.' }
+        @{ Case = 'a 2-vCore start over a ceiling, which still creates T4 and makes no estimate without it (2026-11-09)'; GeneralPurpose = @('Standard_D2ds_v5'); Throws = 'off'; StartSku = 'Standard_D2ds_v5'; Status = 'Warning'; SkipReason = 'MonthlyCeiling'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D2ds_v5.'; Match = 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: .*brings the demo''s month to 398\.00 USD, over monthlyCeilingUsd \(375\.00 USD\)\. T4 is part of every deployment, so a ceiling never leaves it out\.' }
         @{ Case = 'the fallback''s check itself throws'; GeneralPurpose = @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5'); Throws = 'check'; StartSku = ''; Status = 'Warning'; SkipReason = 'Price'; MonthlyMessage = 'Over monthlyCeilingUsd with T4 at Standard_D4ds_v5.'; Match = '^T4''s 2-vCore fallback couldn''t be priced in preflight: HTTP 429' }
     ) {
         Set-HappyAzMock

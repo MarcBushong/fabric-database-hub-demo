@@ -118,9 +118,9 @@ function Invoke-DemoTemplateDeployment {
     asks Azure to rebuild it from the image (ADR 0018).
 
     .PARAMETER T4StartSku
-    Where T4's fallback starts when preflight already ruled sizes out (ADR 0019): Standard_D4ads_v5, Standard_D2ds_v5 (its
-    cost check still runs right before the attempt), None (left out: the 2-vCore fallback can't be created now), or
-    Refused (Azure refused the fallback's last size too). Ignored when the configuration sets t4SkuName or T4 exists.
+    Where T4's fallback starts when preflight already ruled sizes out (ADR 0019): Standard_D4ads_v5, or Standard_D2ds_v5
+    (its cost check still runs right before the attempt, and only reports). Any other value starts at the default.
+    Ignored when the configuration sets t4SkuName or T4 exists.
 
     .PARAMETER ScaleT4
     deploy.ps1's: an existing T4 whose size the configuration doesn't set, and no record keeps, scales to the default,
@@ -370,13 +370,12 @@ function Invoke-DemoTemplateDeployment {
                 $tags[$t4TagName] = 'Standard_D4ads_v5'
                 $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.SKU' -Area 't4' -Target 'T4' -Status 'Warning' -Message 'Preflight found that the region doesn''t offer, or refused, T4''s default Standard_D4ds_v5, so this deployment uses Standard_D4ads_v5, General Purpose with 4 vCores too (autonomous tuning stays on), and later runs keep it.' -Evidence ([ordered]@{ startSku = $T4StartSku }) -Remediation 'Nothing to do. To choose T4''s size yourself, set t4SkuName.' -DocUrl $refusalDoc))
             }
-            { $_ -in 'Standard_D2ds_v5', 'None' } {
+            'Standard_D2ds_v5' {
                 # The 2-vCore fallback: its cost check runs right before the attempt, below, and only reports (2026-11-09:
                 # T4 is part of every deployment, so neither cost nor autonomous tuning leaves it out).
                 $t4Refused.AddRange([string[]]@('Standard_D4ds_v5', 'Standard_D4ads_v5'))
                 $effective = Copy-DemoT4Config -Config $effective -Source fallback -SkuName 'Standard_D2ds_v5'
             }
-            # 'Refused' (a refusal of every size on record): every run tries the sizes again from the default (2026-11-09).
         }
     }
     # Review finding 5: any record no longer holds once the configuration sets t4SkuName and this deployment has T4 in it;

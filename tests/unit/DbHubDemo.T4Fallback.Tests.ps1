@@ -404,7 +404,7 @@ Describe 'Guardrail 2: priced from the Retail Prices API before anything is crea
         $skip = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SKU')[-1]
         $skip.status | Should -Be 'Warning'
         $skip.evidence.next | Should -Be 'None'
-        $skip.evidence.startSku | Should -Be 'None'
+        $skip.evidence.startSku | Should -Be 'Standard_D2ds_v5' -Because 'the 2-vCore size over a ceiling is created anyway (2026-11-09)'
         $skip.evidence.skipReason | Should -Be $Reason
         $skip.message | Should -Match 'so this run creates T4 as General Purpose Standard_D2ds_v5 \(2 vCores, 8 GiB\), with autonomous tuning off, although its cost check doesn''t pass: '
         $skip.message | Should -Match $Because
@@ -858,8 +858,9 @@ Describe 'Guardrail 4: the size is recorded, and an existing server is never res
     It 'starts the fallback at the furthest step preflight found' {
         InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('', 'Standard_D4ads_v5') } | Should -Be 'Standard_D4ads_v5'
         InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('Standard_D2ds_v5', 'Standard_D4ads_v5', '') } | Should -Be 'Standard_D2ds_v5'
-        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('Standard_D2ds_v5', 'None') } | Should -Be 'None'
-        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('None', 'Refused') } | Should -Be 'Refused'
+        # No step leaves T4 out since 2026-11-09: an older None or Refused counts as the default.
+        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('Standard_D2ds_v5', 'None') } | Should -Be 'Standard_D2ds_v5'
+        InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @('None', 'Refused') } | Should -Be ''
         InModuleScope DbHubDemo { Select-DemoT4StartSku -Sku @() } | Should -Be ''
     }
 

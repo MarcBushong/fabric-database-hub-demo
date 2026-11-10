@@ -31,10 +31,8 @@ function Get-DemoEnvironmentStatus {
       wait event type, the oldest transaction, deadlocks); while it's stopped, when Azure starts it again on its own (seven
       days after the stop in the activity log; a Warning within a day), what it then bills at its own size (the Retail
       Prices API), and whether the nightly safety stop (ADR 0024), or else the on-demand control's daily safety stop, stops
-      it again or nothing does (Phase 28 follow-up; Get-DemoT4RestartStopState); a General Purpose T4 says so, and when the fallback chose it, with its hourly list price. A server that
-      exists although the record says T4 is off (DbHubT4Size None or Refused) is a Warning that it bills, and what keeps or
-      removes it (review of 64c28b2; New-DemoT4RecordedOffResult).
-      STATUS.PROFILE_T4 is its activity
+      it again or nothing does (Phase 28 follow-up; Get-DemoT4RestartStopState); a General Purpose T4 says so, and when
+      the fallback chose it, with its hourly list price. STATUS.PROFILE_T4 is its activity
       profile, and with -Detail STATUS.T4.LIVE is T1's runner's live view of T4 (connections against
       max_connections, sessions by state, blockers, the oldest transaction, deadlocks).
     - T1.SQLVM.ASSOCIATEDSERVICES (Phase 7, read-only): the SQL Server instances unified inventory lists for
@@ -233,24 +231,9 @@ function Get-DemoEnvironmentStatus {
     $t4Ready = $false
     $t4Config = Resolve-DemoEffectiveConfig -Config $Config -State $state
     if (-not (Test-DemoT4Enabled -Config $t4Config)) {
-        $t4OffResult = $null
-        if (Test-DemoT4Enabled -Config $Config) {
-            # The record says T4 is off (DbHubT4Size None or Refused), but a server bills whatever the record says, and a run
-            # before the review of 64c28b2 could record None for a server that a failed template attempt had created: one that
-            # exists is a Warning, never hidden.
-            $t4Recorded = [string](Get-DemoMemberValue -InputObject $state -Name 'T4Sku')
-            $t4OffServer = Get-DemoT4State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
-            if ([bool](Get-DemoMemberValue -InputObject $t4OffServer -Name 'Exists') -and $t4Recorded -cin 'None', 'Refused') {
-                $t4OffResult = New-DemoT4RecordedOffResult -CheckId 'STATUS.T4' -Server $t4OffServer -Recorded $t4Recorded
-            }
-            else {
-                $t4OffResult = New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Not selected' -Message (Get-DemoT4OffReason -Config $Config -State $state)
-            }
-        }
-        else {
-            $t4OffResult = New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Not selected' -Message 'T4 is off in this configuration (t4Enabled is false).'
-        }
-        $results.Add($t4OffResult)
+        # Only a configuration built in code can have T4 off: Get-DemoConfig turns a file's on, and no record turns it off
+        # since 2026-11-09.
+        $results.Add((New-DemoResult -CheckId 'STATUS.T4' -Area 't4' -Target 'T4' -Status 'Not selected' -Message 'T4 is off in this configuration (t4Enabled is false).'))
     }
     else {
         $t4 = Get-DemoT4State -Config $t4Config -DeploymentId ([string]$state.Tags['deploymentId'])

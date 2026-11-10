@@ -1,9 +1,8 @@
-# The PaygWizard guided stop on deploy.ps1's side (Phase 28, ADR 0006, ADR 0009, ADR 0018): the T2 track waits for the
-# host's guest build with progress, writes the host's request, starts on-demand Bastion, onboards Arc, and waits for the
-# host to open the pre-filled setup in the guest; then the person is prompted (by deploy.ps1's own process, which owns
-# the console, the clipboard, and the browser), and the track waits for the host's setup check. Whatever happens, the
-# request is cleared, Bastion is removed, and the host password is rotated. Nothing here displays, logs, or stores a
-# password.
+# The T2 track's wait for the host's build, with progress, and what's left of the PaygWizard guided stop on deploy.ps1's
+# side (Phase 28, ADR 0006, ADR 0009, ADR 0018). The guided stop itself is retired (2026-11-09, user-directed: no
+# configuration value leads to the setup wizard), and its code is gone; what an earlier guided stop or session left open
+# is still cleaned up: the host's request is cleared, Bastion is removed, and the host password is rotated
+# (Clear-DemoGuidedStopLeftover). Nothing here displays, logs, or stores a password.
 # Sources (checked 2026-10-29):
 # - Bastion RDP to a Windows VM: https://learn.microsoft.com/azure/bastion/bastion-connect-vm-rdp-windows
 # - Reset a VM's password in the portal (Help, Reset password): https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp
@@ -91,26 +90,13 @@ function Get-DemoT2HostPhase {
     }
 }
 
-function Get-DemoPortalVmUrl {
-    # The Azure portal's page for a demo VM, in the configured tenant (its Connect menu has Bastion). Pure. Internal.
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Config,
-
-        [string] $VmName = 'archost01'
-    )
-
-    return ('https://portal.azure.com/#@{0}/resource/subscriptions/{1}/resourceGroups/{2}/providers/Microsoft.Compute/virtualMachines/{3}' -f [string]$Config['tenantId'], [string]$Config['subscriptionId'], (Get-DemoResourceGroupName -Config $Config), $VmName)
-}
-
 function Set-DemoGuidedStopRequest {
     <#
     .SYNOPSIS
-    Writes (Set) or clears (Clear) the guided stop's request on the T2 host with vm/bootstrap/Set-DemoGuidedSetupRequest.ps1
-    in a managed Run Command, which also starts the host's bootstrap task. Returns a DEPLOY.T2.GUIDEDREQUEST result. The
-    request holds identifiers and an expiry, never a secret. Internal.
+    Clears an earlier guided stop's request on the T2 host with vm/bootstrap/Set-DemoGuidedSetupRequest.ps1 in a managed Run
+    Command, which also starts the host's bootstrap task: the host then turns the guest's one-time sign-in off. Returns a
+    DEPLOY.T2.GUIDEDREQUEST result. Only Clear: nothing writes a request since the guided stop's retirement (2026-11-09).
+    Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -118,75 +104,26 @@ function Set-DemoGuidedStopRequest {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [Parameter(Mandatory)]
-        [ValidateSet('Set', 'Clear')]
-        [string] $Action,
-
-        [string] $RequestId = '',
-
-        [System.Nullable[datetime]] $ExpiresUtc = $null
+        [ValidateSet('Clear')]
+        [string] $Action = 'Clear'
     )
 
     $checkId = 'DEPLOY.T2.GUIDEDREQUEST'
-    if (-not $PSCmdlet.ShouldProcess('archost01', ('{0} the guided stop''s request' -f $Action))) {
+    if (-not $PSCmdlet.ShouldProcess('archost01', 'Clear the guided stop''s request')) {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T2' -Status 'Not selected' -Message 'What if: the guided stop''s request wasn''t changed.')
-    }
-    $parameters = @{ Action = $Action }
-    if ($Action -eq 'Set') {
-        $parameters['RequestId'] = $RequestId
-        $parameters['ExpiresUtc'] = ([datetime]$ExpiresUtc).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
-        $parameters['SubscriptionId'] = [string]$Config['subscriptionId']
-        $parameters['ResourceGroup'] = Get-DemoResourceGroupName -Config $Config
-        $parameters['Region'] = [string]$Config['location']
-        $parameters['TenantId'] = [string]$Config['tenantId']
     }
     $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Set-DemoGuidedSetupRequest.ps1') -Raw
     try {
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName 'archost01' -RunCommandName 'DbHubDemo-GuidedSetup' -Script $script -Parameter $parameters -TimeoutSeconds 300 -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName 'archost01' -RunCommandName 'DbHubDemo-GuidedSetup' -Script $script -Parameter @{ Action = $Action } -TimeoutSeconds 300 -Confirm:$false
     }
     catch {
-        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('The guided stop''s request couldn''t be {0} on archost01: {1}' -f $(if ($Action -eq 'Set') { 'written' } else { 'cleared' }), (Protect-DemoText -Text $_.Exception.Message)) -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed')
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('The guided stop''s request couldn''t be cleared on archost01: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed')
     }
     if ($null -ne $run -and $run.Succeeded) {
-        $text = if ($Action -eq 'Set') { 'The guided stop''s request is on archost01 until {0}: the host prepares the pre-filled setup and the guest''s one-time sign-in.' -f $parameters['ExpiresUtc'] } else { 'The guided stop''s request is cleared on archost01: the host turns the guest''s one-time sign-in off within a minute.' }
-        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T2' -Status 'Pass' -Message $text)
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'The guided stop''s request is cleared on archost01: the host turns the guest''s one-time sign-in off within a minute.')
     }
     $detail = if ($null -ne $run) { if ($run.Error) { $run.Error } else { $run.Output } } else { 'no result' }
-    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('The guided stop''s request couldn''t be {0} on archost01: {1}' -f $(if ($Action -eq 'Set') { 'written' } else { 'cleared' }), $detail) -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed')
-}
-
-function Wait-DemoBastionDeployment {
-    # Waits at most -TimeoutMinutes for New-DemoBastion -NoWait's deployment (bastion-on-demand) to finish. Returns
-    # Succeeded and State. Internal.
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Config,
-
-        [ValidateRange(1, 60)]
-        [int] $TimeoutMinutes = 20,
-
-        [ValidateRange(5, 300)]
-        [int] $PollSeconds = 30
-    )
-
-    $deadline = [System.DateTime]::UtcNow.AddMinutes($TimeoutMinutes)
-    $state = ''
-    while ($true) {
-        $read = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('deployment', 'group', 'show', '--resource-group', (Get-DemoResourceGroupName -Config $Config), '--name', 'bastion-on-demand', '--query', 'properties.provisioningState', '--output', 'tsv') -AllowFailure
-        $state = if ($read.ExitCode -eq 0) { ([string]$read.StdOut).Trim() } else { '' }
-        if ($state -eq 'Succeeded') {
-            return [pscustomobject]@{ Succeeded = $true; State = $state }
-        }
-        if ($state -in 'Failed', 'Canceled') {
-            return [pscustomobject]@{ Succeeded = $false; State = $state }
-        }
-        if ([System.DateTime]::UtcNow -ge $deadline) {
-            return [pscustomobject]@{ Succeeded = $false; State = $(if ($state) { $state } else { 'TimedOut' }) }
-        }
-        Start-Sleep -Seconds $PollSeconds
-    }
+    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('The guided stop''s request couldn''t be cleared on archost01: {0}' -f $detail) -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed')
 }
 
 function Wait-DemoT2HostBuild {
@@ -194,7 +131,7 @@ function Wait-DemoT2HostBuild {
     .SYNOPSIS
     Waits, bounded by -DeadlineUtc, for the T2 host to stop building: until it waits for the product key or for Arc
     onboarding, needs a person, is Ready, or Failed. Every poll updates the status page's T2.HostBuild step and prints a
-    progress line with the elapsed time, the host's step (n of N), and a rough estimate of when the guided stop comes.
+    progress line with the elapsed time, the host's step (n of N), and a rough estimate of when Arc onboarding starts.
     Since 2026-11-09, a host that rebuilds an unfinished PaygWizard guest from Arc Jumpstart's image is followed up once
     (Complete-DemoT2GuestRebuild: the old guest's Arc resources go, and the console and the status page say so, with the
     measured time), the estimate follows the mode the host runs, and a report from the bundle before this run's
@@ -263,8 +200,7 @@ function Wait-DemoT2HostBuild {
         $estimate = if ($phase.Phase -eq 'Build') {
             $low = [System.DateTime]::UtcNow.AddMinutes($phase.RemainingLow).ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
             $high = [System.DateTime]::UtcNow.AddMinutes($phase.RemainingHigh).ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
-            $after = if ($installMode -eq 'PaygWizard') { 'the guided stop needs you' } else { 'Arc onboarding starts' }
-            ' Rough estimate: {0} to {1} more minutes, then {2} (around {3} to {4}).' -f $phase.RemainingLow, $phase.RemainingHigh, $after, $low, $high
+            ' Rough estimate: {0} to {1} more minutes, then Arc onboarding starts (around {2} to {3}).' -f $phase.RemainingLow, $phase.RemainingHigh, $low, $high
         }
         else {
             ''
@@ -330,87 +266,6 @@ function Test-DemoClipboard {
     catch {
         return $false
     }
-}
-
-function Invoke-DemoGuidedStopCredential {
-    <#
-    .SYNOPSIS
-    The host credential for the guided stop's Bastion sign-in, the documented way for this session (ADR 0009): with the
-    Key Vault opt-in, a one-time password stored in the vault first, then set on the host; else, with a working
-    clipboard, a one-time password set on the host and copied to the clipboard, never shown; else no password at all:
-    the person resets it in the portal (Help, Reset password) to one of their own, and the host password is rotated
-    afterward, so the state records that a password was handed over. Returns Mode (keyVault, clipboard, or
-    portalReset), UserName, Text, and Results. Internal.
-    #>
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Config,
-
-        [string] $VmName = 'archost01',
-
-        [System.Nullable[datetime]] $ExpiresUtc = $null
-    )
-
-    $results = [System.Collections.Generic.List[object]]::new()
-    $expiry = if ($null -ne $ExpiresUtc) { ([datetime]$ExpiresUtc).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
-    if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
-        $vault = @(Initialize-DemoKeyVault -Config $Config -EnsureOnly -Confirm:$false)
-        $results.AddRange([object[]]$vault)
-        if (@($vault | Where-Object { $_.status -eq 'Fail' }).Count -eq 0) {
-            $oneTime = New-DemoAdminPassword
-            try {
-                $stored = Set-DemoHostPasswordSecret -Config $Config -VmName $VmName -Password $oneTime -ExpiresUtc $expiry -Confirm:$false
-                $results.Add($stored)
-                if ($stored.status -eq 'Pass') {
-                    $applied = Set-DemoVmLocalPassword -Config $Config -VmName $VmName -Password $oneTime -Confirm:$false
-                    $results.Add($applied)
-                    if ($applied.status -in 'Pass', 'Warning') {
-                        $user = [string](Get-DemoMemberValue -InputObject $stored.evidence -Name 'userName')
-                        $steps = ([string]$stored.message -split 'stop-demo\.ps1 rotates it and disables the secret\. ', 2)[-1]
-                        return [pscustomobject]@{ Mode = 'keyVault'; UserName = $user; Text = $steps; Results = $results.ToArray() }
-                    }
-                    $results.Add((Disable-DemoHostPasswordSecret -Config $Config -VmName $VmName -CheckId 'DEPLOY.T2.KEYVAULT.CLEANUP' -Confirm:$false))
-                }
-            }
-            finally {
-                $oneTime.Dispose()
-            }
-        }
-    }
-    if (Test-DemoClipboard) {
-        $password = New-DemoAdminPassword
-        try {
-            $set = Set-DemoVmLocalPassword -Config $Config -VmName $VmName -Password $password -Confirm:$false
-            $results.Add($set)
-            if ($set.status -in 'Pass', 'Warning') {
-                $user = [string](Get-DemoMemberValue -InputObject $set.evidence -Name 'userName')
-                try {
-                    Set-Clipboard -Value ([System.Net.NetworkCredential]::new('', $password).Password) -ErrorAction Stop
-                    return [pscustomobject]@{ Mode = 'clipboard'; UserName = $user; Text = ''; Results = $results.ToArray() }
-                }
-                catch {
-                    Write-DemoLog -Level Warning -Message 'The one-time password was set but couldn''t be copied to the clipboard, and it''s never displayed: use the portal''s Reset password instead.'
-                }
-            }
-        }
-        finally {
-            $password.Dispose()
-        }
-    }
-    # No clipboard and no vault (Codespaces, Cloud Shell, an SSH session): nothing is set or shown. The person sets a
-    # password of their own in the portal, and the state records it, so this run and stop-demo.ps1 rotate it.
-    $userRead = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('vm', 'show', '--resource-group', (Get-DemoResourceGroupName -Config $Config), '--name', $VmName, '--query', 'osProfile.adminUsername', '--output', 'tsv') -AllowFailure
-    $userName = if ($userRead.ExitCode -eq 0) { ([string]$userRead.StdOut).Trim() } else { '' }
-    try {
-        Set-DemoDeploymentState -Config $Config -Value @{ HostPasswordSet = [System.DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
-    }
-    catch {
-        Write-DemoLog -Level Warning -Message ('The resource group couldn''t record that the host password is handed over, so stop-demo.ps1 may not rotate it: {0}' -f $_.Exception.Message)
-    }
-    $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.HOSTPASSWORD' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'This session has no working clipboard and no Key Vault opt-in, so no password was set or shown: you set one of your own in the Azure portal (Help, Reset password), and it''s rotated after the guided stop.' -DocUrl 'https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/reset-rdp'))
-    return [pscustomobject]@{ Mode = 'portalReset'; UserName = $userName; Text = ''; Results = $results.ToArray() }
 }
 
 function Write-DemoConsoleBlock {
@@ -502,118 +357,6 @@ public static class DbHubDemoAttention
     catch {
         Write-Debug -Message ('The console window couldn''t flash: {0}' -f $_.Exception.Message)
     }
-}
-
-function Get-DemoHumanActionLine {
-    # The one plain handoff line an assistant can relay (brief item 13). Pure. Internal.
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [AllowEmptyString()]
-        [string] $PagePath = '',
-
-        [System.Nullable[datetime]] $DeadlineUtc = $null,
-
-        [string] $HostVm = 'archost01'
-    )
-
-    $until = if ($null -ne $DeadlineUtc) { ', by {0} (local time)' -f ([datetime]$DeadlineUtc).ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
-    # Without a status page (-NoStatusPage, or one that couldn't be set up) the steps are only in the console.
-    $where = if ($PagePath) { '{0} (or ./scripts/status.ps1 -Watch)' -f $PagePath } else { 'printed above in deploy.ps1''s console (there''s no status page in this run; ./scripts/status.ps1 shows where the host is)' }
-    return ('HUMAN ACTION REQUIRED: DEPLOY.T2.GUIDEDSTOP - a person signs in to {0} through Bastion and finishes SQL Server setup in arcsql01 (pay-as-you-go, Standard, Use Azure Login; about 10 minutes){1}. No assistant can do these sign-ins. Steps and link: {2}.' -f $HostVm, $until, $where)
-}
-
-function Show-DemoGuidedStopPrompt {
-    <#
-    .SYNOPSIS
-    The guided stop's unmissable prompt (brief item 4): a large banner, the steps with the credential's way in, how long
-    the run waits and what to run after that, the portal link (opened in the browser where possible), a bell and the
-    console window flashing, and the HUMAN ACTION REQUIRED line. Internal.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string] $Url,
-
-        [Parameter(Mandatory)]
-        [datetime] $DeadlineUtc,
-
-        [string] $HostVm = 'archost01',
-
-        [AllowEmptyString()]
-        [string] $HostUser = '',
-
-        [ValidateSet('', 'clipboard', 'keyVault', 'portalReset', 'unknown')]
-        [string] $SignInWay = '',
-
-        [AllowEmptyString()]
-        [string] $SignInText = '',
-
-        [AllowEmptyString()]
-        [string] $PagePath = '',
-
-        [switch] $NoBrowser,
-
-        # The host's automatic preparation of setup's sign-in didn't finish in time (Phase 28 review): Add... comes first.
-        [switch] $SignInFallback
-    )
-
-    $left = [int][System.Math]::Max(0, ($DeadlineUtc - [System.DateTime]::UtcNow).TotalMinutes)
-    $until = $DeadlineUtc.ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
-    Write-DemoConsoleBlock -Color 'Yellow' -Line @('') 
-    Write-DemoConsoleBlock -Color 'Yellow' -Line (Get-DemoBannerLine -Title 'WAITING FOR YOU: one step, about 10 minutes')
-    Write-DemoConsoleBlock -Color 'Yellow' -Line @(
-        ('Time limit: {0} minutes, until {1} (local time). After that, deploy.ps1 stops; run ./scripts/deploy.ps1 again and it waits for this step again.' -f $left, $until)
-        ('Portal: {0}' -f $Url)
-    )
-    Write-DemoConsoleBlock -Color 'White' -Line (Get-DemoGuidedStopInstruction -HostVm $HostVm -HostUser $HostUser -SignInWay $SignInWay -SignInText $SignInText -SignInFallback:$SignInFallback)
-    $opened = $false
-    if (-not $NoBrowser -and [string]$env:CODESPACES -ne 'true' -and $Url -match '^https://portal\.azure\.com/') {
-        try {
-            if ($IsWindows) {
-                Start-Process -FilePath $Url
-                $opened = $true
-            }
-            elseif ($IsMacOS) {
-                Start-Process -FilePath 'open' -ArgumentList $Url
-                $opened = $true
-            }
-            elseif (Get-Command -Name 'xdg-open' -ErrorAction SilentlyContinue) {
-                Start-Process -FilePath 'xdg-open' -ArgumentList $Url
-                $opened = $true
-            }
-        }
-        catch {
-            $opened = $false
-        }
-    }
-    Write-DemoConsoleBlock -Color 'Gray' -Line @($(if ($opened) { 'The browser opened archost01''s page in the Azure portal.' } else { 'Open the portal link above in your browser.' }))
-    Invoke-DemoAttention
-    Write-DemoConsoleBlock -Color 'Yellow' -Line @((Get-DemoHumanActionLine -PagePath $PagePath -DeadlineUtc $DeadlineUtc -HostVm $HostVm))
-}
-
-function Show-DemoGuidedStopReminder {
-    # A short reminder while the guided stop waits (every few minutes; brief item 4), with the handoff line again.
-    # Internal.
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [datetime] $DeadlineUtc,
-
-        [AllowEmptyString()]
-        [string] $PagePath = '',
-
-        [AllowEmptyString()]
-        [string] $Status = '',
-
-        [string] $HostVm = 'archost01'
-    )
-
-    $left = [int][System.Math]::Max(0, ($DeadlineUtc - [System.DateTime]::UtcNow).TotalMinutes)
-    $now = if ($Status) { ' Now: {0}' -f $Status } else { '' }
-    Write-DemoConsoleBlock -Color 'Yellow' -Line @(('Reminder: the guided stop still waits for you ({0} minutes left, until {1}).{2}' -f $left, $DeadlineUtc.ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture), $now))
-    Invoke-DemoAttention
-    Write-DemoConsoleBlock -Color 'Yellow' -Line @((Get-DemoHumanActionLine -PagePath $PagePath -DeadlineUtc $DeadlineUtc -HostVm $HostVm))
 }
 
 function Complete-DemoGuidedStop {
@@ -714,19 +457,25 @@ function Clear-DemoGuidedStopLeftover {
     Returns its results with DEPLOY.T2.GUIDEDLEFTOVER: Pass when nothing is left; Manual action required naming
     stop-demo.ps1 when something is, so the run isn't DONE with it. Returns nothing when nothing is recorded, when
     deploy.ps1 is being stopped (Test-DemoRunCancelled: the next run does it), and in the evaluation-only mode, which
-    has no guided stop (DONE still waits, and stop-demo.ps1 does it). Internal.
+    has no guided stop (DONE still waits, and stop-demo.ps1 does it). With -Provisional, what's still open is a Warning
+    instead: a later check gives the final word (the T2 step's own, at its end, and DONE, which reads the state), so a
+    cleanup that succeeds there isn't outvoted by this one (review of 27396a4: the T2 track's cleanup before the loader).
+    Internal.
 
     .DESCRIPTION
-    After a Ctrl+C at the guided stop, the guided stop skips its cleanup (Phase 28 live finding), and setup may finish
-    in the guest anyway. The next run's guided stop is then NotNeeded, and before this, nothing removed Bastion or
-    rotated the password, and the run could end DONE. The guided stop's NotNeeded runs this, and so do the T2 track's T2
-    step at its end, whatever it reached (-NoWaitForT2, a golden redeploy), and deploy.ps1 -Sequential's T2 stage.
+    After a Ctrl+C at the guided stop, the guided stop skipped its cleanup (Phase 28 live finding), and setup may have
+    finished in the guest anyway; before this, nothing removed Bastion or rotated the password, and the run could end
+    DONE. Since the guided stop's retirement (2026-11-09), only this cleans up what an earlier one, or start-demo.ps1
+    -Interactive, left open: the T2 track before its loader (-Provisional) and at its T2 step's end, whatever it reached
+    (-NoWaitForT2, a golden redeploy), and deploy.ps1 -Sequential's T2 stage.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([object[]])]
     param(
         [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Config
+        [System.Collections.IDictionary] $Config,
+
+        [switch] $Provisional
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -756,6 +505,9 @@ function Clear-DemoGuidedStopLeftover {
     $remediation = 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly: it removes Bastion and rotates the host password, and leaves the VMs running.'
     if ($null -eq $after) {
         $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDLEFTOVER' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('The cleanup of {0} ran, but the deployment state couldn''t be read to confirm it.' -f $open) -Remediation ('./scripts/status.ps1 shows whether Bastion is still up. {0}' -f $remediation)))
+    }
+    elseif ($left -and $Provisional) {
+        $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDLEFTOVER' -Area 'infra' -Target 'T2' -Status 'Warning' -Message ('{0} is still open after this cleanup; the T2 step tries again at its end, and DONE waits until nothing is open.' -f $left) -Remediation $remediation))
     }
     elseif ($left) {
         $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDLEFTOVER' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message ('{0} is still open after the cleanup, so the run isn''t DONE: DONE never leaves access to the T2 host behind.' -f $left) -Remediation $remediation))
@@ -805,271 +557,11 @@ function Get-DemoGuidedSignInStatus {
 }
 
 function Get-DemoUtcNow {
-    # The current UTC time. The guided stop's deadlines and the chunk sender's stall check read it here, so tests can move
-    # time on. Internal.
+    # The current UTC time. The chunk sender's stall check and other waits read it here, so tests can move time on.
+    # Internal.
     [CmdletBinding()]
     [OutputType([datetime])]
     param()
 
     return [System.DateTime]::UtcNow
-}
-function Invoke-DemoT2GuidedStop {
-    <#
-    .SYNOPSIS
-    The PaygWizard guided stop in deploy.ps1's T2 track (Phase 28). Returns Status (Done, NotNeeded, TimedOut, Failed,
-    or Stopped) and Results. Internal.
-
-    .DESCRIPTION
-    1. Nothing to do when the host is past setup already (NotNeeded), except what an earlier guided stop left open:
-       Clear-DemoGuidedStopLeftover removes its Bastion and rotates the handed-over host password, as after a Ctrl+C
-       at the guided stop when setup finished anyway (Phase 28 review).
-    2. The host's request (Set-DemoGuidedStopRequest), valid until the deadline: at least -PersonMinutes after the prompt.
-    3. On-demand Bastion, deployed in the background (New-DemoBastion -NoWait).
-    4. Arc onboarding when the host waits for it, without the SQL Server configuration, which waits for the setup check.
-    5. Waits for the host to open the pre-filled setup in the guest (SqlSetupWizard), and for Bastion. The host first
-       prepares setup's Azure sign-in (Phase 28 live finding: the WebView2 runtime, and IE Enhanced Security
-       Configuration off for administrators); until its health says guidedSignIn ready, nobody is asked, and the status
-       page shows the host's message as Azure-side preparation. A host whose health has no guidedSignIn (a bundle from
-       before) is ready at its step as before.
-    6. The prompt: the status page's guidedStop turns Ready; deploy.ps1's own process prompts the person (Context
-       PromptInParent, set only when the progress model exists), or this process does (in-process runs, and track
-       processes without a model, such as -NoStatusPage: its console lines reach deploy.ps1's console).
-    7. Waits for the host's setup check, relaying its message (a wrong install's documented fix), until it passes, the
-       deadline passes (TimedOut), or the host fails.
-    8. Always: Complete-DemoGuidedStop, except when deploy.ps1 was stopped (Test-DemoRunCancelled; Stopped): its Azure
-       calls would hold the stop for minutes, so the next deploy.ps1 (Clear-DemoGuidedStopLeftover, whether or not setup
-       finished meanwhile) or stop-demo.ps1 does them (Phase 28 live finding and its review).
-    #>
-    [CmdletBinding()]
-    [OutputType([pscustomobject])]
-    param(
-        [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Config,
-
-        [System.Collections.IDictionary] $Context = @{},
-
-        [AllowNull()]
-        [object] $Health,
-
-        [Parameter(Mandatory)]
-        [datetime] $DeadlineUtc,
-
-        [ValidateRange(10, 240)]
-        [int] $PersonMinutes = 45,
-
-        [ValidateRange(10, 600)]
-        [int] $PollSeconds = 120
-    )
-
-    $results = [System.Collections.Generic.List[object]]::new()
-    $progress = if ($Context.Contains('ProgressPath')) { [string]$Context['ProgressPath'] } else { '' }
-    $inParent = $Context.Contains('PromptInParent') -and [bool]$Context['PromptInParent']
-    $docUrl = 'https://learn.microsoft.com/sql/database-engine/install-windows/install-sql-server-using-a-configuration-file'
-    $phase = Get-DemoT2HostPhase -Health $Health
-    if ($phase.Phase -in 'AfterSetup', 'Ready') {
-        $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Not selected' -Message 'SQL Server is already set up in arcsql01, so no step needs you.' -DocUrl $docUrl))
-        # Setup can finish after a Ctrl+C at the guided stop, which skipped its cleanup: Bastion and the handed-over host
-        # password go now, or the run isn't DONE (Phase 28 review).
-        $leftover = @(Clear-DemoGuidedStopLeftover -Config $Config)
-        $results.AddRange([object[]]$leftover)
-        $cleaned = @($leftover | Where-Object { [string]$_.checkId -eq 'DEPLOY.T2.GUIDEDLEFTOVER' }) | Select-Object -First 1
-        $stepMessage = 'Not needed: SQL Server is already set up in arcsql01.'
-        $stepStatus = ''
-        if ($null -ne $cleaned) {
-            $stepMessage = '{0} {1}' -f $stepMessage, [string]$cleaned.message
-            $stepStatus = [string]$cleaned.status
-        }
-        Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop', 'T2.SetupCheck' -State 'Done' -Status $stepStatus -Message $stepMessage
-        Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'NotSelected'; message = 'SQL Server is already set up in arcsql01.' }
-        return [pscustomobject]@{ Status = 'NotNeeded'; Results = $results.ToArray() }
-    }
-    if ($phase.Phase -eq 'Failed') {
-        $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('archost01 reports Failed at step {0}, so the guided stop didn''t start.' -f $phase.Step) -Remediation 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full), fix the cause, then run ./scripts/deploy.ps1 again.'))
-        return [pscustomobject]@{ Status = 'Failed'; Results = $results.ToArray() }
-    }
-    $now = (Get-DemoUtcNow)
-    $deadline = if ($DeadlineUtc -gt $now.AddMinutes($PersonMinutes + 20)) { $DeadlineUtc } else { $now.AddMinutes($PersonMinutes + 20) }
-    $status = 'TimedOut'
-    # The host's automatic preparation of setup's sign-in didn't finish in time, and it asks for the person anyway, with
-    # Add... first (health guidedSignIn fallback; Phase 28 review).
-    $signInFallback = $false
-    $fallbackNote = ' The automatic preparation of setup''s Azure sign-in didn''t finish, so the person was asked anyway, with Add... in Internet Explorer''s dialog as the way past a blocked sign-in.'
-    $started = [System.Diagnostics.Stopwatch]::StartNew()
-    Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Running' -Message 'Preparing: Bastion, Arc onboarding, the pre-filled setup, setup''s Azure sign-in, and the guest''s one-time sign-in (about 10 to 15 minutes).'
-    Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'Preparing'; message = 'Preparing Bastion and the pre-filled setup (about 10 to 15 minutes); nothing to do yet.'; deadlineAt = (Get-DemoUnixTime -Value $deadline); hostVm = 'archost01' }
-    try {
-        :guided do {
-            $request = Set-DemoGuidedStopRequest -Config $Config -Action Set -RequestId ([guid]::NewGuid().ToString()) -ExpiresUtc $deadline.AddMinutes(5) -Confirm:$false
-            $results.Add($request)
-            if ($request.status -ne 'Pass') {
-                $status = 'Failed'
-                break guided
-            }
-            try {
-                Set-DemoDeploymentStateLocked -Config $Config -Value @{ GuidedStopUtc = $deadline.AddMinutes(5).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) } -Confirm:$false
-            }
-            catch {
-                Write-DemoLog -Level Warning -Message ('The guided stop''s time limit wasn''t recorded: {0}' -f $_.Exception.Message)
-            }
-            $bastion = New-DemoBastion -Config $Config -NoWait -Confirm:$false
-            $results.Add($bastion)
-            if ($bastion.status -eq 'Fail') {
-                $status = 'Failed'
-                break guided
-            }
-            $state = [string](Get-DemoMemberValue -InputObject $Health -Name 'state')
-            if ($state -eq 'WaitingForArcOnboarding') {
-                Set-DemoProgressStep -Path $progress -Id 'T2.ArcOnboarding' -State 'Running' -Message 'Onboarding arcsql01 to Azure Arc before setup.'
-                $arc = @(Invoke-DemoArcConfiguration -Config $Config -SkipConfiguration -Confirm:$false)
-                $results.AddRange([object[]]$arc)
-                if (@($arc | Where-Object { [string]$_.status -eq 'Fail' }).Count -gt 0) {
-                    Set-DemoProgressStep -Path $progress -Id 'T2.ArcOnboarding' -State 'Failed' -Message 'Arc onboarding failed; see the results.'
-                    $status = 'Failed'
-                    break guided
-                }
-                Set-DemoProgressStep -Path $progress -Id 'T2.ArcOnboarding' -State 'Done' -Message 'arcsql01 is connected to Azure Arc.'
-            }
-            # The host opens the pre-filled setup once Arc is connected and the request is there.
-            $ready = $false
-            $health = $Health
-            while (-not $ready) {
-                try {
-                    $read = Get-DemoVmHealth -Config $Config -VmName 'archost01' -View Summary
-                    if ($null -ne $read) {
-                        $health = $read
-                    }
-                }
-                catch {
-                    Write-DemoLog -Level Warning -Message ('Reading archost01''s health failed; reading it again: {0}' -f $_.Exception.Message)
-                }
-                $phase = Get-DemoT2HostPhase -Health $health
-                if ($phase.Phase -in 'AfterSetup', 'Ready') {
-                    $status = 'Done'
-                    break guided
-                }
-                if ($phase.Phase -eq 'Failed') {
-                    $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('archost01 failed while it prepared the guided stop (step {0}): {1}' -f $phase.Step, [string](Get-DemoMemberValue -InputObject $health -Name 'message')) -Remediation 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full), fix the cause, then run ./scripts/deploy.ps1 again.'))
-                    $status = 'Failed'
-                    break guided
-                }
-                # Setup's Azure sign-in must be ready first (Phase 28 live finding): a health without guidedSignIn comes
-                # from a host bundle that predates it. At fallback the host gave up waiting for it and asks anyway.
-                $signIn = Get-DemoMemberValue -InputObject $health -Name 'guidedSignIn'
-                $ready = $phase.Step -eq 'SqlSetupWizard' -and $phase.State -eq 'ManualActionRequired' -and ($null -eq $signIn -or [string]$signIn -in 'ready', 'fallback')
-                $signInFallback = [string]$signIn -eq 'fallback'
-                if (-not $ready) {
-                    if ((Get-DemoUtcNow) -ge $deadline) {
-                        break guided
-                    }
-                    $waitMessage = 'archost01 prepares the pre-filled setup (step {0}); nothing to do yet.' -f $phase.Step
-                    $hostMessage = [string](Get-DemoMemberValue -InputObject $health -Name 'message')
-                    if ($phase.Step -eq 'SqlSetupWizard' -and $phase.State -ne 'ManualActionRequired' -and $hostMessage) {
-                        # The host's own words: what it prepares, Azure-side, with nothing for the person yet.
-                        $waitMessage = $hostMessage
-                        Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Running' -Message $hostMessage -AzureSide
-                    }
-                    Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ message = $waitMessage }
-                    Start-Sleep -Seconds 60
-                }
-            }
-            $bastionReady = Wait-DemoBastionDeployment -Config $Config -TimeoutMinutes 20
-            if (-not $bastionReady.Succeeded) {
-                $results.Add((New-DemoResult -CheckId 'START.BASTION' -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('On-demand Bastion didn''t deploy ({0}), so nobody can sign in to archost01.' -f $bastionReady.State) -Remediation 'Check the AzureBastionSubnet and the public IP quota (PREFLIGHT.P3.PUBLICIP), then run ./scripts/deploy.ps1 again.' -DocUrl 'https://learn.microsoft.com/azure/bastion/configuration-settings'))
-                $status = 'Failed'
-                break guided
-            }
-            # The person's window starts now: at least PersonMinutes.
-            if ($deadline -lt (Get-DemoUtcNow).AddMinutes($PersonMinutes)) {
-                $deadline = (Get-DemoUtcNow).AddMinutes($PersonMinutes)
-                $null = Set-DemoGuidedStopRequest -Config $Config -Action Set -RequestId ([guid]::NewGuid().ToString()) -ExpiresUtc $deadline.AddMinutes(5) -Confirm:$false
-            }
-            $url = Get-DemoPortalVmUrl -Config $Config -VmName 'archost01'
-            $hostMessage = [string](Get-DemoMemberValue -InputObject $health -Name 'message')
-            if ($signInFallback) {
-                Write-DemoLog -Level Warning -Message 'T2: archost01 couldn''t prepare setup''s Azure sign-in automatically in time; you''re asked anyway. If Internet Explorer blocks the sign-in, select Add... in its dialog, then Use Azure Login again.'
-            }
-            Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'Ready'; url = $url; deadlineAt = (Get-DemoUnixTime -Value $deadline); promptedAt = (Get-DemoUnixTime); message = $hostMessage; signInFallback = $signInFallback }
-            Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Action needed' -Message $(if ($signInFallback) { 'Waiting for you: sign in through Bastion and finish SQL Server setup (see the banner). The automatic preparation of setup''s Azure sign-in didn''t finish: if Internet Explorer blocks the sign-in, select Add... in its dialog.' } else { 'Waiting for you: sign in through Bastion and finish SQL Server setup (see the banner).' })
-            Write-DemoLog -Message 'T2: the guided stop is ready: Bastion is up, and arcsql01 has opened the pre-filled SQL Server setup.'
-            $nextReminder = (Get-DemoUtcNow).AddMinutes(5)
-            if (-not $inParent) {
-                $credential = Invoke-DemoGuidedStopCredential -Config $Config -ExpiresUtc $deadline
-                $results.AddRange([object[]]@($credential.Results))
-                Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ credential = $credential.Mode; credentialText = $credential.Text; hostUser = $credential.UserName }
-                Show-DemoGuidedStopPrompt -Url $url -DeadlineUtc $deadline -HostUser $credential.UserName -SignInWay $credential.Mode -SignInText $credential.Text -PagePath ([string]$Context['PagePath']) -SignInFallback:$signInFallback
-            }
-            while ($true) {
-                Start-Sleep -Seconds $PollSeconds
-                try {
-                    $read = Get-DemoVmHealth -Config $Config -VmName 'archost01' -View Summary
-                    if ($null -ne $read) {
-                        $health = $read
-                    }
-                }
-                catch {
-                    Write-DemoLog -Level Warning -Message ('Reading archost01''s health failed; reading it again: {0}' -f $_.Exception.Message)
-                }
-                $phase = Get-DemoT2HostPhase -Health $health
-                if ($phase.Phase -in 'AfterSetup', 'Ready') {
-                    $status = 'Done'
-                    break guided
-                }
-                if ($phase.Phase -eq 'Failed') {
-                    $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('archost01 failed during the guided stop (step {0}): {1}' -f $phase.Step, [string](Get-DemoMemberValue -InputObject $health -Name 'message')) -Remediation 'Read archost01''s health (Get-DemoVmHealth -VmName archost01 -View Full), fix the cause, then run ./scripts/deploy.ps1 again.'))
-                    $status = 'Failed'
-                    break guided
-                }
-                $hostMessage = [string](Get-DemoMemberValue -InputObject $health -Name 'message')
-                Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ message = $hostMessage }
-                if ($hostMessage -match 'Fix:') {
-                    Set-DemoProgressStep -Path $progress -Id 'T2.SetupCheck' -State 'Action needed' -Message $hostMessage
-                    Write-DemoLog -Level Warning -Message ('T2: the setup check found a problem: {0}' -f $hostMessage)
-                }
-                if ((Get-DemoUtcNow) -ge $deadline) {
-                    break guided
-                }
-                if (-not $inParent -and (Get-DemoUtcNow) -ge $nextReminder) {
-                    Show-DemoGuidedStopReminder -DeadlineUtc $deadline -PagePath ([string]$Context['PagePath']) -Status $hostMessage
-                    $nextReminder = (Get-DemoUtcNow).AddMinutes(5)
-                }
-            }
-        } while ($false)
-    }
-    finally {
-        $minutes = [int]$started.Elapsed.TotalMinutes
-        if (Test-DemoRunCancelled) {
-            # deploy.ps1 was stopped (Ctrl+C; Phase 28 live finding): the cleanup's Azure calls would hold the stop for
-            # minutes. The host's request expires on its own, and the host then turns the guest's one-time sign-in off;
-            # the next deploy.ps1 picks the guided stop up again, or cleans up after it when setup finished meanwhile
-            # (Clear-DemoGuidedStopLeftover), and stop-demo.ps1 removes Bastion and rotates the host password; deploy.ps1's
-            # own ending says so on the status page.
-            $status = 'Stopped'
-            $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message ('deploy.ps1 was stopped during the guided stop, {0} minutes after it began. Bastion stays up and the host password isn''t rotated yet; the host''s request expires on its own, and the host then turns the guest''s one-time sign-in off.' -f $minutes) -Remediation 'Run ./scripts/deploy.ps1 again: it continues the guided stop, or, when setup finished meanwhile, removes Bastion and rotates the host password, and it isn''t DONE before. To stop for now, ./scripts/stop-demo.ps1 removes Bastion and rotates the host password.' -DocUrl $docUrl))
-        }
-        else {
-            $results.AddRange([object[]]@(Complete-DemoGuidedStop -Config $Config -Confirm:$false))
-        }
-        switch ($status) {
-            'Stopped' {
-                # Nothing more here: deploy.ps1's own ending writes the status page.
-            }
-            'Done' {
-                Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Done' -Status 'Pass' -Message ('Done in {0} minutes.' -f $minutes)
-                Set-DemoProgressStep -Path $progress -Id 'T2.SetupCheck' -State 'Done' -Status 'Pass' -Message 'Standard, the default instance MSSQLSERVER, and the Azure extension.'
-                Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'Done'; message = 'SQL Server setup is done; deploy.ps1 finishes T2 on its own.' }
-                $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Pass' -Message (('SQL Server Standard is set up in arcsql01 as the default instance with the Azure extension (the host''s check passed), {0} minutes after the guided stop began; Bastion is removed and the host password rotated.' -f $minutes) + $(if ($signInFallback) { $fallbackNote } else { '' })) -DocUrl $docUrl))
-            }
-            'Failed' {
-                Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Failed' -Status 'Fail' -Message 'The guided stop couldn''t go on; see the results.'
-                Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'Failed'; message = 'The guided stop stopped; see the console.' }
-            }
-            default {
-                $until = $deadline.ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
-                Set-DemoProgressStep -Path $progress -Id 'T2.GuidedStop' -State 'Action needed' -Status 'Manual action required' -Message ('Nobody finished SQL Server setup by {0}.' -f $until)
-                Set-DemoProgressValue -Path $progress -Section 'guidedStop' -Value @{ state = 'TimedOut'; message = ('The time limit ({0}) passed.' -f $until) }
-                $results.Add((New-DemoResult -CheckId 'DEPLOY.T2.GUIDEDSTOP' -Area 'infra' -Target 'T2' -Status 'Manual action required' -Message (('Nobody finished SQL Server setup in arcsql01 by the time limit ({0}). The guest''s one-time sign-in was turned off, Bastion was removed, and the host password rotated.' -f $until) + $(if ($signInFallback) { $fallbackNote } else { '' })) -Remediation 'Run ./scripts/deploy.ps1 again when you have about 15 minutes: it opens Bastion, guides you through the pre-filled setup again, and continues.' -DocUrl $docUrl))
-            }
-        }
-    }
-    return [pscustomobject]@{ Status = $status; Results = $results.ToArray() }
 }

@@ -412,7 +412,7 @@ Describe 'Invoke-DemoTemplateDeployment' {
 
         $script:sizes.Clear()
         $withT4['t4SkuName'] = 'Standard_D2ds_v5'
-        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'None'
+        $deployment = Invoke-DemoTemplateDeployment -Config $withT4 -NetworkMode private -T3UseFreeLimit $false -T4StartSku 'Standard_D4ads_v5'
         $script:sizes | Should -Be @('Standard_D2ds_v5')
         @($deployment.Results | Where-Object { $_.checkId -eq 'DEPLOY.T4.SKU' }).Count | Should -Be 0
     }
@@ -1897,6 +1897,34 @@ Describe 'Start-DemoEnvironment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'Activity: business-day:*set activityProfile to baseline for a quiet demo*' } -Times 1 -Exactly
     }
 
+    It 'clears an earlier run''s record that left T4 out, which no longer holds, and keeps any other record (2026-11-09)' {
+        $script:recorded = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recorded.Add($Value) }
+        $base = @{ Stage = 'Validation'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('sqlvm01', 'archost01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('sqlvm01', 'archost01') }
+        foreach ($old in 'None', 'Refused') {
+            $script:recorded.Clear()
+            $script:state = New-TestState ($base + @{ T4Sku = $old })
+            $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+            $record = @($results | Where-Object { $_.checkId -eq 'START.T4.RECORD' })
+            $record.Count | Should -Be 1 -Because $old
+            $record[0].status | Should -Be 'Pass'
+            $record[0].message | Should -Match ('DbHubT4Size {0}\): T4 is part of every deployment' -f $old)
+            @($script:recorded | Where-Object { $_.Contains('T4Sku') -and $_['T4Sku'] -eq '' }).Count | Should -Be 1 -Because $old
+        }
+        foreach ($kept in '', 'Standard_D2ds_v5') {
+            $script:recorded.Clear()
+            $script:state = New-TestState ($base + @{ T4Sku = $kept })
+            $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+            $results | Where-Object { $_.checkId -eq 'START.T4.RECORD' } | Should -BeNullOrEmpty
+            @($script:recorded | Where-Object { $_.Contains('T4Sku') }).Count | Should -Be 0 -Because ('a record of "{0}" stays' -f $kept)
+        }
+        # A record that can't be cleared is a Warning, and the start goes on.
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { throw 'The tag write was refused.' }
+        $script:state = New-TestState ($base + @{ T4Sku = 'None' })
+        $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        ($results | Where-Object { $_.checkId -eq 'START.T4.RECORD' }).status | Should -Be 'Warning'
+        $script:order | Should -Contain 'Start:sqlvm01'
+    }
     It 'uses business-day for a configuration without activityProfile, says so once, and checks the cost with it (2026-11-03)' {
         $unset = New-TestConfig
         $unset.Remove('activityProfile')

@@ -31,7 +31,7 @@ Describe 'One click: a configuration can''t lead to the setup wizard or leave T4
         $config['t2SqlInstallModeSource'] | Should -Be 'legacy'
         $config['t4Enabled'] | Should -BeTrue
         $config['t4EnabledIgnored'] | Should -BeTrue
-        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoT2PaygWizardOptIn -Config $Config } | Should -BeFalse
+
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Test-DemoT4Enabled -Config $Config } | Should -BeTrue
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT2LegacyModeText -Config $Config } | Should -Match 'PaygWizard in your configuration .* is ignored: T2 comes from Arc Jumpstart''s image \(JumpstartImage\), with no setup wizard'
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4IgnoredText -Config $Config } | Should -Match '^t4Enabled false in your configuration is ignored: T4 \(Azure Database for PostgreSQL\) is part of every deployment'
@@ -54,10 +54,10 @@ Describe 'One click: a configuration can''t lead to the setup wizard or leave T4
 
     It 'writes a run''s configuration back without its marks, and it loads the same' {
         $config = Get-DemoConfig -Path (New-TestConfigFile -Values @{ t2SqlInstallMode = 'PaygWizard'; t4Enabled = $false })
-        $config['t2PaygWizardOptIn'] = $true
+        $config['t4SkuSource'] = 'retry'
         $text = InModuleScope DbHubDemo -Parameters @{ Config = $config } { ConvertTo-DemoConfigFileText -Config $Config }
         $written = $text | ConvertFrom-Json -AsHashtable
-        foreach ($mark in 't2SqlInstallModeSource', 't4EnabledIgnored', 't2PaygWizardOptIn', 't4SkuSource') {
+        foreach ($mark in 't2SqlInstallModeSource', 't4EnabledIgnored', 't4SkuSource') {
             $written.Contains($mark) | Should -BeFalse -Because $mark
         }
         $path = Join-Path -Path $TestDrive -ChildPath 'written.json'
@@ -69,13 +69,11 @@ Describe 'One click: a configuration can''t lead to the setup wizard or leave T4
 
     It 'puts what it ignores at the top of the start banner and on the status page' {
         $notes = @('t2SqlInstallMode PaygWizard ... is ignored.', 't4Enabled false ... is ignored.', '')
-        $expect = InModuleScope DbHubDemo -Parameters @{ Notes = $notes } { Get-DemoDeploymentExpectation -InstallMode 'JumpstartImage' -WaitForT2 -Note $Notes }
+        $expect = InModuleScope DbHubDemo -Parameters @{ Notes = $notes } { Get-DemoDeploymentExpectation -InstallMode 'JumpstartImage' -Note $Notes }
         $expect.Lines[1] | Should -Be '- t2SqlInstallMode PaygWizard ... is ignored.'
         $expect.Lines[2] | Should -Be '- t4Enabled false ... is ignored.'
         $expect.Lines | Should -Not -Contain '- '
         $expect.Text | Should -Match 't2SqlInstallMode PaygWizard \.\.\. is ignored\. t4Enabled false \.\.\. is ignored\.$'
-        $expect.GuidedStop | Should -BeFalse
-        $expect.HumanText | Should -BeNullOrEmpty
     }
 }
 
