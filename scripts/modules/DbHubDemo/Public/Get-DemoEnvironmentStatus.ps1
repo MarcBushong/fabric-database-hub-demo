@@ -11,9 +11,10 @@ function Get-DemoEnvironmentStatus {
     - STATUS.VM_SQLVM01 and STATUS.VM_<T2 VM>: the power state and, for a running VM, its health summary
       (Get-DemoVmHealth, a read-only Run Command). With -Detail, the full health, which includes the guest's
       evaluation days left and the workload runner.
-    - STATUS.T2.AUTOSIGNIN (Phase 28, Get-DemoGuidedSignInStatus), only when there's something to say: Pass while the
-      guest's one-time automatic sign-in waits for a guided stop; a Warning when it's armed with no guided stop
-      waiting or its last cleanup didn't finish (archost01's next pass removes the leftovers; status stays read-only).
+    - STATUS.T2.AUTOSIGNIN (Phase 28, Get-DemoGuidedSignInStatus), only when there's something to say: a Warning while
+      the guest's one-time automatic sign-in, which an earlier guided stop armed, is still armed, or its last cleanup
+      didn't finish (archost01's next pass removes the leftovers; status stays read-only). The guided stop is retired
+      (2026-11-09), so nothing is waiting for it.
     - T2.GUEST.STATE (2026-11-03, Get-DemoT2GuestStateResult) while archost01 runs: the nested guest as the host sees
       it now, from the same health read. Fail when a golden capture left it air-gapped, or it's off or cut off from
       its NAT switch; a Warning when it won't start with the host next time; each with the exact command.

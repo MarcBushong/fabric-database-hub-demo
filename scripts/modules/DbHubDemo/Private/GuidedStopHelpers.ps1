@@ -522,10 +522,11 @@ function Get-DemoGuidedSignInStatus {
     <#
     .SYNOPSIS
     STATUS.T2.AUTOSIGNIN (Phase 28, brief item 12): what archost01's health says about the guest's one-time automatic
-    sign-in, from its summary (guidedArmed, guidedRequest, guidedLeft) or its full health (details.guidedSetup). Pass
-    while it's armed for a guided stop that's waiting; a Warning when it's armed with no guided stop waiting, or when the
-    last cleanup didn't finish: archost01's next pass (every 5 minutes while it runs) removes the leftovers, and
-    check-sign-in-data.ps1 -Clean does too. $null when nothing is armed or left. Read-only. Pure. Internal.
+    sign-in, from its summary (guidedArmed, guidedRequest, guidedLeft) or its full health (details.guidedSetup). The
+    guided stop is retired (2026-11-09), so it's only an earlier one's leftover: a Warning when it's still armed, with
+    deploy.ps1 as the fix while that guided stop's request hasn't expired, or when the last cleanup didn't finish:
+    archost01's next pass (every 5 minutes while it runs) removes the leftovers, and check-sign-in-data.ps1 -Clean does
+    too. $null when nothing is armed or left. Read-only. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -545,7 +546,9 @@ function Get-DemoGuidedSignInStatus {
     $docUrl = 'https://learn.microsoft.com/troubleshoot/windows-server/user-profiles-and-logon/turn-on-automatic-logon'
     $evidence = [ordered]@{ armed = [bool]$armed; request = $request; problems = $problems }
     if ([bool]$armed -and $request -eq 'valid') {
-        return (New-DemoResult -CheckId 'STATUS.T2.AUTOSIGNIN' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'arcsql01 signs itself in once for the guided stop, which is waiting for you; automatic sign-in goes off again after setup, and its LSA secret is deleted.' -Evidence $evidence -DocUrl $docUrl)
+        # The guided stop is retired (2026-11-09), so a request that hasn't expired is an earlier one's leftover:
+        # deploy.ps1 clears it before T2's loader (DEPLOY.T2.GUIDEDLEFTOVER), and the host then turns the sign-in off.
+        return (New-DemoResult -CheckId 'STATUS.T2.AUTOSIGNIN' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'Automatic sign-in is still armed in arcsql01 for an earlier guided stop, whose request hasn''t expired; the guided stop is retired (2026-11-09), so nothing uses it.' -Evidence $evidence -Remediation 'Run ./scripts/deploy.ps1: it clears the request before T2''s loader, and archost01''s next pass then turns automatic sign-in off, deletes the LSA secret and the Winlogon values, rotates the guest password, and signs the console out. ./scripts/check-sign-in-data.ps1 -Clean removes them too.' -DocUrl $docUrl)
     }
     if ([bool]$armed) {
         return (New-DemoResult -CheckId 'STATUS.T2.AUTOSIGNIN' -Area 't2' -Target 'T2' -Status 'Warning' -Message 'Automatic sign-in is still armed in arcsql01, but no guided stop is waiting.' -Evidence $evidence -Remediation 'Nothing to do while archost01 runs: its next pass (within about 5 minutes) turns it off, deletes the LSA secret and the Winlogon values, rotates the guest password, and signs the console out. ./scripts/check-sign-in-data.ps1 -Clean removes them too.' -DocUrl $docUrl)

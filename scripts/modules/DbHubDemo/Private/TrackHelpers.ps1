@@ -1503,7 +1503,7 @@ function Invoke-DemoDeploymentTrack {
                 }
                 'T4/Telemetry' {
                     if (-not (Test-DemoT4Enabled -Config $Config)) {
-                        # Phase 28's Burstable fallback left T4 out of this deployment (DEPLOY.T4.SKU says why).
+                        # T4 isn't deployed in this run: Azure refused every size its fallback tries (DEPLOY.T4.SKU says why).
                         & $note 'METRICS.T4' 'T4' 'Not selected' 'T4 isn''t deployed in this run (DEPLOY.T4.SKU says why), so it has no metrics.'
                         break
                     }

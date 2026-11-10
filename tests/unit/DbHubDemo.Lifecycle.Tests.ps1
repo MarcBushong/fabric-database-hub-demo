@@ -1960,7 +1960,7 @@ Describe 'Start-DemoEnvironment' {
             $record.Count | Should -Be 1 -Because $old
             $record[0].status | Should -Be 'Pass'
             $record[0].message | Should -Match ('DbHubT4Size {0}\): T4 is part of every deployment' -f $old)
-            @($script:recorded | Where-Object { $_.Contains('T4Sku') -and $_['T4Sku'] -eq '' }).Count | Should -Be 1 -Because $old
+            @($script:recorded | Where-Object { $_.Contains('T4Sku') -and $_['T4Sku'] -eq '' -and $_.Contains('T4Refused') -and $_['T4Refused'] -eq '' }).Count | Should -Be 1 -Because ('{0}, with what Azure refused (DbHubT4Refused, 2026-11-09)' -f $old)
         }
         foreach ($kept in '', 'Standard_D2ds_v5') {
             $script:recorded.Clear()

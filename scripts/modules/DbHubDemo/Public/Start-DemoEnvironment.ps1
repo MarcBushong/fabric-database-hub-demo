@@ -224,7 +224,7 @@ function Start-DemoEnvironment {
     $recordedOff = [string](Get-DemoMemberValue -InputObject $state -Name 'T4Sku')
     if ($recordedOff -cin 'None', 'Refused') {
         try {
-            Set-DemoDeploymentState -Config $Config -Value @{ T4Sku = '' } -Confirm:$false
+            Set-DemoDeploymentState -Config $Config -Value @{ T4Sku = ''; T4Refused = '' } -Confirm:$false
             $results.Add((New-DemoResult -CheckId 'START.T4.RECORD' -Area 't4' -Target 'T4' -Status 'Pass' -Message ('Cleared an earlier run''s record that left T4 out (DbHubT4Size {0}): T4 is part of every deployment since 2026-11-09, and ./scripts/deploy.ps1 creates it when it doesn''t exist.' -f $recordedOff) -Evidence ([ordered]@{ recorded = $recordedOff })))
         }
         catch {

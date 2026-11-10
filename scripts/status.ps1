@@ -15,8 +15,8 @@ reads the full health (the guest's evaluation days left, the workload runner) an
 which takes a Run Command per item.
 
 -Watch (Phase 28) shows deploy.ps1's live status instead, from its progress model out/deploy-progress.json: the
-banner (Deploying, no action needed; Waiting for you, with the steps, the portal link, and the time left; Done; or
-Stopped, not done, with the command to run) and every track's steps, drawn again every few seconds until the run ends.
+banner (Deploying, no action needed; Done; or Stopped, not done, with the command to run) and every track's steps,
+drawn again every few seconds until the run ends.
 It reads only that local file, so it works in a second terminal anywhere, GitHub Codespaces included. Without a model
 on this machine (deploy.ps1 runs elsewhere, or hasn't started), it reads Azure as above, once.
 

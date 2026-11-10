@@ -844,8 +844,8 @@ function Invoke-DemoParallelDeployment {
             if ($group) {
                 $context.T3AdminGroupName = $group
             }
-            # Where T4's fallback starts when preflight already ruled sizes out, or its cost check left T4 out (Phase 28 and
-            # its follow-up): the furthest step any of its checks found.
+            # Where T4's fallback starts when preflight already ruled sizes out (Phase 28 and its follow-up; for a size
+            # t4SkuName sets, since 2026-11-09): the furthest step any of its checks found.
             $t4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') }) -Order ([string[]]@(@('') + @(Get-DemoT4FallbackOrder -Config $Config)))
             if ($deferPolicy) {
                 Write-DemoLog -Message ('networkMode is {0}, so the policy inventory runs alongside the deployment instead of before it; its results come at the end.' -f [string]$Config['networkMode'])

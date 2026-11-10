@@ -1732,8 +1732,12 @@ finally {
 }
 
 Describe 'STATUS.T2.AUTOSIGNIN: the guest''s one-time sign-in in status.ps1 (brief item 12)' {
-    It 'is Pass while it waits for a guided stop, a Warning when it''s armed with none waiting or its cleanup didn''t finish, and nothing otherwise' {
-        (InModuleScope DbHubDemo { Get-DemoGuidedSignInStatus -Health ([pscustomobject]@{ guidedArmed = $true; guidedRequest = 'valid'; guidedLeft = @() }) }).status | Should -Be 'Pass'
+    It 'is a Warning while it''s armed, an earlier guided stop''s leftover since the guided stop is retired (2026-11-09), or when its cleanup didn''t finish, and nothing otherwise' {
+        $leftover = InModuleScope DbHubDemo { Get-DemoGuidedSignInStatus -Health ([pscustomobject]@{ guidedArmed = $true; guidedRequest = 'valid'; guidedLeft = @() }) }
+        $leftover.status | Should -Be 'Warning'
+        $leftover.message | Should -Match 'for an earlier guided stop, whose request hasn''t expired; the guided stop is retired'
+        $leftover.message | Should -Not -Match 'waiting for you'
+        $leftover.remediation | Should -Match '^Run \./scripts/deploy\.ps1: it clears the request before T2''s loader'
         $armed = InModuleScope DbHubDemo { Get-DemoGuidedSignInStatus -Health ([pscustomobject]@{ guidedArmed = $true; guidedRequest = 'expired'; guidedLeft = @() }) }
         $armed.status | Should -Be 'Warning'
         $armed.remediation | Should -Match 'check-sign-in-data\.ps1 -Clean'
