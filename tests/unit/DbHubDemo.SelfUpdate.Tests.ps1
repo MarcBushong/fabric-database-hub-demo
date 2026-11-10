@@ -19,6 +19,8 @@ BeforeAll {
     function Reset-TestGit {
         $script:git = @{
             Path       = 'git'
+            OnPath     = $true
+            Source     = 'PATH'
             Prefix     = ''
             Branch     = 'main'
             Upstream   = 'origin/main'
@@ -34,13 +36,14 @@ BeforeAll {
             MergeError = ''
         }
         $script:gitCalls = [System.Collections.Generic.List[string]]::new()
+        $script:gitPaths = [System.Collections.Generic.List[string]]::new()
         $script:restarts = [System.Collections.Generic.List[object]]::new()
         $script:logs = [System.Collections.Generic.List[string]]::new()
     }
 
     function Invoke-TestSelfUpdate {
-        param([System.Collections.IDictionary] $Bound = [ordered]@{}, [switch] $NoSelfUpdate, [switch] $Nested, [switch] $WhatIfRun)
-        Invoke-DemoSelfUpdate -ScriptPath (Join-Path -Path $script:root -ChildPath 'scripts/deploy.ps1') -BoundParameters $Bound -RepositoryRoot $script:root -NoSelfUpdate:$NoSelfUpdate -Nested:$Nested -WhatIf:$WhatIfRun
+        param([System.Collections.IDictionary] $Bound = [ordered]@{}, [switch] $NoSelfUpdate, [switch] $Nested, [switch] $WhatIfRun, [string] $ConfigPath = '')
+        Invoke-DemoSelfUpdate -ScriptPath (Join-Path -Path $script:root -ChildPath 'scripts/deploy.ps1') -BoundParameters $Bound -RepositoryRoot $script:root -NoSelfUpdate:$NoSelfUpdate -Nested:$Nested -WhatIf:$WhatIfRun -ConfigPath $ConfigPath
     }
 }
 
@@ -56,11 +59,13 @@ Describe 'Invoke-DemoSelfUpdate: a clean main behind GitHub''s main updates and 
         foreach ($name in $script:selfUpdateVariables) {
             [System.Environment]::SetEnvironmentVariable($name, $null)
         }
-        $script:root = Join-Path -Path $TestDrive -ChildPath 'checkout'
+        # A folder of its own for each test: TestDrive keeps what one test creates (a .git) for the next.
+        $script:root = Join-Path -Path $TestDrive -ChildPath ('checkout-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $script:root -Force
         Reset-TestGit
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRunEnvironment -MockWith { [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $true; Codespaces = $false; Windows = $true } }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logs.Add(('{0}: {1}' -f $Level, $Message)) }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoGitPath -MockWith { $script:git.Path }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGitLocation -MockWith { [pscustomobject]@{ Path = $script:git.Path; OnPath = $script:git.OnPath; Source = $script:git.Source } }
         Mock -ModuleName DbHubDemo -CommandName Start-DemoSelfRestart -MockWith {
             $script:restarts.Add([pscustomobject]@{ ScriptPath = $ScriptPath; ArgumentList = @($ArgumentList); Marker = $Marker })
             return 9
@@ -68,6 +73,7 @@ Describe 'Invoke-DemoSelfUpdate: a clean main behind GitHub''s main updates and 
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGit -MockWith {
             $line = $ArgumentList -join ' '
             $script:gitCalls.Add($line)
+            $script:gitPaths.Add([string]$GitPath)
             $answer = { param([int] $Code, [string] $Out = '', [string] $Err = '', [bool] $Late = $false) [pscustomobject]@{ ExitCode = $Code; StdOut = $Out; StdErr = $Err; TimedOut = $Late } }
             $g = $script:git
             switch -Regex ($line) {
@@ -102,7 +108,7 @@ Describe 'Invoke-DemoSelfUpdate: a clean main behind GitHub''s main updates and 
             $script:restarts.Count | Should -Be 1
             $script:restarts[0].ScriptPath | Should -Be (Join-Path -Path $script:root -ChildPath 'scripts/deploy.ps1')
             $script:restarts[0].ArgumentList | Should -Be @('-ConfigPath', 'C:\demo configs\it''s "mine".json', '-Resume', '-WaitForT2:$false', '-FromStage', '', '-T1WaitMinutes', '12')
-            $script:restarts[0].Marker | Should -Be 'aaaaaaa;bbbbbbb;3'
+            $script:restarts[0].Marker | Should -Be 'aaaaaaa;bbbbbbb;3;'
             @($script:logs | Where-Object { $_ -like 'Info: Updated this copy from GitHub''s main: aaaaaaa to bbbbbbb, 3 new commit(s).*' }).Count | Should -Be 1
         }
 
@@ -203,6 +209,91 @@ Describe 'Invoke-DemoSelfUpdate: a clean main behind GitHub''s main updates and 
         }
     }
 
+    Context 'Git off PATH, and no Git (2026-11-09 live finding)' {
+        BeforeEach {
+            $script:desktopGit = 'C:\Users\demo\AppData\Local\GitHubDesktop\app-3.4.9\resources\app\git\cmd\git.exe'
+            $script:git.Path = $script:desktopGit
+            $script:git.OnPath = $false
+            $script:git.Source = 'GitHub Desktop''s Git (app-3.4.9)'
+        }
+
+        It 'updates with a git found off PATH, runs every git call with it by full path, and names it in the update line and the restarted run''s note' {
+            $outcome = Invoke-TestSelfUpdate
+            $outcome.Restarted | Should -BeTrue
+            $script:gitCalls | Should -Contain ('merge --ff-only --quiet {0}' -f $script:new)
+            @($script:gitPaths | Sort-Object -Unique) | Should -Be @($script:desktopGit)
+            $used = ' It used the git at {0} (GitHub Desktop''s Git (app-3.4.9)), which isn''t on PATH.' -f $script:desktopGit
+            @($script:logs | Where-Object { $_ -like ('Info: Updated this copy from GitHub''s main: aaaaaaa to bbbbbbb, 3 new commit(s).{0} deploy.ps1 starts again*' -f [WildcardPattern]::Escape($used)) }).Count | Should -Be 1
+            $script:restarts[0].Marker | Should -Be ('aaaaaaa;bbbbbbb;3;{0}' -f $used)
+
+            [System.Environment]::SetEnvironmentVariable('DBHUB_SELF_UPDATED', $script:restarts[0].Marker)
+            $restarted = Invoke-TestSelfUpdate
+            $restarted.Result.status | Should -Be 'Pass'
+            $restarted.Result.message | Should -Be ('This copy was updated from GitHub''s main before this run started: aaaaaaa to bbbbbbb, 3 new commit(s). It runs the new code.{0}' -f $used)
+        }
+
+        It 'names the git found off PATH in the Pass, and in a Warning''s evidence' {
+            $script:git.Behind = 0
+            $outcome = Invoke-TestSelfUpdate
+            $outcome.Result.status | Should -Be 'Pass'
+            $outcome.Result.message | Should -BeLike ('This copy has everything on GitHub''s main (bbbbbbb). It used the git at {0} (*), which isn''t on PATH.' -f [WildcardPattern]::Escape($script:desktopGit))
+            $outcome.Result.evidence['git'] | Should -Be $script:desktopGit
+            $outcome.Result.evidence['gitOnPath'] | Should -BeFalse
+
+            $script:git.Behind = 3
+            $script:git.Branch = 'feature'
+            $warning = Invoke-TestSelfUpdate
+            $warning.Result.status | Should -Be 'Warning'
+            $warning.Result.evidence['git'] | Should -Be $script:desktopGit
+        }
+
+        It 'says nothing about git when it''s on PATH' {
+            $script:git.Path = 'git'
+            $script:git.OnPath = $true
+            $script:git.Behind = 0
+            (Invoke-TestSelfUpdate).Result.message | Should -Be 'This copy has everything on GitHub''s main (bbbbbbb).'
+        }
+
+        It 'no Git, but a checkout (.git here): install Git, then git pull --ff-only in this folder, not a fresh clone' {
+            $script:git.Path = ''
+            $null = New-Item -ItemType Directory -Path (Join-Path -Path $script:root -ChildPath '.git') -Force
+            $outcome = Invoke-TestSelfUpdate -ConfigPath (Join-Path -Path $script:root -ChildPath 'config/demo.config.json')
+            $outcome.Result.status | Should -Be 'Warning'
+            $outcome.Result.message | Should -BeLike '*Git isn''t installed (it isn''t on PATH or where Git is usually installed), so deploy.ps1 can''t tell whether this checkout is behind GitHub''s main or update it*'
+            $outcome.Result.remediation | Should -Be ('Install Git (https://git-scm.com/downloads), then run git pull --ff-only in {0}' -f [System.IO.Path]::GetFullPath($script:root))
+            $outcome.Result.remediation | Should -Not -BeLike '*git clone*'
+            $script:gitCalls.Count | Should -Be 0
+        }
+
+        It 'a worktree''s .git file counts as a checkout too' {
+            $script:git.Path = ''
+            Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath '.git') -Value 'gitdir: C:/elsewhere/.git/worktrees/x' -Encoding utf8NoBOM
+            (Invoke-TestSelfUpdate).Result.remediation | Should -BeLike '*then run git pull --ff-only in *'
+        }
+
+        It 'no Git and no .git (a downloaded zip): install Git, clone, and bring this run''s configuration' {
+            $script:git.Path = ''
+            $outcome = Invoke-TestSelfUpdate -ConfigPath (Join-Path -Path $script:root -ChildPath 'config/demo.config.json')
+            $outcome.Result.message | Should -BeLike '*Git isn''t installed (it isn''t on PATH or where Git is usually installed), and this folder isn''t a git checkout*'
+            $outcome.Result.remediation | Should -Be 'Install Git (https://git-scm.com/downloads), then git clone https://github.com/MarcBushong/fabric-database-hub-demo.git, then copy config/demo.config.json, this run''s configuration, to config/ in the new folder and run ./scripts/deploy.ps1 there'
+        }
+    }
+
+    Context 'the advice to clone names this run''s configuration' {
+        It '<Case>' -ForEach @(
+            @{ Case = 'the default, config/demo.config.json'; Relative = 'config/demo.config.json'; Outside = $false; Expected = 'git clone https://github.com/MarcBushong/fabric-database-hub-demo.git, then copy config/demo.config.json, this run''s configuration, to config/ in the new folder and run ./scripts/deploy.ps1 there' }
+            @{ Case = 'another file in this folder'; Relative = 'config/proof.local.json'; Outside = $false; Expected = 'git clone https://github.com/MarcBushong/fabric-database-hub-demo.git, then copy config/proof.local.json, this run''s configuration, to the same place in the new folder and run ./scripts/deploy.ps1 -ConfigPath "./config/proof.local.json" there' }
+            @{ Case = 'a file outside this folder'; Relative = ''; Outside = $true; Expected = 'git clone https://github.com/MarcBushong/fabric-database-hub-demo.git, then run ./scripts/deploy.ps1 -ConfigPath "<config>" in the new folder (this run''s configuration stays where it is)' }
+            @{ Case = 'no configuration path given'; Relative = ''; Outside = $false; Expected = 'git clone https://github.com/MarcBushong/fabric-database-hub-demo.git, then copy config/demo.config.json, this run''s configuration, to config/ in the new folder and run ./scripts/deploy.ps1 there' }
+        ) {
+            $config = if ($Relative) { [System.IO.Path]::GetFullPath((Join-Path -Path $script:root -ChildPath $Relative)) } elseif ($Outside) { [System.IO.Path]::GetFullPath((Join-Path -Path $TestDrive -ChildPath 'elsewhere/my demo.json')) } else { '' }
+            $expected = $Expected.Replace('<config>', $config)
+            $script:git.Prefix = $null
+            (Invoke-TestSelfUpdate -ConfigPath $config).Result.remediation | Should -Be $expected
+            $script:git.Path = ''
+            (Invoke-TestSelfUpdate -ConfigPath $config).Result.remediation | Should -Be ('Install Git (https://git-scm.com/downloads), then {0}' -f $expected)
+        }
+    }
     Context 'opted out' {
         It '<Case>: Not selected, with no git call' -ForEach @(
             @{ Case = '-NoSelfUpdate'; Set = { }; Switch = $true; Words = '-NoSelfUpdate' }
@@ -243,7 +334,7 @@ Describe 'deploy.ps1 and its self-update' {
             $check | Should -BeLessThan $text.IndexOf($later) -Because "$later comes after the self-update"
         }
         $text | Should -Match '(?s)if \(\$selfUpdate\.Restarted\) \{\s*exit \(\[int\]\$selfUpdate\.ExitCode\)\s*\}'
-        $text | Should -Match '-NoSelfUpdate:\$NoSelfUpdate -Nested:\$entryNested'
+        $text | Should -Match '-ConfigPath \(Resolve-DemoUserPath -Path \$ConfigPath\) -NoSelfUpdate:\$NoSelfUpdate -Nested:\$entryNested'
         $text | Should -Match '-Note @\(\$selfUpdate\.Note\)'
         $text | Should -Match '\[switch\] \$NoSelfUpdate'
     }
@@ -261,6 +352,130 @@ Describe 'deploy.ps1 and its self-update' {
     }
 }
 
+Describe 'Finding git when it isn''t on PATH (2026-11-09 live finding: GitHub Desktop''s git, never on PATH)' {
+    BeforeAll {
+        $script:lookupVariables = @('ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA')
+        $script:savedLookup = @{}
+        foreach ($name in $script:lookupVariables) {
+            $script:savedLookup[$name] = [System.Environment]::GetEnvironmentVariable($name)
+        }
+    }
+
+    AfterAll {
+        foreach ($name in $script:lookupVariables) {
+            [System.Environment]::SetEnvironmentVariable($name, $script:savedLookup[$name])
+        }
+    }
+
+    BeforeEach {
+        $script:fake = Join-Path -Path $TestDrive -ChildPath ('pc-' + [guid]::NewGuid().ToString('N'))
+        foreach ($pair in @(@('ProgramFiles', 'Program Files'), @('ProgramFiles(x86)', 'Program Files (x86)'), @('LOCALAPPDATA', 'AppData\Local'))) {
+            [System.Environment]::SetEnvironmentVariable($pair[0], (Join-Path -Path $script:fake -ChildPath $pair[1]))
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVsWhere -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+    }
+
+    It 'on Windows, tries Git for Windows (all users, 32-bit, this user), then GitHub Desktop''s newest app-* first, then each Visual Studio that vswhere lists' {
+        $desktop = Join-Path -Path $script:fake -ChildPath 'AppData\Local\GitHubDesktop'
+        foreach ($app in 'app-3.4.9', 'app-3.10.1', 'app-preview') {
+            $null = New-Item -ItemType Directory -Path (Join-Path -Path $desktop -ChildPath $app) -Force
+        }
+        $null = New-Item -ItemType File -Path (Join-Path -Path $desktop -ChildPath 'app-9.9.9.txt') -Force
+        # Installations under TestDrive, not C:\: PowerShell on Linux and macOS has no C: drive for Join-Path to resolve.
+        $script:vsInstallations = @((Join-Path -Path $script:fake -ChildPath 'VS\2026\Enterprise'), (Join-Path -Path $script:fake -ChildPath 'VS\2026\Preview'))
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVsWhere -MockWith { $script:vsInstallations }
+        $candidates = @(InModuleScope DbHubDemo { Get-DemoGitCandidatePath -Windows $true })
+        $vsGit = 'Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe'
+        $candidates.Path | Should -Be @(
+            (Join-Path -Path $script:fake -ChildPath 'Program Files\Git\cmd\git.exe')
+            (Join-Path -Path $script:fake -ChildPath 'Program Files (x86)\Git\cmd\git.exe')
+            (Join-Path -Path $script:fake -ChildPath 'AppData\Local\Programs\Git\cmd\git.exe')
+            (Join-Path -Path $desktop -ChildPath 'app-3.10.1\resources\app\git\cmd\git.exe')
+            (Join-Path -Path $desktop -ChildPath 'app-3.4.9\resources\app\git\cmd\git.exe')
+            (Join-Path -Path $desktop -ChildPath 'app-preview\resources\app\git\cmd\git.exe')
+            (Join-Path -Path $script:vsInstallations[0] -ChildPath $vsGit)
+            (Join-Path -Path $script:vsInstallations[1] -ChildPath $vsGit)
+        )
+        $candidates.Source | Should -Be @('Git for Windows', 'Git for Windows (32-bit)', 'Git for Windows, installed for this user', 'GitHub Desktop''s Git (app-3.10.1)', 'GitHub Desktop''s Git (app-3.4.9)', 'GitHub Desktop''s Git (app-preview)', 'Visual Studio''s Git', 'Visual Studio''s Git')
+    }
+
+    It 'on Windows without GitHub Desktop, Visual Studio, or %ProgramFiles(x86)%, tries the rest' {
+        [System.Environment]::SetEnvironmentVariable('ProgramFiles(x86)', $null)
+        @(InModuleScope DbHubDemo { Get-DemoGitCandidatePath -Windows $true }).Path | Should -Be @(
+            (Join-Path -Path $script:fake -ChildPath 'Program Files\Git\cmd\git.exe')
+            (Join-Path -Path $script:fake -ChildPath 'AppData\Local\Programs\Git\cmd\git.exe')
+        )
+    }
+
+    It 'on macOS and Linux, tries /usr/bin/git, /usr/local/bin/git, and /opt/homebrew/bin/git, and evaluates none of the Windows lookups' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVsWhere -MockWith { throw 'not expected off Windows' }
+        Mock -ModuleName DbHubDemo -CommandName Get-ChildItem -MockWith { throw 'not expected off Windows' }
+        Mock -ModuleName DbHubDemo -CommandName Test-Path -MockWith { throw 'not expected off Windows' }
+        @(InModuleScope DbHubDemo { Get-DemoGitCandidatePath -Windows $false }).Path | Should -Be @('/usr/bin/git', '/usr/local/bin/git', '/opt/homebrew/bin/git')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVsWhere -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-ChildItem -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-Path -Times 0 -Exactly
+    }
+
+    It 'vswhere: nothing when it isn''t installed' {
+        @(InModuleScope DbHubDemo { Invoke-DemoVsWhere }).Count | Should -Be 0
+    }
+
+    It 'uses the git on PATH first, and looks nowhere else' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGitOnPath -MockWith { 'C:\tools\git.exe' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGitCandidatePath -MockWith { throw 'not expected' }
+        $location = InModuleScope DbHubDemo { Get-DemoGitLocation }
+        $location.Path | Should -Be 'C:\tools\git.exe'
+        $location.OnPath | Should -BeTrue
+        $location.Source | Should -Be 'PATH'
+    }
+
+    It 'off PATH, uses the first candidate that is a file and runs git --version, by full path' {
+        $missing = Join-Path -Path $script:fake -ChildPath 'missing\git.exe'
+        $broken = Join-Path -Path $script:fake -ChildPath 'broken\git.exe'
+        $good = Join-Path -Path $script:fake -ChildPath 'desktop\git.exe'
+        $later = Join-Path -Path $script:fake -ChildPath 'vs\git.exe'
+        foreach ($file in $broken, $good, $later) {
+            $null = New-Item -ItemType File -Path $file -Force
+        }
+        $script:candidateList = @(
+            [pscustomobject]@{ Path = $missing; Source = 'Git for Windows' }
+            [pscustomobject]@{ Path = $broken; Source = 'Git for Windows, installed for this user' }
+            [pscustomobject]@{ Path = $good; Source = 'GitHub Desktop''s Git (app-3.4.9)' }
+            [pscustomobject]@{ Path = $later; Source = 'Visual Studio''s Git' }
+        )
+        $script:probed = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGitOnPath -MockWith { '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGitCandidatePath -MockWith { $script:candidateList }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoGitExecutable -MockWith { $script:probed.Add($Path); $Path -ne $script:candidateList[1].Path }
+        $location = InModuleScope DbHubDemo { Get-DemoGitLocation }
+        $location.Path | Should -Be $good
+        $location.OnPath | Should -BeFalse
+        $location.Source | Should -Be 'GitHub Desktop''s Git (app-3.4.9)'
+        $script:probed | Should -Be @($broken, $good) -Because 'a missing file isn''t run, and the search stops at the first git that runs'
+        InModuleScope DbHubDemo { Get-DemoGitPath } | Should -Be $good
+    }
+
+    It 'finds nothing when no candidate runs' {
+        $file = Join-Path -Path $script:fake -ChildPath 'broken\git.exe'
+        $null = New-Item -ItemType File -Path $file -Force
+        $script:candidateList = @([pscustomobject]@{ Path = $file; Source = 'Git for Windows' })
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGitOnPath -MockWith { '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGitCandidatePath -MockWith { $script:candidateList }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoGitExecutable -MockWith { $false }
+        (InModuleScope DbHubDemo { Get-DemoGitLocation }).Path | Should -Be ''
+    }
+
+    It 'git --version decides whether a file is git: a real git is, another program and a missing file aren''t' {
+        $realGit = Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($realGit) {
+            InModuleScope DbHubDemo -Parameters @{ Git = $realGit.Source } { Test-DemoGitExecutable -Path $Git } | Should -BeTrue
+        }
+        InModuleScope DbHubDemo -Parameters @{ Other = [System.Environment]::ProcessPath } { Test-DemoGitExecutable -Path $Other } | Should -BeFalse
+        InModuleScope DbHubDemo -Parameters @{ Missing = (Join-Path -Path $script:fake -ChildPath 'none\git.exe') } { Test-DemoGitExecutable -Path $Missing } | Should -BeFalse
+    }
+}
 BeforeDiscovery {
     $hasGit = [bool](Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue)
 }

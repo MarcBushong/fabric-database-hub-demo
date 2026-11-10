@@ -243,7 +243,7 @@ Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo
 # 2026-11-09, the owner's choice: before anything else (no transcript, no configuration, no Azure call), a clean main
 # that's behind GitHub's main fast-forwards and this script runs again with the new code and the same parameters; the
 # old code goes no further. Anything else is a Warning with the exact command, and the run goes on (DEPLOY.SELFUPDATE).
-$selfUpdate = Invoke-DemoSelfUpdate -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters -RepositoryRoot (Join-Path -Path $PSScriptRoot -ChildPath '..') -NoSelfUpdate:$NoSelfUpdate -Nested:$entryNested -WhatIf:([bool]$WhatIfPreference)
+$selfUpdate = Invoke-DemoSelfUpdate -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters -RepositoryRoot (Join-Path -Path $PSScriptRoot -ChildPath '..') -ConfigPath (Resolve-DemoUserPath -Path $ConfigPath) -NoSelfUpdate:$NoSelfUpdate -Nested:$entryNested -WhatIf:([bool]$WhatIfPreference)
 if ($selfUpdate.Restarted) {
     exit ([int]$selfUpdate.ExitCode)
 }

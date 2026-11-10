@@ -91,7 +91,7 @@ A **Warning** on the guard means `azureAccount` isn't set: the evidence names th
 
 `deploy.ps1` runs the code in its own folder. Before 2026-11-09 it never asked GitHub whether that code was current, so a tester's assistant that re-ran an older demo from a clone pulled earlier the same day hit a problem that was already fixed on `main`. The owner chose: "Update itself: fast-forward a clean checkout to the latest main, then run".
 
-**What it does.** First, before the transcript, the configuration, or any Azure call, `deploy.ps1` fetches origin's `main` (`git fetch`, at most 20 seconds, never a credential prompt). It updates only a checkout where all of these hold:
+**What it does.** First, before the transcript, the configuration, or any Azure call, `deploy.ps1` fetches origin's `main` (`git fetch`, at most 20 seconds, never a credential prompt). It uses the `git` on `PATH`, or, when there's none, the first that runs from where Git is usually installed: Git for Windows, GitHub Desktop's, or Visual Studio's on Windows, and `/usr/bin`, `/usr/local/bin`, or `/opt/homebrew/bin` elsewhere ([which git](troubleshooting.md#deployps1s-update-from-github-deployselfupdate-2026-11-09)); it says which when it isn't on `PATH`. It updates only a checkout where all of these hold:
 
 - Git is installed, and this folder is a git checkout.
 - The branch is `main`, and it tracks `origin/main`.
@@ -109,7 +109,8 @@ Then `git merge --ff-only` moves it to the fetched commit ([git merge](https://g
 | `main` tracks a branch other than `origin/main`, or none | `git branch --set-upstream-to=origin/main main; git pull --ff-only` |
 | Diverged: local commits on `main` that GitHub's `main` doesn't have | `git merge origin/main` (keeps them), or `git reset --hard origin/main` (discards them) |
 | The fetch fails or takes longer than 20 seconds (offline) | `git pull --ff-only`, once GitHub can be reached |
-| Git isn't installed, or the folder isn't a git checkout (a downloaded zip) | `git clone https://github.com/MarcBushong/fabric-database-hub-demo.git`, then copy `config/demo.config.json` into the new folder |
+| No git runs, on `PATH` or where Git is usually installed, in a git checkout | Install Git, then `git pull --ff-only` in this folder |
+| The folder isn't a git checkout (a downloaded zip), with or without Git | `git clone https://github.com/MarcBushong/fabric-database-hub-demo.git` (install Git first if needed), then bring the configuration this run used: `config/demo.config.json` to `config/` in the new folder, another file in this folder to the same place there, or keep a file from outside this folder where it is and pass the same `-ConfigPath` |
 | `-WhatIf`, which changes nothing, this checkout included | A run without `-WhatIf` updates it first |
 | The fast-forward itself fails | `git status`, then `git pull --ff-only` |
 
