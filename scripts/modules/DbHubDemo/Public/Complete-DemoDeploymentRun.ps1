@@ -136,7 +136,7 @@ function Complete-DemoDeploymentRun {
                     if ($server.Exists) {
                         $t4Created = $true
                     }
-                    elseif ([string]$server.State -eq 'NotFound') {
+                    elseif ([string]$server.State -eq 'NotFound' -or [bool](Get-DemoMemberValue -InputObject $server -Name 'Removing')) {
                         $t4Created = $false
                     }
                 }

@@ -1004,6 +1004,8 @@ function Invoke-DemoParallelDeployment {
                 T3AdminGroupDisplayName = [string]$context.T3AdminGroupName
                 # An existing T4 whose size the configuration doesn't set moves to the default (2026-11-04, ADR 0019).
                 ScaleT4                 = $true
+                # The wait for a T4 server Azure refused shows on the Infrastructure and T4 rows (2026-11-09).
+                ProgressPath            = $ProgressPath
             }
             if ($context.T2Source -eq 'golden' -and $context.T2SnapshotId) {
                 $deployArguments['T2OsDiskSourceId'] = $context.T2SnapshotId

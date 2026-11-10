@@ -65,7 +65,16 @@ function Invoke-DemoTemplateDeployment {
        the network, so an attempt that failed for another resource (the T3 free offer, a budget) can still have created
        it, and a server that exists is treated as existing from then on: it keeps its own size and record, isn't priced
        again, even after the T3 free offer's rejection (it exists and bills), is never recorded None or Refused, and is
-       never moved to another size, which would resize it.
+       never moved to another size, which would resize it. A server Azure refused isn't one of those (live, 2026-11-09):
+       Azure keeps it as a shell for a few minutes, first without a usable state, then Dropping, so after a failed attempt
+       a server whose state isn't one of a deployed server's (Ready, Stopped, Starting, Stopping, Updating, Restarting,
+       Disabled, Inaccessible) is checked against the T4 deployment's own operations first (Get-DemoT4CreateFailure): a
+       SkuNotAvailable for the size the attempt sent is a refusal, whatever the shell's state, and the fallback goes on.
+       The next attempt creates a server with the same name, so it waits until the shell is gone (DEPLOY.T4.REMOVING), at
+       most -T4RemovalWaitMinutes, read every -T4RemovalPollSeconds, said on the console and on the status page's
+       Infrastructure and T4 rows (-ProgressPath); a run that starts while the shell is still there waits the same way.
+       When it outlasts the bound, the run records the next size of the fallback with what Azure refused, so the plain
+       rerun goes on from there, and ends NOT DONE (DEPLOY.T4.REMOVING Fail).
     7. Phase 28 live finding (2026-11-02): a deployment that failed while it ran (DeploymentFailed) and isn't retried
        above gets DEPLOY.TEMPLATE's Fail with the innermost errors of its failed operations, nested deployments
        included (Get-DemoDeploymentFailure, New-DemoTemplateFailureResult), for example "Microsoft.Consumption/budgets
@@ -137,6 +146,17 @@ function Invoke-DemoTemplateDeployment {
     .PARAMETER TemplatePath
     The compiled template; defaults to the repository's azuredeploy.json.
 
+    .PARAMETER ProgressPath
+    deploy.ps1's progress model, for the wait for a refused T4 server's removal on the status page's Infrastructure and
+    T4 rows (2026-11-09); '' writes nothing there.
+
+    .PARAMETER T4RemovalWaitMinutes
+    How long the fallback waits for Azure to remove a T4 server it refused before it creates T4 again with the same name
+    (2026-11-09; 15 by default, live: about 3 minutes). 0 reads once.
+
+    .PARAMETER T4RemovalPollSeconds
+    How often that wait reads T4's server (15 by default).
+
     .EXAMPLE
     Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
     #>
@@ -177,7 +197,16 @@ function Invoke-DemoTemplateDeployment {
 
         [switch] $ScaleT4,
 
-        [string] $TemplatePath = (Join-Path -Path $script:RepoRoot -ChildPath 'azuredeploy.json')
+        [string] $TemplatePath = (Join-Path -Path $script:RepoRoot -ChildPath 'azuredeploy.json'),
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [ValidateRange(0, 120)]
+        [int] $T4RemovalWaitMinutes = 15,
+
+        [ValidateRange(1, 300)]
+        [int] $T4RemovalPollSeconds = 15
     )
 
     $subscriptionId = [string]$Config['subscriptionId']
@@ -249,11 +278,18 @@ function Invoke-DemoTemplateDeployment {
     $t4Exists = $false
     $t4ServerSku = ''
     $t4ServerState = ''
+    # A server Azure is deleting (Dropping, 2026-11-09): not T4, but its name is taken until it's gone, so the fallback
+    # waits for it before the first attempt that creates T4 (below).
+    $t4RemovalPending = $false
     if ($t4On -and $tags.Count -gt 0) {
         $t4Current = Get-DemoT4State -Config $effective -DeploymentId ([string]$tags['deploymentId'])
         $t4Exists = [bool]$t4Current.Exists
         $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4Current -Name 'Server')
         $t4ServerState = [string](Get-DemoMemberValue -InputObject $t4Current -Name 'State')
+        $t4RemovalPending = [bool](Get-DemoMemberValue -InputObject $t4Current -Name 'Removing')
+        if ($t4RemovalPending) {
+            $t4ServerSku = ''
+        }
     }
     # An existing server keeps its own size unless the configuration sets one, or it moves to the default (below): the
     # fallback never resizes a server, so a redeploy never sends another size to a server the fallback created, whatever
@@ -442,6 +478,53 @@ function Invoke-DemoTemplateDeployment {
         $tags[$t4TagName] = ''
         $tags[$t4RefusedTagName] = ''
     }
+    # The wait for a T4 server Azure refused (live, 2026-11-09): Azure keeps it as a shell that it deletes, Dropping for
+    # about 3 minutes, and the next attempt creates a server with the same name, so that attempt waits until the shell is
+    # gone: at most -T4RemovalWaitMinutes, read every -T4RemovalPollSeconds, on the console and on the status page's
+    # Infrastructure and T4 rows (Azure-side, no action needed). Returns $true once it's gone, or when the reads can't
+    # tell (the attempt then answers), and $false while Azure is still removing it.
+    $awaitRemoval = {
+        param([int] $RemovalMinutes, [int] $RemovalPollSeconds)
+        $zone = Get-DemoT4AvailabilityZone -Config $effective
+        $what = '{0}{1}' -f (Get-DemoT4SkuName -Config $effective), $(if ($zone) { ' in zone ' + $zone } else { '' })
+        $show = {
+            param([string] $Text)
+            Write-DemoLog -Message $Text
+            if ($ProgressPath) {
+                # Explicit states: a message alone would set the step Pending. T4's own row hasn't started yet.
+                Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Running' -Message $Text -AzureSide | Out-Null
+                Set-DemoProgressStep -Path $ProgressPath -Id 'T4.Server' -State 'Pending' -Message $Text -AzureSide | Out-Null
+            }
+        }
+        & $show ('Azure is removing the T4 server it refused, which it does within minutes, so the next attempt waits for it to go, up to {0} minutes, before it tries {1}.' -f $RemovalMinutes, $what)
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $polls = [int][System.Math]::Ceiling(($RemovalMinutes * 60) / $RemovalPollSeconds)
+        $shell = $true
+        $readState = ''
+        for ($poll = 0; $poll -le $polls; $poll++) {
+            if ($poll -gt 0) {
+                Start-Sleep -Seconds $RemovalPollSeconds
+            }
+            $read = $null
+            try {
+                $read = Get-DemoT4State -Config $effective -DeploymentId ([string]$tags['deploymentId'])
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('T4''s server couldn''t be read while waiting for its removal: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+            }
+            $readState = [string](Get-DemoMemberValue -InputObject $read -Name 'State')
+            $shell = [bool](Get-DemoMemberValue -InputObject $read -Name 'Removing') -or ([bool](Get-DemoMemberValue -InputObject $read -Name 'Present') -and $readState -notin $script:T4DeployedStates)
+            if (-not $shell -and $readState -and $readState -ne 'Unknown') {
+                & $show ('Azure removed the T4 server it refused after {0} s, so this run tries {1} now.' -f [int]$clock.Elapsed.TotalSeconds, $what)
+                return $true
+            }
+            if ($poll -gt 0 -and (($poll * $RemovalPollSeconds) % 60) -lt $RemovalPollSeconds) {
+                & $show ('Azure is still removing the T4 server it refused ({0}, {1} s so far); {2} waits for it.' -f $(if ($readState) { $readState } else { 'Unknown' }), [int]$clock.Elapsed.TotalSeconds, $what)
+            }
+        }
+        # Reads that couldn't tell aren't a shell: the attempt answers.
+        return (-not $shell)
+    }
     # One attempt for each size the fallback can try, the asked size's retry in another zone, one without T4 after Azure
     # refused them all, and one after the T3 free offer's rejection: 6 without t4SkuName, as before, and up to 8 for a size
     # it sets (2026-11-09).
@@ -479,6 +562,32 @@ function Invoke-DemoTemplateDeployment {
                 $gpResult = New-DemoT4FallbackResult -Refused $gpRefusal -Next 'None' -Cost $cost
                 $results.Add($gpResult)
                 Write-DemoLog -Level Warning -Message $gpResult.message
+            }
+        }
+        # A T4 server Azure refused is still a shell that Azure removes (2026-11-09): this attempt creates a server with its
+        # name, so it waits for it first. When it outlasts the bound, the plain rerun goes on from the next size of the
+        # fallback, recorded now with what Azure refused; a retry in another zone has no record of its own, so the rerun goes
+        # on to the next size. Nothing is recorded for a shell this run didn't see refused (a server deleted by hand, say).
+        if ($t4RemovalPending -and $Action -eq 'Create' -and $ladder -and (Test-DemoT4Enabled -Config $effective)) {
+            $t4RemovalPending = $false
+            if (-not (& $awaitRemoval $T4RemovalWaitMinutes $T4RemovalPollSeconds)) {
+                $pendingSku = Get-DemoT4SkuName -Config $effective
+                $resumeSku = ''
+                if ($t4Refusals.Count -gt 0) {
+                    $resumeSku = if ($pendingSku -ceq $t4Asked) { Get-DemoT4NextSku -Config $effective -Current $pendingSku } else { $pendingSku }
+                    if ($resumeSku) {
+                        & $record $resumeSku
+                    }
+                }
+                $refusedText = if ($null -ne $lastRefusal) { 'Azure refused T4''s {0}, and its server' -f [string]$lastRefusal.Sku } else { 'T4''s server' }
+                $removingText = '{0} was still being removed after {1}, so this run stopped before it created T4 again; the rest of the demo is as the last attempt left it.' -f $refusedText, $(if ($T4RemovalWaitMinutes -eq 1) { '1 minute' } else { '{0} minutes' -f $T4RemovalWaitMinutes })
+                $rerunText = if ($resumeSku) { 'Run ./scripts/deploy.ps1 again in a few minutes: Azure finishes the removal on its own, and the run goes on with {0}, the next size of the fallback (recorded in DbHubT4Size).' -f $resumeSku } else { 'Run ./scripts/deploy.ps1 again in a few minutes: Azure finishes the removal on its own, and the run goes on from there.' }
+                $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.REMOVING' -Area 't4' -Target 'T4' -Status 'Fail' -Message ('{0} {1}' -f $removingText, $rerunText) -Evidence ([ordered]@{ refusedSku = $(if ($null -ne $lastRefusal) { [string]$lastRefusal.Sku } else { '' }); pendingSku = $pendingSku; resumeSku = $resumeSku; waitedMinutes = $T4RemovalWaitMinutes }) -Remediation $rerunText -DocUrl 'https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors'))
+                Write-DemoLog -Level Warning -Message $removingText
+                if ($ProgressPath) {
+                    Set-DemoProgressStep -Path $ProgressPath -Id 'T4.Server' -State 'Pending' -Message $removingText | Out-Null
+                }
+                return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note }
             }
         }
         if ($attempt -gt 1) {
@@ -610,6 +719,13 @@ function Invoke-DemoTemplateDeployment {
         # it keeps its own size and the record that goes with it, isn't priced again (it exists and bills), is never recorded
         # as left out (None) or refused (Refused), and is never moved to another size, which would resize it (review of
         # 64c28b2). A server that can't be read is taken as missing, as before.
+        # A server Azure refused isn't one of those (live, 2026-11-09): Azure keeps it as a shell for a few minutes, first
+        # without a deployed server's state, then Dropping, so the server's own refusal wins over its state. A server that
+        # Azure is deleting, or one in another state than a deployed server's whose T4 deployment failed with SkuNotAvailable
+        # for the size this attempt sent (Get-DemoT4CreateFailure, read from the deployment's own operations), doesn't
+        # count as T4: the fallback goes on, and the next attempt waits until the shell is gone (above).
+        $t4Failure = $null
+        $t4FailureRead = $false
         if ($ladder -and (Test-DemoT4Enabled -Config $effective)) {
             $t4Now = $null
             try {
@@ -618,7 +734,20 @@ function Invoke-DemoTemplateDeployment {
             catch {
                 Write-DemoLog -Level Warning -Message ('T4''s server couldn''t be read after the failed attempt, so the fallback goes on as if it doesn''t exist: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
             }
-            if ([bool](Get-DemoMemberValue -InputObject $t4Now -Name 'Exists')) {
+            $nowState = [string](Get-DemoMemberValue -InputObject $t4Now -Name 'State')
+            $nowExists = [bool](Get-DemoMemberValue -InputObject $t4Now -Name 'Exists')
+            $nowRemoving = [bool](Get-DemoMemberValue -InputObject $t4Now -Name 'Removing')
+            $nowShell = $nowRemoving
+            if (-not $nowRemoving -and ($nowExists -or [bool](Get-DemoMemberValue -InputObject $t4Now -Name 'Present')) -and $nowState -notin $script:T4DeployedStates) {
+                $t4Failure = Get-DemoT4CreateFailure -Config $effective
+                $t4FailureRead = $true
+                $nowShell = $null -ne $t4Failure -and [string]$t4Failure.Sku -ceq (Get-DemoT4SkuName -Config $effective)
+            }
+            if ($nowShell) {
+                $t4RemovalPending = $true
+                Write-DemoLog -Level Warning -Message ('The server Azure began for T4''s {0} after this failed attempt is a shell that Azure removes ({1}), not T4, so the fallback goes on once it''s gone.' -f (Get-DemoT4SkuName -Config $effective), $(if ($nowState) { $nowState } else { 'Unknown' }))
+            }
+            elseif ($nowExists) {
                 $t4Exists = $true
                 $ladder = $false
                 $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4Now -Name 'Server')
@@ -662,8 +791,7 @@ function Invoke-DemoTemplateDeployment {
             }
             continue
         }
-        $t4Failure = $null
-        if ((Test-DemoT4Enabled -Config $effective) -and ($Action -eq 'Create') -and (-not $t4Exists -or $t4Scaling)) {
+        if (-not $t4FailureRead -and (Test-DemoT4Enabled -Config $effective) -and ($Action -eq 'Create') -and (-not $t4Exists -or $t4Scaling)) {
             $t4Failure = Get-DemoT4CreateFailure -Config $effective
         }
         $current = Get-DemoT4SkuName -Config $effective

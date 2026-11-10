@@ -104,6 +104,12 @@ BeforeAll {
         # What the fallback recorded in DbHubT4Refused, and each size's cost check (2026-11-09).
         $script:recordedRefused = [System.Collections.Generic.List[string]]::new()
         $script:costBySize = @{}
+        # A server Azure refused is a shell it removes (live, 2026-11-09): after each refusal, T4's reads see
+        # $script:shellPlan's states in order (Provisioning, Dropping, ...), then the server is gone. None by default.
+        $script:shellPlan = @()
+        $script:shellQueue = [System.Collections.Generic.Queue[string]]::new()
+        $script:shellSeen = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -MockWith { throw 'The unit tests make no Retail Prices API call.' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { $true }
@@ -113,7 +119,14 @@ BeforeAll {
         Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT1SecurityType -MockWith { [pscustomobject]@{ SecurityType = 'TrustedLaunch' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmDiskDrift -MockWith { @() }
         $script:serverState = 'Ready'
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Exists = ($null -ne $script:server); State = $(if ($null -ne $script:server) { $script:serverState } else { 'NotFound' }); Server = $script:server } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith {
+            if ($script:shellQueue.Count -gt 0) {
+                $shellState = $script:shellQueue.Dequeue()
+                $script:shellSeen.Add($shellState)
+                return [pscustomobject]@{ Exists = ($shellState -ne 'Dropping'); Present = $true; Removing = ($shellState -eq 'Dropping'); State = $shellState; Server = [pscustomobject]@{ sku = [pscustomobject]@{ name = $script:currentSize } } }
+            }
+            [pscustomobject]@{ Exists = ($null -ne $script:server); State = $(if ($null -ne $script:server) { $script:serverState } else { 'NotFound' }); Server = $script:server }
+        }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -MockWith {
             if ([string]$script:codes[$script:currentSize] -eq 'SkuNotAvailable') {
                 [pscustomobject]@{ Sku = $script:currentSize; Zone = $(if ($script:sentZones.Count -gt 0) { [string]$script:sentZones[-1] } else { '' }); TimeUtc = '2026-11-02T14:00:00Z' }
@@ -168,6 +181,11 @@ BeforeAll {
                 # Azure refuses a size only when it creates the server; an existing one isn't created again.
                 $code = [string]$script:codes[$script:currentSize]
                 if ($code -and ($null -eq $script:server -or $script:refusesExisting)) {
+                    if ($code -eq 'SkuNotAvailable' -and $null -eq $script:server) {
+                        foreach ($shellState in @($script:shellPlan)) {
+                            $script:shellQueue.Enqueue([string]$shellState)
+                        }
+                    }
                     return (New-AzResult -ExitCode 1 -StdErr ('ERROR: {{"status":"Failed","error":{{"code":"DeploymentFailed","message":"At least one resource deployment operation failed.","details":[{{"code":"{0}","message":"A fake error."}}]}}}}' -f $code))
                 }
                 $other = [string]$script:elsewhere[$script:currentSize]
@@ -1434,5 +1452,212 @@ Describe 'A size t4SkuName sets falls back too, cheapest first, and every automa
             InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -SkuName 'Standard_B2s'); State = $state } { Get-DemoT4RecordedSizeChange -Config $Config -State $State } | Should -BeNullOrEmpty
             InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -SkuName 'Standard_D2ds_v5'); State = $state } { Get-DemoT4RecordedSizeChange -Config $Config -State $State } | Should -BeNullOrEmpty
         }
+    }
+}
+
+Describe 'A server Azure refused is a shell that it removes, not T4 (live, 2026-11-09)' {
+    BeforeEach {
+        Initialize-TemplateHarness
+        # Obviously fake estimates for T4 alone at each size (light use, worst case), never real prices (ADR 0016).
+        $script:costBySize = @{
+            Standard_B1ms     = (New-TestCost -SkuName 'Standard_B1ms' -HourlyUsd 0.1 -T4LightUseMonthlyUsd 10.0 -T4MonthlyWorstCaseUsd 30.0)
+            Standard_B2s      = (New-TestCost -SkuName 'Standard_B2s' -HourlyUsd 0.2 -T4LightUseMonthlyUsd 40.0 -T4MonthlyWorstCaseUsd 120.0)
+            Standard_D2ds_v5  = (New-TestCost -SkuName 'Standard_D2ds_v5' -HourlyUsd 0.3 -T4LightUseMonthlyUsd 50.0 -T4MonthlyWorstCaseUsd 200.0)
+            Standard_D4ds_v5  = (New-TestCost -SkuName 'Standard_D4ds_v5' -HourlyUsd 0.6 -T4LightUseMonthlyUsd 90.0 -T4MonthlyWorstCaseUsd 400.0)
+            Standard_D4ads_v5 = (New-TestCost -SkuName 'Standard_D4ads_v5' -HourlyUsd 0.6 -T4LightUseMonthlyUsd 90.0 -T4MonthlyWorstCaseUsd 400.0)
+        }
+        $script:progress = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:progress.Add([pscustomobject]@{ Id = (@($PesterBoundParameters['Id']) -join ','); State = [string]$PesterBoundParameters['State']; Message = [string]$PesterBoundParameters['Message']; AzureSide = [bool]$PesterBoundParameters['AzureSide'] }) }
+    }
+
+    It 'waits for the refused Standard_B1ms server to go, then tries it in another zone, then Standard_B2s, with the notice (the live case)' {
+        $script:codes = @{ Standard_B1ms = 'SkuNotAvailable' }
+        $script:skuZones = @{ Standard_B1ms = @('1') }
+        $script:shellPlan = @('Dropping', 'Dropping')
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -SkuName 'Standard_B1ms') -NetworkMode private -T3UseFreeLimit $false -ProgressPath 'out/deploy-progress.json'
+        $deployment.Succeeded | Should -BeTrue
+        $deployment.T4SkuName | Should -Be 'Standard_B2s'
+        @($script:sizes) | Should -Be @('Standard_B1ms', 'Standard_B1ms', 'Standard_B2s')
+        @($script:sentZones) | Should -Be @('', '1', '')
+        @($script:shellSeen) | Should -Be @('Dropping', 'Dropping', 'Dropping', 'Dropping') -Because 'each refusal is read right after it, then once more by the wait, which sees it gone at its next read'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 2 -Exactly -ParameterFilter { $Seconds -eq 15 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Message -like 'T4''s server exists after this failed attempt*' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 2 -Exactly -ParameterFilter { $Message -like 'The server Azure began for T4''s Standard_B1ms after this failed attempt is a shell that Azure removes (Dropping)*' }
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.REMOVING') | Should -BeNullOrEmpty
+        $notice = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK')
+        $notice.Count | Should -Be 1
+        $notice[0].message | Should -Match '^T4 was created as Standard_B2s \(Burstable, 2 vCores\) instead of Standard_B1ms'
+        $notice[0].evidence.deployedSku | Should -Be 'Standard_B2s'
+        # On the status page: the Infrastructure row runs and T4's own row waits, both Azure-side, while the server goes.
+        @($script:progress | Where-Object { $_.Id -eq 'Infrastructure' -and $_.State -eq 'Running' -and $_.AzureSide -and $_.Message -like 'Azure is removing the T4 server it refused, which it does within minutes, so the next attempt waits for it to go, up to 15 minutes, before it tries Standard_B1ms in zone 1.' }).Count | Should -Be 1
+        @($script:progress | Where-Object { $_.Id -eq 'T4.Server' -and $_.State -eq 'Pending' -and $_.AzureSide -and $_.Message -like 'Azure removed the T4 server it refused after * s, so this run tries Standard_B2s now.' }).Count | Should -Be 1
+    }
+
+    It 'counts a server without a deployed state after a refusal as the refused shell, from the T4 deployment''s own operations: <First>' -ForEach @(
+        @{ First = 'Provisioning' }
+        @{ First = 'Unknown' }
+        @{ First = 'Failed' }
+    ) {
+        $script:codes = @{ Standard_D4ds_v5 = 'SkuNotAvailable' }
+        $script:shellPlan = @($First, 'Dropping')
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig)
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
+        $deployment.T4SkuName | Should -Be 'Standard_D4ads_v5'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -Times 1 -Exactly -Because 'the refusal is read once, before the state decides'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like ('The server Azure began for T4''s Standard_D4ds_v5 after this failed attempt is a shell that Azure removes ({0})*' -f $First) }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Message -like 'T4''s server exists after this failed attempt*' }
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK').Count | Should -Be 1
+    }
+
+    It 'does the same for the default chain: Standard_D4ds_v5 refused, Dropping, another zone, then Standard_D4ads_v5' {
+        $script:codes = @{ Standard_D4ds_v5 = 'SkuNotAvailable' }
+        $script:zones = @('2')
+        $script:shellPlan = @('Dropping', 'Dropping')
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig)
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5')
+        @($script:sentZones) | Should -Be @('', '2', '')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 2 -Exactly
+        $notice = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK')
+        $notice.Count | Should -Be 1
+        $notice[0].message | Should -Match 'Standard_D4ads_v5'
+        $script:recorded[-1] | Should -Be 'Standard_D4ads_v5'
+    }
+
+    It 'waits first when a run starts while the refused server is still there, and nothing waits once it''s gone' {
+        $script:shellQueue.Enqueue('Dropping')
+        $script:shellQueue.Enqueue('Dropping')
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig)
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 1 -Exactly
+        @($script:shellSeen) | Should -Be @('Dropping', 'Dropping')
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK') | Should -BeNullOrEmpty -Because 'the size the configuration asks for was created'
+    }
+
+    It 'ends NOT DONE when Azure is still removing it after the bound, and records the next size, so the plain rerun goes on with it' {
+        $script:codes = @{ Standard_B1ms = 'SkuNotAvailable' }
+        $script:skuZones = @{ Standard_B1ms = @('1') }
+        $script:shellPlan = @('Dropping') * 30
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -SkuName 'Standard_B1ms') -NetworkMode private -T3UseFreeLimit $false -T4RemovalWaitMinutes 1 -T4RemovalPollSeconds 15
+        $deployment.Succeeded | Should -BeFalse
+        @($script:sizes) | Should -Be @('Standard_B1ms') -Because 'nothing is created again while the shell holds the server''s name'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 4 -Exactly -ParameterFilter { $Seconds -eq 15 }
+        $removing = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.REMOVING')
+        $removing.Count | Should -Be 1
+        $removing[0].status | Should -Be 'Fail'
+        $removing[0].message | Should -Match '^Azure refused T4''s Standard_B1ms, and its server was still being removed after 1 minute, so this run stopped before it created T4 again'
+        $removing[0].remediation | Should -Match '^Run \./scripts/deploy\.ps1 again in a few minutes: Azure finishes the removal on its own, and the run goes on with Standard_B2s, the next size of the fallback'
+        $removing[0].evidence.resumeSku | Should -Be 'Standard_B2s'
+        $script:recorded[-1] | Should -Be 'Standard_B2s'
+        $refused = [string]$script:recordedRefused[-1]
+        $refused | Should -Match '^Standard_B1ms@any;'
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK') | Should -BeNullOrEmpty
+
+        # The plain rerun: the record holds while t4SkuName asks for Standard_B1ms, so it starts at Standard_B2s.
+        Initialize-TemplateHarness
+        $script:groupTags = @{ deploymentId = 'abc123'; DbHubT4Size = 'Standard_B2s'; DbHubT4Refused = $refused }
+        $rerun = Invoke-TestTemplate -Config (Resolve-TestConfig -Config (New-TestConfig -SkuName 'Standard_B1ms') -Record 'Standard_B2s' -Refused $refused -TemplateRuns)
+        $rerun.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_B2s')
+        $rerun.T4SkuName | Should -Be 'Standard_B2s'
+    }
+
+    It 'records nothing when a shell it didn''t see refused outlasts the bound (a server deleted by hand), so the rerun starts as configured' {
+        $script:shellQueue.Enqueue('Dropping')
+        $script:shellQueue.Enqueue('Dropping')
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -T4RemovalWaitMinutes 0
+        $deployment.Succeeded | Should -BeFalse
+        @($script:sizes).Count | Should -Be 0
+        $removing = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.REMOVING')
+        $removing[0].message | Should -Match '^T4''s server was still being removed after 0 minutes'
+        $removing[0].remediation | Should -Match 'the run goes on from there\.$'
+        @($script:recorded).Count | Should -Be 0
+    }
+
+    It 'keeps a server that a failed attempt did create, as before, and waits for nothing: <State>' -ForEach @(
+        @{ State = 'Ready'; Reads = 0 }
+        @{ State = 'Provisioning'; Reads = 1 }
+    ) {
+        $script:serverState = $State
+        $script:createsServer = 'Standard_D4ds_v5'
+        $script:elsewhere = @{ Standard_D4ds_v5 = 'InvalidTemplateDeployment' }
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig)
+        $deployment.Succeeded | Should -BeFalse -Because 'another resource failed'
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T4''s server exists after this failed attempt*' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4CreateFailure -Times $Reads -Exactly -Because 'only a server without a deployed state is checked against a refusal'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.REMOVING') | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-DemoT4State and its callers: a server Azure is deleting isn''t T4 (2026-11-09)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+    }
+
+    It 'maps the server''s state <State> to Exists <Exists>, Removing <Removing>, and Present' -ForEach @(
+        @{ State = 'Ready'; Exists = $true; Removing = $false; Expected = 'Ready' }
+        @{ State = 'Stopped'; Exists = $true; Removing = $false; Expected = 'Stopped' }
+        @{ State = 'Dropping'; Exists = $false; Removing = $true; Expected = 'Dropping' }
+        @{ State = 'Provisioning'; Exists = $true; Removing = $false; Expected = 'Provisioning' }
+        @{ State = 'Failed'; Exists = $true; Removing = $false; Expected = 'Failed' }
+        @{ State = ''; Exists = $true; Removing = $false; Expected = 'Unknown' }
+    ) {
+        $script:mockState = $State
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4Resource -MockWith { [pscustomobject]@{ Found = $true; NotFound = $false; Value = [pscustomobject]@{ properties = [pscustomobject]@{ state = $script:mockState } }; Error = '' } }
+        $read = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4State -Config $Config -DeploymentId 'abc123' }
+        $read.State | Should -Be $Expected
+        $read.Exists | Should -Be $Exists
+        $read.Removing | Should -Be $Removing
+        $read.Present | Should -BeTrue
+    }
+
+    It 'reads a missing server as NotFound and one it couldn''t read as Unknown, neither present' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4Resource -MockWith { [pscustomobject]@{ Found = $false; NotFound = $true; Value = $null; Error = 'ResourceNotFound' } }
+        $missing = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4State -Config $Config -DeploymentId 'abc123' }
+        $missing.State | Should -Be 'NotFound'
+        $missing.Present | Should -BeFalse
+        $missing.Removing | Should -BeFalse
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4Resource -MockWith { [pscustomobject]@{ Found = $false; NotFound = $false; Value = $null; Error = 'A fake transient error.' } }
+        $unknown = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4State -Config $Config -DeploymentId 'abc123' }
+        $unknown.State | Should -Be 'Unknown'
+        $unknown.Present | Should -BeFalse
+    }
+
+    It 'treats it as not deployed in the power actions, the resume''s T4 check, and its validation' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = 'pgflex01-abc123'; ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123'; ResourceGroup = 'rg-dbhub-demo'; Enabled = $true }; Exists = $false; Present = $true; Removing = $true; State = 'Dropping'; Server = $null; Error = '' } }
+        foreach ($action in 'Start', 'Stop') {
+            $power = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Action = $action } { Invoke-DemoT4PowerAction -Config $Config -Action $Action -CheckPrefix STOP -DeploymentId 'abc123' }
+            $power.status | Should -Be 'Not selected' -Because $action
+            $power.message | Should -Match ('^T4''s server is being deleted \(Dropping\), so it isn''t deployed and there''s nothing to {0}\.$' -f $action.ToLowerInvariant())
+        }
+        $missing = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4MissingResult -Config $Config -State ([pscustomobject]@{ Tags = @{ deploymentId = 'abc123' }; Stage = 'Validation' }) }
+        $missing.checkId | Should -Be 'DEPLOY.T4.MISSING'
+        $missing.message | Should -Match 'is being deleted \(Dropping: Azure removes a server it refused within minutes'
+        $missing.evidence.state | Should -Be 'Dropping'
+        $server = @(Test-DemoT4 -Config (New-TestConfig) -DeploymentId 'abc123') | Where-Object checkId -EQ 'T4.SERVER'
+        $server.status | Should -Be 'Fail'
+        $server.message | Should -Match 'is being deleted \(Dropping\)'
+    }
+
+    It 'gives METRICS.T4 and the T4 workload''s setup the deletion as the reason, never start-demo.ps1' {
+        $serverId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123'
+        $metrics = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); ServerId = $serverId } { Test-DemoT4MetricFlow -Config $Config -ServerId $ServerId -State 'Dropping' }
+        $metrics.status | Should -Be 'Warning'
+        $metrics.message | Should -Be 'T4''s server is being deleted (Dropping), so it isn''t deployed and sends no metrics.'
+        $metrics.remediation | Should -Not -Match 'start-demo'
+        # A stopped server keeps its text and fix.
+        $stopped = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); ServerId = $serverId } { Test-DemoT4MetricFlow -Config $Config -ServerId $ServerId -State 'Stopped' }
+        $stopped.message | Should -Be 'T4 is Stopped, so it sends no fresh metrics.'
+        $stopped.remediation | Should -Match '^start-demo\.ps1 starts it'
+
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = 'pgflex01-abc123'; Enabled = $true }; Exists = $false; Present = $true; Removing = $true; State = 'Dropping'; Server = $null; Error = '' } }
+        $enable = Enable-DemoT4Workload -Config (New-TestConfig) -DeploymentId 'abc123' -Confirm:$false
+        $enable.checkId | Should -Be 'WORKLOAD.T4.ENABLE'
+        $enable.status | Should -Be 'Fail'
+        $enable.message | Should -Be 'T4 (pgflex01-abc123) wasn''t found: Azure is deleting it (Dropping)'
     }
 }
