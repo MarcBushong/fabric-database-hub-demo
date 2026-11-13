@@ -8,7 +8,11 @@ function Invoke-DemoVmRunCommand {
     Builds on the Phase 6 Run Command helpers (Get-DemoRunCommandApiVersion, Get-DemoRunCommandBaseUrl,
     Wait-DemoRunCommand, Remove-DemoRunCommand, Test-DemoAzConflict):
 
-    1. Deletes a leftover Run Command with the same name, for example from an interrupted run.
+    1. Deletes a leftover Run Command with the same name, for example from an interrupted run, and waits at most
+       -LeftoverWaitSeconds for it to go. When Azure still lists it then, the script runs under a fresh name
+       (Resolve-DemoRunCommandFreshName: the name and -yyyyMMddHHmmss) instead of a PUT that would fail: live on the T2
+       host, Azure ended most Run Command deletes with an internal error after 6 to 11 minutes and kept the name marked
+       for deletion for hours (2026-11-13). deploy.ps1 reports it (DEPLOY.RUNCOMMAND.STUCK_<VM>).
     2. Writes the request body to a file in a new private temporary directory (only the current user can
        open it; mode 700 on Linux and macOS) and creates the Run Command with
        'az rest --method put --body @<file>' through Invoke-DemoAz. Values in -ProtectedParameter go only
@@ -27,7 +31,8 @@ function Invoke-DemoVmRunCommand {
     Command, while the script runs on the VM; the wait and the delete follow as usual, so a long Run Command
     is never deleted (which would stop its script) because the work beside it failed.
 
-    Returns VmName, RunCommandName, Succeeded (execution state Succeeded and exit code 0), ExecutionState,
+    Returns VmName, RunCommandName, UsedName (the name it ran under: RunCommandName, or a fresh one), Succeeded
+    (execution state Succeeded and exit code 0), ExecutionState,
     ProvisioningState, ExitCode, Output, Error (the last 4 KB the instance view keeps, redacted with
     Protect-DemoText), WaitTimedOut, Stale, Removed, Seconds, and WhileRunningError (the redacted error of
     the -WhileRunning block, empty when it succeeded or there was none). A script that fails doesn't throw;
@@ -75,6 +80,9 @@ function Invoke-DemoVmRunCommand {
     waits behind the VM's extension work), stop waiting; the result has NotStarted set, and the Run Command is
     deleted as usual. 0 (the default) waits the whole timeout.
 
+    .PARAMETER LeftoverWaitSeconds
+    How long a leftover with the same name may take to go before the script runs under a fresh name instead.
+
     .EXAMPLE
     Invoke-DemoVmRunCommand -Config $config -VmName archost01 -RunCommandName DbHubDemo-HealthRead -Script (Get-Content ./vm/health/Get-DemoHealth.ps1 -Raw) -Parameter @{ View = 'Summary' }
     #>
@@ -111,7 +119,10 @@ function Invoke-DemoVmRunCommand {
         [scriptblock] $WhileRunning = $null,
 
         [ValidateRange(0, 7200)]
-        [int] $StartTimeoutSeconds = 0
+        [int] $StartTimeoutSeconds = 0,
+
+        [ValidateRange(0, 1800)]
+        [int] $LeftoverWaitSeconds = 300
     )
 
     $subscriptionId = $Config['subscriptionId']
@@ -156,7 +167,10 @@ function Invoke-DemoVmRunCommand {
     }
 
     $apiVersion = Get-DemoRunCommandApiVersion
-    $url = '{0}/{1}?api-version={2}' -f (Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName), $RunCommandName, $apiVersion
+    $baseUrl = Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName
+    # The name the script runs under: RunCommandName, or a fresh one while Azure keeps it in Deleting (2026-11-13).
+    $usedName = $RunCommandName
+    $url = '{0}/{1}?api-version={2}' -f $baseUrl, $usedName, $apiVersion
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $state = $null
     $removed = $false
@@ -169,9 +183,13 @@ function Invoke-DemoVmRunCommand {
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         $directory = $null
         $removed = $false
+        $putSent = $false
         try {
-            if (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -WaitSeconds 300 -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false)) {
-                Write-DemoLog -Level Warning -Message ('{0}: a leftover {1} is still being deleted; creating it again may hit a conflict, which is retried.' -f $VmName, $RunCommandName)
+            if (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -WaitSeconds $LeftoverWaitSeconds -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false)) {
+                # A PUT of a name Azure keeps marked for deletion fails with OperationNotAllowed, so the script runs under a
+                # fresh name; that throws when the VM has no room for one (2026-11-13 live finding).
+                $usedName = Resolve-DemoRunCommandFreshName -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -VmName $VmName -RunCommandName $RunCommandName -WaitedSeconds $LeftoverWaitSeconds
+                $url = '{0}/{1}?api-version={2}' -f $baseUrl, $usedName, $apiVersion
             }
 
             $protectedList = [System.Collections.Generic.List[object]]::new()
@@ -209,15 +227,16 @@ function Invoke-DemoVmRunCommand {
 
             # 30 seconds of allowance for clock skew between this machine and the VM.
             $notBeforeUtc = [System.DateTime]::UtcNow.AddSeconds(-30)
-            $put = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('rest', '--method', 'put', '--url', $url, '--body', "@$bodyPath") -Label ('{0}: {1}' -f $VmName, $RunCommandName)
+            $putSent = $true
+            $put = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('rest', '--method', 'put', '--url', $url, '--body', "@$bodyPath") -Label ('{0}: {1}' -f $VmName, $usedName)
             # The body holds the protected values; it goes as soon as Azure has the request.
             Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
             $directory = $null
             if ($put.ExitCode -ne 0) {
                 if (Test-DemoAzVmNotRunning -Text ([string]$put.StdErr)) {
-                    throw ('{0}: {1} can''t run, because the VM isn''t running (deallocated or stopped) and Run Command needs it running. Start it first (./scripts/start-demo.ps1).' -f $VmName, $RunCommandName)
+                    throw ('{0}: {1} can''t run, because the VM isn''t running (deallocated or stopped) and Run Command needs it running. Start it first (./scripts/start-demo.ps1).' -f $VmName, $usedName)
                 }
-                throw ('{0}: creating the Run Command {1} failed: {2}' -f $VmName, $RunCommandName, (Protect-DemoText -Text ([string]$put.StdErr).Trim()))
+                throw ('{0}: creating the Run Command {1} failed: {2}' -f $VmName, $usedName, (Protect-DemoText -Text ([string]$put.StdErr).Trim()))
             }
 
             if ($null -ne $WhileRunning -and -not $whileRan) {
@@ -227,7 +246,7 @@ function Invoke-DemoVmRunCommand {
                 }
                 catch {
                     $whileError = Protect-DemoText -Text ([string]$_.Exception.Message)
-                    Write-DemoLog -Level Warning -Message ('{0}: the work done while {1} ran failed; {1} is still awaited: {2}' -f $VmName, $RunCommandName, $whileError)
+                    Write-DemoLog -Level Warning -Message ('{0}: the work done while {1} ran failed; {1} is still awaited: {2}' -f $VmName, $usedName, $whileError)
                 }
             }
 
@@ -239,25 +258,27 @@ function Invoke-DemoVmRunCommand {
             if ($stopped) {
                 # deploy.ps1 was stopped (Ctrl+C): deleting the Run Command can take minutes, so the next run's cleanup
                 # deletes it before it creates the same name again (Phase 28 live finding).
-                Write-DemoLog -Level Warning -Message ('{0}: stopped; the Run Command {1} is left for the next run to delete.' -f $VmName, $RunCommandName)
+                Write-DemoLog -Level Warning -Message ('{0}: stopped; the Run Command {1} is left for the next run to delete.' -f $VmName, $usedName)
             }
             else {
                 try {
-                    $removed = Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false
+                    # Nothing was created without a PUT (no room for a fresh name, a refused value): the delete goes again,
+                    # which is all Azure lets a name marked for deletion have, without a second wait.
+                    $removed = Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -PollIntervalSeconds $PollIntervalSeconds -NoWait:(-not $putSent) -Confirm:$false
                 }
                 catch {
-                    Write-DemoLog -Level Warning -Message ('{0}: the Run Command {1} could not be deleted: {2}' -f $VmName, $RunCommandName, $_.Exception.Message)
+                    Write-DemoLog -Level Warning -Message ('{0}: the Run Command {1} could not be deleted: {2}' -f $VmName, $usedName, $_.Exception.Message)
                 }
             }
             if (-not $removed -and -not $stopped) {
-                Write-DemoLog -Level Warning -Message ('{0}: the Run Command {1} is still being deleted; delete it with az vm run-command delete if it remains.' -f $VmName, $RunCommandName)
+                Write-DemoLog -Level Warning -Message ('{0}: the Run Command {1} is still being deleted; delete it with az vm run-command delete if it remains.' -f $VmName, $usedName)
             }
         }
         if (-not [bool](Get-DemoMemberValue -InputObject $state -Name 'Stale')) {
             break
         }
         if ($attempt -lt $maxAttempts) {
-            Write-DemoLog -Level Warning -Message ('{0}: {1} reported an earlier run (started {2:u}) instead of running the script; trying again in 60 seconds.' -f $VmName, $RunCommandName, $state.StartTime)
+            Write-DemoLog -Level Warning -Message ('{0}: {1} reported an earlier run (started {2:u}) instead of running the script; trying again in 60 seconds.' -f $VmName, $usedName, $state.StartTime)
             Start-Sleep -Seconds 60
         }
     }
@@ -267,12 +288,13 @@ function Invoke-DemoVmRunCommand {
     $succeeded = $state.Found -and -not $stale -and $state.ExecutionState -eq 'Succeeded' -and $state.ExitCode -eq 0
     $level = if ($succeeded) { 'Info' } else { 'Warning' }
     if ($stale) {
-        Write-DemoLog -Level Warning -Message ('{0}: {1} reported an earlier run twice, so the script did not run and its result is ignored. Run it again in a few minutes.' -f $VmName, $RunCommandName)
+        Write-DemoLog -Level Warning -Message ('{0}: {1} reported an earlier run twice, so the script did not run and its result is ignored. Run it again in a few minutes.' -f $VmName, $usedName)
     }
-    Write-DemoLog -Level $level -Message ('{0}: {1} finished (execution state {2}, exit code {3}) in {4:N0} seconds.' -f $VmName, $RunCommandName, $state.ExecutionState, $state.ExitCode, $stopwatch.Elapsed.TotalSeconds)
+    Write-DemoLog -Level $level -Message ('{0}: {1} finished (execution state {2}, exit code {3}) in {4:N0} seconds.' -f $VmName, $usedName, $state.ExecutionState, $state.ExitCode, $stopwatch.Elapsed.TotalSeconds)
     [pscustomobject]@{
         VmName            = $VmName
         RunCommandName    = $RunCommandName
+        UsedName          = $usedName
         Succeeded         = [bool]$succeeded
         ExecutionState    = [string]$state.ExecutionState
         ProvisioningState = [string]$state.ProvisioningState

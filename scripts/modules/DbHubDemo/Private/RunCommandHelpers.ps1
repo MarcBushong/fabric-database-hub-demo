@@ -299,6 +299,158 @@ function Remove-DemoRunCommand {
     }
 }
 
+function Get-DemoRunCommandFreshName {
+    # The name a Run Command runs under when Azure keeps its own name in Deleting (2026-11-13 live finding): the name and
+    # -yyyyMMddHHmmss in UTC, the suffix Test-DemoRunCommandFinished reads. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $Name,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    return ('{0}-{1}' -f $Name, $NowUtc.ToUniversalTime().ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture))
+}
+
+function Resolve-DemoRunCommandFreshName {
+    <#
+    .SYNOPSIS
+    The name Invoke-DemoVmRunCommand runs under when Azure still lists -RunCommandName after the leftover wait: a fresh one
+    (Get-DemoRunCommandFreshName), so a name stuck in Deleting never holds a run (2026-11-13 live finding). Returns it, or
+    throws when the VM has no room for it. Internal.
+
+    .DESCRIPTION
+    Live on archost01 (2026-11-13, both test environments), Azure ended 27 of 29 Run Command deletes with
+    InternalExecutionError after 6 to 11 minutes, and a name whose delete failed stays marked for deletion: a PUT of it
+    fails with OperationNotAllowed until a later delete succeeds, which took hours there. A new name ran at once (its
+    script finished within a minute). One read of the VM's Run Commands comes first:
+    - Earlier fresh copies of the same name are asked to go, without waiting (Remove-DemoRunCommand -NoWait), so they
+      don't pile up across calls and runs.
+    - Azure allows 25 managed Run Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview)
+      and doesn't say whether one being deleted counts, so every one listed counts: at -Limit or more, there's no fresh
+      name, and it throws, which the caller reports as a Run Command that couldn't be created.
+    What it used goes to $script:DemoRunCommandStuck, which deploy.ps1 reports (Get-DemoRunCommandStuckResult), and the
+    console says so at once.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $BaseUrl,
+
+        [Parameter(Mandatory)]
+        [string] $ApiVersion,
+
+        [Parameter(Mandatory)]
+        [string] $VmName,
+
+        [Parameter(Mandatory)]
+        [string] $RunCommandName,
+
+        [int] $WaitedSeconds = 0,
+
+        [ValidateRange(1, 25)]
+        [int] $Limit = 20,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $listed = [System.Collections.Generic.List[string]]::new()
+    $deleting = 0
+    $list = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('rest', '--method', 'get', '--url', ('{0}?api-version={1}' -f $BaseUrl, $ApiVersion)) -AsJson -AllowFailure
+    # Assigned first: Get-DemoMemberValue returns an array as one object, which @() wouldn't unroll.
+    $values = Get-DemoMemberValue -InputObject $list -Name 'value'
+    foreach ($item in @($values | Where-Object { $null -ne $_ })) {
+        $itemName = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
+        if (-not $itemName) {
+            continue
+        }
+        $listed.Add($itemName)
+        if ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'properties') -Name 'provisioningState') -eq 'Deleting') {
+            $deleting++
+        }
+    }
+    $copyPattern = '^{0}-\d{{14}}$' -f [regex]::Escape($RunCommandName)
+    foreach ($copy in @($listed | Where-Object { $_ -match $copyPattern })) {
+        $null = Remove-DemoRunCommand -SubscriptionId $SubscriptionId -Url ('{0}/{1}?api-version={2}' -f $BaseUrl, $copy, $ApiVersion) -NoWait -Confirm:$false
+    }
+    $waited = Format-DemoProgressDuration -Seconds ([long]$WaitedSeconds)
+    if ($listed.Count -ge $Limit) {
+        throw ('{0}: Azure still lists {1} after {2}, and the VM already has {3} Run Commands ({4} being deleted), close to Azure''s limit of 25, so it didn''t run under a fresh name either. That''s Azure-side: Azure deletes them on its own, and the next try checks again.' -f $VmName, $RunCommandName, $waited, $listed.Count, $deleting)
+    }
+    $fresh = Get-DemoRunCommandFreshName -Name $RunCommandName -NowUtc $NowUtc
+    $script:DemoRunCommandStuck.Add([pscustomobject]@{ VmName = $VmName; Name = $RunCommandName; FreshName = $fresh; AtUtc = $NowUtc.ToUniversalTime(); WaitedSeconds = $WaitedSeconds; Listed = $listed.Count; Deleting = $deleting })
+    Write-DemoLog -Level Warning -Message ('{0}: Azure still lists {1} after {2} (its delete hasn''t finished, or Azure ended it with an internal error and keeps the name until another delete), so it runs as {3} instead of waiting. Nothing to do: Azure deletes the stuck one on its own (DEPLOY.RUNCOMMAND.STUCK_{4}).' -f $VmName, $RunCommandName, $waited, $fresh, $VmName.ToUpperInvariant())
+    return $fresh
+}
+
+function Get-DemoRunCommandStuckResult {
+    <#
+    .SYNOPSIS
+    DEPLOY.RUNCOMMAND.STUCK_<VM>: a Warning for each VM where a Run Command ran under a fresh name in this process, because
+    Azure kept its own name in Deleting (Resolve-DemoRunCommandFreshName; 2026-11-13 live finding), for the status page and
+    DONE or NOT DONE (Get-DemoRunCommandStuckNote). -Clear takes what it returns off the record, so each is reported once;
+    -VmName reads one VM's. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [string] $VmName = '',
+
+        [switch] $Clear
+    )
+
+    $items = @($script:DemoRunCommandStuck | Where-Object { -not $VmName -or [string]$_.VmName -eq $VmName })
+    if ($Clear) {
+        foreach ($item in $items) {
+            $null = $script:DemoRunCommandStuck.Remove($item)
+        }
+    }
+    $results = foreach ($group in @($items | Group-Object -Property VmName)) {
+        $vm = [string]$group.Name
+        $names = @($group.Group | ForEach-Object { [string]$_.Name } | Select-Object -Unique)
+        $fresh = @($group.Group | ForEach-Object { [string]$_.FreshName })
+        $waited = [long](@($group.Group | ForEach-Object { [long]$_.WaitedSeconds }) | Measure-Object -Maximum).Maximum
+        $message = 'Azure kept {0} on {1} in Deleting for more than {2}, so {3} Run Command run(s) used a fresh name instead of waiting (the last: {4}). That''s Azure-side: Azure ends some Run Command deletes with an internal error (InternalExecutionError) and keeps the name until a later delete succeeds.' -f ($names -join ', '), $vm, (Format-DemoProgressDuration -Seconds $waited), $fresh.Count, $fresh[-1]
+        New-DemoResult -CheckId ('DEPLOY.RUNCOMMAND.STUCK_{0}' -f $vm.ToUpperInvariant()) -Area 'infra' -Target (Get-DemoVmTarget -VmName $vm) -Status 'Warning' -Message $message -Evidence ([ordered]@{ vmName = $vm; stuck = $names; freshNames = $fresh; waitedSeconds = $waited }) -Remediation 'Nothing to do: the run went on, and Azure deletes the stuck ones on its own. ./scripts/status.ps1 lists any that stay (STATUS.RUNCOMMANDS), with the command that deletes them; if it happens on every run, see docs/troubleshooting.md (Run Commands stuck in Deleting).' -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
+    }
+    return @($results)
+}
+
+function Get-DemoRunCommandStuckNote {
+    # What DONE and NOT DONE say when Run Commands ran under fresh names because Azure kept their own in Deleting
+    # (DEPLOY.RUNCOMMAND.STUCK_<VM>; 2026-11-13 live finding), or ''. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $stuck = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -like 'DEPLOY.RUNCOMMAND.STUCK_*' })
+    if ($stuck.Count -eq 0) {
+        return ''
+    }
+    $vms = [System.Collections.Generic.List[string]]::new()
+    $runs = 0
+    foreach ($item in $stuck) {
+        $evidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
+        $vm = [string](Get-DemoMemberValue -InputObject $evidence -Name 'vmName')
+        if ($vm -and -not $vms.Contains($vm)) {
+            $vms.Add($vm)
+        }
+        # Assigned first: Get-DemoMemberValue returns an array as one object.
+        $fresh = Get-DemoMemberValue -InputObject $evidence -Name 'freshNames'
+        $runs += @($fresh | Where-Object { $_ }).Count
+    }
+    return ('Azure kept Run Command names on {0} in Deleting, so {1} Run Command run(s) used a fresh name instead of waiting (DEPLOY.RUNCOMMAND.STUCK): nothing to do, Azure deletes the stuck ones on its own, and ./scripts/status.ps1 lists any that stay.' -f ($vms -join ' and '), $runs)
+}
+
 function Clear-DemoChunkRunCommand {
     # Deletes every DbHubDemo-Chunk-* Run Command left on a VM, for example by an interrupted run, without waiting for
     # Azure to finish each delete. Returns the names it asked Azure to delete. Internal.

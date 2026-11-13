@@ -1325,7 +1325,8 @@ function Get-DemoDeploymentOutcome {
     The one ending of a deploy.ps1 run (brief item 1): Kind Done, NotDone, or WhatIf, with Reason, Next (the single next
     action), NextCommand (the exact command), Notes (what DONE states plainly: T4 off and why, T4 on the General Purpose
     fallback with its hourly price from -T4HourlyUsd, "created" only when -T4Created or this run's evidence shows the
-    server, a nightly safety stop this run set up only in part (Get-DemoSafetyStopNote, ADR 0024), Developer mode's T2),
+    server, a nightly safety stop this run set up only in part (Get-DemoSafetyStopNote, ADR 0024), Run Commands that ran
+    under a fresh name because Azure kept their own in Deleting (Get-DemoRunCommandStuckNote), Developer mode's T2),
     NonBlocking (what didn't work but never blocks DONE, such as the Insights app; Get-DemoNonBlockingItem), Unfinished
     (tracks that didn't finish), Missing (DONE requirements without a Pass), and ExitCode: 0 when DONE, 1 when NOT DONE
     with a Fail, 2 when NOT DONE otherwise; -WhatIfRun is 0 unless a check failed. Pure. Internal.
@@ -1437,6 +1438,11 @@ function Get-DemoDeploymentOutcome {
     $controlNote = Get-DemoActivityControlRunbookNote -Result $all
     if ($controlNote) {
         $notes.Add($controlNote)
+    }
+    # Run Commands that ran under a fresh name because Azure kept their own in Deleting (2026-11-13 live finding).
+    $stuckNote = Get-DemoRunCommandStuckNote -Result $all
+    if ($stuckNote) {
+        $notes.Add($stuckNote)
     }
     if ($installMode -eq 'Developer') {
         $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default) or ProductKey mode gives them.')

@@ -26,6 +26,10 @@ $script:DemoAzGuardActive = $false
 # Phase 28: the VMs deploy.ps1's watchdog restarted in this process (Restart-DemoVmOnce restarts each at most once).
 $script:DemoVmRestarted = @{}
 
+# 2026-11-13 live finding: the Run Command names Azure kept in Deleting in this process, so Invoke-DemoVmRunCommand used a
+# fresh name instead (Resolve-DemoRunCommandFreshName); deploy.ps1's tracks report them (Get-DemoRunCommandStuckResult).
+$script:DemoRunCommandStuck = [System.Collections.Generic.List[object]]::new()
+
 # Review fix (Phase 28): the golden guest action (the Release) running on the T2 host in this process, keyed
 # '<resource group>/archost01' (Invoke-DemoGoldenGuestAction). The watchdog never restarts the host meanwhile.
 $script:DemoHostAction = @{}

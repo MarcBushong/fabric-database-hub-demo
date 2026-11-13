@@ -417,6 +417,18 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         @($outcome.NonBlocking).Count | Should -Be 0
     }
 
+    It 'stays DONE and says so when Run Commands ran under a fresh name because Azure kept their own in Deleting (2026-11-13 live finding)' {
+        $config = New-TestConfig -WithT4
+        $stuck = @(InModuleScope DbHubDemo {
+                $script:DemoRunCommandStuck.Clear()
+                $script:DemoRunCommandStuck.Add([pscustomobject]@{ VmName = 'archost01'; Name = 'DbHubDemo-HealthRead'; FreshName = 'DbHubDemo-HealthRead-20261113213000'; AtUtc = [datetime]::UtcNow; WaitedSeconds = 300; Listed = 12; Deleting = 1 })
+                Get-DemoRunCommandStuckResult -Clear
+            })
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult -WithT4) + $stuck); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done' -Because 'a stuck name held nothing up'
+        ($outcome.Notes -join ' ') | Should -Match 'Azure kept Run Command names on archost01 in Deleting, so 1 Run Command run\(s\) used a fresh name instead of waiting \(DEPLOY\.RUNCOMMAND\.STUCK\): nothing to do'
+    }
+
     It 'is NOT DONE when Azure refused every T4 size, with why and the fix, never DONE without T4 (2026-11-09)' {
         $config = New-TestConfig -WithoutT4
         $refusal = InModuleScope DbHubDemo { New-DemoT4FallbackResult -Refused $null -Next 'Refused' }

@@ -1399,7 +1399,12 @@ function Invoke-DemoDeploymentTrack {
                             $outcome = 'Open'
                             break
                         }
-                        Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Done' -Status 'Pass' -Message $(if ([bool](Get-DemoMemberValue -InputObject $build -Name 'Rebuilt')) { 'The host made T2 again from Arc Jumpstart''s image (DEPLOY.T2.REBUILD says why).' } else { 'The host and its guest are built.' })
+                        # 2026-11-13 live finding: health reads that ran under a fresh name, because Azure kept their own in
+                        # Deleting, make this row a Warning that says so.
+                        $hostStuck = @(Get-DemoRunCommandStuckResult -Clear)
+                        & $addAll $hostStuck
+                        $builtText = if ([bool](Get-DemoMemberValue -InputObject $build -Name 'Rebuilt')) { 'The host made T2 again from Arc Jumpstart''s image (DEPLOY.T2.REBUILD says why).' } else { 'The host and its guest are built.' }
+                        Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Done' -Status $(if ($hostStuck.Count -gt 0) { 'Warning' } else { 'Pass' }) -Message $(if ($hostStuck.Count -gt 0) { '{0} {1}' -f $builtText, [string]$hostStuck[0].message } else { $builtText })
                         # 2026-11-09: a host that kept its existing finished guest in its own mode says so, and its setup is
                         # done; no guest waits for a person (the guided stop is retired).
                         if ([bool](Get-DemoMemberValue -InputObject $build.Health -Name 'modeAdopted')) {
@@ -1440,9 +1445,12 @@ function Invoke-DemoDeploymentTrack {
                         }
                     }
                     & $addAll $arc
+                    # Its Run Commands that ran under a fresh name (2026-11-13 live finding) show on the onboarding's row.
+                    $arcStuck = @(Get-DemoRunCommandStuckResult -Clear)
+                    & $addAll $arcStuck
                     $onboarding = @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.ONBOARDING', 'T2.ARC.CONNECTED' })
                     if ($onboarding.Count -gt 0) {
-                        & $partDone 'T2.ArcOnboarding' $onboarding
+                        & $partDone 'T2.ArcOnboarding' @($onboarding + $arcStuck)
                     }
                     if (& $hasStatus $arc 'Fail') {
                         $outcome = 'Fail'
@@ -1610,6 +1618,9 @@ function Invoke-DemoDeploymentTrack {
                 & $note 'DEPLOY.T2.GUIDEDLEFTOVER' 'T2' 'Warning' ('What an earlier guided stop left open couldn''t be checked: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly: it removes Bastion and rotates the host password, and leaves the VMs running.'
             }
         }
+        # 2026-11-13 live finding: Run Commands that ran under a fresh name during this step, because Azure kept their own name
+        # in Deleting, are a Warning on the step's row and in DONE or NOT DONE (DEPLOY.RUNCOMMAND.STUCK_<VM>).
+        & $addAll @(Get-DemoRunCommandStuckResult -Clear)
         $timing[$name] = [int]$watch.Elapsed.TotalSeconds
         if (-not $ownProgress -and $stepIds.Count -gt 0) {
             $stepResults = @($results | Select-Object -Skip $resultsBefore)

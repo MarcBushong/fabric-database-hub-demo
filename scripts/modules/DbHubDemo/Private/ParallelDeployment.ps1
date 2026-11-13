@@ -1244,6 +1244,8 @@ function Invoke-DemoParallelDeployment {
     if ($plan.Validation) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
     }
+    # 2026-11-13 live finding: this process's own Run Commands that ran under a fresh name (the tracks report theirs).
+    & $addAll @(Get-DemoRunCommandStuckResult -Clear)
 
     $all = $results.ToArray()
     # 2026-11-09: T4 out of this deployment is never silent (DEPLOY.T4.OFF): a Fail, because DONE needs T4, with the reason

@@ -1403,6 +1403,24 @@ Describe 'T4''s row on the status page says an automatic size change (2026-11-09
         $row['status'] | Should -Be 'Warning'
         $row['message'] | Should -Be $Notice -Because 'T4''s row keeps the whole notice, with both estimates'
     }
+
+    It 'shows a step''s Run Commands that ran under a fresh name on its row as a Warning, once (2026-11-13 live finding)' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4 -MockWith {
+            & (Get-Module -Name DbHubDemo) { $script:DemoRunCommandStuck.Add([pscustomobject]@{ VmName = 'sqlvm01'; Name = 'DbHubDemo-HealthRead'; FreshName = 'DbHubDemo-HealthRead-20261113213000'; AtUtc = [datetime]::UtcNow; WaitedSeconds = 300; Listed = 3; Deleting = 1 }) }
+            New-TestResult 'T4.SERVER'
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { param($Path) $script:DemoRunCommandStuck.Clear(); Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -T4Enabled)) -Confirm:$false }
+        $context = @{ NetworkMode = 'private'; T3UseFreeLimit = $true; T2Source = 'golden'; ConfigPath = ''; NoState = $false; ProgressPath = $progress }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -WithT4); Context = $context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T4' -Context $Context -Step @('Server') }
+        $outcome.Status | Should -Be 'Pass' -Because 'a fresh name held nothing up'
+        @($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.RUNCOMMAND.STUCK_SQLVM01' }).Count | Should -Be 1
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $row = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'T4.Server') { $item } } })[0]
+        $row['status'] | Should -Be 'Warning'
+        $row['message'] | Should -Match 'Azure kept DbHubDemo-HealthRead on sqlvm01 in Deleting'
+        @(InModuleScope DbHubDemo { Get-DemoRunCommandStuckResult }).Count | Should -Be 0 -Because 'the step reported it, so nothing reports it again'
+    }
 }
 Describe 'Invoke-DemoParallelDeployment' {
     BeforeEach {

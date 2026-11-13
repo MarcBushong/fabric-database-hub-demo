@@ -430,6 +430,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R829 | `demo-day`'s session estimate goes over the $15 session ceiling by the replica's share ($16.56 at the list prices of 2026-11-13) | **Accepted** (the owner kept $15): `PREFLIGHT.COST.SESSION` is a **Warning** that names the share and `-SkipT4Replica`, and T4's one-time move to `Standard_D4ds_v5` is decided without the share |
 | R830 | `deploy.ps1` republishes the on-demand control's runbooks only when the deployer can write to its Automation account; until then the control runs older code, which can't start T4 while a replica a session left is stopped | **Mitigated:** `CONTROL.RUNBOOKS` is a **Warning** on the console, the status page, and **DONE**, with what fails until then and the exact command |
 | R831 | Creating or deleting the replica puts T4 in Updating for minutes (live: about 8 to create), which blocks T4's management operations, not its connections | **Accepted:** the scripts order their own T4 operations around it: the template and T4's restart come before the replica, and a size change deletes the replica first |
+| R832 | Azure keeps a Run Command name marked for deletion after it ends the delete with `InternalExecutionError` (live on the T2 host, 2026-11-13: 27 of 29 deletes after 6 to 11 minutes), and fresh names pile up on a VM where every delete fails, toward Azure's limit of 25 managed Run Commands | **Mitigated:** a name still listed after the 5-minute leftover wait runs under `<name>-yyyyMMddHHmmss`, earlier fresh copies get a delete without waiting, and with 20 or more Run Commands listed there's no fresh one; the step then reports a Run Command that couldn't be created, and `DEPLOY.RUNCOMMAND.STUCK_<VM>` says what happened |
 
 ## Phase log
 
@@ -2373,3 +2374,26 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
 **Validation.** See the pull request's description for the exact commands and results. **Live:** the probe above; the upgrade and new-user deployments are [still to verify](#still-to-verify) at this point.
 
 **Risks.** R824 to R831 new.
+
+### A Run Command name stuck in Deleting (live finding, 2026-11-13)
+
+**Why.** Coordinator direction, 2026-11-13: fix it on this branch, in its own commit, although `main` has it too, because it held both live tests and would hold a new user's first deployment for hours. The requirements: a name stuck in Deleting never holds a run for more than about 15 minutes; the console, the status page, and **DONE** or **NOT DONE** say what happened, with the fix; no new manual step; a test; new and upgrading users both work.
+
+**Root cause, from about 4 hours of `archost01`'s activity log on both test environments:**
+
+- On the new host, Azure ended 27 of 29 real Run Command deletes with `InternalExecutionError` ("An internal execution error occurred. Please retry later.") after 343 to 676 seconds; 2 succeeded, after 386 and 429. Creates ended the same way after 344 to 661 seconds, though their scripts had finished within a minute. The upgrade host's log has the same pattern.
+- A name whose delete failed stays marked for deletion: a PUT of it fails with `OperationNotAllowed` ("You can only retry the Delete operation"). `Invoke-DemoVmRunCommand` reused the name: it deleted it, waited 5 minutes, created it into that conflict, and waited 3 more minutes to delete it again. So each of T2's health reads took 8 minutes and failed, and `main`'s own run on the upgrade environment looped on them for 3 hours.
+- Not the host's CPU (4 to 18% on average) or its own network setup (it blocks Azure's platform addresses only for the guest's switch port). `sqlvm01` doesn't show it. Azure takes 6 to 11 minutes to confirm each extension operation on the T2 host and mostly gives up, so a second delete sent within that window would only preempt the first. A new name ran at once.
+
+**Work summary.**
+
+1. **A fresh name** (`Resolve-DemoRunCommandFreshName`): when Azure still lists the name after the leftover wait (`-LeftoverWaitSeconds`, 300 by default), the script runs as `<name>-yyyyMMddHHmmss`. One read of the VM's Run Commands comes first: earlier fresh copies of the name get a delete without waiting, and with 20 or more listed, every state counting (Azure allows 25 and doesn't say whether one being deleted counts), there's no fresh one, and it throws as a Run Command that couldn't be created. A call that created nothing sends the delete again, without a second wait. The result has `UsedName`.
+2. **What it says:** a **Warning** line on the console at once; `DEPLOY.RUNCOMMAND.STUCK_<VM>` (`Get-DemoRunCommandStuckResult`), a **Warning** on the row of the step where it happened (T2's host build and Arc onboarding rows included, and the host-build row while it lasts), reported once; and a note in **DONE** and **NOT DONE** (`Get-DemoRunCommandStuckNote`), which the status page's banner shows too.
+
+**Changed files.** `scripts/modules/DbHubDemo/DbHubDemo.psm1`, `Public/Invoke-DemoVmRunCommand.ps1`, and in `Private/`: `RunCommandHelpers.ps1`, `TrackHelpers.ps1`, `ParallelDeployment.ps1`, `DeployExperience.ps1`, and `GuidedStopHelpers.ps1`; the tests in `tests/unit/DbHubDemo.Arc.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.OneCommand.Tests.ps1`; `docs/troubleshooting.md`, `CHANGELOG.md`, and this report.
+
+**Validation.** `Invoke-Pester` on the Arc, OneCommand, and Tracks tests: 344 passed. On `main`'s module (3881ea1, in a separate worktree), both new Arc tests fail: it keeps no record of a stuck name and has no fresh name. Live, `main` creates the stuck name again and fails with `OperationNotAllowed` (the new-user run's log, above). PSScriptAnalyzer on the changed files: no findings.
+
+**Not this fix:** the upgrade host's VM agent stopped reporting after its 2026-11-13 start ("VM status blob is found but not yet populated"); the start ended `VMStartTimedOut` after 71 minutes, and the watchdog's restart stayed pending for over an hour. No Run Command runs on a VM in that state, under any name. It goes to the owner as a separate finding.
+
+**Risks.** R832 new.
