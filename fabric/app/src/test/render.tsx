@@ -44,6 +44,20 @@ const bins = (target: "T1" | "T2" | "T3" | null, hours: number, base: number): R
         };
     });
 
+/** T4's latest PostgreSQL capture (ADR 0025): five-minute points from 17:00 UTC, as the postgres-series query returns them. */
+const postgresPoints = (target: "T4" | "T4-replica", metric: string, values: number[]): Row[] =>
+    values.map((value, i) => ({
+        Bucket: new Date(Date.UTC(2026, 10, 13, 17, i * 5)).toISOString().slice(0, 19),
+        TargetKey: target,
+        ResourceName: target === "T4" ? "pgflex01-test01" : "pgreplica01-test01",
+        Metric: metric,
+        Value: value,
+        Unit: "",
+        WindowStart: "2026-11-13T17:00:00",
+        WindowEnd: "2026-11-13T18:02:00",
+        CapturedAt: "2026-11-13T18:06:00",
+    }));
+
 export const FIXTURES: Record<string, Row[]> = {
     "history-meta": [
         { LatestCapture: "2026-10-21T20:30:00", LatestDay: "2026-10-21T00:00:00", EarliestDay: "2026-10-20T00:00:00", HoursSince: 2, Freshness: "Pass", NotebookRuns: 3, ScenarioRequests: 0, Incidents: 2, HasBins: 1 },
@@ -94,6 +108,45 @@ export const FIXTURES: Record<string, Row[]> = {
         { TargetKey: "T3", ResourceType: null, ResourceName: null, InstanceName: "azuresql01-test01", DatabaseName: null },
         { TargetKey: "T3", ResourceType: "servers/databases", ResourceName: "azuresql01-test01/ContosoCare", InstanceName: null, DatabaseName: null },
         { TargetKey: "T3", ResourceType: null, ResourceName: "azuresql01-test01/ContosoCare", InstanceName: "azuresql01-test01", DatabaseName: "ContosoCare" },
+    ],
+    "postgres-series": [
+        ...postgresPoints("T4-replica", "physical_replication_delay_in_seconds", [6, 241.4, 2]),
+        ...postgresPoints("T4", "cpu_percent", [43.3, 91.3, 50]),
+        ...postgresPoints("T4-replica", "cpu_percent", [10.3]),
+        ...postgresPoints("T4", "memory_percent", [30.2]),
+        ...postgresPoints("T4", "active_connections", [12, 34]),
+        ...postgresPoints("T4-replica", "active_connections", [1]),
+        ...postgresPoints("T4", "connections_failed", [0, 3, 1]),
+        ...postgresPoints("T4", "physical_replication_delay_in_bytes", [184]),
+    ],
+    "postgres-findings": [
+        {
+            FindingId: "postgresql.T4.capture",
+            TargetKey: "T4",
+            Status: "Pass",
+            StatusSort: 4,
+            Finding: "Azure Monitor metrics of T4 pgflex01-test01 (Standard_D4ds_v5) and its read replica pgreplica01-test01 (Standard_D4ds_v5) from 2026-11-13 17:00 to 2026-11-13 18:02 UTC, every 5 minutes: 8 series, 15 points.",
+            Evidence: '{"intervalMinutes": 5, "servers": [{"resourceName": "pgflex01-test01", "role": "primary", "sku": "Standard_D4ds_v5", "target": "T4"}, {"resourceName": "pgreplica01-test01", "role": "replica", "sku": "Standard_D4ds_v5", "target": "T4-replica"}]}',
+            CapturedAt: "2026-11-13T18:06:00",
+        },
+        {
+            FindingId: "postgresql.T4-replica.lag",
+            TargetKey: "T4-replica",
+            Status: "Warning",
+            StatusSort: 3,
+            Finding: "Read replica lag on pgreplica01-test01 peaked at 241.4 s at 2026-11-13 17:05 UTC (a Warning at 60 s or more).",
+            Evidence: '{"peakSeconds": 241.4, "thresholdSeconds": 60}',
+            CapturedAt: "2026-11-13T18:06:00",
+        },
+        {
+            FindingId: "postgresql.T4.connections_failed",
+            TargetKey: "T4",
+            Status: "Warning",
+            StatusSort: 3,
+            Finding: "Failed connections on T4 (pgflex01-test01): 4 from 2026-11-13 17:00 to 2026-11-13 17:15 UTC, at most 3 in one 5-minute interval (at 2026-11-13 17:05 UTC).",
+            Evidence: '{"total": 4}',
+            CapturedAt: "2026-11-13T18:06:00",
+        },
     ],
 };
 

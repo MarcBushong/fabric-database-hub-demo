@@ -16,6 +16,7 @@ import { applyTheme, loadTheme, saveTheme, THEME_ORDER, THEMES, type ThemeId } f
 
 const EstatePage = lazy(() => import("./pages/EstatePage"));
 const IncidentsPage = lazy(() => import("./pages/IncidentsPage"));
+const PostgresPage = lazy(() => import("./pages/PostgresPage"));
 const ReadinessPage = lazy(() => import("./pages/ReadinessPage"));
 const LinksPage = lazy(() => import("./pages/LinksPage"));
 
@@ -96,7 +97,7 @@ export default function App({ runtime }: { runtime: AppRuntime }) {
         if (next.length > 0) setView({ targets: next, replay: null });
     };
 
-    const Page = { estate: EstatePage, incidents: IncidentsPage, readiness: ReadinessPage, links: LinksPage }[view.page];
+    const Page = { estate: EstatePage, incidents: IncidentsPage, postgres: PostgresPage, readiness: ReadinessPage, links: LinksPage }[view.page];
     const email = session?.user?.email && session.user.email !== "unknown" ? session.user.email : null;
     const wrongAccount = Boolean(runtime.expectedAccount && email && email.toLowerCase() !== runtime.expectedAccount.toLowerCase());
 
@@ -152,7 +153,8 @@ export default function App({ runtime }: { runtime: AppRuntime }) {
                     </p>
                 ) : null}
 
-                {view.page !== "links" ? (
+                {/* The SQL targets and the period don't apply to T4's page, which shows the latest PostgreSQL capture. */}
+                {view.page !== "links" && view.page !== "postgres" ? (
                     <section className="filterbar glass" aria-label="Filters">
                         <span className="label">Targets</span>
                         {SQL_TARGETS.map((t) => (

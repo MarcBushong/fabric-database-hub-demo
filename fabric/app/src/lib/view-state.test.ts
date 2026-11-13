@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_VIEW, isEmbedded, loadSavedView, mergeView, parseHash, saveView, toHash, windowRange } from "./view-state";
+import { DEFAULT_VIEW, isEmbedded, loadSavedView, mergeView, PAGES, parseHash, saveView, toHash, windowRange } from "./view-state";
 
 describe("view state", () => {
     it("round-trips every option through the hash", () => {
@@ -12,6 +12,12 @@ describe("view state", () => {
 
     it("writes only what differs from the defaults", () => {
         expect(toHash(DEFAULT_VIEW)).toBe("#/estate");
+    });
+
+    it("has a page for T4, the PostgreSQL server, after Incidents (ADR 0025)", () => {
+        expect(PAGES.map((p) => p.id)).toEqual(["estate", "incidents", "postgres", "readiness", "links"]);
+        expect(parseHash("#/postgres")).toEqual({ page: "postgres" });
+        expect(toHash(mergeView({ page: "postgres" }))).toBe("#/postgres");
     });
 
     it("drops unknown or unsafe values", () => {

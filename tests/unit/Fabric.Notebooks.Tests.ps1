@@ -725,6 +725,177 @@ print(json.dumps({"threshold": threshold, "minBins": min_bins, "before": episode
         $t2[0]['end'] | Should -Be ([datetime]::new(2026, 10, 23, 20, 29, 0))
         ($result['after']['T3'] | ConvertTo-Json -Compress) | Should -Be ($result['before']['T3'] | ConvertTo-Json -Compress) -Because 'T3 stays on AvgCPUPercent'
     }
+
+    It 'adds T4''s Azure Monitor metrics only from POSTGRES_METRICS, empty by default, before the persist cell, without a network call (ADR 0025)' {
+        $parameters = @($nb.Code | Where-Object { @($_.Metadata['tags']) -contains 'parameters' })[0].Source
+        $parameters | Should -Match '(?m)^POSTGRES_METRICS = ""$'
+        $nb.Code[1].Source | Should -Match '(?m)^POSTGRES_METRICS = str\(POSTGRES_METRICS or ""\)\.strip\(\)$'
+        $t4 = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# T4 \(PostgreSQL\):' })
+        $persist = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# Persist:' })
+        $t4 | Should -BeGreaterThan 0
+        $t4 | Should -BeLessThan $persist -Because 'the persist cell saves the rows it adds, with everything else'
+        $nb.Code[$t4].Source | Should -Match '(?m)^    POSTGRES_CAPTURE = record_postgres_metrics\(POSTGRES_METRICS\)$'
+        $markdown | Should -Match '(?m)^### T4: PostgreSQL and its read replica \(Azure Monitor\)$'
+        $allCode | Should -Match 'POSTGRES_TARGETS = \{"primary": "T4", "replica": "T4-replica"\}'
+        $allCode | Should -Match '(?m)^POSTGRES_ANALYSIS = "postgresql"$'
+        foreach ($name in 'parse_postgres_metrics', 'postgres_snapshot_rows', 'postgres_findings', 'record_postgres_metrics', 'postgres_series_frame') {
+            $body = [regex]::Match($allCode, "(?ms)^def $name\(.*?(?=^\S)").Value
+            $body | Should -Not -BeNullOrEmpty -Because $name
+            $body | Should -Not -Match 'https://|requests\.|get_token|getSecret|write_delta|_spark\(' -Because $name
+        }
+    }
+
+    It 'turns the document Get-DemoPostgresHistoryParameter writes into postgresql rows and findings, and says so in one line without one (ADR 0025)' {
+        # Get-DemoPostgresHistoryParameter's own JSON, from a fake Azure CLI, goes through the notebook's helpers and its T4
+        # cell. Needs Python 3 with pandas: set DBHUB_TEST_PYTHON to its python.
+        $interpreter = $pandasPython
+        $PSNativeCommandUseErrorActionPreference = $false
+        if (-not $interpreter) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $null = & $interpreter -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        # Five-minute values from 17:00 UTC; the 18:00 interval has no value yet.
+        $script:pgPoints = @{
+            'pgflex01-abc123'    = @{ cpu_percent = @(43.27, 91.26, 50); memory_percent = @(30.15); active_connections = @(12, 34); physical_replication_delay_in_bytes = @(184); connections_failed = @(0, 3, 1) }
+            'pgreplica01-abc123' = @{ physical_replication_delay_in_seconds = @(6, 241.37, 2); cpu_percent = @(10.26); active_connections = @(1) }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $text = @($ArgumentList) -join ' '
+            if ($text -match 'flexibleServers/(pg\w+-abc123)/providers/Microsoft\.Insights/metrics') {
+                $server = $Matches[1]
+                $index = [array]::IndexOf([string[]]@($ArgumentList), '--url-parameters')
+                $query = Get-Content -LiteralPath ([string]$ArgumentList[$index + 1]).Substring(1) -Raw | ConvertFrom-Json -AsHashtable
+                $field = ([string]$query['aggregation']).ToLowerInvariant()
+                $units = @{ cpu_percent = 'Percent'; memory_percent = 'Percent'; physical_replication_delay_in_seconds = 'Seconds'; physical_replication_delay_in_bytes = 'Bytes' }
+                $metrics = foreach ($name in ([string]$query['metricnames']).Split(',')) {
+                    $values = @($script:pgPoints[$server][$name])
+                    $data = @(for ($i = 0; $i -lt $values.Count; $i++) { [ordered]@{ timeStamp = ('2026-11-13T17:{0:00}:00Z' -f ($i * 5)); $field = $values[$i] } }) + @([ordered]@{ timeStamp = '2026-11-13T18:00:00Z' })
+                    @{ name = @{ value = $name }; unit = $(if ($units.ContainsKey($name)) { $units[$name] } else { 'Count' }); timeseries = @(@{ data = $data }) }
+                }
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (ConvertTo-Json -InputObject @{ value = @($metrics) } -Depth 10 -Compress); StdErr = '' }
+            }
+            if ($text -match 'flexibleServers/(pg\w+-abc123)\?') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (ConvertTo-Json -InputObject @{ name = $Matches[1]; sku = @{ name = 'Standard_D4ds_v5' } } -Compress); StdErr = '' }
+            }
+            throw "unexpected Azure CLI call: $text"
+        }
+        $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
+        # An obviously fake ID: every group repeats one character.
+        $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
+        $capture = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoPostgresHistoryParameter -Config $Config -DeploymentId 'abc123' -WindowMinutes 60 -NowUtc ([datetime]::new(2026, 11, 13, 18, 2, 37, [System.DateTimeKind]::Utc)) }
+        $capture.Status | Should -Be 'Pass'
+        $capture.PointCount | Should -Be 15
+        $documentPath = Join-Path -Path $TestDrive -ChildPath 'postgres-metrics.json'
+        Set-Content -LiteralPath $documentPath -Value $capture.Json -Encoding utf8NoBOM -NoNewline
+        $script = Join-Path -Path $TestDrive -ChildPath 'postgres.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, sys, types
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+document = open(sys.argv[2], encoding="utf-8").read()
+parameters = next(cell for cell in cells if cell.startswith("# Parameters cell"))
+t4_cell = next(cell for cell in cells if cell.startswith("# T4 (PostgreSQL):"))
+
+def t4(ns):
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        exec(compile(t4_cell, "t4", "exec"), ns)
+    return printed.getvalue()
+
+def run(metrics):
+    ns = {}
+    exec(parameters, ns)
+    ns["POSTGRES_METRICS"] = metrics
+    with contextlib.redirect_stdout(io.StringIO()):
+        for index, cell in enumerate(cells):
+            if cell.startswith("# Helpers, part"):
+                exec(compile(cell, "cell-%d" % index, "exec"), ns)
+    return ns, t4(ns)
+
+def summary(ns, printed):
+    text = lambda value: value.strftime("%Y-%m-%d %H:%M")
+    rows = [row for row in ns["SNAPSHOT_ROWS"] if row["analysis"] == "postgresql"]
+    return {
+        "printed": printed.strip().splitlines(),
+        "rows": [{"target": row["target"], "resource": row["resource_name"], "type": row["resource_type"], "metric": row["metric"],
+                  "bucket": text(row["bucket_utc"]), "value": row["value"], "unit": row["unit"], "windowStart": text(row["window_start_utc"]),
+                  "windowEnd": text(row["window_end_utc"]), "reportDate": str(ns["report_date"]("telemetry_snapshots", row))} for row in rows],
+        "findings": {item["finding_id"]: {"status": item["status"], "finding": item["finding"], "target": item["target"],
+                                          "reportDate": str(ns["report_date"]("analysis_findings", item))}
+                     for item in ns["FINDINGS"] if item["analysis"] == "postgresql"},
+    }
+
+full, printed = run(document)
+again = t4(full)
+partial = json.loads(document)
+partial["servers"] = [server for server in partial["servers"] if server["role"] == "primary"]
+partial["series"] = [series for series in partial["series"] if series["role"] == "primary"]
+print(json.dumps({
+    "full": summary(full, printed),
+    "again": summary(full, again),
+    "primaryOnly": summary(*run(json.dumps(partial))),
+    "invalid": summary(*run('{"version": 2, "servers": [], "series": []}')),
+    "empty": summary(*run("")),
+}))
+'@
+        $output = & $interpreter $script $nb.Path $documentPath 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $result = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+
+        $full = $result['full']
+        $full['rows'].Count | Should -Be 15 -Because 'one row per point the collector kept'
+        @($full['rows'] | ForEach-Object { $_['target'] } | Sort-Object -Unique) | Should -Be @('T4', 'T4-replica')
+        @($full['rows'] | ForEach-Object { $_['type'] } | Sort-Object -Unique) | Should -Be @('flexibleServers')
+        $lag = @($full['rows'] | Where-Object { $_['metric'] -eq 'physical_replication_delay_in_seconds' })
+        @($lag | ForEach-Object { '{0}={1}' -f $_['bucket'], [string]$_['value'] }) | Should -Be @('2026-11-13 17:00=6', '2026-11-13 17:05=241.4', '2026-11-13 17:10=2')
+        $lag[0]['target'] | Should -Be 'T4-replica'
+        $lag[0]['resource'] | Should -Be 'pgreplica01-abc123'
+        $lag[0]['unit'] | Should -Be 'seconds'
+        $lag[0]['windowStart'] | Should -Be '2026-11-13 17:00'
+        $lag[0]['windowEnd'] | Should -Be '2026-11-13 18:02'
+        $lag[0]['reportDate'] | Should -Be '2026-11-13'
+        @($full['rows'] | Where-Object { $_['metric'] -eq 'connections_failed' } | ForEach-Object { '{0}:{1}:{2}' -f $_['target'], $_['unit'], [string]$_['value'] }) | Should -Be @('T4:connections:0', 'T4:connections:3', 'T4:connections:1')
+        @($full['rows'] | Where-Object { $_['metric'] -eq 'cpu_percent' -and $_['target'] -eq 'T4' } | ForEach-Object { $_['value'] }) | Should -Be @(43.3, 91.3, 50)
+        $full['findings'].Count | Should -Be 4
+        foreach ($id in 'postgresql.T4.capture', 'postgresql.T4-replica.lag', 'postgresql.T4.cpu', 'postgresql.T4.connections_failed') {
+            $full['findings'].ContainsKey($id) | Should -BeTrue -Because $id
+        }
+        $full['findings']['postgresql.T4.capture']['status'] | Should -Be 'Pass'
+        $full['findings']['postgresql.T4.capture']['finding'] | Should -Match '^Azure Monitor metrics of T4 pgflex01-abc123 \(Standard_D4ds_v5\) and its read replica pgreplica01-abc123 \(Standard_D4ds_v5\) from 2026-11-13 17:00 to 2026-11-13 18:02 UTC, every 5 minutes: 8 series, 15 points\.$'
+        $full['findings']['postgresql.T4-replica.lag']['status'] | Should -Be 'Warning' -Because '241 seconds is over the 60-second threshold'
+        $full['findings']['postgresql.T4-replica.lag']['finding'] | Should -Be 'Read replica lag on pgreplica01-abc123 peaked at 241.4 s at 2026-11-13 17:05 UTC (a Warning at 60 s or more).'
+        $full['findings']['postgresql.T4.cpu']['status'] | Should -Be 'Warning'
+        $full['findings']['postgresql.T4.cpu']['finding'] | Should -Be 'T4''s CPU on pgflex01-abc123 peaked at 91.3% at 2026-11-13 17:05 UTC (a Warning at 80% or more).'
+        $full['findings']['postgresql.T4.connections_failed']['status'] | Should -Be 'Warning'
+        $full['findings']['postgresql.T4.connections_failed']['finding'] | Should -Match '^Failed connections on T4 \(pgflex01-abc123\): 4 from 2026-11-13 17:00 to 2026-11-13 17:15 UTC, at most 3 in one 5-minute interval'
+        $full['findings']['postgresql.T4.cpu']['reportDate'] | Should -Be '2026-11-13'
+        $full['printed'] | Should -Contain 'T4''s metrics from 2026-11-13 17:00 to 2026-11-13 18:02 UTC, every 5 minutes:'
+
+        # Running the cell again replaces its rows and findings instead of adding to them.
+        $result['again']['rows'].Count | Should -Be 15
+        $result['again']['findings'].Count | Should -Be 4
+
+        $primaryOnly = $result['primaryOnly']
+        @($primaryOnly['rows'] | Where-Object { $_['target'] -eq 'T4-replica' }).Count | Should -Be 0
+        $primaryOnly['findings']['postgresql.T4-replica.lag']['status'] | Should -Be 'Not selected'
+        $primaryOnly['findings']['postgresql.T4-replica.lag']['finding'] | Should -Match 'exists only during a session'
+        $primaryOnly['findings']['postgresql.T4.capture']['status'] | Should -Be 'Pass'
+
+        $result['invalid']['rows'].Count | Should -Be 0
+        @($result['invalid']['findings'].Keys) | Should -Be @('postgresql.T4.capture')
+        $result['invalid']['findings']['postgresql.T4.capture']['status'] | Should -Be 'Fail'
+        $result['invalid']['findings']['postgresql.T4.capture']['finding'] | Should -Be 'T4''s metrics in POSTGRES_METRICS weren''t added: it isn''t a version 1 document.'
+
+        $result['empty']['rows'].Count | Should -Be 0
+        $result['empty']['findings'].Count | Should -Be 0
+        @($result['empty']['printed']).Count | Should -Be 1
+        @($result['empty']['printed'])[0] | Should -Match '^T4''s PostgreSQL metrics weren''t passed in \(POSTGRES_METRICS is empty\), so this run adds none: \./scripts/stop-demo\.ps1 -SaveHistory and \./scripts/deploy\.ps1 pass them'
+    }
 }
 
 Describe 'Report tables for the Power BI history report (Phase 19)' {
@@ -850,8 +1021,8 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
 
     It 'knows every incident scenario in scenarios/ with its default target and expected signal' {
         $scenarioFolder = Join-Path -Path $repoRoot -ChildPath 'scenarios'
-        # T4-only scenarios (connection-surge, idle-in-transaction) have no history in the report: T4's metrics
-        # aren't in the telemetry endpoint, and its history export is a follow-up (Phase 24, ADR 0019).
+        # T4-only scenarios (connection-surge, idle-in-transaction, replica-lag) have no scenario windows here: T4's metrics
+        # aren't in the telemetry endpoint. Its history comes from POSTGRES_METRICS instead (ADR 0025).
         $scenarios = @(Get-ChildItem -LiteralPath $scenarioFolder -Directory | Where-Object {
                 $_.Name -ne 'healthy-baseline' -and @((Get-Content -LiteralPath (Join-Path -Path $_.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json).targets.applicable | Where-Object { $_ -ne 'T4' }).Count -gt 0
             })

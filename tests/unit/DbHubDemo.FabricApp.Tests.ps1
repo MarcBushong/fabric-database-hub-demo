@@ -618,13 +618,15 @@ Describe 'Test-DemoFabricApp' {
         $script:checkStage = Join-Path -Path $TestDrive -ChildPath ('check-' + [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $script:checkStage -Force
         # The row bound each payload carries (resultSetRowCountLimit), as the catalog sets it; a test can lower one.
-        $script:rowLimits = @{ 'connector-check' = 1; 'history-meta' = 1; 'estate-targets' = 50; 'replay-T3' = 500 }
+        $script:rowLimits = @{ 'connector-check' = 1; 'history-meta' = 1; 'estate-targets' = 50; 'replay-T3' = 500; 'postgres-series' = 500 }
+        # The queries the stage's index lists; a test can change them.
+        $script:queryIds = @('connector-check', 'history-meta', 'estate-targets', 'replay-T3')
         # npm run queries:export writes the payloads ({ query, resultSetRowCountLimit }) and their index into the stage.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppProcess -MockWith {
             $folder = Join-Path -Path $WorkingDirectory -ChildPath $ArgumentList[3]
             $null = New-Item -ItemType Directory -Path $folder -Force
             Set-TestDotItemHidden -Path (Split-Path -Path $folder -Parent)
-            $ids = @('connector-check', 'history-meta', 'estate-targets', 'replay-T3')
+            $ids = @($script:queryIds)
             foreach ($id in $ids) {
                 @{ query = ('EVALUATE /* {0} */ ROW("x", 1)' -f $id); resultSetRowCountLimit = $script:rowLimits[$id] } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path -Path $folder -ChildPath ($id + '.json')) -Encoding utf8NoBOM
             }
@@ -644,6 +646,7 @@ Describe 'Test-DemoFabricApp' {
             'history-meta'    = @([pscustomobject]@{ '[LatestDay]' = [datetime]::new(2026, 10, 21, 0, 0, 0, [System.DateTimeKind]::Unspecified) })
             'estate-targets'  = @([pscustomobject]@{ 'Target[Target Key]' = 'T1' }, [pscustomobject]@{ 'Target[Target Key]' = 'T3' })
             'replay-T3'       = @()
+            'postgres-series' = @()
         }
         $script:daxAnswer = { param([string] $Query) $id = [regex]::Match($Query, '/\* (\S+) \*/').Groups[1].Value; [pscustomobject]@{ StatusCode = 200; Rows = @($script:daxRows[$id]); Error = '' } }
     }
@@ -791,6 +794,21 @@ Describe 'Test-DemoFabricApp' {
             $browser.message | Should -Match '^Not needed: the app is deployed \(FABRIC\.APP\.DEPLOY\), and its hosting is protected: the hosted app refuses anonymous requests \(FABRIC\.APP\.HOSTING\); and every query it runs \(4\) ran on SM_DatabaseHub_History under your identity, and 3 returned data; the other one has no history for its window yet \(FABRIC\.APP\.QUERIES, through Power BI''s Execute Queries\)\. '
             $browser.message | Should -Match 'which none of these checks crosses\. To see it, open its item page \(https://app\.fabric\.microsoft\.com/groups/x/appbackends/y\) in the Fabric portal; it opens embedded and signs in by itself\.$'
             $browser.evidence['route'] | Should -Be 'executeQueries'
+        }
+
+        It 'says T4''s PostgreSQL page has no capture yet instead of warning, since its rows come after the check (2026-11-13)' {
+            $script:queryIds = @('connector-check', 'history-meta', 'estate-targets', 'postgres-series')
+            $results = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -ItemUrl 'https://app.fabric.microsoft.com/groups/x/appbackends/y' -Token $script:token -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Deployed)
+            $queries = $results | Where-Object checkId -EQ 'FABRIC.APP.QUERIES'
+            $queries.status | Should -Be 'Pass'
+            $queries.message | Should -Match 'T4''s PostgreSQL page has no capture yet \(postgres-series\): deploy\.ps1''s history snapshot at its end, and stop-demo\.ps1 -SaveHistory, add one\.$'
+            # Another query without rows is still a Warning, with the same note.
+            $script:queryIds = @('connector-check', 'history-meta', 'replay-T3', 'postgres-series')
+            $script:checkStage = Join-Path -Path $TestDrive -ChildPath ('check-' + [guid]::NewGuid().ToString('N'))
+            $null = New-Item -ItemType Directory -Path $script:checkStage -Force
+            $warned = @(Test-DemoFabricApp -StagePath $script:checkStage -HostingUrl $script:hosting -ItemUrl 'https://app.fabric.microsoft.com/groups/x/appbackends/y' -Token $script:token -WorkspaceId $script:workspaceId -SemanticModelId $script:modelId -Deployed) | Where-Object checkId -EQ 'FABRIC.APP.QUERIES'
+            $warned.status | Should -Be 'Warning'
+            $warned.message | Should -Match '1 returned no rows for the newest telemetry day 2026-10-21: replay-T3\. T4''s PostgreSQL page has no capture yet \(postgres-series\)'
         }
 
         It 'reads the workspace and the model from the stage''s rayfin/.env when they aren''t passed, and fails clearly without them' {

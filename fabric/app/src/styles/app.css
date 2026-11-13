@@ -1622,3 +1622,18 @@ table.data td.num {
     width: 16px;
     height: 16px;
 }
+
+/* ---------- T4: PostgreSQL and its read replica ---------- */
+
+.time-lines {
+    display: grid;
+    gap: 8px;
+}
+
+a.btn-primary.pg-live {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+}

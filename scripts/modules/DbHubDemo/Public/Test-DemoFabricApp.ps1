@@ -53,7 +53,8 @@ function Test-DemoFabricApp {
     The app item's page in the Fabric portal, for the browser steps.
 
     .PARAMETER Queries
-    All runs the whole catalog (14 queries); Probe runs only the connector check.
+    All runs the whole catalog (16 queries since 2026-11-13, with T4's PostgreSQL page's two, which may be empty until a
+    capture of T4's metrics exists, and are said, not warned about); Probe runs only the connector check.
 
     .PARAMETER TimeoutSeconds
     How long each connector call may run.
@@ -381,6 +382,12 @@ function Test-DemoFabricApp {
                 }
                 $failed = @($outcomes | Where-Object { -not $_.Ok })
                 $empty = @($outcomes | Where-Object { $_.Ok -and $_.Rows -eq 0 })
+                # T4's PostgreSQL page (2026-11-13) has rows only after a capture of T4's and its read replica's metrics, which
+                # deploy.ps1's history snapshot takes at its end, after this check, and stop-demo.ps1 -SaveHistory at a
+                # session's end; so its queries' being empty is said, not warned about.
+                $notYet = @($empty | Where-Object { $_.Id -like 'postgres-*' })
+                $empty = @($empty | Where-Object { $_.Id -notlike 'postgres-*' })
+                $notYetText = if ($notYet.Count -gt 0) { ' T4''s PostgreSQL page has no capture yet ({0}): deploy.ps1''s history snapshot at its end, and stop-demo.ps1 -SaveHistory, add one.' -f (($notYet | ForEach-Object { $_.Id }) -join ', ') } else { '' }
                 $routes = @($outcomes | ForEach-Object { [string]$_.Route } | Select-Object -Unique)
                 $through = if ($routes.Count -gt 1) {
                     'through the {0} connector''s direct route, then Power BI''s Execute Queries with the same Azure CLI token once that route refused it' -f $connector
@@ -410,10 +417,10 @@ function Test-DemoFabricApp {
                     $results.Add((New-DemoResult -CheckId 'FABRIC.APP.QUERIES' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('{0} of {1} app queries failed {2}: {3}' -f $failed.Count, $outcomes.Count, $through, (($failed | ForEach-Object { '{0} ({1})' -f $_.Id, $_.Error }) -join '; ')) -Evidence $evidence -Remediation $fix -DocUrl $queriesDoc))
                 }
                 elseif ($empty.Count -gt 0) {
-                    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.QUERIES' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('All {0} app queries ran {1}; {2} returned no rows for the newest telemetry day {3}: {4}.' -f $outcomes.Count, $through, $empty.Count, $latestDay, (($empty | ForEach-Object { $_.Id }) -join ', ')) -Evidence $evidence -Remediation 'Run NB_DatabaseHub_LiveActivity (and a scenario) so the lakehouse has history for those visuals, then run the check again.' -DocUrl $queriesDoc))
+                    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.QUERIES' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('All {0} app queries ran {1}; {2} returned no rows for the newest telemetry day {3}: {4}.{5}' -f $outcomes.Count, $through, $empty.Count, $latestDay, (($empty | ForEach-Object { $_.Id }) -join ', '), $notYetText) -Evidence $evidence -Remediation 'Run NB_DatabaseHub_LiveActivity (and a scenario) so the lakehouse has history for those visuals, then run the check again.' -DocUrl $queriesDoc))
                 }
                 else {
-                    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.QUERIES' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('All {0} app queries returned rows {1} (newest telemetry day {2}).' -f $outcomes.Count, $through, $latestDay) -Evidence $evidence -DocUrl $queriesDoc))
+                    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.QUERIES' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('All {0} app queries ran {1}, and every one that needs the telemetry returned rows (newest telemetry day {2}).{3}' -f $outcomes.Count, $through, $latestDay, $notYetText) -Evidence $evidence -DocUrl $queriesDoc))
                 }
             }
             elseif ($Queries -eq 'All') {

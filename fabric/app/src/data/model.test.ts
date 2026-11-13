@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { catalogForCheck, checkIncidentRange, estateQuery, findingsQuery, incidentSeriesQuery, targetNamesQuery } from "./queries";
-import { toBins, toChecks, toIncidents, toMeta, toTargetNames, toTargets, toWaitFlows, waitFamily } from "./model";
+import { catalogForCheck, checkIncidentRange, estateQuery, findingsQuery, incidentSeriesQuery, postgresFindingsQuery, postgresSeriesQuery, targetNamesQuery } from "./queries";
+import {
+    postgresPeak,
+    postgresSeries,
+    postgresSkus,
+    toBins,
+    toChecks,
+    toIncidents,
+    toMeta,
+    toPostgresCapture,
+    toPostgresFindings,
+    toTargetNames,
+    toTargets,
+    toWaitFlows,
+    waitFamily,
+} from "./model";
 
 describe("model parsers", () => {
     it("reads the meta row, with blank measures as null", () => {
@@ -78,15 +92,62 @@ describe("model parsers", () => {
         expect(Object.keys(names)).toEqual(["T1", "T2", "T3"]);
         expect(toTargetNames([])).toEqual({});
     });
+
+    it("reads T4's latest PostgreSQL capture: its targets, servers, window, interval, and points, oldest first (ADR 0025)", () => {
+        const row = (Bucket: string, TargetKey: unknown, Metric: string, Value: unknown, ResourceName = "pgreplica01-test01") => ({
+            Bucket,
+            TargetKey,
+            ResourceName,
+            Metric,
+            Value,
+            WindowStart: "2026-11-13T17:00:00",
+            WindowEnd: "2026-11-13T18:02:00",
+            CapturedAt: "2026-11-13T18:06:00",
+        });
+        const capture = toPostgresCapture([
+            row("2026-11-13T17:05:00", "T4-replica", "physical_replication_delay_in_seconds", 241.4),
+            row("2026-11-13T17:00:00", "T4-replica", "physical_replication_delay_in_seconds", 6),
+            row("2026-11-13T17:10:00", "T4-replica", "physical_replication_delay_in_seconds", 241.4),
+            row("2026-11-13T17:00:00", "T4", "cpu_percent", 43.3, "pgflex01-test01"),
+            row("2026-11-13T17:00:00", "T1", "cpu_percent", 99),
+            row("2026-11-13T17:00:00", "T4", "cpu_percent", null),
+            row("junk", "T4", "cpu_percent", 1),
+            row("2026-11-13T17:00:00", "T4", "<script>", 1),
+        ]);
+        expect(capture?.points).toHaveLength(4);
+        expect(capture?.servers).toEqual({ "T4-replica": "pgreplica01-test01", T4: "pgflex01-test01" });
+        expect(capture?.windowStart?.toISOString()).toBe("2026-11-13T17:00:00.000Z");
+        expect(capture?.windowEnd?.toISOString()).toBe("2026-11-13T18:02:00.000Z");
+        expect(capture?.capturedAt?.toISOString()).toBe("2026-11-13T18:06:00.000Z");
+        expect(capture?.intervalMinutes).toBe(5);
+        const lag = postgresSeries(capture, "T4-replica", "physical_replication_delay_in_seconds");
+        expect(lag.map((p) => p.value)).toEqual([6, 241.4, 241.4]);
+        expect(postgresPeak(lag)).toEqual({ value: 241.4, at: new Date(Date.UTC(2026, 10, 13, 17, 5)) });
+        expect(postgresPeak([])).toBeNull();
+        expect(postgresSeries(null, "T4", "cpu_percent")).toEqual([]);
+        expect(toPostgresCapture([row("2026-11-13T17:00:00", "T3", "cpu_percent", 1)])).toBeNull();
+    });
+
+    it("reads the capture's findings worst first, and each server's size from the capture finding's evidence", () => {
+        const findings = toPostgresFindings([
+            { FindingId: "postgresql.T4.capture", TargetKey: "T4", Status: "Pass", StatusSort: 4, Evidence: '{"servers": [{"role": "primary", "sku": "Standard_D4ds_v5"}, {"role": "replica", "sku": "<b>"}, {"role": "other", "sku": "X"}]}' },
+            { FindingId: "postgresql.T4-replica.lag", TargetKey: "T4-replica", Status: "Warning", StatusSort: 3, Evidence: "not json" },
+            { FindingId: "", Status: "Fail", StatusSort: 1 },
+        ]);
+        expect(findings.map((f) => f.id)).toEqual(["postgresql.T4-replica.lag", "postgresql.T4.capture"]);
+        expect(findings[0].evidence).toBeNull();
+        expect(postgresSkus(findings)).toEqual({ T4: "Standard_D4ds_v5" });
+        expect(postgresSkus([])).toEqual({});
+    });
 });
 
 describe("query catalog", () => {
     const latest = new Date(Date.UTC(2026, 9, 21));
     const catalog = catalogForCheck(latest);
 
-    it("has 14 bounded, unique, read-only queries", () => {
-        expect(catalog).toHaveLength(14);
-        expect(new Set(catalog.map((q) => q.id)).size).toBe(14);
+    it("has 16 bounded, unique, read-only queries", () => {
+        expect(catalog).toHaveLength(16);
+        expect(new Set(catalog.map((q) => q.id)).size).toBe(16);
         for (const q of catalog) {
             expect(q.dax.trimStart().startsWith("EVALUATE") || q.dax.trimStart().startsWith("DEFINE")).toBe(true);
             expect(q.rowLimit).toBeGreaterThan(0);
@@ -128,6 +189,8 @@ describe("query catalog", () => {
             "readiness-summary",
             "telemetry-coverage",
             "target-names",
+            "postgres-series",
+            "postgres-findings",
         ];
 
         it("lies in the newest telemetry day when history-meta has no anchors", () => {
@@ -188,5 +251,17 @@ describe("query catalog", () => {
         expect(q.id).toBe("target-names");
         expect(q.dax).toContain(`'Telemetry Snapshots'[Target Key] IN { "T1", "T2", "T3" }`);
         expect(q.columns.map((c) => c.key)).toEqual(["TargetKey", "ResourceType", "ResourceName", "InstanceName", "DatabaseName"]);
+    });
+
+    it("reads T4's metrics and findings from the latest PostgreSQL capture's run only, whatever the filters (ADR 0025)", () => {
+        const latestRun = `CALCULATE ( MAX ( 'Analysis Findings'[Captured At UTC] ), REMOVEFILTERS (), 'Analysis Findings'[Analysis Key] = "postgresql" )`;
+        for (const q of [postgresSeriesQuery(), postgresFindingsQuery()]) {
+            expect(q.dax).toContain(latestRun);
+            expect(q.dax).not.toContain("DATESBETWEEN");
+            expect(q.dax).not.toContain("'Target'[Target Key]");
+        }
+        expect(postgresSeriesQuery().dax).toContain(`'Telemetry Snapshots'[Analysis Key] = "postgresql",\n            TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )`);
+        expect(postgresFindingsQuery().dax).toContain(`'Analysis Findings'[Analysis Key] = "postgresql",\n            TREATAS ( LatestRun, 'Analysis Findings'[Run ID] )`);
+        expect(postgresSeriesQuery().columns.map((c) => c.key)).toEqual(["Bucket", "TargetKey", "ResourceName", "Metric", "Value", "Unit", "WindowStart", "WindowEnd", "CapturedAt"]);
     });
 });

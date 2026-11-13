@@ -1,7 +1,7 @@
-/// The demo's targets and platform scopes. T1, T2, and T3 are the SQL targets; the other rows are the scopes that validation checks report on. Sorted in a fixed T1-to-T3 order; never colored by hue in the report.
+/// The demo's targets and platform scopes. T1, T2, and T3 are the SQL targets; T4 and T4-replica are the PostgreSQL flexible server and its read replica, whose Azure Monitor metrics the live-activity notebook saves when the scripts pass them (ADR 0025); the other rows are the scopes that validation checks report on. Sorted in a fixed T1-to-T4 order; never colored by hue in the report.
 table Target
 
-    /// Join key, the target value the notebooks write (T1, T2, T3, all, fabric, subscription, tenant, github, repo).
+    /// Join key, the target value the notebooks write (T1, T2, T3, T4, T4-replica, all, fabric, subscription, tenant, github, repo).
     column 'Target Key'
         dataType: string
         isHidden
@@ -22,7 +22,7 @@ table Target
         sourceColumn: [Target Short]
         sortByColumn: 'Target Sort'
 
-    /// SQL target, All targets, or Platform scope.
+    /// SQL target, PostgreSQL target, All targets, or Platform scope.
     column 'Target Kind'
         dataType: string
         isNameInferred
@@ -51,11 +51,13 @@ table Target
                         { "T1", "T1 · SQL Server on Azure VM", "T1", "SQL target", "SQL Server 2022 on an Azure VM", 1 },
                         { "T2", "T2 · Arc-enabled SQL Server", "T2", "SQL target", "Arc-enabled SQL Server in a nested Hyper-V guest", 2 },
                         { "T3", "T3 · Azure SQL Database", "T3", "SQL target", "Azure SQL Database", 3 },
-                        { "all", "All targets", "All", "All targets", "Every SQL target", 4 },
-                        { "fabric", "Fabric workspace", "Fabric", "Platform scope", "Fabric workspace and lakehouse", 5 },
-                        { "subscription", "Azure subscription", "Subscription", "Platform scope", "Azure subscription and resource group", 6 },
-                        { "tenant", "Fabric tenant", "Tenant", "Platform scope", "Tenant settings", 7 },
-                        { "github", "GitHub", "GitHub", "Platform scope", "GitHub repository and Actions", 8 },
-                        { "repo", "Repository", "Repo", "Platform scope", "Static checks", 9 }
+                        { "T4", "T4 · Azure Database for PostgreSQL", "T4", "PostgreSQL target", "Azure Database for PostgreSQL flexible server", 4 },
+                        { "T4-replica", "T4 · read replica", "T4 replica", "PostgreSQL target", "Same-region read replica of T4, during a session", 5 },
+                        { "all", "All targets", "All", "All targets", "Every SQL target", 6 },
+                        { "fabric", "Fabric workspace", "Fabric", "Platform scope", "Fabric workspace and lakehouse", 7 },
+                        { "subscription", "Azure subscription", "Subscription", "Platform scope", "Azure subscription and resource group", 8 },
+                        { "tenant", "Fabric tenant", "Tenant", "Platform scope", "Tenant settings", 9 },
+                        { "github", "GitHub", "GitHub", "Platform scope", "GitHub repository and Actions", 10 },
+                        { "repo", "Repository", "Repo", "Platform scope", "Static checks", 11 }
                     }
                 )

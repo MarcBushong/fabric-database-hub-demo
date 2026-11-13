@@ -4,7 +4,7 @@
 
 import { isTargetKey, SQL_TARGETS, type DateWindow, type TargetKey } from "./dax";
 
-export type PageId = "estate" | "incidents" | "readiness" | "links";
+export type PageId = "estate" | "incidents" | "postgres" | "readiness" | "links";
 export type WindowId = "day" | "7d" | "30d" | "all";
 export type SignalId = "waits" | "cpu" | "sessions" | "batch" | "bufferIo";
 export type ClockMetric = "batch" | "waits" | "sessions";
@@ -24,6 +24,7 @@ export interface ViewState {
 export const PAGES: ReadonlyArray<{ id: PageId; label: string }> = [
     { id: "estate", label: "Estate" },
     { id: "incidents", label: "Incidents" },
+    { id: "postgres", label: "PostgreSQL" },
     { id: "readiness", label: "Readiness" },
     { id: "links", label: "Live links" },
 ];
@@ -46,7 +47,7 @@ export const DEFAULT_VIEW: ViewState = {
     waitsView: "sankey",
 };
 
-const PAGE_IDS = new Set<PageId>(["estate", "incidents", "readiness", "links"]);
+const PAGE_IDS = new Set<PageId>(["estate", "incidents", "postgres", "readiness", "links"]);
 const WINDOW_IDS = new Set<WindowId>(["day", "7d", "30d", "all"]);
 const SIGNALS = new Set<SignalId>(["waits", "cpu", "sessions", "batch", "bufferIo"]);
 const CLOCK = new Set<ClockMetric>(["batch", "waits", "sessions"]);

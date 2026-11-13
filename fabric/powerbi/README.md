@@ -11,6 +11,8 @@ The approved design is [`_brief/report-spec.md`](_brief/report-spec.md); its `De
 
 The demo's Fabric app is a separate item: a Fabric Apps (preview) item built with the Rayfin SDK and CLI, over `SM_DatabaseHub_History` through the semantic model connector (Phase 19b). This folder and `configure-powerbi.ps1` create no app. The model's table, column, and measure names are the app's contract, so they stay stable.
 
+T4, the PostgreSQL flexible server, and its read replica (ADR 0025) have rows too, when the scripts passed their Azure Monitor metrics to the live-activity notebook: `telemetry_snapshots` and `analysis_findings` with the analysis `postgresql` and the targets `T4` and `T4-replica`, which the Target dimension names as **PostgreSQL target** rows and the Analysis dimension as **PostgreSQL (Azure Monitor)**. The report's measures and pages stay on the three SQL targets; T4's findings appear in its findings tables, and the Insights app's **PostgreSQL** page charts its metrics.
+
 ## History and live
 
 | Question | History (this report) | Live (Database Hub, Real-Time Dashboard) |

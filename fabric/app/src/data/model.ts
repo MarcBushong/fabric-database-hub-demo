@@ -346,3 +346,164 @@ export function waitFamily(category: string): string {
     if (/Log Rate Governor/i.test(category)) return "Resource governance";
     return "Other";
 }
+
+// ---- T4: the PostgreSQL flexible server and its read replica (2026-11-13, ADR 0025) ----------------------------------
+
+/** The history's targets for T4: the primary (pgflex01-<deploymentId>) and its read replica (pgreplica01-<deploymentId>). */
+export type PostgresTarget = "T4" | "T4-replica";
+
+export const POSTGRES_TARGET_INFO: Record<PostgresTarget, { name: string; short: string; role: string; color: string }> = {
+    T4: { name: "T4 · Azure Database for PostgreSQL", short: "T4", role: "flexible server", color: "var(--accent)" },
+    "T4-replica": { name: "T4's read replica", short: "Read replica", role: "same-region read replica", color: "var(--accent-2)" },
+};
+
+export function isPostgresTarget(value: unknown): value is PostgresTarget {
+    return value === "T4" || value === "T4-replica";
+}
+
+/** The Azure Monitor metrics the notebook keeps for T4 (analysis postgresql), by what they show. */
+export const POSTGRES_METRICS = {
+    /** Read Replica Lag, Database Hub's Read replica lag chart; on the replica only. */
+    lag: "physical_replication_delay_in_seconds",
+    /** Max Physical Replication Lag; on the primary only. */
+    lagBytes: "physical_replication_delay_in_bytes",
+    cpu: "cpu_percent",
+    memory: "memory_percent",
+    connections: "active_connections",
+    /** Failed connections in each interval (a total, not a maximum). */
+    failed: "connections_failed",
+} as const;
+
+export interface PostgresPoint {
+    at: Date;
+    target: PostgresTarget;
+    server: string;
+    metric: string;
+    value: number;
+}
+
+/** The latest PostgreSQL capture: its window, its servers, and its points, oldest first. */
+export interface PostgresCapture {
+    capturedAt: Date | null;
+    windowStart: Date | null;
+    windowEnd: Date | null;
+    /** Minutes between consecutive points of one series, or null with single points only. */
+    intervalMinutes: number | null;
+    /** Each target's server name. */
+    servers: Partial<Record<PostgresTarget, string>>;
+    points: PostgresPoint[];
+}
+
+const METRIC_NAME = /^[a-z0-9_]{1,64}$/;
+
+function intervalOf(points: readonly PostgresPoint[]): number | null {
+    const previous = new Map<string, number>();
+    let best: number | null = null;
+    for (const p of points) {
+        const key = `${p.target}|${p.metric}`;
+        const before = previous.get(key);
+        const time = p.at.getTime();
+        if (before !== undefined && time > before) {
+            const gap = (time - before) / 60000;
+            if (best === null || gap < best) best = gap;
+        }
+        previous.set(key, time);
+    }
+    return best;
+}
+
+/** The postgres-series rows as one capture, or null without a valid row (no capture yet). */
+export function toPostgresCapture(rows: readonly Row[]): PostgresCapture | null {
+    const points: PostgresPoint[] = [];
+    const servers: Partial<Record<PostgresTarget, string>> = {};
+    let capturedAt: Date | null = null;
+    let windowStart: Date | null = null;
+    let windowEnd: Date | null = null;
+    for (const r of rows) {
+        const at = toDate(r.Bucket);
+        const value = num(r.Value);
+        const metric = text(r.Metric);
+        const target = r.TargetKey;
+        if (!at || value === null || !isPostgresTarget(target) || !METRIC_NAME.test(metric)) continue;
+        const server = safeName(r.ResourceName) ?? "";
+        points.push({ at, target, server, metric, value });
+        if (server && !servers[target]) servers[target] = server;
+        capturedAt ??= toDate(r.CapturedAt);
+        windowStart ??= toDate(r.WindowStart);
+        windowEnd ??= toDate(r.WindowEnd);
+    }
+    if (points.length === 0) return null;
+    points.sort((a, b) => a.at.getTime() - b.at.getTime());
+    return { capturedAt, windowStart, windowEnd, intervalMinutes: intervalOf(points), servers, points };
+}
+
+/** One series of the capture, oldest first; empty without a capture or without that series. */
+export function postgresSeries(capture: PostgresCapture | null, target: PostgresTarget, metric: string): PostgresPoint[] {
+    return capture ? capture.points.filter((p) => p.target === target && p.metric === metric) : [];
+}
+
+export interface PostgresPeak {
+    value: number;
+    at: Date;
+}
+
+/** The highest point of a series (the earliest of equal ones), or null for an empty one. */
+export function postgresPeak(points: readonly PostgresPoint[]): PostgresPeak | null {
+    let peak: PostgresPeak | null = null;
+    for (const p of points) {
+        if (!peak || p.value > peak.value) peak = { value: p.value, at: p.at };
+    }
+    return peak;
+}
+
+export interface PostgresFinding {
+    id: string;
+    target: string;
+    status: string;
+    statusSort: number;
+    text: string;
+    capturedAt: Date | null;
+    evidence: Record<string, unknown> | null;
+}
+
+function evidenceOf(value: unknown): Record<string, unknown> | null {
+    if (typeof value !== "string" || !value.trim().startsWith("{")) return null;
+    try {
+        const parsed: unknown = JSON.parse(value);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+    } catch {
+        return null;
+    }
+}
+
+/** The latest capture's findings, worst first. */
+export function toPostgresFindings(rows: readonly Row[]): PostgresFinding[] {
+    return rows
+        .map((r) => ({
+            id: text(r.FindingId),
+            target: text(r.TargetKey),
+            status: text(r.Status),
+            statusSort: num(r.StatusSort) ?? 6,
+            text: text(r.Finding),
+            capturedAt: toDate(r.CapturedAt),
+            evidence: evidenceOf(r.Evidence),
+        }))
+        .filter((f) => f.id !== "")
+        .sort((a, b) => a.statusSort - b.statusSort || a.id.localeCompare(b.id));
+}
+
+const SKU = /^[A-Za-z0-9_]{1,64}$/;
+
+/** Each server's compute size, from the capture finding's evidence (servers: role and sku). */
+export function postgresSkus(findings: readonly PostgresFinding[]): Partial<Record<PostgresTarget, string>> {
+    const out: Partial<Record<PostgresTarget, string>> = {};
+    const servers = findings.find((f) => f.id === "postgresql.T4.capture")?.evidence?.servers;
+    if (!Array.isArray(servers)) return out;
+    for (const server of servers as unknown[]) {
+        if (!server || typeof server !== "object") continue;
+        const { role, sku } = server as Record<string, unknown>;
+        const target: PostgresTarget | null = role === "primary" ? "T4" : role === "replica" ? "T4-replica" : null;
+        if (target && typeof sku === "string" && SKU.test(sku)) out[target] = sku;
+    }
+    return out;
+}

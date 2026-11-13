@@ -7,11 +7,15 @@ import type { StatusName } from "./status";
 import type { PageId } from "./view-state";
 import {
     FAMILY_LABEL,
+    POSTGRES_METRICS,
+    postgresPeak,
+    postgresSeries,
     waitFamily,
     type Bin,
     type Check,
     type Incident,
     type Meta,
+    type PostgresCapture,
     type ReadinessSummary,
     type TargetSummary,
     type WaitFlow,
@@ -279,5 +283,80 @@ export function freshnessInsight(meta: Meta | null, now: Date = new Date()): Ins
         title: `The newest snapshot is from ${formatDateTimeUtc(meta.latestCapture)}, ${formatDuration(hours * 60)} ago.`,
         detail: `${formatNumber(meta.notebookRuns, "int")} notebook run${meta.notebookRuns === 1 ? "" : "s"} saved telemetry; history covers ${formatDayUtc(meta.earliestDay)} to ${formatDayUtc(meta.latestDay)}. ${hours > 24 ? "Run NB_DatabaseHub_LiveActivity to refresh it." : ""}`.trim(),
         page: "links",
+    };
+}
+
+// ---- T4: the PostgreSQL flexible server and its read replica (2026-11-13, ADR 0025) ----------------------------------
+
+/** The notebook's thresholds for T4's findings, presenter heuristics: Read replica lag of 60 s or more, CPU of 80 % or more. */
+export const REPLICA_LAG_WARNING_SECONDS = 60;
+export const POSTGRES_CPU_WARNING_PERCENT = 80;
+
+/** The read replica's peak lag in the latest capture, or why there's none: the replica exists only during a session. */
+export function replicaLagInsight(capture: PostgresCapture | null): Insight | null {
+    if (!capture) return null;
+    const lag = postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag);
+    const peak = postgresPeak(lag);
+    if (!peak) {
+        return {
+            id: "replica-lag",
+            status: "Not selected",
+            metric: "none",
+            title: "The latest capture has no Read replica lag.",
+            detail: "T4's read replica exists only during a session: start-demo.ps1 creates it, and stop-demo.ps1 captures its metrics before it deletes it.",
+            page: "postgres",
+        };
+    }
+    const replica = capture.servers["T4-replica"];
+    return {
+        id: "replica-lag",
+        status: peak.value >= REPLICA_LAG_WARNING_SECONDS ? "Warning" : "Pass",
+        metric: formatNumber(peak.value, "seconds"),
+        title: `Read replica lag peaked at ${formatNumber(peak.value, "seconds")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
+        detail: `${formatNumber(mean(lag.map((p) => p.value)), "seconds")} on average over ${lag.length} interval${lag.length === 1 ? "" : "s"}${replica ? ` on ${replica}` : ""}; ${REPLICA_LAG_WARNING_SECONDS} s or more is a warning.`,
+        page: "postgres",
+    };
+}
+
+/** T4's peak CPU in the latest capture, with its peak of active connections. */
+export function postgresCpuInsight(capture: PostgresCapture | null): Insight | null {
+    const cpu = postgresSeries(capture, "T4", POSTGRES_METRICS.cpu);
+    const peak = postgresPeak(cpu);
+    if (!peak) return null;
+    const connections = postgresPeak(postgresSeries(capture, "T4", POSTGRES_METRICS.connections));
+    return {
+        id: "postgres-cpu",
+        status: peak.value >= POSTGRES_CPU_WARNING_PERCENT ? "Warning" : "Pass",
+        metric: formatNumber(peak.value, "percent"),
+        title: `T4's CPU peaked at ${formatNumber(peak.value, "percent")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
+        detail: `${formatNumber(mean(cpu.map((p) => p.value)), "percent")} on average${connections ? `; active connections peaked at ${formatNumber(connections.value, "int")} at ${formatTimeUtc(connections.at)} UTC` : ""}. ${POSTGRES_CPU_WARNING_PERCENT} % or more is a warning.`,
+        page: "postgres",
+    };
+}
+
+/** T4's failed connections in the latest capture: their total, and the interval with the most. */
+export function failedConnectionsInsight(capture: PostgresCapture | null): Insight | null {
+    const failed = postgresSeries(capture, "T4", POSTGRES_METRICS.failed);
+    const peak = postgresPeak(failed);
+    if (!peak) return null;
+    const total = failed.reduce((sum, p) => sum + p.value, 0);
+    if (total <= 0) {
+        return {
+            id: "postgres-failed",
+            status: "Pass",
+            metric: "0",
+            title: "No failed connections on T4 in the latest capture.",
+            detail: `${failed.length} interval${failed.length === 1 ? "" : "s"} from ${formatDateTimeUtc(failed[0].at)} to ${formatDateTimeUtc(failed[failed.length - 1].at)}.`,
+            page: "postgres",
+        };
+    }
+    const interval = capture?.intervalMinutes;
+    return {
+        id: "postgres-failed",
+        status: "Warning",
+        metric: formatNumber(total, "int"),
+        title: `${formatNumber(total, "int")} failed connection${total === 1 ? "" : "s"} on T4 in the latest capture.`,
+        detail: `At most ${formatNumber(peak.value, "int")} in one${interval ? ` ${formatNumber(interval, "int")}-minute` : ""} interval, at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
+        page: "postgres",
     };
 }
