@@ -29,6 +29,9 @@ $script:DemoVmRestarted = @{}
 # 2026-11-13 live finding: the Run Command names Azure kept in Deleting in this process, so Invoke-DemoVmRunCommand used a
 # fresh name instead (Resolve-DemoRunCommandFreshName); deploy.ps1's tracks report them (Get-DemoRunCommandStuckResult).
 $script:DemoRunCommandStuck = [System.Collections.Generic.List[object]]::new()
+# The same names as '<vm>/<name>', never cleared by a report, so a later call in this process doesn't wait the whole leftover
+# wait for a name that was stuck already.
+$script:DemoRunCommandStuckName = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 # Review fix (Phase 28): the golden guest action (the Release) running on the T2 host in this process, keyed
 # '<resource group>/archost01' (Invoke-DemoGoldenGuestAction). The watchdog never restarts the host meanwhile.

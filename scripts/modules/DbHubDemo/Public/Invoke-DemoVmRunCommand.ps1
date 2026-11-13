@@ -12,7 +12,8 @@ function Invoke-DemoVmRunCommand {
        -LeftoverWaitSeconds for it to go. When Azure still lists it then, the script runs under a fresh name
        (Resolve-DemoRunCommandFreshName: the name and -yyyyMMddHHmmss) instead of a PUT that would fail: live on the T2
        host, Azure ended most Run Command deletes with an internal error after 6 to 11 minutes and kept the name marked
-       for deletion for hours (2026-11-13). deploy.ps1 reports it (DEPLOY.RUNCOMMAND.STUCK_<VM>).
+       for deletion for hours (2026-11-13). deploy.ps1 reports it (DEPLOY.RUNCOMMAND.STUCK_<VM>). A name that was stuck
+       earlier in this process is waited for 30 seconds at most, and a fresh name's own delete isn't waited for.
     2. Writes the request body to a file in a new private temporary directory (only the current user can
        open it; mode 700 on Linux and macOS) and creates the Run Command with
        'az rest --method put --body @<file>' through Invoke-DemoAz. Values in -ProtectedParameter go only
@@ -171,6 +172,9 @@ function Invoke-DemoVmRunCommand {
     # The name the script runs under: RunCommandName, or a fresh one while Azure keeps it in Deleting (2026-11-13).
     $usedName = $RunCommandName
     $url = '{0}/{1}?api-version={2}' -f $baseUrl, $usedName, $apiVersion
+    # A name Azure kept in Deleting earlier in this process isn't waited for again: 30 seconds at most (live, 2026-11-13: a
+    # health read took 11 minutes with the whole wait and a fresh name's own delete waited for).
+    $leftoverWait = if ($script:DemoRunCommandStuckName.Contains(('{0}/{1}' -f $VmName, $RunCommandName))) { [System.Math]::Min($LeftoverWaitSeconds, 30) } else { $LeftoverWaitSeconds }
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $state = $null
     $removed = $false
@@ -185,10 +189,10 @@ function Invoke-DemoVmRunCommand {
         $removed = $false
         $putSent = $false
         try {
-            if (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -WaitSeconds $LeftoverWaitSeconds -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false)) {
+            if (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -WaitSeconds $leftoverWait -PollIntervalSeconds $PollIntervalSeconds -Confirm:$false)) {
                 # A PUT of a name Azure keeps marked for deletion fails with OperationNotAllowed, so the script runs under a
                 # fresh name; that throws when the VM has no room for one (2026-11-13 live finding).
-                $usedName = Resolve-DemoRunCommandFreshName -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -VmName $VmName -RunCommandName $RunCommandName -WaitedSeconds $LeftoverWaitSeconds
+                $usedName = Resolve-DemoRunCommandFreshName -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -VmName $VmName -RunCommandName $RunCommandName -WaitedSeconds $leftoverWait
                 $url = '{0}/{1}?api-version={2}' -f $baseUrl, $usedName, $apiVersion
             }
 
@@ -263,8 +267,9 @@ function Invoke-DemoVmRunCommand {
             else {
                 try {
                     # Nothing was created without a PUT (no room for a fresh name, a refused value): the delete goes again,
-                    # which is all Azure lets a name marked for deletion have, without a second wait.
-                    $removed = Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -PollIntervalSeconds $PollIntervalSeconds -NoWait:(-not $putSent) -Confirm:$false
+                    # which is all Azure lets a name marked for deletion have, without a second wait. A fresh name's own
+                    # delete isn't waited for either: its VM is one where Azure's deletes stall (2026-11-13).
+                    $removed = Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $url -PollIntervalSeconds $PollIntervalSeconds -NoWait:(-not $putSent -or $usedName -cne $RunCommandName) -Confirm:$false
                 }
                 catch {
                     Write-DemoLog -Level Warning -Message ('{0}: the Run Command {1} could not be deleted: {2}' -f $VmName, $usedName, $_.Exception.Message)

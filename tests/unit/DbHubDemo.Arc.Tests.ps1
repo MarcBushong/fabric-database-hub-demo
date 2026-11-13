@@ -219,7 +219,7 @@ Describe 'Invoke-DemoVmRunCommand' {
     }
 
     It 'runs under a fresh name when Azure keeps the name in Deleting after the leftover wait, and reports it once (2026-11-13 live finding)' {
-        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear() }
+        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
         $null = $script:stuck.Add('DbHubDemo-HealthRead')
         $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -LeftoverWaitSeconds 0
 
@@ -240,7 +240,7 @@ Describe 'Invoke-DemoVmRunCommand' {
     }
 
     It 'asks earlier fresh copies to go without waiting, and makes no fresh name when the VM is close to Azure''s limit of 25' {
-        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear() }
+        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
         $null = $script:stuck.Add('DbHubDemo-HealthRead')
         $null = $script:stuck.Add('DbHubDemo-HealthRead-20261113200000')
         $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -LeftoverWaitSeconds 0
@@ -254,6 +254,33 @@ Describe 'Invoke-DemoVmRunCommand' {
         @($script:calls | Where-Object Method -eq 'put').Count | Should -Be 0
         @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq 'DbHubDemo-HealthRead' }).Count | Should -Be 2 -Because 'the delete goes again, without a second wait'
         @(InModuleScope -ModuleName DbHubDemo { Get-DemoRunCommandStuckResult }).Count | Should -Be 0
+    }
+
+    It 'waits only 30 seconds for a name Azure kept in Deleting earlier in the process, and never for a fresh name''s own delete (live, 2026-11-13)' {
+        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
+        $null = $script:stuck.Add('DbHubDemo-HealthRead')
+        $script:waits = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRunCommand -MockWith {
+            $name = if ($Url -match '/runCommands/([^?]+)\?') { $Matches[1] } else { '' }
+            $script:waits.Add(('{0} wait={1} nowait={2}' -f $name, $WaitSeconds, [bool]$NoWait))
+            if ($script:stuck.Contains($name)) {
+                return $false
+            }
+            $script:runCommands.Remove($name)
+            return $true
+        }
+        $first = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0
+        $firstWaits = @($script:waits)
+        $script:waits.Clear()
+        $second = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0
+
+        $first.Succeeded | Should -BeTrue
+        $second.Succeeded | Should -BeTrue
+        $firstWaits[0] | Should -Be 'DbHubDemo-HealthRead wait=300 nowait=False' -Because 'the first time, the whole leftover wait'
+        $firstWaits[-1] | Should -BeLike ('{0} wait=* nowait=True' -f $first.UsedName) -Because 'a fresh name''s own delete isn''t waited for'
+        $script:waits[0] | Should -Be 'DbHubDemo-HealthRead wait=30 nowait=False' -Because 'the second time, it was stuck already'
+        $second.UsedName | Should -Match '^DbHubDemo-HealthRead-\d{14}$'
+        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
     }
 
     It 'runs -WhileRunning once, after Azure accepted the Run Command and before waiting for it (ADR 0018)' {

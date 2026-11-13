@@ -385,6 +385,7 @@ function Resolve-DemoRunCommandFreshName {
     }
     $fresh = Get-DemoRunCommandFreshName -Name $RunCommandName -NowUtc $NowUtc
     $script:DemoRunCommandStuck.Add([pscustomobject]@{ VmName = $VmName; Name = $RunCommandName; FreshName = $fresh; AtUtc = $NowUtc.ToUniversalTime(); WaitedSeconds = $WaitedSeconds; Listed = $listed.Count; Deleting = $deleting })
+    $null = $script:DemoRunCommandStuckName.Add(('{0}/{1}' -f $VmName, $RunCommandName))
     Write-DemoLog -Level Warning -Message ('{0}: Azure still lists {1} after {2} (its delete hasn''t finished, or Azure ended it with an internal error and keeps the name until another delete), so it runs as {3} instead of waiting. Nothing to do: Azure deletes the stuck one on its own (DEPLOY.RUNCOMMAND.STUCK_{4}).' -f $VmName, $RunCommandName, $waited, $fresh, $VmName.ToUpperInvariant())
     return $fresh
 }
