@@ -477,6 +477,13 @@ function Resolve-DemoTrackPlan {
             if ($last -and $last -in $names) {
                 $first = [array]::IndexOf($names, $last) + 1
             }
+            # T4's read replica (2026-11-13, ADR 0025): an environment that an earlier version deployed recorded T4's track
+            # past where the Replica step sits now, so that step runs on its resume until the replica is set up, and the
+            # status page shows it instead of "Finished in an earlier run".
+            $replicaAt = [array]::IndexOf($names, 'Replica')
+            if ($track -eq 'T4' -and $replicaAt -ge 0 -and $first -gt $replicaAt -and -not (Test-DemoT4ReplicaSetUp -State $State)) {
+                $first = $replicaAt
+            }
             $artifactsAt = [array]::IndexOf($names, 'Artifacts')
             if ($artifactsAt -ge 0 -and $first -gt $artifactsAt -and $stop -ge [array]::IndexOf($stages, 'Artifacts')) {
                 $pastArtifacts.Add($track)

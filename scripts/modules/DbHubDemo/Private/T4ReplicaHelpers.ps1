@@ -791,7 +791,8 @@ function Complete-DemoT4ReplicaCreate {
             $why = if ($null -ne $failure) { $failure.Text } else { 'the deployment failed, and its error couldn''t be read' }
             $evidence['attempt'] = Format-DemoT4ReplicaAttemptText -Attempt $attempt
             $evidence['error'] = $why
-            $results.Add((New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $failStatus -Message ('T4''s read replica ({0}) couldn''t be created as {1}: {2}' -f $names.ServerName, $evidence['attempt'], $why) -Evidence $evidence -Remediation 'Fix the cause (a quota, or a policy denial, names itself), then run the script again; the replica is created when it''s missing.' -DocUrl $docUrl))
+            $fix = if ($null -ne $failure -and $failure.Code -eq 'SourceNotReady') { 'T4 stayed busy (restarting, updating, or starting) through 3 tries. Run the script again once ./scripts/status.ps1 shows T4 Ready: the replica is created when it''s missing.' } else { 'Fix the cause (a quota, or a policy denial, names itself), then run the script again; the replica is created when it''s missing.' }
+            $results.Add((New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $failStatus -Message ('T4''s read replica ({0}) couldn''t be created as {1}: {2}' -f $names.ServerName, $evidence['attempt'], $why) -Evidence $evidence -Remediation $fix -DocUrl $docUrl))
             return $results.ToArray()
         }
         $refused.Add([pscustomobject]@{ SkuName = $attempt.SkuName; Zone = $attempt.Zone; TimeUtc = $failure.TimeUtc })

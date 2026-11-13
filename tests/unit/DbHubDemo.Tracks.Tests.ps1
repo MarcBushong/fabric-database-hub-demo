@@ -42,7 +42,7 @@ BeforeAll {
         [pscustomobject]@{
             Exists = $true; Stage = ''; StageUtc = ''; BundleSha256 = ('a' * 64); BundleChunkCount = 1; RunnerSha256 = ('b' * 64); RunnerChunkCount = 7
             BundleSentTo = @('sqlvm01', 'archost01'); RunnerSentTo = @('sqlvm01', 'archost01'); NetworkMode = 'private'; T3UseFreeLimit = $true; T3AdminGroupName = 'sg-t3'
-            BastionExpiresUtc = ''; HostPasswordUtc = ''; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; T2Source = ''; Tags = @{}
+            BastionExpiresUtc = ''; HostPasswordUtc = ''; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; T2Source = ''; T4Replica = ''; Tags = @{}
         }
     }
 }
@@ -106,6 +106,20 @@ Describe 'Resolve-DemoTrackPlan' {
         $plan.Tracks['T2'] | Should -Be @('Restore', 'Artifacts', 'Bootstraps', 'T2', 'Telemetry')
         $plan.Tracks['T4'] | Should -Be @('Replica', 'Telemetry')
         @($plan.Tracks['Fabric']).Count | Should -Be 0
+    }
+
+    It 'runs T4''s Replica step again on the resume of an environment an earlier version deployed, until the replica is set up (ADR 0025)' {
+        # Live, 2026-11-13: main's run recorded T4's track at Telemetry, past where the Replica step sits now, and the status
+        # page said the Replica step "Finished in an earlier run".
+        $state = New-TestState
+        $state.Stage = 'Infrastructure'
+        $state.TrackT4 = 'Telemetry'
+        $plan = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State }
+        $plan.Tracks['T4'] | Should -Be @('Replica', 'Telemetry')
+
+        $state | Add-Member -NotePropertyName 'T4Replica' -NotePropertyValue 'Session' -Force
+        $plan = InModuleScope DbHubDemo -Parameters @{ State = $state } { Resolve-DemoTrackPlan -Resume -State $State }
+        @($plan.Tracks['T4']).Count | Should -Be 0 -Because 'a set-up environment resumes after its last step'
     }
 
     It 'names the VM tracks a resume continues past their Artifacts step, and sends a -Resend track back to it (live finding, 2026-11-06)' {
@@ -1943,6 +1957,10 @@ Describe 'Invoke-DemoParallelDeployment' {
                     }
                     $done.Add($name)
                     $script:tags[('Track{0}' -f $Track)] = $name
+                    if ($Track -eq 'T4' -and $name -eq 'Replica') {
+                        # The real step records that the environment has the replica (ADR 0025).
+                        $script:tags['T4Replica'] = 'Session'
+                    }
                 }
                 if ($status -eq 'Pass' -and $Track -eq 'T1') {
                     foreach ($id in 'T3.PROPERTY', 'TELEMETRY.T1', 'TELEMETRY.T3') {
