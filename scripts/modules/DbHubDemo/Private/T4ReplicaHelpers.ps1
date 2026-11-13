@@ -669,6 +669,16 @@ function Start-DemoT4ReplicaCreate {
             return (& $finish 'Warning' ('T4 ({0}) is {1} after its restart, so its read replica wasn''t created.' -f $names.SourceName, $t4.State) $evidence 'Run ./scripts/start-demo.ps1 once T4 is Ready; it creates the replica.')
         }
     }
+    # The restart's pending flag clears while T4 is still restarting (live, 2026-11-13: the replica went out then, and Azure
+    # refused it with ReadReplicaServerInUnexpectedState, "in 'Restarting' state"), so T4 must read Ready again first.
+    $t4 = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
+    if ($t4.State -ne 'Ready') {
+        Write-DemoLog -Message ('T4 ({0}) is {1}; T4''s read replica is created once it''s Ready again (at most {2} minutes).' -f $names.SourceName, $t4.State, $setting['powerWaitMinutes'])
+        $t4 = Wait-DemoT4State -Config $Config -State @('Ready') -TimeoutMinutes ([int]$setting['powerWaitMinutes']) -DeploymentId $DeploymentId
+        if ($t4.State -ne 'Ready') {
+            return (& $finish 'Warning' ('T4 ({0}) is {1}, not Ready, after {2} minutes, so its read replica wasn''t created: Azure creates a replica only from a running server.' -f $names.SourceName, $t4.State, $setting['powerWaitMinutes']) $evidence 'Run ./scripts/start-demo.ps1 once T4 is Ready; it creates the replica.')
+        }
+    }
     $zones = @(Get-DemoT4SkuZone -Config $Config -SkuName $support.SkuName | Where-Object { $_ -ne $support.Zone })
     $context.Order = @(Get-DemoT4ReplicaSizeOrder -T4SkuName $support.SkuName -Record ([string]$state.T4ReplicaSize) -Zone $zones)
     $context.Index = 0
@@ -744,6 +754,7 @@ function Complete-DemoT4ReplicaCreate {
     foreach ($item in @($Context.Refused)) {
         $refused.Add($item)
     }
+    $notReadyRetries = 0
     while ($true) {
         $attempt = $order[$index]
         $outcome = Wait-DemoT4ReplicaTemplate -Config $Config -TimeoutMinutes ([int]$setting['createTimeoutMinutes'])
@@ -756,6 +767,25 @@ function Complete-DemoT4ReplicaCreate {
             return $results.ToArray()
         }
         $failure = Get-DemoT4ReplicaCreateFailure -Config $Config
+        if ($null -ne $failure -and $failure.Code -eq 'SourceNotReady' -and $notReadyRetries -lt 3) {
+            # Azure refused the replica because T4 was busy (ReadReplicaServerInUnexpectedState, live 2026-11-13: T4 was
+            # restarting for max_connections): the same size goes out again once T4 reads Ready and has settled a minute.
+            $notReadyRetries++
+            Write-DemoLog -Level Warning -Message ('Azure refused T4''s read replica because T4 wasn''t ready ({0}); trying {1} again once T4 is Ready (retry {2} of 3).' -f $failure.Text, (Format-DemoT4ReplicaAttemptText -Attempt $attempt), $notReadyRetries)
+            $null = Wait-DemoT4State -Config $Config -State @('Ready') -TimeoutMinutes ([int]$setting['powerWaitMinutes']) -DeploymentId ([string]$Context.DeploymentId)
+            $shell = Get-DemoT4ReplicaState -Config $Config -DeploymentId ([string]$Context.DeploymentId)
+            if ($shell.Present) {
+                $null = Wait-DemoT4ReplicaState -Config $Config -State @('NotFound') -TimeoutMinutes ([int]$setting['deleteTimeoutMinutes']) -DeploymentId ([string]$Context.DeploymentId)
+            }
+            Start-Sleep -Seconds 60
+            $sent = Send-DemoT4ReplicaTemplate -Config $Config -Names $names -Support $support -SkuName $attempt.SkuName -Zone $attempt.Zone -NoWait
+            if ($sent.ExitCode -ne 0) {
+                $evidence['error'] = $sent.Error
+                $results.Add((New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $failStatus -Message ('T4''s read replica ({0}) couldn''t be created as {1}: {2}' -f $names.ServerName, (Format-DemoT4ReplicaAttemptText -Attempt $attempt), $sent.Error) -Evidence $evidence -Remediation 'Fix the cause, then run the script again.' -DocUrl $docUrl))
+                return $results.ToArray()
+            }
+            continue
+        }
         $refusedSize = $null -ne $failure -and $failure.Code -eq 'SkuNotAvailable' -and ($failure.Sku -ceq $attempt.SkuName -or -not $failure.Sku)
         if (-not $refusedSize) {
             $why = if ($null -ne $failure) { $failure.Text } else { 'the deployment failed, and its error couldn''t be read' }

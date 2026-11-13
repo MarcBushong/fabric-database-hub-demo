@@ -233,6 +233,40 @@ Describe 'Creating the replica: the fallback, its notice, and Azure''s refusals 
         $results[0].status | Should -Be 'Warning'
         $results[0].message | Should -Match 'is Stopped, not Ready, so its read replica wasn''t created'
     }
+
+    It 'waits for T4 to read Ready again after max_connections'' restart before the replica goes out (live, 2026-11-13)' {
+        # Live: the restart's pending flag cleared while T4 was still restarting, the replica went out, and Azure refused it.
+        $script:t4Reads = 0
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { $script:t4Reads++; New-T4State -State $(if ($script:t4Reads -eq 1) { 'Ready' } else { 'Restarting' }) }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT4State -MockWith { New-T4State }
+        $script:pending = 1
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ParameterState -MockWith { $flag = $script:pending -gt 0; $script:pending--; [pscustomobject]@{ Found = $true; Value = '50'; PendingRestart = $flag } }
+        $script:outcomes.Enqueue('Succeeded')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4ReplicaCreate -Config $Config -DeploymentId 'abc123' -CheckPrefix DEPLOY -WaitForRestartMinutes 90 -Confirm:$false })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Wait-DemoT4State -Times 1 -Exactly -ParameterFilter { @($State) -contains 'Ready' }
+        @($script:sent) | Should -Be @('Standard_D4ds_v5@')
+        ($results | Where-Object checkId -EQ 'DEPLOY.T4.REPLICA').status | Should -Be 'Pass'
+    }
+
+    It 'sends the same size again when Azure refused it because T4 was busy (ReadReplicaServerInUnexpectedState), at most 3 times' {
+        $script:failureCode = 'SourceNotReady'
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT4State -MockWith { New-T4State }
+        $script:outcomes.Enqueue('Failed')
+        $script:outcomes.Enqueue('Succeeded')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4ReplicaCreate -Config $Config -DeploymentId 'abc123' -CheckPrefix DEPLOY -Confirm:$false })
+        @($script:sent) | Should -Be @('Standard_D4ds_v5@', 'Standard_D4ds_v5@') -Because 'it isn''t a size refusal, so the size stays'
+        ($results | Where-Object checkId -EQ 'DEPLOY.T4.REPLICA').status | Should -Be 'Pass'
+        $results | Where-Object checkId -EQ 'DEPLOY.T4.REPLICA.FALLBACK' | Should -BeNullOrEmpty
+
+        $script:sent.Clear()
+        $script:replicaReads = 0
+        foreach ($i in 1..4) {
+            $script:outcomes.Enqueue('Failed')
+        }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4ReplicaCreate -Config $Config -DeploymentId 'abc123' -CheckPrefix DEPLOY -Confirm:$false })
+        $script:sent.Count | Should -Be 4 -Because 'the first attempt and 3 retries'
+        ($results | Where-Object checkId -EQ 'DEPLOY.T4.REPLICA').status | Should -Be 'Fail'
+    }
 }
 
 Describe 'Azure''s power order, and deleting the replica (live, 2026-11-13)' {
