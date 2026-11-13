@@ -1491,7 +1491,10 @@ function Get-DemoPostgresHistoryCapture {
         [System.Collections.IDictionary] $Config,
 
         [ValidateRange(15, 10080)]
-        [int] $WindowMinutes = 720
+        [int] $WindowMinutes = 720,
+
+        [ValidatePattern('^[A-Z0-9]+(\.[A-Z0-9_]+)+$')]
+        [string] $CheckId = 'STOP.T4.HISTORY'
     )
 
     $docUrl = [string](Get-DemoT4ReplicaSetting)['docUrls']['concepts']
@@ -1506,11 +1509,93 @@ function Get-DemoPostgresHistoryCapture {
         $points = [int](Get-DemoMemberValue -InputObject $capture -Name 'PointCount')
         $evidence = [ordered]@{ servers = $servers; points = $points; bytes = $json.Length; windowMinutes = $WindowMinutes; notes = @(Get-DemoMemberValue -InputObject $capture -Name 'Notes') }
         if ($json -and $points -gt 0) {
-            return [pscustomobject]@{ Json = $json; Result = (New-DemoResult -CheckId 'STOP.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Pass' -Message ('Captured {0} metric point(s) of T4 and its read replica from Azure Monitor over the last {1} minutes for the session''s history, before the replica is deleted (its metrics go with it).' -f $points, $WindowMinutes) -Evidence $evidence -DocUrl $docUrl) }
+            return [pscustomobject]@{ Json = $json; Result = (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'T4' -Status 'Pass' -Message ('Captured {0} metric point(s) of T4 and its read replica from Azure Monitor over the last {1} minutes for the session''s history, before the replica is deleted (its metrics go with it).' -f $points, $WindowMinutes) -Evidence $evidence -DocUrl $docUrl) }
         }
-        return [pscustomobject]@{ Json = $json; Result = (New-DemoResult -CheckId 'STOP.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message ('Azure Monitor had no metrics for T4 or its read replica over the last {0} minutes, so the session''s history has none of them.' -f $WindowMinutes) -Evidence $evidence -Remediation 'Database Hub''s PostgreSQL dashboard shows T4''s metrics for its retention; the replica''s go with it.' -DocUrl $docUrl) }
+        return [pscustomobject]@{ Json = $json; Result = (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'T4' -Status 'Warning' -Message ('Azure Monitor had no metrics for T4 or its read replica over the last {0} minutes, so the session''s history has none of them.' -f $WindowMinutes) -Evidence $evidence -Remediation 'Database Hub''s PostgreSQL dashboard shows T4''s metrics for its retention; the replica''s go with it.' -DocUrl $docUrl) }
     }
     catch {
-        return [pscustomobject]@{ Json = ''; Result = (New-DemoResult -CheckId 'STOP.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message ('T4''s and its read replica''s metrics weren''t captured for the session''s history: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Nothing to do for the demo; the history keeps the SQL targets.' -DocUrl $docUrl) }
+        return [pscustomobject]@{ Json = ''; Result = (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'T4' -Status 'Warning' -Message ('T4''s and its read replica''s metrics weren''t captured for the session''s history: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Nothing to do for the demo; the history keeps the SQL targets.' -DocUrl $docUrl) }
     }
+}
+
+function Save-DemoPostgresHistoryPending {
+    <#
+    .SYNOPSIS
+    Keeps T4's and its read replica's captured metrics (the POSTGRES_METRICS document) in out/history-pending when the
+    session's history run didn't save them, for example while the Fabric capacity is paused (2026-11-13, ADR 0025).
+    stop-demo.ps1 deletes the replica, and Azure Monitor no longer answers for a deleted replica's metrics
+    (ResourceNotFound, live 2026-11-13), so without this file the session's Read replica lag would be gone. Returns
+    STOP.T4.HISTORY.PENDING: a Warning that says so, names the file, and gives the command that adds it to the history
+    once the capacity runs; or $null when there's nothing to keep. Never throws. Internal.
+
+    .DESCRIPTION
+    The file holds what the notebook's parameter would have: server names, sizes, metric names, times, and numbers; no
+    resource ID, subscription, or credential (Get-DemoPostgresHistoryParameter). out/ is Git-ignored.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyString()]
+        [string] $Json = '',
+
+        [string] $Directory = (Join-Path -Path $script:RepoRoot -ChildPath 'out/history-pending'),
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    if (-not $Json) {
+        return $null
+    }
+    $checkId = 'STOP.T4.HISTORY.PENDING'
+    $docUrl = [string](Get-DemoT4ReplicaSetting)['docUrls']['concepts']
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    $document = $null
+    try {
+        $document = $Json | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('The captured POSTGRES_METRICS document isn''t JSON: {0}' -f $_.Exception.Message)
+    }
+    # Get-DemoMemberValue keeps an array intact, so each list is assigned before it's enumerated.
+    $serverList = Get-DemoMemberValue -InputObject $document -Name 'servers'
+    $seriesList = Get-DemoMemberValue -InputObject $document -Name 'series'
+    $replica = @(@($serverList) | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'role') -eq 'replica' }) | Select-Object -First 1
+    $peak = $null
+    foreach ($series in @($seriesList)) {
+        if ($null -eq $series -or [string](Get-DemoMemberValue -InputObject $series -Name 'metric') -ne 'physical_replication_delay_in_seconds') {
+            continue
+        }
+        $pointList = Get-DemoMemberValue -InputObject $series -Name 'points'
+        foreach ($point in @($pointList)) {
+            $value = @($point)[-1]
+            if ($value -is [ValueType] -and $value -isnot [datetime] -and ($null -eq $peak -or [double]$value -gt $peak)) {
+                $peak = [double]$value
+            }
+        }
+    }
+    $name = 'postgres-metrics-{0}-{1}.json' -f (Get-DemoResourceGroupName -Config $Config), $NowUtc.ToUniversalTime().ToString("yyyyMMdd'T'HHmmss'Z'", $invariant)
+    $path = Join-Path -Path $Directory -ChildPath $name
+    $lost = if ($null -ne $replica) { 'T4''s read replica is deleted, and Azure Monitor no longer has its metrics' } else { 'T4''s metrics weren''t added to the history' }
+    if (-not $PSCmdlet.ShouldProcess($path, 'Keep T4''s captured metrics for the history')) {
+        return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'T4' -Status 'Not selected' -Message ('What if: the captured metrics would be kept in {0}.' -f $path) -DocUrl $docUrl)
+    }
+    try {
+        $null = New-Item -ItemType Directory -Path $Directory -Force
+        [System.IO.File]::WriteAllText($path, $Json, [System.Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'T4' -Status 'Warning' -Message ('The session''s history wasn''t saved (STOP.FABRIC.SAVEHISTORY says why), and {0}; the metrics captured before the delete couldn''t be kept either ({1}), so this session''s are lost.' -f $lost, (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Database Hub''s PostgreSQL dashboard keeps T4''s own metrics for their retention. Next time, run stop-demo.ps1 -SaveHistory while the Fabric capacity runs.' -DocUrl $docUrl)
+    }
+    $shown = $path
+    $root = $script:RepoRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if ($path.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $shown = './' + $path.Substring($root.Length).Replace('\', '/')
+    }
+    $command = './scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity -PostgresMetricsPath {0}' -f $shown
+    $lag = if ($null -ne $peak) { ' (Read replica lag up to {0} s)' -f $peak.ToString('0.#', $invariant) } else { '' }
+    $message = 'The session''s history wasn''t saved (STOP.FABRIC.SAVEHISTORY says why), and {0}: the metrics captured before the delete{1} are kept in {2}, so they aren''t lost.' -f $lost, $lag, $shown
+    return (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'T4' -Status 'Warning' -Message $message -Evidence ([ordered]@{ path = $shown; replica = ($null -ne $replica); peakLagSeconds = $peak; command = $command }) -Remediation ('Once the Fabric capacity runs, run {0} (add -ConfigPath for another configuration): it adds them to the history.' -f $command) -DocUrl $docUrl)
 }

@@ -36,6 +36,10 @@ function Stop-DemoEnvironment {
       NB_DatabaseHub_LiveActivity on demand to save the session's history (Save-DemoFabricHistory), and then, with
       fabric.manageCapacity true, the Fabric capacity that start-demo.ps1 resumed is paused (STOP.FABRIC.CAPACITY,
       Suspend-DemoFabricCapacity), never while that run is still going. With the defaults the capacity isn't called.
+      T4's read replica (ADR 0025) is deleted after each session, and its Azure Monitor metrics with it, so -SaveHistory
+      first reads T4's and the replica's metrics (STOP.T4.HISTORY) and sends them with that run; when the run doesn't save
+      them (a paused capacity, for example), they're kept in out/history-pending, with the command that adds them once
+      the capacity runs (STOP.T4.HISTORY.PENDING, Save-DemoPostgresHistoryPending).
     Run Command needs a running VM: a password rotation on a deallocated host reports Manual action required
     with the steps, and a profile on a VM that isn't running is already inactive (Not selected).
 
@@ -268,13 +272,24 @@ function Stop-DemoEnvironment {
         $capacitySetting = Get-DemoFabricCapacitySetting -Config $Config
         $historyRunning = $false
         if ($SaveHistory -or $capacitySetting.SaveHistoryOnStop) {
+            $historySaved = $false
             try {
                 $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' })
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning
+                $historySaved = [string]$saved.Result.status -eq 'Pass' -or $historyRunning
             }
             catch {
                 $results.Add((New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The session''s history wasn''t saved: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'In Fabric, run NB_DatabaseHub_LiveActivity in the demo''s workspace (Run all).'))
+            }
+            # T4's read replica is deleted by now, and its metrics with it (ADR 0025): when the run that would have added them
+            # to the history didn't (a paused capacity, for example), they're kept in out/history-pending, with the command
+            # that adds them once the capacity runs, so they're never lost without a word.
+            if (-not $historySaved -and $null -ne $postgresHistory -and [string]$postgresHistory.Json) {
+                $kept = Save-DemoPostgresHistoryPending -Config $Config -Json ([string]$postgresHistory.Json) -Confirm:$false
+                if ($null -ne $kept) {
+                    $results.Add($kept)
+                }
             }
         }
         if ($historyRunning -and $capacitySetting.ManageCapacity) {

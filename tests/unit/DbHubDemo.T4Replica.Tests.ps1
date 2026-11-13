@@ -278,4 +278,34 @@ Describe 'The history keeps the session''s lag: captured before stop-demo.ps1 de
         $delete | Should -BeGreaterThan $capture
         $source | Should -Match '-PostgresMetrics'
     }
+
+    It 'keeps the captured metrics in a file, with the command that adds them to the history, and says the replica''s are otherwise gone' {
+        $json = '{"version":1,"servers":[{"role":"primary","target":"T4","resourceName":"pgflex01-abc123","sku":"Standard_D4ds_v5"},{"role":"replica","target":"T4-replica","resourceName":"pgreplica01-abc123","sku":"Standard_D4ds_v5"}],"series":[{"resourceName":"pgreplica01-abc123","role":"replica","metric":"physical_replication_delay_in_seconds","aggregation":"Maximum","unit":"Seconds","points":[["2026-11-13T17:00:00Z",6],["2026-11-13T17:05:00Z",245]]}]}'
+        $folder = Join-Path -Path $TestDrive -ChildPath 'history-pending'
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Json = $json; Folder = $folder } {
+            Save-DemoPostgresHistoryPending -Config $Config -Json $Json -Directory $Folder -NowUtc ([datetime]::new(2026, 11, 13, 19, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false
+        }
+        $result.checkId | Should -Be 'STOP.T4.HISTORY.PENDING'
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'replica is deleted, and Azure Monitor no longer has its metrics'
+        $result.message | Should -Match 'Read replica lag up to 245 s'
+        $path = @(Get-ChildItem -LiteralPath $folder -Filter 'postgres-metrics-rg-*-20261113T190000Z.json' -File -Force)[0].FullName
+        [System.IO.File]::ReadAllText($path) | Should -BeExactly $json
+        $result.remediation | Should -Match ([regex]::Escape('./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity -PostgresMetricsPath ' + $path))
+
+        # Nothing captured: nothing to keep, and nothing said.
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Folder = $folder } { Save-DemoPostgresHistoryPending -Config $Config -Json '' -Directory $Folder -Confirm:$false } | Should -BeNullOrEmpty
+        @(Get-ChildItem -LiteralPath $folder -File).Count | Should -Be 1
+    }
+
+    It 'says the session''s metrics are lost when the file can''t be written' {
+        $blocked = Join-Path -Path $TestDrive -ChildPath 'blocked'
+        Set-Content -LiteralPath $blocked -Value 'a file where the folder would go'
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Folder = (Join-Path -Path $blocked -ChildPath 'pending') } {
+            Save-DemoPostgresHistoryPending -Config $Config -Json '{"version":1,"servers":[],"series":[]}' -Directory $Folder -Confirm:$false
+        }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'couldn''t be kept either'
+        $result.message | Should -Match 'so this session''s are lost'
+    }
 }

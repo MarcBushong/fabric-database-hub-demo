@@ -691,5 +691,30 @@ Describe 'configure-fabric.ps1' {
         $sent.CONFIRM.value | Should -Be 'false' -Because 'Run all would otherwise send an activity request'
         $sent.STOP_ACTIVITY.value | Should -Be 'false'
         $sent.SAVE_RESULTS.value | Should -Be 'true'
+        $sent.PSObject.Properties.Name | Should -Not -Contain 'POSTGRES_METRICS' -Because 'with -FabricToken no subscription guard runs, so Azure Monitor isn''t read'
+    }
+
+    It 'adds the PostgreSQL metrics stop-demo.ps1 kept for a paused capacity with -PostgresMetricsPath, then moves the file aside (ADR 0025)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        $pending = Join-Path -Path $TestDrive -ChildPath 'history-pending'
+        $null = New-Item -ItemType Directory -Path $pending -Force
+        $file = Join-Path -Path $pending -ChildPath 'postgres-metrics-20261113T190000Z.json'
+        $document = '{"version":1,"servers":[{"role":"replica","target":"T4-replica","resourceName":"pgreplica01-abc123","sku":"Standard_D4ds_v5"}],"series":[]}'
+        [System.IO.File]::WriteAllText($file, $document)
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
+            @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = 'Completed' }) }
+            @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$itemId/jobs/instances/$operationId" }) }
+        )
+        $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -PostgresMetricsPath $file -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
+        $LASTEXITCODE | Should -Be 0
+        (Read-ImportResult | Where-Object checkId -EQ 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY').status | Should -Be 'Pass'
+        $run = @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -like '*jobType=RunNotebook' })
+        (Get-RequestBody -Request $run[-1]).executionData.parameters.POSTGRES_METRICS.value | Should -BeExactly $document
+        Test-Path -LiteralPath $file | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path -Path $pending -ChildPath 'saved/postgres-metrics-20261113T190000Z.json') | Should -BeTrue
+
+        { & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -PostgresMetricsPath (Join-Path -Path $pending -ChildPath 'missing.json') -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false } | Should -Throw '*doesn''t exist*'
+        { & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -PostgresMetricsPath $file -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false } | Should -Throw '*goes with -RunLiveActivity*'
     }
 }
