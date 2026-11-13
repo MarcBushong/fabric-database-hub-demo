@@ -704,17 +704,20 @@ function Invoke-DemoDeployment {
                 }
                 $t4State = Get-DemoT4State -Config $Config
                 $results.Add((Test-DemoT4MetricFlow -Config $Config -ServerId $t4State.Names.ServerId -State $t4State.State -WaitMinutes ([System.Math]::Min($TelemetryWaitMinutes, 10))))
-                # T4's read replica (2026-11-13, ADR 0025), after T4's restart above, as the T4 track creates it; the environment
-                # has the replica's lifecycle from now on (DbHubT4Replica Session).
+                # T4's read replica (2026-11-13, ADR 0025), after T4's restart above, as the T4 track creates it; once it's created
+                # or isn't supported, the environment has the replica's lifecycle (DbHubT4Replica Session), not after a failure.
                 $replicaResults = @(Invoke-DemoT4ReplicaCreate -Config $Config -CheckPrefix DEPLOY)
                 & $addAll $replicaResults
-                try {
-                    Set-DemoDeploymentState -Config $Config -Value @{ T4Replica = [string](Get-DemoT4ReplicaSetting)['recordValue'] } -Confirm:$false
+                $replicaCreated = @($replicaResults | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0
+                if ($replicaCreated -or @($replicaResults | Where-Object { [string]$_.status -eq 'Not supported' }).Count -gt 0) {
+                    try {
+                        Set-DemoDeploymentState -Config $Config -Value @{ T4Replica = [string](Get-DemoT4ReplicaSetting)['recordValue'] } -Confirm:$false
+                    }
+                    catch {
+                        $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.RECORD' -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('The replica''s record (DbHubT4Replica) wasn''t set on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run ./scripts/deploy.ps1 again.'))
+                    }
                 }
-                catch {
-                    $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.RECORD' -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('The replica''s record (DbHubT4Replica) wasn''t set on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run ./scripts/deploy.ps1 again.'))
-                }
-                if (@($replicaResults | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0) {
+                if ($replicaCreated) {
                     $results.Add((Test-DemoT4ReplicaServer -Config $Config))
                     $results.Add((Test-DemoT4ReplicaEstate -Config $Config -WaitMinutes 5))
                     $results.Add((Test-DemoT4ReplicaMetricFlow -Config $Config -WaitMinutes ([System.Math]::Min($TelemetryWaitMinutes, 10))))

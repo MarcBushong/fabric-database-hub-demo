@@ -2355,6 +2355,8 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
       - If it still fails, the fix says so.
     - **The upgrade (`rg-dbhubup-demo`):** main's run had recorded T4's track at Telemetry, so the resume skipped the new Replica step, and the status page said it "Finished in an earlier run". DONE's gate would still have created the replica, out of sight of the T4 row.
       - Now a resume runs the Replica step until the environment has the replica (`DbHubT4Replica`).
+    - **The new deployment's resume, after the refusal above:** the Replica step had recorded `DbHubT4Replica` whatever its outcome, so the resume skipped it as well, and only DONE's gate would have created the replica, out of sight of T4's row.
+      - Now the step records it only once the replica is created, or isn't supported on a Burstable T4, so a resume runs a failed one again, on T4's row.
 
 **Changed files.**
 

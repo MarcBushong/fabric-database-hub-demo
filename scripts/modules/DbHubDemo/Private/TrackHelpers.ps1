@@ -1529,9 +1529,12 @@ function Invoke-DemoDeploymentTrack {
                     $recordReplica = { param([System.Collections.IDictionary] $Values) if ($recordState) { Set-DemoDeploymentStateLocked -Config $Config -Value $Values -Confirm:$false } }
                     $replicaResults = @(Invoke-DemoT4ReplicaCreate -Config $Config -CheckPrefix DEPLOY -WaitForRestartMinutes ([int](& $option 'T4ReplicaRestartWaitMinutes' 90)) -RecordState $recordReplica)
                     & $addAll $replicaResults
-                    if ($recordState) {
-                        # The environment has the replica's lifecycle from now on (DbHubT4Replica Session), whatever this run's
-                        # outcome: start-demo.ps1 creates it, stop-demo.ps1 deletes it, and status.ps1 reports it.
+                    $created = @($replicaResults | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0
+                    $notSupported = @($replicaResults | Where-Object { [string]$_.status -eq 'Not supported' }).Count -gt 0
+                    if ($recordState -and ($created -or $notSupported)) {
+                        # The environment has the replica's lifecycle from now on (DbHubT4Replica Session): start-demo.ps1
+                        # creates it, stop-demo.ps1 deletes it, and status.ps1 reports it. Not after a creation that failed
+                        # (live, 2026-11-13): then a resume runs this step again (Resolve-DemoTrackPlan), on T4's row.
                         try {
                             Set-DemoDeploymentStateLocked -Config $Config -Value @{ T4Replica = [string](Get-DemoT4ReplicaSetting)['recordValue'] } -Confirm:$false
                         }
@@ -1541,13 +1544,12 @@ function Invoke-DemoDeploymentTrack {
                     }
                     # A size change's notice (DEPLOY.T4.REPLICA.FALLBACK, a Warning) is the row's message on the status page, as
                     # T4's own is (2026-11-09): the step's first result that isn't a Pass.
-                    $created = @($replicaResults | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0
                     if ($created) {
                         $results.Add((Test-DemoT4ReplicaServer -Config $Config))
                         $results.Add((Test-DemoT4ReplicaEstate -Config $Config -WaitMinutes 5))
                         $results.Add((Test-DemoT4ReplicaMetricFlow -Config $Config -WaitMinutes ([int](& $option 'TelemetryWaitMinutes' 15))))
                     }
-                    elseif (@($replicaResults | Where-Object { [string]$_.status -eq 'Not supported' }).Count -gt 0) {
+                    elseif ($notSupported) {
                         foreach ($requirement in 'HUB.ESTATE.T4.REPLICA', 'METRICS.T4.REPLICA') {
                             $results.Add((New-DemoT4ReplicaNotSupportedResult -CheckId $requirement -T4SkuName ([string](Get-DemoT4ReplicaSupport -T4State (Get-DemoT4State -Config $Config)).SkuName)))
                         }

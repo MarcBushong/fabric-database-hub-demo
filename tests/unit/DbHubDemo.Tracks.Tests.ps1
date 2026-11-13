@@ -1421,6 +1421,27 @@ Describe 'T4''s row on the status page says an automatic size change (2026-11-09
         $row['message'] | Should -Match 'Azure kept DbHubDemo-HealthRead on sqlvm01 in Deleting'
         @(InModuleScope DbHubDemo { Get-DemoRunCommandStuckResult }).Count | Should -Be 0 -Because 'the step reported it, so nothing reports it again'
     }
+
+    It 'records that the environment has the replica only once it''s created or isn''t supported, so a resume runs a failed one again: <Name> (live, 2026-11-13)' -ForEach @(
+        @{ Name = 'created'; Status = 'Pass'; Recorded = 1 }
+        @{ Name = 'not supported'; Status = 'Not supported'; Recorded = 1 }
+        @{ Name = 'refused'; Status = 'Fail'; Recorded = 0 }
+    ) {
+        $script:replicaStatus = $Status
+        $script:recorded = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { $script:recorded.Add($Value) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaCreate -MockWith { New-TestResult 'DEPLOY.T4.REPLICA' $script:replicaStatus }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4ReplicaServer -MockWith { New-TestResult 'T4.REPLICA' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4ReplicaEstate -MockWith { New-TestResult 'HUB.ESTATE.T4.REPLICA' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4ReplicaMetricFlow -MockWith { New-TestResult 'METRICS.T4.REPLICA' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Exists = $true } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaSupport -MockWith { [pscustomobject]@{ Supported = $false; Reason = 'Burstable'; SkuName = 'Standard_B2s' } }
+        $context = @{ NetworkMode = 'private'; T3UseFreeLimit = $true; T2Source = 'golden'; ConfigPath = ''; NoState = $false }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -WithT4); Context = $context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T4' -Context $Context -Step @('Replica') }
+        $outcome.Status | Should -Be 'Pass' -Because 'the replica never fails T4''s track'
+        @($script:recorded | Where-Object { $_.Contains('T4Replica') }).Count | Should -Be $Recorded
+        @($script:recorded | Where-Object { $_.Contains('TrackT4') }).Count | Should -Be 1 -Because 'the step itself is recorded as before'
+    }
 }
 Describe 'Invoke-DemoParallelDeployment' {
     BeforeEach {
