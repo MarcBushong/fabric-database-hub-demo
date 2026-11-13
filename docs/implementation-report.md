@@ -120,6 +120,7 @@ Dated examples from `estimate-cost.ps1` at list prices from the Azure Retail Pri
 - **The self-update's git off PATH** (2026-11-09): unit-tested with each lookup mocked. Live: a `./scripts/deploy.ps1` from a clone made with GitHub Desktop, in a terminal without `git`, that updates with GitHub Desktop's git and says so; and one on a PC with Visual Studio's git only (R800, R801).
 - **A paused capacity isn't a missing lakehouse** (2026-11-10): unit-tested with the live run's answers (List Lakehouses' HTTP 404 `CapacityNotActive` while the owner had paused the F4). Live: a `./scripts/deploy.ps1` whose capacity is paused before its validation ends **NOT DONE** with `FABRIC.P5.CAPACITY` as the reason and its resume as the next step, on the console and the status page; `FABRIC.ITEMS.REQUIRED` is **Manual action required**, "couldn't all be checked", never "is missing"; `DEPLOY.FABRIC.HISTORY` says the capacity isn't running; and `./scripts/status.ps1` on the paused capacity passes `STATUS.FABRIC` (R810 to R813).
 - **Entry scripts use the module they imported** (2026-11-10): proven in a child process that loaded two copies of the module, with each entry script's own import and selection; the tests fail on the old scripts with the live error. Live: `./scripts/start-demo.ps1 -WarmUpMinutes 10` from a second clone, in a window that ran the first clone's scripts, ends with its report and no "is not recognized" (R821).
+- **T4's read replica** (2026-11-13): the probe ran live, and the rest is unit-tested, with the runner's scenario run against a local primary and standby. Live: an environment deployed by `main` that a plain `./scripts/deploy.ps1` gives the replica; a new deployment that ends **DONE** with it; `start-demo.ps1`, `replica-lag`'s climb in Read replica lag, `stop-demo.ps1 -SaveHistory`, and one safety stop job; the replica as its own row in Database Hub's Estate (R824, R828).
 
 ## Risk register
 
@@ -421,6 +422,14 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R821 | The fix is proven in a child process that loaded two copies of the module from the test drive, with each entry script's own import and selection, not by a live `start-demo.ps1` from a second clone | **Open:** a live `start-demo.ps1 -WarmUpMinutes 10` from a second clone, in a window that ran the first clone's scripts ([still to verify](#still-to-verify)) |
 | R822 | `./tests/Invoke-StaticValidation.ps1` and `Invoke-Pester` run in the window they're started from, so in a window that ran another copy's scripts, Pester's `InModuleScope` stops with "Multiple script or manifest modules named 'DbHubDemo' are currently loaded" (Pester 5.9.1, checked 2026-11-10) | **Accepted:** it affects contributors only, and Pester's message names the cause; run the tests in a new PowerShell window ([CONTRIBUTING](../CONTRIBUTING.md#validate-before-you-open-a-pull-request)). CI runs them in a new process |
 | R823 | Another entry script can call a module function that isn't exported, as `estimate-cost.ps1` did from 2026-11-04 to 2026-11-13, and a `try` around several reads hides it behind one message | **Mitigated:** `estimate-cost.ps1` runs its internal calls through its module object, each of its reads stands on its own, and `DbHubDemo.EstimateCost.Tests.ps1` covers it; other entry scripts aren't checked for calls to internal functions yet |
+| R824 | That Database Hub's Estate lists T4's read replica as a row of its own is inferred from Estate listing flexible servers; `HUB.ESTATE.T4.REPLICA` checks Azure Resource Graph only | **Open:** see it in Estate (**View: PostgreSQL**) in a rehearsal ([still to verify](#still-to-verify)) |
+| R825 | Each `start-demo.ps1` waits about 9 minutes for the replica, and Azure can refuse its size at a session's start | **Mitigated:** it's created within the 30-minute warm-up, with T4's fallback rules; when Azure refuses every size, the session starts without it, with a **Warning**; `-SkipT4Replica` leaves it out |
+| R826 | A session that ends without `stop-demo.ps1` leaves its replica: the safety stop stops it after T4, but it bills storage and its Defender plans until `stop-demo.ps1` deletes it, and whether Azure's 7-day automatic start starts a stopped replica, and in which order with T4, isn't documented | **Accepted:** `STATUS.T4.REPLICA` is a **Warning** with `stop-demo.ps1` as the fix, and the scripts start a stopped replica before T4 |
+| R827 | A deleted replica's Azure Monitor metrics are gone (`ResourceNotFound`, live), so the history has the replica's lag only from `stop-demo.ps1 -SaveHistory` or `deploy.ps1`'s history snapshot, read while it existed; a notebook run started in Fabric adds no T4 metrics | **Accepted:** documented, and the notebook says so in one line |
+| R828 | The `replica-lag` scenario's climb is proven against a local PostgreSQL 18.7 primary and hot standby, not yet against Azure | **Open:** the live upgrade test ([still to verify](#still-to-verify)) |
+| R829 | `demo-day`'s session estimate goes over the $15 session ceiling by the replica's share ($16.56 at the list prices of 2026-11-13) | **Accepted** (the owner kept $15): `PREFLIGHT.COST.SESSION` is a **Warning** that names the share and `-SkipT4Replica`, and T4's one-time move to `Standard_D4ds_v5` is decided without the share |
+| R830 | `deploy.ps1` republishes the on-demand control's runbooks only when the deployer can write to its Automation account; until then the control runs older code, which can't start T4 while a replica a session left is stopped | **Mitigated:** `CONTROL.RUNBOOKS` is a **Warning** on the console, the status page, and **DONE**, with what fails until then and the exact command |
+| R831 | Creating or deleting the replica puts T4 in Updating for minutes (live: about 8 to create), which blocks T4's management operations, not its connections | **Accepted:** the scripts order their own T4 operations around it: the template and T4's restart come before the replica, and a size change deletes the replica first |
 
 ## Phase log
 
@@ -2292,3 +2301,67 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
 **Validation.** `Invoke-Pester -Path tests/unit/DbHubDemo.EstimateCost.Tests.ps1`: 4 passed. Against `main`'s `scripts/estimate-cost.ps1`, the same 4 fail: the coverage is read 0 times, and none of the new lines is written. **Live:** the owner's kind of configuration signed in, 2026-11-13, before the fix: the misleading warning and the rest-of-month restart.
 
 **Risks.** R823 new.
+
+### T4's read replica, for each session (2026-11-13)
+
+**Why.** User-directed, 2026-11-13 ("Postgres HA/DR"): add a read replica of T4 to the one-click deployment and its upgrade; account for the replica's lag and PostgreSQL's health in the activity notebook and the Insights app; keep it efficient and cost manageable; and break nothing, for new users and for those who deployed before. Database Hub's PostgreSQL dashboard charts **Read replica lag** (`physical_replication_delay_in_seconds`, on replicas only), which stayed empty because T4 had no replica. Hyperscale, an HA standby, and Azure SQL geo-replication are out of scope ([ADR 0025](adr/0025-t4-read-replica.md)).
+
+**Work summary.**
+
+1. **A live probe first** (West US 3, two `Standard_D2ds_v5` servers in a delegated subnet, about $1, deleted the same day):
+   - A replica took 460 to 525 seconds to create, and a second deployment of its template fails (`ReadReplicaAlreadyExistWithGivenName`). A replica of a stopped primary is refused (`ReadReplicaServerInUnexpectedState`).
+   - Azure enforces the power order both ways (`SourceReplicasStartStopOrder`).
+   - Deleting a replica took about 100 seconds and left the primary Ready, and a deleted replica's metrics answer `ResourceNotFound`.
+   - `max_standby_streaming_delay` is settable on the replica, and an idle replica's lag was 2 to 6 seconds.
+2. **One replica per session** (ADR 0025's R1, approved within the owner's delegated scope). A lasting replica would bill its storage and Defender plans all month, and add a 7-day restart of its own: a first deployment's worst-case month would be about $576 against the $375 ceiling. Per session, that month is $315.82, with no change to the ceilings, the restart rule, or any role.
+3. **The template and the module** (`infra/replica/pgreplica01.bicep`, `Private/T4ReplicaHelpers.ps1`):
+   - `pgreplica01-<deploymentId>` is a same-region replica in T4's subnet and private DNS zone, at T4's actual size, with `max_standby_streaming_delay` 600000 ms.
+   - Its creation starts without waiting and finishes later. It has the size fallback: only `SkuNotAvailable` moves it on, from T4's size to another zone, then to larger documented sizes, never fewer vCores, after the `Dropping` shell is gone.
+   - The rest: the records (`DbHubT4ReplicaSize`, and `DbHubT4Replica` for an environment that has it), the delete, the start-first and stop-after order, the checks (`T4.REPLICA`, `METRICS.T4.REPLICA`, `HUB.ESTATE.T4.REPLICA`, `STATUS.T4.REPLICA`), DONE's gate, and the history's capture.
+4. **The scripts:**
+   - `deploy.ps1`: the T4 track's Replica step, DONE's requirements and gate, the status page's T4 row, and the replica's notes in DONE and NOT DONE.
+   - `start-demo.ps1`: created once T4 is Ready and waited for at the end; `-SkipT4Replica` leaves it out.
+   - `stop-demo.ps1`: the history's capture first, then the delete, in parallel with the VMs.
+   - Also `status.ps1`, `validate.ps1`, `reset-demo.ps1` through the runner, `destroy.ps1` (deleted before the group), preflight (`PREFLIGHT.T4.REPLICA`), and `estimate-cost.ps1` (a **Replica session** column).
+5. **Older environments:**
+   - Without `DbHubT4Replica`, every script says "isn't deployed yet: run ./scripts/deploy.ps1", as **Not selected** or a **Warning**, never a **Fail**, and changes nothing. A plain `./scripts/deploy.ps1` adds the replica.
+   - Coordinator direction: `deploy.ps1` republishes the on-demand control's runbooks when the control is set up (`Update-DemoActivityControlRunbook`, `CONTROL.RUNBOOKS`). When it can't, it's a **Warning**, with what fails until then and the exact command.
+6. **The runbooks** (`DbHubControl.Common.ps1`):
+   - The nightly safety stop, its T3 check, the control's T4 stop, and the auto-stop stop a replica a session left running, once T4 is Stopped.
+   - A control run starts a stopped replica before T4, and says plainly when there's none: the replica beat isn't available, and `start-demo.ps1` creates the replica.
+   - No role changes: the roles already allow read, start, and stop on flexible servers at the demo resource group.
+7. **Cost** (`Get-DemoCostEstimate`):
+   - It counts the replica's compute, storage, and Defender plans for a session's running hours only, with evidence and output fields such as `T4ReplicaSession` and `SessionCostWithoutReplica`.
+   - The owner kept `sessionCeilingUsd` at $15. `PREFLIGHT.COST.SESSION` names the replica's share and `-SkipT4Replica` when a session is over it.
+   - T4's one-time move to `Standard_D4ds_v5` (`ConvertTo-DemoT4FallbackCost`) is decided without that share, so `demo-day` keeps its move.
+8. **The runner** (`workload-generator`, `database/postgresql`, `vm/bootstrap`):
+   - `--replica-server` for T4's commands, and `profile run --t4-replica-server`.
+   - The `replica-lag` scenario (`scenarios/replica-lag`, `demo.usp_scenario_replica_lag`, `demo.replica_lag_marks`). `stop` and `reset` end the demo's sessions on the replica, and are **Not selected** there when it isn't there.
+   - T1's settings carry `t4.replicaServerFqdn` (empty on a Burstable T4); the control's relay and the activity host pass it on.
+   - Against a local PostgreSQL 18.7 primary and hot standby, the replica's lag went 7.9, 22.5, then 36.8 seconds during a report, and 0.1 after it.
+9. **The notebook and the Insights app, evaluated and changed:**
+   - The activity notebook had no T4 content. A Fabric notebook can't read Azure Monitor (its tokens don't cover Azure Resource Manager), and T4 is private. So the operator's scripts read the metrics (`Get-DemoPostgresHistoryParameter`, 5-minute bins, at most 24 KiB) and pass them as `POSTGRES_METRICS`; `stop-demo.ps1 -SaveHistory` reads them before the delete.
+     - On T4: CPU, memory, connections, failed connections, and replication bytes.
+     - On the replica: Read Replica Lag, CPU, and connections.
+   - The notebook's new PostgreSQL section checks that document, then adds rows (analysis `postgresql`, targets `T4` and `T4-replica`) and findings (a lag of 60 seconds or more, CPU, failed connections).
+   - The history model's Target and Analysis dimensions add them, and the Insights app gets a **PostgreSQL** page with lag and health time lines (16 queries).
+   - The notebook's estate pulse, locks, consumption, and correlation sections stay SQL-only: their source, the telemetry endpoint, has no PostgreSQL data.
+
+**Changed files.**
+
+- Infrastructure: `infra/replica/pgreplica01.bicep` (new), `infra/modules/demo.bicep`, `azuredeploy.json`, and `config/versions.json` (`postgresql.replica`).
+- Module, in `scripts/modules/DbHubDemo`:
+  - New: `Private/T4ReplicaHelpers.ps1` and `Private/PostgresHistoryHelpers.ps1`.
+  - Changed, in `Private/`: `ActivityControlHelpers.ps1`, `DeployExperience.ps1`, `DeployHelpers.ps1`, `FabricCapacityHelpers.ps1`, `HistorySnapshotHelpers.ps1`, `ParallelDeployment.ps1`, `ProgressHelpers.ps1`, `SafetyStopHelpers.ps1`, `T4Helpers.ps1`, `TrackHelpers.ps1`, and `ValidationAreas.ps1`.
+  - Changed, in `Public/`: `Get-DemoCostEstimate.ps1`, `Get-DemoDeploymentState.ps1`, `Get-DemoEnvironmentStatus.ps1`, `Invoke-DemoDeployment.ps1`, `Invoke-DemoFabricNotebookRun.ps1`, `Invoke-DemoPreflight.ps1`, `Invoke-DemoTemplateDeployment.ps1`, `Remove-DemoEnvironment.ps1`, `Set-DemoDeploymentState.ps1`, `Start-DemoEnvironment.ps1`, `Stop-DemoEnvironment.ps1`, and `Test-DemoFabricApp.ps1`.
+- Scripts and runbooks: `scripts/start-demo.ps1`, `scripts/estimate-cost.ps1`, and `automation/runbooks/DbHubControl.Common.ps1`.
+- Runner and VM: `workload-generator` (`CommandLine.cs`, `CommandLine.Postgres.cs`, `PgConnection.cs`, `PgScenarioRunner.cs`, and the new `PgReplica.cs` and `ReplicaLag.cs`), `database/postgresql/110-demo-control.sql` and `120-scenario-functions.sql`, `scenarios/replica-lag/` (new), `vm/bootstrap/Invoke-DemoWorkloadControl.ps1`, `Start-DemoWorkload.ps1`, and `lib/Workload.ps1`.
+- Fabric: `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb`; `fabric/app` (`App.tsx`, `data/`, `lib/`, `LinksPage.tsx`, the new `pages/PostgresPage.tsx` and `visuals/TimeLines.tsx`, styles, and tests); and `fabric/powerbi` (`Target.tmdl`, `Analysis.tmdl`, the README, and the report spec).
+- Tests:
+  - New: `tests/unit/DbHubDemo.T4Replica.Tests.ps1`, `DbHubDemo.PostgresHistory.Tests.ps1`, and the runner's `ReplicaLagTests.cs`.
+  - Changed: the cost, T4, T4 fallback, track, one-command, lifecycle, teardown, runbook, control, Fabric app, notebook, and VM workload tests, the runner's `CatalogTests.cs`, and `tests/Invoke-StaticValidation.ps1` (it builds `infra/replica`).
+- Docs: the README, `AGENTS.md`, ADR 0025 and the ADR index, the architecture, deployment, cost management, limitations, troubleshooting, the walkthrough, the automation support matrix, the scenarios, Fabric, app, history model, and runner guides, `CHANGELOG.md`, and this report.
+
+**Validation.** See the pull request's description for the exact commands and results. **Live:** the probe above; the upgrade and new-user deployments are [still to verify](#still-to-verify) at this point.
+
+**Risks.** R824 to R831 new.
