@@ -2347,6 +2347,13 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
    - The history model's Target and Analysis dimensions add them, and the Insights app gets a **PostgreSQL** page with lag and health time lines (16 queries).
    - The notebook's estate pulse, locks, consumption, and correlation sections stay SQL-only: their source, the telemetry endpoint, has no PostgreSQL data.
    - Coordinator direction (2026-11-13, with the capacity paused for the live tests): a `-SaveHistory` that can't save mustn't lose the replica's metrics without saying so. So when the notebook run doesn't save them, `stop-demo.ps1` keeps the captured document in `out/history-pending` (`Save-DemoPostgresHistoryPending`, `STOP.T4.HISTORY.PENDING`, a **Warning** with the replica's peak lag and the command). `configure-fabric.ps1 -RunLiveActivity -PostgresMetricsPath <file>` adds it once the capacity runs, then moves the file to `out/history-pending/saved`. Without the parameter, `-RunLiveActivity` sends T4's and a running replica's metrics, after the subscription guard only.
+10. **Live findings, fixed the same day:**
+    - **A new deployment (`rg-dbhubha-demo`):** the T4 track waited for `max_connections`' pending restart, whose flag cleared while T4 was still restarting, and sent the replica. Azure refused it, `ReadReplicaServerInUnexpectedState`: "Cannot perform operation on read replica 'pgflex01-...' because it's in 'Restarting' state". The status page showed the T4 row's Replica step as Failed, with Azure's error.
+      - Now the replica waits for T4 to read Ready.
+      - A refusal of that kind (`SourceNotReady`) goes out again at the same size once T4 is Ready and has settled, at most 3 times. It's never taken for a size refusal.
+      - If it still fails, the fix says so.
+    - **The upgrade (`rg-dbhubup-demo`):** main's run had recorded T4's track at Telemetry, so the resume skipped the new Replica step, and the status page said it "Finished in an earlier run". DONE's gate would still have created the replica, out of sight of the T4 row.
+      - Now a resume runs the Replica step until the environment has the replica (`DbHubT4Replica`).
 
 **Changed files.**
 
