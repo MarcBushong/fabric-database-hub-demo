@@ -48,6 +48,8 @@ T3 connections use a 60-second connect timeout and retry the documented transien
 
 **Local containers only:** `--sql-login-from-environment` signs in with `CONTOSOCARE_SQL_USER` and `CONTOSOCARE_SQL_PASSWORD` from the environment (never from arguments), as a `SqlCredential`. It's refused for T3, and the demo targets never use it ([ADR 0009](../docs/adr/0009-secrets-handling.md)).
 
+**T4's read replica ([ADR 0025](../docs/adr/0025-t4-read-replica.md)):** T4 commands take `--replica-server <fqdn>`, the replica `pgreplica01-<id>` that `start-demo.ps1` creates for a session, signed in with the same role, token, and TLS checks as `--server`. `run` needs it for `replica-lag`, which is refused without it; `stop` and `reset` also end the demo's `ContosoCare.Demo/` sessions there (`pg_cancel_backend`, then `pg_terminate_backend`), and a replica that isn't there is **Not selected**, never a failure; `status` adds its replay lag. A T1 host that also drives T4 takes `profile run --t4-replica-server`. Other T4 commands ignore it, and the other targets refuse it.
+
 ## Activity profiles
 
 Defined in [`scenarios/activity-profiles.json`](../scenarios/activity-profiles.json) (schema: [`activity-profiles.schema.json`](../scenarios/activity-profiles.schema.json)):

@@ -145,7 +145,7 @@ internal static partial class CommandLine
                 var request = run.ToRequest(parseResult, definition.Id, endpointTarget);
                 var plan = RunBounds.Plan(definition, request, DateTimeOffset.UtcNow);
                 IScenarioExecutor runner = endpointTarget == DemoTarget.T4
-                    ? new PgScenarioRunner(new PgConnectionOpener(target.ResolvePostgres(parseResult), log), log, TimeProvider.System)
+                    ? target.PostgresRunner(parseResult, log)
                     : new ScenarioRunner(new SqlConnectionOpener(target.Resolve(parseResult), log), log, TimeProvider.System);
                 var result = await runner.RunAsync(plan, cancellationToken).ConfigureAwait(false);
                 WriteRunResult(parseResult, result, parseResult.GetValue(json));
@@ -225,10 +225,21 @@ internal static partial class CommandLine
                 }
 
                 int cancelled;
+                CheckRecord? replicaCheck = null;
                 if (targetValue == DemoTarget.T4)
                 {
-                    await using var pgConnection = await new PgConnectionOpener(target.ResolvePostgres(parseResult), log).OpenAsync(SessionNames.ForControl("stop"), cancellationToken).ConfigureAwait(false);
-                    cancelled = await new PgDemoDatabase(pgConnection).StopAsync(scope, id, scenarioId, who, cancellationToken).ConfigureAwait(false);
+                    var endpoint = target.ResolvePostgres(parseResult);
+                    var replica = target.ResolvePostgresReplica(parseResult, endpoint);
+                    await using (var pgConnection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("stop"), cancellationToken).ConfigureAwait(false))
+                    {
+                        cancelled = await new PgDemoDatabase(pgConnection).StopAsync(scope, id, scenarioId, who, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    // T4's read replica (ADR 0025): the stopped runs' sessions there end too, and a replica that isn't there never fails the stop.
+                    if (replica is not null)
+                    {
+                        replicaCheck = await PgReplicaSessions.EndAsync(new PgConnectionOpener(replica, log), "replica-sessions-ended", ReplicaSessionScope.ForStop(scope, id, scenarioId), kill: true, TimeProvider.System, cancellationToken).ConfigureAwait(false);
+                    }
                 }
                 else
                 {
@@ -239,7 +250,7 @@ internal static partial class CommandLine
 
                 log.Info("stop.requested", "Stop requested.", ("target", targetValue), ("scope", scope), ("runsCancelled", cancelled));
                 var check = new CheckRecord("stop", "Pass", string.Create(CultureInfo.InvariantCulture, $"Stop requested ({scope}); {cancelled} Running run(s) marked Cancelled. Their sessions end within a few seconds.{(scope == "all" ? " The activity profile is off." : string.Empty)}"));
-                WriteChecks(parseResult, targetValue, "stop", [check], parseResult.GetValue(json));
+                WriteChecks(parseResult, targetValue, "stop", replicaCheck is null ? [check] : [check, replicaCheck], parseResult.GetValue(json));
                 return ExitCodes.Success;
             }).ConfigureAwait(false);
         });
@@ -306,7 +317,7 @@ internal static partial class CommandLine
                 var options = new ResetOptions(who, seconds, !parseResult.GetValue(noKill), keep, parseResult.GetValue(undo), parseResult.GetValue(reseed));
                 if (targetValue == DemoTarget.T4)
                 {
-                    checks.AddRange(await new PgScenarioRunner(new PgConnectionOpener(target.ResolvePostgres(parseResult), log), log, TimeProvider.System).ResetAsync(options, cancellationToken).ConfigureAwait(false));
+                    checks.AddRange(await target.PostgresRunner(parseResult, log).ResetAsync(options, cancellationToken).ConfigureAwait(false));
                 }
                 else
                 {
@@ -346,7 +357,8 @@ internal static partial class CommandLine
             {
                 if (target.TargetOf(parseResult) == DemoTarget.T4)
                 {
-                    return await StatusT4Async(parseResult, target.ResolvePostgres(parseResult), Math.Clamp(parseResult.GetValue(count), 1, 100), parseResult.GetValue(profileFile), parseResult.GetValue(hostFile), parseResult.GetValue(json), log, cancellationToken).ConfigureAwait(false);
+                    var t4 = target.ResolvePostgres(parseResult);
+                    return await StatusT4Async(parseResult, t4, target.ResolvePostgresReplica(parseResult, t4), Math.Clamp(parseResult.GetValue(count), 1, 100), parseResult.GetValue(profileFile), parseResult.GetValue(hostFile), parseResult.GetValue(json), log, cancellationToken).ConfigureAwait(false);
                 }
 
                 var endpoint = target.Resolve(parseResult);
@@ -568,6 +580,7 @@ internal static partial class CommandLine
         var t4Server = new Option<string?>("--t4-server") { Description = "Also drive T4 from this machine (T1 only): the PostgreSQL flexible server's FQDN. Its profile lives in --t4-profile-file." };
         var t4User = new Option<string?>("--t4-user") { Description = "The PostgreSQL role T4's runs sign in as (default contosocare_runner)." };
         var t4Identity = new Option<string?>("--t4-managed-identity-client-id") { Description = "Client ID of a user-assigned identity for T4; omit for the VM's system-assigned identity." };
+        var t4Replica = new Option<string?>("--t4-replica-server") { Description = "With --t4-server: T4's read replica's FQDN (ADR 0025), for replica-lag and for the end of the demo's sessions there in a reset. It exists only during a session; nothing connects to it until a run needs it." };
         var t4File = new Option<string?>("--t4-profile-file") { Description = "T4's activity profile file. Defaults to C:\\ProgramData\\DbHubDemo\\activity-t4.json (or /var/lib/DbHubDemo/activity-t4.json)." };
         var hostFile = ProfileFile();
         var hostStateFile = HostStateFile();
@@ -577,6 +590,7 @@ internal static partial class CommandLine
         host.Options.Add(t4Server);
         host.Options.Add(t4User);
         host.Options.Add(t4Identity);
+        host.Options.Add(t4Replica);
         host.Options.Add(t4File);
         host.Options.Add(hostFile);
         host.Options.Add(hostStateFile);
@@ -591,7 +605,7 @@ internal static partial class CommandLine
                 var targets = new List<ProfileTarget>();
                 if (primary == DemoTarget.T4)
                 {
-                    targets.Add(new ProfileTarget(DemoTarget.T4, new PgScenarioRunner(new PgConnectionOpener(hostTarget.ResolvePostgres(parseResult), log), log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))));
+                    targets.Add(new ProfileTarget(DemoTarget.T4, hostTarget.PostgresRunner(parseResult, log), new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))));
                 }
                 else
                 {
@@ -618,7 +632,11 @@ internal static partial class CommandLine
                     }
 
                     var t4 = PgEndpoint.Create(pgServer, parseResult.GetValue(t4User), passwordFromEnvironment: false, parseResult.GetValue(t4Identity));
-                    targets.Add(new ProfileTarget(DemoTarget.T4, new PgScenarioRunner(new PgConnectionOpener(t4, log), log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))));
+                    targets.Add(new ProfileTarget(DemoTarget.T4, PgRunner(t4, t4.Replica(parseResult.GetValue(t4Replica), "--t4-replica-server"), log), new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))));
+                }
+                else if (parseResult.GetValue(t4Replica) is not null)
+                {
+                    throw new ScenarioRequestException("--t4-replica-server goes with --t4-server; a T4 host takes --replica-server.");
                 }
 
                 var options = ProfileHostOptions.From(ActivityProfilesDefinition.Default, parseResult.GetValue(hostStateFile) ?? HostLanesFile.DefaultPath) with { RaisePriority = true };
@@ -763,6 +781,10 @@ internal static partial class CommandLine
         target is DemoTarget.T3 or DemoTarget.T4
             ? new FileProfileStore(profileFile ?? FileProfileStore.DefaultPathFor(target))
             : new SqlProfileStore(new SqlConnectionOpener(endpoint(), log));
+
+    /// <summary>T4's runner (Phase 24), with its read replica when there is one (ADR 0025).</summary>
+    private static PgScenarioRunner PgRunner(PgEndpoint endpoint, PgEndpoint? replica, RunnerLog log) =>
+        new(new PgConnectionOpener(endpoint, log), log, TimeProvider.System, replica is null ? null : new PgConnectionOpener(replica, log));
 
     private static async Task<int> Guard(ParseResult parseResult, RunnerLog log, Func<Task<int>> action)
     {
@@ -1000,6 +1022,7 @@ internal static partial class CommandLine
         private readonly Option<bool> sqlLogin = new("--sql-login-from-environment") { Description = "Local SQL Server containers only: sign in with CONTOSOCARE_SQL_USER and CONTOSOCARE_SQL_PASSWORD from the environment." };
         private readonly Option<string?> user = new("--user") { Description = "T4 only: the PostgreSQL role to sign in as with the managed identity's token (default contosocare_runner; setup signs in as the P6 group's name)." };
         private readonly Option<bool> pgPassword = new("--pg-password-from-environment") { Description = "Local PostgreSQL tests only (T4): sign in with CONTOSOCARE_PG_USER and CONTOSOCARE_PG_PASSWORD from the environment." };
+        private readonly Option<string?> replicaServer = new("--replica-server") { Description = "T4 only: T4's read replica's FQDN (pgreplica01-<id>.postgres.database.azure.com, ADR 0025), signed in like --server. run needs it for replica-lag; stop and reset also end the demo's sessions there; status shows its replay lag. Other commands ignore it." };
 
         public TargetOptions(Command command)
         {
@@ -1009,9 +1032,19 @@ internal static partial class CommandLine
             command.Options.Add(sqlLogin);
             command.Options.Add(user);
             command.Options.Add(pgPassword);
+            command.Options.Add(replicaServer);
         }
 
-        public DemoTarget TargetOf(ParseResult parseResult) => parseResult.GetValue(target);
+        public DemoTarget TargetOf(ParseResult parseResult)
+        {
+            var value = parseResult.GetValue(target);
+            if (value != DemoTarget.T4 && parseResult.GetValue(replicaServer) is not null)
+            {
+                throw new ScenarioRequestException("--replica-server is for T4: it names T4's read replica.");
+            }
+
+            return value;
+        }
 
         public TargetEndpoint Resolve(ParseResult parseResult)
         {
@@ -1031,6 +1064,16 @@ internal static partial class CommandLine
             }
 
             return PgEndpoint.Create(parseResult.GetValue(server), parseResult.GetValue(user), parseResult.GetValue(pgPassword), parseResult.GetValue(clientId));
+        }
+
+        /// <summary>T4's read replica from --replica-server, signed in like <paramref name="primary"/>; null without one.</summary>
+        public PgEndpoint? ResolvePostgresReplica(ParseResult parseResult, PgEndpoint primary) => primary.Replica(parseResult.GetValue(replicaServer));
+
+        /// <summary>T4's runner, with its read replica when --replica-server names one.</summary>
+        public PgScenarioRunner PostgresRunner(ParseResult parseResult, RunnerLog log)
+        {
+            var endpoint = ResolvePostgres(parseResult);
+            return PgRunner(endpoint, ResolvePostgresReplica(parseResult, endpoint), log);
         }
     }
 

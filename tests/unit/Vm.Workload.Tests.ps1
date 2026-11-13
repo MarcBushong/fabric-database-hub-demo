@@ -125,6 +125,17 @@ Describe 'Workload settings' {
         (Get-DemoVmWorkloadSetting -Settings ([ordered]@{ role = 'SqlVm' })).T4 | Should -BeNullOrEmpty
     }
 
+    It 'reads T4''s read replica''s FQDN, and has none for settings from before the replica or a name that isn''t a flexible server''s (ADR 0025)' {
+        $t4 = [ordered]@{ serverName = 'pgflex01-abc123'; serverFqdn = 'pgflex01-abc123.postgres.database.azure.com'; replicaServerName = 'pgreplica01-abc123'; replicaServerFqdn = 'PGREPLICA01-abc123.postgres.database.azure.com' }
+        (Get-DemoVmWorkloadSetting -Settings ([ordered]@{ t4 = $t4 })).T4.ReplicaServerFqdn | Should -Be 'pgreplica01-abc123.postgres.database.azure.com'
+        foreach ($other in @('', 'pgreplica01-abc123', 'pgreplica01-abc123.example.com', 'pg.postgres.database.azure.com', '-pgreplica01.postgres.database.azure.com', 'pgreplica01-abc123.postgres.database.azure.com.evil.example', 'pgflex01-abc123.postgres.database.azure.com')) {
+            $t4['replicaServerFqdn'] = $other
+            (Get-DemoVmWorkloadSetting -Settings ([ordered]@{ t4 = $t4 })).T4.ReplicaServerFqdn | Should -Be '' -Because $other
+        }
+        $t4.Remove('replicaServerFqdn')
+        (Get-DemoVmWorkloadSetting -Settings ([ordered]@{ t4 = $t4 })).T4.ReplicaServerFqdn | Should -Be '' -Because 'settings from before the replica have none'
+    }
+
     It 'refuses an invalid activity profile or shutdown time' {
         { Get-DemoVmWorkloadSetting -Settings @{ workload = @{ activityProfile = 'everything' } } } | Should -Throw '*invalid activity profile*'
         { Get-DemoVmWorkloadSetting -Settings @{ workload = @{ autoShutdownTime = '25:00' } } } | Should -Throw '*auto-shutdown time*'
@@ -432,6 +443,26 @@ Describe 'Workload records and the task' {
         $record = New-DemoVmWorkloadRecord -Root (New-TestRoot) -Workload $workload -PrimaryTarget 'T2' -DotNetPin $pin
         $record.t3 | Should -BeNullOrEmpty
         $record.primaryTarget | Should -Be 'T2'
+    }
+
+    It 'writes T4''s read replica next to T4''s server, and a replica the settings gain rewrites the record (ADR 0025)' {
+        $root = New-TestRoot
+        $settings = @{
+            workload = @{ runnerSha256 = ('ab' * 32); runnerChunkCount = 7; activityProfile = 'baseline'; autoShutdownTime = '1900'; autoShutdownTimeZone = 'UTC' }
+            t4       = @{ serverName = 'pgflex01-abc123'; serverFqdn = 'pgflex01-abc123.postgres.database.azure.com'; replicaServerFqdn = 'pgreplica01-abc123.postgres.database.azure.com' }
+        }
+        $expected = New-DemoVmWorkloadRecord -Root $root -Workload (Get-DemoVmWorkloadSetting -Settings $settings) -PrimaryTarget 'T1' -DotNetPin $pin
+        @(@($expected.t4.Keys)[0..2]) | Should -Be @('serverName', 'serverFqdn', 'replicaServerFqdn')
+        $expected.t4.replicaServerFqdn | Should -Be 'pgreplica01-abc123.postgres.database.azure.com'
+        $record = New-DemoVmWorkloadRecord -Root $root -Workload (Get-DemoVmWorkloadSetting -Settings $settings) -PrimaryTarget 'T1' -DotNetPin $pin
+        $record.setup['T1'] = @{ status = 'Pass' }
+        Test-DemoVmWorkloadRecord -Record $record -Expected $expected | Should -BeTrue
+        $record.t4.Remove('replicaServerFqdn')
+        Test-DemoVmWorkloadRecord -Record $record -Expected $expected | Should -BeFalse -Because 'a record from before the replica gets rewritten with it'
+        $settings.t4.Remove('replicaServerFqdn')
+        $older = New-DemoVmWorkloadRecord -Root $root -Workload (Get-DemoVmWorkloadSetting -Settings $settings) -PrimaryTarget 'T1' -DotNetPin $pin
+        $older.t4.replicaServerFqdn | Should -Be ''
+        Test-DemoVmWorkloadRecord -Record $record -Expected $older | Should -BeTrue -Because 'settings and a record from before the replica still match'
     }
 
     It 'defines DbHubDemo-Workload as SYSTEM, two minutes after startup, running the stable wrapper, bounded to 13 hours' {

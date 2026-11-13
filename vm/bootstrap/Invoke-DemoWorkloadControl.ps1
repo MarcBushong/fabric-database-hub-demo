@@ -20,13 +20,15 @@ Actions:
   object ID), applies and seeds the schema, records t4-workload.json, sets T4's activity profile, and
   restarts DbHubDemo-Workload so its host adds T4.
 - Runner (sqlvm01 for T1, T3, and T4; archost01 relays T2 into the guest over PowerShell Direct)
-  { target, arguments[], timeoutSeconds, readySeconds }: runs one runner command. The token {{NEXT_SHUTDOWN}}
-  in an argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, and T4 commands the
-  flexible server's FQDN and the runner's role. The evidence keeps the end of the runner's output, and the active
-  profile's name and expiry, read from the whole output first (re-review of PR 16, 2026-11-04). Before a command
-  that starts activity ('profile set' with a profile other than off, or 'run'), the target must accept connections
-  within readySeconds (10 minutes by default, 20 for T2; 0 skips the wait): the runner's warmup is retried while it
-  fails with a documented transient error (Wait-DemoControlTargetReady), so a cold start doesn't fail the command.
+  { target, arguments[], timeoutSeconds, readySeconds, replicaServerFqdn }: runs one runner command. The token
+  {{NEXT_SHUTDOWN}} in an argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, and T4
+  commands the flexible server's FQDN, the runner's role, and T4's read replica when it's known (--replica-server, from
+  the request's optional replicaServerFqdn or else workload-install.json; ADR 0025). The evidence keeps the end of the
+  runner's output, and the active profile's name and expiry, read from the whole output first (re-review of PR 16,
+  2026-11-04). Before a command that starts activity ('profile set' with a profile other than off, or 'run'), the
+  target must accept connections within readySeconds (10 minutes by default, 20 for T2; 0 skips the wait): the
+  runner's warmup is retried while it fails with a documented transient error (Wait-DemoControlTargetReady), so a
+  cold start doesn't fail the command.
   On archost01 the guest is made ready first (Invoke-DemoControlGuestReady): a golden snapshot's source that the
   capture left air-gapped is released, a restored copy whose Arc identity wasn't reset is never started, and a
   guest that's off starts.
@@ -61,6 +63,8 @@ $script:ControlSqlTransient = @(233, 997, 10060, 4060, 4221, 1204, 1205, 1222, 1
 $script:ControlSqlStarting = @(2, 26, 40, 53, -1, 10061)
 # Azure SQL Database's transient fault list.
 $script:ControlAzureSqlTransient = @(615, 926, 4060, 4221, 40197, 40501, 40613, 49918, 49919, 49920)
+# T4's read replica (ADR 0025): a flexible server's FQDN, lowercase, as Get-DemoVmWorkloadSetting accepts it.
+$script:ControlReplicaFqdnPattern = '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\.postgres\.database\.azure\.com$'
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Vm.psd1') -Force
 
 function Write-DemoControlLine {
@@ -584,8 +588,10 @@ function Get-DemoControlTargetArgument {
     <#
     .SYNOPSIS
     The target options a runner command gets on sqlvm01: --target, and the server (T3's FQDN; T4's FQDN and the runner's
-    role) from the install record unless the arguments name one. Returns Arguments, or Error when the target isn't set
-    up on this VM.
+    role) from the install record unless the arguments name one. T4 commands also get T4's read replica (ADR 0025),
+    --replica-server: ReplicaServerFqdn (the request's, already checked) or else the install record's. An install record
+    from before the replica has none, and then no flag goes. Returns Arguments, or Error when the target isn't set up on
+    this VM.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -597,7 +603,10 @@ function Get-DemoControlTargetArgument {
         [string[]] $Arguments = @(),
 
         [Parameter(Mandatory = $true)]
-        [System.Collections.IDictionary] $Install
+        [System.Collections.IDictionary] $Install,
+
+        [AllowEmptyString()]
+        [string] $ReplicaServerFqdn = ''
     )
 
     $full = @($Arguments) + @('--target', $Target)
@@ -624,6 +633,15 @@ function Get-DemoControlTargetArgument {
         }
         if ($full -notcontains '--user' -and $t4['runnerRole']) {
             $full += @('--user', [string]$t4['runnerRole'])
+        }
+        if ($full -notcontains '--replica-server') {
+            $replica = $ReplicaServerFqdn
+            if (-not $replica -and $t4.Contains('replicaServerFqdn') -and $t4['replicaServerFqdn']) {
+                $replica = ([string]$t4['replicaServerFqdn']).ToLowerInvariant()
+            }
+            if ($replica -match $script:ControlReplicaFqdnPattern) {
+                $full += @('--replica-server', $replica)
+            }
         }
     }
     return [pscustomobject]@{ Arguments = $full; Error = '' }
@@ -1034,6 +1052,15 @@ function Invoke-DemoControlRunner {
     if ($Request.Contains('timeoutSeconds') -and [int]$Request['timeoutSeconds'] -ge 30) {
         $timeout = [System.Math]::Min(5400, [int]$Request['timeoutSeconds'])
     }
+    # The request may name T4's read replica itself (ADR 0025), checked like the settings' replicaServerFqdn.
+    $replicaFqdn = ''
+    if ($Request.Contains('replicaServerFqdn') -and $null -ne $Request['replicaServerFqdn'] -and [string]$Request['replicaServerFqdn']) {
+        $replicaFqdn = ([string]$Request['replicaServerFqdn']).ToLowerInvariant()
+        if ($target -ne 'T4' -or $replicaFqdn -notmatch $script:ControlReplicaFqdnPattern) {
+            Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message 'The request''s replicaServerFqdn must be T4''s read replica, <name>.postgres.database.azure.com, and goes with target T4 only.'
+            return
+        }
+    }
     $workload = Get-DemoVmWorkloadSetting -Settings $Settings
     $shutdown = Get-DemoVmNextShutdown -Time $workload.AutoShutdownTime -TimeZoneId $workload.AutoShutdownTimeZone
     $arguments = Get-DemoControlArgument -Value $Request['arguments'] -NextShutdown $shutdown.Iso
@@ -1050,7 +1077,7 @@ function Invoke-DemoControlRunner {
             Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message 'The workload runner is not installed on T1 yet.'
             return
         }
-        $targetArguments = Get-DemoControlTargetArgument -Target $target -Arguments $arguments -Install $install
+        $targetArguments = Get-DemoControlTargetArgument -Target $target -Arguments $arguments -Install $install -ReplicaServerFqdn $replicaFqdn
         if ($targetArguments.Error) {
             Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message $targetArguments.Error
             return
@@ -1060,7 +1087,7 @@ function Invoke-DemoControlRunner {
         $runnerDll = [string]$install['runnerDll']
         if ($activity -and $readySeconds -gt 0) {
             # The same target options as the command, so the warmup connects exactly as the command will.
-            $warmup = (Get-DemoControlTargetArgument -Target $target -Arguments @('warmup', '--json') -Install $install).Arguments
+            $warmup = (Get-DemoControlTargetArgument -Target $target -Arguments @('warmup', '--json') -Install $install -ReplicaServerFqdn $replicaFqdn).Arguments
             $probe = {
                 param($AttemptSeconds)
                 Invoke-DemoVmRunnerProcess -DotNetExe $dotnet -RunnerDll $runnerDll -ArgumentList $warmup -TimeoutSeconds $AttemptSeconds

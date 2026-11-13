@@ -16,9 +16,11 @@ namespace ContosoCare.Workload.Postgres;
 /// the run's hard deadline, and calls each scenario's short step function in a loop until the deadline or a stop
 /// request; every step raises SQLSTATE CC001 once the run has ended. Layer 2: the run's commands are cancelled 60
 /// seconds after the deadline. Layer 3, the watchdog: sessions still open 15 seconds later are ended with
-/// pg_terminate_backend through demo.usp_kill_demo_sessions, which touches this run's sessions only.
+/// pg_terminate_backend through demo.usp_kill_demo_sessions, which touches this run's sessions only. With
+/// <paramref name="replica"/>, T4's read replica (ADR 0025): replica-lag's report runs there, and reset ends the demo's
+/// sessions there too.
 /// </summary>
-internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log, TimeProvider time) : IScenarioExecutor
+internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log, TimeProvider time, PgConnectionOpener? replica = null) : IScenarioExecutor
 {
     /// <summary>Raised by demo.usp_run_assert_running once a run is stopped or past its deadline.</summary>
     internal const string RunEndedState = "CC001";
@@ -34,8 +36,10 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
     private static readonly TimeSpan GracefulStopWindow = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan KillAfterCancel = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan GiveUpAfterKill = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan HoldPollInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan LagCheckInterval = TimeSpan.FromSeconds(5);
 
-    public string Description => opener.Endpoint.Describe();
+    public string Description => replica is null ? opener.Endpoint.Describe() : opener.Endpoint.Describe() + "; " + replica.Endpoint.Describe();
 
     public async Task<RunResult> RunAsync(RunPlan plan, CancellationToken cancellationToken)
     {
@@ -64,6 +68,20 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
             return Refused(plan, runId, parameters, "The PostgreSQL runner drives T4 only.", checks, "request");
         }
 
+        if (plan.Scenario.Id == ReplicaLag.ScenarioId)
+        {
+            if (replica is null)
+            {
+                return Refused(plan, runId, parameters, ReplicaLag.NoReplicaReason, checks, "request");
+            }
+
+            var problem = await CheckReplicaAsync(runId, cancellationToken).ConfigureAwait(false);
+            if (problem is { } refusal)
+            {
+                return Refused(plan, runId, parameters, refusal.Reason, checks, refusal.RefusalReason);
+            }
+        }
+
         NpgsqlConnection control;
         try
         {
@@ -84,7 +102,12 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                 {
                     var reset = await database.ResetAsync(new ResetOptions(plan.RequestedBy, 30, KillSessions: true, KeepProfile: true, UndoRemediation: false, Reseed: false), time, cancellationToken).ConfigureAwait(false);
                     checks.AddRange(reset.Select(r => r with { CheckId = "reset-before:" + r.CheckId }));
-                    log.Info("run.reset", "Reset before the run.", ("runId", runId), ("checks", string.Join(", ", reset.Select(r => r.CheckId + "=" + r.Status))));
+                    if (replica is not null)
+                    {
+                        checks.Add(await PgReplicaSessions.EndAsync(replica, "reset-before:replica-sessions-ended", ReplicaSessionScope.All, kill: true, time, cancellationToken).ConfigureAwait(false));
+                    }
+
+                    log.Info("run.reset", "Reset before the run.", ("runId", runId), ("checks", string.Join(", ", checks.Select(r => r.CheckId + "=" + r.Status))));
                 }
 
                 registration = await database.BeginRunAsync(
@@ -114,8 +137,19 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     public async Task<IReadOnlyList<CheckRecord>> ResetAsync(ResetOptions options, CancellationToken cancellationToken)
     {
-        await using var connection = await opener.OpenAsync(SessionNames.ForControl("reset"), cancellationToken).ConfigureAwait(false);
-        return await new PgDemoDatabase(connection).ResetAsync(options, time, cancellationToken).ConfigureAwait(false);
+        List<CheckRecord> checks;
+        await using (var connection = await opener.OpenAsync(SessionNames.ForControl("reset"), cancellationToken).ConfigureAwait(false))
+        {
+            checks = [.. await new PgDemoDatabase(connection).ResetAsync(options, time, cancellationToken).ConfigureAwait(false)];
+        }
+
+        // T4's read replica (ADR 0025): the demo's sessions there end too. A replica that isn't there never fails T4's reset.
+        if (replica is not null)
+        {
+            checks.Add(await PgReplicaSessions.EndAsync(replica, "replica-sessions-ended", ReplicaSessionScope.All, options.KillSessions, time, cancellationToken).ConfigureAwait(false));
+        }
+
+        return checks;
     }
 
     private async Task<RunResult> ExecuteAsync(
@@ -142,6 +176,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
             "connection-surge" => RunConnectionSurgeAsync(context, database),
             "idle-in-transaction" => RunIdleInTransactionAsync(context),
             "io-pressure" => RunIoAsync(context),
+            ReplicaLag.ScenarioId => RunReplicaLagAsync(context),
             _ => RunWorkersAsync(context),
         };
 
@@ -241,6 +276,11 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
             : "Completed";
 
         checks.Add(await VerifySessionsClosedAsync(database, runId, plan.RequestedBy).ConfigureAwait(false));
+        if (replica is not null && plan.Scenario.Id == ReplicaLag.ScenarioId)
+        {
+            // The run's sessions on the replica, which T4's pg_stat_activity doesn't show; any left are ended there.
+            checks.Add(await PgReplicaSessions.EndAsync(replica, "run-replica-sessions-closed", ReplicaSessionScope.Run(runId), kill: true, time, CancellationToken.None).ConfigureAwait(false));
+        }
 
         var outcome = ScenarioRunner.Summarize(outcomes);
         if (errors.Count > 0)
@@ -611,6 +651,355 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
         return await Task.WhenAll(tasks).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// replica-lag (ADR 0025): each cycle, a report on T4's read replica holds demo.replica_lag_marks for the cycle's hold
+    /// (ReplicaLag.ReportSql). Once the replica's pg_locks shows it holding the table, the writer on T4 takes the table's
+    /// ACCESS EXCLUSIVE lock in one short call, then commits a mark every markIntervalMs. Replaying that lock waits for
+    /// the report, up to max_standby_streaming_delay, so the replica's lag (the time since its last replayed transaction)
+    /// climbs until the report ends by itself or recovery cancels it (SQLSTATE 40001), both the expected end of a cycle.
+    /// Replay then catches up; the writer goes on for ReplicaLag.RecoveryWindow, so the lag visibly drops, and the run
+    /// pauses. Every session is this run's: a monitor and each cycle's report on the replica, and the writer on T4.
+    /// Source: https://www.postgresql.org/docs/current/hot-standby.html#HOT-STANDBY-CONFLICT
+    /// </summary>
+    private async Task<IReadOnlyList<WorkerOutcome>> RunReplicaLagAsync(RunContext context)
+    {
+        var plan = context.Plan;
+        var holdSeconds = (int)plan.Parameters["holdSeconds"].Integer;
+        var pauseSeconds = (int)plan.Parameters["pauseSeconds"].Integer;
+        var markInterval = TimeSpan.FromMilliseconds(plan.Parameters["markIntervalMs"].Integer);
+        var totals = new ReplicaLagTotals();
+        int? writerSession = null;
+        NpgsqlConnection? monitor = null;
+        NpgsqlConnection? writer = null;
+        try
+        {
+            monitor = await replica!.OpenAsync(context.ApplicationName, context.Abort, Limits(context)).ConfigureAwait(false);
+            var state = await QueryRowAsync(monitor, ReplicaLag.ReplicaStateSql, context.Abort).ConfigureAwait(false);
+            var delayMs = state.TryGetValue("max_standby_streaming_delay_ms", out var delay) ? delay as long? : null;
+            var lag = state.TryGetValue("replay_lag_seconds", out var seconds) ? seconds as decimal? : null;
+            context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "replica-ready", null, string.Create(CultureInfo.InvariantCulture, $"T4's read replica {replica.Endpoint.Host} is in recovery (monitor pid {monitor.ProcessID} there): max_standby_streaming_delay {ReplicaLag.DescribeDelay(delayMs)}, replay lag {(lag is { } current ? current.ToString("0.0", CultureInfo.InvariantCulture) + " s" : "unknown")}. Each cycle holds the report up to {holdSeconds} s.")));
+            if (delayMs is { } limit && limit >= 0 && limit < holdSeconds * 1000L)
+            {
+                context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "replica-delay-short", null, string.Create(CultureInfo.InvariantCulture, $"max_standby_streaming_delay ({ReplicaLag.DescribeDelay(limit)}) is shorter than holdSeconds ({holdSeconds} s): recovery cancels each report at that point, so the lag climbs to about that much.")));
+            }
+
+            writer = await opener.OpenAsync(context.ApplicationName, context.Abort, Limits(context)).ConfigureAwait(false);
+            writerSession = writer.ProcessID;
+            context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "writer-connected", writerSession, string.Create(CultureInfo.InvariantCulture, $"The writer on T4: {plan.Scenario.Procedure}, a mark every {markInterval.TotalMilliseconds:0} ms while a report holds the table, and for {ReplicaLag.RecoveryWindow.TotalSeconds:0} s after.")));
+            while (!context.Stop.IsCancellationRequested)
+            {
+                var hold = ReplicaLag.CycleHold(holdSeconds, time.GetUtcNow(), context.Deadline);
+                if (hold is null)
+                {
+                    break;
+                }
+
+                totals.Cycles++;
+                if (await RunReplicaLagCycleAsync(context, writer, monitor, hold.Value, markInterval, delayMs, totals).ConfigureAwait(false))
+                {
+                    break;
+                }
+
+                var resumeAt = time.GetUtcNow() + TimeSpan.FromSeconds(pauseSeconds);
+                if (context.Stop.IsCancellationRequested || ReplicaLag.CycleHold(holdSeconds, resumeAt, context.Deadline) is null)
+                {
+                    break;
+                }
+
+                await WaitUntilAsync(resumeAt, context).ConfigureAwait(false);
+            }
+
+            return [new WorkerOutcome("writer", 1, writerSession, totals.ToMetrics(), totals.Error, false)];
+        }
+        catch (Exception ex) when (IsCancellation(ex, context))
+        {
+            return [new WorkerOutcome("writer", 1, writerSession, totals.ToMetrics(), null, true)];
+        }
+        catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or IOException or ScenarioRequestException or Azure.Identity.AuthenticationFailedException)
+        {
+            return [new WorkerOutcome("writer", 1, writerSession, totals.ToMetrics(), PgConnectionOpener.Describe(ex), false)];
+        }
+        finally
+        {
+            if (writer is not null)
+            {
+                await writer.DisposeAsync().ConfigureAwait(false);
+            }
+
+            if (monitor is not null)
+            {
+                await monitor.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>One replica-lag cycle (<see cref="RunReplicaLagAsync"/>). True once the run has ended (CC001) or a report failed.</summary>
+    private async Task<bool> RunReplicaLagCycleAsync(RunContext context, NpgsqlConnection writer, NpgsqlConnection monitor, TimeSpan hold, TimeSpan markInterval, long? standbyDelayMs, ReplicaLagTotals totals)
+    {
+        var cycle = totals.Cycles;
+        var report = await replica!.OpenAsync(context.ApplicationName, context.Abort, ReplicaLag.ReportLimits(hold, context.HardDeadline - time.GetUtcNow())).ConfigureAwait(false);
+        await using (report.ConfigureAwait(false))
+        {
+            var reportSession = report.ProcessID;
+            using var reportStop = CancellationTokenSource.CreateLinkedTokenSource(context.Stop, context.Abort);
+            var reportStarted = time.GetUtcNow();
+            var reportTask = RunReplicaReportAsync(report, hold, reportStop.Token);
+            try
+            {
+                // (a) The report holds the table before T4 takes its lock: replaying a lock that came first would only make
+                // the report wait for a moment.
+                if (!await WaitForReportHoldAsync(monitor, reportSession, reportTask, context).ConfigureAwait(false))
+                {
+                    await reportStop.CancelAsync().ConfigureAwait(false);
+                    var missed = await reportTask.ConfigureAwait(false);
+                    if (missed.Kind == ReplicaReportEndKind.Failed)
+                    {
+                        totals.Error = "The report on T4's read replica failed: " + missed.Detail;
+                        return true;
+                    }
+
+                    if (!context.Stop.IsCancellationRequested)
+                    {
+                        context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "replica-report-no-lock", null, string.Create(CultureInfo.InvariantCulture, $"Cycle {cycle}: the report on the replica (pid {reportSession}) didn't hold demo.replica_lag_marks within {ReplicaLag.LockWait.TotalSeconds:0} s{(missed.Detail is null ? string.Empty : ": " + missed.Detail)}. The cycle is skipped.")));
+                    }
+
+                    return false;
+                }
+
+                // (b) T4: the lock once, a short call, then a mark every interval while the report holds the table. The
+                // replica's lag is read every LagCheckInterval, and once more just before the report ends.
+                DateTimeOffset? lockedAt = null;
+                decimal? peakLag = null;
+                var runEnded = false;
+                var lastLagCheck = DateTimeOffset.MaxValue;
+                var nextLagCheck = DateTimeOffset.MaxValue;
+                while (!reportTask.IsCompleted && !context.Stop.IsCancellationRequested)
+                {
+                    var step = await ReplicaLagStepAsync(writer, context, takeLock: lockedAt is null, totals).ConfigureAwait(false);
+                    if (step == ReplicaLagStep.RunEnded)
+                    {
+                        runEnded = true;
+                        break;
+                    }
+
+                    var now = time.GetUtcNow();
+                    if (step == ReplicaLagStep.Locked)
+                    {
+                        lockedAt = now;
+                        lastLagCheck = ReplicaLag.LastLagCheck(reportStarted + hold, now, standbyDelayMs);
+                        nextLagCheck = NextLagCheck(now, lastLagCheck);
+                        context.Events.Enqueue(new RunEvent(now, "replica-lag-locked", writer.ProcessID, string.Create(CultureInfo.InvariantCulture, $"Cycle {cycle}: the report on the replica (pid {reportSession}) holds demo.replica_lag_marks for up to {hold.TotalSeconds:0} s, and T4 took its ACCESS EXCLUSIVE lock (mark {totals.LastMarkId}): replaying that lock waits for the report.")));
+                    }
+                    else if (lockedAt is not null && now >= nextLagCheck)
+                    {
+                        peakLag = Larger(peakLag, await ReplayLagAsync(monitor, context).ConfigureAwait(false));
+                        nextLagCheck = NextLagCheck(time.GetUtcNow(), lastLagCheck);
+                    }
+
+                    await WaitUntilOrAsync(time.GetUtcNow() + markInterval, reportTask, context).ConfigureAwait(false);
+                }
+
+                // (c) The report's end: by itself after the hold, recovery cancelled it, or the run is ending (a stop
+                // request, the deadline, or CC001 from the step), which cancels it now.
+                if (runEnded)
+                {
+                    await reportStop.CancelAsync().ConfigureAwait(false);
+                }
+
+                var end = await reportTask.ConfigureAwait(false);
+                totals.RecordHold(end, peakLag);
+                if (lockedAt is null && end.Kind != ReplicaReportEndKind.Stopped)
+                {
+                    context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "replica-lag-no-lock", writer.ProcessID, string.Create(CultureInfo.InvariantCulture, $"Cycle {cycle}: T4 couldn't take its lock on demo.replica_lag_marks while the report held it ({totals.LockTimeouts} lock_timeout(s) so far), so the replica's lag didn't climb.")));
+                }
+
+                var (name, detail) = DescribeReportEnd(cycle, reportSession, end, peakLag);
+                context.Events.Enqueue(new RunEvent(time.GetUtcNow(), name, null, detail));
+                if (end.Kind == ReplicaReportEndKind.Failed)
+                {
+                    totals.Error = "The report on T4's read replica failed: " + end.Detail;
+                    return true;
+                }
+
+                if (runEnded)
+                {
+                    return true;
+                }
+
+                // (d) Marks for the recovery window, so the lag drops to about the mark interval before the pause.
+                var recoverUntil = Earlier(time.GetUtcNow() + ReplicaLag.RecoveryWindow, context.Deadline);
+                var recovering = false;
+                while (!context.Stop.IsCancellationRequested && time.GetUtcNow() < recoverUntil)
+                {
+                    if (await ReplicaLagStepAsync(writer, context, takeLock: false, totals).ConfigureAwait(false) == ReplicaLagStep.RunEnded)
+                    {
+                        return true;
+                    }
+
+                    recovering = true;
+                    await WaitUntilAsync(Earlier(time.GetUtcNow() + markInterval, recoverUntil), context).ConfigureAwait(false);
+                }
+
+                if (recovering && !context.Stop.IsCancellationRequested)
+                {
+                    var after = await ReplayLagAsync(monitor, context).ConfigureAwait(false);
+                    context.Events.Enqueue(new RunEvent(time.GetUtcNow(), "replica-lag-recovered", null, string.Create(CultureInfo.InvariantCulture, $"Cycle {cycle}: after {ReplicaLag.RecoveryWindow.TotalSeconds:0} s of marks, the replica's replay lag is {(after is { } value ? value.ToString("0.0", CultureInfo.InvariantCulture) + " s" : "unknown")}.")));
+                }
+
+                return false;
+            }
+            finally
+            {
+                if (!reportTask.IsCompleted)
+                {
+                    await reportStop.CancelAsync().ConfigureAwait(false);
+                }
+
+                // Never throws: RunReplicaReportAsync turns every end into a ReplicaReportEnd.
+                await reportTask.ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>The cycle's report on the replica (ReplicaLag.ReportSql), and how it ended; never an exception.</summary>
+    private async Task<ReplicaReportEnd> RunReplicaReportAsync(NpgsqlConnection report, TimeSpan hold, CancellationToken cancellationToken)
+    {
+        var started = time.GetUtcNow();
+        try
+        {
+            await QueryRowAsync(report, ReplicaLag.ReportSql, cancellationToken, ("hold_seconds", hold.TotalSeconds)).ConfigureAwait(false);
+            return new ReplicaReportEnd(ReplicaReportEndKind.Completed, time.GetUtcNow() - started, null);
+        }
+        catch (PostgresException ex) when (ex.SqlState == ReplicaLag.RecoveryConflictState)
+        {
+            return new ReplicaReportEnd(ReplicaReportEndKind.RecoveryConflict, time.GetUtcNow() - started, PgConnectionOpener.Describe(ex));
+        }
+        catch (Exception ex) when (cancellationToken.IsCancellationRequested && ex is OperationCanceledException or NpgsqlException or InvalidOperationException)
+        {
+            return new ReplicaReportEnd(ReplicaReportEndKind.Stopped, time.GetUtcNow() - started, null);
+        }
+        catch (PostgresException ex) when (ex.SqlState is QueryCanceledState or LockNotAvailableState)
+        {
+            // Its statement_timeout or lock_timeout, or a stop or reset that cancelled it from another session.
+            return new ReplicaReportEnd(ReplicaReportEndKind.Cancelled, time.GetUtcNow() - started, PgConnectionOpener.Describe(ex));
+        }
+        catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or IOException or TimeoutException or OperationCanceledException)
+        {
+            return new ReplicaReportEnd(ReplicaReportEndKind.Failed, time.GetUtcNow() - started, PgConnectionOpener.Describe(ex));
+        }
+    }
+
+    /// <summary>Waits until the report's session holds demo.replica_lag_marks (pg_locks on the replica), at most ReplicaLag.LockWait.</summary>
+    private async Task<bool> WaitForReportHoldAsync(NpgsqlConnection monitor, int reportSession, Task reportTask, RunContext context)
+    {
+        var until = time.GetUtcNow() + ReplicaLag.LockWait;
+        while (!reportTask.IsCompleted && !context.Stop.IsCancellationRequested)
+        {
+            var row = await QueryRowAsync(monitor, ReplicaLag.ReportHoldsSql, context.Abort, ("pid", reportSession)).ConfigureAwait(false);
+            if (row.TryGetValue("holding", out var holding) && holding is true)
+            {
+                return true;
+            }
+
+            if (time.GetUtcNow() >= until)
+            {
+                return false;
+            }
+
+            await WaitUntilOrAsync(time.GetUtcNow() + HoldPollInterval, reportTask, context).ConfigureAwait(false);
+        }
+
+        return false;
+    }
+
+    /// <summary>One call of the step on T4: a mark, with the table's lock first when <paramref name="takeLock"/>.</summary>
+    private static async Task<ReplicaLagStep> ReplicaLagStepAsync(NpgsqlConnection writer, RunContext context, bool takeLock, ReplicaLagTotals totals)
+    {
+        try
+        {
+            var metrics = await QueryRowAsync(writer, ReplicaLag.StepSql, context.Abort, ("run_id", context.RunId), ("take_lock", takeLock)).ConfigureAwait(false);
+            totals.Marks += metrics.TryGetValue("marks_written", out var marks) && marks is int written ? written : 0;
+            totals.LastMarkId = metrics.TryGetValue("last_mark_id", out var mark) && mark is long id ? id : totals.LastMarkId;
+            if (!takeLock)
+            {
+                return ReplicaLagStep.Marked;
+            }
+
+            totals.Locks++;
+            return ReplicaLagStep.Locked;
+        }
+        catch (PostgresException ex) when (ex.SqlState == RunEndedState)
+        {
+            return ReplicaLagStep.RunEnded;
+        }
+        catch (PostgresException ex) when (ex.SqlState == LockNotAvailableState && takeLock && !context.Abort.IsCancellationRequested)
+        {
+            // lock_timeout on T4 (the function's 5 s): the next interval tries again while the report still holds the table.
+            totals.LockTimeouts++;
+            return ReplicaLagStep.LockTimedOut;
+        }
+    }
+
+    /// <summary>The replica's replay lag now, in seconds; null when the monitor can't read it.</summary>
+    private async Task<decimal?> ReplayLagAsync(NpgsqlConnection monitor, RunContext context)
+    {
+        try
+        {
+            var row = await QueryRowAsync(monitor, ReplicaLag.ReplicaStateSql, context.Abort).ConfigureAwait(false);
+            return row.TryGetValue("replay_lag_seconds", out var lag) ? lag as decimal? : null;
+        }
+        catch (Exception ex) when ((ex is NpgsqlException or InvalidOperationException) && !context.Abort.IsCancellationRequested)
+        {
+            log.Warn("run.replica-lag-unread", "The replica's replay lag couldn't be read; the run goes on.", ("runId", context.RunId), ("error", PgConnectionOpener.Describe(ex)));
+            return null;
+        }
+    }
+
+    /// <summary>Waits like <see cref="WaitUntilAsync"/>, and also ends when <paramref name="other"/> completes.</summary>
+    private async Task WaitUntilOrAsync(DateTimeOffset until, Task other, RunContext context)
+    {
+        var wait = until - time.GetUtcNow();
+        if (wait <= TimeSpan.Zero || other.IsCompleted)
+        {
+            return;
+        }
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(context.Stop, context.Abort);
+        var delay = Task.Delay(wait, time, linked.Token);
+        await Task.WhenAny(delay, other).ConfigureAwait(false);
+        await linked.CancelAsync().ConfigureAwait(false);
+        try
+        {
+            await delay.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // The other task ended first, or a stop request ended the wait; the caller checks both.
+        }
+
+        context.Abort.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>A cycle's end as a run event: its name and detail.</summary>
+    private static (string Name, string Detail) DescribeReportEnd(int cycle, int reportSession, ReplicaReportEnd end, decimal? peakLag)
+    {
+        var held = end.Elapsed.TotalSeconds;
+        var lag = peakLag is { } value ? string.Create(CultureInfo.InvariantCulture, $"; replay lag reached {value:0.0} s or more") : string.Empty;
+        return end.Kind switch
+        {
+            ReplicaReportEndKind.Completed => ("replica-report-ended", string.Create(CultureInfo.InvariantCulture, $"Cycle {cycle}: the report on the replica (pid {reportSession}) ended by itself after {held:0.0} s{lag}, and replay resumed.")),
+            ReplicaReportEndKind.RecoveryConflict => ("replica-report-recovery-cancel", string.Create(CultureInfo.InvariantCulture, $"Cycle {cycle}: recovery cancelled the report (pid {reportSession}) after {held:0.0} s, at max_standby_streaming_delay (SQLSTATE 40001, conflict with recovery){lag}, and replay resumed.")),
+            ReplicaReportEndKind.Stopped => ("replica-report-stopped", string.Create(CultureInfo.InvariantCulture, $"Cycle {cycle}: the report (pid {reportSession}) was cancelled after {held:0.0} s, because the run is ending{lag}.")),
+            ReplicaReportEndKind.Cancelled => ("replica-report-cancelled", string.Create(CultureInfo.InvariantCulture, $"Cycle {cycle}: the report (pid {reportSession}) ended after {held:0.0} s: {end.Detail}{lag}.")),
+            _ => ("replica-report-failed", string.Create(CultureInfo.InvariantCulture, $"Cycle {cycle}: the report (pid {reportSession}) failed after {held:0.0} s: {end.Detail}")),
+        };
+    }
+
+    private static decimal? Larger(decimal? a, decimal? b) => a is null ? b : b is null ? a : Math.Max(a.Value, b.Value);
+
+    /// <summary>The next read of the replica's lag: LagCheckInterval from now, or <paramref name="last"/>, just before the report's planned end, when that comes first.</summary>
+    private static DateTimeOffset NextLagCheck(DateTimeOffset now, DateTimeOffset last) => now < last ? Earlier(now + LagCheckInterval, last) : now + LagCheckInterval;
 
     // Building blocks -----------------------------------------------------------------------------------------------------
 
@@ -1035,6 +1424,33 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         _ => "sql",
     };
 
+    /// <summary>
+    /// Before a replica-lag run registers: T4's read replica answers and is in recovery. Null when it's ready; otherwise
+    /// why not, with the refusal reason: connect, which the profile host tries again (bounded), or request.
+    /// </summary>
+    private async Task<(string Reason, string RefusalReason)?> CheckReplicaAsync(string runId, CancellationToken cancellationToken)
+    {
+        var host = replica!.Endpoint.Host;
+        try
+        {
+            await using var connection = await replica.OpenAsync(SessionNames.ForControl(runId), cancellationToken, retry: false).ConfigureAwait(false);
+            var state = await QueryRowAsync(connection, ReplicaLag.ReplicaStateSql, cancellationToken).ConfigureAwait(false);
+            return state.TryGetValue("in_recovery", out var recovering) && recovering is true
+                ? null
+                : ($"{host} isn't a read replica: pg_is_in_recovery() is false there, so it may have been promoted. replica-lag needs T4's read replica, which start-demo.ps1 creates.", "request");
+        }
+        catch (ScenarioRequestException ex)
+        {
+            return (ex.Message, "request");
+        }
+        catch (Exception ex) when (PgReplicaSessions.IsConnectFailure(ex) && !cancellationToken.IsCancellationRequested)
+        {
+            return PgReplicaSessions.IsHostNotFound(ex)
+                ? ($"T4's read replica {host} isn't there: its name doesn't resolve. It exists only during a session that start-demo.ps1 started with it.", "connect")
+                : ($"Can't connect to T4's read replica {host}: {PgConnectionOpener.Describe(ex)}", "connect");
+        }
+    }
+
     private RunResult Refused(RunPlan plan, string runId, Dictionary<string, string> parameters, string reason, List<CheckRecord> checks, string refusalReason)
     {
         log.Error("run.refused", "The run didn't start.", ("runId", runId), ("scenario", plan.Scenario.Id), ("target", plan.Target), ("reason", reason));
@@ -1174,4 +1590,87 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     /// <summary>Ends a step loop normally (the io-pressure grower when the scratch set is full).</summary>
     private sealed class StepLoopDoneException : Exception;
+
+    /// <summary>How a replica-lag report ended.</summary>
+    private enum ReplicaReportEndKind
+    {
+        /// <summary>pg_sleep finished: the report ended by itself after its hold.</summary>
+        Completed,
+
+        /// <summary>Recovery cancelled it at max_standby_streaming_delay (SQLSTATE 40001).</summary>
+        RecoveryConflict,
+
+        /// <summary>The run cancelled it: a stop request, the deadline, or the watchdog.</summary>
+        Stopped,
+
+        /// <summary>Its own statement_timeout or lock_timeout, or a stop or reset from another session (SQLSTATE 57014 or 55P03).</summary>
+        Cancelled,
+
+        /// <summary>Anything else, such as a replica that went away.</summary>
+        Failed,
+    }
+
+    /// <summary>What one call of replica-lag's step on T4 came to.</summary>
+    private enum ReplicaLagStep
+    {
+        Marked,
+        Locked,
+        LockTimedOut,
+        RunEnded,
+    }
+
+    private sealed record ReplicaReportEnd(ReplicaReportEndKind Kind, TimeSpan Elapsed, string? Detail);
+
+    /// <summary>replica-lag's counters, which become the writer's metrics; the longest_ ones are maxima.</summary>
+    private sealed class ReplicaLagTotals
+    {
+        public int Cycles { get; set; }
+
+        public int Locks { get; set; }
+
+        public int LockTimeouts { get; set; }
+
+        public long Marks { get; set; }
+
+        public long LastMarkId { get; set; }
+
+        /// <summary>Why the run failed: a report that ended for a reason other than its hold, recovery, a stop, or a timeout.</summary>
+        public string? Error { get; set; }
+
+        private long HeldMs { get; set; }
+
+        private long LongestHoldMs { get; set; }
+
+        private long LongestLagMs { get; set; }
+
+        private int RecoveryCancels { get; set; }
+
+        public void RecordHold(ReplicaReportEnd end, decimal? peakLag)
+        {
+            var held = (long)end.Elapsed.TotalMilliseconds;
+            HeldMs += held;
+            LongestHoldMs = Math.Max(LongestHoldMs, held);
+            if (peakLag is { } lag)
+            {
+                LongestLagMs = Math.Max(LongestLagMs, (long)(lag * 1000));
+            }
+
+            if (end.Kind == ReplicaReportEndKind.RecoveryConflict)
+            {
+                RecoveryCancels++;
+            }
+        }
+
+        public Dictionary<string, object?> ToMetrics() => new(StringComparer.Ordinal)
+        {
+            ["cycles"] = Cycles,
+            ["locks_taken"] = Locks,
+            ["lock_timeouts"] = LockTimeouts,
+            ["marks_written"] = Marks,
+            ["held_ms"] = HeldMs,
+            ["longest_hold_ms"] = LongestHoldMs,
+            ["longest_lag_ms"] = LongestLagMs,
+            ["recovery_cancels"] = RecoveryCancels,
+        };
+    }
 }

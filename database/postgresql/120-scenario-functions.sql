@@ -350,3 +350,27 @@ BEGIN
     RETURN QUERY SELECT v_rows, (EXTRACT(EPOCH FROM clock_timestamp() - v_started) * 1000)::integer;
 END;
 $$;
+-- @batch
+
+-- replica-lag (ADR 0025): one mark a call, in the call's own transaction. With p_lock, the call first takes an ACCESS
+-- EXCLUSIVE lock on demo.replica_lag_marks, which T4 writes to the WAL: T4's read replica can't replay it while a
+-- ContosoCare.Demo/replica-lag report there holds the table, so its replay waits, up to max_standby_streaming_delay,
+-- and the replica's lag grows (https://www.postgresql.org/docs/current/hot-standby.html#HOT-STANDBY-CONFLICT). T4
+-- holds the lock only until the call ends, and lock_timeout keeps any wait for it short. The runner's role may take
+-- it because it has UPDATE, DELETE, and TRUNCATE on the demo tables (https://www.postgresql.org/docs/current/sql-lock.html).
+CREATE OR REPLACE FUNCTION demo.usp_scenario_replica_lag(p_run_id varchar, p_lock boolean)
+RETURNS TABLE (marks_written integer, locks_taken integer, last_mark_id bigint)
+LANGUAGE plpgsql
+SET lock_timeout = '5s'
+AS $$
+DECLARE
+    v_mark bigint;
+BEGIN
+    PERFORM demo.usp_run_assert_running(p_run_id);
+    IF COALESCE(p_lock, false) THEN
+        LOCK TABLE demo.replica_lag_marks IN ACCESS EXCLUSIVE MODE;
+    END IF;
+    INSERT INTO demo.replica_lag_marks (run_id) VALUES (p_run_id) RETURNING mark_id INTO v_mark;
+    RETURN QUERY SELECT 1, CASE WHEN COALESCE(p_lock, false) THEN 1 ELSE 0 END, v_mark;
+END;
+$$;

@@ -9,7 +9,7 @@ function Get-DemoVmWorkloadSetting {
     .SYNOPSIS
     The workload part of settings.json: the runner's SHA-256 and chunk count, the activity profile and
     whether the VM sets it at boot (profileOnBoot, default false), the auto-shutdown schedule, and (on T1)
-    T3's names.
+    T3's and T4's names, with T4's read replica's FQDN when the settings have one (ADR 0025).
 
     .DESCRIPTION
     The template writes these into the loader's settings (infra/modules/demo.bicep). Selected is true only
@@ -100,11 +100,22 @@ function Get-DemoVmWorkloadSetting {
             if ($t4Settings.Contains('runnerRole') -and $t4Settings['runnerRole'] -match '^[a-z_][a-z0-9_]{0,62}$') {
                 $runnerRole = [string]$t4Settings['runnerRole']
             }
+            # T4's read replica (ADR 0025), for replica-lag and for the end of the demo's sessions there: settings from
+            # before the replica have none, and a name that isn't a flexible server's FQDN is left out. It exists only
+            # during a session, so nothing here resolves it.
+            $replicaFqdn = ''
+            if ($t4Settings.Contains('replicaServerFqdn') -and $t4Settings['replicaServerFqdn']) {
+                $replicaFqdn = ([string]$t4Settings['replicaServerFqdn']).ToLowerInvariant()
+                if ($replicaFqdn -notmatch '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\.postgres\.database\.azure\.com$' -or $replicaFqdn -eq $fqdn) {
+                    $replicaFqdn = ''
+                }
+            }
             $t4 = @{
-                ServerName   = [string]$t4Settings['serverName']
-                ServerFqdn   = $fqdn
-                DatabaseName = $databaseName
-                RunnerRole   = $runnerRole
+                ServerName        = [string]$t4Settings['serverName']
+                ServerFqdn        = $fqdn
+                DatabaseName      = $databaseName
+                RunnerRole        = $runnerRole
+                ReplicaServerFqdn = $replicaFqdn
             }
         }
     }
@@ -1170,7 +1181,12 @@ function New-DemoVmWorkloadRecord {
     }
     $t4 = $null
     if ($PrimaryTarget -eq 'T1' -and $Workload.Contains('T4') -and $null -ne $Workload.T4) {
-        $t4 = [ordered]@{ serverName = $Workload.T4.ServerName; serverFqdn = $Workload.T4.ServerFqdn; databaseName = $Workload.T4.DatabaseName; runnerRole = $Workload.T4.RunnerRole }
+        # replicaServerFqdn (ADR 0025) next to serverFqdn: the control's Runner relay passes it to T4's commands.
+        $replicaFqdn = ''
+        if ($Workload.T4.Contains('ReplicaServerFqdn')) {
+            $replicaFqdn = [string]$Workload.T4.ReplicaServerFqdn
+        }
+        $t4 = [ordered]@{ serverName = $Workload.T4.ServerName; serverFqdn = $Workload.T4.ServerFqdn; replicaServerFqdn = $replicaFqdn; databaseName = $Workload.T4.DatabaseName; runnerRole = $Workload.T4.RunnerRole }
     }
     return [ordered]@{
         schemaVersion        = 1
@@ -1192,7 +1208,8 @@ function New-DemoVmWorkloadRecord {
 }
 
 function Test-DemoVmWorkloadRecord {
-    # True when workload-install.json matches the wanted runner, runtime, profile, schedule, and T3 and T4 servers.
+    # True when workload-install.json matches the wanted runner, runtime, profile, schedule, and T3 and T4 servers,
+    # T4's read replica included, so a replica that the settings gain or lose rewrites the record.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -1225,16 +1242,18 @@ function Test-DemoVmWorkloadRecord {
     if ($wantedT3 -ne $recordedT3) {
         return $false
     }
-    $wantedT4 = ''
-    if ($Expected.Contains('t4') -and $null -ne $Expected['t4']) {
-        $wantedT4 = [string]$Expected['t4']['serverFqdn']
-    }
-    $recordedT4 = ''
-    if ($Record.Contains('t4') -and $null -ne $Record['t4']) {
-        $recordedT4 = [string]$Record['t4']['serverFqdn']
-    }
-    if ($wantedT4 -ne $recordedT4) {
-        return $false
+    foreach ($key in @('serverFqdn', 'replicaServerFqdn')) {
+        $wanted = ''
+        if ($Expected.Contains('t4') -and $null -ne $Expected['t4'] -and $Expected['t4'].Contains($key)) {
+            $wanted = [string]$Expected['t4'][$key]
+        }
+        $recorded = ''
+        if ($Record.Contains('t4') -and $null -ne $Record['t4'] -and $Record['t4'].Contains($key)) {
+            $recorded = [string]$Record['t4'][$key]
+        }
+        if ($wanted -ne $recorded) {
+            return $false
+        }
     }
     $setup = $Record['setup']
     if ($null -eq $setup -or -not $setup.Contains($Expected['primaryTarget'])) {

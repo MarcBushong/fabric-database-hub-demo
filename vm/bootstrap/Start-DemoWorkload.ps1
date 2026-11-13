@@ -11,7 +11,8 @@ Reads workload-install.json, which the WorkloadRunner step writes, then:
    Enable-DemoT3Workload has recorded that T1's identity reaches T3 (t3-workload.json) and T3's name
    resolves. It doesn't after stop-demo.ps1 -RemoveT3, until start-demo.ps1 recreates T3. T4, the
    PostgreSQL flexible server, joins the same way once Enable-DemoT4Workload has recorded t4-workload.json
-   (Phase 24, ADR 0019); its sessions sign in as the runner's role with T1's managed identity.
+   (Phase 24, ADR 0019); its sessions sign in as the runner's role with T1's managed identity. T4's read
+   replica goes with T4 by name (ADR 0025), for an incident:replica-lag; it exists only during a session.
 3. Sets every target's activity profile to the configured one (activityProfile, baseline by default), ending
    before the next auto-shutdown: once after each install (a deployment), and once per boot only when
    activityProfileOnBoot is true. It's false by default: a VM that starts (a manual start, a scheduled
@@ -345,6 +346,7 @@ function Invoke-DemoWorkloadHost {
 
     $t4Fqdn = ''
     $t4Role = ''
+    $t4ReplicaFqdn = ''
     $t4 = Get-DemoWorkloadValue -InputObject $install -Name 't4'
     if ($primary -eq 'T1' -and $null -ne $t4) {
         $fqdn = [string](Get-DemoWorkloadValue -InputObject $t4 -Name 'serverFqdn')
@@ -355,6 +357,12 @@ function Invoke-DemoWorkloadHost {
                 $t4Role = [string](Get-DemoWorkloadValue -InputObject $marker -Name 'runnerRole')
                 if ($t4Role -notmatch '^[a-z_][a-z0-9_]{0,62}$') {
                     $t4Role = 'contosocare_runner'
+                }
+                # T4's read replica (ADR 0025), for an incident:replica-lag that the host runs: it exists only during a
+                # session and may still be being created when this task starts, so its name isn't resolved here.
+                $replica = ([string](Get-DemoWorkloadValue -InputObject $t4 -Name 'replicaServerFqdn')).ToLowerInvariant()
+                if ($replica -match '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\.postgres\.database\.azure\.com$' -and $replica -ne $fqdn) {
+                    $t4ReplicaFqdn = $replica
                 }
             }
             else {
@@ -433,6 +441,9 @@ function Invoke-DemoWorkloadHost {
     }
     if ($t4Fqdn) {
         $hostArguments += @('--t4-server', $t4Fqdn, '--t4-user', $t4Role)
+        if ($t4ReplicaFqdn) {
+            $hostArguments += @('--t4-replica-server', $t4ReplicaFqdn)
+        }
     }
     $targetText = $primary
     if ($t3Fqdn) {

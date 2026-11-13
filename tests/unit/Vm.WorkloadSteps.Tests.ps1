@@ -445,6 +445,31 @@ Describe 'Start-DemoWorkload.ps1' {
         ($script:runs -join "`n") | Should -Not -Match 'T3|t3-server'
     }
 
+    It 'hosts T4 with its read replica''s name, which isn''t resolved, and without one for settings from before the replica or a Burstable T4 (ADR 0025)' {
+        $root = New-WrapperRoot
+        $installPath = Join-Path -Path $root -ChildPath 'workload-install.json'
+        Set-Content -LiteralPath (Join-Path -Path $root -ChildPath 't4-workload.json') -Value (@{ serverFqdn = 'pgflex01-abc123.postgres.database.azure.com'; runnerRole = 'contosocare_runner' } | ConvertTo-Json)
+        foreach ($case in @(
+                @{ Replica = 'pgreplica01-abc123.postgres.database.azure.com'; Expected = ' --t4-replica-server pgreplica01-abc123.postgres.database.azure.com' },
+                @{ Replica = $null; Expected = '' },
+                @{ Replica = ''; Expected = '' },
+                @{ Replica = 'pgflex01-abc123.postgres.database.azure.com'; Expected = '' }
+            )) {
+            $install = Get-Content -LiteralPath $installPath -Raw | ConvertFrom-Json
+            $t4 = [ordered]@{ serverFqdn = 'pgflex01-abc123.postgres.database.azure.com'; runnerRole = 'contosocare_runner' }
+            if ($null -ne $case.Replica) {
+                $t4.replicaServerFqdn = $case.Replica
+            }
+            $install | Add-Member -NotePropertyName 't4' -NotePropertyValue ([pscustomobject]$t4) -Force
+            Set-Content -LiteralPath $installPath -Value ($install | ConvertTo-Json -Depth 5)
+            $script:runs.Clear()
+            Invoke-DemoWorkloadHost -StateRoot $root -Now $script:noon | Should -Be 0
+            $script:runs[-1] | Should -BeLike 'profile run --target T1 --not-after 2026-10-20T19:00:00+00:00 --log-file *'
+            $script:runs[-1].EndsWith(' --t4-server pgflex01-abc123.postgres.database.azure.com --t4-user contosocare_runner' + $case.Expected, [System.StringComparison]::Ordinal) | Should -BeTrue -Because $script:runs[-1]
+        }
+        Should -Invoke -CommandName Test-DemoWorkloadNameResolve -ParameterFilter { $HostName -like 'pgreplica01-*' } -Times 0 -Exactly
+    }
+
     It 'gives the off profile no end time, and hosts T2 alone in the guest' {
         $root = New-WrapperRoot -ActivityProfile 'off' -PrimaryTarget 'T2'
         Invoke-DemoWorkloadHost -StateRoot $root -Now $script:noon | Out-Null
@@ -476,7 +501,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         # The real function, before any mock replaces it (BeforeEach runs it with a fixed clock).
         $script:realNextShutdown = ${function:Get-DemoVmNextShutdown}
 
-        function New-ControlRoot([string] $Role = 'SqlVm', [switch] $NoInstall) {
+        function New-ControlRoot([string] $Role = 'SqlVm', [switch] $NoInstall, [string] $ReplicaServerFqdn = '') {
             $root = Join-Path -Path $TestDrive -ChildPath ('control-' + [guid]::NewGuid().ToString('N'))
             New-Item -ItemType Directory -Path $root -Force | Out-Null
             $settings = [ordered]@{ role = $Role; workload = [ordered]@{ runnerSha256 = $script:sha; runnerChunkCount = 7; activityProfile = 'baseline'; autoShutdownTime = '1900'; autoShutdownTimeZone = 'UTC' } }
@@ -487,6 +512,10 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
                 Set-Content -LiteralPath $dotnet -Value 'host'
                 Set-Content -LiteralPath $runner -Value 'runner'
                 $install = [ordered]@{ primaryTarget = 'T1'; runnerDll = $runner; dotnetExe = $dotnet; activityProfile = 'baseline'; autoShutdownTime = '2359'; autoShutdownTimeZone = 'UTC'; installedUtc = 'x'; t3 = [ordered]@{ serverFqdn = 'azuresql01-abc123.database.windows.net' }; t4 = [ordered]@{ serverFqdn = 'pgflex01-abc123.postgres.database.azure.com'; runnerRole = 'contosocare_runner' }; setup = [ordered]@{ T1 = [ordered]@{ status = 'Pass' } } }
+                if ($ReplicaServerFqdn) {
+                    # workload-install.json from a bundle that knows T4's read replica (ADR 0025).
+                    $install.t4['replicaServerFqdn'] = $ReplicaServerFqdn
+                }
                 Set-Content -LiteralPath (Join-Path -Path $root -ChildPath 'workload-install.json') -Value ($install | ConvertTo-Json -Depth 5)
             }
             return $root
@@ -633,6 +662,56 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         (Get-ControlResult).status | Should -Be 'Pass'
         Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter {
             ($ArgumentList -join ' ') -eq 'status --json --target T4 --server pgflex01-abc123.postgres.database.azure.com --user contosocare_runner'
+        }
+    }
+
+    It 'Runner on T1: adds T4''s read replica from workload-install.json, to the warmup too, unless the arguments name one (ADR 0025)' {
+        $root = New-ControlRoot -ReplicaServerFqdn 'pgreplica01-abc123.postgres.database.azure.com'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '{"target":"T4"}'; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T4'; arguments = @('run', '--scenario', 'replica-lag', '--json') }) -StateRoot $root
+        (Get-ControlResult).status | Should -Be 'Pass'
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter {
+            ($ArgumentList -join ' ') -eq 'run --scenario replica-lag --json --target T4 --server pgflex01-abc123.postgres.database.azure.com --user contosocare_runner --replica-server pgreplica01-abc123.postgres.database.azure.com'
+        }
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -like 'warmup --json --target T4 * --replica-server pgreplica01-abc123.postgres.database.azure.com' }
+        $script:lines.Clear()
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T4'; arguments = @('reset', '--replica-server', 'pgreplica01-other.postgres.database.azure.com', '--json') }) -StateRoot $root
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter {
+            ($ArgumentList -join ' ') -eq 'reset --replica-server pgreplica01-other.postgres.database.azure.com --json --target T4 --server pgflex01-abc123.postgres.database.azure.com --user contosocare_runner'
+        }
+    }
+
+    It 'Runner on T1: takes the request''s replicaServerFqdn for T4, and refuses one that isn''t T4''s read replica (ADR 0025)' {
+        $root = New-ControlRoot -ReplicaServerFqdn 'pgreplica01-abc123.postgres.database.azure.com'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '[]'; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T4'; arguments = @('stop', '--scenario', 'replica-lag', '--json'); replicaServerFqdn = 'PGREPLICA01-xyz789.postgres.database.azure.com' }) -StateRoot $root
+        (Get-ControlResult).status | Should -Be 'Pass'
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter {
+            ($ArgumentList -join ' ') -eq 'stop --scenario replica-lag --json --target T4 --server pgflex01-abc123.postgres.database.azure.com --user contosocare_runner --replica-server pgreplica01-xyz789.postgres.database.azure.com'
+        }
+        foreach ($request in @(
+                @{ target = 'T4'; arguments = @('status', '--json'); replicaServerFqdn = 'pgreplica01-abc123.example.com' }
+                @{ target = 'T4'; arguments = @('status', '--json'); replicaServerFqdn = 'pgreplica01-abc123.postgres.database.azure.com --user x' }
+                @{ target = 'T1'; arguments = @('status', '--json'); replicaServerFqdn = 'pgreplica01-abc123.postgres.database.azure.com' }
+            )) {
+            $script:lines.Clear()
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request $request) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Fail'
+            $result.message | Should -Match 'replicaServerFqdn must be T4''s read replica'
+        }
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly
+    }
+
+    It 'Runner on T1: adds no replica for an install record from before it, or one whose name isn''t a flexible server''s (ADR 0025)' {
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '[]'; StdErr = '' } }
+        foreach ($root in @((New-ControlRoot), (New-ControlRoot -ReplicaServerFqdn 'pgreplica01-abc123.example.com --user x'))) {
+            $script:lines.Clear()
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T4'; arguments = @('reset', '--json') }) -StateRoot $root
+            (Get-ControlResult).status | Should -Be 'Pass'
+        }
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 2 -Exactly -ParameterFilter {
+            ($ArgumentList -join ' ') -eq 'reset --json --target T4 --server pgflex01-abc123.postgres.database.azure.com --user contosocare_runner'
         }
     }
 
