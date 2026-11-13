@@ -449,6 +449,8 @@ function Invoke-DemoPreflight {
         $tuningSku = if ($t4Start) { $t4Start } else { $t4Sku }
         $tuningWhy = if ($t4Start -and $t4Pinned) { 'deploy.ps1''s fallback starts at {0} because {1}, the size t4SkuName sets, is ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' -f $t4Start, $t4Pinned } elseif ($t4Start -eq 'Standard_D2ds_v5') { 'deploy.ps1''s fallback uses Standard_D2ds_v5 because the 4-vCore sizes are ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' } elseif ($t4Explicit) { ('t4SkuName sets {0}.' -f $tuningSku) } else { '' }
         $results.Add((New-DemoT4TuningResult -Config $Config -SkuName $tuningSku -Why $tuningWhy -CheckPrefix PREFLIGHT))
+        # T4's read replica (2026-11-13, ADR 0025), on the size T4 gets: a Burstable size has none (Not supported, with the fix).
+        $results.Add((New-DemoT4ReplicaPreflightResult -SkuName $tuningSku))
     }
     else {
         $results.Add((New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT))

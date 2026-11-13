@@ -567,6 +567,10 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
             $text = $ArgumentList -join ' '
             $script:order.Add(($ArgumentList[0..2] -join ' '))
+            if ($text -match 'flexibleServers/pgreplica01-') {
+                # T4's read replica (ADR 0025), read before the group: none between sessions.
+                return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (ResourceNotFound) The Resource was not found.')
+            }
             if ($text -match '^group delete --name rg-dbhub-golden') {
                 $script:goldenGroupExists = $false
                 return (New-AzResult)
@@ -591,7 +595,8 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
     It 'reads the manifest first, deletes the group, then the deployment record, then checks for residue' {
         $manifestPath = Join-Path -Path $TestDrive -ChildPath 'out/destroy-manifest.json'
         $results = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
-        $script:order | Should -Be @('Manifest', 'group delete --name', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host'
+        # T4's read replica (ADR 0025) is read before the group, by the manifest's deploymentId; there's none here.
+        $script:order | Should -Be @('Manifest', 'rest --method get', 'group delete --name', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.DEPLOYMENT' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.BUDGET' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }).status | Should -Be 'Pass'
@@ -628,6 +633,10 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
             $script:budgetDelete = New-AzResult
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
                 $text = $ArgumentList -join ' '
+                if ($text -match 'flexibleServers/pgreplica01-') {
+                    # T4's read replica (ADR 0025), read before the group: none between sessions.
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (ResourceNotFound) The Resource was not found.')
+                }
                 if ($text -match '^rest --method (get|delete)') {
                     $script:restCalls.Add($text)
                     if ($Matches[1] -eq 'get') {

@@ -20,7 +20,9 @@ function Get-DemoDeploymentState {
     configuration asks for first, with the zones tried and when, in the DbHubT4Refused tag; ConvertFrom-DemoT4RefusedRecord),
     T2BuildUtc (when the T2 host's loader started a bootstrap generation that nobody has seen finish; empty when none
     runs; Phase 28 review follow-up), T2InstallMode (the T2 guest's own install mode as its host reported it, in the
-    DbHubT2InstallMode tag; 2026-11-09, Get-DemoT2GuestInstallMode), and Tags (every tag on the group). Read-only.
+    DbHubT2InstallMode tag; 2026-11-09, Get-DemoT2GuestInstallMode), T4Replica (Session once deploy.ps1 has set up T4's
+    read replica for this environment, in the DbHubT4Replica tag; 2026-11-13, ADR 0025), T4ReplicaSize (the size and zone the
+    last replica was created with, in the DbHubT4ReplicaSize tag), and Tags (every tag on the group). Read-only.
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -72,6 +74,8 @@ function Get-DemoDeploymentState {
         T4Refused         = & $read 'T4Refused'
         T2BuildUtc        = & $read 'T2BuildUtc'
         T2InstallMode     = & $read 'T2InstallMode'
+        T4Replica         = & $read 'T4Replica'
+        T4ReplicaSize     = & $read 'T4ReplicaSize'
         Tags              = $tags
     }
 }

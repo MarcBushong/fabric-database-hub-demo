@@ -357,6 +357,27 @@ function Invoke-DemoValidationT4 {
     $record = [pscustomobject]@{ T4Sku = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Context -Name 'Tags') -Name (Get-DemoDeploymentStateTagName)['T4Sku']) }
     $parameters['Config'] = Resolve-DemoEffectiveConfig -Config $Context.Config -State $record
     @(Test-DemoT4 @parameters)
+    # T4's read replica (2026-11-13, ADR 0025): its checks, its place in Database Hub's Estate, and its Read replica lag,
+    # read-only. Before deploy.ps1 set it up (the resource group's DbHubT4Replica tag), only a Warning with the upgrade's
+    # command, without reading anything more; between sessions it isn't there by design (a Pass that says so); on a
+    # Burstable T4, Not supported with the fix.
+    $tags = Get-DemoMemberValue -InputObject $Context -Name 'Tags'
+    $tagNames = Get-DemoDeploymentStateTagName
+    $replicaState = [pscustomobject]@{ T4Replica = [string](Get-DemoMemberValue -InputObject $tags -Name $tagNames['T4Replica']); T4ReplicaSize = [string](Get-DemoMemberValue -InputObject $tags -Name $tagNames['T4ReplicaSize']) }
+    if (-not (Test-DemoT4ReplicaSetUp -State $replicaState)) {
+        New-DemoT4ReplicaNotSetUpResult -CheckId 'T4.REPLICA' -Status 'Warning'
+        return
+    }
+    $replicaParameters = @{ Config = $parameters['Config'] }
+    if ($Context.DeploymentId) {
+        $replicaParameters['DeploymentId'] = $Context.DeploymentId
+    }
+    $replicaCheck = Test-DemoT4ReplicaServer @replicaParameters -State $replicaState
+    $replicaCheck
+    if ([string]$replicaCheck.status -eq 'Pass' -and [string](Get-DemoMemberValue -InputObject $replicaCheck.evidence -Name 'state') -eq 'Ready') {
+        Test-DemoT4ReplicaEstate @replicaParameters
+        Test-DemoT4ReplicaMetricFlow @replicaParameters
+    }
 }
 
 function Invoke-DemoValidationHub {

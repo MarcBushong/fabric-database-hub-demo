@@ -1717,16 +1717,29 @@ function Stop-DbHubDemo {
         }
     }
     $t4 = Get-DbHubT4 -Context $Context -Tags $Tags
+    $t4Outcome = ''
     if ($t4.State -in 'Ready', 'Starting', 'Updating') {
         if (Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action stop) {
             $done.Add(('{0} stopping' -f $t4.Name))
+            $t4Outcome = 'Sent'
         }
         else {
             $failed.Add($t4.Name)
+            $t4Outcome = 'Failed'
         }
     }
     elseif ($t4.State -notin 'Unknown', '') {
         $done.Add(('T4 {0}' -f $t4.State.ToLowerInvariant()))
+    }
+    # T4's read replica, when a session left it running (ADR 0025): the control can't delete it, so it's stopped once T4
+    # is (Azure's order), which waits for T4's stop only when there's a replica to stop.
+    $replica = Invoke-DbHubT4ReplicaStop -Context $Context -Tags $Tags -T4Outcome $t4Outcome -WaitMinutes (Get-DbHubT4WaitMinute -Settings $settings)
+    $replicaText = Get-DbHubT4ReplicaStopText -Outcome $replica
+    if ($replica.Outcome -eq 'Failed') {
+        $failed.Add($replicaText)
+    }
+    elseif ($replicaText) {
+        $done.Add($replicaText)
     }
     return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray() }
 }
@@ -1945,7 +1958,16 @@ function Invoke-DbHubNightlyStop {
     else {
         $done.Add($t4Text)
     }
-    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); Vms = $vms; T4 = $t4Text }
+    # T4's read replica, when a session left it behind (ADR 0025): stopped once T4 is.
+    $replica = Invoke-DbHubT4ReplicaStop -Context $Context -Tags $Tags -T4Outcome $t4.Outcome -WaitMinutes (Get-DbHubT4WaitMinute -Settings $settings) -PollSeconds $PollSeconds
+    $replicaText = Get-DbHubT4ReplicaStopText -Outcome $replica
+    if ($replica.Outcome -eq 'Failed') {
+        $failed.Add($replicaText)
+    }
+    elseif ($replicaText) {
+        $done.Add($replicaText)
+    }
+    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); Vms = $vms; T4 = $t4Text; Replica = $replicaText }
 }
 
 function Get-DbHubT4WaitMinute {
@@ -1977,6 +1999,200 @@ function Get-DbHubT4StopText {
         'Skipped' { return ('T4 {0}' -f $Outcome.Current.ToLowerInvariant()) }
     }
     return ('failed: {0}' -f $Outcome.Error)
+}
+
+function Get-DbHubT4Replica {
+    # T4's read replica, <t4ReplicaPrefix><deploymentId> (ADR 0025), which start-demo.ps1 creates for each session and
+    # stop-demo.ps1 deletes: Name and State (Ready, Stopped, Starting, Stopping, Dropping, ...), or State Missing (none,
+    # as between sessions), Unknown, or NotConfigured (settings without t4ReplicaPrefix).
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $prefix = [string](Get-DbHubMember -InputObject $Context.Settings -Name 't4ReplicaPrefix')
+    if (-not $prefix) {
+        return [pscustomobject]@{ Name = ''; State = 'NotConfigured' }
+    }
+    $deploymentId = [string](Get-DbHubMember -InputObject $Tags -Name 'deploymentId')
+    if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
+        return [pscustomobject]@{ Name = ''; State = 'Unknown' }
+    }
+    $name = '{0}{1}' -f $prefix, $deploymentId
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
+    $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $name) -ApiVersion $version
+    if ($read.StatusCode -eq 404) {
+        return [pscustomobject]@{ Name = $name; State = 'Missing' }
+    }
+    if ($read.StatusCode -ne 200) {
+        return [pscustomobject]@{ Name = $name; State = 'Unknown' }
+    }
+    return [pscustomobject]@{ Name = $name; State = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'state') }
+}
+
+function Invoke-DbHubT4ReplicaStop {
+    <#
+    .SYNOPSIS
+    Stops T4's read replica when a session left it behind (ADR 0025): start-demo.ps1 creates it and stop-demo.ps1 deletes
+    it, so outside a session it's there only when a session ended without stop-demo.ps1. Azure stops a replica only after
+    its primary is stopped (SourceReplicasStartStopOrder, live 2026-11-13), so this waits for T4 to be stopped, reading
+    both every PollSeconds for up to WaitMinutes; with -T4Outcome Failed (T4's stop failed) it doesn't wait. A replica that's
+    stopped, stopping, being deleted, or missing is left alone, and nothing is started or deleted. Returns Outcome (Sent,
+    AlreadyStopped, Missing, Skipped, NotConfigured, or Failed), Name, State (as last read), and Error.
+    https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [string] $T4Outcome = '',
+
+        [int] $WaitMinutes = 10,
+
+        [int] $PollSeconds = 30
+    )
+
+    $giveUp = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    $errorText = ''
+    while ($true) {
+        $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+        $outcome = [pscustomobject]@{ Outcome = ''; Name = [string]$replica.Name; State = [string]$replica.State; Error = '' }
+        if ($replica.State -in 'NotConfigured', 'Missing') {
+            $outcome.Outcome = $replica.State
+            return $outcome
+        }
+        if ($replica.State -in 'Stopped', 'Stopping') {
+            $outcome.Outcome = 'AlreadyStopped'
+            return $outcome
+        }
+        if ($replica.State -in 'Dropping', 'Disabled') {
+            $outcome.Outcome = 'Skipped'
+            return $outcome
+        }
+        if ($T4Outcome -eq 'Failed') {
+            $outcome.Outcome = 'Failed'
+            $outcome.Error = 'T4 wasn''t stopped, and Azure stops a read replica only after its primary'
+            return $outcome
+        }
+        $t4 = Get-DbHubT4 -Context $Context -Tags $Tags
+        if ($replica.State -eq 'Ready' -and $t4.State -in 'Stopped', 'Missing') {
+            $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
+            $sent = Invoke-DbHubArm -Context $Context -Method POST -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}/stop' -f (Get-DbHubDemoPath -Settings $Context.Settings), $replica.Name) -ApiVersion $version
+            if ($sent.StatusCode -in 200, 202) {
+                Write-DbHubLog -Context $Context -Message ('{0}: stop accepted (T4''s read replica, left from a session).' -f $replica.Name)
+                $outcome.Outcome = 'Sent'
+                return $outcome
+            }
+            $errorText = $sent.Error
+            if ($sent.StatusCode -notin 400, 409) {
+                $outcome.Outcome = 'Failed'
+                $outcome.Error = $errorText
+                return $outcome
+            }
+        }
+        if ((Get-DbHubUtcNow) -ge $giveUp) {
+            $outcome.Outcome = 'Failed'
+            $outcome.Error = if ($errorText) { $errorText } else { 'it was {0} and T4 {1} after {2} minutes, and Azure stops a read replica only after its primary is stopped; the next safety stop tries again' -f $replica.State, $t4.State, $WaitMinutes }
+            Write-DbHubLog -Context $Context -Message ('{0}: not stopped: {1}.' -f $replica.Name, $outcome.Error)
+            return $outcome
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+}
+
+function Get-DbHubT4ReplicaStopText {
+    # What a stop says about T4's read replica, from Invoke-DbHubT4ReplicaStop's outcome, in plain words: nothing when
+    # there's none (between sessions); otherwise that a session left it behind, what that bills, and the fix.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Outcome
+    )
+
+    switch ($Outcome.Outcome) {
+        'Sent' { return ('T4''s read replica {0} stopped (a session left it behind without stop-demo.ps1; stopped it still bills its storage and Defender plans until ./scripts/stop-demo.ps1 deletes it)' -f $Outcome.Name) }
+        'AlreadyStopped' { return ('T4''s read replica {0} already {1} (a session left it behind; ./scripts/stop-demo.ps1 deletes it)' -f $Outcome.Name, $Outcome.State.ToLowerInvariant()) }
+        'Skipped' { return ('T4''s read replica {0} {1}' -f $Outcome.Name, $Outcome.State.ToLowerInvariant()) }
+        { $_ -in 'Missing', 'NotConfigured' } { return '' }
+    }
+    return ('T4''s read replica {0} (a session left it behind) not stopped: {1}; ./scripts/stop-demo.ps1 deletes it' -f $Outcome.Name, $Outcome.Error)
+}
+
+function Invoke-DbHubT4ReplicaStartFirst {
+    <#
+    .SYNOPSIS
+    Before a run starts a stopped T4: Azure starts a primary only once its replicas are Ready (SourceReplicasStartStopOrder,
+    live 2026-11-13), so a stopped replica that a session left behind is started first and waited for, up to WaitMinutes.
+    The control never creates a replica (it can't create servers); without one, Outcome is Missing, and the run says
+    plainly that its replica beat isn't available. Returns Outcome (Missing, NotConfigured, Ready, Started, or Failed), Name,
+    State, and Error.
+    https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [int] $WaitMinutes = 10,
+
+        [int] $PollSeconds = 20
+    )
+
+    $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+    $outcome = [pscustomobject]@{ Outcome = ''; Name = [string]$replica.Name; State = [string]$replica.State; Error = '' }
+    if ($replica.State -in 'NotConfigured', 'Missing') {
+        $outcome.Outcome = $replica.State
+        return $outcome
+    }
+    if ($replica.State -eq 'Ready') {
+        $outcome.Outcome = 'Ready'
+        return $outcome
+    }
+    if ($replica.State -eq 'Stopped' -and -not (Invoke-DbHubT4Action -Context $Context -Name $replica.Name -Action start)) {
+        $outcome.Outcome = 'Failed'
+        $outcome.Error = 'Azure didn''t accept its start'
+        return $outcome
+    }
+    $giveUp = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    while ((Get-DbHubUtcNow) -lt $giveUp) {
+        Start-Sleep -Seconds $PollSeconds
+        $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+        $outcome.State = [string]$replica.State
+        if ($replica.State -eq 'Ready') {
+            $outcome.Outcome = 'Started'
+            return $outcome
+        }
+        if ($replica.State -in 'Missing', 'Dropping') {
+            $outcome.Outcome = 'Missing'
+            return $outcome
+        }
+    }
+    $outcome.Outcome = 'Failed'
+    $outcome.Error = 'it was still {0} after {1} minutes' -f $outcome.State, $WaitMinutes
+    return $outcome
+}
+
+function Get-DbHubT4ReplicaRunNote {
+    # What an on-demand run says about T4's read replica (ADR 0025), plainly, when its replica beat isn't available: the
+    # control doesn't create the replica, so Database Hub's Read replica lag stays empty and the replica-lag scenario
+    # can't run, and start-demo.ps1 is how to get it. Empty when the replica is there, or settings predate it.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Outcome
+    )
+
+    switch ($Outcome.Outcome) {
+        'Missing' { return ('T4''s read replica isn''t there: on-demand runs don''t create it, so Database Hub''s Read replica lag stays empty and the replica-lag scenario can''t run in this run. For that beat, start the demo with ./scripts/start-demo.ps1, which creates the replica (about 9 minutes), and stop it with ./scripts/stop-demo.ps1, which deletes it.') }
+        'Failed' { return ('T4''s read replica {0} couldn''t be started ({1}), and Azure starts T4 only after its replicas, so T4 sits this run out. ./scripts/stop-demo.ps1 deletes the replica; ./scripts/start-demo.ps1 then creates a new one.' -f $Outcome.Name, $Outcome.Error) }
+    }
+    return ''
 }
 
 function Get-DbHubT3Database {
@@ -2123,7 +2339,17 @@ function Invoke-DbHubT3Check {
         $failed = @(('T4 ({0})' -f $t4.Error))
         $sentence = 'T4 couldn''t be stopped: {0}' -f $t4.Error
     }
-    return [pscustomobject]@{ action = 'check-t3'; status = $status; t3 = $check.t3; t3Status = $check.t3Status; autoPauseDelay = $check.autoPauseDelay; minutesSinceStop = $check.minutesSinceStop; message = ('{0} {1}.' -f $check.message, $sentence); t4 = $t4Text; failed = $failed }
+    # T4's read replica, when a session left it behind (ADR 0025): stopped once T4 is.
+    $replica = Invoke-DbHubT4ReplicaStop -Context $Context -Tags $Tags -T4Outcome $t4.Outcome -WaitMinutes (Get-DbHubT4WaitMinute -Settings $Context.Settings) -PollSeconds $PollSeconds
+    $replicaText = Get-DbHubT4ReplicaStopText -Outcome $replica
+    if ($replica.Outcome -eq 'Failed') {
+        $status = 'Partial'
+        $failed = @($failed) + @($replicaText)
+    }
+    if ($replicaText) {
+        $sentence = '{0}; {1}' -f $sentence, $replicaText
+    }
+    return [pscustomobject]@{ action = 'check-t3'; status = $status; t3 = $check.t3; t3Status = $check.t3Status; autoPauseDelay = $check.autoPauseDelay; minutesSinceStop = $check.minutesSinceStop; message = ('{0} {1}.' -f $check.message, $sentence); t4 = $t4Text; replica = $replicaText; failed = $failed }
 }
 
 function Get-DbHubRequester {
@@ -2201,9 +2427,9 @@ function Start-DbHubActivityRun {
 
     $settings = $Context.Settings
     if (-not $PSCmdlet.ShouldProcess($settings.demoResourceGroup, 'Start an on-demand run')) {
-        return [pscustomobject]@{ action = 'run'; status = 'Refused'; message = 'What if: nothing was started.'; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @() }
+        return [pscustomobject]@{ action = 'run'; status = 'Refused'; message = 'What if: nothing was started.'; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @(); replica = '' }
     }
-    $result = [ordered]@{ action = 'run'; status = 'Refused'; message = ''; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @() }
+    $result = [ordered]@{ action = 'run'; status = 'Refused'; message = ''; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @(); replica = '' }
     $active = Get-DbHubActiveRun -Context $Context
     if ($active.Active) {
         $result.message = $active.Reason
@@ -2307,6 +2533,32 @@ function Start-DbHubActivityRun {
             if ($accepted -and $vm -eq $sqlVm) {
                 $sqlStartedUtc = Get-DbHubUtcNow
             }
+        }
+    }
+    if ($null -ne $t4 -and $t4.State -eq 'Stopped') {
+        # T4's read replica (ADR 0025): Azure starts T4 only once a stopped replica is Ready, so one a session left behind
+        # starts first. The control never creates one: without it, the run says plainly that its replica beat isn't there.
+        $replicaFirst = Invoke-DbHubT4ReplicaStartFirst -Context $Context -Tags $Tags -PollSeconds $PollSeconds
+        $replicaNote = Get-DbHubT4ReplicaRunNote -Outcome $replicaFirst
+        if ($replicaNote) {
+            $result.replica = $replicaNote
+            Write-DbHubLog -Context $Context -Message $replicaNote
+        }
+        if ($replicaFirst.Outcome -eq 'Failed') {
+            $skipped.Add(('T4 (its read replica {0} couldn''t be started first: {1})' -f $replicaFirst.Name, $replicaFirst.Error))
+            foreach ($vm in @($byVm.Keys)) {
+                $byVm[$vm] = @($byVm[$vm] | Where-Object { $_.Target -ne 'T4' })
+            }
+            $t4 = $null
+        }
+    }
+    elseif ($null -ne $t4) {
+        # A T4 that runs needs nothing first; without a replica, the run still says its replica beat isn't there.
+        $replicaNow = Get-DbHubT4Replica -Context $Context -Tags $Tags
+        $replicaNote = Get-DbHubT4ReplicaRunNote -Outcome ([pscustomobject]@{ Outcome = $(if ($replicaNow.State -eq 'Missing') { 'Missing' } else { '' }); Name = [string]$replicaNow.Name; State = [string]$replicaNow.State; Error = '' })
+        if ($replicaNote) {
+            $result.replica = $replicaNote
+            Write-DbHubLog -Context $Context -Message $replicaNote
         }
     }
     if ($null -ne $t4 -and $t4.State -eq 'Stopped' -and -not (Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action start)) {
@@ -2464,6 +2716,9 @@ function Start-DbHubActivityRun {
     $plugin = @{ Running = ' T1''s monitoring plugin runs.'; Restarted = ' T1''s monitoring plugin was restarted and runs.'; StillNotRunning = ' T1''s monitoring plugin still didn''t run after its restart.'; RestartRefused = ' T1''s monitoring plugin needed a restart that Azure didn''t accept.' }
     if ($plugin.ContainsKey([string]$result.monitoring)) {
         $note += $plugin[[string]$result.monitoring]
+    }
+    if ($result.replica) {
+        $note += ' ' + $result.replica
     }
     $result.message = 'Dispatched {0}. The profiles end by {1} UTC and the auto-stop runs at {2}; each target is waited for until it accepts connections, and telemetry shows the activity 3 to 15 minutes later.{3}' -f ($dispatched -join '; '), $result.runEndUtc, $result.autoStopUtc, $note
     return [pscustomobject]$result
@@ -2654,10 +2909,16 @@ function Invoke-DbHubStop {
             $status = 'Partial'
             $failedText = '; failed: ' + (@($nightly.Failed) -join ', ')
         }
-        return [pscustomobject]@{ action = $label; status = $status; message = ('Nightly safety stop: {0}{1}.' -f (@($nightly.Done) -join ', '), $failedText); done = $nightly.Done; failed = $nightly.Failed; vms = $nightly.Vms; t4 = $nightly.T4 }
+        return [pscustomobject]@{ action = $label; status = $status; message = ('Nightly safety stop: {0}{1}.' -f (@($nightly.Done) -join ', '), $failedText); done = $nightly.Done; failed = $nightly.Failed; vms = $nightly.Vms; t4 = $nightly.T4; replica = $nightly.Replica }
     }
     if ($Scope -eq 'T4') {
         $t4 = Get-DbHubT4 -Context $Context -Tags $group.Tags
+        # T4's read replica, when a session left it behind (ADR 0025): stopped once T4 is, which waits for T4's stop.
+        $replicaPart = {
+            param([string] $T4Outcome)
+            $replica = Invoke-DbHubT4ReplicaStop -Context $Context -Tags $group.Tags -T4Outcome $T4Outcome -WaitMinutes (Get-DbHubT4WaitMinute -Settings $Context.Settings) -PollSeconds $PollSeconds
+            return [pscustomobject]@{ Failed = ($replica.Outcome -eq 'Failed'); Text = (Get-DbHubT4ReplicaStopText -Outcome $replica) }
+        }
         if ($t4.State -in 'Ready', 'Starting', 'Updating') {
             $sent = Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action stop
             $status = 'Partial'
@@ -2666,7 +2927,17 @@ function Invoke-DbHubStop {
                 $status = 'Stopped'
                 $outcome = 'accepted'
             }
-            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 ({0}) was {1}; its stop was {2}.' -f $t4.Name, $t4.State, $outcome) }
+            $replicaDone = & $replicaPart $(if ($sent) { 'Sent' } else { 'Failed' })
+            if ($replicaDone.Failed) {
+                $status = 'Partial'
+            }
+            $replicaSentence = if ($replicaDone.Text) { ' {0}.' -f $replicaDone.Text } else { '' }
+            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 ({0}) was {1}; its stop was {2}.{3}' -f $t4.Name, $t4.State, $outcome, $replicaSentence); replica = $replicaDone.Text }
+        }
+        $replicaDone = & $replicaPart ''
+        if ($replicaDone.Text) {
+            $status = if ($replicaDone.Failed) { 'Partial' } else { 'Stopped' }
+            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 is {0}. {1}.' -f $t4.State, $replicaDone.Text); replica = $replicaDone.Text }
         }
         return [pscustomobject]@{ action = $label; status = 'Skipped'; message = ('T4 is {0}; nothing to stop.' -f $t4.State) }
     }

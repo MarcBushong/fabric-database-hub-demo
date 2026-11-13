@@ -166,6 +166,7 @@ function Get-DemoProgressCatalog {
         $tracks.Add([ordered]@{ name = 'T4'; label = 'T4: Azure Database for PostgreSQL'; steps = @(
                     (& $step 'T4.Server' 'Server checks' @('T4/Server'))
                     (& $step 'T4.Setup' 'Set up from T1' @('T1/T4'))
+                    (& $step 'T4.Replica' 'Read replica (created for each session; about 9 minutes)' @('T4/Replica'))
                     (& $step 'T4.Telemetry' 'Metrics in Azure Monitor' @('T4/Telemetry'))
                 )
             })
@@ -230,6 +231,7 @@ function Get-DemoProgressStepId {
         'T2/T2' { return @('T2.HostBuild', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring') }
         'T2/Telemetry' { return @('T2.Telemetry') }
         'T4/Server' { return @('T4.Server') }
+        'T4/Replica' { return @('T4.Replica') }
         'T4/Telemetry' { return @('T4.Telemetry') }
         'Fabric/Fabric' { return @('Fabric.Items', 'Fabric.Report', 'Fabric.App') }
         default { return @() }

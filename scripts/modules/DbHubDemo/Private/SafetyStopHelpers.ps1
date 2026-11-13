@@ -268,6 +268,8 @@ function Get-DemoSafetyStopRunbookSetting {
         t3ServerPrefix        = 'azuresql01-'
         demoDatabase          = 'ContosoCare'
         t4ServerPrefix        = 'pgflex01-'
+        # T4's read replica (ADR 0025): the safety stop stops one a session left behind, only after T4 is stopped.
+        t4ReplicaPrefix       = ('{0}-' -f (Get-DemoT4ReplicaSetting)['serverNamePrefix'])
         autoShutdownTime      = $(if ($Config['autoShutdownTime']) { [string]$Config['autoShutdownTime'] } else { '1900' })
         autoShutdownTimeZone  = $(if ($Config['autoShutdownTimeZone']) { [string]$Config['autoShutdownTimeZone'] } else { 'UTC' })
         t4WaitMinutes         = 10

@@ -13,6 +13,9 @@ T4's 7-day automatic restart: when signed in, the script also reads whether a sa
 (Get-DemoT4RestartCoverage, read-only): the nightly safety stop that every deployment sets up (its schedule, its role, and
 its last run; ADR 0024), or the on-demand control's daily T4 safety stop. Then each restart counts as about a day;
 otherwise, and when not signed in, the worst case counts the rest of the month.
+T4's read replica (2026-11-13, ADR 0025) exists only during a session: start-demo.ps1 creates it and stop-demo.ps1 deletes
+it, so its compute (at T4's size), storage, and Defender plans are in the running hours (the Replica session column), and
+no automatic restart applies to it. A Burstable T4 has no replica.
 Prices are list prices in USD on the day you run it: estimates, not quotes.
 
 Microsoft Defender for Cloud: when the Azure CLI is already signed in to the configured subscription, the
@@ -195,6 +198,7 @@ $summary = foreach ($name in $profileNames) {
         'Defender session' = if ($estimate.DefenderIncluded) { $estimate.DefenderSession } else { 'excluded' }
         'Defender month'   = if ($estimate.DefenderIncluded) { $estimate.DefenderMonthly } else { 'excluded' }
         'T3 free offer'    = if ($estimate.T3FreeOffer) { 'yes' } elseif ($estimate.T3FreeOfferUnchecked) { 'unchecked' } else { 'no' }
+        'Replica session'  = if ($estimate.T4ReplicaIncluded) { $estimate.T4ReplicaSession } else { 'none' }
     }
     $queriedOn = $estimate.QueriedOn
     $effectiveNetworkMode = $estimate.NetworkMode

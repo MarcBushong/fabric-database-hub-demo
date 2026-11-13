@@ -101,6 +101,12 @@ function Get-DemoDeploymentStateTagName {
         # Developer) once nothing is left to set up in it, so a golden capture tags its snapshot with the guest's real mode
         # (Get-DemoT2GuestInstallMode).
         T2InstallMode            = 'DbHubT2InstallMode'
+        # 2026-11-13 (ADR 0025): T4's read replica. T4Replica is Session once deploy.ps1 has set the replica up for this
+        # environment (start-demo.ps1 creates it for each session, stop-demo.ps1 deletes it); an environment without it was
+        # deployed before the replica, and the lifecycle scripts point to ./scripts/deploy.ps1. T4ReplicaSize is the size and
+        # zone the last replica was created with ("Standard_D4ds_v5@any"), where the next one starts while it still fits T4.
+        T4Replica                = 'DbHubT4Replica'
+        T4ReplicaSize            = 'DbHubT4ReplicaSize'
     }
 }
 

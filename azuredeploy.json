@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "4999307340440567332"
+      "templateHash": "9528227165614826831"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -650,7 +650,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "15930217157101282985"
+              "templateHash": "6759720116500439876"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -1203,6 +1203,45 @@
                 "limits": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits",
                 "restartServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-restart-server"
               },
+              "replica": {
+                "note": "T4's read replica (2026-11-13, user-directed; ADR 0025): a same-region read replica of T4, created for each session (deploy.ps1 and start-demo.ps1 create it, stop-demo.ps1 deletes it) from infra/replica/pgreplica01.bicep, in T4's subnet and private DNS zone, at T4's actual size; Burstable isn't supported. Learn (checked 2026-11-13): the replica's vCores must be the same or higher than the source's; stop the primary first and start the replica first, which Azure enforces (SourceReplicasStartStopOrder, live 2026-11-13); a second deployment of the replica's template fails (ReadReplicaAlreadyExistWithGivenName, live), so it's deployed only while the replica doesn't exist. maxStandbyStreamingDelayMs is how long replaying the primary's changes waits for a query on the replica (dynamic), which the replica-lag scenario relies on. generalPurposeSizes are the documented sizes the size fallback tries, in order, never with fewer vCores than T4. Read Replica Lag (physical_replication_delay_in_seconds) is on the replica only, and Max Physical Replication Lag (physical_replication_delay_in_bytes) on the primary only. Measured live on 2026-11-13: created in 525 seconds, deleted in 97, each stop or start about 125.",
+                "serverNamePrefix": "pgreplica01",
+                "templateDeploymentName": "dbhub-t4-replica",
+                "recordTag": "DbHubT4Replica",
+                "recordValue": "Session",
+                "sizeTag": "DbHubT4ReplicaSize",
+                "maxStandbyStreamingDelayMs": 600000,
+                "createMinutes": 9,
+                "createTimeoutMinutes": 40,
+                "deleteTimeoutMinutes": 15,
+                "powerWaitMinutes": 15,
+                "generalPurposeSizes": [
+                  "Standard_D2ds_v5",
+                  "Standard_D4ds_v5",
+                  "Standard_D4ads_v5"
+                ],
+                "metrics": {
+                  "replica": [
+                    "physical_replication_delay_in_seconds",
+                    "cpu_percent",
+                    "memory_percent",
+                    "active_connections",
+                    "iops",
+                    "storage_percent"
+                  ],
+                  "primary": [
+                    "physical_replication_delay_in_bytes"
+                  ],
+                  "hubLag": "physical_replication_delay_in_seconds"
+                },
+                "docUrls": {
+                  "concepts": "https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas",
+                  "create": "https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica",
+                  "capacityErrors": "https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors",
+                  "hotStandby": "https://www.postgresql.org/docs/current/hot-standby.html"
+                },
+                "verifiedOn": "2026-11-13"
+              },
               "verifiedOn": "2026-10-23"
             },
             "catalogProfile": "[variables('$fxv#0')[parameters('profile')]]",
@@ -1216,6 +1255,8 @@
             "isNestedT2": "[not(equals(parameters('t2Mode'), 'EvaluationOnlyAzureVm'))]",
             "t4ServerName": "[format('{0}-{1}', variables('postgres').serverNamePrefix, parameters('deploymentId'))]",
             "t4ServerFqdn": "[format('{0}.postgres.database.azure.com', variables('t4ServerName'))]",
+            "t4ReplicaServerName": "[format('{0}-{1}', variables('postgres').replica.serverNamePrefix, parameters('deploymentId'))]",
+            "t4ReplicaServerFqdn": "[if(startsWith(parameters('t4SkuName'), 'Standard_B'), '', format('{0}.postgres.database.azure.com', variables('t4ReplicaServerName')))]",
             "workloadSettings": {
               "runnerSha256": "[toLower(parameters('workloadRunnerSha256'))]",
               "runnerChunkCount": "[parameters('workloadRunnerChunkCount')]",
@@ -9155,7 +9196,7 @@
                   "hostVmName": "[if(variables('isNestedT2'), createObject('value', reference('archost01').outputs.vmName.value), createObject('value', reference('arcsql01Eval').outputs.vmName.value))]",
                   "hostRole": "[if(variables('isNestedT2'), createObject('value', 'ArcHost'), createObject('value', 'EvalArcVm'))]",
                   "sqlVmSettings": {
-                    "value": "[union(variables('commonSettings'), createObject('role', 'SqlVm', 'dataDiskTier', variables('t1DataDiskTier'), 't3', createObject('serverName', reference('azuresql01').outputs.serverName.value, 'serverFqdn', reference('azuresql01').outputs.serverFqdn.value, 'databaseName', reference('azuresql01').outputs.databaseName.value)), if(parameters('t4Enabled'), createObject('t4', createObject('serverName', variables('t4ServerName'), 'serverFqdn', variables('t4ServerFqdn'), 'databaseName', variables('postgres').databaseName, 'runnerRole', variables('postgres').runnerRole)), createObject()))]"
+                    "value": "[union(variables('commonSettings'), createObject('role', 'SqlVm', 'dataDiskTier', variables('t1DataDiskTier'), 't3', createObject('serverName', reference('azuresql01').outputs.serverName.value, 'serverFqdn', reference('azuresql01').outputs.serverFqdn.value, 'databaseName', reference('azuresql01').outputs.databaseName.value)), if(parameters('t4Enabled'), createObject('t4', createObject('serverName', variables('t4ServerName'), 'serverFqdn', variables('t4ServerFqdn'), 'databaseName', variables('postgres').databaseName, 'runnerRole', variables('postgres').runnerRole, 'replicaServerName', variables('t4ReplicaServerName'), 'replicaServerFqdn', variables('t4ReplicaServerFqdn'))), createObject()))]"
                   },
                   "hostSettings": {
                     "value": "[variables('hostLoaderSettings')]"
@@ -10195,7 +10236,7 @@
                 "description": "The bootstrap loaders' settings (nothing secret), for the loaders deploy.ps1 runs itself (ADR 0018); deploy.ps1 fills in the workload runner fields."
               },
               "value": {
-                "sqlVm": "[union(variables('commonSettings'), createObject('role', 'SqlVm', 'dataDiskTier', variables('t1DataDiskTier'), 't3', createObject('serverName', reference('azuresql01').outputs.serverName.value, 'serverFqdn', reference('azuresql01').outputs.serverFqdn.value, 'databaseName', reference('azuresql01').outputs.databaseName.value)), if(parameters('t4Enabled'), createObject('t4', createObject('serverName', variables('t4ServerName'), 'serverFqdn', variables('t4ServerFqdn'), 'databaseName', variables('postgres').databaseName, 'runnerRole', variables('postgres').runnerRole)), createObject()))]",
+                "sqlVm": "[union(variables('commonSettings'), createObject('role', 'SqlVm', 'dataDiskTier', variables('t1DataDiskTier'), 't3', createObject('serverName', reference('azuresql01').outputs.serverName.value, 'serverFqdn', reference('azuresql01').outputs.serverFqdn.value, 'databaseName', reference('azuresql01').outputs.databaseName.value)), if(parameters('t4Enabled'), createObject('t4', createObject('serverName', variables('t4ServerName'), 'serverFqdn', variables('t4ServerFqdn'), 'databaseName', variables('postgres').databaseName, 'runnerRole', variables('postgres').runnerRole, 'replicaServerName', variables('t4ReplicaServerName'), 'replicaServerFqdn', variables('t4ReplicaServerFqdn'))), createObject()))]",
                 "host": "[variables('hostLoaderSettings')]"
               }
             }

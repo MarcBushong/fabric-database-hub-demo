@@ -704,6 +704,21 @@ function Invoke-DemoDeployment {
                 }
                 $t4State = Get-DemoT4State -Config $Config
                 $results.Add((Test-DemoT4MetricFlow -Config $Config -ServerId $t4State.Names.ServerId -State $t4State.State -WaitMinutes ([System.Math]::Min($TelemetryWaitMinutes, 10))))
+                # T4's read replica (2026-11-13, ADR 0025), after T4's restart above, as the T4 track creates it; the environment
+                # has the replica's lifecycle from now on (DbHubT4Replica Session).
+                $replicaResults = @(Invoke-DemoT4ReplicaCreate -Config $Config -CheckPrefix DEPLOY)
+                & $addAll $replicaResults
+                try {
+                    Set-DemoDeploymentState -Config $Config -Value @{ T4Replica = [string](Get-DemoT4ReplicaSetting)['recordValue'] } -Confirm:$false
+                }
+                catch {
+                    $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.RECORD' -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('The replica''s record (DbHubT4Replica) wasn''t set on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run ./scripts/deploy.ps1 again.'))
+                }
+                if (@($replicaResults | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0) {
+                    $results.Add((Test-DemoT4ReplicaServer -Config $Config))
+                    $results.Add((Test-DemoT4ReplicaEstate -Config $Config -WaitMinutes 5))
+                    $results.Add((Test-DemoT4ReplicaMetricFlow -Config $Config -WaitMinutes ([System.Math]::Min($TelemetryWaitMinutes, 10))))
+                }
                 & $recordStage 'T4'
                 if ((& $hasStatus $t4Checks 'Fail') -or ($null -ne $t4Enable -and $t4Enable.status -eq 'Fail')) {
                     & $stageResult 'T4' 'Fail' 'A T4 check or its setup failed; the rest of the deployment continues.' 'Read the T4 and WORKLOAD.T4.ENABLE results, fix the cause, then run deploy.ps1 -FromStage T4.'

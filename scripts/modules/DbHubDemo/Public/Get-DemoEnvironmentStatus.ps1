@@ -300,6 +300,9 @@ function Get-DemoEnvironmentStatus {
             if ($null -ne $sizeChange) {
                 $results.Add($sizeChange)
             }
+            # T4's read replica (2026-11-13, ADR 0025): not set up yet (the upgrade's command), Not supported on Burstable,
+            # none between sessions, running with its lag, or left over while T4 is stopped.
+            $results.Add((Get-DemoT4ReplicaStatusResult -Config $Config -State $state -T4State $t4 -DeploymentId ([string]$state.Tags['deploymentId'])))
         }
     }
 

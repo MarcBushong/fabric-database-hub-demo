@@ -597,6 +597,16 @@ Describe 'deploy.ps1''s A1 re-grant (Invoke-DemoActivityControlRegrant)' {
         $script:logs = [System.Collections.Generic.List[string]]::new()
         Register-FakeAzure
         Initialize-GuardTestContext -ObjectId $script:callerId
+        # The runbooks' refresh has its own Describe below.
+        Mock -ModuleName DbHubDemo -CommandName Update-DemoActivityControlRunbook -MockWith { @() }
+    }
+
+    It 'publishes the control''s runbooks again with this code after A1, so an update reaches them at deploy.ps1 (2026-11-13)' {
+        Mock -ModuleName DbHubDemo -CommandName Grant-DemoActivityControlRole -MockWith { @([pscustomobject]@{ checkId = 'CONTROL.ROLE.A1'; status = 'Pass' }) }
+        Mock -ModuleName DbHubDemo -CommandName Update-DemoActivityControlRunbook -MockWith { @([pscustomobject]@{ checkId = 'CONTROL.RUNBOOKS'; status = 'Pass' }) }
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -AssignRoles $true) } { Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath './config/demo.config.json' -Confirm:$false })
+        @($results | ForEach-Object checkId) | Should -Be @('CONTROL.ROLE.A1', 'CONTROL.RUNBOOKS')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Update-DemoActivityControlRunbook -Times 1 -Exactly -ParameterFilter { $ConfigPath -eq './config/demo.config.json' }
     }
 
     It 'does nothing when control.enabled is false' {
@@ -659,6 +669,90 @@ Describe 'deploy.ps1''s A1 re-grant (Invoke-DemoActivityControlRegrant)' {
         $summary.Status | Should -Be 'Manual action required'
         $summary.Message | Should -Match ([regex]::Escape('1 item(s) need you: CONTROL.ROLE.A1: An Owner of the subscription runs, signed in with multifactor authentication: ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole'))
         @($summary.Evidence['manual']).Count | Should -Be 1
+    }
+}
+
+Describe 'deploy.ps1''s refresh of the control''s runbooks (Update-DemoActivityControlRunbook, 2026-11-13)' {
+    BeforeEach {
+        $script:clientId = 'cccccccc-0000-0000-0000-000000000003'
+        $script:identityAnswer = 'Ok'
+        $script:published = @{}
+        $script:armUrls = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            $script:armUrls.Add($Url)
+            if ($Url -match '/userAssignedIdentities/') {
+                switch ($script:identityAnswer) {
+                    'Missing' { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' } }
+                    'Denied' { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'AuthorizationFailed' } }
+                }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ clientId = $script:clientId } }; Error = '' }
+            }
+            if ($Url -match '/runbooks/([^/]+)/content') {
+                $runbook = $Matches[1]
+                if ($script:published.ContainsKey($runbook)) {
+                    return [pscustomobject]@{ Ok = $true; Missing = $false; Value = [string]$script:published[$runbook]; Error = '' }
+                }
+                return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' }
+            }
+            throw ('unexpected ARM call: {0}' -f $Url)
+        }
+        $config = New-ControlConfig
+        # What this code publishes, with the identity's client ID: the runbooks as they'd be after setup-activity-control.ps1.
+        $script:current = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config; ClientId = $script:clientId } {
+            $name = Get-DemoActivityControlName -Config $Config
+            $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name $name -IdentityClientId $ClientId
+            $content = @{}
+            foreach ($runbook in $name.ControlRunbook, $name.StopRunbook, $name.MonitorRunbook) {
+                $content[$runbook] = Get-DemoActivityControlRunbookContent -Name $runbook -Setting $setting
+            }
+            $content
+        }
+    }
+
+    It 'does nothing when control.enabled is false, or the control isn''t set up' {
+        @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -Enabled $false) } { Update-DemoActivityControlRunbook -Config $Config -Confirm:$false }).Count | Should -Be 0
+        $script:armUrls.Count | Should -Be 0
+        $script:identityAnswer = 'Missing'
+        @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Update-DemoActivityControlRunbook -Config $Config -Confirm:$false }).Count | Should -Be 0
+    }
+
+    It 'leaves runbooks that already have this code alone' {
+        $script:published = @{} + $script:current
+        Mock -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -MockWith { throw 'not expected' }
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Update-DemoActivityControlRunbook -Config $Config -Confirm:$false })
+        $results.Count | Should -Be 1
+        $results[0].checkId | Should -Be 'CONTROL.RUNBOOKS'
+        $results[0].status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -Times 0 -Exactly
+    }
+
+    It 'publishes the three runbooks again when the published code is older (an existing control after an update)' {
+        $script:published = @{} + $script:current
+        $script:published['DbHub-Control'] = '# DbHub-Control from before T4''s read replica'
+        Mock -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -MockWith { New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'DbHub-Control, DbHub-Stop, DbHub-Monitor published.' }
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Update-DemoActivityControlRunbook -Config $Config -Confirm:$false })
+        $results[0].status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -Times 1 -Exactly -ParameterFilter { $Setting['identityClientId'] -eq $script:clientId -and $Setting['t4ReplicaPrefix'] -eq 'pgreplica01-' }
+    }
+
+    It 'warns, with what fails until then and the exact command, when <Case>, and DONE and the status page say so' -ForEach @(
+        @{ Case = 'the publish fails'; Identity = 'Ok'; Because = 'DbHub-Control: couldn''t publish: AuthorizationFailed' }
+        @{ Case = 'the identity can''t be read'; Identity = 'Denied'; Because = 'its identity id-dbhub-automation couldn''t be read \(AuthorizationFailed\)' }
+    ) {
+        $script:identityAnswer = $Identity
+        Mock -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -MockWith { New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message 'DbHub-Control: couldn''t publish: AuthorizationFailed' -Remediation 'Run setup-activity-control.ps1 again; it publishes all three runbooks each time.' }
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Update-DemoActivityControlRunbook -Config $Config -ConfigPath './config/demo.config.json' -Confirm:$false })
+        $results.Count | Should -Be 1
+        $results[0].status | Should -Be 'Warning' -Because 'the control is optional: it never fails a deployment'
+        $results[0].message | Should -Match ('^The on-demand control''s runbooks weren''t updated with this code: {0}\. Until then the control runs its older code: a run can''t start T4 while a read replica that a session left behind is stopped' -f $Because)
+        $results[0].remediation | Should -Be 'Run ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json; it publishes the runbooks with the current code.'
+        $note = InModuleScope -ModuleName DbHubDemo -Parameters @{ Result = $results } { Get-DemoActivityControlRunbookNote -Result $Result }
+        $note | Should -Match 'Until then the control runs its older code'
+        $note | Should -Match ([regex]::Escape('Run ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json'))
+        # DONE's and NOT DONE's notes, which the status page shows with the run's reason.
+        $source = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/Private/DeployExperience.ps1') -Raw
+        $source | Should -Match 'Get-DemoActivityControlRunbookNote -Result \$all'
     }
 }
 

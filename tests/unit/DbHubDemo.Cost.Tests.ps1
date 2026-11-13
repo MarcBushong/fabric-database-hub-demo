@@ -298,10 +298,12 @@ Describe 'Get-DemoCostEstimate' {
         $cost.T4MonthlyWorstCaseUsd | Should -Be ([System.Math]::Round(27.46 + 0.18 * 730, 2))
         $cost.DefenderIncluded | Should -BeTrue
         @($cost.Unpriced) | Should -BeNullOrEmpty
-        # The demo's month with it is what PREFLIGHT.COST.MONTHLY checks: the light-use month plus the restart's worst case.
+        # The demo's month with it is what PREFLIGHT.COST.MONTHLY checks: the light-use month plus the restart's worst case,
+        # without T4's read replica's share, which never changes a size verdict (ADR 0025, 2026-11-13).
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }) -NetworkMode public -DefenderPlans $plans -T3UseFreeLimit $false
-        $cost.MonthlyWorstCaseUsd | Should -Be ([System.Math]::Round($estimate.LightUseMonthly + $estimate.T4AutoRestartWorstCaseMonthly, 2))
-        $cost.SessionUsd | Should -Be $estimate.SessionCost
+        $cost.MonthlyWorstCaseUsd | Should -Be ([System.Math]::Round($estimate.LightUseMonthlyWithoutReplica + $estimate.T4AutoRestartWorstCaseMonthly, 2))
+        $cost.SessionUsd | Should -Be $estimate.SessionCostWithoutReplica
+        $estimate.SessionCostWithoutReplica | Should -BeLessThan $estimate.SessionCost -Because 'the estimate itself counts the replica'
         $cost.Allowed | Should -Be ($cost.MonthlyWorstCaseUsd -le 250 -and $cost.SessionUsd -le 15)
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -ParameterFilter { [uri]::UnescapeDataString($Uri) -match "productName eq 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'" }
 
@@ -310,6 +312,68 @@ Describe 'Get-DemoCostEstimate' {
         $unread = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4GeneralPurposeCost -Config $Config -NetworkMode public -T3UseFreeLimit $false }
         $unread.DefenderIncluded | Should -BeFalse
         @($unread.Unpriced) | Should -Contain 'Microsoft Defender for Cloud (the subscription''s plans weren''t read)'
+    }
+
+    It 'prices T4''s read replica for each session only: its compute at T4''s size, its storage by the hour, and its Defender plans, with no restart to count (ADR 0025)' {
+        $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'OpenSourceRelationalDatabases'; pricingTier = 'Standard'; subPlan = $null })
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans
+        $replica = @($estimate.Components | Where-Object Name -Match 'T4 read replica')
+        $compute = $replica | Where-Object Name -EQ 'T4 read replica compute (Standard_D4ds_v5; for each session only)'
+        $compute.Basis | Should -Be 'running'
+        $compute.UnitPrice | Should -Be 0.09 -Because 'T4''s own vCore meter: the replica follows T4''s size'
+        $compute.Quantity | Should -Be 4
+        $storage = $replica | Where-Object Name -EQ 'T4 read replica storage (for each session only)'
+        $storage.Basis | Should -Be 'running'
+        $storage.Quantity | Should -Be (32 / 730) -Because '32 GiB for one of the month''s 730 hours'
+        ($replica | Where-Object Name -Match 'open-source relational').Quantity | Should -Be (1 / 730)
+        ($replica | Where-Object Name -Match 'Defender CSPM').Cost | Should -Be 0.012
+        @($replica | Where-Object Basis -NE 'running').Count | Should -Be 0 -Because 'nothing of it bills between sessions'
+        $hourly = 0.36 + [System.Math]::Round(0.10 * 32 / 730, 4) + [System.Math]::Round(15.0 / 730, 4) + 0.012
+        $estimate.T4ReplicaIncluded | Should -BeTrue
+        $estimate.T4ReplicaHourly | Should -Be ([System.Math]::Round($hourly, 4))
+        $estimate.T4ReplicaSession | Should -Be ([System.Math]::Round($hourly * 5, 2))
+        $estimate.T4ReplicaMonthly | Should -Be ([System.Math]::Round($hourly * 10, 2))
+        $estimate.SessionCost | Should -BeGreaterThan $estimate.SessionCostWithoutReplica
+        [System.Math]::Abs($estimate.SessionCost - ($estimate.SessionCostWithoutReplica + $hourly * 5)) | Should -BeLessOrEqual 0.011 -Because 'both totals are rounded to the cent'
+        [System.Math]::Abs($estimate.LightUseMonthly - ($estimate.LightUseMonthlyWithoutReplica + $hourly * 10)) | Should -BeLessOrEqual 0.011
+        # It's deleted, not stopped, after a session, so T4's restart worst case and fixed costs stay T4's own.
+        $estimate.T4AutoRestartWorstCaseMonthly | Should -Be ([System.Math]::Round(0.09 * 4 * (730 - 10), 2))
+        $estimate.T4FixedMonthly | Should -Be 27.46
+        ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Match ('T4''s read replica, which exists only during a session, is {0:N2} USD of it \(start-demo\.ps1 -SkipT4Replica starts a session without it\)' -f $estimate.T4ReplicaSession)
+        ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'T4''s read replica exists only during a session .+ nothing between sessions, with no automatic restart to count'
+
+        # A Burstable T4 has none: Azure doesn't support read replicas there.
+        $burstable = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_B1ms' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans
+        @($burstable.Components | Where-Object Name -Match 'read replica').Count | Should -Be 0
+        $burstable.T4ReplicaIncluded | Should -BeFalse
+        $burstable.SessionCost | Should -Be $burstable.SessionCostWithoutReplica
+        ($burstable.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Not -Match 'read replica'
+    }
+
+    It 'leaves T4''s read replica out of T4''s size verdicts: a demo-day session that only its share puts over sessionCeilingUsd warns, and T4''s one-time move to the default is still allowed (2026-11-13)' {
+        $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'OpenSourceRelationalDatabases'; pricingTier = 'Standard'; subPlan = $null })
+        $config = New-TestConfig -Override @{ t4Enabled = $true }
+        $priced = Get-DemoCostEstimate -Config $config -ProfileName 'demo-day' -NetworkMode public -DefenderPlans $plans -T3UseFreeLimit $false
+        # The session ceiling between the two totals, as demo-day's 2026-11-13 example had it: 14.75 USD without the
+        # replica, 16.56 with it, against 15.
+        $config['sessionCeilingUsd'] = [System.Math]::Round(($priced.SessionCostWithoutReplica + $priced.SessionCost) / 2, 2)
+        $config['monthlyCeilingUsd'] = 100000
+        $estimate = Get-DemoCostEstimate -Config $config -ProfileName 'demo-day' -NetworkMode public -DefenderPlans $plans -T3UseFreeLimit $false
+        $session = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION'
+        $session.status | Should -Be 'Warning' -Because 'the session with the replica is over the ceiling'
+        $session.message | Should -Match ('is {0:N2} USD of it \(start-demo\.ps1 -SkipT4Replica' -f $estimate.T4ReplicaSession)
+        # deploy.ps1's move of an older T4 to Standard_D4ds_v5 is gated on this verdict (Invoke-DemoTemplateDeployment), as
+        # before the replica.
+        $move = InModuleScope DbHubDemo -Parameters @{ Estimate = $estimate; Config = $config } { ConvertTo-DemoT4FallbackCost -Estimate $Estimate -Config $Config -SkuName 'Standard_D4ds_v5' }
+        $move.Allowed | Should -BeTrue
+        $move.SkipReason | Should -Be ''
+        $move.SessionUsd | Should -Be $estimate.SessionCostWithoutReplica
+        $move.LightUseMonthlyUsd | Should -Be $estimate.LightUseMonthlyWithoutReplica
+        # An estimate without the replica's totals (from before it) is read as before.
+        $older = [pscustomobject]@{ LightUseMonthly = 50.0; T4AutoRestartWorstCaseMonthly = 100.0; SessionCost = 9.0; T4FixedMonthly = 5.0; DefenderIncluded = $true; MissingPrices = @(); Components = @([pscustomobject]@{ Name = 'T4 compute (Standard_D4ds_v5)'; UnitPrice = 0.09; Quantity = 4 }) }
+        $read = InModuleScope DbHubDemo -Parameters @{ Estimate = $older; Config = $config } { ConvertTo-DemoT4FallbackCost -Estimate $Estimate -Config $Config -SkuName 'Standard_D4ds_v5' }
+        $read.SessionUsd | Should -Be 9.0
+        $read.MonthlyWorstCaseUsd | Should -Be 150.0
     }
 
     It 'reads each price once for estimates that share a price cache, as preflight''s General Purpose check does (Phase 28 follow-up)' {

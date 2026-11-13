@@ -2906,9 +2906,12 @@ Describe 'Remove-DemoEnvironment' {
         }
     }
 
-    It 'deletes the Arc SQL instances, then the Arc machines, then the resource group, then the deployment record and the budget, and checks for residue' {
+    It 'deletes the Arc SQL instances, then the Arc machines, then T4''s read replica, then the resource group, then the deployment record and the budget, and checks for residue' {
+        # T4's read replica (ADR 0025) goes before the group, named from the manifest's deploymentId.
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { $script:order.Add('Replica'); $null }
         $results = Remove-DemoEnvironment -Config $config -Confirm:$false
-        $script:order | Should -Be @('Instance', 'Machine', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
+        $script:order | Should -Be @('Instance', 'Machine', 'Replica', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -Times 1 -Exactly -ParameterFilter { $CheckPrefix -eq 'DESTROY' -and $DeploymentId -eq 'abc123' -and $Quiet }
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.ARC.SQLINSTANCES' }).area | Should -Be 'teardown'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }).status | Should -Be 'Pass'

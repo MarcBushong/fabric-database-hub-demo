@@ -160,7 +160,7 @@ Describe 'The first-run setup from deploy.ps1 (brief goal 1)' {
 Describe 'What DONE requires (brief item 16)' {
     It 'is Database Hub''s own views of every target, T2 at Standard with PAYG and monitoring, T1''s inventory, and the required Fabric items' {
         $ids = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' }
-        $ids | Should -Be @('HUB.ESTATE.T1', 'HUB.ESTATE.T2', 'HUB.ESTATE.T3', 'HUB.ESTATE.T4', 'TELEMETRY.T1', 'TELEMETRY.T2', 'TELEMETRY.T3', 'METRICS.T4', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T1.SQLVM.ASSOCIATEDSERVICES', 'FABRIC.ITEMS.REQUIRED')
+        $ids | Should -Be @('HUB.ESTATE.T1', 'HUB.ESTATE.T2', 'HUB.ESTATE.T3', 'HUB.ESTATE.T4', 'TELEMETRY.T1', 'TELEMETRY.T2', 'TELEMETRY.T3', 'METRICS.T4', 'HUB.ESTATE.T4.REPLICA', 'METRICS.T4.REPLICA', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T1.SQLVM.ASSOCIATEDSERVICES', 'FABRIC.ITEMS.REQUIRED')
         (InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'ProductKey' }) | Should -Contain 'T2.ARC.MONITORING'
         $ids | Should -Not -Contain 'DEPLOY.FABRIC.APP'
     }
@@ -175,7 +175,7 @@ Describe 'What DONE requires (brief item 16)' {
         $developer | Should -Not -Contain 'FABRIC.ITEMS.REQUIRED'
     }
 
-    It 'checks only what this run''s results don''t show passing, read-only, so a resumed run judges every target' {
+    It 'checks only what this run''s results don''t show passing, so a resumed run judges every target' {
         $config = New-TestConfig -WithT4
         $script:calls = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
@@ -183,13 +183,15 @@ Describe 'What DONE requires (brief item 16)' {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith { $script:calls.Add('telemetry ' + ($Target -join ',')); foreach ($t in $Target) { New-TestResult ('TELEMETRY.{0}' -f $t) } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Names = [pscustomobject]@{ ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' } } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoT4MetricFlow -MockWith { $script:calls.Add('metrics'); New-TestResult 'METRICS.T4' }
+        # T4's read replica (ADR 0025): created when a run didn't create it, then read (its own tests are in DbHubDemo.T4Replica.Tests.ps1).
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDoneCheck -MockWith { $script:calls.Add('replica ' + (@($Missing | Where-Object { $_ -like '*.T4.REPLICA' }) -join ',')); New-TestResult 'HUB.ESTATE.T4.REPLICA'; New-TestResult 'METRICS.T4.REPLICA' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcCheck -MockWith { $script:calls.Add('arc ' + ($Check -join ',')); foreach ($c in $Check) { New-TestResult ('T2.ARC.{0}' -f $c.ToUpperInvariant()) } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoSqlVmAssociatedService -MockWith { $script:calls.Add('inventory'); New-TestResult 'T1.SQLVM.ASSOCIATEDSERVICES' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricRequiredItem -MockWith { $script:calls.Add('fabric'); New-TestResult 'FABRIC.ITEMS.REQUIRED' }
         $seen = @((New-TestResult 'HUB.ESTATE.T1'), (New-TestResult 'HUB.ESTATE.T3'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3'), (New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'TELEMETRY.T2' 'Warning'))
         $requirement = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' }
         $new = InModuleScope DbHubDemo -Parameters @{ Config = $config; Seen = $seen; Requirement = $requirement } { Invoke-DemoDoneGate -Config $Config -Result $Seen -Requirement $Requirement -TelemetryWaitMinutes 5 }
-        $script:calls | Should -Be @('estate T2,T4', 'metrics', 'arc Monitoring', 'inventory', 'fabric', 'telemetry T2') -Because 'the telemetry comes last, so its recovery runs only when the rest passed (Phase 28 live finding)'
+        $script:calls | Should -Be @('estate T2,T4', 'metrics', 'replica HUB.ESTATE.T4.REPLICA,METRICS.T4.REPLICA', 'arc Monitoring', 'inventory', 'fabric', 'telemetry T2') -Because 'the telemetry comes last, so its recovery runs only when the rest passed (Phase 28 live finding)'
         (InModuleScope DbHubDemo -Parameters @{ All = @($seen + $new); Requirement = $requirement } { Test-DemoDoneEvidence -Result $All -Requirement $Requirement }).Complete | Should -BeTrue
     }
 

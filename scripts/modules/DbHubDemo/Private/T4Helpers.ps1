@@ -711,7 +711,9 @@ function ConvertTo-DemoT4FallbackCost {
     place, otherwise the rest of the month's compute at that size), with T4's storage, its private DNS zone, and, where
     the subscription's plans are on Standard (what a tenant policy enforces, PREFLIGHT.POLICY.DEFENDER), Defender CSPM
     and Defender for open-source relational databases. Unpriced names what the Retail Prices API had no price for, which
-    the totals leave out, and Defender for Cloud when its plans weren't read. Returns Allowed, SkipReason
+    the totals leave out, and Defender for Cloud when its plans weren't read. T4's read replica (ADR 0025) is left out
+    of the session and the month here (the estimate's SessionCostWithoutReplica and LightUseMonthlyWithoutReplica), so it
+    never changes a size verdict; PREFLIGHT.COST.* count it. Returns Allowed, SkipReason
     (MonthlyCeiling, SessionCeiling, Price, or ''), SkuName, HourlyUsd, T4LightUseMonthlyUsd and T4MonthlyWorstCaseUsd (T4
     alone), LightUseMonthlyUsd and MonthlyWorstCaseUsd (the demo's month with it), SessionUsd, MonthlyCeilingUsd,
     SessionCeilingUsd, DefenderIncluded, Unpriced, Location, PriceError, and RestartAssumption (SafetyStop, RestOfMonth,
@@ -741,8 +743,19 @@ function ConvertTo-DemoT4FallbackCost {
     $hoursPerMonth = [double](Get-DemoProfile).assumptions.hoursPerMonth
     $monthlyCeiling = [double]$Config['monthlyCeilingUsd']
     $sessionCeiling = [double]$Config['sessionCeilingUsd']
-    $monthlyWorst = [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthly') + [double](Get-DemoMemberValue -InputObject $Estimate -Name 'T4AutoRestartWorstCaseMonthly'), 2)
-    $session = [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'SessionCost'), 2)
+    # T4's read replica (2026-11-13, ADR 0025) is left out of this verdict, so its share of a session never changes a T4 size
+    # decision (the one-time move to the default kept its demo-day behavior; coordinator's direction, 2026-11-13).
+    # PREFLIGHT.COST.* still count it. An estimate from before the replica has no such totals: its own are the same thing.
+    $lightUseBasis = Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthlyWithoutReplica'
+    if ($null -eq $lightUseBasis) {
+        $lightUseBasis = Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthly'
+    }
+    $sessionBasis = Get-DemoMemberValue -InputObject $Estimate -Name 'SessionCostWithoutReplica'
+    if ($null -eq $sessionBasis) {
+        $sessionBasis = Get-DemoMemberValue -InputObject $Estimate -Name 'SessionCost'
+    }
+    $monthlyWorst = [System.Math]::Round([double]$lightUseBasis + [double](Get-DemoMemberValue -InputObject $Estimate -Name 'T4AutoRestartWorstCaseMonthly'), 2)
+    $session = [System.Math]::Round([double]$sessionBasis, 2)
     # T4 alone: its fixed costs and its compute for the light-use hours plus the restart worst case the estimate counted
     # (T4RestartHours: the rest of the month, or about a day per restart where a safety stop is in place;
     # 2026-11-04). An estimate without it counts every hour of the month.
@@ -771,7 +784,7 @@ function ConvertTo-DemoT4FallbackCost {
         HourlyUsd             = $hourly
         T4LightUseMonthlyUsd  = $t4Light
         T4MonthlyWorstCaseUsd = $t4Worst
-        LightUseMonthlyUsd    = $(if ($null -ne $Estimate) { [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthly'), 2) } else { $null })
+        LightUseMonthlyUsd    = $(if ($null -ne $Estimate) { [System.Math]::Round([double]$lightUseBasis, 2) } else { $null })
         MonthlyWorstCaseUsd   = $(if ($null -ne $Estimate) { $monthlyWorst } else { $null })
         SessionUsd            = $(if ($null -ne $Estimate) { $session } else { $null })
         MonthlyCeilingUsd     = $monthlyCeiling
@@ -2463,6 +2476,14 @@ function Invoke-DemoT4PowerAction {
             $current = Wait-DemoT4State -Config $Config -State @('Ready', 'Stopped') -TimeoutMinutes 15 -DeploymentId $DeploymentId
         }
         if ($current.State -ne $wanted -and $current.State -ne $(if ($Action -eq 'Start') { 'Starting' } else { 'Stopping' })) {
+            if ($Action -eq 'Start' -and $CheckPrefix -in 'DEPLOY', 'START') {
+                # T4's read replica (ADR 0025): Azure starts T4 only once a stopped replica is Ready
+                # (SourceReplicasStartStopOrder, live 2026-11-13), which a session that ended without stop-demo.ps1 leaves.
+                $replicaFirst = Invoke-DemoT4ReplicaStartFirst -Config $Config -CheckPrefix $CheckPrefix -DeploymentId $DeploymentId
+                if ($null -ne $replicaFirst) {
+                    $evidence['replicaFirst'] = [ordered]@{ status = [string]$replicaFirst.status; message = [string]$replicaFirst.message }
+                }
+            }
             $url = 'https://management.azure.com{0}/{1}?api-version={2}' -f $names.ServerId, $Action.ToLowerInvariant(), (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.DBforPostgreSQL/flexibleServers')
             $post = Invoke-DemoAzWithConflictRetry -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('rest', '--method', 'post', '--url', $url) -Label ('T4 {0}: {1}' -f $names.ServerName, $Action.ToLowerInvariant()) -MaxConflictRetries 4
             if ($post.ExitCode -ne 0) {

@@ -780,7 +780,9 @@ function Get-DemoDoneRequirement {
     <#
     .SYNOPSIS
     The checks DONE needs to pass (brief item 16; the same list stops ADR 0018's clock): Database Hub's own views of
-    every target. HUB.ESTATE.T1 to T4; TELEMETRY.T1, T2, and T3; METRICS.T4; T2.ARC.SQLINSTANCE (Standard with PAYG or
+    every target. HUB.ESTATE.T1 to T4; TELEMETRY.T1, T2, and T3; METRICS.T4; T4's read replica in Estate and in Azure
+    Monitor (HUB.ESTATE.T4.REPLICA and METRICS.T4.REPLICA, 2026-11-13, ADR 0025; Not supported meets them on a Burstable
+    T4); T2.ARC.SQLINSTANCE (Standard with PAYG or
     Paid) and T2.ARC.MONITORING in JumpstartImage, PaygWizard, and ProductKey modes; T1.SQLVM.ASSOCIATEDSERVICES (T1's
     inventory); and FABRIC.ITEMS.REQUIRED (the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the
     history model and report). T4's are always in (2026-11-09, user-directed: T4 isn't optional); Developer mode (opt-in)
@@ -806,6 +808,8 @@ function Get-DemoDoneRequirement {
     }
     $ids.Add('TELEMETRY.T3')
     $ids.Add('METRICS.T4')
+    $ids.Add('HUB.ESTATE.T4.REPLICA')
+    $ids.Add('METRICS.T4.REPLICA')
     if ($InstallMode -ne 'Developer') {
         $ids.Add('T2.ARC.SQLINSTANCE')
         $ids.Add('T2.ARC.MONITORING')
@@ -819,7 +823,9 @@ function Get-DemoDoneRequirement {
 
 function Test-DemoDoneEvidence {
     # Which of -Requirement have a Pass among -Result: Complete, Missing (the ones without), and Problem (the first
-    # missing one's latest result, or $null when it wasn't checked). Pure. Internal.
+    # missing one's latest result, or $null when it wasn't checked). T4's read replica's requirements (ADR 0025) are met
+    # by Not supported too: a Burstable T4, which Azure supports no read replica on, says so with its fix and isn't kept
+    # from DONE. Pure. Internal.
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -834,7 +840,8 @@ function Test-DemoDoneEvidence {
     $problem = $null
     foreach ($id in $Requirement) {
         $items = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq $id })
-        if (@($items | Where-Object { [string]$_.status -eq 'Pass' }).Count -gt 0) {
+        $met = if ($id -in 'HUB.ESTATE.T4.REPLICA', 'METRICS.T4.REPLICA') { @('Pass', 'Not supported') } else { @('Pass') }
+        if (@($items | Where-Object { [string]$_.status -in $met }).Count -gt 0) {
             continue
         }
         $missing.Add($id)
@@ -1186,13 +1193,16 @@ function Invoke-DemoDoneGate {
     <#
     .SYNOPSIS
     At the end of a run whose tracks all finished: runs each DONE requirement (Get-DemoDoneRequirement) that this run's
-    results don't already show passing, read-only, so a resumed run judges every target and not only the ones it
-    worked on. Returns the new results. Internal.
+    results don't already show passing, read-only except for T4's read replica, so a resumed run judges every target and
+    not only the ones it worked on. Returns the new results. Internal.
 
     .DESCRIPTION
     The telemetry comes last (Invoke-DemoTelemetryCheck): when nothing else this gate checked failed, a target whose
     telemetry didn't come gets its monitoring checked, and its telemetry once more, before the run is judged (Phase 28
     live finding, 2026-10-30: T1's plugin had stopped after a restart, and the run ended NOT DONE on TELEMETRY.T1).
+    T4's read replica exists only during a session (ADR 0025), so a run that didn't create it (a resumed run whose T4
+    track finished earlier, after stop-demo.ps1 deleted it) creates it here, as the T4 track does, before it reads it
+    (Invoke-DemoT4ReplicaDoneCheck).
     -ProgressPath is the status page's model, whose Validation step says so. When the latest read of the Hub tenant
     setting in -Result says it's off, it's read once more (FABRIC.P4.HUBSETTING, one call to the Fabric admin API), so a
     setting an administrator turned on during the run doesn't keep it from DONE (Phase 28 review).
@@ -1227,7 +1237,7 @@ function Invoke-DemoDoneGate {
         return $results.ToArray()
     }
     Write-DemoLog -Message ('Checking what DONE needs and this run didn''t show yet: {0}.' -f ($missing -join ', '))
-    $estate = @($missing | Where-Object { $_ -like 'HUB.ESTATE.*' } | ForEach-Object { $_.Substring(11) })
+    $estate = @($missing | Where-Object { $_ -like 'HUB.ESTATE.T?' } | ForEach-Object { $_.Substring(11) })
     if ($estate.Count -gt 0) {
         $results.AddRange([object[]]@(Test-DemoHubEstate -Config $Config -Target $estate))
     }
@@ -1235,6 +1245,11 @@ function Invoke-DemoDoneGate {
     if ('METRICS.T4' -in $missing) {
         $t4 = Get-DemoT4State -Config $Config
         $results.Add((Test-DemoT4MetricFlow -Config $Config -ServerId $t4.Names.ServerId -State $t4.State -WaitMinutes $TelemetryWaitMinutes))
+    }
+    if ('METRICS.T4.REPLICA' -in $missing -or 'HUB.ESTATE.T4.REPLICA' -in $missing) {
+        # T4's read replica (ADR 0025) exists only during a session: a run that didn't create it (a resumed run's
+        # validation, after stop-demo.ps1 deleted it) creates it now, as the T4 track does, then reads it.
+        $results.AddRange([object[]]@(Invoke-DemoT4ReplicaDoneCheck -Config $Config -Missing $missing -WaitMinutes $TelemetryWaitMinutes))
     }
     $arc = @(@(if ('T2.ARC.SQLINSTANCE' -in $missing) { 'SqlInstance' }) + @(if ('T2.ARC.MONITORING' -in $missing) { 'Monitoring' }))
     if ($arc.Count -gt 0) {
@@ -1413,6 +1428,16 @@ function Get-DemoDeploymentOutcome {
     if ($safetyStop) {
         $notes.Add($safetyStop)
     }
+    # T4's read replica (ADR 0025): created for this session, at another size than T4's (its notice), or Not supported.
+    $replicaNote = Get-DemoT4ReplicaNote -Result $all
+    if ($replicaNote) {
+        $notes.Add($replicaNote)
+    }
+    # The on-demand control's runbooks, when this run couldn't publish them with this code (2026-11-13).
+    $controlNote = Get-DemoActivityControlRunbookNote -Result $all
+    if ($controlNote) {
+        $notes.Add($controlNote)
+    }
     if ($installMode -eq 'Developer') {
         $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default) or ProductKey mode gives them.')
     }
@@ -1483,7 +1508,7 @@ function Get-DemoDeploymentOutcome {
         $outcome.NextCommand = ''
         $targets = 'T1, T2, T3, and T4'
         $performance = if ($installMode -eq 'Developer') { 'performance telemetry from T1 and T3' } else { 'performance telemetry from T1, T2, and T3' }
-        $metrics = ' and T4''s Azure Monitor metrics'
+        $metrics = if (@($core | Where-Object { [string]$_.checkId -eq 'METRICS.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0) { ' and T4''s Azure Monitor metrics, with its read replica''s Read replica lag' } else { ' and T4''s Azure Monitor metrics' }
         $t2 = if ($installMode -eq 'Developer') { '' } else { ' T2 runs SQL Server Standard with pay-as-you-go (or your license) and monitoring on.' }
         # The Insights app, part of every deployment, when this run's records show it deployed and working.
         $app = Get-DemoInsightsAppSummary -Result $all

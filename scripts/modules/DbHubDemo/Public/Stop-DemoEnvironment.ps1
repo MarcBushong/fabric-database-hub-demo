@@ -203,6 +203,34 @@ function Stop-DemoEnvironment {
         }
     }
 
+    # T4's read replica (2026-11-13, ADR 0025) exists only during a session: it's deleted now, while the VMs deallocate, so
+    # nothing bills for it between sessions and no 7-day restart applies to it. Its Azure Monitor metrics go with it
+    # (ResourceNotFound, live 2026-11-13), so the session's history captures them first (-SaveHistory). Deleting it leaves
+    # T4 Ready (about 100 seconds, live), and T4's stop below waits for it.
+    $replicaDeleting = $false
+    $postgresHistory = $null
+    if (-not $ParkT2 -and $t4On -and -not $t4Missing) {
+        if (-not (Test-DemoT4ReplicaSetUp -State $state)) {
+            $results.Add((New-DemoT4ReplicaNotSetUpResult -CheckId 'STOP.T4.REPLICA'))
+        }
+        else {
+            $capacitySettingEarly = Get-DemoFabricCapacitySetting -Config $Config
+            if ($SaveHistory -or $capacitySettingEarly.SaveHistoryOnStop) {
+                $postgresHistory = Get-DemoPostgresHistoryCapture -Config $Config -WindowMinutes $SaveHistoryWindowMinutes
+                if ($null -ne $postgresHistory -and $null -ne $postgresHistory.Result) {
+                    $results.Add($postgresHistory.Result)
+                }
+            }
+            $replicaDelete = Remove-DemoT4Replica -Config $Config -CheckPrefix STOP -NoWait -DeploymentId ([string]$state.Tags['deploymentId'])
+            if ($null -ne $replicaDelete) {
+                $replicaDeleting = [string]$replicaDelete.status -eq 'Pass' -and [string](Get-DemoMemberValue -InputObject $replicaDelete.evidence -Name 'stateBefore') -ne 'NotFound'
+                if (-not $replicaDeleting) {
+                    $results.Add($replicaDelete)
+                }
+            }
+        }
+    }
+
     if ($hostVm -eq 'archost01' -and $power[$hostVm] -eq 'PowerState/running') {
         # A clean guest shutdown before the host deallocates, as before, within the same bound; the guest's automatic stop
         # action (ShutDown) shuts it down when the host deallocates otherwise.
@@ -219,6 +247,14 @@ function Stop-DemoEnvironment {
         $results.Add((ConvertTo-DemoStopProfileResult -Record $record -WaitSeconds $ProfileOffWaitSeconds -DeallocationFailed:(-not [bool]$deallocated[[string]$record.VmName])))
     }
     if (-not $ParkT2 -and $t4On -and -not $t4Missing) {
+        if ($replicaDeleting) {
+            # The replica's deletion went out before the VMs' deallocation; T4 stops once it's gone.
+            $replicaGone = Wait-DemoT4ReplicaState -Config $Config -State @('NotFound') -TimeoutMinutes ([int](Get-DemoT4ReplicaSetting)['deleteTimeoutMinutes']) -PollSeconds 10 -DeploymentId ([string]$state.Tags['deploymentId'])
+            $results.Add((Remove-DemoT4Replica -Config $Config -CheckPrefix STOP -DeploymentId ([string]$state.Tags['deploymentId'])))
+            if ($replicaGone.Present) {
+                Write-DemoLog -Level Warning -Message ('T4''s read replica ({0}) is still {1}; T4 stops anyway, and the nightly safety stop stops a replica that''s still there after T4.' -f $replicaGone.Names.ServerName, $replicaGone.State)
+            }
+        }
         # After the VMs, so T1's runner has ended T4's sessions; the stop finishes in the background.
         $results.Add((Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 0 -CheckPrefix STOP))
     }
@@ -233,7 +269,7 @@ function Stop-DemoEnvironment {
         $historyRunning = $false
         if ($SaveHistory -or $capacitySetting.SaveHistoryOnStop) {
             try {
-                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes
+                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' })
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning
             }

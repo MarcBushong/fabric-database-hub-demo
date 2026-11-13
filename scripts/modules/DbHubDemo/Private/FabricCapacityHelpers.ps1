@@ -477,7 +477,12 @@ function Save-DemoFabricHistory {
         [int] $WindowMinutes = 720,
 
         [ValidateRange(1, 15)]
-        [int] $TimeoutMinutes = 15
+        [int] $TimeoutMinutes = 15,
+
+        # T4's and its read replica's Azure Monitor metrics as JSON (2026-11-13, ADR 0025; Get-DemoPostgresHistoryCapture),
+        # captured before stop-demo.ps1 deleted the replica, for the notebook's POSTGRES_METRICS parameter; '' sends none.
+        [AllowEmptyString()]
+        [string] $PostgresMetrics = ''
     )
 
     $checkId = 'STOP.FABRIC.SAVEHISTORY'
@@ -523,6 +528,11 @@ function Save-DemoFabricHistory {
         WINDOW_MINUTES = $WindowMinutes
         KEY_VAULT_URL  = ''
         RESOURCE_GROUP = (Get-DemoResourceGroupName -Config $Config)
+    }
+    if ($PostgresMetrics) {
+        # The notebook can't read Azure Monitor (no Azure Resource Manager token in Fabric), so T4's and its read replica's
+        # metrics come from here, captured before the replica was deleted (ADR 0025).
+        $parameters['POSTGRES_METRICS'] = $PostgresMetrics
     }
     $run = Invoke-DemoFabricNotebookRun -Config $resolved -Name 'NB_DatabaseHub_LiveActivity' -Parameter $parameters -Token $token -TimeoutMinutes $TimeoutMinutes
     $jobStatus = [string](Get-DemoMemberValue -InputObject $run.evidence -Name 'status')

@@ -55,14 +55,15 @@ Describe 'Resolve-DemoTrackPlan' {
         $plan.Validation | Should -BeTrue
         $plan.Tracks['T1'] | Should -Be @('T3Setup', 'Artifacts', 'Bootstraps', 'T3', 'T4', 'Activity', 'Monitoring', 'Telemetry')
         $plan.Tracks['T2'] | Should -Be @('Restore', 'Artifacts', 'Bootstraps', 'T2', 'Telemetry')
-        $plan.Tracks['T4'] | Should -Be @('Server', 'Telemetry')
+        # T4's read replica (ADR 0025) between T4's server and its telemetry.
+        $plan.Tracks['T4'] | Should -Be @('Server', 'Replica', 'Telemetry')
         $plan.Tracks['Fabric'] | Should -Be @('Fabric')
     }
 
     It 'maps -FromStage T4 onto T1''s T4 step and the T4 track, and leaves the T4 track empty with -SkipT4' {
         $plan = InModuleScope DbHubDemo { Resolve-DemoTrackPlan -FromStage 'T4' -StopAfter 'T4' }
         $plan.Tracks['T1'] | Should -Be @('T4')
-        $plan.Tracks['T4'] | Should -Be @('Server')
+        $plan.Tracks['T4'] | Should -Be @('Server', 'Replica')
         @((InModuleScope DbHubDemo { Resolve-DemoTrackPlan -SkipT4 }).Tracks['T4']).Count | Should -Be 0
     }
 
@@ -103,7 +104,7 @@ Describe 'Resolve-DemoTrackPlan' {
         $plan.Infrastructure | Should -BeFalse
         $plan.Tracks['T1'] | Should -Be @('T4', 'Activity', 'Monitoring', 'Telemetry')
         $plan.Tracks['T2'] | Should -Be @('Restore', 'Artifacts', 'Bootstraps', 'T2', 'Telemetry')
-        $plan.Tracks['T4'] | Should -Be @('Telemetry')
+        $plan.Tracks['T4'] | Should -Be @('Replica', 'Telemetry')
         @($plan.Tracks['Fabric']).Count | Should -Be 0
     }
 
@@ -1396,6 +1397,8 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-TestResult 'DEPLOY.T4.START' 'Not selected' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Exists = $true; Names = [pscustomobject]@{ ServerName = 'pgflex01-abc123'; ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' } } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoT4MetricFlow -MockWith { New-TestResult 'METRICS.T4' }
+        # T4's read replica (ADR 0025): DONE's gate reads what a test's own tracks didn't record.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDoneCheck -MockWith { foreach ($id in @($Missing | Where-Object { $_ -in 'HUB.ESTATE.T4.REPLICA', 'METRICS.T4.REPLICA' })) { New-TestResult $id } }
         $script:calls = [System.Collections.Generic.List[string]]::new()
         $script:source = 'golden'
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
@@ -1428,7 +1431,7 @@ Describe 'Invoke-DemoParallelDeployment' {
             $trackResults = switch ($Track) {
                 'T1' { @((New-TestResult 'T3.PROPERTY'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3')) }
                 'T2' { @((New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'T2.ARC.MONITORING'), (New-TestResult 'TELEMETRY.T2')) }
-                'T4' { @((New-TestResult 'T4.SERVER'), (New-TestResult 'METRICS.T4')) }
+                'T4' { @((New-TestResult 'T4.SERVER'), (New-TestResult 'HUB.ESTATE.T4.REPLICA'), (New-TestResult 'METRICS.T4.REPLICA'), (New-TestResult 'METRICS.T4')) }
                 default { @(New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT') + @($script:fabricAppRecords) }
             }
             [pscustomobject]@{ Track = $Track; Status = 'Pass'; Steps = @($Step); Timing = [ordered]@{}; ReadyUtc = $ready; StartedUtc = ''; EndedUtc = ''; Results = $trackResults }

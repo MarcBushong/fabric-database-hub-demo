@@ -74,6 +74,13 @@ BeforeAll {
         $script:restartedAt = $null
         $script:runCommandStatus = 201
         $script:t4ActionStatus = 202
+        # T4's read replica (ADR 0025): its state ('' for none, as between sessions), and the minutes T4's stop and the
+        # replica's start take in this fake; without them, T4 stays Stopping and the replica Starting.
+        $script:replica = ''
+        $script:replicaStartMinutes = $null
+        $script:replicaReadyAt = $null
+        $script:t4StopMinutes = $null
+        $script:t4StoppedAt = $null
         # Run Commands listed on a VM, by VM name; without an entry, the earlier run's DbHubControl-<vm>-20261026000000
         # and someone else's DbHubDemo-Other, without instance views.
         $script:runCommands = @{}
@@ -191,6 +198,7 @@ BeforeAll {
             '/flexibleServers/pgflex01-abc123$' {
                 if (-not $script:t4) { return (New-Response 404) }
                 if ($script:t4 -eq 'Starting' -and $null -ne $script:t4ReadyAt -and $script:clock -ge $script:t4ReadyAt) { $script:t4 = 'Ready' }
+                if ($script:t4 -eq 'Stopping' -and $null -ne $script:t4StoppedAt -and $script:clock -ge $script:t4StoppedAt) { $script:t4 = 'Stopped' }
                 if ($script:t4Sku) {
                     return (New-Response 200 (ConvertTo-Json -InputObject @{ sku = @{ name = $script:t4Sku; tier = $script:t4Tier }; properties = @{ state = $script:t4 } }))
                 }
@@ -198,7 +206,21 @@ BeforeAll {
             }
             '/flexibleServers/pgflex01-abc123/(start|stop)$' {
                 if ($script:t4ActionStatus -ne 202) { return (New-Response $script:t4ActionStatus '{"error":{"code":"UnsupportedMediaType","message":"Unsupported media type."}}') }
+                # Azure's order (SourceReplicasStartStopOrder, live 2026-11-13): T4 starts only once its replica is Ready.
+                if ($Matches[1] -eq 'start' -and $script:replica -in 'Stopped', 'Starting') { return (New-Response 400 '{"error":{"code":"SourceReplicasStartStopOrder","message":"Start the replicas first."}}') }
+                if ($Matches[1] -eq 'stop' -and $null -ne $script:t4StopMinutes) { $script:t4StoppedAt = $script:clock.AddMinutes($script:t4StopMinutes) }
                 $script:t4 = $(if ($Matches[1] -eq 'start') { 'Starting' } else { 'Stopping' }); return (New-Response 202)
+            }
+            '/flexibleServers/pgreplica01-abc123$' {
+                if (-not $script:replica) { return (New-Response 404) }
+                if ($script:replica -eq 'Starting' -and $null -ne $script:replicaReadyAt -and $script:clock -ge $script:replicaReadyAt) { $script:replica = 'Ready' }
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ state = $script:replica; replicationRole = 'AsyncReplica' } }))
+            }
+            '/flexibleServers/pgreplica01-abc123/(start|stop)$' {
+                # Azure's order: the replica stops only once T4 is stopped.
+                if ($Matches[1] -eq 'stop' -and $script:t4 -notin 'Stopped', '') { return (New-Response 400 '{"error":{"code":"SourceReplicasStartStopOrder","message":"Stop the source first."}}') }
+                if ($Matches[1] -eq 'start' -and $null -ne $script:replicaStartMinutes) { $script:replicaReadyAt = $script:clock.AddMinutes($script:replicaStartMinutes) }
+                $script:replica = $(if ($Matches[1] -eq 'start') { 'Starting' } else { 'Stopping' }); return (New-Response 202)
             }
         }
         return (New-Response 404)
@@ -798,6 +820,34 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/flexibleServers/pgflex01-abc123/start$' }).Count | Should -Be 1
         @($result.dispatched) | Should -Contain 'T4: idle-in-transaction for 10 minutes'
         @($result.skipped) | Should -BeNullOrEmpty
+        # No replica (ADR 0025): the run says plainly that its replica beat isn't there, and how to get it.
+        $result.replica | Should -Match '^T4''s read replica isn''t there: on-demand runs don''t create it, so Database Hub''s Read replica lag stays empty and the replica-lag scenario can''t run in this run\. For that beat, start the demo with \./scripts/start-demo\.ps1'
+        $result.message | Should -Match 'T4''s read replica isn''t there: on-demand runs don''t create it'
+    }
+
+    It 'starts a stopped read replica a session left behind before T4, because Azure starts T4 only after its replicas (ADR 0025)' {
+        $script:t4 = 'Stopped'
+        $script:replica = 'Stopped'
+        $script:replicaStartMinutes = 2
+        Mock Get-DbHubT4 { return [pscustomobject]@{ Name = 'pgflex01-abc123'; State = $(if ($script:t4 -eq 'Starting') { 'Ready' } else { $script:t4 }) } }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }, @{ target = 'T4'; scenario = 'idle-in-transaction' }); durationMinutes = 10 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        $starts = @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/flexibleServers/(pgreplica01|pgflex01)-abc123/start$' })
+        @($starts | ForEach-Object { $_.Path -replace '^.*/flexibleServers/', '' }) | Should -Be @('pgreplica01-abc123/start', 'pgflex01-abc123/start')
+        $starts[1].At | Should -BeGreaterOrEqual $script:replicaReadyAt
+        @($result.dispatched) | Should -Contain 'T4: idle-in-transaction for 10 minutes'
+        $result.replica | Should -BeNullOrEmpty -Because 'the replica is there, so the beat is too'
+    }
+
+    It 'skips T4, and says why, when a left-over replica can''t be started first' {
+        $script:t4 = 'Stopped'
+        $script:replica = 'Stopped'
+        Mock Get-DbHubT4 { return [pscustomobject]@{ Name = 'pgflex01-abc123'; State = $script:t4 } }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }, @{ target = 'T4'; scenario = 'baseline' }); durationMinutes = 10 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        ($result.skipped -join '; ') | Should -Match 'T4 \(its read replica pgreplica01-abc123 couldn''t be started first: it was still Starting after 10 minutes\)'
+        $result.replica | Should -Match 'Azure starts T4 only after its replicas, so T4 sits this run out'
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/start$' }) | Should -BeNullOrEmpty
     }
 
     It 'stops everything again when nothing could be dispatched' {
@@ -1007,6 +1057,62 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/(start|stop)$' }) | Should -BeNullOrEmpty
     }
 
+    It 'stops a read replica a session left behind once T4 is stopped (Azure''s order), and says so plainly with the fix (ADR 0025)' {
+        $script:t4 = 'Ready'
+        $script:t4StopMinutes = 2
+        $script:replica = 'Ready'
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.replica | Should -Be 'T4''s read replica pgreplica01-abc123 stopped (a session left it behind without stop-demo.ps1; stopped it still bills its storage and Defender plans until ./scripts/stop-demo.ps1 deletes it)'
+        $result.message | Should -Match 'T4 stopped \(was Ready\), T4''s read replica pgreplica01-abc123 stopped \(a session left it behind'
+        @(Get-TestWrite | ForEach-Object { '{0} {1}' -f $_.Method, ($_.Path -replace '^.*/providers/', '') }) | Should -Be @('POST Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123/stop', 'POST Microsoft.DBforPostgreSQL/flexibleServers/pgreplica01-abc123/stop')
+        @(Get-TestWrite)[1].At | Should -BeGreaterOrEqual $script:t4StoppedAt -Because 'Azure stops a replica only after its primary'
+        @($script:calls | Where-Object { $_.Path -match '/start$' }) | Should -BeNullOrEmpty
+        # It never deletes the replica: the safety stop's role can't, and stop-demo.ps1 does.
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' }) | Should -BeNullOrEmpty
+    }
+
+    It 'leaves a stopped replica alone, and says how to delete it; says nothing when there''s none' {
+        $script:t4 = 'Stopped'
+        $script:replica = 'Stopped'
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.message | Should -Be 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped, T4''s read replica pgreplica01-abc123 already stopped (a session left it behind; ./scripts/stop-demo.ps1 deletes it).'
+        Get-TestWrite | Should -BeNullOrEmpty
+        $script:calls.Clear()
+        $script:replica = ''
+        (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).message | Should -Be 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped.'
+    }
+
+    It 'reports a left-over replica it couldn''t stop, without waiting, when T4''s own stop failed' {
+        $script:t4 = 'Ready'
+        $script:t4ActionStatus = 409
+        $script:replica = 'Ready'
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Partial'
+        @($result.failed) -join ' | ' | Should -Match 'T4''s read replica pgreplica01-abc123 \(a session left it behind\) not stopped: T4 wasn''t stopped, and Azure stops a read replica only after its primary; \./scripts/stop-demo\.ps1 deletes it'
+        @($script:calls | Where-Object { $_.Path -match '/pgreplica01-abc123/stop$' }) | Should -BeNullOrEmpty
+    }
+
+    It 'the T3 check and the control''s daily T4 stop stop a left-over replica after T4 too (ADR 0025)' {
+        $script:t4 = 'Ready'
+        $script:t4StopMinutes = 2
+        $script:replica = 'Ready'
+        $now = [datetime]::new(2026, 10, 27, 23, 30, 0, [System.DateTimeKind]::Utc)
+        $check = Invoke-DbHubStop -Scope T3Check -Context (New-TestContext -NowUtc $now)
+        $check.replica | Should -Match '^T4''s read replica pgreplica01-abc123 stopped'
+        $check.message | Should -Match 'T4 stopped \(was Ready\); T4''s read replica pgreplica01-abc123 stopped'
+        $script:replica | Should -Be 'Stopping'
+        Reset-TestAzure
+        $script:t4 = 'Ready'
+        $script:t4StopMinutes = 2
+        $script:replica = 'Ready'
+        $daily = Invoke-DbHubStop -Scope T4 -Context (New-TestContext)
+        $daily.status | Should -Be 'Stopped'
+        $daily.message | Should -Match '^T4 \(pgflex01-abc123\) was Ready; its stop was accepted\. T4''s read replica pgreplica01-abc123 stopped'
+        $script:replica | Should -Be 'Stopping'
+    }
+
     It 'says <Status>, and changes nothing, when the demo resource group <Name>' -ForEach @(
         @{ Name = 'can''t be read: the role isn''t assigned'; Code = 403; Status = 'NotGranted'; Match = 'role "DbHub Demo Safety Stop" isn''t assigned there yet \(an Owner runs \./scripts/grant-safety-stop\.ps1\)' }
         @{ Name = 'doesn''t answer'; Code = 500; Status = 'Partial'; Match = 'couldn''t be read' }
@@ -1046,7 +1152,8 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         $result.t4 | Should -Be 'T4 missing'
         $result.message | Should -Match ' T4 missing\.$'
         Get-TestWrite | Should -BeNullOrEmpty
-        @($script:calls | Where-Object { $_.Path -notmatch '/resourceGroups/rg-dbhub-demo$' } | ForEach-Object { $_.Path -replace '^.*/providers/', '' }) | Should -Be @('Microsoft.Sql/servers/azuresql01-abc123/databases/ContosoCare', 'Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123')
+        @($script:calls | Where-Object { $_.Path -notmatch '/resourceGroups/rg-dbhub-demo$' } | ForEach-Object { $_.Path -replace '^.*/providers/', '' }) | Should -Be @('Microsoft.Sql/servers/azuresql01-abc123/databases/ContosoCare', 'Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123', 'Microsoft.DBforPostgreSQL/flexibleServers/pgreplica01-abc123')
+        $result.replica | Should -BeNullOrEmpty -Because 'between sessions there''s no replica, and nothing to say about it'
     }
 
     It 'the T3 check stops a T4 that runs, after reading T3, through Azure Resource Manager only, and starts nothing (2026-11-09)' {

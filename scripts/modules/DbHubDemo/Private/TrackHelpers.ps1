@@ -256,7 +256,7 @@ function Get-DemoTrackStep {
     switch ($Track) {
         'T1' { return [ordered]@{ T3Setup = 'T3'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T3 = 'T3'; T4 = 'T4'; Activity = 'Activity'; Monitoring = 'Monitoring'; Telemetry = 'Validation' } }
         'T2' { return [ordered]@{ Restore = 'Artifacts'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T2 = 'T2'; Telemetry = 'Validation' } }
-        'T4' { return [ordered]@{ Server = 'T4'; Telemetry = 'Validation' } }
+        'T4' { return [ordered]@{ Server = 'T4'; Replica = 'T4'; Telemetry = 'Validation' } }
         default { return [ordered]@{ Fabric = 'Fabric' } }
     }
 }
@@ -720,8 +720,9 @@ function Invoke-DemoDeploymentTrack {
       incidents, which deploy.ps1 switches at its end; 2026-11-03), Monitoring (the plugin confirmed), Telemetry (T1 and T3 in
       Database Hub).
     - T4 (Phase 24, ADR 0019): Server (Test-DemoT4: the server, its version and size, Entra-only, the network,
-      the P6 administrator, the database, the enhanced metrics), Telemetry (METRICS.T4: Azure Monitor has its
-      metrics, which Database Hub's PostgreSQL dashboard charts).
+      the P6 administrator, the database, the enhanced metrics), Replica (2026-11-13, ADR 0025: T4's read replica, created
+      once T1's T4 step has restarted T4, with its checks, its place in Database Hub's Estate, and its Read replica lag in
+      Azure Monitor), Telemetry (METRICS.T4: Azure Monitor has its metrics, which Database Hub's PostgreSQL dashboard charts).
     - T2: Restore (a host restored from a golden snapshot: the VM agent, the host password, then the golden
       Release, which resets a copy's Arc identity locally and rotates the guest password before the guest
       reaches the network; archost01's bundle and runner travel in their own Run Commands while the Release
@@ -1499,6 +1500,42 @@ function Invoke-DemoDeploymentTrack {
                     }
                     if (& $hasStatus $checks 'Fail') {
                         $outcome = 'Fail'
+                    }
+                }
+                'T4/Replica' {
+                    # T4's read replica (2026-11-13, ADR 0025): created for each session, here for the deployment's own,
+                    # after T1's T4 step restarted T4 for max_connections (the replica inherits it, and a hot standby needs at
+                    # least the primary's value in effect), so it waits for that restart. It never fails the track: a replica
+                    # Azure refuses every size of is DEPLOY.T4.REPLICA's Fail, with the fix, and the run ends NOT DONE.
+                    if (-not (Test-DemoT4Enabled -Config $Config)) {
+                        & $note 'DEPLOY.T4.REPLICA' 'T4' 'Not selected' 'T4 isn''t deployed in this run (DEPLOY.T4.SKU says why), so it has no read replica.'
+                        break
+                    }
+                    $recordReplica = { param([System.Collections.IDictionary] $Values) if ($recordState) { Set-DemoDeploymentStateLocked -Config $Config -Value $Values -Confirm:$false } }
+                    $replicaResults = @(Invoke-DemoT4ReplicaCreate -Config $Config -CheckPrefix DEPLOY -WaitForRestartMinutes ([int](& $option 'T4ReplicaRestartWaitMinutes' 90)) -RecordState $recordReplica)
+                    & $addAll $replicaResults
+                    if ($recordState) {
+                        # The environment has the replica's lifecycle from now on (DbHubT4Replica Session), whatever this run's
+                        # outcome: start-demo.ps1 creates it, stop-demo.ps1 deletes it, and status.ps1 reports it.
+                        try {
+                            Set-DemoDeploymentStateLocked -Config $Config -Value @{ T4Replica = [string](Get-DemoT4ReplicaSetting)['recordValue'] } -Confirm:$false
+                        }
+                        catch {
+                            & $note 'DEPLOY.T4.REPLICA.RECORD' 'T4' 'Warning' ('The replica''s record (DbHubT4Replica) wasn''t set on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/deploy.ps1 again.'
+                        }
+                    }
+                    # A size change's notice (DEPLOY.T4.REPLICA.FALLBACK, a Warning) is the row's message on the status page, as
+                    # T4's own is (2026-11-09): the step's first result that isn't a Pass.
+                    $created = @($replicaResults | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0
+                    if ($created) {
+                        $results.Add((Test-DemoT4ReplicaServer -Config $Config))
+                        $results.Add((Test-DemoT4ReplicaEstate -Config $Config -WaitMinutes 5))
+                        $results.Add((Test-DemoT4ReplicaMetricFlow -Config $Config -WaitMinutes ([int](& $option 'TelemetryWaitMinutes' 15))))
+                    }
+                    elseif (@($replicaResults | Where-Object { [string]$_.status -eq 'Not supported' }).Count -gt 0) {
+                        foreach ($requirement in 'HUB.ESTATE.T4.REPLICA', 'METRICS.T4.REPLICA') {
+                            $results.Add((New-DemoT4ReplicaNotSupportedResult -CheckId $requirement -T4SkuName ([string](Get-DemoT4ReplicaSupport -T4State (Get-DemoT4State -Config $Config)).SkuName)))
+                        }
                     }
                 }
                 'T4/Telemetry' {

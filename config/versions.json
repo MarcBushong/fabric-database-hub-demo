@@ -215,6 +215,32 @@
       "limits": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits",
       "restartServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-restart-server"
     },
+    "replica": {
+      "note": "T4's read replica (2026-11-13, user-directed; ADR 0025): a same-region read replica of T4, created for each session (deploy.ps1 and start-demo.ps1 create it, stop-demo.ps1 deletes it) from infra/replica/pgreplica01.bicep, in T4's subnet and private DNS zone, at T4's actual size; Burstable isn't supported. Learn (checked 2026-11-13): the replica's vCores must be the same or higher than the source's; stop the primary first and start the replica first, which Azure enforces (SourceReplicasStartStopOrder, live 2026-11-13); a second deployment of the replica's template fails (ReadReplicaAlreadyExistWithGivenName, live), so it's deployed only while the replica doesn't exist. maxStandbyStreamingDelayMs is how long replaying the primary's changes waits for a query on the replica (dynamic), which the replica-lag scenario relies on. generalPurposeSizes are the documented sizes the size fallback tries, in order, never with fewer vCores than T4. Read Replica Lag (physical_replication_delay_in_seconds) is on the replica only, and Max Physical Replication Lag (physical_replication_delay_in_bytes) on the primary only. Measured live on 2026-11-13: created in 525 seconds, deleted in 97, each stop or start about 125.",
+      "serverNamePrefix": "pgreplica01",
+      "templateDeploymentName": "dbhub-t4-replica",
+      "recordTag": "DbHubT4Replica",
+      "recordValue": "Session",
+      "sizeTag": "DbHubT4ReplicaSize",
+      "maxStandbyStreamingDelayMs": 600000,
+      "createMinutes": 9,
+      "createTimeoutMinutes": 40,
+      "deleteTimeoutMinutes": 15,
+      "powerWaitMinutes": 15,
+      "generalPurposeSizes": [ "Standard_D2ds_v5", "Standard_D4ds_v5", "Standard_D4ads_v5" ],
+      "metrics": {
+        "replica": [ "physical_replication_delay_in_seconds", "cpu_percent", "memory_percent", "active_connections", "iops", "storage_percent" ],
+        "primary": [ "physical_replication_delay_in_bytes" ],
+        "hubLag": "physical_replication_delay_in_seconds"
+      },
+      "docUrls": {
+        "concepts": "https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas",
+        "create": "https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica",
+        "capacityErrors": "https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors",
+        "hotStandby": "https://www.postgresql.org/docs/current/hot-standby.html"
+      },
+      "verifiedOn": "2026-11-13"
+    },
     "verifiedOn": "2026-10-23"
   },
   "vmImages": {

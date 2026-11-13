@@ -122,6 +122,10 @@ BeforeAll {
                 }
                 return (New-AzResult -Json (New-ServerJson -State $script:t4.State -LocalSignIn $script:t4.PasswordAuth -Sku $script:t4.Sku))
             }
+            if ($text -match 'flexibleServers/pgreplica01-abc123\?') {
+                # T4's read replica (ADR 0025), read before T4 starts: between sessions there's none.
+                return (New-AzResult -ExitCode 1 -StdErr '(ResourceNotFound) The Resource was not found.')
+            }
             throw "unexpected Azure CLI call: $text"
         }
     }

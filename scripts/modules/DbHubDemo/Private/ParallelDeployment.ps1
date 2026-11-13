@@ -526,7 +526,7 @@ function Invoke-DemoParallelDeployment {
     $showT4Off = {
         $offResult = New-DemoT4OffResult -Config $Config -State $state -Result $results.ToArray()
         if ($null -ne $offResult) {
-            Set-DemoProgressStep -Path $ProgressPath -Id 'T4.Server', 'T4.Setup', 'T4.Telemetry' -State 'Skipped' -Status ([string]$offResult.status) -Message ([string]$offResult.message)
+            Set-DemoProgressStep -Path $ProgressPath -Id 'T4.Server', 'T4.Setup', 'T4.Replica', 'T4.Telemetry' -State 'Skipped' -Status ([string]$offResult.status) -Message ([string]$offResult.message)
         }
         $offResult
     }

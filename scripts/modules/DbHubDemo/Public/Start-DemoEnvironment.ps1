@@ -52,6 +52,12 @@ function Start-DemoEnvironment {
        (Servers - Start) and confirmed before its profile is set (START.T4.START). -SkipT4 leaves it stopped. An
        earlier run's record that left T4 out (DbHubT4Size None or Refused) is cleared, since no record leaves T4 out
        any more (2026-11-09): the next deploy.ps1 creates T4 when it doesn't exist (START.T4.RECORD).
+    4b. T4's read replica (2026-11-13, ADR 0025), created for each session: once T4 is Ready, its creation goes out
+       (Start-DemoT4ReplicaCreate, about 9 minutes) and runs while the profiles are set and the warm-up runs; the start
+       waits for it at its end (START.T4.REPLICA, with START.T4.REPLICA.FALLBACK when Azure refused T4's size). A replica
+       a session left stopped starts before T4, because Azure starts T4 only after its replicas (Invoke-DemoT4PowerAction).
+       An environment deploy.ps1 hasn't set the replica up in is Not selected, with the upgrade's command; -SkipT4Replica
+       leaves it out of a session.
     5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
        2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown (START.PROFILE_*). A profile with incidents is set
        as its interim, baseline, first. The VMs don't set it at boot unless
@@ -112,6 +118,10 @@ function Start-DemoEnvironment {
     .PARAMETER SkipT4
     Leave T4, the PostgreSQL flexible server, stopped.
 
+    .PARAMETER SkipT4Replica
+    Leave T4's read replica out of this session (ADR 0025): no wait for its creation, no cost for it, and no Read replica
+    lag or replica-lag scenario.
+
     .PARAMETER T4StartMinutes
     How long to wait for T4 to be Ready before its activity profile is set.
 
@@ -152,6 +162,8 @@ function Start-DemoEnvironment {
         [int] $T2ProfileRetrySeconds = 120,
 
         [switch] $SkipT4,
+
+        [switch] $SkipT4Replica,
 
         [ValidateRange(1, 30)]
         [int] $T4StartMinutes = 15,
@@ -373,11 +385,26 @@ function Start-DemoEnvironment {
     }
 
     $t4Ready = $false
+    $replicaContext = $null
     if ($t4On) {
         $t4Requested = $null -ne $t4Request -and [string](Get-DemoMemberValue -InputObject $t4Request.evidence -Name 'stateBefore') -notin @('', 'Ready')
         $t4Start = if ($t4Request.status -in 'Pass', 'Warning') { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes $T4StartMinutes -CheckPrefix START -Requested:$t4Requested } else { $t4Request }
         $results.Add($t4Start)
         $t4Ready = $t4Start.status -eq 'Pass' -and [string](Get-DemoMemberValue -InputObject $t4Start.evidence -Name 'stateAfter') -eq 'Ready'
+        # T4's read replica (2026-11-13, ADR 0025), created for each session once T4 is Ready (about 9 minutes), while the
+        # profiles are set and the warm-up runs; the start waits for it at its end (Complete-DemoT4ReplicaCreate).
+        if ($SkipT4Replica) {
+            $results.Add((New-DemoResult -CheckId 'START.T4.REPLICA' -Area 'infra' -Target 'T4' -Status 'Not selected' -Message 'T4''s read replica was left out of this session (-SkipT4Replica): Database Hub''s Read replica lag stays empty, and the replica-lag scenario isn''t available.' -Remediation 'Run ./scripts/start-demo.ps1 without -SkipT4Replica to have it (about 9 minutes).'))
+        }
+        elseif ($t4Ready) {
+            $replicaContext = Start-DemoT4ReplicaCreate -Config $Config -CheckPrefix START -DeploymentId ([string]$state.Tags['deploymentId']) -Confirm:$false
+        }
+        elseif (Test-DemoT4ReplicaSetUp -State $state) {
+            $results.Add((New-DemoResult -CheckId 'START.T4.REPLICA' -Area 'infra' -Target 'T4' -Status 'Warning' -Message 'T4 isn''t running (START.T4.START says why), so its read replica wasn''t created: Database Hub''s Read replica lag stays empty this session.' -Remediation 'Run ./scripts/start-demo.ps1 again once T4 starts; it creates the replica.'))
+        }
+        else {
+            $results.Add((New-DemoT4ReplicaNotSetUpResult -CheckId 'START.T4.REPLICA'))
+        }
     }
 
     $t3Enabled = $t3Ready -and ((Test-DemoDeploymentStageReached -Recorded $state.Stage -Stage 'T3') -or @($results | Where-Object { $_.checkId -like 'WORKLOAD.T3*' -and $_.status -in 'Pass', 'Warning' }).Count -gt 0)
@@ -477,6 +504,16 @@ function Start-DemoEnvironment {
 
     if ($Interactive) {
         $results.Add((New-DemoBastion -Config $Config -Confirm:$false))
+    }
+    if ($null -ne $replicaContext) {
+        # The replica was being created during the profiles and the warm-up: its result, with the size fallback when Azure
+        # refused T4's size (START.T4.REPLICA.FALLBACK), comes now.
+        if (-not $replicaContext.Done) {
+            Write-DemoLog -Message ('Waiting for T4''s read replica ({0}), which was being created meanwhile.' -f $replicaContext.Names.ServerName)
+        }
+        foreach ($item in @(Complete-DemoT4ReplicaCreate -Config $Config -Context $replicaContext)) {
+            $results.Add($item)
+        }
     }
     return $results.ToArray()
 }

@@ -287,6 +287,17 @@ function Remove-DemoEnvironment {
             }
         }
 
+        # T4's read replica (2026-11-13, ADR 0025) goes before the group: "If a server has read replicas, delete the read
+        # replicas first before deleting the primary server" (Learn, read replicas, checked 2026-11-13). Nothing when a
+        # session's replica isn't there. The manifest's deploymentId names it, so the group isn't read again for it.
+        $manifestId = [string](Get-DemoMemberValue -InputObject $manifest -Name 'DeploymentId')
+        if ($manifestId -match '^[a-z0-9]{6}$') {
+            $replicaGone = Remove-DemoT4Replica -Config $Config -CheckPrefix DESTROY -DeploymentId $manifestId -Quiet -Confirm:$false
+            if ($null -ne $replicaGone) {
+                $results.Add($replicaGone)
+            }
+        }
+
         $delete = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('group', 'delete', '--name', $resourceGroupName, '--yes', '--no-wait') -Label ('Deleting {0}' -f $resourceGroupName)
         # A run after an interruption can find the group still being deleted (ResourceGroupBeingDeleted): wait.
         $deleting = [string]$delete.StdErr -match '(?i)ResourceGroupBeingDeleted|deprovisioning state'

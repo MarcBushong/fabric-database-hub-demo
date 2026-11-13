@@ -194,6 +194,10 @@ BeforeAll {
                 }
                 return (New-AzResult -StdOut '{"properties":{"provisioningState":"Succeeded","duration":"PT3M","outputs":{"resourceGroupName":{"value":"rg-dbhub-demo"}}}}')
             }
+            if ($joined -like 'rest --method get --url *flexibleServers/pgreplica01-*') {
+                # T4's read replica (ADR 0025) is read before T4 grows; between sessions there's none.
+                return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (ResourceNotFound) The Resource ''Microsoft.DBforPostgreSQL/flexibleServers/pgreplica01-abc123'' under resource group ''rg-dbhub-demo'' was not found.')
+            }
             throw ('unexpected Azure CLI call: {0}' -f $joined)
         }
     }
@@ -961,10 +965,14 @@ Describe 'A record that says an earlier run left T4 out never turns T4 off (2026
             $script:server = $server
             $context = [pscustomobject]@{ Config = (New-TestConfig); Tags = @{ deploymentId = 'abc123'; DbHubT4Size = $Record }; DeploymentId = 'abc123' }
             $results = @(InModuleScope DbHubDemo -Parameters @{ Context = $context } { Invoke-DemoValidationT4 -Context $Context })
-            $results.Count | Should -Be 1
+            $results.Count | Should -Be 2
             $results[0].checkId | Should -Be 'T4.SERVER'
             $results[0].status | Should -Be 'Pass'
             $results[0].message | Should -Be 'T4''s own checks ran.' -Because 'no record says T4 is off any more'
+            # T4's read replica (ADR 0025): these tags are from before it, so the upgrade's command, and nothing more is read.
+            $results[1].checkId | Should -Be 'T4.REPLICA'
+            $results[1].status | Should -Be 'Warning'
+            $results[1].remediation | Should -Match '^Run \./scripts/deploy\.ps1: it adds the replica'
         }
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoT4 -Times 2 -Exactly -ParameterFilter { $IncludeMetrics -and $DeploymentId -eq 'abc123' -and $Config['t4Enabled'] -and -not $Config.Contains('t4SkuSource') }
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4State -Times 0 -Exactly -Because 'T4''s own checks read the server'

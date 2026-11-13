@@ -120,8 +120,8 @@ function Invoke-DemoFabricNotebookRun {
     }
     $body = [ordered]@{ executionData = [ordered]@{ parameters = $parameters } }
     $submitUri = '{0}/workspaces/{1}/items/{2}/jobs/instances?jobType=RunNotebook' -f $script:FabricApiBaseUri, $workspaceId, $itemId
-    # IDs are named in the log, never shown.
-    Write-DemoLog -Message ('Running {0} on demand ({1}).' -f $Name, (($parameters.Keys | ForEach-Object { if ($_ -like '*_ID') { '{0}=(resolved)' -f $_ } else { '{0}={1}' -f $_, $parameters[$_].value } }) -join ', '))
+    # IDs are named in the log, never shown, and a long value (POSTGRES_METRICS, T4's metrics as JSON, 2026-11-13) by its size.
+    Write-DemoLog -Message ('Running {0} on demand ({1}).' -f $Name, (($parameters.Keys | ForEach-Object { if ($_ -like '*_ID') { '{0}=(resolved)' -f $_ } elseif ($parameters[$_].value.Length -gt 200) { '{0}=({1:N0} characters)' -f $_, $parameters[$_].value.Length } else { '{0}={1}' -f $_, $parameters[$_].value } }) -join ', '))
     # A second submit would start a second run, so it's sent again only when it never reached the service.
     $submit = Invoke-DemoFabricRequest -Method 'Post' -Uri $submitUri -Token $Token -Body $body -NotIdempotent
     if ($submit.StatusCode -ne 202) {

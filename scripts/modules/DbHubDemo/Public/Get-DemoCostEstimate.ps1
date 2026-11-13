@@ -20,12 +20,16 @@ function Get-DemoCostEstimate {
       all month) is reported but left out of the totals.
     - Defender for Azure SQL (SqlServers): the T3 server, all month.
     - Defender for open-source relational databases (OpenSourceRelationalDatabases): the T4 server, per month,
-      stopped or not (Phase 24, ADR 0019).
-    - Defender CSPM (CloudPosture): T1 and the T2 host while they aren't deallocated, the T4 server all month, and the T3 server
-      all month. Arc machines aren't billable resources.
+      stopped or not (Phase 24, ADR 0019), and T4's read replica for the hours it exists (ADR 0025).
+    - Defender CSPM (CloudPosture): T1 and the T2 host while they aren't deallocated, the T4 server all month, T4's read
+      replica while it exists, and the T3 server all month. Arc machines aren't billable resources.
     - Defender for Storage: the deployment creates no storage accounts, so it adds nothing.
     Subscription-wide plans, such as Defender for Resource Manager, aren't attributed to the demo.
     Without -DefenderPlans the estimate excludes Defender and reports a Warning.
+
+    T4's read replica (2026-11-13, ADR 0025) exists only during a session: start-demo.ps1 creates it and
+    stop-demo.ps1 deletes it. So its compute (at T4's size), its storage (prorated by the hour), and its Defender
+    plans are running costs, and no 7-day restart applies to it. A Burstable T4 has no replica.
 
     Returns hourly running cost, one demo-day session, idle monthly cost, and a light-use month, plus
     validation results that compare them with the configured ceilings. The monthly ceiling is hard: a
@@ -326,6 +330,7 @@ function Get-DemoCostEstimate {
     $t4ComputeItem = $null
     $t4WorstCase = $null
     $t4Restart = $null
+    $t4ReplicaOn = $false
     if ($t4On -and $null -ne $sizing.t4) {
         # The size actually deployed: the t4SkuName setting or the default (General Purpose Standard_D4ds_v5 since
         # 2026-11-04), the fallback's D4ads_v5 or D2ds_v5 (General Purpose, priced per vCore-hour), or a Burstable size
@@ -346,6 +351,15 @@ function Get-DemoCostEstimate {
             $t4Capped = $null -ne $T4RestartCoverage -and [bool](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Counts')
             $t4Restart = Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $t4Capped -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])
             $t4WorstCase = [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $t4Restart.Hours, 2)
+        }
+        # T4's read replica (2026-11-13, ADR 0025): created for each session and deleted after it, so everything it bills is
+        # counted for the session's running hours only: its compute at T4's size, and its storage prorated by the hour (its
+        # Defender plans are below). No 7-day restart applies: stop-demo.ps1 deletes it rather than stopping it. A Burstable T4
+        # has no replica (Azure doesn't support one there).
+        $t4ReplicaOn = $t4Spec.Tier -ne 'Burstable'
+        if ($t4ReplicaOn) {
+            Add-Component ('T4 read replica compute ({0}; for each session only)' -f $t4SkuName) 'running' $t4ComputeItem $t4ComputeQuantity $(if ($t4Spec.PerVCore) { 'vCore-hour' } else { 'hour' })
+            Add-Component 'T4 read replica storage (for each session only)' 'running' ($t4StorageItems | Where-Object { $_.meterName -eq 'Storage Data Stored' } | Select-Object -First 1) ([double]$sizing.t4.storageSizeGB / $hoursPerMonth) 'GB-month'
         }
     }
 
@@ -436,6 +450,10 @@ function Get-DemoCostEstimate {
         if ($t4On) {
             # A stopped flexible server is still a billable CSPM resource.
             Add-Component 'Defender CSPM (T4 server)' 'idle' $item $hoursPerMonth 'hour' -Defender
+            if ($t4ReplicaOn) {
+                # T4's read replica is a billable resource while it exists, during sessions only (ADR 0025).
+                Add-Component 'Defender CSPM (T4 read replica, for each session only)' 'running' $item 1 'hour' -Defender
+            }
         }
     }
     if ($t4On -and $standardPlans.Contains('OpenSourceRelationalDatabases')) {
@@ -444,6 +462,10 @@ function Get-DemoCostEstimate {
         $ossItems = Get-CachedPrice "serviceFamily eq 'Security' and productName eq 'Microsoft Defender for PostgreSQL' and skuName eq 'Standard' and priceType eq 'Consumption' and (armRegionName eq '$location' or armRegionName eq 'Global')"
         $ossItem = @($ossItems | Where-Object { $_.meterName -eq 'Standard Node' -and $_.unitOfMeasure -match 'Month' } | Sort-Object -Property @{ Expression = { $_.armRegionName -ne $location } }) | Select-Object -First 1
         Add-Component 'Defender for open-source relational databases (T4 server)' 'idle' $ossItem 1 'server-month' -Defender
+        if ($t4ReplicaOn) {
+            # The replica is a PostgreSQL server of its own while it exists: its month prorated by the hour (ADR 0025).
+            Add-Component 'Defender for open-source relational databases (T4 read replica, for each session only)' 'running' $ossItem (1.0 / $hoursPerMonth) 'server-month' -Defender
+        }
     }
     $attributed = @('VirtualMachines', 'SqlServerVirtualMachines', 'SqlServers', 'CloudPosture', 'StorageAccounts') + @(if ($t4On) { 'OpenSourceRelationalDatabases' })
     $notAttributed = @($standardPlans.Keys | Where-Object { $_ -notin $attributed })
@@ -477,6 +499,16 @@ function Get-DemoCostEstimate {
     $t3IncrementMonthly = [System.Math]::Round($t3IncrementVcores * $LightUseHoursPerMonth * $t3IncrementPrice, 2)
     $sessionCost = [System.Math]::Round($running * $DemoHours + $bastion * $BastionHours, 2)
     $lightUseMonthly = [System.Math]::Round($idle + $running * $LightUseHoursPerMonth + $bastion * $BastionHours - $t3FreeCredit, 2)
+    # T4's read replica (ADR 0025): its running hours, and the session and month without them, for T4's size verdicts
+    # (ConvertTo-DemoT4FallbackCost), which leave it out so it never changes one (2026-11-13).
+    $replicaRunning = 0.0
+    foreach ($component in $components) {
+        if ($component.Basis -eq 'running' -and $component.Name -match 'T4 read replica') {
+            $replicaRunning += [double]$component.Cost
+        }
+    }
+    $sessionCostWithoutReplica = [System.Math]::Round(($running - $replicaRunning) * $DemoHours + $bastion * $BastionHours, 2)
+    $lightUseMonthlyWithoutReplica = [System.Math]::Round($idle + ($running - $replicaRunning) * $LightUseHoursPerMonth + $bastion * $BastionHours - $t3FreeCredit, 2)
     $defenderSession = [System.Math]::Round($defenderRunning * $DemoHours, 2)
     $defenderMonthly = [System.Math]::Round($defenderIdle + $defenderRunning * $LightUseHoursPerMonth, 2)
     # T4's fixed monthly cost: everything billed while it's stopped (storage, DNS zone, its Defender plans).
@@ -514,6 +546,11 @@ function Get-DemoCostEstimate {
         $evidence['t4RestartAssumption'] = if ($null -ne $t4Restart -and $t4Restart.Restarts -gt 0) { 'SafetyStop' } else { 'RestOfMonth' }
         $evidence['t4RestartHours'] = if ($null -ne $t4Restart) { $t4Restart.Hours } else { $null }
         $evidence['t4RestartMissing'] = if ($null -eq $T4RestartCoverage) { 'NotChecked' } else { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Missing') }
+        # T4's read replica (ADR 0025): per session, so only in the running hours.
+        $evidence['t4ReplicaIncluded'] = [bool]$t4ReplicaOn
+        $evidence['t4ReplicaHourly'] = [System.Math]::Round($replicaRunning, 4)
+        $evidence['t4ReplicaSession'] = [System.Math]::Round($replicaRunning * $DemoHours, 2)
+        $evidence['t4ReplicaMonthly'] = [System.Math]::Round($replicaRunning * $LightUseHoursPerMonth, 2)
     }
     if ($defenderIncluded) {
         $evidence['defenderSession'] = $defenderSession
@@ -552,6 +589,10 @@ function Get-DemoCostEstimate {
                 [string]::Format($culture, ' Azure starts a stopped T4 again on its own after 7 days, and {0}, so the worst case counts it running for the rest of the month: {1:N0} hours, {2:N2} USD of T4 compute, against the ceiling.', $why, $t4Restart.Hours, [double]$t4WorstCase)
             }
             $monthlyMessage += [string]::Format($culture, ' T4 (PostgreSQL, {0}) costs {1:N2} USD a month even while stopped (storage, its private DNS zone, and its Defender plans).{2}', $t4Sku, $t4FixedMonthly, $restartText)
+            if ($t4ReplicaOn) {
+                # T4's read replica (ADR 0025): created for each session and deleted after it, so it's in the running hours.
+                $monthlyMessage += [string]::Format($culture, ' T4''s read replica exists only during a session (start-demo.ps1 creates it, stop-demo.ps1 deletes it), so it adds {0:N3} USD a running hour and nothing between sessions, with no automatic restart to count.', $replicaRunning)
+            }
 
             $safetyFix = if ($null -ne $t4Restart -and $t4Restart.Restarts -eq 0) {
                 $fix = if ($null -ne $T4RestartCoverage) { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Fix') } else { '' }
@@ -623,8 +664,13 @@ function Get-DemoCostEstimate {
             $monthlyMessage += $activityText
             $sessionActivity = $activityText
         }
+        # T4's read replica (ADR 0025): its share of the session, which start-demo.ps1 -SkipT4Replica leaves out.
+        $sessionReplica = ''
+        if ($t4ReplicaOn) {
+            $sessionReplica = ' T4''s read replica, which exists only during a session, is {0:N2} USD of it (start-demo.ps1 -SkipT4Replica starts a session without it).' -f [double]$evidence['t4ReplicaSession']
+        }
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.SESSION' -Area 'preflight' -Target 'subscription' -Status $sessionStatus `
-                    -Message ('{0}: a {1}-hour demo session is estimated at {2:N2} USD{3} against a ceiling of {4:N2} USD.{5}' -f $ProfileName, $DemoHours, $sessionCost, $sessionDefender, $sessionCeiling, $sessionActivity) `
+                    -Message ('{0}: a {1}-hour demo session is estimated at {2:N2} USD{3} against a ceiling of {4:N2} USD.{5}{6}' -f $ProfileName, $DemoHours, $sessionCost, $sessionDefender, $sessionCeiling, $sessionReplica, $sessionActivity) `
                     -Evidence $evidence -Remediation 'Shorten the session, choose a smaller profile, or opt in to Spot (ADR 0016).' -DocUrl $retailPricesDoc))
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status $monthlyStatus `
                     -Message $monthlyMessage -Evidence $evidence -Remediation $monthlyRemediation -DocUrl $retailPricesDoc))
@@ -690,6 +736,12 @@ function Get-DemoCostEstimate {
         T4AutoRestartWorstCaseMonthly  = $t4WorstCase
         T4RestartHours                 = $(if ($null -ne $t4Restart) { $t4Restart.Hours } else { $null })
         T4RestartAssumption            = $(if ($null -ne $t4Restart -and $t4Restart.Restarts -gt 0) { 'SafetyStop' } elseif ($null -ne $t4Restart) { 'RestOfMonth' } else { '' })
+        T4ReplicaIncluded              = [bool]$t4ReplicaOn
+        T4ReplicaHourly                = $(if ($t4On) { $evidence['t4ReplicaHourly'] } else { $null })
+        T4ReplicaSession               = $(if ($t4On) { $evidence['t4ReplicaSession'] } else { $null })
+        T4ReplicaMonthly               = $(if ($t4On) { $evidence['t4ReplicaMonthly'] } else { $null })
+        SessionCostWithoutReplica      = $sessionCostWithoutReplica
+        LightUseMonthlyWithoutReplica  = $lightUseMonthlyWithoutReplica
         T3FreeOffer                    = [bool]$t3UsesFreeOffer
         T3FreeOfferUnchecked           = $t3FreeOfferUnchecked
         T3FreeOfferCreditMonthly       = $t3FreeCreditMonthly

@@ -402,6 +402,9 @@ function Get-DemoActivityControlRunbookSetting {
         t3ServerPrefix         = 'azuresql01-'
         demoDatabase           = 'ContosoCare'
         t4ServerPrefix         = 'pgflex01-'
+        # T4's read replica (ADR 0025): a run starts a stopped one before T4 (Azure's order), and its stops stop one a
+        # session left behind after T4. The control never creates or deletes it.
+        t4ReplicaPrefix        = ('{0}-' -f (Get-DemoT4ReplicaSetting)['serverNamePrefix'])
         autoShutdownTime       = $(if ($Config['autoShutdownTime']) { [string]$Config['autoShutdownTime'] } else { '1900' })
         autoShutdownTimeZone   = $(if ($Config['autoShutdownTimeZone']) { [string]$Config['autoShutdownTimeZone'] } else { 'UTC' })
         shutdownMarginMinutes  = 2
@@ -983,6 +986,92 @@ function Publish-DemoActivityControlRunbook {
         return (New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0}, {1}, and {2} would be published (Windows PowerShell 5.1) with the current catalog and settings.' -f $Name.ControlRunbook, $Name.StopRunbook, $Name.MonitorRunbook) -DocUrl $doc)
     }
     return (New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('{0} published (Windows PowerShell 5.1) with the current scenario catalog ({1} scenarios) and settings.' -f ($published -join ', '), @($Setting['scenarios'].Keys).Count) -Evidence ([ordered]@{ runbooks = $published.ToArray(); targets = @($Setting['targets'].Keys); scenarios = @($Setting['scenarios'].Keys) }) -DocUrl $doc)
+}
+
+function Update-DemoActivityControlRunbook {
+    <#
+    .SYNOPSIS
+    deploy.ps1's refresh of the on-demand control's runbooks (2026-11-13): when control.enabled is true and the control
+    is set up (its identity exists), the three runbooks are published again with the current code and settings unless
+    each one's published content is the same already (Runbook - Get Content). So an update that changes the control's
+    code reaches it at the next ./scripts/deploy.ps1, as the nightly safety stop's does, without setup-activity-control.ps1
+    (T4's read replica, ADR 0025, changed it: a run starts a stopped replica before T4, says when there's none, and its
+    stops stop one a session left behind). Returns CONTROL.RUNBOOKS, or nothing when the control is off or not set up.
+    Never throws: a problem is a Warning with setup-activity-control.ps1 as the fix. Internal.
+    - Runbook - Get Content: https://learn.microsoft.com/rest/api/automation/runbook/get-content
+    - User Assigned Identities - Get: https://learn.microsoft.com/rest/api/managedidentity/user-assigned-identities/get
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = ''
+    )
+
+    if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
+        return @()
+    }
+    $doc = 'https://learn.microsoft.com/rest/api/automation/runbook/get-content'
+    $command = '{0} -ConfigPath {1}' -f './scripts/setup-activity-control.ps1', $(if ($ConfigPath) { $ConfigPath } else { './config/demo.config.json' })
+    $untilThen = 'Until then the control runs its older code: a run can''t start T4 while a read replica that a session left behind is stopped (Azure starts T4 only after its replicas), a run doesn''t say when T4''s replica beat isn''t there, and its stops leave such a replica running (the nightly safety stop still stops it).'
+    $warning = {
+        param([string] $Why)
+        New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The on-demand control''s runbooks weren''t updated with this code: {0}. {1}' -f $Why.TrimEnd('.'), $untilThen) -Evidence ([ordered]@{ command = $command }) -Remediation ('Run {0}; it publishes the runbooks with the current code.' -f $command) -DocUrl $doc
+    }
+    try {
+        $name = Get-DemoActivityControlName -Config $Config
+        $identity = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $name.IdentityId -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.ManagedIdentity/userAssignedIdentities'))
+        if ($identity.Missing) {
+            # Not set up yet: setup-activity-control.ps1 creates it, and CONTROL.SETUP in validate.ps1 says so.
+            return @()
+        }
+        $clientId = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $identity.Value -Name 'properties') -Name 'clientId')
+        if (-not $identity.Ok -or $clientId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            return @(& $warning ('its identity {0} couldn''t be read ({1})' -f $name.Identity, $(if ($identity.Error) { $identity.Error } else { 'no client ID' })))
+        }
+        $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name $name -IdentityClientId $clientId
+        $normalize = { param([string] $Text) ($Text -replace "`r`n", "`n").TrimEnd() }
+        $stale = [System.Collections.Generic.List[string]]::new()
+        foreach ($runbook in $name.ControlRunbook, $name.StopRunbook, $name.MonitorRunbook) {
+            $published = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/runbooks/{1}/content' -f $name.AutomationAccountId, $runbook) -ApiVersion '2024-10-23')
+            $content = Get-DemoActivityControlRunbookContent -Name $runbook -Setting $setting
+            if (-not ($published.Ok -and $published.Value -is [string] -and (& $normalize $published.Value) -ceq (& $normalize $content))) {
+                $stale.Add($runbook)
+            }
+        }
+        if ($stale.Count -eq 0) {
+            return @(New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The on-demand control''s runbooks in {0} are published with the current code and settings.' -f $name.AutomationAccount) -DocUrl $doc)
+        }
+        Write-DemoLog -Message ('The on-demand control''s runbooks differ from this code ({0}); publishing them again.' -f ($stale -join ', '))
+        $result = Publish-DemoActivityControlRunbook -Config $Config -Name $name -Setting $setting -Confirm:$false
+        if ([string]$result.status -eq 'Fail') {
+            return @(& $warning (ConvertTo-DemoPlainText -Value $result.message))
+        }
+        return @($result)
+    }
+    catch {
+        return @(& $warning ('they couldn''t be checked against it: {0}' -f (Protect-DemoText -Text $_.Exception.Message)))
+    }
+}
+
+function Get-DemoActivityControlRunbookNote {
+    # DONE's and NOT DONE's line, on the console and the status page, when deploy.ps1 couldn't publish the on-demand
+    # control's runbooks with this code (Update-DemoActivityControlRunbook, 2026-11-13): what fails until then, and the
+    # exact command. Empty otherwise. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $problem = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'CONTROL.RUNBOOKS' -and [string]$_.status -in 'Warning', 'Fail' }) | Select-Object -Last 1
+    if ($null -eq $problem) {
+        return ''
+    }
+    return ('{0} {1}' -f (ConvertTo-DemoPlainText -Value $problem.message).TrimEnd(), (ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $problem -Name 'remediation'))).Trim()
 }
 
 function Get-DemoActivityControlSafetyStopTime {
@@ -1650,8 +1739,9 @@ function Invoke-DemoActivityControlRegrant {
     .SYNOPSIS
     deploy.ps1's A1 step after the template (ADR 0020): with control.enabled, grants A1 again when assignRoles is true
     (Grant-DemoActivityControlRole, A1 only), and otherwise checks it. A missing or failed A1 is Manual action
-    required with the exact -GrantRole command, so DEPLOY.SUMMARY lists it. Nothing when control.enabled is false.
-    Internal.
+    required with the exact -GrantRole command, so DEPLOY.SUMMARY lists it. Then the control's runbooks are published
+    again when this code changed them (Update-DemoActivityControlRunbook, 2026-11-13). Nothing when control.enabled is
+    false. Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([object[]])]
@@ -1665,15 +1755,21 @@ function Invoke-DemoActivityControlRegrant {
     if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
         return @()
     }
+    $results = [System.Collections.Generic.List[object]]::new()
     try {
         if ($Config['assignRoles']) {
-            return @(Grant-DemoActivityControlRole -Config $Config -Assignment 'A1' -ConfigPath $ConfigPath -Confirm:$false)
+            $results.AddRange([object[]]@(Grant-DemoActivityControlRole -Config $Config -Assignment 'A1' -ConfigPath $ConfigPath -Confirm:$false))
         }
-        return @(Test-DemoActivityControlRole -Config $Config -Assignment 'A1' -ConfigPath $ConfigPath)
+        else {
+            $results.AddRange([object[]]@(Test-DemoActivityControlRole -Config $Config -Assignment 'A1' -ConfigPath $ConfigPath))
+        }
     }
     catch {
-        return @(New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message ('A1 wasn''t granted: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f (Get-DemoActivityControlCommand -ConfigPath $ConfigPath)) -DocUrl 'https://learn.microsoft.com/azure/role-based-access-control/role-assignments-rest')
+        $results.Add((New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message ('A1 wasn''t granted: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f (Get-DemoActivityControlCommand -ConfigPath $ConfigPath)) -DocUrl 'https://learn.microsoft.com/azure/role-based-access-control/role-assignments-rest'))
     }
+    # The control's runbooks with this code (2026-11-13): an update reaches them at deploy.ps1, as the safety stop's does.
+    $results.AddRange([object[]]@(Update-DemoActivityControlRunbook -Config $Config -ConfigPath $ConfigPath -Confirm:$false))
+    return $results.ToArray()
 }
 
 function Remove-DemoActivityControlRole {
