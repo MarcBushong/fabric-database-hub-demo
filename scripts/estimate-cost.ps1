@@ -86,13 +86,15 @@ $ErrorActionPreference = 'Stop'
 # This checkout's DbHubDemo, loaded again on every run, so a session that ran an earlier checkout's script doesn't keep
 # that code (live finding, 2026-11-06). Not when the repository's own code runs this script (a DbHubDemo function,
 # another script, or a test): it loaded the module already, and the module's state stays, such as the subscription
-# guard's validated context, the redaction's registered values, or a test's mocks.
+# guard's validated context, the redaction's registered values, or a test's mocks. $module is the module object this
+# script imported, for the module's internal functions, which run in its scope (& $module { ... }; 2026-11-13: T4's
+# restart coverage called them from the script, where they aren't visible, so a signed-in estimate never read it).
 $entryRepoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '..')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
 $entryNested = $false
 foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
     $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
-Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
+$module = Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested) -PassThru
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
@@ -103,8 +105,9 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
 }
 $config = Get-DemoConfig -Path $ConfigPath
 
-# Defender plans, the T3 free offer, and the T2 golden snapshots are read only when the CLI is already signed
-# in to the configured subscription.
+# Defender plans, the T3 free offer, the T2 golden snapshots, and whether a safety stop covers T4's 7-day restart are read
+# only when the CLI is already signed in to the configured subscription. Each read stands on its own (2026-11-13): one
+# that fails says what it left out, and the others are still read.
 $defenderPlans = $null
 $t3UseFreeLimit = $null
 $goldenSnapshots = @()
@@ -113,22 +116,47 @@ if ($config['subscriptionId'] -eq '00000000-0000-0000-0000-000000000000') {
     Write-DemoLog -Level Warning -Message 'The configuration has no subscription yet, so the estimate excludes Defender for Cloud and prices T3 as regular serverless.'
 }
 else {
+    $signedIn = $false
     try {
         $null = Assert-DemoAzContext -SubscriptionId $config['subscriptionId'] -TenantId $config['tenantId'] -Account ([string]$config['azureAccount'])
-        $defenderPlans = @(Get-DemoDefenderPlan -SubscriptionId $config['subscriptionId'])
-        Write-DemoLog -Message ('Read {0} Defender for Cloud plans from the subscription (read-only).' -f $defenderPlans.Count)
-        $freeOffer = Get-DemoT3FreeOfferStatus -Config $config
-        $t3UseFreeLimit = [bool]$freeOffer.UseFreeLimit
-        Write-DemoLog -Message ('T3 free offer: {0} ({1})' -f $freeOffer.Result.status, $freeOffer.Result.message)
-        $goldenSnapshots = @(Get-DemoT2GoldenSnapshot -Config $config)
-        Write-DemoLog -Message ('T2 golden snapshots in the golden resource group: {0} (ADR 0018).' -f $goldenSnapshots.Count)
-        if (Test-DemoT4Enabled -Config $config) {
-            $t4RestartCoverage = Get-DemoT4RestartCoverage -Config $config -ConfigPath $ConfigPath
-            Write-DemoLog -Message ('T4''s automatic restart: {0} (2026-11-04, ADR 0016).' -f $(if ($t4RestartCoverage.Counts) { 'about a day each, ' + $t4RestartCoverage.Reason } else { 'the rest of the month, because ' + $t4RestartCoverage.Reason }))
-        }
+        $signedIn = $true
     }
     catch {
-        Write-DemoLog -Level Warning -Message ('The Defender for Cloud plans, the T3 free offer, or the golden snapshots weren''t read, so the estimate may exclude Defender and the snapshots and prices T3 as regular serverless. {0}' -f $_.Exception.Message)
+        Write-DemoLog -Level Warning -Message ('The Azure CLI isn''t signed in to the configured subscription, so the estimate excludes Defender for Cloud and the T2 golden snapshots, prices T3 as regular serverless, and counts T4''s 7-day restart for the rest of the month. {0}' -f $_.Exception.Message)
+    }
+    if ($signedIn) {
+        try {
+            $defenderPlans = @(Get-DemoDefenderPlan -SubscriptionId $config['subscriptionId'])
+            Write-DemoLog -Message ('Read {0} Defender for Cloud plans from the subscription (read-only).' -f $defenderPlans.Count)
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The Defender for Cloud plans couldn''t be read, so the estimate excludes Defender. {0}' -f $_.Exception.Message)
+        }
+        try {
+            $freeOffer = Get-DemoT3FreeOfferStatus -Config $config
+            $t3UseFreeLimit = [bool]$freeOffer.UseFreeLimit
+            Write-DemoLog -Message ('T3 free offer: {0} ({1})' -f $freeOffer.Result.status, $freeOffer.Result.message)
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The T3 free offer couldn''t be checked, so T3 is priced as regular serverless. {0}' -f $_.Exception.Message)
+        }
+        try {
+            $goldenSnapshots = @(Get-DemoT2GoldenSnapshot -Config $config)
+            Write-DemoLog -Message ('T2 golden snapshots in the golden resource group: {0} (ADR 0018).' -f $goldenSnapshots.Count)
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The T2 golden snapshots couldn''t be listed, so the estimate leaves them out. {0}' -f $_.Exception.Message)
+        }
+        try {
+            $t4RestartCoverage = & $module { param($Settings, $Path) if (Test-DemoT4Enabled -Config $Settings) { Get-DemoT4RestartCoverage -Config $Settings -ConfigPath $Path } } $config $ConfigPath
+            if ($null -ne $t4RestartCoverage) {
+                Write-DemoLog -Message ('T4''s automatic restart: {0} (2026-11-04, ADR 0016).' -f $(if ($t4RestartCoverage.Counts) { 'about a day each, ' + $t4RestartCoverage.Reason } else { 'the rest of the month, because ' + $t4RestartCoverage.Reason }))
+            }
+        }
+        catch {
+            $t4RestartCoverage = $null
+            Write-DemoLog -Level Warning -Message ('Whether a safety stop covers T4''s 7-day restart couldn''t be read, so the estimate counts it for the rest of the month. {0}' -f $_.Exception.Message)
+        }
     }
 }
 

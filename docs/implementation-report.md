@@ -420,6 +420,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R820 | The background jobs (the parallel tracks, the artifact builds, the policy inventory, T1's monitoring, and the status page's writer) still look DbHubDemo up by name (`Get-Module -Name 'DbHubDemo'`), which in a window finds every copy loaded there | **Accepted:** each job runs in its own process (`Start-Job`) or runspace (`Start-ThreadJob`), where only the copy it imports by path from its own checkout is loaded, as a probe with two copies in the parent showed (2026-11-10); `Repo.Conventions` fails when a lookup isn't in such a job or comes before the job's import |
 | R821 | The fix is proven in a child process that loaded two copies of the module from the test drive, with each entry script's own import and selection, not by a live `start-demo.ps1` from a second clone | **Open:** a live `start-demo.ps1 -WarmUpMinutes 10` from a second clone, in a window that ran the first clone's scripts ([still to verify](#still-to-verify)) |
 | R822 | `./tests/Invoke-StaticValidation.ps1` and `Invoke-Pester` run in the window they're started from, so in a window that ran another copy's scripts, Pester's `InModuleScope` stops with "Multiple script or manifest modules named 'DbHubDemo' are currently loaded" (Pester 5.9.1, checked 2026-11-10) | **Accepted:** it affects contributors only, and Pester's message names the cause; run the tests in a new PowerShell window ([CONTRIBUTING](../CONTRIBUTING.md#validate-before-you-open-a-pull-request)). CI runs them in a new process |
+| R823 | Another entry script can call a module function that isn't exported, as `estimate-cost.ps1` did from 2026-11-04 to 2026-11-13, and a `try` around several reads hides it behind one message | **Mitigated:** `estimate-cost.ps1` runs its internal calls through its module object, each of its reads stands on its own, and `DbHubDemo.EstimateCost.Tests.ps1` covers it; other entry scripts aren't checked for calls to internal functions yet |
 
 ## Phase log
 
@@ -2276,3 +2277,18 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
 **Validation.** See the pull request's description for the exact commands and results. The new tests fail on `main`'s scripts with the live wording, "The term 'DbHubDemo DbHubDemo' is not recognized". **Live:** none; [still to verify](#still-to-verify).
 
 **Risks.** R820 to R822 new.
+
+### `estimate-cost.ps1` reads the safety stop's coverage (found 2026-11-13)
+
+**Why.** Found while pricing T4's read replica, 2026-11-13: signed in to the owner's subscription, `./scripts/estimate-cost.ps1` warned "The Defender for Cloud plans, the T3 free offer, or the golden snapshots weren't read ... The term 'Test-DemoT4Enabled' is not recognized", although it had just read all three, and its monthly check counted T4's 7-day restart for the rest of the month. Since 654145e (2026-11-04), the script called `Test-DemoT4Enabled` and `Get-DemoT4RestartCoverage`, two of the module's internal functions, from its own scope, where they aren't visible, so no signed-in estimate ever read whether a safety stop covers the restart: it counted 720 hours ($256.32 at `Standard_D4ds_v5`, a dated example) where the nightly safety stop holds it to about 96 ($34.18). Preflight and `start-demo.ps1` weren't affected: they read it inside the module.
+
+**Work summary.**
+
+1. **The script keeps the module it imported** (`$module = Import-Module ... -PassThru`, as `start-demo.ps1` does since 2026-11-10) and runs the two internal functions through it (`& $module { ... }`).
+2. **Each read stands on its own:** the sign-in (`Assert-DemoAzContext`), the Defender for Cloud plans, the T3 free offer, the T2 golden snapshots, and the safety stop's coverage each have their own `try`. One that fails is one **Warning** line that says what the estimate left out; the others are still read. Not signed in is one line that names everything it leaves out.
+
+**Changed files.** `scripts/estimate-cost.ps1`; `tests/unit/DbHubDemo.EstimateCost.Tests.ps1` (new); `CHANGELOG.md`; and this report.
+
+**Validation.** `Invoke-Pester -Path tests/unit/DbHubDemo.EstimateCost.Tests.ps1`: 4 passed. Against `main`'s `scripts/estimate-cost.ps1`, the same 4 fail: the coverage is read 0 times, and none of the new lines is written. **Live:** the owner's kind of configuration signed in, 2026-11-13, before the fix: the misleading warning and the rest-of-month restart.
+
+**Risks.** R823 new.
