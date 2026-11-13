@@ -750,6 +750,25 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.READY' } | Should -BeNullOrEmpty
     }
 
+    It 'says why the host''s waits stopped when Azure keeps its Run Commands in Deleting: the Ready wait and the build wait (2026-11-13 live finding)' {
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { $script:calls.Add('health ' + $VmName); [pscustomobject]@{ Health = [pscustomobject]@{ state = 'InProgress'; message = 'Step WorkloadRunner is running.' }; Polls = 3; Full = $true } }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $ready = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.READY' }
+        $ready.status | Should -Be 'Warning'
+        $ready.message | Should -Match 'couldn''t be read for 15 minutes, because Azure keeps archost01''s Run Commands in Deleting'
+
+        $script:context['T2Source'] = 'build'
+        $script:context['WaitForT2'] = $true
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith { [pscustomobject]@{ Health = [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestFirstBoot' }; TimedOut = $true; Failed = $false; Rebuilt = $false; Results = @(); Full = $true } }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+        $outcome.Status | Should -Be 'Open'
+        $wait = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.WAIT' }
+        $wait.status | Should -Be 'Manual action required'
+        $wait.message | Should -Match 'health couldn''t be read for 15 minutes, because Azure keeps its Run Commands in Deleting'
+        $wait.message | Should -Match 'last reported step GuestFirstBoot'
+        $wait.remediation | Should -Match 'Run \./scripts/deploy\.ps1 again in about 30 minutes'
+    }
+
     It 'says so when an earlier run already released the copy, instead of claiming a reset (live, 2026-10-22)' {
         $script:context['T2Source'] = 'existing-golden'
         $script:releaseData = [pscustomobject]@{ role = 'Copy'; captured = $true; guestState = 'Running' }

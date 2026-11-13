@@ -135,8 +135,9 @@ function Wait-DemoT2HostBuild {
     Since 2026-11-09, a host that rebuilds an unfinished PaygWizard guest from Arc Jumpstart's image is followed up once
     (Complete-DemoT2GuestRebuild: the old guest's Arc resources go, and the console and the status page say so, with the
     measured time), the estimate follows the mode the host runs, and a report from the bundle before this run's
-    (-BundlePrefix) doesn't end the wait for up to 20 minutes. Returns Health, TimedOut, Failed, Rebuilt, and Results.
-    Internal.
+    (-BundlePrefix) doesn't end the wait for up to 20 minutes. Since 2026-11-13, reads that find no room for a fresh Run
+    Command name (Azure keeps the host's Run Commands in Deleting) end the wait after 15 minutes, with TimedOut and Full.
+    Returns Health, TimedOut, Failed, Rebuilt, Results, and Full. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -169,15 +170,30 @@ function Wait-DemoT2HostBuild {
     # 2026-11-09: the host's rebuild of an unfinished guest, followed up once (Complete-DemoT2GuestRebuild).
     $followUp = [System.Collections.Generic.List[object]]::new()
     $rebuilding = $false
+    # 2026-11-13 live finding: reads that find no room for a fresh Run Command name (Azure keeps the host's Run Commands in
+    # Deleting) end the wait after 15 minutes, as Full, instead of at the deadline.
+    $fullSince = $null
     while ($true) {
         try {
             $read = Get-DemoVmHealth -Config $Config -VmName 'archost01' -View Summary
             if ($null -ne $read) {
                 $health = $read
             }
+            $fullSince = $null
         }
         catch {
             Write-DemoLog -Level Warning -Message ('Reading archost01''s health failed (it may be restarting); reading it again later: {0}' -f $_.Exception.Message)
+            if (Test-DemoRunCommandFullError -Text $_.Exception.Message) {
+                if ($null -eq $fullSince) {
+                    $fullSince = [System.DateTime]::UtcNow
+                }
+            }
+            else {
+                $fullSince = $null
+            }
+        }
+        if ($null -ne $fullSince -and ([System.DateTime]::UtcNow - $fullSince).TotalMinutes -ge 15) {
+            return [pscustomobject]@{ Health = $health; TimedOut = $true; Failed = $false; Rebuilt = $rebuilding; Results = $followUp.ToArray(); Full = $true }
         }
         if (-not $rebuilding) {
             $rebuild = @(Complete-DemoT2GuestRebuild -Config $Config -Health $health -ProgressPath $ProgressPath -Confirm:$false)
@@ -214,11 +230,11 @@ function Wait-DemoT2HostBuild {
         Set-DemoProgressStep -Path $ProgressPath -Id 'T2.HostBuild' -State 'Running' -Message $message
         Write-DemoLog -Message ('T2: {0}' -f $message)
         if ($state -in $stopStates -and -not $stale) {
-            return [pscustomobject]@{ Health = $health; TimedOut = $false; Failed = ($state -eq 'Failed'); Rebuilt = $rebuilding; Results = $followUp.ToArray() }
+            return [pscustomobject]@{ Health = $health; TimedOut = $false; Failed = ($state -eq 'Failed'); Rebuilt = $rebuilding; Results = $followUp.ToArray(); Full = $false }
         }
         $left = ($DeadlineUtc - [System.DateTime]::UtcNow).TotalSeconds
         if ($left -le 0) {
-            return [pscustomobject]@{ Health = $health; TimedOut = $true; Failed = $false; Rebuilt = $rebuilding; Results = $followUp.ToArray() }
+            return [pscustomobject]@{ Health = $health; TimedOut = $true; Failed = $false; Rebuilt = $rebuilding; Results = $followUp.ToArray(); Full = $false }
         }
         $poll = if ($stale) { [System.Math]::Min($PollSeconds, 60) } else { $PollSeconds }
         Start-Sleep -Seconds ([int][System.Math]::Max(5, [System.Math]::Min($poll, $left)))

@@ -1394,6 +1394,13 @@ function Invoke-DemoDeploymentTrack {
                             break
                         }
                         if ($build.TimedOut) {
+                            if ([bool](Get-DemoMemberValue -InputObject $build -Name 'Full')) {
+                                # 2026-11-13 live finding: no room for a fresh Run Command name for 15 minutes.
+                                Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Action needed' -Status 'Manual action required' -Message 'archost01''s health couldn''t be read for 15 minutes: Azure keeps its Run Commands in Deleting, close to its limit of 25 (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01).'
+                                & $note 'DEPLOY.T2.WAIT' 'T2' 'Manual action required' ('archost01''s health couldn''t be read for 15 minutes, because Azure keeps its Run Commands in Deleting, close to its limit of 25 managed Run Commands (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01). The guest build goes on in the background; it last reported step {0}.' -f [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep')) 'Run ./scripts/deploy.ps1 again in about 30 minutes: Azure deletes them on its own, and ./scripts/status.ps1 lists the ones that stay (STATUS.RUNCOMMANDS), with the command that deletes each.'
+                                $outcome = 'Open'
+                                break
+                            }
                             Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Action needed' -Status 'Manual action required' -Message 'The build didn''t finish within the wait.'
                             & $note 'DEPLOY.T2.WAIT' 'T2' 'Manual action required' ('archost01''s guest build didn''t finish within {0} minutes (it reports step {1}); it goes on in the background.' -f [int](& $option 'T2WaitMinutes' 180), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep')) 'Run ./scripts/deploy.ps1 again (or ./scripts/deploy.ps1 -FromStage T2): it waits for T2 again and continues. A slow first build is in docs/troubleshooting.md.'
                             $outcome = 'Open'
@@ -1494,7 +1501,8 @@ function Invoke-DemoDeploymentTrack {
                             break
                         }
                         else {
-                            & $note 'DEPLOY.T2.READY' 'T2' 'Warning' ('T2''s host isn''t Ready after {0} minutes (state {1}: {2}); its profile is set anyway.' -f $minutes, $state, $message) 'Follow it with ./scripts/status.ps1, and run deploy.ps1 -Resume if a step stays failed.'
+                            $why = if ([bool](Get-DemoMemberValue -InputObject $wait -Name 'Full')) { 'its health couldn''t be read for 15 minutes, because Azure keeps archost01''s Run Commands in Deleting (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01)' } else { 'state {0}: {1}' -f $state, $message }
+                            & $note 'DEPLOY.T2.READY' 'T2' 'Warning' ('T2''s host isn''t Ready after {0} minutes ({1}); its profile is set anyway.' -f $minutes, $why) 'Follow it with ./scripts/status.ps1, and run deploy.ps1 -Resume if a step stays failed.'
                         }
                     }
                     $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $activityProfile.Interim -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo))

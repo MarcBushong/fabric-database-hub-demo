@@ -314,6 +314,20 @@ function Get-DemoRunCommandFreshName {
     return ('{0}-{1}' -f $Name, $NowUtc.ToUniversalTime().ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture))
 }
 
+function Test-DemoRunCommandFullError {
+    # True for Resolve-DemoRunCommandFreshName's refusal: the VM had no room for a fresh name, because Azure keeps the
+    # others in Deleting (2026-11-13 live finding). The health waits stop after 15 minutes of it. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    return ([string]$Text -match 'close to Azure''s limit of 25, so it didn''t run under a fresh name')
+}
+
 function Resolve-DemoRunCommandFreshName {
     <#
     .SYNOPSIS

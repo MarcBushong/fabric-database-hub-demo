@@ -1529,3 +1529,40 @@ Describe 'Get-DemoArcHostIdentity' {
         $failed.Reason | Should -Match 'couldn''t be read'
     }
 }
+
+Describe 'Wait-DemoVmHealthState stops when the VM has no room for a fresh Run Command name (2026-11-13 live finding)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:reads = 0
+        $script:readError = 'archost01: Azure still lists DbHubDemo-HealthRead after 30s, and the VM already has 24 Run Commands (9 being deleted), close to Azure''s limit of 25, so it didn''t run under a fresh name either. That''s Azure-side: Azure deletes them on its own, and the next try checks again.'
+    }
+
+    It 'ends the wait with Full, whatever MaxPolls allows, and keeps the last state it read' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            $script:reads++
+            if ($script:reads -eq 1) {
+                return [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup' }
+            }
+            throw $script:readError
+        }
+        $wait = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Wait-DemoVmHealthState -Config $Config -VmName 'archost01' -State @('Ready') -MaxPolls 30 -PollSeconds 60 -FullMinutes 0 }
+        $wait.Full | Should -BeTrue
+        $wait.Health.state | Should -Be 'InProgress'
+        $script:reads | Should -Be 2 -Because 'the first refusal ends it with -FullMinutes 0, not 30 polls'
+    }
+
+    It 'keeps waiting through other read failures, as before' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            $script:reads++
+            if ($script:reads -lt 3) {
+                throw 'archost01: DbHubDemo-HealthRead timed out.'
+            }
+            [pscustomobject]@{ state = 'Ready'; currentStep = '' }
+        }
+        $wait = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Wait-DemoVmHealthState -Config $Config -VmName 'archost01' -State @('Ready') -MaxPolls 30 -PollSeconds 60 -FullMinutes 0 }
+        $wait.Full | Should -BeFalse
+        $wait.Health.state | Should -Be 'Ready'
+        $script:reads | Should -Be 3
+    }
+}
