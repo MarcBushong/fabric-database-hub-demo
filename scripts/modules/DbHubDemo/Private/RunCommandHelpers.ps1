@@ -326,11 +326,12 @@ function Resolve-DemoRunCommandFreshName {
     InternalExecutionError after 6 to 11 minutes, and a name whose delete failed stays marked for deletion: a PUT of it
     fails with OperationNotAllowed until a later delete succeeds, which took hours there. A new name ran at once (its
     script finished within a minute). One read of the VM's Run Commands comes first:
-    - Earlier fresh copies of the same name are asked to go, without waiting (Remove-DemoRunCommand -NoWait), so they
-      don't pile up across calls and runs.
+    - Earlier fresh copies of the same name, and chunk Run Commands whose script ended (a finished transfer's leftovers,
+      which only a later Artifacts step deleted before; 9 of the 20 on the T2 host, live), are asked to go, without
+      waiting (Remove-DemoRunCommand -NoWait), so they don't pile up across calls and runs.
     - Azure allows 25 managed Run Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview)
-      and doesn't say whether one being deleted counts, so every one listed counts: at -Limit or more, there's no fresh
-      name, and it throws, which the caller reports as a Run Command that couldn't be created.
+      and doesn't say whether one being deleted counts, so every one listed counts: at -Limit (24) or more, there's no
+      fresh name, and it throws, which the caller reports as a Run Command that couldn't be created.
     What it used goes to $script:DemoRunCommandStuck, which deploy.ps1 reports (Get-DemoRunCommandStuckResult), and the
     console says so at once.
     #>
@@ -355,13 +356,14 @@ function Resolve-DemoRunCommandFreshName {
         [int] $WaitedSeconds = 0,
 
         [ValidateRange(1, 25)]
-        [int] $Limit = 20,
+        [int] $Limit = 24,
 
         [datetime] $NowUtc = [DateTime]::UtcNow
     )
 
     $listed = [System.Collections.Generic.List[string]]::new()
     $deleting = 0
+    $finishedChunks = [System.Collections.Generic.List[string]]::new()
     $list = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('rest', '--method', 'get', '--url', ('{0}?api-version={1}' -f $BaseUrl, $ApiVersion)) -AsJson -AllowFailure
     # Assigned first: Get-DemoMemberValue returns an array as one object, which @() wouldn't unroll.
     $values = Get-DemoMemberValue -InputObject $list -Name 'value'
@@ -371,13 +373,20 @@ function Resolve-DemoRunCommandFreshName {
             continue
         }
         $listed.Add($itemName)
-        if ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'properties') -Name 'provisioningState') -eq 'Deleting') {
+        $provisioning = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'properties') -Name 'provisioningState')
+        if ($provisioning -eq 'Deleting') {
             $deleting++
+        }
+        elseif ($itemName -like 'DbHubDemo-Chunk-*' -and $provisioning -in 'Succeeded', 'Failed') {
+            # A chunk whose script ended: its file is on the VM or failed, and nothing reads the Run Command again.
+            $finishedChunks.Add($itemName)
         }
     }
     $copyPattern = '^{0}-\d{{14}}$' -f [regex]::Escape($RunCommandName)
-    foreach ($copy in @($listed | Where-Object { $_ -match $copyPattern })) {
-        $null = Remove-DemoRunCommand -SubscriptionId $SubscriptionId -Url ('{0}/{1}?api-version={2}' -f $BaseUrl, $copy, $ApiVersion) -NoWait -Confirm:$false
+    # Earlier fresh copies of the name, and chunks left from finished transfers (live, 2026-11-13: 9 of the 20 there), are
+    # asked to go without waiting; they still count until Azure has deleted them.
+    foreach ($leftover in @(@($listed | Where-Object { $_ -match $copyPattern }) + $finishedChunks.ToArray())) {
+        $null = Remove-DemoRunCommand -SubscriptionId $SubscriptionId -Url ('{0}/{1}?api-version={2}' -f $BaseUrl, $leftover, $ApiVersion) -NoWait -Confirm:$false
     }
     $waited = Format-DemoProgressDuration -Seconds ([long]$WaitedSeconds)
     if ($listed.Count -ge $Limit) {

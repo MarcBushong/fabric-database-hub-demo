@@ -239,18 +239,21 @@ Describe 'Invoke-DemoVmRunCommand' {
         @(InModuleScope -ModuleName DbHubDemo { Get-DemoRunCommandStuckResult }).Count | Should -Be 0 -Because '-Clear reports each once'
     }
 
-    It 'asks earlier fresh copies to go without waiting, and makes no fresh name when the VM is close to Azure''s limit of 25' {
+    It 'asks earlier fresh copies and finished chunks to go without waiting, and makes no fresh name when the VM is close to Azure''s limit of 25' {
         InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
         $null = $script:stuck.Add('DbHubDemo-HealthRead')
         $null = $script:stuck.Add('DbHubDemo-HealthRead-20261113200000')
+        # A chunk left from a finished transfer (live: 9 of the 20 on the T2 host).
+        $script:runCommands['DbHubDemo-Chunk-abcdef123456-001'] = $true
         $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -LeftoverWaitSeconds 0
         $result.Succeeded | Should -BeTrue
         @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq 'DbHubDemo-HealthRead-20261113200000' }).Count | Should -Be 1
+        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq 'DbHubDemo-Chunk-abcdef123456-001' }).Count | Should -Be 1
         InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear() }
 
         $script:calls.Clear()
-        $script:extraListed = 18
-        { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -LeftoverWaitSeconds 0 } | Should -Throw '*already has 20 Run Commands (2 being deleted), close to Azure''s limit of 25*'
+        $script:extraListed = 22
+        { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -LeftoverWaitSeconds 0 } | Should -Throw '*already has 24 Run Commands (2 being deleted), close to Azure''s limit of 25*'
         @($script:calls | Where-Object Method -eq 'put').Count | Should -Be 0
         @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq 'DbHubDemo-HealthRead' }).Count | Should -Be 2 -Because 'the delete goes again, without a second wait'
         @(InModuleScope -ModuleName DbHubDemo { Get-DemoRunCommandStuckResult }).Count | Should -Be 0
