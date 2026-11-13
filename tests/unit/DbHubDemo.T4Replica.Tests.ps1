@@ -343,3 +343,33 @@ Describe 'The history keeps the session''s lag: captured before stop-demo.ps1 de
         $result.message | Should -Match 'so this session''s are lost'
     }
 }
+
+Describe 'Reading the replica''s metrics from Azure Monitor (live, 2026-11-13)' {
+    It 'reads Read Replica Lag and T4''s bytes behind through a private parameter file, then deletes it' {
+        # Live: the function's private directory prefix was longer than Initialize-DemoPrivateDirectory allows, and T4's
+        # Replica step stopped with a ValidatePattern error right after the replica was created; nothing had run it here.
+        $script:urls = [System.Collections.Generic.List[string]]::new()
+        $script:paramFile = ''
+        $script:paramExisted = $false
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            $url = [string]$ArgumentList[[array]::IndexOf($ArgumentList, '--url') + 1]
+            $script:urls.Add($url)
+            $script:paramFile = ([string]$ArgumentList[[array]::IndexOf($ArgumentList, '--url-parameters') + 1]).Substring(1)
+            $script:paramExisted = Test-Path -LiteralPath $script:paramFile
+            $metric = if ($url -like '*pgreplica01-abc123*') { 'physical_replication_delay_in_seconds' } else { 'physical_replication_delay_in_bytes' }
+            $values = if ($metric -like '*seconds') { @(3, 241, 12) } else { @(1024, 524288, 2048) }
+            $points = @(for ($i = 0; $i -lt $values.Count; $i++) { @{ timeStamp = [DateTime]::UtcNow.AddMinutes($i - 3).ToString('o'); maximum = $values[$i] } })
+            [pscustomobject]@{ ExitCode = 0; StdOut = (@{ value = @(@{ name = @{ value = $metric }; timeseries = @(@{ data = $points }) }) } | ConvertTo-Json -Depth 8); StdErr = '' }
+        }
+        $replicaId = $script:t4Id -replace 'pgflex01-abc123', 'pgreplica01-abc123'
+        $snapshot = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); ReplicaId = $replicaId; PrimaryId = $script:t4Id } { Get-DemoT4ReplicaMetricSnapshot -Config $Config -ServerId $ReplicaId -PrimaryId $PrimaryId -Minutes 15 }
+
+        $snapshot.Succeeded | Should -BeTrue
+        $snapshot.Peak['physical_replication_delay_in_seconds'] | Should -Be 241
+        $snapshot.Latest['physical_replication_delay_in_seconds'] | Should -Be 12
+        $snapshot.PrimaryPeak['physical_replication_delay_in_bytes'] | Should -Be 524288
+        $script:urls.Count | Should -Be 2
+        $script:paramExisted | Should -BeTrue
+        Test-Path -LiteralPath $script:paramFile | Should -BeFalse -Because 'the private directory goes after the reads'
+    }
+}

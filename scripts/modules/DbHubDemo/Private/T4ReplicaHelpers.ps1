@@ -1072,7 +1072,8 @@ function Get-DemoT4ReplicaMetricSnapshot {
     $primaryPeak = [ordered]@{}
     $newest = $null
     $errors = [System.Collections.Generic.List[string]]::new()
-    $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-t4replicametrics'
+    # At most 20 characters (Initialize-DemoPrivateDirectory); 'dbhub-t4replicametrics' threw live, 2026-11-13.
+    $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-t4replmetrics'
     try {
         $index = 0
         foreach ($read in $reads) {
@@ -1089,7 +1090,10 @@ function Get-DemoT4ReplicaMetricSnapshot {
             foreach ($metric in (Get-DemoMemberList -InputObject $body -Name 'value')) {
                 $name = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $metric -Name 'name') -Name 'value')
                 foreach ($series in (Get-DemoMemberList -InputObject $metric -Name 'timeseries')) {
-                    $points = @(Get-DemoMemberList -InputObject $series -Name 'data' | Where-Object { $null -ne (Get-DemoMemberValue -InputObject $_ -Name 'maximum') })
+                    # Assigned first: Get-DemoMemberList returns its list as one pipeline object, which Where-Object would
+                    # get whole, and every point was left out (live, 2026-11-13).
+                    $data = Get-DemoMemberList -InputObject $series -Name 'data'
+                    $points = @($data | Where-Object { $null -ne (Get-DemoMemberValue -InputObject $_ -Name 'maximum') })
                     if ($points.Count -eq 0) {
                         continue
                     }
