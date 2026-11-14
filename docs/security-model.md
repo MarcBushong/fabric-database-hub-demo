@@ -23,14 +23,14 @@
 | The bootstrap bundle, pinned media, and the Jumpstart image | Integrity of what VMs install. Since 2026-10-20 the bundle travels in Run Command chunks and media comes straight from Microsoft; there's no artifact cache. Since 2026-11-05 the default T2 guest is Arc Jumpstart's image, downloaded from Jumpstart's public storage, verified by its own Content-MD5 and length, and compared with the pinned ETag. |
 | T1's managed identity | A T3 administrator through the P6 group (risk R26) |
 | The GitHub federated credential | Lets workflows act as Contributor on the subscription |
-| Fabric workspace and notebooks | Presenter tooling; can hold a P9 token reference |
+| Fabric workspace and notebooks | Presenter tooling; the control notebook reads the session control's webhook and session secrets from its vault (ADR 0026) |
 | SQL telemetry | Operational metadata about the demo servers. T1's rows arrive under the Compute VM's resource ID and T3's under the database's, so Azure RBAC on those resources governs who can read them (live finding, 2026-10-20). |
 | Script output, Run Command instance views, and deployment history | Where a secret could leak at run time. `Find-DemoSecretLeak` scans them (ADR 0009). `out/` is ignored by Git; the resource IDs in it aren't secrets, but don't publish them. |
 | The `DbHubDemo` module and the VM-side scripts | Everything the operator and the VMs run. The module dot-sources `Private/*.ps1` in alphabetical order, so a second function with the same name silently replaces the first. |
 | The Insights app `APP_DatabaseHub_Insights` (Phase 19b) and its deploy record | The app reads the history model as each signed-in viewer. The deploy stage `out/fabric-app` holds the item ID, the hosting URL, and the app's publishable key; Git holds only placeholders. |
 | The T2 golden snapshot (`rg-<prefix>-golden`, [ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)) | A copy of the whole T2 host: the host's and guest's local password hashes, the host's DPAPI-protected guest password, the guest Arc agent's key for the captured identity, the SQL Server instance with synthetic data, and setup's logs (redacted). `DenyAll` and public network access off, so it can't be exported; captured only after the sign-in cleanup, IE ESC, and the host password rotation; a copy boots air-gapped, resets its Arc identity, and rotates both passwords before it reaches the network. Any Contributor on the subscription can create a disk from it (a recorded deviation: no role assignments, ADR 0008). |
-| The on-demand activity control's webhook URL (`control.enabled` only, [ADR 0020](adr/0020-on-demand-activity-control.md)) | A bearer secret: whoever has it starts a bounded run of the demo. It's kept only as the secret `dbhub-activity-webhook` in `kv-<prefix>-ctl-<suffix>`, which only the A3 users can read; Azure shows it once, and it expires after 90 days by default. |
-| The control's identity `id-<prefix>-automation` (`control.enabled` only) | Its custom role starts and deallocates the demo's VMs, starts and stops T4, and runs commands as SYSTEM on the demo's VMs through managed Run Command, at the demo resource group (A1) and its own Automation account (A2) only. |
+| The session control's webhook URL (every deployment since 2026-11-14, [ADR 0026](adr/0026-one-run-all-session.md); optional before, [ADR 0020](adr/0020-on-demand-activity-control.md)) | A bearer secret: whoever has it starts a bounded run or session of the demo. It's kept only as the secret `dbhub-activity-webhook` in `kv-<prefix>-ctl-<suffix>`, which only the A3 users can read; Azure shows it once, and it expires after 90 days by default. |
+| The control's identity `id-<prefix>-automation` (every deployment since 2026-11-14) | Its custom role starts and deallocates the demo's VMs, starts and stops T4, creates and deletes T4's read replica, reads their metrics, writes the demo resource group's tags (the busy marker), and runs commands as SYSTEM on the demo's VMs through managed Run Command, at the demo resource group (A1) and its own Automation account (A2) only; a second role writes the two session secrets only (A4). |
 | The nightly safety stop's identity `id-<prefix>-<environment>-safetystop` (every deployment, [ADR 0024](adr/0024-nightly-safety-stop.md)) | Its custom role reads the demo resource group, its VMs, T3's database, and T4, and can only deallocate the VMs and stop T4, at the demo resource group only: no start, no Run Command, no data access. Its Automation account has local authentication off, so nothing starts its runbook from outside; only its two schedules do. |
 
 ## Trust boundaries
@@ -50,7 +50,9 @@ flowchart LR
   T1 -->|"HTTPS 443"| MSM["Microsoft-managed telemetry and Hub"]
   GUEST -->|"HTTPS 443 through the host NAT"| MSM
   FAB["Fabric notebooks"] -->|"kusto token"| MSM
-  FAB -.->|"workflow_dispatch with P9 token"| GH
+  CTL["Control notebook, its own workspace"] -->|"managed private endpoint"| CKV["Control vault: webhook URL, session secrets"]
+  CTL -->|"webhook request"| AUTO["Session control runbook"]
+  AUTO -->|"managed identity, A1 to A4"| ARM
   OP -.->|"opt-in only: the one-time host password"| KV["Opt-in Key Vault"]
 ```
 
@@ -63,7 +65,7 @@ flowchart LR
 | B5 | VNet → internet | Deny inbound (`SECURITY.NETWORK.INBOUND` checks the VM and private-endpoint NSGs); outbound limited to HTTPS, KMS, and T1-to-T3 SQL ports, plus platform traffic (DNS, IMDS, licensing) that NSGs allow by default; the FQDN gap is documented (ADR 0007) |
 | B6 | Clients → T3 | Entra-only; TLS 1.2; VNet rule or private endpoint; no "Allow Azure services" |
 | B7 | Tenant → Microsoft-managed previews | Read-only telemetry and inventory flows; Hub needs subscription Reader, and T2's performance data also needs the Arc telemetry role (`Microsoft.AzureArcData/sqlServerInstances/getTelemetry/action`) |
-| B8 | Fabric → GitHub | Optional P9 token from a Key Vault the user owns, scoped to `actions: write` on this repo |
+| B8 | Fabric → GitHub | None since 2026-11-14: the live-activity notebook's GitHub path (the P9 token) is removed ([ADR 0026](adr/0026-one-run-all-session.md)) |
 | B9 | Operator → the opt-in Key Vault (`keyVault.enabled` only) | Off by default. Azure RBAC authorization, no access policies; roles on the vault only (Key Vault Secrets Officer for the caller and `keyVault.operatorObjectIds`, Key Vault Secrets User for `keyVault.readerObjectIds`), which is why the option requires `assignRoles`; the firewall limited to `keyVault.allowedIpRanges` when set; soft delete, and purge protection on request. The scripts write the password from a file in a private temporary directory, never on a command line, and the stop disables it (ADR 0008, ADR 0009). `SECURITY.SECRETS.KEYVAULT` and `SECURITY.RBAC.ROLEASSIGNMENTS` check the vault and its roles. |
 
 ## The token handoff
@@ -184,14 +186,16 @@ Until 2026-11-09, one more token reached the guest outside the scripts: in `Payg
 
 ## The on-demand activity control (Phase 25c)
 
-Optional, off by default ([ADR 0020](adr/0020-on-demand-activity-control.md)). What protects it:
+The session control behind the control notebook's **Run all**: part of every deployment since 2026-11-14 ([ADR 0026](adr/0026-one-run-all-session.md)); optional and off by default before ([ADR 0020](adr/0020-on-demand-activity-control.md)). What protects it:
 
 - **The webhook URL is the only credential**, and it's treated as a secret everywhere: setup gets it from Webhook - Generate Uri, registers it for redaction, and passes it only as a secure template parameter in a private file that's deleted afterwards; the template has no output. The notebook reads it from the vault for one request and prints only the HTTP status and the job ID; a failed request prints its error's type, never its text. `-RotateWebhook` replaces it, and status warns 14 days before it expires.
 - **The request can't widen what runs:** the runbook accepts a JSON object of at most 4 KB with only known fields, allow-listed targets and scenarios from the catalog, capped durations, and one activity per target; it refuses everything else, and refuses a run while another is active. Automation records each request as the job's input, so the notebook sends no credential header.
 - **Every run has its own stop**, created before anything starts, and Stop now, the auto-stop, and the daily T4 safety stop go through Azure Resource Manager only, never Run Command.
 - **The vault:** Standard, Azure RBAC, 7-day soft delete, public network access by the tenant's policy (`control.vaultNetworkMode`): public with per-user roles, or `Disabled` and reached only through the control workspace's managed private endpoint. It has **no diagnostic settings, so there are no data-plane logs** of who read the secret ([Key Vault logging](https://learn.microsoft.com/azure/key-vault/general/logging)). The script never adds a policy's exclusion tag.
 - **The Automation account** keeps public network access and local authentication on, because webhooks need local authentication ([disable local authentication](https://learn.microsoft.com/azure/automation/disable-local-authentication)); it has no system-assigned identity, no variables, and no credentials. The runbooks call Azure Resource Manager only, with the user-assigned identity's token, which lives in one job's memory.
-- **The identity's reach:** the custom role's 22 actions at the demo group and the control account only ([permissions](permissions.md#the-on-demand-activity-control)).
+- **The identity's reach:** the custom role's 27 actions at the demo group and the control account only, and the session writer role's 2 actions at the two session secrets only ([permissions](permissions.md#the-on-demand-activity-control)). It deletes a server only when Azure reports it as T4's read replica, by its configured name.
+- **The session's secrets hold no credential:** `dbhub-session-status` holds the session's plan and progress, and `dbhub-session-metrics` T4's and the replica's Azure Monitor metrics for the history. The runbook writes them through Azure Resource Manager; the control notebook reads them from the control vault, as data, and hands the metrics to the history notebook as a parameter.
+- **The busy marker is bounded:** the `DbHubBusy*` tags on the demo resource group defer the nightly stop for at most 3 hours past their last refresh, so an abandoned session is still stopped the same night ([ADR 0024](adr/0024-nightly-safety-stop.md)).
 
 ## The Jumpstart image (`JumpstartImage` mode, 2026-11-05)
 

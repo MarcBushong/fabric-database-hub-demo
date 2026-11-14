@@ -37,8 +37,8 @@ Step 2, the notebook import (Phase 12; -SkipNotebookImport skips it). For each n
 (NB_DatabaseHub_Deployment and NB_DatabaseHub_LiveActivity), Get-DemoFabricNotebookDefinition validates the
 file and Import-DemoFabricNotebook creates the notebook or overrides its definition through Fabric REST, so
 re-runs converge. The uploaded copy is bound to the resolved lakehouse (ADR 0021); without a resolved lakehouse,
-nothing is imported. Its GITHUB_REPOSITORY and GITHUB_ENVIRONMENT come from github.repository and github.environment,
-unless the repository is still the example configuration's placeholder. With -NewNotebooksOnly, which deploy.ps1
+nothing is imported. NB_DatabaseHub_Deployment's GITHUB_REPOSITORY and GITHUB_ENVIRONMENT come from github.repository
+and github.environment, unless the repository is still the example configuration's placeholder. With -NewNotebooksOnly, which deploy.ps1
 passes while fabric.importNotebooks is false, a notebook that isn't in the workspace yet is imported without asking
 and one that is stays as it is (Not selected).
 The step runs only when the module has those functions; otherwise FABRIC.NOTEBOOKS.IMPORT is
@@ -167,7 +167,7 @@ With -ImportDashboard, skip step 4.
 .PARAMETER RunLiveActivity
 Also run step 5: NB_DatabaseHub_LiveActivity on demand with SAVE_RESULTS true (Invoke-DemoFabricNotebookRun), so
 the lakehouse tables the history report reads (incident windows, telemetry snapshots, validation results) are
-current. It runs analyze-only (CONFIRM and STOP_ACTIVITY false), scoped to the demo's resource group
+current. It runs analyze-only, scoped to the demo's resource group
 (RESOURCE_GROUP, rg-<prefix>-<environment>). It waits up to -TimeoutSeconds (at least 5 minutes) for the job. Step 5
 also runs once by itself when step 2 created the notebook, or bound it to a lakehouse that step 0 created, so a new
 lakehouse gets the tables.
@@ -625,6 +625,8 @@ if ($RunLiveActivity -or $firstRun) {
             $runToken = Get-DemoFabricToken -SubscriptionId $config['subscriptionId']
         }
         $notebookParameters = [ordered]@{
+            # For a notebook imported before 2026-11-14, whose Run all sent an activity request through GitHub: today's
+            # notebook has none of these three (ADR 0026), and a job's extra parameters change nothing in it.
             CONFIRM                    = $false
             STOP_ACTIVITY              = $false
             SAVE_RESULTS               = $true

@@ -52,7 +52,7 @@ Microsoft doesn't document it yet. Every incident scenario runs on T1, T2, or T3
 Performance telemetry arrives a few minutes after the activity: live, T3's first sample came 2.8 minutes after it was created, and T2's 7 minutes after monitoring was turned on. Allow up to 15 minutes, and use `validate.ps1` or the walkthrough's readiness gates before a session.
 
 **Can the notebooks start or stop the demo?**
-Not directly: Fabric notebooks can't get an Azure Resource Manager token. With the optional P9 token, the live-activity notebook triggers the `demo-control` workflow; without it, it prints the command ([ADR 0014](adr/0014-notebook-role-and-capacity.md)).
+Not directly: Fabric notebooks can't get an Azure Resource Manager token. Since 2026-11-14 the session control notebook, `NB_DatabaseHub_Control`, runs a whole demo session through the control's Azure Automation webhook, with one Run all and no GitHub ([ADR 0026](adr/0026-one-run-all-session.md)).
 
 ## Cost and lifecycle
 

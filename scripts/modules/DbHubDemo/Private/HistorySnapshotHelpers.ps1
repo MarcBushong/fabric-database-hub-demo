@@ -22,13 +22,12 @@ function Get-DemoHistorySnapshotParameter {
     Internal.
 
     .DESCRIPTION
-    - CONFIRM false: the notebook's Run all would otherwise send its activity request through GitHub (P9, 240 minutes of
-      business-day), on top of the one the deployment started.
-    - STOP_ACTIVITY false: it never stops what runs.
     - SAVE_RESULTS true, over the last -WindowMinutes (WINDOW_MINUTES): it writes only the lakehouse's history tables.
-    - KEY_VAULT_URL empty: no GitHub token is read.
     - RESOURCE_GROUP: the demo's resource group, which the notebook's queries are scoped to, as stop-demo.ps1 -SaveHistory
       sends it.
+    - CONFIRM and STOP_ACTIVITY false, and KEY_VAULT_URL empty: for a notebook imported before 2026-11-14, whose Run all
+      sent its own activity request through GitHub (P9). Today's notebook has none of them (ADR 0026: it changes no
+      activity), and a job's extra parameters change nothing in it.
     Invoke-DemoFabricNotebookRun adds the resolved WORKSPACE_ID and LAKEHOUSE_ID.
     #>
     [CmdletBinding()]

@@ -181,17 +181,29 @@ Describe 'Notebook <_>' -ForEach $notebookNames {
         $parameters[0].Source | Should -Match '(?m)^LAKEHOUSE_NAME = "LH_DatabaseHub"\s*$'
     }
 
-    It 'defaults GITHUB_REPOSITORY to the public repository, which the import replaces with github.repository' {
+    It 'defaults GITHUB_REPOSITORY to the public repository, which the import replaces with github.repository (the deployment notebook only)' {
+        if ($name -eq 'NB_DatabaseHub_LiveActivity') {
+            # 2026-11-14 (ADR 0026): the live-activity notebook has no GitHub path, so no repository to name.
+            $parameters[0].Source | Should -Not -Match 'GITHUB_'
+            return
+        }
         $parameters[0].Source | Should -Match '(?m)^GITHUB_REPOSITORY = "MarcBushong/fabric-database-hub-demo"\s*$'
     }
 
-    It 'runs on Run all: CONFIRM is True by default, and the switch that stops activity or drops tables stays False (2026-11-03)' {
+    It 'runs on Run all: nothing to switch first, and the switch that drops tables stays False (2026-11-03)' {
         # The owner, 2026-11-03: "We should not default to dry runs anywhere. users should be able to just click run all
         # and then it should run."
-        $parameters[0].Source | Should -Match '(?m)^CONFIRM = True\s*$'
-        $switches = @([regex]::Matches($parameters[0].Source, '(?m)^(STOP_ACTIVITY|PURGE_DEMO_TABLES) = (\w+)'))
-        $switches.Count | Should -Be 1
-        $switches[0].Groups[2].Value | Should -Be 'False'
+        if ($name -eq 'NB_DatabaseHub_LiveActivity') {
+            # 2026-11-14 (ADR 0026): it changes no activity, so it has no CONFIRM and no stop switch; Run all analyzes and saves.
+            $parameters[0].Source | Should -Not -Match '(?m)^(CONFIRM|STOP_ACTIVITY) = '
+            $parameters[0].Source | Should -Match '(?m)^SAVE_RESULTS = True\s*$'
+        }
+        else {
+            $parameters[0].Source | Should -Match '(?m)^CONFIRM = True\s*$'
+            $switches = @([regex]::Matches($parameters[0].Source, '(?m)^(STOP_ACTIVITY|PURGE_DEMO_TABLES) = (\w+)'))
+            $switches.Count | Should -Be 1
+            $switches[0].Groups[2].Value | Should -Be 'False'
+        }
         $nb.Raw | Should -Not -Match 'Run all\*\* is safe|That''s safe|\(the default\) it only prints a dry run|Leave them False'
     }
 
@@ -247,6 +259,12 @@ Describe 'Notebook <_>' -ForEach $notebookNames {
         $mutating = 'submit_simulation_request|dispatch_workflow|drop_demo_tables'
         foreach ($definition in [regex]::Matches($allCode, "(?ms)^def ($mutating)\(.*?(?=^\S)")) {
             $definition.Value | Should -Match 'if not \(?CONFIRM'
+        }
+        if ($name -eq 'NB_DatabaseHub_LiveActivity') {
+            # 2026-11-14 (ADR 0026): no cell changes a resource; it writes only the lakehouse's tables.
+            $nb.Raw | Should -Not -Match 'RESOURCE-CHANGING CELL|Resource-changing cell'
+            $allCode | Should -Not -Match "\b($mutating)\("
+            return
         }
         $flagged = 0
         for ($index = 0; $index -lt $nb.Cells.Count; $index++) {
@@ -504,18 +522,23 @@ Describe 'NB_DatabaseHub_LiveActivity content' {
         $nb = Get-Notebook -Name 'NB_DatabaseHub_LiveActivity'
         $markdown = ($nb.Cells | Where-Object Type -EQ 'markdown' | ForEach-Object Source) -join "`n"
         $allCode = ($nb.Code | ForEach-Object Source) -join "`n"
-        $adrInputs = @('environment', 'target', 'scenario', 'duration', 'concurrency', 'intensity', 'reset-before', 'auto-cleanup')
     }
 
     It 'narrates section <_>' -ForEach @(
-        'Parameters', 'Helpers', 'Simulation control', 'Telemetry access', 'Estate pulse', 'Locks and blocking', 'Overall consumption',
-        'Correlation: scenario windows and telemetry', 'See it in the Hub', 'Optional: Real-Time Dashboard', 'Persist', 'Stop and clean up', 'Next steps'
+        'Parameters', 'Helpers', 'This session', 'Telemetry access', 'Estate pulse', 'Locks and blocking', 'Overall consumption',
+        'Correlation: scenario windows and telemetry', 'See it in the Hub', 'Optional: Real-Time Dashboard', 'Persist', 'Next steps'
     ) {
         $markdown | Should -Match ('(?m)^## \d+\. ' + [regex]::Escape($_) + '$')
     }
 
-    It 'offers the four activity profiles' {
-        $allCode | Should -Match 'PROFILES = \("baseline", "business-day", "off"\)'
+    It 'uses no GitHub and changes no activity: no workflow dispatch, no token, no Key Vault, no P9 (2026-11-14, ADR 0026)' {
+        foreach ($pattern in 'api\.github\.com', 'workflow_dispatch', 'getSecret\(', 'GITHUB_', 'KEY_VAULT_URL', '\bCONFIRM\b', 'STOP_ACTIVITY', 'demo-control\.yml', 'build_simulation_request', 'submit_simulation_request') {
+            # Case-sensitive: scenario_runs keeps its github_run_id and github_run_url columns, empty, for the report's schema.
+            $allCode | Should -Not -MatchExactly $pattern -Because $pattern
+        }
+        $markdown | Should -Not -Match 'P9|demo-control\.yml|workflow_dispatch'
+        $markdown | Should -Match 'uses no GitHub Actions'
+        $markdown | Should -Match 'NB_DatabaseHub_Control'
         $allCode | Should -Match 'profile\.startswith\("incident:"\)'
     }
 
@@ -528,86 +551,80 @@ Describe 'NB_DatabaseHub_LiveActivity content' {
         $dashboard | Should -BeGreaterThan $helpers
     }
 
-    It 'sends only the demo-control.yml inputs that ADR 0011 defines' {
-        $block = [regex]::Match($allCode, '(?s)    inputs = \{(.*?)\n    \}').Groups[1].Value
-        $keys = @([regex]::Matches($block, '"([a-z-]+)":') | ForEach-Object { $_.Groups[1].Value }) + @([regex]::Matches($allCode, 'inputs\["([a-z-]+)"\] =') | ForEach-Object { $_.Groups[1].Value })
-        $keys | Should -Not -BeNullOrEmpty
-        foreach ($key in $keys) {
-            $key | Should -BeIn $adrInputs
-        }
-        $workflow = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath '.github/workflows/demo-control.yml') -Raw
-        $declared = [regex]::Match($workflow, '(?ms)^\s+workflow_dispatch:\s*\n\s+inputs:\s*\n(.*?)(?=^\S|^\s{0,2}\w|\z)')
-        if (-not $declared.Success) {
-            Set-ItResult -Skipped -Because 'demo-control.yml declares no workflow_dispatch inputs yet (Phase 13)'
-            return
-        }
-        foreach ($key in $keys) {
-            $declared.Groups[1].Value | Should -Match ('(?m)^\s+' + [regex]::Escape($key) + ':')
-        }
-    }
-
-    It 'reads the GitHub token only from Key Vault, and only when P9 is configured' {
-        $nb.Code[0].Source | Should -Match '(?m)^KEY_VAULT_URL = ""'
-        foreach ($call in [regex]::Matches($allCode, 'getSecret\(([^)]*)\)')) {
-            $call.Groups[1].Value | Should -Be 'KEY_VAULT_URL, GITHUB_TOKEN_SECRET_NAME'
-        }
-        $allCode | Should -Match 'Refusing to send the GitHub token outside this repository'
-        $allCode | Should -Match 'GITHUB_API = "https://api\.github\.com"'
-    }
-
-    It 'prints the GitHub link and CLI command when P9 is not configured' {
-        $allCode | Should -Match 'def print_manual_trigger'
-        $allCode | Should -Match '"gh", "workflow", "run", GITHUB_WORKFLOW_FILE'
-    }
-
-    It 'sends business-day on every target for 240 minutes on Run all with its defaults, and never the stop (2026-11-03)' {
+    It 'records a control session and its beats as scenario windows, and saves a session only once (ADR 0026)' {
         if (-not $python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
             return
         }
-        # Runs the notebook's own parameters, send, and stop cells, with stand-ins for the helpers that would reach GitHub.
-        $script = Join-Path -Path $TestDrive -ChildPath 'send.py'
+        # The session helpers from part 3 and the session cell, with stand-ins for what needs pandas or Spark.
+        $script = Join-Path -Path $TestDrive -ChildPath 'session.py'
         Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
-import json, sys
+import datetime as dt, json, re, sys, types
 cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
-params = next(cell for cell in cells if cell.startswith("# Parameters cell"))
-send = next(cell for cell in cells if cell.startswith("# RESOURCE-CHANGING CELL: triggers demo-control.yml"))
-stop = next(cell for cell in cells if cell.startswith("# RESOURCE-CHANGING CELL: sets the activity profile to \"off\""))
+part3 = next(cell for cell in cells if cell.startswith("# Helpers, part 3"))
+session_cell = next(cell for cell in cells if cell.startswith("# This session"))
+functions = "\n".join(re.findall(r"(?m)^_SCENARIO_ID = .*$", part3) + re.findall(r"(?ms)^def (?:parse_session_plan|session_requests)\(.*?(?=^\S|\Z)", part3))
 
-def run(**overrides):
-    ns = {}
-    exec(params, ns)
-    ns.update(overrides)
-    sent = []
-    ns["build_simulation_request"] = lambda profile, target, duration, *rest: {"profile": profile, "target": target, "duration_minutes": duration}
-    ns["REQUEST"] = ns["build_simulation_request"](ns["PROFILE"], ns["SIM_TARGET"], ns["DURATION_MINUTES"])
-    ns["LAST_REQUEST"] = None
-    ns["print_simulation_plan"] = lambda request: None
-    ns["submit_simulation_request"] = lambda request: sent.append(request) or dict(request)
-    exec(send, ns)
-    exec(stop, ns)
-    return ns, sent
+def run(session_id, plan, saved=False):
+    exits = []
+    ns = {"json": json, "re": re, "dt": dt, "RUN_ID": "run-1", "NOTEBOOK_NAME": "NB_DatabaseHub_LiveActivity", "SELECTED_TARGETS": ["T1", "T2", "T3"],
+          "SESSION_REQUESTS": [], "SAVE_RESULTS": True, "SESSION_ID": session_id, "SESSION_PLAN": plan,
+          "_parse_utc": lambda text: dt.datetime.fromisoformat(text.replace("Z", "+00:00")),
+          "utc_now": lambda: dt.datetime(2026, 11, 14, 16, 0, tzinfo=dt.timezone.utc),
+          "session_saved": lambda session: saved,
+          "_notebookutils": lambda: types.SimpleNamespace(notebook=types.SimpleNamespace(exit=lambda value: exits.append(value)))}
+    exec(functions, ns)
+    exec(session_cell, ns)
+    return ns, exits
 
-ns, sent = run()
-assert ns["CONFIRM"] is True and ns["STOP_ACTIVITY"] is False, (ns["CONFIRM"], ns["STOP_ACTIVITY"])
-assert sent == [{"profile": "business-day", "target": "all", "duration_minutes": 240}], sent
-ns, sent = run(CONFIRM=False)
-assert sent == [], sent
-ns, sent = run(STOP_ACTIVITY=True)
-assert [item["profile"] for item in sent] == ["business-day", "off"], sent
-print("ok")
+sid = "0123456789abcdef0123456789abcdef"
+plan = json.dumps({"version": 1, "sessionId": sid, "startUtc": "2026-11-14T14:00:00Z", "endUtc": "2026-11-14T15:30:00Z", "beats": [
+    {"target": "T1", "scenario": "blocking-chain", "startUtc": "2026-11-14T14:04:00Z", "endUtc": "2026-11-14T14:14:00Z"},
+    {"target": "T3", "scenario": "resource-governance", "startUtc": "2026-11-14T14:05:00Z", "endUtc": "2026-11-14T14:17:00Z"},
+    {"target": "T4", "scenario": "replica-lag", "startUtc": "2026-11-14T14:59:00Z", "endUtc": "2026-11-14T15:08:00Z"},
+    {"target": "T1", "scenario": "DROP TABLE", "startUtc": "2026-11-14T14:20:00Z", "endUtc": "2026-11-14T14:30:00Z"},
+    {"target": "T2", "scenario": "cpu-pressure", "startUtc": "2026-11-14T14:30:00Z", "endUtc": "2026-11-14T14:20:00Z"}]})
+report = {}
+ns, exits = run("", "")
+report["none"] = {"rows": len(ns["SESSION_REQUESTS"]), "exits": exits}
+ns, exits = run(sid, plan)
+report["session"] = {"rows": [[row["request_id"], row["target"], row["profile"], row["duration_minutes"], row["dispatch_mode"]] for row in ns["SESSION_REQUESTS"]],
+                     "save": ns["SAVE_RESULTS"], "exits": exits}
+ns, exits = run(sid, plan, saved=True)
+report["saved"] = {"rows": len(ns["SESSION_REQUESTS"]), "save": ns["SAVE_RESULTS"], "exits": exits}
+ns, exits = run(sid, "not json")
+report["bad"] = {"rows": [row["profile"] for row in ns["SESSION_REQUESTS"]], "exits": exits}
+print(json.dumps(report))
 '@
         $PSNativeCommandUseErrorActionPreference = $false
         $output = & $python $script $nb.Path 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
-        $markdown | Should -Match 'With `CONFIRM = False` it sends and records nothing'
-        $markdown | Should -Match '\*\*Run all\*\* never stops anything'
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        $report.none.rows | Should -Be 0
+        @($report.none.exits) | Should -BeNullOrEmpty
+        # The session row, then its beats on T1 to T3 as incident windows; T4's beat shows in its own metrics, and a beat
+        # with a bad scenario or window is left out.
+        $rows = @($report.session.rows)
+        $rows.Count | Should -Be 3
+        $rows[0] | Should -Be @('session:0123456789abcdef0123456789abcdef', 'all', 'session', 90, 'session')
+        $rows[1] | Should -Be @('session:0123456789abcdef0123456789abcdef:00', 'T1', 'incident:blocking-chain', 10, 'session')
+        $rows[2] | Should -Be @('session:0123456789abcdef0123456789abcdef:01', 'T3', 'incident:resource-governance', 12, 'session')
+        $report.session.save | Should -BeTrue
+        # A session already saved: nothing is recorded or saved, and the run ends there.
+        $report.saved.rows | Should -Be 0
+        $report.saved.save | Should -BeFalse
+        @($report.saved.exits).Count | Should -Be 1
+        # A plan it can't read keeps the session's own row out too (no window), and never stops the run.
+        @($report.bad.rows) | Should -BeNullOrEmpty
+        @($report.bad.exits) | Should -BeNullOrEmpty
     }
 
-    It 'records each request in scenario_runs and saves telemetry_snapshots and analysis_findings' {
-        $allCode | Should -Match 'write_delta\("scenario_runs", \[record\], replace_run=False\)'
-        $allCode | Should -Match 'write_delta\("telemetry_snapshots"'
-        $allCode | Should -Match 'write_delta\("analysis_findings"'
+    It 'saves telemetry_snapshots, analysis_findings, and the report tables, then a session''s rows in scenario_runs, last' {
+        $persist = @($nb.Code | Where-Object { $_.Source -match '^# Persist:' })[0].Source
+        $persist | Should -Match 'write_delta\("telemetry_snapshots"'
+        $persist | Should -Match 'write_delta\("analysis_findings"'
+        $persist.IndexOf('prepare_report_tables()') | Should -BeLessThan $persist.IndexOf('write_delta("scenario_runs"')
+        $persist | Should -Match 'write_delta\("scenario_runs", SESSION_ROWS, replace_run=False\)'
     }
 
     It 'analyzes blocking, consumption, and T3 log-rate governance with charts' {
@@ -973,7 +990,7 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
     It 'prepares the report tables in the persist cell, after both writes and only when SAVE_RESULTS is True' {
         $persist = @($live.Code | Where-Object { $_.Source -match '^# Persist:' })
         $persist.Count | Should -Be 1
-        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+else:'
+        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS, replace_run=False\)\s+else:'
     }
 
     It 'creates missing tables, adds and backfills report_date_utc in UTC, and compacts tables with many files' {
@@ -1019,7 +1036,7 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
         ([regex]::Matches($liveCode, '(?m)^def expected_signals\(')).Count | Should -Be 1
     }
 
-    It 'knows every incident scenario in scenarios/ with its default target and expected signal' {
+    It 'knows every incident scenario in scenarios/ with its expected signal' {
         $scenarioFolder = Join-Path -Path $repoRoot -ChildPath 'scenarios'
         # T4-only scenarios (connection-surge, idle-in-transaction, replica-lag) have no scenario windows here: T4's metrics
         # aren't in the telemetry endpoint. Its history comes from POSTGRES_METRICS instead (ADR 0025).
@@ -1027,13 +1044,8 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
                 $_.Name -ne 'healthy-baseline' -and @((Get-Content -LiteralPath (Join-Path -Path $_.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json).targets.applicable | Where-Object { $_ -ne 'T4' }).Count -gt 0
             })
         $scenarios.Count | Should -BeGreaterThan 5
-        $known = [regex]::Match($liveCode, '(?s)KNOWN_SCENARIOS = \((.*?)\)').Groups[1].Value
-        $defaults = [regex]::Match($liveCode, '(?s)SCENARIO_DEFAULT_TARGET = \{(.*?)\}').Groups[1].Value
         $signals = [regex]::Match($liveCode, '(?s)SCENARIO_SIGNALS = \{(.*?)\n\}').Groups[1].Value
         foreach ($scenario in $scenarios) {
-            $definition = Get-Content -LiteralPath (Join-Path -Path $scenario.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json
-            $known | Should -Match ('"{0}"' -f [regex]::Escape($scenario.Name))
-            $defaults | Should -Match ('"{0}": "{1}"' -f [regex]::Escape($scenario.Name), @($definition.targets.default)[0])
             $signals | Should -Match ('"{0}": \(' -f [regex]::Escape($scenario.Name))
         }
         $signals | Should -Match '"resource-governance": \("cpu",\)'

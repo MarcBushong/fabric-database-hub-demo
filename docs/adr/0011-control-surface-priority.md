@@ -57,7 +57,7 @@
 **Priority 2: Fabric notebooks** (ADR 0014).
 
 - `NB_DatabaseHub_Deployment` is the deployment companion, validator, and presenter script.
-- `NB_DatabaseHub_LiveActivity` switches activity profiles through `workflow_dispatch` with the P9 token. Without P9, it prints the Actions link and the CLI command.
+- `NB_DatabaseHub_LiveActivity` switches activity profiles through `workflow_dispatch` with the P9 token. Without P9, it prints the Actions link and the CLI command. **Retired 2026-11-14** ([ADR 0026](0026-one-run-all-session.md)): a demo session needs no GitHub. The control notebook's **Run all** runs the session through the session control's runbook, and the live-activity notebook analyzes and saves only.
 
 **Priority 3: PowerShell CLI.**
 
@@ -130,7 +130,7 @@ As built, with the differences from the decision above:
 ## Consequences
 
 - **Positive:** one code path to test. The local path needs no administrator. Schedules keep compute running only around demos.
-- **Negative:** the schedules, notebook triggering, and one-click Actions depend on the optional P7 and P9.
+- **Negative:** the schedules, notebook triggering, and one-click Actions depend on the optional P7 and P9. Since 2026-11-14 notebook triggering doesn't: P9 is retired, and a session runs from the control notebook with no GitHub ([ADR 0026](0026-one-run-all-session.md)).
 
 ## Validation
 

@@ -463,8 +463,9 @@ function Save-DemoFabricHistory {
     The workspace and lakehouse are resolved by name, read-only (Resolve-DemoFabricConfig without -Create). A capacity
     that isn't running is Manual action required (FABRIC.P5.CAPACITY), also when Fabric refused the lakehouse list because
     of it (evidence capacityInactive; live finding, 2026-11-10), which doesn't mean the lakehouse is missing. The run
-    (Invoke-DemoFabricNotebookRun) uses the notebook's safe switches: SAVE_RESULTS true, CONFIRM and STOP_ACTIVITY false,
-    no Key Vault, so it writes only the lakehouse's history tables. Returns Result and StillRunning (the run hadn't
+    (Invoke-DemoFabricNotebookRun) saves only: SAVE_RESULTS true, and, for a notebook imported before 2026-11-14 whose Run
+    all sent an activity request through GitHub, CONFIRM and STOP_ACTIVITY false and no Key Vault, which today's notebook
+    doesn't have (ADR 0026). It writes only the lakehouse's history tables. Returns Result and StillRunning (the run hadn't
     finished when the wait ended, so the capacity mustn't be paused under it).
     #>
     [CmdletBinding()]
@@ -494,8 +495,8 @@ function Save-DemoFabricHistory {
             StillRunning = $StillRunning
         }
     }
-    # CONFIRM is True by default since 2026-11-03 (no dry-run defaults), so a run by hand that only saves sets it to False.
-    $manualRun = 'In Fabric, open NB_DatabaseHub_LiveActivity in the demo''s workspace, set CONFIRM = False in its parameters cell (it''s True by default, so Run all would also send its activity request to the stopped VMs), and select Run all: it then writes only the lakehouse''s history tables.'
+    # Since 2026-11-14 the notebook changes no activity (ADR 0026), so its Run all only analyzes and saves.
+    $manualRun = 'In Fabric, open NB_DatabaseHub_LiveActivity in the demo''s workspace and select Run all: it writes only the lakehouse''s history tables.'
     try {
         $token = Get-DemoFabricToken -SubscriptionId ([string]$Config['subscriptionId'])
     }

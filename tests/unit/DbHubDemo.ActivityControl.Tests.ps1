@@ -28,8 +28,6 @@ BeforeAll {
         'Microsoft.DBforPostgreSQL/flexibleServers/write'
         'Microsoft.DBforPostgreSQL/flexibleServers/delete'
         'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'
-        'Microsoft.Network/virtualNetworks/subnets/join/action'
-        'Microsoft.Network/privateDnsZones/join/action'
         'Microsoft.Insights/metrics/read'
         'Microsoft.Resources/tags/write'
         'Microsoft.Automation/automationAccounts/read'
@@ -1230,7 +1228,7 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -NowUtc $script:now)
         $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
         $definition.status | Should -Be 'Warning'
-        $definition.message | Should -Match 'lacks 7 of its approved actions'
+        $definition.message | Should -Match 'lacks 5 of its approved actions'
         $definition.message | Should -Match 'runs without T4''s read replica'
         $a4 = $results | Where-Object checkId -EQ 'CONTROL.ROLE.A4'
         $a4.status | Should -Be 'Warning'

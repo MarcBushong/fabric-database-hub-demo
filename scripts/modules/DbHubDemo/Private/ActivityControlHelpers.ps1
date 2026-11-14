@@ -11,8 +11,8 @@
 #   it's a read replica).
 # - flexibleServers/configurations/write: the replica's max_standby_streaming_delay; it could change any server
 #   parameter of T4 or the replica.
-# - virtualNetworks/subnets/join/action and privateDnsZones/join/action: the replica joins T4's delegated subnet and
-#   private DNS zone, as T4 does; they could put another resource in the demo's subnets and zones.
+# - No network join action: the replica's create names T4's delegated subnet and private DNS zone, and Azure created it
+#   without virtualNetworks/subnets/join/action or privateDnsZones/join/action (live, 2026-11-14), so neither is granted.
 # - Microsoft.Insights/metrics/read: T4's and the replica's Azure Monitor metrics for the history; read-only.
 # - Microsoft.Resources/tags/write: the busy marker and the session's ID on the demo resource group (the safety stop
 #   honors the marker); it could change any tag in the demo resource group, the deploymentId included.
@@ -35,8 +35,6 @@ $script:ActivityControlRoleActions = @(
     'Microsoft.DBforPostgreSQL/flexibleServers/write'
     'Microsoft.DBforPostgreSQL/flexibleServers/delete'
     'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'
-    'Microsoft.Network/virtualNetworks/subnets/join/action'
-    'Microsoft.Network/privateDnsZones/join/action'
     'Microsoft.Insights/metrics/read'
     'Microsoft.Resources/tags/write'
     'Microsoft.Automation/automationAccounts/read'
@@ -64,8 +62,6 @@ $script:ActivityControlActionReach = [ordered]@{
     'Microsoft.DBforPostgreSQL/flexibleServers/write'                 = 'creates T4''s read replica; it could also change T4, which the runbook never does'
     'Microsoft.DBforPostgreSQL/flexibleServers/delete'                = 'deletes T4''s read replica after a session; it could also delete T4, which the runbook never does (it deletes only a server whose replicationRole says it''s a read replica)'
     'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'  = 'sets the replica''s max_standby_streaming_delay; it could change any server parameter of T4 or the replica'
-    'Microsoft.Network/virtualNetworks/subnets/join/action'           = 'puts the replica in T4''s delegated subnet; it could put another resource in the demo''s subnets'
-    'Microsoft.Network/privateDnsZones/join/action'                   = 'registers the replica in T4''s private DNS zone; it could register another resource there'
     'Microsoft.Insights/metrics/read'                                 = 'reads T4''s and the replica''s Azure Monitor metrics for the history; read-only'
     'Microsoft.Resources/tags/write'                                  = 'marks the demo busy for the nightly stop and records the session; it could change any tag in the demo resource group'
     'Microsoft.KeyVault/vaults/secrets/read'                          = 'reads the session secrets'' properties (never their values through Azure Resource Manager); at those two secrets only'
@@ -434,9 +430,11 @@ function Get-DemoActivityControlProfile {
     $profiles = [ordered]@{}
     foreach ($name in @('showcase')) {
         $definition = $definitions['profiles'][$name]
+        # cycleMinutes (2026-11-14): a session cut short by the VMs' auto-shutdown ends after whole cycles, so no beat is cut.
         $profiles[$name] = [ordered]@{
             maxMinutes     = [int]$definition['maxDurationMinutes']
             defaultMinutes = [int]$definition['defaultDurationMinutes']
+            cycleMinutes   = [int]$definition['cycleMinutes']
             targets        = @($definition['incidents'] | ForEach-Object { [string]$_['target'] } | Sort-Object -Unique)
         }
     }
@@ -1544,12 +1542,86 @@ function New-DemoActivityControlWebhook {
     return (New-DemoResult -CheckId 'CONTROL.WEBHOOK' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The webhook {0} starts {1} until {2:yyyy-MM-dd}; its URL is only in the secret {3} ({4}), never printed.{5}' -f $webhookName, $Name.ControlRunbook, $expiry, $Name.Secret, $Name.KeyVault, $(if ($removed.Count) { ' Replaced: ' + ($removed -join ', ') + '.' } else { '' })) -Evidence $evidence -DocUrl $doc)
 }
 
+function Get-DemoActivityControlSessionRule {
+    <#
+    .SYNOPSIS
+    The session's rules for the control notebook's plan (2026-11-14), from the runbook's settings: the minimum minutes,
+    the margin before the VMs' auto-shutdown, the auto-stop's buffer, and the auto-shutdown itself, with its zone's IANA
+    name for Python (zoneinfo), which knows no Windows time zone ID. Internal and pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Setting
+    )
+
+    $zone = [string]$Setting['autoShutdownTimeZone']
+    $iana = ''
+    if ($zone -and -not [System.TimeZoneInfo]::TryConvertWindowsIdToIanaId($zone, [ref]$iana)) {
+        $iana = if ($zone -match '^[A-Za-z_]+(/[A-Za-z0-9_+-]+)+$' -or $zone -eq 'UTC') { $zone } else { '' }
+    }
+    return [ordered]@{
+        minMinutes            = [int]$Setting['minSessionMinutes']
+        shutdownMarginMinutes = [int]$Setting['shutdownMarginMinutes']
+        autoStopBufferMinutes = [int]$Setting['autoStopBufferMinutes']
+        autoShutdownTime      = [string]$Setting['autoShutdownTime']
+        autoShutdownTimeZone  = $zone
+        autoShutdownIana      = $(if ($iana) { $iana } else { 'UTC' })
+    }
+}
+
+function Get-DemoActivityControlShowcase {
+    <#
+    .SYNOPSIS
+    The showcase's beats for the control notebook's guide (2026-11-14), from scenarios/activity-profiles.json: its cycle,
+    each incident slot as the runner reads it (target, scenario, startMinute, durationMinutes, and cycles, tier, and
+    replica when set), and each scenario's title and the first Database Hub signal it fills (scenarios/<id>/scenario.json).
+    Internal and pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param()
+
+    $definition = (Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'scenarios/activity-profiles.json') -Raw | ConvertFrom-Json -AsHashtable)['profiles']['showcase']
+    $slots = [System.Collections.Generic.List[object]]::new()
+    $scenarios = [ordered]@{}
+    foreach ($incident in @($definition['incidents'])) {
+        $slot = [ordered]@{ target = [string]$incident['target']; scenario = [string]$incident['scenario']; startMinute = [int]$incident['startMinute']; durationMinutes = [int]$incident['durationMinutes'] }
+        foreach ($key in 'cycles', 'tier') {
+            if ($incident.ContainsKey($key)) {
+                $slot[$key] = [string]$incident[$key]
+            }
+        }
+        if ($incident.ContainsKey('replica')) {
+            $slot['replica'] = [bool]$incident['replica']
+        }
+        $slots.Add($slot)
+        if (-not $scenarios.Contains($slot['scenario'])) {
+            # The first signal for the SQL targets and the first for T4 (its text starts with "T4"), Performance first:
+            # what the guide says each beat fills.
+            $scenario = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath ('scenarios/{0}/scenario.json' -f $slot['scenario'])) -Raw | ConvertFrom-Json -AsHashtable
+            $signals = @($scenario['expectedHubSignals'] | Sort-Object -Stable -Property { if ($_['surface'] -eq 'Performance') { 0 } else { 1 } })
+            $entry = [ordered]@{ title = [string]$scenario['title'] }
+            foreach ($kind in 'sql', 't4') {
+                $match = @($signals | Where-Object { ([string]$_['signal']).StartsWith('T4') -eq ($kind -eq 't4') }) | Select-Object -First 1
+                if ($null -ne $match) {
+                    $entry[$kind] = [ordered]@{ surface = [string]$match['surface']; signal = [string]$match['signal'] }
+                }
+            }
+            $scenarios[$slot['scenario']] = $entry
+        }
+    }
+    return [ordered]@{ cycleMinutes = [int]$definition['cycleMinutes']; incidents = $slots.ToArray(); scenarios = $scenarios }
+}
+
 function Get-DemoActivityControlNotebook {
     <#
     .SYNOPSIS
     The control notebook (fabric/control/NB_DatabaseHub_Control.ipynb) with its parameters cell filled for this
-    environment: the vault URL, the demo's names, and the catalog the runbook allows. No secret goes in: the notebook
-    reads the webhook URL from the vault at run time. Returns a Fabric notebook definition (Get-DemoFabricNotebookDefinition).
+    environment: the vault URL and its secrets' names, the demo's names, its tenant and Fabric workspace, the rules the
+    runbook applies (the catalog and the session's), and the showcase's beats. No secret goes in: the notebook reads the
+    webhook URL from the vault at run time. Returns a Fabric notebook definition (Get-DemoFabricNotebookDefinition).
     Internal.
     #>
     [CmdletBinding()]
@@ -1559,21 +1631,32 @@ function Get-DemoActivityControlNotebook {
         [pscustomobject] $Name,
 
         [Parameter(Mandatory)]
-        [System.Collections.IDictionary] $Setting
+        [System.Collections.IDictionary] $Setting,
+
+        [AllowEmptyString()]
+        [string] $TenantId = '',
+
+        [AllowEmptyString()]
+        [string] $DemoWorkspaceId = ''
     )
 
     $path = Join-Path -Path $script:RepoRoot -ChildPath 'fabric/control/NB_DatabaseHub_Control.ipynb'
     $notebook = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
-    $catalog = [ordered]@{ targets = @($Setting['targets'].Keys); scenarios = $Setting['scenarios']; profiles = $Setting['profiles']; minDurationMinutes = $Setting['minDurationMinutes']; maxDurationMinutes = $Setting['maxDurationMinutes'] }
+    $catalog = [ordered]@{ targets = @($Setting['targets'].Keys); scenarios = $Setting['scenarios']; profiles = $Setting['profiles']; minDurationMinutes = $Setting['minDurationMinutes']; maxDurationMinutes = $Setting['maxDurationMinutes']; session = (Get-DemoActivityControlSessionRule -Setting $Setting) }
     $values = [ordered]@{
         KEY_VAULT_URL       = $Name.KeyVaultUri
         WEBHOOK_SECRET_NAME = $Name.Secret
+        STATUS_SECRET_NAME  = $Name.StatusSecret
+        METRICS_SECRET_NAME = $Name.MetricsSecret
         RESOURCE_GROUP      = $Name.DemoResourceGroup
         T1_VM_NAME          = 'sqlvm01'
         T2_MACHINE_NAME     = [string]$Setting['t2GuestName']
         T3_SERVER_PREFIX    = [string]$Setting['t3ServerPrefix']
         DEMO_DATABASE       = [string]$Setting['demoDatabase']
+        TENANT_ID           = $TenantId.ToLowerInvariant()
+        DEMO_WORKSPACE_ID   = $DemoWorkspaceId.ToLowerInvariant()
         CATALOG_JSON        = (ConvertTo-Json -InputObject $catalog -Depth 8 -Compress)
+        SHOWCASE_JSON       = (ConvertTo-Json -InputObject (Get-DemoActivityControlShowcase) -Depth 8 -Compress)
     }
     $cell = @($notebook['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' }) | Select-Object -First 1
     if ($null -eq $cell) {
@@ -1588,7 +1671,7 @@ function Get-DemoActivityControlNotebook {
         }
         $comment = ''
         $match = [regex]::Match($lines[$index], '\s+#.*$')
-        if ($key -ne 'CATALOG_JSON' -and $match.Success) {
+        if ($key -notin 'CATALOG_JSON', 'SHOWCASE_JSON' -and $match.Success) {
             $comment = $match.Value.TrimEnd("`n")
         }
         $lines[$index] = '{0} = {1}{2}{3}' -f $key, $literal, $comment, $(if ($lines[$index].EndsWith("`n")) { "`n" } else { '' })
@@ -1678,7 +1761,7 @@ function Set-DemoActivityControlFabric {
     $results = [System.Collections.Generic.List[object]]::new()
     $base = $script:FabricApiBaseUri
     $add = { param([string] $CheckId, [string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence, [string] $Remediation, [string] $DocUrl) $results.Add((New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $DocUrl)) }
-    $notebook = Get-DemoActivityControlNotebook -Name $Name -Setting $Setting
+    $notebook = Get-DemoActivityControlNotebook -Name $Name -Setting $Setting -TenantId ([string]$Config['tenantId'])
     if ($WhatIfPreference -or -not $Token) {
         $plan = if ($Mode -eq 'public') { ('the folder "{0}" in the existing workspace, with {1} in it' -f $Name.FabricFolder, $Name.Notebook) } else { ('the workspace "{0}" on the existing workspace''s capacity, a managed private endpoint to {1} approved on the vault, and {2} in it' -f $Name.FabricWorkspace, $Name.KeyVault, $Name.Notebook) }
         & $add 'CONTROL.FABRIC.NOTEBOOK' 'Not selected' ('What if: {0} would be created through the Fabric REST API; the capacity is never resumed, paused, or scaled.' -f $plan) ([ordered]@{ mode = $Mode; notebookSha256 = $notebook.Sha256 }) '' 'https://learn.microsoft.com/rest/api/fabric/core/items/create-item'
@@ -1692,6 +1775,8 @@ function Set-DemoActivityControlFabric {
         & $add 'CONTROL.FABRIC.NOTEBOOK' 'Manual action required' ('The demo''s Fabric workspace isn''t resolved, so the control notebook wasn''t imported. {0}' -f $why).Trim() @{} 'Run ./scripts/configure-fabric.ps1 or ./scripts/deploy.ps1 first (they create the workspace when fabric.createIfMissing is true), then run setup-activity-control.ps1 again.' 'https://learn.microsoft.com/rest/api/fabric/core/workspaces/list-workspaces'
         return $results.ToArray()
     }
+    # The notebook runs the activity notebook's job in the demo's workspace and links to its report (2026-11-14).
+    $notebook = Get-DemoActivityControlNotebook -Name $Name -Setting $Setting -TenantId ([string]$Config['tenantId']) -DemoWorkspaceId $sharedId
     $Config = $resolution.Config
     $workspaceCheck = @(Test-DemoFabricWorkspace -Config $Config -Token $Token)
     $capacity = @($workspaceCheck | Where-Object { $_.checkId -eq 'FABRIC.P5.CAPACITY' }) | Select-Object -First 1
@@ -1743,7 +1828,7 @@ function Set-DemoActivityControlFabric {
             return $results.ToArray()
         }
         else {
-            $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces' -f $base) -Body ([ordered]@{ displayName = $Name.FabricWorkspace; description = 'On-demand activity control for the Database Hub demo (ADR 0020): the control notebook and its managed private endpoint to the control vault.'; capacityId = $capacityId }) -Token $Token -NotIdempotent
+            $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces' -f $base) -Body ([ordered]@{ displayName = $Name.FabricWorkspace; description = 'The Database Hub demo''s session control (ADR 0026): NB_DatabaseHub_Control, whose Run all runs a whole demo session, and its managed private endpoint to the control vault.'; capacityId = $capacityId }) -Token $Token -NotIdempotent
             if ($created.StatusCode -notin 200, 201) {
                 & $add 'CONTROL.FABRIC.WORKSPACE' 'Fail' ('The workspace "{0}" couldn''t be created: {1}' -f $Name.FabricWorkspace, (Get-DemoFabricErrorText -Response $created)) @{} 'Creating a workspace needs the Fabric tenant setting that allows it and a role on the capacity; then run setup-activity-control.ps1 again.' $workspaceDoc
                 return $results.ToArray()
@@ -1804,7 +1889,7 @@ function Set-DemoActivityControlFabric {
         }
     }
 
-    $import = @{ WorkspaceId = $targetWorkspace; Notebook = $notebook; Token = $Token; Description = 'On-demand activity control for the Database Hub demo (ADR 0020), imported by scripts/setup-activity-control.ps1.'; Confirm = $false }
+    $import = @{ WorkspaceId = $targetWorkspace; Notebook = $notebook; Token = $Token; Description = 'One Run all runs a whole Database Hub demo session (ADR 0026); imported by deploy.ps1.'; Confirm = $false }
     if ($folderId) {
         $import['FolderId'] = $folderId
     }

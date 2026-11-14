@@ -131,8 +131,6 @@ One custom role, assignable only in the configured subscription, with exactly th
 - `Microsoft.DBforPostgreSQL/flexibleServers/write` (2026-11-14, [ADR 0026](0026-one-run-all-session.md))
 - `Microsoft.DBforPostgreSQL/flexibleServers/delete` (2026-11-14)
 - `Microsoft.DBforPostgreSQL/flexibleServers/configurations/write` (2026-11-14)
-- `Microsoft.Network/virtualNetworks/subnets/join/action` (2026-11-14)
-- `Microsoft.Network/privateDnsZones/join/action` (2026-11-14)
 - `Microsoft.Insights/metrics/read` (2026-11-14)
 - `Microsoft.Resources/tags/write` (2026-11-14)
 - `Microsoft.Automation/automationAccounts/read`

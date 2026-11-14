@@ -28,8 +28,9 @@ flowchart LR
   subgraph GH["GitHub (optional, P7)"]
     ACT["Workflows: deploy, demo-control, schedules, destroy"]
   end
-  subgraph CTRL["rg-prefix-control (optional)"]
-    UAMI["GitHub identity and federated credentials"]
+  subgraph CTRL["rg-prefix-control"]
+    UAMI["GitHub identity and federated credentials (optional)"]
+    AUTO["Session control: Automation runbook and private vault (ADR 0026)"]
   end
   subgraph RG["rg-prefix-env (one resource group)"]
     BUD["Budget with alerts"]
@@ -51,6 +52,7 @@ flowchart LR
   subgraph FAB["Fabric workspace on F or Trial capacity"]
     NB1["NB_DatabaseHub_Deployment"]
     NB2["NB_DatabaseHub_LiveActivity"]
+    NB3["NB_DatabaseHub_Control: one Run all per session"]
     LH["LH_DatabaseHub Delta tables"]
   end
   AG["Fallback agents: Copilot CLI or VS Code with microsoft-sql-fdh and microsoft-sql"]
@@ -68,7 +70,9 @@ flowchart LR
   TEL --> HUB
   RG -.->|"Azure Resource Graph"| HUB
   NB2 -->|"KQL with kusto token"| TEL
-  NB2 -.->|"workflow_dispatch (P9)"| ACT
+  NB3 -->|"webhook, status and metrics secrets"| AUTO
+  AUTO -->|"start, replica, stop; ARM only"| RG
+  NB3 -->|"job at the session's end"| NB2
   NB1 --> LH
   NB2 --> LH
   AG --> HUB
