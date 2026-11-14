@@ -191,6 +191,8 @@ All notable changes to this project are recorded here. The format follows [Keep 
     - A new deployment's replica went out while T4 was still restarting for `max_connections`, because the restart's pending flag cleared first, and Azure refused it (`ReadReplicaServerInUnexpectedState`). The replica now waits for T4 to read Ready, and a refusal of that kind is retried at the same size, at most 3 times, never taken for a size refusal.
     - An environment's upgrade resumed past the new Replica step, which the status page showed as "Finished in an earlier run". A resume now runs it until the environment has the replica.
     - After a replica Azure refused, the Replica step still recorded that the environment had the replica's lifecycle, so the next resume skipped it too. The record now waits until the replica is created (or isn't supported, on a Burstable T4), and the resume runs the step again on T4's row.
+    - An upgrade that resumed an unfinished run skipped the template, so T1's settings, which came from the older template's outputs, didn't have the replica's name, and the runner refused `replica-lag` ("T4's read replica isn't known"). A resume now adds the name and FQDN to T1's settings from those outputs, as the template does.
+    - The replica's metric reader stopped T4's Replica step right after the replica was created (a private directory prefix over the 20 characters allowed), and dropped every point (a list piped whole), so `METRICS.T4.REPLICA` would always have read no data; both are fixed, with a test that runs the reader.
 
 ### Changed
 

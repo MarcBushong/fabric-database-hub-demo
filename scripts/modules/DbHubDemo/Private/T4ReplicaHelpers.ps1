@@ -21,6 +21,45 @@ function Get-DemoT4ReplicaSetting {
     return (Get-DemoPostgresSetting)['replica']
 }
 
+function Add-DemoT4ReplicaLoaderSetting {
+    <#
+    .SYNOPSIS
+    T1's loader settings with T4's read replica (t4.replicaServerName and t4.replicaServerFqdn), when a run reads them from
+    the outputs of a template deployment that predates the replica (2026-11-13 live finding): a resumed upgrade skips the
+    template, so T1 never got the replica's name, and the replica-lag beat was refused. Computed as infra/modules/demo.bicep
+    does: no FQDN for a Burstable T4. Returns the settings, with the names added or as they were. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $LoaderSettings
+    )
+
+    $t4 = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $LoaderSettings -Name 'sqlVm') -Name 't4'
+    if ($null -eq $t4 -or $null -ne (Get-DemoMemberValue -InputObject $t4 -Name 'replicaServerName')) {
+        return $LoaderSettings
+    }
+    $names = Get-DemoT4ReplicaName -Config $Config
+    if (-not $names.ServerName) {
+        return $LoaderSettings
+    }
+    $fqdn = if ((Get-DemoT4SkuName -Config $Config) -like 'Standard_B*') { '' } else { [string]$names.Fqdn }
+    if ($t4 -is [System.Collections.IDictionary]) {
+        $t4['replicaServerName'] = [string]$names.ServerName
+        $t4['replicaServerFqdn'] = $fqdn
+    }
+    else {
+        $t4 | Add-Member -NotePropertyName 'replicaServerName' -NotePropertyValue ([string]$names.ServerName) -Force
+        $t4 | Add-Member -NotePropertyName 'replicaServerFqdn' -NotePropertyValue $fqdn -Force
+    }
+    Write-DemoLog -Message ('The last template deployment predates T4''s read replica, so T1''s settings get its name from this run: {0}.' -f $names.ServerName)
+    return $LoaderSettings
+}
+
 function Get-DemoT4ReplicaName {
     <#
     .SYNOPSIS

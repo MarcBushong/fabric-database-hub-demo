@@ -373,3 +373,35 @@ Describe 'Reading the replica''s metrics from Azure Monitor (live, 2026-11-13)' 
         Test-Path -LiteralPath $script:paramFile | Should -BeFalse -Because 'the private directory goes after the reads'
     }
 }
+
+Describe 'A resumed upgrade gives T1 the replica''s name the older template didn''t (live, 2026-11-13)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaName -MockWith { [pscustomobject]@{ ServerName = 'pgreplica01-abc123'; Fqdn = 'pgreplica01-abc123.postgres.database.azure.com' } }
+    }
+
+    It 'adds the replica''s name and FQDN to T1''s settings from an older template''s outputs: <Name>' -ForEach @(
+        @{ Name = 'General Purpose'; Sku = 'Standard_D4ds_v5'; Fqdn = 'pgreplica01-abc123.postgres.database.azure.com' }
+        @{ Name = 'Burstable, as the template does'; Sku = 'Standard_B2s'; Fqdn = '' }
+    ) {
+        $script:sku = $Sku
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SkuName -MockWith { $script:sku }
+        # The shape az deployment sub show returns: a main-era template's T1 settings, with T4 but no replica.
+        $outputs = '{"sqlVm":{"role":"SqlVm","t4":{"serverName":"pgflex01-abc123","serverFqdn":"pgflex01-abc123.postgres.database.azure.com","databaseName":"contosocare","runnerRole":"dbhub-runner"}},"host":{"role":"ArcHost"}}' | ConvertFrom-Json
+        $settings = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Settings = $outputs } { Add-DemoT4ReplicaLoaderSetting -Config $Config -LoaderSettings $Settings }
+        $settings.sqlVm.t4.replicaServerName | Should -Be 'pgreplica01-abc123'
+        $settings.sqlVm.t4.replicaServerFqdn | Should -Be $Fqdn
+        $settings.sqlVm.t4.serverName | Should -Be 'pgflex01-abc123' -Because 'the rest stays as the template wrote it'
+    }
+
+    It 'leaves settings alone that have the replica already, or no T4' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SkuName -MockWith { 'Standard_D4ds_v5' }
+        $current = '{"sqlVm":{"t4":{"serverName":"pgflex01-abc123","replicaServerName":"pgreplica01-abc123","replicaServerFqdn":""}}}' | ConvertFrom-Json
+        $same = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Settings = $current } { Add-DemoT4ReplicaLoaderSetting -Config $Config -LoaderSettings $Settings }
+        $same.sqlVm.t4.replicaServerFqdn | Should -Be '' -Because 'what the template wrote wins'
+        $noT4 = '{"sqlVm":{"role":"SqlVm"}}' | ConvertFrom-Json
+        $plain = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Settings = $noT4 } { Add-DemoT4ReplicaLoaderSetting -Config $Config -LoaderSettings $Settings }
+        $plain.sqlVm.PSObject.Properties.Name | Should -Not -Contain 't4'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaName -Times 0 -Exactly
+    }
+}

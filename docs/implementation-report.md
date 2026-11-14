@@ -2357,6 +2357,9 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
       - Now a resume runs the Replica step until the environment has the replica (`DbHubT4Replica`).
     - **The new deployment's resume, after the refusal above:** the Replica step had recorded `DbHubT4Replica` whatever its outcome, so the resume skipped it as well, and only DONE's gate would have created the replica, out of sight of T4's row.
       - Now the step records it only once the replica is created, or isn't supported on a Burstable T4, so a resume runs a failed one again, on T4's row.
+    - **The upgrade, after its replica was created** (`pgreplica01-aka7ep`, AsyncReplica at T4's `Standard_D4ds_v5`, from the resume's Replica step on the environment `main` deployed):
+      - T4's Replica step stopped right after the creation: `Get-DemoT4ReplicaMetricSnapshot`'s private directory prefix had 22 characters, over the 20 that `Initialize-DemoPrivateDirectory` allows. Its new test found that it also piped `Get-DemoMemberList`'s list whole into `Where-Object`, so every point was dropped and `METRICS.T4.REPLICA`, a DONE requirement, would always have read no data. Both are fixed (ed1a394); no test had run the reader, whose callers are mocked one level up.
+      - `replica-lag` was refused on T1 ("replica-lag needs T4's read replica, and T4's read replica isn't known"): the upgrade resumed `main`'s unfinished run, which skips the template, so T1's settings came from the older template's outputs, without the replica's name. A resume now adds `t4.replicaServerName` and `t4.replicaServerFqdn` to them (`Add-DemoT4ReplicaLoaderSetting`), as the template does; T1's loader runs again on such an upgrade, because its bundle changed. `demo-control.ps1` had reported **Pass** for setting the profile; the refusal shows in the runner's log on `sqlvm01` only.
 
 **Changed files.**
 

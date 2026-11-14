@@ -1036,10 +1036,11 @@ function Invoke-DemoParallelDeployment {
         }
         & $ensureContext
 
-        # The loader settings come from the template; a run that skipped it reads the last deployment's outputs.
+        # The loader settings come from the template; a run that skipped it reads the last deployment's outputs, which
+        # an older template wrote without T4's read replica (2026-11-13 live finding: Add-DemoT4ReplicaLoaderSetting).
         if ($null -eq $loaderSettings -and $needsArtifacts) {
             $outputs = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('deployment', 'sub', 'show', '--name', (Get-DemoMainDeploymentName -Config $Config), '--query', 'properties.outputs.loaderSettings.value', '--output', 'json') -AsJson -AllowFailure
-            $loaderSettings = $outputs
+            $loaderSettings = Add-DemoT4ReplicaLoaderSetting -Config $Config -LoaderSettings $outputs
         }
         $context['LoaderSettings'] = $loaderSettings
         if ($useJobs) {
