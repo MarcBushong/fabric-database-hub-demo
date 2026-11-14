@@ -4,8 +4,20 @@
 
 # The one custom role, exactly as the owner approved it on 2026-10-26 (ADR 0020, section "The role"): every action
 # the run, Stop now, and the auto-stop need, and nothing else. Changing this list needs the owner's approval.
+# 2026-11-14 (ADR 0026, approved for the user by the coordinator, who reviews it with the user before any merge): the
+# session's actions, at the demo resource group only (A1), with what each could touch there:
+# - flexibleServers/write and /delete: create and delete T4's read replica; they could also change or delete T4, which
+#   the runbook never does (it touches pgreplica01-<id> only, and deletes a server only when its replicationRole says
+#   it's a read replica).
+# - flexibleServers/configurations/write: the replica's max_standby_streaming_delay; it could change any server
+#   parameter of T4 or the replica.
+# - virtualNetworks/subnets/join/action and privateDnsZones/join/action: the replica joins T4's delegated subnet and
+#   private DNS zone, as T4 does; they could put another resource in the demo's subnets and zones.
+# - Microsoft.Insights/metrics/read: T4's and the replica's Azure Monitor metrics for the history; read-only.
+# - Microsoft.Resources/tags/write: the busy marker and the session's ID on the demo resource group (the safety stop
+#   honors the marker); it could change any tag in the demo resource group, the deploymentId included.
 $script:ActivityControlRoleName = 'DbHub Demo Activity Operator'
-$script:ActivityControlRoleDescription = 'Start, deallocate, and run commands on the Database Hub demo''s VMs, start and stop its PostgreSQL server, and manage the demo control account''s own one-time stop schedules. Assigned only at the demo resource group and at the control Automation account.'
+$script:ActivityControlRoleDescription = 'Start, deallocate, and run commands on the Database Hub demo''s VMs, start and stop its PostgreSQL server, create and delete its read replica, read their metrics, mark the demo busy, and manage the demo control account''s own one-time stop schedules. Assigned only at the demo resource group and at the control Automation account.'
 $script:ActivityControlRoleActions = @(
     'Microsoft.Resources/subscriptions/resourceGroups/read'
     'Microsoft.Compute/virtualMachines/read'
@@ -20,6 +32,13 @@ $script:ActivityControlRoleActions = @(
     'Microsoft.DBforPostgreSQL/flexibleServers/read'
     'Microsoft.DBforPostgreSQL/flexibleServers/start/action'
     'Microsoft.DBforPostgreSQL/flexibleServers/stop/action'
+    'Microsoft.DBforPostgreSQL/flexibleServers/write'
+    'Microsoft.DBforPostgreSQL/flexibleServers/delete'
+    'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'
+    'Microsoft.Network/virtualNetworks/subnets/join/action'
+    'Microsoft.Network/privateDnsZones/join/action'
+    'Microsoft.Insights/metrics/read'
+    'Microsoft.Resources/tags/write'
     'Microsoft.Automation/automationAccounts/read'
     'Microsoft.Automation/automationAccounts/runbooks/read'
     'Microsoft.Automation/automationAccounts/jobs/read'
@@ -30,6 +49,28 @@ $script:ActivityControlRoleActions = @(
     'Microsoft.Automation/automationAccounts/jobSchedules/write'
     'Microsoft.Automation/automationAccounts/jobSchedules/delete'
 )
+# The second custom role (2026-11-14, ADR 0026, approved as above): the control identity writes the session's status and
+# the history's metrics to two secrets of the control vault through Azure Resource Manager (A4, at those two secrets
+# only, never at the demo resource group, whose optional vault it can't reach). It could overwrite those two secrets'
+# values, which the notebook reads as status and metrics, never as credentials.
+$script:SessionWriterRoleName = 'DbHub Demo Session Writer'
+$script:SessionWriterRoleDescription = 'Read and write the Database Hub demo control''s session status and metrics secrets through Azure Resource Manager. Assigned only at those two secrets of the control vault.'
+$script:SessionWriterRoleActions = @(
+    'Microsoft.KeyVault/vaults/secrets/read'
+    'Microsoft.KeyVault/vaults/secrets/write'
+)
+# What each action added on 2026-11-14 could touch, for the grant's output (ADR 0026, docs/permissions.md).
+$script:ActivityControlActionReach = [ordered]@{
+    'Microsoft.DBforPostgreSQL/flexibleServers/write'                 = 'creates T4''s read replica; it could also change T4, which the runbook never does'
+    'Microsoft.DBforPostgreSQL/flexibleServers/delete'                = 'deletes T4''s read replica after a session; it could also delete T4, which the runbook never does (it deletes only a server whose replicationRole says it''s a read replica)'
+    'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'  = 'sets the replica''s max_standby_streaming_delay; it could change any server parameter of T4 or the replica'
+    'Microsoft.Network/virtualNetworks/subnets/join/action'           = 'puts the replica in T4''s delegated subnet; it could put another resource in the demo''s subnets'
+    'Microsoft.Network/privateDnsZones/join/action'                   = 'registers the replica in T4''s private DNS zone; it could register another resource there'
+    'Microsoft.Insights/metrics/read'                                 = 'reads T4''s and the replica''s Azure Monitor metrics for the history; read-only'
+    'Microsoft.Resources/tags/write'                                  = 'marks the demo busy for the nightly stop and records the session; it could change any tag in the demo resource group'
+    'Microsoft.KeyVault/vaults/secrets/read'                          = 'reads the session secrets'' properties (never their values through Azure Resource Manager); at those two secrets only'
+    'Microsoft.KeyVault/vaults/secrets/write'                         = 'writes the session''s status and metrics; it could overwrite those two secrets'' values, at those two secrets only'
+}
 # Key Vault Secrets User (built-in): https://learn.microsoft.com/azure/role-based-access-control/built-in-roles/security#key-vault-secrets-user
 $script:VaultReaderRoleGuid = '4633458b-17de-408a-b874-0445c86b69e6'
 $script:ActivityControlDoc = 'https://learn.microsoft.com/azure/automation/automation-webhooks'
@@ -125,10 +166,16 @@ function Get-DemoActivityControlName {
         KeyVaultUri         = 'https://{0}.vault.azure.net/' -f $vault
         Secret              = 'dbhub-activity-webhook'
         SecretId            = '{0}/providers/Microsoft.KeyVault/vaults/{1}/secrets/dbhub-activity-webhook' -f $groupId, $vault
+        # The session's status and the history's metrics (2026-11-14, ADR 0026): the runbook writes them, the notebook reads them.
+        StatusSecret        = 'dbhub-session-status'
+        StatusSecretId      = '{0}/providers/Microsoft.KeyVault/vaults/{1}/secrets/dbhub-session-status' -f $groupId, $vault
+        MetricsSecret       = 'dbhub-session-metrics'
+        MetricsSecretId     = '{0}/providers/Microsoft.KeyVault/vaults/{1}/secrets/dbhub-session-metrics' -f $groupId, $vault
         ControlRunbook      = 'DbHub-Control'
         StopRunbook         = 'DbHub-Stop'
         MonitorRunbook      = 'DbHub-Monitor'
         AutoStopSchedule    = 'dbhub-autostop'
+        AutoStopBackupSchedule = 'dbhub-autostop-backup'
         MonitorPrefix       = 'dbhub-monitor-'
         SafetyStopSchedule  = 'dbhub-t4-safety-stop'
         WebhookPrefix       = 'dbhub-activity-'
@@ -168,23 +215,29 @@ function Get-DemoActivityControlTag {
 function Get-DemoActivityControlRoleDefinition {
     <#
     .SYNOPSIS
-    The custom role "DbHub Demo Activity Operator" as an Azure Resource Manager role definition body, assignable in the
-    configured subscription only. The action list is the owner-approved one and nothing else. Internal.
+    The custom role "DbHub Demo Activity Operator", or with -Writer "DbHub Demo Session Writer" (2026-11-14), as an Azure
+    Resource Manager role definition body, assignable in the configured subscription only. Each action list is the
+    approved one and nothing else. Internal.
     https://learn.microsoft.com/rest/api/authorization/role-definitions/create-or-update
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
     param(
         [Parameter(Mandatory)]
-        [string] $SubscriptionId
+        [string] $SubscriptionId,
+
+        [switch] $Writer
     )
 
+    $roleName = if ($Writer) { $script:SessionWriterRoleName } else { $script:ActivityControlRoleName }
+    $description = if ($Writer) { $script:SessionWriterRoleDescription } else { $script:ActivityControlRoleDescription }
+    $actions = if ($Writer) { @($script:SessionWriterRoleActions) } else { @($script:ActivityControlRoleActions) }
     return [ordered]@{
         properties = [ordered]@{
-            roleName         = $script:ActivityControlRoleName
-            description      = $script:ActivityControlRoleDescription
+            roleName         = $roleName
+            description      = $description
             type             = 'CustomRole'
-            permissions      = @([ordered]@{ actions = @($script:ActivityControlRoleActions); notActions = @(); dataActions = @(); notDataActions = @() })
+            permissions      = @([ordered]@{ actions = $actions; notActions = @(); dataActions = @(); notDataActions = @() })
             assignableScopes = @('/subscriptions/{0}' -f $SubscriptionId.ToLowerInvariant())
         }
     }
@@ -367,7 +420,7 @@ function Get-DemoActivityControlRunbookSetting {
 
     $versions = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable
     $apiVersions = [ordered]@{}
-    foreach ($type in 'Microsoft.Automation/automationAccounts', 'Microsoft.Compute/virtualMachines', 'Microsoft.Compute/virtualMachines/runCommands', 'Microsoft.Resources/resourceGroups', 'Microsoft.Sql/servers/databases', 'Microsoft.DBforPostgreSQL/flexibleServers') {
+    foreach ($type in 'Microsoft.Automation/automationAccounts', 'Microsoft.Compute/virtualMachines', 'Microsoft.Compute/virtualMachines/runCommands', 'Microsoft.Resources/resourceGroups', 'Microsoft.Sql/servers/databases', 'Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforPostgreSQL/flexibleServers/configurations', 'Microsoft.KeyVault/vaults', 'Microsoft.Resources/tags', 'Microsoft.Insights/metrics') {
         $apiVersions[$type] = [string]$versions['apiVersions'][$type]
         if (-not $apiVersions[$type]) {
             throw ('config/versions.json has no API version for {0}.' -f $type)
@@ -402,9 +455,28 @@ function Get-DemoActivityControlRunbookSetting {
         t3ServerPrefix         = 'azuresql01-'
         demoDatabase           = 'ContosoCare'
         t4ServerPrefix         = 'pgflex01-'
-        # T4's read replica (ADR 0025): a run starts a stopped one before T4 (Azure's order), and its stops stop one a
-        # session left behind after T4. The control never creates or deletes it.
+        # T4's read replica (ADR 0025): a run starts a stopped one before T4 (Azure's order). A session (the control
+        # notebook's Run all, 2026-11-14, ADR 0026) creates it once T4 is Ready, at T4's size or the next documented size
+        # Azure accepts, and the stop deletes it after saving its metrics; without the grant, it's stopped after T4.
         t4ReplicaPrefix        = ('{0}-' -f (Get-DemoT4ReplicaSetting)['serverNamePrefix'])
+        t4Replica              = [ordered]@{
+            sizes                      = @((Get-DemoT4ReplicaSetting)['generalPurposeSizes'])
+            maxStandbyStreamingDelayMs = [int](Get-DemoT4ReplicaSetting)['maxStandbyStreamingDelayMs']
+            createWaitMinutes          = 25
+            deleteWaitMinutes          = [int](Get-DemoT4ReplicaSetting)['deleteTimeoutMinutes']
+            raceMinutes                = 10
+        }
+        # The session's status and the history's metrics (2026-11-14): written to these secrets of the control vault through
+        # Azure Resource Manager, for the control notebook to read.
+        controlVault           = $Name.KeyVault
+        statusName             = $Name.StatusSecret
+        metricsName            = $Name.MetricsSecret
+        # A session's second auto-stop, for when the first one's job fails; it goes with the first.
+        autoStopBackupSchedule = $Name.AutoStopBackupSchedule
+        autoStopBackupMinutes  = 30
+        minSessionMinutes      = 30
+        # The busy marker of a session ends this long after its auto-stop.
+        busyMarginMinutes      = 15
         autoShutdownTime       = $(if ($Config['autoShutdownTime']) { [string]$Config['autoShutdownTime'] } else { '1900' })
         autoShutdownTimeZone   = $(if ($Config['autoShutdownTimeZone']) { [string]$Config['autoShutdownTimeZone'] } else { 'UTC' })
         shutdownMarginMinutes  = 2
@@ -551,27 +623,36 @@ function Get-DemoActivityControlUrl {
 function Get-DemoActivityControlRoleId {
     <#
     .SYNOPSIS
-    The custom role's definition ID (a GUID) in the subscription, found by its name; empty when it doesn't exist.
-    Throws when the role definitions can't be read. Internal.
+    A custom role's definition ID (a GUID) in the subscription, found by its name (the operator role by default); empty
+    when it doesn't exist. With -WithActions, an object with Id and Actions instead. Throws when the role definitions
+    can't be read. Internal.
     https://learn.microsoft.com/rest/api/authorization/role-definitions/list
     #>
     [CmdletBinding()]
-    [OutputType([string])]
+    [OutputType([string], [pscustomobject])]
     param(
         [Parameter(Mandatory)]
-        [string] $SubscriptionId
+        [string] $SubscriptionId,
+
+        [string] $RoleName = $script:ActivityControlRoleName,
+
+        [switch] $WithActions
     )
 
-    $read = Invoke-DemoActivityControlArm -SubscriptionId $SubscriptionId -Method get -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions' -f $SubscriptionId) -Query ([ordered]@{ '$filter' = ("roleName eq '{0}'" -f $script:ActivityControlRoleName); 'api-version' = '2022-04-01' })
+    $read = Invoke-DemoActivityControlArm -SubscriptionId $SubscriptionId -Method get -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions' -f $SubscriptionId) -Query ([ordered]@{ '$filter' = ("roleName eq '{0}'" -f $RoleName); 'api-version' = '2022-04-01' })
     if (-not $read.Ok) {
         throw ('The role definitions couldn''t be read: {0}' -f $read.Error)
     }
-    $match = @(Get-DemoActivityControlList -InputObject $read.Value -Name 'value') | Where-Object { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'roleName') -ceq $script:ActivityControlRoleName } | Select-Object -First 1
+    $match = @(Get-DemoActivityControlList -InputObject $read.Value -Name 'value') | Where-Object { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'roleName') -ceq $RoleName } | Select-Object -First 1
+    if ($WithActions) {
+        $actions = @(foreach ($permission in @(Get-DemoActivityControlList -InputObject (Get-DemoMemberValue -InputObject $match -Name 'properties') -Name 'permissions')) { Get-DemoActivityControlList -InputObject $permission -Name 'actions' })
+        return [pscustomobject]@{ Id = [string](Get-DemoMemberValue -InputObject $match -Name 'name'); Actions = @($actions | ForEach-Object { [string]$_ }) }
+    }
     return [string](Get-DemoMemberValue -InputObject $match -Name 'name')
 }
 
 function Get-DemoActivityControlCommand {
-    # The exact command an Owner runs to grant the control's roles. Internal.
+    # The exact command an Owner runs to grant the control's roles; without -GrantRole, the control's setup. Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -580,6 +661,19 @@ function Get-DemoActivityControlCommand {
 
     $path = if ($ConfigPath) { $ConfigPath } else { './config/demo.config.json' }
     return ('./scripts/setup-activity-control.ps1 -ConfigPath {0} -GrantRole' -f $path)
+}
+
+function Get-DemoActivityControlGrantCommand {
+    # The one grant script an Owner runs for the safety stop's role and the control's roles together (2026-11-14,
+    # ADR 0026), which the control's role Warnings name. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [string] $ConfigPath = ''
+    )
+
+    $path = if ($ConfigPath) { $ConfigPath } else { './config/demo.config.json' }
+    return ('./scripts/grant-safety-stop.ps1 -ConfigPath {0}' -f $path)
 }
 
 function Get-DemoActivityControlPrincipalId {
@@ -641,7 +735,9 @@ function Get-DemoActivityControlGrantPlan {
     The approved role assignments (ADR 0020), as the owner approved them on 2026-10-26: A1, the custom role for the
     automation identity at the demo resource group; A2, the same at the control Automation account; A3, Key Vault
     Secrets User at the one secret dbhub-activity-webhook, for the signed-in owner and control.notebookUserObjectIds.
-    Internal and pure.
+    2026-11-14 (ADR 0026): A3 also at the session's two secrets, dbhub-session-status and dbhub-session-metrics, which the
+    notebook reads; and A4, the custom role "DbHub Demo Session Writer" for the automation identity at those two secrets
+    only, which the runbook writes. Internal and pure.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -656,6 +752,9 @@ function Get-DemoActivityControlGrantPlan {
         [string] $RoleId = '',
 
         [AllowEmptyString()]
+        [string] $WriterRoleId = '',
+
+        [AllowEmptyString()]
         [string] $PrincipalId = '',
 
         [AllowEmptyString()]
@@ -664,12 +763,17 @@ function Get-DemoActivityControlGrantPlan {
         [AllowEmptyString()]
         [string] $CallerPrincipalType = 'User',
 
-        [ValidateSet('A1', 'A2', 'A3')]
-        [string[]] $Assignment = @('A1', 'A2', 'A3')
+        [ValidateSet('A1', 'A2', 'A3', 'A4')]
+        [string[]] $Assignment = @('A1', 'A2', 'A3', 'A4')
     )
 
     $roleDefinition = if ($RoleId) { '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}' -f $Name.SubscriptionId, $RoleId } else { '' }
+    $writerDefinition = if ($WriterRoleId) { '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}' -f $Name.SubscriptionId, $WriterRoleId } else { '' }
     $secretsUser = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}' -f $Name.SubscriptionId, $script:VaultReaderRoleGuid
+    $sessionSecrets = @(
+        [pscustomobject]@{ Name = $Name.StatusSecret; Id = $Name.StatusSecretId }
+        [pscustomobject]@{ Name = $Name.MetricsSecret; Id = $Name.MetricsSecretId }
+    )
     $plan = [System.Collections.Generic.List[object]]::new()
     if ('A1' -in $Assignment) {
         $plan.Add([pscustomobject]@{ Id = 'A1'; Role = $script:ActivityControlRoleName; RoleId = $RoleId; RoleDefinitionId = $roleDefinition; Scope = $Name.DemoResourceGroupId; ScopeLabel = $Name.DemoResourceGroup; PrincipalId = $PrincipalId; PrincipalType = 'ServicePrincipal'; PrincipalLabel = $Name.Identity })
@@ -687,8 +791,16 @@ function Get-DemoActivityControlGrantPlan {
                 $users.Add([pscustomobject]@{ Id = $id; Type = ''; Label = ('notebook user {0}' -f $id) })
             }
         }
+        $secrets = @([pscustomobject]@{ Name = $Name.Secret; Id = $Name.SecretId }) + $sessionSecrets
         foreach ($user in $users) {
-            $plan.Add([pscustomobject]@{ Id = 'A3'; Role = 'Key Vault Secrets User'; RoleId = $script:VaultReaderRoleGuid; RoleDefinitionId = $secretsUser; Scope = $Name.SecretId; ScopeLabel = ('{0}/secrets/{1}' -f $Name.KeyVault, $Name.Secret); PrincipalId = $user.Id; PrincipalType = $user.Type; PrincipalLabel = $user.Label })
+            foreach ($secret in $secrets) {
+                $plan.Add([pscustomobject]@{ Id = 'A3'; Role = 'Key Vault Secrets User'; RoleId = $script:VaultReaderRoleGuid; RoleDefinitionId = $secretsUser; Scope = $secret.Id; ScopeLabel = ('{0}/secrets/{1}' -f $Name.KeyVault, $secret.Name); PrincipalId = $user.Id; PrincipalType = $user.Type; PrincipalLabel = $user.Label })
+            }
+        }
+    }
+    if ('A4' -in $Assignment) {
+        foreach ($secret in $sessionSecrets) {
+            $plan.Add([pscustomobject]@{ Id = 'A4'; Role = $script:SessionWriterRoleName; RoleId = $WriterRoleId; RoleDefinitionId = $writerDefinition; Scope = $secret.Id; ScopeLabel = ('{0}/secrets/{1}' -f $Name.KeyVault, $secret.Name); PrincipalId = $PrincipalId; PrincipalType = 'ServicePrincipal'; PrincipalLabel = $Name.Identity })
         }
     }
     return $plan.ToArray()
@@ -697,16 +809,17 @@ function Get-DemoActivityControlGrantPlan {
 function Grant-DemoActivityControlRole {
     <#
     .SYNOPSIS
-    Creates or updates the custom role (with -IncludeDefinition) and the requested assignments of A1-A3, as the
-    signed-in caller, and returns CONTROL.ROLE.DEFINITION and CONTROL.ROLE.<A1|A2|A3> results. The one function behind
-    setup-activity-control.ps1 -GrantRole (every assignment, and the role) and deploy.ps1's re-grant (A1 only, when
-    assignRoles and control.enabled are true). Internal.
+    Creates or updates the custom roles (with -IncludeDefinition) and the requested assignments of A1-A4, as the
+    signed-in caller, and returns CONTROL.ROLE.DEFINITION, CONTROL.ROLE.WRITER, and CONTROL.ROLE.<A1|A2|A3|A4> results.
+    The one function behind scripts/grant-safety-stop.ps1 and setup-activity-control.ps1 -GrantRole (every assignment,
+    and the roles), and deploy.ps1's control setup (2026-11-14). Internal.
 
     .DESCRIPTION
-    An assignment that exists is kept (Pass). One that can't be made, because the caller isn't an Owner or User
-    Access Administrator, a write needs a fresh multifactor sign-in, the role definition or the identity doesn't
-    exist yet, or Azure refuses it, is Manual action required with the exact -GrantRole command. Every write is a
-    documented Azure Resource Manager call through the subscription guard:
+    An assignment that exists is kept (Pass). One that can't be made, because the caller isn't an Owner or User Access
+    Administrator, a write needs a fresh multifactor sign-in, the role definition or the identity doesn't exist yet, or
+    Azure refuses it, is a Warning with the exact grant command (./scripts/grant-safety-stop.ps1), as the safety stop's
+    role is: a session runs without what it needs and says so. Every write is a documented Azure Resource Manager call
+    through the subscription guard:
     https://learn.microsoft.com/rest/api/authorization/role-definitions/create-or-update
     https://learn.microsoft.com/rest/api/authorization/role-assignments/create
     #>
@@ -716,8 +829,8 @@ function Grant-DemoActivityControlRole {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [ValidateSet('A1', 'A2', 'A3')]
-        [string[]] $Assignment = @('A1', 'A2', 'A3'),
+        [ValidateSet('A1', 'A2', 'A3', 'A4')]
+        [string[]] $Assignment = @('A1', 'A2', 'A3', 'A4'),
 
         [switch] $IncludeDefinition,
 
@@ -727,11 +840,11 @@ function Grant-DemoActivityControlRole {
     $results = [System.Collections.Generic.List[object]]::new()
     $name = Get-DemoActivityControlName -Config $Config
     $subscriptionId = $name.SubscriptionId
-    $command = Get-DemoActivityControlCommand -ConfigPath $ConfigPath
+    $command = Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath
     $doc = 'https://learn.microsoft.com/azure/role-based-access-control/role-assignments-rest'
     $manual = {
         param([string] $CheckId, [string] $Message, [System.Collections.IDictionary] $Evidence)
-        New-DemoResult -CheckId $CheckId -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message $Message -Evidence $Evidence -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $command) -DocUrl $doc
+        New-DemoResult -CheckId $CheckId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message $Message -Evidence $Evidence -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $command) -DocUrl $doc
     }
 
     $permissions = Invoke-DemoActivityControlArm -SubscriptionId $subscriptionId -Method get -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01' -f $subscriptionId)
@@ -742,50 +855,60 @@ function Grant-DemoActivityControlRole {
     $canAssign = $permissions.Ok -and (Test-DemoPermission -Permission $entries -Action 'Microsoft.Authorization/roleAssignments/write')
     $canDefine = $permissions.Ok -and (Test-DemoPermission -Permission $entries -Action 'Microsoft.Authorization/roleDefinitions/write')
 
-    $roleId = ''
+    $roleIds = @{ Operator = ''; Writer = '' }
     try {
-        $roleId = Get-DemoActivityControlRoleId -SubscriptionId $subscriptionId
+        $roleIds.Operator = Get-DemoActivityControlRoleId -SubscriptionId $subscriptionId
+        $roleIds.Writer = Get-DemoActivityControlRoleId -SubscriptionId $subscriptionId -RoleName $script:SessionWriterRoleName
     }
     catch {
         $results.Add((& $manual 'CONTROL.ROLE.DEFINITION' (Protect-DemoText -Text $_.Exception.Message) ([ordered]@{ role = $script:ActivityControlRoleName })))
         return $results.ToArray()
     }
     if ($IncludeDefinition) {
-        $definition = Get-DemoActivityControlRoleDefinition -SubscriptionId $subscriptionId
-        $definitionId = if ($roleId) { $roleId } else { ConvertTo-DemoStableGuid -Key ('{0}|{1}' -f $subscriptionId, $script:ActivityControlRoleName) }
-        $evidence = [ordered]@{ role = $script:ActivityControlRoleName; roleId = $definitionId; actions = @($script:ActivityControlRoleActions); assignableScopes = @('/subscriptions/{0}' -f $subscriptionId) }
-        if (-not $canDefine) {
-            $results.Add((& $manual 'CONTROL.ROLE.DEFINITION' ('The custom role "{0}" needs Microsoft.Authorization/roleDefinitions/write, which the signed-in caller doesn''t have.' -f $script:ActivityControlRoleName) $evidence))
-        }
-        elseif (-not $PSCmdlet.ShouldProcess(('/subscriptions/{0}' -f $subscriptionId), ('{0} the custom role "{1}" with exactly the {2} approved actions' -f $(if ($roleId) { 'Update' } else { 'Create' }), $script:ActivityControlRoleName, $script:ActivityControlRoleActions.Count))) {
-            $results.Add((New-DemoResult -CheckId 'CONTROL.ROLE.DEFINITION' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: the custom role "{0}" would be {1} with exactly these actions: {2}.' -f $script:ActivityControlRoleName, $(if ($roleId) { 'updated' } else { 'created' }), ($script:ActivityControlRoleActions -join ', ')) -Evidence $evidence -DocUrl $doc))
-            $roleId = $definitionId
-        }
-        else {
-            $write = Invoke-DemoActivityControlArm -SubscriptionId $subscriptionId -Method put -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}?api-version=2022-04-01' -f $subscriptionId, $definitionId) -Body $definition
-            if ($write.Ok) {
-                $roleId = $definitionId
-                $results.Add((New-DemoResult -CheckId 'CONTROL.ROLE.DEFINITION' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The custom role "{0}" exists with exactly the {1} approved actions, assignable in this subscription only.' -f $script:ActivityControlRoleName, $script:ActivityControlRoleActions.Count) -Evidence $evidence -DocUrl $doc))
+        foreach ($kind in 'Operator', 'Writer') {
+            $writer = $kind -eq 'Writer'
+            $roleName = if ($writer) { $script:SessionWriterRoleName } else { $script:ActivityControlRoleName }
+            $actions = if ($writer) { @($script:SessionWriterRoleActions) } else { @($script:ActivityControlRoleActions) }
+            $checkId = if ($writer) { 'CONTROL.ROLE.WRITER' } else { 'CONTROL.ROLE.DEFINITION' }
+            $definition = Get-DemoActivityControlRoleDefinition -SubscriptionId $subscriptionId -Writer:$writer
+            $definitionId = if ($roleIds[$kind]) { $roleIds[$kind] } else { ConvertTo-DemoStableGuid -Key ('{0}|{1}' -f $subscriptionId, $roleName) }
+            $evidence = [ordered]@{ role = $roleName; roleId = $definitionId; actions = $actions; assignableScopes = @('/subscriptions/{0}' -f $subscriptionId) }
+            if (-not $canDefine) {
+                $results.Add((& $manual $checkId ('The custom role "{0}" needs Microsoft.Authorization/roleDefinitions/write, which the signed-in caller doesn''t have.' -f $roleName) $evidence))
+            }
+            elseif (-not $PSCmdlet.ShouldProcess(('/subscriptions/{0}' -f $subscriptionId), ('{0} the custom role "{1}" with exactly the {2} approved actions' -f $(if ($roleIds[$kind]) { 'Update' } else { 'Create' }), $roleName, $actions.Count))) {
+                $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: the custom role "{0}" would be {1} with exactly these actions: {2}.' -f $roleName, $(if ($roleIds[$kind]) { 'updated' } else { 'created' }), ($actions -join ', ')) -Evidence $evidence -DocUrl $doc))
+                $roleIds[$kind] = $definitionId
             }
             else {
-                $results.Add((& $manual 'CONTROL.ROLE.DEFINITION' ('The custom role couldn''t be written: {0}' -f $write.Error) $evidence))
+                $write = Invoke-DemoActivityControlArm -SubscriptionId $subscriptionId -Method put -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}?api-version=2022-04-01' -f $subscriptionId, $definitionId) -Body $definition
+                if ($write.Ok) {
+                    $roleIds[$kind] = $definitionId
+                    $reach = @($actions | Where-Object { $script:ActivityControlActionReach.Contains($_) } | ForEach-Object { '{0}: {1}' -f $_, $script:ActivityControlActionReach[$_] })
+                    $evidence['reach'] = $reach
+                    $reachText = if ($reach.Count) { ' What the session''s actions (2026-11-14) could touch: {0}.' -f ($reach -join '; ') } else { '' }
+                    $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The custom role "{0}" exists with exactly the {1} approved actions, assignable in this subscription only.{2}' -f $roleName, $actions.Count, $reachText) -Evidence $evidence -DocUrl $doc))
+                }
+                else {
+                    $results.Add((& $manual $checkId ('The custom role "{0}" couldn''t be written: {1}' -f $roleName, $write.Error) $evidence))
+                }
             }
         }
     }
 
     $principalId = Get-DemoActivityControlPrincipalId -Name $name
     $caller = Get-DemoCallerIdentity -SubscriptionId $subscriptionId
-    $plan = @(Get-DemoActivityControlGrantPlan -Name $name -Config $Config -RoleId $roleId -PrincipalId $principalId -CallerObjectId ([string]$caller.ObjectId) -CallerPrincipalType ([string]$caller.PrincipalType) -Assignment $Assignment)
+    $plan = @(Get-DemoActivityControlGrantPlan -Name $name -Config $Config -RoleId $roleIds.Operator -WriterRoleId $roleIds.Writer -PrincipalId $principalId -CallerObjectId ([string]$caller.ObjectId) -CallerPrincipalType ([string]$caller.PrincipalType) -Assignment $Assignment)
     foreach ($item in $plan) {
         $checkId = 'CONTROL.ROLE.{0}' -f $item.Id
         $evidence = [ordered]@{ assignment = $item.Id; role = $item.Role; scope = $item.ScopeLabel; principal = $item.PrincipalLabel; principalId = $item.PrincipalId }
         $label = '{0}: {1} for {2} at {3}' -f $item.Id, $item.Role, $item.PrincipalLabel, $item.ScopeLabel
         if (-not $item.RoleId) {
-            $results.Add((& $manual $checkId ('{0} wasn''t granted: the custom role "{1}" doesn''t exist yet.' -f $label, $script:ActivityControlRoleName) $evidence))
+            $results.Add((& $manual $checkId ('{0} wasn''t granted: the custom role "{1}" doesn''t exist yet.' -f $label, $item.Role) $evidence))
             continue
         }
         if (-not $item.PrincipalId) {
-            $why = if ($item.Id -eq 'A3') { 'the signed-in caller''s object ID is unknown' } else { ('the identity {0} doesn''t exist yet; run setup-activity-control.ps1 first' -f $name.Identity) }
+            $why = if ($item.Id -eq 'A3') { 'the signed-in caller''s object ID is unknown' } else { ('the identity {0} doesn''t exist yet; ./scripts/deploy.ps1 creates it' -f $name.Identity) }
             $results.Add((& $manual $checkId ('{0} wasn''t granted: {1}.' -f $label, $why) $evidence))
             continue
         }
@@ -795,8 +918,7 @@ function Grant-DemoActivityControlRole {
             continue
         }
         if ($existing.Missing) {
-            $status = if ($item.Id -eq 'A1') { 'Warning' } else { 'Manual action required' }
-            $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status $status -Message ('{0} wasn''t granted: {1} doesn''t exist.' -f $label, $item.ScopeLabel) -Evidence $evidence -Remediation $(if ($item.Id -eq 'A1') { ('Deploy the demo; deploy.ps1 grants A1 when assignRoles and control.enabled are true, or run {0}.' -f $command) } else { ('Run setup-activity-control.ps1, then {0}.' -f $command) }) -DocUrl $doc))
+            $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('{0} wasn''t granted: {1} doesn''t exist.' -f $label, $item.ScopeLabel) -Evidence $evidence -Remediation ('Run ./scripts/deploy.ps1, which creates it, then {0}.' -f $command) -DocUrl $doc))
             continue
         }
         if (-not $canAssign) {
@@ -1299,6 +1421,56 @@ function Get-DemoActivityControlWebhook {
     }
 }
 
+function Initialize-DemoActivityControlSessionSecret {
+    <#
+    .SYNOPSIS
+    Creates the session's two secrets in the control vault when they don't exist (2026-11-14, ADR 0026):
+    dbhub-session-status and dbhub-session-metrics, each with an empty JSON object, through Azure Resource Manager
+    (Secrets - Create Or Update), which Contributor may and which works with the vault private. They must exist to be the
+    scopes of A3 and A4; the runbook writes them during a session, and an existing one is never overwritten here.
+    Returns CONTROL.SECRETS. Internal.
+    https://learn.microsoft.com/rest/api/keyvault/keyvault/secrets/create-or-update
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name
+    )
+
+    $doc = 'https://learn.microsoft.com/rest/api/keyvault/keyvault/secrets/create-or-update'
+    $version = Get-DemoPinnedApiVersion -ResourceType 'Microsoft.KeyVault/vaults/secrets'
+    $created = [System.Collections.Generic.List[string]]::new()
+    $kept = [System.Collections.Generic.List[string]]::new()
+    foreach ($secret in @([pscustomobject]@{ Name = $Name.StatusSecret; Id = $Name.StatusSecretId }, [pscustomobject]@{ Name = $Name.MetricsSecret; Id = $Name.MetricsSecretId })) {
+        $read = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $secret.Id -ApiVersion $version)
+        if ($read.Ok) {
+            $kept.Add($secret.Name)
+            continue
+        }
+        if (-not $read.Missing) {
+            return (New-DemoResult -CheckId 'CONTROL.SECRETS' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The session''s secret {0} couldn''t be read: {1}' -f $secret.Name, $read.Error) -Remediation 'Run ./scripts/deploy.ps1 again.' -DocUrl $doc)
+        }
+        if (-not $PSCmdlet.ShouldProcess(('{0}/secrets/{1}' -f $Name.KeyVault, $secret.Name), 'Create the session''s secret with an empty JSON object')) {
+            $created.Add(('{0} (what if)' -f $secret.Name))
+            continue
+        }
+        $write = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method put -Url (Get-DemoActivityControlUrl -Id $secret.Id -ApiVersion $version) -Body ([ordered]@{ properties = [ordered]@{ value = '{}'; contentType = 'application/json' } })
+        if (-not $write.Ok) {
+            return (New-DemoResult -CheckId 'CONTROL.SECRETS' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The session''s secret {0} couldn''t be created: {1}' -f $secret.Name, $write.Error) -Remediation 'Run ./scripts/deploy.ps1 again; a Contributor on the control resource group can create it.' -DocUrl $doc)
+        }
+        $created.Add($secret.Name)
+    }
+    $text = @()
+    if ($created.Count) {
+        $text += ('created {0}' -f ($created -join ', '))
+    }
+    if ($kept.Count) {
+        $text += ('kept {0}' -f ($kept -join ', '))
+    }
+    return (New-DemoResult -CheckId 'CONTROL.SECRETS' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The session''s secrets in {0}: {1}. The runbook writes a session''s status and metrics there, and the notebook reads them.' -f $Name.KeyVault, ($text -join '; ')) -Evidence ([ordered]@{ vault = $Name.KeyVault; created = $created.ToArray(); kept = $kept.ToArray() }) -DocUrl $doc)
+}
+
 function New-DemoActivityControlWebhook {
     <#
     .SYNOPSIS
@@ -1651,9 +1823,11 @@ function Set-DemoActivityControlFabric {
 function Test-DemoActivityControlRole {
     <#
     .SYNOPSIS
-    Read-only: whether A1, A2, and A3 are in place. Returns CONTROL.ROLE.<A1|A2|A3>: Pass when present, Manual action
-    required with the exact -GrantRole command when missing, Warning when it can't be read. A3 passes when at least one
-    principal holds Key Vault Secrets User on the secret. Internal.
+    Read-only: whether the control's roles and assignments are in place (ADR 0020; A4 and A3's session secrets since
+    2026-11-14, ADR 0026). Returns CONTROL.ROLE.DEFINITION (the operator role has every approved action),
+    CONTROL.ROLE.<A1|A2|A3|A4>: Pass when present, a Warning with the exact grant command (./scripts/grant-safety-stop.ps1)
+    when missing, as the safety stop's role is, and a Warning when it can't be read. A3 passes when someone holds Key
+    Vault Secrets User on each of the three secrets. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -1661,20 +1835,24 @@ function Test-DemoActivityControlRole {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [ValidateSet('A1', 'A2', 'A3')]
-        [string[]] $Assignment = @('A1', 'A2', 'A3'),
+        [ValidateSet('A1', 'A2', 'A3', 'A4')]
+        [string[]] $Assignment = @('A1', 'A2', 'A3', 'A4'),
 
         [string] $ConfigPath = ''
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
     $name = Get-DemoActivityControlName -Config $Config
-    $command = Get-DemoActivityControlCommand -ConfigPath $ConfigPath
+    $command = Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath
     $doc = 'https://learn.microsoft.com/azure/role-based-access-control/role-assignments-list-rest'
-    $missing = { param([string] $CheckId, [string] $Message) $results.Add((New-DemoResult -CheckId $CheckId -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message $Message -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $command) -DocUrl $doc)) }
-    $roleId = ''
+    $missing = { param([string] $CheckId, [string] $Message) $results.Add((New-DemoResult -CheckId $CheckId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message $Message -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $command) -DocUrl $doc)) }
+    $operator = $null
+    $writerId = ''
     try {
-        $roleId = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId
+        $operator = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId -WithActions
+        if ('A4' -in $Assignment) {
+            $writerId = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId -RoleName $script:SessionWriterRoleName
+        }
     }
     catch {
         foreach ($item in $Assignment) {
@@ -1682,30 +1860,68 @@ function Test-DemoActivityControlRole {
         }
         return $results.ToArray()
     }
+    $roleId = [string]$operator.Id
+    if ($roleId -and ('A1' -in $Assignment -or 'A2' -in $Assignment)) {
+        # An environment set up before 2026-11-14 has the role with its first 22 actions: the session then runs without its
+        # read replica, the busy marker, and the history's metrics, and says so.
+        $lacking = @($script:ActivityControlRoleActions | Where-Object { $_ -notin @($operator.Actions) })
+        if ($lacking.Count -gt 0) {
+            & $missing 'CONTROL.ROLE.DEFINITION' ('The custom role "{0}" lacks {1} of its approved actions ({2}), so a session in the control notebook runs without T4''s read replica, the busy marker, or the history''s metrics.' -f $script:ActivityControlRoleName, $lacking.Count, ($lacking -join ', '))
+        }
+    }
     $principalId = Get-DemoActivityControlPrincipalId -Name $name
+    $secrets = @(
+        [pscustomobject]@{ Name = $name.Secret; Id = $name.SecretId; Why = 'the notebook can''t read the webhook URL' }
+        [pscustomobject]@{ Name = $name.StatusSecret; Id = $name.StatusSecretId; Why = 'the notebook can''t follow a session' }
+        [pscustomobject]@{ Name = $name.MetricsSecret; Id = $name.MetricsSecretId; Why = 'the notebook can''t save the replica''s metrics in the history' }
+    )
+    $holders = {
+        param([string] $Scope, [string] $RoleGuid, [string] $PrincipalId)
+        $read = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/providers/Microsoft.Authorization/roleAssignments?$filter=atScope()&api-version=2022-04-01' -f $Scope)
+        if (-not $read.Ok) {
+            return [pscustomobject]@{ Ok = $false; Missing = $read.Missing; Error = $read.Error; Count = 0 }
+        }
+        $found = @(@(Get-DemoActivityControlList -InputObject $read.Value -Name 'value') | Where-Object {
+                $properties = Get-DemoMemberValue -InputObject $_ -Name 'properties'
+                ([string](Get-DemoMemberValue -InputObject $properties -Name 'roleDefinitionId')).EndsWith('/' + $RoleGuid, [System.StringComparison]::OrdinalIgnoreCase) -and
+                [string]::Equals([string](Get-DemoMemberValue -InputObject $properties -Name 'scope'), $Scope, [System.StringComparison]::OrdinalIgnoreCase) -and
+                (-not $PrincipalId -or [string](Get-DemoMemberValue -InputObject $properties -Name 'principalId') -eq $PrincipalId)
+            })
+        return [pscustomobject]@{ Ok = $true; Missing = $false; Error = ''; Count = $found.Count }
+    }
     foreach ($item in $Assignment) {
         $checkId = 'CONTROL.ROLE.{0}' -f $item
-        if ($item -eq 'A3') {
-            $read = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/providers/Microsoft.Authorization/roleAssignments?$filter=atScope()&api-version=2022-04-01' -f $name.SecretId)
-            if (-not $read.Ok) {
-                if ($read.Missing) {
-                    & $missing $checkId ('A3 isn''t in place: the secret {0} doesn''t exist yet; run setup-activity-control.ps1.' -f $name.Secret)
-                }
-                else {
-                    $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('A3 wasn''t checked: {0}' -f $read.Error) -DocUrl $doc))
-                }
+        if ($item -in 'A3', 'A4') {
+            $wanted = if ($item -eq 'A3') { $secrets } else { @($secrets | Select-Object -Skip 1) }
+            if ($item -eq 'A4' -and -not $writerId) {
+                & $missing $checkId ('A4 isn''t in place: the custom role "{0}" doesn''t exist yet, so the runbook can''t write a session''s status or metrics for the notebook.' -f $script:SessionWriterRoleName)
                 continue
             }
-            $holders = @(@(Get-DemoActivityControlList -InputObject $read.Value -Name 'value') | Where-Object {
-                    $properties = Get-DemoMemberValue -InputObject $_ -Name 'properties'
-                    ([string](Get-DemoMemberValue -InputObject $properties -Name 'roleDefinitionId')).EndsWith('/' + $script:VaultReaderRoleGuid, [System.StringComparison]::OrdinalIgnoreCase) -and
-                    [string]::Equals([string](Get-DemoMemberValue -InputObject $properties -Name 'scope'), $name.SecretId, [System.StringComparison]::OrdinalIgnoreCase)
-                })
-            if ($holders.Count -gt 0) {
-                $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('A3: {0} principal(s) hold Key Vault Secrets User on the secret {1} only.' -f $holders.Count, $name.Secret) -Evidence ([ordered]@{ holders = $holders.Count }) -DocUrl $doc))
+            if ($item -eq 'A4' -and -not $principalId) {
+                & $missing $checkId ('A4 isn''t in place: the identity {0} doesn''t exist yet; ./scripts/deploy.ps1 creates it.' -f $name.Identity)
+                continue
+            }
+            $gaps = [System.Collections.Generic.List[string]]::new()
+            $unread = ''
+            foreach ($secret in $wanted) {
+                $count = if ($item -eq 'A3') { & $holders $secret.Id $script:VaultReaderRoleGuid '' } else { & $holders $secret.Id $writerId $principalId }
+                if (-not $count.Ok -and -not $count.Missing) {
+                    $unread = $count.Error
+                }
+                elseif ($count.Missing -or $count.Count -eq 0) {
+                    $gaps.Add($(if ($item -eq 'A3') { '{0} ({1})' -f $secret.Name, $secret.Why } else { $secret.Name }))
+                }
+            }
+            if ($unread) {
+                $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('{0} wasn''t checked: {1}' -f $item, $unread) -DocUrl $doc))
+            }
+            elseif ($gaps.Count -gt 0) {
+                $what = if ($item -eq 'A3') { 'nobody holds Key Vault Secrets User on' } else { ('{0} doesn''t hold "{1}" on' -f $name.Identity, $script:SessionWriterRoleName) }
+                & $missing $checkId ('{0} isn''t in place: {1} {2}.' -f $item, $what, ($gaps -join '; '))
             }
             else {
-                & $missing $checkId ('A3 isn''t in place: nobody holds Key Vault Secrets User on the secret {0}, so the notebook can''t read the webhook URL.' -f $name.Secret)
+                $text = if ($item -eq 'A3') { 'A3: Key Vault Secrets User is held on the secrets {0} only.' -f (@($wanted | ForEach-Object { $_.Name }) -join ', ') } else { 'A4: {0} holds "{1}" on the secrets {2} only.' -f $name.Identity, $script:SessionWriterRoleName, (@($wanted | ForEach-Object { $_.Name }) -join ', ') }
+                $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Pass' -Message $text -DocUrl $doc))
             }
             continue
         }
@@ -1716,7 +1932,7 @@ function Test-DemoActivityControlRole {
             continue
         }
         if (-not $principalId) {
-            & $missing $checkId ('{0} isn''t in place: the identity {1} doesn''t exist yet; run setup-activity-control.ps1 first.' -f $item, $name.Identity)
+            & $missing $checkId ('{0} isn''t in place: the identity {1} doesn''t exist yet; ./scripts/deploy.ps1 creates it.' -f $item, $name.Identity)
             continue
         }
         $existing = Test-DemoActivityControlAssignment -SubscriptionId $name.SubscriptionId -Scope $scope -PrincipalId $principalId -RoleId $roleId
@@ -1730,7 +1946,7 @@ function Test-DemoActivityControlRole {
             $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('{0} wasn''t checked: {1}' -f $item, $existing.Error) -DocUrl $doc))
         }
         else {
-            $why = if ($item -eq 'A1') { ' A redeploy deletes it with the group; deploy.ps1 grants it again only when assignRoles is true.' } else { '' }
+            $why = if ($item -eq 'A1') { ' A redeploy deletes it with the group; deploy.ps1 grants it again when you may.' } else { '' }
             & $missing $checkId ('{0} isn''t in place: {1} doesn''t hold "{2}" at {3}, so the runbooks can''t act there.{4}' -f $item, $name.Identity, $script:ActivityControlRoleName, $label, $why)
         }
     }
@@ -1768,7 +1984,7 @@ function Invoke-DemoActivityControlRegrant {
         }
     }
     catch {
-        $results.Add((New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message ('A1 wasn''t granted: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f (Get-DemoActivityControlCommand -ConfigPath $ConfigPath)) -DocUrl 'https://learn.microsoft.com/azure/role-based-access-control/role-assignments-rest'))
+        $results.Add((New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('A1 wasn''t granted: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f (Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath)) -DocUrl 'https://learn.microsoft.com/azure/role-based-access-control/role-assignments-rest'))
     }
     # The control's runbooks with this code (2026-11-13): an update reaches them at deploy.ps1, as the safety stop's does.
     $results.AddRange([object[]]@(Update-DemoActivityControlRunbook -Config $Config -ConfigPath $ConfigPath -Confirm:$false))
@@ -1791,31 +2007,36 @@ function Remove-DemoActivityControlRole {
 
     $doc = 'https://learn.microsoft.com/rest/api/authorization/role-assignments/delete'
     $roleId = ''
+    $writerId = ''
     try {
         $roleId = Get-DemoActivityControlRoleId -SubscriptionId $Name.SubscriptionId
+        $writerId = Get-DemoActivityControlRoleId -SubscriptionId $Name.SubscriptionId -RoleName $script:SessionWriterRoleName
     }
     catch {
         return (New-DemoResult -CheckId 'CONTROL.REMOVE.ROLES' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The role assignments weren''t removed: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -DocUrl $doc)
     }
     $targets = [System.Collections.Generic.List[string]]::new()
     $principalId = Get-DemoActivityControlPrincipalId -Name $Name
-    if ($principalId -and $roleId) {
+    if ($principalId -and ($roleId -or $writerId)) {
         $read = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/roleAssignments' -f $Name.SubscriptionId) -Query ([ordered]@{ '$filter' = ("principalId eq '{0}'" -f $principalId); 'api-version' = '2022-04-01' })
         foreach ($item in @(Get-DemoActivityControlList -InputObject $read.Value -Name 'value')) {
-            if (([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'properties') -Name 'roleDefinitionId')).EndsWith('/' + $roleId, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $definition = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'properties') -Name 'roleDefinitionId')
+            if (($roleId -and $definition.EndsWith('/' + $roleId, [System.StringComparison]::OrdinalIgnoreCase)) -or ($writerId -and $definition.EndsWith('/' + $writerId, [System.StringComparison]::OrdinalIgnoreCase))) {
                 $targets.Add([string](Get-DemoMemberValue -InputObject $item -Name 'id'))
             }
         }
     }
-    $secretRead = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/providers/Microsoft.Authorization/roleAssignments?$filter=atScope()&api-version=2022-04-01' -f $Name.SecretId)
-    foreach ($item in @(Get-DemoActivityControlList -InputObject $secretRead.Value -Name 'value')) {
-        $properties = Get-DemoMemberValue -InputObject $item -Name 'properties'
-        if (([string](Get-DemoMemberValue -InputObject $properties -Name 'roleDefinitionId')).EndsWith('/' + $script:VaultReaderRoleGuid, [System.StringComparison]::OrdinalIgnoreCase) -and [string]::Equals([string](Get-DemoMemberValue -InputObject $properties -Name 'scope'), $Name.SecretId, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $targets.Add([string](Get-DemoMemberValue -InputObject $item -Name 'id'))
+    foreach ($secretId in $Name.SecretId, $Name.StatusSecretId, $Name.MetricsSecretId) {
+        $secretRead = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url ('https://management.azure.com{0}/providers/Microsoft.Authorization/roleAssignments?$filter=atScope()&api-version=2022-04-01' -f $secretId)
+        foreach ($item in @(Get-DemoActivityControlList -InputObject $secretRead.Value -Name 'value')) {
+            $properties = Get-DemoMemberValue -InputObject $item -Name 'properties'
+            if (([string](Get-DemoMemberValue -InputObject $properties -Name 'roleDefinitionId')).EndsWith('/' + $script:VaultReaderRoleGuid, [System.StringComparison]::OrdinalIgnoreCase) -and [string]::Equals([string](Get-DemoMemberValue -InputObject $properties -Name 'scope'), $secretId, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $targets.Add([string](Get-DemoMemberValue -InputObject $item -Name 'id'))
+            }
         }
     }
-    if (-not $PSCmdlet.ShouldProcess(('{0} role assignment(s) and the custom role "{1}"' -f $targets.Count, $script:ActivityControlRoleName), 'Delete')) {
-        return (New-DemoResult -CheckId 'CONTROL.REMOVE.ROLES' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} role assignment(s) (A1-A3) and the custom role "{1}" would be deleted.' -f $targets.Count, $script:ActivityControlRoleName) -DocUrl $doc)
+    if (-not $PSCmdlet.ShouldProcess(('{0} role assignment(s) and the custom roles "{1}" and "{2}"' -f $targets.Count, $script:ActivityControlRoleName, $script:SessionWriterRoleName), 'Delete')) {
+        return (New-DemoResult -CheckId 'CONTROL.REMOVE.ROLES' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} role assignment(s) (A1-A4) and the custom roles "{1}" and "{2}" would be deleted.' -f $targets.Count, $script:ActivityControlRoleName, $script:SessionWriterRoleName) -DocUrl $doc)
     }
     $failed = [System.Collections.Generic.List[string]]::new()
     foreach ($id in $targets) {
@@ -1824,11 +2045,16 @@ function Remove-DemoActivityControlRole {
             $failed.Add($delete.Error)
         }
     }
-    $roleNote = 'the custom role didn''t exist'
-    if ($roleId) {
-        $delete = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}?api-version=2022-04-01' -f $Name.SubscriptionId, $roleId)
-        $roleNote = if ($delete.Ok -or $delete.Missing) { 'the custom role was deleted' } else { 'the custom role was kept ({0})' -f $delete.Error }
+    $notes = [System.Collections.Generic.List[string]]::new()
+    foreach ($role in @(@{ Id = $roleId; Label = 'the custom role' }, @{ Id = $writerId; Label = ('the custom role "{0}"' -f $script:SessionWriterRoleName) })) {
+        if (-not $role.Id) {
+            $notes.Add(('{0} didn''t exist' -f $role.Label))
+            continue
+        }
+        $delete = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}?api-version=2022-04-01' -f $Name.SubscriptionId, $role.Id)
+        $notes.Add($(if ($delete.Ok -or $delete.Missing) { '{0} was deleted' -f $role.Label } else { '{0} was kept ({1})' -f $role.Label, $delete.Error }))
     }
+    $roleNote = $notes -join '; '
     $status = if ($failed.Count -gt 0) { 'Manual action required' } else { 'Pass' }
     return (New-DemoResult -CheckId 'CONTROL.REMOVE.ROLES' -Area 'workload' -Target 'subscription' -Status $status -Message ('{0} of {1} role assignment(s) deleted; {2}.{3}' -f ($targets.Count - $failed.Count), $targets.Count, $roleNote, $(if ($failed.Count) { ' Failed: ' + ($failed -join '; ') } else { '' })) -Remediation $(if ($failed.Count) { 'Deleting role assignments needs Owner or User Access Administrator, signed in with multifactor authentication.' } else { '' }) -DocUrl $doc)
 }

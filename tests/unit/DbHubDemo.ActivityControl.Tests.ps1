@@ -25,6 +25,13 @@ BeforeAll {
         'Microsoft.DBforPostgreSQL/flexibleServers/read'
         'Microsoft.DBforPostgreSQL/flexibleServers/start/action'
         'Microsoft.DBforPostgreSQL/flexibleServers/stop/action'
+        'Microsoft.DBforPostgreSQL/flexibleServers/write'
+        'Microsoft.DBforPostgreSQL/flexibleServers/delete'
+        'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'
+        'Microsoft.Network/virtualNetworks/subnets/join/action'
+        'Microsoft.Network/privateDnsZones/join/action'
+        'Microsoft.Insights/metrics/read'
+        'Microsoft.Resources/tags/write'
         'Microsoft.Automation/automationAccounts/read'
         'Microsoft.Automation/automationAccounts/runbooks/read'
         'Microsoft.Automation/automationAccounts/jobs/read'
@@ -95,16 +102,36 @@ BeforeAll {
                 if ($script:roleReadFails) {
                     return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access.')
                 }
-                $value = @(if ($script:roleExists) { @{ name = $script:customRoleId; properties = @{ roleName = 'DbHub Demo Activity Operator' } } })
-                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ value = $value } -Depth 5))
+                $value = @()
+                if ($script:roleExists -and $query -match 'DbHub Demo Activity Operator') {
+                    $value += @{ name = $script:customRoleId; properties = @{ roleName = 'DbHub Demo Activity Operator'; permissions = @(@{ actions = @($script:roleActions) }) } }
+                }
+                if ($script:writerExists -and $query -match 'DbHub Demo Session Writer') {
+                    $value += @{ name = $script:writerRoleId; properties = @{ roleName = 'DbHub Demo Session Writer'; permissions = @(@{ actions = @('Microsoft.KeyVault/vaults/secrets/read', 'Microsoft.KeyVault/vaults/secrets/write') }) } }
+                }
+                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ value = @($value) } -Depth 6))
             }
             '/providers/Microsoft\.Authorization/roleDefinitions/([0-9a-f-]+)$' {
+                $id = $Matches[1]
                 if ($Method -eq 'put') {
-                    $script:roleExists = $true
-                    $script:customRoleId = $Matches[1]
+                    $definition = ($Body | ConvertFrom-Json -AsHashtable)['properties']
+                    if ($definition['roleName'] -eq 'DbHub Demo Session Writer') {
+                        $script:writerExists = $true
+                        $script:writerRoleId = $id
+                    }
+                    else {
+                        $script:roleExists = $true
+                        $script:customRoleId = $id
+                        $script:roleActions = @($definition['permissions'][0]['actions'])
+                    }
                 }
                 elseif ($Method -eq 'delete') {
-                    $script:roleExists = $false
+                    if ($id -eq $script:writerRoleId) {
+                        $script:writerExists = $false
+                    }
+                    else {
+                        $script:roleExists = $false
+                    }
                 }
                 return (New-AzResult -StdOut '{}')
             }
@@ -172,6 +199,17 @@ BeforeAll {
                     return (Get-NotFound 'dbhub-activity-webhook')
                 }
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ attributes = @{ exp = [DateTimeOffset]::new($script:webhookExpiry).ToUnixTimeSeconds() } } } -Depth 4))
+            }
+            '/secrets/(dbhub-session-status|dbhub-session-metrics)$' {
+                # The session's secrets (2026-11-14), which setup creates when they're missing.
+                if ($Method -eq 'put') {
+                    $script:ops.Add(('arm put session secret {0}' -f $Matches[1]))
+                    return (New-AzResult -StdOut '{}')
+                }
+                if (-not $script:secretExists) {
+                    return (Get-NotFound $Matches[1])
+                }
+                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ name = $Matches[1]; properties = @{ contentType = 'application/json' } } -Depth 4))
             }
             '/webhooks/generateUri$' {
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject $script:webhookUrl))
@@ -259,6 +297,11 @@ BeforeAll {
         $script:roleExists = $true
         $script:roleReadFails = $false
         $script:customRoleId = 'eeeeeeee-0000-0000-0000-000000000005'
+        # The operator role's actions as Azure holds them (all approved ones by default), and the session writer role
+        # (2026-11-14).
+        $script:roleActions = @($script:approvedActions)
+        $script:writerExists = $true
+        $script:writerRoleId = 'eeeeeeee-0000-0000-0000-000000000006'
         $script:identityExists = $true
         $script:demoGroupExists = $true
         $script:secretExists = $true
@@ -387,29 +430,45 @@ Describe 'The custom role "DbHub Demo Activity Operator" (owner-approved, 2026-1
         @($listed | Sort-Object) | Should -Be @($script:approvedActions | Sort-Object)
     }
 
-    It 'plans A1, A2, and A3 at exactly their approved scopes' {
+    It 'plans A1 to A4 at exactly their approved scopes' {
         $config = New-ControlConfig
         $config['control']['notebookUserObjectIds'] = @('BBBBBBBB-0000-0000-0000-000000000002', $script:callerId)
         $name = Get-ControlName $config
         $plan = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config; Name = $name; Role = $script:customRoleId; Principal = $script:identityPrincipal; Caller = $script:callerId } {
-                Get-DemoActivityControlGrantPlan -Name $Name -Config $Config -RoleId $Role -PrincipalId $Principal -CallerObjectId $Caller -CallerPrincipalType 'User'
+                Get-DemoActivityControlGrantPlan -Name $Name -Config $Config -RoleId $Role -WriterRoleId 'eeeeeeee-0000-0000-0000-000000000005' -PrincipalId $Principal -CallerObjectId $Caller -CallerPrincipalType 'User'
             })
-        @($plan | ForEach-Object Id) | Should -Be @('A1', 'A2', 'A3', 'A3')
+        @($plan | ForEach-Object Id) | Should -Be @('A1', 'A2', 'A3', 'A3', 'A3', 'A3', 'A3', 'A3', 'A4', 'A4')
         $plan[0].Scope | Should -Be $name.DemoResourceGroupId
         $plan[0].PrincipalId | Should -Be $script:identityPrincipal
         $plan[0].PrincipalType | Should -Be 'ServicePrincipal'
         $plan[0].Role | Should -Be 'DbHub Demo Activity Operator'
         $plan[1].Scope | Should -Be $name.AutomationAccountId
         $plan[1].PrincipalType | Should -Be 'ServicePrincipal'
-        foreach ($item in $plan[2..3]) {
-            $item.Scope | Should -Be $name.SecretId
+        foreach ($item in $plan[2..7]) {
             $item.Role | Should -Be 'Key Vault Secrets User'
             $item.RoleDefinitionId | Should -Match '/roleDefinitions/4633458b-17de-408a-b874-0445c86b69e6$'
         }
-        $plan[2].PrincipalId | Should -Be $script:callerId
+        @($plan[2..4] | ForEach-Object Scope) | Should -Be @($name.SecretId, $name.StatusSecretId, $name.MetricsSecretId)
+        @($plan[2..4] | ForEach-Object PrincipalId | Select-Object -Unique) | Should -Be @($script:callerId)
         $plan[2].PrincipalType | Should -Be 'User'
-        $plan[3].PrincipalId | Should -Be 'bbbbbbbb-0000-0000-0000-000000000002' -Because 'the caller is listed once'
+        @($plan[5..7] | ForEach-Object PrincipalId | Select-Object -Unique) | Should -Be @('bbbbbbbb-0000-0000-0000-000000000002') -Because 'the caller is listed once'
+        # A4 (2026-11-14): the session writer role for the identity at the two session secrets only.
+        foreach ($item in $plan[8..9]) {
+            $item.Role | Should -Be 'DbHub Demo Session Writer'
+            $item.RoleDefinitionId | Should -Match '/roleDefinitions/eeeeeeee-0000-0000-0000-000000000005$'
+            $item.PrincipalId | Should -Be $script:identityPrincipal
+            $item.PrincipalType | Should -Be 'ServicePrincipal'
+        }
+        @($plan[8..9] | ForEach-Object Scope) | Should -Be @($name.StatusSecretId, $name.MetricsSecretId)
         @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config; Name = $name } { Get-DemoActivityControlGrantPlan -Name $Name -Config $Config -RoleId 'x' -PrincipalId 'y' -Assignment 'A1' }).Count | Should -Be 1
+    }
+
+    It 'has a second role, "DbHub Demo Session Writer", with only the two secret actions (2026-11-14)' {
+        $definition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Sub = $script:sub } { Get-DemoActivityControlRoleDefinition -SubscriptionId $Sub -Writer }
+        $definition['properties']['roleName'] | Should -Be 'DbHub Demo Session Writer'
+        @($definition['properties']['permissions'][0]['actions']) | Should -Be @('Microsoft.KeyVault/vaults/secrets/read', 'Microsoft.KeyVault/vaults/secrets/write')
+        @($definition['properties']['permissions'][0]['dataActions']).Count | Should -Be 0
+        @($definition['properties']['assignableScopes']) | Should -Be @(('/subscriptions/{0}' -f $script:sub))
     }
 }
 
@@ -532,26 +591,39 @@ Describe 'Granting the roles (setup-activity-control.ps1 -GrantRole)' {
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { [pscustomobject]@{ checkId = 'PREFLIGHT.GUARD.CONTEXT'; status = 'Pass'; message = 'ok'; remediation = '' } }
     }
 
-    It 'creates the role with exactly the approved actions, then assigns A1, A2, and A3 at their scopes only' {
+    It 'creates the roles with exactly the approved actions, then assigns A1 to A4 at their scopes only' {
         $script:roleExists = $false
+        $script:writerExists = $false
         $config = New-ControlConfig
         $name = Get-ControlName $config
         $results = @(Invoke-DemoActivityControlSetup -Config $config -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
         $definition = @($script:rest | Where-Object { $_.Method -eq 'put' -and $_.Url -match '/roleDefinitions/' })
-        $definition.Count | Should -Be 1
+        $definition.Count | Should -Be 2
         $body = $definition[0].Body | ConvertFrom-Json -AsHashtable
         @($body['properties']['permissions'][0]['actions']) | Should -Be $script:approvedActions
         @($body['properties']['assignableScopes']) | Should -Be @(('/subscriptions/{0}' -f $script:sub))
-        @($script:assignments | ForEach-Object scope) | Should -Be @($name.DemoResourceGroupId, $name.AutomationAccountId, $name.SecretId)
+        $writer = $definition[1].Body | ConvertFrom-Json -AsHashtable
+        $writer['properties']['roleName'] | Should -Be 'DbHub Demo Session Writer'
+        @($writer['properties']['permissions'][0]['actions']) | Should -Be @('Microsoft.KeyVault/vaults/secrets/read', 'Microsoft.KeyVault/vaults/secrets/write')
+        @($script:assignments | ForEach-Object scope) | Should -Be @($name.DemoResourceGroupId, $name.AutomationAccountId, $name.SecretId, $name.StatusSecretId, $name.MetricsSecretId, $name.StatusSecretId, $name.MetricsSecretId)
         $script:assignments[0].principalId | Should -Be $script:identityPrincipal
         $script:assignments[0].principalType | Should -Be 'ServicePrincipal'
         $script:assignments[1].principalType | Should -Be 'ServicePrincipal'
-        $script:assignments[2].principalId | Should -Be $script:callerId
-        $script:assignments[2].principalType | Should -Be 'User'
-        $script:assignments[2].roleDefinitionId | Should -Match '/4633458b-17de-408a-b874-0445c86b69e6$'
-        foreach ($id in 'CONTROL.ROLE.DEFINITION', 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3') {
-            ($results | Where-Object checkId -EQ $id).status | Should -Be 'Pass' -Because $id
+        foreach ($index in 2..4) {
+            $script:assignments[$index].principalId | Should -Be $script:callerId
+            $script:assignments[$index].principalType | Should -Be 'User'
+            $script:assignments[$index].roleDefinitionId | Should -Match '/4633458b-17de-408a-b874-0445c86b69e6$'
         }
+        foreach ($index in 5..6) {
+            $script:assignments[$index].principalId | Should -Be $script:identityPrincipal
+            $script:assignments[$index].roleDefinitionId | Should -Match ('/{0}$' -f $script:writerRoleId)
+        }
+        foreach ($id in 'CONTROL.ROLE.DEFINITION', 'CONTROL.ROLE.WRITER', 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3', 'CONTROL.ROLE.A4') {
+            @($results | Where-Object checkId -EQ $id | ForEach-Object status | Select-Object -Unique) | Should -Be @('Pass') -Because $id
+        }
+        # The grant's output says what each action added on 2026-11-14 could touch.
+        ($results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION').message | Should -Match 'flexibleServers/delete: deletes T4''s read replica after a session; it could also delete T4'
+        ($results | Where-Object checkId -EQ 'CONTROL.ROLE.WRITER').message | Should -Match 'at those two secrets only'
         foreach ($file in $script:bodyFiles) {
             Test-Path -LiteralPath $file | Should -BeFalse -Because 'each request body''s private file is deleted'
         }
@@ -561,9 +633,15 @@ Describe 'Granting the roles (setup-activity-control.ps1 -GrantRole)' {
         $config = New-ControlConfig
         $name = Get-ControlName $config
         $role = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}' -f $script:sub, $script:customRoleId
+        $reader = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/4633458b-17de-408a-b874-0445c86b69e6' -f $script:sub
+        $writer = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}' -f $script:sub, $script:writerRoleId
         $script:assignments.Add([pscustomobject]@{ name = '1'; scope = $name.DemoResourceGroupId; roleDefinitionId = $role; principalId = $script:identityPrincipal })
         $script:assignments.Add([pscustomobject]@{ name = '2'; scope = $name.AutomationAccountId; roleDefinitionId = $role; principalId = $script:identityPrincipal })
-        $script:assignments.Add([pscustomobject]@{ name = '3'; scope = $name.SecretId; roleDefinitionId = ('/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/4633458b-17de-408a-b874-0445c86b69e6' -f $script:sub); principalId = $script:callerId })
+        $script:assignments.Add([pscustomobject]@{ name = '3'; scope = $name.SecretId; roleDefinitionId = $reader; principalId = $script:callerId })
+        $script:assignments.Add([pscustomobject]@{ name = '4'; scope = $name.StatusSecretId; roleDefinitionId = $reader; principalId = $script:callerId })
+        $script:assignments.Add([pscustomobject]@{ name = '5'; scope = $name.MetricsSecretId; roleDefinitionId = $reader; principalId = $script:callerId })
+        $script:assignments.Add([pscustomobject]@{ name = '6'; scope = $name.StatusSecretId; roleDefinitionId = $writer; principalId = $script:identityPrincipal })
+        $script:assignments.Add([pscustomobject]@{ name = '7'; scope = $name.MetricsSecretId; roleDefinitionId = $writer; principalId = $script:identityPrincipal })
         $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } { Grant-DemoActivityControlRole -Config $Config -Confirm:$false })
         @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
         @($results | Where-Object status -NE 'Pass') | Should -BeNullOrEmpty
@@ -571,22 +649,24 @@ Describe 'Granting the roles (setup-activity-control.ps1 -GrantRole)' {
 
     It 'changes nothing with -WhatIf, and says what it would do' {
         $script:roleExists = $false
+        $script:writerExists = $false
         $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -GrantRole -WhatIf)
         @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
-        foreach ($id in 'CONTROL.ROLE.DEFINITION', 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3') {
-            ($results | Where-Object checkId -EQ $id).status | Should -Be 'Not selected' -Because $id
+        foreach ($id in 'CONTROL.ROLE.DEFINITION', 'CONTROL.ROLE.WRITER', 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3', 'CONTROL.ROLE.A4') {
+            @($results | Where-Object checkId -EQ $id | ForEach-Object status | Select-Object -Unique) | Should -Be @('Not selected') -Because $id
         }
         ($results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION').message | Should -Match 'Microsoft\.Compute/virtualMachines/deallocate/action'
     }
 
-    It 'reports Manual action required with the exact command when the caller can''t create role assignments' {
+    It 'reports a Warning with the grant script when the caller can''t create role assignments, as the safety stop does (2026-11-14)' {
         $script:canAssign = $false
         $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
         @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
-        foreach ($id in 'CONTROL.ROLE.DEFINITION', 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3') {
-            $result = $results | Where-Object checkId -EQ $id
-            $result.status | Should -Be 'Manual action required' -Because $id
-            $result.remediation | Should -Match ([regex]::Escape('./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole'))
+        foreach ($id in 'CONTROL.ROLE.DEFINITION', 'CONTROL.ROLE.WRITER', 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3', 'CONTROL.ROLE.A4') {
+            foreach ($result in @($results | Where-Object checkId -EQ $id)) {
+                $result.status | Should -Be 'Warning' -Because $id
+                $result.remediation | Should -Match ([regex]::Escape('./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
+            }
         }
     }
 }
@@ -632,7 +712,7 @@ Describe 'deploy.ps1''s A1 re-grant (Invoke-DemoActivityControlRegrant)' {
         @($script:rest | Where-Object { $_.Method -eq 'put' -and $_.Url -match '/roleDefinitions/' }) | Should -BeNullOrEmpty
     }
 
-    It 'reports Manual action required with the -GrantRole command when <Case>' -ForEach @(
+    It 'reports a Warning with the grant script when <Case>' -ForEach @(
         @{ Case = 'assignRoles is false'; AssignRoles = $false; Setup = { } }
         @{ Case = 'the caller can''t assign roles'; AssignRoles = $true; Setup = { $script:canAssign = $false } }
         @{ Case = 'the role definition is missing'; AssignRoles = $true; Setup = { $script:roleExists = $false } }
@@ -640,18 +720,18 @@ Describe 'deploy.ps1''s A1 re-grant (Invoke-DemoActivityControlRegrant)' {
     ) {
         & $Setup
         $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -AssignRoles $AssignRoles) } { Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath './config/demo.config.json' -Confirm:$false })
-        $a1 = $results | Where-Object checkId -EQ $(if ($Case -match 'can''t be read') { 'CONTROL.ROLE.DEFINITION' } else { 'CONTROL.ROLE.A1' })
-        $a1.status | Should -Be 'Manual action required'
-        $a1.remediation | Should -Match ([regex]::Escape('./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole'))
+        $a1 = $results | Where-Object checkId -EQ $(if ($Case -match 'can''t be read') { 'CONTROL.ROLE.DEFINITION' } else { 'CONTROL.ROLE.A1' }) | Select-Object -First 1
+        $a1.status | Should -Be 'Warning'
+        $a1.remediation | Should -Match ([regex]::Escape('./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
         $script:assignments.Count | Should -Be 0
     }
 
-    It 'reports Manual action required when the grant throws' {
+    It 'reports a Warning with the grant script when the grant throws' {
         Mock -ModuleName DbHubDemo -CommandName Grant-DemoActivityControlRole -MockWith { throw 'AADSTS50076: multifactor authentication is required.' }
         $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -AssignRoles $true) } { Invoke-DemoActivityControlRegrant -Config $Config -Confirm:$false })
         $results[0].checkId | Should -Be 'CONTROL.ROLE.A1'
-        $results[0].status | Should -Be 'Manual action required'
-        $results[0].remediation | Should -Match '-GrantRole'
+        $results[0].status | Should -Be 'Warning'
+        $results[0].remediation | Should -Match 'grant-safety-stop\.ps1'
     }
 
     It 'is called after the Infrastructure stage on both deploy paths, and DEPLOY.SUMMARY lists what needs an Owner' {
@@ -1046,9 +1126,15 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         $config = New-ControlConfig
         $name = Get-ControlName $config
         $role = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}' -f $script:sub, $script:customRoleId
+        $reader = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/4633458b-17de-408a-b874-0445c86b69e6' -f $script:sub
+        $writer = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}' -f $script:sub, $script:writerRoleId
         $script:assignments.Add([pscustomobject]@{ name = '1'; scope = $name.DemoResourceGroupId; roleDefinitionId = $role; principalId = $script:identityPrincipal })
         $script:assignments.Add([pscustomobject]@{ name = '2'; scope = $name.AutomationAccountId; roleDefinitionId = $role; principalId = $script:identityPrincipal })
-        $script:assignments.Add([pscustomobject]@{ name = '3'; scope = $name.SecretId; roleDefinitionId = ('/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/4633458b-17de-408a-b874-0445c86b69e6' -f $script:sub); principalId = $script:callerId })
+        $script:assignments.Add([pscustomobject]@{ name = '3'; scope = $name.SecretId; roleDefinitionId = $reader; principalId = $script:callerId })
+        $script:assignments.Add([pscustomobject]@{ name = '4'; scope = $name.StatusSecretId; roleDefinitionId = $reader; principalId = $script:callerId })
+        $script:assignments.Add([pscustomobject]@{ name = '5'; scope = $name.MetricsSecretId; roleDefinitionId = $reader; principalId = $script:callerId })
+        $script:assignments.Add([pscustomobject]@{ name = '6'; scope = $name.StatusSecretId; roleDefinitionId = $writer; principalId = $script:identityPrincipal })
+        $script:assignments.Add([pscustomobject]@{ name = '7'; scope = $name.MetricsSecretId; roleDefinitionId = $writer; principalId = $script:identityPrincipal })
         $script:webhooks = @('dbhub-activity-202610270000')
         $script:now = [datetime]::new(2026, 10, 27, 15, 0, 0, [System.DateTimeKind]::Utc)
     }
@@ -1062,17 +1148,31 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
 
     It 'passes when everything is in place' {
         $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -NowUtc $script:now)
-        @($results | ForEach-Object checkId) | Should -Be @('CONTROL.SETUP', 'CONTROL.WEBHOOK', 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3', 'CONTROL.AUTOSTOP', 'CONTROL.SAFETYSTOP')
+        @($results | ForEach-Object checkId) | Should -Be @('CONTROL.SETUP', 'CONTROL.WEBHOOK', 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3', 'CONTROL.ROLE.A4', 'CONTROL.AUTOSTOP', 'CONTROL.SAFETYSTOP')
         @($results | Where-Object status -NE 'Pass') | Should -BeNullOrEmpty
         @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty -Because 'validation only reads'
     }
 
-    It 'reports a missing A1 after a redeploy as Manual action required with the -GrantRole command' {
+    It 'reports a missing A1 after a redeploy as a Warning with the grant script' {
         $script:assignments.RemoveAt(0)
         $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -NowUtc $script:now)
         $a1 = $results | Where-Object checkId -EQ 'CONTROL.ROLE.A1'
-        $a1.status | Should -Be 'Manual action required'
-        $a1.remediation | Should -Match ([regex]::Escape('./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole'))
+        $a1.status | Should -Be 'Warning'
+        $a1.remediation | Should -Match ([regex]::Escape('./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
+    }
+
+    It 'reports an operator role from before 2026-11-14, without the session''s actions, and A4 that''s missing, each with the grant script' {
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notmatch 'flexibleServers/(write|delete)$|configurations/write|/join/action|metrics/read|tags/write' })
+        $script:assignments.RemoveAt(6)
+        $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -NowUtc $script:now)
+        $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
+        $definition.status | Should -Be 'Warning'
+        $definition.message | Should -Match 'lacks 7 of its approved actions'
+        $definition.message | Should -Match 'runs without T4''s read replica'
+        $a4 = $results | Where-Object checkId -EQ 'CONTROL.ROLE.A4'
+        $a4.status | Should -Be 'Warning'
+        $a4.message | Should -Match 'dbhub-session-metrics'
+        $a4.remediation | Should -Match 'grant-safety-stop\.ps1'
     }
 
     It 'warns 14 days before the webhook expires, and needs a rotation once it has' -ForEach @(
@@ -1099,8 +1199,8 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         $script:assignments.RemoveAt(0)
         $status = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig); Now = $script:now } { Get-DemoActivityControlStatus -Config $Config -NowUtc $Now }
         $status.checkId | Should -Be 'STATUS.CONTROL'
-        $status.status | Should -Be 'Manual action required'
-        $status.remediation | Should -Match '-GrantRole'
+        $status.status | Should -Be 'Warning'
+        $status.remediation | Should -Match 'grant-safety-stop\.ps1'
     }
 
     It 'reads the daily T4 safety stop''s schedule the same way for CONTROL.SAFETYSTOP, stop-demo.ps1, and status.ps1 (review of 20e855c): <Case>' -ForEach @(

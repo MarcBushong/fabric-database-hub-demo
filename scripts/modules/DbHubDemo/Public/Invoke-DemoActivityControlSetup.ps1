@@ -191,6 +191,8 @@ function Invoke-DemoActivityControlSetup {
     else {
         $results.Add((New-DemoResult -CheckId 'CONTROL.WEBHOOK' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The webhook {0} is valid until {1:yyyy-MM-dd}, and its URL is in the secret {2}; -RotateWebhook replaces it.' -f $newest.Name, $newest.ExpiryUtc, $name.Secret) -Evidence ([ordered]@{ webhook = $newest.Name; expiresUtc = $newest.ExpiryUtc }) -DocUrl $script:ActivityControlDoc))
     }
+    # 6b. The session's status and metrics secrets (2026-11-14), which A3 and A4 are scoped to.
+    $results.Add((Initialize-DemoActivityControlSessionSecret -Name $name -Confirm:$false))
 
     # 7. The notebook.
     if ($SkipFabric) {
@@ -205,17 +207,19 @@ function Invoke-DemoActivityControlSetup {
         }
     }
 
-    # What's left for the owner: the roles.
+    # 8. The roles (2026-11-14, ADR 0026): granted when the caller may (an Owner or User Access Administrator), as the
+    # safety stop's is; otherwise each missing one is a Warning with ./scripts/grant-safety-stop.ps1, and a session runs
+    # without what it lacks and says so.
     if (-not $WhatIfPreference) {
-        foreach ($item in @(Test-DemoActivityControlRole -Config $Config -ConfigPath $ConfigPath)) {
+        foreach ($item in @(Grant-DemoActivityControlRole -Config $Config -IncludeDefinition -ConfigPath $ConfigPath -Confirm:$false)) {
             $results.Add($item)
         }
     }
-    $manual = @($results | Where-Object { $_.status -eq 'Manual action required' })
+    $manual = @($results | Where-Object { $_.status -in 'Manual action required', 'Warning' })
     $failed = @($results | Where-Object { $_.status -eq 'Fail' })
-    $summaryStatus = if ($failed.Count) { 'Fail' } elseif ($manual.Count) { 'Manual action required' } elseif ($WhatIfPreference) { 'Not selected' } else { 'Pass' }
+    $summaryStatus = if ($failed.Count) { 'Fail' } elseif ($manual.Count) { 'Warning' } elseif ($WhatIfPreference) { 'Not selected' } else { 'Pass' }
     $where = if ($mode.Mode -eq 'public') { 'the folder "{0}" of the existing workspace' -f $name.FabricFolder } else { 'the workspace "{0}"' -f $name.FabricWorkspace }
-    $summary = if ($failed.Count) { '{0} step(s) failed; fix them and run setup-activity-control.ps1 again.' -f $failed.Count } elseif ($manual.Count) { '{0} item(s) need you: {1}' -f $manual.Count, (@($manual | ForEach-Object { '{0}: {1}' -f $_.checkId, $(if ($_.remediation) { $_.remediation } else { $_.message }) }) -join ' | ') } else { 'The control is ready: open {0} in {1}, set its parameters, and run it.' -f $name.Notebook, $where }
+    $summary = if ($failed.Count) { '{0} step(s) failed; fix them and run ./scripts/deploy.ps1 again.' -f $failed.Count } elseif ($manual.Count) { 'The control is set up; {0} item(s) need attention: {1}' -f $manual.Count, (@($manual | ForEach-Object { '{0}: {1}' -f $_.checkId, $(if ($_.remediation) { $_.remediation } else { $_.message }) }) -join ' | ') } else { 'The control is ready: open {0} in {1} and select Run all.' -f $name.Notebook, $where }
     $results.Add((New-DemoResult -CheckId 'CONTROL.SUMMARY' -Area 'workload' -Target 'subscription' -Status $summaryStatus -Message $summary -Evidence ([ordered]@{ mode = $mode.Mode; resourceGroup = $name.ResourceGroup; notebook = $name.Notebook; notebookPlace = $where }) -DocUrl $script:ActivityControlDoc))
     return $results.ToArray()
 }

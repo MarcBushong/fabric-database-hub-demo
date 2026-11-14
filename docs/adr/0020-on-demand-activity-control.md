@@ -128,6 +128,13 @@ One custom role, assignable only in the configured subscription, with exactly th
 - `Microsoft.DBforPostgreSQL/flexibleServers/read`
 - `Microsoft.DBforPostgreSQL/flexibleServers/start/action`
 - `Microsoft.DBforPostgreSQL/flexibleServers/stop/action`
+- `Microsoft.DBforPostgreSQL/flexibleServers/write` (2026-11-14, [ADR 0026](0026-one-run-all-session.md))
+- `Microsoft.DBforPostgreSQL/flexibleServers/delete` (2026-11-14)
+- `Microsoft.DBforPostgreSQL/flexibleServers/configurations/write` (2026-11-14)
+- `Microsoft.Network/virtualNetworks/subnets/join/action` (2026-11-14)
+- `Microsoft.Network/privateDnsZones/join/action` (2026-11-14)
+- `Microsoft.Insights/metrics/read` (2026-11-14)
+- `Microsoft.Resources/tags/write` (2026-11-14)
 - `Microsoft.Automation/automationAccounts/read`
 - `Microsoft.Automation/automationAccounts/runbooks/read`
 - `Microsoft.Automation/automationAccounts/jobs/read`
@@ -138,7 +145,7 @@ One custom role, assignable only in the configured subscription, with exactly th
 - `Microsoft.Automation/automationAccounts/jobSchedules/write`
 - `Microsoft.Automation/automationAccounts/jobSchedules/delete`
 
-It has no `NotActions` and no data actions. It can't create or delete a VM, disk, network, or database; it has no action Run Command, and no Key Vault, Fabric, or role-assignment permission. Every name is from the Azure permissions reference: [Compute](https://learn.microsoft.com/azure/role-based-access-control/permissions/compute), [Databases](https://learn.microsoft.com/azure/role-based-access-control/permissions/databases), [Management and governance](https://learn.microsoft.com/azure/role-based-access-control/permissions/management-and-governance), and [General](https://learn.microsoft.com/azure/role-based-access-control/permissions/general). The runbooks poll resources rather than asynchronous operation URLs, so every call stays within the scopes below. `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` fails if the module's list and this one differ.
+It has no `NotActions` and no data actions. It can't create or delete a VM, disk, network, or Azure SQL database; it has no action Run Command, and no Key Vault, Fabric, or role-assignment permission. Since 2026-11-14 ([ADR 0026](0026-one-run-all-session.md), approved for the user by the project's coordinator, who reviews it with the user before any merge), it can create and delete PostgreSQL flexible servers in the demo resource group, for T4's read replica, set the replica's streaming delay, read T4's and the replica's metrics, and tag the demo resource group; ADR 0026 says what each of those actions could touch. Every name is from the Azure permissions reference: [Compute](https://learn.microsoft.com/azure/role-based-access-control/permissions/compute), [Databases](https://learn.microsoft.com/azure/role-based-access-control/permissions/databases), [Networking](https://learn.microsoft.com/azure/role-based-access-control/permissions/networking), [Monitor](https://learn.microsoft.com/azure/role-based-access-control/permissions/monitor), [Management and governance](https://learn.microsoft.com/azure/role-based-access-control/permissions/management-and-governance), and [General](https://learn.microsoft.com/azure/role-based-access-control/permissions/general). The runbooks poll resources rather than asynchronous operation URLs, so every call stays within the scopes below. `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` fails if the module's list and this one differ.
 
 ### The assignments A1-A3
 

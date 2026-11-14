@@ -43,6 +43,7 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | [0023](0023-first-run-automation.md) | First-run automation: `init.ps1`, the P6 group, the Rayfin sign-in, and opt-in capacity and history steps | User-directed (2026-10-26, 2026-10-27, 2026-11-09), with the coordinator's decisions | Accepted; live check of `init.ps1` read-only, the rest pending; Phase 28: `deploy.ps1` runs the first run; 2026-11-09: the Rayfin CLI deploys with the Azure CLI's tokens, its own sign-in only as the fallback |
 | [0024](0024-nightly-safety-stop.md) | The nightly safety stop: every database stopped or checked each night, with a stop-only role | User-directed (2026-11-05, 2026-11-09), with engineering detail; an owner-approved exception to ADR 0008 | Accepted; ran live from 2026-11-06; amended 2026-11-09 (each link's scope read by its ID, and T4 stopped at the T3 check), unit-tested |
 | [0025](0025-t4-read-replica.md) | T4's read replica, created for each session | User-directed (2026-11-13, "Postgres HA/DR"), with the lifecycle chosen from a live probe and approved within the owner's delegated scope | Accepted; probe live on 2026-11-13; live deployment results in the ADR |
+| [0026](0026-one-run-all-session.md) | One Run all for a whole demo session | User-directed (2026-11-14: one notebook, one thing to run; no GitHub Actions for a demo), with the design and the control identity's grant approved for the user by the coordinator | Accepted; live validation in the ADR |
 
 ## Template
 

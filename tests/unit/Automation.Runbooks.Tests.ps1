@@ -86,6 +86,22 @@ BeforeAll {
         # Run Commands listed on a VM, by VM name; without an entry, the earlier run's DbHubControl-<vm>-20261026000000
         # and someone else's DbHubDemo-Other, without instance views.
         $script:runCommands = @{}
+        # The control session (2026-11-14, ADR 0026): the replica's creation (sizes Azure refuses, how many times T4 isn't
+        # ready for it, whether the identity may, and the minutes it takes), its deletion, its parameter, the second
+        # auto-stop, the control vault's secrets as the runbook writes them, and whether the group's tags can be written.
+        $script:replicaRefuse = @()
+        $script:replicaNotReady = 0
+        $script:replicaForbidden = $false
+        $script:replicaCreateMinutes = 9
+        $script:replicaSku = ''
+        $script:replicaRole = 'AsyncReplica'
+        $script:replicaGoneAt = $null
+        $script:replicaDeleteForbidden = $false
+        $script:replicaParameter = ''
+        $script:backup = ''
+        $script:secrets = @{}
+        $script:secretsForbidden = $false
+        $script:tagsForbidden = $false
     }
 
     function Get-TestVmState([string] $Name) {
@@ -97,6 +113,46 @@ BeforeAll {
 
     function Invoke-TestAzure([string] $Method, [string] $Path, [object] $Body) {
         switch -Regex ($Path) {
+            '/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Resources/tags/default$' {
+                if ($script:tagsForbidden) { return (New-Response 403 '{"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.Resources/tags/write."}}') }
+                foreach ($property in $Body.properties.tags.GetEnumerator()) { $script:groupTags[[string]$property.Key] = [string]$property.Value }
+                return (New-Response 200 '{}')
+            }
+            '/vaults/kv-dbhub-ctl-[0-9a-f]{6}/secrets/(dbhub-session-status|dbhub-session-metrics)$' {
+                if ($script:secretsForbidden) { return (New-Response 403 '{"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.KeyVault/vaults/secrets/write."}}') }
+                $name = $Matches[1]
+                if (-not $script:secrets.ContainsKey($name)) { $script:secrets[$name] = [System.Collections.Generic.List[object]]::new() }
+                $script:secrets[$name].Add([pscustomobject]@{ Value = [string]$Body.properties.value; Tags = $Body['tags']; At = $script:clock })
+                return (New-Response 200 '{}')
+            }
+            '/flexibleServers/(pgflex01|pgreplica01)-abc123/providers/Microsoft\.Insights/metrics\?' {
+                # Three 1-minute points of each metric asked for; Read Replica Lag climbs to 180 seconds and drops.
+                $server = $Matches[1]
+                $null = $Path -match 'metricnames=([^&]+)'
+                $names = $Matches[1] -split ','
+                $null = $Path -match 'aggregation=(\w+)'
+                $field = $Matches[1].ToLowerInvariant()
+                $value = foreach ($metric in $names) {
+                    $points = foreach ($index in 0..2) {
+                        $number = if ($metric -eq 'physical_replication_delay_in_seconds') { @(4, 180, 6)[$index] } else { 10 + $index }
+                        @{ timeStamp = $script:clock.Date.AddHours(15).AddMinutes($index).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture); $field = $number }
+                    }
+                    @{ name = @{ value = $metric }; unit = $(if ($metric -match 'percent') { 'Percent' } elseif ($metric -match 'seconds') { 'Seconds' } elseif ($metric -match 'bytes') { 'Bytes' } else { 'Count' }); timeseries = @(@{ data = @($points) }); server = $server }
+                }
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($value) } -Depth 8))
+            }
+            '/flexibleServers/pgreplica01-abc123/configurations/max_standby_streaming_delay$' {
+                $script:replicaParameter = [string]$Body.properties.value
+                return (New-Response 202)
+            }
+            '/schedules/dbhub-autostop-backup$' {
+                if ($Method -eq 'GET') {
+                    if (-not $script:backup) { return (New-Response 404) }
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:backup } }))
+                }
+                if ($Method -eq 'PUT') { $script:backup = [string]$Body.properties.startTime; return (New-Response 201 '{}') }
+                if ($Method -eq 'DELETE') { $script:backup = ''; return (New-Response 200) }
+            }
             '/resourceGroups/rg-dbhub-demo$' {
                 if ($script:group -ne 200) { return (New-Response $script:group) }
                 # The busy marker's tags (2026-11-14) and any others a test sets, beside the deployment ID.
@@ -204,10 +260,12 @@ BeforeAll {
                 if (-not $script:t4) { return (New-Response 404) }
                 if ($script:t4 -eq 'Starting' -and $null -ne $script:t4ReadyAt -and $script:clock -ge $script:t4ReadyAt) { $script:t4 = 'Ready' }
                 if ($script:t4 -eq 'Stopping' -and $null -ne $script:t4StoppedAt -and $script:clock -ge $script:t4StoppedAt) { $script:t4 = 'Stopped' }
+                # T4's location, subnet, private DNS zone, and storage, which its replica copies (the session, 2026-11-14).
+                $server = @{ id = ($script:demo + '/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123'); location = 'westus3'; properties = @{ state = $script:t4; replicationRole = 'Primary'; network = @{ delegatedSubnetResourceId = ($script:demo + '/providers/Microsoft.Network/virtualNetworks/vnet-dbhub-demo/subnets/snet-pg'); privateDnsZoneArmResourceId = ($script:demo + '/providers/Microsoft.Network/privateDnsZones/dbhub.private.postgres.database.azure.com') }; storage = @{ storageSizeGB = 32; tier = 'P4' } } }
                 if ($script:t4Sku) {
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ sku = @{ name = $script:t4Sku; tier = $script:t4Tier }; properties = @{ state = $script:t4 } }))
+                    $server['sku'] = @{ name = $script:t4Sku; tier = $script:t4Tier }
                 }
-                return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ state = $script:t4 } }))
+                return (New-Response 200 (ConvertTo-Json -InputObject $server -Depth 6))
             }
             '/flexibleServers/pgflex01-abc123/(start|stop)$' {
                 if ($script:t4ActionStatus -ne 202) { return (New-Response $script:t4ActionStatus '{"error":{"code":"UnsupportedMediaType","message":"Unsupported media type."}}') }
@@ -217,9 +275,33 @@ BeforeAll {
                 $script:t4 = $(if ($Matches[1] -eq 'start') { 'Starting' } else { 'Stopping' }); return (New-Response 202)
             }
             '/flexibleServers/pgreplica01-abc123$' {
+                if ($Method -eq 'PUT') {
+                    # The session's creation (createMode Replica): refused sizes, a T4 that isn't ready yet, or no grant.
+                    $sku = [string]$Body.sku.name
+                    if ($script:replicaForbidden) { return (New-Response 403 '{"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.DBforPostgreSQL/flexibleServers/write."}}') }
+                    if ($script:replicaNotReady -gt 0) {
+                        $script:replicaNotReady--
+                        return (New-Response 409 '{"error":{"code":"ReadReplicaServerInUnexpectedState","message":"Cannot perform operation on read replica because it''s in ''Restarting'' state."}}')
+                    }
+                    if ($sku -in $script:replicaRefuse) { return (New-Response 400 ('{{"error":{{"code":"SkuNotAvailable","message":"The requested SKU {0} isn''t available in westus3."}}}}' -f $sku)) }
+                    $script:replica = 'Provisioning'
+                    $script:replicaSku = $sku
+                    $script:replicaReadyAt = $script:clock.AddMinutes($script:replicaCreateMinutes)
+                    return (New-Response 201 '{}')
+                }
+                if ($Method -eq 'DELETE') {
+                    if ($script:replicaDeleteForbidden) { return (New-Response 403 '{"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.DBforPostgreSQL/flexibleServers/delete."}}') }
+                    if (-not $script:replica) { return (New-Response 404) }
+                    $script:replica = 'Dropping'
+                    $script:replicaGoneAt = $script:clock.AddMinutes(2)
+                    return (New-Response 202)
+                }
+                if ($script:replica -eq 'Dropping' -and $null -ne $script:replicaGoneAt -and $script:clock -ge $script:replicaGoneAt) { $script:replica = '' }
                 if (-not $script:replica) { return (New-Response 404) }
-                if ($script:replica -eq 'Starting' -and $null -ne $script:replicaReadyAt -and $script:clock -ge $script:replicaReadyAt) { $script:replica = 'Ready' }
-                return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ state = $script:replica; replicationRole = 'AsyncReplica' } }))
+                if ($script:replica -in 'Starting', 'Provisioning' -and $null -ne $script:replicaReadyAt -and $script:clock -ge $script:replicaReadyAt) { $script:replica = 'Ready' }
+                $server = @{ properties = @{ state = $script:replica; replicationRole = $script:replicaRole } }
+                if ($script:replicaSku) { $server['sku'] = @{ name = $script:replicaSku; tier = 'GeneralPurpose' } }
+                return (New-Response 200 (ConvertTo-Json -InputObject $server -Depth 4))
             }
             '/flexibleServers/pgreplica01-abc123/(start|stop)$' {
                 # Azure's order: the replica stops only once T4 is stopped.
@@ -968,6 +1050,294 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
     }
 }
 
+Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read replica, its status, and its end' {
+    BeforeEach {
+        Reset-TestAzure
+        Mock Get-DbHubUtcNow { return $script:clock }
+        Mock Start-Sleep { $script:clock = $script:clock.AddSeconds($Seconds) }
+        Mock Invoke-DbHubArm {
+            $script:calls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body; At = $script:clock })
+            return (Invoke-TestAzure -Method $Method -Path $Path -Body $Body)
+        }
+        # An environment deploy.ps1 set the replica up in, with T4 stopped on its default size and no replica between sessions.
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4 = 'Stopped'
+        $script:t4Sku = 'Standard_D4ds_v5'
+        $script:t4Tier = 'GeneralPurpose'
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $script:sessionId = '0123456789abcdef0123456789abcdef'
+        # The status the notebook reads: the latest write of the status secret, parsed.
+        function Get-SessionStatus {
+            $writes = $script:secrets['dbhub-session-status']
+            return ($writes[$writes.Count - 1].Value | ConvertFrom-Json)
+        }
+    }
+
+    It 'validates its requests: a session needs a sessionId, takes the showcase''s minutes, and runs the showcase on every target' {
+        $session = Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Settings $script:settings
+        $session.Valid | Should -BeTrue
+        $session.Action | Should -Be 'session'
+        $session.SessionId | Should -Be $script:sessionId
+        $session.DurationMinutes | Should -Be 90
+        @($session.Activities | ForEach-Object Target) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        @($session.Activities | ForEach-Object Scenario | Select-Object -Unique) | Should -Be @('showcase')
+        (Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; durationMinutes = 120 }) -Settings $script:settings).DurationMinutes | Should -Be 120
+        foreach ($body in @(
+                @{ action = 'session' }
+                @{ action = 'session'; sessionId = 'ABCDEF0123456789ABCDEF0123456789' }
+                @{ action = 'session'; sessionId = $script:sessionId; durationMinutes = 20 }
+                @{ action = 'session'; sessionId = $script:sessionId; durationMinutes = 121 }
+                @{ action = 'session'; sessionId = $script:sessionId; activities = @() }
+                @{ action = 'capture' }
+            )) {
+            (Test-DbHubControlRequest -WebhookData (New-Webhook $body) -Settings $script:settings).Valid | Should -BeFalse -Because ($body | ConvertTo-Json -Compress)
+        }
+        (Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'capture'; sessionId = $script:sessionId }) -Settings $script:settings).Valid | Should -BeTrue
+        $stop = Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:sessionId }) -Settings $script:settings
+        $stop.Valid | Should -BeTrue
+        $stop.SessionId | Should -Be $script:sessionId
+    }
+
+    It 'starts everything, marks the demo busy, asks for T4''s read replica once T4 is Ready, and says when the replica beat runs' {
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $result.action | Should -Be 'session'
+        $result.status | Should -Be 'Started'
+        $result.sessionId | Should -Be $script:sessionId
+        # The busy marker and the session's ID, before anything starts.
+        $script:groupTags['DbHubBusyBy'] | Should -Be 'session'
+        $script:groupTags['DbHubSessionId'] | Should -Be $script:sessionId
+        $script:groupTags['DbHubSessionStartUtc'] | Should -Be '2026-10-27T15:00:00Z'
+        $marker = @($script:calls | Where-Object { $_.Method -eq 'PATCH' }) | Select-Object -First 1
+        $firstStart = @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/start$' }) | Select-Object -First 1
+        $marker.At | Should -BeLessOrEqual $firstStart.At
+        $script:calls.IndexOf($marker) | Should -BeLessThan $script:calls.IndexOf($firstStart)
+        # The auto-stop and its second, 30 minutes later.
+        $script:autostop | Should -Not -BeNullOrEmpty
+        ([datetime]::Parse($script:backup, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) - [datetime]::Parse($script:autostop, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)).TotalMinutes | Should -Be 30
+        @($script:links | Where-Object Schedule -EQ 'dbhub-autostop-backup' | ForEach-Object { $_.Parameters.Scope }) | Should -Be @('All')
+        # The replica: once T4 is Ready, at T4's size, in T4's subnet and DNS zone, then its parameter and its size's record.
+        $create = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' })
+        $create.Count | Should -Be 1
+        $create[0].Body.properties.createMode | Should -Be 'Replica'
+        $create[0].Body.sku.name | Should -Be 'Standard_D4ds_v5'
+        $create[0].Body.properties.sourceServerResourceId | Should -Match '/flexibleServers/pgflex01-abc123$'
+        $create[0].Body.properties.network.delegatedSubnetResourceId | Should -Match '/subnets/snet-pg$'
+        $create[0].Body.properties.network.publicNetworkAccess | Should -Be 'Disabled'
+        $create[0].Body.tags['component'] | Should -Be 't4-replica'
+        $create[0].At | Should -BeGreaterOrEqual $script:t4ReadyAt
+        $script:replica | Should -Be 'Ready'
+        $script:replicaParameter | Should -Be '600000'
+        $script:groupTags['DbHubT4ReplicaSize'] | Should -Be 'Standard_D4ds_v5@any'
+        # The status the notebook reads.
+        $status = Get-SessionStatus
+        $status.sessionId | Should -Be $script:sessionId
+        $status.phase | Should -Be 'running'
+        $status.replica.state | Should -Be 'Ready'
+        $status.replica.sizeUsed | Should -Be 'Standard_D4ds_v5'
+        $status.busy.marked | Should -BeTrue
+        $status.replicaLag.planned | Should -BeTrue
+        @($status.replicaLag.windows).Count | Should -Be 1 -Because 'a 90-minute session has one even cycle after T4''s profile is set'
+        @($status.dispatched) | Should -Contain 'T4: showcase for 90 minutes'
+        @($status.steps | ForEach-Object step) | Should -Contain 'ReplicaLag'
+        @($script:secrets['dbhub-session-status'] | ForEach-Object { ($_.Value | ConvertFrom-Json).phase } | Select-Object -Unique) | Should -Be @('accepted', 'starting', 'replica', 'running')
+        @($script:secrets['dbhub-session-status'] | ForEach-Object { $_.Tags['sessionId'] } | Select-Object -Unique) | Should -Be @($script:sessionId)
+    }
+
+    It 'moves to the next documented size when Azure refuses T4''s, and says so with what it used' {
+        $script:replicaRefuse = @('Standard_D4ds_v5')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Started'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' } | ForEach-Object { $_.Body.sku.name }) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
+        $status = Get-SessionStatus
+        $status.replica.sizeUsed | Should -Be 'Standard_D4ads_v5'
+        @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('SkuNotAvailable', 'Accepted')
+        $status.replica.note | Should -Match 'Azure refused T4''s size \(Standard_D4ds_v5\) for the replica, so it runs on Standard_D4ads_v5'
+        $script:groupTags['DbHubT4ReplicaSize'] | Should -Be 'Standard_D4ads_v5@any'
+    }
+
+    It 'asks again while T4 restarts (ReadReplicaServerInUnexpectedState, live 2026-11-13), then creates the replica' {
+        $script:replicaNotReady = 3
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Started'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' }).Count | Should -Be 4
+        $script:replica | Should -Be 'Ready'
+    }
+
+    It 'runs the session without the replica, and says why with the fix, when <Case>' -ForEach @(
+        @{ Case = 'the control identity can''t create it yet'; Setup = { $script:replicaForbidden = $true }; State = 'NotGranted'; Match = 'grant-safety-stop\.ps1' }
+        @{ Case = 'T4 is Burstable'; Setup = { $script:t4Sku = 'Standard_B1ms'; $script:t4Tier = 'Burstable' }; State = 'NotSupported'; Match = 't4SkuName' }
+        @{ Case = 'deploy.ps1 hasn''t set the replica up here'; Setup = { $script:groupTags = @{} }; State = 'NotSetUp'; Match = 'deploy\.ps1' }
+        @{ Case = 'Azure refuses every size'; Setup = { $script:replicaRefuse = @('Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5') }; State = 'Refused'; Match = 'Region access request' }
+    ) {
+        & $Setup
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be $(if ($State -eq 'NotSupported') { 'Started' } else { 'Partial' })
+        @($result.dispatched) | Should -Contain 'T1: showcase for 90 minutes'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'running'
+        $status.replica.state | Should -Be $State
+        $status.replica.fix | Should -Match $Match
+        $status.replicaLag.planned | Should -BeFalse
+        $status.replicaLag.note | Should -Match 'doesn''t run this session'
+        $script:replica | Should -BeNullOrEmpty
+    }
+
+    It 'ends before the VMs'' auto-shutdown and says so, and refuses a session that would be shorter than 30 minutes' {
+        # 18:20 Eastern: 38 minutes to the 19:00 auto-shutdown, less its 2-minute margin.
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 22, 20, 0, [System.DateTimeKind]::Utc)))
+        $result.status | Should -Be 'Partial'
+        $status = Get-SessionStatus
+        $status.plannedMinutes | Should -Be 38
+        (@($status.steps) | Where-Object step -EQ 'Plan').message | Should -Match 'runs 38 of the 90 minutes asked: it ends at 18:58, before the VMs'' auto-shutdown at 19:00'
+        Reset-TestAzure
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $late = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 22, 40, 0, [System.DateTimeKind]::Utc)))
+        $late.status | Should -Be 'Refused'
+        $late.message | Should -Match 'too soon for a session of at least 30 minutes'
+        (Get-SessionStatus).phase | Should -Be 'refused'
+        @($script:calls | Where-Object { $_.Method -in 'POST', 'PATCH' }) | Should -BeNullOrEmpty -Because 'nothing starts and the demo isn''t marked busy'
+    }
+
+    It 'refuses a session while another run is active, and says how to end it' {
+        $script:autostop = '2026-10-27T15:40:00Z'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Refused'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'refused'
+        (@($status.steps) | Where-Object step -EQ 'Start').fix | Should -Match 'Stop now'
+        @($script:calls | Where-Object { $_.Method -in 'POST', 'PATCH' }) | Should -BeNullOrEmpty
+    }
+
+    It 'Stop now saves the history''s metrics first, deletes the replica, then stops T4, and clears the session''s marker' {
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:replicaSku = 'Standard_D4ds_v5'
+        $script:autostop = '2026-10-27T15:30:00Z'
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session'; DbHubSessionId = $script:sessionId; DbHubSessionStartUtc = '2026-10-27T13:30:00Z' }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        # The metrics, while the replica exists: T4's and the replica's, with the session's ID.
+        $metrics = $script:secrets['dbhub-session-metrics'][0]
+        $document = $metrics.Value | ConvertFrom-Json
+        $document.version | Should -Be 1
+        $document.sessionId | Should -Be $script:sessionId
+        @($document.servers | ForEach-Object role) | Should -Be @('primary', 'replica')
+        $lag = @($document.series) | Where-Object metric -EQ 'physical_replication_delay_in_seconds'
+        @($lag.points | ForEach-Object { $_[1] }) | Should -Be @(4, 180, 6)
+        ([datetime]$document.startUtc).ToUniversalTime() | Should -Be ([datetime]::new(2026, 10, 27, 13, 20, 0, [System.DateTimeKind]::Utc)) -Because 'the window starts 10 minutes before the session'
+        $metrics.Tags['replica'] | Should -Be 'yes'
+        $capture = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Path -match '/secrets/dbhub-session-metrics$' }) | Select-Object -First 1))
+        $delete = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' }) | Select-Object -First 1))
+        $t4Stop = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' }) | Select-Object -First 1))
+        $capture | Should -BeLessThan $delete
+        $delete | Should -BeLessThan $t4Stop
+        $script:replica | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgreplica01-abc123/stop$' }) | Should -BeNullOrEmpty
+        $script:groupTags['DbHubBusyUntilUtc'] | Should -BeNullOrEmpty
+        $script:groupTags['DbHubBusyBy'] | Should -BeNullOrEmpty
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'stopped'
+        $status.stoppedBy | Should -Be 'Stop now'
+        @($status.done) | Should -Contain 'T4''s read replica pgreplica01-abc123 deleted'
+        @($script:calls | Where-Object { $_.Path -match '/runCommands' }) | Should -BeNullOrEmpty
+    }
+
+    It 'the auto-stop does the same, and writes its stop to the session the group names' {
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session'; DbHubSessionId = $script:sessionId; DbHubSessionStartUtc = '2026-10-27T13:30:00Z' }
+        $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $script:replica | Should -BeNullOrEmpty
+        $status = Get-SessionStatus
+        $status.stoppedBy | Should -Be 'Auto-stop'
+        $status.sessionId | Should -Be $script:sessionId
+        $status.metrics.status | Should -Be 'Pass'
+    }
+
+    It 'stops the replica after T4 instead when the control identity can''t delete it yet, and leaves a deploy.ps1''s marker alone' {
+        $script:t4 = 'Ready'
+        $script:t4StopMinutes = 2
+        $script:replica = 'Ready'
+        $script:replicaDeleteForbidden = $true
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'deploy' }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop' }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgreplica01-abc123/stop$' }).Count | Should -Be 1
+        $script:replica | Should -Be 'Stopping'
+        $script:groupTags['DbHubBusyBy'] | Should -Be 'deploy'
+        $script:secrets.ContainsKey('dbhub-session-status') | Should -BeFalse -Because 'no session is known'
+    }
+
+    It 'never deletes a server whose replicationRole isn''t a read replica''s' {
+        $script:replica = 'Ready'
+        $script:replicaRole = 'Primary'
+        $removed = Remove-DbHubT4Replica -Context (New-TestContext) -Tags @{ deploymentId = 'abc123' }
+        $removed.Outcome | Should -Be 'NotReplica'
+        @($script:calls | Where-Object Method -EQ 'DELETE') | Should -BeNullOrEmpty
+    }
+
+    It 'captures the history''s metrics on request (capture), and starts or stops nothing' {
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'capture'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Captured'
+        $result.replica | Should -BeTrue
+        ($script:secrets['dbhub-session-metrics'][0].Value | ConvertFrom-Json).sessionId | Should -Be $script:sessionId
+        @($script:calls | Where-Object { $_.Method -in 'POST', 'DELETE', 'PATCH' }) | Should -BeNullOrEmpty
+    }
+
+    It 'removes the second auto-stop with the first, so it never stops a later run' {
+        $script:autostop = '2026-10-27T15:30:00Z'
+        $script:backup = '2026-10-27T16:00:00Z'
+        $script:links.Add([pscustomobject]@{ Id = 'dddddddd-0000-0000-0000-00000000000d'; Schedule = 'dbhub-autostop-backup'; Runbook = 'DbHub-Stop'; Parameters = @{ Scope = 'All' } })
+        Clear-DbHubAutoStop -Context (New-TestContext) | Should -BeTrue
+        $script:backup | Should -BeNullOrEmpty
+        @($script:links | Where-Object Schedule -EQ 'dbhub-autostop-backup') | Should -BeNullOrEmpty
+    }
+
+    It 'plans the replica beat''s windows from when T4''s profile was set' {
+        $set = [datetime]::new(2026, 10, 27, 15, 10, 0, [System.DateTimeKind]::Utc)
+        $ninety = Get-DbHubReplicaLagPlan -ProfileSetUtc $set -RunEndUtc $set.AddMinutes(85)
+        @($ninety).Count | Should -Be 1
+        $ninety[0]['startUtc'] | Should -Be '2026-10-27T16:00:00Z'
+        $ninety[0]['endUtc'] | Should -Be '2026-10-27T16:09:00Z'
+        # The plan comes back as one array (return , $windows): assigned, never wrapped in @() again.
+        $long = Get-DbHubReplicaLagPlan -ProfileSetUtc $set -RunEndUtc $set.AddMinutes(118)
+        $long.Count | Should -Be 2
+        $long[1]['startUtc'] | Should -Be '2026-10-27T17:00:00Z'
+        $long[1]['endUtc'] | Should -Be '2026-10-27T17:06:00Z' -Because 'the runner ends 2 minutes before the run'
+        $short = Get-DbHubReplicaLagPlan -ProfileSetUtc $set -RunEndUtc $set.AddMinutes(45)
+        $short.Count | Should -Be 0
+    }
+
+    It 'orders the replica''s sizes as the module does, never with fewer vCores than T4''s (shared cases)' -ForEach @(
+        @{ T4 = 'Standard_D4ds_v5'; Record = ''; Expected = @('Standard_D4ds_v5', 'Standard_D4ads_v5') }
+        @{ T4 = 'Standard_D2ds_v5'; Record = ''; Expected = @('Standard_D2ds_v5', 'Standard_D4ds_v5', 'Standard_D4ads_v5') }
+        @{ T4 = 'Standard_D4ds_v5'; Record = 'Standard_D4ads_v5@any'; Expected = @('Standard_D4ads_v5', 'Standard_D4ds_v5') }
+        @{ T4 = 'Standard_D2ds_v5'; Record = 'Standard_D4ads_v5@any'; Expected = @('Standard_D2ds_v5', 'Standard_D4ads_v5', 'Standard_D4ds_v5') }
+        @{ T4 = 'Standard_D4ds_v5'; Record = 'Standard_D2ds_v5@any'; Expected = @('Standard_D4ds_v5', 'Standard_D4ads_v5') }
+    ) {
+        $sizes = @($script:settings.t4Replica.sizes)
+        @(Get-DbHubReplicaSizeOrder -T4SkuName $T4 -Record $Record -Sizes $sizes) | Should -Be $Expected
+        $module = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ T4 = $T4; Record = $Record } { Get-DemoT4ReplicaSizeOrder -T4SkuName $T4 -Record $Record | ForEach-Object SkuName })
+        $module | Should -Be $Expected -Because 'the runbook and the module follow the same order'
+    }
+
+    It 'combines metric points into intervals as the module does (shared cases)' {
+        $points = [System.Collections.Generic.SortedDictionary[datetime, double]]::new()
+        foreach ($minute in 0..9) {
+            $points[[datetime]::new(2026, 10, 27, 15, $minute, 0, [System.DateTimeKind]::Utc)] = [double](($minute * 7) % 11) + 0.04
+        }
+        foreach ($case in @(@{ Aggregation = 'Maximum'; Unit = 'Seconds'; Interval = 5 }, @{ Aggregation = 'Total'; Unit = 'Count'; Interval = 5 }, @{ Aggregation = 'Maximum'; Unit = 'Percent'; Interval = 1 })) {
+            $runbook = ConvertTo-DbHubMetricPoint -Point $points -Aggregation $case.Aggregation -Unit $case.Unit -IntervalMinutes $case.Interval
+            $module = InModuleScope -ModuleName DbHubDemo -Parameters @{ Points = $points; Case = $case } { ConvertTo-DemoPostgresHistoryPoint -Point $Points -Aggregation $Case.Aggregation -Unit $Case.Unit -IntervalMinutes $Case.Interval }
+            (ConvertTo-Json -InputObject $runbook -Compress) | Should -Be (ConvertTo-Json -InputObject $module -Compress) -Because ($case | ConvertTo-Json -Compress)
+        }
+    }
+}
+
 Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 0024) against a mocked Azure Resource Manager' {
     # Start-Sleep moves the fake clock (Get-DbHubUtcNow), so the waits take no real time.
     BeforeEach {
@@ -1472,9 +1842,14 @@ Describe 'The published runbooks' {
             '{"action":"run","activities":[{"target":"T1","scenario":"drop-database"}],"durationMinutes":20}'
             '[{"action":"stop"}]'
             '[1,2]'
+            '{"action":"session","sessionId":"0123456789abcdef0123456789abcdef"}'
+            '{"action":"session","sessionId":"0123456789abcdef0123456789abcdef","durationMinutes":120}'
+            '{"action":"session"}'
+            '{"action":"capture","sessionId":"0123456789abcdef0123456789abcdef"}'
+            '{"action":"stop","sessionId":"0123456789abcdef0123456789abcdef"}'
         )
         $expected = @($bodies | ForEach-Object { (Test-DbHubControlRequest -WebhookData (New-Webhook $_) -Settings $script:settings).Valid })
-        ($expected | ForEach-Object { $_.ToString() }) -join ',' | Should -Be 'True,False,True,True,False,False,False'
+        ($expected | ForEach-Object { $_.ToString() }) -join ',' | Should -Be 'True,False,True,True,False,False,False,True,True,False,True,True'
         $requestFile = Join-Path -Path $TestDrive -ChildPath 'requests.json'
         Set-Content -LiteralPath $requestFile -Value (ConvertTo-Json -InputObject @{ settings = $script:settingsJson; bodies = $bodies } -Depth 4) -Encoding utf8
         $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
@@ -1482,5 +1857,45 @@ Describe 'The published runbooks' {
         $output = & $powershell.Source -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $command
         $LASTEXITCODE | Should -Be 0
         ([string]($output | Select-Object -Last 1)).Trim() | Should -Be (($expected | ForEach-Object { $_.ToString() }) -join ',')
+    }
+
+    It 'orders the replica''s sizes, combines metric points, and writes a session''s JSON the same way in Windows PowerShell 5.1 (2026-11-14)' {
+        $powershell = Get-Command -Name 'powershell.exe' -CommandType Application -ErrorAction SilentlyContinue
+        if (-not $IsWindows -or -not $powershell) {
+            Set-ItResult -Skipped -Because 'Windows PowerShell 5.1 runs on Windows only'
+            return
+        }
+        # The same pure work in both: Windows PowerShell 5.1's ConvertFrom-Json keeps times as strings, its ConvertTo-Json
+        # differs in places, and .NET Framework has no DateTime.UnixEpoch.
+        $probe = {
+            param([string] $Common, [string] $SettingsJson)
+            . $Common
+            $settings = ConvertFrom-DbHubSetting -Json $SettingsJson
+            $order = (Get-DbHubReplicaSizeOrder -T4SkuName 'Standard_D2ds_v5' -Record 'Standard_D4ads_v5@any' -Sizes @($settings.t4Replica.sizes)) -join ','
+            $points = New-Object -TypeName 'System.Collections.Generic.SortedDictionary[datetime,double]'
+            foreach ($minute in 0..9) {
+                $points[(New-Object -TypeName DateTime -ArgumentList 2026, 10, 27, 15, $minute, 0, ([System.DateTimeKind]::Utc))] = [double](($minute * 7) % 11) + 0.04
+            }
+            $converted = ConvertTo-DbHubMetricPoint -Point $points -Aggregation 'Maximum' -Unit 'Seconds' -IntervalMinutes 5
+            $document = [ordered]@{ version = 1; sessionId = 'abc'; servers = @([ordered]@{ role = 'replica'; target = 'T4-replica' }); series = @([ordered]@{ metric = 'physical_replication_delay_in_seconds'; points = $converted }) }
+            $windows = Get-DbHubReplicaLagPlan -ProfileSetUtc (New-Object -TypeName DateTime -ArgumentList 2026, 10, 27, 15, 10, 0, ([System.DateTimeKind]::Utc)) -RunEndUtc (New-Object -TypeName DateTime -ArgumentList 2026, 10, 27, 17, 8, 0, ([System.DateTimeKind]::Utc))
+            $status = [ordered]@{ windows = $windows; steps = @() }
+            Add-DbHubSessionStep -Status $status -Step 'Replica' -State 'Pass' -Message 'Ready.'
+            return @($order, (ConvertTo-Json -InputObject $document -Depth 8 -Compress), (ConvertTo-Json -InputObject $status -Depth 8 -Compress))
+        }
+        $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
+        $here = & $probe $common $script:settingsJson
+        $inputFile = Join-Path -Path $TestDrive -ChildPath 'probe.json'
+        Set-Content -LiteralPath $inputFile -Value (ConvertTo-Json -InputObject @{ common = $common; settings = $script:settingsJson; probe = $probe.ToString() } -Depth 4) -Encoding utf8
+        $command = "`$in = Get-Content -LiteralPath '{0}' -Raw | ConvertFrom-Json; `$probe = [scriptblock]::Create(`$in.probe); `$out = & `$probe `$in.common `$in.settings; `$out | ForEach-Object {{ [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]`$_)) }}" -f $inputFile
+        $output = @(& $powershell.Source -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $command)
+        $LASTEXITCODE | Should -Be 0
+        $there = @($output | Select-Object -Last 3 | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(([string]$_).Trim())) })
+        $there[0] | Should -Be 'Standard_D2ds_v5,Standard_D4ads_v5,Standard_D4ds_v5'
+        $there[0] | Should -Be $here[0]
+        $there[1] | Should -Be $here[1]
+        $there[1] | Should -Match '"points":\[\["2026-10-27T15:00:00Z",[0-9.]+\],\["2026-10-27T15:05:00Z",[0-9.]+\]\]'
+        $there[2] | Should -Match '"windows":\[\{"startUtc":"2026-10-27T16:00:00Z","endUtc":"2026-10-27T16:09:00Z"\},\{"startUtc":"2026-10-27T17:00:00Z","endUtc":"2026-10-27T17:06:00Z"\}\]'
+        $there[2] | Should -Match '"steps":\[\{"step":"Replica","state":"Pass"'
     }
 }
