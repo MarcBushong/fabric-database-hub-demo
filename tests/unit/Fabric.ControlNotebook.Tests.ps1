@@ -50,17 +50,20 @@ BeforeAll {
     }
 
     # The notebook as deploy.ps1 imports it, for a demo whose VMs shut down at 19:00 in the zone given.
-    function Get-FilledNotebook([string] $Zone = 'UTC') {
+    function Get-FilledNotebook([string] $Zone = 'UTC', [string] $Prefix = '') {
         $filledConfig = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $filledConfig['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $filledConfig['autoShutdownTime'] = '1900'
         $filledConfig['autoShutdownTimeZone'] = $Zone
+        if ($Prefix) {
+            $filledConfig['prefix'] = $Prefix
+        }
         $definition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $filledConfig } {
             $controlName = Get-DemoActivityControlName -Config $Config
             $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name $controlName -IdentityClientId '99999999-9999-9999-9999-999999999999'
             Get-DemoActivityControlNotebook -Name $controlName -Setting $setting -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -DemoWorkspaceId 'BBBBBBBB-0000-0000-0000-000000000002'
         }
-        $file = Join-Path -Path $TestDrive -ChildPath ('filled-{0}.ipynb' -f ($Zone -replace '[^A-Za-z]', ''))
+        $file = Join-Path -Path $TestDrive -ChildPath ('filled-{0}{1}.ipynb' -f ($Zone -replace '[^A-Za-z]', ''), $Prefix)
         [System.IO.File]::WriteAllBytes($file, [System.Convert]::FromBase64String($definition.Definition['parts'][0]['payload']))
         return $file
     }
@@ -614,6 +617,8 @@ print(json.dumps(out))
         ($job.SESSION_PLAN | ConvertFrom-Json).beats.Count | Should -BeGreaterThan 20
         ($job.POSTGRES_METRICS | ConvertFrom-Json).sessionId | Should -Be $job.SESSION_ID
         ([datetime]$job.WINDOW_START_UTC).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 14, 13, 55, 0, [System.DateTimeKind]::Utc))
+        $job.RESOURCE_GROUP | Should -Be 'rg-dbhub-demo'
+        $job.T1_VM_NAME | Should -Be 'sqlvm01'
         $report.printed | Should -Match 'This session runs 90 minutes, until 15:30 \(UTC\)'
         $report.printed | Should -Match 'Pass: the demo workspace''s capacity fabricdemo is Active\.'
         $report.printed | Should -Match '=== The presenter''s guide: session [0-9a-f]{8}'
@@ -625,6 +630,21 @@ print(json.dumps(out))
         $report.printed | Should -Match 'Stopped: T4''s read replica deleted, T4 stopped'
         $report.printed | Should -Match 'Waiting \d+ minutes for the last telemetry to arrive'
         $report.printed | Should -Match 'Pass: the history is saved'
+    }
+
+    It 'saves the history of another environment''s session with that environment''s names, not the activity notebook''s defaults' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # The activity notebook's defaults name the owner's environment (rg-dbhub-demo), and its import fills only the
+        # workspace and the lakehouse, so the job must say which resource group its telemetry comes from.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC' -Prefix 'contoso') -Scenario 'session' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.jobs).Count | Should -Be 1
+        $report.jobs[0].RESOURCE_GROUP | Should -Be 'rg-contoso-demo'
+        $report.jobs[0].T2_MACHINE_NAME | Should -Be 'arcsql01'
+        $report.jobs[0].T3_SERVER_PREFIX | Should -Not -BeNullOrEmpty
     }
 
     It 'runs Run all in <Case>' -ForEach @(
