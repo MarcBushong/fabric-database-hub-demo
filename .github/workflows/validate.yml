@@ -1,6 +1,9 @@
 name: validate
 
-# Static validation on every pull request and on main: no Azure sign-in, no Azure calls.
+# Static validation on pull requests and on main: no Azure sign-in, no Azure calls. A copy of this repository
+# spends no Actions minutes unless its owner opts in (2026-11-14, ADR 0022): a push or a pull request runs the
+# static checks only in a public repository, where GitHub-hosted runners are free, or when the repository
+# variable STATIC_CHECKS_ENABLED is 'true'. A run by hand always runs them.
 # Run it by hand with "live" set to also validate a deployed environment: the live job calls
 # scripts/validate.ps1 (Phase 14) through the shared OpenID Connect runner, uploads out/validate.jsonl as
 # an artifact, and fails when validate.ps1 exits nonzero (1 means at least one Fail; ADR 0012).
@@ -29,6 +32,7 @@ concurrency:
 jobs:
   static:
     name: Static checks
+    if: github.event_name == 'workflow_dispatch' || github.event.repository.visibility == 'public' || vars.STATIC_CHECKS_ENABLED == 'true'
     uses: ./.github/workflows/reusable-static-checks.yml
 
   live:

@@ -78,7 +78,7 @@ flowchart TB
 
 - **Azure:** the resource group `rg-dbhub-demo`, in West US 3 by default (`location` in your configuration; preflight checks that Database Hub supports the region). It holds T1 to T4, their network (no VM has a public IP), the workload runner, and the [nightly safety stop](#what-stops-or-pauses-on-its-own). Two more groups appear only if you use what they hold: `rg-dbhub-golden` keeps the optional T2 golden snapshot, and `rg-dbhub-control` holds the optional [on-demand activity control](#on-demand-activity-control-optional).
 - **Fabric:** the workspace **Database Hub Demo**, with the lakehouse `LH_DatabaseHub`, on an F or Trial capacity. The scripts find both by name and create them when they're missing, so you never look up an ID.
-- **Where you run the scripts:** your computer, the repository's [dev container](.devcontainer/devcontainer.json), or GitHub Codespaces. GitHub Actions is optional ([quick start](#quick-start)).
+- **Where you run the scripts:** your computer, the repository's [dev container](.devcontainer/devcontainer.json), or GitHub Codespaces. GitHub Actions is optional ([quick start](#quick-start)), and a copy of this repository spends no Actions minutes unless you opt in: a push or a pull request runs its static checks only when the repository is public, where GitHub-hosted runners are free, or when you set the repository variable `STATIC_CHECKS_ENABLED` to `true`.
 
 **Before you start** (once; people do these):
 

@@ -127,6 +127,36 @@ Describe 'Workflows in a public repository (ADR 0022)' {
         }
     }
 
+    It 'in a copy of this repository, a push or a pull request runs no job unless the repository is public or its owner opts in (2026-11-14)' {
+        # A private copy made with "Use this template" pays for its Actions minutes, Dependabot's pull requests included;
+        # GitHub-hosted runners are free only in a public repository.
+        $checked = 0
+        foreach ($name in $script:allWorkflows) {
+            $text = Get-WorkflowText $name
+            $triggers = @(Get-WorkflowTrigger -Text $text)
+            if (-not ($triggers -contains 'push' -or $triggers -contains 'pull_request')) {
+                continue
+            }
+            $jobsBlock = [regex]::Match($text, '(?ms)^jobs:[ \t]*\n(.*)').Groups[1].Value
+            $jobs = @([regex]::Split($jobsBlock, '(?m)^(?=  [A-Za-z0-9_-]+:[ \t]*$)') | Where-Object { $_ -match '^  [A-Za-z0-9_-]+:' })
+            $jobs.Count | Should -BeGreaterThan 0 -Because $name
+            foreach ($job in $jobs) {
+                $jobName = [regex]::Match($job, '^  ([A-Za-z0-9_-]+):').Groups[1].Value
+                $condition = [regex]::Match($job, '(?m)^    if: (.+)$').Groups[1].Value.Trim()
+                $byHandOnly = $condition -match "^github\.event_name == 'workflow_dispatch' && "
+                $optIn = $condition -match "github\.event\.repository\.visibility == 'public' \|\| vars\.[A-Z_]+_ENABLED == 'true'"
+                ($byHandOnly -or $optIn) | Should -BeTrue -Because ('{0}/{1} runs on a push or a pull request with the condition "{2}"' -f $name, $jobName, $condition)
+                $checked++
+            }
+        }
+        $checked | Should -BeGreaterOrEqual 3 -Because 'validate.yml has two jobs and codeql.yml one'
+    }
+
+    It 'validate.yml''s static checks run on a push or a pull request only in a public repository or with STATIC_CHECKS_ENABLED, and always by hand' {
+        $text = Get-WorkflowText 'validate.yml'
+        $text | Should -Match "(?m)^  static:\s*\n    name: Static checks\s*\n    if: github\.event_name == 'workflow_dispatch' \|\| github\.event\.repository\.visibility == 'public' \|\| vars\.STATIC_CHECKS_ENABLED == 'true'\s*\n    uses: \./\.github/workflows/reusable-static-checks\.yml"
+    }
+
     It 'every workflow sets its token''s permissions, and only the shared runner asks for an OpenID Connect token at the top level' {
         foreach ($name in $script:allWorkflows) {
             $text = Get-WorkflowText $name

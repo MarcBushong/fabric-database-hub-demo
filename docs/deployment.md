@@ -614,7 +614,7 @@ No price is hard-coded: estimates and the hourly Bastion figures come from the A
 | `demo-control.yml` | By hand, or from the live-activity notebook | Sets a profile or one bounded incident; its inputs are the [ADR 0014](adr/0014-notebook-role-and-capacity.md) contract: `environment`, `target`, `scenario`, `duration`, `concurrency`, `intensity`, `reset-before`, and `auto-cleanup`, all strings |
 | `warm-up.yml` | By hand | `start-demo.ps1 -WarmUpMinutes 30`, about 45 minutes before a session |
 | `destroy.yml` | By hand, with the environment's name typed again | `destroy.ps1 -Force` |
-| `validate.yml` | Every pull request; by hand with `live` | The static checks; with `live`, `validate.ps1 -ConfigPath config/demo.config.json -OutputPath out/validate.jsonl`, uploaded as an artifact, failing the job on a nonzero exit code |
+| `validate.yml` | Every pull request and push to `main` in a public repository, or in a private one with the repository variable `STATIC_CHECKS_ENABLED` set to `true`; always by hand, and with `live` | The static checks; with `live`, `validate.ps1 -ConfigPath config/demo.config.json -OutputPath out/validate.jsonl`, uploaded as an artifact, failing the job on a nonzero exit code |
 | `schedule-start.yml` | Weekdays 15:15 UTC | `start-demo.ps1 -WarmUpMinutes 30` |
 | `schedule-stop.yml` | Daily 01:00 UTC | `stop-demo.ps1` |
 | `expiry.yml` | Daily 06:30 UTC | `destroy.ps1 -Force -IfExpired` |

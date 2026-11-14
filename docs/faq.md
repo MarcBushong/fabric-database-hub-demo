@@ -69,7 +69,7 @@ Not for Database Hub: each Hub user needs only a Fabric Free license (P4). The n
 Only the build modes (`ProductKey` and `Developer`, and a kept `PaygWizard` guest) use the Windows Server evaluation, which lasts 180 days; the default `JumpstartImage` guest's Windows Server 2022 Standard isn't an evaluation. Since 2026-11-05 the host rearms an evaluation guest by itself when 30 or fewer days are left and a rearm is left, and warns you to rebuild T2 when none is. `reset-demo.ps1 -RebuildGuest` isn't supported yet, so rebuild with `destroy.ps1`, then `deploy.ps1` ([limitations](limitations.md#targets-and-licensing)).
 
 **Can I run it without GitHub?**
-Yes. Every operation is a PowerShell script that runs in Cloud Shell or PowerShell 7. GitHub Actions is optional (P7).
+Yes. Every operation is a PowerShell script that runs in Cloud Shell or PowerShell 7. GitHub Actions is optional (P7), and a demo session needs none. A copy of this repository spends no Actions minutes on its own: its workflows' jobs run on a push, a pull request, or a schedule only when it's public, where GitHub-hosted runners are free, or when you opt in with the repository variables `STATIC_CHECKS_ENABLED` (the static checks), `CODE_SCANNING_ENABLED` (CodeQL), or `DBHUB_SCHEDULES_ENABLED` (the schedules). A run by hand always runs.
 
 **Where do I report a security problem?**
 Privately, as [SECURITY.md](../SECURITY.md) describes. Never include secrets, tokens, or subscription or tenant IDs.
