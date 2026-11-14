@@ -265,7 +265,7 @@ Describe 'Invoke-DemoVmRunCommand' {
         $script:waits = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoRunCommand -MockWith {
             $name = if ($Url -match '/runCommands/([^?]+)\?') { $Matches[1] } else { '' }
-            $script:waits.Add(('{0} wait={1} nowait={2}' -f $name, $WaitSeconds, [bool]$NoWait))
+            $script:waits.Add(('{0} wait={1} nowait={2}' -f $name, $PesterBoundParameters['WaitSeconds'], [bool]$PesterBoundParameters['NoWait']))
             if ($script:stuck.Contains($name)) {
                 return $false
             }
