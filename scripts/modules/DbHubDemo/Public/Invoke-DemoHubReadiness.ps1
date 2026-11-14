@@ -10,7 +10,7 @@ function Invoke-DemoHubReadiness {
     1. The subscription guard (Assert-DemoAzContext). If it fails, only its Fail result is returned and
        nothing else runs.
     2. P4 (Test-DemoFabricHubSetting), P5 with the capacity (Test-DemoFabricWorkspace), and the optional P11 viewer
-       licensing from that capacity's SKU (Test-DemoFabricViewerLicense, Phase 18), unless -SkipFabric.
+       licensing, assumed since 2026-11-14 (Test-DemoFabricViewerLicense, Not selected), unless -SkipFabric.
     3. Estate visibility through Azure Resource Graph (Test-DemoHubEstate).
     4. Performance telemetry through the documented REST endpoint (Test-DemoHubTelemetry), unless
        -SkipTelemetry. A target without rows whose Estate check reports a pending manual step (T2 before
@@ -121,7 +121,7 @@ function Invoke-DemoHubReadiness {
         Add-ResultItem @(Test-DemoFabricHubSetting -Config $Config -FabricAdmin:$FabricAdmin -Token $FabricToken)
         Add-ResultItem @(Test-DemoFabricWorkspace -Config $Config -Token $FabricToken)
         # P11 (optional, Phase 18): reuses the SKU that FABRIC.P5.CAPACITY read, so it sends no request of its own.
-        Add-ResultItem @(Test-DemoFabricViewerLicense -Config $Config -Token $FabricToken -CapacityResult ($results | Where-Object { $_.checkId -eq 'FABRIC.P5.CAPACITY' } | Select-Object -First 1))
+        Add-ResultItem @(Test-DemoFabricViewerLicense -Config $Config)
     }
 
     Add-ResultItem @(Test-DemoHubEstate -Config $Config -Target $Target -DeploymentId $DeploymentId)

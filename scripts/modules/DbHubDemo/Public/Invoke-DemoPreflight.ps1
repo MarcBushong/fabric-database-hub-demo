@@ -22,8 +22,8 @@ function Invoke-DemoPreflight {
       administrator, otherwise a reminder to confirm it (Test-DemoFabricHubSetting -CheckId PREFLIGHT.P4.HUBSETTING;
       Phase 28 live finding), and the Fabric workspace and lakehouse by
       name, read-only (Test-DemoFabricResolution, Phase 26a): your role and the capacity of a workspace that exists,
-      or the capacity deploy.ps1 would create it on; the optional P11, Power BI viewer licensing on the workspace's
-      capacity (Test-DemoFabricViewerLicense, a Warning below F64); and P12 and P13, the tenant settings the Insights
+      or the capacity deploy.ps1 would create it on; the optional P11, Power BI viewer licensing, which
+      the demo assumes since 2026-11-14 (Test-DemoFabricViewerLicense, Not selected, nothing read); and P12 and P13, the tenant settings the Insights
       app needs, which never block the run (Test-DemoFabricAppTenantSetting, PREFLIGHT.FABRIC.APPSETTINGS: a Pass, or a
       Warning when one is off or can't be read; 2026-11-05).
     - P6: the T3 Entra admin group exists and the caller owns it, read from Microsoft Graph with a token
@@ -536,8 +536,9 @@ function Invoke-DemoPreflight {
     $results.Add((Test-DemoFabricHubSetting -Config $Config -CheckId 'PREFLIGHT.P4.HUBSETTING'))
     $fabricCheck = Test-DemoFabricResolution -Config $Config
     $results.Add($fabricCheck.Result)
-    # P11 (optional, Phase 18): Power BI viewer licensing on the workspace's capacity; a Warning below F64.
-    $results.Add((Test-DemoFabricViewerLicense -Config $fabricCheck.Config -CapacityResult $fabricCheck.CapacityResult))
+    # P11 (optional): Power BI viewer licenses are assumed since 2026-11-14 (the user), so it's Not selected and reads
+    # nothing; it used to warn on every deployment below F64.
+    $results.Add((Test-DemoFabricViewerLicense -Config $fabricCheck.Config))
     # P12 and P13 (2026-11-05): the tenant settings the Insights app needs, which is part of every deployment but never
     # blocks it; read through the Fabric admin API, and never more than a Warning.
     $results.Add((Test-DemoFabricAppTenantSetting -Config $Config))

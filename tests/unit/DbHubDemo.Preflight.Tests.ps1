@@ -62,9 +62,10 @@ BeforeAll {
             [pscustomobject]@{ Results = @(New-DemoResult -CheckId 'PREFLIGHT.COST.SESSION' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.') }
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @() }
-        # Phase 18's P11 check has its own tests (DbHubDemo.FabricItem.Tests.ps1); here it only has to be called.
+        # The P11 check has its own tests (DbHubDemo.FabricItem.Tests.ps1); here it only has to be called. Since 2026-11-14
+        # the viewers' licenses are assumed, so it's Not selected.
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricViewerLicense -MockWith {
-            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.VIEWERLICENSE' -Area 'preflight' -Target 'fabric' -Status 'Warning' -Message 'F16 is smaller than F64.'
+            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.VIEWERLICENSE' -Area 'preflight' -Target 'fabric' -Status 'Not selected' -Message 'Power BI viewer licenses are assumed.'
         }
         # P5 by name (Phase 26a) has its own tests (DbHubDemo.FabricResolve.Tests.ps1); here it sends nothing.
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricResolution -MockWith {
@@ -812,14 +813,13 @@ Describe 'Invoke-DemoPreflight' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { $ArgumentList[0] -eq 'deployment' -and $ArgumentList[1] -eq 'sub' } -Times 0
     }
 
-    It 'reports the optional P11 viewer licensing (Phase 18) once, with the configuration and no token of its own' {
+    It 'reports the optional P11 viewer licensing once, asking it for nothing but the configuration (2026-11-14)' {
         Set-HappyAzMock
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf
         $license = @($results | Where-Object checkId -eq 'PREFLIGHT.FABRIC.VIEWERLICENSE')
         $license.Count | Should -Be 1
-        $license[0].status | Should -Be 'Warning'
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricViewerLicense -Times 1 -Exactly -ParameterFilter {
-            $Config['fabric']['workspaceId'] -eq $config['fabric']['workspaceId'] -and $null -eq $Token -and $null -eq $CapacityResult
+            $Config['fabric']['workspaceId'] -eq $config['fabric']['workspaceId'] -and @($PesterBoundParameters.Keys) -join ',' -eq 'Config'
         }
         @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
     }

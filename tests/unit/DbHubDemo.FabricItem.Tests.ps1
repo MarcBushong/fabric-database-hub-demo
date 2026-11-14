@@ -333,90 +333,24 @@ Describe 'Import-DemoFabricItem with the Real-Time Dashboard' {
 Describe 'Test-DemoFabricViewerLicense (PREFLIGHT.FABRIC.VIEWERLICENSE)' {
     BeforeEach {
         Clear-DemoSecret
-        $script:capacitySku = 'F16'
-        $script:capacityListed = $true
-        Initialize-HubFabricMock -Handler {
-            if ($script:HubFabricRequest.Uri -like '*/workspaces/*') {
-                return ConvertTo-HubFabricResponse -Body @{ id = $script:workspaceId; displayName = 'Database Hub Demo'; capacityId = $script:capacityId }
-            }
-            if ($script:HubFabricRequest.Uri -like '*/capacities*') {
-                $listed = @(if ($script:capacityListed) { @{ id = $script:capacityId; displayName = 'shared'; sku = $script:capacitySku; state = 'Active'; region = 'West US 3' } })
-                return ConvertTo-HubFabricResponse -Body @{ value = $listed }
-            }
-            throw ('unexpected request: {0}' -f $script:HubFabricRequest.Uri)
+        Initialize-HubFabricMock -Handler { throw ('no Fabric request expected: {0}' -f $script:HubFabricRequest.Uri) }
+    }
+
+    It 'assumes the viewers'' Power BI licenses (the user, 2026-11-14): Not selected with the rule, never a Warning, and reads nothing' {
+        foreach ($config in @((Get-TestConfig), $(& { $without = Get-TestConfig; $without['fabric'].Remove('workspaceId'); $without }))) {
+            $result = Test-DemoFabricViewerLicense -Config $config
+            $result.checkId | Should -Be 'PREFLIGHT.FABRIC.VIEWERLICENSE'
+            $result.area | Should -Be 'preflight'
+            $result.status | Should -Be 'Not selected'
+            $result.message | Should -Match '^Power BI viewer licenses are assumed, so nothing is checked \(P11\): .+Pro, PPU, or an individual trial on a capacity smaller than F64'
+            $result.remediation | Should -BeNullOrEmpty
+            $result.evidence.assumed | Should -BeTrue
+            $result.docUrl | Should -Be 'https://learn.microsoft.com/fabric/enterprise/licenses'
         }
-    }
-
-    It 'reports <Sku> as <Status>' -ForEach @(
-        @{ Sku = 'F2'; Status = 'Warning'; NeedsPro = $true }
-        @{ Sku = 'F16'; Status = 'Warning'; NeedsPro = $true }
-        @{ Sku = 'F32'; Status = 'Warning'; NeedsPro = $true }
-        @{ Sku = 'F64'; Status = 'Pass'; NeedsPro = $false }
-        @{ Sku = 'F128'; Status = 'Pass'; NeedsPro = $false }
-        @{ Sku = 'P1'; Status = 'Pass'; NeedsPro = $false }
-        @{ Sku = 'A2'; Status = 'Warning'; NeedsPro = $true }
-        @{ Sku = 'FT1'; Status = 'Warning'; NeedsPro = $null }
-    ) {
-        $script:capacitySku = $Sku
-        $result = Test-DemoFabricViewerLicense -Config (Get-TestConfig)
-        $result.checkId | Should -Be 'PREFLIGHT.FABRIC.VIEWERLICENSE'
-        $result.area | Should -Be 'preflight'
-        $result.status | Should -Be $Status
-        $result.evidence.sku | Should -Be $Sku
-        $result.evidence.viewersNeedProOrPpu | Should -Be $NeedsPro
-        $result.docUrl | Should -Be 'https://learn.microsoft.com/fabric/enterprise/licenses'
-        if ($Status -eq 'Warning') {
-            $result.message | Should -Match 'Pro, PPU, or (an )?individual trial'
-            $result.remediation | Should -Match 'P11'
-            $result.remediation | Should -Match 'sharing your screen'
-        }
-    }
-
-    It 'reads the SKU with Get Workspace and List Capacities only, with the operator''s token' {
-        $passed = Get-HubFakeToken
-        $null = Test-DemoFabricViewerLicense -Config (Get-TestConfig) -Token (ConvertTo-HubSecureString $passed)
-        @($script:HubFabricCalls | ForEach-Object { '{0} {1}' -f $_.Method, $_.Uri }) | Should -Be @("Get $api/workspaces/$workspaceId", "Get $api/capacities")
-        @($script:HubFabricCalls | Where-Object { $_.Token -ne $passed }).Count | Should -Be 0
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -Times 0
-    }
-
-    It 'is a Warning, never a Fail, when the SKU can''t be read' {
-        $script:capacityListed = $false
-        $result = Test-DemoFabricViewerLicense -Config (Get-TestConfig)
-        $result.status | Should -Be 'Warning'
-        $result.message | Should -Match 'couldn''t be read'
-        $result.message | Should -Match 'administer or contribute to'
-    }
-
-    It 'is a Warning without a Fabric token, and sends nothing' {
-        Initialize-HubFabricMock -TokenFails -Handler { throw 'no Fabric request expected' }
-        $result = Test-DemoFabricViewerLicense -Config (Get-TestConfig)
-        $result.status | Should -Be 'Warning'
-        $script:HubFabricCalls.Count | Should -Be 0
-    }
-
-    It 'reuses the SKU from FABRIC.P5.CAPACITY and sends no request' {
-        $capacity = New-DemoResult -CheckId 'FABRIC.P5.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'capacity' -Evidence @{ capacityId = $capacityId; sku = 'F64'; state = 'Active' }
-        $result = Test-DemoFabricViewerLicense -Config (Get-TestConfig) -CapacityResult $capacity
-        $result.status | Should -Be 'Pass'
-        $result.evidence.skuSource | Should -Be 'FABRIC.P5.CAPACITY'
         $script:HubFabricCalls.Count | Should -Be 0
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -Times 0
-
-        $unknown = New-DemoResult -CheckId 'FABRIC.P5.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message 'The SKU could not be read.' -Evidence @{ capacityId = $capacityId }
-        $result = Test-DemoFabricViewerLicense -Config (Get-TestConfig) -CapacityResult $unknown
-        $result.status | Should -Be 'Warning'
-        $script:HubFabricCalls.Count | Should -Be 0
-    }
-
-    It 'is Not selected without a configured workspace, and sends nothing' {
-        $config = Get-TestConfig
-        $config['fabric'].Remove('workspaceId')
-        (Test-DemoFabricViewerLicense -Config $config).status | Should -Be 'Not selected'
-        $script:HubFabricCalls.Count | Should -Be 0
     }
 }
-
 Describe 'configure-fabric.ps1 -ImportDashboard' {
     BeforeAll {
         $config = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json') -Raw | ConvertFrom-Json -AsHashtable

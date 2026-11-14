@@ -23,8 +23,8 @@ has no public API or ARM resource, so the checklist uses documented interfaces o
   (not a Fabric administrator, no token), which is a reminder to confirm it, worded as such.
 - P5: Contributor or higher on the resolved workspace and an F or Trial capacity, through Fabric REST with your
   Fabric token.
-- P11 (optional, Phase 18): Power BI viewer licensing on the workspace's capacity (PREFLIGHT.FABRIC.VIEWERLICENSE):
-  a Warning below F64, where viewers of the Phase 19 report and app need Pro, PPU, or a trial.
+- P11 (optional): Power BI viewer licensing (PREFLIGHT.FABRIC.VIEWERLICENSE), assumed since 2026-11-14: Not selected,
+  with the rule (Pro, PPU, or a trial for viewers of the report and the app below F64), and nothing read.
 - Estate: every selected target in Azure Resource Graph, the Hub's inventory source (HUB.ESTATE.*).
 - Telemetry: rows, the newest sample, and the lag per target from the telemetry REST endpoint (TELEMETRY.T1,
   TELEMETRY.T2, TELEMETRY.T3). Telemetry takes 3 to 15 minutes to appear; use -WaitMinutes.

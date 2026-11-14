@@ -387,7 +387,7 @@
       "capacityNote": "Fabric (F) SKUs run notebooks. TODO(verify): Learn doesn't document the SKU string that List Capacities returns for a Trial capacity, so any other SKU is reported as Manual action required until a live read confirms it.",
       "viewerLicense": {
         "minimumFreeViewerFSku": 64,
-        "note": "Phase 18, PREFLIGHT.FABRIC.VIEWERLICENSE: on F SKUs smaller than F64, each user viewing Power BI content must have Pro, PPU, or an individual trial; on F64 or larger, and on P SKUs, users with only a Free license and a viewer role can view. A Trial capacity acts like F64 for viewing, but its SKU string isn't documented, so it's reported as a Warning until a live read records it.",
+        "note": "Phase 18, PREFLIGHT.FABRIC.VIEWERLICENSE: on F SKUs smaller than F64, each user viewing Power BI content must have Pro, PPU, or an individual trial; on F64 or larger, and on P SKUs, users with only a Free license and a viewer role can view. Since 2026-11-14 the viewers' licenses are assumed (the user), so the check is Not selected with this rule and reads nothing.",
         "docUrl": "https://learn.microsoft.com/fabric/enterprise/licenses",
         "verifiedOn": "2026-10-21"
       },
