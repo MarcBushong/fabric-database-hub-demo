@@ -124,7 +124,12 @@ Only Azure's `SkuNotAvailable` for the size an attempt sent, read from the deplo
 ## Validation
 
 - Static: Bicep build, Pester (`tests/unit/DbHubDemo.T4Replica.Tests.ps1` and the cost, preflight, lifecycle, tracks, safety stop, and control tests), and the runner's tests.
-- Live: an environment deployed by `main` gets the replica from `deploy.ps1`; a new deployment ends DONE with it; `start-demo.ps1`, `replica-lag`, `stop-demo.ps1`, and one safety stop job run as described.
+- **Live (West US 3, 2026-11-13 and 14):**
+  - **New environment:** a new deployment ended DONE with the replica, which DONE's gate created at T4's `Standard_D4ds_v5` in 563 seconds.
+  - **Older environment:** one that `main` deployed got the replica from `deploy.ps1`.
+  - **A session:** `start-demo.ps1` started a stopped replica before T4, and `replica-lag` made Read Replica Lag climb to 218 seconds and drop, twice. `stop-demo.ps1 -SaveHistory` read the metrics before it deleted the replica, and the lakehouse history kept the climb.
+  - **The safety stop:** its 19:30 pass stopped T4, then the replica.
+- **Not yet live:** the replica's size fallback (Azure took every size asked), and the replica's own Estate row and Read replica lag chart on Database Hub's pages, which only a person sees.
 
 ## Sources
 
