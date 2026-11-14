@@ -511,17 +511,33 @@ function Invoke-DemoParallelDeployment {
         $resend = Resolve-DemoArtifactResend -State $state -Plan $resumePlan -SkipRunner:$SkipRunner
         & $addAll @($resend.Results)
     }
+    # 2026-11-13 live finding (on main too): a first run that met a paused Fabric capacity recorded the Fabric step as
+    # finished without its workspace, so no later run created it. A resume whose record says the step finished checks that
+    # the workspace, the lakehouse, and the items are there (read-only), and runs the step again when one is missing.
+    $progressNotes = @{}
+    foreach ($key in @($resend.Notes.Keys)) {
+        $progressNotes[$key] = $resend.Notes[$key]
+    }
+    $reopenFabric = $false
+    if ($Resume -and -not $FromStage -and -not $whatIf -and -not $SkipFabric -and [string](Get-DemoMemberValue -InputObject $state -Name 'TrackFabric') -eq 'Fabric') {
+        $fabricMissing = Get-DemoFabricTrackRecheck -Config $Config
+        if ($null -ne $fabricMissing) {
+            $reopenFabric = $true
+            $progressNotes['Fabric'] = 'An earlier run recorded this step as finished, but {0} Running it again.' -f ([string]$fabricMissing.message).TrimEnd()
+            Write-DemoLog -Message ('An earlier run recorded the Fabric step as finished, but {0} So this run runs it again.' -f ([string]$fabricMissing.message).TrimEnd())
+        }
+    }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28). T4 is part of every
     # deployment (2026-11-09): a "no T4" record (None or Refused) has the fallback try every size again when this run
     # deploys the template.
     $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -Resend @($resend.Tracks)).Infrastructure
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:$templateRuns
     $skipT4 = -not (Test-DemoT4Enabled -Config $Config)
-    $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4 -Resend @($resend.Tracks)
+    $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4 -Resend @($resend.Tracks) -ReopenFabric:$reopenFabric
     if ($whatIf) {
         $plan = Resolve-DemoTrackPlan -StopAfter 'Infrastructure'
     }
-    Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -ResendNote $resend.Notes
+    Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -ResendNote $progressNotes
     # T4 out of this run is said on its own rows, with why and the fix (2026-11-09); DEPLOY.T4.OFF, a Fail, says it at the end.
     $showT4Off = {
         $offResult = New-DemoT4OffResult -Config $Config -State $state -Result $results.ToArray()

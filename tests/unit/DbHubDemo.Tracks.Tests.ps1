@@ -933,6 +933,28 @@ Describe 'Invoke-DemoDeploymentTrack' {
         (InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }).Status | Should -Be 'Fail'
     }
 
+    It 'doesn''t record the Fabric step as finished when it needs a person, such as a paused capacity, so the next run runs it again (live, 2026-11-13)' {
+        # Live (rg-dbhubup-demo, main's behavior): the first run met a paused capacity, so the workspace couldn't be created;
+        # its records were Manual action required, not Fail, so DbHubTrackFabric said Fabric and no later run created it.
+        $script:recorded = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { if ($null -ne $Value) { $script:recorded.Add($Value) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith {
+            New-DemoResult -CheckId 'FABRIC.RESOLVE.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The Fabric workspace "DBHub Test" doesn''t exist, and it can''t be created: The capacity "fabrictest" (F4) is Inactive, so nothing can be created on it.' -Evidence ([ordered]@{ capacityState = 'Inactive' })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.SEMANTICMODEL' 'Not selected' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { New-TestResult 'DEPLOY.FABRIC.APP' 'Not selected' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Open' -Because 'DEPLOY.TRACK.FABRIC is then a Warning, and the run isn''t DONE'
+        @($outcome.Steps).Count | Should -Be 0
+        @($script:recorded | Where-Object { $_.Contains('TrackFabric') }).Count | Should -Be 0 -Because 'a resume would skip the step otherwise'
+
+        # Once it works, it's recorded as before.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.RESOLVE.WORKSPACE' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:recorded | Where-Object { $_.Contains('TrackFabric') }).Count | Should -Be 1
+    }
+
     It 'says on the console, as soon as a step fails, what failed and why, and that a rerun resumes it, once (Phase 28 live finding, 2026-10-30)' {
         # Live: the history report step failed on a TLS error at about 19:24 UTC, and the console said nothing until the banner.
         $script:warned = [System.Collections.Generic.List[string]]::new()
@@ -2091,6 +2113,41 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:failStep = ''
             $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume }
             $script:calls | Should -Contain 'track T1: Monitoring,Telemetry'
+        }
+
+        It 'runs the Fabric step again on a resume when an earlier run recorded it but its workspace isn''t there (live, 2026-11-13)' {
+            # Live (rg-dbhubup-demo, main's behavior): the first run met a paused capacity and recorded the Fabric step as
+            # finished without its workspace, so every later resume skipped it, and DONE's check said "run deploy.ps1 again".
+            $script:tags = @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+            $script:itemsStatus = 'Fail'
+            Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricRequiredItem -MockWith {
+                $script:calls.Add('fabric items ' + $script:itemsStatus)
+                New-DemoResult -CheckId 'FABRIC.ITEMS.REQUIRED' -Area 'fabric' -Target 'fabric' -Status $script:itemsStatus -Message 'The Fabric workspace "DBHub Test" isn''t there.'
+            }
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $calls = @($script:calls)
+            $calls | Should -Contain 'track Fabric: Fabric'
+            [array]::IndexOf($calls, 'fabric items Fail') | Should -BeLessThan ([array]::IndexOf($calls, 'track Fabric: Fabric')) -Because 'the resume checks before it plans'
+            $calls | Should -Contain 'state TrackFabric=' -Because 'a run that runs the step again lowers its record first'
+            @($calls | Where-Object { $_ -match '^track T[12]' }) | Should -BeNullOrEmpty -Because 'T1 and T2 resume as recorded'
+
+            # A paused capacity, or anything else the check can't tell: the run goes on as recorded.
+            foreach ($status in 'Manual action required', 'Warning', 'Pass') {
+                $script:calls.Clear()
+                $script:tags = @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric' }
+                $script:itemsStatus = $status
+                $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+                $script:calls | Should -Not -Contain 'track Fabric: Fabric' -Because $status
+            }
+
+            # A record that doesn't say the step finished needs no check: the step runs anyway.
+            $script:calls.Clear()
+            $script:tags = @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = '' }
+            $script:itemsStatus = 'Fail'
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $calls = @($script:calls)
+            $calls | Should -Contain 'track Fabric: Fabric'
+            @($calls[0..([array]::IndexOf($calls, 'track Fabric: Fabric'))] | Where-Object { $_ -like 'fabric items*' }) | Should -BeNullOrEmpty -Because 'only DONE''s check reads the items then'
         }
 
         It 'keeps the records on -Resume, and lowers on -FromStage only those of the tracks it runs again, as before' {

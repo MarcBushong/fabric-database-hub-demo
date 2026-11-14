@@ -1031,6 +1031,41 @@ function Test-DemoFabricRequiredItem {
     }
 }
 
+function Get-DemoFabricTrackRecheck {
+    <#
+    .SYNOPSIS
+    Whether a resumed deploy.ps1 runs the Fabric step again although an earlier run recorded it as finished
+    (DbHubTrackFabric): FABRIC.ITEMS.REQUIRED's read-only check (Test-DemoFabricRequiredItem), when it's a Fail, which it is
+    only when a list that answered lacks the workspace, the lakehouse, or an item. Returns that record, or $null when
+    everything is there or the check couldn't tell (a paused capacity, access, throttling, an error): the run then goes on
+    as recorded, and its DONE check says why. Internal.
+
+    .DESCRIPTION
+    Live finding, 2026-11-13 (rg-dbhubup-demo, on main too): a first run met a paused capacity, so the workspace couldn't be
+    created, but the step's records were "Manual action required", not "Fail", and the step was recorded as finished. Every
+    later run skipped it, and DONE's check said "run deploy.ps1 again" each time. A Fabric step with "Manual action required"
+    isn't recorded any more (Invoke-DemoDeploymentTrack); this covers a record that an earlier version wrote.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    try {
+        $check = @(Test-DemoFabricRequiredItem -Config $Config | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq 'FABRIC.ITEMS.REQUIRED' }) | Select-Object -Last 1
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('Whether the Fabric workspace and its items are there couldn''t be checked, so the Fabric step goes on as recorded: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return $null
+    }
+    if ($null -ne $check -and [string](Get-DemoMemberValue -InputObject $check -Name 'status') -eq 'Fail') {
+        return $check
+    }
+    return $null
+}
+
 function Get-DemoTelemetryRetryTarget {
     <#
     .SYNOPSIS

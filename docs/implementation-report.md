@@ -431,6 +431,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R830 | `deploy.ps1` republishes the on-demand control's runbooks only when the deployer can write to its Automation account; until then the control runs older code, which can't start T4 while a replica a session left is stopped | **Mitigated:** `CONTROL.RUNBOOKS` is a **Warning** on the console, the status page, and **DONE**, with what fails until then and the exact command |
 | R831 | Creating or deleting the replica puts T4 in Updating for minutes (live: about 8 to create), which blocks T4's management operations, not its connections | **Accepted:** the scripts order their own T4 operations around it: the template and T4's restart come before the replica, and a size change deletes the replica first |
 | R832 | Azure keeps a Run Command name marked for deletion after it ends the delete with `InternalExecutionError` (live on the T2 host, 2026-11-13: 27 of 29 deletes after 6 to 11 minutes), and fresh names pile up on a VM where every delete fails, toward Azure's limit of 25 managed Run Commands | **Mitigated:** a name still listed after the 5-minute leftover wait runs under `<name>-yyyyMMddHHmmss`, earlier fresh copies and finished chunks get a delete without waiting, and with 24 or more Run Commands listed there's no fresh one; the step then reports a Run Command that couldn't be created, and `DEPLOY.RUNCOMMAND.STUCK_<VM>` says what happened |
+| R833 | A Fabric step whose record says it finished is checked only on a resume, by reading the required items; when Fabric can't answer then (a paused capacity, access, throttling), the run goes on as recorded | **Mitigated:** DONE's `FABRIC.ITEMS.REQUIRED` reads them again at the end and names the paused capacity first, and since this fix a Fabric step with **Manual action required** isn't recorded at all |
 
 ## Phase log
 
@@ -2404,3 +2405,26 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
 **Not this fix:** the upgrade host's VM agent stopped reporting after its 2026-11-13 start ("VM status blob is found but not yet populated"); the start ended `VMStartTimedOut` after 71 minutes, and the watchdog's restart stayed pending for over an hour. No Run Command runs on a VM in that state, under any name. It goes to the owner as a separate finding.
 
 **Risks.** R832 new.
+
+### A first run that met a paused capacity never created the workspace (live finding, 2026-11-13)
+
+**Why.** Coordinator direction, 2026-11-13: fix it on this branch, in its own commit; `main` has it too, and it breaks one-click. On the upgrade test environment (`rg-dbhubup-demo`), `main`'s first run reached its Fabric step at 17:07 ET while the capacity "fabricmbprod" was paused.
+
+- `FABRIC.RESOLVE.WORKSPACE` was **Manual action required**: "doesn't exist, and it can't be created: The capacity "fabricmbprod" (F4) is Inactive".
+- The step's outcome counted only a **Fail**, so `DbHubTrackFabric` recorded Fabric.
+- Every later run resumed past it ("Finished in an earlier run"), with the capacity running, so the workspace was never created. DONE's `FABRIC.ITEMS.REQUIRED` would say "Run ./scripts/deploy.ps1 again: its Fabric track creates the workspace", which no rerun did.
+
+**Work summary.**
+
+1. **Not recorded** (`Invoke-DemoDeploymentTrack`): a Fabric step whose Fabric or Power BI records include **Manual action required** ends Open, as T1's T3 step does for its group.
+   - It isn't recorded, `DEPLOY.TRACK.FABRIC` is a **Warning**, and the run ends **NOT DONE**, naming the paused capacity first (#50).
+   - The next `deploy.ps1` runs it again. The Insights app's records still never count.
+2. **Older records** (`Get-DemoFabricTrackRecheck`, `Resolve-DemoTrackPlan -ReopenFabric`): a resume whose `DbHubTrackFabric` says Fabric runs `FABRIC.ITEMS.REQUIRED`'s read-only check before it plans.
+   - A **Fail** (a list answered without the workspace, the lakehouse, or an item) runs the step again: its record is lowered first (`Get-DemoTrackRecordReset`), and its rows on the status page say why.
+   - Anything else (everything there, a paused capacity, access, throttling, an error) leaves the plan as recorded. It costs a few Fabric reads on such a resume.
+
+**Changed files.** In `scripts/modules/DbHubDemo/Private/`: `TrackHelpers.ps1`, `ParallelDeployment.ps1`, `DeployExperience.ps1`, and `ProgressHelpers.ps1`; `tests/unit/DbHubDemo.Tracks.Tests.ps1`; `CHANGELOG.md`, and this report.
+
+**Validation.** `Invoke-Pester` on `DbHubDemo.Tracks.Tests.ps1`: 149 passed. On `main` (3881ea1, in a separate worktree), both new tests fail. The Fabric step ends Pass and is recorded, and the resume doesn't run it ("Expected 'track Fabric: Fabric' to be found"). **Live:** it waits for the orchestration's live test, as the coordinator decided, so the capacity isn't kept on for it; `rg-dbhubup-demo` keeps the record that shows it.
+
+**Risks.** R833 new.

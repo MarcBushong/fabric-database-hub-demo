@@ -309,7 +309,8 @@ function Set-DemoProgressPlan {
     a step outside the run is Skipped, and the T2 steps its source doesn't use are Skipped (a golden restore has no build;
     a build has no restore). A track in -ResendNote, which a resumed run sends back to its Artifacts step
     because its VM's artifacts changed since the last run (Resolve-DemoArtifactResend), shows that note on its Artifacts
-    step instead. Internal.
+    step instead; the Fabric track's note, when a resumed run runs its step again although an earlier run recorded it
+    (Get-DemoFabricTrackRecheck), shows on its rows. Internal.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
     [CmdletBinding()]
@@ -358,7 +359,7 @@ function Set-DemoProgressPlan {
                     if ($unused.Contains($id)) {
                         $map[$id] = $unused[$id]
                     }
-                    elseif ($resendText -and $names[$i] -eq 'Artifacts') {
+                    elseif ($resendText -and ($names[$i] -eq 'Artifacts' -or $track -eq 'Fabric')) {
                         $map[$id] = 'Resend'
                         $notes[$id] = Protect-DemoProgressText -Text $resendText
                         $again = $false

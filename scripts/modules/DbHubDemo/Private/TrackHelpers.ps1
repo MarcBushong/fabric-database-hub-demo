@@ -425,6 +425,8 @@ function Resolve-DemoTrackPlan {
     bundle and workload runner aren't sent again. A track in -Resend goes back to its Artifacts step instead, and runs its
     Bootstraps step and the steps after it again, because what the resource group's state records for its VM isn't what
     this checkout builds (Resolve-DemoArtifactResend; live finding, 2026-11-06); Resend names the tracks it moved back.
+    -ReopenFabric runs a resumed Fabric track's step again although DbHubTrackFabric records it as finished, because the
+    workspace, the lakehouse, or an item isn't there (Get-DemoFabricTrackRecheck; live finding, 2026-11-13).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -443,7 +445,9 @@ function Resolve-DemoTrackPlan {
         [switch] $SkipT4,
 
         [AllowEmptyCollection()]
-        [string[]] $Resend = @()
+        [string[]] $Resend = @(),
+
+        [switch] $ReopenFabric
     )
 
     $stages = @(Get-DemoDeploymentStageName)
@@ -483,6 +487,9 @@ function Resolve-DemoTrackPlan {
             $replicaAt = [array]::IndexOf($names, 'Replica')
             if ($track -eq 'T4' -and $replicaAt -ge 0 -and $first -gt $replicaAt -and -not (Test-DemoT4ReplicaSetUp -State $State)) {
                 $first = $replicaAt
+            }
+            if ($track -eq 'Fabric' -and $ReopenFabric) {
+                $first = 0
             }
             $artifactsAt = [array]::IndexOf($names, 'Artifacts')
             if ($artifactsAt -ge 0 -and $first -gt $artifactsAt -and $stop -ge [array]::IndexOf($stages, 'Artifacts')) {
@@ -1600,6 +1607,12 @@ function Invoke-DemoDeploymentTrack {
                     & $addAll @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $fabricConfigPath -FabricResult $fabric -ProgressPath $progress)
                     if (& $hasStatus @($fabric + $powerBI) 'Fail') {
                         $outcome = 'Fail'
+                    }
+                    elseif (& $hasStatus @($fabric + $powerBI) 'Manual action required') {
+                        # Not finished, so not recorded: the next deploy.ps1 runs this step again once a person has acted (live,
+                        # 2026-11-13: a first run that met a paused capacity recorded the step, so no later run created the
+                        # workspace). The Insights app's records never count, as above.
+                        $outcome = 'Open'
                     }
                 }
                 default {
