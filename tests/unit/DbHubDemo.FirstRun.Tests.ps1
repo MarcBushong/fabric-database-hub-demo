@@ -751,7 +751,7 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; RunnerSha256 = ''; RunnerSentTo = @(); HostPasswordUtc = ''; Tags = @{ deploymentId = 'abc123' }; T4Replica = 'Session'; FabricCapacityResumed = ''; FabricCapacityResumedUtc = '' } }
             Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Exists = $true; Removing = $false } }
             Mock -ModuleName DbHubDemo -CommandName Get-DemoPostgresHistoryCapture -MockWith { $script:order.Add('Capture'); [pscustomobject]@{ Json = '{"version":1}'; Result = (New-DemoResult -CheckId 'STOP.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Pass' -Message 'captured') } }
-            Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { $script:order.Add('DeleteReplica'); New-DemoResult -CheckId 'STOP.T4.REPLICA' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'deleted' -Evidence @{ stateBefore = 'Ready' } }
+            Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { $script:order.Add('DeleteReplica'); New-DemoResult -CheckId 'STOP.T4.REPLICA' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'deleted' -Evidence @{ replica = 'pgreplica01-abc123'; stateBefore = 'Ready' } }
             Mock -ModuleName DbHubDemo -CommandName Wait-DemoT4ReplicaState -MockWith { [pscustomobject]@{ State = 'NotFound'; Present = $false; Names = [pscustomobject]@{ ServerName = 'pgreplica01-abc123' } } }
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'stopped' }
             Mock -ModuleName DbHubDemo -CommandName Save-DemoPostgresHistoryPending -MockWith { $script:order.Add('Keep:' + $Json); New-DemoResult -CheckId 'STOP.T4.HISTORY.PENDING' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'kept' }
@@ -759,6 +759,8 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
 
             $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
             $script:order.IndexOf('Capture') | Should -BeLessThan $script:order.IndexOf('DeleteReplica') -Because 'a deleted replica''s metrics are gone'
+            @($script:order | Where-Object { $_ -eq 'DeleteReplica' }).Count | Should -Be 1 -Because 'the delete goes once; the wait sees it gone'
+            ($results | Where-Object { $_.checkId -eq 'STOP.T4.REPLICA' }).message | Should -Be 'T4''s read replica (pgreplica01-abc123) was deleted, so nothing bills for it until the next session creates it again.' -Because 'live, a second call said "isn''t there, so there''s nothing to delete" after this run deleted it'
             $script:order | Should -Contain 'SaveHistory:{"version":1}'
             $script:order | Should -Contain 'Keep:{"version":1}'
             ($results | Where-Object { $_.checkId -eq 'STOP.T4.HISTORY.PENDING' }).status | Should -Be 'Warning'

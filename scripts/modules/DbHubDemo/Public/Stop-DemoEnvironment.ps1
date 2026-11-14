@@ -254,9 +254,15 @@ function Stop-DemoEnvironment {
         if ($replicaDeleting) {
             # The replica's deletion went out before the VMs' deallocation; T4 stops once it's gone.
             $replicaGone = Wait-DemoT4ReplicaState -Config $Config -State @('NotFound') -TimeoutMinutes ([int](Get-DemoT4ReplicaSetting)['deleteTimeoutMinutes']) -PollSeconds 10 -DeploymentId ([string]$state.Tags['deploymentId'])
-            $results.Add((Remove-DemoT4Replica -Config $Config -CheckPrefix STOP -DeploymentId ([string]$state.Tags['deploymentId'])))
             if ($replicaGone.Present) {
+                $results.Add((Remove-DemoT4Replica -Config $Config -CheckPrefix STOP -DeploymentId ([string]$state.Tags['deploymentId'])))
                 Write-DemoLog -Level Warning -Message ('T4''s read replica ({0}) is still {1}; T4 stops anyway, and the nightly safety stop stops a replica that''s still there after T4.' -f $replicaGone.Names.ServerName, $replicaGone.State)
+            }
+            else {
+                # This run deleted it (live, 2026-11-13: a second Remove-DemoT4Replica then said "isn't there, so there's nothing
+                # to delete").
+                $replicaName = [string](Get-DemoMemberValue -InputObject $replicaDelete.evidence -Name 'replica')
+                $results.Add((New-DemoResult -CheckId 'STOP.T4.REPLICA' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4''s read replica ({0}) was deleted, so nothing bills for it until the next session creates it again.' -f $replicaName) -Evidence ([ordered]@{ replica = $replicaName; stateBefore = [string](Get-DemoMemberValue -InputObject $replicaDelete.evidence -Name 'stateBefore'); stateAfter = 'NotFound' }) -DocUrl ([string](Get-DemoT4ReplicaSetting)['docUrls']['concepts'])))
             }
         }
         # After the VMs, so T1's runner has ended T4's sessions; the stop finishes in the background.
