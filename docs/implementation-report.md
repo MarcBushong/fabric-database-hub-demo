@@ -2560,6 +2560,8 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
 **Validation.**
 
 - **Targeted, under strict mode:** P11's four test files, 344 passed; R843's `DbHubDemo.T4Replica.Tests.ps1` and `DbHubDemo.FirstRun.Tests.ps1`, 81 passed; `Fabric.ControlNotebook.Tests.ps1` and `DbHubDemo.ActivityControl.Tests.ps1`, 128 passed. Each new test fails on the code before its change. The simulator's Fabric stand-in now fails on any capacity call.
-- **Live:** none for the history (R848): the capacity is paused, and only the user resumes it.
+- **The full offline validation at 26ff68c** (`tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester, Markdown -CI`): PSScriptAnalyzer 0 findings in 357 files; Pester 4,283 passed, 0 failed, 4 skipped; markdownlint 0 issues in 138 files. That's 4 tests fewer than at c45cccc: P11 made 13 viewer-license tests (8 SKU cases and 5 others) one, and milestone 3 added 8 elsewhere.
+- **Live, Azure only (R843, `rg-dbhubup-demo`, the upgrade test environment, 2026-11-14 13:31 to 13:57 UTC):** this branch's `start-demo.ps1 -SkipT3` started the VMs and T4 and created T4's read replica (`Standard_D4ds_v5`, Ready in 501 seconds). Its `stop-demo.ps1` deleted the replica, deallocated both VMs, and then sent T4's stop through `Invoke-DemoT4StopConfirmed`: Azure took the first stop (`STOP.T4.STOP` **Pass**, `stopAttempts` 1, Stopping at the first read, 15 seconds later), and T4 was Stopped about 2 minutes after the stop. The race didn't recur this time, so the confirmation cost one read; the stop took 5 minutes in all. Nothing was left running.
+- **Live, the history:** none (R848): the capacity is paused, and only the user resumes it.
 
 **Risks.** R844 and R847 updated; R848 new.
