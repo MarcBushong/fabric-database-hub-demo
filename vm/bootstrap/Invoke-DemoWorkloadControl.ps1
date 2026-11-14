@@ -647,6 +647,52 @@ function Get-DemoControlTargetArgument {
     return [pscustomobject]@{ Arguments = $full; Error = '' }
 }
 
+function Test-DemoControlReplicaLagProfile {
+    # True for 'profile set ... --name incident:replica-lag': a profile that T1's profile host runs later with T4's read
+    # replica from workload-install.json (ADR 0025). Pure.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyCollection()]
+        [string[]] $Arguments = @()
+    )
+
+    $list = @($Arguments)
+    if ($list.Count -lt 4 -or $list[0] -ne 'profile' -or $list[1] -ne 'set') {
+        return $false
+    }
+    for ($i = 2; $i -lt $list.Count - 1; $i++) {
+        if ($list[$i] -eq '--name') {
+            return ($list[$i + 1] -eq 'incident:replica-lag')
+        }
+    }
+    return $false
+}
+
+function Get-DemoControlInstallReplica {
+    # T4's read replica's FQDN in workload-install.json (ADR 0025), lowercase, or '' when it names none: what T1's profile
+    # host runs replica-lag against. Pure.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [System.Collections.IDictionary] $Install
+    )
+
+    if ($null -eq $Install -or -not $Install.Contains('t4') -or $null -eq $Install['t4']) {
+        return ''
+    }
+    $t4 = $Install['t4']
+    if (-not $t4.Contains('replicaServerFqdn') -or -not $t4['replicaServerFqdn']) {
+        return ''
+    }
+    $replica = ([string]$t4['replicaServerFqdn']).ToLowerInvariant()
+    if ($replica -notmatch $script:ControlReplicaFqdnPattern) {
+        return ''
+    }
+    return $replica
+}
+
 function Get-DemoControlGoldenDecision {
     <#
     .SYNOPSIS
@@ -1080,6 +1126,12 @@ function Invoke-DemoControlRunner {
         $targetArguments = Get-DemoControlTargetArgument -Target $target -Arguments $arguments -Install $install -ReplicaServerFqdn $replicaFqdn
         if ($targetArguments.Error) {
             Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message $targetArguments.Error
+            return
+        }
+        # replica-lag through T1's profile host (ADR 0025): the host runs it later with T4's read replica from these settings,
+        # and without one it refuses the run where only its log says so (live, 2026-11-13), so that profile isn't stored.
+        if ($target -eq 'T4' -and (Test-DemoControlReplicaLagProfile -Arguments $arguments) -and -not (Get-DemoControlInstallReplica -Install $install)) {
+            Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message 'T1''s runner settings don''t name T4''s read replica, so T1''s profile host would refuse replica-lag; nothing was set. deploy.ps1 sends T1 its name.' -Evidence ([ordered]@{ target = $target; replicaKnown = $false })
             return
         }
         $full = $targetArguments.Arguments

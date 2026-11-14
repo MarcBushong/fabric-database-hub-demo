@@ -102,6 +102,18 @@ function Invoke-DemoControl {
             Write-DemoLog -Message ('An incident runs on one target: {0}, the default for {1}.' -f $targets[0], $id)
         }
     }
+    # replica-lag (ADR 0025) needs T4 and its read replica running: checked here first, because 'profile set' only stores the
+    # profile, and T1's profile host refuses the run later where only its log says so (live, 2026-11-13: CONTROL.T4 said Pass
+    # while the safety stop had stopped both). Whether T1's runner settings name the replica is checked on sqlvm01.
+    $replicaLag = $Scenario -eq 'incident:replica-lag'
+    if ($replicaLag -and 'T4' -in $targets) {
+        $block = Get-DemoT4ReplicaLagBlock -Config $Config -CheckId 'CONTROL.T4'
+        if ($null -ne $block) {
+            Write-DemoLog -Level Warning -Message ('CONTROL.T4: {0}' -f [string]$block.message)
+            $results.Add($block)
+            $targets = @($targets | Where-Object { $_ -ne 'T4' })
+        }
+    }
 
     $arguments = [System.Collections.Generic.List[string]]::new([string[]]@('profile', 'set', '--name', $Scenario))
     if ($Scenario -ne 'off') {
@@ -137,8 +149,14 @@ function Invoke-DemoControl {
             $status = 'Warning'
             $message = 'T2''s runner isn''t ready yet (the guest needs SQL Server first): ' + $message
         }
+        $remediation = ''
+        if ($status -eq 'Fail' -and $item -eq 'T4' -and $replicaLag -and (Get-DemoMemberValue -InputObject $run.Result.evidence -Name 'replicaKnown') -eq $false) {
+            # sqlvm01 refused it: T1's runner settings don't name T4's read replica (Invoke-DemoWorkloadControl.ps1).
+            $status = 'Warning'
+            $remediation = 'Run ./scripts/deploy.ps1: it sends T1 the replica''s name and changes nothing else; then send replica-lag again.'
+        }
         $evidence = [ordered]@{ scenario = $Scenario; durationMinutes = $DurationMinutes; concurrency = $Concurrency; intensity = $Intensity; resetBefore = $ResetBefore; autoCleanup = $AutoCleanup; exitCode = $run.ExitCode }
-        $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status $status -Message $message -Evidence $evidence))
+        $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status $status -Message $message -Evidence $evidence -Remediation $remediation))
     }
     return $results.ToArray()
 }

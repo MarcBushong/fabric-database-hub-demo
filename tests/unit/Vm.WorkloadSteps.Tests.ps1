@@ -681,6 +681,35 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         }
     }
 
+    It 'Runner on T1: doesn''t store replica-lag for T4 when workload-install.json names no read replica, which the profile host would need (live, 2026-11-13)' {
+        # Live (rg-dbhubup-demo): T1's settings came from main's outputs without the replica, demo-control.ps1 said Pass, and
+        # the profile host's refusal showed only in its log on sqlvm01.
+        $root = New-ControlRoot
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '[]'; StdErr = '' } }
+        $set = @('profile', 'set', '--name', 'incident:replica-lag', '--duration', '10m', '--not-after', '{{NEXT_SHUTDOWN}}', '--json')
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T4'; arguments = $set }) -StateRoot $root
+        $result = Get-ControlResult
+        $result.status | Should -Be 'Fail'
+        $result.evidence.replicaKnown | Should -Be $false
+        $result.message | Should -Be 'T1''s runner settings don''t name T4''s read replica, so T1''s profile host would refuse replica-lag; nothing was set. deploy.ps1 sends T1 its name.'
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 0
+
+        # A request that names the replica doesn't change what the profile host runs against.
+        $script:lines.Clear()
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T4'; arguments = $set; replicaServerFqdn = 'pgreplica01-abc123.postgres.database.azure.com' }) -StateRoot $root
+        (Get-ControlResult).status | Should -Be 'Fail'
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 0
+
+        # Named in the settings: stored as before. Another incident on T4 isn't checked.
+        $script:lines.Clear()
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T4'; arguments = $set }) -StateRoot (New-ControlRoot -ReplicaServerFqdn 'pgreplica01-abc123.postgres.database.azure.com')
+        (Get-ControlResult).status | Should -Be 'Pass'
+        Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -ParameterFilter { ($ArgumentList -join ' ') -like 'profile set --name incident:replica-lag *' } -Times 1 -Exactly
+        $script:lines.Clear()
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T4'; arguments = @('profile', 'set', '--name', 'incident:cpu-pressure', '--json') }) -StateRoot $root
+        (Get-ControlResult).status | Should -Be 'Pass'
+    }
+
     It 'Runner on T1: takes the request''s replicaServerFqdn for T4, and refuses one that isn''t T4''s read replica (ADR 0025)' {
         $root = New-ControlRoot -ReplicaServerFqdn 'pgreplica01-abc123.postgres.database.azure.com'
         Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '[]'; StdErr = '' } }

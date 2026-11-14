@@ -3011,6 +3011,66 @@ Describe 'Invoke-DemoControl' {
         $script:t2Message = 'The control action failed: The specified module ''C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1'' was not loaded because no valid module file was found in any module directory.'
         (Invoke-DemoControl -Config $config -Target T2 -Scenario baseline -Confirm:$false | Where-Object { $_.checkId -eq 'CONTROL.T2' }).status | Should -Be 'Warning'
     }
+
+    It 'sends replica-lag only when T4 and its read replica are Ready, and says why not with the fix (live, 2026-11-13)' {
+        # Live (rg-dbhubha-demo, 00:44Z): the safety stop's 19:30 pass had stopped T4 and its replica, and CONTROL.T4 said Pass,
+        # because 'profile set' only stores the profile; T1's profile host couldn't run it, and only its log on sqlvm01 said so.
+        $script:t4 = 'Stopped'
+        $script:replica = 'Ready'
+        $script:sku = 'Standard_D4ds_v5'
+        $script:setUp = 'Session'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Tags = @{ deploymentId = 'rrpigs' }; T4Replica = $script:setUp } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith {
+            $server = [pscustomobject]@{ sku = [pscustomobject]@{ name = $script:sku; tier = $(if ($script:sku -like 'Standard_B*') { 'Burstable' } else { 'GeneralPurpose' }) }; properties = [pscustomobject]@{ state = $script:t4 } }
+            [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = 'pgflex01-rrpigs' }; Exists = $true; Present = $true; Removing = $false; State = $script:t4; Server = $server; Error = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = 'pgreplica01-rrpigs' }; Present = ($script:replica -ne 'NotFound'); State = $script:replica; Error = '' } }
+        $send = { Invoke-DemoControl -Config $config -Target T4 -Scenario 'incident:replica-lag' -DurationMinutes 10 -Confirm:$false | Where-Object { $_.checkId -eq 'CONTROL.T4' } }
+
+        $row = & $send
+        $row.status | Should -Be 'Warning'
+        $row.message | Should -Be 'T4 (pgflex01-rrpigs) is Stopped, so replica-lag wasn''t sent: it needs T4 and its read replica running, and T1''s profile host would refuse it.'
+        $row.remediation | Should -Match '^Run \./scripts/start-demo\.ps1: it starts T4 and creates or starts its read replica'
+        $script:calls.Count | Should -Be 0 -Because 'nothing is sent'
+
+        # The replica: deleted by stop-demo.ps1, stopped, or still being created.
+        $script:t4 = 'Ready'
+        foreach ($case in @(@{ State = 'NotFound'; Fix = 'start-demo\.ps1: it creates the replica' }, @{ State = 'Stopped'; Fix = 'start-demo\.ps1: it starts the replica' }, @{ State = 'Provisioning'; Fix = '^Wait until it''s Ready' })) {
+            $script:replica = $case.State
+            $row = & $send
+            $row.status | Should -Be 'Warning' -Because $case.State
+            $row.message | Should -Match ('^T4''s read replica \(pgreplica01-rrpigs\) ') -Because $case.State
+            $row.remediation | Should -Match $case.Fix -Because $case.State
+        }
+
+        # An environment deployed before the replica, and a Burstable T4.
+        $script:replica = 'Ready'
+        $script:setUp = ''
+        $row = & $send
+        $row.status | Should -Be 'Warning'
+        $row.remediation | Should -Match '^Run \./scripts/deploy\.ps1'
+        $script:setUp = 'Session'
+        $script:sku = 'Standard_B2s'
+        (& $send).status | Should -Be 'Not supported'
+        $script:calls.Count | Should -Be 0
+
+        # Everything Ready: sent as before.
+        $script:sku = 'Standard_D4ds_v5'
+        (& $send).status | Should -Be 'Pass'
+        $script:calls.Count | Should -Be 1
+
+        # sqlvm01 refused it: T1's runner settings don't name the replica (Invoke-DemoWorkloadControl.ps1).
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            [pscustomobject]@{ Status = 'Fail'; ExitCode = $null; Records = @(); Result = (New-DemoResult -CheckId 'WORKLOAD.T4.COMMAND' -Area 'workload' -Target 'T4' -Status 'Fail' -Message 'T1''s runner settings don''t name T4''s read replica, so T1''s profile host would refuse replica-lag; nothing was set. deploy.ps1 sends T1 its name.' -Evidence @{ replicaKnown = $false }) }
+        }
+        $row = & $send
+        $row.status | Should -Be 'Warning'
+        $row.remediation | Should -Match '^Run \./scripts/deploy\.ps1: it sends T1 the replica''s name'
+
+        # Other scenarios aren't checked.
+        $null = Invoke-DemoControl -Config $config -Target T4 -Scenario 'incident:cpu-pressure' -DurationMinutes 10 -Confirm:$false
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -Times 5 -Exactly -Because 'only replica-lag reads the replica, and only once T4 is Ready and set up for it'
+    }
 }
 
 Describe 'Initialize-DemoGitHubOidc' {

@@ -370,6 +370,101 @@ function New-DemoT4ReplicaNotSupportedResult {
     return (New-DemoResult -CheckId $CheckId -Area 'infra' -Target 'T4' -Status 'Not supported' -Message ('T4 runs on the Burstable size {0}, and Azure supports read replicas only on the General Purpose and Memory Optimized tiers, so T4 has no read replica and Database Hub''s Read replica lag stays empty.' -f $(if ($T4SkuName) { $T4SkuName } else { 'it has' })) -Evidence ([ordered]@{ t4SkuName = $T4SkuName; tier = 'Burstable' }) -Remediation 'To have the replica, remove t4SkuName from config/demo.config.json (the default is General Purpose Standard_D4ds_v5) or set it to Standard_D2ds_v5, then run ./scripts/deploy.ps1, which moves T4 to that size and adds the replica. A General Purpose T4 costs more: ./scripts/estimate-cost.ps1 shows by how much.' -DocUrl ([string]$setting['docUrls']['concepts']))
 }
 
+function Get-DemoT4ReplicaLagBlock {
+    <#
+    .SYNOPSIS
+    Why the replica-lag scenario can't run now, as -CheckId's record, or $null when it can: T4 Ready, set up for its read
+    replica, not Burstable, and the replica there and Ready. Read from this PC before demo-control.ps1 sends the scenario.
+    Internal.
+
+    .DESCRIPTION
+    Live, 2026-11-13 (rg-dbhubha-demo): the safety stop's 19:30 pass had stopped T4 and its replica, and demo-control.ps1
+    still said Pass for replica-lag, because it only stores the profile; T1's profile host then couldn't run it, and only
+    its log on sqlvm01 said so. Each reason here is a Warning with the fix (start-demo.ps1 starts T4 and creates or starts
+    the replica; deploy.ps1 sets the replica up), or Not supported on a Burstable T4. Whether T1's runner settings name the
+    replica is checked on sqlvm01, in the same Run Command (Invoke-DemoWorkloadControl.ps1): only that VM has them.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidatePattern('^[A-Z0-9]+(\.[A-Z0-9_]+)+$')]
+        [string] $CheckId = 'CONTROL.T4'
+    )
+
+    $setting = Get-DemoT4ReplicaSetting
+    $docUrl = [string]$setting['docUrls']['concepts']
+    $notSent = 'so replica-lag wasn''t sent: it needs T4 and its read replica running, and T1''s profile host would refuse it'
+    $again = 'then send replica-lag again'
+    $warn = {
+        param([string] $Message, [string] $Remediation, [System.Collections.IDictionary] $Evidence)
+        New-DemoResult -CheckId $CheckId -Area 'workload' -Target 'T4' -Status 'Warning' -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $docUrl
+    }
+    $state = Get-DemoDeploymentState -Config $Config
+    $deploymentId = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $state -Name 'Tags') -Name 'deploymentId')
+    if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
+        $deploymentId = ''
+    }
+    $t4 = Get-DemoT4State -Config $Config -DeploymentId $deploymentId
+    $t4Name = [string]$t4.Names.ServerName
+    $evidence = [ordered]@{ scenario = 'incident:replica-lag'; t4 = $t4Name; t4State = [string]$t4.State }
+    if ([string]$t4.State -ne 'Ready') {
+        switch -Regex ([string]$t4.State) {
+            '^NotFound$' {
+                return (& $warn ('T4 ({0}) isn''t there, {1}.' -f $(if ($t4Name) { $t4Name } else { 'pgflex01-<deploymentId>' }), $notSent) 'Run ./scripts/deploy.ps1: it creates T4 and its read replica.' $evidence)
+            }
+            '^(Stopped|Stopping|Disabled)$' {
+                return (& $warn ('T4 ({0}) is {1}, {2}.' -f $t4Name, $t4.State, $notSent) ('Run ./scripts/start-demo.ps1: it starts T4 and creates or starts its read replica (about {0} minutes); {1}.' -f $setting['createMinutes'], $again) $evidence)
+            }
+            '^Unknown$' {
+                $evidence['error'] = Protect-DemoText -Text ([string]$t4.Error)
+                return (& $warn ('T4''s state couldn''t be read, {0}: {1}' -f $notSent, $evidence['error']) ('Run it again in a few minutes; ./scripts/status.ps1 shows T4.') $evidence)
+            }
+            default {
+                return (& $warn ('T4 ({0}) is {1}, not Ready, {2}.' -f $t4Name, $t4.State, $notSent) ('Wait until T4 is Ready (./scripts/status.ps1 shows it, usually within minutes); {0}.' -f $again) $evidence)
+            }
+        }
+    }
+    $support = Get-DemoT4ReplicaSupport -T4State $t4
+    if ($support.Reason -eq 'Burstable') {
+        $burstable = New-DemoT4ReplicaNotSupportedResult -CheckId $CheckId -T4SkuName $support.SkuName
+        $burstable.message = 'replica-lag wasn''t sent: ' + [string]$burstable.message
+        return $burstable
+    }
+    if (-not (Test-DemoT4ReplicaSetUp -State $state)) {
+        $notSetUp = New-DemoT4ReplicaNotSetUpResult -CheckId $CheckId -Status 'Warning'
+        $notSetUp.message = 'replica-lag wasn''t sent: ' + [string]$notSetUp.message
+        return $notSetUp
+    }
+    $replica = Get-DemoT4ReplicaState -Config $Config -DeploymentId $deploymentId
+    $replicaName = [string]$replica.Names.ServerName
+    $evidence['replica'] = $replicaName
+    $evidence['replicaState'] = [string]$replica.State
+    if ([string]$replica.State -eq 'Ready') {
+        return $null
+    }
+    switch -Regex ([string]$replica.State) {
+        '^NotFound$' {
+            return (& $warn ('T4''s read replica ({0}) isn''t there, {1}. stop-demo.ps1 deletes it after each session.' -f $replicaName, $notSent) ('Run ./scripts/start-demo.ps1: it creates the replica (about {0} minutes); {1}.' -f $setting['createMinutes'], $again) $evidence)
+        }
+        '^(Stopped|Stopping|Disabled)$' {
+            return (& $warn ('T4''s read replica ({0}) is {1}, {2}.' -f $replicaName, $replica.State, $notSent) ('Run ./scripts/start-demo.ps1: it starts the replica; {0}.' -f $again) $evidence)
+        }
+        '^Dropping$' {
+            return (& $warn ('T4''s read replica ({0}) is being deleted, {1}.' -f $replicaName, $notSent) ('Run ./scripts/start-demo.ps1 once it''s gone (about 2 minutes): it creates the replica again; {0}.' -f $again) $evidence)
+        }
+        '^Unknown$' {
+            $evidence['error'] = Protect-DemoText -Text ([string]$replica.Error)
+            return (& $warn ('T4''s read replica ({0}) couldn''t be read, {1}: {2}' -f $replicaName, $notSent, $evidence['error']) 'Run it again in a few minutes; ./scripts/status.ps1 shows the replica.' $evidence)
+        }
+        default {
+            return (& $warn ('T4''s read replica ({0}) is {1}, not Ready, {2}.' -f $replicaName, $replica.State, $notSent) ('Wait until it''s Ready (./scripts/status.ps1 shows it; creating it takes about {0} minutes); {1}.' -f $setting['createMinutes'], $again) $evidence)
+        }
+    }
+}
+
 function New-DemoT4ReplicaPreflightResult {
     # PREFLIGHT.T4.REPLICA (ADR 0025): what deploy.ps1 does about T4's read replica on the size T4 gets (-SkuName): Not
     # supported with the fix on a Burstable size, otherwise a Pass that says when it's created and deleted. Pure. Internal.
