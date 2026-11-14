@@ -82,6 +82,8 @@ BeforeAll {
         $script:replicaStartMinutes = $null
         $script:replicaReadyAt = $null
         $script:t4StopMinutes = $null
+        # Stops that Azure accepts and then fails, leaving T4 Ready (SourceReplicasStartStopOrder after a replica's delete).
+        $script:t4StopIgnored = 0
         $script:t4StoppedAt = $null
         # Run Commands listed on a VM, by VM name; without an entry, the earlier run's DbHubControl-<vm>-20261026000000
         # and someone else's DbHubDemo-Other, without instance views.
@@ -271,6 +273,7 @@ BeforeAll {
                 if ($script:t4ActionStatus -ne 202) { return (New-Response $script:t4ActionStatus '{"error":{"code":"UnsupportedMediaType","message":"Unsupported media type."}}') }
                 # Azure's order (SourceReplicasStartStopOrder, live 2026-11-13): T4 starts only once its replica is Ready.
                 if ($Matches[1] -eq 'start' -and $script:replica -in 'Stopped', 'Starting') { return (New-Response 400 '{"error":{"code":"SourceReplicasStartStopOrder","message":"Start the replicas first."}}') }
+                if ($Matches[1] -eq 'stop' -and $script:t4StopIgnored -gt 0) { $script:t4StopIgnored--; return (New-Response 202) }
                 if ($Matches[1] -eq 'stop' -and $null -ne $script:t4StopMinutes) { $script:t4StoppedAt = $script:clock.AddMinutes($script:t4StopMinutes) }
                 $script:t4 = $(if ($Matches[1] -eq 'start') { 'Starting' } else { 'Stopping' }); return (New-Response 202)
             }
@@ -403,6 +406,8 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         $script:settings.profiles.showcase.defaultMinutes | Should -Be 90
         $script:settings.profiles.showcase.maxMinutes | Should -Be 120
         @($script:settings.profiles.showcase.targets) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        # A session the auto-shutdown cuts short ends after whole cycles (2026-11-14).
+        $script:settings.profiles.showcase.cycleMinutes | Should -Be 30
     }
 }
 
@@ -1099,10 +1104,14 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
     }
 
     It 'starts everything, marks the demo busy, asks for T4''s read replica once T4 is Ready, and says when the replica beat runs' {
-        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $context = New-TestContext
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context $context
         $result.action | Should -Be 'session'
         $result.status | Should -Be 'Started'
         $result.sessionId | Should -Be $script:sessionId
+        # A session creates the replica, so it never says a run's "on-demand runs don't create it" (live, 2026-11-14).
+        @($context.Log | Where-Object { $_ -match 'don''t create it' }) | Should -BeNullOrEmpty
+        $result.replica | Should -Not -Match 'start-demo\.ps1'
         # The busy marker and the session's ID, before anything starts.
         $script:groupTags['DbHubBusyBy'] | Should -Be 'session'
         $script:groupTags['DbHubSessionId'] | Should -Be $script:sessionId
@@ -1138,6 +1147,13 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status.replicaLag.planned | Should -BeTrue
         @($status.replicaLag.windows).Count | Should -Be 1 -Because 'a 90-minute session has one even cycle after T4''s profile is set'
         @($status.dispatched) | Should -Contain 'T4: showcase for 90 minutes'
+        # When each target's showcase began, for the notebook's guide: T1 and T3 on sqlvm01's dispatch, T4 on its own.
+        $utcText = { param($Value) if ($Value -is [datetime]) { $Value.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) } else { [string]$Value } }
+        foreach ($target in 'T1', 'T2', 'T3', 'T4') {
+            (& $utcText $status.dispatchUtc.$target) | Should -Match '^2026-10-27T15:\d\d:\d\dZ$' -Because $target
+        }
+        (& $utcText $status.dispatchUtc.T3) | Should -Be (& $utcText $status.dispatchUtc.T1)
+        (& $utcText $status.dispatchUtc.T4) | Should -Be (& $utcText $status.t4.dispatchUtc)
         @($status.steps | ForEach-Object step) | Should -Contain 'ReplicaLag'
         @($script:secrets['dbhub-session-status'] | ForEach-Object { ($_.Value | ConvertFrom-Json).phase } | Select-Object -Unique) | Should -Be @('accepted', 'starting', 'replica', 'running')
         @($script:secrets['dbhub-session-status'] | ForEach-Object { $_.Tags['sessionId'] } | Select-Object -Unique) | Should -Be @($script:sessionId)
@@ -1182,13 +1198,22 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $script:replica | Should -BeNullOrEmpty
     }
 
-    It 'ends before the VMs'' auto-shutdown and says so, and refuses a session that would be shorter than 30 minutes' {
-        # 18:20 Eastern: 38 minutes to the 19:00 auto-shutdown, less its 2-minute margin.
+    It 'ends after its last whole showcase cycle before the VMs'' auto-shutdown and says so, and refuses a session that would be shorter than 30 minutes' {
+        # 18:20 Eastern: 38 minutes to the 19:00 auto-shutdown, less its 2-minute margin, so one whole 30-minute cycle: no
+        # beat stops midway when the VMs' activity ends (2026-11-14).
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 22, 20, 0, [System.DateTimeKind]::Utc)))
         $result.status | Should -Be 'Partial'
         $status = Get-SessionStatus
-        $status.plannedMinutes | Should -Be 38
-        (@($status.steps) | Where-Object step -EQ 'Plan').message | Should -Match 'runs 38 of the 90 minutes asked: it ends at 18:58, before the VMs'' auto-shutdown at 19:00'
+        $status.plannedMinutes | Should -Be 30
+        ([datetime]$status.runEndUtc).ToUniversalTime() | Should -Be ([datetime]::new(2026, 10, 27, 22, 50, 0, [System.DateTimeKind]::Utc))
+        @($status.dispatched) | Should -Contain 'T1: showcase for 30 minutes'
+        (@($status.steps) | Where-Object step -EQ 'Plan').message | Should -Match 'runs 30 of the 90 minutes asked: it ends at 18:50, before the VMs'' auto-shutdown at 19:00 \(Eastern Standard Time\), when the activity on the VMs ends\. It ends after 1 whole 30-minute showcase cycle, so no beat is cut off\.'
+        (@($status.steps) | Where-Object step -EQ 'Plan').fix | Should -Match 'autoShutdownTime'
+        # 17:15 Eastern: 103 minutes left, so the 90 asked fit, whole cycles or not.
+        Reset-TestAzure
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 21, 15, 0, [System.DateTimeKind]::Utc)))
+        (Get-SessionStatus).plannedMinutes | Should -Be 90
         Reset-TestAzure
         $script:groupTags = @{ DbHubT4Replica = 'Session' }
         $late = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 22, 40, 0, [System.DateTimeKind]::Utc)))
@@ -1254,6 +1279,34 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status.stoppedBy | Should -Be 'Auto-stop'
         $status.sessionId | Should -Be $script:sessionId
         $status.metrics.status | Should -Be 'Pass'
+    }
+
+    It 'asks T4 to stop again when Azure fails its first stop right after the replica''s delete (SourceReplicasStartStopOrder, live 2026-11-14)' {
+        # Live: the session's auto-stop saw the replica's 404 about 20 seconds before its delete finished, and T4's stop,
+        # accepted, failed a minute later, which left T4 running.
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:t4StopIgnored = 1
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session'; DbHubSessionId = $script:sessionId; DbHubSessionStartUtc = '2026-10-27T13:30:00Z' }
+        $context = New-TestContext
+        $result = Invoke-DbHubStop -Scope All -Context $context -PollSeconds 5
+        $result.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' }).Count | Should -Be 2
+        $script:t4 | Should -BeIn @('Stopping', 'Stopped')
+        @($result.done) | Should -Contain 'pgflex01-abc123 stopping'
+        @($context.Log | Where-Object { $_ -match 'is stopping after 2 stops' }) | Should -Not -BeNullOrEmpty
+    }
+
+    It 'says T4 wasn''t stopped, with the nightly safety stop as its backstop, when Azure keeps failing its stop after the replica''s delete' {
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:t4StopIgnored = 99
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session'; DbHubSessionId = $script:sessionId; DbHubSessionStartUtc = '2026-10-27T13:30:00Z' }
+        $result = Invoke-DbHubStop -Scope All -Context (New-TestContext) -PollSeconds 5
+        $result.status | Should -Be 'Partial'
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' }).Count | Should -Be 3
+        @($result.failed) | Should -Contain 'pgflex01-abc123 not stopped: it was still Ready after 3 stop(s) in 10 minutes; the nightly safety stop stops it tonight'
+        (Get-SessionStatus).failed | Should -Contain 'pgflex01-abc123 not stopped: it was still Ready after 3 stop(s) in 10 minutes; the nightly safety stop stops it tonight'
     }
 
     It 'stops the replica after T4 instead when the control identity can''t delete it yet, and leaves a deploy.ps1''s marker alone' {

@@ -1856,8 +1856,9 @@ function Stop-DbHubDemo {
     With the control's session settings (2026-11-14, ADR 0026), and T4's read replica there or a session's busy marker set:
     T4's and the replica's Azure Monitor metrics go to the control vault first (Save-DbHubSessionMetric), because a
     deleted server's can't be read; then the replica is deleted (Remove-DbHubT4Replica) before T4 stops, and a session's
-    busy marker is cleared. Without the grant to delete it (or with the safety stop's settings), the replica is stopped
-    once T4 is, as before.
+    busy marker is cleared. T4's stop right after the replica's deletion is confirmed (Stop-DbHubT4Confirmed): Azure can
+    still refuse it then (SourceReplicasStartStopOrder, live 2026-11-14). Without the grant to delete it (or with the safety
+    stop's settings), the replica is stopped once T4 is, as before.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -1868,7 +1869,9 @@ function Stop-DbHubDemo {
         [object] $Tags,
 
         [AllowEmptyString()]
-        [string] $SessionId = ''
+        [string] $SessionId = '',
+
+        [int] $PollSeconds = 20
     )
 
     $settings = $Context.Settings
@@ -1917,6 +1920,7 @@ function Stop-DbHubDemo {
         }
     }
     $replicaDeleted = $false
+    $replicaJustDeleted = $false
     if ($session -and $replicaThere) {
         # T4's read replica (ADR 0025) bills only during a session: deleted, which doesn't wait for T4 (2026-11-14).
         $removed = Remove-DbHubT4Replica -Context $Context -Tags $Tags -WaitMinutes (Get-DbHubSessionReplicaSetting -Settings $settings).DeleteMinutes
@@ -1924,6 +1928,7 @@ function Stop-DbHubDemo {
             'Deleted' {
                 $done.Add(('T4''s read replica {0} deleted' -f $removed.Name))
                 $replicaDeleted = $true
+                $replicaJustDeleted = $true
             }
             'Missing' {
                 $replicaDeleted = $true
@@ -1938,7 +1943,19 @@ function Stop-DbHubDemo {
     }
     $t4 = Get-DbHubT4 -Context $Context -Tags $Tags
     $t4Outcome = ''
-    if ($t4.State -in 'Ready', 'Starting', 'Updating') {
+    if ($t4.State -in 'Ready', 'Starting', 'Updating' -and $replicaJustDeleted) {
+        # Right after the replica's delete, Azure can still refuse T4's stop (live, 2026-11-14), so it's confirmed.
+        $confirmed = Stop-DbHubT4Confirmed -Context $Context -Tags $Tags -Name $t4.Name -PollSeconds $PollSeconds
+        if ($confirmed.Stopped) {
+            $done.Add(('{0} stopping' -f $t4.Name))
+            $t4Outcome = 'Sent'
+        }
+        else {
+            $failed.Add(('{0} not stopped: {1}; the nightly safety stop stops it tonight' -f $t4.Name, $confirmed.Error))
+            $t4Outcome = 'Failed'
+        }
+    }
+    elseif ($t4.State -in 'Ready', 'Starting', 'Updating') {
         if (Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action stop) {
             $done.Add(('{0} stopping' -f $t4.Name))
             $t4Outcome = 'Sent'
@@ -2798,7 +2815,10 @@ function Start-DbHubActivityRun {
         # T4's read replica (ADR 0025): Azure starts T4 only once a stopped replica is Ready, so one a session left behind
         # starts first. The control never creates one: without it, the run says plainly that its replica beat isn't there.
         $replicaFirst = Invoke-DbHubT4ReplicaStartFirst -Context $Context -Tags $Tags -PollSeconds $PollSeconds
-        $replicaNote = Get-DbHubT4ReplicaRunNote -Outcome $replicaFirst
+        $replicaNote = ''
+        if ($null -eq $OnT4Ready -or $replicaFirst.Outcome -ne 'Missing') {
+            $replicaNote = Get-DbHubT4ReplicaRunNote -Outcome $replicaFirst
+        }
         if ($replicaNote) {
             $result.replica = $replicaNote
             Write-DbHubLog -Context $Context -Message $replicaNote
@@ -2811,8 +2831,10 @@ function Start-DbHubActivityRun {
             $t4 = $null
         }
     }
-    elseif ($null -ne $t4) {
-        # A T4 that runs needs nothing first; without a replica, the run still says its replica beat isn't there.
+    elseif ($null -ne $t4 -and $null -eq $OnT4Ready) {
+        # A T4 that runs needs nothing first; without a replica, the run still says its replica beat isn't there. A session
+        # (OnT4Ready) creates the replica itself, so it says nothing here (live, 2026-11-14: the note told a session to use
+        # start-demo.ps1 for a replica it was about to create).
         $replicaNow = Get-DbHubT4Replica -Context $Context -Tags $Tags
         $replicaNote = Get-DbHubT4ReplicaRunNote -Outcome ([pscustomobject]@{ Outcome = $(if ($replicaNow.State -eq 'Missing') { 'Missing' } else { '' }); Name = [string]$replicaNow.Name; State = [string]$replicaNow.State; Error = '' })
         if ($replicaNote) {
@@ -3260,6 +3282,8 @@ function New-DbHubSessionStatus {
         skipped           = @()
         monitoring        = ''
         t4                = [ordered]@{ state = ''; sku = ''; tier = ''; dispatchUtc = '' }
+        # When each target's activity went out (2026-11-14): its showcase's cycles start there, for the notebook's guide.
+        dispatchUtc       = [ordered]@{}
         replica           = [ordered]@{ state = ''; sizeAsked = ''; sizeUsed = ''; attempts = @(); readyUtc = ''; note = ''; fix = '' }
         replicaLag        = [ordered]@{ planned = $false; windows = @(); note = ''; fix = '' }
         message           = ''
@@ -3599,6 +3623,63 @@ function Remove-DbHubT4Replica {
         }
         Start-Sleep -Seconds $PollSeconds
     }
+}
+
+function Stop-DbHubT4Confirmed {
+    <#
+    .SYNOPSIS
+    T4's stop right after its read replica's deletion, confirmed: Azure refuses a primary's stop while an operation still
+    runs on its replica (SourceReplicasStartStopOrder). Live, 2026-11-14: the replica's GET answered 404 about 20 seconds
+    before its delete finished, and T4's stop, accepted, failed a minute later, which left T4 running after the session's
+    auto-stop. So the stop is asked again until T4 is Stopping or Stopped, at most Attempts times within WaitMinutes.
+    Returns Stopped ($true when T4 is Stopping or Stopped), Attempts, and Error.
+    https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Stop-DbHubDemo, its caller, asks ShouldProcess.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [int] $WaitMinutes = 10,
+
+        [int] $Attempts = 3,
+
+        [int] $SettleSeconds = 150,
+
+        [int] $PollSeconds = 20
+    )
+
+    $giveUp = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    $tries = 0
+    $state = ''
+    while ($tries -lt $Attempts -and (Get-DbHubUtcNow) -lt $giveUp) {
+        $tries++
+        $null = Invoke-DbHubT4Action -Context $Context -Name $Name -Action stop
+        # A stop that Azure took starts within seconds; one that failed leaves T4 Ready, and a second stop while the first
+        # still runs is refused, so each one gets SettleSeconds to show.
+        $settle = (Get-DbHubUtcNow).AddSeconds($SettleSeconds)
+        if ($settle -gt $giveUp) {
+            $settle = $giveUp
+        }
+        while ((Get-DbHubUtcNow) -lt $settle) {
+            Start-Sleep -Seconds $PollSeconds
+            $state = [string](Get-DbHubT4 -Context $Context -Tags $Tags).State
+            if ($state -in 'Stopping', 'Stopped') {
+                if ($tries -gt 1) {
+                    Write-DbHubLog -Context $Context -Message ('{0} is {1} after {2} stops: Azure refused the first while its read replica''s delete finished.' -f $Name, $state.ToLowerInvariant(), $tries)
+                }
+                return [pscustomobject]@{ Stopped = $true; Attempts = $tries; Error = '' }
+            }
+        }
+        Write-DbHubLog -Context $Context -Message ('{0} is still {1} after stop {2}; asking again.' -f $Name, $(if ($state) { $state } else { 'unknown' }), $tries)
+    }
+    return [pscustomobject]@{ Stopped = $false; Attempts = $tries; Error = ('it was still {0} after {1} stop(s) in {2} minutes' -f $(if ($state) { $state } else { 'unknown' }), $tries, $WaitMinutes) }
 }
 
 function Test-DbHubSessionOpen {
@@ -4315,7 +4396,8 @@ function Start-DbHubSession {
     1. Refused while a run is active (Get-DbHubActiveRun), with the reason in the status.
     2. The plan (Get-DbHubRunPlan): the showcase on every target for the session's minutes, ending before the VMs' next
        auto-shutdown, as a run does: the profile hosts on the VMs end their activity there. A shorter session than asked
-       says so, with when it ends and why; one with less than minSessionMinutes left is refused.
+       ends after its last whole showcase cycle (cycleMinutes), so no beat is cut off, and says so, with when it ends and
+       why; one with less than minSessionMinutes left is refused.
     3. The busy marker (DbHubBusyUntilUtc, DbHubBusyBy session) until busyMarginMinutes after the auto-stop, with the
        session's ID and start (DbHubSessionId, DbHubSessionStartUtc): the nightly stop's passes and the control's T4 stop
        leave the session to its own auto-stop, which saves the metrics and deletes the replica.
@@ -4390,9 +4472,31 @@ function Start-DbHubSession {
     if (-not $plan.Valid -or $planned -lt $minimum) {
         return (& $refuse ('The VMs shut down at {0} ({1}), too soon for a session of at least {2} minutes, so nothing was started.' -f (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $minimum) 'Run all again earlier in the day, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.')
     }
+    # A session that the auto-shutdown cuts short ends after its last whole showcase cycle (2026-11-14), so no beat stops
+    # midway when the VMs' activity ends.
+    $wholeCycles = $false
+    $cycle = [int](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $settings -Name 'profiles') -Name 'showcase') -Name 'cycleMinutes')
+    if ($planned -lt [int]$Request.DurationMinutes - 1 -and $cycle -gt 0 -and $planned -ge $cycle) {
+        if (($planned % $cycle) -ne 0) {
+            $shorter = $Request.PSObject.Copy()
+            $shorter.DurationMinutes = [int]([System.Math]::Floor($planned / $cycle) * $cycle)
+            $plan = Get-DbHubRunPlan -Request $shorter -Settings $settings -NowUtc $Context.NowUtc
+            $planned = [int][System.Math]::Floor(($plan.RunEndUtc - $Context.NowUtc).TotalMinutes)
+        }
+        $wholeCycles = $true
+    }
     $status['plannedMinutes'] = $planned
     if ($planned -lt [int]$Request.DurationMinutes - 1) {
-        Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Warning' -Message ('This session runs {0} of the {1} minutes asked: it ends at {2}, before the VMs'' auto-shutdown at {3} ({4}), when the activity on the VMs ends.' -f $planned, $Request.DurationMinutes, (& $clock $plan.RunEndUtc), (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone) -Fix 'For a full session, Run all earlier, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.'
+        $cycleText = ''
+        if ($wholeCycles) {
+            $count = [int]($planned / $cycle)
+            $noun = 'cycles'
+            if ($count -eq 1) {
+                $noun = 'cycle'
+            }
+            $cycleText = ' It ends after {0} whole {1}-minute showcase {2}, so no beat is cut off.' -f $count, $cycle, $noun
+        }
+        Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Warning' -Message ('This session runs {0} of the {1} minutes asked: it ends at {2}, before the VMs'' auto-shutdown at {3} ({4}), when the activity on the VMs ends.{5}' -f $planned, $Request.DurationMinutes, (& $clock $plan.RunEndUtc), (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $cycleText) -Fix 'For a full session, Run all earlier, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.'
     }
     else {
         Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Pass' -Message ('The showcase runs {0} minutes on every target, until {1} ({2}).' -f $planned, (& $clock $plan.RunEndUtc), $settings.autoShutdownTimeZone)
@@ -4433,6 +4537,10 @@ function Start-DbHubSession {
             't4-start' { Add-DbHubSessionStep -Status $shared.Status -Step 'T4' -State 'Info' -Message ('T4 ({0}) is starting.' -f $Detail) }
             'dispatched' {
                 Add-DbHubSessionStep -Status $shared.Status -Step 'Activity' -State 'Pass' -Message $Detail
+                $target = ($Detail -split ':')[0]
+                if ($target -match '^T[1-4]$') {
+                    $shared.Status['dispatchUtc'][$target] = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
+                }
                 if ($Detail -like 'T4:*') {
                     $shared.Status['t4']['dispatchUtc'] = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
                 }
@@ -4778,7 +4886,7 @@ function Invoke-DbHubStop {
         }
         return [pscustomobject]@{ action = $label; status = 'Skipped'; message = ('T4 is {0}; nothing to stop.' -f $t4.State) }
     }
-    $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags
+    $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags -PollSeconds $PollSeconds
     $status = 'Stopped'
     $failedText = ''
     if (@($stopped.Failed).Count -gt 0) {
