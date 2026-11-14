@@ -728,7 +728,8 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         $script:steps = [System.Collections.Generic.List[object]]::new()
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:steps.Add([pscustomobject]@{ Id = (@($Id) -join ','); State = $State; Status = $Status; Message = $Message }) }
+        # Through PesterBoundParameters: a parameter the caller didn't pass isn't a variable, which strict mode refuses.
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:steps.Add([pscustomobject]@{ Id = (@($PesterBoundParameters['Id']) -join ','); State = $PesterBoundParameters['State']; Status = $PesterBoundParameters['Status']; Message = $PesterBoundParameters['Message'] }) }
         $script:clientId = 'cccccccc-0000-0000-0000-000000000003'
         $script:vaultAnswer = 'Disabled'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
