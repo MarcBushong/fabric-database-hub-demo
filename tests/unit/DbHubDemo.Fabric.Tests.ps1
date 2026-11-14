@@ -178,22 +178,24 @@ Describe 'Get-DemoFabricNotebookDefinition' {
         [System.IO.File]::ReadAllBytes($path) | Should -Be $before
     }
 
-    It 'points only the uploaded copy at a GitHub repository and environment, without a lakehouse too' {
+    It 'points only the uploaded copy at a GitHub repository, without a lakehouse too, and leaves the live-activity notebook, which has no GitHub path, as it is' {
         $before = [System.IO.File]::ReadAllBytes($liveNotebook)
         $definition = Get-DemoFabricNotebookDefinition -Path $liveNotebook -GitHubRepository 'contoso/dbhub-fork' -GitHubEnvironment 'demo-fork'
         $definition.LakehouseRebound | Should -BeFalse
         $uploaded = ConvertFrom-TestPayload -Payload $definition.Definition.parts[0].payload | ConvertFrom-Json -AsHashtable -Depth 64
         $parameters = (@($uploaded['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]['source']) -join ''
-        $parameters | Should -Match '(?m)^GITHUB_REPOSITORY = "contoso/dbhub-fork"$'
-        $parameters | Should -Match '(?m)^GITHUB_ENVIRONMENT = "demo-fork"$'
+        # Since 2026-11-14 (ADR 0026) the live-activity notebook has no GITHUB_* parameter, so nothing is added to it.
+        $parameters | Should -Not -Match 'GITHUB_'
         $parameters | Should -Match '(?m)^WORKSPACE_ID = ""$'
         $uploaded['metadata']['dependencies']['lakehouse'].Contains('default_lakehouse') | Should -BeFalse
         [System.IO.File]::ReadAllBytes($liveNotebook) | Should -Be $before
         # The deployment notebook has no GITHUB_ENVIRONMENT line, so only its repository changes.
+        $deploymentBefore = [System.IO.File]::ReadAllBytes($deploymentNotebook)
         $deployment = Get-DemoFabricNotebookDefinition -Path $deploymentNotebook -GitHubRepository 'contoso/dbhub-fork' -GitHubEnvironment 'demo-fork'
         $text = ConvertFrom-TestPayload -Payload $deployment.Definition.parts[0].payload
         $text | Should -Match 'GITHUB_REPOSITORY = \\"contoso/dbhub-fork\\"'
         $text | Should -Not -Match 'GITHUB_ENVIRONMENT'
+        [System.IO.File]::ReadAllBytes($deploymentNotebook) | Should -Be $deploymentBefore
         { Get-DemoFabricNotebookDefinition -Path $liveNotebook -GitHubRepository 'not a repository' } | Should -Throw
     }
 }
@@ -509,18 +511,18 @@ Describe 'configure-fabric.ps1' {
         $output | Should -Not -Match ([regex]::Escape($plainToken))
     }
 
-    It 'points the uploaded notebooks at github.repository and github.environment, but not at the example''s placeholder' {
+    It 'points the uploaded deployment notebook at github.repository, but not at the example''s placeholder, and adds no GitHub parameter to the live-activity notebook' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
         $gitHubConfig = Get-Content -LiteralPath $idConfigPath -Raw | ConvertFrom-Json -AsHashtable
         $gitHubConfig['github'] = [ordered]@{ repository = 'contoso/dbhub-fork'; environment = 'demo-fork' }
         $gitHubConfigPath = Join-Path -Path $TestDrive -ChildPath 'demo.github.config.json'
         Set-Content -LiteralPath $gitHubConfigPath -Value ($gitHubConfig | ConvertTo-Json -Depth 10) -Encoding utf8NoBOM
-        $default = [regex]::Match([System.IO.File]::ReadAllText($liveNotebook), 'GITHUB_REPOSITORY = \\"([^\\"]+)\\"').Groups[1].Value
+        $default = [regex]::Match([System.IO.File]::ReadAllText($deploymentNotebook), 'GITHUB_REPOSITORY = \\"([^\\"]+)\\"').Groups[1].Value
         $default | Should -Not -BeNullOrEmpty
         # The ID configuration is the example's, so its github.repository is the placeholder and the default stays.
         foreach ($case in @(
-                @{ Path = $gitHubConfigPath; Repository = 'contoso/dbhub-fork'; Environment = 'demo-fork' }
-                @{ Path = $idConfigPath; Repository = $default; Environment = 'demo' }
+                @{ Path = $gitHubConfigPath; Repository = 'contoso/dbhub-fork' }
+                @{ Path = $idConfigPath; Repository = $default }
             )) {
             Set-FabricMock -Routes @(
                 @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_Deployment' }, @{ id = $operationId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
@@ -533,9 +535,12 @@ Describe 'configure-fabric.ps1' {
             foreach ($update in $updates) {
                 $uploaded = ConvertFrom-TestPayload -Payload (Get-RequestBody -Request $update).definition.parts[0].payload | ConvertFrom-Json -AsHashtable -Depth 64
                 $parameters = (@($uploaded['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]['source']) -join ''
-                $parameters | Should -Match ('(?m)^GITHUB_REPOSITORY = "{0}"$' -f [regex]::Escape($case.Repository))
                 if ($update.Uri -like "*/items/$operationId/updateDefinition") {
-                    $parameters | Should -Match ('(?m)^GITHUB_ENVIRONMENT = "{0}"$' -f [regex]::Escape($case.Environment))
+                    # The live-activity notebook has no GitHub path since 2026-11-14 (ADR 0026).
+                    $parameters | Should -Not -Match 'GITHUB_'
+                }
+                else {
+                    $parameters | Should -Match ('(?m)^GITHUB_REPOSITORY = "{0}"$' -f [regex]::Escape($case.Repository))
                 }
             }
         }
