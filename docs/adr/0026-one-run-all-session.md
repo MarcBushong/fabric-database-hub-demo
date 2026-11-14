@@ -102,3 +102,5 @@ Azure has no narrower action and no name condition for these: attribute-based co
 - Metrics - List: <https://learn.microsoft.com/rest/api/monitor/metrics/list>
 - Azure permissions reference: <https://learn.microsoft.com/azure/role-based-access-control/permissions/databases>, <https://learn.microsoft.com/azure/role-based-access-control/permissions/networking>, <https://learn.microsoft.com/azure/role-based-access-control/permissions/security>
 - Azure Automation's fair share (a cloud job runs at most 3 hours): <https://learn.microsoft.com/azure/automation/automation-runbook-execution#fair-share>
+- NotebookUtils credentials (the `pbi` audience key is for "Call Power BI and Fabric REST APIs", updated 2026-09-23): <https://learn.microsoft.com/fabric/data-engineering/notebookutils/notebookutils-credentials>
+- Job Scheduler - Run On Demand Item Job (`RunNotebook`, with `executionData.parameters`): <https://learn.microsoft.com/rest/api/fabric/core/job-scheduler/run-on-demand-item-job>
