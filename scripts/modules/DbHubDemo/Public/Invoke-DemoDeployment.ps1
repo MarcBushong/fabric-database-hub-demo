@@ -530,11 +530,10 @@ function Invoke-DemoDeployment {
                     # counts in DEPLOY.SUMMARY and the exit code) without stopping the deployment.
                     & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
                 }
-                # The on-demand activity control's A1 (ADR 0020): a redeploy deleted it with the group. Granted again only
-                # with assignRoles; otherwise, or when it fails, Manual action required with the -GrantRole command.
-                & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
                 # The nightly safety stop (ADR 0024), part of every deployment; its problems are Warnings, never a Fail.
                 & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                # The session control's Azure part (ADR 0026), the same way; its notebook comes with the Fabric stage.
+                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
             }
             'Artifacts' {
                 $current = Get-DemoDeploymentState -Config $Config
@@ -847,6 +846,8 @@ function Invoke-DemoDeployment {
                 $null = Update-DemoFabricAppSignInFromApp -SignIn $appSignIn -AppResult $app -Results $results
                 $appSummary = Get-DemoInsightsAppSummary -Result $app
                 $appText = if ($null -ne $appSummary -and [bool]$appSummary.Failed) { '; the Insights app wasn''t created or doesn''t work, which doesn''t block DONE (the summary says why)' } elseif ($null -ne $appSummary -and [bool]$appSummary.Deployed) { ', with the Insights app' } else { '' }
+                # The session control's notebook (ADR 0026), now that the workspace exists; never a Fail.
+                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
                 & $recordStage 'Fabric'
                 & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}{1}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }), $appText)
             }

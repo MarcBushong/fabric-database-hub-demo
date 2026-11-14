@@ -160,11 +160,16 @@ function Invoke-DemoPreflight {
         Add-Check 'PREFLIGHT.P1.ROLEASSIGNMENTS' 'subscription' 'Not selected' 'assignRoles is false; no role assignments will be created.'
     }
 
-    # P2: resource providers.
+    # P2: resource providers. The session control (ADR 0026), part of every deployment since 2026-11-14, needs Automation,
+    # Key Vault, and managed identities; with a private vault, its notebook reads the vault through a Fabric managed private
+    # endpoint (Fabric capacities only, Trial capacities included), which needs Microsoft.Network registered:
+    # https://learn.microsoft.com/fabric/security/security-managed-private-endpoints-overview
+    # https://learn.microsoft.com/fabric/security/security-managed-private-endpoints-create#prerequisites
     $requiredProviders = @(
         'Microsoft.Sql', 'Microsoft.SqlVirtualMachine', 'Microsoft.AzureArcData', 'Microsoft.HybridCompute',
         'Microsoft.GuestConfiguration', 'Microsoft.HybridConnectivity', 'Microsoft.Compute', 'Microsoft.Network',
-        'Microsoft.Storage', 'Microsoft.Consumption', 'Microsoft.DevTestLab'
+        'Microsoft.Storage', 'Microsoft.Consumption', 'Microsoft.DevTestLab', 'Microsoft.Automation', 'Microsoft.KeyVault',
+        'Microsoft.ManagedIdentity'
     ) + @(if (Test-DemoT4Enabled -Config $Config) { 'Microsoft.DBforPostgreSQL' })
     $providerStates = @{}
     foreach ($provider in @(Invoke-Az -Arguments @('provider', 'list') -Json)) {

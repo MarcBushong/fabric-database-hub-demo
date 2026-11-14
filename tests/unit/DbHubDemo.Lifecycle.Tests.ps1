@@ -1935,7 +1935,7 @@ Describe 'Start-DemoEnvironment' {
         $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
         # A VM this start booted gets the interim baseline as soon as it runs, and its own Run Commands wait for it (review of
         # PR 16, and its re-review).
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Switch:T1,T3=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'T1Monitoring', 'WarmT3', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T2=business-day')
+        $script:order | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Switch:T1,T3=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'T1Monitoring', 'WarmT3', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T2=business-day')
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 1 -Exactly -ParameterFilter { $ProfileName -eq 'business-day' -and $WaitSeconds -eq 180 -and $RequestedBy -eq 'start-demo' }
         foreach ($target in 'T1', 'T3', 'T2') {
             $switch = $results | Where-Object { $_.checkId -eq ('START.INCIDENTS_{0}' -f $target) }
@@ -2023,7 +2023,7 @@ Describe 'Start-DemoEnvironment' {
         # An earlier start, or a deploy.ps1 that ended NOT DONE, can have left business-day's incidents running.
         Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $false }
         Start-DemoEnvironment -Config $config -SkipT3 -Confirm:$false | Out-Null
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Switch:T1,T2=baseline', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Profile:T1=baseline', 'Profile:T2=baseline', 'Switch:T1,T2=business-day') -Because '-SkipT3 leaves T3 alone, quiet included'
+        $script:order | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'Switch:T1,T2=baseline', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Profile:T1=baseline', 'Profile:T2=baseline', 'Switch:T1,T2=business-day') -Because '-SkipT3 leaves T3 alone, quiet included'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 1 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and $WaitSeconds -eq 0 -and $ExpiresMinutes -eq 10 }
 
         # An explicit baseline has no incidents to quiet.
@@ -2079,7 +2079,7 @@ Describe 'Start-DemoEnvironment' {
             $script:refuse = @()
         }
         Start-DemoEnvironment -Config $config -SkipT3 -Confirm:$false | Out-Null
-        @($script:order[0..9]) | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Switch:T2=baseline', 'Start:sqlvm01', 'Switch:T1=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T2')
+        @($script:order[0..10]) | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'Switch:T2=baseline', 'Start:sqlvm01', 'Switch:T1=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T2')
         $script:order[-1] | Should -Be 'Switch:T1,T2=business-day'
 
         # A VM that doesn't run gets nothing: a Run Command can't reach it.
@@ -2150,8 +2150,7 @@ Describe 'Start-DemoEnvironment' {
         $script:order | Should -Contain 'Profile:T2=baseline'
     }
 
-    It 'leaves the auto-stop alone with the control off, or with -WhatIf' {
-        Start-DemoEnvironment -Config $config -Confirm:$false | Out-Null
+    It 'leaves the auto-stop alone with -WhatIf; the control is part of every deployment since 2026-11-14 (ADR 0026)' {
         Start-DemoEnvironment -Config (New-ControlTestConfig) -WhatIf | Out-Null
         Should -Invoke -ModuleName DbHubDemo -CommandName Clear-DemoActivityControlAutoStop -Times 0 -Exactly
     }
@@ -2219,7 +2218,7 @@ Describe 'Start-DemoEnvironment' {
     It 'recreates a removed T3 under the same names, with the recorded bundle and runner, and checks T1''s monitoring after the template' {
         $script:t3Exists = $false
         Start-DemoEnvironment -Config $config -ActivityProfile 'off' -Confirm:$false | Out-Null
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Template:abab:cdcd', 'Group', 'T3Setup', 'EnableT3', 'Gate', 'Monitoring:20', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off')
+        $script:order | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Template:abab:cdcd', 'Group', 'T3Setup', 'EnableT3', 'Gate', 'Monitoring:20', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off')
         # A plugin the redeployment leaves NotRunning gets the agent's restart at once, as after a start (the owner's
         # decision, 2026-10-30), never the whole wait.
         Should -Invoke -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['NotRunningGraceMinutes'] -eq 0 }
@@ -2283,7 +2282,7 @@ Describe 'Start-DemoEnvironment' {
             New-DemoResult -CheckId 'START.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 is {0}.' -f $after) -Evidence @{ stateBefore = 'Stopped'; stateAfter = $after }
         }
         $results = Start-DemoEnvironment -Config (New-TestConfig -WithT4) -Confirm:$false
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'T4:Start:0', 'Start:sqlvm01', 'Switch:T1,T3,T4=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T4,T2', 'T1Monitoring', 'WarmT3', 'T4:Start:15', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T4=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T4,T2=business-day')
+        $script:order | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'T4:Start:0', 'Start:sqlvm01', 'Switch:T1,T3,T4=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T4,T2', 'T1Monitoring', 'WarmT3', 'T4:Start:15', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T4=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T4,T2=business-day')
         ($results | Where-Object { $_.checkId -eq 'START.T4.START' }).status | Should -Be 'Pass'
         # The confirming call knows this run requested the start, so it doesn't say "was already running" (Phase 25d).
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -Times 1 -Exactly -ParameterFilter { $WaitMinutes -gt 0 -and $Requested }
@@ -2777,9 +2776,8 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         $result.message | Should -Match 'sqlvm01: the Run Commands couldn''t be listed \(ERROR: \(AuthorizationFailed\)'
     }
 
-    It 'start-demo.ps1''s cleanup says nothing with the control off and nothing to delete, and a Pass with it on' {
+    It 'start-demo.ps1''s cleanup says Pass when the control left nothing to delete (the control is part of every deployment since 2026-11-14)' {
         $script:listed['sqlvm01'] = @(New-RunCommand 'DbHubDemo-Bootstrap')
-        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01') -Confirm:$false } | Should -BeNullOrEmpty
         $controlConfig = New-TestConfig
         $controlConfig['control']['enabled'] = $true
         $result = InModuleScope DbHubDemo -Parameters @{ Config = $controlConfig } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01') -Confirm:$false }

@@ -43,7 +43,7 @@ BeforeAll {
         'Microsoft.Automation/automationAccounts/jobSchedules/delete'
     )
 
-    function New-ControlConfig([bool] $Enabled = $true, [bool] $AssignRoles = $false, [string] $Mode = 'auto') {
+    function New-ControlConfig([bool] $Enabled = $true, [bool] $AssignRoles = $false, [string] $Mode = 'auto', [string] $WorkspaceName = '') {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $config['subscriptionId'] = $script:sub
         $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
@@ -52,6 +52,11 @@ BeforeAll {
         $config['autoShutdownTimeZone'] = 'Eastern Standard Time'
         $config['control']['enabled'] = $Enabled
         $config['control']['vaultNetworkMode'] = $Mode
+        # A control set up before 2026-11-14 kept init.ps1's "DBHub Control" ("enabled": true); a new one is named after
+        # the demo's workspace (ADR 0026).
+        if ($WorkspaceName) {
+            $config['control']['fabricWorkspaceName'] = $WorkspaceName
+        }
         $config['fabric']['workspaceId'] = 'abcdabcd-abcd-abcd-abcd-abcdabcdabcd'
         return $config
     }
@@ -221,6 +226,16 @@ BeforeAll {
             '/webhooks/' {
                 return (New-AzResult -StdOut '{}')
             }
+            '/schedules/dbhub-autostop-backup$' {
+                # A control session's backup auto-stop (ADR 0026).
+                if ($Method -eq 'delete' -and $script:backupDeleteFails) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to delete the schedule.')
+                }
+                if (-not $script:backupStop) {
+                    return (Get-NotFound 'dbhub-autostop-backup')
+                }
+                return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:backupStop.ToString('o') } }))
+            }
             '/schedules/dbhub-autostop$' {
                 if ($Method -eq 'delete' -and $script:autoStopDeleteFails) {
                     return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to delete the schedule.')
@@ -263,6 +278,7 @@ BeforeAll {
                 $value = @(
                     if ($script:safetyStop -and $script:safetyStopLinked) { @{ properties = @{ jobScheduleId = 'ffffffff-0000-0000-0000-000000000006'; schedule = @{ name = 'dbhub-t4-safety-stop' }; runbook = @{ name = 'DbHub-Stop' } } } }
                     if ($script:autoStop) { @{ properties = @{ jobScheduleId = 'ffffffff-0000-0000-0000-000000000007'; schedule = @{ name = 'dbhub-autostop' }; runbook = @{ name = 'DbHub-Stop' } } } }
+                    if ($script:backupStop) { @{ properties = @{ jobScheduleId = 'ffffffff-0000-0000-0000-000000000008'; schedule = @{ name = 'dbhub-autostop-backup' }; runbook = @{ name = 'DbHub-Stop' } } } }
                     foreach ($recheck in @($script:monitorSchedules)) { @{ properties = @{ jobScheduleId = ('ffffffff-0000-0000-0000-00000000010{0}' -f $recheck.Substring($recheck.Length - 1)); schedule = @{ name = $recheck }; runbook = @{ name = 'DbHub-Monitor' } } } }
                 )
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ value = $value } -Depth 6))
@@ -314,6 +330,8 @@ BeforeAll {
         $script:webhookUrl = ''
         $script:autoStop = $null
         $script:autoStopDeleteFails = $false
+        $script:backupStop = $null
+        $script:backupDeleteFails = $false
         $script:monitorSchedules = @()
         $script:stopJobStates = @()
         $script:jobReads = 0
@@ -591,6 +609,23 @@ Describe 'Granting the roles (setup-activity-control.ps1 -GrantRole)' {
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { [pscustomobject]@{ checkId = 'PREFLIGHT.GUARD.CONTEXT'; status = 'Pass'; message = 'ok'; remediation = '' } }
     }
 
+    It 'never writes or assigns the shared custom roles when control.roleNameSuffix gives this environment its own (2026-11-14)' {
+        # The subscription's shared roles exist, as another environment's (live: the owner's control identity holds "DbHub
+        # Demo Activity Operator", with its first 22 actions, at its own demo resource group).
+        $script:roleActions = @($script:approvedActions | Select-Object -First 22)
+        $sharedOperator = $script:customRoleId
+        $sharedWriter = $script:writerRoleId
+        $config = New-ControlConfig
+        $config['control']['roleNameSuffix'] = 'dbhubup'
+        $results = @(Invoke-DemoActivityControlSetup -Config $config -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
+        $writes = @($script:rest | Where-Object { $_.Method -ne 'get' -and $_.Url -match '/roleDefinitions/' })
+        @($writes | Where-Object { $_.Url -match ('/roleDefinitions/({0}|{1})' -f [regex]::Escape($sharedOperator), [regex]::Escape($sharedWriter)) }) | Should -BeNullOrEmpty -Because 'the shared roles belong to every environment in the subscription'
+        @($writes | ForEach-Object { ($_.Body | ConvertFrom-Json -AsHashtable)['properties']['roleName'] }) | Should -Be @('DbHub Demo Activity Operator (dbhubup)', 'DbHub Demo Session Writer (dbhubup)')
+        @($script:assignments | Where-Object { $_.roleDefinitionId -match ('/({0}|{1})$' -f [regex]::Escape($sharedOperator), [regex]::Escape($sharedWriter)) }) | Should -BeNullOrEmpty
+        @($script:assignments | Where-Object { $_.principalId -eq $script:identityPrincipal }).Count | Should -Be 4 -Because 'A1, A2, and A4 at its two secrets, all with the suffixed roles'
+        ($results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION').message | Should -Match 'The custom role "DbHub Demo Activity Operator \(dbhubup\)"'
+    }
+
     It 'creates the roles with exactly the approved actions, then assigns A1 to A4 at their scopes only' {
         $script:roleExists = $false
         $script:writerExists = $false
@@ -662,177 +697,207 @@ Describe 'Granting the roles (setup-activity-control.ps1 -GrantRole)' {
         $script:canAssign = $false
         $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
         @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
-        foreach ($id in 'CONTROL.ROLE.DEFINITION', 'CONTROL.ROLE.WRITER', 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3', 'CONTROL.ROLE.A4') {
+        foreach ($id in 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2', 'CONTROL.ROLE.A3', 'CONTROL.ROLE.A4') {
             foreach ($result in @($results | Where-Object checkId -EQ $id)) {
                 $result.status | Should -Be 'Warning' -Because $id
                 $result.remediation | Should -Match ([regex]::Escape('./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
             }
         }
+        # Roles that already have exactly the approved actions need no write, so nothing about them needs an Owner.
+        foreach ($id in 'CONTROL.ROLE.DEFINITION', 'CONTROL.ROLE.WRITER') {
+            ($results | Where-Object checkId -EQ $id).status | Should -Be 'Pass' -Because $id
+            ($results | Where-Object checkId -EQ $id).message | Should -Match 'has exactly the \d+ approved actions'
+        }
+    }
+
+    It 'reports an outdated or missing role as a Warning with the grant script when the caller can''t write role definitions' {
+        $script:canAssign = $false
+        $script:roleActions = @($script:approvedActions | Select-Object -First 22)
+        $script:writerExists = $false
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
+        @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
+        $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
+        $definition.status | Should -Be 'Warning'
+        $definition.message | Should -Match 'lacks some of its approved actions, and writing it needs Microsoft\.Authorization/roleDefinitions/write'
+        $writer = $results | Where-Object checkId -EQ 'CONTROL.ROLE.WRITER'
+        $writer.status | Should -Be 'Warning'
+        $writer.message | Should -Match 'doesn''t exist yet'
+        $writer.remediation | Should -Match ([regex]::Escape('./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
     }
 }
 
-Describe 'deploy.ps1''s A1 re-grant (Invoke-DemoActivityControlRegrant)' {
+Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11-14)' {
     BeforeEach {
-        Reset-FakeAzure
-        $script:logs = [System.Collections.Generic.List[string]]::new()
-        Register-FakeAzure
-        Initialize-GuardTestContext -ObjectId $script:callerId
-        # The runbooks' refresh has its own Describe below.
-        Mock -ModuleName DbHubDemo -CommandName Update-DemoActivityControlRunbook -MockWith { @() }
-    }
-
-    It 'publishes the control''s runbooks again with this code after A1, so an update reaches them at deploy.ps1 (2026-11-13)' {
-        Mock -ModuleName DbHubDemo -CommandName Grant-DemoActivityControlRole -MockWith { @([pscustomobject]@{ checkId = 'CONTROL.ROLE.A1'; status = 'Pass' }) }
-        Mock -ModuleName DbHubDemo -CommandName Update-DemoActivityControlRunbook -MockWith { @([pscustomobject]@{ checkId = 'CONTROL.RUNBOOKS'; status = 'Pass' }) }
-        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -AssignRoles $true) } { Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath './config/demo.config.json' -Confirm:$false })
-        @($results | ForEach-Object checkId) | Should -Be @('CONTROL.ROLE.A1', 'CONTROL.RUNBOOKS')
-        Should -Invoke -ModuleName DbHubDemo -CommandName Update-DemoActivityControlRunbook -Times 1 -Exactly -ParameterFilter { $ConfigPath -eq './config/demo.config.json' }
-    }
-
-    It 'does nothing when control.enabled is false' {
-        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -Enabled $false -AssignRoles $true) } { Invoke-DemoActivityControlRegrant -Config $Config -Confirm:$false })
-        $results.Count | Should -Be 0
-        $script:azCalls.Count | Should -Be 0
-    }
-
-    It 'grants A1 only, with the -GrantRole function, when assignRoles and control.enabled are true' {
-        $config = New-ControlConfig -AssignRoles $true
-        Mock -ModuleName DbHubDemo -CommandName Grant-DemoActivityControlRole -MockWith { @([pscustomobject]@{ checkId = 'CONTROL.ROLE.A1'; status = 'Pass' }) }
-        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoActivityControlRegrant -Config $Config -Confirm:$false })
-        $results[0].status | Should -Be 'Pass'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Grant-DemoActivityControlRole -Times 1 -Exactly -ParameterFilter { @($Assignment) -join ',' -eq 'A1' -and -not $IncludeDefinition }
-    }
-
-    It 'assigns A1 at the demo resource group after a redeploy' {
-        $config = New-ControlConfig -AssignRoles $true
-        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoActivityControlRegrant -Config $Config -Confirm:$false })
-        @($results | ForEach-Object checkId) | Should -Be @('CONTROL.ROLE.A1')
-        $results[0].status | Should -Be 'Pass'
-        @($script:assignments | ForEach-Object scope) | Should -Be @((Get-ControlName $config).DemoResourceGroupId)
-        @($script:rest | Where-Object { $_.Method -eq 'put' -and $_.Url -match '/roleDefinitions/' }) | Should -BeNullOrEmpty
-    }
-
-    It 'reports a Warning with the grant script when <Case>' -ForEach @(
-        @{ Case = 'assignRoles is false'; AssignRoles = $false; Setup = { } }
-        @{ Case = 'the caller can''t assign roles'; AssignRoles = $true; Setup = { $script:canAssign = $false } }
-        @{ Case = 'the role definition is missing'; AssignRoles = $true; Setup = { $script:roleExists = $false } }
-        @{ Case = 'the role definitions can''t be read'; AssignRoles = $true; Setup = { $script:roleReadFails = $true } }
-    ) {
-        & $Setup
-        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -AssignRoles $AssignRoles) } { Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath './config/demo.config.json' -Confirm:$false })
-        $a1 = $results | Where-Object checkId -EQ $(if ($Case -match 'can''t be read') { 'CONTROL.ROLE.DEFINITION' } else { 'CONTROL.ROLE.A1' }) | Select-Object -First 1
-        $a1.status | Should -Be 'Warning'
-        $a1.remediation | Should -Match ([regex]::Escape('./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
-        $script:assignments.Count | Should -Be 0
-    }
-
-    It 'reports a Warning with the grant script when the grant throws' {
-        Mock -ModuleName DbHubDemo -CommandName Grant-DemoActivityControlRole -MockWith { throw 'AADSTS50076: multifactor authentication is required.' }
-        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -AssignRoles $true) } { Invoke-DemoActivityControlRegrant -Config $Config -Confirm:$false })
-        $results[0].checkId | Should -Be 'CONTROL.ROLE.A1'
-        $results[0].status | Should -Be 'Warning'
-        $results[0].remediation | Should -Match 'grant-safety-stop\.ps1'
-    }
-
-    It 'is called after the Infrastructure stage on both deploy paths, and DEPLOY.SUMMARY lists what needs an Owner' {
-        foreach ($file in 'Public/Invoke-DemoDeployment.ps1', 'Private/ParallelDeployment.ps1') {
-            $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath ('scripts/modules/DbHubDemo/{0}' -f $file)) -Raw
-            $text | Should -Match 'Invoke-DemoActivityControlRegrant -Config \$Config -ConfigPath \$ConfigPath -Confirm:\$false' -Because $file
-            # Since Phase 28 both paths build DEPLOY.SUMMARY in one place, which keeps an Owner's step apart from what
-            # only a person can confirm.
-            $text | Should -Match 'Get-DemoDeploySummary -Result \$all' -Because $file
-        }
-        $summary = InModuleScope -ModuleName DbHubDemo {
-            $grant = New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message 'A1 wasn''t granted: the caller isn''t an Owner.' -Remediation 'An Owner of the subscription runs, signed in with multifactor authentication: ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole'
-            Get-DemoDeploySummary -Result @($grant)
-        }
-        $summary.Status | Should -Be 'Manual action required'
-        $summary.Message | Should -Match ([regex]::Escape('1 item(s) need you: CONTROL.ROLE.A1: An Owner of the subscription runs, signed in with multifactor authentication: ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole'))
-        @($summary.Evidence['manual']).Count | Should -Be 1
-    }
-}
-
-Describe 'deploy.ps1''s refresh of the control''s runbooks (Update-DemoActivityControlRunbook, 2026-11-13)' {
-    BeforeEach {
-        $script:clientId = 'cccccccc-0000-0000-0000-000000000003'
-        $script:identityAnswer = 'Ok'
-        $script:published = @{}
-        $script:armUrls = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:steps = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:steps.Add([pscustomobject]@{ Id = (@($Id) -join ','); State = $State; Status = $Status; Message = $Message }) }
+        $script:clientId = 'cccccccc-0000-0000-0000-000000000003'
+        $script:vaultAnswer = 'Disabled'
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
-            $script:armUrls.Add($Url)
-            if ($Url -match '/userAssignedIdentities/') {
-                switch ($script:identityAnswer) {
-                    'Missing' { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' } }
-                    'Denied' { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'AuthorizationFailed' } }
+            if ($Url -match '/vaults/') {
+                if ($script:vaultAnswer -eq 'Missing') {
+                    return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' }
                 }
-                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ clientId = $script:clientId } }; Error = '' }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ publicNetworkAccess = $script:vaultAnswer } }; Error = '' }
             }
-            if ($Url -match '/runbooks/([^/]+)/content') {
-                $runbook = $Matches[1]
-                if ($script:published.ContainsKey($runbook)) {
-                    return [pscustomobject]@{ Ok = $true; Missing = $false; Value = [string]$script:published[$runbook]; Error = '' }
-                }
-                return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' }
+            if ($Url -match '/userAssignedIdentities/') {
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ clientId = $script:clientId } }; Error = '' }
             }
             throw ('unexpected ARM call: {0}' -f $Url)
         }
-        $config = New-ControlConfig
-        # What this code publishes, with the identity's client ID: the runbooks as they'd be after setup-activity-control.ps1.
-        $script:current = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config; ClientId = $script:clientId } {
-            $name = Get-DemoActivityControlName -Config $Config
-            $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name $name -IdentityClientId $ClientId
-            $content = @{}
-            foreach ($runbook in $name.ControlRunbook, $name.StopRunbook, $name.MonitorRunbook) {
-                $content[$runbook] = Get-DemoActivityControlRunbookContent -Name $runbook -Setting $setting
-            }
-            $content
-        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -MockWith { [System.Security.SecureString]::new() }
     }
 
-    It 'does nothing when control.enabled is false, or the control isn''t set up' {
-        @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -Enabled $false) } { Update-DemoActivityControlRunbook -Config $Config -Confirm:$false }).Count | Should -Be 0
-        $script:armUrls.Count | Should -Be 0
-        $script:identityAnswer = 'Missing'
-        @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Update-DemoActivityControlRunbook -Config $Config -Confirm:$false }).Count | Should -Be 0
+    It 'is on whatever an older configuration says, and notes an older "enabled": false once' {
+        $setting = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -Enabled $false) } { Get-DemoActivityControlSetting -Config $Config }
+        $setting.Enabled | Should -BeTrue
+        $setting.LegacyOff | Should -BeTrue
+        $fresh = New-ControlConfig
+        $fresh['control'].Remove('enabled')
+        $setting = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $fresh } { Get-DemoActivityControlSetting -Config $Config }
+        $setting.Enabled | Should -BeTrue
+        $setting.LegacyOff | Should -BeFalse
+        # A new configuration, from the example, as init.ps1 writes it: no "enabled": false, and no shared workspace name.
+        $example = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json') -Raw | ConvertFrom-Json -AsHashtable
+        $example['control'].Contains('enabled') | Should -BeFalse
+        $example['control'].Contains('fabricWorkspaceName') | Should -BeFalse
     }
 
-    It 'leaves runbooks that already have this code alone' {
-        $script:published = @{} + $script:current
-        Mock -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -MockWith { throw 'not expected' }
-        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Update-DemoActivityControlRunbook -Config $Config -Confirm:$false })
-        $results.Count | Should -Be 1
-        $results[0].checkId | Should -Be 'CONTROL.RUNBOOKS'
-        $results[0].status | Should -Be 'Pass'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -Times 0 -Exactly
-    }
-
-    It 'publishes the three runbooks again when the published code is older (an existing control after an update)' {
-        $script:published = @{} + $script:current
-        $script:published['DbHub-Control'] = '# DbHub-Control from before T4''s read replica'
-        Mock -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -MockWith { New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'DbHub-Control, DbHub-Stop, DbHub-Monitor published.' }
-        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Update-DemoActivityControlRunbook -Config $Config -Confirm:$false })
-        $results[0].status | Should -Be 'Pass'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -Times 1 -Exactly -ParameterFilter { $Setting['identityClientId'] -eq $script:clientId -and $Setting['t4ReplicaPrefix'] -eq 'pgreplica01-' }
-    }
-
-    It 'warns, with what fails until then and the exact command, when <Case>, and DONE and the status page say so' -ForEach @(
-        @{ Case = 'the publish fails'; Identity = 'Ok'; Because = 'DbHub-Control: couldn''t publish: AuthorizationFailed' }
-        @{ Case = 'the identity can''t be read'; Identity = 'Denied'; Because = 'its identity id-dbhub-automation couldn''t be read \(AuthorizationFailed\)' }
+    It 'names the control''s workspace "<Expected>" when <Case>, so two environments in one tenant never share it' -ForEach @(
+        @{ Case = 'a new configuration names none'; Enabled = $null; Name = $null; Expected = 'Database Hub Demo Control' }
+        @{ Case = 'an older configuration has init.ps1''s defaults and no control'; Enabled = $false; Name = 'DBHub Control'; Expected = 'Database Hub Demo Control' }
+        @{ Case = 'a control was set up before 2026-11-14 ("enabled": true)'; Enabled = $true; Name = 'DBHub Control'; Expected = 'DBHub Control' }
+        @{ Case = 'the configuration names its own'; Enabled = $false; Name = 'Contoso Control'; Expected = 'Contoso Control' }
     ) {
-        $script:identityAnswer = $Identity
-        Mock -ModuleName DbHubDemo -CommandName Publish-DemoActivityControlRunbook -MockWith { New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message 'DbHub-Control: couldn''t publish: AuthorizationFailed' -Remediation 'Run setup-activity-control.ps1 again; it publishes all three runbooks each time.' }
-        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Update-DemoActivityControlRunbook -Config $Config -ConfigPath './config/demo.config.json' -Confirm:$false })
+        $config = New-ControlConfig
+        $config['fabric']['workspaceName'] = 'Database Hub Demo'
+        if ($null -eq $Enabled) { $config['control'].Remove('enabled') } else { $config['control']['enabled'] = $Enabled }
+        if ($null -eq $Name) { $config['control'].Remove('fabricWorkspaceName') } else { $config['control']['fabricWorkspaceName'] = $Name }
+        (Get-ControlName $config).FabricWorkspace | Should -Be $Expected
+    }
+
+    It 'gives the two custom roles this environment''s own names with control.roleNameSuffix, and keeps the shared ones without it' {
+        $config = New-ControlConfig
+        $config['control']['roleNameSuffix'] = 'dbhubup'
+        $name = Get-ControlName $config
+        $name.RoleName | Should -Be 'DbHub Demo Activity Operator (dbhubup)'
+        $name.WriterRoleName | Should -Be 'DbHub Demo Session Writer (dbhubup)'
+        $plan = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config; Name = $name } { Get-DemoActivityControlGrantPlan -Name $Name -Config $Config -RoleId 'r1' -WriterRoleId 'r2' -PrincipalId 'p1' })
+        @($plan | Where-Object Id -In 'A1', 'A2' | ForEach-Object Role | Select-Object -Unique) | Should -Be 'DbHub Demo Activity Operator (dbhubup)'
+        @($plan | Where-Object Id -EQ 'A4' | ForEach-Object Role | Select-Object -Unique) | Should -Be 'DbHub Demo Session Writer (dbhubup)'
+        $definition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Sub = $script:sub } { Get-DemoActivityControlRoleDefinition -SubscriptionId $Sub -Writer -RoleName 'DbHub Demo Session Writer (dbhubup)' }
+        $definition['properties']['roleName'] | Should -Be 'DbHub Demo Session Writer (dbhubup)'
+        $shared = Get-ControlName (New-ControlConfig)
+        $shared.RoleName | Should -Be 'DbHub Demo Activity Operator'
+        $shared.WriterRoleName | Should -Be 'DbHub Demo Session Writer'
+    }
+
+    It 'reports the setup as deploy.ps1 does: never a Fail or a blocking step, and its fixes as deploy.ps1 or the grant script' {
+        $converted = @(InModuleScope -ModuleName DbHubDemo {
+                $items = @(
+                    New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'The guard passed.'
+                    New-DemoResult -CheckId 'CONTROL.TEMPLATE' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message 'The template failed: RequestDisallowedByPolicy.' -Remediation 'Fix the policy, then run setup-activity-control.ps1 again.'
+                    New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Manual action required' -Message 'A1 is missing.' -Remediation 'An Owner runs: ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole'
+                    New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'The Fabric part was skipped (-SkipFabric).'
+                    New-DemoResult -CheckId 'CONTROL.SUMMARY' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message '1 step(s) failed.'
+                    New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message 'DbHub-Control: couldn''t publish.'
+                )
+                ConvertTo-DemoControlDeployResult -Result $items
+            })
+        @($converted | ForEach-Object checkId) | Should -Be @('CONTROL.TEMPLATE', 'CONTROL.ROLE.A1', 'CONTROL.RUNBOOKS')
+        @($converted | ForEach-Object status | Select-Object -Unique) | Should -Be 'Warning'
+        $converted[0].remediation | Should -Be 'Fix the policy, then run ./scripts/deploy.ps1 again.'
+        $converted[1].remediation | Should -Be 'An Owner runs: ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'
+        $converted[2].remediation | Should -Match '^Run \./scripts/deploy\.ps1 again; it sets the session control up each time\.'
+    }
+
+    It 'sets the control up in Azure on every run, adopting an earlier one, says so for an older "enabled": false, and never fails the run' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlSetup -MockWith {
+            New-DemoResult -CheckId 'CONTROL.TEMPLATE' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message 'The template failed.' -Remediation 'Run setup-activity-control.ps1 again.'
+            New-DemoResult -CheckId 'CONTROL.SUMMARY' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message '1 step(s) failed.'
+        }
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -Enabled $false) } { Invoke-DemoControlDeployStep -Config $Config -Part Azure -ConfigPath './config/demo.config.json' -ProgressPath 'out/progress.json' })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlSetup -Times 1 -Exactly -ParameterFilter { $SkipFabric -and $AssumeGuarded -and $ConfigPath -eq './config/demo.config.json' }
+        $results[0].checkId | Should -Be 'DEPLOY.CONTROL.ON'
+        $results[0].message | Should -Match 'part of every deployment since 2026-11-14'
+        @($results | Where-Object status -In 'Fail', 'Manual action required') | Should -BeNullOrEmpty
+        ($results | Where-Object checkId -EQ 'CONTROL.TEMPLATE').remediation | Should -Be 'Run ./scripts/deploy.ps1 again.'
+        $script:steps[-1].Id | Should -Be 'Control'
+        $script:steps[-1].State | Should -Be 'Running'
+        $script:steps[-1].Message | Should -Be '1 item(s) need attention: The template failed. The notebook follows the Fabric track.'
+    }
+
+    It 'reports a setup that throws as a Warning with deploy.ps1 as the fix' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlSetup -MockWith { throw 'The Automation provider isn''t registered.' }
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Azure -SkipFabric })
         $results.Count | Should -Be 1
-        $results[0].status | Should -Be 'Warning' -Because 'the control is optional: it never fails a deployment'
-        $results[0].message | Should -Match ('^The on-demand control''s runbooks weren''t updated with this code: {0}\. Until then the control runs its older code: a run can''t start T4 while a read replica that a session left behind is stopped' -f $Because)
-        $results[0].remediation | Should -Be 'Run ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json; it publishes the runbooks with the current code.'
-        $note = InModuleScope -ModuleName DbHubDemo -Parameters @{ Result = $results } { Get-DemoActivityControlRunbookNote -Result $Result }
-        $note | Should -Match 'Until then the control runs its older code'
-        $note | Should -Match ([regex]::Escape('Run ./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json'))
-        # DONE's and NOT DONE's notes, which the status page shows with the run's reason.
+        $results[0].checkId | Should -Be 'CONTROL.SETUP'
+        $results[0].status | Should -Be 'Warning'
+        $results[0].remediation | Should -Match '^Run \./scripts/deploy\.ps1 again'
+        $script:steps[-1].State | Should -Be 'Done' -Because 'without the Fabric part, the row ends with the Azure part'
+        $script:steps[-1].Message | Should -Match 'The notebook wasn''t set up \(-SkipFabric\)\.$'
+    }
+
+    It 'puts the notebook in the control workspace for a private vault, and DEPLOY.CONTROL says where Run all is' {
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -MockWith {
+            New-DemoResult -CheckId 'CONTROL.FABRIC.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'The workspace exists.'
+            New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'NB_DatabaseHub_Control was updated.' -Evidence ([ordered]@{ workspace = $Name.FabricWorkspace; folder = ''; mode = $Mode })
+        }
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric -ProgressPath 'out/progress.json' })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -Times 1 -Exactly -ParameterFilter { $Mode -eq 'private' -and $Setting['identityClientId'] -eq $script:clientId }
+        $control = $results | Where-Object checkId -EQ 'DEPLOY.CONTROL'
+        $control.status | Should -Be 'Pass'
+        $control.message | Should -BeExactly 'Run all is ready: open NB_DatabaseHub_Control in the workspace "Database Hub Demo Control" and select Run all. It runs the whole session and stops it.'
+        $script:steps[-1].State | Should -Be 'Done'
+        $script:steps[-1].Status | Should -Be 'Pass'
+    }
+
+    It 'leaves Fabric alone while the capacity isn''t Active: a Warning that names the next deploy.ps1, never a Fail' {
+        $script:vaultAnswer = 'Enabled'
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -MockWith {
+            New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The existing workspace''s capacity isn''t usable now (Paused), so nothing was created in Fabric; this script never resumes, pauses, or scales a capacity.' -Remediation 'When the capacity''s administrator has it Active, run setup-activity-control.ps1 again.'
+        }
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -Times 1 -Exactly -ParameterFilter { $Mode -eq 'public' }
+        @($results | Where-Object status -In 'Fail', 'Manual action required') | Should -BeNullOrEmpty
+        $control = $results | Where-Object checkId -EQ 'DEPLOY.CONTROL'
+        $control.status | Should -Be 'Warning'
+        $control.message | Should -Match '^NB_DatabaseHub_Control isn''t in Fabric yet: The existing workspace''s capacity isn''t usable now \(Paused\)'
+        $control.remediation | Should -Be 'When the capacity''s administrator has it Active, run ./scripts/deploy.ps1 again.'
+    }
+
+    It 'says the notebook waits for the Azure part when the vault isn''t there' {
+        $script:vaultAnswer = 'Missing'
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -MockWith { throw 'not expected' }
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric })
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -Times 0 -Exactly
+        ($results | Where-Object checkId -EQ 'CONTROL.FABRIC.NOTEBOOK').message | Should -Match 'kv-dbhub-ctl-[0-9a-f]{6} isn''t there'
+        ($results | Where-Object checkId -EQ 'DEPLOY.CONTROL').status | Should -Be 'Warning'
+    }
+
+    It 'runs on both deploy paths: the Azure part beside the nightly safety stop, the notebook after the Fabric track, a status page row, and DONE''s line' {
+        foreach ($file in 'Public/Invoke-DemoDeployment.ps1', 'Private/ParallelDeployment.ps1') {
+            $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath ('scripts/modules/DbHubDemo/{0}' -f $file)) -Raw
+            $text | Should -Match 'Invoke-DemoSafetyStopSetup -Config \$Config -ConfigPath \$ConfigPath -Confirm:\$false\)\s+(#[^\n]*\n\s+)*(Write-DemoLog[^\n]*\n\s+)?& \$addAll @\(Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Azure' -Because $file
+            $text | Should -Match 'Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Fabric -ProgressPath \$ProgressPath' -Because $file
+            $text | Should -Not -Match 'Invoke-DemoActivityControlRegrant' -Because $file
+            # Since Phase 28 both paths build DEPLOY.SUMMARY in one place.
+            $text | Should -Match 'Get-DemoDeploySummary -Result \$all' -Because $file
+        }
         $source = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/Private/DeployExperience.ps1') -Raw
-        $source | Should -Match 'Get-DemoActivityControlRunbookNote -Result \$all'
+        $source | Should -Match 'Get-DemoControlDeployNote -Result \$all'
+        $row = @(InModuleScope -ModuleName DbHubDemo { @(Get-DemoProgressCatalog -T4Enabled) | Where-Object { $_.name -eq 'Validation' } | ForEach-Object { $_.steps } | Where-Object { $_.id -eq 'Control' } })
+        $row.Count | Should -Be 1
+        $row[0].nonBlocking | Should -BeTrue
+        $note = InModuleScope -ModuleName DbHubDemo {
+            Get-DemoControlDeployNote -Result @(
+                New-DemoResult -CheckId 'DEPLOY.CONTROL' -Area 'workload' -Target 'fabric' -Status 'Pass' -Message 'Run all is ready: open NB_DatabaseHub_Control in the workspace "X" and select Run all.'
+                New-DemoResult -CheckId 'CONTROL.ROLE.A4' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'A4 isn''t in place.' -Remediation 'An Owner of the subscription runs, signed in with multifactor authentication: ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'
+            )
+        }
+        $note | Should -Match '^Run all is ready: open NB_DatabaseHub_Control'
+        $note | Should -Match 'Until its roles are granted, Run all runs a session without what they allow .*: An Owner of the subscription runs, signed in with multifactor authentication: \./scripts/grant-safety-stop\.ps1'
+        (InModuleScope -ModuleName DbHubDemo { Get-DemoControlDeployNote -Result @() }) | Should -Be ''
     }
 }
 
@@ -867,12 +932,11 @@ Describe 'Setting up the control (setup-activity-control.ps1)' {
         ($script:rest | Where-Object { $_.Method -eq 'put' -and $_.Url -match '/jobSchedules/' } | Select-Object -First 1).Body | Should -Match '"Scope":\s*"T4"'
     }
 
-    It 'does nothing while control.enabled is false' {
-        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig -Enabled $false))
-        $results.Count | Should -Be 1
-        $results[0].checkId | Should -Be 'CONTROL.SETUP'
-        $results[0].status | Should -Be 'Not selected'
-        $script:azCalls.Count | Should -Be 0
+    It 'sets the control up whatever an older configuration says: it''s part of every deployment since 2026-11-14 (ADR 0026)' {
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig -Enabled $false) -WhatIf)
+        @($results | Where-Object { $_.checkId -eq 'CONTROL.SETUP' -and $_.status -eq 'Not selected' }) | Should -BeNullOrEmpty
+        @($results | ForEach-Object checkId) | Should -Contain 'CONTROL.MODE'
+        @($results | ForEach-Object checkId) | Should -Contain 'CONTROL.RUNBOOKS'
     }
 
     It 'changes nothing with -WhatIf: every step is Not selected' {
@@ -969,7 +1033,7 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
             return [pscustomobject]@{ StatusCode = 404; Body = $null }
         }
         function Invoke-Placement([string] $Mode) {
-            $config = New-ControlConfig
+            $config = New-ControlConfig -WorkspaceName 'DBHub Control'
             InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config; Mode = $Mode; Token = (New-TestSecureString) } {
                 $name = Get-DemoActivityControlName -Config $Config
                 $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name $name -IdentityClientId '99999999-9999-9999-9999-999999999999'
@@ -1090,7 +1154,7 @@ Describe 'Removing the control (setup-activity-control.ps1 -Remove)' {
 
     It 'removes Fabric first, then the roles, then the resources, and keeps a group that still holds something' {
         $script:leftInGroup = 1
-        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force)
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig -WorkspaceName 'DBHub Control') -Remove -Force)
         $script:ops | Should -Contain 'fabric delete /v1/workspaces/abcdabcd-abcd-abcd-abcd-abcdabcdabcd/items/notebook-1'
         $script:ops | Should -Contain 'fabric delete /v1/workspaces/workspace-2'
         $script:ops | Should -Not -Contain 'fabric delete /v1/workspaces/workspace-3'
@@ -1139,11 +1203,10 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         $script:now = [datetime]::new(2026, 10, 27, 15, 0, 0, [System.DateTimeKind]::Utc)
     }
 
-    It 'is Not selected while control.enabled is false' {
-        $results = @(Test-DemoActivityControl -Config (New-ControlConfig -Enabled $false))
-        $results.Count | Should -Be 1
-        $results[0].status | Should -Be 'Not selected'
-        $script:azCalls.Count | Should -Be 0
+    It 'checks the control whatever an older configuration says: it''s part of every deployment since 2026-11-14 (ADR 0026)' {
+        $results = @(Test-DemoActivityControl -Config (New-ControlConfig -Enabled $false) -NowUtc $script:now)
+        @($results | ForEach-Object checkId) | Should -Contain 'CONTROL.SETUP'
+        ($results | Where-Object checkId -EQ 'CONTROL.SETUP').status | Should -Be 'Pass'
     }
 
     It 'passes when everything is in place' {
@@ -1223,15 +1286,15 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty -Because 'it only reads'
     }
 
-    It 'reads nothing for the daily T4 safety stop while control.enabled is false' {
+    It 'reads the daily T4 safety stop whatever an older configuration says (ADR 0026)' {
         $safety = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig -Enabled $false) } { Get-DemoT4SafetyStopState -Config $Config }
-        $safety.State | Should -Be 'Off'
-        $script:azCalls.Count | Should -Be 0
+        $safety.State | Should -Be 'Scheduled'
     }
 
-    It 'lets Security validation accept A1 at the demo group only when the control is on' {
+    It 'lets Security validation accept A1 at the demo group, under this environment''s name for the role' {
         $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/Private/ValidationSecurity.ps1') -Raw
-        $text | Should -Match '\$controlOn -and \$role -eq \$script:ActivityControlRoleName -and \[string\]::Equals\(\$scope, \$groupScope'
+        $text | Should -Match '\$controlRole = \(Get-DemoActivityControlName -Config \$config\)\.RoleName'
+        $text | Should -Match '\$controlOn -and \$role -eq \$controlRole -and \[string\]::Equals\(\$scope, \$groupScope'
     }
 }
 
@@ -1258,6 +1321,30 @@ Describe 'stop-demo.ps1, start-demo.ps1, and a pending auto-stop (Clear-DemoActi
         $result.checkId | Should -Be 'STOP.CONTROL.AUTOSTOP'
         $result.status | Should -Be 'Pass'
         Get-Deleted | Should -Be @('ffffffff-0000-0000-0000-000000000007', 'dbhub-autostop')
+    }
+
+    It '<Purpose> removes a control session''s backup auto-stop and its link too, even after the auto-stop itself fired (ADR 0026)' -ForEach @(
+        @{ Purpose = 'Stop' }
+        @{ Purpose = 'Start' }
+    ) {
+        # The auto-stop fired and its job failed before it cleared both, so the backup would stop this session's VMs.
+        $script:autoStop = $script:now.AddMinutes(-20)
+        $script:backupStop = $script:now.AddMinutes(10)
+        $result = @(Invoke-Clear -Purpose $Purpose)[0]
+        @(Get-Deleted)[0..1] | Should -Be @('ffffffff-0000-0000-0000-000000000008', 'dbhub-autostop-backup')
+        $result.message | Should -Match 'The session''s backup auto-stop dbhub-autostop-backup was removed too\.$'
+        $result.evidence['backupRemoved'] | Should -BeTrue
+    }
+
+    It 'warns, with how to cancel it, when a session''s backup auto-stop can''t be removed, and removes nothing with -WhatIf' {
+        $script:backupStop = $script:now.AddMinutes(40)
+        $null = Invoke-Clear -Purpose Stop -DryRun
+        @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
+        $script:backupDeleteFails = $true
+        $result = Invoke-Clear -Purpose Stop
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'No on-demand run is pending.*The session''s backup auto-stop dbhub-autostop-backup is still pending: it couldn''t be removed \(.*AuthorizationFailed'
+        $result.remediation | Should -Match 'delete the schedule dbhub-autostop-backup in the Automation account aa-dbhub-control'
     }
 
     It '<Purpose> removes the run''s monitoring re-checks and their links to DbHub-Monitor with the auto-stop' -ForEach @(

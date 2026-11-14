@@ -16,7 +16,7 @@
 
 ### The session
 
-The control notebook NB_DatabaseHub_Control, in its own workspace "DBHub Control", is the one place a person runs a session: open it and select **Run all**. Nothing is edited first.
+The control notebook NB_DatabaseHub_Control, in its own workspace (with a private vault; a folder of the demo's workspace with a public one, [ADR 0020](0020-on-demand-activity-control.md)), is the one place a person runs a session: open it and select **Run all**. Nothing is edited first.
 
 1. **The session request:** Run all sends `{"action":"session","sessionId":"<32 hex>"}` to the runbook DbHub-Control, which:
    - refuses while another run is active, with the reason;
@@ -30,6 +30,18 @@ The control notebook NB_DatabaseHub_Control, in its own workspace "DBHub Control
 3. **The notebook** follows the status, prints the presenter's guide (Database Hub's pages, the Insights app, when each incident shows, and the Database Agent prompts with this session's names and windows), and runs the activity notebook as a job in the demo workspace.
 4. **The end:** the runbook's auto-stop (and Stop now) saves T4's and the replica's Azure Monitor metrics to the secret `dbhub-session-metrics` (`{"action":"capture"}` does the same on its own), deletes the replica, then stops T4, deallocates the VMs, and clears the busy marker. The notebook's next run saves those metrics to the lakehouse history when it hasn't yet.
 5. **No GitHub Actions in a session:** the activity notebook's simulation control through `demo-control.yml` is gone; Actions stay for CI and the repository's own deploy workflows.
+
+### In every deployment
+
+`deploy.ps1` sets the control up on every run, for a new environment and an existing one, with nothing to turn on:
+
+- **No switch:** `control.enabled` is ignored. An older configuration's `"enabled": false`, which `init.ps1` wrote by default, gets one line (`DEPLOY.CONTROL.ON`). A control set up before 2026-11-14 is adopted as it is: the same names, so the same resources, updated in place.
+- **Azure part:** the setup without Fabric (the vault's mode, the group, the template, the runbooks with this code, the T4 safety stop, the webhook, the session's secrets, and the roles) runs beside the nightly safety stop while the tracks run.
+- **Fabric part:** the notebook goes into Fabric after the Fabric track, where the vault actually is (`publicNetworkAccess`). While the capacity isn't Active, nothing in Fabric changes: a Warning, and the next `deploy.ps1` does it. The capacity is never resumed or paused.
+- **Never a Fail:** what doesn't work is a Warning with its fix ([ADR 0012](0012-validation-model.md)), never in DONE's way, as the nightly safety stop's problems are. The status page's **Session control** row and DONE's line say where Run all is, or what it still needs and who does it.
+- **Preflight:** P2 also registers `Microsoft.Automation`, `Microsoft.KeyVault`, and `Microsoft.ManagedIdentity`. `Microsoft.Network` was already required; a private vault's managed private endpoint needs it, on any Fabric capacity, Trial included ([prerequisites](https://learn.microsoft.com/fabric/security/security-managed-private-endpoints-create#prerequisites)).
+- **The control workspace's name:** the demo workspace's name followed by " Control", so two environments in one tenant never share a workspace. "DBHub Control", the earlier default, stays for a control set up before 2026-11-14.
+- **Shared roles:** custom roles belong to the whole subscription, so environments in one subscription share them, and a `deploy.ps1` on newer code updates them for every environment there. `control.roleNameSuffix` gives an environment its own two roles, "DbHub Demo Activity Operator (*suffix*)" and "DbHub Demo Session Writer (*suffix*)", for an environment beside a demo on other code (the test environments use it). A role that already has exactly its approved actions isn't written again, so a Contributor's `deploy.ps1` has nothing to report about it.
 
 ### The permissions (one-time, by an Owner)
 
@@ -58,7 +70,7 @@ Azure has no narrower action and no name condition for these: attribute-based co
 
 **A3** (Key Vault Secrets User) extends from the webhook's secret to the two session secrets, for the signed-in owner and `control.notebookUserObjectIds`, so the notebook can read them.
 
-**Not used:** the pre-approved `Microsoft.DevTestLab/schedules/read` and `/write`. A session ends before the VMs' auto-shutdown, as a run always has, because the profile hosts on T1 and in T2's guest end their activity there (`--not-after`, set when they start); moving the auto-shutdown alone wouldn't keep a session's activity going. A session that runs past it would need those hosts to take a later end too, a change on the VMs that's a [follow-up](#consequences).
+**No DevTestLab action** (the coordinator's decision for the user, 2026-11-14: grant only what the runbook uses): the two that were pre-approved to move the VMs' auto-shutdown for a session aren't in the role. A session ends before the auto-shutdown instead, as a run always has, because the profile hosts on T1 and in T2's guest end their activity there (`--not-after`, set when they start); moving the auto-shutdown alone wouldn't keep a session's activity going. Running past it would need those hosts to take a later end too, a change on the VMs that the [implementation report](../implementation-report.md) lists as a follow-up.
 
 ## Consequences
 
@@ -71,7 +83,7 @@ Azure has no narrower action and no name condition for these: attribute-based co
 
 ## Validation
 
-- **Static:** `tests/unit/Automation.Runbooks.Tests.ps1` (the session, capture, and stop paths against a fake Azure), `DbHubDemo.ActivityControl.Tests.ps1` (the roles, the grant plan, and the setup), the runner's `ProfileSchedulerTests` and `CatalogTests` (the replica slot).
+- **Static:** `tests/unit/Automation.Runbooks.Tests.ps1` (the session, capture, and stop paths against a fake Azure), `DbHubDemo.ActivityControl.Tests.ps1` (the roles, the grant plan, the setup, the deploy step, the workspace's name, the role names' suffix, and the backup auto-stop's removal by `start-demo.ps1` and `stop-demo.ps1`), the runner's `ProfileSchedulerTests` and `CatalogTests` (the replica slot).
 - **Live:** pending.
 
 ## Sources

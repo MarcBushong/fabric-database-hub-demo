@@ -88,6 +88,10 @@ function Invoke-DemoActivityControlSetup {
         [Parameter(ParameterSetName = 'Remove')]
         [switch] $SkipFabric,
 
+        # deploy.ps1's control step (Invoke-DemoControlDeployStep, 2026-11-14): the run asserted the subscription guard already.
+        [Parameter(ParameterSetName = 'Setup')]
+        [switch] $AssumeGuarded,
+
         [Parameter(ParameterSetName = 'Remove')]
         [switch] $Force,
 
@@ -101,7 +105,9 @@ function Invoke-DemoActivityControlSetup {
         return $results.ToArray()
     }
     try {
-        $results.Add((Assert-DemoAzContext -SubscriptionId ([string]$Config['subscriptionId']) -TenantId ([string]$Config['tenantId']) -Account ([string]$Config['azureAccount'])))
+        if (-not $AssumeGuarded) {
+            $results.Add((Assert-DemoAzContext -SubscriptionId ([string]$Config['subscriptionId']) -TenantId ([string]$Config['tenantId']) -Account ([string]$Config['azureAccount'])))
+        }
     }
     catch {
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing changed. Sign in yourself (az login) and run setup-activity-control.ps1 again.'))

@@ -1039,14 +1039,15 @@ function Invoke-DemoParallelDeployment {
             if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                 & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
             }
-            # The on-demand activity control's A1 (ADR 0020), as in the sequential path.
-            & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
         }
         if ($StopAfter -in 'Preflight', 'Infrastructure') {
-            # The nightly safety stop (ADR 0024) comes with what the template deployed, as in a full run.
+            # The nightly safety stop (ADR 0024) and the session control's Azure part (ADR 0026) come with what the template
+            # deployed, as in a full run.
             if ($StopAfter -eq 'Infrastructure' -and $plan.Infrastructure -and -not $whatIf) {
                 Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
                 & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                Write-DemoLog -Message 'Setting up the session control (ADR 0026).'
+                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric)
             }
             & $applyPolicy 15
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
@@ -1079,6 +1080,10 @@ function Invoke-DemoParallelDeployment {
         if (-not $whatIf) {
             Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
             & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+            # The session control's Azure part (ADR 0026), the same way: while the tracks run, never a Fail. A control set up
+            # before 2026-11-14 is adopted; its runbooks get this code, and its roles what this code needs.
+            Write-DemoLog -Message 'Setting up the session control (ADR 0026).'
+            & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
         }
 
         # 4. The tracks.
@@ -1262,6 +1267,16 @@ function Invoke-DemoParallelDeployment {
     # reaches its validation, a resumed one with nothing left to do included; never a Fail, and never in DONE's way.
     if ($plan.Validation) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
+    }
+    # 9. The session control's notebook (ADR 0026), once the Fabric track has the demo's workspace: never a Fail, and never
+    # in DONE's way. Without the Fabric track finished (a paused capacity, for example), the next deploy.ps1 does it.
+    if (-not $whatIf -and -not $SkipFabric) {
+        if (& $trackFinished 'Fabric' 'Fabric') {
+            & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
+        }
+        else {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Control' -State 'Skipped' -Message 'The notebook waits for the Fabric track; the next ./scripts/deploy.ps1 puts it in Fabric.'
+        }
     }
     # 2026-11-13 live finding: this process's own Run Commands that ran under a fresh name (the tracks report theirs).
     & $addAll @(Get-DemoRunCommandStuckResult -Clear)

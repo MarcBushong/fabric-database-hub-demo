@@ -1480,6 +1480,11 @@ function Get-DemoDeploymentOutcome {
     if ($controlNote) {
         $notes.Add($controlNote)
     }
+    # The session control (ADR 0026): where Run all is, or what it still needs and who does it.
+    $sessionControl = Get-DemoControlDeployNote -Result $all
+    if ($sessionControl) {
+        $notes.Add($sessionControl)
+    }
     # Run Commands that ran under a fresh name because Azure kept their own in Deleting (2026-11-13 live finding).
     $stuckNote = Get-DemoRunCommandStuckNote -Result $all
     if ($stuckNote) {

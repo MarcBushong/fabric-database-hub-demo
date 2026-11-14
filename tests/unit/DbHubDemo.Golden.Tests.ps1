@@ -1180,9 +1180,9 @@ Describe 'Get-DemoGoldenCaptureControlResult (GOLDEN.CAPTURE.CONTROL, review of 
         $schedule.message | Should -Match 'dbhub-autostop couldn''t be read \(Timeout\)'
     }
 
-    It 'is Not selected, and reads nothing, when the control is off' {
+    It 'checks the control whatever an older configuration says: it''s part of every deployment since 2026-11-14 (ADR 0026)' {
         $config['control'] = @{ enabled = $false }
-        (Get-ControlCheck).status | Should -Be 'Not selected'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -Times 0 -Exactly
+        (Get-ControlCheck).status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -ParameterFilter { $Url -match '/automationAccounts/aa-dbhub-control/' }
     }
 }

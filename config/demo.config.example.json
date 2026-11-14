@@ -39,13 +39,11 @@
     "readerObjectIds": []
   },
   "control": {
-    "enabled": false,
     "vaultNetworkMode": "auto",
     "webhookExpiryDays": 90,
     "t4SafetyStopTime": "",
     "notebookUserObjectIds": [],
-    "fabricFolderName": "DBHub Control",
-    "fabricWorkspaceName": "DBHub Control"
+    "fabricFolderName": "DBHub Control"
   },
   "hostPriority": "Regular",
   "t1Priority": "Regular",

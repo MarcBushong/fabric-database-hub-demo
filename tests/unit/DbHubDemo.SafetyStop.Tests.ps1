@@ -832,15 +832,20 @@ Describe 'What stops T4 after its 7-day restart, and DONE (ADR 0024)' {
 }
 
 Describe 'scripts/grant-safety-stop.ps1, the Owner''s one command' {
-    It 'runs Invoke-DemoSafetyStopSetup -GrantRole with the configuration, writes its results, and exits 0 on a Warning' {
+    It 'runs Invoke-DemoSafetyStopSetup -GrantRole and the control''s grant with the configuration, writes their results, and exits 0 on a Warning' {
         $configPath = Join-Path -Path $TestDrive -ChildPath 'demo.config.json'
         Copy-Item -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json') -Destination $configPath
         $outputPath = Join-Path -Path $TestDrive -ChildPath 'grant.jsonl'
         Mock -CommandName Invoke-DemoSafetyStopSetup -MockWith { New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'You can''t create role assignments.' }
+        # The session control's roles too (2026-11-14, ADR 0026): one grant script for everything deploy.ps1 couldn't assign.
+        Mock -CommandName Invoke-DemoActivityControlSetup -MockWith { New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'You can''t create role assignments.' }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/grant-safety-stop.ps1') -ConfigPath $configPath -OutputPath $outputPath
         $LASTEXITCODE | Should -Be 0
         Should -Invoke -CommandName Invoke-DemoSafetyStopSetup -Times 1 -ParameterFilter { $GrantRole -and $ConfigPath -eq $configPath }
-        (Get-Content -LiteralPath $outputPath -Raw) | Should -Match 'SAFETYSTOP\.ROLE'
+        Should -Invoke -CommandName Invoke-DemoActivityControlSetup -Times 1 -ParameterFilter { $GrantRole -and $ConfigPath -eq $configPath }
+        $written = Get-Content -LiteralPath $outputPath -Raw
+        $written | Should -Match 'SAFETYSTOP\.ROLE'
+        $written | Should -Match 'CONTROL\.ROLE\.A1'
     }
 }
 

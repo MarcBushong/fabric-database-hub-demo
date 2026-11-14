@@ -20,7 +20,8 @@ These are for an agent asked to **set up, deploy, upgrade, or try** this demo fo
 ## Report what deploy.ps1 says
 
 - **The ending banner:** **DONE**, or **NOT DONE** with its reason and the exact next command it prints. Without **DONE**, the setup isn't finished; say so.
-- **What it changed in an existing environment,** when these lines appear: `DEPLOY.T2.REBUILD`, `DEPLOY.T2.MODE`, `DEPLOY.T4.MISSING`, `DEPLOY.T4.RETRY`, `DEPLOY.T4.OFF`, `DEPLOY.T4.REPLICA` (T4's read replica it added, or why not), and `CONTROL.RUNBOOKS` (the on-demand control's runbooks, republished, or a **Warning** with the command).
+- **What it changed in an existing environment,** when these lines appear: `DEPLOY.T2.REBUILD`, `DEPLOY.T2.MODE`, `DEPLOY.T4.MISSING`, `DEPLOY.T4.RETRY`, `DEPLOY.T4.OFF`, `DEPLOY.T4.REPLICA` (T4's read replica it added, or why not), `DEPLOY.CONTROL.ON` (the session control set up although the configuration said `"enabled": false`), and `CONTROL.RUNBOOKS` (the control's runbooks, republished, or a **Warning** with the fix).
+- **Where Run all is:** `DEPLOY.CONTROL` says where the control notebook `NB_DatabaseHub_Control` is (one Run all runs a whole session, since 2026-11-14), or what it still needs and who does it.
 - **Every automatic size change:** `DEPLOY.T4.FALLBACK` and `DEPLOY.T4.REPLICA.FALLBACK` say what was asked for, what Azure refused, what was deployed, and the cost difference; pass them on.
 - **When the demo stops tonight,** when `DEPLOY.NIGHTLYSTOP` is a **Warning**: the run was still going at the nightly stop's time, which waited for it, and the demo now stops 60 minutes after the run. Pass on its time and both choices: `./scripts/start-demo.ps1` keeps it running tonight, `./scripts/stop-demo.ps1` stops it now. Don't change the schedules yourself.
 - **Whether it updated itself from GitHub:** the first line, "Updated this copy from GitHub's main: ... to ...", or the `DEPLOY.SELFUPDATE` **Warning** with its command.
@@ -32,7 +33,7 @@ These are for an agent asked to **set up, deploy, upgrade, or try** this demo fo
 - **The Insights app's browser sign-in, only if Fabric refuses the Azure CLI's token** (`FABRIC.APP.TOKEN`, a **Warning**, and the run says the app wasn't created). Since 2026-11-09 the app deploys with the person's `az login`, so usually there's nothing to do. `deploy.ps1` doesn't start that sign-in under an assistant, so ask the person to run `./scripts/configure-fabric-app.ps1 -SignIn` in their own terminal.
 - **The Insights app's browser confirmation, only when it's listed under Please confirm.** When the app is deployed and every query it runs returned its data, `FABRIC.APP.BROWSER` is a note instead (since 2026-11-09).
 - **Nothing for T2 or T4:** no setup wizard, and no step for PostgreSQL or its read replica. T4 is part of every deployment; when Azure refuses every T4 size, or every size of its read replica, the run ends **NOT DONE** with the fix (a Region access request, or `t4SkuName`), which only the person can act on. A Burstable `t4SkuName` has no replica: `DEPLOY.T4.REPLICA` is **Not supported**, with the fix.
-- **When the person isn't an Owner:** an Owner runs `./scripts/grant-safety-stop.ps1` once, which **DONE** prints.
+- **When the person isn't an Owner:** an Owner runs `./scripts/grant-safety-stop.ps1` once, which **DONE** prints; it grants the nightly safety stop's role and the session control's roles together.
 
 ## Cost
 

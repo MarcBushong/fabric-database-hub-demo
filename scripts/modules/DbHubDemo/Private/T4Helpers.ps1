@@ -2161,7 +2161,7 @@ function Get-DemoT4ControlRestartCoverage {
             return (& $missing 'Schedule' ('the daily T4 safety stop {0}' -f $what) ('Run {0}, which schedules it again.' -f $setup) $evidence)
         }
         $name = Get-DemoActivityControlName -Config $Config
-        $roleId = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId
+        $roleId = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId -RoleName $name.RoleName
         $principalId = if ($roleId) { Get-DemoActivityControlPrincipalId -Name $name } else { '' }
         $a1 = if ($roleId -and $principalId) { Test-DemoActivityControlAssignment -SubscriptionId $name.SubscriptionId -Scope $name.DemoResourceGroupId -PrincipalId $principalId -RoleId $roleId } else { $null }
         $evidence['a1'] = if ($null -ne $a1 -and $a1.Exists) { 'assigned' } elseif ($null -ne $a1 -and $a1.Error -and -not $a1.Missing) { 'unread' } else { 'missing' }

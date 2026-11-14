@@ -496,7 +496,7 @@ function Invoke-DemoValidationWorkload {
     .SYNOPSIS
     The Workload area: the runner's status on each selected target (Invoke-DemoWorkloadCommand status --json,
     read-only), the scenario bounds from it, and the profile host lane that serves the target (WORKLOAD.<target>.HOST,
-    Phase 25b). With control.enabled, the on-demand activity control's CONTROL.* checks (Test-DemoActivityControl, ADR 0020). T1 and T3 run on sqlvm01, and T2 through the host into the guest, so each needs that VM running; T2
+    Phase 25b). The session control's CONTROL.* checks (Test-DemoActivityControl, ADR 0020 and ADR 0026). T1 and T3 run on sqlvm01, and T2 through the host into the guest, so each needs that VM running; T2
     also needs the host's last step, after the setup wizard. A status read that fails the way load makes it fail (a
     time-out, a 409, a lock, or a resource limit) while one of business-day's incidents is due on the target (or on T1,
     whose sqlvm01 runs T3's and T4's commands), and a host lane that fails while the target's own status says it runs
@@ -582,7 +582,7 @@ function Invoke-DemoValidationWorkload {
             $results.Add((ConvertTo-DemoIncidentAwareResult -Result (Test-DemoValidationWorkloadHost -Target $target -StdOut $run.StdOut -VmName $vmName) -Config $Context.Config -IncidentTarget $incidentTargets -ValidationArea 'Workload' -Kind Host -RunnerStdOut $run.StdOut -RunnerProfile $runnerProfile))
         }
     }
-    # The optional on-demand activity control (ADR 0020): CONTROL.*, read-only, or one Not selected when it's off.
+    # The session control (ADR 0020, ADR 0026), part of every deployment since 2026-11-14: CONTROL.*, read-only.
     foreach ($item in @(Test-DemoActivityControl -Config $Context.Config)) {
         $results.Add($item)
     }

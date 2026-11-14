@@ -203,6 +203,9 @@ function Get-DemoProgressCatalog {
     # The busy marker (2026-11-14): deploy.ps1's refresher says here when the nightly stop waits for this run, and its end
     # says when the demo stops tonight (Update-DemoBusyMarker, Complete-DemoBusyMarkerRun).
     $validation.Add((& $step 'NightlyStop' 'Nightly stop (waits while this run works, then stops the demo the same night)' @() $true))
+    # The session control (ADR 0026): deploy.ps1 sets it up in Azure while the tracks run, and puts its notebook in Fabric
+    # after the Fabric track (Invoke-DemoControlDeployStep). Non-blocking: it never keeps the run from DONE.
+    $validation.Add((& $step 'Control' 'Session control (NB_DatabaseHub_Control: one Run all runs a whole session)' @() $true))
     $tracks.Add([ordered]@{ name = 'Validation'; label = 'Validation'; steps = $validation.ToArray() })
     return $tracks.ToArray()
 }

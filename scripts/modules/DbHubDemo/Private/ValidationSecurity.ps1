@@ -182,6 +182,8 @@ function Invoke-DemoValidationSecurity {
         }
         $vaultScope = '{0}/providers/Microsoft.KeyVault/vaults/' -f $groupScope
         $controlOn = (Get-DemoActivityControlSetting -Config $config).Enabled
+        # This environment's name for the control's role (control.roleNameSuffix, 2026-11-14).
+        $controlRole = (Get-DemoActivityControlName -Config $config).RoleName
         $isExpected = {
             param([object] $Assignment)
             $role = [string](Get-DemoMemberValue -InputObject $Assignment -Name 'roleDefinitionName')
@@ -195,7 +197,7 @@ function Invoke-DemoValidationSecurity {
                 return $true
             }
             # A1 of the on-demand activity control (ADR 0020): its custom role for its identity, at the group itself.
-            if ($controlOn -and $role -eq $script:ActivityControlRoleName -and [string]::Equals($scope, $groupScope, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($controlOn -and $role -eq $controlRole -and [string]::Equals($scope, $groupScope, [System.StringComparison]::OrdinalIgnoreCase)) {
                 return $true
             }
             if (-not $vaultOptIn.Enabled -or $role -notin @('Key Vault Secrets Officer', 'Key Vault Secrets User') -or -not $scope.StartsWith($vaultScope, [System.StringComparison]::OrdinalIgnoreCase)) {

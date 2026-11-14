@@ -436,6 +436,10 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R835 | Each template deployment sets the VMs' auto-shutdown back to `autoShutdownTime`; one that does so within the last 2 minutes before that time can still deallocate the VMs under a running `deploy.ps1` | **Accepted:** the refresher checks every 2 minutes in the 16 minutes before the time, and the template runs once, early in a run; a rerun starts the VMs and continues |
 | R836 | Without the safety stop's role, the deferred pass can't stop T4; and an abandoned run's moved auto-shutdown stays moved until the next `start-demo.ps1`, `stop-demo.ps1`, or `deploy.ps1` | **Mitigated:** the moved auto-shutdown still stops the VMs that night, T4 is as before without the role (`SAFETYSTOP.ROLE`), and `STATUS.NIGHTLYSTOP` warns about the moved time with the commands that put it back |
 | R837 | A `start-demo.ps1` session isn't marked busy, so the nightly stop still stops one that's going at its time | **Accepted** for now: the notebook orchestration's control sessions mark it; a `start-demo.ps1` session after the stop's time runs until the next evening's stop, as before |
+| R838 | The session control's identity can change or delete T4, change any of T4's or the replica's server parameters, join resources to the demo's subnets and private DNS zone, and change the demo resource group's tags (the seven actions approved on 2026-11-14) | **Accepted** (the coordinator's decision for the user, reversible: without the grant, Run all runs a session without the replica and says so): the runbook writes only `pgreplica01-<id>`, deletes a server only when its `replicationRole` says it's a read replica, and writes only the session's tags; ADR 0026 and the grant's output list what each action could touch |
+| R839 | Custom roles belong to the whole subscription, so environments in one subscription share the control's two roles, and a `deploy.ps1` on newer code updates them for every environment there (a test grant would have changed the owner's) | **Mitigated:** `control.roleNameSuffix` gives an environment its own two roles, and a test proves a suffixed grant never writes or assigns the shared ones; a role that already has exactly its approved actions isn't written again |
+| R840 | A Run all session started late in the day is shorter than asked: it ends before the VMs' auto-shutdown, because the profile hosts on T1 and in T2's guest end their activity there | **Accepted** for now: the session's plan and the notebook say when it ends and why, with `autoShutdownTime` as the fix; running past it is a follow-up (the [entry below](#the-session-control-in-every-deployment-2026-11-14)) |
+| R841 | The session control's notebook needs an Active capacity when `deploy.ps1` puts it in Fabric; a run that meets a paused capacity sets up only its Azure part | **Mitigated:** `DEPLOY.CONTROL` is a **Warning** that says the next `./scripts/deploy.ps1` puts the notebook there, and the capacity is never resumed or paused |
 
 ## Phase log
 
@@ -2465,3 +2469,29 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
 **Validation.** `Invoke-Pester` on the runbook, safety stop, one-command, progress, lifecycle, tracks, activity control, and the other files that call the changed functions: 1,352 passed, 0 failed. The new runbook and module tests fail on the code before this change (no `Deferred`, no marker). **Live (2026-11-14, `rg-dbhubha-demo`, stopped; nothing started):** the new `DbHub-Stop` published; `Nightly` and `T3Check` jobs completed `Deferred` with a marker ahead, and `Nightly` did the usual stop with it expired; a refresh scheduled `dbhub-safety-deferred` (hourly, Scope `Nightly`, start and expiry as designed); the run's end set the grace, the pass, and both VMs' auto-shutdown to 00:50 with `DEPLOY.NIGHTLYSTOP` and DONE's note; `STATUS.NIGHTLYSTOP` showed it; `stop-demo.ps1`'s settlement put everything back (ADR 0024's [validation](adr/0024-nightly-safety-stop.md#validation)). Still to do live: a `deploy.ps1` across the stop's time with its refresher. Run all and the capacity-dependent checks wait for the user's resume of the capacity.
 
 **Risks.** R834 to R837 new.
+
+### One Run all: the control's runbook runs a whole session (2026-11-14)
+
+**Why.** User-directed, relayed by the coordinator: "I just want to go to one notebook and execute one thing", "as easy as possible for users to execute and show. One click, one deploy", and no GitHub Actions in a session. The design and its grant were approved by the coordinator for the user, who reviews them before anything merges ([ADR 0026](adr/0026-one-run-all-session.md)).
+
+**Work summary.**
+
+1. **The showcase's replica beat** (`scenarios/activity-profiles.json`, the runner's `ProfileScheduler`): `replica-lag` in T4's even cycles, from minute 20 for 9 minutes, only on a host with T4's replica configured.
+2. **The runbook** (`automation/runbooks/DbHubControl.Common.ps1`): `session`, `capture`, and `stop` with a session, as ADR 0026 describes; each step in plain words with its fix in the control vault's `dbhub-session-status`, written through Azure Resource Manager; the metrics document in `dbhub-session-metrics`; a backup auto-stop 30 minutes after the auto-stop.
+3. **The roles** (`scripts/modules/DbHubDemo/Private/ActivityControlHelpers.ps1`): the operator role's seven new actions and the new two-action writer role at the two session secrets; a missing grant is a **Warning** with `./scripts/grant-safety-stop.ps1`, which grants them with the safety stop's.
+
+**Validation.** Offline at 54af730: PSScriptAnalyzer 0 findings in 356 files, Pester 4,259 passed, markdownlint 0 issues; `dotnet test` 555 passed, 18 skipped. The runbook's session tests run against a fake Azure, with Windows PowerShell 5.1 cross-checks of the pure parts. Live: pending, Azure-only first, on the kept test environments.
+
+### The session control in every deployment (2026-11-14)
+
+**Why.** The same direction: one deploy sets up everything Run all needs, for a new user and one who deployed before.
+
+**Work summary.**
+
+1. **`Invoke-DemoControlDeployStep`** (`scripts/modules/DbHubDemo/Private/ControlDeployHelpers.ps1`, new): the control's Azure part beside the nightly safety stop, while the tracks run, on both deploy paths, and its notebook after the Fabric track; never a **Fail**. `DEPLOY.CONTROL`, the status page's **Session control** row, and DONE's line (`Get-DemoControlDeployNote`) say where Run all is, or what it still needs and who does it. It replaces the A1 re-grant and the runbooks' refresh, which it covers.
+2. **The control in every configuration** (`Get-DemoActivityControlSetting`): `control.enabled` no longer turns it off, with a note for an older `false`; a new control's workspace is named after the demo's; `control.roleNameSuffix` gives an environment its own two roles; a role with exactly its approved actions isn't written again.
+3. **`start-demo.ps1` and `stop-demo.ps1`** remove a session's backup auto-stop too. **Preflight** P2 registers `Microsoft.Automation`, `Microsoft.KeyVault`, and `Microsoft.ManagedIdentity`.
+
+**Follow-up, not built (the coordinator's decision, 2026-11-14):** a session that runs past the VMs' auto-shutdown. The profile hosts on T1 and in T2's guest take their end (`--not-after`) from the next auto-shutdown when they start, so a session would need a VM-side way to give them a later end (a session file that `Start-DemoWorkload.ps1` and the control's VM-side script read, and a restart of the host's task, in T2's guest too), and then the control could move the auto-shutdown during a session as `deploy.ps1` does, with `Microsoft.DevTestLab/schedules/read` and `/write` added to its role then. Until then the control's role has no DevTestLab action, and a session ends before the auto-shutdown and says so.
+
+**Risks.** R838 to R841 new.

@@ -278,14 +278,14 @@
       "default": {}
     },
     "control": {
-      "description": "Optional on-demand activity control (ADR 0020): a Fabric notebook calls an Azure Automation webhook in rg-<prefix>-control that starts the targets and runs bounded scenarios, with an auto-stop for every run. Off by default; scripts/setup-activity-control.ps1 sets it up, and an Owner grants its one custom role once (-GrantRole). Contributor-only deployers use scripts/demo-control.ps1.",
+      "description": "The session control (ADR 0020, ADR 0026): the control notebook NB_DatabaseHub_Control's Run all starts a whole demo session through an Azure Automation webhook in rg-<prefix>-control, with an auto-stop for every run. Part of every deployment since 2026-11-14: deploy.ps1 sets it up and grants its roles when you may; otherwise an Owner runs scripts/grant-safety-stop.ps1 once.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "description": "Use the on-demand activity control: setup-activity-control.ps1 creates it, validate.ps1 and status.ps1 check it, and deploy.ps1 grants A1 again after a redeploy when assignRoles is true.",
+          "description": "Ignored since 2026-11-14 (ADR 0026): the control is part of every deployment. An older configuration's false (init.ps1 wrote it) doesn't turn it off; true marks a control set up before then, whose workspace name deploy.ps1 keeps.",
           "type": "boolean",
-          "default": false
+          "default": true
         },
         "vaultNetworkMode": {
           "description": "The control vault's network access. auto reads the tenant's policy assignments: public (and the notebook in a folder of the existing workspace) where new vaults can stay public, private (and the notebook in a separate DBHub Control workspace with a managed private endpoint) where a policy makes them private. public and private force a path; public is refused where a policy would make the vault private.",
@@ -322,11 +322,16 @@
           "default": "DBHub Control"
         },
         "fabricWorkspaceName": {
-          "description": "The workspace for the control notebook when the vault is private (on the existing workspace's capacity).",
+          "description": "The workspace for the control notebook when the vault is private (on the existing workspace's capacity). Empty: the demo workspace's name followed by \" Control\", so two environments in one tenant never share it; \"DBHub Control\", the earlier default, stays only with \"enabled\": true (a control set up before 2026-11-14).",
           "type": "string",
-          "minLength": 1,
           "maxLength": 100,
-          "default": "DBHub Control"
+          "default": ""
+        },
+        "roleNameSuffix": {
+          "description": "Gives this environment its own two custom roles, \"DbHub Demo Activity Operator (<suffix>)\" and \"DbHub Demo Session Writer (<suffix>)\", for an environment that shares its subscription with a demo on other code (custom roles are shared by the whole subscription). Empty: the shared roles.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9-]{0,24}$",
+          "default": ""
         }
       },
       "default": {}

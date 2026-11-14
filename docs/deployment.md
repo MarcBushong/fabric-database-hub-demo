@@ -56,7 +56,7 @@ A **Warning** on the guard means `azureAccount` isn't set: the evidence names th
 | Stage | What it does | A Fail here |
 |---|---|---|
 | Preflight | The subscription guard, P1–P6, region, sizes, quota, policy, and the cost estimate against both ceilings. It resolves the network mode, the T3 free offer, and the P6 group's name. | Stops before anything is deployed |
-| Infrastructure | Deploys `azuredeploy.json` at subscription scope. If Azure rejects the T3 free offer, it deploys again with regular serverless and reports a **Warning** (`T3.FREEOFFER`). With the Key Vault opt-in, it then deploys the vault and your access to it ([below](#opt-in-the-password-in-key-vault-instead-of-the-clipboard)). With the on-demand activity control, it then grants A1 again ([below](#the-on-demand-activity-control-a1-after-a-redeploy)). Then it sets up the [nightly safety stop](#the-nightly-safety-stop), Warnings only. | Stops (a vault **Fail** doesn't, nor does A1 or the safety stop) |
+| Infrastructure | Deploys `azuredeploy.json` at subscription scope. If Azure rejects the T3 free offer, it deploys again with regular serverless and reports a **Warning** (`T3.FREEOFFER`). With the Key Vault opt-in, it then deploys the vault and your access to it ([below](#opt-in-the-password-in-key-vault-instead-of-the-clipboard)). Then it sets up the [nightly safety stop](#the-nightly-safety-stop) and the [session control](#the-on-demand-activity-control) in Azure, with A1 again after a redeploy, Warnings only; the control's notebook follows the Fabric stage. | Stops (a vault **Fail** doesn't, nor do the safety stop and the control) |
 | Artifacts | Builds the bootstrap bundle and the workload runner, then sends both to each VM in Run Command chunks. A VM that already has exactly these chunks is skipped. | Stops |
 | Bootstraps | Deploys the template again with both SHA-256 hashes and chunk counts, which runs the loaders; waits for them, then for T1 to be Ready. | Stops |
 | T3 | Adds T1 to the T3 administrators group (P6), runs the T3 setup from T1, enables the runner on T3, and checks T3, in the order that worked live. | Stops |
@@ -406,7 +406,7 @@ T4's same-region read replica, `pgreplica01-<deploymentId>` ([ADR 0025](adr/0025
 - **A Burstable T4** (`t4SkuName` `Standard_B1ms` or `Standard_B2s`) has no replica: Azure supports none there. `PREFLIGHT.T4.REPLICA`, `DEPLOY.T4.REPLICA`, `HUB.ESTATE.T4.REPLICA`, and `METRICS.T4.REPLICA` are **Not supported**, with the fix (a General Purpose size, or no `t4SkuName`), and the run can still end **DONE**.
 - **When T4 grows** (its one-time move to the default, or a larger `t4SkuName`), the replica is deleted before the template, because Azure scales a primary only within its replicas' compute (`DEPLOY.T4.REPLICA.REMOVE`); the step creates it again at T4's new size.
 - **Before T4 starts,** a replica that a session left stopped starts first and is waited for (`DEPLOY.T4.REPLICA.START`): Azure starts T4 only after its replicas are Ready (`SourceReplicasStartStopOrder`, live 2026-11-13).
-- **The on-demand control's runbooks** (when the control is set up) are published again when this code changed them (`CONTROL.RUNBOOKS`, 2026-11-13), so its runs start a stopped replica before T4, and its stops stop one after T4, from the next `deploy.ps1` on. When that can't happen, it's a **Warning** with what fails until then and the exact command, `./scripts/setup-activity-control.ps1`, on the console, in **DONE**'s notes, and on the status page.
+- **The session control's runbooks** are published with this code on every `deploy.ps1` (`CONTROL.RUNBOOKS`, since 2026-11-14 with the control's whole setup, [ADR 0026](adr/0026-one-run-all-session.md)), so its runs start a stopped replica before T4, and its stops delete or stop it after T4. When that can't happen, it's a **Warning** with what fails until then and the fix, on the console, in **DONE**'s notes, and on the status page.
 
 ### Update an existing environment
 
@@ -421,7 +421,7 @@ A change to the template, the workload runner, or its T-SQL reaches an environme
 
 Raising `monthlyCeilingUsd` needs the template too, because the budget's amount comes from it ([cost management](cost-management.md#dated-example-the-4-vcore-t4-default-and-the-375-ceiling-2026-11-04)). So an existing environment gets the $375 default budget at its next `deploy.ps1 -FromStage Infrastructure` (or a plain `deploy.ps1` after a run that ended **DONE**). Either way, a move of T4 to a larger size is priced first: a plain run's preflight prices the new size against both ceilings (`PREFLIGHT.COST.*`) and says the move ahead (`PREFLIGHT.T4.SIZE`), and, because `-FromStage Infrastructure` skips preflight, the template step itself prices a move to the default, or to a larger `t4SkuName` you set, with the same estimate as the 2-vCore fallback, the safety stop's restart rule included. Over either ceiling, or without a price, T4 keeps its size, and `DEPLOY.T4.SIZE` names the ceiling to raise; nothing is recorded, so the next run checks again (the review of PR 20).
 
-**The on-demand activity control** isn't part of `deploy.ps1`'s setup: after the deployment, `./scripts/setup-activity-control.ps1 -SkipFabric` publishes the runbooks (`DbHub-Control`, `DbHub-Stop`, `DbHub-Monitor`) with the settings they need, such as the showcase profile and T1's monitoring checks, and `./scripts/setup-activity-control.ps1` without `-SkipFabric` also imports the control notebook again, with its new defaults (Run all runs the showcase on T1 to T4). Since 2026-11-13, once the control is set up, every `deploy.ps1` publishes its runbooks again when the code changed them (`CONTROL.RUNBOOKS`), so a code update reaches it in one click; the notebook still comes from `setup-activity-control.ps1`.
+**The session control** is part of `deploy.ps1`'s setup since 2026-11-14 ([ADR 0026](adr/0026-one-run-all-session.md)): every run sets it up in Azure beside the nightly safety stop, with the runbooks (`DbHub-Control`, `DbHub-Stop`, `DbHub-Monitor`) on this code and the settings they need, and after the Fabric track it imports the control notebook again with its new defaults. An environment whose control you set up before is adopted as it is, and one without a control gets one; see [the session control](#the-on-demand-activity-control).
 
 #### An older demo: a plain `deploy.ps1` upgrades it (2026-11-09)
 
@@ -538,28 +538,28 @@ The copy happens inside the portal, so the machine that ran `start-demo.ps1` nee
 
 ## The on-demand activity control
 
-Optional, off by default ([ADR 0020](adr/0020-on-demand-activity-control.md); why it may need a second workspace is in the [README](../README.md#why-it-may-need-a-second-workspace)). It's set up apart from `deploy.ps1`, once, and lives in `rg-<prefix>-control`, which destroy keeps:
+The session control behind the control notebook's Run all ([ADR 0026](adr/0026-one-run-all-session.md), [ADR 0020](adr/0020-on-demand-activity-control.md); why it may need a second workspace is in the [README](../README.md#why-it-may-need-a-second-workspace)). Since 2026-11-14 every `deploy.ps1` sets it up, and it lives in `rg-<prefix>-control`, which destroy keeps:
+
+- **The Azure part,** beside the nightly safety stop, while the tracks run: the vault's mode from the tenant's policy (`CONTROL.MODE`), the provider and the group, the identity, account, and vault (`CONTROL.RESOURCES`), the three runbooks published with the current scenario catalog (`CONTROL.RUNBOOKS`), the daily T4 safety stop, the webhook and its secret, the session's two secrets (`CONTROL.SECRETS`), and the roles when you may grant them (`CONTROL.ROLE.*`).
+- **The notebook,** after the Fabric track: `NB_DatabaseHub_Control` in a folder "DBHub Control" of the demo's workspace (a public vault), or in the control workspace with a managed private endpoint to the vault (a private one), named after the demo's workspace ("Database Hub Demo Control" by default), `CONTROL.FABRIC.*`. While the capacity isn't Active, nothing in Fabric changes, and the next `deploy.ps1` does it; the capacity is never resumed, paused, or scaled.
+- **What it says:** `DEPLOY.CONTROL`, the status page's **Session control** row, and a line in **DONE** say where Run all is, or what it still needs and who does it. Nothing about the control is ever a **Fail** or keeps the run from **DONE**. An older configuration's `"enabled": false` under `control` no longer turns it off (`DEPLOY.CONTROL.ON` says so once).
+- **Then, in Fabric:** open `NB_DatabaseHub_Control` and select **Run all** ([the notebook's guide](../fabric/control/README.md)).
+- **Check it** with `validate.ps1 -Area Workload` (`CONTROL.*`) and `status.ps1` (`STATUS.CONTROL`: an active run and its auto-stop, the webhook's expiry, and any role to grant again).
+
+`setup-activity-control.ps1` still does the same on its own, for example to rotate the webhook before it expires:
 
 ```powershell
-# 1. In config/demo.config.json: "control": { "enabled": true } (vaultNetworkMode auto by default)
-./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -WhatIf   # what it would do
-./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json           # Contributor
-# 2. An Owner, signed in with multifactor authentication:
-./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -GrantRole
-# Later: a new webhook before the old one expires
-./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -RotateWebhook
+./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -WhatIf          # what it would do
+./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -RotateWebhook   # a new webhook
+./scripts/setup-activity-control.ps1 -ConfigPath ./config/demo.config.json -Remove -WhatIf  # what removing it deletes
 ```
-
-- **Setup** reports `CONTROL.*` results: the vault's mode from the tenant's policy (`CONTROL.MODE`), the provider and the group, the identity, account, and vault (`CONTROL.RESOURCES`), the three runbooks (`DbHub-Control`, `DbHub-Stop`, and `DbHub-Monitor`) published with the current scenario catalog (`CONTROL.RUNBOOKS`; run setup again after a scenario changes, and after an update of this repository: `-SkipFabric` publishes the runbooks alone), the daily T4 safety stop, the webhook and its secret, and the notebook in Fabric (`CONTROL.FABRIC.*`), then which roles an Owner still has to grant, summed up in `CONTROL.SUMMARY`. Every step is idempotent, and `-WhatIf` changes nothing. `-SkipFabric` leaves Fabric for later, for example while the capacity is paused; this script never resumes, pauses, or scales it.
-- **Then, in Fabric:** open `NB_DatabaseHub_Control` (in the folder "DBHub Control" of the existing workspace, or in the "DBHub Control" workspace when the vault is private), set `ACTIVITIES` and `DURATION_MINUTES`, run it once as a dry run, then set `CONFIRM = True` and run section 3 ([the notebook's guide](../fabric/control/README.md)).
-- **Check it** with `validate.ps1 -Area Workload` (`CONTROL.*`) and `status.ps1` (`STATUS.CONTROL`: an active run and its auto-stop, the webhook's expiry, and any role to grant again).
 
 ### The on-demand activity control: A1 after a redeploy
 
-A1, the control's role for its identity at `rg-<prefix>-<environment>`, is deleted with the group, so after each redeploy:
+A1, the control's role for its identity at `rg-<prefix>-<environment>`, is deleted with the group, so each redeploy needs it again:
 
-- **With `assignRoles` and `control.enabled` true,** `deploy.ps1` grants A1 again right after the Infrastructure stage (`CONTROL.ROLE.A1`), with the same function as `-GrantRole`, for A1 only.
-- **Otherwise, or when that grant fails** (no Owner rights, a sign-in that needs multifactor authentication, or the role definition missing), it reports **Manual action required** with the exact `-GrantRole` command, and `DEPLOY.SUMMARY` lists it. The deployment goes on: until A1 is back, a notebook request does nothing and its job says why.
+- **When you may grant roles,** `deploy.ps1` assigns it again with the control's setup (`CONTROL.ROLE.A1`), with the other assignments it checks each time.
+- **Otherwise,** it's a **Warning** with `./scripts/grant-safety-stop.ps1`, which an Owner runs once for the safety stop's role and the control's. The deployment goes on: until A1 is back, a notebook request does nothing and its job says why.
 
 ## The nightly safety stop
 
