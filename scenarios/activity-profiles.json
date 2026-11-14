@@ -40,7 +40,7 @@
       ]
     },
     "showcase": {
-      "description": "Run all in the control notebook: the baseline plus a 30-minute rotation of bounded incidents on every target, at most two at a time per target, staggered across targets, to fill the Database Hub visuals that can fill within one session (README: What fills each Database Hub visual, and when). T1: blocking, log flushes, deadlocks, and CPU. T2: CPU, memory grants, IO, and parallelism or tempdb. T3: the CPU cap, blocking or deadlocks, network, a missing index, or a plan regression, and log rate. T4: a connection surge, CPU (shorter on Burstable), idle-in-transaction or locking, IO, and, on General Purpose, the missing-index lookups autonomous tuning can recommend indexes for. Each target's cycle starts when its profile is set; some slots run in odd or even cycles, or in one cycle only.",
+      "description": "Run all in the control notebook: the baseline plus a 30-minute rotation of bounded incidents on every target, at most two at a time per target, staggered across targets, to fill the Database Hub visuals that can fill within one session (README: What fills each Database Hub visual, and when). T1: blocking, log flushes, deadlocks, and CPU. T2: CPU, memory grants, IO, and parallelism or tempdb. T3: the CPU cap, blocking or deadlocks, network, a missing index, or a plan regression, and log rate. T4: a connection surge, CPU (shorter on Burstable), idle-in-transaction or locking, IO, and, on General Purpose, the missing-index lookups autonomous tuning can recommend indexes for and, in even cycles when the host has T4's read replica, replica-lag in their place (Read replica lag climbs to about 3 minutes, twice). Each target's cycle starts when its profile is set; some slots run in odd or even cycles, or in one cycle only.",
       "defaultDurationMinutes": 90,
       "maxDurationMinutes": 120,
       "baseline": true,
@@ -69,7 +69,9 @@
         { "target": "T4", "scenario": "idle-in-transaction", "startMinute": 10, "durationMinutes": 10, "concurrency": 3, "intensity": 5, "cycles": "odd" },
         { "target": "T4", "scenario": "locking-blocking", "startMinute": 10, "durationMinutes": 10, "concurrency": 3, "intensity": 5, "cycles": "even" },
         { "target": "T4", "scenario": "io-pressure", "startMinute": 20, "durationMinutes": 9, "concurrency": 2, "intensity": 6, "parameters": { "scratchMb": "1024" } },
-        { "target": "T4", "scenario": "missing-index", "startMinute": 20, "durationMinutes": 9, "concurrency": 2, "intensity": 5, "tier": "GeneralPurpose" }
+        { "target": "T4", "scenario": "missing-index", "startMinute": 20, "durationMinutes": 9, "concurrency": 2, "intensity": 5, "tier": "GeneralPurpose", "cycles": "odd" },
+        { "target": "T4", "scenario": "missing-index", "startMinute": 20, "durationMinutes": 9, "concurrency": 2, "intensity": 5, "tier": "GeneralPurpose", "replica": false, "cycles": "even" },
+        { "target": "T4", "scenario": "replica-lag", "startMinute": 20, "durationMinutes": 9, "concurrency": 1, "intensity": 5, "tier": "GeneralPurpose", "replica": true, "cycles": "even", "parameters": { "holdSeconds": "180", "pauseSeconds": "60" } }
       ]
     },
     "incident": {

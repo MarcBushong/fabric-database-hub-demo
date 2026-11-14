@@ -4,6 +4,7 @@ A T4 incident (Azure Database for PostgreSQL flexible server, [ADR 0019](../../d
 
 - **Definition:** [`scenario.json`](scenario.json) (10 minutes by default, 15 at most; each cycle holds for 240 seconds by default, 540 at most).
 - **Needs the replica:** `pgreplica01-<deploymentId>`, which `start-demo.ps1` creates for each session. T1 knows its name from `deploy.ps1`, and its runner gets it as `--replica-server`; without it, the run is refused with that fix, and a replica that doesn't answer or isn't in recovery refuses it too.
+- **In the showcase** (since 2026-11-14): T4's even cycles run it from minute 20 for 9 minutes, with `holdSeconds` 180 and `pauseSeconds` 60, so the lag climbs to about 3 minutes twice. Only a profile host that has the replica configured plans that slot; one without it runs `missing-index` there ([activity profiles](../activity-profiles.json)).
 - **Sessions:** all tagged `ContosoCare.Demo/replica-lag/<run>`, all to `contosocare`. Each cycle:
   - **The report** (on the replica) reads `demo.replica_lag_marks` and sleeps for `holdSeconds` in the same statement, so it holds the table's `ACCESS SHARE` lock that long. Its `statement_timeout` is the hold plus 30 seconds, never past the run's hard deadline.
   - **The writer** (on T4), once the replica's `pg_locks` shows the report holding the table, calls `demo.usp_scenario_replica_lag` once with its lock: an `ACCESS EXCLUSIVE` lock on the table in a short transaction (`lock_timeout` 5 seconds), which T4 writes to the WAL. Then it commits a small mark every `markIntervalMs`.

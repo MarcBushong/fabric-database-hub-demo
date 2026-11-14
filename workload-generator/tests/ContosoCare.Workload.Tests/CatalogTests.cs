@@ -148,6 +148,7 @@ public sealed partial class CatalogTests
             Assert.InRange(slot.Concurrency.Value, scenario.Concurrency.Min, scenario.Concurrency.Max);
             Assert.InRange(slot.Intensity.Value, scenario.Intensity.Min, scenario.Intensity.Max);
             Assert.True(slot.Tier is null || slot.Target == "T4", "Only T4's slots are tier-specific.");
+            Assert.True(slot.Replica is null || slot.Target == "T4", "Only T4's slots depend on its read replica.");
             ScenarioCatalog.ResolveParameters(scenario, target, slot.Parameters);
         }
     }
@@ -162,15 +163,18 @@ public sealed partial class CatalogTests
 
         foreach (var tier in new[] { "Burstable", "GeneralPurpose" })
         {
-            for (var cycle = 1; cycle <= cycles; cycle++)
+            foreach (var hasReplica in new[] { false, true })
             {
-                foreach (var group in profile.Incidents.Where(s => s.RunsInCycle(cycle) && s.RunsOnTier(tier)).GroupBy(s => s.Target, StringComparer.Ordinal))
+                for (var cycle = 1; cycle <= cycles; cycle++)
                 {
-                    for (var minute = 0; minute < profile.CycleMinutes; minute++)
+                    foreach (var group in profile.Incidents.Where(s => s.RunsInCycle(cycle) && s.RunsOnTier(tier) && s.RunsWithReplica(hasReplica)).GroupBy(s => s.Target, StringComparer.Ordinal))
                     {
-                        var active = group.Where(s => s.StartMinute <= minute && minute < s.StartMinute + s.DurationMinutes).ToList();
-                        Assert.True(active.Count <= 2, $"{group.Key}, cycle {cycle}, {tier}: {active.Count} incidents at minute {minute}.");
-                        Assert.Equal(active.Count, active.Select(s => s.Scenario).Distinct(StringComparer.Ordinal).Count());
+                        for (var minute = 0; minute < profile.CycleMinutes; minute++)
+                        {
+                            var active = group.Where(s => s.StartMinute <= minute && minute < s.StartMinute + s.DurationMinutes).ToList();
+                            Assert.True(active.Count <= 2, $"{group.Key}, cycle {cycle}, {tier}, replica {hasReplica}: {active.Count} incidents at minute {minute}.");
+                            Assert.Equal(active.Count, active.Select(s => s.Scenario).Distinct(StringComparer.Ordinal).Count());
+                        }
                     }
                 }
             }
@@ -188,8 +192,11 @@ public sealed partial class CatalogTests
             {
                 foreach (var tier in new[] { "Burstable", "GeneralPurpose" })
                 {
-                    var slots = profile.Incidents.Where(s => s.Target == target && s.RunsInCycle(cycle) && s.RunsOnTier(tier)).ToList();
-                    Assert.True(slots.Count >= 3, $"{target} has {slots.Count} incidents in cycle {cycle} ({tier}).");
+                    foreach (var hasReplica in new[] { false, true })
+                    {
+                        var slots = profile.Incidents.Where(s => s.Target == target && s.RunsInCycle(cycle) && s.RunsOnTier(tier) && s.RunsWithReplica(hasReplica)).ToList();
+                        Assert.True(slots.Count >= 3, $"{target} has {slots.Count} incidents in cycle {cycle} ({tier}, replica {hasReplica}).");
+                    }
                 }
             }
         }

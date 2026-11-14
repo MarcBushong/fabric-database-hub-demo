@@ -155,7 +155,11 @@ internal sealed class FileProfileStore(string path, TimeSpan? lockTimeout = null
 }
 
 /// <summary>One target the profile host serves: how it runs and resets scenarios, and where its profile lives.</summary>
-internal sealed record ProfileTarget(DemoTarget Target, IScenarioExecutor Executor, IProfileStore Store);
+internal sealed record ProfileTarget(DemoTarget Target, IScenarioExecutor Executor, IProfileStore Store)
+{
+    /// <summary>T4 only: whether the host has T4's read replica configured, which a profile's replica slots need (ADR 0025).</summary>
+    public bool HasReplica { get; init; }
+}
 
 /// <summary>What a lane does on its target besides reading the profile: start a bounded run, reset before a profile, and recover runs an earlier host left Running. The seam for tests.</summary>
 internal interface ILaneWork
@@ -485,7 +489,7 @@ internal sealed class ProfileHost(
         IReadOnlyList<PlannedActivity> planned;
         try
         {
-            planned = ProfileScheduler.Plan(state, target, now, definitions, catalog, notAfter);
+            planned = ProfileScheduler.Plan(state, target, now, definitions, catalog, notAfter, lane.Target.HasReplica);
         }
         catch (ScenarioRequestException ex)
         {

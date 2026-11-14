@@ -605,7 +605,8 @@ internal static partial class CommandLine
                 var targets = new List<ProfileTarget>();
                 if (primary == DemoTarget.T4)
                 {
-                    targets.Add(new ProfileTarget(DemoTarget.T4, hostTarget.PostgresRunner(parseResult, log), new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))));
+                    var runner = hostTarget.PostgresRunner(parseResult, log);
+                    targets.Add(new ProfileTarget(DemoTarget.T4, runner, new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))) { HasReplica = runner.HasReplica });
                 }
                 else
                 {
@@ -632,7 +633,8 @@ internal static partial class CommandLine
                     }
 
                     var t4 = PgEndpoint.Create(pgServer, parseResult.GetValue(t4User), passwordFromEnvironment: false, parseResult.GetValue(t4Identity));
-                    targets.Add(new ProfileTarget(DemoTarget.T4, PgRunner(t4, t4.Replica(parseResult.GetValue(t4Replica), "--t4-replica-server"), log), new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))));
+                    var t4Runner = PgRunner(t4, t4.Replica(parseResult.GetValue(t4Replica), "--t4-replica-server"), log);
+                    targets.Add(new ProfileTarget(DemoTarget.T4, t4Runner, new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))) { HasReplica = t4Runner.HasReplica });
                 }
                 else if (parseResult.GetValue(t4Replica) is not null)
                 {

@@ -41,6 +41,9 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     public string Description => replica is null ? opener.Endpoint.Describe() : opener.Endpoint.Describe() + "; " + replica.Endpoint.Describe();
 
+    /// <summary>Whether T4's read replica is configured (ADR 0025): a profile's replica slots run only then.</summary>
+    public bool HasReplica => replica is not null;
+
     public async Task<RunResult> RunAsync(RunPlan plan, CancellationToken cancellationToken)
     {
         var runId = SessionNames.NewRunId(time.GetUtcNow(), plan.Target);

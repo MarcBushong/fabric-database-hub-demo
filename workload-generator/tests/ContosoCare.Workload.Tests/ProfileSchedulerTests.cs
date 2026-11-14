@@ -333,6 +333,61 @@ public sealed class ProfileSchedulerTests
         }
     }
 
+    [Theory]
+    [InlineData(21, false, "missing-index")]
+    [InlineData(51, false, "missing-index")]
+    [InlineData(81, false, "missing-index")]
+    [InlineData(21, true, "missing-index")]
+    [InlineData(51, true, "replica-lag")]
+    [InlineData(81, true, "missing-index")]
+    [InlineData(111, true, "replica-lag")]
+    public void TheShowcaseRunsReplicaLagInEvenCyclesOnlyWhereT4sReadReplicaIsConfigured(int minute, bool hasReplica, string scenario)
+    {
+        // 2026-11-14: with T4's read replica (ADR 0025), replica-lag takes the even cycles' missing-index slot, so a control
+        // session fills Database Hub's Read replica lag; a host without the replica keeps missing-index in every cycle.
+        var state = State("showcase", SetAt.AddMinutes(120), new ProfileParameters { Tier = "GeneralPurpose", VCores = 4 });
+
+        var incidents = ProfileScheduler.Plan(state, DemoTarget.T4, SetAt.AddMinutes(minute), Definitions, Catalog, null, hasReplica).Where(a => !a.IsBaseline).ToList();
+
+        Assert.Contains(incidents, a => a.ScenarioId == scenario);
+        Assert.DoesNotContain(incidents, a => a.ScenarioId == (scenario == "replica-lag" ? "missing-index" : "replica-lag"));
+        Assert.True(incidents.Count <= 2, "at most two incidents at once on a target");
+    }
+
+    [Fact]
+    public void TheShowcasesReplicaLagHoldsItsReportForThreeMinutesAndEndsWithItsSlot()
+    {
+        var state = State("showcase", SetAt.AddMinutes(90), new ProfileParameters { Tier = "GeneralPurpose", VCores = 4 });
+
+        var lag = Assert.Single(ProfileScheduler.Plan(state, DemoTarget.T4, SetAt.AddMinutes(50), Definitions, Catalog, null, hasReplica: true), a => a.ScenarioId == "replica-lag");
+
+        Assert.Equal(SetAt.AddMinutes(50), lag.Start);
+        Assert.Equal(SetAt.AddMinutes(59), lag.End);
+        Assert.Equal(1, lag.Concurrency);
+        Assert.Equal("180", lag.Parameters["holdSeconds"]);
+    }
+
+    [Fact]
+    public void ABurstableT4NeverRunsReplicaLag()
+    {
+        // Azure has no read replica on the Burstable tier, so a Burstable T4's host never plans the slot.
+        var state = State("showcase", SetAt.AddMinutes(90), new ProfileParameters { Tier = "Burstable", VCores = 1 });
+
+        Assert.DoesNotContain(ProfileScheduler.Plan(state, DemoTarget.T4, SetAt.AddMinutes(51), Definitions, Catalog, null, hasReplica: true), a => a.ScenarioId == "replica-lag");
+    }
+
+    [Theory]
+    [InlineData(null, false, true)]
+    [InlineData(null, true, true)]
+    [InlineData(true, true, true)]
+    [InlineData(true, false, false)]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, false)]
+    public void ReplicaSlotsRunOnlyWhereTheirReplicaConditionHolds(bool? replica, bool hasReplica, bool runs)
+    {
+        Assert.Equal(runs, new IncidentSlot { Target = "T4", Scenario = "replica-lag", StartMinute = 0, DurationMinutes = 5, Replica = replica }.RunsWithReplica(hasReplica));
+    }
+
     [Fact]
     public void VCoresScaleOnlyT4sCpuBoundSlots()
     {
