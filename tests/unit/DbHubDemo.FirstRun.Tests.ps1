@@ -754,12 +754,16 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { $script:order.Add('DeleteReplica'); New-DemoResult -CheckId 'STOP.T4.REPLICA' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'deleted' -Evidence @{ replica = 'pgreplica01-abc123'; stateBefore = 'Ready' } }
             Mock -ModuleName DbHubDemo -CommandName Wait-DemoT4ReplicaState -MockWith { [pscustomobject]@{ State = 'NotFound'; Present = $false; Names = [pscustomobject]@{ ServerName = 'pgreplica01-abc123' } } }
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'stopped' }
+            # This run deleted the replica, so T4's stop is the confirmed one (R843), which its own tests cover.
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4StopConfirmed -MockWith { $script:order.Add('ConfirmedStop'); New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'stopped' }
             Mock -ModuleName DbHubDemo -CommandName Save-DemoPostgresHistoryPending -MockWith { $script:order.Add('Keep:' + $Json); New-DemoResult -CheckId 'STOP.T4.HISTORY.PENDING' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'kept' }
             Mock -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -MockWith { $script:order.Add('SaveHistory:' + $PostgresMetrics); [pscustomobject]@{ Result = (New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status $script:saveStatus -Message 'history'); StillRunning = $script:still } }
 
             $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
             $script:order.IndexOf('Capture') | Should -BeLessThan $script:order.IndexOf('DeleteReplica') -Because 'a deleted replica''s metrics are gone'
             @($script:order | Where-Object { $_ -eq 'DeleteReplica' }).Count | Should -Be 1 -Because 'the delete goes once; the wait sees it gone'
+            $script:order.IndexOf('DeleteReplica') | Should -BeLessThan $script:order.IndexOf('ConfirmedStop') -Because 'T4''s stop after the replica''s delete is confirmed (R843)'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -Times 0 -Exactly -Because 'only the confirmed stop stops T4 when this run deleted the replica'
             ($results | Where-Object { $_.checkId -eq 'STOP.T4.REPLICA' }).message | Should -Be 'T4''s read replica (pgreplica01-abc123) was deleted, so nothing bills for it until the next session creates it again.' -Because 'live, a second call said "isn''t there, so there''s nothing to delete" after this run deleted it'
             $script:order | Should -Contain 'SaveHistory:{"version":1}'
             $script:order | Should -Contain 'Keep:{"version":1}'

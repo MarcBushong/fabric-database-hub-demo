@@ -274,8 +274,15 @@ function Stop-DemoEnvironment {
                 $results.Add((New-DemoResult -CheckId 'STOP.T4.REPLICA' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4''s read replica ({0}) was deleted, so nothing bills for it until the next session creates it again.' -f $replicaName) -Evidence ([ordered]@{ replica = $replicaName; stateBefore = [string](Get-DemoMemberValue -InputObject $replicaDelete.evidence -Name 'stateBefore'); stateAfter = 'NotFound' }) -DocUrl ([string](Get-DemoT4ReplicaSetting)['docUrls']['concepts'])))
             }
         }
-        # After the VMs, so T1's runner has ended T4's sessions; the stop finishes in the background.
-        $results.Add((Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 0 -CheckPrefix STOP))
+        # After the VMs, so T1's runner has ended T4's sessions; the stop finishes in the background. When this run asked for
+        # the replica's deletion, Azure can accept T4's stop and then refuse it while the delete finishes, which left T4
+        # running after the control's auto-stop (live, 2026-11-14), so that stop is confirmed and asked again (R843).
+        if ($replicaDeleting) {
+            $results.Add((Invoke-DemoT4StopConfirmed -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])))
+        }
+        else {
+            $results.Add((Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 0 -CheckPrefix STOP))
+        }
     }
     elseif (-not $ParkT2 -and $t4On) {
         $results.Add((New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Not selected' -Message 'T4 isn''t deployed, so there''s nothing to stop.'))

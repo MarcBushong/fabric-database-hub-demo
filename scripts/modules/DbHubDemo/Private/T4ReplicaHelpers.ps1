@@ -1158,6 +1158,81 @@ function Invoke-DemoT4ReplicaStartFirst {
     return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica ({0}) is {1}, not Ready, after {2} minutes, so T4 may not start (Azure starts a replica before its source).' -f $names.ServerName, $replica.State, $setting['powerWaitMinutes']) -Evidence $evidence -Remediation 'Run ./scripts/stop-demo.ps1, which deletes the replica, then ./scripts/start-demo.ps1.' -DocUrl $docUrl)
 }
 
+function Invoke-DemoT4StopConfirmed {
+    <#
+    .SYNOPSIS
+    T4's stop right after this run asked for its read replica's deletion, confirmed: asked again until T4 is Stopping or
+    Stopped, at most -Attempts times within -WaitMinutes. Returns STOP.T4.STOP. Internal.
+
+    .DESCRIPTION
+    Azure refuses a primary's stop while an operation still runs on its read replica (SourceReplicasStartStopOrder), and
+    the replica's read answers 404 about 20 seconds before its delete finishes. Live on 2026-11-14, the session control's
+    runbook sent T4's stop then twice: Azure accepted it, failed it a minute later, and T4 kept running and billing. So
+    stop-demo.ps1 doesn't trust an accepted stop after the replica's deletion; it reads T4 until it's Stopping or Stopped,
+    and asks again when it's still running after -SettleSeconds, as the runbook's Stop-DbHubT4Confirmed does (R843). A
+    stop that Azure takes at once costs one read; a refused one costs about 2.5 minutes per try. A T4 still running after
+    the last try is a Fail with the fix, never a silent Pass.
+    https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'stop-demo.ps1 confirms once for the whole stop.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $DeploymentId = '',
+
+        [ValidateRange(1, 5)]
+        [int] $Attempts = 3,
+
+        [ValidateRange(0, 600)]
+        [int] $SettleSeconds = 150,
+
+        [ValidateRange(1, 30)]
+        [int] $WaitMinutes = 10,
+
+        [ValidateRange(0, 60)]
+        [int] $PollSeconds = 15
+    )
+
+    $giveUp = [DateTime]::UtcNow.AddMinutes($WaitMinutes)
+    $tries = 0
+    $state = ''
+    $result = $null
+    while ($tries -lt $Attempts -and [DateTime]::UtcNow -lt $giveUp) {
+        $tries++
+        $result = Invoke-DemoT4PowerAction -Config $Config -Action Stop -WaitMinutes 0 -CheckPrefix STOP -DeploymentId $DeploymentId -Requested:($tries -gt 1)
+        if ([string]$result.status -ne 'Pass') {
+            # A stop that Azure refused outright, or a T4 that isn't there, is already reported with its fix.
+            return $result
+        }
+        # An accepted stop shows within seconds; a failed one leaves T4 running, and a second stop while the first still
+        # runs is refused, so each try gets SettleSeconds to show.
+        $settle = [DateTime]::UtcNow.AddSeconds($SettleSeconds)
+        if ($settle -gt $giveUp) {
+            $settle = $giveUp
+        }
+        do {
+            Start-Sleep -Seconds $PollSeconds
+            $state = [string](Get-DemoT4State -Config $Config -DeploymentId $DeploymentId).State
+            if ($state -in 'Stopping', 'Stopped') {
+                $result.evidence['stateAfter'] = $state
+                $result.evidence['stopAttempts'] = $tries
+                if ($tries -gt 1) {
+                    $result.message = ('{0} It took {1} stops: Azure refused the first while T4''s read replica''s delete finished.' -f $result.message, $tries)
+                    Write-DemoLog -Level Warning -Message ('T4 is {0} after {1} stops: Azure refused the first while its read replica''s delete finished.' -f $state.ToLowerInvariant(), $tries)
+                }
+                return $result
+            }
+        } while ([DateTime]::UtcNow -lt $settle)
+        Write-DemoLog -Message ('T4 is still {0} after stop {1}; Azure can refuse a stop while its read replica''s delete finishes, so the stop is asked again.' -f $(if ($state) { $state } else { 'unknown' }), $tries)
+    }
+    $names = Get-DemoT4Name -Config $Config -DeploymentId $DeploymentId
+    $evidence = [ordered]@{ server = $names.ServerName; stateAfter = $state; stopAttempts = $tries; waitMinutes = $WaitMinutes }
+    return (New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Fail' -Message ('T4 ({0}) is still {1} after {2} stop(s) in {3} minutes: Azure accepted each stop and then refused it, which it does while an operation runs on its read replica, so T4 keeps running and billing.' -f $names.ServerName, $(if ($state) { $state } else { 'unknown' }), $tries, $WaitMinutes) -Evidence $evidence -Remediation 'Run ./scripts/stop-demo.ps1 again in a few minutes; otherwise the nightly safety stop stops T4 at its next run.' -DocUrl ([string](Get-DemoT4ReplicaSetting)['docUrls']['concepts']))
+}
+
 function Get-DemoT4ReplicaMetricSnapshot {
     <#
     .SYNOPSIS

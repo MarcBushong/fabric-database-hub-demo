@@ -300,6 +300,51 @@ Describe 'Azure''s power order, and deleting the replica (live, 2026-11-13)' {
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Remove-DemoT4Replica -Config $Config -DeploymentId 'abc123' -CheckPrefix DESTROY -Quiet -Confirm:$false } | Should -BeNullOrEmpty
         $script:azCalls.Count | Should -Be 0
     }
+
+    It 'asks T4 to stop again after the replica''s delete when Azure took the first stop and then refused it (R843, live 2026-11-14), and says so' {
+        # Live, in the control's runbook: the replica read 404 about 20 seconds before its delete finished, and T4's stop,
+        # accepted, failed a minute later (SourceReplicasStartStopOrder), which left T4 running.
+        $script:stops = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { $script:stops++; New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'T4 (pgflex01-abc123) is stopping; the operation runs in the background.' -Evidence @{ server = 'pgflex01-abc123' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { New-T4State -State $(if ($script:stops -lt 2) { 'Ready' } else { 'Stopping' }) }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4StopConfirmed -Config $Config -DeploymentId 'abc123' -SettleSeconds 0 -PollSeconds 0 }
+        $script:stops | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['Requested'] }
+        $result.checkId | Should -Be 'STOP.T4.STOP'
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'It took 2 stops: Azure refused the first while T4''s read replica''s delete finished\.$'
+        $result.evidence['stopAttempts'] | Should -Be 2
+        $result.evidence['stateAfter'] | Should -Be 'Stopping'
+    }
+
+    It 'reports a T4 that''s still running after three stops as a Fail with its fix, never as a Pass' {
+        $script:stops = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { $script:stops++; New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'T4 (pgflex01-abc123) is stopping; the operation runs in the background.' -Evidence @{ server = 'pgflex01-abc123' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { New-T4State -State 'Ready' }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4StopConfirmed -Config $Config -DeploymentId 'abc123' -SettleSeconds 0 -PollSeconds 0 }
+        $script:stops | Should -Be 3
+        $result.checkId | Should -Be 'STOP.T4.STOP'
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match '^T4 \(pgflex01-abc123\) is still Ready after 3 stop\(s\) in 10 minutes: Azure accepted each stop and then refused it'
+        $result.remediation | Should -Match '^Run \./scripts/stop-demo\.ps1 again in a few minutes; otherwise the nightly safety stop stops T4 at its next run\.$'
+        $result.evidence['stopAttempts'] | Should -Be 3
+    }
+
+    It 'reads T4 once when Azure takes the stop at once, and returns a stop that Azure refused outright as it is' {
+        $script:stops = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { $script:stops++; New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'T4 (pgflex01-abc123) is stopping; the operation runs in the background.' -Evidence @{ server = 'pgflex01-abc123' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { New-T4State -State 'Stopping' }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4StopConfirmed -Config $Config -DeploymentId 'abc123' -PollSeconds 0 }
+        $script:stops | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4State -Times 1 -Exactly
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Not -Match 'It took'
+
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Fail' -Message 'T4 (pgflex01-abc123) couldn''t be stopped: a fake error.' }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4StopConfirmed -Config $Config -DeploymentId 'abc123' -PollSeconds 0 }
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Be 'T4 (pgflex01-abc123) couldn''t be stopped: a fake error.'
+    }
 }
 
 Describe 'The history keeps the session''s lag: captured before stop-demo.ps1 deletes the replica (ADR 0025)' {
