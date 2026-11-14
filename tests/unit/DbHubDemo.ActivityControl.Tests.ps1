@@ -1004,11 +1004,12 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
         $script:endpoints = @()
         $script:fabricPosts = [System.Collections.Generic.List[object]]::new()
         $script:imports = [System.Collections.Generic.List[object]]::new()
+        $script:lakehouses = @(@{ id = 'cccccccc-0000-0000-0000-000000000003'; displayName = 'LH_DatabaseHub' })
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -MockWith { @([pscustomobject]@{ checkId = 'FABRIC.P5.CAPACITY'; status = $script:capacityStatus; message = ('The capacity is {0}.' -f $(if ($script:capacityStatus -eq 'Pass') { 'Active' } else { 'Paused' })) }) }
         Mock -ModuleName DbHubDemo -CommandName Import-DemoFabricNotebook -MockWith {
             # A parameter that wasn't passed has no variable in a mock's body under strict mode.
             $folder = [string](Get-Variable -Name 'FolderId' -ValueOnly -ErrorAction SilentlyContinue)
-            $script:imports.Add([pscustomobject]@{ WorkspaceId = $WorkspaceId; FolderId = $folder })
+            $script:imports.Add([pscustomobject]@{ WorkspaceId = $WorkspaceId; FolderId = $folder; Notebook = $Notebook })
             [pscustomobject]@{ status = 'Pass'; message = 'was imported.'; remediation = '' }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -MockWith {
@@ -1026,6 +1027,7 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
                 '/folders$' { return [pscustomobject]@{ StatusCode = 200; Body = @{ value = @($script:folders) } } }
                 '/networking/communicationPolicy$' { return [pscustomobject]@{ StatusCode = 200; Body = @{ outbound = @{ publicAccessRules = @{ defaultAction = $script:outbound } } } } }
                 '/managedPrivateEndpoints$' { return [pscustomobject]@{ StatusCode = 200; Body = @{ value = @($script:endpoints) } } }
+                '/lakehouses$' { return [pscustomobject]@{ StatusCode = 200; Body = @{ value = @($script:lakehouses) } } }
                 '^/v1/workspaces$' { return [pscustomobject]@{ StatusCode = 200; Body = @{ value = @($script:fabricWorkspaces) } } }
                 '^/v1/workspaces/[^/]+$' { return [pscustomobject]@{ StatusCode = 200; Body = @{ id = $script:shared; capacityId = 'capacity-1' } } }
             }
@@ -1065,6 +1067,36 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
         ($results | Where-Object checkId -EQ 'CONTROL.FABRIC.FOLDER').status | Should -Be 'Warning'
         $script:imports[0].WorkspaceId | Should -Be $script:shared
         $script:imports[0].FolderId | Should -BeNullOrEmpty
+    }
+
+    It 'makes the demo''s lakehouse the notebook''s default lakehouse, read by name, so Run all saves each history in its own Spark session' {
+        # Fabric blocks a reference run whose notebook names another lakehouse than the caller's (Learn, NotebookUtils).
+        $script:folders = @(@{ id = '0f0f0f0f-0000-0000-0000-000000000001'; displayName = 'DBHub Control' })
+        $results = @(Invoke-Placement -Mode 'public')
+        ($results | Where-Object checkId -EQ 'CONTROL.FABRIC.LAKEHOUSE').status | Should -Be 'Pass'
+        $text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($script:imports[0].Notebook.Definition['parts'][0]['payload']))
+        $binding = ($text | ConvertFrom-Json -AsHashtable -Depth 64)['metadata']['dependencies']['lakehouse']
+        $binding['default_lakehouse'] | Should -Be 'cccccccc-0000-0000-0000-000000000003'
+        $binding['default_lakehouse_workspace_id'] | Should -Be $script:shared
+        $binding['default_lakehouse_name'] | Should -Be 'LH_DatabaseHub'
+        $text | Should -Match 'DEMO_LAKEHOUSE_ID = \\"cccccccc-0000-0000-0000-000000000003\\"'
+        $script:fabricPosts.Count | Should -Be 0 -Because 'the lakehouse is only read'
+    }
+
+    It 'imports the notebook without a lakehouse, with a Warning that says what that means, when the demo''s lakehouse isn''t there' {
+        $script:folders = @(@{ id = '0f0f0f0f-0000-0000-0000-000000000001'; displayName = 'DBHub Control' })
+        $script:lakehouses = @()
+        $results = @(Invoke-Placement -Mode 'public')
+        ($results | Where-Object checkId -EQ 'CONTROL.FABRIC.NOTEBOOK').status | Should -Be 'Pass'
+        $lakehouse = @($results | Where-Object checkId -EQ 'CONTROL.FABRIC.LAKEHOUSE')
+        $lakehouse.Count | Should -Be 1
+        $lakehouse[0].status | Should -Be 'Warning'
+        $lakehouse[0].message | Should -Match 'separate Spark job, which a capacity whose Spark cores are all in use refuses \(HTTP 430\)'
+        $lakehouse[0].remediation | Should -Match 'deploy\.ps1'
+        $text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($script:imports[0].Notebook.Definition['parts'][0]['payload']))
+        ($text | ConvertFrom-Json -AsHashtable -Depth 64)['metadata'].Contains('dependencies') | Should -BeFalse
+        $text | Should -Match 'DEMO_LAKEHOUSE_ID = \\"\\"'
+        $script:fabricPosts.Count | Should -Be 0 -Because 'nothing here creates a lakehouse'
     }
 
     It 'creates nothing, and never touches the capacity, when it isn''t Active' {

@@ -129,7 +129,7 @@
 
 - **Decision source:** the user, through the coordinator: a demo session needs no GitHub Actions, and one **Run all** in the control notebook runs the whole session ([ADR 0026](0026-one-run-all-session.md)).
 - **`NB_DatabaseHub_LiveActivity`:** its simulation control is removed, with no default and no fallback: section 3's request through `demo-control.yml` with the P9 token, the cell that stopped all activity, and their parameters (`CONFIRM`, `STOP_ACTIVITY`, `KEY_VAULT_URL`, `PROFILE`, the `SIM_*` and `GITHUB_*` names). It analyzes and saves only. This supersedes item 2 of its role above, the 2026-11-03 amendment's request in section 3, and the 2026-11-06 amendment's reason for sending `CONFIRM` false.
-- **A session's run:** the control notebook starts it as a job with `SESSION_ID` and `SESSION_PLAN`, and it records the session's row and its incident beats in `scenario_runs`. A session already saved isn't saved again.
+- **A session's run:** the control notebook runs it in its own Spark session (a reference run; as a job when it can't, [ADR 0026](0026-one-run-all-session.md#the-historys-spark-session-2026-11-14)) with `SESSION_ID` and `SESSION_PLAN`, and it records the session's row and its incident beats in `scenario_runs`. A session already saved isn't saved again.
 - **The scripts' runs** (`stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s snapshot, `configure-fabric.ps1`) still send `CONFIRM` and `STOP_ACTIVITY` false and `KEY_VAULT_URL` empty, which only a copy imported before 2026-11-14 reads.
 
 ## Sources (checked 2026-10-19; Phase 12 sources checked 2026-10-20, live-attempt sources 2026-10-21)

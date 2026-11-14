@@ -1619,10 +1619,18 @@ function Get-DemoActivityControlNotebook {
     <#
     .SYNOPSIS
     The control notebook (fabric/control/NB_DatabaseHub_Control.ipynb) with its parameters cell filled for this
-    environment: the vault URL and its secrets' names, the demo's names, its tenant and Fabric workspace, the rules the
-    runbook applies (the catalog and the session's), and the showcase's beats. No secret goes in: the notebook reads the
-    webhook URL from the vault at run time. Returns a Fabric notebook definition (Get-DemoFabricNotebookDefinition).
-    Internal.
+    environment: the vault URL and its secrets' names, the demo's names, its tenant, Fabric workspace, and lakehouse, the
+    rules the runbook applies (the catalog and the session's), and the showcase's beats. No secret goes in: the notebook
+    reads the webhook URL from the vault at run time. Returns a Fabric notebook definition
+    (Get-DemoFabricNotebookDefinition). Internal.
+
+    .DESCRIPTION
+    With -DemoLakehouseId and -DemoWorkspaceId, the copy is bound to the demo's lakehouse as its default lakehouse
+    (2026-11-14): Run all then saves each history in its own Spark session, a reference run of NB_DatabaseHub_LiveActivity
+    (notebookutils.notebook.run), so no second Spark job is submitted for a small capacity to refuse (HTTP 430). Fabric
+    blocks a reference run whose notebook names another lakehouse than the caller's. The repository's copy names none.
+    - Reference run: https://learn.microsoft.com/fabric/data-engineering/notebookutils/notebookutils-notebook-run
+    - Concurrency limits: https://learn.microsoft.com/fabric/data-engineering/spark-job-concurrency-and-queueing
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1637,11 +1645,19 @@ function Get-DemoActivityControlNotebook {
         [string] $TenantId = '',
 
         [AllowEmptyString()]
-        [string] $DemoWorkspaceId = ''
+        [string] $DemoWorkspaceId = '',
+
+        [AllowEmptyString()]
+        [ValidatePattern('^$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+        [string] $DemoLakehouseId = '',
+
+        [AllowEmptyString()]
+        [string] $DemoLakehouseName = ''
     )
 
     $path = Join-Path -Path $script:RepoRoot -ChildPath 'fabric/control/NB_DatabaseHub_Control.ipynb'
     $notebook = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+    $bind = [bool]($DemoLakehouseId -and $DemoWorkspaceId)
     $catalog = [ordered]@{ targets = @($Setting['targets'].Keys); scenarios = $Setting['scenarios']; profiles = $Setting['profiles']; minDurationMinutes = $Setting['minDurationMinutes']; maxDurationMinutes = $Setting['maxDurationMinutes']; session = (Get-DemoActivityControlSessionRule -Setting $Setting) }
     $values = [ordered]@{
         KEY_VAULT_URL       = $Name.KeyVaultUri
@@ -1655,6 +1671,7 @@ function Get-DemoActivityControlNotebook {
         DEMO_DATABASE       = [string]$Setting['demoDatabase']
         TENANT_ID           = $TenantId.ToLowerInvariant()
         DEMO_WORKSPACE_ID   = $DemoWorkspaceId.ToLowerInvariant()
+        DEMO_LAKEHOUSE_ID   = $(if ($bind) { $DemoLakehouseId.ToLowerInvariant() } else { '' })
         CATALOG_JSON        = (ConvertTo-Json -InputObject $catalog -Depth 8 -Compress)
         SHOWCASE_JSON       = (ConvertTo-Json -InputObject (Get-DemoActivityControlShowcase) -Depth 8 -Compress)
     }
@@ -1677,9 +1694,17 @@ function Get-DemoActivityControlNotebook {
         $lines[$index] = '{0} = {1}{2}{3}' -f $key, $literal, $comment, $(if ($lines[$index].EndsWith("`n")) { "`n" } else { '' })
     }
     $cell['source'] = $lines
+    if ($bind) {
+        # Get-DemoFabricNotebookDefinition fills the binding's IDs into metadata.dependencies.lakehouse.
+        $lakehouseName = if ($DemoLakehouseName) { $DemoLakehouseName } else { 'LH_DatabaseHub' }
+        $notebook['metadata']['dependencies'] = [ordered]@{ lakehouse = [ordered]@{ default_lakehouse_name = $lakehouseName } }
+    }
     $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-control-nb'
     try {
         $file = Write-DemoPrivateFile -Directory $directory -Name 'NB_DatabaseHub_Control.ipynb' -Content (ConvertTo-Json -InputObject $notebook -Depth 64)
+        if ($bind) {
+            return (Get-DemoFabricNotebookDefinition -Path $file -DisplayName $Name.Notebook -LakehouseId $DemoLakehouseId.ToLowerInvariant() -LakehouseWorkspaceId $DemoWorkspaceId.ToLowerInvariant() -LakehouseName $lakehouseName)
+        }
         return (Get-DemoFabricNotebookDefinition -Path $file -DisplayName $Name.Notebook)
     }
     finally {
@@ -1730,6 +1755,8 @@ function Set-DemoActivityControlFabric {
       virtual network for the whole workspace, which turns off starter pools, so its sessions start in 3 to 5 minutes;
       that's why it's a separate workspace, not a folder.
     The capacity is never resumed, paused, or scaled: when it isn't Active, nothing is created (Manual action required).
+    The notebook's default lakehouse is the demo's, resolved by name (read-only), so Run all saves each history in its
+    own Spark session (CONTROL.FABRIC.LAKEHOUSE; a Warning, with the fallback it means, when it isn't resolved).
     - Folders: https://learn.microsoft.com/rest/api/fabric/core/folders/create-folder
     - Workspaces: https://learn.microsoft.com/rest/api/fabric/core/workspaces/create-workspace
     - Network communication policy: https://learn.microsoft.com/rest/api/fabric/core/workspaces/get-network-communication-policy
@@ -1767,16 +1794,22 @@ function Set-DemoActivityControlFabric {
         & $add 'CONTROL.FABRIC.NOTEBOOK' 'Not selected' ('What if: {0} would be created through the Fabric REST API; the capacity is never resumed, paused, or scaled.' -f $plan) ([ordered]@{ mode = $Mode; notebookSha256 = $notebook.Sha256 }) '' 'https://learn.microsoft.com/rest/api/fabric/core/items/create-item'
         return $results.ToArray()
     }
-    # The demo's workspace by name (Phase 26a, ADR 0021), read-only: deploy.ps1 and configure-fabric.ps1 create it.
-    $resolution = Resolve-DemoFabricConfig -Config $Config -Token $Token -SkipLakehouse -Confirm:$false
+    # The demo's workspace and lakehouse by name (Phase 26a, ADR 0021), read-only: deploy.ps1 and configure-fabric.ps1
+    # create them. The lakehouse becomes the control notebook's default lakehouse (2026-11-14).
+    $resolution = Resolve-DemoFabricConfig -Config $Config -Token $Token -Confirm:$false
     $sharedId = [string]$resolution.WorkspaceId
     if ($sharedId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
         $why = @($resolution.Results | ForEach-Object { [string]$_.message }) -join ' '
         & $add 'CONTROL.FABRIC.NOTEBOOK' 'Manual action required' ('The demo''s Fabric workspace isn''t resolved, so the control notebook wasn''t imported. {0}' -f $why).Trim() @{} 'Run ./scripts/configure-fabric.ps1 or ./scripts/deploy.ps1 first (they create the workspace when fabric.createIfMissing is true), then run setup-activity-control.ps1 again.' 'https://learn.microsoft.com/rest/api/fabric/core/workspaces/list-workspaces'
         return $results.ToArray()
     }
-    # The notebook runs the activity notebook's job in the demo's workspace and links to its report (2026-11-14).
-    $notebook = Get-DemoActivityControlNotebook -Name $Name -Setting $Setting -TenantId ([string]$Config['tenantId']) -DemoWorkspaceId $sharedId
+    $lakehouseId = [string]$resolution.LakehouseId
+    if ($lakehouseId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        $lakehouseId = ''
+    }
+    $lakehouseName = [string]$resolution.LakehouseName
+    # The notebook runs the activity notebook in the demo's workspace and links to its report (2026-11-14).
+    $notebook = Get-DemoActivityControlNotebook -Name $Name -Setting $Setting -TenantId ([string]$Config['tenantId']) -DemoWorkspaceId $sharedId -DemoLakehouseId $lakehouseId -DemoLakehouseName $lakehouseName
     $Config = $resolution.Config
     $workspaceCheck = @(Test-DemoFabricWorkspace -Config $Config -Token $Token)
     $capacity = @($workspaceCheck | Where-Object { $_.checkId -eq 'FABRIC.P5.CAPACITY' }) | Select-Object -First 1
@@ -1895,6 +1928,17 @@ function Set-DemoActivityControlFabric {
     }
     $imported = Import-DemoFabricNotebook @import
     $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status ([string]$imported.status) -Message ('{0} {1}' -f $Name.Notebook, [string]$imported.message) -Evidence ([ordered]@{ workspace = $(if ($Mode -eq 'public') { 'existing' } else { $Name.FabricWorkspace }); folder = $(if ($folderId) { $Name.FabricFolder } else { '' }); mode = $Mode }) -Remediation ([string]$imported.remediation) -DocUrl 'https://learn.microsoft.com/rest/api/fabric/core/items/create-item'))
+    if ([string]$imported.status -eq 'Pass') {
+        # A reference run uses the caller's Spark session, so the history needs no second Spark job (2026-11-14).
+        $runDoc = 'https://learn.microsoft.com/fabric/data-engineering/notebookutils/notebookutils-notebook-run'
+        if ($lakehouseId) {
+            & $add 'CONTROL.FABRIC.LAKEHOUSE' 'Pass' ('{0}''s default lakehouse is the demo''s "{1}", so Run all saves each session''s history in its own Spark session, with no second Spark job for the capacity to admit.' -f $Name.Notebook, $lakehouseName) ([ordered]@{ lakehouseName = $lakehouseName }) '' $runDoc
+        }
+        else {
+            $why = (@($resolution.Results | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq 'FABRIC.RESOLVE.LAKEHOUSE' } | ForEach-Object { ([string]$_.message).TrimEnd('.') }) -join '; ')
+            & $add 'CONTROL.FABRIC.LAKEHOUSE' 'Warning' ('{0} isn''t attached to the demo''s lakehouse ({1}), so Run all saves each history with a separate Spark job, which a capacity whose Spark cores are all in use refuses (HTTP 430); the notebook then says so, with the fix.' -f $Name.Notebook, $(if ($why) { $why } else { 'it wasn''t resolved' })) @{} 'Run ./scripts/deploy.ps1 again: it creates the lakehouse when it''s missing and attaches it to the notebook.' $runDoc
+        }
+    }
     return $results.ToArray()
 }
 

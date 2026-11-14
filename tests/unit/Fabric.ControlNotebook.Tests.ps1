@@ -61,7 +61,7 @@ BeforeAll {
         $definition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $filledConfig } {
             $controlName = Get-DemoActivityControlName -Config $Config
             $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name $controlName -IdentityClientId '99999999-9999-9999-9999-999999999999'
-            Get-DemoActivityControlNotebook -Name $controlName -Setting $setting -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -DemoWorkspaceId 'BBBBBBBB-0000-0000-0000-000000000002'
+            Get-DemoActivityControlNotebook -Name $controlName -Setting $setting -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -DemoWorkspaceId 'BBBBBBBB-0000-0000-0000-000000000002' -DemoLakehouseId 'CCCCCCCC-0000-0000-0000-000000000003' -DemoLakehouseName 'LH_DatabaseHub'
         }
         $file = Join-Path -Path $TestDrive -ChildPath ('filled-{0}{1}.ipynb' -f ($Zone -replace '[^A-Za-z]', ''), $Prefix)
         [System.IO.File]::WriteAllBytes($file, [System.Convert]::FromBase64String($definition.Definition['parts'][0]['payload']))
@@ -69,7 +69,7 @@ BeforeAll {
     }
 
     # Runs every code cell of a filled notebook with stand-ins (no network call leaves the process) and returns what it sent,
-    # the history jobs it started, and what it printed.
+    # the histories it saved (reference runs) or started as jobs, the order of both, and what it printed.
     $script:simulator = Join-Path -Path $TestDrive -ChildPath 'simulate_control.py'
     Set-Content -LiteralPath $script:simulator -Encoding utf8NoBOM -Value @'
 import contextlib
@@ -113,10 +113,11 @@ def iso(value):
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-SENT, JOBS, SECRET_URL = [], [], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
+SENT, JOBS, REFS, ORDER, REFUSED, SECRET_URL = [], [], [], [], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
 VAULT = {"dbhub-session-status": "{}", "dbhub-session-metrics": "{}", "dbhub-activity-webhook": SECRET_URL}
 RUNBOOK = {"session": None, "accepted": None, "minutes": 0}
-CAPACITY = "Inactive" if scenario == "paused" else "Active"
+# The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound" and "full".
+LAKEHOUSE = "" if scenario in ("unbound", "full") else "cccccccc-0000-0000-0000-000000000003"
 
 
 def running_status(session_id, accepted, minutes):
@@ -179,6 +180,18 @@ class Credentials:
         return "simulated-" + audience
 
 
+class Notebook:
+    """notebookutils.notebook: a reference run takes 4 minutes, in "refail" it fails as Fabric's lakehouse check would."""
+    def run(self, path, timeout_seconds=90, arguments=None, workspace=""):
+        arguments = dict(arguments or {})
+        REFS.append({"path": path, "timeout": timeout_seconds, "workspace": workspace, "args": arguments})
+        ORDER.append("history:" + str(arguments.get("SESSION_ID", ""))[:8])
+        if scenario == "refail":
+            raise RuntimeError("The referenced notebook's default lakehouse differs from the caller's.")
+        _sleep(240)
+        return ""
+
+
 class Response:
     def __init__(self, status, body=None, location=""):
         self.status_code, self._body, self.headers = status, body, {"Location": location} if location else {}
@@ -205,6 +218,7 @@ def post(url, data=None, headers=None, timeout=None, json=None):
     if url == SECRET_URL:
         body = __import__("json").loads(data)
         SENT.append(body)
+        ORDER.append("sent:" + body["action"])
         runbook(body)
         return Response(202, {"JobIds": ["job-%d" % len(SENT)]})
     if "arcdataservices.com" in url:
@@ -213,16 +227,17 @@ def post(url, data=None, headers=None, timeout=None, json=None):
 
 
 def request(method, url, json=None, headers=None, timeout=None):
+    # No capacity call: the control never checks, starts, or pauses the capacity (the user, 2026-11-14).
     assert url.startswith(FABRIC + "/"), url
-    if method == "GET" and url.endswith("/workspaces/bbbbbbbb-0000-0000-0000-000000000002"):
-        return Response(200, {"capacityId": "CAP-1"})
-    if method == "GET" and url == FABRIC + "/capacities":
-        return Response(200, {"value": [{"id": "cap-1", "displayName": "fabricdemo", "state": CAPACITY}]})
     if method == "GET" and "/items?type=" in url:
         names = {"Notebook": [("NB_DatabaseHub_LiveActivity", "nb-1")], "Report": [("RPT_DatabaseHub_History", "RPT-1")], "KQLDashboard": []}[url.split("type=")[1]]
         return Response(200, {"value": [{"displayName": name, "id": item} for name, item in names]})
     if method == "POST" and url.endswith("/items/nb-1/jobs/instances?jobType=RunNotebook"):
+        if scenario == "full":
+            REFUSED[0] += 1
+            return Response(430, {"errorCode": "TooManyRequestsForCapacity", "message": "This Spark job can't be run because you have hit a Spark compute or API rate limit."})
         JOBS.append({key: value["value"] for key, value in json["executionData"]["parameters"].items()})
+        ORDER.append("job:" + JOBS[-1].get("SESSION_ID", "")[:8])
         return Response(202, None, FABRIC + "/workspaces/x/items/nb-1/jobs/instances/run-%d" % len(JOBS))
     if method == "GET" and "/jobs/instances/run-" in url:
         return Response(200, {"status": "Completed"})
@@ -232,7 +247,8 @@ def request(method, url, json=None, headers=None, timeout=None):
 fake_requests.post, fake_requests.request = post, request
 sys.modules["requests"] = fake_requests
 sys.modules["pandas"] = types.ModuleType("pandas")
-namespace = {"notebookutils": types.SimpleNamespace(credentials=Credentials())}
+namespace = {"notebookutils": types.SimpleNamespace(credentials=Credentials(), notebook=Notebook(),
+                                                   runtime=types.SimpleNamespace(context={"currentWorkspaceId": "dddddddd-0000-0000-0000-000000000004", "defaultLakehouseId": LAKEHOUSE}))}
 buffer = io.StringIO()
 error = ""
 with contextlib.redirect_stdout(buffer):
@@ -246,7 +262,7 @@ with contextlib.redirect_stdout(buffer):
     except Exception as failure:
         error = "%s: %s" % (type(failure).__name__, failure)
 printed = buffer.getvalue()
-print(json.dumps({"sent": SENT, "jobs": JOBS, "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed}))
+print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "order": ORDER, "refused": REFUSED[0], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed}))
 '@
 
     function Invoke-Simulation([string] $Path, [string] $Scenario, [string] $Start) {
@@ -272,10 +288,11 @@ Describe 'NB_DatabaseHub_Control' {
         $script:notebook['metadata'].Contains('widgets') | Should -BeFalse
     }
 
-    It 'runs on the PySpark kernel with no default lakehouse: it reads and writes no table' {
+    It 'runs on the PySpark kernel, and its repository copy names no lakehouse: deploy.ps1 attaches the demo''s at import' {
         $script:notebook['metadata']['kernelspec']['name'] | Should -Be 'synapse_pyspark'
         $script:notebook['metadata']['language_info']['name'] | Should -BeExactly 'python'
         $script:notebook['metadata'].Contains('dependencies') | Should -BeFalse
+        # The notebook itself reads and writes no table: the activity notebook saves the history, in this session.
         $script:raw | Should -Not -Match 'default_lakehouse|saveAsTable|spark\.sql|spark\.read'
         foreach ($cell in $script:code) {
             $cell.Metadata['microsoft']['language'] | Should -Be 'python'
@@ -299,7 +316,7 @@ Describe 'NB_DatabaseHub_Control' {
             $source | Should -Match ('(?m)^\s+\{{"target": "{0}", "scenario": "showcase"\}},\s*$' -f $target)
         }
         $source | Should -Match '(?m)^WATCH_MINUTES = 30\s'
-        foreach ($empty in 'KEY_VAULT_URL', 'CATALOG_JSON', 'SHOWCASE_JSON', 'TENANT_ID', 'DEMO_WORKSPACE_ID') {
+        foreach ($empty in 'KEY_VAULT_URL', 'CATALOG_JSON', 'SHOWCASE_JSON', 'TENANT_ID', 'DEMO_WORKSPACE_ID', 'DEMO_LAKEHOUSE_ID') {
             $source | Should -Match ('(?m)^{0} = ""' -f $empty)
         }
         $source | Should -Match '(?m)^WEBHOOK_SECRET_NAME = "dbhub-activity-webhook"'
@@ -610,17 +627,28 @@ print(json.dumps(out))
             $text = ConvertTo-Json -InputObject $body -Compress
             (Test-DbHubControlRequest -WebhookData ([pscustomobject]@{ RequestBody = $text }) -Settings $script:runbookSettings).Valid | Should -BeTrue -Because $text
         }
-        # The history: one job in the demo workspace, after the stop, with the session's ID, beats, window, and T4's metrics.
-        @($report.jobs).Count | Should -Be 1
-        $job = $report.jobs[0]
+        # The history: one reference run of the activity notebook in this notebook's own Spark session, after the stop,
+        # with the session's ID, beats, window, T4's metrics, and the demo's workspace and lakehouse; no Spark job.
+        @($report.jobs).Count | Should -Be 0
+        @($report.refs).Count | Should -Be 1
+        $ref = $report.refs[0]
+        $ref.path | Should -BeExactly 'NB_DatabaseHub_LiveActivity'
+        $ref.workspace | Should -Be 'bbbbbbbb-0000-0000-0000-000000000002'
+        $ref.timeout | Should -Be 1800
+        $job = $ref.args
+        $job.WORKSPACE_ID | Should -Be 'bbbbbbbb-0000-0000-0000-000000000002'
+        $job.LAKEHOUSE_ID | Should -Be 'cccccccc-0000-0000-0000-000000000003'
         $job.SESSION_ID | Should -Be $report.sent[0].sessionId
         ($job.SESSION_PLAN | ConvertFrom-Json).beats.Count | Should -BeGreaterThan 20
         ($job.POSTGRES_METRICS | ConvertFrom-Json).sessionId | Should -Be $job.SESSION_ID
         ([datetime]$job.WINDOW_START_UTC).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 14, 13, 55, 0, [System.DateTimeKind]::Utc))
         $job.RESOURCE_GROUP | Should -Be 'rg-dbhub-demo'
         $job.T1_VM_NAME | Should -Be 'sqlvm01'
+        @($report.order) | Should -Be @('sent:session', 'sent:stop', ('history:{0}' -f $job.SESSION_ID.Substring(0, 8)))
         $report.printed | Should -Match 'This session runs 90 minutes, until 15:30 \(UTC\)'
-        $report.printed | Should -Match 'Pass: the demo workspace''s capacity fabricdemo is Active\.'
+        # The capacity runs this notebook, so it isn't checked; the stand-in fails on any capacity call. ("Capacity maxed
+        # out" is a showcase scenario.)
+        $report.printed | Should -Not -Match '(?i)workspace''s capacity|capacity \S+ is (Active|Inactive|Paused)|resume it'
         $report.printed | Should -Match '=== The presenter''s guide: session [0-9a-f]{8}'
         $report.printed | Should -Match 'Database Hub: https://app\.fabric\.microsoft\.com/workloads/fdh/databaseHub\?ctid=aaaaaaaa-0000-0000-0000-000000000001'
         $report.printed | Should -Match 'The history report: https://app\.fabric\.microsoft\.com/groups/bbbbbbbb-0000-0000-0000-000000000002/reports/rpt-1'
@@ -629,6 +657,7 @@ print(json.dumps(out))
         $report.printed | Should -Match 'Now: T4 Read replica lag'
         $report.printed | Should -Match 'Stopped: T4''s read replica deleted, T4 stopped'
         $report.printed | Should -Match 'Waiting \d+ minutes for the last telemetry to arrive'
+        $report.printed | Should -Match 'NB_DatabaseHub_LiveActivity runs in this notebook''s Spark session to save session [0-9a-f]{8}''s history\.'
         $report.printed | Should -Match 'Pass: the history is saved'
     }
 
@@ -638,25 +667,26 @@ print(json.dumps(out))
             return
         }
         # The activity notebook's defaults name the owner's environment (rg-dbhub-demo), and its import fills only the
-        # workspace and the lakehouse, so the job must say which resource group its telemetry comes from.
+        # workspace and the lakehouse, so the history must say which resource group its telemetry comes from.
         $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC' -Prefix 'contoso') -Scenario 'session' -Start '2026-11-14T14:00:00Z'
         $report.error | Should -BeNullOrEmpty
-        @($report.jobs).Count | Should -Be 1
-        $report.jobs[0].RESOURCE_GROUP | Should -Be 'rg-contoso-demo'
-        $report.jobs[0].T2_MACHINE_NAME | Should -Be 'arcsql01'
-        $report.jobs[0].T3_SERVER_PREFIX | Should -Not -BeNullOrEmpty
+        @($report.refs).Count | Should -Be 1
+        $report.refs[0].args.RESOURCE_GROUP | Should -Be 'rg-contoso-demo'
+        $report.refs[0].args.T2_MACHINE_NAME | Should -Be 'arcsql01'
+        $report.refs[0].args.T3_SERVER_PREFIX | Should -Not -BeNullOrEmpty
     }
 
     It 'runs Run all in <Case>' -ForEach @(
-        @{ Case = 'a paused capacity: it says so and starts nothing'; Scenario = 'paused'; Start = '2026-11-14T14:00:00Z'; Sent = @(); Jobs = 0; Printed = 'Manual action required: the demo workspace''s capacity fabricdemo is Inactive, so .* nothing was started\. Fix: resume it .* This notebook never resumes or pauses a capacity\.' }
-        @{ Case = 'a session that already runs: it follows that one and ends it, rather than start another'; Scenario = 'active'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Jobs = 1; Printed = 'A session already runs \(session aaaaaaaa, until 15:10, UTC\): this Run all follows it' }
-        @{ Case = 'the evening, too close to the auto-shutdown: nothing starts, and it says how to change it'; Scenario = 'late'; Start = '2026-11-14T18:45:00Z'; Sent = @(); Jobs = 0; Printed = 'Nothing is started: .* too soon for a session of at least 30 minutes\.\s+Fix: Run all again earlier in the day, or set autoShutdownTime' }
-        @{ Case = 'the late afternoon: it says before it starts when the session ends and why'; Scenario = 'capped'; Start = '2026-11-14T17:45:00Z'; Sent = @('session', 'stop'); Jobs = 1; Printed = 'This session runs 60 of the 90 minutes asked: it ends at 18:45' }
-        @{ Case = 'an earlier session''s metrics in the vault: its history is saved first, while this one starts'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Jobs = 2; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault' }
-        @{ Case = 'Stop now: it ends the session that runs, its history saved too'; Scenario = 'stopnow'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Jobs = 1; Printed = '=== Stop now: stopping session aaaaaaaa ===' }
-        @{ Case = 'MODE "check": the plan and the checks, and nothing sent'; Scenario = 'check'; Start = '2026-11-14T14:00:00Z'; Sent = @(); Jobs = 0; Printed = 'MODE is "check", so nothing was sent\.' }
-        @{ Case = 'WAIT_FOR_END False: the session goes on, and its auto-stop ends it'; Scenario = 'nowait'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Jobs = 0; Printed = 'The session goes on until 15:30 \(UTC\)\. Its auto-stop at 15:40' }
-        @{ Case = 'a runbook that refuses the session: the reason and the fix'; Scenario = 'refused'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Jobs = 0; Printed = '(?s)A run is already active.*Fix: Wait until it ends, or run the notebook''s Stop now cell first\..*Nothing runs: A run is already active' }
+        @{ Case = 'a session that already runs: it follows that one and ends it, rather than start another'; Scenario = 'active'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Printed = 'A session already runs \(session aaaaaaaa, until 15:10, UTC\): this Run all follows it' }
+        @{ Case = 'the evening, too close to the auto-shutdown: nothing starts, and it says how to change it'; Scenario = 'late'; Start = '2026-11-14T18:45:00Z'; Sent = @(); Refs = 0; Jobs = 0; Printed = 'Nothing is started: .* too soon for a session of at least 30 minutes\.\s+Fix: Run all again earlier in the day, or set autoShutdownTime' }
+        @{ Case = 'the late afternoon: it says before it starts when the session ends and why'; Scenario = 'capped'; Start = '2026-11-14T17:45:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Printed = 'This session runs 60 of the 90 minutes asked: it ends at 18:45' }
+        @{ Case = 'an earlier session''s metrics in the vault: its history is saved right after the start is sent'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
+        @{ Case = 'Stop now: it ends the session that runs, its history saved too'; Scenario = 'stopnow'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Printed = '=== Stop now: stopping session aaaaaaaa ===' }
+        @{ Case = 'MODE "check": the plan and the checks, and nothing sent'; Scenario = 'check'; Start = '2026-11-14T14:00:00Z'; Sent = @(); Refs = 0; Jobs = 0; Printed = 'MODE is "check", so nothing was sent\.' }
+        @{ Case = 'WAIT_FOR_END False: the session goes on, and its auto-stop ends it'; Scenario = 'nowait'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Refs = 0; Jobs = 0; Printed = 'The session goes on until 15:30 \(UTC\)\. Its auto-stop at 15:40' }
+        @{ Case = 'a runbook that refuses the session: the reason and the fix'; Scenario = 'refused'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Refs = 0; Jobs = 0; Printed = '(?s)A run is already active.*Fix: Wait until it ends, or run the notebook''s Stop now cell first\..*Nothing runs: A run is already active' }
+        @{ Case = 'a notebook without the demo''s lakehouse: the history runs as a job in the demo workspace, and it says why'; Scenario = 'unbound'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 0; Jobs = 1; Printed = 'NB_DatabaseHub_LiveActivity runs as a job in the demo workspace instead, because this notebook''s default lakehouse isn''t the demo''s \(none is attached; \./scripts/deploy\.ps1 attaches it\)\.' }
+        @{ Case = 'a reference run that fails: the history runs as a job, with the reason'; Scenario = 'refail'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 1; Printed = 'runs as a job in the demo workspace instead, because it didn''t finish in this session \(RuntimeError: The referenced notebook''s default lakehouse differs' }
     ) {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
@@ -666,16 +696,44 @@ print(json.dumps(out))
         $report.error | Should -BeNullOrEmpty
         $report.leaked | Should -BeFalse
         @($report.sent | ForEach-Object action) | Should -Be $Sent
+        @($report.refs).Count | Should -Be $Refs
         @($report.jobs).Count | Should -Be $Jobs
         $report.printed | Should -Match $Printed
+        $report.printed | Should -Not -Match 'Warning: the session''s history wasn''t saved'
         if ($Scenario -eq 'leftover') {
-            $report.jobs[0].SESSION_ID | Should -Be ('e' * 32)
+            # Its metrics are read before the start, and its history saved right after the start is sent.
+            $session = $report.sent[0].sessionId
+            @($report.order) | Should -Be @('sent:session', 'history:eeeeeeee', 'sent:stop', ('history:{0}' -f $session.Substring(0, 8)))
+            $report.refs[0].args.SESSION_ID | Should -Be ('e' * 32)
+            $report.refs[0].args.PSObject.Properties.Name | Should -Contain 'POSTGRES_METRICS'
+            $report.refs[1].args.SESSION_ID | Should -Be $session
+        }
+        if ($Scenario -in 'unbound', 'refail') {
+            $report.jobs[0].SESSION_ID | Should -Be $report.sent[0].sessionId
             $report.jobs[0].PSObject.Properties.Name | Should -Contain 'POSTGRES_METRICS'
-            $report.jobs[1].SESSION_ID | Should -Be $report.sent[0].sessionId
+            $report.printed | Should -Match 'Pass: the history is saved'
         }
         if ($Scenario -in 'active', 'stopnow') {
             $report.sent[0].sessionId | Should -Be ('a' * 32)
         }
+    }
+
+    It 'says when a full capacity refuses the history job (HTTP 430), and how the history still gets saved' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # Learn: notebook jobs started through the API aren't queued, so a capacity whose Spark cores are all in use refuses
+        # them with HTTP 430. That's only the fallback: with the demo's lakehouse attached, the history needs no job at all.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'full' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+        @($report.refs).Count | Should -Be 0
+        @($report.jobs).Count | Should -Be 0
+        $report.refused | Should -Be 3
+        $report.printed | Should -Match 'Warning: the session''s history wasn''t saved: the capacity refused the job 3 times: TooManyRequestsForCapacity \(HTTP 430\), because all its Spark cores are in use, this notebook''s session among them\.'
+        $report.printed | Should -Match ('Fix: the next Run all saves it first, while its metrics are in the control vault .*SESSION_ID = "{0}"' -f $report.sent[0].sessionId)
+        $report.printed | Should -Not -Match 'Pass: the history is saved'
     }
 
     It 'says in the demo''s own time zone when the session ends (needs Python''s time zone data)' {
@@ -818,6 +876,27 @@ Describe 'The notebook deploy.ps1 imports' {
         $showcase['scenarios']['blocking-chain']['sql']['surface'] | Should -Be 'Performance'
         $text | Should -Not -Match '(?i)webhooks\?token='
         @($filled['cells'] | Where-Object { $_['cell_type'] -eq 'code' } | ForEach-Object { @($_['outputs']).Count } | Where-Object { $_ -gt 0 }) | Should -BeNullOrEmpty
+        # Without the demo's lakehouse, the copy names none, and the history runs as a job (the fallback).
+        $source | Should -Match '(?m)^DEMO_LAKEHOUSE_ID = ""'
+        $filled['metadata'].Contains('dependencies') | Should -BeFalse
+    }
+
+    It 'attaches the demo''s lakehouse as the copy''s default lakehouse, so its history can run in the notebook''s own session' {
+        $notebookDefinition = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $script:config; Json = $script:settingsJson } {
+            Get-DemoActivityControlNotebook -Name (Get-DemoActivityControlName -Config $Config) -Setting ($Json | ConvertFrom-Json -AsHashtable) -TenantId 'AAAAAAAA-0000-0000-0000-000000000001' -DemoWorkspaceId 'BBBBBBBB-0000-0000-0000-000000000002' -DemoLakehouseId 'CCCCCCCC-0000-0000-0000-000000000003' -DemoLakehouseName 'LH_DatabaseHub'
+        }
+        $notebookDefinition.LakehouseRebound | Should -BeTrue
+        $filled = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($notebookDefinition.Definition['parts'][0]['payload'])) | ConvertFrom-Json -AsHashtable -Depth 64
+        $binding = $filled['metadata']['dependencies']['lakehouse']
+        $binding['default_lakehouse'] | Should -Be 'cccccccc-0000-0000-0000-000000000003'
+        $binding['default_lakehouse_workspace_id'] | Should -Be 'bbbbbbbb-0000-0000-0000-000000000002'
+        $binding['default_lakehouse_name'] | Should -Be 'LH_DatabaseHub'
+        @($binding['known_lakehouses'] | ForEach-Object { $_['id'] }) | Should -Be @('cccccccc-0000-0000-0000-000000000003')
+        $source = (@(@($filled['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]['source']) -join '')
+        $source | Should -Match '(?m)^DEMO_LAKEHOUSE_ID = "cccccccc-0000-0000-0000-000000000003"\s+#'
+        $source | Should -Match '(?m)^DEMO_WORKSPACE_ID = "bbbbbbbb-0000-0000-0000-000000000002"'
+        # The binding goes only into the uploaded copy: the repository's notebook stays unbound (ADR 0021).
+        $script:notebook['metadata'].Contains('dependencies') | Should -BeFalse
     }
 
     It 'converts the auto-shutdown''s Windows time zone to its IANA name, and falls back to UTC for one it doesn''t know' {
