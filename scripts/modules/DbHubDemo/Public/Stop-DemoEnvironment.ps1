@@ -25,7 +25,9 @@ function Stop-DemoEnvironment {
       what it then bills, and whether the nightly safety stop (ADR 0024) stops it again (Phase 28 follow-up); its
       storage and the Defender plans a tenant policy enables are billed while it's stopped.
       With the on-demand activity control (control.enabled, ADR 0020), it first removes a pending auto-stop, so
-      it can't deallocate a later session's VMs (STOP.CONTROL.AUTOSTOP).
+      it can't deallocate a later session's VMs (STOP.CONTROL.AUTOSTOP). The busy marker (2026-11-14) is cleared, a
+      deferred nightly pass removed, and the VMs' auto-shutdown put back at autoShutdownTime, since everything stops now
+      (STOP.NIGHTLYSTOP when something changed; Resolve-DemoBusyNightlyStop).
     - -ParkT2 (C4): only the T2 side, and only T2's profile goes off; T1, T3, and T4 keep running, for
       agent-focused demos on T1 and T3.
     - -RemoveBastionOnly: only Bastion, the password rotation, and the guided stop's record; with -IfExpired, a Bastion
@@ -150,6 +152,13 @@ function Stop-DemoEnvironment {
     if (-not $ParkT2 -and (Get-DemoActivityControlSetting -Config $Config).Enabled) {
         # The on-demand activity control's pending auto-stop (ADR 0020) would deallocate a later session's VMs.
         $results.Add((Clear-DemoActivityControlAutoStop -Config $Config -Confirm:$false))
+    }
+    if (-not $ParkT2) {
+        # The busy marker (2026-11-14): everything stops now, so nothing waits for the nightly stop any more; a deferred
+        # pass goes, and the VMs' auto-shutdown comes back to autoShutdownTime (STOP.NIGHTLYSTOP, when something changed).
+        foreach ($item in @(Resolve-DemoBusyNightlyStop -Config $Config -State $state -Purpose Stop -Confirm:$false)) {
+            $results.Add($item)
+        }
     }
 
     $power = @{}

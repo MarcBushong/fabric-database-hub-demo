@@ -9,7 +9,8 @@ function Set-DemoDeploymentState {
     BundleChunkCount, RunnerSha256, RunnerChunkCount, BundleSentTo, RunnerSentTo (arrays become a comma list),
     NetworkMode, T3UseFreeLimit, T3AdminGroupName, BastionExpiresUtc, HostPasswordSet, FabricCapacityResumed and
     FabricCapacityResumedUtc (fabric.manageCapacity, Phase 26b), GuidedStopUtc and T4Sku (Phase 28), T2BuildUtc (Phase
-    28 review follow-up), T2InstallMode (2026-11-09), and T4Replica and T4ReplicaSize (2026-11-13, ADR 0025). A Stage value also
+    28 review follow-up), T2InstallMode (2026-11-09), T4Replica and T4ReplicaSize (2026-11-13, ADR 0025), and BusyUntilUtc
+    and BusyBy (the busy marker, 2026-11-14). A Stage value also
     sets StageUtc. A value that the Azure CLI can't carry safely on Windows (a double quote or a percent sign)
     is left out with a warning. The template keeps these tags on every redeployment, because deploy.ps1 passes
     the group's existing tags (ADR 0002).

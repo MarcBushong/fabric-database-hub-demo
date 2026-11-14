@@ -107,6 +107,11 @@ function Get-DemoDeploymentStateTagName {
         # zone the last replica was created with ("Standard_D4ds_v5@any"), where the next one starts while it still fits T4.
         T4Replica                = 'DbHubT4Replica'
         T4ReplicaSize            = 'DbHubT4ReplicaSize'
+        # 2026-11-14: the busy marker (BusyMarkerHelpers.ps1). Until when a deploy.ps1 run, or a session, that's still going
+        # keeps the nightly stop waiting (ISO 8601 UTC; empty when none), and who set it: deploy, deploy-grace (a run the
+        # nightly stop waited for, which ended), or session. The safety stop's runbook reads them (Get-DbHubBusyMarker).
+        BusyUntilUtc             = 'DbHubBusyUntilUtc'
+        BusyBy                   = 'DbHubBusyBy'
     }
 }
 

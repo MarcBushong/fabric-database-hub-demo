@@ -743,6 +743,8 @@ function Invoke-DemoParallelDeployment {
                 & $collectPolicy 0
                 & $collectMonitoring 0
                 & $signInTick
+                # The busy marker's refresher (2026-11-14) runs beside the tracks; its lines reach the console here.
+                Receive-DemoBusyMarkerOutput
             }
             catch {
                 Write-DemoLog -Level Warning -Message ('The policy inventory, T1''s monitoring check, or the Insights app''s sign-in couldn''t be read this time: {0}' -f $_.Exception.Message)

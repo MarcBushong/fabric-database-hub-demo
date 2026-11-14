@@ -29,6 +29,11 @@ When the demo resource group doesn't exist (destroyed) or can't be read, it logs
 output holds the log and one result line, 'DBHUB-STOP <json>'. A Nightly or T3Check job that couldn't do its work
 (status Partial or NotGranted) fails after that line, so the account's job history shows it.
 
+Scope Nightly, T3Check, and T4 change nothing while the demo resource group's busy marker (DbHubBusyUntilUtc) is ahead,
+by at most 3 hours: a deploy.ps1 run or a demo session that's still running sets it. Their status is then Deferred, and
+the job completes. deploy.ps1 schedules a later pass, dbhub-safety-deferred, that stops everything once the marker has
+expired, the same night (2026-11-14).
+
 .PARAMETER Scope
 All (the default), T4, Nightly, or T3Check.
 #>

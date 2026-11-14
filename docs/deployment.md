@@ -576,6 +576,17 @@ Every `deploy.ps1` sets it up (since 2026-11-05, [ADR 0024](adr/0024-nightly-saf
 - **What it does each night** is in the README's [what stops or pauses on its own](../README.md#what-stops-or-pauses-on-its-own). `status.ps1` (`STATUS.SAFETYSTOP`) and `validate.ps1 -Area Cost` (`COST.SAFETYSTOP`) show it, and each job is in the account's job history (Process Automation > Jobs).
 - **An Owner's one command,** `./scripts/grant-safety-stop.ps1 [-ConfigPath <path>] [-WhatIf]`, runs the subscription guard and then creates the role and its assignment only, and writes `out/grant-safety-stop.jsonl`. A destroy deletes the assignment with the group, so after a redeploy by someone who can't assign roles it's needed again.
 
+### A run the nightly stop waits for (2026-11-14)
+
+`deploy.ps1` marks the demo resource group busy while it runs, so the nightly stop never cuts it off ([ADR 0024's amendment](adr/0024-nightly-safety-stop.md#amendment-the-busy-marker-so-the-nightly-stop-doesnt-cut-off-a-run-2026-11-14)):
+
+1. **While it runs:** a process of its own, with its own subscription guard, sets `DbHubBusyUntilUtc` 60 minutes ahead and moves it on every 10 minutes. The stop, its T3 check, and the control's T4 stop change nothing while it's ahead (their job result says `Deferred`), by at most 3 hours.
+2. **When the stop's time falls inside the run:** the status page's **Nightly stop** row and the console say so; `dbhub-safety-deferred` is scheduled to run the stop hourly from the marker's end until the next morning; and the VMs' auto-shutdown moves past the run, and again after the template sets it back.
+3. **At the end:** a run that went past the stop's time keeps the demo up 60 minutes more, then the deferred pass and the auto-shutdown stop it. `DEPLOY.NIGHTLYSTOP`, a **Warning** that doesn't block **DONE**, says when, and so do **DONE** and the status page. To keep the demo running tonight, run `./scripts/start-demo.ps1`; to stop it now, `./scripts/stop-demo.ps1`. A run that ended before the stop's time puts everything back.
+4. **A run that was abandoned** (its window closed) stops being marked: the marker expires within an hour, the deferred pass stops the demo that night, and the moved auto-shutdown stops the VMs even without the safety stop's role. `status.ps1` then shows the moved auto-shutdown (`STATUS.NIGHTLYSTOP`) until the next `start-demo.ps1`, `stop-demo.ps1`, or `deploy.ps1` puts it back.
+
+An environment deployed before 2026-11-14 gets it with its next plain `./scripts/deploy.ps1`, which publishes the new `DbHub-Stop`; nothing else changes until a run crosses the stop's time.
+
 ## Cost guardrails
 
 | Guardrail | Where |

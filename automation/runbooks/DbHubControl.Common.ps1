@@ -1011,6 +1011,96 @@ function Get-DbHubResourceGroupTag {
     return [pscustomobject]@{ GroupState = $state; Tags = (Get-DbHubMember -InputObject $group.Body -Name 'tags'); Error = $group.Error }
 }
 
+function Get-DbHubBusyMarker {
+    <#
+    .SYNOPSIS
+    The demo resource group's busy marker (2026-11-14): DbHubBusyUntilUtc, which deploy.ps1 and a control session set
+    and refresh while they run, and DbHubBusyBy, who set it (deploy, deploy-grace, or session). Returns Active, UntilUtc,
+    By, and Reason. Active only while the marker is ahead of now by at most busyMarkerMaximumMinutes (180 by default): a
+    marker further ahead can't come from a refresh, so it's ignored, and an expired one means its run ended or was
+    abandoned. Pure, apart from the clock.
+    #>
+    param(
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [AllowNull()]
+        [object] $NowUtc = $null
+    )
+
+    $now = if ($null -ne $NowUtc) { ([datetime]$NowUtc).ToUniversalTime() } else { [DateTime]::UtcNow }
+    $text = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubBusyUntilUtc')
+    $by = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubBusyBy')
+    if ($by -notmatch '^[a-z][a-z-]{0,31}$') {
+        $by = ''
+    }
+    $answer = [pscustomobject]@{ Active = $false; UntilUtc = $null; By = $by; Reason = 'None' }
+    if (-not $text) {
+        return $answer
+    }
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if (-not [datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref] $parsed)) {
+        $answer.Reason = 'Unreadable'
+        return $answer
+    }
+    $answer.UntilUtc = $parsed
+    $maximum = [int](Get-DbHubMember -InputObject $Settings -Name 'busyMarkerMaximumMinutes')
+    if ($maximum -le 0) {
+        $maximum = 180
+    }
+    if ($parsed -le $now) {
+        $answer.Reason = 'Expired'
+    }
+    elseif ($parsed -gt $now.AddMinutes($maximum)) {
+        $answer.Reason = 'TooFar'
+    }
+    else {
+        $answer.Active = $true
+        $answer.Reason = 'Active'
+    }
+    return $answer
+}
+
+function Get-DbHubBusyDeferral {
+    # A stop's result when the busy marker defers it (Get-DbHubBusyMarker): Deferred, with who's busy and until when; or $null.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Label,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Context
+    )
+
+    $busy = Get-DbHubBusyMarker -Tags $Tags -Settings $Context.Settings -NowUtc $Context.NowUtc
+    if (-not $busy.Active) {
+        if ($busy.Reason -in 'TooFar', 'Unreadable') {
+            Write-DbHubLog -Context $Context -Message ('The busy marker ({0}) was ignored: it''s {1}, so the stop goes on.' -f [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubBusyUntilUtc'), $(if ($busy.Reason -eq 'TooFar') { 'further ahead than a run refreshes it' } else { 'not a time' }))
+        }
+        return $null
+    }
+    $who = switch ($busy.By) {
+        'deploy' { 'deploy.ps1 is still running' }
+        'deploy-grace' { 'deploy.ps1 finished after the nightly stop, and its grace period runs' }
+        'session' { 'a demo session is running' }
+        default { 'a run is still busy' }
+    }
+    $until = $busy.UntilUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    $message = 'Deferred: {0} (busy until {1}), so nothing was stopped now. The run stops everything at its end, or a later pass does once the marker expires.' -f $who, $until
+    Write-DbHubLog -Context $Context -Message $message
+    $result = [pscustomobject]@{ action = $Label; status = 'Deferred'; message = $message; busyUntil = $until; busyBy = $busy.By }
+    if ($Label -eq 'check-t3') {
+        $result | Add-Member -NotePropertyName 't3' -NotePropertyValue 'Deferred'
+    }
+    return $result
+}
+
 function Get-DbHubT3State {
     # T3's database (<t3ServerPrefix><deploymentId>/<demoDatabase>) from the group's deploymentId tag: Present, Missing,
     # or Unknown.
@@ -2862,7 +2952,8 @@ function Invoke-DbHubStop {
     Nightly (the nightly safety stop, ADR 0024): deallocates the VMs and stops T4 (Invoke-DbHubNightlyStop). Scope T3Check (its
     check, ADR 0024): reads T3's status and stops T4 when it runs (Invoke-DbHubT3Check). None of them starts anything.
     Nightly and T3Check say when the safety stop's identity can't read the demo resource group (NotGranted: its role isn't
-    assigned).
+    assigned). Nightly, T3Check, and T4 are Deferred while the group's busy marker is active (Get-DbHubBusyMarker,
+    2026-11-14): a deploy.ps1 run or a demo session that's still running isn't cut off.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -2897,6 +2988,14 @@ function Invoke-DbHubStop {
             return [pscustomobject]@{ action = $label; status = $status; message = ('Nothing was done: {0}.' -f $why) }
         }
         return [pscustomobject]@{ action = $label; status = 'NoEnvironment'; message = ('The demo resource group is {0}; nothing was stopped.' -f $group.GroupState) }
+    }
+    if ($Scope -in 'Nightly', 'T3Check', 'T4') {
+        # The busy marker (2026-11-14): a deploy.ps1 run or a demo session that's still running isn't cut off by a nightly
+        # pass; an expired marker no longer defers anything (Get-DbHubBusyMarker).
+        $deferred = Get-DbHubBusyDeferral -Label $label -Tags $group.Tags -Context $Context
+        if ($null -ne $deferred) {
+            return $deferred
+        }
     }
     if ($Scope -eq 'T3Check') {
         return (Invoke-DbHubT3Check -Context $Context -Tags $group.Tags -PollSeconds $PollSeconds)

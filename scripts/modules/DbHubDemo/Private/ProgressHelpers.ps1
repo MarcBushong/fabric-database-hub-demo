@@ -200,6 +200,9 @@ function Get-DemoProgressCatalog {
         # (Invoke-DemoHistorySnapshotStep, 2026-11-06).
         $validation.Add((& $step 'Fabric.History' 'History report''s snapshot (NB_DatabaseHub_LiveActivity, once, analyze-only)' @('Validation') $true))
     }
+    # The busy marker (2026-11-14): deploy.ps1's refresher says here when the nightly stop waits for this run, and its end
+    # says when the demo stops tonight (Update-DemoBusyMarker, Complete-DemoBusyMarkerRun).
+    $validation.Add((& $step 'NightlyStop' 'Nightly stop (waits while this run works, then stops the demo the same night)' @() $true))
     $tracks.Add([ordered]@{ name = 'Validation'; label = 'Validation'; steps = $validation.ToArray() })
     return $tracks.ToArray()
 }

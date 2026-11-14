@@ -289,7 +289,7 @@ try {
     $waitForT2Now = -not $NoWaitForT2 -and (-not $environment.Ci -or $WaitForT2) -and -not $Sequential
     # A Ctrl+C while the run's experience starts still lets the PC sleep again (the outer finally block below).
     $awake = 'starting'
-    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -Note @($selfUpdate.Note) -WhatIf:$whatIf -Confirm:$false
+    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -Note @($selfUpdate.Note) -BusyMarker -WhatIf:$whatIf -Confirm:$false
     $results = @($selfUpdate.Result | Where-Object { $null -ne $_ })
     $outcome = $null
     $finished = $false
@@ -350,6 +350,11 @@ try {
         if (-not $finished) {
             Write-DemoDeploymentOutcome -Outcome $outcome -WorkspaceName $workspaceName
         }
+    }
+
+    # What the ending added (DEPLOY.NIGHTLYSTOP: when the nightly stop waited for this run, and when the demo stops).
+    if ($null -ne $outcome -and $null -ne $outcome.PSObject.Properties['Added']) {
+        $results = @($results) + @($outcome.Added | Where-Object { $null -ne $_ })
     }
 
     # A remediation that says to run deploy.ps1 names this run's own command, with its -ConfigPath (2026-11-06).

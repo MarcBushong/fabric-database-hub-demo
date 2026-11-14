@@ -231,6 +231,12 @@ function Start-DemoEnvironment {
             $results.Add((New-DemoResult -CheckId 'START.CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('A pending on-demand auto-stop couldn''t be checked: {0}. If one is pending, it deallocates the VMs at its time; the start carried on.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'status.ps1 shows whether one is pending (STATUS.CONTROL). To cancel it, delete the schedule dbhub-autostop in the control Automation account aa-<prefix>-control (Shared resources > Schedules) in the Azure portal, or run start-demo.ps1 again.' -DocUrl 'https://learn.microsoft.com/rest/api/automation/schedule/delete'))
         }
     }
+    # The busy marker (2026-11-14): this session takes over from a run the nightly stop waited for, so the deferred pass
+    # goes and the VMs' auto-shutdown comes back to autoShutdownTime; a deploy.ps1 or a session that's still running keeps
+    # its marker (START.NIGHTLYSTOP, when something changed; Resolve-DemoBusyNightlyStop).
+    foreach ($item in @(Resolve-DemoBusyNightlyStop -Config $Config -State $state -Purpose Start -Confirm:$false)) {
+        $results.Add($item)
+    }
     # 2026-11-09 (user-directed: T4 is part of every deployment): an earlier run's "no T4" record doesn't hold any more, so
     # it goes here too, not only at the next deploy.ps1 that deploys the template.
     $recordedOff = [string](Get-DemoMemberValue -InputObject $state -Name 'T4Sku')

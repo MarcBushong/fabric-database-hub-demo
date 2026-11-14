@@ -1309,6 +1309,34 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         Get-Content -LiteralPath (Join-Path -Path $script:out -ChildPath 'deploy-status.html') -Raw | Should -Match 'Stopped, not done'
         InModuleScope DbHubDemo { $script:DemoRunCancelWatch } | Should -BeFalse
     }
+
+    It 'starts the busy marker''s refresher only with -BusyMarker (deploy.ps1), and its ending settles the nightly stop, adds the result, and says it (2026-11-14)' {
+        $script:settled = New-DemoResult -CheckId 'DEPLOY.NIGHTLYSTOP' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The nightly stop waited for this run: its 19:00 stop (Pacific Standard Time) found deploy.ps1 still running, so it changed nothing. The demo now stops at 21:35 (Pacific Standard Time), 60 minutes after this run ended.' -Remediation 'To keep the demo running tonight, run ./scripts/start-demo.ps1. To stop the demo now, run ./scripts/stop-demo.ps1.'
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoBusyMarkerRun -MockWith { [pscustomobject]@{ Job = $null; StartedUtc = [DateTime]::UtcNow; By = 'deploy'; Completed = $false } }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoBusyMarkerRun -MockWith { @($script:settled) }
+        $config = New-TestConfig -WithT4
+        $plain = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+        $plain.Busy | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoBusyMarkerRun -Times 0 -Exactly -Because 'a run without -BusyMarker (the unit tests, a what-if) starts no process'
+        $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -BusyMarker -Confirm:$false
+        $run.Busy.By | Should -Be 'deploy'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoBusyMarkerRun -Times 1 -Exactly -ParameterFilter { $ProgressPath -eq $run.ProgressPath }
+        $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result @(New-DoneResult) -State (New-FinishedState -WithT4)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Complete-DemoBusyMarkerRun -Times 1 -Exactly -ParameterFilter { $null -ne $Run -and $Run.By -eq 'deploy' -and -not $Stopped }
+        $outcome.Kind | Should -Be 'Done' -Because 'a Warning never keeps the deployment from DONE'
+        @($outcome.Added).checkId | Should -Be 'DEPLOY.NIGHTLYSTOP'
+        $note = 'The nightly stop waited for this run: its 19:00 stop (Pacific Standard Time) found deploy.ps1 still running, so it changed nothing. The demo now stops at 21:35 (Pacific Standard Time), 60 minutes after this run ended. To keep the demo running tonight, run ./scripts/start-demo.ps1. To stop the demo now, run ./scripts/stop-demo.ps1.'
+        @($outcome.Notes) | Should -Contain $note
+        @(InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) | Should -Contain $note
+        $model = Get-Content -LiteralPath $run.ProgressPath -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $model['run']['reason'] | Should -Match ([regex]::Escape('The demo now stops at 21:35 (Pacific Standard Time)'))
+        # The status page has its Nightly stop row, which the refresher and the ending fill in.
+        @($model['tracks'] | ForEach-Object { @($_['steps']) } | Where-Object { $_['id'] -eq 'NightlyStop' }).Count | Should -Be 1
+        # A stopped run says so to the ending, which only ends the marker.
+        $stopped = Start-DemoDeploymentRun -Config $config -WaitForT2 -OutputDirectory $script:out -BusyMarker -Confirm:$false
+        $null = Complete-DemoDeploymentRun -Run $stopped -Config $config -Result @() -Stopped
+        Should -Invoke -ModuleName DbHubDemo -CommandName Complete-DemoBusyMarkerRun -Times 1 -Exactly -ParameterFilter { $Stopped }
+    }
 }
 
 Describe 'The host credential an earlier guided stop handed over, rotated and cleaned up (ADR 0009)' {

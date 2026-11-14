@@ -2074,7 +2074,8 @@ function Get-DemoT4RestartCoverage {
             else {
                 $stopStatus = if ($null -ne $runs.Stop) { [string](Get-DemoMemberValue -InputObject $runs.Stop.Result -Name 'status') } else { '' }
                 $evidence['nightlyLastRun'] = if ($null -eq $runs.Stop) { 'none' } else { '{0} ({1})' -f $runs.Stop.Status, $(if ($stopStatus) { $stopStatus } else { 'no result line' }) }
-                if ($null -ne $runs.Stop -and ($runs.Stop.Status -ne 'Completed' -or $stopStatus -ne 'Stopped')) {
+                # Deferred (2026-11-14): a run was still going, so it changed nothing, by design; it isn't a failed run.
+                if ($null -ne $runs.Stop -and ($runs.Stop.Status -ne 'Completed' -or $stopStatus -notin 'Stopped', 'Deferred')) {
                     $when = if ($null -ne $runs.Stop.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$runs.Stop.CreatedUtc) } else { '' }
                     $gap = @('StopJob', ('the nightly safety stop''s last run{0} didn''t finish its work (job {1}), so it may not stop T4' -f $when, $runs.Stop.Status), 'Run ./scripts/status.ps1 to see what it said (STATUS.SAFETYSTOP), fix that, then run this again.')
                 }

@@ -22,6 +22,7 @@ These are for an agent asked to **set up, deploy, upgrade, or try** this demo fo
 - **The ending banner:** **DONE**, or **NOT DONE** with its reason and the exact next command it prints. Without **DONE**, the setup isn't finished; say so.
 - **What it changed in an existing environment,** when these lines appear: `DEPLOY.T2.REBUILD`, `DEPLOY.T2.MODE`, `DEPLOY.T4.MISSING`, `DEPLOY.T4.RETRY`, `DEPLOY.T4.OFF`, `DEPLOY.T4.REPLICA` (T4's read replica it added, or why not), and `CONTROL.RUNBOOKS` (the on-demand control's runbooks, republished, or a **Warning** with the command).
 - **Every automatic size change:** `DEPLOY.T4.FALLBACK` and `DEPLOY.T4.REPLICA.FALLBACK` say what was asked for, what Azure refused, what was deployed, and the cost difference; pass them on.
+- **When the demo stops tonight,** when `DEPLOY.NIGHTLYSTOP` is a **Warning**: the run was still going at the nightly stop's time, which waited for it, and the demo now stops 60 minutes after the run. Pass on its time and both choices: `./scripts/start-demo.ps1` keeps it running tonight, `./scripts/stop-demo.ps1` stops it now. Don't change the schedules yourself.
 - **Whether it updated itself from GitHub:** the first line, "Updated this copy from GitHub's main: ... to ...", or the `DEPLOY.SELFUPDATE` **Warning** with its command.
 - **What it lists under Please confirm:** for example the Database Hub tenant setting, which only a Fabric administrator can read, and Database Hub's own pages, which have no API.
 

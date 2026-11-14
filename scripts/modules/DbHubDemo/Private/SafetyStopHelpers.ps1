@@ -274,6 +274,8 @@ function Get-DemoSafetyStopRunbookSetting {
         autoShutdownTimeZone  = $(if ($Config['autoShutdownTimeZone']) { [string]$Config['autoShutdownTimeZone'] } else { 'UTC' })
         t4WaitMinutes         = 10
         t3CheckMarginMinutes  = 10
+        # The busy marker (2026-11-14): a marker further ahead than this is ignored, as no refresh writes it.
+        busyMarkerMaximumMinutes = [int]$script:BusyMarkerSetting['maximumMinutes']
         apiVersions           = $apiVersions
     }
 }
@@ -1045,7 +1047,8 @@ function Get-DemoSafetyStopStatus {
             $evidence['lastStopJobId'] = $runs.Stop.JobId
             $evidence['lastStop'] = $stopStatus
             $parts.Add(('Last run {0:yyyy-MM-dd HH:mm} UTC (job {1}): {2}' -f ([datetime]$runs.Stop.CreatedUtc), $runs.Stop.Status, $stopText.TrimEnd('.') + '.'))
-            if ($runs.Stop.Status -ne 'Completed' -or $stopStatus -ne 'Stopped') {
+            # Deferred (2026-11-14): a deploy.ps1 run was still going, so it changed nothing, by design.
+            if ($runs.Stop.Status -ne 'Completed' -or $stopStatus -notin 'Stopped', 'Deferred') {
                 $problems.Add('its last run didn''t finish its work')
             }
         }
@@ -1063,7 +1066,7 @@ function Get-DemoSafetyStopStatus {
             $t3Problem = switch ($verdict) {
                 'Awake' { 'T3 was still online past its auto-pause delay' }
                 'AutoPauseOff' { 'T3''s auto-pause is off' }
-                { $_ -in 'Paused', 'Pausing', 'Missing', 'TooEarly' } { '' }
+                { $_ -in 'Paused', 'Pausing', 'Missing', 'TooEarly', 'Deferred' } { '' }
                 default { 'its last T3 check didn''t read T3' }
             }
             if ($t3Problem) {

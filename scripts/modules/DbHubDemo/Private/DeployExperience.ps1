@@ -1360,7 +1360,8 @@ function Get-DemoDeploymentOutcome {
     The one ending of a deploy.ps1 run (brief item 1): Kind Done, NotDone, or WhatIf, with Reason, Next (the single next
     action), NextCommand (the exact command), Notes (what DONE states plainly: T4 off and why, T4 on the General Purpose
     fallback with its hourly price from -T4HourlyUsd, "created" only when -T4Created or this run's evidence shows the
-    server, a nightly safety stop this run set up only in part (Get-DemoSafetyStopNote, ADR 0024), Run Commands that ran
+    server, a nightly safety stop this run set up only in part (Get-DemoSafetyStopNote, ADR 0024), the nightly stop that
+    waited for this run and when the demo stops tonight (Get-DemoBusyMarkerNote, 2026-11-14), Run Commands that ran
     under a fresh name because Azure kept their own in Deleting (Get-DemoRunCommandStuckNote), Developer mode's T2),
     NonBlocking (what didn't work but never blocks DONE, such as the Insights app; Get-DemoNonBlockingItem), Unfinished
     (tracks that didn't finish), Missing (DONE requirements without a Pass), and ExitCode: 0 when DONE, 1 when NOT DONE
@@ -1463,6 +1464,11 @@ function Get-DemoDeploymentOutcome {
     $safetyStop = Get-DemoSafetyStopNote -Result $all
     if ($safetyStop) {
         $notes.Add($safetyStop)
+    }
+    # The busy marker (2026-11-14): the nightly stop waited for this run, and when the demo stops tonight.
+    $busyNote = Get-DemoBusyMarkerNote -Result $all
+    if ($busyNote) {
+        $notes.Add($busyNote)
     }
     # T4's read replica (ADR 0025): created for this session, at another size than T4's (its notice), or Not supported.
     $replicaNote = Get-DemoT4ReplicaNote -Result $all

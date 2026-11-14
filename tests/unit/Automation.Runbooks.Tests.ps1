@@ -58,6 +58,8 @@ BeforeAll {
         $script:conflictState = @{}
         $script:t4ReadyAt = $null
         $script:group = 200
+        # The demo resource group's tags beside deploymentId: the busy marker's (2026-11-14), when a test sets them.
+        $script:groupTags = @{}
         $script:jobs = @()
         $script:autostop = ''
         $script:rechecks = @{}
@@ -97,7 +99,10 @@ BeforeAll {
         switch -Regex ($Path) {
             '/resourceGroups/rg-dbhub-demo$' {
                 if ($script:group -ne 200) { return (New-Response $script:group) }
-                return (New-Response 200 '{"name":"rg-dbhub-demo","tags":{"deploymentId":"abc123"}}')
+                # The busy marker's tags (2026-11-14) and any others a test sets, beside the deployment ID.
+                $groupTags = @{ deploymentId = 'abc123' }
+                foreach ($key in @($script:groupTags.Keys)) { $groupTags[$key] = $script:groupTags[$key] }
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ name = 'rg-dbhub-demo'; tags = $groupTags } -Depth 4))
             }
             '/jobs\?' {
                 return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($script:jobs) } -Depth 8))
@@ -1125,6 +1130,72 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
             $result.status | Should -Be $Status
             $result.message | Should -Match $Match
             Get-TestWrite | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'the busy marker (2026-11-14): a deploy.ps1 run or a session that''s still going isn''t cut off' {
+        It 'changes nothing while the marker is ahead (<By>), for the stop, its T3 check, and the control''s daily T4 stop, and completes' -ForEach @(
+            @{ By = 'deploy'; Who = 'deploy\.ps1 is still running' }
+            @{ By = 'deploy-grace'; Who = 'deploy\.ps1 finished after the nightly stop, and its grace period runs' }
+            @{ By = 'session'; Who = 'a demo session is running' }
+        ) {
+            # Live, 2026-11-13: the 19:00 stop and the 19:30 check stopped T4 and its replica under a running deploy.ps1.
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+            $script:t4 = 'Ready'
+            $script:replica = 'Ready'
+            $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = $By }
+            foreach ($scope in 'Nightly', 'T3Check', 'T4') {
+                $script:calls.Clear()
+                $result = Invoke-DbHubStop -Scope $scope -Context (New-TestContext)
+                $result.status | Should -Be 'Deferred'
+                $result.message | Should -Match ('^Deferred: {0} \(busy until 2026-10-27T15:45:00Z\), so nothing was stopped now\.' -f $Who)
+                $result.busyUntil | Should -Be '2026-10-27T15:45:00Z'
+                $result.busyBy | Should -Be $By
+                Get-TestWrite | Should -BeNullOrEmpty
+                @($script:calls | Where-Object { $_.Path -match '/virtualMachines/|/flexibleServers/|/databases/' }) | Should -BeNullOrEmpty -Because 'it reads nothing else either'
+            }
+            # The T3 check's verdict says so too, so status.ps1 doesn't take it as an unread T3 (Get-DemoSafetyStopStatus).
+            (Invoke-DbHubStop -Scope T3Check -Context (New-TestContext)).t3 | Should -Be 'Deferred'
+            (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).action | Should -Be 'stop-nightly'
+        }
+
+        It 'stops as usual once the marker has expired, and ignores one further ahead than 3 hours, or one that isn''t a time' -ForEach @(
+            @{ Name = 'expired'; Until = '2026-10-27T14:59:59Z'; Logged = '' }
+            @{ Name = 'too far ahead'; Until = '2026-10-27T18:00:01Z'; Logged = 'further ahead than a run refreshes it' }
+            @{ Name = 'not a time'; Until = 'soon'; Logged = 'not a time' }
+        ) {
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+            $script:t4 = 'Ready'
+            $script:groupTags = @{ DbHubBusyUntilUtc = $Until; DbHubBusyBy = 'deploy' }
+            $context = New-TestContext
+            $result = Invoke-DbHubStop -Scope Nightly -Context $context
+            $result.status | Should -Be 'Stopped'
+            @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 1
+            @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' }).Count | Should -Be 1
+            if ($Logged) {
+                @($context.Log | Where-Object { $_ -match 'The busy marker .* was ignored' -and $_ -match [regex]::Escape($Logged) }).Count | Should -Be 1
+            }
+        }
+
+        It 'counts a marker exactly 3 hours ahead, the most a refresh can set' {
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+            $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T18:00:00Z'; DbHubBusyBy = 'deploy' }
+            (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).status | Should -Be 'Deferred'
+            Get-TestWrite | Should -BeNullOrEmpty
+        }
+
+        It 'never defers the per-run auto-stop (Scope All): it''s a session''s own end' {
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+            $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session' }
+            $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+            $result.status | Should -Be 'Stopped'
+            @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 1
+        }
+
+        It 'DbHub-Stop completes a Deferred job: only Error, Partial, and NotGranted fail it' {
+            $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHub-Stop.ps1') -Raw
+            $text | Should -Match ([regex]::Escape("[string]`$result.status -in 'Partial', 'NotGranted'"))
+            $text | Should -Not -Match 'Deferred.*throw'
         }
     }
 

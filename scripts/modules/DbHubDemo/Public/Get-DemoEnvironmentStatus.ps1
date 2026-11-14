@@ -70,7 +70,11 @@ function Get-DemoEnvironmentStatus {
     - STATUS.SHUTDOWN: the next auto-shutdown.
     - STATUS.SAFETYSTOP (ADR 0024, Get-DemoSafetyStopStatus): the nightly safety stop's times, whether its role is
       assigned, what its last run stopped, and what its last T3 check found; a Warning that names the fix when it isn't
-      set up, can't act (its role; T4 isn't covered then), didn't finish, or found T3 still online past its auto-pause.
+      set up, can't act (its role; T4 isn't covered then), didn't finish, or found T3 still online past its auto-pause. A
+      run it waited for (Deferred, 2026-11-14) isn't a problem.
+    - STATUS.NIGHTLYSTOP (2026-11-14, Get-DemoBusyMarkerStatus), only while the busy marker's tag holds anything: a
+      deploy.ps1 run the nightly stop waits for, the deferred pass dbhub-safety-deferred, and a VM auto-shutdown that's
+      moved; a Warning, with the commands that put it back, for one that's moved with no run or pass to explain it.
     - STATUS.FABRIC.CAPACITY, with fabric.manageCapacity true or a DbHubFabricCapacityResumed record only (Phase 26b,
       Get-DemoFabricCapacityStatus): the capacity's state, and whether start-demo.ps1 resumed it (the record, which
       stop-demo.ps1 pauses and clears). Read-only: a stale record is shown, and stop-demo.ps1 clears it.
@@ -470,5 +474,10 @@ function Get-DemoEnvironmentStatus {
     $results.Add((New-DemoResult -CheckId 'STATUS.SHUTDOWN' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('Next auto-shutdown: {0:yyyy-MM-dd HH:mm} UTC ({1} {2}).' -f $shutdown, $Config['autoShutdownTime'], $Config['autoShutdownTimeZone'])))
     # The nightly safety stop (ADR 0024): its times, its role, and what its last stop and T3 check did. Read-only.
     $results.Add((Get-DemoSafetyStopStatus -Config $Config -NowUtc $NowUtc))
+    # The busy marker (2026-11-14): a run the nightly stop waits for, the deferred pass, a moved auto-shutdown. Read-only.
+    $busy = Get-DemoBusyMarkerStatus -Config $Config -State $state -NowUtc $NowUtc
+    if ($null -ne $busy) {
+        $results.Add($busy)
+    }
     return $results.ToArray()
 }

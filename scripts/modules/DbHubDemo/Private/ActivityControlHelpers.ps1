@@ -408,6 +408,9 @@ function Get-DemoActivityControlRunbookSetting {
         autoShutdownTime       = $(if ($Config['autoShutdownTime']) { [string]$Config['autoShutdownTime'] } else { '1900' })
         autoShutdownTimeZone   = $(if ($Config['autoShutdownTimeZone']) { [string]$Config['autoShutdownTimeZone'] } else { 'UTC' })
         shutdownMarginMinutes  = 2
+        # The busy marker (2026-11-14): the daily T4 safety stop changes nothing while it's active, and one further ahead
+        # than this is ignored.
+        busyMarkerMaximumMinutes = [int]$script:BusyMarkerSetting['maximumMinutes']
         minDurationMinutes     = 5
         maxDurationMinutes     = 120
         maxBodyBytes           = 4096
