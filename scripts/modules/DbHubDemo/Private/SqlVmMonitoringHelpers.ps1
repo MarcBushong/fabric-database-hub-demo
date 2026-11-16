@@ -544,8 +544,11 @@ function Invoke-DemoSqlVmMonitoringWait {
     grace for a NotRunning plugin (Get-DemoSqlVmPluginGrace: 3 minutes, or 5 when this run merged the flag, -JustMerged;
     none with -RestartAtOnce, which start-demo.ps1 passes, though a flag this call merges still gets 5); the agent's
     restart when the plugin is stuck (Restore-DemoSqlVmMonitoringPlugin, with no grace of its own); and after a restart
-    that worked, T1.SQLVM.MONITORING as it is then (Get-DemoSqlVmMonitoringAfterRestart). Returns T1.SQLVM.MONITORING,
-    then the restart's result when there was one. Internal.
+    that worked, T1.SQLVM.MONITORING as it is then (Get-DemoSqlVmMonitoringAfterRestart). A SqlIaasExtension whose
+    provisioning is Failed gets the documented repair first, once per run and only when it's safe
+    (Repair-DemoSqlIaasExtension), then the monitoring again, which merges the flag the repair dropped. Returns the repair's
+    result first when there was one (<DEPLOY|START>.T1.SQLIAAS.REPAIR, so the step's row shows it), then
+    T1.SQLVM.MONITORING, then the restart's result when there was one. Internal.
 
     .DESCRIPTION
     Live (2026-10-30, Phase 28): after a start from deallocation, the step waited 20 minutes (25 with the reads) on a
@@ -580,13 +583,485 @@ function Invoke-DemoSqlVmMonitoringWait {
     $grace = Get-DemoSqlVmPluginGrace
     $graceMinutes = if ($RestartAtOnce) { 0 } elseif ($JustMerged) { [int]$grace.JustMerged } else { [int]$grace.FlagSet }
     $monitoring = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes $WaitMinutes -NotRunningGraceMinutes $graceMinutes -ProgressPath $ProgressPath -Confirm:$false
+    # A SqlIaasExtension whose provisioning is Failed gets the documented repair, once per run and only when it's safe, and
+    # then the monitoring again, which merges the flag the repair dropped (live, 2026-11-16: the extension's update met T1's
+    # bootstrap restarting SQL Server in single-user mode). Its result comes first, so the step's row shows it.
+    $lead = @()
+    if (Test-DemoSqlIaasRepairNeeded -Result $monitoring) {
+        $repair = Repair-DemoSqlIaasExtension -Config $Config -CheckPrefix $(if ($CheckId -like 'START.*') { 'START' } else { 'DEPLOY' }) -ProgressPath $ProgressPath -Confirm:$false
+        $repairEvidence = Get-DemoMemberValue -InputObject $repair -Name 'evidence'
+        $repaired = [bool](Get-DemoMemberValue -InputObject $repairEvidence -Name 'repaired')
+        # An extension that's no longer Failed when the repair looks (Updating, for example) is read again, as it is now.
+        $statesSeen = Get-DemoMemberValue -InputObject $repairEvidence -Name 'extensionStates'
+        $changed = [string]$repair.status -eq 'Not selected' -and [string](@($statesSeen) | Select-Object -First 1) -notin '', 'Failed'
+        if ($repaired -or $changed) {
+            $monitoring = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes $WaitMinutes -NotRunningGraceMinutes $graceMinutes -ProgressPath $ProgressPath -Confirm:$false
+        }
+        if ($repaired) {
+            Add-DemoSqlIaasRepairFlagNote -Repair $repair -Monitoring $monitoring
+        }
+        $lead = @($repair)
+    }
     if ([string]$monitoring.status -eq 'Fail' -or -not (Test-DemoSqlVmMonitoringStuck -Result $monitoring)) {
-        return @($monitoring)
+        return @($lead + @($monitoring))
     }
     # The template run, or a start, can leave the plugin NotRunning, and waiting doesn't bring it back; the agent's restart
     # does (live, 2026-10-27 and 2026-10-30). The grace is spent.
     $restore = Restore-DemoSqlVmMonitoringPlugin -Config $Config -CheckId $CheckId -Occasion $Occasion -NotRunningGraceMinutes 0 -ProgressPath $ProgressPath
-    return @((Get-DemoSqlVmMonitoringAfterRestart -Config $Config -Monitoring $monitoring -Restore $restore), $restore)
+    return @($lead + @((Get-DemoSqlVmMonitoringAfterRestart -Config $Config -Monitoring $monitoring -Restore $restore), $restore))
+}
+
+function Test-DemoSqlIaasRepairNeeded {
+    <#
+    .SYNOPSIS
+    True when a T1.SQLVM.MONITORING result is the Fail for a SqlIaasExtension whose provisioning is Failed: the state the
+    documented Repair is for (https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/sql-agent-extension-troubleshoot-known-issues#repair-extension).
+    Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $Result
+    )
+
+    if ($null -eq $Result -or [string](Get-DemoMemberValue -InputObject $Result -Name 'status') -ne 'Fail') {
+        return $false
+    }
+    return ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Result -Name 'evidence') -Name 'provisioningState') -eq 'Failed')
+}
+
+function Get-DemoSqlVmTemplateSetting {
+    <#
+    .SYNOPSIS
+    What the deployment sets on T1's SQL virtual machine resource besides its license type, as infra/modules/sqlvm01.bicep
+    sets it (a Repo test compares them): automatic upgrade of the SQL IaaS Agent extension, and LOCAL connectivity on port
+    1433 (ADR 0007). A repair of the extension doesn't keep them (Repair-DemoSqlIaasExtension). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param()
+
+    return [ordered]@{
+        enableAutomaticUpgrade = $true
+        connectivityType       = 'LOCAL'
+        port                   = 1433
+    }
+}
+
+function Get-DemoSqlVmSqlMode {
+    <#
+    .SYNOPSIS
+    Whether T1's SQL IaaS Agent extension can be repaired without meeting the bootstrap's lockout recovery, read-only, with
+    one Run Command (DbHubDemo-SqlModeRead): the bootstrap's state from health.json (Ready once every step has finished,
+    the SqlAdminAccess step's single-user restart included), the SQL Server service's status, and
+    SERVERPROPERTY('IsSingleUser') over a Windows-authentication connection, which a server in single-user mode refuses
+    with error 18461. Returns Read, BootstrapState, SqlService, SingleUser ($true, $false, or $null when unknown), and
+    Error. Never throws. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $VmName = 'sqlvm01'
+    )
+
+    # Windows PowerShell 5.1 on the VM; the default instance, as vm/dsc/sqlvm.psd1 names it.
+    $script = @'
+$ErrorActionPreference = 'Stop'
+$out = [ordered]@{ bootstrapState = 'NotStarted'; sqlService = ''; singleUser = $null; error = '' }
+$healthPath = Join-Path -Path $env:ProgramData -ChildPath 'DbHubDemo\health.json'
+if (Test-Path -LiteralPath $healthPath) {
+    try {
+        $out['bootstrapState'] = [string](Get-Content -LiteralPath $healthPath -Raw | ConvertFrom-Json).state
+    }
+    catch {
+        $out['bootstrapState'] = 'Unreadable'
+    }
+}
+$service = Get-Service -Name 'MSSQLSERVER' -ErrorAction SilentlyContinue
+if ($null -ne $service) {
+    $out['sqlService'] = [string]$service.Status
+}
+if ($out['sqlService'] -eq 'Running') {
+    $connection = New-Object -TypeName 'System.Data.SqlClient.SqlConnection' -ArgumentList 'Data Source=.;Initial Catalog=master;Integrated Security=True;Application Name=DbHubDemo.SqlModeRead;Connect Timeout=15'
+    try {
+        $connection.Open()
+        $command = $connection.CreateCommand()
+        $command.CommandText = "SELECT CONVERT(int, SERVERPROPERTY('IsSingleUser'))"
+        $out['singleUser'] = ([int]$command.ExecuteScalar() -eq 1)
+    }
+    catch {
+        $inner = $_.Exception
+        while ($null -ne $inner -and -not ($inner -is [System.Data.SqlClient.SqlException])) {
+            $inner = $inner.InnerException
+        }
+        if ($null -ne $inner -and $inner.Number -eq 18461) {
+            $out['singleUser'] = $true
+        }
+        $text = [string]$_.Exception.Message
+        $out['error'] = $text.Substring(0, [Math]::Min(300, $text.Length))
+    }
+    finally {
+        $connection.Dispose()
+    }
+}
+[Console]::Out.WriteLine(($out | ConvertTo-Json -Compress))
+'@
+    $answer = { param([bool] $Read, [string] $Bootstrap, [string] $Service, [object] $SingleUser, [string] $Problem) [pscustomobject]@{ Read = $Read; BootstrapState = $Bootstrap; SqlService = $Service; SingleUser = $SingleUser; Error = $Problem } }
+    try {
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-SqlModeRead' -Script $script -TimeoutSeconds 300
+    }
+    catch {
+        return (& $answer $false '' '' $null (Protect-DemoText -Text $_.Exception.Message))
+    }
+    if ($null -eq $run) {
+        return (& $answer $false '' '' $null 'the Run Command didn''t run')
+    }
+    if (-not $run.Succeeded) {
+        $detail = if ($run.Error) { [string]$run.Error } else { [string]$run.Output }
+        return (& $answer $false '' '' $null ('the Run Command ended {0} (exit code {1}): {2}' -f $run.ExecutionState, $run.ExitCode, $detail.Trim()))
+    }
+    $read = ConvertFrom-DemoRunCommandOutput -Text $run.Output
+    if ($null -eq $read) {
+        return (& $answer $false '' '' $null 'its output didn''t parse')
+    }
+    $single = Get-DemoMemberValue -InputObject $read -Name 'singleUser'
+    return (& $answer $true ([string](Get-DemoMemberValue -InputObject $read -Name 'bootstrapState')) ([string](Get-DemoMemberValue -InputObject $read -Name 'sqlService')) $(if ($null -eq $single) { $null } else { [bool]$single }) ([string](Get-DemoMemberValue -InputObject $read -Name 'error')))
+}
+
+function Repair-DemoSqlIaasExtension {
+    <#
+    .SYNOPSIS
+    Repairs T1's SQL IaaS Agent extension when its provisioning is Failed, with the documented API behind the portal's
+    Repair, then re-applies and verifies what the deployment sets on the SQL virtual machine resource. Returns
+    <CheckPrefix>.T1.SQLIAAS.REPAIR: a Warning when it repaired the extension (evidence repaired), a Fail with the reason
+    and the portal's Repair otherwise, Not selected when there's nothing to repair or under -WhatIf. Internal.
+
+    .DESCRIPTION
+    Live (2026-11-16): T1's Bootstraps step merged the monitoring flag while the bootstrap's lockout recovery had SQL
+    Server in single-user mode, so the extension's update failed ("Login failed for user 'NT Service\MSSQLSERVER'.
+    Reason: Server is in single user mode"), and the run ended NOT DONE with only the portal's Repair as the fix.
+    - Only when it's safe: the extension's provisioning is Failed now; sqlvm01 is running; T1's bootstrap is Ready and
+      SQL Server runs in multi-user mode (Get-DemoSqlVmSqlMode), so the repair can't meet the same window; and this
+      process hasn't repaired it already (at most once per run).
+    - Sql Virtual Machines - Redeploy (POST .../sqlVirtualMachines/sqlvm01/redeploy, "Uninstalls and reinstalls the SQL
+      IaaS Extension"; https://learn.microsoft.com/rest/api/sqlvm/sql-virtual-machines/redeploy), which the Contributor
+      role allows (Microsoft.SqlVirtualMachine/sqlVirtualMachines/redeploy/action is within its *), then at most
+      -TimeoutMinutes for the extension to report Succeeded.
+    - "If you repair or reinstall the SQL IaaS Agent extension, your settings aren't preserved, other than licensing
+      changes" (sql-agent-extension-troubleshoot-known-issues): the resource's own PUT, as the template sends it
+      (Get-DemoSqlVmTemplateSetting, with the resource's location, tags, VM, and license type, which the repair keeps),
+      then a read with $expand=* that verifies each setting. The monitoring flag is the caller's to merge again
+      (Enable-DemoSqlVmMonitoring, then Add-DemoSqlIaasRepairFlagNote).
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateSet('DEPLOY', 'START')]
+        [string] $CheckPrefix = 'DEPLOY',
+
+        [ValidateRange(1, 30)]
+        [int] $TimeoutMinutes = 15,
+
+        [ValidateRange(1, 30)]
+        [int] $ReapplyTimeoutMinutes = 15,
+
+        [ValidateRange(1, 300)]
+        [int] $PollSeconds = 30,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [string] $ProgressStepId = 'T1.Monitoring'
+    )
+
+    $vmName = 'sqlvm01'
+    $checkId = '{0}.T1.SQLIAAS.REPAIR' -f $CheckPrefix
+    $docUrl = 'https://learn.microsoft.com/azure/azure-sql/virtual-machines/windows/sql-agent-extension-troubleshoot-known-issues#repair-extension'
+    $portal = 'Repair it in the Azure portal (SQL virtual machines > {0} > SQL IaaS Agent Extension Settings > Repair), then run ./scripts/deploy.ps1 again.' -f $vmName
+    $subscriptionId = [string]$Config['subscriptionId']
+    $resourceGroupName = Get-DemoResourceGroupName -Config $Config
+    $setting = Get-DemoArcSetting
+    $sqlVm = $setting.SqlVm
+    $resourceUrl = 'https://management.azure.com/subscriptions/{0}/resourceGroups/{1}/providers/Microsoft.SqlVirtualMachine/sqlVirtualMachines/{2}' -f $subscriptionId, $resourceGroupName, $vmName
+    $apiVersion = [string]$setting.SqlVmApiVersion
+    $evidence = [ordered]@{ vmName = $vmName; repaired = $false; failure = ''; extensionStates = @(); minutes = 0; reapplied = @(); verified = $false }
+    $answer = {
+        param([string] $Status, [string] $Message, [string] $Remediation = '')
+        New-DemoResult -CheckId $checkId -Area 't1' -Target 'T1' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $docUrl
+    }
+    $readExtension = {
+        $call = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'extension', 'show', '--resource-group', $resourceGroupName, '--vm-name', $vmName, '--name', [string]$sqlVm['extensionInstanceName'], '--instance-view', '--output', 'json') -AllowFailure
+        if ($call.ExitCode -ne 0) {
+            return [pscustomobject]@{ State = $(if (Test-DemoAzNotFound -Text ([string]$call.StdErr)) { 'NotFound' } else { 'Unknown' }); Reason = '' }
+        }
+        $extension = [string]$call.StdOut | ConvertFrom-Json -Depth 64
+        # The failed component's own message (live: "Login failed for user 'NT Service\MSSQLSERVER'. Reason: Server is in
+        # single user mode. ..."), shortened. Assigned first: Get-DemoMemberValue returns an array as one object.
+        $substatuses = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $extension -Name 'instanceView') -Name 'substatuses'
+        $failed = @(@($substatuses) | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'code') -match '/failed' } | Select-Object -First 1)
+        $reason = if ($failed.Count -gt 0) { ([string](Get-DemoMemberValue -InputObject $failed[0] -Name 'message') -replace '\s+', ' ').Trim() } else { '' }
+        if ($reason.Length -gt 160) {
+            $reason = $reason.Substring(0, 157) + '...'
+        }
+        [pscustomobject]@{ State = [string](Get-DemoMemberValue -InputObject $extension -Name 'provisioningState'); Reason = (Protect-DemoText -Text $reason) }
+    }
+
+    if ([bool](Get-Variable -Name 'DemoSqlIaasRepairDone' -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) {
+        return (& $answer 'Fail' ('The SqlIaasExtension on {0} is Failed again after this run repaired it, and it isn''t repaired twice in one run.' -f $vmName) $portal)
+    }
+    $before = & $readExtension
+    $evidence['extensionStates'] = @($before.State)
+    $evidence['failure'] = $before.Reason
+    if ($before.State -eq 'Unknown') {
+        return (& $answer 'Fail' ('The SqlIaasExtension on {0} couldn''t be read again, so it wasn''t repaired.' -f $vmName) ('Run ./scripts/deploy.ps1 again: it repairs the extension then. Or: {0}' -f $portal))
+    }
+    if ($before.State -ne 'Failed') {
+        return (& $answer 'Not selected' ('The SqlIaasExtension on {0} is {1} now, so there''s nothing to repair.' -f $vmName, $before.State))
+    }
+    $failedText = if ($before.Reason) {
+        # The reason's own words, short enough for the status page's row (live: "Server is in single user mode").
+        $short = if ($before.Reason -match 'Reason: ([^.]+)') { $Matches[1].Trim() } else { ($before.Reason -split '(?<=\.)\s')[0].TrimEnd('.') }
+        ' ({0})' -f $(if ($short.Length -gt 100) { $short.Substring(0, 97) + '...' } else { $short })
+    }
+    else {
+        ''
+    }
+    $power = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $vmName
+    if ($power -ne 'PowerState/running') {
+        $shown = if ($power) { $power -replace '^PowerState/', '' } else { 'in an unknown state' }
+        return (& $answer 'Fail' ('The SqlIaasExtension on {0} is Failed{1}, and it wasn''t repaired: {0} is {2}, and the repair needs it running.' -f $vmName, $failedText, $shown) ('Start it (./scripts/start-demo.ps1), then run ./scripts/deploy.ps1 again: it repairs the extension then. Or: {0}' -f $portal))
+    }
+    if (-not $PSCmdlet.ShouldProcess($vmName, 'Repair the SQL IaaS Agent extension (Sql Virtual Machines - Redeploy)')) {
+        return (& $answer 'Not selected' ('What if: the SqlIaasExtension on {0}, which is Failed, wasn''t repaired.' -f $vmName))
+    }
+    $mode = Get-DemoSqlVmSqlMode -Config $Config -VmName $vmName
+    $evidence['bootstrapState'] = $mode.BootstrapState
+    $evidence['sqlService'] = $mode.SqlService
+    $evidence['singleUser'] = $mode.SingleUser
+    $unsafe = if (-not $mode.Read) {
+        'SQL Server''s mode couldn''t be read ({0})' -f ([string]$mode.Error).TrimEnd('.')
+    }
+    elseif ($mode.BootstrapState -ne 'Ready') {
+        'T1''s bootstrap isn''t finished (state {0}), and its lockout recovery restarts SQL Server in single-user mode, which is what failed the extension' -f $mode.BootstrapState
+    }
+    elseif ($mode.SqlService -ne 'Running') {
+        'SQL Server isn''t running (service {0})' -f $(if ($mode.SqlService) { $mode.SqlService } else { 'not found' })
+    }
+    elseif ($mode.SingleUser -ne $false) {
+        if ($mode.SingleUser -eq $true) { 'SQL Server is in single-user mode' } else { 'SQL Server''s mode couldn''t be read ({0})' -f ([string]$mode.Error).TrimEnd('.') }
+    }
+    else {
+        ''
+    }
+    if ($unsafe) {
+        return (& $answer 'Fail' ('The SqlIaasExtension on {0} is Failed{1}, and it wasn''t repaired: {2}.' -f $vmName, $failedText, $unsafe) ('Run ./scripts/deploy.ps1 again once T1''s bootstrap is Ready: it repairs the extension then. Or: {0}' -f $portal))
+    }
+
+    $script:DemoSqlIaasRepairDone = $true
+    Write-DemoLog -Level Warning -Message ('The SqlIaasExtension on {0} is Failed{1}; repairing it with Azure''s Redeploy, as the portal''s Repair does (up to {2} minutes), then re-applying what the deployment sets on the SQL virtual machine; no action needed.' -f $vmName, $failedText, $TimeoutMinutes)
+    Set-DemoProgressStep -Path $ProgressPath -Id $ProgressStepId -State 'Running' -AzureSide -Message ('Repairing T1''s SQL IaaS Agent extension, which failed: no action needed (up to {0} minutes).' -f $TimeoutMinutes)
+    $post = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('rest', '--method', 'post', '--url', ('{0}/redeploy?api-version={1}' -f $resourceUrl, $apiVersion)) -Label ('{0}: the SQL IaaS Agent extension''s repair' -f $vmName) -MaxConflictRetries 4
+    if ($post.ExitCode -ne 0) {
+        return (& $answer 'Fail' ('The SqlIaasExtension on {0} is Failed{1}, and Azure refused its repair: {2}' -f $vmName, $failedText, ((Get-DemoDeploymentErrorText -Text ([string]$post.StdErr) -MaxLength 300) -replace '\s+', ' ').Trim()) $portal)
+    }
+
+    # Right after the request the extension can still show its old Failed state, so a Failed counts only after a state of
+    # the reinstall (Deleting, NotFound, Creating, Updating).
+    $startUtc = Get-DemoUtcNow
+    $budget = $TimeoutMinutes * 60
+    $slept = 0
+    $states = [System.Collections.Generic.List[string]]::new()
+    $states.Add($before.State)
+    $current = $before
+    $progressed = $false
+    while ($true) {
+        $spent = [System.Math]::Max(((Get-DemoUtcNow) - $startUtc).TotalSeconds, $slept)
+        if ($spent -ge $budget) {
+            break
+        }
+        $pause = [int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, [System.Math]::Ceiling($budget - $spent)))
+        Start-Sleep -Seconds $pause
+        $slept += $pause
+        $current = & $readExtension
+        if ($states[$states.Count - 1] -ne $current.State) {
+            $states.Add($current.State)
+        }
+        if ($current.State -eq 'Succeeded' -or ($current.State -eq 'Failed' -and $progressed)) {
+            break
+        }
+        if ($current.State -in 'Deleting', 'NotFound', 'Creating', 'Updating') {
+            $progressed = $true
+        }
+    }
+    $minutes = [int][System.Math]::Max(1, [System.Math]::Ceiling([System.Math]::Max(((Get-DemoUtcNow) - $startUtc).TotalSeconds, $slept) / 60))
+    $evidence['extensionStates'] = $states.ToArray()
+    $evidence['minutes'] = $minutes
+    if ($current.State -ne 'Succeeded') {
+        $why = if ($current.State -eq 'Failed' -and $progressed) {
+            'it failed again{0}' -f $(if ($current.Reason) { ' ({0})' -f $current.Reason.TrimEnd('.') } else { '' })
+        }
+        else {
+            'it was still {0} after {1} minutes' -f $current.State, $minutes
+        }
+        return (& $answer 'Fail' ('This run repaired the SqlIaasExtension on {0}, which was Failed{1}, with Azure''s Redeploy, but {2}.' -f $vmName, $failedText, $why) $portal)
+    }
+    $evidence['repaired'] = $true
+    Write-DemoLog -Message ('The SqlIaasExtension on {0} is Succeeded again after its repair ({1} minutes); re-applying what the deployment sets on the SQL virtual machine, which a repair doesn''t keep.' -f $vmName, $minutes)
+
+    # The resource's own PUT, as infra/modules/sqlvm01.bicep sends it.
+    $template = Get-DemoSqlVmTemplateSetting
+    $getUrl = '{0}?api-version={1}&$expand=*' -f $resourceUrl, $apiVersion
+    $resource = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('rest', '--method', 'get', '--url', $getUrl) -AsJson -AllowFailure
+    $properties = Get-DemoMemberValue -InputObject $resource -Name 'properties'
+    $license = [string](Get-DemoMemberValue -InputObject $properties -Name 'sqlServerLicenseType')
+    $vmId = [string](Get-DemoMemberValue -InputObject $properties -Name 'virtualMachineResourceId')
+    $settingsText = 'LOCAL connectivity on port {0} and automatic upgrade' -f $template['port']
+    $reapplyFix = 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template sets them again, and the run continues from there.'
+    if ($null -eq $resource -or -not $vmId) {
+        return (& $answer 'Fail' ('This run repaired the SqlIaasExtension on {0} in {1} minutes, but the SQL virtual machine resource couldn''t be read, so what a repair doesn''t keep ({2}) wasn''t re-applied.' -f $vmName, $minutes, $settingsText) $reapplyFix)
+    }
+    $tags = [ordered]@{}
+    $tagValue = Get-DemoMemberValue -InputObject $resource -Name 'tags'
+    if ($tagValue -is [System.Collections.IDictionary]) {
+        foreach ($key in $tagValue.Keys) {
+            $tags[[string]$key] = [string]$tagValue[$key]
+        }
+    }
+    elseif ($null -ne $tagValue) {
+        foreach ($property in $tagValue.PSObject.Properties) {
+            $tags[$property.Name] = [string]$property.Value
+        }
+    }
+    $body = [ordered]@{
+        location   = [string](Get-DemoMemberValue -InputObject $resource -Name 'location')
+        tags       = $tags
+        properties = [ordered]@{
+            virtualMachineResourceId               = $vmId
+            sqlServerLicenseType                   = $license
+            enableAutomaticUpgrade                 = [bool]$template['enableAutomaticUpgrade']
+            serverConfigurationsManagementSettings = [ordered]@{
+                sqlConnectivityUpdateSettings = [ordered]@{ connectivityType = [string]$template['connectivityType']; port = [int]$template['port'] }
+            }
+        }
+    }
+    $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-sqlvm'
+    try {
+        $path = Write-DemoPrivateFile -Directory $directory -Name 'sqlvm.json' -Content ($body | ConvertTo-Json -Depth 10)
+        $put = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('rest', '--method', 'put', '--url', ('{0}?api-version={1}' -f $resourceUrl, $apiVersion), '--body', "@$path") -Label ('{0}: re-applying the SQL virtual machine''s settings' -f $vmName) -MaxConflictRetries 6
+    }
+    finally {
+        Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
+    }
+    if ($put.ExitCode -ne 0) {
+        return (& $answer 'Fail' ('This run repaired the SqlIaasExtension on {0} in {1} minutes, but Azure refused what a repair doesn''t keep ({2}): {3}' -f $vmName, $minutes, $settingsText, ((Get-DemoDeploymentErrorText -Text ([string]$put.StdErr) -MaxLength 300) -replace '\s+', ' ').Trim()) $reapplyFix)
+    }
+    $evidence['reapplied'] = @(('connectivityType={0}' -f $template['connectivityType']), ('port={0}' -f $template['port']), ('enableAutomaticUpgrade={0}' -f ([string]$template['enableAutomaticUpgrade']).ToLowerInvariant()), ('sqlServerLicenseType={0}' -f $license))
+
+    # The PUT applies through the extension (live, Phase 13: a template run keeps it Updating for about 10 minutes).
+    $reapplyStartUtc = Get-DemoUtcNow
+    $reapplyBudget = $ReapplyTimeoutMinutes * 60
+    $reapplySlept = 0
+    $state = ''
+    $resource = $null
+    while ($true) {
+        $resource = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('rest', '--method', 'get', '--url', $getUrl) -AsJson -AllowFailure
+        $state = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $resource -Name 'properties') -Name 'provisioningState')
+        if ($state -in 'Succeeded', 'Failed', 'Canceled') {
+            break
+        }
+        $spent = [System.Math]::Max(((Get-DemoUtcNow) - $reapplyStartUtc).TotalSeconds, $reapplySlept)
+        if ($spent -ge $reapplyBudget) {
+            break
+        }
+        $pause = [int][System.Math]::Max(1, [System.Math]::Min($PollSeconds, [System.Math]::Ceiling($reapplyBudget - $spent)))
+        Start-Sleep -Seconds $pause
+        $reapplySlept += $pause
+    }
+    $properties = Get-DemoMemberValue -InputObject $resource -Name 'properties'
+    $connectivity = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'serverConfigurationsManagementSettings') -Name 'sqlConnectivityUpdateSettings'
+    $found = [ordered]@{
+        connectivityType       = [string](Get-DemoMemberValue -InputObject $connectivity -Name 'connectivityType')
+        port                   = [string](Get-DemoMemberValue -InputObject $connectivity -Name 'port')
+        enableAutomaticUpgrade = [string](Get-DemoMemberValue -InputObject $properties -Name 'enableAutomaticUpgrade')
+        sqlServerLicenseType   = [string](Get-DemoMemberValue -InputObject $properties -Name 'sqlServerLicenseType')
+    }
+    $evidence['provisioningState'] = $state
+    $evidence['found'] = $found
+    $mismatch = @(
+        if ($found['connectivityType'] -ne [string]$template['connectivityType']) { 'connectivity {0}' -f $(if ($found['connectivityType']) { $found['connectivityType'] } else { 'not reported' }) }
+        if ($found['port'] -ne [string]$template['port']) { 'port {0}' -f $(if ($found['port']) { $found['port'] } else { 'not reported' }) }
+        if ($found['enableAutomaticUpgrade'] -ine ([string]$template['enableAutomaticUpgrade'])) { 'automatic upgrade {0}' -f $(if ($found['enableAutomaticUpgrade']) { $found['enableAutomaticUpgrade'] } else { 'not reported' }) }
+        if ($found['sqlServerLicenseType'] -ne $license) { 'license type {0}' -f $found['sqlServerLicenseType'] }
+    )
+    if ($state -ne 'Succeeded' -or $mismatch.Count -gt 0) {
+        $how = if ($state -ne 'Succeeded') { 'the SQL virtual machine was still {0} after {1} minutes' -f $(if ($state) { $state } else { 'unreadable' }), $ReapplyTimeoutMinutes } else { 'a read afterward shows {0}' -f ($mismatch -join ', ') }
+        return (& $answer 'Fail' ('This run repaired the SqlIaasExtension on {0} in {1} minutes and re-applied what a repair doesn''t keep ({2}), but {3}.' -f $vmName, $minutes, $settingsText, $how) $reapplyFix)
+    }
+    $evidence['verified'] = $true
+    $message = 'T1''s SQL IaaS Agent extension had failed{0}, so this run repaired it with Azure''s Redeploy (the portal''s Repair) in {1} minutes and re-applied what a repair drops: {2}, both verified (license {3} kept).' -f $failedText, $minutes, $settingsText, $license
+    Write-DemoLog -Level Warning -Message ('{0}: {1}' -f $checkId, $message)
+    return (& $answer 'Warning' $message 'Nothing to do: the extension is Succeeded again. If it fails again, the portal''s Repair (SQL virtual machines > sqlvm01 > SQL IaaS Agent Extension Settings) does the same.')
+}
+
+function Get-DemoSqlIaasRepairNote {
+    <#
+    .SYNOPSIS
+    What DONE and NOT DONE say when this run repaired T1's SQL IaaS Agent extension (DEPLOY.T1.SQLIAAS.REPAIR's Warning;
+    2026-11-16 live finding), or ''. A repair that failed is a Fail, which NOT DONE names with its own fix. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $repair = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T1.SQLIAAS.REPAIR' -and [string]$_.status -eq 'Warning' } | Select-Object -Last 1)
+    if ($repair.Count -eq 0) {
+        return ''
+    }
+    return ('{0} Nothing to do (DEPLOY.T1.SQLIAAS.REPAIR).' -f [string]$repair[0].message)
+}
+
+function Add-DemoSqlIaasRepairFlagNote {
+    <#
+    .SYNOPSIS
+    Adds to a repair's result (Repair-DemoSqlIaasExtension) what the monitoring after it did with the monitoring flag,
+    which the repair drops: merged again, still set, or not merged yet (T1.SQLVM.MONITORING says why). Internal.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object] $Repair,
+
+        [AllowNull()]
+        [object] $Monitoring
+    )
+
+    $flag = [string](Get-DemoArcSetting).SqlVm['featureFlag']
+    $evidence = Get-DemoMemberValue -InputObject $Monitoring -Name 'evidence'
+    # Assigned first: Get-DemoMemberValue returns an array as one object.
+    $actions = Get-DemoMemberValue -InputObject $evidence -Name 'actions'
+    $merged = @(@($actions) | Where-Object { [string]$_ -like ('Merged {0}*' -f $flag) }).Count -gt 0
+    $set = [bool](Get-DemoMemberValue -InputObject $evidence -Name 'featureFlagEnabled')
+    $state, $text = if ($merged) {
+        'merged', ('The monitoring flag {0}, which the repair dropped, was merged again.' -f $flag)
+    }
+    elseif ($set) {
+        'set', ('The monitoring flag {0} was still set.' -f $flag)
+    }
+    else {
+        'notMerged', ('The monitoring flag {0} isn''t merged again yet: T1.SQLVM.MONITORING says why.' -f $flag)
+    }
+    $Repair.message = '{0} {1}' -f [string]$Repair.message, $text
+    $Repair.evidence['monitoringFlag'] = $state
 }
 
 function Get-DemoSqlVmMonitoringAfterRestart {

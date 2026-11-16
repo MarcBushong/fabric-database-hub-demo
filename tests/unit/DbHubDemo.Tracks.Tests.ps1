@@ -991,6 +991,55 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:warned[0] | Should -Match '^The monitoring step failed: Track T1 stopped at Monitoring: A network error reached'
     }
 
+    It 'repairs a Failed SQL IaaS Agent extension in the Monitoring step a resumed run starts at, and records the step with the repair on its row (2026-11-16 live finding)' {
+        # Live (rg-dbhubnu-demo, from 0f37192): T1's Monitoring step failed on "The SqlIaasExtension on sqlvm01 is Failed, not
+        # Succeeded", the run ended NOT DONE with only the portal's Repair as the fix, and the next deploy.ps1 resumed T1 at
+        # Monitoring with the extension still Failed. An environment deployed before this fix is in the same state.
+        $script:monitoringReads = 0
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith {
+            $script:monitoringReads++
+            if ($script:monitoringReads -eq 1) {
+                New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'The SqlIaasExtension on sqlvm01 is Failed, not Succeeded.' -Remediation 'Wait for the extension, or repair it in the portal (SQL virtual machines), then run configure-monitoring.ps1 again.' -Evidence ([ordered]@{ provisioningState = 'Failed' })
+            }
+            else {
+                New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'sqlvm01 reports DatabaseMonitorArcPlugin Running with MetricsUploadStatus OK.' -Evidence ([ordered]@{ provisioningState = 'Succeeded'; featureFlagEnabled = $true; pluginState = 'Running'; pending = $false; actions = @('Merged DatabaseWatcheronAzureVM into the SqlIaasExtension public settings, keeping 4 other setting(s) and 0 other feature flag(s).') })
+            }
+        }
+        $script:repairs = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Repair-DemoSqlIaasExtension -MockWith {
+            $script:repairs.Add([string]$CheckPrefix)
+            New-DemoResult -CheckId ('{0}.T1.SQLIAAS.REPAIR' -f $CheckPrefix) -Area 't1' -Target 'T1' -Status 'Warning' -Message 'T1''s SQL IaaS Agent extension had failed (Server is in single user mode), so this run repaired it with Azure''s Redeploy (the portal''s Repair) in 6 minutes and re-applied what a repair drops: LOCAL connectivity on port 1433 and automatic upgrade, both verified (license PAYG kept).' -Remediation 'Nothing to do: the extension is Succeeded again.' -Evidence ([ordered]@{ repaired = $true; extensionStates = @('Failed', 'Deleting', 'Creating', 'Succeeded') })
+        }
+        $script:recorded = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { if ($null -ne $Value) { $script:recorded.Add($Value) } }
+        $script:progressSteps = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:progressSteps.Add([pscustomobject]@{ Id = @($PesterBoundParameters['Id']) -join ','; State = [string]$PesterBoundParameters['State']; Status = [string]$PesterBoundParameters['Status']; Message = [string]$PesterBoundParameters['Message'] }) }
+        $script:context['ProgressPath'] = Join-Path -Path $TestDrive -ChildPath 'progress-repair.json'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring') }
+        $outcome.Status | Should -Be 'Pass' -Because 'the repair brings the step through with no manual step'
+        @($outcome.Steps) | Should -Be @('Monitoring')
+        @($script:recorded | Where-Object { $_.Contains('TrackT1') }).Count | Should -Be 1 -Because 'a later resume goes on from there'
+        @($script:repairs) | Should -Be @('DEPLOY')
+        @($outcome.Results | Where-Object { [string]$_.checkId -in 'DEPLOY.T1.SQLIAAS.REPAIR', 'T1.SQLVM.MONITORING' } | ForEach-Object { '{0} {1}' -f $_.checkId, $_.status }) | Should -Be @('DEPLOY.T1.SQLIAAS.REPAIR Warning', 'T1.SQLVM.MONITORING Pass')
+        $row = @($script:progressSteps | Where-Object { $_.Id -eq 'T1.Monitoring' -and $_.State -eq 'Done' })[-1]
+        $row.Status | Should -Be 'Warning'
+        $row.Message | Should -Match '^T1''s SQL IaaS Agent extension had failed \(Server is in single user mode\), so this run repaired it'
+        $row.Message | Should -Match 'The monitoring flag DatabaseWatcheronAzureVM, which the repair dropped, was merged again\.$'
+        $note = InModuleScope DbHubDemo -Parameters @{ Results = $outcome.Results } { Get-DemoSqlIaasRepairNote -Result $Results }
+        $note | Should -Match '^T1''s SQL IaaS Agent extension had failed .* Nothing to do \(DEPLOY\.T1\.SQLIAAS\.REPAIR\)\.$'
+
+        # A repair that fails stops the step, with the repair's own reason first.
+        $script:monitoringReads = 0
+        Mock -ModuleName DbHubDemo -CommandName Repair-DemoSqlIaasExtension -MockWith {
+            New-DemoResult -CheckId 'DEPLOY.T1.SQLIAAS.REPAIR' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'The SqlIaasExtension on sqlvm01 is Failed (Server is in single user mode), and Azure refused its repair: Forbidden.' -Remediation 'Repair it in the Azure portal (SQL virtual machines > sqlvm01 > SQL IaaS Agent Extension Settings > Repair), then run ./scripts/deploy.ps1 again.' -Evidence ([ordered]@{ repaired = $false; extensionStates = @('Failed') })
+        }
+        $script:progressSteps.Clear()
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Monitoring') }
+        $outcome.Status | Should -Be 'Fail'
+        $row = @($script:progressSteps | Where-Object { $_.Id -eq 'T1.Monitoring' -and $_.State -eq 'Failed' })[-1]
+        $row.Message | Should -Match '^The SqlIaasExtension on sqlvm01 is Failed \(Server is in single user mode\), and Azure refused its repair'
+    }
+
     It 'gives the Insights app the workspace the Fabric step resolved, and shows its actual reason as Failed, while the track passes (Phase 28 live finding; 2026-11-05)' {
         # Live: the app's own lookup by name of the workspace just created failed, and the page showed Skipped with a
         # status of Fail and a generic message about tenant settings that were on. Since 2026-11-05 the app is part of

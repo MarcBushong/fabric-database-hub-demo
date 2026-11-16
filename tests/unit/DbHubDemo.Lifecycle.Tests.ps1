@@ -4318,6 +4318,261 @@ Describe 'Invoke-DemoSqlVmMonitoringWait: a deployment step''s T1 monitoring (Ph
     }
 }
 
+Describe 'A Failed SQL IaaS Agent extension: the documented repair, once per run, only when it''s safe (2026-11-16 live finding)' {
+    BeforeAll {
+        $config = New-TestConfig
+        $script:repairUrl = 'https://management.azure.com/subscriptions/{0}/resourceGroups/rg-{1}-{2}/providers/Microsoft.SqlVirtualMachine/sqlVirtualMachines/sqlvm01' -f $config['subscriptionId'], $config['prefix'], $config['environment']
+        # Live, rg-dbhubnu-demo (0f37192): the instance view of the extension whose update met T1's lockout recovery.
+        $script:singleUserText = 'Login failed for user ''NT Service\MSSQLSERVER''. Reason: Server is in single user mode. Only one administrator can connect at this time.'
+        function New-ExtensionJson([string] $State, [string] $Failure = $script:singleUserText) {
+            $substatuses = if ($State -eq 'Failed') { @([ordered]@{ code = 'ComponentStatus/SQL Server IaaS Agent/failed/56061'; level = 'Error'; message = $Failure }, [ordered]@{ code = 'ComponentStatus/DatabaseMonitorArcPlugin/succeeded'; level = 'Info'; message = '{}' }) } else { @([ordered]@{ code = 'ComponentStatus/SQL Server IaaS Agent/succeeded'; level = 'Info'; message = 'Healthy' }) }
+            ConvertTo-Json -Depth 10 -InputObject ([ordered]@{ name = 'SqlIaasExtension'; provisioningState = $State; instanceView = [ordered]@{ substatuses = $substatuses } })
+        }
+        function New-SqlVmResource([string] $State = 'Succeeded', [string] $Connectivity = 'LOCAL', [int] $Port = 1433, [bool] $Upgrade = $true) {
+            [pscustomobject]@{
+                location   = 'westus3'
+                tags       = [pscustomobject]@{ owner = 'tester'; deploymentId = 'abc123' }
+                properties = [pscustomobject]@{
+                    provisioningState                      = $State
+                    virtualMachineResourceId               = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01'
+                    sqlServerLicenseType                   = 'PAYG'
+                    enableAutomaticUpgrade                 = $Upgrade
+                    serverConfigurationsManagementSettings = [pscustomobject]@{ sqlConnectivityUpdateSettings = [pscustomobject]@{ connectivityType = $Connectivity; port = $Port } }
+                }
+            }
+        }
+        function New-FailedMonitoring {
+            New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'The SqlIaasExtension on sqlvm01 is Failed, not Succeeded.' -Remediation 'Wait for the extension, or repair it in the portal (SQL virtual machines), then run configure-monitoring.ps1 again.' -Evidence ([ordered]@{ provisioningState = 'Failed'; featureFlagEnabled = $true; pluginState = 'Running'; powerState = 'PowerState/running'; pending = $false; actions = @() })
+        }
+    }
+
+    BeforeEach {
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:calls = [System.Collections.Generic.List[string]]::new()
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed', 'Deleting', 'NotFound', 'Creating', 'Succeeded'))
+        $script:power = 'PowerState/running'
+        $script:mode = '{"bootstrapState":"Ready","sqlService":"Running","singleUser":false,"error":""}'
+        $script:modeSucceeded = $true
+        $script:postExit = 0
+        $script:putExit = 0
+        $script:putBody = $null
+        $script:afterConnectivity = 'LOCAL'
+        $script:afterState = 'Succeeded'
+        $script:monitoringCalls = 0
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add(('{0}|{1}' -f $PesterBoundParameters['Level'], $PesterBoundParameters['Message'])) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        $script:sleptSeconds = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:sleptSeconds += [int]$PesterBoundParameters['Seconds'] }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:calls.Add('power'); $script:power }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $script:calls.Add('mode ' + $RunCommandName)
+            [pscustomobject]@{ Succeeded = $script:modeSucceeded; ExecutionState = $(if ($script:modeSucceeded) { 'Succeeded' } else { 'Failed' }); ExitCode = $(if ($script:modeSucceeded) { 0 } else { 1 }); Output = $script:mode; Error = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith {
+            $script:monitoringCalls++
+            $script:calls.Add('monitoring')
+            if ($script:monitoringCalls -eq 1) {
+                New-FailedMonitoring
+            }
+            else {
+                New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'sqlvm01 reports DatabaseMonitorArcPlugin Running with MetricsUploadStatus OK.' -Evidence ([ordered]@{ provisioningState = 'Succeeded'; featureFlagEnabled = $true; pluginState = 'Running'; powerState = 'PowerState/running'; pending = $false; actions = @('Merged DatabaseWatcheronAzureVM into the SqlIaasExtension public settings, keeping 4 other setting(s) and 0 other feature flag(s).') })
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = $ArgumentList -join ' '
+            if ($joined -like 'vm extension show*') {
+                $state = if ($script:extensionStates.Count -gt 1) { $script:extensionStates.Dequeue() } else { $script:extensionStates.Peek() }
+                $script:calls.Add('extension ' + $state)
+                if ($state -eq 'NotFound') {
+                    return [pscustomobject]@{ ExitCode = 3; StdOut = ''; StdErr = 'ERROR: (ResourceNotFound) The Resource ''Microsoft.Compute/virtualMachines/sqlvm01/extensions/SqlIaasExtension'' under resource group ''rg-dbhub-demo'' was not found.' }
+                }
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (New-ExtensionJson -State $state); StdErr = '' }
+            }
+            if ($joined -like 'rest --method post*') {
+                $script:calls.Add('post ' + $ArgumentList[4])
+                return [pscustomobject]@{ ExitCode = $script:postExit; StdOut = ''; StdErr = $(if ($script:postExit) { 'ERROR: (AuthorizationFailed) The client does not have authorization to perform action ''Microsoft.SqlVirtualMachine/sqlVirtualMachines/redeploy/action''.' } else { '' }) }
+            }
+            if ($joined -like 'rest --method put*') {
+                $path = ([string]$ArgumentList[[array]::IndexOf($ArgumentList, '--body') + 1]).TrimStart('@')
+                $script:putBody = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+                $script:calls.Add('put ' + $ArgumentList[4])
+                return [pscustomobject]@{ ExitCode = $script:putExit; StdOut = ''; StdErr = $(if ($script:putExit) { 'ERROR: (BadRequest) The SQL virtual machine is in a state that doesn''t allow this operation.' } else { '' }) }
+            }
+            if ($joined -like 'rest --method get*') {
+                $script:calls.Add('get ' + $ArgumentList[4])
+                if ($null -eq $script:putBody) {
+                    return (New-SqlVmResource -Connectivity 'LOCAL')
+                }
+                return (New-SqlVmResource -State $script:afterState -Connectivity $script:afterConnectivity)
+            }
+            throw ('unexpected az call: ' + $joined)
+        }
+    }
+
+    It 'repairs a Failed extension when sqlvm01 runs and SQL Server is multi-user, re-applies and verifies the template''s settings, merges the flag again, and says so first, as a Warning' {
+        # On the code before it, the Monitoring step returned only the Fail, and the run ended NOT DONE with the portal's Repair.
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -ProgressPath 'progress.json' } $config)
+        @($results.checkId) | Should -Be @('DEPLOY.T1.SQLIAAS.REPAIR', 'T1.SQLVM.MONITORING') -Because 'the step''s row shows the first result that isn''t a Pass'
+        $results[0].status | Should -Be 'Warning'
+        $results[1].status | Should -Be 'Pass'
+        $script:monitoringCalls | Should -Be 2 -Because 'the monitoring runs again after the repair, and merges the flag it dropped'
+        # Safe first (running, multi-user), then the documented API, once.
+        @($script:calls | Where-Object { $_ -like 'post *' }) | Should -Be @(('post {0}/redeploy?api-version=2023-10-01' -f $script:repairUrl))
+        $script:calls.IndexOf('mode DbHubDemo-SqlModeRead') | Should -BeLessThan $script:calls.IndexOf(('post {0}/redeploy?api-version=2023-10-01' -f $script:repairUrl))
+        $script:calls.IndexOf('power') | Should -BeLessThan $script:calls.IndexOf('mode DbHubDemo-SqlModeRead')
+        # What the template sets, sent again with the resource's own location, tags, VM, and license, after the extension is back.
+        $script:calls.IndexOf('extension Succeeded') | Should -BeLessThan $script:calls.IndexOf(('put {0}?api-version=2023-10-01' -f $script:repairUrl))
+        $script:putBody['location'] | Should -Be 'westus3'
+        $script:putBody['tags']['owner'] | Should -Be 'tester'
+        $script:putBody['tags']['deploymentId'] | Should -Be 'abc123'
+        $script:putBody['properties']['virtualMachineResourceId'] | Should -Match '/virtualMachines/sqlvm01$'
+        $script:putBody['properties']['sqlServerLicenseType'] | Should -Be 'PAYG'
+        $script:putBody['properties']['enableAutomaticUpgrade'] | Should -BeTrue
+        $script:putBody['properties']['serverConfigurationsManagementSettings']['sqlConnectivityUpdateSettings']['connectivityType'] | Should -Be 'LOCAL'
+        $script:putBody['properties']['serverConfigurationsManagementSettings']['sqlConnectivityUpdateSettings']['port'] | Should -Be 1433
+        @($script:calls | Where-Object { $_ -like 'get *' })[-1] | Should -Be ('get {0}?api-version=2023-10-01&$expand=*' -f $script:repairUrl)
+        $results[0].message | Should -Be 'T1''s SQL IaaS Agent extension had failed (Server is in single user mode), so this run repaired it with Azure''s Redeploy (the portal''s Repair) in 2 minutes and re-applied what a repair drops: LOCAL connectivity on port 1433 and automatic upgrade, both verified (license PAYG kept). The monitoring flag DatabaseWatcheronAzureVM, which the repair dropped, was merged again.'
+        $results[0].message.Length | Should -BeLessOrEqual 400 -Because 'the status page''s row keeps 400 characters'
+        $results[0].remediation | Should -Match '^Nothing to do'
+        $results[0].evidence.repaired | Should -BeTrue
+        $results[0].evidence.verified | Should -BeTrue
+        $results[0].evidence.monitoringFlag | Should -Be 'merged'
+        $results[0].evidence.failure | Should -Be $script:singleUserText
+        @($results[0].evidence.extensionStates) | Should -Be @('Failed', 'Deleting', 'NotFound', 'Creating', 'Succeeded')
+        @($results[0].evidence.reapplied) | Should -Be @('connectivityType=LOCAL', 'port=1433', 'enableAutomaticUpgrade=true', 'sqlServerLicenseType=PAYG')
+        # The console says it as it starts and as it ends; DONE says it too.
+        @($script:logged | Where-Object { $_ -like 'Warning|The SqlIaasExtension on sqlvm01 is Failed (Server is in single user mode); repairing it*' }).Count | Should -Be 1
+        @($script:logged | Where-Object { $_ -like 'Warning|DEPLOY.T1.SQLIAAS.REPAIR: T1''s SQL IaaS Agent extension had failed*' }).Count | Should -Be 1
+        $note = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoSqlIaasRepairNote -Result $r } $results
+        $note | Should -Be ('{0} Nothing to do (DEPLOY.T1.SQLIAAS.REPAIR).' -f $results[0].message)
+
+        # start-demo.ps1 (after it recreates T3) names it START.
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:monitoringCalls = 0
+        $script:putBody = $null
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed', 'Updating', 'Succeeded'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -RestartAtOnce -CheckId 'START.T1.MONITORING' } $config)
+        $results[0].checkId | Should -Be 'START.T1.SQLIAAS.REPAIR'
+        $results[0].status | Should -Be 'Warning'
+        (& (Get-Module -Name DbHubDemo) { param($r) Get-DemoSqlIaasRepairNote -Result $r } $results) | Should -BeNullOrEmpty -Because 'DONE is deploy.ps1''s'
+    }
+
+    It 'doesn''t repair when <Name>, and says why with the portal''s Repair' -ForEach @(
+        @{ Name = 'sqlvm01 isn''t running'; Power = 'PowerState/deallocated'; Mode = ''; Succeeded = $true; Expected = 'it wasn''t repaired: sqlvm01 is deallocated, and the repair needs it running\.$'; Reads = $false }
+        @{ Name = 'T1''s bootstrap isn''t finished'; Power = 'PowerState/running'; Mode = '{"bootstrapState":"Running","sqlService":"Running","singleUser":false,"error":""}'; Succeeded = $true; Expected = 'T1''s bootstrap isn''t finished \(state Running\), and its lockout recovery restarts SQL Server in single-user mode'; Reads = $true }
+        @{ Name = 'SQL Server is in single-user mode'; Power = 'PowerState/running'; Mode = '{"bootstrapState":"Ready","sqlService":"Running","singleUser":true,"error":"Login failed for user ''NT AUTHORITY\\SYSTEM''. Reason: Server is in single user mode."}'; Succeeded = $true; Expected = 'it wasn''t repaired: SQL Server is in single-user mode\.$'; Reads = $true }
+        @{ Name = 'SQL Server isn''t running'; Power = 'PowerState/running'; Mode = '{"bootstrapState":"Ready","sqlService":"Stopped","singleUser":null,"error":""}'; Succeeded = $true; Expected = 'SQL Server isn''t running \(service Stopped\)'; Reads = $true }
+        @{ Name = 'SQL Server''s mode can''t be read'; Power = 'PowerState/running'; Mode = 'not json'; Succeeded = $false; Expected = 'SQL Server''s mode couldn''t be read \(the Run Command ended Failed \(exit code 1\)'; Reads = $true }
+    ) {
+        $script:power = $Power
+        $script:mode = $Mode
+        $script:modeSucceeded = $Succeeded
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        @($results.checkId) | Should -Be @('DEPLOY.T1.SQLIAAS.REPAIR', 'T1.SQLVM.MONITORING')
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match ('^The SqlIaasExtension on sqlvm01 is Failed \(Server is in single user mode\), and it wasn''t repaired: ')
+        $results[0].message | Should -Match $Expected
+        $results[0].remediation | Should -Match ([regex]::Escape('Repair it in the Azure portal (SQL virtual machines > sqlvm01 > SQL IaaS Agent Extension Settings > Repair), then run ./scripts/deploy.ps1 again.'))
+        $results[0].evidence.repaired | Should -BeFalse
+        $results[1].status | Should -Be 'Fail' -Because 'the monitoring isn''t read again without a repair'
+        @($script:calls | Where-Object { $_ -like 'post *' -or $_ -like 'put *' }) | Should -BeNullOrEmpty
+        ($script:calls -contains 'mode DbHubDemo-SqlModeRead') | Should -Be $Reads -Because 'a VM that isn''t running gets no Run Command'
+        $script:monitoringCalls | Should -Be 1
+    }
+
+    It 'is a Fail with the reason and the portal''s Repair when Azure refuses the repair, when the extension fails again, or when it''s still Failed after 15 minutes' {
+        $script:postExit = 1
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match 'and Azure refused its repair: .*does not have authorization'
+        $results[0].remediation | Should -Match '^Repair it in the Azure portal'
+        @($results.checkId) | Should -Be @('DEPLOY.T1.SQLIAAS.REPAIR', 'T1.SQLVM.MONITORING')
+
+        # The reinstall fails again: its own reason.
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:postExit = 0
+        $script:monitoringCalls = 0
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed', 'Failed', 'Creating', 'Failed'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'This run repaired the SqlIaasExtension on sqlvm01, which was Failed (Server is in single user mode), with Azure''s Redeploy, but it failed again (Login failed for user ''NT Service\MSSQLSERVER''. Reason: Server is in single user mode. Only one administrator can connect at this time).'
+        $results[0].remediation | Should -Match '^Repair it in the Azure portal'
+        @($script:calls | Where-Object { $_ -like 'put *' }) | Should -BeNullOrEmpty
+        $script:monitoringCalls | Should -Be 1
+
+        # Never past its bound: Failed throughout (the old state) is still Failed after 15 minutes.
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:monitoringCalls = 0
+        $script:sleptSeconds = 0
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match 'but it was still Failed after 15 minutes\.$'
+        $script:sleptSeconds | Should -Be 900
+    }
+
+    It 'repairs once per run: a second Failed extension in the same run is a Fail, with no second repair' {
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config
+        @($script:calls | Where-Object { $_ -like 'post *' }).Count | Should -Be 1
+        $script:monitoringCalls = 0
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'The SqlIaasExtension on sqlvm01 is Failed again after this run repaired it, and it isn''t repaired twice in one run.'
+        $results[0].remediation | Should -Match '^Repair it in the Azure portal'
+        @($script:calls | Where-Object { $_ -like 'post *' }).Count | Should -Be 1
+    }
+
+    It 'is a Fail that names the template''s rerun when what a repair drops can''t be re-applied or verified' {
+        $script:putExit = 1
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match '^This run repaired the SqlIaasExtension on sqlvm01 in 2 minutes, but Azure refused what a repair doesn''t keep \(LOCAL connectivity on port 1433 and automatic upgrade\): .*doesn''t allow this operation'
+        $results[0].remediation | Should -Be 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template sets them again, and the run continues from there.'
+        $results[0].evidence.repaired | Should -BeTrue -Because 'the extension itself is back, so the monitoring runs again'
+        $script:monitoringCalls | Should -Be 2
+
+        # Applied, but a read afterward shows another value.
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:putExit = 0
+        $script:putBody = $null
+        $script:monitoringCalls = 0
+        $script:afterConnectivity = 'PRIVATE'
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed', 'Updating', 'Succeeded'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match 'but a read afterward shows connectivity PRIVATE\. The monitoring flag'
+        $results[0].evidence.verified | Should -BeFalse
+    }
+
+    It 'reads an extension that''s no longer Failed again, as it is now, without a repair' {
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Updating'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Not selected'
+        $results[0].message | Should -Be 'The SqlIaasExtension on sqlvm01 is Updating now, so there''s nothing to repair.'
+        $results[1].status | Should -Be 'Pass'
+        $script:monitoringCalls | Should -Be 2
+        @($script:calls | Where-Object { $_ -like 'post *' }) | Should -BeNullOrEmpty
+    }
+
+    It 're-applies exactly what infra/modules/sqlvm01.bicep sets on the SQL virtual machine' {
+        # A setting the template adds later fails this test until the repair re-applies it too.
+        $bicep = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/sqlvm01.bicep') -Raw
+        $start = $bicep.IndexOf('resource sqlVirtualMachine ')
+        $start | Should -BeGreaterThan 0
+        $end = $bicep.IndexOf('@description(', $start)
+        $block = $bicep.Substring($start, $end - $start)
+        $keys = @([regex]::Matches($block, '(?m)^\s+(\w+):') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -notin 'name', 'location', 'tags', 'properties' } | Sort-Object)
+        $keys | Should -Be @('connectivityType', 'enableAutomaticUpgrade', 'port', 'serverConfigurationsManagementSettings', 'sqlConnectivityUpdateSettings', 'sqlServerLicenseType', 'virtualMachineResourceId')
+        $template = & (Get-Module -Name DbHubDemo) { Get-DemoSqlVmTemplateSetting }
+        $block | Should -Match ('enableAutomaticUpgrade: {0}' -f ([string]$template['enableAutomaticUpgrade']).ToLowerInvariant())
+        $block | Should -Match ('connectivityType: ''{0}''' -f $template['connectivityType'])
+        $block | Should -Match ('port: {0}' -f $template['port'])
+        $block | Should -Match 'sqlServerLicenseType: sqlLicenseType' -Because 'the license type is the resource''s own, which a repair keeps'
+    }
+}
+
 Describe 'T1''s monitoring when Azure can''t be read (review of c7c86ec)' {
     BeforeAll {
         $config = New-TestConfig

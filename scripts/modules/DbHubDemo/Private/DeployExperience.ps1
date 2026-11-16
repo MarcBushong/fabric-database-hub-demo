@@ -1362,7 +1362,8 @@ function Get-DemoDeploymentOutcome {
     fallback with its hourly price from -T4HourlyUsd, "created" only when -T4Created or this run's evidence shows the
     server, a nightly safety stop this run set up only in part (Get-DemoSafetyStopNote, ADR 0024), the nightly stop that
     waited for this run and when the demo stops tonight (Get-DemoBusyMarkerNote, 2026-11-14), Run Commands that ran
-    under a fresh name because Azure kept their own in Deleting (Get-DemoRunCommandStuckNote), Developer mode's T2),
+    under a fresh name because Azure kept their own in Deleting (Get-DemoRunCommandStuckNote), T1's SQL IaaS Agent
+    extension that this run repaired (Get-DemoSqlIaasRepairNote), Developer mode's T2),
     NonBlocking (what didn't work but never blocks DONE, such as the Insights app; Get-DemoNonBlockingItem), Unfinished
     (tracks that didn't finish), Missing (DONE requirements without a Pass), and ExitCode: 0 when DONE, 1 when NOT DONE
     with a Fail, 2 when NOT DONE otherwise; -WhatIfRun is 0 unless a check failed. Pure. Internal.
@@ -1489,6 +1490,11 @@ function Get-DemoDeploymentOutcome {
     $stuckNote = Get-DemoRunCommandStuckNote -Result $all
     if ($stuckNote) {
         $notes.Add($stuckNote)
+    }
+    # T1's SQL IaaS Agent extension, which this run repaired (2026-11-16 live finding).
+    $repairNote = Get-DemoSqlIaasRepairNote -Result $all
+    if ($repairNote) {
+        $notes.Add($repairNote)
     }
     if ($installMode -eq 'Developer') {
         $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default) or ProductKey mode gives them.')

@@ -1281,7 +1281,8 @@ function Invoke-DemoDeploymentTrack {
                     # fail, for example) stops the step with its own cause (Invoke-DemoSqlVmMonitoringWait).
                     $monitoring = @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes ([int](& $option 'MonitoringWaitMinutes' 20)) -JustMerged:$monitoringMerged -ProgressPath $progress)
                     & $addAll $monitoring
-                    if ([string]$monitoring[0].status -eq 'Fail') {
+                    # A repair of the SqlIaasExtension, when there was one, comes first (2026-11-16).
+                    if (@($monitoring | Where-Object { [string]$_.status -eq 'Fail' }).Count -gt 0) {
                         $outcome = 'Fail'
                     }
                 }

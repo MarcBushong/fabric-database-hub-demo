@@ -763,9 +763,10 @@ function Invoke-DemoDeployment {
                 foreach ($item in $monitoringResults) {
                     $results.Add($item)
                 }
-                $monitoring = $monitoringResults[0]
-                if ($monitoring.status -eq 'Fail') {
-                    & $stageResult 'Monitoring' 'Fail' 'T1 performance monitoring couldn''t be turned on.' $monitoring.remediation
+                # A repair of the SqlIaasExtension, when there was one, comes first (2026-11-16); its Fail has its own fix.
+                $monitoringFail = @($monitoringResults | Where-Object { [string]$_.status -eq 'Fail' } | Select-Object -First 1)
+                if ($monitoringFail.Count -gt 0) {
+                    & $stageResult 'Monitoring' 'Fail' 'T1 performance monitoring couldn''t be turned on.' $monitoringFail[0].remediation
                     return (& $finishEarly)
                 }
                 & $recordStage 'Monitoring'
