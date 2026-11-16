@@ -258,10 +258,14 @@ function Get-DemoHostRestartBlocker {
 function Restart-DemoVmOnce {
     <#
     .SYNOPSIS
-    The watchdog's restart: 'az vm restart' for one VM, at most once per deploy.ps1 process, then the wait for its VM
-    agent. Never the T2 host while Get-DemoHostRestartBlocker names a reason: the guided stop's request is valid (its
-    guest may be in the middle of setup), the golden Release runs on it, or its guest build may be running, judged from
-    the deployment state (review finding 6 and its follow-up). Returns Restarted, Reason, and AtUtc. Internal.
+    The watchdog's restart: 'az vm restart --no-wait' for one VM, at most once per deploy.ps1 process, then a bounded wait
+    until Azure has finished it (Wait-DemoVmRestarted, -RestartMinutes) and the VM agent is Ready; a restart Azure doesn't
+    finish in that time gets one deallocate and start (Invoke-DemoVmRestartRecovery, -RecoverMinutes), so no restart holds
+    a run without end (2026-11-16). Never the T2 host while Get-DemoHostRestartBlocker names a reason: the guided stop's
+    request is valid (its guest may be in the middle of setup), the golden Release runs on it, or its guest build may be
+    running, judged from the deployment state (review finding 6 and its follow-up). Returns Restarted, Reason, AtUtc,
+    Recovered (the deallocate and start brought it back), Failed (it isn't back: the watchdog's result is a Fail), Detail,
+    and Results (the guest's shutdown, when the recovery ran it). Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -273,32 +277,232 @@ function Restart-DemoVmOnce {
         [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9-]{0,14}$')]
         [string] $VmName,
 
-        [string] $Because = 'Azure''s work on its extensions was stuck'
+        [string] $Because = 'Azure''s work on its extensions was stuck',
+
+        [ValidateRange(1, 60)]
+        [int] $RestartMinutes = 15,
+
+        [ValidateRange(1, 60)]
+        [int] $RecoverMinutes = 20,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 15
     )
 
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
     $key = '{0}/{1}' -f $resourceGroupName, $VmName
     if ($script:DemoVmRestarted.ContainsKey($key)) {
-        return [pscustomobject]@{ Restarted = $false; Reason = 'it was restarted once already in this run'; AtUtc = $script:DemoVmRestarted[$key] }
+        return [pscustomobject]@{ Restarted = $false; Reason = 'it was restarted once already in this run'; AtUtc = $script:DemoVmRestarted[$key]; Recovered = $false; Failed = $false; Detail = ''; Results = @() }
     }
     if ($VmName -eq 'archost01') {
         $blocker = Get-DemoHostRestartBlocker -Config $Config -VmName $VmName
         if ($blocker) {
-            return [pscustomobject]@{ Restarted = $false; Reason = $blocker; AtUtc = $null }
+            return [pscustomobject]@{ Restarted = $false; Reason = $blocker; AtUtc = $null; Recovered = $false; Failed = $false; Detail = ''; Results = @() }
         }
     }
     if (-not $PSCmdlet.ShouldProcess($VmName, 'Restart the VM once, because its Azure-side work is stuck')) {
-        return [pscustomobject]@{ Restarted = $false; Reason = 'what if'; AtUtc = $null }
+        return [pscustomobject]@{ Restarted = $false; Reason = 'what if'; AtUtc = $null; Recovered = $false; Failed = $false; Detail = ''; Results = @() }
     }
     $at = [System.DateTime]::UtcNow
     $script:DemoVmRestarted[$key] = $at
     Write-DemoLog -Level Warning -Message ('{0}: {1} for about 15 minutes, so the VM restarts once now (az vm restart); the run goes on afterward.' -f $VmName, $Because)
-    $restart = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('vm', 'restart', '--resource-group', $resourceGroupName, '--name', $VmName) -AllowFailure
+    $subscriptionId = [string]$Config['subscriptionId']
+    # --no-wait, then a bounded wait (2026-11-16): without them, a restart Azure never finished held the track, and deploy.ps1,
+    # with no end and no NOT DONE (live: archost01 'updating', its agent Not Ready, 40 minutes after the restart).
+    $restart = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'restart', '--resource-group', $resourceGroupName, '--name', $VmName, '--no-wait') -AllowFailure -TimeoutSeconds 300
     if ($restart.ExitCode -ne 0) {
-        return [pscustomobject]@{ Restarted = $false; Reason = ('the restart failed: {0}' -f (Get-DemoDeploymentErrorText -Text $restart.StdErr -MaxLength 300)); AtUtc = $at }
+        return [pscustomobject]@{ Restarted = $false; Reason = ('the restart failed: {0}' -f (Get-DemoDeploymentErrorText -Text $restart.StdErr -MaxLength 300)); AtUtc = $at; Recovered = $false; Failed = $false; Detail = ''; Results = @() }
     }
-    $null = Wait-DemoVmAgentReady -SubscriptionId ([string]$Config['subscriptionId']) -ResourceGroupName $resourceGroupName -VmName $VmName -TimeoutMinutes 15
-    return [pscustomobject]@{ Restarted = $true; Reason = ''; AtUtc = $at }
+    $wait = Wait-DemoVmRestarted -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName -SinceUtc $at -TimeoutMinutes $RestartMinutes -PollSeconds $PollSeconds
+    if ($wait.Done) {
+        return [pscustomobject]@{ Restarted = $true; Reason = ''; AtUtc = $at; Recovered = $false; Failed = $false; Detail = ''; Results = @() }
+    }
+    Write-DemoLog -Level Warning -Message ('{0}: Azure didn''t finish its restart in {1} minutes ({2}), so it''s deallocated and started once now; no action needed.' -f $VmName, $RestartMinutes, $wait.State)
+    $recover = Invoke-DemoVmRestartRecovery -Config $Config -VmName $VmName -TimeoutMinutes $RecoverMinutes -PollSeconds $PollSeconds
+    $detail = 'Azure didn''t finish its restart in {0} minutes ({1}), so {2}' -f $RestartMinutes, $wait.State, $recover.Detail
+    return [pscustomobject]@{ Restarted = $true; Reason = ''; AtUtc = $at; Recovered = [bool]$recover.Recovered; Failed = -not [bool]$recover.Recovered; Detail = $detail; Results = @($recover.Results) }
+}
+
+function Get-DemoVmRestartState {
+    # One read of a VM's instance view for the watchdog's bounded restart: Read, Provisioning (the ProvisioningState code),
+    # ProvisionedUtc (its time, when Azure gives one), Power (the PowerState code), Agent (the VM agent's displayStatus), and
+    # Text for the messages. Internal.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string] $VmName
+    )
+
+    $view = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('vm', 'get-instance-view', '--resource-group', $ResourceGroupName, '--name', $VmName, '--query', 'instanceView', '--output', 'json') -AsJson -AllowFailure -TimeoutSeconds 120
+    if ($null -eq $view) {
+        return [pscustomobject]@{ Read = $false; Provisioning = ''; ProvisionedUtc = $null; Power = ''; Agent = ''; Text = 'its instance view couldn''t be read' }
+    }
+    # Assigned first: Get-DemoMemberValue returns an array as one object.
+    $statusValue = Get-DemoMemberValue -InputObject $view -Name 'statuses'
+    $statuses = @($statusValue)
+    $provisioning = @($statuses | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'code') -like 'ProvisioningState/*' }) | Select-Object -First 1
+    $power = @($statuses | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'code') -like 'PowerState/*' }) | Select-Object -First 1
+    $agentValue = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $view -Name 'vmAgent') -Name 'statuses'
+    $agent = [string](Get-DemoMemberValue -InputObject (@($agentValue) | Select-Object -First 1) -Name 'displayStatus')
+    $time = [string](Get-DemoMemberValue -InputObject $provisioning -Name 'time')
+    $provisionedUtc = $null
+    if ($time) {
+        $parsed = [System.DateTimeOffset]::MinValue
+        if ([System.DateTimeOffset]::TryParse($time, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+            $provisionedUtc = $parsed.UtcDateTime
+        }
+    }
+    $state = [pscustomobject]@{
+        Read           = $true
+        Provisioning   = [string](Get-DemoMemberValue -InputObject $provisioning -Name 'code')
+        ProvisionedUtc = $provisionedUtc
+        Power          = [string](Get-DemoMemberValue -InputObject $power -Name 'code')
+        Agent          = $agent
+        Text           = ''
+    }
+    $state.Text = 'provisioning {0}, power {1}, agent {2}' -f $(if ($state.Provisioning) { $state.Provisioning.Split('/')[-1] } else { 'unknown' }), $(if ($state.Power) { $state.Power.Split('/')[-1] } else { 'unknown' }), $(if ($agent) { $agent } else { 'unknown' })
+    return $state
+}
+
+function Wait-DemoVmRestarted {
+    <#
+    .SYNOPSIS
+    After 'az vm restart --no-wait' (2026-11-16): waits at most -TimeoutMinutes until Azure has finished the restart, that
+    is, the VM's provisioning state is Succeeded again (with a time at or after -SinceUtc, or after Updating was seen), it's
+    running, and its VM agent reports Ready. Returns Done, Seconds, and State (the last read, in words). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string] $VmName,
+
+        [Parameter(Mandatory)]
+        [datetime] $SinceUtc,
+
+        [ValidateRange(1, 60)]
+        [int] $TimeoutMinutes = 15,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 15
+    )
+
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $sawWork = $false
+    $last = 'not read yet'
+    while ($true) {
+        $state = Get-DemoVmRestartState -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName
+        if ($state.Read) {
+            $last = $state.Text
+            if ($state.Provisioning -ne 'ProvisioningState/succeeded' -or $state.Power -ne 'PowerState/running' -or $state.Agent -ne 'Ready') {
+                $sawWork = $true
+            }
+            $finished = $sawWork -or ($null -ne $state.ProvisionedUtc -and $state.ProvisionedUtc -ge $SinceUtc.ToUniversalTime().AddSeconds(-5))
+            if ($finished -and $state.Provisioning -eq 'ProvisioningState/succeeded' -and $state.Power -eq 'PowerState/running' -and $state.Agent -eq 'Ready') {
+                return [pscustomobject]@{ Done = $true; Seconds = [int]$watch.Elapsed.TotalSeconds; State = $last }
+            }
+        }
+        if ($watch.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
+            return [pscustomobject]@{ Done = $false; Seconds = [int]$watch.Elapsed.TotalSeconds; State = $last }
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+}
+
+function Invoke-DemoVmRestartRecovery {
+    <#
+    .SYNOPSIS
+    The watchdog's last resort when Azure doesn't finish a VM's restart (2026-11-16; the T2 host on rg-dbhubup-demo on
+    2026-11-13 and 14, and on rg-dbhubmn-demo on 2026-11-16, where a deallocate and start by hand cleared the same state):
+    the T2 guest shut down cleanly first when the host can still run commands (its agent Ready; Stop-DemoGuestVm, at most 3
+    minutes), then one deallocate and one start, each with --no-wait and a bounded wait (Invoke-DemoVmPowerAction), then
+    its agent Ready. Azure refusing the deallocate (an operation still in progress, after the conflict retries), or a VM
+    that still isn't running with its agent Ready, is reported, not waited for. Returns Recovered, Detail (what happened,
+    in words), and Results (the guest's shutdown, when it ran). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9-]{0,14}$')]
+        [string] $VmName,
+
+        [ValidateRange(1, 60)]
+        [int] $TimeoutMinutes = 20,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 15
+    )
+
+    $subscriptionId = [string]$Config['subscriptionId']
+    $resourceGroupName = Get-DemoResourceGroupName -Config $Config
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $results = [System.Collections.Generic.List[object]]::new()
+    $guestText = ''
+    if ($VmName -eq (Get-DemoHostVmName -Config $Config)) {
+        $state = Get-DemoVmRestartState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
+        if ($state.Agent -eq 'Ready') {
+            try {
+                $guest = Stop-DemoGuestVm -Config $Config -TimeoutSeconds 180 -Confirm:$false
+                $results.Add($guest)
+                $guestText = 'its guest was shut down first ({0}), ' -f [string]$guest.status
+            }
+            catch {
+                $guestText = 'its guest''s clean shutdown failed ({0}), ' -f (Protect-DemoText -Text $_.Exception.Message)
+            }
+        }
+        else {
+            $guestText = 'its guest wasn''t shut down first (the host''s agent can''t run commands: {0}), ' -f $state.Text
+        }
+    }
+    # Invoke-DemoAz here, not Invoke-DemoAzWithConflictRetry: Azure names the refused operation, 'deallocate', which that
+    # function's not-running check would read as a VM that's already deallocated. A conflict with an operation in progress
+    # is asked again, 4 times at most, 30 seconds apart; any other refusal is reported at once.
+    $deallocate = $null
+    for ($try = 1; $try -le 4; $try++) {
+        $deallocate = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'deallocate', '--resource-group', $resourceGroupName, '--name', $VmName, '--no-wait') -AllowFailure -TimeoutSeconds 300
+        if ($deallocate.ExitCode -eq 0 -or [string]$deallocate.StdErr -notmatch '(?i)conflict|in progress|another operation|preempt') {
+            break
+        }
+        if ($try -lt 4) {
+            Start-Sleep -Seconds 30
+        }
+    }
+    if ($deallocate.ExitCode -ne 0) {
+        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}Azure refused its deallocate: {1}' -f $guestText, (Get-DemoDeploymentErrorText -Text $deallocate.StdErr -MaxLength 300)); Results = $results.ToArray() }
+    }
+    $seconds = [int][System.Math]::Max(60, ($TimeoutMinutes * 60) - $watch.Elapsed.TotalSeconds)
+    $stopped = Invoke-DemoVmPowerAction -Config $Config -VmName $VmName -Action Deallocate -TimeoutSeconds ([System.Math]::Min(3600, $seconds)) -PollSeconds $PollSeconds
+    if ([string]$stopped.status -ne 'Pass') {
+        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was asked to deallocate, but {1}' -f $guestText, [string]$stopped.message); Results = $results.ToArray() }
+    }
+    $seconds = [int][System.Math]::Max(60, ($TimeoutMinutes * 60) - $watch.Elapsed.TotalSeconds)
+    $started = Invoke-DemoVmPowerAction -Config $Config -VmName $VmName -Action Start -TimeoutSeconds ([System.Math]::Min(3600, $seconds)) -PollSeconds $PollSeconds
+    if ([string]$started.status -ne 'Pass') {
+        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was deallocated, but its start didn''t finish: {1}' -f $guestText, [string]$started.message); Results = $results.ToArray() }
+    }
+    $minutes = [int][System.Math]::Max(1, [System.Math]::Ceiling((($TimeoutMinutes * 60) - $watch.Elapsed.TotalSeconds) / 60))
+    $agent = Wait-DemoVmAgentReady -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName -TimeoutMinutes ([System.Math]::Min(60, $minutes)) -PollSeconds $PollSeconds
+    if ($agent -lt 0) {
+        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was deallocated and started, but its VM agent wasn''t Ready within {1} minutes' -f $guestText, $TimeoutMinutes); Results = $results.ToArray() }
+    }
+    return [pscustomobject]@{ Recovered = $true; Detail = ('{0}it was deallocated and started once, and it''s running with its agent Ready after {1} minutes' -f $guestText, [int][System.Math]::Ceiling($watch.Elapsed.TotalMinutes)); Results = $results.ToArray() }
 }
 
 function Invoke-DemoVmWatchdog {
@@ -331,11 +535,25 @@ function Invoke-DemoVmWatchdog {
     $restart = Restart-DemoVmOnce -Config $Config -VmName $VmName -Because $Cause -Confirm:$false
     $at = if ($null -ne $restart.AtUtc) { ([datetime]$restart.AtUtc).ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
     $what = if ($activity.Labels.Count -gt 0) { ' Azure was busy with {0}.' -f ($activity.Labels -join ', ') } else { '' }
+    $recovered = [bool](Get-DemoMemberValue -InputObject $restart -Name 'Recovered')
+    $failed = [bool](Get-DemoMemberValue -InputObject $restart -Name 'Failed')
+    $detail = [string](Get-DemoMemberValue -InputObject $restart -Name 'Detail')
     $done = if ($restart.Restarted) { '{0} was restarted automatically at {1} (local time), because {2}.{3}' -f $VmName, $at, $Cause, $what } else { '{0} wasn''t restarted ({1}), although {2}.{3}' -f $VmName, $restart.Reason, $Cause, $what }
-    Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -AzureSide -Message ('{0} No action needed.' -f $done)
+    if ($detail) {
+        $done = '{0} {1}.' -f $done, $detail
+    }
     $savedText = if ($saved) { ' Its instance view is saved in {0} for ./scripts/collect-diagnostics.ps1.' -f $saved } else { '' }
-    $result = New-DemoResult -CheckId ('DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target (Get-DemoVmTarget -VmName $VmName) -Status 'Warning' -Message ('{0}{1}' -f $done, $savedText) -Evidence ([ordered]@{ vmName = $VmName; restarted = [bool]$restart.Restarted; restartedAtUtc = $(if ($null -ne $restart.AtUtc) { ([datetime]$restart.AtUtc).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }); busy = @($activity.Items); runCommandsDeleting = @($activity.RunCommandsDeleting).Count; instanceView = $saved }) -Remediation 'Nothing to do. If it happens on every run, an extension that a policy installs may be failing on the VM: see docs/troubleshooting.md.' -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-restart'
-    return [pscustomobject]@{ Restarted = [bool]$restart.Restarted; Saved = $saved; Items = @($activity.Labels); Result = $result }
+    $evidence = [ordered]@{ vmName = $VmName; restarted = [bool]$restart.Restarted; restartedAtUtc = $(if ($null -ne $restart.AtUtc) { ([datetime]$restart.AtUtc).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }); recovered = $recovered; busy = @($activity.Items); runCommandsDeleting = @($activity.RunCommandsDeleting).Count; instanceView = $saved }
+    $checkId = 'DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()
+    if ($failed) {
+        Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -AzureSide -Message ('{0} Azure-side; the run stops this step.' -f $done)
+        $result = New-DemoResult -CheckId $checkId -Area 'infra' -Target (Get-DemoVmTarget -VmName $VmName) -Status 'Fail' -Message ('{0}{1}' -f $done, $savedText) -Evidence $evidence -Remediation 'Wait 30 minutes, then run ./scripts/deploy.ps1 again; it continues where it stopped, and restarts the VM again, or deallocates and starts it, if it still needs to.' -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/states-billing'
+    }
+    else {
+        Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -AzureSide -Message ('{0} No action needed.' -f $done)
+        $result = New-DemoResult -CheckId $checkId -Area 'infra' -Target (Get-DemoVmTarget -VmName $VmName) -Status 'Warning' -Message ('{0}{1}' -f $done, $savedText) -Evidence $evidence -Remediation 'Nothing to do. If it happens on every run, an extension that a policy installs may be failing on the VM: see docs/troubleshooting.md.' -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-restart'
+    }
+    return [pscustomobject]@{ Restarted = [bool]$restart.Restarted; Recovered = $recovered; Failed = $failed; Saved = $saved; Items = @($activity.Labels); Result = $result; Results = @(@((Get-DemoMemberValue -InputObject $restart -Name 'Results')) | Where-Object { $null -ne $_ }) }
 }
 
 function New-DemoVmStuckResult {
@@ -403,10 +621,15 @@ function Invoke-DemoVmSettle {
         return [pscustomobject]@{ Settled = $true; Results = @() }
     }
     $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('Azure''s extension work didn''t finish in {0} minutes' -f $first.Minutes) -ProgressPath $ProgressPath -ProgressId $ProgressId
+    if ([bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed')) {
+        # The VM isn't back (its restart and the deallocate and start didn't finish): the watchdog's Fail says why and when to
+        # run deploy.ps1 again, and waiting on its extensions here would only add time.
+        return [pscustomobject]@{ Settled = $false; Results = @(@((Get-DemoMemberValue -InputObject $watchdog -Name 'Results') | Where-Object { $null -ne $_ }) + @($watchdog.Result)) }
+    }
     $second = Wait-DemoVmExtensionSettled -Config $Config -VmName $VmName -TimeoutMinutes $AfterRestartMinutes -PollSeconds $PollSeconds -ProgressPath $ProgressPath -ProgressId $ProgressId
     if ($second.Settled) {
-        return [pscustomobject]@{ Settled = $true; Results = @($watchdog.Result) }
+        return [pscustomobject]@{ Settled = $true; Results = @(@((Get-DemoMemberValue -InputObject $watchdog -Name 'Results') | Where-Object { $null -ne $_ }) + @($watchdog.Result)) }
     }
     $stuck = New-DemoVmStuckResult -VmName $VmName -What 'Extension work' -Item $second.Activity.Labels -Minutes ($first.Minutes + $second.Minutes) -Restarted $watchdog.Restarted
-    return [pscustomobject]@{ Settled = $false; Results = @($watchdog.Result, $stuck) }
+    return [pscustomobject]@{ Settled = $false; Results = @(@((Get-DemoMemberValue -InputObject $watchdog -Name 'Results') | Where-Object { $null -ne $_ }) + @($watchdog.Result, $stuck)) }
 }

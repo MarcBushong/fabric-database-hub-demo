@@ -886,11 +886,20 @@ function Invoke-DemoAzWithConflictRetry {
         [string] $Label,
 
         [ValidateRange(0, 12)]
-        [int] $MaxConflictRetries = 9
+        [int] $MaxConflictRetries = 9,
+
+        # Bounds each try (Invoke-DemoAz -TimeoutSeconds); 0 leaves it to the command (2026-11-16: calls that wait on a VM,
+        # such as 'az vm extension set', pass one).
+        [ValidateRange(0, 86400)]
+        [int] $TimeoutSeconds = 0
     )
 
+    $bound = @{}
+    if ($TimeoutSeconds -gt 0) {
+        $bound['TimeoutSeconds'] = $TimeoutSeconds
+    }
     for ($attempt = 1; ; $attempt++) {
-        $result = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList $ArgumentList -AllowFailure
+        $result = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList $ArgumentList -AllowFailure @bound
         if ($result.ExitCode -eq 0) {
             return $result
         }

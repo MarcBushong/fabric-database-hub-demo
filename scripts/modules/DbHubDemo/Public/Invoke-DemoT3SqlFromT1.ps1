@@ -158,7 +158,9 @@ function Invoke-DemoT3SqlFromT1 {
         [System.IO.File]::WriteAllText($scriptPath, $script.Text, [System.Text.Encoding]::ASCII)
         $arguments = @('vm', 'run-command', 'invoke', '--resource-group', $names.ResourceGroup, '--name', $names.T1VmName, '--command-id', 'RunPowerShellScript', '--scripts', "@$scriptPath", '--output', 'json')
         for ($attempt = 1; $attempt -le $RunCommandAttempts; $attempt++) {
-            $run = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList $arguments -AllowFailure
+            # Bounded (2026-11-16): 'az vm run-command invoke' waits for the script, which a stuck VM agent would hold until
+            # Azure's own 90-minute limit; the batches have their own time limit, so this allows that plus 15 minutes.
+            $run = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList $arguments -AllowFailure -TimeoutSeconds ([System.Math]::Min(5400, $BatchTimeoutSeconds + 900))
             if ($run.ExitCode -eq 0 -or $attempt -eq $RunCommandAttempts -or $run.StdErr -notmatch '(?i)conflict|in progress|another operation') {
                 break
             }

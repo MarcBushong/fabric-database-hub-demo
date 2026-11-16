@@ -931,7 +931,13 @@ function Invoke-DemoDeploymentTrack {
             }
             Write-DemoLog -Level Warning -Message ('{0}: sending the artifacts got stuck ({1}); the watchdog steps in, then they go one chunk at a time.' -f $VmName, $problem)
             $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('sending its artifacts got stuck ({0})' -f $problem) -ProgressPath $progress -ProgressId $progressId
+            foreach ($extra in @((Get-DemoMemberValue -InputObject $watchdog -Name 'Results') | Where-Object { $null -ne $_ })) {
+                $results.Add($extra)
+            }
             $results.Add($watchdog.Result)
+            if ([bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed')) {
+                throw ('{0} isn''t back after its restart and one deallocate and start, so its artifacts weren''t sent (DEPLOY.WATCHDOG_{1}).' -f $VmName, $VmName.ToUpperInvariant())
+            }
             try {
                 $sent = @(Send-DemoChunkSet -Config $Config -File $files -VmName $VmName -ChunkSizeKiB $chunkSize -Parallelism 1)
             }
@@ -991,9 +997,15 @@ function Invoke-DemoDeploymentTrack {
         $loader = & $runLoader
         if ($loader.status -ne 'Pass' -and [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
             $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('its bootstrap loader didn''t start within {0} minutes' -f [int]($loaderStartSeconds / 60)) -ProgressPath $progress -ProgressId $progressId
+            foreach ($extra in @((Get-DemoMemberValue -InputObject $watchdog -Name 'Results') | Where-Object { $null -ne $_ })) {
+                $results.Add($extra)
+            }
             $results.Add($watchdog.Result)
-            $loader = & $runLoader
-            if ($loader.status -ne 'Pass' -and [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
+            # A VM that isn't back gets no second loader run: the watchdog's Fail says when to run deploy.ps1 again.
+            if (-not [bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed')) {
+                $loader = & $runLoader
+            }
+            if (-not [bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed') -and $loader.status -ne 'Pass' -and [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
                 $activity = Get-DemoVmExtensionActivity -Config $Config -VmName $VmName
                 $results.Add((New-DemoVmStuckResult -VmName $VmName -What 'The bootstrap loader' -Item $activity.Labels -Minutes ([int](2 * $loaderStartSeconds / 60)) -Restarted $watchdog.Restarted))
             }

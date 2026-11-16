@@ -1468,6 +1468,8 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmAgentReady -MockWith { 10 }
+        # 2026-11-16: the restart's own bounded wait; each test that needs another answer mocks it again.
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmRestarted -MockWith { [pscustomobject]@{ Done = $true; Seconds = 60; State = 'provisioning succeeded, power running, agent Ready' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = $script:guidedUntil } }
         $script:guidedUntil = ''
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
@@ -1652,6 +1654,154 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $settle.Settled | Should -BeTrue
         @($settle.Results).Count | Should -Be 1
         $settle.Results[0].status | Should -Be 'Warning'
+    }
+
+    It 'asks for the restart without waiting on az, then waits, bounded, until Azure has finished it and the agent is Ready (2026-11-16)' {
+        $script:restartArgs = ''
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = $ArgumentList -join ' '
+            if ($joined -match '^vm restart') {
+                $script:restartArgs = $joined
+                $script:restartTimeout = $PesterBoundParameters['TimeoutSeconds']
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            throw ('unexpected Azure CLI call: ' + $joined)
+        }
+        $restart = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'sqlvm01' -Confirm:$false }
+        $script:restartArgs | Should -Match '--no-wait'
+        $script:restartTimeout | Should -BeGreaterThan 0
+        $restart.Restarted | Should -BeTrue
+        $restart.Recovered | Should -BeFalse
+        $restart.Failed | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Wait-DemoVmRestarted -Times 1 -Exactly -ParameterFilter { $VmName -eq 'sqlvm01' -and $TimeoutMinutes -eq 15 }
+    }
+
+    It 'counts a restart as finished only once Azure has worked on it, never the view from before it (2026-11-16)' {
+        $since = [DateTime]::UtcNow
+        $script:states = [System.Collections.Generic.Queue[object]]::new()
+        $ready = [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/succeeded'; ProvisionedUtc = $since.AddHours(-2); Power = 'PowerState/running'; Agent = 'Ready'; Text = 'provisioning succeeded, power running, agent Ready' }
+        $updating = [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = ''; Agent = 'Not Ready'; Text = 'provisioning updating, power unknown, agent Not Ready' }
+        foreach ($state in @($ready, $updating, $ready)) {
+            $script:states.Enqueue($state)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { $script:states.Dequeue() }
+        $wait = InModuleScope DbHubDemo -Parameters @{ Since = $since } { & (Get-Command -Name Wait-DemoVmRestarted -CommandType Function) -SubscriptionId '11111111-2222-3333-4444-555555555555' -ResourceGroupName 'rg-dbhub-demo' -VmName 'archost01' -SinceUtc $Since -TimeoutMinutes 15 -PollSeconds 1 }
+        $wait.Done | Should -BeTrue
+        $script:states.Count | Should -Be 0 -Because 'the first view, from before the restart, mustn''t count as its end'
+    }
+
+    It 'deallocates and starts a VM whose restart Azure doesn''t finish in time, once, bounded, and says so as a Warning (2026-11-16)' {
+        $script:power = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmRestarted -MockWith { [pscustomobject]@{ Done = $false; Seconds = 900; State = 'provisioning updating, power unknown, agent Not Ready' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = ''; Agent = 'Not Ready'; Text = 'provisioning updating, power unknown, agent Not Ready' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = $ArgumentList -join ' '
+            if ($joined -match '^vm get-instance-view') {
+                return $script:idle
+            }
+            if ($joined -match '^vm restart') {
+                $script:restarts++
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            if ($joined -match '^vm deallocate') {
+                $script:power.Add($joined)
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            if ($joined -match '^rest --method get') {
+                return [pscustomobject]@{ value = @() }
+            }
+            throw ('unexpected Azure CLI call: ' + $joined)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:power.Add(('wait {0} {1}' -f $Action, $TimeoutSeconds)); New-DemoResult -CheckId ('STOP.VM_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'ok' }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -MockWith { throw 'The guest can''t be shut down through a host whose agent isn''t Ready.' }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoVmInstanceView -MockWith { '' }
+        $script:stateValues = @{ GuidedStopUtc = ''; Stage = ''; TrackT1 = 'Telemetry'; TrackT2 = 'Artifacts'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]$script:stateValues }
+        $script:views.Enqueue($script:idle)
+        $watchdog = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmWatchdog -Config $Config -VmName 'archost01' -Cause 'sending its artifacts got stuck' }
+        $watchdog.Restarted | Should -BeTrue
+        $watchdog.Recovered | Should -BeTrue
+        $watchdog.Failed | Should -BeFalse
+        $script:power[0] | Should -Match '^vm deallocate .*--no-wait'
+        $script:power[1] | Should -Match '^wait Deallocate \d+'
+        $script:power[2] | Should -Match '^wait Start \d+'
+        $script:power.Count | Should -Be 3
+        $watchdog.Result.status | Should -Be 'Warning'
+        $watchdog.Result.message | Should -Match 'Azure didn''t finish its restart in 15 minutes \(provisioning updating, power unknown, agent Not Ready\), so its guest wasn''t shut down first \(the host''s agent can''t run commands.*it was deallocated and started once, and it''s running with its agent Ready'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -Times 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'archost01: Azure didn''t finish its restart in 15 minutes*deallocated and started once now; no action needed.' } -Times 1 -Exactly
+    }
+
+    It 'shuts the T2 guest down cleanly first when the host can still run commands (2026-11-16)' {
+        $script:order = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = 'PowerState/running'; Agent = 'Ready'; Text = 'provisioning updating, power running, agent Ready' } }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -MockWith { $script:order.Add(('guest {0}' -f $TimeoutSeconds)); New-DemoResult -CheckId 'STOP.GUEST' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'The guest is off.' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            if (($ArgumentList -join ' ') -match '^vm deallocate .*--no-wait') {
+                $script:order.Add('deallocate')
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            throw ('unexpected Azure CLI call: ' + ($ArgumentList -join ' '))
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add($Action); New-DemoResult -CheckId 'STOP.VM_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'ok' }
+        $recovery = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmRestartRecovery -Config $Config -VmName 'archost01' -PollSeconds 1 }
+        $recovery.Recovered | Should -BeTrue
+        $script:order | Should -Be @('guest 180', 'deallocate', 'Deallocate', 'Start')
+        @($recovery.Results).checkId | Should -Be @('STOP.GUEST')
+        $recovery.Detail | Should -Match '^its guest was shut down first \(Pass\), it was deallocated and started once'
+    }
+
+    It 'fails the step, with the single next step and the time to wait, when Azure refuses the deallocate, and waits no longer (2026-11-16)' {
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmRestarted -MockWith { [pscustomobject]@{ Done = $false; Seconds = 900; State = 'provisioning updating, power unknown, agent Not Ready' } }
+        $script:deallocates = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = $ArgumentList -join ' '
+            if ($joined -match '^vm get-instance-view') {
+                return $script:busy
+            }
+            if ($joined -match '^vm restart') {
+                $script:restarts++
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            if ($joined -match '^vm deallocate') {
+                $script:deallocates++
+                return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (OperationNotAllowed) Operation ''deallocate'' is not allowed since a conflicting operation is in progress.' }
+            }
+            if ($joined -match '^rest --method get') {
+                return [pscustomobject]@{ value = @() }
+            }
+            throw ('unexpected Azure CLI call: ' + $joined)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { throw 'Nothing waits for a deallocate Azure refused.' }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoVmInstanceView -MockWith { '' }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmExtensionSettled -MockWith { $script:settleWaits++; [pscustomobject]@{ Settled = $false; Minutes = 0; Activity = [pscustomobject]@{ Labels = @() } } }
+        $script:settleWaits = 0
+        $script:views.Enqueue($script:busy)
+        $settle = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmSettle -Config $Config -VmName 'sqlvm01' -FirstMinutes 0 -AfterRestartMinutes 10 -PollSeconds 1 }
+        $settle.Settled | Should -BeFalse
+        $script:settleWaits | Should -Be 1 -Because 'a VM that isn''t back isn''t waited on again'
+        $script:deallocates | Should -Be 4 -Because 'a conflict with an operation in progress is asked again, 4 times at most'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 30 } -Times 3 -Exactly
+        $fail = @($settle.Results | Where-Object { $_.checkId -eq 'DEPLOY.WATCHDOG_SQLVM01' })
+        $fail.Count | Should -Be 1
+        $fail[0].status | Should -Be 'Fail'
+        $fail[0].message | Should -Match 'Azure refused its deallocate: .*OperationNotAllowed'
+        $fail[0].remediation | Should -Match '^Wait 30 minutes, then run \./scripts/deploy\.ps1 again'
+        @($settle.Results | Where-Object { $_.checkId -eq 'DEPLOY.EXTENSIONS_SQLVM01' }).Count | Should -Be 0
+    }
+
+    It 'bounds every other call that waits on a VM: the extension''s update, T1''s Run Command for T3, and the workload actions (2026-11-16)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActionRunCommand -MockWith { $script:actionTimeout = $PesterBoundParameters['TimeoutSeconds']; [pscustomobject]@{ ExitCode = 0; StdOut = '{"status":"Pass","message":"ok"}'; StdErr = '' } }
+        foreach ($case in @(@{ Action = 'EnableT3'; Request = @{ serverFqdn = 'azuresql01-abc123.database.windows.net' }; Expected = 1800 }, @{ Action = 'Runner'; Request = @{ target = 'T1'; arguments = @('--scenario', 'baseline'); timeoutSeconds = 3000; readySeconds = 300 }; Expected = 3900 })) {
+            $script:actionTimeout = $null
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Case = $case } { Invoke-DemoWorkloadAction -Config $Config -VmName 'sqlvm01' -Action $Case.Action -Request $Case.Request }
+            $script:actionTimeout | Should -Be $case.Expected -Because $case.Action
+        }
+        $root = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../..'))
+        $monitoring = Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'scripts/modules/DbHubDemo/Public/Enable-DemoSqlVmMonitoring.ps1') -Raw
+        $monitoring | Should -Match "Label \('\{0\}: merging \{1\}' -f \`$state\.VmName, \`$flagName\) -TimeoutSeconds 1200"
+        $t3 = Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'scripts/modules/DbHubDemo/Public/Invoke-DemoT3SqlFromT1.ps1') -Raw
+        $t3 | Should -Match '-ArgumentList \$arguments -AllowFailure -TimeoutSeconds \('
     }
 }
 

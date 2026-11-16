@@ -159,6 +159,19 @@ What doesn't change: the chunk scripts, their names and SHA-256 checks, the 409 
 
 Sources (checked 2026-10-29): [az vm get-instance-view](https://learn.microsoft.com/cli/azure/vm#az-vm-get-instance-view), [az vm restart](https://learn.microsoft.com/cli/azure/vm#az-vm-restart), [managed Run Command](https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed), [VM extensions and their states](https://learn.microsoft.com/azure/virtual-machines/extensions/overview).
 
+### 2026-11-16 amendment: a restart Azure doesn't finish
+
+**The finding (live, 2026-11-16):** the watchdog's `az vm restart` of the T2 host on the upgrade test environment was accepted at 15:06 and still unfinished 40 minutes later, with the VM's provisioning state Updating, no power state, and its agent Not Ready. The call waited without a limit, so the track, and `deploy.ps1`, had no end and no **NOT DONE**. The same host state appeared on another test environment on 2026-11-13 and 14, where a deallocate and start by hand cleared it. `main` has the same unbounded call.
+
+**The decision (the coordinator, for the user: failures surface, and one click):**
+
+1. **The restart is bounded.** `az vm restart --no-wait`, then at most 15 minutes until Azure has finished it: the provisioning state Succeeded again (dated after the request, or after Updating was seen), the VM running, and its agent Ready (`Wait-DemoVmRestarted`).
+2. **Then one deallocate and start, automatically,** each with `--no-wait` and a bounded wait, 20 minutes in all (`Invoke-DemoVmRestartRecovery`). The T2 guest is shut down cleanly first (`STOP.GUEST`, at most 3 minutes) when the host can still run commands, that is, its agent is Ready. A deallocate refused because an operation is still in progress is asked again 4 times, 30 seconds apart.
+3. **What shows:** recovered, `DEPLOY.WATCHDOG_<VM>` stays a **Warning** that says what happened. Refused, or still not running with its agent Ready, `DEPLOY.WATCHDOG_<VM>` is a **Fail**: the step stops at once, without another wait, and **NOT DONE** gives the single next step, "Wait 30 minutes, then run ./scripts/deploy.ps1 again", whose own watchdog restarts the VM again, or deallocates and starts it, if it still needs to.
+4. **Every other call that waits on a VM is bounded too:** `az vm extension set` (T1's monitoring flag, 20 minutes), T1's Run Command for T3's SQL (its batches' time limit plus 15 minutes), and the workload actions (`Invoke-DemoWorkloadAction`: the runner's own limit plus 10 minutes, otherwise 30 minutes). Starts, deallocations, managed Run Commands, and their deletes already were ([implementation report](../implementation-report.md), R857).
+
+Sources (checked 2026-11-16): [az vm restart, deallocate, and start](https://learn.microsoft.com/cli/azure/vm) (`--no-wait`), [VM power states and billing](https://learn.microsoft.com/azure/virtual-machines/states-billing), [action Run Command restrictions](https://learn.microsoft.com/azure/virtual-machines/windows/run-command#restrictions) (90 minutes at most).
+
 ## Amendment: the host's steps for JumpstartImage (2026-11-05)
 
 **Why:** since 2026-11-05 the default install mode is `JumpstartImage` (user-directed, [ADR 0006](0006-sql-editions-and-licensing.md#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default)): the host makes the guest from Arc Jumpstart's prebuilt SQL Server 2022 Standard disk instead of building it. This supersedes the context's "`PaygWizard` (default)" and its one guest image in every mode (the guest now has two sources, the Jumpstart image or the build), and, in this mode, replaces steps 5, 6, 9, and 10 above and changes steps 4 and 7. The state machine is unchanged: one step list in every mode, each step checks before it acts, and a step that a mode doesn't use reports **Not selected** with the reason.

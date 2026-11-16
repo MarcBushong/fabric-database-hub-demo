@@ -455,6 +455,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R854 | After a stopped replica restarts, Azure Monitor's Read replica lag reads the time since its last replay until T4 writes again (1,380 s on 2026-11-13), and the history's lag finding and the app named that as the session's peak | **Fixed** (2026-11-16): the notebook and the app leave the catch-up out of the peak with one rule (a gap of 10 minutes or more, then the leading points that reach half the time since), and say so; the rows keep every point |
 | R855 | A stopped replica's start-first record lived only in T4's start evidence, so a start-first **Warning** could go unseen | **Fixed** (2026-11-16): T4's start record carries its message, and its status and fix when worse |
 | R856 | An empty list of a VM's chunk Run Commands reached the callers as `$null`, so "The Run Commands on the VM could not be listed" was a **Warning** in nearly every deploy (`main` too), and `DEPLOY.ARTIFACTS.CLEANUP_<VM>` named chunks that Azure had already deleted | **Fixed** (2026-11-16): the list stays a list; a failed list is tried 3 times, and its **Warning** keeps az's redacted error |
+| R857 | The watchdog's `az vm restart` waited without a limit, so a restart Azure never finished held `deploy.ps1` with no end and no **NOT DONE** (live, 2026-11-16: the T2 host Updating, its agent Not Ready, over 40 minutes; `main` too), and three other calls that wait on a VM had no bound of their own | **Fixed** (2026-11-16): `--no-wait` and 15 minutes, then one deallocate and start, bounded; a refusal or a VM still not Ready fails the step with when to run `deploy.ps1` again; the other calls bounded |
 
 ## Phase log
 
@@ -2613,8 +2614,25 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
 - **Tests:** four in `DbHubDemo.Bundle.Tests.ps1` fail on 48fafeb: no **Warning** when the VM has no chunk Run Commands; no leftover when the deletes are done by the first look; a failed list tried again, with the leftover still deleted first; and three failed lists, with the redacted error in the **Warning**.
 - **Live:** the deploy rows stay on 48fafeb; this commit changes only the list's path, and its live proof is the smallest real call, `Clear-DemoChunkRunCommand` and `Wait-DemoChunkRunCommandGone` on a running test VM, with the old and the new module.
 
+**Every Azure call that waits on a VM, bounded** (R857; live on 2026-11-16, the coordinator's decision: fix the whole class). The upgrade test's T2 track sent its chunks to `archost01`; one stayed Pending for 900 seconds, so the watchdog ran `az vm restart` at 15:06. Azure accepted it at 15:06:36 and hadn't finished it 40 minutes later (provisioning Updating, no power state, agent Not Ready), and the call had no limit. The restart now goes with `--no-wait` and a 15-minute wait for its end, then one deallocate and start, bounded, with the T2 guest shut down cleanly first when the host's agent is Ready ([ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md#2026-11-16-amendment-a-restart-azure-doesnt-finish)). The audit, of every call `deploy.ps1` and the lifecycle scripts make that can wait on a VM:
+
+| Call | Where | Bound |
+|---|---|---|
+| `az vm restart` (the watchdog) | `Restart-DemoVmOnce` | **Now** `--no-wait`, 15 minutes for Azure to finish it and the agent to be Ready, then one deallocate and start in 20 minutes; else a **Fail** |
+| `az vm start`, `az vm deallocate` | `Invoke-DemoVmPowerAction`, `Request-DemoVmStart` (deploy, start, stop, and the recovery) | Already: `--no-wait`, then the power state polled for 900 seconds at most (a **Warning** when it's still moving) |
+| The T2 guest's clean shutdown | `Stop-DemoGuestVm` (`STOP.GUEST`) | Already: 180 seconds, then the host's deallocation stops the guest anyway |
+| `az vm extension set` (T1's monitoring flag) | `Enable-DemoSqlVmMonitoring`, through `Invoke-DemoAzWithConflictRetry` | **Now** 20 minutes a try (the function's new `-TimeoutSeconds`); a time-out is the step's existing **Fail** |
+| `az vm run-command invoke` (action Run Command), T1's SQL for T3 | `Invoke-DemoT3SqlFromT1` | **Now** its batches' time limit plus 15 minutes, 90 at most; Azure's own limit is 90 minutes |
+| `az vm run-command invoke`, the workload actions (`EnableT3`, `EnableT4`, `Runner`, `StopGuest`) | `Invoke-DemoWorkloadAction` | **Now** by default: the runner's own limit plus its ready wait and 10 minutes, otherwise 30 minutes; `StopGuest` passes its own |
+| Managed Run Command create (`PUT`) and its wait | `Invoke-DemoVmRunCommand`, `Send-DemoChunkSet` | Already: `az rest` returns at once; the wait is bounded (each chunk 600 seconds, a Run Command 1,800 by default, with a start time limit) |
+| Managed Run Command delete | `Remove-DemoRunCommand`, the chunk cleanups | Already: `az rest` returns at once; the waits are bounded (120 seconds at a send's end, 30 seconds or a fresh name for a name in Deleting) |
+| T4's and the replica's start, stop, and restart; the SQL IaaS Agent's repair | `Invoke-DemoT4PowerAction`, the replica helpers, `Repair-DemoSqlIaasExtension` | Already: `az rest` `POST` returns at once; the waits are bounded |
+| Template deployments | the control's, the safety stop's, and the replica's templates | Already: 900 to 1,800 seconds, or the replica's own creation time limit. The main template has no client bound: Azure Resource Manager fails each resource at its own limit (a VM's provisioning, an extension, a Run Command's `timeoutInSeconds`) |
+
+The tests in `DbHubDemo.OneCommand.Tests.ps1` fail on 2916abd: the restart asked with `--no-wait` and a bounded wait; a view from before the restart never counts as its end; a restart Azure doesn't finish gets one deallocate and start, named in the **Warning**; the guest shut down first when the host can run commands; a refused deallocate fails the step with the next step and no further wait; and the other calls' bounds. **Live:** stopping the upgrade that this held, then `deploy.ps1` again on `rg-dbhubmn-demo`, by self-update to this commit.
+
 **Validation.**
 
 - **Targeted, under strict mode:** `Repo.LifecycleScripts.Tests.ps1` on the merge, 66 passed, and markdownlint on its 9 documents, 0 issues; the twelve test files the end step touches, 934 passed, 0 failed, before the session's mark moved to the replica's creation; then `DbHubDemo.T4Replica.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`, 424 passed, and the history guard's `DbHubDemo.FirstRun.Tests.ps1`, `DbHubDemo.FabricItem.Tests.ps1`, and `DbHubDemo.Fabric.Tests.ps1`, 115 passed. PSScriptAnalyzer: 0 findings in the 15 changed PowerShell files. Each new test fails on the code before its change.
 
-**Risks.** R849 to R856 new.
+**Risks.** R849 to R857 new.
