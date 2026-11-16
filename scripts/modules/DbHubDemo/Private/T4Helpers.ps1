@@ -2468,6 +2468,24 @@ function Invoke-DemoT4PowerAction {
     $wanted = if ($Action -eq 'Start') { 'Ready' } else { 'Stopped' }
     $before = $current.State
     $evidence = [ordered]@{ server = $names.ServerName; stateBefore = $before }
+    # The read replica's start-first record (2026-11-16): its message goes into T4's own record, and its status when that's
+    # worse, so a start-first Warning never shows only in the evidence.
+    $replicaFirst = $null
+    $withFirst = {
+        param([object] $Result)
+        if ($null -eq $replicaFirst -or [string]$replicaFirst.status -in '', 'Not selected') {
+            return $Result
+        }
+        $Result.message = '{0} {1}' -f [string]$Result.message, [string]$replicaFirst.message
+        $worst = Get-DemoWorstStatus -Status @([string]$Result.status, [string]$replicaFirst.status)
+        if ($worst -ne [string]$Result.status) {
+            $Result.status = $worst
+            if (-not [string](Get-DemoMemberValue -InputObject $Result -Name 'remediation')) {
+                $Result.remediation = [string](Get-DemoMemberValue -InputObject $replicaFirst -Name 'remediation')
+            }
+        }
+        return $Result
+    }
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $requestUtc = [DateTime]::UtcNow
     if ($before -ne $wanted) {
@@ -2489,7 +2507,7 @@ function Invoke-DemoT4PowerAction {
             $post = Invoke-DemoAzWithConflictRetry -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('rest', '--method', 'post', '--url', $url) -Label ('T4 {0}: {1}' -f $names.ServerName, $Action.ToLowerInvariant()) -MaxConflictRetries 4
             if ($post.ExitCode -ne 0) {
                 $evidence['error'] = Protect-DemoText -Text ([string]$post.StdErr).Trim()
-                return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Fail' -Message ('T4 ({0}) couldn''t be {1}: {2}' -f $names.ServerName, $(if ($Action -eq 'Start') { 'started' } else { 'stopped' }), $evidence['error']) -Evidence $evidence -Remediation ('Run the script again in a few minutes; a server that''s updating rejects {0} until it finishes.' -f $Action.ToLowerInvariant()) -DocUrl $docUrl)
+                return (& $withFirst (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Fail' -Message ('T4 ({0}) couldn''t be {1}: {2}' -f $names.ServerName, $(if ($Action -eq 'Start') { 'started' } else { 'stopped' }), $evidence['error']) -Evidence $evidence -Remediation ('Run the script again in a few minutes; a server that''s updating rejects {0} until it finishes.' -f $Action.ToLowerInvariant()) -DocUrl $docUrl))
             }
         }
         if ($WaitMinutes -gt 0) {
@@ -2531,13 +2549,13 @@ function Invoke-DemoT4PowerAction {
     if ($current.State -eq $wanted) {
         $verb = if ($Action -eq 'Start') { 'running (Ready)' } else { 'stopped' }
         $how = if ($before -eq $wanted -and -not $Requested) { 'was already' } else { 'is now' }
-        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 ({0}) {1} {2}.{3}' -f $names.ServerName, $how, $verb, $autoStart) -Evidence $evidence -DocUrl $docUrl)
+        return (& $withFirst (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 ({0}) {1} {2}.{3}' -f $names.ServerName, $how, $verb, $autoStart) -Evidence $evidence -DocUrl $docUrl))
     }
     $pending = if ($Action -eq 'Start') { 'Starting' } else { 'Stopping' }
     if ($WaitMinutes -eq 0 -and $current.State -in @($pending, $before)) {
-        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 ({0}) is {1}; the operation runs in the background.{2}' -f $names.ServerName, $pending.ToLowerInvariant(), $autoStart) -Evidence $evidence -DocUrl $docUrl)
+        return (& $withFirst (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 ({0}) is {1}; the operation runs in the background.{2}' -f $names.ServerName, $pending.ToLowerInvariant(), $autoStart) -Evidence $evidence -DocUrl $docUrl))
     }
-    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4 ({0}) is {1}, not {2}, after {3} minute(s).{4}' -f $names.ServerName, $current.State, $wanted, $WaitMinutes, $autoStart) -Evidence $evidence -Remediation 'Check it again with status.ps1 in a few minutes; a Burstable server that has used up its CPU credits can take longer to stop or start.' -DocUrl $docUrl)
+    return (& $withFirst (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4 ({0}) is {1}, not {2}, after {3} minute(s).{4}' -f $names.ServerName, $current.State, $wanted, $WaitMinutes, $autoStart) -Evidence $evidence -Remediation 'Check it again with status.ps1 in a few minutes; a Burstable server that has used up its CPU credits can take longer to stop or start.' -DocUrl $docUrl))
 }
 
 function Get-DemoT4ParameterState {

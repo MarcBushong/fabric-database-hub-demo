@@ -456,6 +456,33 @@ export function postgresPeak(points: readonly PostgresPoint[]): PostgresPeak | n
     return peak;
 }
 
+/** Read replica lag right after a gap of at least this many minutes in its series: see replicaCatchUp (the notebook's REPLICA_RESTART_GAP_MINUTES). */
+export const REPLICA_RESTART_GAP_MINUTES = 10;
+
+/**
+ * The read replica's lag points that are its catch-up after a restart, not replication lag, as the notebook leaves them
+ * out of its lag finding (2026-11-16): Azure Monitor reports the time since the replica last replayed a transaction, so a
+ * replica that was stopped reports at least the time since then until T4 writes again (live, 2026-11-13: 1,380 s, before
+ * the scenario's 219 s). After a gap of REPLICA_RESTART_GAP_MINUTES (and two intervals) or more in the series, or after the
+ * window's start, the leading points that reach half the time since the last point before the gap are that catch-up.
+ */
+export function replicaCatchUp(capture: PostgresCapture | null, lag: readonly PostgresPoint[]): PostgresPoint[] {
+    if (!capture || lag.length === 0) return [];
+    const intervalMs = (capture.intervalMinutes ?? 5) * 60000;
+    const gapMs = Math.max(REPLICA_RESTART_GAP_MINUTES * 60000, 2 * intervalMs);
+    let anchor = (capture.windowStart ?? lag[0].at).getTime();
+    let resumed: number | null = null;
+    const caught: PostgresPoint[] = [];
+    for (const p of lag) {
+        const at = p.at.getTime();
+        if (at - anchor >= gapMs) resumed = anchor;
+        if (resumed !== null && p.value >= (0.5 * (at + intervalMs - resumed)) / 1000) caught.push(p);
+        else resumed = null;
+        anchor = at + intervalMs;
+    }
+    return caught;
+}
+
 export interface PostgresFinding {
     id: string;
     target: string;

@@ -10,6 +10,7 @@ import {
     POSTGRES_METRICS,
     postgresPeak,
     postgresSeries,
+    replicaCatchUp,
     waitFamily,
     type Bin,
     type Check,
@@ -292,12 +293,26 @@ export function freshnessInsight(meta: Meta | null, now: Date = new Date()): Ins
 export const REPLICA_LAG_WARNING_SECONDS = 60;
 export const POSTGRES_CPU_WARNING_PERCENT = 80;
 
-/** The read replica's peak lag in the latest capture, or why there's none: the replica exists only during a session. */
+/** The read replica's peak lag in the latest capture, or why there's none: the replica exists only during a session. Its catch-up after a restart isn't lag (replicaCatchUp). */
 export function replicaLagInsight(capture: PostgresCapture | null): Insight | null {
     if (!capture) return null;
-    const lag = postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag);
+    const all = postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag);
+    const caught = replicaCatchUp(capture, all);
+    const lag = all.filter((p) => !caught.includes(p));
     const peak = postgresPeak(lag);
+    const caughtPeak = postgresPeak(caught);
+    const left = caughtPeak ? ` Left out: ${formatNumber(caughtPeak.value, "seconds")} at ${formatTimeUtc(caught[0].at)} UTC, the replica's catch-up after its restart, not lag.` : "";
     if (!peak) {
+        if (caughtPeak) {
+            return {
+                id: "replica-lag",
+                status: "Pass",
+                metric: "catch-up",
+                title: "The latest capture's Read replica lag is only the replica's catch-up after its restart.",
+                detail: `Up to ${formatNumber(caughtPeak.value, "seconds")} from ${formatTimeUtc(caught[0].at)} UTC on ${formatDayUtc(caught[0].at)}: the time since its last replay until T4 wrote again, not replication lag.`,
+                page: "postgres",
+            };
+        }
         return {
             id: "replica-lag",
             status: "Not selected",
@@ -313,7 +328,7 @@ export function replicaLagInsight(capture: PostgresCapture | null): Insight | nu
         status: peak.value >= REPLICA_LAG_WARNING_SECONDS ? "Warning" : "Pass",
         metric: formatNumber(peak.value, "seconds"),
         title: `Read replica lag peaked at ${formatNumber(peak.value, "seconds")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
-        detail: `${formatNumber(mean(lag.map((p) => p.value)), "seconds")} on average over ${lag.length} interval${lag.length === 1 ? "" : "s"}${replica ? ` on ${replica}` : ""}; ${REPLICA_LAG_WARNING_SECONDS} s or more is a warning.`,
+        detail: `${formatNumber(mean(lag.map((p) => p.value)), "seconds")} on average over ${lag.length} interval${lag.length === 1 ? "" : "s"}${replica ? ` on ${replica}` : ""}; ${REPLICA_LAG_WARNING_SECONDS} s or more is a warning.${left}`,
         page: "postgres",
     };
 }

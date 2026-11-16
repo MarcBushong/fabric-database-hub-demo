@@ -11,6 +11,7 @@ import {
     postgresPeak,
     postgresSeries,
     postgresSkus,
+    replicaCatchUp,
     toPostgresCapture,
     toPostgresFindings,
     type PostgresCapture,
@@ -51,7 +52,12 @@ export default function PostgresPage() {
     const rowsOf = (...metrics: string[]): Row[] => rows.filter((r) => metrics.includes(String(r.Metric)));
 
     const lag = lineOf(capture, "T4-replica", POSTGRES_METRICS.lag, "Read replica lag");
-    const lagPeak = postgresPeak(postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag));
+    // The replica's catch-up after a restart isn't lag, so the marked peak leaves it out, and the summary says so (2026-11-16).
+    const lagSeries = postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag);
+    const caught = replicaCatchUp(capture, lagSeries);
+    const lagPeak = postgresPeak(lagSeries.filter((p) => !caught.includes(p)));
+    const caughtPeak = postgresPeak(caught);
+    const caughtText = caughtPeak ? ` The ${formatNumber(caughtPeak.value, "seconds")} at ${formatDateTimeUtc(caught[0].at)} is the replica's catch-up after its restart (the time since its last replay until T4 wrote again), not lag.` : "";
     const cpuPeak = postgresPeak(postgresSeries(capture, "T4", POSTGRES_METRICS.cpu));
     const failed = postgresSeries(capture, "T4", POSTGRES_METRICS.failed);
     const failedTotal = failed.reduce((sum, p) => sum + p.value, 0);
@@ -108,7 +114,7 @@ export default function PostgresPage() {
                         empty={!series.loading && lag.points.length === 0}
                         emptyText={capture ? NO_REPLICA : `No metrics in the latest capture. ${HOW_IT_GETS_HERE}`}
                         table={series.data ? { columns: seriesSpec.columns, rows: rowsOf(POSTGRES_METRICS.lag), caption: "Read replica lag per interval" } : null}
-                        summary={lagPeak ? `Read replica lag over time; it peaked at ${formatNumber(lagPeak.value, "seconds")} at ${formatDateTimeUtc(lagPeak.at)}.` : "No Read replica lag in the latest capture."}
+                        summary={lagPeak ? `Read replica lag over time; it peaked at ${formatNumber(lagPeak.value, "seconds")} at ${formatDateTimeUtc(lagPeak.at)}.${caughtText}` : caughtPeak ? `Read replica lag over time: only the replica's catch-up after its restart.${caughtText}` : "No Read replica lag in the latest capture."}
                         fetchedAt={series.data?.fetchedAt}
                         onRefresh={series.refetch}
                     >

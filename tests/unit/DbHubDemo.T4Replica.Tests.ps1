@@ -311,6 +311,33 @@ Describe 'Azure''s power order, and deleting the replica (live, 2026-11-13)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Wait-DemoT4ReplicaState -Times 1 -Exactly -ParameterFilter { @($State) -contains 'Ready' }
     }
 
+    It 'shows the replica''s start-first on T4''s own start record, with its status when that''s worse, never only in the evidence (2026-11-16)' {
+        # Found 2026-11-13: START.T4.START said only "T4 ... is now running (Ready)", and a start-first Warning (the replica not
+        # Ready within its wait) showed only in its evidence, unless T4's own start then failed.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { New-T4State -State 'Stopped' }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT4State -MockWith { New-T4State -State 'Ready' }
+        $script:first = New-DemoResult -CheckId 'START.T4.REPLICA.START' -Area 'infra' -Target 'T4' -Status 'Warning' -Message 'T4''s read replica (pgreplica01-abc123) is Starting, not Ready, after 15 minutes, so T4 may not start (Azure starts a replica before its source).' -Remediation 'Run ./scripts/stop-demo.ps1, which deletes the replica, then ./scripts/start-demo.ps1.'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaStartFirst -MockWith { $script:first }
+        $start = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 10 -CheckPrefix START -DeploymentId 'abc123' }
+        $start.checkId | Should -Be 'START.T4.START'
+        $start.status | Should -Be 'Warning'
+        $start.message | Should -Be 'T4 (pgflex01-abc123) is now running (Ready). T4''s read replica (pgreplica01-abc123) is Starting, not Ready, after 15 minutes, so T4 may not start (Azure starts a replica before its source).'
+        $start.remediation | Should -Be 'Run ./scripts/stop-demo.ps1, which deletes the replica, then ./scripts/start-demo.ps1.'
+        $start.evidence.replicaFirst.status | Should -Be 'Warning'
+
+        # A start-first that worked is said, and keeps T4's Pass.
+        $script:first = New-DemoResult -CheckId 'START.T4.REPLICA.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'T4''s read replica (pgreplica01-abc123) was stopped and is running again (95 s), so T4 can start: Azure starts a replica before its source.'
+        $start = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 10 -CheckPrefix START -DeploymentId 'abc123' }
+        $start.status | Should -Be 'Pass'
+        $start.message | Should -Match '^T4 \(pgflex01-abc123\) is now running \(Ready\)\. T4''s read replica \(pgreplica01-abc123\) was stopped and is running again \(95 s\)'
+        $start.remediation | Should -BeNullOrEmpty
+
+        # No replica to start first: T4's record as before.
+        $script:first = $null
+        $start = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 10 -CheckPrefix START -DeploymentId 'abc123' }
+        $start.message | Should -Be 'T4 (pgflex01-abc123) is now running (Ready).'
+    }
+
     It 'deletes a replica with az rest (the CLI''s delete has no --no-wait), and does nothing when there''s none' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -MockWith { New-ReplicaState -State 'Ready' -SkuName 'Standard_D4ds_v5' }
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoT4ReplicaState -MockWith { New-ReplicaState -State 'NotFound' }

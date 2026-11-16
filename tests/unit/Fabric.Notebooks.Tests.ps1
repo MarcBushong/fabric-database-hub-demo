@@ -762,6 +762,75 @@ print(json.dumps({"threshold": threshold, "minBins": min_bins, "before": episode
         }
     }
 
+    It 'leaves the replica''s catch-up after a restart out of the lag finding''s peak, and says so, with the Nov 13 data (2026-11-16)' {
+        # Live, 2026-11-13: the safety stop stopped the replica at 00:38:46Z, start-demo.ps1 started it first at 00:57Z, and
+        # Azure Monitor's lag read 1,380 s at 01:00 (the time since its last replay until T4 wrote again); the replica-lag beat
+        # then peaked at 219 s. The finding named 1,380 s. Needs Python 3 with pandas: set DBHUB_TEST_PYTHON to its python.
+        $interpreter = $pandasPython
+        $PSNativeCommandUseErrorActionPreference = $false
+        if (-not $interpreter) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $null = & $interpreter -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'catch-up.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, sys, types
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+exec(next(cell for cell in cells if cell.startswith("# Parameters cell")), ns)
+with contextlib.redirect_stdout(io.StringIO()):
+    for index, cell in enumerate(cells):
+        if cell.startswith("# Helpers, part"):
+            exec(compile(cell, "cell-%d" % index, "exec"), ns)
+
+def document(lag):
+    return json.dumps({"version": 1, "capturedUtc": "2026-11-14T01:40:00Z", "startUtc": "2026-11-14T00:00:00Z", "endUtc": "2026-11-14T01:40:00Z",
+                       "windowMinutes": 100, "intervalMinutes": 5,
+                       "servers": [{"role": "primary", "resourceName": "pgflex01-rrpigs", "sku": "Standard_D4ds_v5"},
+                                   {"role": "replica", "resourceName": "pgreplica01-rrpigs", "sku": "Standard_D4ds_v5"}],
+                       "series": [{"role": "replica", "resourceName": "pgreplica01-rrpigs", "metric": "physical_replication_delay_in_seconds",
+                                   "aggregation": "Maximum", "unit": "Seconds", "points": [["2026-11-14T%s:00Z" % at, value] for at, value in lag]}]})
+
+def lag_finding(lag):
+    capture, error = ns["parse_postgres_metrics"](document(lag))
+    found = next(item for item in ns["postgres_findings"](capture) if item["key"] == "lag")
+    return {"status": found["status"], "finding": found["finding"], "evidence": {key: value for key, value in found["evidence"].items() if key != "resourceName"}}
+
+# Running before the stop, nothing while it was stopped, its catch-up at 01:00, then the replica-lag beat.
+nov13 = [("00:20", 3), ("00:25", 2), ("00:30", 4), ("00:35", 5), ("01:00", 1380), ("01:05", 67), ("01:10", 218), ("01:15", 219), ("01:20", 3)]
+# The window starts after the stop, so the series starts with the catch-up.
+late = [("00:50", 1950), ("00:55", 9), ("01:00", 188)]
+# Only the catch-up: no point since the window's start, so it reads at least that long.
+only = [("01:00", 3900)]
+# A replica created during the window: its first points are small, and a beat's peak right after a short gap stays.
+fresh = [("00:30", 0.4), ("00:35", 1), ("00:40", 120), ("00:45", 2), ("01:05", 300), ("01:10", 2)]
+print(json.dumps({"nov13": lag_finding(nov13), "late": lag_finding(late), "only": lag_finding(only), "fresh": lag_finding(fresh)}))
+'@
+        $output = & $interpreter $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $result = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+
+        $result['nov13']['status'] | Should -Be 'Warning'
+        $result['nov13']['finding'] | Should -Be 'Read replica lag on pgreplica01-rrpigs peaked at 219.0 s at 2026-11-14 01:15 UTC (a Warning at 60 s or more). Left out: 1 point from 2026-11-14 01:00 UTC, up to 1380.0 s, the replica''s catch-up after its restart (the time since its last replay until T4 wrote again), not replication lag.'
+        $result['nov13']['evidence']['peakSeconds'] | Should -Be 219
+        $result['nov13']['evidence']['catchUpPoints'] | Should -Be 1
+        $result['nov13']['evidence']['catchUpPeakSeconds'] | Should -Be 1380
+        $result['nov13']['evidence']['points'] | Should -Be 9 -Because 'the rows keep every point; only the finding leaves it out'
+
+        $result['late']['finding'] | Should -Match '^Read replica lag on pgreplica01-rrpigs peaked at 188\.0 s at 2026-11-14 01:00 UTC .* Left out: 1 point from 2026-11-14 00:50 UTC, up to 1950\.0 s'
+        $result['only']['status'] | Should -Be 'Pass'
+        $result['only']['finding'] | Should -Be 'Read replica lag on pgreplica01-rrpigs: only the replica''s catch-up after its restart, up to 3900.0 s from 2026-11-14 01:00 UTC (the time since its last replay until T4 wrote again), not replication lag.'
+        $result['only']['evidence'].ContainsKey('peakSeconds') | Should -BeFalse
+        $result['fresh']['finding'] | Should -Be 'Read replica lag on pgreplica01-rrpigs peaked at 300.0 s at 2026-11-14 01:05 UTC (a Warning at 60 s or more).' -Because 'a gap whose next point is under half its length is lag, not catch-up'
+        $result['fresh']['evidence']['catchUpPoints'] | Should -Be 0
+    }
+
     It 'turns the document Get-DemoPostgresHistoryParameter writes into postgresql rows and findings, and says so in one line without one (ADR 0025)' {
         # Get-DemoPostgresHistoryParameter's own JSON, from a fake Azure CLI, goes through the notebook's helpers and its T4
         # cell. Needs Python 3 with pandas: set DBHUB_TEST_PYTHON to its python.

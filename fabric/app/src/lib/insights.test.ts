@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { Bin, Incident, PostgresCapture, PostgresPoint, TargetSummary, WaitFlow } from "@/data/model";
+import { replicaCatchUp, type Bin, type Incident, type PostgresCapture, type PostgresPoint, type TargetSummary, type WaitFlow } from "@/data/model";
 import {
     busiestHourInsight,
     compareIncident,
@@ -202,6 +202,34 @@ describe("T4's insights (ADR 0025)", () => {
         const insight = replicaLagInsight(capture([point("T4", "cpu_percent", 0, 40)]));
         expect(insight?.status).toBe("Not selected");
         expect(insight?.detail).toContain("exists only during a session");
+    });
+
+    it("leaves the replica's catch-up after a restart out of the lag's peak, with the Nov 13 data (2026-11-16)", () => {
+        // Live, 2026-11-13: the replica stopped at 00:38:46Z and started again at 00:57Z; Azure Monitor read 1,380 s at 01:00,
+        // the time since its last replay, before the replica-lag beat's 219 s.
+        const lagAt = (hour: number, minute: number, value: number): PostgresPoint => ({
+            at: new Date(Date.UTC(2026, 10, 14, hour, minute)),
+            target: "T4-replica",
+            server: "pgreplica01-rrpigs",
+            metric: "physical_replication_delay_in_seconds",
+            value,
+        });
+        const nov13 = [lagAt(0, 20, 3), lagAt(0, 25, 2), lagAt(0, 30, 4), lagAt(0, 35, 5), lagAt(1, 0, 1380), lagAt(1, 5, 67), lagAt(1, 10, 218), lagAt(1, 15, 219), lagAt(1, 20, 3)];
+        const window = (points: PostgresPoint[], hour = 0, minute = 0): PostgresCapture => ({ ...capture(points), windowStart: new Date(Date.UTC(2026, 10, 14, hour, minute)) });
+        expect(replicaCatchUp(window(nov13), nov13).map((p) => p.value)).toEqual([1380]);
+        const insight = replicaLagInsight(window(nov13));
+        expect(insight?.status).toBe("Warning");
+        expect(insight?.title).toBe("Read replica lag peaked at 219 s at 01:15 UTC on 14 Nov.");
+        expect(insight?.detail).toContain("Left out: 1,380 s at 01:00 UTC, the replica's catch-up after its restart, not lag.");
+        // Only the catch-up: a Pass that says so.
+        const only = [lagAt(1, 0, 3900)];
+        const onlyInsight = replicaLagInsight(window(only));
+        expect(onlyInsight?.status).toBe("Pass");
+        expect(onlyInsight?.title).toBe("The latest capture's Read replica lag is only the replica's catch-up after its restart.");
+        // A fresh replica's small first points, and a beat's 300 s right after a short gap, are lag.
+        const fresh = [lagAt(0, 30, 0.4), lagAt(0, 35, 1), lagAt(0, 40, 120), lagAt(0, 45, 2), lagAt(1, 5, 300), lagAt(1, 10, 2)];
+        expect(replicaCatchUp(window(fresh), fresh)).toEqual([]);
+        expect(replicaLagInsight(window(fresh))?.title).toBe("Read replica lag peaked at 300 s at 01:05 UTC on 14 Nov.");
     });
 
     it("warns about T4's CPU at 80 % or more, with its connections' peak", () => {
