@@ -1,6 +1,13 @@
 BeforeAll {
     $modulePath = Join-Path -Path $PSScriptRoot -ChildPath '../../scripts/modules/DbHubDemo/DbHubDemo.psd1'
     Import-Module -Name $modulePath -Force
+    # No test here reaches the Azure CLI (2026-11-16, tests/TestAzGuard.ps1): an az call that no test mocks gets what the
+    # real CLI answered for these tests' made-up subscription, which they relied on, without leaving this process.
+    Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+        $at = [array]::IndexOf([string[]]$ArgumentList, '--subscription')
+        $subscription = if ($at -ge 0 -and $at + 1 -lt $ArgumentList.Count) { $ArgumentList[$at + 1] } else { '11111111-2222-3333-4444-555555555555' }
+        [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ("ERROR: Subscription '{0}' not found. Check the spelling and casing and try again." -f $subscription) }
+    }
     $exampleConfig = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
 
     # Recorded-style price items keyed by a fragment of the API filter. Prices are fixtures, not real prices.

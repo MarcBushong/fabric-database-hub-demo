@@ -28,7 +28,7 @@ pre-commit install
 ./tests/Invoke-StaticValidation.ps1
 ```
 
-It runs PSScriptAnalyzer, Pester, the Bicep build and `azuredeploy.json` sync check, PSRule for Azure, the workload generator's build and tests, the Fabric App's checks (when Node.js is installed), and markdownlint, and reports each check as **Pass**, **Fail**, or **Not selected**. It makes no Azure calls. CI runs the same checks, plus actionlint and gitleaks.
+It runs PSScriptAnalyzer, Pester, the Bicep build and `azuredeploy.json` sync check, PSRule for Azure, the workload generator's build and tests, the Fabric App's checks (when Node.js is installed), and markdownlint, and reports each check as **Pass**, **Fail**, or **Not selected**. It makes no Azure calls. CI runs the same checks, plus actionlint and gitleaks. Pester runs with a guard (`tests/TestAzGuard.ps1`, 2026-11-16): a stand-in `az` stops any call a unit test makes and lists it as `STATIC.PESTER.AZURECLI` **Fail**, and `AZURE_CONFIG_DIR` is an empty folder, so no test uses your Azure sign-in.
 
 - **A faster loop:** pick checks with `-Check`, for example `./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester`, or run one test file with `Invoke-Pester -Path tests/unit/<file>.Tests.ps1`. Run the whole validation once before you open the pull request.
 - **One copy of the module per window:** Pester runs in the window you start it from. If that window ran the demo's scripts from another copy of the repository, the tests stop with "Multiple script or manifest modules named 'DbHubDemo' are currently loaded"; run them in a new PowerShell window (R822).
