@@ -244,6 +244,9 @@ Describe 'Send-DemoBootstrapBundle' {
         # Phase 28: reads that find a chunk still running, and deletes Azure holds (a busy extension).
         $script:runningReads = 0
         $script:stuckDeletes = $false
+        # 2026-11-16: lists that fail before one succeeds, with az's error.
+        $script:listFailures = 0
+        $script:listError = ''
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
@@ -275,6 +278,10 @@ Describe 'Send-DemoBootstrapBundle' {
                 }
                 default {
                     if (-not $name) {
+                        if ($script:listFailures -gt 0) {
+                            $script:listFailures--
+                            return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = $script:listError }
+                        }
                         $value = @($script:runCommands.Keys | ForEach-Object { @{ name = $_ } })
                         return [pscustomobject]@{ ExitCode = 0; StdOut = (@{ value = $value } | ConvertTo-Json -Depth 5); StdErr = '' }
                     }
@@ -363,6 +370,53 @@ Describe 'Send-DemoBootstrapBundle' {
         $script:calls[1].Method | Should -Be 'delete'
         $script:calls[1].Name | Should -Be 'DbHubDemo-Chunk-aaaaaaaaaaaa-007'
         $script:runCommands.Keys | Should -Be @('DbHubDemo-Bootstrap')
+    }
+
+    It 'lists the Run Commands again when a list fails, so leftovers are still deleted first, logs the cause, and warns of nothing (2026-11-16)' {
+        $script:listFailures = 1
+        $script:listError = 'ERROR: (TooManyRequests) The request is being throttled.'
+        $script:runCommands['DbHubDemo-Chunk-aaaaaaaaaaaa-007'] = @{}
+        Send-DemoBootstrapBundle -Config $config -Bundle $sendBundle -VmName 'sqlvm01' -ChunkSizeKiB 1 | Out-Null
+        $script:calls[0].Method | Should -Be 'get'
+        $script:calls[1].Method | Should -Be 'get'
+        $script:calls[1].Name | Should -BeNullOrEmpty
+        $script:calls[2].Method | Should -Be 'delete'
+        $script:calls[2].Name | Should -Be 'DbHubDemo-Chunk-aaaaaaaaaaaa-007'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 5 } -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'Listed the Run Commands on sqlvm01 on try 2 of 3; the try before failed (az: ERROR: (TooManyRequests) The request is being throttled.).' } -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' } -Times 0
+    }
+
+    It 'warns of nothing when the VM has no chunk Run Commands, the usual case, and lists once at each end (2026-11-16)' {
+        # An empty list reached the callers as $null, which they read as "couldn't be listed": a Warning in nearly every
+        # deploy, before the send and after it, while every list had succeeded (az exit code 0).
+        Send-DemoBootstrapBundle -Config $config -Bundle $sendBundle -VmName 'sqlvm01' -ChunkSizeKiB 1 | Out-Null
+        @($script:calls | Where-Object { $_.Method -eq 'get' -and -not $_.Name }).Count | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' } -Times 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 5 } -Times 0
+    }
+
+    It 'reports no leftover when the deletes it asked for are done by its first look, not every name it asked to delete (2026-11-16)' {
+        $script:runCommands['DbHubDemo-Chunk-bbbbbbbbbbbb-001'] = @{}
+        $script:runCommands['DbHubDemo-Bootstrap'] = @{}
+        $baseUrl = 'https://management.azure.com/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01/runCommands'
+        $left = @(InModuleScope DbHubDemo -Parameters @{ BaseUrl = $baseUrl; ApiVersion = $apiVersion } { Wait-DemoChunkRunCommandGone -SubscriptionId '11111111-2222-3333-4444-555555555555' -BaseUrl $BaseUrl -ApiVersion $ApiVersion -TimeoutSeconds 60 })
+        $left.Count | Should -Be 0
+        $script:runCommands.Keys | Should -Be @('DbHubDemo-Bootstrap')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' } -Times 0
+    }
+
+    It 'warns with az''s error, redacted, after three failed lists, and still sends the bundle (2026-11-16)' {
+        $fakeToken = 'Bearer ' + ('q' * 40)
+        $script:listFailures = 3
+        $script:listError = ('ERROR: (AuthorizationFailed) The client failed with header {0}.' -f $fakeToken)
+        $result = Send-DemoBootstrapBundle -Config $config -Bundle $sendBundle -VmName 'archost01' -ChunkSizeKiB 1
+        $result.ChunkCount | Should -Be $expectedChunks.Count
+        @($script:calls | Select-Object -First 3).Method | Should -Be @('get', 'get', 'get')
+        $script:calls[3].Method | Should -Be 'put'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 5 } -Times 2 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'The Run Commands on archost01 could not be listed in 3 tries (az: ERROR: (AuthorizationFailed) The client failed with header *), so leftover chunk Run Commands weren''t deleted this time. Nothing to do:*./scripts/status.ps1*' -and $Message -notlike ('*{0}*' -f ('q' * 40)) } -Times 1 -Exactly
+        $script:runCommands.Count | Should -Be 0
     }
 
     It 'never waits on a delete Azure holds: one bounded cleanup at the end reports what''s left (Phase 28, R49)' {

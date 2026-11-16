@@ -491,9 +491,11 @@ function Clear-DemoChunkRunCommand {
         [string] $ApiVersion
     )
 
-    $names = Get-DemoChunkRunCommandName -SubscriptionId $SubscriptionId -BaseUrl $BaseUrl -ApiVersion $ApiVersion
+    $status = @{}
+    $names = Get-DemoChunkRunCommandName -SubscriptionId $SubscriptionId -BaseUrl $BaseUrl -ApiVersion $ApiVersion -Status $status
     if ($null -eq $names) {
-        Write-DemoLog -Level Warning -Message 'The Run Commands on the VM could not be listed, so leftover chunk Run Commands were not checked.'
+        $vm = ($BaseUrl -split '/')[-2]
+        Write-DemoLog -Level Warning -Message ('The Run Commands on {0} could not be listed in {1} tries ({2}), so leftover chunk Run Commands weren''t deleted this time. Nothing to do: the next cleanup checks again (after this send, or in the next run), and ./scripts/status.ps1 lists any Run Command that stays.' -f $vm, $status['Tries'], $status['Error'])
         return @()
     }
     $removed = [System.Collections.Generic.List[string]]::new()
@@ -515,7 +517,9 @@ function Clear-DemoChunkRunCommand {
 
 function Get-DemoChunkRunCommandName {
     # The DbHubDemo-Chunk-* Run Commands a VM still lists (a Run Command Azure is deleting is still listed), or $null
-    # when they can't be listed. Internal.
+    # when they can't be listed in -Tries tries, -RetrySeconds apart; -Status then gets Tries and Error, az's last error,
+    # redacted. A failed try that a later one makes up for is logged with its error, so its cause shows (2026-11-16: a
+    # Warning in nearly every deploy, main's too, that az's dropped error left unexplained). Internal.
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
@@ -526,20 +530,61 @@ function Get-DemoChunkRunCommandName {
         [string] $BaseUrl,
 
         [Parameter(Mandatory)]
-        [string] $ApiVersion
+        [string] $ApiVersion,
+
+        [AllowNull()]
+        [hashtable] $Status = $null,
+
+        [ValidateRange(1, 5)]
+        [int] $Tries = 3,
+
+        [ValidateRange(0, 60)]
+        [int] $RetrySeconds = 5
     )
 
-    $list = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('rest', '--method', 'get', '--url', ('{0}?api-version={1}' -f $BaseUrl, $ApiVersion)) -AsJson -AllowFailure
+    $list = $null
+    $problem = ''
+    for ($try = 1; $try -le $Tries -and $null -eq $list; $try++) {
+        if ($try -gt 1) {
+            Start-Sleep -Seconds $RetrySeconds
+        }
+        $result = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('rest', '--method', 'get', '--url', ('{0}?api-version={1}' -f $BaseUrl, $ApiVersion), '--output', 'json') -AllowFailure
+        if ($result.ExitCode -ne 0) {
+            $text = (Protect-DemoText -Text ([string]$result.StdErr)).Trim() -replace '\s+', ' '
+            $problem = if ($text) { 'az: {0}' -f $text.Substring(0, [System.Math]::Min(400, $text.Length)) } else { 'az ended with exit code {0} and no error text' -f $result.ExitCode }
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($result.StdOut)) {
+            $problem = 'az returned nothing'
+            continue
+        }
+        try {
+            $list = $result.StdOut | ConvertFrom-Json -Depth 64
+        }
+        catch {
+            $problem = 'az''s answer wasn''t JSON: {0}' -f $_.Exception.Message
+        }
+    }
     if ($null -eq $list) {
+        if ($null -ne $Status) {
+            $Status['Tries'] = $Tries
+            $Status['Error'] = $problem
+        }
         return $null
     }
+    if ($problem) {
+        Write-DemoLog -Message ('Listed the Run Commands on {0} on try {1} of {2}; the try before failed ({3}).' -f ($BaseUrl -split '/')[-2], ($try - 1), $Tries, $problem)
+    }
     $items = Get-DemoMemberValue -InputObject $list -Name 'value'
-    return @(foreach ($item in @($items)) {
+    $names = [string[]]@(foreach ($item in @($items)) {
             $name = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
             if ($name -like 'DbHubDemo-Chunk-*') {
                 $name
             }
         })
+    # The unary comma keeps an empty list a list: unrolled, it reached the callers as $null, which they read as "couldn't
+    # be listed" (the cause of that Warning in nearly every deploy, and of a false "still deleting" Warning; 2026-11-16).
+    return , $names
 }
 
 function Wait-DemoChunkRunCommandGone {
