@@ -1945,7 +1945,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         [array]::IndexOf($calls, 'replica end') | Should -BeGreaterThan $history
         [array]::IndexOf($ids, 'DEPLOY.T4.REPLICA.END') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY'))
         [array]::IndexOf($ids, 'DEPLOY.T4.REPLICA.END') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDeployEnd -Times 1 -Exactly -ParameterFilter { $ProgressPath -eq 'progress.json' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDeployEnd -Times 1 -Exactly -ParameterFilter { $ProgressPath -eq 'progress.json' -and $ChecksRan -eq $true }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 1 -Exactly -ParameterFilter {
             [bool]$PesterBoundParameters['DoneChecked'] -and -not [bool]$PesterBoundParameters['SkipFabric'] -and -not [bool]$PesterBoundParameters['WhatIfRun'] -and $ProgressPath -eq 'progress.json' -and [string]$ActivityProfile.Name -eq 'business-day' -and
             @($Requirement) -contains 'TELEMETRY.T2' -and @($Requirement) -contains 'FABRIC.ITEMS.REQUIRED' -and

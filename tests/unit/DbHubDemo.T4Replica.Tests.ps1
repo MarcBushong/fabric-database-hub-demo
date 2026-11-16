@@ -438,6 +438,16 @@ Describe 'deploy.ps1''s end deletes the replica unless a session uses it (2026-1
         InModuleScope DbHubDemo -Parameters @{ Item = $result } { Get-DemoT4ReplicaNote -Result @($Item) } | Should -Be $result.message
     }
 
+    It 'a run that stopped before DONE''s checks: deletes the replica, and never says those checks read it (live, 2026-11-16)' {
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Now = $script:now } { Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath 'progress.json' -DeploymentId 'abc123' -NowUtc $Now -ChecksRan $false -Confirm:$false }
+        $result.status | Should -Be 'Pass'
+        $result.evidence['outcome'] | Should -Be 'Deleted'
+        $result.message | Should -Match '^T4''s read replica \(pgreplica01-abc123\) was deleted at the end of this run( in \d+ s)?, which stopped before DONE''s checks, so nothing bills for it meanwhile; the next \./scripts/deploy\.ps1 creates it again for them\. '
+        $result.message | Should -Not -Match 'had read it'
+        @($script:rows | Where-Object { $_.Id -eq 'T4ReplicaEnd' -and $_.State -eq 'Running' })[0].Message | Should -Match 'the run stopped before DONE''s checks, and no session uses it'
+        & $script:deletes | Should -Be 1
+    }
+
     It 'an existing environment: the replica an earlier deploy left, stopped by the nightly stop, goes at the next deploy''s end' {
         $script:replica = New-ReplicaState -State 'Stopped' -SkuName 'Standard_D4ds_v5'
         $result = Invoke-End

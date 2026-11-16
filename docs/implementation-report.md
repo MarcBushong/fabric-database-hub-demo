@@ -456,6 +456,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R855 | A stopped replica's start-first record lived only in T4's start evidence, so a start-first **Warning** could go unseen | **Fixed** (2026-11-16): T4's start record carries its message, and its status and fix when worse |
 | R856 | An empty list of a VM's chunk Run Commands reached the callers as `$null`, so "The Run Commands on the VM could not be listed" was a **Warning** in nearly every deploy (`main` too), and `DEPLOY.ARTIFACTS.CLEANUP_<VM>` named chunks that Azure had already deleted | **Fixed** (2026-11-16): the list stays a list; a failed list is tried 3 times, and its **Warning** keeps az's redacted error |
 | R857 | The watchdog's `az vm restart` waited without a limit, so a restart Azure never finished held `deploy.ps1` with no end and no **NOT DONE** (live, 2026-11-16: the T2 host Updating, its agent Not Ready, over 40 minutes; `main` too), and three other calls that wait on a VM had no bound of their own | **Fixed** (2026-11-16): `--no-wait` and 15 minutes, then one deallocate and start, bounded; a refusal or a VM still not Ready fails the step with when to run `deploy.ps1` again; the other calls bounded |
+| R858 | A run that stopped before DONE's checks said they had read T4's replica when it deleted it (`DEPLOY.T4.REPLICA.END`) | **Fixed** (2026-11-16): the line says the run stopped before those checks, and that the next `deploy.ps1` creates the replica again for them |
 
 ## Phase log
 
@@ -2631,8 +2632,10 @@ The lakehouse existed. Fabric didn't list it because the capacity was paused ([P
 
 The tests in `DbHubDemo.OneCommand.Tests.ps1` fail on 2916abd: the restart asked with `--no-wait` and a bounded wait; a view from before the restart never counts as its end; a restart Azure doesn't finish gets one deallocate and start, named in the **Warning**; the guest shut down first when the host can run commands; a refused deallocate fails the step with the next step and no further wait; and the other calls' bounds. **Live:** stopping the upgrade that this held, then `deploy.ps1` again on `rg-dbhubmn-demo`, by self-update to this commit.
 
+**The replica's line on a run that stopped early** (R858; live, 2026-11-16). The held upgrade ended **NOT DONE** on T2 at 16:06, after Azure finished the restart at 15:55 and the resent chunks stuck again, and `DEPLOY.T4.REPLICA.END` said the replica was deleted "once DONE's checks and the history snapshot had read it", though they hadn't run. Both deploy paths now pass whether DONE's checks ran (`-ChecksRan`), and the line says when they didn't; the deletion is the same, decided earlier for every run, a **NOT DONE** one included.
+
 **Validation.**
 
 - **Targeted, under strict mode:** `Repo.LifecycleScripts.Tests.ps1` on the merge, 66 passed, and markdownlint on its 9 documents, 0 issues; the twelve test files the end step touches, 934 passed, 0 failed, before the session's mark moved to the replica's creation; then `DbHubDemo.T4Replica.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`, 424 passed, and the history guard's `DbHubDemo.FirstRun.Tests.ps1`, `DbHubDemo.FabricItem.Tests.ps1`, and `DbHubDemo.Fabric.Tests.ps1`, 115 passed. PSScriptAnalyzer: 0 findings in the 15 changed PowerShell files. Each new test fails on the code before its change.
 
-**Risks.** R849 to R857 new.
+**Risks.** R849 to R858 new.

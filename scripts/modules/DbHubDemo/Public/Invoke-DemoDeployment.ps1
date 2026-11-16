@@ -322,7 +322,7 @@ function Invoke-DemoDeployment {
     $finishEarly = {
         & $switchActivity
         if (-not $whatIf) {
-            $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -Confirm:$false))
+            $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -ChecksRan $false -Confirm:$false))
         }
         $results.ToArray()
     }
@@ -918,7 +918,7 @@ function Invoke-DemoDeployment {
     # T4's read replica (2026-11-16), as in the parallel path: DONE's checks and the history snapshot have read it, so it's
     # deleted unless a session uses it now. Never a Fail.
     if (-not $whatIf) {
-        $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -Confirm:$false))
+        $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -ChecksRan $doneChecked -Confirm:$false))
     }
 
     $all = $results.ToArray()

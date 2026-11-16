@@ -1297,7 +1297,7 @@ function Invoke-DemoParallelDeployment {
     # leaves nothing new billing between sessions, unless a session uses it now; start-demo.ps1 and Run all create it for
     # each session. On every run, a NOT DONE one included; never a Fail, and never in DONE's way.
     if (-not $whatIf) {
-        $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -Confirm:$false))
+        $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -ChecksRan $doneChecked -Confirm:$false))
     }
     # 2026-11-13 live finding: this process's own Run Commands that ran under a fresh name (the tracks report theirs).
     & $addAll @(Get-DemoRunCommandStuckResult -Clear)

@@ -1933,7 +1933,10 @@ function Invoke-DemoT4ReplicaDeployEnd {
 
         [string] $DeploymentId = '',
 
-        [datetime] $NowUtc = [DateTime]::UtcNow
+        [datetime] $NowUtc = [DateTime]::UtcNow,
+
+        # False when the run stopped before DONE's checks (live, 2026-11-16: a NOT DONE run's line said they had read it).
+        [bool] $ChecksRan = $true
     )
 
     $checkId = 'DEPLOY.T4.REPLICA.END'
@@ -1941,6 +1944,7 @@ function Invoke-DemoT4ReplicaDeployEnd {
     $setting = Get-DemoT4ReplicaSetting
     $docUrl = [string]$setting['docUrls']['concepts']
     $again = './scripts/start-demo.ps1 and the control notebook''s Run all create it for each session (about {0} minutes).' -f $setting['createMinutes']
+    $why = if ($ChecksRan) { 'once DONE''s checks and the history snapshot had read it, so nothing bills for it between sessions' } else { 'which stopped before DONE''s checks, so nothing bills for it meanwhile; the next ./scripts/deploy.ps1 creates it again for them' }
     $finish = {
         param([string] $Status, [string] $Message, [string] $Outcome, [System.Collections.IDictionary] $Evidence, [string] $Remediation = '', [string] $RowState = 'Done')
         $Evidence['outcome'] = $Outcome
@@ -1995,7 +1999,7 @@ function Invoke-DemoT4ReplicaDeployEnd {
         if (-not $PSCmdlet.ShouldProcess($names.ServerName, 'Delete T4''s read replica at the end of this run')) {
             return (& $finish 'Not selected' ('What if: T4''s read replica ({0}) would be deleted at the end of this run, unless a session uses it.' -f $names.ServerName) 'None' $evidence '' 'Skipped')
         }
-        Set-DemoProgressStep -Path $ProgressPath -Id $rowId -State 'Running' -Message ('Deleting T4''s read replica ({0}): DONE''s checks and the history snapshot have read it, and no session uses it (about 2 minutes).' -f $names.ServerName)
+        Set-DemoProgressStep -Path $ProgressPath -Id $rowId -State 'Running' -Message ('Deleting T4''s read replica ({0}): {1}, and no session uses it (about 2 minutes).' -f $names.ServerName, $(if ($ChecksRan) { 'DONE''s checks and the history snapshot have read it' } else { 'the run stopped before DONE''s checks' }))
         $removed = Remove-DemoT4Replica -Config $Config -CheckPrefix DEPLOY -CheckId $checkId -DeploymentId $DeploymentId -Confirm:$false
         foreach ($key in @($removed.evidence.Keys)) {
             $evidence[[string]$key] = $removed.evidence[$key]
@@ -2005,7 +2009,7 @@ function Invoke-DemoT4ReplicaDeployEnd {
                 return (& $finish 'Pass' ('T4''s read replica ({0}) isn''t there any more, so nothing bills for it between sessions. {1}' -f $names.ServerName, $again) 'None' $evidence '' 'Skipped')
             }
             $seconds = [int](Get-DemoMemberValue -InputObject $removed.evidence -Name 'seconds')
-            return (& $finish 'Pass' ('T4''s read replica ({0}) was deleted at the end of this run{1}, once DONE''s checks and the history snapshot had read it, so nothing bills for it between sessions. {2}' -f $names.ServerName, $(if ($seconds -gt 0) { ' in {0} s' -f $seconds } else { '' }), $again) 'Deleted' $evidence)
+            return (& $finish 'Pass' ('T4''s read replica ({0}) was deleted at the end of this run{1}, {2}. {3}' -f $names.ServerName, $(if ($seconds -gt 0) { ' in {0} s' -f $seconds } else { '' }), $why, $again) 'Deleted' $evidence)
         }
         return (& $finish 'Warning' ([string]$removed.message) 'NotDeleted' $evidence 'Run ./scripts/stop-demo.ps1 when no session runs: it deletes the replica, and so does the next ./scripts/deploy.ps1; the nightly safety stop stops it meanwhile.' 'Action needed')
     }
