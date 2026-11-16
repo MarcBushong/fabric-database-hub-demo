@@ -927,6 +927,7 @@ function Grant-DemoActivityControlRole {
             $reach = @($actions | Where-Object { $script:ActivityControlActionReach.Contains($_) } | ForEach-Object { '{0}: {1}' -f $_, $script:ActivityControlActionReach[$_] })
             $reachText = if ($reach.Count) { ' What the session''s actions (2026-11-14) could touch: {0}.' -f ($reach -join '; ') } else { '' }
             $current = @($roleActions[$kind])
+            $updating = [bool]$roleIds[$kind]
             if ($roleIds[$kind] -and $current.Count -eq $actions.Count -and @($actions | Where-Object { $_ -cnotin $current }).Count -eq 0) {
                 # Already exactly the approved actions (an Owner's grant, or an earlier run): nothing to write, so no
                 # roleDefinitions/write is needed, and a Contributor's deploy.ps1 has nothing to report here.
@@ -946,7 +947,18 @@ function Grant-DemoActivityControlRole {
                 if ($write.Ok) {
                     $roleIds[$kind] = $definitionId
                     $evidence['reach'] = $reach
-                    $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The custom role "{0}" exists with exactly the {1} approved actions, assignable in this subscription only.{2}' -f $roleName, $actions.Count, $reachText) -Evidence $evidence -DocUrl $doc))
+                    # What changed (2026-11-16): an existing role is updated in place, under its own ID, so its assignments
+                    # stay; the message says which actions it gained or lost.
+                    $what = 'was created with exactly the {0} approved actions' -f $actions.Count
+                    if ($updating) {
+                        $added = @($actions | Where-Object { $_ -cnotin $current })
+                        $removed = @($current | Where-Object { $_ -cnotin $actions })
+                        $evidence['updated'] = $true
+                        $evidence['added'] = $added
+                        $evidence['removed'] = $removed
+                        $what = 'was updated in place, under the same ID, so its assignments stay, from {0} to exactly the {1} approved actions{2}{3}' -f $current.Count, $actions.Count, $(if ($added.Count) { '; added: {0}' -f ($added -join ', ') } else { '' }), $(if ($removed.Count) { '; removed: {0}' -f ($removed -join ', ') } else { '' })
+                    }
+                    $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The custom role "{0}" {1}, assignable in this subscription only.{2}' -f $roleName, $what, $reachText) -Evidence $evidence -DocUrl $doc))
                 }
                 else {
                     $results.Add((& $manual $checkId ('The custom role "{0}" couldn''t be written: {1}' -f $roleName, $write.Error) $evidence))

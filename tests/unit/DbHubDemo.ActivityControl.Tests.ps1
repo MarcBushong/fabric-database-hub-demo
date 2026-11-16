@@ -662,6 +662,37 @@ Describe 'Granting the roles (setup-activity-control.ps1 -GrantRole)' {
         }
     }
 
+    It 'updates the shared operator role from main in place, keeps its assignments with no duplicate, adds the writer role, and says what changed (the default, unsuffixed path; 2026-11-16)' {
+        # The owner's own upgrade: main's -GrantRole left "DbHub Demo Activity Operator" with its 22 actions, assigned to the
+        # control's identity at A1 (the demo resource group) and A2 (the Automation account), and no writer role.
+        $script:roleActions = @($script:approvedActions | Select-Object -First 22)
+        $script:writerExists = $false
+        $roleId = $script:customRoleId
+        $config = New-ControlConfig
+        $name = Get-ControlName $config
+        $role = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}' -f $script:sub, $roleId
+        $script:assignments.Add([pscustomobject]@{ name = '1'; scope = $name.DemoResourceGroupId; roleDefinitionId = $role; principalId = $script:identityPrincipal })
+        $script:assignments.Add([pscustomobject]@{ name = '2'; scope = $name.AutomationAccountId; roleDefinitionId = $role; principalId = $script:identityPrincipal })
+        $results = @(Invoke-DemoActivityControlSetup -Config $config -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
+        $puts = @($script:rest | Where-Object { $_.Method -eq 'put' -and $_.Url -match '/roleDefinitions/' })
+        $puts.Count | Should -Be 2
+        $puts[0].Url | Should -Match ('/roleDefinitions/{0}\?' -f [regex]::Escape($roleId)) -Because 'the role is updated under its own ID, not created again'
+        @(($puts[0].Body | ConvertFrom-Json -AsHashtable)['properties']['permissions'][0]['actions']) | Should -Be $script:approvedActions
+        ($puts[1].Body | ConvertFrom-Json -AsHashtable)['properties']['roleName'] | Should -Be 'DbHub Demo Session Writer'
+        foreach ($scope in $name.DemoResourceGroupId, $name.AutomationAccountId) {
+            @($script:assignments | Where-Object { $_.scope -eq $scope -and $_.principalId -eq $script:identityPrincipal -and $_.roleDefinitionId -eq $role }).Count | Should -Be 1 -Because "the assignment at $scope stays, with no duplicate"
+        }
+        @($script:assignments | Where-Object { $_.principalId -eq $script:identityPrincipal -and $_.roleDefinitionId -match ('/{0}$' -f [regex]::Escape($script:writerRoleId)) } | ForEach-Object scope) | Should -Be @($name.StatusSecretId, $name.MetricsSecretId)
+        $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
+        $definition.status | Should -Be 'Pass'
+        $definition.message | Should -Match '^The custom role "DbHub Demo Activity Operator" was updated in place, under the same ID, so its assignments stay, from 22 to exactly the \d+ approved actions; added: '
+        @($definition.evidence['added']).Count | Should -Be ($script:approvedActions.Count - 22)
+        ($results | Where-Object checkId -EQ 'CONTROL.ROLE.WRITER').message | Should -Match '^The custom role "DbHub Demo Session Writer" was created with exactly the 2 approved actions'
+        foreach ($id in 'CONTROL.ROLE.A1', 'CONTROL.ROLE.A2') {
+            ($results | Where-Object checkId -EQ $id).message | Should -Match 'is in place\.$' -Because $id
+        }
+    }
+
     It 'keeps assignments that exist, and writes nothing then' {
         $config = New-ControlConfig
         $name = Get-ControlName $config
