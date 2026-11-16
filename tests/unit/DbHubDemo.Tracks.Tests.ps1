@@ -1579,6 +1579,12 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:calls.Add(('history done={0} skipFabric={1} whatIf={2}' -f [bool]$PesterBoundParameters['DoneChecked'], [bool]$PesterBoundParameters['SkipFabric'], [bool]$PesterBoundParameters['WhatIfRun']))
             New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status $script:historyStatus -Message ('history {0}' -f $script:historyStatus) -Evidence @{ nonBlocking = 'historySnapshot' }
         }
+        # T4's read replica at the run's end (2026-11-16) has its own tests (DbHubDemo.T4Replica.Tests.ps1); here it notes
+        # when it ran, and never reaches Azure.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDeployEnd -MockWith {
+            $script:calls.Add('replica end')
+            New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.END' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'replica end' -Evidence @{ outcome = 'Deleted' }
+        }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -1856,6 +1862,11 @@ Describe 'Invoke-DemoParallelDeployment' {
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.TIMING'))
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        # T4's read replica goes after them (2026-11-16): DONE's checks and the snapshot read it first.
+        [array]::IndexOf($calls, 'replica end') | Should -BeGreaterThan $history
+        [array]::IndexOf($ids, 'DEPLOY.T4.REPLICA.END') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY'))
+        [array]::IndexOf($ids, 'DEPLOY.T4.REPLICA.END') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDeployEnd -Times 1 -Exactly -ParameterFilter { $ProgressPath -eq 'progress.json' }
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 1 -Exactly -ParameterFilter {
             [bool]$PesterBoundParameters['DoneChecked'] -and -not [bool]$PesterBoundParameters['SkipFabric'] -and -not [bool]$PesterBoundParameters['WhatIfRun'] -and $ProgressPath -eq 'progress.json' -and [string]$ActivityProfile.Name -eq 'business-day' -and
             @($Requirement) -contains 'TELEMETRY.T2' -and @($Requirement) -contains 'FABRIC.ITEMS.REQUIRED' -and
@@ -1897,6 +1908,7 @@ Describe 'Invoke-DemoParallelDeployment' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -WhatIf })
         $script:calls | Should -Contain 'history done=False skipFabric=False whatIf=True'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDeployEnd -Times 0 -Exactly -Because 'a what-if deletes nothing'
         $ids = @($results | ForEach-Object { [string]$_.checkId })
         $ids[-1] | Should -Be 'DEPLOY.FABRIC.HISTORY'
         [array]::IndexOf($ids, 'DEPLOY.STAGE.INFRASTRUCTURE') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY'))

@@ -206,6 +206,11 @@ function Get-DemoProgressCatalog {
     # The session control (ADR 0026): deploy.ps1 sets it up in Azure while the tracks run, and puts its notebook in Fabric
     # after the Fabric track (Invoke-DemoControlDeployStep). Non-blocking: it never keeps the run from DONE.
     $validation.Add((& $step 'Control' 'Session control (NB_DatabaseHub_Control: one Run all runs a whole session)' @() $true))
+    if ($T4Enabled) {
+        # T4's read replica at the run's end (2026-11-16, Invoke-DemoT4ReplicaDeployEnd): deleted once DONE's checks and the
+        # history snapshot have read it, unless a session uses it. Non-blocking: it never keeps the run from DONE.
+        $validation.Add((& $step 'T4ReplicaEnd' 'T4''s read replica at the end (deleted unless a session uses it; start-demo.ps1 and Run all create it for each session)' @() $true))
+    }
     $tracks.Add([ordered]@{ name = 'Validation'; label = 'Validation'; steps = $validation.ToArray() })
     return $tracks.ToArray()
 }

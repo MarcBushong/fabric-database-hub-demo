@@ -56,9 +56,12 @@ function Invoke-DemoDeployment {
         activity profile, on a run whose validation ran: NB_DatabaseHub_LiveActivity once, analyze-only (CONFIRM false),
         then the history model's refresh (Invoke-DemoHistorySnapshotStep, DEPLOY.FABRIC.HISTORY), as the parallel path
         does. It never stops the run or keeps it from DONE.
+    12. T4's read replica at the run's end (2026-11-16; Invoke-DemoT4ReplicaDeployEnd, DEPLOY.T4.REPLICA.END), as the
+        parallel path does: deleted unless a session uses it now, on a run that stops at a Fail too. Never a Fail.
 
-    A Fail stops the run, and nothing after it runs. Manual action required never stops it and is never
-    hidden: it's in the results and in DEPLOY.SUMMARY. Deployment success alone is never Pass (ADR 0012).
+    A Fail stops the run, and nothing after it runs but the switch and the replica's end. Manual action required never
+    stops it and is never hidden: it's in the results and in DEPLOY.SUMMARY. Deployment success alone is never Pass
+    (ADR 0012).
     With -WhatIf, it runs the read-only preflight (without registering providers) and the template's
     what-if, then stops.
 
@@ -304,9 +307,13 @@ function Invoke-DemoDeployment {
             & $addAll @(Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile $activity -Result $results.ToArray() -CheckPrefix 'DEPLOY' -RequestedBy 'deploy')
         }
     }
-    # A run that stops at a Fail switches the VMs it noted too, then returns what it has.
+    # A run that stops at a Fail switches the VMs it noted too, and deletes T4's read replica as a whole run does
+    # (2026-11-16), then returns what it has.
     $finishEarly = {
         & $switchActivity
+        if (-not $whatIf) {
+            $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -Confirm:$false))
+        }
         $results.ToArray()
     }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28 and its follow-up). T4 is
@@ -894,6 +901,11 @@ function Invoke-DemoDeployment {
     # NB_DatabaseHub_LiveActivity runs once, analyze-only, and the history model is refreshed. Never a Fail.
     if ($validated) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
+    }
+    # T4's read replica (2026-11-16), as in the parallel path: DONE's checks and the history snapshot have read it, so it's
+    # deleted unless a session uses it now. Never a Fail.
+    if (-not $whatIf) {
+        $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -Confirm:$false))
     }
 
     $all = $results.ToArray()

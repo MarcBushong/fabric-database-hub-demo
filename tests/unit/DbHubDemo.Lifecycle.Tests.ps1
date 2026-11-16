@@ -933,6 +933,13 @@ Describe 'Invoke-DemoDeployment' {
             $script:history.Add([pscustomobject]@{ Before = $script:order.ToArray(); DoneChecked = [bool]$PesterBoundParameters['DoneChecked']; SkipFabric = [bool]$PesterBoundParameters['SkipFabric']; WhatIfRun = [bool]$PesterBoundParameters['WhatIfRun'] })
             New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Saved the history report''s snapshots.' -Evidence @{ nonBlocking = 'historySnapshot' }
         }
+        # T4's read replica at the run's end (2026-11-16) has its own tests (DbHubDemo.T4Replica.Tests.ps1); here it notes
+        # what had run before it, and never reaches Azure.
+        $script:replicaEnd = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDeployEnd -MockWith {
+            $script:replicaEnd.Add([pscustomobject]@{ Before = $script:order.ToArray(); Snapshots = $script:history.Count })
+            New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.END' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'replica end' -Evidence @{ outcome = 'Deleted' }
+        }
     }
 
     It 'sets up the nightly safety stop after the Infrastructure stage, and not with -WhatIf (ADR 0024)' {
@@ -1292,6 +1299,11 @@ Describe 'Invoke-DemoDeployment' {
         $ids = @($results | ForEach-Object { [string]$_.checkId })
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        # T4's read replica goes after the snapshot (2026-11-16): DONE's checks and the snapshot read it first.
+        $script:replicaEnd.Count | Should -Be 1
+        $script:replicaEnd[0].Snapshots | Should -Be 1
+        [array]::IndexOf($ids, 'DEPLOY.T4.REPLICA.END') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY'))
+        [array]::IndexOf($ids, 'DEPLOY.T4.REPLICA.END') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 1 -Exactly -ParameterFilter {
             [bool]$PesterBoundParameters['DoneChecked'] -and -not [bool]$PesterBoundParameters['SkipFabric'] -and -not [bool]$PesterBoundParameters['WhatIfRun'] -and [string]$ActivityProfile.Name -eq 'business-day' -and
             @($Requirement) -contains 'TELEMETRY.T2' -and @($Requirement) -contains 'FABRIC.ITEMS.REQUIRED' -and
@@ -1319,11 +1331,13 @@ Describe 'Invoke-DemoDeployment' {
 
         $script:order.Clear()
         $script:state = New-TestState
+        $script:replicaEnd.Clear()
         $results = @(Invoke-DemoDeployment -Config $config -Resume -WhatIf)
         $script:order | Should -Be @('Preflight', 'Template')
         $script:history.Count | Should -Be 1
         $script:history[0].WhatIfRun | Should -BeTrue
         $results[-1].checkId | Should -Be 'DEPLOY.FABRIC.HISTORY'
+        $script:replicaEnd.Count | Should -Be 0 -Because 'a what-if deletes nothing'
     }
 
     It 'still switches when it stops at a Fail after the profiles were set, so no VM stays on the interim baseline (-Sequential)' {
@@ -1333,6 +1347,9 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Not -Contain 'DoneGate'
         $script:order[-1] | Should -Be 'Switch:T1,T3,T2=business-day'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.INCIDENTS_T2' }).status | Should -Be 'Pass'
+        # And deletes T4's read replica, as a whole run does (2026-11-16).
+        $script:replicaEnd.Count | Should -Be 1
+        $script:replicaEnd[0].Before[-1] | Should -Be 'Switch:T1,T3,T2=business-day'
     }
 
     It 'reports a switch that doesn''t finish in time as a Warning, never a Fail (-Sequential)' {

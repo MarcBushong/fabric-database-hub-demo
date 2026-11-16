@@ -57,7 +57,10 @@ function Start-DemoEnvironment {
        waits for it at its end (START.T4.REPLICA, with START.T4.REPLICA.FALLBACK when Azure refused T4's size). A replica
        a session left stopped starts before T4, because Azure starts T4 only after its replicas (Invoke-DemoT4PowerAction).
        An environment deploy.ps1 hasn't set the replica up in is Not selected, with the upgrade's command; -SkipT4Replica
-       leaves it out of a session.
+       leaves it out of a session. The session marks the replica as its own until the VMs' next auto-shutdown
+       (Set-DemoT4ReplicaHold, 2026-11-16) before the warm-up: a new one through its template's tags, one that's running
+       already at once, and one that was stopped once it's Ready. So a deploy.ps1 run that ends during the session leaves
+       it (a Warning, START.T4.REPLICA.HOLD, when the mark couldn't be written).
     5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
        2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown (START.PROFILE_*). A profile with incidents is set
        as its interim, baseline, first. The VMs don't set it at boot unless
@@ -392,6 +395,7 @@ function Start-DemoEnvironment {
 
     $t4Ready = $false
     $replicaContext = $null
+    $replicaMarkPending = $false
     if ($t4On) {
         $t4Requested = $null -ne $t4Request -and [string](Get-DemoMemberValue -InputObject $t4Request.evidence -Name 'stateBefore') -notin @('', 'Ready')
         $t4Start = if ($t4Request.status -in 'Pass', 'Warning') { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes $T4StartMinutes -CheckPrefix START -Requested:$t4Requested } else { $t4Request }
@@ -404,6 +408,12 @@ function Start-DemoEnvironment {
         }
         elseif ($t4Ready) {
             $replicaContext = Start-DemoT4ReplicaCreate -Config $Config -CheckPrefix START -DeploymentId ([string]$state.Tags['deploymentId']) -Confirm:$false
+            # The session marks its replica before the warm-up (2026-11-16), so a deploy.ps1 that ends meanwhile leaves it.
+            $mark = Invoke-DemoT4ReplicaStartMark -Config $Config -Context $replicaContext -DeploymentId ([string]$state.Tags['deploymentId'])
+            $replicaMarkPending = $mark.Pending
+            if ($null -ne $mark.Result) {
+                $results.Add($mark.Result)
+            }
         }
         elseif (Test-DemoT4ReplicaSetUp -State $state) {
             $results.Add((New-DemoResult -CheckId 'START.T4.REPLICA' -Area 'infra' -Target 'T4' -Status 'Warning' -Message 'T4 isn''t running (START.T4.START says why), so its read replica wasn''t created: Database Hub''s Read replica lag stays empty this session.' -Remediation 'Run ./scripts/start-demo.ps1 again once T4 starts; it creates the replica.'))
@@ -519,6 +529,15 @@ function Start-DemoEnvironment {
         }
         foreach ($item in @(Complete-DemoT4ReplicaCreate -Config $Config -Context $replicaContext)) {
             $results.Add($item)
+        }
+        # A replica that was stopped, or that another run was creating, is marked now that it's Ready (2026-11-16):
+        # a deploy.ps1 run during this session leaves the replica at its end, until the VMs' next auto-shutdown
+        # (Set-DemoT4ReplicaHold). stop-demo.ps1 deletes the replica, mark and all.
+        if ($replicaMarkPending -and @($results | Where-Object { [string]$_.checkId -eq 'START.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0) {
+            $hold = Set-DemoT4ReplicaHold -Config $Config -DeploymentId ([string]$state.Tags['deploymentId']) -Confirm:$false
+            if ($null -ne $hold) {
+                $results.Add($hold)
+            }
         }
     }
     return $results.ToArray()

@@ -11,6 +11,11 @@
 # - Servers - Get, Start, Delete: https://learn.microsoft.com/rest/api/postgresql/flexibleserver/servers
 # - Capacity errors: https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors
 
+# 2026-11-16: the replica's own tag that says until when a start-demo.ps1 session uses it (from the replica's creation,
+# in its template's tags, or Set-DemoT4ReplicaHold), so deploy.ps1 leaves it at its end (Get-DemoT4ReplicaHold); it goes
+# with the replica.
+$script:T4ReplicaSessionTag = 'DbHubSessionUntilUtc'
+
 function Get-DemoT4ReplicaSetting {
     # config/versions.json's postgresql.replica block: the replica's name prefix, template deployment, records, the
     # lag scenario's replay delay, bounds, sizes, metrics, and sources. Internal.
@@ -413,7 +418,7 @@ function Get-DemoT4ReplicaLagBlock {
     if ([string]$t4.State -ne 'Ready') {
         switch -Regex ([string]$t4.State) {
             '^NotFound$' {
-                return (& $warn ('T4 ({0}) isn''t there, {1}.' -f $(if ($t4Name) { $t4Name } else { 'pgflex01-<deploymentId>' }), $notSent) 'Run ./scripts/deploy.ps1: it creates T4 and its read replica.' $evidence)
+                return (& $warn ('T4 ({0}) isn''t there, {1}.' -f $(if ($t4Name) { $t4Name } else { 'pgflex01-<deploymentId>' }), $notSent) 'Run ./scripts/deploy.ps1, which creates T4 and sets its read replica up, then ./scripts/start-demo.ps1, which creates the replica for a session.' $evidence)
             }
             '^(Stopped|Stopping|Disabled)$' {
                 return (& $warn ('T4 ({0}) is {1}, {2}.' -f $t4Name, $t4.State, $notSent) ('Run ./scripts/start-demo.ps1: it starts T4 and creates or starts its read replica (about {0} minutes); {1}.' -f $setting['createMinutes'], $again) $evidence)
@@ -447,7 +452,7 @@ function Get-DemoT4ReplicaLagBlock {
     }
     switch -Regex ([string]$replica.State) {
         '^NotFound$' {
-            return (& $warn ('T4''s read replica ({0}) isn''t there, {1}. stop-demo.ps1 deletes it after each session.' -f $replicaName, $notSent) ('Run ./scripts/start-demo.ps1: it creates the replica (about {0} minutes); {1}.' -f $setting['createMinutes'], $again) $evidence)
+            return (& $warn ('T4''s read replica ({0}) isn''t there, {1}. It exists only during a session: stop-demo.ps1 deletes it after each one, and deploy.ps1 at its end.' -f $replicaName, $notSent) ('Run ./scripts/start-demo.ps1: it creates the replica (about {0} minutes); {1}.' -f $setting['createMinutes'], $again) $evidence)
         }
         '^(Stopped|Stopping|Disabled)$' {
             return (& $warn ('T4''s read replica ({0}) is {1}, {2}.' -f $replicaName, $replica.State, $notSent) ('Run ./scripts/start-demo.ps1: it starts the replica; {0}.' -f $again) $evidence)
@@ -542,7 +547,8 @@ function Send-DemoT4ReplicaTemplate {
     .SYNOPSIS
     Deploys infra/replica/pgreplica01.bicep for one size and zone (resource group deployment dbhub-t4-replica), with the
     demo's own tags and component t4-replica, T4's location, subnet, private DNS zone, and storage, and the lag
-    scenario's replay delay. With -NoWait it returns once Azure accepted the deployment. Returns ExitCode and Error.
+    scenario's replay delay. -ExtraTag adds tags, such as a start-demo.ps1 session's mark (2026-11-16), which the replica
+    then has from its creation. With -NoWait it returns once Azure accepted the deployment. Returns ExitCode and Error.
     The parameters go in a file in a private directory. Internal.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Callers confirm once for the whole deployment or start.')]
@@ -564,6 +570,9 @@ function Send-DemoT4ReplicaTemplate {
         [ValidateSet('', '1', '2', '3')]
         [string] $Zone = '',
 
+        [AllowNull()]
+        [System.Collections.IDictionary] $ExtraTag = $null,
+
         [switch] $NoWait
     )
 
@@ -581,6 +590,11 @@ function Send-DemoT4ReplicaTemplate {
         Write-DemoLog -Level Debug -Message ('The demo resource group''s tags weren''t read for T4''s read replica: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
     }
     $tags['component'] = 't4-replica'
+    if ($null -ne $ExtraTag) {
+        foreach ($key in @($ExtraTag.Keys)) {
+            $tags[[string]$key] = [string]$ExtraTag[$key]
+        }
+    }
     $parameters = [ordered]@{
         '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
         contentVersion = '1.0.0.0'
@@ -693,7 +707,9 @@ function Start-DemoT4ReplicaCreate {
       and its max_connections must be in effect: a replica inherits the value, and a hot standby needs at least the
       primary's. With -WaitForRestartMinutes it waits for T1's T4 step to restart T4 (deploy.ps1's parallel tracks), then
       restarts it itself (Invoke-DemoT4PendingRestart).
-    - Then the first size of Get-DemoT4ReplicaSizeOrder goes out (Send-DemoT4ReplicaTemplate -NoWait).
+    - Then the first size of Get-DemoT4ReplicaSizeOrder goes out (Send-DemoT4ReplicaTemplate -NoWait). For start-demo.ps1,
+      its tags include the session's mark, DbHubSessionUntilUtc (2026-11-16, Get-DemoT4ReplicaHold), so the replica is
+      the session's from its creation, and a deploy.ps1 that ends during the warm-up leaves it.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -713,7 +729,7 @@ function Start-DemoT4ReplicaCreate {
     $checkId = '{0}.T4.REPLICA' -f $CheckPrefix
     $setting = Get-DemoT4ReplicaSetting
     $docUrl = [string]$setting['docUrls']['create']
-    $context = [ordered]@{ Done = $true; Results = [System.Collections.Generic.List[object]]::new(); CheckPrefix = $CheckPrefix; Names = $null; Support = $null; Order = @(); Index = -1; Refused = [System.Collections.Generic.List[object]]::new(); StartUtc = [DateTime]::UtcNow; Waiting = ''; DeploymentId = $DeploymentId }
+    $context = [ordered]@{ Done = $true; Results = [System.Collections.Generic.List[object]]::new(); CheckPrefix = $CheckPrefix; Names = $null; Support = $null; Order = @(); Index = -1; Refused = [System.Collections.Generic.List[object]]::new(); StartUtc = [DateTime]::UtcNow; Waiting = ''; DeploymentId = $DeploymentId; SessionTags = [ordered]@{} }
     $finish = {
         param([string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}, [string] $Remediation = '')
         $context.Results.Add((New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $docUrl))
@@ -733,7 +749,7 @@ function Start-DemoT4ReplicaCreate {
     $support = Get-DemoT4ReplicaSupport -T4State $t4
     $context.Support = $support
     if ($support.Reason -eq 'NoT4') {
-        return (& $finish 'Not selected' ('T4 ({0}) isn''t deployed, so it has no read replica.' -f $names.SourceName) ([ordered]@{ t4State = $t4.State }) 'Run ./scripts/deploy.ps1: it creates T4, then its replica.')
+        return (& $finish 'Not selected' ('T4 ({0}) isn''t deployed, so it has no read replica.' -f $names.SourceName) ([ordered]@{ t4State = $t4.State }) 'Run ./scripts/deploy.ps1: it creates T4 and sets its read replica up; start-demo.ps1 then creates the replica for each session.')
     }
     if (-not $support.Supported) {
         $context.Results.Add((New-DemoT4ReplicaNotSupportedResult -CheckId $checkId -T4SkuName $support.SkuName))
@@ -817,8 +833,16 @@ function Start-DemoT4ReplicaCreate {
     $context.Order = @(Get-DemoT4ReplicaSizeOrder -T4SkuName $support.SkuName -Record ([string]$state.T4ReplicaSize) -Zone $zones)
     $context.Index = 0
     $first = $context.Order[0]
+    if ($CheckPrefix -eq 'START') {
+        try {
+            $context.SessionTags[$script:T4ReplicaSessionTag] = ConvertTo-DemoBusyTimeText -Utc (Get-DemoNextShutdownUtc -Config $Config)
+        }
+        catch {
+            Write-DemoLog -Level Debug -Message ('The session''s mark for T4''s read replica wasn''t worked out; the start marks the replica once it''s Ready: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        }
+    }
     Write-DemoLog -Message ('Creating T4''s read replica ({0}) as {1}; it takes about {2} minutes.' -f $names.ServerName, (Format-DemoT4ReplicaAttemptText -Attempt $first), $setting['createMinutes'])
-    $sent = Send-DemoT4ReplicaTemplate -Config $Config -Names $names -Support $support -SkuName $first.SkuName -Zone $first.Zone -NoWait
+    $sent = Send-DemoT4ReplicaTemplate -Config $Config -Names $names -Support $support -SkuName $first.SkuName -Zone $first.Zone -ExtraTag $context.SessionTags -NoWait
     if ($sent.ExitCode -ne 0) {
         $evidence['error'] = $sent.Error
         return (& $finish $(if ($CheckPrefix -eq 'DEPLOY') { 'Fail' } else { 'Warning' }) ('T4''s read replica ({0}) couldn''t be created: {1}' -f $names.ServerName, $sent.Error) $evidence 'Fix the cause (a policy denial names its policy), then run the script again.')
@@ -865,6 +889,7 @@ function Complete-DemoT4ReplicaCreate {
     $checkId = '{0}.T4.REPLICA' -f $Context.CheckPrefix
     $names = $Context.Names
     $support = $Context.Support
+    $sessionTags = Get-DemoMemberValue -InputObject $Context -Name 'SessionTags'
     $failStatus = if ($Context.CheckPrefix -eq 'DEPLOY') { 'Fail' } else { 'Warning' }
     $evidence = [ordered]@{ replica = $names.ServerName; source = $names.SourceName; t4SkuName = $support.SkuName }
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -912,7 +937,7 @@ function Complete-DemoT4ReplicaCreate {
                 $null = Wait-DemoT4ReplicaState -Config $Config -State @('NotFound') -TimeoutMinutes ([int]$setting['deleteTimeoutMinutes']) -DeploymentId ([string]$Context.DeploymentId)
             }
             Start-Sleep -Seconds 60
-            $sent = Send-DemoT4ReplicaTemplate -Config $Config -Names $names -Support $support -SkuName $attempt.SkuName -Zone $attempt.Zone -NoWait
+            $sent = Send-DemoT4ReplicaTemplate -Config $Config -Names $names -Support $support -SkuName $attempt.SkuName -Zone $attempt.Zone -ExtraTag $sessionTags -NoWait
             if ($sent.ExitCode -ne 0) {
                 $evidence['error'] = $sent.Error
                 $results.Add((New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $failStatus -Message ('T4''s read replica ({0}) couldn''t be created as {1}: {2}' -f $names.ServerName, (Format-DemoT4ReplicaAttemptText -Attempt $attempt), $sent.Error) -Evidence $evidence -Remediation 'Fix the cause, then run the script again.' -DocUrl $docUrl))
@@ -952,7 +977,7 @@ function Complete-DemoT4ReplicaCreate {
         }
         $attempt = $order[$index]
         Write-DemoLog -Message ('Trying T4''s read replica as {0}.' -f (Format-DemoT4ReplicaAttemptText -Attempt $attempt))
-        $sent = Send-DemoT4ReplicaTemplate -Config $Config -Names $names -Support $support -SkuName $attempt.SkuName -Zone $attempt.Zone -NoWait
+        $sent = Send-DemoT4ReplicaTemplate -Config $Config -Names $names -Support $support -SkuName $attempt.SkuName -Zone $attempt.Zone -ExtraTag $sessionTags -NoWait
         if ($sent.ExitCode -ne 0) {
             $evidence['error'] = $sent.Error
             $results.Add((New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $failStatus -Message ('T4''s read replica ({0}) couldn''t be created as {1}: {2}' -f $names.ServerName, (Format-DemoT4ReplicaAttemptText -Attempt $attempt), $sent.Error) -Evidence $evidence -Remediation 'Fix the cause, then run the script again.' -DocUrl $docUrl))
@@ -1685,9 +1710,9 @@ function Get-DemoT4ReplicaNote {
     <#
     .SYNOPSIS
     What DONE or NOT DONE says about T4's read replica (ADR 0025), from a run's results, or '': its size change's notice
-    (DEPLOY.T4.REPLICA.FALLBACK), Not supported on a Burstable T4 with the fix, or, once created, that it's there for this
-    session only. A replica Azure refused every size of is DEPLOY.T4.REPLICA's Fail, which NOT DONE gives as its reason.
-    Pure. Internal.
+    (DEPLOY.T4.REPLICA.FALLBACK), Not supported on a Burstable T4 with the fix, and what the run's end did with it
+    (DEPLOY.T4.REPLICA.END, 2026-11-16: deleted, or kept for a session that uses it). A replica Azure refused every size of
+    is DEPLOY.T4.REPLICA's Fail, which NOT DONE gives as its reason. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -1697,22 +1722,299 @@ function Get-DemoT4ReplicaNote {
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
+    $lines = [System.Collections.Generic.List[string]]::new()
     $notice = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA.FALLBACK' }) | Select-Object -Last 1
     if ($null -ne $notice) {
-        return [string]$notice.message
+        $lines.Add([string]$notice.message)
     }
     $main = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA' }) | Select-Object -Last 1
-    if ($null -eq $main) {
-        return ''
+    if ($null -ne $main -and [string]$main.status -eq 'Not supported') {
+        $lines.Add(('{0} {1}' -f [string]$main.message, [string]$main.remediation).Trim())
     }
-    if ([string]$main.status -eq 'Not supported') {
-        return ('{0} {1}' -f [string]$main.message, [string]$main.remediation).Trim()
+    $end = @($all | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA.END' -and [string]$_.status -in 'Pass', 'Warning' }) | Select-Object -Last 1
+    if ($null -ne $end -and (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $end -Name 'evidence') -Name 'outcome') -in 'Deleted', 'Kept', 'NotDeleted') {
+        $lines.Add(('{0} {1}' -f [string]$end.message, $(if ([string]$end.status -eq 'Warning') { [string]$end.remediation } else { '' })).Trim())
     }
-    if ([string]$main.status -eq 'Pass') {
+    elseif ($null -eq $end -and $null -ne $main -and [string]$main.status -eq 'Pass') {
         $name = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $main -Name 'evidence') -Name 'replica')
-        return ('T4''s read replica{0} runs for this session only: ./scripts/stop-demo.ps1 deletes it, so nothing bills for it between sessions, and ./scripts/start-demo.ps1 creates it again (about {1} minutes).' -f $(if ($name) { ' ({0})' -f $name } else { '' }), (Get-DemoT4ReplicaSetting)['createMinutes'])
+        $lines.Add(('T4''s read replica{0} runs for a session only: ./scripts/stop-demo.ps1 deletes it, so nothing bills for it between sessions, and ./scripts/start-demo.ps1 creates it again (about {1} minutes).' -f $(if ($name) { ' ({0})' -f $name } else { '' }), (Get-DemoT4ReplicaSetting)['createMinutes']))
     }
-    return ''
+    return ($lines -join ' ')
+}
+
+function Get-DemoT4ReplicaHold {
+    <#
+    .SYNOPSIS
+    Whether a demo session uses T4's read replica now (2026-11-16), so deploy.ps1 leaves it at its end
+    (Invoke-DemoT4ReplicaDeployEnd). Returns Held, By (Control, StartDemo, Unknown, or ''), UntilUtc, and Error. Read-only;
+    never throws. Internal.
+
+    .DESCRIPTION
+    - A session or run the control notebook started (ADR 0020, ADR 0026): its auto-stop, the one-time schedule
+      dbhub-autostop in the control's Automation account, is still to come. That auto-stop deletes the replica at the
+      session's end.
+    - A session start-demo.ps1 started: the replica's DbHubSessionUntilUtc tag, the VMs' next auto-shutdown when the
+      session started, is still ahead. A new replica has it from its creation (Start-DemoT4ReplicaCreate); one that was
+      there already gets it from Set-DemoT4ReplicaHold. The tag goes with the replica, which stop-demo.ps1 and a
+      control session's auto-stop delete; one more than a day ahead is ignored, so no tag keeps a replica longer.
+    - The control's auto-stop couldn't be read (anything but "not there", such as no control at all): Held, By Unknown,
+      so a replica a session may use is never deleted.
+    https://learn.microsoft.com/rest/api/automation/schedule/get
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Replica = $null,
+
+        [string] $DeploymentId = '',
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $now = if ($NowUtc.Kind -eq [System.DateTimeKind]::Local) { $NowUtc.ToUniversalTime() } else { $NowUtc }
+    $controlError = ''
+    try {
+        $name = Get-DemoActivityControlName -Config $Config
+        $url = Get-DemoActivityControlUrl -Id ('{0}/schedules/{1}' -f $name.AutomationAccountId, $name.AutoStopSchedule) -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts')
+        $schedule = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url $url
+        if ($schedule.Ok) {
+            $stopUtc = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties') -Name 'startTime')
+            if ($null -ne $stopUtc -and $stopUtc -gt $now) {
+                return [pscustomobject]@{ Held = $true; By = 'Control'; UntilUtc = $stopUtc; Error = '' }
+            }
+        }
+        elseif (-not $schedule.Missing) {
+            $controlError = if ($schedule.Error) { [string]$schedule.Error } else { 'it couldn''t be read' }
+        }
+    }
+    catch {
+        $controlError = Protect-DemoText -Text $_.Exception.Message
+    }
+    try {
+        if ($null -eq $Replica) {
+            $Replica = Get-DemoT4ReplicaState -Config $Config -DeploymentId $DeploymentId
+        }
+        $tags = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Replica -Name 'Server') -Name 'tags'
+        $mark = [string](Get-DemoMemberValue -InputObject $tags -Name $script:T4ReplicaSessionTag)
+        $until = if ($mark) { ConvertTo-DemoUtcDateTime -Value $mark } else { $null }
+        if ($null -ne $until -and $until -gt $now -and $until -le $now.AddHours(24)) {
+            return [pscustomobject]@{ Held = $true; By = 'StartDemo'; UntilUtc = $until; Error = '' }
+        }
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('T4''s read replica''s session mark couldn''t be read: {0}' -f $_.Exception.Message)
+    }
+    if ($controlError) {
+        return [pscustomobject]@{ Held = $true; By = 'Unknown'; UntilUtc = $null; Error = (Protect-DemoText -Text $controlError) }
+    }
+    return [pscustomobject]@{ Held = $false; By = ''; UntilUtc = $null; Error = '' }
+}
+
+function Set-DemoT4ReplicaHold {
+    <#
+    .SYNOPSIS
+    start-demo.ps1's mark on T4's read replica (2026-11-16): the replica's DbHubSessionUntilUtc tag says until when this
+    session uses it, the VMs' next auto-shutdown, when the session's activity ends, so a deploy.ps1 run during the session
+    leaves the replica at its end (Get-DemoT4ReplicaHold). The tag goes with the replica, which stop-demo.ps1 and a control
+    session's auto-stop delete; the merge leaves its other tags. Returns START.T4.REPLICA.HOLD, a Warning, when the mark
+    couldn't be written, and nothing otherwise. Never throws. Internal.
+    https://learn.microsoft.com/cli/azure/tag#az-tag-update
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [datetime] $UntilUtc = [datetime]::MinValue,
+
+        [string] $DeploymentId = ''
+    )
+
+    $why = ''
+    $untilText = ''
+    try {
+        $names = Get-DemoT4ReplicaName -Config $Config -DeploymentId $DeploymentId
+        if (-not $names.ServerName) {
+            return
+        }
+        if ($UntilUtc -eq [datetime]::MinValue) {
+            $UntilUtc = Get-DemoNextShutdownUtc -Config $Config
+        }
+        $untilText = ConvertTo-DemoBusyTimeText -Utc $UntilUtc
+        if (-not $PSCmdlet.ShouldProcess($names.ServerName, ('Mark T4''s read replica as this session''s until {0}' -f $untilText))) {
+            return
+        }
+        $run = Invoke-DemoAzWithConflictRetry -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('tag', 'update', '--resource-id', $names.ServerId, '--operation', 'Merge', '--tags', ('{0}={1}' -f $script:T4ReplicaSessionTag, $untilText)) -Label ('T4 replica {0}: session mark' -f $names.ServerName) -MaxConflictRetries 4
+        if ($run.ExitCode -eq 0) {
+            return
+        }
+        $why = Protect-DemoText -Text ([string]$run.StdErr).Trim()
+    }
+    catch {
+        $why = Protect-DemoText -Text $_.Exception.Message
+    }
+    return (New-DemoResult -CheckId 'START.T4.REPLICA.HOLD' -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4''s read replica couldn''t be marked as this session''s{0}: {1}. A deploy.ps1 run during this session would delete it at its end.' -f $(if ($untilText) { ' (until {0})' -f $untilText } else { '' }), $why) -Remediation 'Don''t run ./scripts/deploy.ps1 during this session; if one ran, ./scripts/start-demo.ps1 creates the replica again (about 9 minutes).' -DocUrl 'https://learn.microsoft.com/cli/azure/tag#az-tag-update')
+}
+
+function Invoke-DemoT4ReplicaStartMark {
+    <#
+    .SYNOPSIS
+    start-demo.ps1's mark on T4's read replica before the warm-up (2026-11-16), from Start-DemoT4ReplicaCreate's context,
+    so a deploy.ps1 run that ends during the warm-up leaves the replica: a new one has the mark in its template's tags,
+    so nothing is written; one that's running already is marked now (Set-DemoT4ReplicaHold). One that's stopped or
+    still starting is marked once it's Ready, because Azure may refuse a change to a server in those states. Returns
+    Pending (start-demo.ps1 marks the replica once it's Ready) and Result (START.T4.REPLICA.HOLD's Warning, or $null).
+    Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Context,
+
+        [string] $DeploymentId = ''
+    )
+
+    if ($null -eq $Context) {
+        return [pscustomobject]@{ Pending = $false; Result = $null }
+    }
+    $waiting = [string](Get-DemoMemberValue -InputObject $Context -Name 'Waiting')
+    if ($waiting -eq 'Create') {
+        $tags = Get-DemoMemberValue -InputObject $Context -Name 'SessionTags'
+        return [pscustomobject]@{ Pending = -not ($null -ne $tags -and $tags.Contains($script:T4ReplicaSessionTag)); Result = $null }
+    }
+    if ($waiting) {
+        return [pscustomobject]@{ Pending = $true; Result = $null }
+    }
+    $running = @(Get-DemoMemberValue -InputObject $Context -Name 'Results' | Where-Object { [string]$_.checkId -eq 'START.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0
+    if (-not $running) {
+        return [pscustomobject]@{ Pending = $false; Result = $null }
+    }
+    return [pscustomobject]@{ Pending = $false; Result = (Set-DemoT4ReplicaHold -Config $Config -DeploymentId $DeploymentId -Confirm:$false) }
+}
+
+function Invoke-DemoT4ReplicaDeployEnd {
+    <#
+    .SYNOPSIS
+    deploy.ps1's end for T4's read replica (2026-11-16, decided by the project's coordinator for the user, who can reverse
+    it before the merge): DONE's checks and the history snapshot have read it, so it's deleted and waited for, and a
+    deployment, an upgrade included, leaves nothing new billing between sessions. start-demo.ps1 and the control notebook's
+    Run all create it for each session (about 9 minutes). A replica a session uses stays (Get-DemoT4ReplicaHold). Returns
+    DEPLOY.T4.REPLICA.END, never a Fail, and shows it on the status page's T4ReplicaEnd row. Internal.
+
+    .DESCRIPTION
+    - T4 isn't deployed: Not selected. No replica: Pass, nothing to delete (evidence outcome None).
+    - The control's session or run uses it (its auto-stop is pending), or a start-demo.ps1 session does (the replica's
+      mark is ahead): Pass, kept, with whose session, until when, and what deletes it (Kept).
+    - Whether a control session uses it couldn't be read: a Warning, kept (NotDeleted), with the fix.
+    - It's still Provisioning, Starting, Updating, or Restarting, which this run's own creation never leaves it (it waits
+      for Ready): another run, such as a session's start, may be creating or starting it, so it's kept with a Warning
+      (NotDeleted). A start-demo.ps1 session's replica has its mark from its creation, so that's a Kept above.
+    - Otherwise Remove-DemoT4Replica: Pass (Deleted), or a Warning when the delete failed or Azure was still deleting it
+      after deleteTimeoutMinutes (NotDeleted). The nightly safety stop stops a replica that's left meanwhile.
+    The replica's own metrics go with it (ResourceNotFound); this run's history snapshot read them first, and T4's stay.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = '',
+
+        [string] $DeploymentId = '',
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $checkId = 'DEPLOY.T4.REPLICA.END'
+    $rowId = 'T4ReplicaEnd'
+    $setting = Get-DemoT4ReplicaSetting
+    $docUrl = [string]$setting['docUrls']['concepts']
+    $again = './scripts/start-demo.ps1 and the control notebook''s Run all create it for each session (about {0} minutes).' -f $setting['createMinutes']
+    $finish = {
+        param([string] $Status, [string] $Message, [string] $Outcome, [System.Collections.IDictionary] $Evidence, [string] $Remediation = '', [string] $RowState = 'Done')
+        $Evidence['outcome'] = $Outcome
+        $item = New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $docUrl
+        $rowText = if ($Remediation) { '{0} {1}' -f $Message, $Remediation } else { $Message }
+        Set-DemoProgressStep -Path $ProgressPath -Id $rowId -State $RowState -Status $(if ($RowState -eq 'Skipped') { 'Not selected' } else { $Status }) -Message $rowText -MaxLength 1200
+        if ($Status -eq 'Warning') {
+            Write-DemoLog -Level Warning -Message $rowText
+        }
+        elseif ($Outcome -in 'Deleted', 'Kept') {
+            Write-DemoLog -Message $Message
+        }
+        return $item
+    }
+    try {
+        $names = Get-DemoT4ReplicaName -Config $Config -DeploymentId $DeploymentId
+        if (-not $names.ServerName) {
+            return (& $finish 'Not selected' 'T4 isn''t deployed, so it has no read replica to delete.' 'None' ([ordered]@{}) '' 'Skipped')
+        }
+        $replica = Get-DemoT4ReplicaState -Config $Config -DeploymentId $DeploymentId
+        $evidence = [ordered]@{ replica = $names.ServerName; stateBefore = $replica.State }
+        if ($replica.State -eq 'NotFound') {
+            return (& $finish 'Pass' ('T4''s read replica ({0}) isn''t there, so nothing bills for it between sessions. {1}' -f $names.ServerName, $again) 'None' $evidence '' 'Skipped')
+        }
+        if (-not $replica.Present) {
+            $evidence['error'] = $replica.Error
+            return (& $finish 'Warning' ('T4''s read replica ({0}) couldn''t be read at the end of this run, so it wasn''t deleted: {1}' -f $names.ServerName, $replica.Error) 'NotDeleted' $evidence 'Run ./scripts/stop-demo.ps1 when no session runs: it deletes the replica, and so does the next ./scripts/deploy.ps1; the nightly safety stop stops it meanwhile.' 'Action needed')
+        }
+        $hold = Get-DemoT4ReplicaHold -Config $Config -Replica $replica -DeploymentId $DeploymentId -NowUtc $NowUtc
+        if ($hold.Held) {
+            $evidence['heldBy'] = $hold.By
+            if ($null -ne $hold.UntilUtc) {
+                $evidence['heldUntilUtc'] = ConvertTo-DemoBusyTimeText -Utc $hold.UntilUtc
+            }
+            if ($hold.By -eq 'Unknown') {
+                $evidence['error'] = $hold.Error
+                return (& $finish 'Warning' ('T4''s read replica ({0}) was kept at the end of this run: whether a session from the control notebook uses it couldn''t be read ({1}), and a replica a session uses is never deleted.' -f $names.ServerName, $hold.Error.TrimEnd('.')) 'NotDeleted' $evidence 'When no session runs, ./scripts/stop-demo.ps1 deletes it, and so does the next ./scripts/deploy.ps1; the nightly safety stop stops it meanwhile.' 'Action needed')
+            }
+            $shutdown = Get-DemoAutoShutdownSetting -Config $Config
+            $untilText = '{0} ({1})' -f (Get-DemoBusyLocalTime -Utc $hold.UntilUtc -Zone $shutdown.Zone).Text, $shutdown.TimeZoneId
+            $message = if ($hold.By -eq 'Control') {
+                'T4''s read replica ({0}) was kept at the end of this run: a session from the control notebook uses it, and its auto-stop at {1} deletes it.' -f $names.ServerName, $untilText
+            }
+            else {
+                'T4''s read replica ({0}) was kept at the end of this run: a start-demo.ps1 session uses it until {1}. ./scripts/stop-demo.ps1 deletes it when the session ends, and so does the next ./scripts/deploy.ps1 after that time.' -f $names.ServerName, $untilText
+            }
+            return (& $finish 'Pass' $message 'Kept' $evidence)
+        }
+        if ($replica.State -in 'Provisioning', 'Starting', 'Updating', 'Restarting') {
+            return (& $finish 'Warning' ('T4''s read replica ({0}) was kept at the end of this run: it''s {1}, so another run, such as a session''s start, may be creating or starting it.' -f $names.ServerName, $replica.State) 'NotDeleted' $evidence 'When no session runs, ./scripts/stop-demo.ps1 deletes it, and so does the next ./scripts/deploy.ps1; the nightly safety stop stops it meanwhile.' 'Action needed')
+        }
+        if (-not $PSCmdlet.ShouldProcess($names.ServerName, 'Delete T4''s read replica at the end of this run')) {
+            return (& $finish 'Not selected' ('What if: T4''s read replica ({0}) would be deleted at the end of this run, unless a session uses it.' -f $names.ServerName) 'None' $evidence '' 'Skipped')
+        }
+        Set-DemoProgressStep -Path $ProgressPath -Id $rowId -State 'Running' -Message ('Deleting T4''s read replica ({0}): DONE''s checks and the history snapshot have read it, and no session uses it (about 2 minutes).' -f $names.ServerName)
+        $removed = Remove-DemoT4Replica -Config $Config -CheckPrefix DEPLOY -CheckId $checkId -DeploymentId $DeploymentId -Confirm:$false
+        foreach ($key in @($removed.evidence.Keys)) {
+            $evidence[[string]$key] = $removed.evidence[$key]
+        }
+        if ([string]$removed.status -eq 'Pass') {
+            if ([string](Get-DemoMemberValue -InputObject $removed.evidence -Name 'stateBefore') -eq 'NotFound') {
+                return (& $finish 'Pass' ('T4''s read replica ({0}) isn''t there any more, so nothing bills for it between sessions. {1}' -f $names.ServerName, $again) 'None' $evidence '' 'Skipped')
+            }
+            $seconds = [int](Get-DemoMemberValue -InputObject $removed.evidence -Name 'seconds')
+            return (& $finish 'Pass' ('T4''s read replica ({0}) was deleted at the end of this run{1}, once DONE''s checks and the history snapshot had read it, so nothing bills for it between sessions. {2}' -f $names.ServerName, $(if ($seconds -gt 0) { ' in {0} s' -f $seconds } else { '' }), $again) 'Deleted' $evidence)
+        }
+        return (& $finish 'Warning' ([string]$removed.message) 'NotDeleted' $evidence 'Run ./scripts/stop-demo.ps1 when no session runs: it deletes the replica, and so does the next ./scripts/deploy.ps1; the nightly safety stop stops it meanwhile.' 'Action needed')
+    }
+    catch {
+        if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) {
+            throw
+        }
+        return (& $finish 'Warning' ('T4''s read replica wasn''t deleted at the end of this run: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) 'NotDeleted' ([ordered]@{}) 'Run ./scripts/stop-demo.ps1 when no session runs: it deletes the replica, and so does the next ./scripts/deploy.ps1; the nightly safety stop stops it meanwhile.' 'Action needed')
+    }
 }
 
 function Get-DemoPostgresHistoryCapture {

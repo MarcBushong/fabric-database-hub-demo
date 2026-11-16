@@ -358,6 +358,10 @@ function Invoke-DemoParallelDeployment {
        about 15 minutes; a resumed run with nothing left to do runs it again. Never a Fail: a paused capacity or a job that
        outlives its wait is a Warning, and -WhatIf, -SkipFabric, GitHub Actions, or checks that didn't pass are Not
        selected. The status page's Fabric.History row shows it.
+    8. T4's read replica at the run's end (2026-11-16; Invoke-DemoT4ReplicaDeployEnd, DEPLOY.T4.REPLICA.END): after the
+       history snapshot and the session control's notebook, it's deleted, so the run leaves nothing new billing between
+       sessions, unless a session uses it now (the control's pending auto-stop, or a start-demo.ps1 session's mark on the
+       replica); on every run, a NOT DONE one included, never a Fail. The status page's T4ReplicaEnd row shows it.
 
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
     does; a resume first checks that sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout
@@ -1277,6 +1281,12 @@ function Invoke-DemoParallelDeployment {
         else {
             Set-DemoProgressStep -Path $ProgressPath -Id 'Control' -State 'Skipped' -Message 'The notebook waits for the Fabric track; the next ./scripts/deploy.ps1 puts it in Fabric.'
         }
+    }
+    # 10. T4's read replica (2026-11-16): DONE's checks and the history snapshot have read it, so it's deleted, and the run
+    # leaves nothing new billing between sessions, unless a session uses it now; start-demo.ps1 and Run all create it for
+    # each session. On every run, a NOT DONE one included; never a Fail, and never in DONE's way.
+    if (-not $whatIf) {
+        $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -Confirm:$false))
     }
     # 2026-11-13 live finding: this process's own Run Commands that ran under a fresh name (the tracks report theirs).
     & $addAll @(Get-DemoRunCommandStuckResult -Clear)
