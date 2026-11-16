@@ -440,7 +440,7 @@ function Test-DemoFabricApp {
     else {
         $code = 0
         try {
-            $response = Invoke-WebRequest -Uri $HostingUrl -Method Get -Headers @{ Accept = 'application/json' } -SkipHttpErrorCheck -MaximumRedirection 0 -TimeoutSec 60 -ErrorAction Stop
+            $response = Invoke-WebRequest -Uri $HostingUrl -Method Get -Headers @{ Accept = 'application/json' } -SkipHttpErrorCheck -MaximumRedirection 0 -TimeoutSec 60 -OperationTimeoutSeconds 60 -ErrorAction Stop
             $code = [int]$response.StatusCode
         }
         catch {

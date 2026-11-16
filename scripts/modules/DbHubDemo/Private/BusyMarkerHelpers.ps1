@@ -742,6 +742,78 @@ function Test-DemoBusyParentAlive {
     }
 }
 
+function Get-DemoProgressFingerprint {
+    # A SHA-256 of every step's id, state, status, and message in deploy.ps1's progress file, without the NightlyStop row,
+    # which the busy marker's refresher writes itself, and without the heartbeat, which a run that's stuck still writes; ''
+    # when the file can't be read. The refresher compares them to see whether the run still moves (R862). Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $Path
+    )
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ''
+    }
+    try {
+        $model = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -Depth 32
+    }
+    catch {
+        return ''
+    }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    # Assigned first: Get-DemoMemberValue returns an array as one object, which @() wouldn't unroll.
+    $tracks = Get-DemoMemberValue -InputObject $model -Name 'tracks'
+    foreach ($track in @($tracks)) {
+        $steps = Get-DemoMemberValue -InputObject $track -Name 'steps'
+        foreach ($step in @($steps)) {
+            $id = [string](Get-DemoMemberValue -InputObject $step -Name 'id')
+            if (-not $id -or $id -eq 'NightlyStop') {
+                continue
+            }
+            $parts.Add(('{0}|{1}|{2}|{3}' -f $id, [string](Get-DemoMemberValue -InputObject $step -Name 'state'), [string](Get-DemoMemberValue -InputObject $step -Name 'status'), [string](Get-DemoMemberValue -InputObject $step -Name 'message')))
+        }
+    }
+    if ($parts.Count -eq 0) {
+        return ''
+    }
+    return [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes(($parts -join "`n"))))
+}
+
+function Test-DemoBusyRunStalled {
+    # Why the busy marker's refresher stops moving the mark on, or '' while it goes on (R862, the coordinator's decision: a run
+    # that's stuck must not keep the demo awake overnight): no step of the run changed for -StallMinutes, or the run is older
+    # than -MaxRunHours. The real runs took at most about 3 hours, and a step that waits says so at least every few minutes.
+    # Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [datetime] $RunStartUtc,
+
+        [Parameter(Mandatory)]
+        [datetime] $LastChangeUtc,
+
+        [Parameter(Mandatory)]
+        [datetime] $NowUtc,
+
+        [ValidateRange(1, 1440)]
+        [int] $StallMinutes = 60,
+
+        [ValidateRange(1, 48)]
+        [int] $MaxRunHours = 6
+    )
+
+    if (($NowUtc - $RunStartUtc).TotalHours -ge $MaxRunHours) {
+        return ('deploy.ps1 has run for more than {0} hours' -f $MaxRunHours)
+    }
+    if (($NowUtc - $LastChangeUtc).TotalMinutes -ge $StallMinutes) {
+        return ('no step of deploy.ps1 has changed for {0} minutes, since {1:HH:mm} UTC' -f $StallMinutes, $LastChangeUtc)
+    }
+    return ''
+}
+
 function Invoke-DemoBusyMarkerLoop {
     <#
     .SYNOPSIS
@@ -749,7 +821,10 @@ function Invoke-DemoBusyMarkerLoop {
     refresh (Update-DemoBusyMarker) every refreshMinutes, every 2 minutes until the marker is first written (a first
     deployment's group doesn't exist until its template), and a check of the VMs' auto-shutdown every 2 minutes in the 16
     minutes before autoShutdownTime, when the template may have set it back. It ends when deploy.ps1's process is gone, so
-    an abandoned run's marker expires. Internal.
+    an abandoned run's marker expires, and when the run is stuck (Test-DemoBusyRunStalled: no step changed for
+    -StallMinutes, 60, or the run is older than -MaxRunHours, 6), so a run that hangs doesn't keep the demo awake
+    overnight (R862; live on 2026-11-16, a deploy whose T1 track hung renewed its mark for hours and moved the VMs'
+    auto-shutdown). Internal.
     #>
     [CmdletBinding()]
     param(
@@ -769,7 +844,13 @@ function Invoke-DemoBusyMarkerLoop {
 
         [long] $ParentStartTicks = 0,
 
-        [int] $MaxTicks = 0
+        [int] $MaxTicks = 0,
+
+        [ValidateRange(1, 1440)]
+        [int] $StallMinutes = 60,
+
+        [ValidateRange(1, 48)]
+        [int] $MaxRunHours = 6
     )
 
     $known = @{}
@@ -777,12 +858,30 @@ function Invoke-DemoBusyMarkerLoop {
     $last = [datetime]::MinValue
     $lastCheck = [datetime]::MinValue
     $ticks = 0
+    $fingerprint = ''
+    $lastChange = [DateTime]::UtcNow
     while ($true) {
         if ($ParentId -gt 0 -and -not (Test-DemoBusyParentAlive -ProcessId $ParentId -StartTicks $ParentStartTicks)) {
             Write-DemoLog -Message 'deploy.ps1 ended, so the busy marker isn''t moved on any more: it expires on its own, and the nightly stop goes on.'
             return
         }
         $now = [DateTime]::UtcNow
+        $print = Get-DemoProgressFingerprint -Path $ProgressPath
+        # Without a readable progress file, there's nothing to compare: only -MaxRunHours applies.
+        if (-not $print -or $print -ne $fingerprint) {
+            $fingerprint = $print
+            $lastChange = $now
+        }
+        $stalled = Test-DemoBusyRunStalled -RunStartUtc $RunStartUtc -LastChangeUtc $lastChange -NowUtc $now -StallMinutes $StallMinutes -MaxRunHours $MaxRunHours
+        if ($stalled) {
+            $expires = if ($known.Contains('Until')) { ' at {0:HH:mm} UTC' -f [datetime]$known['Until'] } else { '' }
+            $text = '{0}, so the busy marker isn''t moved on any more: it expires on its own{1}, and the nightly stop goes on. The run may be stuck: its status page shows the step it''s on; stop it, then run ./scripts/deploy.ps1 again.' -f $stalled, $expires
+            Write-DemoLog -Level Warning -Message $text
+            if ($ProgressPath) {
+                Set-DemoProgressStep -Path $ProgressPath -Id 'NightlyStop' -State 'Running' -Status 'Warning' -Message $text
+            }
+            return
+        }
         $every = if ($known.Contains('Written')) { [int]$script:BusyMarkerSetting['refreshMinutes'] } else { 2 }
         # A refresh that throws doesn't end the refresher: the next one tries again, well before the marker expires.
         try {

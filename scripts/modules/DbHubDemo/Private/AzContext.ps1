@@ -643,6 +643,8 @@ function Invoke-DemoRestRequest {
         Token              = $secure
         SkipHttpErrorCheck = $true
         TimeoutSec         = $TimeoutSeconds
+        # PowerShell 7.4's TimeoutSec ends at the response's headers; this bounds each read of its body (R862).
+        OperationTimeoutSeconds = $TimeoutSeconds
         ErrorAction        = 'Stop'
     }
     if ($Body) {

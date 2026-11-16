@@ -603,6 +603,17 @@ Describe 'Invoke-DemoAz' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 1 -Exactly -ParameterFilter { $TimeoutSeconds -eq 30 }
     }
 
+    It 'gives az rest 300 seconds unless the caller sets a limit, and leaves other commands to the SDK''s own (2026-11-16 live finding)' {
+        # Live: one az rest GET got no answer for over 2 hours, and deploy.ps1's T1 track waited with no end.
+        $url = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/rg-dbhub-demo?api-version=2021-04-01"
+        Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList 'rest', '--method', 'get', '--url', $url | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 1 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'rest' -and $TimeoutSeconds -eq 300 }
+        Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList 'rest', '--method', 'get', '--url', $url -TimeoutSeconds 45 | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 1 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'rest' -and $TimeoutSeconds -eq 45 }
+        Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList 'group', 'show', '--name', 'rg-dbhub-demo' | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 1 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'group' -and -not $TimeoutSeconds }
+    }
+
     It 'parses JSON output with -AsJson' {
         $result = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList 'group', 'show', '--name', 'rg-dbhub-demo' -AsJson
         $result.name | Should -Be 'rg-dbhub-demo'

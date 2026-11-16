@@ -261,6 +261,8 @@ function Invoke-DemoHubHttp {
         Token                   = $Token
         Headers                 = @{ Accept = 'application/json'; 'x-ms-app' = 'DbHubDemo'; 'x-ms-client-request-id' = 'DbHubDemo;' + [guid]::NewGuid().ToString() }
         TimeoutSec              = $TimeoutSec
+        # PowerShell 7.4's TimeoutSec ends at the response's headers; this bounds each read of its body (R862).
+        OperationTimeoutSeconds = $TimeoutSec
         SkipHttpErrorCheck      = $true
         StatusCodeVariable      = 'statusCode'
         ResponseHeadersVariable = 'responseHeaders'

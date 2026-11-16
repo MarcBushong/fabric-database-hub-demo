@@ -14,7 +14,7 @@ function Invoke-DemoRetailPriceRequest {
     while ($true) {
         $attempt++
         try {
-            return Invoke-RestMethod -Uri $Uri -Method Get -TimeoutSec 60
+            return Invoke-RestMethod -Uri $Uri -Method Get -TimeoutSec 60 -OperationTimeoutSeconds 60
         }
         catch {
             if ($attempt -ge 4) {

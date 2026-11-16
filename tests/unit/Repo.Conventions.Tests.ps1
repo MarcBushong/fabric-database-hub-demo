@@ -925,3 +925,75 @@ Describe 'Markdown' {
         $broken | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Time limits on every network call (R862, 2026-11-16 live finding)' {
+    # Live: one call that got no answer held a deploy.ps1 run for over 2 hours. A request without a limit holds the run, or,
+    # in a notebook, its Spark session and with it the capacity.
+    It 'gives every Invoke-WebRequest and Invoke-RestMethod in the scripts and the runbooks a time limit, and the module''s a read limit too' {
+        $offenders = foreach ($file in Get-RepoFile -Include '*.ps1' | Where-Object { $_.FullName -match '[\\/](scripts|automation)[\\/]' -and $_.Name -notlike '*.Tests.ps1' }) {
+            $path = $file.FullName.Substring($repoRoot.Length + 1).Replace('\', '/')
+            # PowerShell 7.4's TimeoutSec ends at the response's headers, so the module (7.4) bounds each read of the body too;
+            # Windows PowerShell 5.1, the runbooks', bounds reads on its own.
+            $need = if ($path -like 'scripts/*') { @('TimeoutSec', 'OperationTimeoutSeconds') } else { @('TimeoutSec') }
+            $tokens = $null
+            $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            $calls = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -in 'Invoke-WebRequest', 'Invoke-RestMethod' }, $true)
+            foreach ($call in $calls) {
+                # A splatted call's limits are in its parameters' hashtable, checked below.
+                if (@($call.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) {
+                    continue
+                }
+                $given = @($call.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } | ForEach-Object { $_.ParameterName })
+                foreach ($name in $need | Where-Object { $_ -notin $given }) {
+                    '{0}:{1} {2} without -{3}' -f $path, $call.Extent.StartLineNumber, $call.GetCommandName(), $name
+                }
+            }
+            $tables = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.HashtableAst] }, $true)
+            foreach ($table in $tables) {
+                $keys = @($table.KeyValuePairs | ForEach-Object { $_.Item1.Extent.Text.Trim('''', '"') })
+                if ('Uri' -notin $keys -or 'Method' -notin $keys) {
+                    continue
+                }
+                foreach ($name in $need | Where-Object { $_ -notin $keys }) {
+                    '{0}:{1} a request''s parameters without {2}' -f $path, $table.Extent.StartLineNumber, $name
+                }
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
+
+    It 'passes a timeout to every requests call in the notebooks' {
+        $offenders = foreach ($file in Get-RepoFile -Include '*.ipynb' | Where-Object { $_.FullName -match '[\\/]fabric[\\/]' }) {
+            $notebook = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
+            $index = 0
+            foreach ($cell in @($notebook.cells)) {
+                if ($cell.cell_type -eq 'code') {
+                    $source = @($cell.source) -join ''
+                    foreach ($match in [regex]::Matches($source, '\brequests\.(get|post|put|delete|patch|head|request)\(')) {
+                        $depth = 0
+                        $end = $source.Length - 1
+                        for ($at = $match.Index + $match.Length - 1; $at -lt $source.Length; $at++) {
+                            if ($source[$at] -eq '(') {
+                                $depth++
+                            }
+                            elseif ($source[$at] -eq ')') {
+                                $depth--
+                                if ($depth -eq 0) {
+                                    $end = $at
+                                    break
+                                }
+                            }
+                        }
+                        $call = $source.Substring($match.Index, $end - $match.Index + 1)
+                        if ($call -notmatch '\btimeout\s*=') {
+                            '{0} cell {1}: {2}' -f $file.Name, $index, ($call -split "`n")[0]
+                        }
+                    }
+                }
+                $index++
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
+}

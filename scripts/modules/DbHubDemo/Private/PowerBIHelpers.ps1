@@ -48,6 +48,8 @@ function Invoke-DemoPowerBIRequest {
         Token              = $Token
         SkipHttpErrorCheck = $true
         TimeoutSec         = 120
+        # PowerShell 7.4's TimeoutSec ends at the response's headers; this bounds each read of its body (R862).
+        OperationTimeoutSeconds = 120
         ErrorAction        = 'Stop'
     }
     if ($null -ne $Body) {

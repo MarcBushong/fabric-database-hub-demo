@@ -1140,4 +1140,54 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Invoke-DemoBusyMarkerLoop -Config $Config -RunStartUtc ([DateTime]::UtcNow) -ParentId 4242 -ParentStartTicks 1 -MaxTicks 1 }
         Should -Invoke -ModuleName DbHubDemo -CommandName Update-DemoBusyMarker -Times 1 -Exactly
     }
+
+    It 'stops moving the mark on when no step of the run changed for 60 minutes, or after 6 hours, so a run that hangs doesn''t keep the demo awake (R862)' {
+        # Live on 2026-11-16, a deploy whose T1 track hung on one call renewed its mark for hours and moved the VMs' auto-shutdown.
+        $stalled = @(InModuleScope DbHubDemo {
+                $start = [datetime]::new(2026, 11, 16, 19, 49, 0, [System.DateTimeKind]::Utc)
+                Test-DemoBusyRunStalled -RunStartUtc $start -LastChangeUtc $start.AddMinutes(10) -NowUtc $start.AddMinutes(69)
+                Test-DemoBusyRunStalled -RunStartUtc $start -LastChangeUtc $start.AddMinutes(10) -NowUtc $start.AddMinutes(70)
+                Test-DemoBusyRunStalled -RunStartUtc $start -LastChangeUtc $start.AddMinutes(355) -NowUtc $start.AddMinutes(360)
+            })
+        $stalled[0] | Should -BeNullOrEmpty -Because 'a run whose steps moved 59 minutes ago goes on'
+        $stalled[1] | Should -Be 'no step of deploy.ps1 has changed for 60 minutes, since 19:59 UTC'
+        $stalled[2] | Should -Be 'deploy.ps1 has run for more than 6 hours'
+    }
+
+    It 'tells a run that moves from one that''s stuck by its steps, not by the heartbeat or the busy marker''s own row (R862)' {
+        $path = Join-Path -Path $TestDrive -ChildPath 'progress.json'
+        $write = {
+            param([string] $Message, [string] $Nightly, [int] $Beat)
+            @{ heartbeatAt = $Beat; tracks = @(@{ name = 'T1'; steps = @(@{ id = 'T1.Artifacts'; state = 'Running'; status = ''; message = $Message }) }, @{ name = 'Validation'; steps = @(@{ id = 'NightlyStop'; state = 'Running'; status = ''; message = $Nightly }) }) } |
+                ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path
+        }
+        $read = { InModuleScope DbHubDemo -Parameters @{ Path = $path } { Get-DemoProgressFingerprint -Path $Path } }
+        & $write 'sending' 'busy until 18:51' 1
+        $first = & $read
+        & $write 'sending' 'busy until 19:01' 2
+        $second = & $read
+        & $write 'sent' 'busy until 19:01' 3
+        $third = & $read
+
+        $first | Should -Not -BeNullOrEmpty
+        $second | Should -Be $first -Because 'the heartbeat and the busy marker''s own row don''t count'
+        $third | Should -Not -Be $first
+        InModuleScope DbHubDemo -Parameters @{ Path = (Join-Path -Path $TestDrive -ChildPath 'missing.json') } { Get-DemoProgressFingerprint -Path $Path } | Should -BeNullOrEmpty
+    }
+
+    It 'the refresher stops, says why on the console and the Nightly stop row, and moves the mark on no more when the run is stuck (R862)' {
+        $path = Join-Path -Path $TestDrive -ChildPath 'stuck.json'
+        @{ tracks = @(@{ name = 'T1'; steps = @(@{ id = 'T1.Artifacts'; state = 'Running'; status = ''; message = '' }) }) } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoBusyParentAlive -MockWith { $true }
+        Mock -ModuleName DbHubDemo -CommandName Update-DemoBusyMarker -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoBusyRunStalled -MockWith { 'no step of deploy.ps1 has changed for 60 minutes, since 20:13 UTC' }
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig); Path = $path } { Invoke-DemoBusyMarkerLoop -Config $Config -RunStartUtc ([DateTime]::UtcNow) -ProgressPath $Path -ParentId 4242 -ParentStartTicks 1 -MaxTicks 1 }
+
+        Should -Invoke -ModuleName DbHubDemo -CommandName Update-DemoBusyMarker -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'no step of deploy.ps1 has changed for 60 minutes, since 20:13 UTC, so the busy marker isn''t moved on any more: it expires on its own, and the nightly stop goes on.*run ./scripts/deploy.ps1 again.' } -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -ParameterFilter { $Id -contains 'NightlyStop' -and $Status -eq 'Warning' } -Times 1 -Exactly
+    }
 }
