@@ -557,7 +557,10 @@ function Save-DemoFabricHistory {
         $evidence['postgresMetrics'] = 'withheld'
     }
     if ($run.status -eq 'Pass' -and $postgresWithheld) {
-        return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.' -f $WindowMinutes, $postgresWithheld) $evidence 'Run ./scripts/deploy.ps1, which updates the notebook. T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).')
+        # deploy.ps1 updates an existing notebook only with fabric.importNotebooks true (init.ps1 writes it); with false, it
+        # keeps the workspace's copy and the edits in it, and configure-fabric.ps1 is the explicit update.
+        $updateFix = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { 'Run ./scripts/deploy.ps1, which updates the notebook.' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' }
+        return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.' -f $WindowMinutes, $postgresWithheld) $evidence ('{0} T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).' -f $updateFix))
     }
     if ($run.status -eq 'Pass') {
         return (& $answer 'Pass' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}' -f $WindowMinutes, $run.message) $evidence)

@@ -524,11 +524,22 @@ function Invoke-DemoParallelDeployment {
     }
     $reopenFabric = $false
     if ($Resume -and -not $FromStage -and -not $whatIf -and -not $SkipFabric -and [string](Get-DemoMemberValue -InputObject $state -Name 'TrackFabric') -eq 'Fabric') {
-        $fabricMissing = Get-DemoFabricTrackRecheck -Config $Config
-        if ($null -ne $fabricMissing) {
+        # 2026-11-16 (the merge's upgrade test): a resume skipped a Fabric step that an earlier version had finished, so the
+        # workspace kept the older notebooks, history model, and Insights app, and a session's history lost T4's metrics. The
+        # step runs again when this copy publishes other content than the step last published in full; no Fabric call.
+        $contentReason = Get-DemoFabricContentReopen -State $state -Current (Get-DemoFabricContentSha256)
+        if ($contentReason) {
             $reopenFabric = $true
-            $progressNotes['Fabric'] = 'An earlier run recorded this step as finished, but {0} Running it again.' -f ([string]$fabricMissing.message).TrimEnd()
-            Write-DemoLog -Message ('An earlier run recorded the Fabric step as finished, but {0} So this run runs it again.' -f ([string]$fabricMissing.message).TrimEnd())
+            $progressNotes['Fabric'] = 'An earlier run recorded this step as finished, but {0} Publishing them again.' -f $contentReason
+            Write-DemoLog -Message ('An earlier run recorded the Fabric step as finished, but {0} So this run publishes them again: the notebooks, the history model and report, the dashboard, and the Insights app.' -f $contentReason)
+        }
+        else {
+            $fabricMissing = Get-DemoFabricTrackRecheck -Config $Config
+            if ($null -ne $fabricMissing) {
+                $reopenFabric = $true
+                $progressNotes['Fabric'] = 'An earlier run recorded this step as finished, but {0} Running it again.' -f ([string]$fabricMissing.message).TrimEnd()
+                Write-DemoLog -Message ('An earlier run recorded the Fabric step as finished, but {0} So this run runs it again.' -f ([string]$fabricMissing.message).TrimEnd())
+            }
         }
     }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28). T4 is part of every

@@ -80,6 +80,10 @@ function Get-DemoDeploymentStateTagName {
         TrackT2           = 'DbHubTrackT2'
         TrackT4           = 'DbHubTrackT4'
         TrackFabric       = 'DbHubTrackFabric'
+        # 2026-11-16: the Fabric content (Get-DemoFabricContentSha256) that the Fabric step last published in full, the
+        # notebooks, the history model and report, the dashboard, and the Insights app, so a resume publishes them again
+        # when this copy of the scripts has other ones (Get-DemoFabricContentReopen). Empty before 2026-11-16.
+        FabricSha256      = 'DbHubFabricSha256'
         T2Source          = 'DbHubT2Source'
         # fabric.manageCapacity (Phase 26b): the capacity start-demo.ps1 resumed, "<resource group>/<name>", and when.
         FabricCapacityResumed    = 'DbHubFabricCapacityResumed'

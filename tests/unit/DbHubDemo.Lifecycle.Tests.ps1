@@ -7,6 +7,8 @@ BeforeAll {
     # The .NET SDK that deploy.ps1 installs when it's missing (2026-11-09) has its own tests (DbHubDemo.DotNetSdk.Tests.ps1);
     # here it's there, and adds no record, unless a test says otherwise.
     Mock -ModuleName DbHubDemo -CommandName Initialize-DemoDotNetSdk -MockWith { }
+    # The Fabric content the scripts publish (2026-11-16), the same as New-TestState records, unless a test says otherwise.
+    Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricContentSha256 -MockWith { 'f' * 64 }
 
     function New-TestConfig([switch] $WithT4) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
@@ -22,10 +24,11 @@ BeforeAll {
     }
 
     function New-TestState([hashtable] $Values = @{}) {
+        # FabricSha256 is the content Get-DemoFabricContentSha256 returns below (2026-11-16): the Fabric items are current.
         $state = [ordered]@{
             Exists = $true; Stage = ''; StageUtc = ''; BundleSha256 = ''; BundleChunkCount = 0; RunnerSha256 = ''; RunnerChunkCount = 0
             BundleSentTo = @(); RunnerSentTo = @(); NetworkMode = 'private'; T3UseFreeLimit = $false; T3AdminGroupName = 'DbHub T3 Admins'
-            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; Tags = @{ deploymentId = 'abc123' }
+            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; FabricSha256 = ('f' * 64); Tags = @{ deploymentId = 'abc123' }
         }
         foreach ($key in $Values.Keys) {
             $state[$key] = $Values[$key]
@@ -1051,6 +1054,22 @@ Describe 'Invoke-DemoDeployment' {
             $null = @(Invoke-DemoDeployment -Config $config @run)
             $script:order | Should -Not -Contain 'Sdk'
         }
+    }
+
+    It 'runs the Fabric stage again on -Resume when this copy has other Fabric content than the stage last published, and records it (2026-11-16)' {
+        # Live, on the parallel path (the merge's upgrade test): a resume after the Fabric step kept main's notebook, history
+        # model, and Insights app. A -Sequential resume after its Fabric stage did the same.
+        $script:state = New-TestState @{ Stage = 'Fabric'; FabricSha256 = '' }
+        $null = @(Invoke-DemoDeployment -Config $config -Resume)
+        $script:order | Should -Contain 'Fabric'
+        $script:order | Should -Contain 'App'
+        @($script:recorded | Where-Object { $_.Contains('FabricSha256') })[-1]['FabricSha256'] | Should -Be ('f' * 64)
+
+        # The same content: only the validation runs, as before.
+        $script:order.Clear()
+        $script:state = New-TestState @{ Stage = 'Fabric' }
+        $null = @(Invoke-DemoDeployment -Config $config -Resume)
+        $script:order | Should -Not -Contain 'Fabric'
     }
 
     It 'imports the Real-Time Dashboard and the history model and report in the Fabric stage, as the parallel Fabric track does (review follow-up)' {

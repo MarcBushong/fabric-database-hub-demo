@@ -667,10 +667,15 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C -PostgresMetrics '{"version":1}' }
         $saved.Result.status | Should -Be 'Warning'
         $saved.Result.message | Should -Match 'T4''s metrics weren''t sent: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history \(2026-11-13\), so it would ignore them\.$'
-        $saved.Result.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which updates the notebook\. T4''s metrics are kept in out/history-pending'
+        $saved.Result.remediation | Should -Match '^Run \./scripts/configure-fabric\.ps1, which updates the notebook \(fabric\.importNotebooks is false, so deploy\.ps1 keeps the workspace''s copy\)\. T4''s metrics are kept in out/history-pending'
         $saved.PostgresDropped | Should -BeTrue
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { -not $Parameter.Contains('POSTGRES_METRICS') }
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq '13131313-1313-1313-1313-131313131313' -and $Name -eq 'NB_DatabaseHub_LiveActivity' -and $Parameter -eq 'POSTGRES_METRICS' }
+        # With fabric.importNotebooks true, which init.ps1 writes, deploy.ps1 updates it (2026-11-16).
+        $updating = @{} + $script:historyConfig
+        $updating['fabric'] = @{ workspaceName = 'Database Hub Demo'; lakehouseName = 'LH_DatabaseHub'; importNotebooks = $true }
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $updating } { Save-DemoFabricHistory -Config $C -PostgresMetrics '{"version":1}' }
+        $saved.Result.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which updates the notebook\. T4''s metrics are kept in out/history-pending'
 
         # A copy that knows it, and one whose definition can't be read, get them as before.
         foreach ($knows in @([pscustomobject]@{ Known = $true; Has = $true; Error = '' }, [pscustomobject]@{ Known = $false; Has = $false; Error = 'a fake error' })) {
@@ -683,7 +688,7 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
 
         # Without metrics, nothing is read.
         $null = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C }
-        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 3 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 4 -Exactly
     }
 
     It 'runs NB_DatabaseHub_LiveActivity with only its safe switches, bounded at 15 minutes' {

@@ -234,3 +234,99 @@ function Test-DemoFabricNotebookParameter {
         return (& $answer $false $false (Protect-DemoText -Text $_.Exception.Message))
     }
 }
+
+function Get-DemoFabricContentSha256 {
+    <#
+    .SYNOPSIS
+    One SHA-256 over the Fabric content that deploy.ps1's Fabric step publishes from this copy of the scripts: the
+    notebooks (fabric/notebooks/*.ipynb), the dashboard (fabric/realtime/*.json), the history model and report
+    (fabric/powerbi/*.SemanticModel and *.Report), and the Insights app's source (fabric/app, without dependencies, build
+    output, Markdown, or the deploy-time files its .gitignore names). Each file counts with its path, and with LF line
+    endings, so a checkout's line endings don't change it. Lowercase hex. Internal.
+
+    .DESCRIPTION
+    2026-11-16 (the merge's upgrade test): a resumed deploy.ps1 skipped the Fabric step that an earlier run had
+    finished, so an upgraded environment kept the older notebooks, model, and app, and its sessions' history lost T4's
+    metrics. The step records this value when it has published all of them (DbHubFabricSha256), and a resume compares it
+    (Get-DemoFabricContentReopen). The control's notebook isn't in it: every run publishes that one.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [string] $Root = $script:RepoRoot
+    )
+
+    $fabric = Join-Path -Path $Root -ChildPath 'fabric'
+    $files = [System.Collections.Generic.List[string]]::new()
+    $add = {
+        param([string] $Path, [string] $Filter, [switch] $Recurse)
+        if (Test-Path -LiteralPath $Path) {
+            foreach ($item in @(Get-ChildItem -LiteralPath $Path -Filter $Filter -File -Recurse:$Recurse)) {
+                $files.Add($item.FullName)
+            }
+        }
+    }
+    & $add (Join-Path -Path $fabric -ChildPath 'notebooks') '*.ipynb'
+    & $add (Join-Path -Path $fabric -ChildPath 'realtime') '*.json'
+    foreach ($folder in @(Get-ChildItem -LiteralPath (Join-Path -Path $fabric -ChildPath 'powerbi') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*.SemanticModel' -or $_.Name -like '*.Report' })) {
+        & $add $folder.FullName '*' -Recurse
+    }
+    $app = Join-Path -Path $fabric -ChildPath 'app'
+    $skipName = '^(\.gitignore|\.deployments\.json|rayfin\.config\.json|dbhub-app\.json)$|^\.env|\.(md|log)$'
+    if (Test-Path -LiteralPath $app) {
+        # Never into dependencies or build output, which a local npm install or build leaves there (tens of thousands of files).
+        $folders = [System.Collections.Generic.Stack[string]]::new()
+        $folders.Push($app)
+        while ($folders.Count -gt 0) {
+            $folder = $folders.Pop()
+            foreach ($child in [System.IO.Directory]::EnumerateDirectories($folder)) {
+                if ([System.IO.Path]::GetFileName($child) -notin 'node_modules', 'dist', '.temp') {
+                    $folders.Push($child)
+                }
+            }
+            foreach ($file in [System.IO.Directory]::EnumerateFiles($folder)) {
+                if ([System.IO.Path]::GetFileName($file) -notmatch $skipName) {
+                    $files.Add($file)
+                }
+            }
+        }
+    }
+    $entries = foreach ($path in $files) {
+        $relative = [System.IO.Path]::GetRelativePath($Root, $path) -replace '\\', '/'
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes) -replace "`r`n", "`n"
+        $hash = [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes($text))).ToLowerInvariant()
+        [pscustomobject]@{ Path = $relative; Hash = $hash }
+    }
+    $lines = @($entries | Sort-Object -Property Path -Culture ([System.Globalization.CultureInfo]::InvariantCulture) -CaseSensitive | ForEach-Object { '{0} {1}' -f $_.Hash, $_.Path })
+    $all = [System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    return [System.Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($all)).ToLowerInvariant()
+}
+
+function Get-DemoFabricContentReopen {
+    <#
+    .SYNOPSIS
+    Why a resumed deploy.ps1 runs the Fabric step again although an earlier run recorded it as finished: the Fabric content
+    it last published in full (the state's FabricSha256) isn't what this copy of the scripts publishes (-Current,
+    Get-DemoFabricContentSha256), or nothing was recorded (a run from before 2026-11-16, or one whose Insights app wasn't
+    deployed). Returns that reason as a sentence, or '' when the content is the same. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $State,
+
+        [Parameter(Mandatory)]
+        [string] $Current
+    )
+
+    $recorded = ([string](Get-DemoMemberValue -InputObject $State -Name 'FabricSha256')).Trim().ToLowerInvariant()
+    if ($recorded -eq $Current.ToLowerInvariant()) {
+        return ''
+    }
+    if (-not $recorded) {
+        return 'no record says it published this version''s notebooks, history model and report, dashboard, and Insights app (an earlier version, or a run whose Insights app wasn''t deployed).'
+    }
+    return ('this copy of the scripts has other notebooks, history model, report, dashboard, or Insights app than the ones it published ({0}, not {1}).' -f $Current.Substring(0, 12), $recorded.Substring(0, [System.Math]::Min(12, $recorded.Length)))
+}

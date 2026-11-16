@@ -506,3 +506,65 @@ Describe 'Test-DemoFabricNotebookParameter: whether the workspace''s copy of a n
         $knows.Error | Should -Match '403'
     }
 }
+
+Describe 'Get-DemoFabricContentSha256 and Get-DemoFabricContentReopen: what the Fabric step publishes, compared on a resume (2026-11-16)' {
+    BeforeEach {
+        # A small fabric folder with what the step publishes, and what it doesn't.
+        $script:root = Join-Path -Path $TestDrive -ChildPath ('repo-' + [guid]::NewGuid().ToString('N'))
+        $files = [ordered]@{
+            'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb'                   = "{`n  ""cells"": []`n}`n"
+            'fabric/realtime/RealTimeDashboard.json'                               = "{}`n"
+            'fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/model.tmdl' = "model Model`n"
+            'fabric/powerbi/RPT_DatabaseHub_History.Report/definition.pbir'         = "{}`n"
+            'fabric/powerbi/generator/New-Model.ps1'                               = "# generator`n"
+            'fabric/app/src/pages/PostgresPage.tsx'                                = "export const page = 1;`n"
+            'fabric/app/package.json'                                              = "{}`n"
+            'fabric/app/README.md'                                                 = "# app`n"
+            'fabric/app/node_modules/react/index.js'                               = "module.exports = 1;`n"
+            'fabric/app/dist/assets/index.js'                                      = "built`n"
+            'fabric/app/rayfin/.env'                                               = "WORKSPACE=1`n"
+            'fabric/app/public/dbhub-app.json'                                     = "{}`n"
+            'fabric/control/NB_DatabaseHub_Control.ipynb'                          = "{}`n"
+        }
+        foreach ($name in $files.Keys) {
+            $path = Join-Path -Path $script:root -ChildPath $name
+            $null = New-Item -ItemType Directory -Path (Split-Path -Path $path -Parent) -Force
+            [System.IO.File]::WriteAllText($path, $files[$name])
+        }
+        $script:hash = { & (Get-Module -Name DbHubDemo) { param($Root) Get-DemoFabricContentSha256 -Root $Root } $script:root }
+        $script:change = { param([string] $Name, [string] $Text) [System.IO.File]::WriteAllText((Join-Path -Path $script:root -ChildPath $Name), $Text) }
+    }
+
+    It 'changes with the notebooks, the history model and report, the dashboard, and the app''s source, and with nothing else' {
+        $before = & $script:hash
+        $before | Should -Match '^[0-9a-f]{64}$'
+        # A checkout's line endings don't count.
+        & $script:change 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb' "{`r`n  ""cells"": []`r`n}`r`n"
+        & $script:hash | Should -Be $before
+        # Dependencies, build output, Markdown, deploy-time files, the generator, and the control's notebook (every run
+        # publishes that one) don't count.
+        foreach ($name in 'fabric/app/node_modules/react/index.js', 'fabric/app/dist/assets/index.js', 'fabric/app/README.md', 'fabric/app/rayfin/.env', 'fabric/app/public/dbhub-app.json', 'fabric/powerbi/generator/New-Model.ps1', 'fabric/control/NB_DatabaseHub_Control.ipynb') {
+            & $script:change $name 'changed'
+            & $script:hash | Should -Be $before -Because $name
+        }
+        # What the step publishes does.
+        foreach ($name in 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb', 'fabric/realtime/RealTimeDashboard.json', 'fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/model.tmdl', 'fabric/powerbi/RPT_DatabaseHub_History.Report/definition.pbir', 'fabric/app/src/pages/PostgresPage.tsx', 'fabric/app/package.json') {
+            $current = & $script:hash
+            & $script:change $name ('changed {0}' -f [guid]::NewGuid())
+            & $script:hash | Should -Not -Be $current -Because $name
+        }
+        # A file that's added counts too.
+        $current = & $script:hash
+        & $script:change 'fabric/app/src/pages/NewPage.tsx' "export const other = 2;`n"
+        & $script:hash | Should -Not -Be $current
+    }
+
+    It 'says why a resume publishes them again: nothing recorded, or other content; and nothing when they''re the same' {
+        $module = Get-Module -Name DbHubDemo
+        $current = 'ab' * 32
+        & $module { param($State, $Current) Get-DemoFabricContentReopen -State $State -Current $Current } ([pscustomobject]@{ FabricSha256 = $current.ToUpperInvariant() }) $current | Should -Be ''
+        & $module { param($State, $Current) Get-DemoFabricContentReopen -State $State -Current $Current } ([pscustomobject]@{ FabricSha256 = '' }) $current | Should -Be 'no record says it published this version''s notebooks, history model and report, dashboard, and Insights app (an earlier version, or a run whose Insights app wasn''t deployed).'
+        & $module { param($State, $Current) Get-DemoFabricContentReopen -State $State -Current $Current } ([pscustomobject]@{ TrackFabric = 'Fabric' }) $current | Should -Match '^no record says' -Because 'a state from before 2026-11-16 has no such property'
+        & $module { param($State, $Current) Get-DemoFabricContentReopen -State $State -Current $Current } ([pscustomobject]@{ FabricSha256 = ('cd' * 32) }) $current | Should -Be 'this copy of the scripts has other notebooks, history model, report, dashboard, or Insights app than the ones it published (abababababab, not cdcdcdcdcdcd).'
+    }
+}

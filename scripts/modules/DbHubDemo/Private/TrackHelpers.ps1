@@ -799,6 +799,8 @@ function Invoke-DemoDeploymentTrack {
     $switchTo = if ($activityProfile.HasIncidents) { $activityProfile.Name } else { '' }
     $tagKey = 'Track{0}' -f $Track
     $recordState = -not [bool](& $option 'NoState' $false)
+    # The Fabric content the Fabric step published in full, recorded with the step (2026-11-16); '' otherwise.
+    $fabricPublished = ''
     $handoff = [string](& $option 'HandoffPath' '')
     $handoffMinutes = [int](& $option 'HandoffTimeoutMinutes' 120)
     # The status page's model (Phase 28); empty when there's none, and every update is then a no-op.
@@ -1590,6 +1592,9 @@ function Invoke-DemoDeploymentTrack {
                 'Fabric/Fabric' {
                     $import = [bool](& $option 'ImportNotebooks' $false) -or [bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')
                     $fabricConfigPath = [string](& $option 'ConfigPath' '')
+                    # What this step publishes, recorded once all of it is in the workspace (2026-11-16), so a later resume
+                    # publishes it again when the scripts have other content (Get-DemoFabricContentReopen).
+                    $fabricContent = Get-DemoFabricContentSha256
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Items' -State 'Running' -Message ''
                     $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks)
                     & $addAll $fabric
@@ -1605,7 +1610,8 @@ function Invoke-DemoDeploymentTrack {
                     # workspace the step above just resolved or created, so it doesn't look it up by name again (live, a
                     # second lookup right after the creation failed). The status page shows its actual reason, as Failed
                     # when it wasn't created, and the console says so at once.
-                    & $addAll @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $fabricConfigPath -FabricResult $fabric -ProgressPath $progress)
+                    $appRecords = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $fabricConfigPath -FabricResult $fabric -ProgressPath $progress)
+                    & $addAll $appRecords
                     if (& $hasStatus @($fabric + $powerBI) 'Fail') {
                         $outcome = 'Fail'
                     }
@@ -1614,6 +1620,13 @@ function Invoke-DemoDeploymentTrack {
                         # 2026-11-13: a first run that met a paused capacity recorded the step, so no later run created the
                         # workspace). The Insights app's records never count, as above.
                         $outcome = 'Open'
+                    }
+                    else {
+                        # The notebooks, the dashboard, the history model and report, and the app are all this version's.
+                        $appSummary = Get-DemoInsightsAppSummary -Result $appRecords
+                        if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') {
+                            $fabricPublished = $fabricContent
+                        }
                     }
                 }
                 default {
@@ -1686,7 +1699,12 @@ function Invoke-DemoDeploymentTrack {
         $done.Add($name)
         if ($recordState) {
             try {
-                Set-DemoDeploymentStateLocked -Config $Config -Value @{ $tagKey = $name } -Confirm:$false
+                $record = @{ $tagKey = $name }
+                if ($fabricPublished) {
+                    $record['FabricSha256'] = $fabricPublished
+                    $fabricPublished = ''
+                }
+                Set-DemoDeploymentStateLocked -Config $Config -Value $record -Confirm:$false
             }
             catch {
                 Write-DemoLog -Level Warning -Message ('Track {0} finished {1}, but its state wasn''t recorded: {2}' -f $Track, $name, $_.Exception.Message)

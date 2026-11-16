@@ -662,7 +662,7 @@ if ($RunLiveActivity -or $firstRun) {
             if ($knows.Known -and -not $knows.Has) {
                 $notebookParameters.Remove('POSTGRES_METRICS')
                 $postgresWithheld = $true
-                $results.Add((New-DemoResult -CheckId 'FABRIC.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'T4''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history (2026-11-13), so it would ignore them.' -Remediation $(if ($PostgresMetricsPath) { 'Run this command again without -SkipNotebookImport, which updates the notebook first; the file stays where it is.' } else { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook.' })))
+                $results.Add((New-DemoResult -CheckId 'FABRIC.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'T4''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history (2026-11-13), so it would ignore them.' -Remediation $(if ($PostgresMetricsPath) { 'Run this command again without -SkipNotebookImport, which updates the notebook first; the file stays where it is.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' })))
             }
         }
         $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes ([Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0)))

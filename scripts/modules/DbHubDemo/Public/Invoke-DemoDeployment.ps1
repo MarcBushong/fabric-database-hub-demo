@@ -273,6 +273,16 @@ function Invoke-DemoDeployment {
         $startIndex = [array]::IndexOf($stages, 'Validation')
         Write-DemoLog -Message 'Every stage finished earlier; running the validation again.'
     }
+    # 2026-11-16 (the merge's upgrade test): a resume after the Fabric stage publishes the Fabric items again when this copy
+    # of the scripts has other content than the stage last published in full (Get-DemoFabricContentReopen), so an upgraded
+    # environment never keeps the older notebooks, history model, or Insights app.
+    if ($Resume -and -not $FromStage -and -not $whatIf -and -not $SkipFabric -and $startIndex -gt $fabricIndex -and $fabricIndex -le $stopIndex) {
+        $contentReason = Get-DemoFabricContentReopen -State $state -Current (Get-DemoFabricContentSha256)
+        if ($contentReason) {
+            $startIndex = $fabricIndex
+            Write-DemoLog -Message ('An earlier run recorded the Fabric stage as finished, but {0} So this run continues from the Fabric stage, which publishes them again.' -f $contentReason)
+        }
+    }
     # The .NET SDK the workload runner's build needs, before anything is created (2026-11-09): the dotnet on PATH, the SDK
     # installed for the user earlier, or the pinned SDK, installed now (Initialize-DemoDotNetSdk), when the run builds it.
     $artifactsIndex = [array]::IndexOf($stages, 'Artifacts')
@@ -834,6 +844,7 @@ function Invoke-DemoDeployment {
                 # parallel Fabric track imports them (review follow-up): DONE's FABRIC.ITEMS.REQUIRED looks for all of them, and a
                 # new workspace has none. Then the Insights app, part of every deployment (2026-11-05), whose step never stops
                 # the stage or keeps the run from DONE (Invoke-DemoInsightsAppStep).
+                $fabricContent = Get-DemoFabricContentSha256
                 $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -ImportNotebooks:$importNotebooks -NewNotebooksOnly -ImportDashboard)
                 & $addAll $fabric
                 if (& $hasStatus $fabric 'Fail') {
@@ -856,7 +867,8 @@ function Invoke-DemoDeployment {
                 $appText = if ($null -ne $appSummary -and [bool]$appSummary.Failed) { '; the Insights app wasn''t created or doesn''t work, which doesn''t block DONE (the summary says why)' } elseif ($null -ne $appSummary -and [bool]$appSummary.Deployed) { ', with the Insights app' } else { '' }
                 # The session control's notebook (ADR 0026), now that the workspace exists; never a Fail.
                 & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
-                & $recordStage 'Fabric'
+                # What the stage published, once the app is this version's too (2026-11-16, Get-DemoFabricContentReopen).
+                & $recordStage 'Fabric' $(if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') { @{ FabricSha256 = $fabricContent } } else { @{} })
                 & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}{1}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }), $appText)
             }
             'Validation' {

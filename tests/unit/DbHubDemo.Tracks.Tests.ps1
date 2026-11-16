@@ -39,12 +39,14 @@ BeforeAll {
     }
 
     function New-TestState {
+        # FabricSha256 is the content Get-DemoFabricContentSha256 returns below (2026-11-16): the Fabric items are current.
         [pscustomobject]@{
             Exists = $true; Stage = ''; StageUtc = ''; BundleSha256 = ('a' * 64); BundleChunkCount = 1; RunnerSha256 = ('b' * 64); RunnerChunkCount = 7
             BundleSentTo = @('sqlvm01', 'archost01'); RunnerSentTo = @('sqlvm01', 'archost01'); NetworkMode = 'private'; T3UseFreeLimit = $true; T3AdminGroupName = 'sg-t3'
-            BastionExpiresUtc = ''; HostPasswordUtc = ''; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; T2Source = ''; T4Replica = ''; Tags = @{}
+            BastionExpiresUtc = ''; HostPasswordUtc = ''; TrackT1 = ''; TrackT2 = ''; TrackT4 = ''; TrackFabric = ''; FabricSha256 = ('f' * 64); T2Source = ''; T4Replica = ''; Tags = @{}
         }
     }
+    Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricContentSha256 -MockWith { 'f' * 64 }
 }
 
 Describe 'Resolve-DemoTrackPlan' {
@@ -931,6 +933,31 @@ Describe 'Invoke-DemoDeploymentTrack' {
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APP' }).status | Should -Be 'Not selected'
         $script:powerBIStatus = 'Fail'
         (InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }).Status | Should -Be 'Fail'
+    }
+
+    It 'records what the Fabric step published with the step once the notebooks, the model, and the Insights app are this version''s, and not while the app isn''t (2026-11-16)' {
+        $script:recorded = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { if ($null -ne $Value) { $script:recorded.Add($Value) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { New-TestResult 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY' }
+        $script:appDeploy = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { New-DemoResult -CheckId 'FABRIC.APP.DEPLOY' -Area 'fabric' -Target 'fabric' -Status $script:appDeploy -Message ('FABRIC.APP.DEPLOY {0}' -f $script:appDeploy) }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Pass'
+        $record = @($script:recorded | Where-Object { $_.Contains('TrackFabric') })
+        $record.Count | Should -Be 1
+        $record[0]['TrackFabric'] | Should -Be 'Fabric'
+        $record[0]['FabricSha256'] | Should -Be ('f' * 64) -Because 'a later resume compares it with what its own copy publishes'
+
+        # The app wasn't deployed: the step is still finished, as before, but the content isn't recorded, so a resume
+        # publishes everything again until the app is this version's too.
+        $script:recorded.Clear()
+        $script:appDeploy = 'Fail'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+        $outcome.Status | Should -Be 'Pass' -Because 'the app never stops the track'
+        $record = @($script:recorded | Where-Object { $_.Contains('TrackFabric') })
+        $record.Count | Should -Be 1
+        $record[0].Contains('FabricSha256') | Should -BeFalse
     }
 
     It 'doesn''t record the Fabric step as finished when it needs a person, such as a paused capacity, so the next run runs it again (live, 2026-11-13)' {
@@ -2209,6 +2236,34 @@ Describe 'Invoke-DemoParallelDeployment' {
             $calls = @($script:calls)
             $calls | Should -Contain 'track Fabric: Fabric'
             @($calls[0..([array]::IndexOf($calls, 'track Fabric: Fabric'))] | Where-Object { $_ -like 'fabric items*' }) | Should -BeNullOrEmpty -Because 'only DONE''s check reads the items then'
+        }
+
+        It 'publishes the Fabric items again on a resume when this copy has other content than the step last published, before any Fabric read (2026-11-16)' {
+            # Live (the merge's upgrade test, rg-dbhubmn-demo): main's run had finished the Fabric step, so the resumed upgrade
+            # skipped it, and the workspace kept main's notebook, history model, and Insights app: Run all's history would
+            # have lost T4's metrics. An environment from before 2026-11-16 has no record of what the step published.
+            $script:logged = [System.Collections.Generic.List[string]]::new()
+            Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$PesterBoundParameters['Message']) }
+            foreach ($case in @(@{ Name = 'no record'; Sha = ''; Says = 'no record says it published this version''s notebooks, history model and report, dashboard, and Insights app' }, @{ Name = 'other content'; Sha = ('e' * 64); Says = '(ffffffffffff, not eeeeeeeeeeee)' })) {
+                $script:calls.Clear()
+                $script:logged.Clear()
+                $script:tags = @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric'; FabricSha256 = $case.Sha }
+                $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+                $calls = @($script:calls)
+                $calls | Should -Contain 'track Fabric: Fabric' -Because $case.Name
+                @($calls[0..([array]::IndexOf($calls, 'track Fabric: Fabric'))] | Where-Object { $_ -like 'fabric items*' }) | Should -BeNullOrEmpty -Because ('{0}: the record decides, with no Fabric call; only DONE''s check reads the items' -f $case.Name)
+                @($calls | Where-Object { $_ -match '^track T[12]' }) | Should -BeNullOrEmpty -Because 'T1 and T2 resume as recorded'
+                @($script:logged | Where-Object { $_ -like 'An earlier run recorded the Fabric step as finished, but *' -and $_ -like ('*{0}*' -f $case.Says) -and $_ -like '*So this run publishes them again: the notebooks, the history model and report, the dashboard, and the Insights app.' }).Count | Should -Be 1 -Because $case.Name
+            }
+
+            # The same content: as recorded, and the items are read before the plan, as before.
+            $script:calls.Clear()
+            $script:tags = @{ Stage = 'Monitoring'; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = 'Fabric'; FabricSha256 = ('f' * 64) }
+            $null = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+            $script:calls | Should -Not -Contain 'track Fabric: Fabric'
+            $calls = @($script:calls)
+            [array]::IndexOf($calls, 'fabric items') | Should -BeLessThan ([array]::FindIndex([string[]]$calls, [System.Predicate[string]] { param($c) $c -like 'track *' })) -Because 'the resume reads the items before it plans'
+            [array]::IndexOf($calls, 'fabric items') | Should -BeGreaterOrEqual 0
         }
 
         It 'keeps the records on -Resume, and lowers on -FromStage only those of the tracks it runs again, as before' {
