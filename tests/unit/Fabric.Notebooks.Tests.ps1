@@ -635,6 +635,71 @@ print(json.dumps(report))
         $allCode | Should -Match 'axvspan'
     }
 
+    It 'prints one line for each table and chart in a reference run, as Run all''s history save runs it: no display, no chart, no table value (2026-11-16 live finding)' {
+        # Live: Fabric's reference run (notebookutils.notebook.run) failed on a cell's result, a JSON parse error on a bare
+        # token, so the history fell back to a job that queued behind Run all's own Spark session.
+        $PSNativeCommandUseErrorActionPreference = $false
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'reference_run.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import ast, contextlib, io, json, sys, types
+
+notebook = json.load(open(sys.argv[1], encoding="utf-8"))
+code = ["".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"]
+wanted = {"_notebookutils", "runtime_context", "in_reference_run", "display_frame", "plot_panels"}
+DISPLAYED = []
+namespace = {"display": DISPLAYED.append,
+             "notebookutils": types.SimpleNamespace(runtime=types.SimpleNamespace(context={"isReferenceRun": True}))}
+for source in code:
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "notebook", "exec"), namespace)
+            wanted.discard(node.name)
+if wanted:
+    raise SystemExit("missing notebook functions: %s" % sorted(wanted))
+sys.modules["matplotlib"] = None  # a chart would fail to import
+
+
+class Frame:
+    columns = ["Target", "Value", "Note"]
+    empty = False
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    def to_string(self, index=False):
+        return "\n".join(str(row) for row in self.rows)
+
+
+secret_like = '{"sessionId":"' + "e" * 32 + '","series":[]}'
+frame = Frame([["T1", float("nan"), secret_like], ["T2", float("inf"), "x"], ["T3", 1.5, "y"]])
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    reference = namespace["in_reference_run"]()
+    namespace["REFERENCE_RUN"] = reference
+    namespace["display_frame"](frame)
+    namespace["plot_panels"]("Locks and blocking", [("Blocked processes", frame, "count")])
+    namespace["REFERENCE_RUN"] = False
+    namespace["display_frame"](frame)
+print(json.dumps({"reference": reference, "displayed": len(DISPLAYED), "printed": out.getvalue()}))
+'@
+        $live = Get-Notebook -Name 'NB_DatabaseHub_LiveActivity'
+        $output = & $python $script $live.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        $report.reference | Should -BeTrue
+        $report.displayed | Should -Be 1 -Because 'only a run that isn''t a reference run displays the table'
+        $report.printed | Should -Match '\(3 row\(s\) of Target, Value, Note; the history report and the Insights app show them\.\)'
+        $report.printed | Should -Match 'Locks and blocking: 1 panel\(s\), in the history report and the Insights app; a reference run draws no chart\.'
+        $report.printed | Should -Not -Match '(?i)\bnan\b|\binf\b|eeeeeeee|matplotlib'
+    }
+
     It 'describes signals for Database Agent prompts, never expected answers' {
         $markdown | Should -Match 'never a specific answer'
         $allCode | Should -Match 'Look for:'

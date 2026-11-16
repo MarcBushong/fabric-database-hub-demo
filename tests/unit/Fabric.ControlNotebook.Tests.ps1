@@ -113,7 +113,7 @@ def iso(value):
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-SENT, JOBS, REFS, ORDER, REFUSED, SECRET_URL = [], [], [], [], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
+SENT, JOBS, REFS, ORDER, REFUSED, JOBREADS, STOPS, SECRET_URL = [], [], [], [], [0], [0], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
 VAULT = {"dbhub-session-status": "{}", "dbhub-session-metrics": "{}", "dbhub-activity-webhook": SECRET_URL}
 RUNBOOK = {"session": None, "accepted": None, "minutes": 0}
 # The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound" and "full".
@@ -141,8 +141,9 @@ if scenario in ("active", "stopnow"):
     VAULT["dbhub-session-status"] = json.dumps(running_status("a" * 32, RUNBOOK["accepted"], 90))
 if scenario == "leftover":
     earlier = Clock.now - real_dt.timedelta(days=1)
+    # The runbook writes the metrics compact (ConvertTo-Json -Compress).
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "e" * 32, "capturedUtc": iso(earlier), "startUtc": iso(earlier - real_dt.timedelta(minutes=100)),
-                                                 "endUtc": iso(earlier), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]})
+                                                 "endUtc": iso(earlier), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
 
 
 def runbook(body):
@@ -161,7 +162,7 @@ def runbook(body):
         if session:
             accepted = RUNBOOK["accepted"] or Clock.now
             VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": session, "capturedUtc": iso(Clock.now), "startUtc": iso(accepted), "endUtc": iso(Clock.now),
-                                                         "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]})
+                                                         "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
 
 
 def vault_read(name):
@@ -188,6 +189,9 @@ class Notebook:
         ORDER.append("history:" + str(arguments.get("SESSION_ID", ""))[:8])
         if scenario == "refail":
             raise RuntimeError("The referenced notebook's default lakehouse differs from the caller's.")
+        if scenario in ("queued", "queuedjob"):
+            # Live, 2026-11-16: Fabric's reference run failed on a cell's result, and the job then queued behind this session.
+            raise RuntimeError("Unrecognized token 'REDACTED': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')")
         _sleep(240)
         return ""
 
@@ -240,15 +244,25 @@ def request(method, url, json=None, headers=None, timeout=None):
         ORDER.append("job:" + JOBS[-1].get("SESSION_ID", "")[:8])
         return Response(202, None, FABRIC + "/workspaces/x/items/nb-1/jobs/instances/run-%d" % len(JOBS))
     if method == "GET" and "/jobs/instances/run-" in url:
-        return Response(200, {"status": "Completed"})
+        JOBREADS[0] += 1
+        return Response(200, {"status": "NotStarted" if scenario in ("queued", "queuedjob") else "Completed"})
     raise AssertionError("unexpected %s %s" % (method, url))
 
 
 fake_requests.post, fake_requests.request = post, request
+
+
+def stop_session():
+    # notebookutils.session.stop(): no code runs after it, so it must be the notebook's last statement.
+    STOPS[0] += 1
+    ORDER.append("session.stop")
+
 sys.modules["requests"] = fake_requests
 sys.modules["pandas"] = types.ModuleType("pandas")
-namespace = {"notebookutils": types.SimpleNamespace(credentials=Credentials(), notebook=Notebook(),
-                                                   runtime=types.SimpleNamespace(context={"currentWorkspaceId": "dddddddd-0000-0000-0000-000000000004", "defaultLakehouseId": LAKEHOUSE}))}
+# Run all in the notebook editor is an interactive session; "queuedjob" is a scheduled or pipeline run.
+namespace = {"notebookutils": types.SimpleNamespace(credentials=Credentials(), notebook=Notebook(), session=types.SimpleNamespace(stop=stop_session),
+                                                   runtime=types.SimpleNamespace(context={"currentWorkspaceId": "dddddddd-0000-0000-0000-000000000004", "defaultLakehouseId": LAKEHOUSE,
+                                                                                          "isForInteractive": scenario != "queuedjob"}))}
 buffer = io.StringIO()
 error = ""
 with contextlib.redirect_stdout(buffer):
@@ -262,7 +276,7 @@ with contextlib.redirect_stdout(buffer):
     except Exception as failure:
         error = "%s: %s" % (type(failure).__name__, failure)
 printed = buffer.getvalue()
-print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "order": ORDER, "refused": REFUSED[0], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed}))
+print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed}))
 '@
 
     function Invoke-Simulation([string] $Path, [string] $Scenario, [string] $Start) {
@@ -736,6 +750,57 @@ print(json.dumps(out))
         $report.printed | Should -Not -Match 'Pass: the history is saved'
     }
 
+    It 'starts the history job without waiting when Fabric queues it, and an interactive Run all then ends its own Spark session (2026-11-16 live finding)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # Live on an F4: Run all waited 30 minutes for a job that Fabric held back until Run all's own session ended.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'queued' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+        @($report.refs).Count | Should -Be 1
+        @($report.jobs).Count | Should -Be 1
+        $report.jobs[0].SESSION_ID | Should -Be $report.sent[0].sessionId
+        $report.jobReads | Should -Be 1 -Because 'one look at the job, and no wait while this session holds the capacity'
+        $report.printed | Should -Match 'runs as a job in the demo workspace instead, because it didn''t finish in this session \(RuntimeError: Unrecognized token'
+        $report.printed | Should -Match 'The history job is queued: Fabric starts it once this notebook''s Spark session ends \(a small capacity, such as an F2 or F4, runs one Spark session at a time\), and Run all ends the session when it finishes\. Its result: NB_DatabaseHub_LiveActivity''s run in the demo workspace''s Monitor hub'
+        $report.printed | Should -Not -Match 'Warning: the history job is|Pass: the history is saved'
+        $report.stops | Should -Be 1
+        $report.order[-1] | Should -Be 'session.stop' -Because 'no code runs after notebookutils.session.stop()'
+        $report.printed | Should -Match 'This notebook''s Spark session ends now, so Fabric can start the queued history job'
+        # The same document, but never the vault secret's own text: Fabric redacts a secret's exact text in the output.
+        foreach ($sent in $report.refs[0].args.POSTGRES_METRICS, $report.jobs[0].POSTGRES_METRICS) {
+            $sent | Should -Not -BeExactly $report.vaultMetrics
+            ($sent | ConvertFrom-Json).sessionId | Should -Be $report.sent[0].sessionId
+            ($sent | ConvertFrom-Json | ConvertTo-Json -Depth 8 -Compress) | Should -BeExactly ($report.vaultMetrics | ConvertFrom-Json | ConvertTo-Json -Depth 8 -Compress)
+        }
+    }
+
+    It 'leaves the Spark session of <Case> alone' -TestCases @(
+        @{ Case = 'a scheduled run, which ends by itself, with its history job queued'; Scenario = 'queuedjob'; Printed = 'The history job is queued: Fabric starts it once' }
+        @{ Case = 'a Run all whose history job already finished'; Scenario = 'refail'; Printed = 'Pass: the history is saved' }
+    ) {
+        param($Scenario, $Printed)
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.jobs).Count | Should -Be 1
+        $report.jobReads | Should -Be 1
+        $report.printed | Should -Match ([regex]::Escape($Printed))
+        $report.stops | Should -Be 0
+        $report.printed | Should -Not -Match 'Spark session ends now'
+    }
+
+    It 'ends Run all with the step that can end its Spark session, because no code runs after notebookutils.session.stop()' {
+        $last = $script:code[-1].Source.TrimEnd()
+        $last | Should -Match '\nend_session_for_history\(\)$'
+        @([regex]::Matches($script:allCode, 'session\.stop\(\)')).Count | Should -Be 1
+        $script:allCode | Should -Match '(?m)^    utils\.session\.stop\(\)\n    return True$'
+    }
     It 'says in the demo''s own time zone when the session ends (needs Python''s time zone data)' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
