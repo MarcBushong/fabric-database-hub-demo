@@ -299,7 +299,8 @@ function Stop-DemoEnvironment {
                 $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' })
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning
-                $historySaved = [string]$saved.Result.status -eq 'Pass' -or $historyRunning
+                # A notebook that doesn't know POSTGRES_METRICS wasn't sent them (2026-11-16): they're kept below.
+                $historySaved = ([string]$saved.Result.status -eq 'Pass' -or $historyRunning) -and -not [bool](Get-DemoMemberValue -InputObject $saved -Name 'PostgresDropped')
             }
             catch {
                 $results.Add((New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The session''s history wasn''t saved: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'In Fabric, run NB_DatabaseHub_LiveActivity in the demo''s workspace (Run all).'))

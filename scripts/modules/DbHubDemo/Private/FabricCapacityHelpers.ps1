@@ -465,8 +465,10 @@ function Save-DemoFabricHistory {
     of it (evidence capacityInactive; live finding, 2026-11-10), which doesn't mean the lakehouse is missing. The run
     (Invoke-DemoFabricNotebookRun) saves only: SAVE_RESULTS true, and, for a notebook imported before 2026-11-14 whose Run
     all sent an activity request through GitHub, CONFIRM and STOP_ACTIVITY false and no Key Vault, which today's notebook
-    doesn't have (ADR 0026). It writes only the lakehouse's history tables. Returns Result and StillRunning (the run hadn't
-    finished when the wait ended, so the capacity mustn't be paused under it).
+    doesn't have (ADR 0026). It writes only the lakehouse's history tables. T4's metrics go with the run only when the
+    workspace's notebook knows POSTGRES_METRICS (Test-DemoFabricNotebookParameter, 2026-11-16); otherwise it's a Warning
+    that says so, with PostgresDropped. Returns Result, StillRunning (the run hadn't finished when the wait ended, so the
+    capacity mustn't be paused under it), and PostgresDropped.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -488,11 +490,15 @@ function Save-DemoFabricHistory {
 
     $checkId = 'STOP.FABRIC.SAVEHISTORY'
     $doc = $script:FabricCapacityDoc
+    # T4's metrics that a copy of the notebook from before 2026-11-13 would ignore (2026-11-16): the run doesn't send them,
+    # and PostgresDropped tells stop-demo.ps1 to keep them in out/history-pending.
+    $postgresWithheld = ''
     $answer = {
         param([string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}, [string] $Remediation = '', [bool] $StillRunning = $false)
         [pscustomobject]@{
-            Result       = (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $doc['NotebookRun'])
-            StillRunning = $StillRunning
+            Result          = (New-DemoResult -CheckId $checkId -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $doc['NotebookRun'])
+            StillRunning    = $StillRunning
+            PostgresDropped = [bool]$postgresWithheld
         }
     }
     # Since 2026-11-14 the notebook changes no activity (ADR 0026), so its Run all only analyzes and saves.
@@ -532,13 +538,27 @@ function Save-DemoFabricHistory {
     }
     if ($PostgresMetrics) {
         # The notebook can't read Azure Monitor (no Azure Resource Manager token in Fabric), so T4's and its read replica's
-        # metrics come from here, captured before the replica was deleted (ADR 0025).
-        $parameters['POSTGRES_METRICS'] = $PostgresMetrics
+        # metrics come from here, captured before the replica was deleted (ADR 0025). A copy of the notebook that doesn't
+        # know POSTGRES_METRICS (an environment whose deploy.ps1 hasn't updated it yet) would ignore them; one whose
+        # definition can't be read gets them, as before.
+        $knows = Test-DemoFabricNotebookParameter -WorkspaceId ([string](Get-DemoMemberValue -InputObject $resolved['fabric'] -Name 'workspaceId')) -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'POSTGRES_METRICS' -Token $token
+        if ($knows.Known -and -not $knows.Has) {
+            $postgresWithheld = 'the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history (2026-11-13), so it would ignore them'
+        }
+        else {
+            $parameters['POSTGRES_METRICS'] = $PostgresMetrics
+        }
     }
     $run = Invoke-DemoFabricNotebookRun -Config $resolved -Name 'NB_DatabaseHub_LiveActivity' -Parameter $parameters -Token $token -TimeoutMinutes $TimeoutMinutes
     $jobStatus = [string](Get-DemoMemberValue -InputObject $run.evidence -Name 'status')
     $stillRunning = $run.status -eq 'Warning' -and $jobStatus -notin 'Completed', 'Failed', 'Cancelled', 'Deduped', ''
     $evidence = [ordered]@{ windowMinutes = $WindowMinutes; jobStatus = $jobStatus; seconds = (Get-DemoMemberValue -InputObject $run.evidence -Name 'seconds') }
+    if ($postgresWithheld) {
+        $evidence['postgresMetrics'] = 'withheld'
+    }
+    if ($run.status -eq 'Pass' -and $postgresWithheld) {
+        return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.' -f $WindowMinutes, $postgresWithheld) $evidence 'Run ./scripts/deploy.ps1, which updates the notebook. T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).')
+    }
     if ($run.status -eq 'Pass') {
         return (& $answer 'Pass' ('Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. {1}' -f $WindowMinutes, $run.message) $evidence)
     }

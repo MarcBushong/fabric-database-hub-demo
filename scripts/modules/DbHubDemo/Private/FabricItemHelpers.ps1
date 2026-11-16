@@ -159,3 +159,78 @@ function Get-DemoFabricItemReadBack {
     }
     & $result $status $message $remediation
 }
+
+function Test-DemoFabricNotebookParameter {
+    <#
+    .SYNOPSIS
+    Whether the workspace's copy of a notebook knows a parameter (2026-11-16): a copy imported before the parameter
+    existed ignores it when a run passes it, as NB_DatabaseHub_LiveActivity from before 2026-11-13 ignores
+    POSTGRES_METRICS. Reads the notebook's definition (Items - Get Item Definition, which can answer 202) and looks for
+    the parameter's name. Returns Known ($true when the definition was read), Has, and Error. Never throws. Internal.
+    https://learn.microsoft.com/rest/api/fabric/core/items/get-item-definition
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string] $WorkspaceId,
+
+        [Parameter(Mandatory)]
+        [string] $Name,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Z][A-Z0-9_]*$')]
+        [string] $Parameter,
+
+        [Parameter(Mandatory)]
+        [securestring] $Token,
+
+        [ValidateRange(10, 600)]
+        [int] $TimeoutSeconds = 120
+    )
+
+    $answer = {
+        param([bool] $Known, [bool] $Has, [string] $Why = '')
+        [pscustomobject]@{ Known = $Known; Has = $Has; Error = $Why }
+    }
+    try {
+        $found = Find-DemoFabricItem -WorkspaceId $WorkspaceId -DisplayName $Name -Type 'Notebook' -Token $Token
+        $itemId = if ([int]$found.StatusCode -eq 200 -and @($found.Items).Count -gt 0) { [string](Get-DemoMemberValue -InputObject @($found.Items)[0] -Name 'id') } else { '' }
+        if (-not $itemId) {
+            return (& $answer $false $false $(if ([string]$found.Error) { [string]$found.Error } else { '{0} isn''t in the workspace' -f $Name }))
+        }
+        $uri = '{0}/workspaces/{1}/items/{2}/getDefinition' -f $script:FabricApiBaseUri, $WorkspaceId, $itemId
+        $response = Invoke-DemoFabricRequest -Method Post -Uri $uri -Token $Token
+        $body = $null
+        if ([int]$response.StatusCode -eq 200) {
+            $body = $response.Body
+        }
+        elseif ([int]$response.StatusCode -eq 202) {
+            $operationId = Get-DemoFabricHeaderValue -Headers $response.Headers -Name 'x-ms-operation-id'
+            $state = Wait-DemoFabricOperation -OperationId $operationId -Token $Token -TimeoutSeconds $TimeoutSeconds -RetryAfterSeconds (Get-DemoFabricRetryDelay -Headers $response.Headers -Default 5 -Maximum 30)
+            if ([string]$state.Status -ne 'Succeeded') {
+                return (& $answer $false $false ('reading its definition ended {0} {1}' -f $state.Status, $state.Error).Trim())
+            }
+            $operationResult = Invoke-DemoFabricRequest -Method Get -Uri ('{0}/operations/{1}/result' -f $script:FabricApiBaseUri, $operationId) -Token $Token
+            if ([int]$operationResult.StatusCode -ne 200) {
+                return (& $answer $false $false (Get-DemoFabricErrorText -Response $operationResult))
+            }
+            $body = $operationResult.Body
+        }
+        else {
+            return (& $answer $false $false (Get-DemoFabricErrorText -Response $response))
+        }
+        $parts = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $body -Name 'definition') -Name 'parts'
+        foreach ($part in @($parts)) {
+            $payload = [string](Get-DemoMemberValue -InputObject $part -Name 'payload')
+            if ($payload -and [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($payload)).Contains($Parameter)) {
+                return (& $answer $true $true)
+            }
+        }
+        return (& $answer $true $false)
+    }
+    catch {
+        return (& $answer $false $false (Protect-DemoText -Text $_.Exception.Message))
+    }
+}

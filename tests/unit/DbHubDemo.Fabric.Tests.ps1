@@ -706,8 +706,10 @@ Describe 'configure-fabric.ps1' {
         $file = Join-Path -Path $pending -ChildPath 'postgres-metrics-20261113T190000Z.json'
         $document = '{"version":1,"servers":[{"role":"replica","target":"T4-replica","resourceName":"pgreplica01-abc123","sku":"Standard_D4ds_v5"}],"series":[]}'
         [System.IO.File]::WriteAllText($file, $document)
+        $notebookDefinition = { param([string] $Text) New-FabricResponse -Status 200 -Body @{ definition = @{ parts = @(@{ path = 'notebook-content.py'; payload = [System.Convert]::ToBase64String([System.Text.UTF8Encoding]::new($false).GetBytes($Text)); payloadType = 'InlineBase64' }) } } }
         Set-FabricMock -Routes @(
             @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
+            @{ Method = 'Post'; Match = [regex]::Escape("/items/$itemId/getDefinition"); Responses = @(& $notebookDefinition "# PARAMETERS CELL`nPOSTGRES_METRICS = ''`n") }
             @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = 'Completed' }) }
             @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$itemId/jobs/instances/$operationId" }) }
         )
@@ -718,6 +720,24 @@ Describe 'configure-fabric.ps1' {
         (Get-RequestBody -Request $run[-1]).executionData.parameters.POSTGRES_METRICS.value | Should -BeExactly $document
         Test-Path -LiteralPath $file | Should -BeFalse
         Test-Path -LiteralPath (Join-Path -Path $pending -ChildPath 'saved/postgres-metrics-20261113T190000Z.json') | Should -BeTrue
+
+        # The workspace's notebook is from before T4's history (2026-11-16): it would ignore them, so they aren't sent, the
+        # run says so, and the file stays where it is.
+        [System.IO.File]::WriteAllText($file, $document)
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
+            @{ Method = 'Post'; Match = [regex]::Escape("/items/$itemId/getDefinition"); Responses = @(& $notebookDefinition "# PARAMETERS CELL`nCONFIRM = True`n") }
+            @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = 'Completed' }) }
+            @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$itemId/jobs/instances/$operationId" }) }
+        )
+        $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -PostgresMetricsPath $file -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
+        $withheld = Read-ImportResult | Where-Object checkId -EQ 'FABRIC.T4.HISTORY'
+        $withheld.status | Should -Be 'Warning'
+        $withheld.message | Should -Match 'is from before T4''s history \(2026-11-13\), so it would ignore them\.$'
+        $withheld.remediation | Should -Match 'without -SkipNotebookImport'
+        $run = @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -like '*jobType=RunNotebook' })
+        (Get-RequestBody -Request $run[-1]).executionData.parameters.PSObject.Properties.Name | Should -Not -Contain 'POSTGRES_METRICS'
+        Test-Path -LiteralPath $file | Should -BeTrue -Because 'the metrics aren''t in the history'
 
         { & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -PostgresMetricsPath (Join-Path -Path $pending -ChildPath 'missing.json') -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false } | Should -Throw '*doesn''t exist*'
         { & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -PostgresMetricsPath $file -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false } | Should -Throw '*goes with -RunLiveActivity*'

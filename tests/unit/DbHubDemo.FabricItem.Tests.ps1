@@ -452,3 +452,57 @@ Describe 'configure-fabric.ps1 -ImportDashboard' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-WebRequest -Times 0 -Exactly
     }
 }
+
+Describe 'Test-DemoFabricNotebookParameter: whether the workspace''s copy of a notebook knows a parameter (2026-11-16)' {
+    BeforeAll {
+        # A copy of NB_DatabaseHub_LiveActivity imported before 2026-11-13 ignores POSTGRES_METRICS, so stop-demo.ps1 and
+        # configure-fabric.ps1 don't send T4's metrics to it.
+        $script:secureToken = ConvertTo-TestSecureString $script:plainToken
+        $script:notebookListUri = [regex]::Escape("$script:api/workspaces/$script:workspaceId/items?type=Notebook")
+        $script:notebookFound = New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $script:itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }
+        function Invoke-NotebookCheck {
+            InModuleScope DbHubDemo -Parameters @{ W = $script:workspaceId; T = $script:secureToken } { Test-DemoFabricNotebookParameter -WorkspaceId $W -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'POSTGRES_METRICS' -Token $T }
+        }
+    }
+
+    It 'finds the parameter in a copy that has it, through a long-running read of its definition' {
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $notebookListUri; Responses = @($notebookFound) }
+            @{ Method = 'Post'; Match = $readUri; Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ 'x-ms-operation-id' = @($operationId); 'Retry-After' = @('1') }) }
+            @{ Method = 'Get'; Match = $operationUri; Responses = @(New-FabricResponse -Status 200 -Body @{ status = 'Succeeded' }) }
+            @{ Method = 'Get'; Match = $resultUri; Responses = @(New-FabricResponse -Status 200 -Body (ConvertTo-ReadBackBody -Json "# PARAMETERS CELL`nPOSTGRES_METRICS = ''`n" -Path 'notebook-content.py')) }
+        )
+        $knows = Invoke-NotebookCheck
+        $knows.Known | Should -BeTrue
+        $knows.Has | Should -BeTrue
+        @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -match $readUri }).Count | Should -Be 1
+    }
+
+    It 'says an older copy doesn''t have it' {
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $notebookListUri; Responses = @($notebookFound) }
+            @{ Method = 'Post'; Match = $readUri; Responses = @(New-FabricResponse -Status 200 -Body (ConvertTo-ReadBackBody -Json "# PARAMETERS CELL`nCONFIRM = True`nWINDOW_MINUTES = 60`n" -Path 'notebook-content.py')) }
+        )
+        $knows = Invoke-NotebookCheck
+        $knows.Known | Should -BeTrue
+        $knows.Has | Should -BeFalse
+    }
+
+    It 'doesn''t know, and never throws, when the notebook isn''t there or its definition can''t be read' {
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $notebookListUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @() }) }
+        )
+        $knows = Invoke-NotebookCheck
+        $knows.Known | Should -BeFalse
+        $knows.Error | Should -Match 'NB_DatabaseHub_LiveActivity isn''t in the workspace'
+
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $notebookListUri; Responses = @($notebookFound) }
+            @{ Method = 'Post'; Match = $readUri; Responses = @(New-FabricResponse -Status 403 -Body @{ errorCode = 'InsufficientPrivileges'; message = 'A fake refusal.' }) }
+        )
+        $knows = Invoke-NotebookCheck
+        $knows.Known | Should -BeFalse
+        $knows.Has | Should -BeFalse
+        $knows.Error | Should -Match '403'
+    }
+}

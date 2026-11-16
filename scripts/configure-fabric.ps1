@@ -654,9 +654,20 @@ if ($RunLiveActivity -or $firstRun) {
                 $notebookParameters['POSTGRES_METRICS'] = [string]$postgresCapture.Json
             }
         }
+        # A copy of the notebook from before 2026-11-13 doesn't know POSTGRES_METRICS and would ignore them (2026-11-16): they
+        # aren't sent, and a kept file stays where it is. One whose definition can't be read gets them, as before.
+        $postgresWithheld = $false
+        if ($notebookParameters.Contains('POSTGRES_METRICS')) {
+            $knows = & $module { param($Configuration, $FabricToken) Test-DemoFabricNotebookParameter -WorkspaceId ([string](Get-DemoMemberValue -InputObject $Configuration['fabric'] -Name 'workspaceId')) -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'POSTGRES_METRICS' -Token $FabricToken } $config $runToken
+            if ($knows.Known -and -not $knows.Has) {
+                $notebookParameters.Remove('POSTGRES_METRICS')
+                $postgresWithheld = $true
+                $results.Add((New-DemoResult -CheckId 'FABRIC.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'T4''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history (2026-11-13), so it would ignore them.' -Remediation $(if ($PostgresMetricsPath) { 'Run this command again without -SkipNotebookImport, which updates the notebook first; the file stays where it is.' } else { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook.' })))
+            }
+        }
         $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes ([Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0)))
         $results.Add($run)
-        if ($PostgresMetricsPath -and [string]$run.status -eq 'Pass') {
+        if ($PostgresMetricsPath -and [string]$run.status -eq 'Pass' -and -not $postgresWithheld) {
             # Added to the history: the file moves aside, so it isn't sent again by mistake.
             $savedFolder = Join-Path -Path (Split-Path -Path $PostgresMetricsPath -Parent) -ChildPath 'saved'
             try {
