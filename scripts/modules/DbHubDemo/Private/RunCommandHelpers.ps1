@@ -328,6 +328,21 @@ function Test-DemoRunCommandFullError {
     return ([string]$Text -match 'close to Azure''s limit of 25, so it didn''t run under a fresh name')
 }
 
+function Test-DemoRunCommandHeldError {
+    # True for Azure's refusal of a PUT to a Run Command name it keeps marked for deletion: "Operation 'PUT Extension' is
+    # not allowed on VM extension '<name>' since it is marked for deletion" (live on archost01, 2026-11-13 and 16). A
+    # retry doesn't help: Azure has held such names for hours. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    return ([string]$Text -match '(?i)\bmarked for deletion\b')
+}
+
 function Resolve-DemoRunCommandFreshName {
     <#
     .SYNOPSIS
@@ -347,7 +362,10 @@ function Resolve-DemoRunCommandFreshName {
       and doesn't say whether one being deleted counts, so every one listed counts: at -Limit (24) or more, there's no
       fresh name, and it throws, which the caller reports as a Run Command that couldn't be created.
     What it used goes to $script:DemoRunCommandStuck, which deploy.ps1 reports (Get-DemoRunCommandStuckResult), and the
-    console says so at once.
+    console says so at once. -ForChunk is Send-DemoChunkSet's, for a chunk whose PUT Azure refused because it keeps the
+    name marked for deletion (2026-11-16 live finding): other chunks are left alone, because the chunk set deletes its
+    own and one of them can have finished without being read back yet, and the text says what Azure answered, since
+    nothing was waited for.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -372,7 +390,9 @@ function Resolve-DemoRunCommandFreshName {
         [ValidateRange(1, 25)]
         [int] $Limit = 24,
 
-        [datetime] $NowUtc = [DateTime]::UtcNow
+        [datetime] $NowUtc = [DateTime]::UtcNow,
+
+        [switch] $ForChunk
     )
 
     $listed = [System.Collections.Generic.List[string]]::new()
@@ -391,7 +411,7 @@ function Resolve-DemoRunCommandFreshName {
         if ($provisioning -eq 'Deleting') {
             $deleting++
         }
-        elseif ($itemName -like 'DbHubDemo-Chunk-*' -and $provisioning -in 'Succeeded', 'Failed') {
+        elseif (-not $ForChunk -and $itemName -like 'DbHubDemo-Chunk-*' -and $provisioning -in 'Succeeded', 'Failed') {
             # A chunk whose script ended: its file is on the VM or failed, and nothing reads the Run Command again.
             $finishedChunks.Add($itemName)
         }
@@ -402,14 +422,15 @@ function Resolve-DemoRunCommandFreshName {
     foreach ($leftover in @(@($listed | Where-Object { $_ -match $copyPattern }) + $finishedChunks.ToArray())) {
         $null = Remove-DemoRunCommand -SubscriptionId $SubscriptionId -Url ('{0}/{1}?api-version={2}' -f $BaseUrl, $leftover, $ApiVersion) -NoWait -Confirm:$false
     }
-    $waited = Format-DemoProgressDuration -Seconds ([long]$WaitedSeconds)
+    $held = if ($ForChunk) { 'Azure keeps {0} marked for deletion' -f $RunCommandName } else { 'Azure still lists {0} after {1}' -f $RunCommandName, (Format-DemoProgressDuration -Seconds ([long]$WaitedSeconds)) }
     if ($listed.Count -ge $Limit) {
-        throw ('{0}: Azure still lists {1} after {2}, and the VM already has {3} Run Commands ({4} being deleted), close to Azure''s limit of 25, so it didn''t run under a fresh name either. That''s Azure-side: Azure deletes them on its own, and the next try checks again.' -f $VmName, $RunCommandName, $waited, $listed.Count, $deleting)
+        throw ('{0}: {1}, and the VM already has {2} Run Commands ({3} being deleted), close to Azure''s limit of 25, so it didn''t run under a fresh name either. That''s Azure-side: Azure deletes them on its own, and the next try checks again.' -f $VmName, $held, $listed.Count, $deleting)
     }
     $fresh = Get-DemoRunCommandFreshName -Name $RunCommandName -NowUtc $NowUtc
-    $script:DemoRunCommandStuck.Add([pscustomobject]@{ VmName = $VmName; Name = $RunCommandName; FreshName = $fresh; AtUtc = $NowUtc.ToUniversalTime(); WaitedSeconds = $WaitedSeconds; Listed = $listed.Count; Deleting = $deleting })
+    $script:DemoRunCommandStuck.Add([pscustomobject]@{ VmName = $VmName; Name = $RunCommandName; FreshName = $fresh; AtUtc = $NowUtc.ToUniversalTime(); WaitedSeconds = $WaitedSeconds; Listed = $listed.Count; Deleting = $deleting; Refused = [bool]$ForChunk })
     $null = $script:DemoRunCommandStuckName.Add(('{0}/{1}' -f $VmName, $RunCommandName))
-    Write-DemoLog -Level Warning -Message ('{0}: Azure still lists {1} after {2} (its delete hasn''t finished, or Azure ended it with an internal error and keeps the name until another delete), so it runs as {3} instead of waiting. Nothing to do: Azure deletes the stuck one on its own (DEPLOY.RUNCOMMAND.STUCK_{4}).' -f $VmName, $RunCommandName, $waited, $fresh, $VmName.ToUpperInvariant())
+    $instead = if ($ForChunk) { '' } else { ' instead of waiting' }
+    Write-DemoLog -Level Warning -Message ('{0}: {1} (its delete hasn''t finished, or Azure ended it with an internal error and keeps the name until another delete), so it runs as {2}{3}. Nothing to do: Azure deletes the stuck one on its own (DEPLOY.RUNCOMMAND.STUCK_{4}).' -f $VmName, $held, $fresh, $instead, $VmName.ToUpperInvariant())
     return $fresh
 }
 
@@ -440,7 +461,10 @@ function Get-DemoRunCommandStuckResult {
         $names = @($group.Group | ForEach-Object { [string]$_.Name } | Select-Object -Unique)
         $fresh = @($group.Group | ForEach-Object { [string]$_.FreshName })
         $waited = [long](@($group.Group | ForEach-Object { [long]$_.WaitedSeconds }) | Measure-Object -Maximum).Maximum
-        $message = 'Azure kept {0} on {1} in Deleting for more than {2}, so {3} Run Command run(s) used a fresh name instead of waiting (the last: {4}). That''s Azure-side: Azure ends some Run Command deletes with an internal error (InternalExecutionError) and keeps the name until a later delete succeeds.' -f ($names -join ', '), $vm, (Format-DemoProgressDuration -Seconds $waited), $fresh.Count, $fresh[-1]
+        # Chunks (Send-DemoChunkSet) don't wait for a delete, so a group of them alone says what Azure answered instead.
+        $refusedOnly = @($group.Group | Where-Object { -not [bool](Get-DemoMemberValue -InputObject $_ -Name 'Refused') }).Count -eq 0
+        $kept = if ($refusedOnly) { 'marked for deletion' } else { 'in Deleting for more than {0}' -f (Format-DemoProgressDuration -Seconds $waited) }
+        $message = 'Azure kept {0} on {1} {2}, so {3} Run Command run(s) used a fresh name instead of waiting (the last: {4}). That''s Azure-side: Azure ends some Run Command deletes with an internal error (InternalExecutionError) and keeps the name until a later delete succeeds.' -f ($names -join ', '), $vm, $kept, $fresh.Count, $fresh[-1]
         New-DemoResult -CheckId ('DEPLOY.RUNCOMMAND.STUCK_{0}' -f $vm.ToUpperInvariant()) -Area 'infra' -Target (Get-DemoVmTarget -VmName $vm) -Status 'Warning' -Message $message -Evidence ([ordered]@{ vmName = $vm; stuck = $names; freshNames = $fresh; waitedSeconds = $waited }) -Remediation 'Nothing to do: the run went on, and Azure deletes the stuck ones on its own. ./scripts/status.ps1 lists any that stay (STATUS.RUNCOMMANDS), with the command that deletes them; if it happens on every run, see docs/troubleshooting.md (Run Commands stuck in Deleting).' -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
     }
     return @($results)
@@ -477,7 +501,8 @@ function Get-DemoRunCommandStuckNote {
 
 function Clear-DemoChunkRunCommand {
     # Deletes every DbHubDemo-Chunk-* Run Command left on a VM, for example by an interrupted run, without waiting for
-    # Azure to finish each delete. Returns the names it asked Azure to delete. Internal.
+    # Azure to finish each delete. Returns the names it asked Azure to delete; -Status gets the listing's (Total, or Tries
+    # and Error). Internal.
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
@@ -488,10 +513,13 @@ function Clear-DemoChunkRunCommand {
         [string] $BaseUrl,
 
         [Parameter(Mandatory)]
-        [string] $ApiVersion
+        [string] $ApiVersion,
+
+        [AllowNull()]
+        [hashtable] $Status = $null
     )
 
-    $status = @{}
+    $status = if ($null -ne $Status) { $Status } else { @{} }
     $names = Get-DemoChunkRunCommandName -SubscriptionId $SubscriptionId -BaseUrl $BaseUrl -ApiVersion $ApiVersion -Status $status
     if ($null -eq $names) {
         $vm = ($BaseUrl -split '/')[-2]
@@ -518,8 +546,9 @@ function Clear-DemoChunkRunCommand {
 function Get-DemoChunkRunCommandName {
     # The DbHubDemo-Chunk-* Run Commands a VM still lists (a Run Command Azure is deleting is still listed), or $null
     # when they can't be listed in -Tries tries, -RetrySeconds apart; -Status then gets Tries and Error, az's last error,
-    # redacted. A failed try that a later one makes up for is logged with its error, so its cause shows (2026-11-16: a
-    # Warning in nearly every deploy, main's too, that az's dropped error left unexplained). Internal.
+    # redacted, and otherwise Total, every Run Command the VM lists. A failed try that a later one makes up for is logged
+    # with its error, so its cause shows (2026-11-16: a Warning in nearly every deploy, main's too, that az's dropped error
+    # left unexplained). Internal.
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
@@ -576,6 +605,10 @@ function Get-DemoChunkRunCommandName {
         Write-DemoLog -Message ('Listed the Run Commands on {0} on try {1} of {2}; the try before failed ({3}).' -f ($BaseUrl -split '/')[-2], ($try - 1), $Tries, $problem)
     }
     $items = Get-DemoMemberValue -InputObject $list -Name 'value'
+    if ($null -ne $Status) {
+        # Every Run Command listed, a chunk or not, one being deleted included: what counts toward Azure's 25 per VM.
+        $Status['Total'] = @($items | Where-Object { $null -ne $_ }).Count
+    }
     $names = [string[]]@(foreach ($item in @($items)) {
             $name = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
             if ($name -like 'DbHubDemo-Chunk-*') {
@@ -645,12 +678,16 @@ function Send-DemoChunkSet {
     chunks of every file share one queue, so deploy.ps1's tracks send the bootstrap bundle (1 chunk) and the
     workload runner (7) in one wave of 8 instead of one after the other (ADR 0018). For each chunk: PUT the
     managed Run Command DbHubDemo-Chunk-<sha12>-<nnn> with 'az rest' (the body in a temporary file; a 409
-    Conflict is retried with backoff), read its instance view until the script is terminal (exit code 0
-    required), then DELETE it without waiting for Azure to finish the delete (Phase 28: a delete that a busy,
+    Conflict is retried with backoff; a name Azure keeps marked for deletion runs at once under a fresh one,
+    <name>-yyyyMMddHHmmss, through Resolve-DemoRunCommandFreshName, 2026-11-16 live finding), read its
+    instance view until the script is terminal (exit code 0 required), then DELETE it without waiting for
+    Azure to finish the delete (Phase 28: a delete that a busy,
     usually policy-installed, extension holds cost up to 3 minutes per chunk before; R49, R336). Up to
     -Parallelism chunk Run Commands run at once, read every 10 seconds; with 1 they go one at a time. When no
     chunk finishes for -StallSeconds while several run, the rest go one at a time (Stalled). Leftover
-    DbHubDemo-Chunk-* Run Commands are deleted before the first chunk, and once at the end, in a finally block,
+    DbHubDemo-Chunk-* Run Commands are deleted before the first chunk (their deletes waited for, at most
+    -RoomWaitSeconds, only when the VM wouldn't otherwise have room for the set under Azure's limit of 25), and
+    once at the end, in a finally block,
     with one bounded wait of -CleanupWaitSeconds; the names Azure still lists then are returned as
     LeftoverRunCommands for the caller's Warning. Two calls must never run on one VM at once: one call with
     every file is how they travel together. Returns one object per file, in order: Description, Sha256,
@@ -688,7 +725,10 @@ function Send-DemoChunkSet {
         [int] $StallSeconds = 300,
 
         [ValidateRange(0, 1800)]
-        [int] $CleanupWaitSeconds = 120
+        [int] $CleanupWaitSeconds = 120,
+
+        [ValidateRange(0, 1800)]
+        [int] $RoomWaitSeconds = 300
     )
 
     $subscriptionId = $Config['subscriptionId']
@@ -733,7 +773,35 @@ function Send-DemoChunkSet {
         Write-DemoLog -Message ('{0}: the {1} files'' {2} chunks travel together, up to {3} at once.' -f $VmName, $entries.Count, $pending.Count, $Parallelism)
     }
     try {
-        Clear-DemoChunkRunCommand -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion | Out-Null
+        $listing = @{}
+        $asked = @(Clear-DemoChunkRunCommand -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -Status $listing | Where-Object { $_ -is [string] -and $_ })
+        # Room for the set (2026-11-16 live finding: 23 of Azure's 25 on the upgrade test's T2 host, 17 of them chunks). Every
+        # Run Command listed counts, one being deleted included, and each chunk of this set can stay listed until Azure has
+        # deleted it, so when they wouldn't fit under the fresh-name limit of 24 (Resolve-DemoRunCommandFreshName), the
+        # deletes just asked for are waited for, at most -RoomWaitSeconds, before the first chunk.
+        if ($asked.Count -gt 0 -and $listing.ContainsKey('Total') -and ([int]$listing['Total'] + $pending.Count) -gt 24) {
+            $before = [int]$listing['Total']
+            $total = $before
+            Write-DemoLog -Message ('{0}: it lists {1} Run Commands, {2} of them chunks it just asked Azure to delete, and {3} chunk(s) need room under Azure''s limit of 25, so it waits up to {4} for those deletes first.' -f $VmName, $before, $asked.Count, $pending.Count, (Format-DemoProgressDuration -Seconds $RoomWaitSeconds))
+            $roomDeadline = [System.DateTime]::UtcNow.AddSeconds($RoomWaitSeconds)
+            $roomWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            while (($total + $pending.Count) -gt 24 -and [System.DateTime]::UtcNow -lt $roomDeadline) {
+                Start-Sleep -Seconds 10
+                $poll = @{}
+                $null = Get-DemoChunkRunCommandName -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -Status $poll -Tries 1
+                if (-not $poll.ContainsKey('Total')) {
+                    break
+                }
+                $total = [int]$poll['Total']
+            }
+            $waitedText = Format-DemoProgressDuration -Seconds ([long]$roomWatch.Elapsed.TotalSeconds)
+            if (($total + $pending.Count) -le 24) {
+                Write-DemoLog -Message ('{0}: Azure finished enough of those deletes in {1}: {2} Run Commands listed, room for the {3} chunk(s).' -f $VmName, $waitedText, $total, $pending.Count)
+            }
+            else {
+                Write-DemoLog -Level Warning -Message ('{0}: Azure still lists {1} Run Commands after {2}, so the {3} chunk(s) go now; a chunk that finds no room stops with Azure''s limit named, and the watchdog steps in (Azure-side).' -f $VmName, $total, $waitedText, $pending.Count)
+            }
+        }
         # Creates one chunk's Run Command (retrying a conflict) and returns its URL. PUTs are sent one at a time,
         # so one body file serves them all.
         $putChunk = {
@@ -750,6 +818,7 @@ function Send-DemoChunkSet {
             }
             [System.IO.File]::WriteAllText($bodyPath, ($body | ConvertTo-Json -Depth 5 -Compress), [System.Text.UTF8Encoding]::new($false))
 
+            $renamed = $false
             for ($attempt = 1; ; $attempt++) {
                 $put = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('rest', '--method', 'put', '--url', $url, '--body', "@$bodyPath") -AllowFailure
                 if ($put.ExitCode -eq 0) {
@@ -758,6 +827,16 @@ function Send-DemoChunkSet {
                 if (Test-DemoAzVmNotRunning -Text $put.StdErr) {
                     $shared['VmStopped'] = $true
                     throw ('{0} isn''t running (deallocated), so it can''t receive chunks; start it first (start-demo.ps1), then send again.' -f $VmName)
+                }
+                if (-not $renamed -and (Test-DemoRunCommandHeldError -Text $put.StdErr)) {
+                    # Azure keeps the name marked for deletion (an earlier run's chunk; on archost01 it held 17 for hours,
+                    # and the refused PUT restarted the VM, 2026-11-16), so the chunk runs under a fresh name at once, like
+                    # a named Run Command, before any conflict backoff. The script is the same, so the VM writes the same
+                    # chunk-<nnn> file, and the name still matches DbHubDemo-Chunk-*, so the cleanup deletes it.
+                    $renamed = $true
+                    $fresh = Resolve-DemoRunCommandFreshName -SubscriptionId $subscriptionId -BaseUrl $baseUrl -ApiVersion $apiVersion -VmName $VmName -RunCommandName $Chunk.Name -ForChunk
+                    $url = '{0}/{1}?api-version={2}' -f $baseUrl, $fresh, $apiVersion
+                    continue
                 }
                 if ($attempt -le $maxConflictRetries -and (Test-DemoAzConflict -Text $put.StdErr)) {
                     $delay = Get-DemoConflictDelay -Attempt $attempt

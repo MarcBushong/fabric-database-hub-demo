@@ -247,6 +247,14 @@ Describe 'Send-DemoBootstrapBundle' {
         # 2026-11-16: lists that fail before one succeeds, with az's error.
         $script:listFailures = 0
         $script:listError = ''
+        # 2026-11-16: names Azure keeps marked for deletion: listed as Deleting, a delete leaves them, and a PUT is refused
+        # with the live answer (its status line empty, as az printed it; or Conflict).
+        $script:held = [System.Collections.Generic.HashSet[string]]::new()
+        $script:heldStatus = ''
+        # 2026-11-16: deletes Azure finishes only after this many more lists (a crowded VM's leftovers).
+        $script:deleteLag = 0
+        $script:pendingDeletes = @{}
+        InModuleScope DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
@@ -267,12 +275,21 @@ Describe 'Send-DemoBootstrapBundle' {
                     if ($script:putError) {
                         return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = $script:putError }
                     }
+                    if ($script:held.Contains($name)) {
+                        $answer = '{{"error":{{"code":"OperationNotAllowed","message":"Operation ''PUT Extension'' is not allowed on VM extension ''{0}'' since it is marked for deletion. You can only retry the Delete operation (or wait for an ongoing one to complete)."}}}}' -f $name
+                        return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ('ERROR: {0}({1})' -f $script:heldStatus, $answer) }
+                    }
                     $script:runCommands[$name] = $call.Body
                     return [pscustomobject]@{ ExitCode = 0; StdOut = '{}'; StdErr = '' }
                 }
                 'delete' {
-                    if (-not $script:stuckDeletes) {
-                        $script:runCommands.Remove($name)
+                    if (-not $script:stuckDeletes -and -not $script:held.Contains($name)) {
+                        if ($script:deleteLag -gt 0) {
+                            $script:pendingDeletes[$name] = $script:deleteLag
+                        }
+                        else {
+                            $script:runCommands.Remove($name)
+                        }
                     }
                     return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
                 }
@@ -282,7 +299,14 @@ Describe 'Send-DemoBootstrapBundle' {
                             $script:listFailures--
                             return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = $script:listError }
                         }
-                        $value = @($script:runCommands.Keys | ForEach-Object { @{ name = $_ } })
+                        foreach ($pendingName in @($script:pendingDeletes.Keys)) {
+                            $script:pendingDeletes[$pendingName]--
+                            if ($script:pendingDeletes[$pendingName] -le 0) {
+                                $script:pendingDeletes.Remove($pendingName)
+                                $script:runCommands.Remove($pendingName)
+                            }
+                        }
+                        $value = @($script:runCommands.Keys | ForEach-Object { @{ name = $_; properties = @{ provisioningState = $(if ($script:held.Contains($_)) { 'Deleting' } else { 'Succeeded' }) } } })
                         return [pscustomobject]@{ ExitCode = 0; StdOut = (@{ value = $value } | ConvertTo-Json -Depth 5); StdErr = '' }
                     }
                     if (-not $script:runCommands.Contains($name)) {
@@ -438,6 +462,97 @@ Describe 'Send-DemoBootstrapBundle' {
         $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'sqlvm01' -ChunkSizeKiB 1 -CleanupWaitSeconds 300 })
         $script:cleanupWaited | Should -BeFalse
         @($sent[0].LeftoverRunCommands).Count | Should -Be 0
+    }
+
+    It 'sends a chunk whose name Azure keeps marked for deletion under a fresh name at once, with the same script, and its cleanup still finds it (2026-11-16 live finding)' {
+        # Live on archost01, the refused PUT failed the transfer, and the watchdog restarted the VM, which Azure then hung.
+        $held = $expectedChunks[0].Name
+        $script:runCommands[$held] = @{}
+        $null = $script:held.Add($held)
+        $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 })
+
+        $sent[0].ChunkCount | Should -Be $expectedChunks.Count
+        $puts = @($script:calls | Where-Object Method -eq 'put')
+        $puts.Count | Should -Be ($expectedChunks.Count + 1)
+        $puts[0].Name | Should -Be $held
+        $puts[1].Name | Should -Match ('^{0}-\d{{14}}$' -f [regex]::Escape($held))
+        $puts[1].Body.properties.source.script | Should -Be $expectedChunks[0].Script -Because 'the VM writes the same chunk-001 file, whatever the Run Command is called'
+        @($puts | Select-Object -Skip 2).Name | Should -Be @($expectedChunks | Select-Object -Skip 1).Name
+        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $puts[1].Name }).Count | Should -Be 1 -Because 'it''s deleted once it finished, like any chunk'
+        $script:runCommands.Keys | Should -Be @($held)
+        @($sent[0].LeftoverRunCommands) | Should -Be @($held) -Because 'the cleanup at the end still reports the one Azure holds'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 10 } -Times 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -like ('archost01: Azure keeps {0} marked for deletion (*), so it runs as {0}-*. Nothing to do: Azure deletes the stuck one on its own (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01).' -f $held) } -Times 1 -Exactly
+        $stuck = @(InModuleScope DbHubDemo { Get-DemoRunCommandStuckResult -Clear })
+        $stuck.Count | Should -Be 1
+        $stuck[0].checkId | Should -Be 'DEPLOY.RUNCOMMAND.STUCK_ARCHOST01'
+        $stuck[0].status | Should -Be 'Warning'
+        $stuck[0].message | Should -BeLike ('Azure kept {0} on archost01 marked for deletion, so 1 Run Command run(s) used a fresh name instead of waiting (the last: {1}).*' -f $held, $puts[1].Name)
+    }
+
+    It 'leaves the other chunks of its set alone while one gets a fresh name, so each is still read back (2026-11-16)' {
+        $expectedChunks.Count | Should -BeGreaterOrEqual 3
+        $held = $expectedChunks[2].Name
+        $script:runCommands[$held] = @{}
+        $null = $script:held.Add($held)
+        $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -Parallelism 4 -CleanupWaitSeconds 0 })
+
+        $sent[0].ChunkCount | Should -Be $expectedChunks.Count
+        # Chunks 1 and 2 had finished, unread, when chunk 3's fresh name was resolved: only their own finish deletes them.
+        foreach ($name in $expectedChunks[0].Name, $expectedChunks[1].Name) {
+            @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $name }).Count | Should -Be 1
+        }
+        $script:runCommands.Keys | Should -Be @($held)
+    }
+
+    It 'gives a held name a fresh name at once when Azure''s answer reads Conflict too, with no backoff (2026-11-16)' {
+        $script:heldStatus = 'Conflict'
+        $held = $expectedChunks[0].Name
+        $script:runCommands[$held] = @{}
+        $null = $script:held.Add($held)
+        $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 })
+
+        $sent[0].ChunkCount | Should -Be $expectedChunks.Count
+        @($script:calls | Where-Object { $_.Method -eq 'put' -and $_.Name -eq $held }).Count | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 10 } -Times 0
+    }
+
+    It 'stops with Azure''s limit of 25, not the refused PUT, when the VM has no room for a fresh name (2026-11-16)' {
+        $held = $expectedChunks[0].Name
+        $script:runCommands[$held] = @{}
+        $null = $script:held.Add($held)
+        foreach ($i in 1..23) {
+            $script:runCommands[('DbHubDemo-Other-{0:d2}' -f $i)] = @{}
+        }
+        { InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 -RoomWaitSeconds 0 } } | Should -Throw ('archost01: Azure keeps {0} marked for deletion, and the VM already has 24 Run Commands (1 being deleted), close to Azure''s limit of 25*' -f $held)
+        @($script:calls | Where-Object Method -eq 'put').Count | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -like ('archost01: Azure still lists 24 Run Commands after 0s, so the {0} chunk(s) go now;*' -f $expectedChunks.Count) } -Times 1 -Exactly
+    }
+
+    It 'waits for its leftovers'' deletes before the first chunk when the VM has no room for the set, so a held chunk still gets a fresh name (2026-11-16 live finding)' {
+        # Live on archost01: 23 of Azure's 25, among them 9 finished chunks of an earlier send and 8 held ones.
+        $script:deleteLag = 2
+        foreach ($i in 1..9) {
+            $script:runCommands[('DbHubDemo-Chunk-4e8f3641cbfc-{0:d3}' -f $i)] = @{}
+        }
+        $held = $expectedChunks[0].Name
+        foreach ($name in @($held) + @(2..8 | ForEach-Object { 'DbHubDemo-Chunk-a8a10d93133c-{0:d3}' -f $_ })) {
+            $script:runCommands[$name] = @{}
+            $null = $script:held.Add($name)
+        }
+        foreach ($i in 1..7) {
+            $script:runCommands[('DbHubDemo-Named-{0}' -f $i)] = @{}
+        }
+        # 24 listed: without the wait, the held chunk would find no room for a fresh name.
+        $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 })
+
+        $sent[0].ChunkCount | Should -Be $expectedChunks.Count
+        $puts = @($script:calls | Where-Object Method -eq 'put')
+        $firstPut = $script:calls.IndexOf($puts[0])
+        @($script:calls | Select-Object -First $firstPut | Where-Object { $_.Method -eq 'get' -and -not $_.Name }).Count | Should -Be 3 -Because 'the cleanup''s list, then two more until the leftovers were gone'
+        $puts[1].Name | Should -Match ('^{0}-\d{{14}}$' -f [regex]::Escape($held))
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like ('archost01: it lists 24 Run Commands, 17 of them chunks it just asked Azure to delete, and {0} chunk(s) need room under Azure''s limit of 25, so it waits up to 5m 00s for those deletes first.' -f $expectedChunks.Count) } -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like ('archost01: Azure finished enough of those deletes in *: 15 Run Commands listed, room for the {0} chunk(s).' -f $expectedChunks.Count) } -Times 1 -Exactly
     }
 
     It 'goes on one chunk at a time after a stall, when no chunk finishes for StallSeconds while several run (Phase 28)' {

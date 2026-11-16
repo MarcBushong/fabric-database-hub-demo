@@ -172,6 +172,22 @@ Sources (checked 2026-10-29): [az vm get-instance-view](https://learn.microsoft.
 
 Sources (checked 2026-11-16): [az vm restart, deallocate, and start](https://learn.microsoft.com/cli/azure/vm) (`--no-wait`), [VM power states and billing](https://learn.microsoft.com/azure/virtual-machines/states-billing), [action Run Command restrictions](https://learn.microsoft.com/azure/virtual-machines/windows/run-command#restrictions) (90 minutes at most).
 
+### 2026-11-16 amendment: chunk names Azure keeps
+
+**The finding (live, 2026-11-16):** on the upgrade test environment's T2 host, Azure had ended the deletes of 17 chunk Run Commands with an internal error and kept their names marked for deletion since that morning. A rerun's chunk had one of those names, and Azure refused it: "Operation 'PUT Extension' is not allowed on VM extension 'DbHubDemo-Chunk-cb840b69ea86-001' since it is marked for deletion". The transfer failed, and the watchdog restarted the VM, which Azure then left unfinished. `main` has the same fixed names and no other way out.
+
+**The decision (the coordinator, for the user: every known bug fixed):** a chunk whose name Azure refuses that way runs at once under a fresh name, `<name>-yyyyMMddHHmmss`, through the rule named Run Commands follow since 2026-11-13 (`Resolve-DemoRunCommandFreshName -ForChunk`):
+
+- before any conflict backoff, because a retry doesn't free the name;
+- without deleting the set's other chunks, one of which can have finished without being read back yet;
+- reported as `DEPLOY.RUNCOMMAND.STUCK_<VM>` (**Warning**), on the console, the status page, and **DONE** or **NOT DONE**.
+
+**Room first:** every Run Command the VM lists counts toward Azure's 25, one being deleted included, and each chunk of a set can stay listed until Azure has deleted it. At 17:25 the same host listed 23: 9 finished chunks of an earlier send, 8 held ones, and 6 named ones. So when the VM's count plus the set's chunks would pass the fresh-name limit of 24, the send waits for the leftover deletes its cleanup just asked for, 5 minutes at most (`-RoomWaitSeconds`), before the first chunk; a VM with room doesn't wait.
+
+The script, and so the file the VM writes (`chunk-<nnn>.bin`), is the same, and the fresh name still matches `DbHubDemo-Chunk-*`, so the cleanups delete it. With still no room after that wait, a chunk that needs a fresh name stops with Azure's limit of 25 named and goes to the watchdog, as before. Unit-tested in `tests/unit/DbHubDemo.Bundle.Tests.ps1`; live proof is the upgrade test's next run.
+
+Sources (checked 2026-11-16): [managed Run Command](https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed), [Run Command overview](https://learn.microsoft.com/azure/virtual-machines/run-command-overview) (25 per VM).
+
 ## Amendment: the host's steps for JumpstartImage (2026-11-05)
 
 **Why:** since 2026-11-05 the default install mode is `JumpstartImage` (user-directed, [ADR 0006](0006-sql-editions-and-licensing.md#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default)): the host makes the guest from Arc Jumpstart's prebuilt SQL Server 2022 Standard disk instead of building it. This supersedes the context's "`PaygWizard` (default)" and its one guest image in every mode (the guest now has two sources, the Jumpstart image or the build), and, in this mode, replaces steps 5, 6, 9, and 10 above and changes steps 4 and 7. The state machine is unchanged: one step list in every mode, each step checks before it acts, and a step that a mode doesn't use reports **Not selected** with the reason.
