@@ -4,7 +4,7 @@
 #   docker build --file workload-generator/Dockerfile --tag contosocare-workload .
 # Base images are updated by Dependabot.
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:11.0 AS build
 WORKDIR /src
 COPY workload-generator/global.json workload-generator/Directory.Build.props workload-generator/Directory.Packages.props workload-generator/
 COPY workload-generator/src/ContosoCare.Workload/ContosoCare.Workload.csproj workload-generator/src/ContosoCare.Workload/packages.lock.json workload-generator/src/ContosoCare.Workload/
