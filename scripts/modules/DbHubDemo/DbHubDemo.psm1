@@ -69,6 +69,12 @@ $script:TokenResourceAlternates = @{
 }
 $script:DemoTokenResourceInUse = @{}
 
+# 2026-11-16 live finding: the Azure CLI hands back its cached token until about 5 minutes before it expires, so a step that
+# holds a Fabric or Power BI token across a long wait can send it expired. Each one Get-DemoFabricToken and
+# Get-DemoPowerBIToken issued is recorded here, keyed by the SecureString itself (never its value), with where it came from
+# and the token that replaced it (Register-DemoIssuedToken, Get-DemoCurrentToken).
+$script:DemoIssuedToken = [System.Runtime.CompilerServices.ConditionalWeakTable[System.Security.SecureString, object]]::new()
+
 # Every resource type the demo creates, including those created at run time by scripts, Arc onboarding,
 # and on-demand Bastion. The policy inventory (Get-DemoPolicyConstraint) checks Azure Policy against this list.
 $script:DemoResourceTypes = @(

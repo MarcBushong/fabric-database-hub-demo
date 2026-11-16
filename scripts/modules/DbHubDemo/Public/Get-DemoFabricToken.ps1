@@ -30,5 +30,7 @@ function Get-DemoFabricToken {
     if ($null -eq $issued.Token) {
         throw ("No verified Fabric token is available: {0} Sign in once with 'az login --tenant <tenantId>'; you don't need to change the default subscription." -f $issued.Error)
     }
+    # Fabric and Power BI requests renew it when it's about to expire, or was refused (Get-DemoCurrentToken).
+    Register-DemoIssuedToken -Token $issued.Token -SubscriptionId $SubscriptionId -Resource $script:FabricTokenResource -ExpiresOnUtc ([string]$issued.Claims.ExpiresOnUtc)
     return $issued.Token
 }

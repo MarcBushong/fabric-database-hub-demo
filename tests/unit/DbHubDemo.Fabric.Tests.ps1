@@ -743,3 +743,127 @@ Describe 'configure-fabric.ps1' {
         { & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -PostgresMetricsPath $file -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false } | Should -Throw '*goes with -RunLiveActivity*'
     }
 }
+
+Describe 'Fabric and Power BI requests with a token that expires (2026-11-16 live finding)' {
+    # Live: configure-powerbi.ps1 imported the history report with the Fabric token it got before an 8-minute Direct Lake
+    # refresh, and Fabric answered HTTP 401 TokenExpired, so a first deployment ended NOT DONE.
+    BeforeDiscovery {
+        $renewalCases = @(
+            # How each refuses a token, as seen live on 2026-11-16: Fabric with 401 and an error code, Power BI with 403, an
+            # X-PowerBI-Error-Info header, and no body.
+            @{ Service = 'Fabric'; Uri = 'https://api.fabric.microsoft.com/v1/workspaces'; Status = 401; Info = ''; Content = '{"requestId":"r","errorCode":"TokenExpired","message":"Access token has expired, resubmit with a new access token"}' }
+            @{ Service = 'Power BI'; Uri = 'https://api.powerbi.com/v1.0/myorg/groups'; Status = 403; Info = 'TokenExpired'; Content = '' }
+        )
+    }
+
+    BeforeAll {
+        function New-RenewalTestToken {
+            # A fake token Get-DemoAccessToken accepts, with an exp claim.
+            param([int] $ExpiresInSeconds = 3600)
+            $claims = [ordered]@{ tid = $tenantId; oid = $script:GuardTestObjectId; idtyp = 'user'; exp = [System.DateTimeOffset]::UtcNow.AddSeconds($ExpiresInSeconds).ToUnixTimeSeconds(); nonce = [guid]::NewGuid().ToString('N') }
+            return ('tok{0}.{1}.sig{2}' -f [guid]::NewGuid().ToString('N'), (ConvertTo-GuardTestBase64Url ($claims | ConvertTo-Json -Compress)), [guid]::NewGuid().ToString('N'))
+        }
+
+        $script:getToken = {
+            param([string] $Service)
+            if ($Service -eq 'Fabric') { Get-DemoFabricToken -SubscriptionId $subscriptionId } else { Get-DemoPowerBIToken -SubscriptionId $subscriptionId }
+        }
+        $script:send = {
+            param([string] $Service, [string] $Uri, [securestring] $Token)
+            InModuleScope DbHubDemo -Parameters @{ Service = $Service; Uri = $Uri; Token = $Token } {
+                if ($Service -eq 'Fabric') { Invoke-DemoFabricRequest -Method Get -Uri $Uri -Token $Token } else { Invoke-DemoPowerBIRequest -Method Get -Uri $Uri -Token $Token }
+            }
+        }
+    }
+
+    BeforeEach {
+        Clear-DemoSecret
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        # The Azure CLI hands out the tokens in $script:issue, in order.
+        $script:issue = [System.Collections.Generic.Queue[string]]::new()
+        $script:azCalls = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            $script:azCalls++
+            [pscustomobject]@{ ExitCode = 0; StdOut = (@{ accessToken = $script:issue.Dequeue() } | ConvertTo-Json); StdErr = '' }
+        }
+        # Fabric and Power BI refuse the tokens in $script:refused as $script:refusal says; each request's token is kept.
+        $script:refused = [System.Collections.Generic.HashSet[string]]::new()
+        $script:refusal = $null
+        $script:sent = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith {
+            $plain = [System.Net.NetworkCredential]::new('', $Token).Password
+            $script:sent.Add($plain)
+            if ($script:refused.Contains($plain)) {
+                return $script:refusal
+            }
+            [pscustomobject]@{ StatusCode = 200; Headers = @{}; Content = '{"value":[]}' }
+        }
+    }
+
+    It 'renews a refused <Service> token once and sends the request again; a caller still holding it sends the new one, without the Azure CLI' -TestCases $renewalCases {
+        param($Service, $Uri, $Status, $Info, $Content)
+        $script:refusal = [pscustomobject]@{ StatusCode = $Status; Headers = @{ 'X-PowerBI-Error-Info' = @($Info | Where-Object { $_ }) }; Content = $Content }
+        $old = New-RenewalTestToken
+        $new = New-RenewalTestToken
+        $script:issue.Enqueue($old)
+        $script:issue.Enqueue($new)
+        $null = $script:refused.Add($old)
+        $token = & $getToken $Service
+
+        (& $send $Service $Uri $token).StatusCode | Should -Be 200
+        @($script:sent) | Should -Be @($old, $new)
+        $script:azCalls | Should -Be 2
+        (& $send $Service $Uri $token).StatusCode | Should -Be 200
+        $script:sent[-1] | Should -Be $new -Because 'the renewal is remembered for the token the caller still holds'
+        $script:azCalls | Should -Be 2
+        $pattern = '{0} refused the token in use (HTTP {1}), so a new one came from the Azure CLI*' -f $Service, $Status
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like $pattern } -Times 1 -Exactly
+    }
+
+    It 'renews a <Service> token that expires within 4 minutes before sending it, so it''s never refused' -TestCases $renewalCases {
+        param($Service, $Uri, $Status, $Info, $Content)
+        $script:refusal = [pscustomobject]@{ StatusCode = $Status; Headers = @{ 'X-PowerBI-Error-Info' = @($Info | Where-Object { $_ }) }; Content = $Content }
+        $old = New-RenewalTestToken -ExpiresInSeconds 120
+        $new = New-RenewalTestToken -ExpiresInSeconds 3600
+        $script:issue.Enqueue($old)
+        $script:issue.Enqueue($new)
+        $null = $script:refused.Add($old)
+        $token = & $getToken $Service
+
+        (& $send $Service $Uri $token).StatusCode | Should -Be 200
+        @($script:sent) | Should -Be @($new)
+        (& $send $Service $Uri $token).StatusCode | Should -Be 200
+        $script:azCalls | Should -Be 2 -Because 'the new token is far from its expiry'
+    }
+
+    It 'sends a refused <Service> token again only when the Azure CLI has a new one, asks it at most once a minute, and leaves a caller''s own token, and a 403 for a permission, as they are' -TestCases $renewalCases {
+        param($Service, $Uri, $Status, $Info, $Content)
+        $script:refusal = [pscustomobject]@{ StatusCode = $Status; Headers = @{ 'X-PowerBI-Error-Info' = @($Info | Where-Object { $_ }) }; Content = $Content }
+        $only = New-RenewalTestToken
+        $script:issue.Enqueue($only)
+        $script:issue.Enqueue($only)
+        $null = $script:refused.Add($only)
+        $token = & $getToken $Service
+
+        (& $send $Service $Uri $token).StatusCode | Should -Be $Status
+        $script:sent.Count | Should -Be 1
+        $script:azCalls | Should -Be 2
+        (& $send $Service $Uri $token).StatusCode | Should -Be $Status
+        $script:azCalls | Should -Be 2 -Because 'the same token came back less than a minute ago'
+
+        $ownPlain = New-RenewalTestToken
+        $null = $script:refused.Add($ownPlain)
+        (& $send $Service $Uri (ConvertTo-TestSecureString -Value $ownPlain)).StatusCode | Should -Be $Status
+        $script:azCalls | Should -Be 2
+        $script:sent.Count | Should -Be 3
+
+        # A 403 for a missing permission says nothing about the token.
+        $script:refusal = [pscustomobject]@{ StatusCode = 403; Headers = @{}; Content = '{"error":{"code":"PowerBINotAuthorizedException"}}' }
+        $fresh = New-RenewalTestToken
+        $script:issue.Enqueue($fresh)
+        $null = $script:refused.Add($fresh)
+        $other = & $getToken $Service
+        (& $send $Service $Uri $other).StatusCode | Should -Be 403
+        $script:azCalls | Should -Be 3 -Because 'only the token itself came from the Azure CLI'
+    }
+}

@@ -30,5 +30,7 @@ function Get-DemoPowerBIToken {
     if ($null -eq $issued.Token) {
         throw ("No verified Power BI token is available: {0} Sign in once with 'az login --tenant <tenantId>'; you don't need to change the default subscription." -f $issued.Error)
     }
+    # Power BI requests renew it when it's about to expire, or was refused (Get-DemoCurrentToken).
+    Register-DemoIssuedToken -Token $issued.Token -SubscriptionId $SubscriptionId -Resource $script:PowerBITokenResource -ExpiresOnUtc ([string]$issued.Claims.ExpiresOnUtc)
     return $issued.Token
 }

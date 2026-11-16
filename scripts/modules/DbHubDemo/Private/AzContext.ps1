@@ -357,6 +357,143 @@ function Get-DemoSecureStringSha256 {
     }
 }
 
+function Register-DemoIssuedToken {
+    # Records where a Fabric or Power BI token came from (Get-DemoFabricToken, Get-DemoPowerBIToken), keyed by the
+    # SecureString itself and never its value, so Get-DemoCurrentToken can renew it for a caller that still holds it
+    # (2026-11-16 live finding). -Line puts a renewed token in the line of the one it replaces. Internal.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [securestring] $Token,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $Resource,
+
+        [AllowEmptyString()]
+        [string] $ExpiresOnUtc = '',
+
+        [object] $Line = $null
+    )
+
+    $expires = $null
+    $parsed = [datetime]::MinValue
+    if ($ExpiresOnUtc -and [datetime]::TryParse($ExpiresOnUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+        $expires = $parsed.ToUniversalTime()
+    }
+    if ($null -eq $Line) {
+        $Line = [pscustomobject]@{ SubscriptionId = $SubscriptionId; Resource = $Resource; Current = $Token; ExpiresOnUtc = $expires; QuietUntilUtc = [datetime]::MinValue }
+    }
+    else {
+        $Line.Current = $Token
+        $Line.ExpiresOnUtc = $expires
+        $Line.QuietUntilUtc = [datetime]::MinValue
+    }
+    $script:DemoIssuedToken.AddOrUpdate($Token, $Line)
+}
+
+function Test-DemoTokenRefused {
+    # True when Fabric or Power BI refused the token itself, which a renewed token can fix: HTTP 401 (Fabric: errorCode
+    # TokenExpired), or HTTP 403 with Power BI's X-PowerBI-Error-Info header TokenExpired or InvalidToken (live, 2026-11-16:
+    # Power BI answers a bad token with 403, that header, and no body), or a 403 body whose error code says so. A 403 for a
+    # missing permission isn't one. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $Response
+    )
+
+    $status = [int](Get-DemoMemberValue -InputObject $Response -Name 'StatusCode')
+    if ($status -eq 401) {
+        return $true
+    }
+    if ($status -ne 403) {
+        return $false
+    }
+    $info = ''
+    $headers = Get-DemoMemberValue -InputObject $Response -Name 'Headers'
+    if ($headers -is [System.Collections.IDictionary]) {
+        foreach ($key in @($headers.Keys)) {
+            if ([string]$key -ieq 'X-PowerBI-Error-Info') {
+                $info = (@($headers[$key]) | ForEach-Object { [string]$_ }) -join ','
+            }
+        }
+    }
+    $content = [string](Get-DemoMemberValue -InputObject $Response -Name 'Content')
+    return ($info -match '(?i)\b(TokenExpired|InvalidToken)\b' -or $content -match '(?i)"(errorCode|code)"\s*:\s*"(TokenExpired|InvalidToken)"')
+}
+
+function Get-DemoCurrentToken {
+    <#
+    .SYNOPSIS
+    The token to send in -Token's place: the newest one issued in its line, renewed from the Azure CLI first when it
+    expires within -RenewSeconds, or when -Rejected (the token just sent) was refused. A token this process didn't issue
+    (one a caller brought) comes back as it is. Internal; Invoke-DemoFabricRequest and Invoke-DemoPowerBIRequest use it.
+
+    .DESCRIPTION
+    The Azure CLI hands back its cached token until about 5 minutes before it expires, so a token can come with only
+    that left, and a step that holds it across a long wait sends it expired: live on 2026-11-16, configure-powerbi.ps1
+    imported the history report with the Fabric token it got before an 8-minute Direct Lake refresh and got HTTP 401
+    TokenExpired, so a first deployment ended NOT DONE. -RenewSeconds (240) stays under the Azure CLI's own point, so a
+    renewal brings a new token, not the cached one again. Each renewal is recorded for every token of its line, so callers
+    that still hold an older one send the newest without asking the Azure CLI again; a renewal that brings back the same
+    token, or none, isn't asked again for a minute. The Telemetry calls follow the same rule on their own
+    (Invoke-DemoHubRestCall: one fresh token after a 401). Nothing here logs or keeps a token's value.
+    https://learn.microsoft.com/cli/azure/account#az-account-get-access-token
+    #>
+    [CmdletBinding()]
+    [OutputType([securestring])]
+    param(
+        [Parameter(Mandatory)]
+        [securestring] $Token,
+
+        [securestring] $Rejected,
+
+        [int] $RejectedStatus = 401,
+
+        [ValidateRange(0, 290)]
+        [int] $RenewSeconds = 240
+    )
+
+    $line = $null
+    if (-not $script:DemoIssuedToken.TryGetValue($Token, [ref]$line)) {
+        return $Token
+    }
+    $current = $line.Current
+    $now = [System.DateTime]::UtcNow
+    if ($null -ne $Rejected) {
+        if (-not [object]::ReferenceEquals($Rejected, $current)) {
+            # Another request renewed it already.
+            return $current
+        }
+        $why = 'refused the token in use (HTTP {0})' -f $RejectedStatus
+    }
+    elseif ($null -ne $line.ExpiresOnUtc -and ($line.ExpiresOnUtc - $now).TotalSeconds -le $RenewSeconds) {
+        $why = 'the token in use expires at {0:HH:mm:ss} UTC' -f $line.ExpiresOnUtc
+    }
+    else {
+        return $current
+    }
+    if ($now -lt $line.QuietUntilUtc) {
+        return $current
+    }
+    $service = if ($line.Resource -match 'powerbi') { 'Power BI' } else { 'Fabric' }
+    $issued = Get-DemoAccessToken -SubscriptionId $line.SubscriptionId -Resource $line.Resource
+    if ($null -eq $issued.Token -or (Get-DemoSecureStringSha256 -Value $issued.Token) -eq (Get-DemoSecureStringSha256 -Value $current)) {
+        $line.QuietUntilUtc = $now.AddSeconds(60)
+        $issued = $null
+        return $current
+    }
+    Register-DemoIssuedToken -Token $issued.Token -SubscriptionId $line.SubscriptionId -Resource $line.Resource -ExpiresOnUtc ([string]$issued.Claims.ExpiresOnUtc) -Line $line
+    $subject = if ($null -ne $Rejected) { '{0} {1}' -f $service, $why } else { '{0}: {1}' -f $service, $why }
+    Write-DemoLog -Message ('{0}, so a new one came from the Azure CLI (az account get-access-token); nothing to do.' -f $subject)
+    return $issued.Token
+}
+
 function Get-DemoClaimsChallenge {
     <#
     .SYNOPSIS

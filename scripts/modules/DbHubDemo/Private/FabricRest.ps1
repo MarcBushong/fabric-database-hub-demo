@@ -95,7 +95,11 @@ function Invoke-DemoFabricRequest {
     502, 503, and 504, up to 4 attempts, after Retry-After when there is one, as the Fabric throttling guidance
     describes: https://learn.microsoft.com/rest/api/fabric/articles/throttling); with -NotIdempotent (a request that
     starts something, such as a notebook run), only a request that never reached the server, and HTTP 429. A network
-    error that lasts throws, with its innermost cause (Phase 28 live finding, 2026-10-30).
+    error that lasts throws, with its innermost cause (Phase 28 live finding, 2026-10-30). A token from
+    Get-DemoFabricToken goes as the newest of its line, renewed from the Azure CLI first when it expires within 4
+    minutes, and a refused token (HTTP 401; Test-DemoTokenRefused) gets one renewal and one more try
+    (Get-DemoCurrentToken; 2026-11-16 live finding: a token held across a long wait expired); a token the caller brought
+    goes as it is.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -133,7 +137,20 @@ function Invoke-DemoFabricRequest {
         $request['ContentType'] = 'application/json; charset=utf-8'
     }
 
+    # A token from Get-DemoFabricToken goes as the newest of its line, renewed first when it's about to expire, and a refused
+    # token (Test-DemoTokenRefused) gets one renewal and one more try (2026-11-16 live finding: a token held across a long
+    # wait expired; Get-DemoCurrentToken). Fabric answers a refused token before the request runs, so a request that starts
+    # something is safe to send again.
+    $sendToken = Get-DemoCurrentToken -Token $Token
+    $request['Token'] = $sendToken
     $response = Invoke-DemoTransientRetry -Send { param([hashtable] $Call) Invoke-WebRequest @Call } -State $request -Target ([uri]$Uri).Host -NotIdempotent:$NotIdempotent
+    if (Test-DemoTokenRefused -Response $response) {
+        $renewed = Get-DemoCurrentToken -Token $Token -Rejected $sendToken -RejectedStatus ([int]$response.StatusCode)
+        if (-not [object]::ReferenceEquals($renewed, $sendToken)) {
+            $request['Token'] = $renewed
+            $response = Invoke-DemoTransientRetry -Send { param([hashtable] $Call) Invoke-WebRequest @Call } -State $request -Target ([uri]$Uri).Host -NotIdempotent:$NotIdempotent
+        }
+    }
     $statusCode = [int]$response.StatusCode
 
     $content = [string]$response.Content
