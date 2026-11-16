@@ -585,7 +585,7 @@ Describe 'Invoke-DemoDeploymentTrack' {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoT3 -MockWith { $script:calls.Add('t3checks'); New-TestResult 'T3.DATABASE' }
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add('monitoring'); New-TestResult 'T1.SQLVM.MONITORING' }
         # Phase 28: the VM's extensions settle before its artifacts and its loader (brief item 14); its own tests are in DbHubDemo.OneCommand.Tests.ps1.
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith { [pscustomobject]@{ Settled = $true; Results = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith { if ($VmName -eq 'sqlvm01' -and $ProgressId -eq 'T1.Bootstraps') { $script:calls.Add('settle ' + $VmName) }; [pscustomobject]@{ Settled = $true; Results = @() } }
     }
 
     It 'says on the console and the status page why a resumed run sends a VM''s artifacts again (live finding, 2026-11-06)' {
@@ -1183,8 +1183,11 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Artifacts', 'Bootstraps', 'T3', 'Activity', 'Monitoring', 'Telemetry') }
         $outcome.Status | Should -Be 'Pass'
         $order = @($script:calls | Where-Object { $_ -notmatch '^state' })
-        # One wave for both artifacts; T1's monitoring is merged right after the loader, before the health wait.
-        $order[0..3] | Should -Be @('chunks sqlvm01 bootstrap bundle+workload runner 8', 'loader sqlvm01', 'monitoring', 'health sqlvm01')
+        # One wave for both artifacts; T1's monitoring is merged before the loader, once sqlvm01's extensions have settled, so
+        # the extension's update ends before the bootstrap's lockout recovery puts SQL Server in single-user mode (R852,
+        # live 2026-11-16: merged right after the loader, it failed there). Then the health wait.
+        $order[0..4] | Should -Be @('chunks sqlvm01 bootstrap bundle+workload runner 8', 'settle sqlvm01', 'monitoring', 'loader sqlvm01', 'health sqlvm01')
+        @($order | Where-Object { $_ -eq 'settle sqlvm01' }).Count | Should -Be 1 -Because 'the loader''s own settle is the same, once per step'
         $script:calls | Should -Contain 'telemetry T1,T3'
         $outcome.ReadyUtc['T1'] | Should -Not -BeNullOrEmpty
         $outcome.ReadyUtc['T3'] | Should -Not -BeNullOrEmpty
@@ -1331,7 +1334,7 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $outcome.Status | Should -Be 'Pass'
         $outcome.Steps | Should -Be @('T3Setup', 'Artifacts', 'Bootstraps', 'T3', 'Activity', 'Monitoring', 'Telemetry')
         $order = @($script:calls | Where-Object { $_ -notmatch '^state' })
-        $order | Should -Be @('group', 't3setup', 'chunks sqlvm01 bootstrap bundle+workload runner 8', 'loader sqlvm01', 'monitoring', 'health sqlvm01', 't3workload', 't3checks', 'profile T1', 'profile T3', 'monitoring', 'telemetry T1,T3')
+        $order | Should -Be @('group', 't3setup', 'chunks sqlvm01 bootstrap bundle+workload runner 8', 'settle sqlvm01', 'monitoring', 'loader sqlvm01', 'health sqlvm01', 't3workload', 't3checks', 'profile T1', 'profile T3', 'monitoring', 'telemetry T1,T3')
         $order | Should -Not -Contain 'profile T4' -Because 'T4 is off in this configuration'
         @($outcome.Results | Where-Object { $_.checkId -eq 'T3.GROUP' }).Count | Should -Be 1
         @($outcome.Results | Where-Object { $_.checkId -eq 'T3.SQL' }).Count | Should -Be 1

@@ -345,6 +345,16 @@ Unit-tested (`tests/unit/DbHubDemo.Tracks.Tests.ps1`, `tests/unit/DbHubDemo.Prog
 
 Unit-tested (`tests/unit/DbHubDemo.HistorySnapshot.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, `DbHubDemo.Lifecycle.Tests.ps1`, `DbHubDemo.Progress.Tests.ps1`). Not run live yet ([implementation report](../implementation-report.md#the-history-reports-snapshot-at-the-end-of-deployps1)).
 
+## Amendments (2026-11-16: T1's monitoring before its loader)
+
+Phase 22 merged T1's monitoring flag right after the loader started T1's bootstrap. Live on 2026-11-16, on a first deployment, that update of the SQL IaaS Agent extension met the bootstrap's lockout recovery, which restarts SQL Server in single-user mode ([ADR 0003](0003-t2-host-size-security-type-bootstrap.md)), and failed: "Login failed for user 'NT Service\MSSQLSERVER'. Reason: Server is in single user mode". The extension stayed Failed, and the run ended **NOT DONE** with the portal's Repair as the fix.
+
+| Phase 22 as built | 2026-11-16 | Why it's safe |
+|---|---|---|
+| The feature-flag merge right after T1's loader started the bootstrap | The merge right before the loader, once `sqlvm01`'s extensions have settled (the loader's own settle, once per step); the Monitoring step still confirms the plugin | VM extension operations run one at a time, so the update ends before the bootstrap starts, and no Run Command runs on `sqlvm01` then. It costs about 4 minutes on T1's track, which isn't the critical path. With the flag set, as in every environment that's been deployed, nothing is written |
+
+A Failed extension that an earlier run left gets the documented repair in the Monitoring step (`Repair-DemoSqlIaasExtension`, `DEPLOY.T1.SQLIAAS.REPAIR`).
+
 ## Sources (checked 2026-11-05)
 
 - `slmgr.vbs` options (`/rearm` "resets the activation timers"; `/ato` tries activation): <https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options>

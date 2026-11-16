@@ -1168,23 +1168,28 @@ function Invoke-DemoDeploymentTrack {
                     & $send 'sqlvm01'
                 }
                 'T1/Bootstraps' {
+                    if ('Monitoring' -in $Step) {
+                        # The documented feature-flag merge before the loader starts T1's bootstrap, once sqlvm01's extensions
+                        # have settled (ADR 0018; R852, live 2026-11-16): merged right after the loader, the extension's update
+                        # met the bootstrap's lockout recovery, which has SQL Server in single-user mode, and failed. VM
+                        # extension operations run one at a time, so the update ends before the bootstrap starts; the plugin
+                        # still starts during the bootstrap, and the Monitoring step confirms it. With the flag set, as in
+                        # every environment that's been deployed, nothing is written.
+                        if (& $settle 'sqlvm01' 'T1.Bootstraps') {
+                            try {
+                                $merge = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes 0 -Confirm:$false
+                                $mergeActions = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $merge -Name 'evidence') -Name 'actions'
+                                $monitoringMerged = @($mergeActions | Where-Object { $_ }).Count -gt 0
+                                Write-DemoLog -Message ('Track T1: T1''s monitoring, set before T1 bootstraps: {0}' -f $merge.message)
+                            }
+                            catch {
+                                Write-DemoLog -Level Warning -Message ('Track T1: T1''s monitoring couldn''t be set before T1 bootstraps; the Monitoring step sets it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+                            }
+                        }
+                    }
                     if (-not (& $load 'sqlvm01' 'sqlVm')) {
                         $outcome = 'Fail'
                         break
-                    }
-                    if ('Monitoring' -in $Step) {
-                        # The documented feature-flag merge right after the loader started T1's bootstrap, while no
-                        # Run Command runs on sqlvm01: the plugin starts during the bootstrap, and the Monitoring
-                        # step confirms it (ADR 0018).
-                        try {
-                            $merge = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes 0 -Confirm:$false
-                            $mergeActions = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $merge -Name 'evidence') -Name 'actions'
-                            $monitoringMerged = @($mergeActions | Where-Object { $_ }).Count -gt 0
-                            Write-DemoLog -Message ('Track T1: T1''s monitoring, set while T1 bootstraps: {0}' -f $merge.message)
-                        }
-                        catch {
-                            Write-DemoLog -Level Warning -Message ('Track T1: T1''s monitoring couldn''t be set while T1 bootstraps; the Monitoring step sets it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
-                        }
                     }
                     $minutes = [int](& $option 'T1WaitMinutes' 45)
                     $wait = Wait-DemoVmHealthState -Config $Config -VmName 'sqlvm01' -State @('Ready', 'Failed', 'ManualActionRequired') -MaxPolls ([System.Math]::Max(1, $minutes)) -PollSeconds 60

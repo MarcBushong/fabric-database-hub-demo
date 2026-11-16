@@ -357,7 +357,7 @@ Phase 22 built Phase 20's follow-up overlaps, and two more that G6's timeline sh
 | T2's artifacts during the Release | The bundle and the runner travel in their own chunk Run Commands while the golden Release runs; the Artifacts step sends whatever didn't arrive | About 4.9 minutes |
 | The guards during the template | The track processes start right after Preflight and wait for the template's result | About 1.2 minutes |
 | T1's bundle and runner at once | One wave of 8 chunk Run Commands instead of two | About 1.7 minutes |
-| T1's monitoring alongside its bootstrap | The feature-flag merge right after T1's loader, with no other Run Command on `sqlvm01`; the Monitoring step confirms the plugin | About 2.8 minutes |
+| T1's monitoring alongside its bootstrap | The feature-flag merge right before T1's loader, once `sqlvm01`'s extensions have settled, so the extension's update ends before the bootstrap's lockout recovery (2026-11-16, R852); the Monitoring step confirms the plugin | About 2.8 minutes |
 | T2 before the template finishes | A golden T2 starts its Restore as soon as the template has deployed `archost01` | New |
 | T3 first | T1 joins the T3 group during the template and sets T3 up before its own artifacts: T3's telemetry started about 10 minutes after its setup in G6 | New |
 
