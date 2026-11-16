@@ -3,7 +3,8 @@ name: codeql
 # Code scanning on a private repository needs GitHub Code Security (Advanced Security).
 # This workflow runs on public repositories, or when the repository variable
 # CODE_SCANNING_ENABLED is 'true'. Otherwise it's skipped; gitleaks and the other static checks
-# in validate.yml still run. See SECURITY.md.
+# in validate.yml still run where they're on: a public repository, or STATIC_CHECKS_ENABLED 'true'.
+# See SECURITY.md.
 on:
   pull_request:
   push:
