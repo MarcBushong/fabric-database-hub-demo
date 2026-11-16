@@ -16,7 +16,7 @@ COPY workload-generator/src/ src/
 RUN dotnet publish src/ContosoCare.Workload/ContosoCare.Workload.csproj --configuration Release --no-restore --output /app
 
 # The default (Debian) runtime image includes ICU, which Microsoft.Data.SqlClient needs; chiseled images don't.
-FROM mcr.microsoft.com/dotnet/runtime:10.0 AS final
+FROM mcr.microsoft.com/dotnet/runtime:11.0 AS final
 WORKDIR /app
 COPY --from=build /app ./
 # Run as the non-root user that the .NET images define.
