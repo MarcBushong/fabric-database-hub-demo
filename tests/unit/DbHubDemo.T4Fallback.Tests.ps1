@@ -972,7 +972,7 @@ Describe 'A record that says an earlier run left T4 out never turns T4 off (2026
             # T4's read replica (ADR 0025): these tags are from before it, so the upgrade's command, and nothing more is read.
             $results[1].checkId | Should -Be 'T4.REPLICA'
             $results[1].status | Should -Be 'Warning'
-            $results[1].remediation | Should -Match '^Run \./scripts/deploy\.ps1: it adds the replica'
+            $results[1].remediation | Should -Match '^Run \./scripts/deploy\.ps1: it sets the replica up'
         }
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoT4 -Times 2 -Exactly -ParameterFilter { $IncludeMetrics -and $DeploymentId -eq 'abc123' -and $Config['t4Enabled'] -and -not $Config.Contains('t4SkuSource') }
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4State -Times 0 -Exactly -Because 'T4''s own checks read the server'

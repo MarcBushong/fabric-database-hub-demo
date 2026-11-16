@@ -3767,7 +3767,7 @@ function Start-DbHubSessionReplica {
         return (& $finish 'NotConfigured' 'The control''s settings predate T4''s read replica, so this session has none.' 'Run ./scripts/deploy.ps1: it publishes the control again.')
     }
     if ([string](Get-DbHubMember -InputObject $Tags -Name 'DbHubT4Replica') -ne 'Session') {
-        return (& $finish 'NotSetUp' 'T4''s read replica isn''t set up in this environment, which was deployed before the replica existed, so Database Hub''s Read replica lag stays empty and the replica-lag beat doesn''t run.' 'Run ./scripts/deploy.ps1: it adds the replica (about 9 minutes) and changes nothing else.')
+        return (& $finish 'NotSetUp' 'T4''s read replica isn''t set up in this environment, which was deployed before the replica existed, so Database Hub''s Read replica lag stays empty and the replica-lag beat doesn''t run.' 'Run ./scripts/deploy.ps1: it sets the replica up, and each session creates it.')
     }
     $t4 = Get-DbHubT4Server -Context $Context -Tags $Tags
     $sku = Get-DbHubMember -InputObject $t4.Body -Name 'sku'

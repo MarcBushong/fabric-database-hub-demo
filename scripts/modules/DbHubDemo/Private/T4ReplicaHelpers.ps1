@@ -354,7 +354,7 @@ function New-DemoT4ReplicaNotSetUpResult {
     )
 
     $setting = Get-DemoT4ReplicaSetting
-    return (New-DemoResult -CheckId $CheckId -Area 'infra' -Target 'T4' -Status $Status -Message ('T4''s read replica isn''t deployed yet: this environment was deployed before the replica existed, so nothing was done for it. Database Hub''s Read replica lag stays empty until then.') -Remediation ('Run ./scripts/deploy.ps1: it adds the replica (about {0} minutes) and changes nothing else; after that, start-demo.ps1 creates it for each session and stop-demo.ps1 deletes it.' -f $setting['createMinutes']) -DocUrl ([string]$setting['docUrls']['concepts']))
+    return (New-DemoResult -CheckId $CheckId -Area 'infra' -Target 'T4' -Status $Status -Message ('T4''s read replica isn''t deployed yet: this environment was deployed before the replica existed, so nothing was done for it. Database Hub''s Read replica lag stays empty until then.') -Remediation ('Run ./scripts/deploy.ps1: it sets the replica up (it creates it for its checks, about {0} minutes, and deletes it at its end); after that, start-demo.ps1 and Run all create it for each session, and stop-demo.ps1 deletes it.' -f $setting['createMinutes']) -DocUrl ([string]$setting['docUrls']['concepts']))
 }
 
 function New-DemoT4ReplicaNotSupportedResult {

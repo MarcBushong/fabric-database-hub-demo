@@ -126,7 +126,7 @@ Describe 'An environment deployed before the replica: start, stop, status, and v
         $result.checkId | Should -Be 'START.T4.REPLICA'
         $result.status | Should -Be 'Not selected'
         $result.message | Should -Match 'isn''t deployed yet: this environment was deployed before the replica existed, so nothing was done for it'
-        $result.remediation | Should -Match '^Run \./scripts/deploy\.ps1: it adds the replica \(about 9 minutes\) and changes nothing else'
+        $result.remediation | Should -Match '^Run \./scripts/deploy\.ps1: it sets the replica up \(it creates it for its checks, about 9 minutes, and deletes it at its end\); after that, start-demo\.ps1 and Run all create it for each session'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4State -Times 0 -Exactly
     }
 

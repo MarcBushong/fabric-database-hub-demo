@@ -153,7 +153,7 @@ function Invoke-DemoControl {
         if ($status -eq 'Fail' -and $item -eq 'T4' -and $replicaLag -and (Get-DemoMemberValue -InputObject $run.Result.evidence -Name 'replicaKnown') -eq $false) {
             # sqlvm01 refused it: T1's runner settings don't name T4's read replica (Invoke-DemoWorkloadControl.ps1).
             $status = 'Warning'
-            $remediation = 'Run ./scripts/deploy.ps1: it sends T1 the replica''s name and changes nothing else; then send replica-lag again.'
+            $remediation = 'Run ./scripts/deploy.ps1: it sends T1 the replica''s name; then send replica-lag again.'
         }
         $evidence = [ordered]@{ scenario = $Scenario; durationMinutes = $DurationMinutes; concurrency = $Concurrency; intensity = $Intensity; resetBefore = $ResetBefore; autoCleanup = $AutoCleanup; exitCode = $run.ExitCode }
         $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target $item -Status $status -Message $message -Evidence $evidence -Remediation $remediation))
