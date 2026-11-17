@@ -24,7 +24,7 @@ reviewed: 2026-11-03
 
 # Tour the showcase across every target in Database Hub
 
-Use while **Run all** in the control notebook runs the showcase: the baseline on every target plus a 30-minute rotation of incidents, at most two at a time per target (the [README](../../../README.md#what-fills-each-database-hub-visual-and-when) has the schedule). These prompts tour the estate; for a closer look at one incident, use its scenario's prompt file, and finish with [incident-wrap-up.in-hub](incident-wrap-up.in-hub.md).
+Use while **Run all** in the control notebook runs the showcase: the baseline on every target plus a 30-minute rotation of incidents, at most two at a time per target (the [README](../../../docs/database-hub-visuals.md#what-fills-each-database-hub-visual-and-when) has the schedule). These prompts tour the estate; for a closer look at one incident, use its scenario's prompt file, and finish with [incident-wrap-up.in-hub](incident-wrap-up.in-hub.md).
 
 Start about 30 minutes after Run all, so the first cycle has reached the telemetry.
 

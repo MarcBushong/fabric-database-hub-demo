@@ -41,4 +41,4 @@ These are for an agent asked to **set up, deploy, upgrade, or try** this demo fo
 - **Before you deploy, say what it costs:** `./scripts/estimate-cost.ps1` estimates it from Azure's list prices, with no sign-in. Preflight checks the same estimate against `monthlyCeilingUsd` and `sessionCeilingUsd` and stops at a hard ceiling.
 - **When the person doesn't want new resources,** say what then won't work, rather than skipping parts quietly: for example, without `deploy.ps1` there's no T4, so no PostgreSQL in Database Hub, and no nightly safety stop, so T4 bills again after Azure starts it on its own 7 days after a stop. Without T4's read replica (`start-demo.ps1 -SkipT4Replica`), Database Hub's Read replica lag stays empty and the `replica-lag` beat isn't available; it bills only during a session, because `stop-demo.ps1` deletes it, and so does `deploy.ps1` at its end.
 
-More: [README](README.md#running-it-with-an-ai-assistant), [deployment](docs/deployment.md), and [troubleshooting](docs/troubleshooting.md).
+More: [README](docs/deployment.md#running-it-with-an-ai-assistant), [deployment](docs/deployment.md), and [troubleshooting](docs/troubleshooting.md).

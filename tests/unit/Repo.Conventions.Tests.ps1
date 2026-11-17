@@ -924,6 +924,106 @@ Describe 'Markdown' {
         }
         $broken | Should -BeNullOrEmpty
     }
+
+    It 'every link''s fragment names a heading or an anchor in its target, as GitHub makes them (2026-11-17)' {
+        # GitHub's heading IDs, as github-slugger makes them: the heading's text, lowercased, without punctuation, with spaces
+        # as hyphens, and -1, -2, ... for a repeat in one file; plus explicit <a id> anchors. On 2026-11-17 the README's long
+        # sections moved to docs pages, and 76 links named their anchors, which no check followed across files. Printed
+        # links ("docs/x.md#y" in a script's fix) count too: from the repository's root, or else from their own folder.
+        function Get-TestMarkdownAnchor([string] $Path) {
+            $anchors = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            $seen = @{}
+            $fence = $null
+            foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+                if ($line -match '^\s{0,3}(`{3,}|~{3,})') {
+                    $marker = $Matches[1].Substring(0, 3)
+                    if ($null -eq $fence) { $fence = $marker } elseif ($marker -eq $fence) { $fence = $null }
+                    continue
+                }
+                if ($null -ne $fence) {
+                    continue
+                }
+                foreach ($match in [regex]::Matches($line, '<a\s+(?:id|name)="([^"]+)"')) {
+                    [void]$anchors.Add($match.Groups[1].Value)
+                }
+                if ($line -notmatch '^\s{0,3}#{1,6}\s+(?<text>.*?)\s*#*\s*$') {
+                    continue
+                }
+                # Code spans keep their text; outside them, HTML tags go and entities are decoded; a link keeps its text.
+                $parts = [regex]::Split($Matches['text'], '(`[^`]*`)')
+                $plain = ($parts | ForEach-Object { if ($_ -match '^`([^`]*)`$') { $Matches[1] } else { [System.Net.WebUtility]::HtmlDecode([regex]::Replace($_, '<[^>]+>', '')) } }) -join ''
+                $plain = [regex]::Replace($plain, '!?\[([^\]]*)\]\([^)]*\)', '$1')
+                $slug = [regex]::Replace($plain.ToLowerInvariant(), '[^\p{L}\p{M}\p{N}\p{Pc}\- ]', '').Replace(' ', '-')
+                $unique = $slug
+                if ($seen.ContainsKey($slug)) {
+                    do {
+                        $seen[$slug]++
+                        $unique = '{0}-{1}' -f $slug, $seen[$slug]
+                    } while ($seen.ContainsKey($unique))
+                }
+                $seen[$unique] = 0
+                [void]$anchors.Add($unique)
+            }
+            return , $anchors
+        }
+        $cache = @{}
+        $broken = [System.Collections.Generic.List[string]]::new()
+        $checkLink = {
+            param([string] $Source, [int] $Line, [string] $Link, [string[]] $Candidates, [string] $Fragment)
+            $target = @($Candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }) | Select-Object -First 1
+            if ($null -eq $target) {
+                $broken.Add(('{0}:{1} -> {2} (no such file)' -f $Source, $Line, $Link))
+                return
+            }
+            if (-not $cache.ContainsKey($target)) {
+                $cache[$target] = Get-TestMarkdownAnchor -Path $target
+            }
+            if (-not $cache[$target].Contains([System.Uri]::UnescapeDataString($Fragment))) {
+                $broken.Add(('{0}:{1} -> {2}' -f $Source, $Line, $Link))
+            }
+        }
+        foreach ($file in Get-RepoFile -Include '*.md') {
+            $source = $file.FullName.Substring($repoRoot.Length + 1).Replace('\', '/')
+            $fence = $null
+            $number = 0
+            foreach ($line in [System.IO.File]::ReadAllLines($file.FullName)) {
+                $number++
+                if ($line -match '^\s{0,3}(`{3,}|~{3,})') {
+                    $marker = $Matches[1].Substring(0, 3)
+                    if ($null -eq $fence) { $fence = $marker } elseif ($marker -eq $fence) { $fence = $null }
+                    continue
+                }
+                if ($null -ne $fence) {
+                    continue
+                }
+                $text = [regex]::Replace($line, '`[^`]*`', '')
+                $targets = @([regex]::Matches($text, '\]\((?<t>[^)\s]+)(?:\s+"[^"]*")?\)') | ForEach-Object { $_.Groups['t'].Value })
+                if ($text -match '^\s{0,3}\[[^\]]+\]:\s*<?(?<t>[^\s>]+)>?') {
+                    $targets += $Matches['t']
+                }
+                foreach ($target in $targets | Where-Object { $_ -notmatch '^(https?:|mailto:|<)' -and $_.Contains('#') }) {
+                    $pathPart, $fragment = $target.Split('#', 2)
+                    $targetPath = if ($pathPart) { [System.IO.Path]::GetFullPath((Join-Path -Path $file.DirectoryName -ChildPath ([System.Uri]::UnescapeDataString($pathPart)))) } else { $file.FullName }
+                    if ($targetPath.EndsWith('.md', [System.StringComparison]::OrdinalIgnoreCase)) {
+                        & $checkLink $source $number $target @($targetPath) $fragment
+                    }
+                }
+            }
+        }
+        $code = Get-RepoFile -Include '*.ps1', '*.psm1', '*.py', '*.ipynb', '*.json', '*.bicep', '*.yml', '*.yaml', '*.cs', '*.ts', '*.tsx', '*.js', '*.mjs', '*.sql', '*.kql' | Where-Object { $_.FullName -notmatch '[\\/]tests[\\/]' }
+        foreach ($file in $code) {
+            $source = $file.FullName.Substring($repoRoot.Length + 1).Replace('\', '/')
+            $number = 0
+            foreach ($line in [System.IO.File]::ReadAllLines($file.FullName)) {
+                $number++
+                foreach ($match in [regex]::Matches($line, '(?<![\w/.\-])(?<p>(?:[A-Za-z0-9_.\-]+/)*[A-Za-z0-9_.\-]+\.md)#(?<a>[A-Za-z0-9_\-%]+)')) {
+                    $candidates = @((Join-Path -Path $repoRoot -ChildPath $match.Groups['p'].Value), (Join-Path -Path $file.DirectoryName -ChildPath $match.Groups['p'].Value)) | ForEach-Object { [System.IO.Path]::GetFullPath($_) }
+                    & $checkLink $source $number $match.Value $candidates $match.Groups['a'].Value
+                }
+            }
+        }
+        $broken | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Time limits on every network call (R862, 2026-11-16 live finding)' {

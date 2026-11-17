@@ -79,6 +79,70 @@ flowchart LR
   AG --> TEL
 ```
 
+## At a glance
+
+`deploy.ps1` deploys everything below that has documented automation, with one command after `az login`, in parallel tracks: T1 with T3, T2, T4, and Fabric. T2 needs no person: by default (`JumpstartImage`), the T2 host downloads [Arc Jumpstart](https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md)'s prebuilt SQL Server 2022 Standard guest disk and makes it `arcsql01`, and no Bastion is needed. After `az login`, a default deployment needs a person only when you aren't an Owner, for one command that an Owner runs once for the roles of the nightly safety stop and the session control (`./scripts/grant-safety-stop.ps1`). The Insights app deploys with your `az login` too, so it needs a browser sign-in only if Fabric refuses that token. Neither keeps the run from **DONE**. A clean first deployment took **91 minutes** to **DONE**, measured on 2026-11-06 from a fresh clone, in West US 3 with the default `lowest-cost` profile; [deployment](deployment.md#expected-duration) has the other measured times. [Deploy it, step by step](deployment.md#deploy-it-step-by-step) has every step, and [automated vs manual](automation-support-matrix.md#automated-vs-manual) lists them all, automated or not.
+
+| What | Where | What it is | Deployed by |
+|---|---|---|---|
+| **T1** `sqlvm01` | Azure VM | SQL Server 2022 Standard, pay-as-you-go. Shows in Database Hub through the SQL IaaS Agent extension | `deploy.ps1` |
+| **T2** `arcsql01` | Nested Hyper-V guest on the Azure VM `archost01` | SQL Server 2022 Standard, pay-as-you-go, presented as a **simulated** on-premises server. Shows in Hub through SQL Server enabled by Azure Arc | `deploy.ps1`, unattended: by default (`JumpstartImage`) the guest is Arc Jumpstart's prebuilt SQL Server Standard image, which the host downloads, checks, and makes `arcsql01` ([options](deployment.md#options-t2s-install-modes)). A redeploy can restore the finished guest from an optional golden snapshot ([ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)), with no manual step |
+| **T3** `azuresql01-<id>` | Azure SQL Database | The `ContosoCare` database, General Purpose serverless, Microsoft Entra-only. Native in Hub | `deploy.ps1` |
+| **T4** `pgflex01-<id>` | Azure Database for PostgreSQL flexible server | PostgreSQL 18 with the `contosocare` database, Microsoft Entra only, no public access. Shows in Hub through Azure Monitor metrics. Its size is `t4SkuName`: General Purpose `Standard_D4ds_v5` (4 vCores) by default since 2026-11-04, with autonomous tuning, which needs 4 vCores; when Azure refuses it, another zone, then `Standard_D4ads_v5`, then `Standard_D2ds_v5` with tuning off once its price fits the cost ceilings. `Standard_B1ms` is the cheapest size, with tuning off. T4 is part of every deployment since 2026-11-09: a configuration's `t4Enabled: false` is ignored, with a note ([ADR 0019](adr/0019-t4-postgresql-flexible-server.md)) | `deploy.ps1` |
+| **T4's read replica** `pgreplica01-<id>` | Azure Database for PostgreSQL flexible server | A same-region read replica of T4, at T4's size, **for each session** (since 2026-11-13): it's created at the start, in about 9 minutes, and deleted at the stop, so nothing bills for it between sessions or after a deployment. Database Hub's Estate lists it, and its **Read replica lag** chart has data; the `replica-lag` scenario makes that lag climb on purpose. When Azure refuses T4's size for it, it tries another zone, then a size with at least T4's vCores, and says what that costs. A Burstable T4 has none: **Not supported**, with the fix ([ADR 0025](adr/0025-t4-read-replica.md)) | `start-demo.ps1` or Run all, for each session; `stop-demo.ps1` or the session's auto-stop deletes it. `deploy.ps1` creates it for its checks and deletes it at its end (since 2026-11-16) |
+| Workload | T1 to T4 | A workload runner with activity profiles and bounded incident scenarios that act only inside `ContosoCare` (`contosocare` on T4) | `deploy.ps1`; driven by `demo-control.ps1` |
+| Nightly safety stop | Azure Automation in the demo resource group | Every evening at the VMs' auto-shutdown time, it deallocates both VMs and stops T4 if they run, then reads, through Azure Resource Manager only, whether T3 paused, and stops T4 again if it runs. A read replica that a session left behind is stopped once T4 is, and the job says so, with the fix. It never starts anything or connects to a database. It waits for a `deploy.ps1` that's still running, then stops the demo the same night, 60 minutes after the run ends, and DONE says when (since 2026-11-14; [what stops or pauses on its own](cost-management.md#what-stops-or-pauses-on-its-own)) | `deploy.ps1`, on every run; it assigns the safety stop's role when you're an Owner, and otherwise an Owner runs one command once (P16) |
+| Fabric notebooks | Fabric workspace | `NB_DatabaseHub_Deployment` (validator) and `NB_DatabaseHub_LiveActivity` (live analysis), which save the demo's history to the lakehouse `LH_DatabaseHub` | `deploy.ps1`'s Fabric track (`configure-fabric.ps1`) |
+| Real-Time Dashboard | Fabric workspace | `RTD_DatabaseHub_LiveView`: the live view, defined as code, over the telemetry endpoint | `deploy.ps1`'s Fabric track (`configure-fabric.ps1`) |
+| Power BI history report | Fabric workspace | `RPT_DatabaseHub_History`: four pages over its Direct Lake semantic model, `SM_DatabaseHub_History` | `deploy.ps1`'s Fabric track (`configure-powerbi.ps1`) |
+| [Fabric App](../fabric/app/README.md) (preview) | Fabric workspace | The Insights app, `APP_DatabaseHub_Insights`: a read-only app over the same model, built with the Rayfin SDK and CLI, with custom visuals, DAX and CSV export on every visual, and ready-made prompts for Database Hub's Database Agent. Part of every deployment; when it can't be created, the run goes on and still ends **DONE**, and the status page shows its step as **Failed**, with the actual error and the fix | `deploy.ps1`'s Fabric track (`configure-fabric-app.ps1`), with your `az login`, once a Fabric administrator has turned on two tenant settings. A browser sign-in is needed only if Fabric refuses that token; `deploy.ps1` then starts it at the beginning of the next run ([prerequisites](prerequisites.md#for-the-insights-app)) |
+| Database Hub | Fabric portal | Nothing to deploy: a portal page that finds the targets through Azure Resource Graph and charts their telemetry | — |
+
+Also included: start, stop, reset, status, cost estimate, and destroy, from PowerShell or GitHub Actions; a [Database Agent prompt pack](../fabric/agent/README.md); and validation in six statuses: **Pass**, **Fail**, **Warning**, **Manual action required**, **Not supported**, and **Not selected**. A successful deployment alone is never **Pass**.
+
+```mermaid
+flowchart TB
+  OP["You: PowerShell 7 or GitHub Actions"]
+  subgraph RG["Azure: one resource group, Contributor only"]
+    T1["T1 sqlvm01<br/>SQL Server on an Azure VM"]
+    subgraph HOST["archost01: Hyper-V host"]
+      T2["T2 arcsql01<br/>Arc-enabled SQL Server,<br/>simulated on-premises"]
+    end
+    T3["T3 azuresql01<br/>Azure SQL Database"]
+    T4["T4 pgflex01<br/>Azure Database for PostgreSQL"]
+    T4R["T4's read replica pgreplica01<br/>for each session"]
+  end
+  GOLD[("rg-dbhub-golden<br/>T2 golden snapshot, optional")]
+  JS[("Arc Jumpstart<br/>public SQL Server guest image")]
+  TEL["SQL telemetry endpoint (preview)"]
+  HUB["Database Hub and Database Agent (preview)<br/>a Fabric portal page"]
+  subgraph WS["Fabric workspace on F capacity"]
+    NB["Notebooks"]
+    LH[("LH_DatabaseHub<br/>history tables")]
+    RTD["Real-Time Dashboard<br/>live, as code"]
+    PBI["Semantic model and<br/>Power BI report: history"]
+    APP["Insights app: Fabric App (preview)<br/>history insights"]
+  end
+  OP -- "deploy, start, stop, reset, validate, destroy" --> RG
+  OP -- "import and check" --> WS
+  JS -. "downloaded once per guest build" .-> HOST
+  GOLD -. "restored on a redeploy" .-> HOST
+  T1 --> TEL
+  T2 --> TEL
+  T3 --> TEL
+  RG -. "Estate: Azure Resource Graph" .-> HUB
+  TEL -- "Performance" --> HUB
+  T4 -. "Azure Monitor metrics" .-> HUB
+  T4 -- "replication" --> T4R
+  T4R -. "Azure Monitor metrics: Read replica lag" .-> HUB
+  TEL -- "KQL as each viewer" --> RTD
+  TEL -- "KQL" --> NB
+  NB --> LH
+  LH -- "Direct Lake" --> PBI
+  PBI -- "semantic model connector" --> APP
+  APP -. "Database Agent prompt, pasted by you" .-> HUB
+```
+
 ## Components and defaults
 
 Every value is a parameter. Profiles (`lowest-cost`, `demo-day`, `enhanced-performance`) only set defaults ([ADR 0016](adr/0016-cost-profiles.md)).

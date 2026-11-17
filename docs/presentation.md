@@ -73,6 +73,28 @@ The demo's Fabric app is the Insights app, `APP_DatabaseHub_Insights`: a [Fabric
 
 The org app that the report spec planned was dropped on 2026-10-22.
 
+## Screenshots
+
+Captured from live data by the agents that built each surface, without automating any portal. Nothing identifying is visible: no tenant, subscription, or resource IDs, no emails, account names, or IP addresses. T3's server suffix shows as `<id>`, and the notebook's run ID is masked.
+
+### The Power BI history report
+
+Power BI Desktop's render of the deployed report against the live model, captured on 2026-10-22 from the history that the notebooks saved on 2026-10-20 and 2026-10-21; times are UTC. No scenario had run yet, so the incident shown is a detected IO-pressure window, not a requested one.
+
+| 1. Estate at a glance | 2. The incident, minute by minute |
+|---|---|
+| ![The Estate at a glance page: 3 of 3 targets sent telemetry, CPU per target against an 80 % attention line, and the findings that still need attention](images/readme/powerbi-report-estate.png) | ![The incident page: Buffer IO waits on T2 around a detected incident window, a verdict, and the notebook's findings for that window](images/readme/powerbi-report-incident.png) |
+| Telemetry coverage, CPU per target against the 80 % attention line, and the findings that still need attention | One incident's signal before, during, and after its window, with a verdict and the notebook's evidence |
+
+| 3. Signal explorer | 4. Readiness checks |
+|---|---|
+| ![The Signal explorer page: CPU per target over time, the signal against load, and wait time by category](images/readme/powerbi-report-explorer.png) | ![The Readiness checks page: 12 checks with 0 failed, 2 manual steps, and 2 warnings, each with its exact fix](images/readme/powerbi-report-readiness.png) |
+| Any signal on any target over time, against load, with the wait time by category | The deployment notebook's checks by status, with the exact fix for each one |
+
+### The Fabric App (preview)
+
+No screenshots yet. The [app's guide](../fabric/app/README.md#whats-in-it) describes its four pages: Estate, Incidents, Readiness, and Live links.
+
 ## Sources (checked 2026-10-21)
 
 - [Fabric licenses](https://learn.microsoft.com/fabric/enterprise/licenses): the F64 viewer rule, Power BI and non-Power BI items, and Trial and P capacities

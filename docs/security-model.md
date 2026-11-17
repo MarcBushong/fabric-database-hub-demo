@@ -103,6 +103,27 @@ Every protected value on this path is checked before it leaves the operator: `In
 
 Until 2026-11-09, one more token reached the guest outside the scripts: in `PaygWizard` mode, the operator signed in with **Use Azure Login** in SQL Server setup, inside the guest, once per guest build. Setup's interactive sign-in can leave sign-in data on the VM; the host's `GuestSignInCleanup` step removed it right after the wizard and verified that none remained, and the build failed if any remained; nothing from that sign-in was kept or reused (ADR 0009, R74). Since `PaygWizard` is retired, no mode has such a sign-in. `./scripts/check-sign-in-data.ps1` checks any time, and reports counts and locations only.
 
+## Your sign-in and tokens
+
+**Where you sign in:**
+
+- `az login` on your PC.
+- Nothing more for T2: no mode needs a sign-in for T2 beyond `az login` since 2026-11-09, when the guided stop, with its sign-ins to the T2 host and in SQL Server setup, was retired.
+- The Rayfin CLI, for the Insights app, only when Fabric refuses your Azure CLI's token (`FABRIC.APP.TOKEN`): `deploy.ps1` then starts its browser sign-in at the beginning of the next run, and `./scripts/configure-fabric-app.ps1 -SignIn` runs it at once. By default, since 2026-11-09, the app deploys with your `az login`.
+
+**What the scripts do with it:**
+
+- Nothing from your sign-in is stored in the repository, the configuration, Key Vault, logs, or snapshots.
+- Short-lived tokens travel only in memory or as protected Run Command parameters, and the Run Commands that carried them are deleted right after. A Run Command that receives the one-time host password or the SQL Server product key clears the VM's Windows PowerShell log afterward when that log recorded the value (a Warning, because endpoint protection may report it), and never the Security log.
+- The one-time host password for interactive access (`./scripts/start-demo.ps1 -Interactive -ResetAdminPassword`) goes to your clipboard, never shown, or to the Key Vault opt-in; without either, nothing is set, and you choose one yourself with the portal's **Reset password**. Either way it's rotated afterward ([ADR 0009](adr/0009-secrets-handling.md)).
+- The guest's one automatic sign-in for the guided stop (Phase 28) is retired with it (2026-11-09). For an environment that an earlier guided stop left with it armed, the T2 host turns it off, deletes its secret, and rotates the guest's password by itself ([security model](#the-guests-one-automatic-sign-in-phase-28)).
+- With `assignRoles: true`, Arc onboarding uses the host's own Onboarding-only identity, so your token isn't used at all. Without it, your token (valid for about an hour) is used, and endpoint protection on the host can record the command line that carried it.
+- Right after setup, and after every Arc onboarding, the scripts remove the sign-in data left on the VMs and verify that none remains. The build fails if any remains, and so does an automatic sign-in that's still armed. `./scripts/check-sign-in-data.ps1` checks any time, and reports counts and locations only. It never clears the Security log on its own; it gives you the command.
+- The golden snapshot is captured only after a clean scan. Nothing from your sign-in is kept or reused across redeploys.
+- **The Jumpstart image's published password** (`JumpstartImage` mode): the T2 host reads it during the deploy from Arc Jumpstart's own script at a pinned commit, checked by its SHA-256, and keeps it only in memory; it's never in the repository, the configuration, or a log. The host uses it once, while the guest has no network, to replace it with a random password that it keeps protected like the other guest passwords, and it disables `sa` and every other SQL login ([ADR 0009](adr/0009-secrets-handling.md)).
+
+**What stays on your own PC:** your Azure CLI sign-in, and the Rayfin CLI's own sign-in if you made one. End them with `az logout` and, from the repository root, `./out/fabric-app/node_modules/.bin/rayfin logout` when you're done; the scripts never do that.
+
 ## Roles
 
 | Persona or identity | Minimum rights | Notes |

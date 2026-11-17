@@ -137,7 +137,7 @@ The session control behind the control notebook's **Run all**, part of every dep
 
 ## The nightly safety stop
 
-Part of every deployment since 2026-11-05 ([ADR 0024](adr/0024-nightly-safety-stop.md); [what it does](../README.md#what-stops-or-pauses-on-its-own)). Contributor sets up everything except its role:
+Part of every deployment since 2026-11-05 ([ADR 0024](adr/0024-nightly-safety-stop.md); [what it does](cost-management.md#what-stops-or-pauses-on-its-own)). Contributor sets up everything except its role:
 
 - **Contributor's part, on every `deploy.ps1`:** the identity `id-<prefix>-<environment>-safetystop` and the Automation account `aa-<prefix>-<environment>-safetystop` in the demo resource group (`infra/safetystop/safetystop.bicep`), the runbook `DbHub-Stop`, and its two daily schedules.
 - **The role:** the custom role **DbHub Demo Safety Stop**, assignable only in this subscription, with exactly 7 actions: read the resource group, the VMs, their instance view, T3's database, and T4; deallocate a VM; and stop T4 ([the list](adr/0024-nightly-safety-stop.md#the-role-dbhub-demo-safety-stop)). It can't start, create, change, or delete anything, has no Run Command, and has no Automation, Key Vault, Fabric, or role permission. Its one assignment is to the safety stop's identity at `rg-<prefix>-<environment>`, with the principal type set.

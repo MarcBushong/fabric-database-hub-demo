@@ -23,7 +23,7 @@ reviewed: 2026-11-03
 
 # Tour the showcase across every target with Copilot CLI or VS Code
 
-The skills version of the showcase tour. Run [session-setup.skills](session-setup.skills.md) first, and start about 30 minutes after **Run all**, so the first cycle has reached the telemetry. Prompts 1 and 2 work on every target from anywhere; prompt 3 needs a SQL connection ([line of sight](../README.md#part-4-line-of-sight-and-identities-for-t-sql-skills)). The schedule is in the [README](../../../README.md#what-fills-each-database-hub-visual-and-when).
+The skills version of the showcase tour. Run [session-setup.skills](session-setup.skills.md) first, and start about 30 minutes after **Run all**, so the first cycle has reached the telemetry. Prompts 1 and 2 work on every target from anywhere; prompt 3 needs a SQL connection ([line of sight](../README.md#part-4-line-of-sight-and-identities-for-t-sql-skills)). The schedule is in the [README](../../../docs/database-hub-visuals.md#what-fills-each-database-hub-visual-and-when).
 
 ## Prompts
 
