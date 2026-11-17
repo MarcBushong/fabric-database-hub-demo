@@ -3412,6 +3412,34 @@ Describe 'Invoke-DemoVmPowerAction' {
         $result.message | Should -Match 'wasn''t found'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 0 -Exactly
     }
+
+    It 'waits for the start this run asked for while Azure still works on it, and sends no second start (live, 2026-11-16)' {
+        # Live, 2026-11-16: archost01 read stopped, with its provisioning state Updating, for 12 minutes after the start
+        # deploy.ps1 asked for, and a second start went out 19 seconds after the first.
+        foreach ($state in 'PowerState/stopped', 'PowerState/stopped', 'PowerState/stopped', 'PowerState/running') {
+            $script:states.Enqueue($state)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { @('ProvisioningState/updating', 'PowerState/stopped') }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Start -StartRequested -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.evidence.issued | Should -Be ''
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 0 -Exactly
+    }
+
+    It 'starts the VM once when the start Azure was working on ends without it running' {
+        foreach ($state in 'PowerState/stopped', 'PowerState/stopped', 'PowerState/deallocated', 'PowerState/starting', 'PowerState/running') {
+            $script:states.Enqueue($state)
+        }
+        $script:views = [System.Collections.Generic.Queue[object]]::new()
+        $script:views.Enqueue(@('ProvisioningState/updating', 'PowerState/stopped'))
+        $script:views.Enqueue(@('ProvisioningState/updating', 'PowerState/stopped'))
+        $script:views.Enqueue(@('ProvisioningState/failed/AllocationFailed', 'PowerState/deallocated'))
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { if ($script:views.Count -gt 1) { $script:views.Dequeue() } else { $script:views.Peek() } }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Start -StartRequested -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.evidence.issued | Should -Be 'start'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'start' }
+    }
 }
 
 Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts what was stopped (Phase 28 live finding)' {

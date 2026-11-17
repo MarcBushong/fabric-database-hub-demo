@@ -684,13 +684,47 @@ function Get-DemoStartedVm {
             & $add 'T4'
         }
     }
+    # A VM the watchdog's recovery left deallocating or deallocated (live, 2026-11-16: the banner called archost01 running
+    # and billing) is named apart, by Get-DemoBillingNote -Left.
+    foreach ($name in @((Get-DemoWatchdogLeftVm -Result @($Result)).Keys)) {
+        $down.Add([string]$name)
+    }
     return @($names | Where-Object { $_ -notin $down })
+}
+
+function Get-DemoWatchdogLeftVm {
+    # The VMs the watchdog's recovery left deallocating or deallocated (DEPLOY.WATCHDOG_<VM>'s evidence, left), each with
+    # that state, from the VM's last watchdog result. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $left = [ordered]@{}
+    foreach ($item in @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -like 'DEPLOY.WATCHDOG_*' })) {
+        $evidence = Get-DemoMemberValue -InputObject $item -Name 'evidence'
+        $vm = [string](Get-DemoMemberValue -InputObject $evidence -Name 'vmName')
+        if (-not $vm) {
+            continue
+        }
+        $state = [string](Get-DemoMemberValue -InputObject $evidence -Name 'left')
+        if ($state -in 'deallocating', 'deallocated') {
+            $left[$vm] = $state
+        }
+        elseif ($left.Contains($vm)) {
+            $left.Remove($vm)
+        }
+    }
+    return $left
 }
 
 function Get-DemoBillingNote {
     # The one line a NOT DONE or stopped run's banner adds when this run started or created VMs (Phase 28): what runs and
-    # bills now, and how it stops: stop-demo.ps1 now, or the nightly auto-shutdown at its configured time. '' when
-    # nothing was started. Pure. Internal.
+    # bills now, and how it stops: stop-demo.ps1 now, or the nightly auto-shutdown at its configured time. -Left names a VM
+    # the watchdog's recovery left deallocating or deallocated (Get-DemoWatchdogLeftVm), which doesn't bill for compute
+    # once deallocated. '' when there's neither. Pure. Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -699,14 +733,29 @@ function Get-DemoBillingNote {
         [AllowEmptyCollection()]
         [string[]] $Name = @(),
 
-        [string] $Command = './scripts/deploy.ps1'
+        [string] $Command = './scripts/deploy.ps1',
+
+        [System.Collections.IDictionary] $Left = @{}
     )
 
-    $names = @($Name | Where-Object { $_ } | Select-Object -Unique)
-    if ($names.Count -eq 0) {
-        return ''
-    }
+    $leftNames = @(@($Left.Keys) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    $names = @($Name | Where-Object { $_ -and $_ -notin $leftNames } | Select-Object -Unique)
     $join = { param([string[]] $Items) if ($Items.Count -le 2) { $Items -join ' and ' } else { '{0}, and {1}' -f ($Items[0..($Items.Count - 2)] -join ', '), $Items[-1] } }
+    $leftText = @(foreach ($state in 'deallocating', 'deallocated') {
+            $these = @($leftNames | Where-Object { [string]$Left[$_] -eq $state })
+            if ($these.Count -gt 0) {
+                $verb = if ($these.Count -eq 1) { 'is' } else { 'are' }
+                if ($state -eq 'deallocating') {
+                    '{0} {1} deallocating: the watchdog asked Azure to deallocate {2}, Azure finishes that on its own, and a deallocated VM doesn''t bill for compute.' -f (& $join $these), $verb, $(if ($these.Count -eq 1) { 'it' } else { 'them' })
+                }
+                else {
+                    '{0} {1} deallocated by the watchdog, so {2} doesn''t bill for compute.' -f (& $join $these), $verb, $(if ($these.Count -eq 1) { 'it' } else { 'they' })
+                }
+            }
+        }) -join ' '
+    if ($names.Count -eq 0) {
+        return $leftText
+    }
     $them = if ($names.Count -eq 1) { 'it' } else { 'them' }
     $stop = (Get-DemoStopDemoCommand -Command $Command) -replace ' -RemoveBastionOnly', ''
     $vms = @($names | Where-Object { $_ -ne 'T4' })
@@ -716,7 +765,7 @@ function Get-DemoBillingNote {
         $zone = if ([string]$Config['autoShutdownTimeZone']) { ' ({0})' -f [string]$Config['autoShutdownTimeZone'] } else { '' }
         $shutdown = '; otherwise the nightly auto-shutdown stops {0} at {1}{2}' -f $(if ($vms.Count -eq $names.Count) { $them } else { & $join $vms }), $clock, $zone
     }
-    return ('Running and billing, because this run started or created {0}: {1}. {2} stops {0} now{3}.' -f $them, (& $join $names), $stop, $shutdown)
+    return ('Running and billing, because this run started or created {0}: {1}. {2} stops {0} now{3}.{4}' -f $them, (& $join $names), $stop, $shutdown, $(if ($leftText) { ' ' + $leftText } else { '' }))
 }
 
 function Get-DemoT4OffReason {
@@ -1440,7 +1489,7 @@ function Get-DemoDeploymentOutcome {
     )
 
     $all = @($Result | Where-Object { $null -ne $_ })
-    $billing = Get-DemoBillingNote -Config $Config -Name $StartedVm -Command $Command
+    $billing = Get-DemoBillingNote -Config $Config -Name $StartedVm -Command $Command -Left (Get-DemoWatchdogLeftVm -Result $all)
     $core = @($all | Where-Object { -not (Test-DemoNonBlockingResult -Result $_) })
     $fails = @($core | Where-Object { [string]$_.status -eq 'Fail' -and [string]$_.checkId -ne 'DEPLOY.SUMMARY' })
     # Only what a person or a rerun can act on blocks DONE; what only a person can confirm is listed instead.

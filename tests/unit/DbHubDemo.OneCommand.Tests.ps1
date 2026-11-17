@@ -1285,6 +1285,24 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $plain | Should -Be 'Running and billing, because this run started or created it: sqlvm01. ./scripts/stop-demo.ps1 stops it now.'
     }
 
+    It 'names a VM that the watchdog left deallocating on its own, not as running and billing (live, 2026-11-16)' {
+        # Live, 2026-11-16: a NOT DONE said "Running and billing ... sqlvm01, archost01, and T4", although the watchdog's
+        # recovery had asked Azure to deallocate archost01, which read deallocating, and then deallocated.
+        $config = New-TestConfig
+        $config['autoShutdownTime'] = ''
+        $started = New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'Started sqlvm01 and archost01.' -Evidence ([ordered]@{ vms = @('sqlvm01', 'archost01'); started = @('sqlvm01', 'archost01'); notRunning = @(); t4 = 'Pass'; minutes = 13 })
+        $watchdog = New-DemoResult -CheckId 'DEPLOY.WATCHDOG_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'archost01 was restarted automatically at 20:48 (local time); it was asked to deallocate, but archost01 is still PowerState/running after 1194 seconds.' -Evidence ([ordered]@{ vmName = 'archost01'; restarted = $true; recovered = $false; left = 'deallocating' })
+        $names = @(InModuleScope DbHubDemo -Parameters @{ Result = @($started, $watchdog) } { Get-DemoStartedVm -Result $Result })
+        $names | Should -Be @('sqlvm01', 'T4')
+        $result = @(New-DoneResult | Where-Object { $_.checkId -ne 'TELEMETRY.T1' }) + @((New-TestResult 'TELEMETRY.T1' 'Fail'), $started, $watchdog)
+        $notDone = InModuleScope DbHubDemo -Parameters @{ Result = $result; State = (New-FinishedState); Config = $config; Names = $names } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config -StartedVm $Names }
+        $notDone.Kind | Should -Be 'NotDone'
+        @($notDone.Notes) | Should -Contain 'Running and billing, because this run started or created them: sqlvm01 and T4. ./scripts/stop-demo.ps1 stops them now. archost01 is deallocating: the watchdog asked Azure to deallocate it, Azure finishes that on its own, and a deallocated VM doesn''t bill for compute.'
+        # A later watchdog result for the same VM that left it running again takes it back.
+        $again = New-DemoResult -CheckId 'DEPLOY.WATCHDOG_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01 was restarted automatically.' -Evidence ([ordered]@{ vmName = 'archost01'; restarted = $true; recovered = $true; left = 'running' })
+        @(InModuleScope DbHubDemo -Parameters @{ Result = @($started, $watchdog, $again) } { Get-DemoStartedVm -Result $Result }) | Should -Be @('sqlvm01', 'archost01', 'T4')
+    }
+
     It 'ends the page and keep-awake itself when it''s stopped while it starts, before deploy.ps1 holds the run (Phase 28 live finding)' {
         Mock -ModuleName DbHubDemo -CommandName Exit-DemoKeepAwake -MockWith { $true }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentNotice -MockWith { throw 'stopped while the banner was printed' }

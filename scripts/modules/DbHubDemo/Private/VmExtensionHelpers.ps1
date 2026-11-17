@@ -320,7 +320,7 @@ function Restart-DemoVmOnce {
     Write-DemoLog -Level Warning -Message ('{0}: Azure didn''t finish its restart in {1} minutes ({2}), so it''s deallocated and started once now; no action needed.' -f $VmName, $RestartMinutes, $wait.State)
     $recover = Invoke-DemoVmRestartRecovery -Config $Config -VmName $VmName -TimeoutMinutes $RecoverMinutes -PollSeconds $PollSeconds
     $detail = 'Azure didn''t finish its restart in {0} minutes ({1}), so {2}' -f $RestartMinutes, $wait.State, $recover.Detail
-    return [pscustomobject]@{ Restarted = $true; Reason = ''; AtUtc = $at; Recovered = [bool]$recover.Recovered; Failed = -not [bool]$recover.Recovered; Detail = $detail; Results = @($recover.Results) }
+    return [pscustomobject]@{ Restarted = $true; Reason = ''; AtUtc = $at; Recovered = [bool]$recover.Recovered; Failed = -not [bool]$recover.Recovered; Detail = $detail; Results = @($recover.Results); Left = [string](Get-DemoMemberValue -InputObject $recover -Name 'Left') }
 }
 
 function Get-DemoVmRestartState {
@@ -485,24 +485,24 @@ function Invoke-DemoVmRestartRecovery {
         }
     }
     if ($deallocate.ExitCode -ne 0) {
-        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}Azure refused its deallocate: {1}' -f $guestText, (Get-DemoDeploymentErrorText -Text $deallocate.StdErr -MaxLength 300)); Results = $results.ToArray() }
+        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}Azure refused its deallocate: {1}' -f $guestText, (Get-DemoDeploymentErrorText -Text $deallocate.StdErr -MaxLength 300)); Results = $results.ToArray(); Left = '' }
     }
     $seconds = [int][System.Math]::Max(60, ($TimeoutMinutes * 60) - $watch.Elapsed.TotalSeconds)
     $stopped = Invoke-DemoVmPowerAction -Config $Config -VmName $VmName -Action Deallocate -TimeoutSeconds ([System.Math]::Min(3600, $seconds)) -PollSeconds $PollSeconds
     if ([string]$stopped.status -ne 'Pass') {
-        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was asked to deallocate, but {1}' -f $guestText, [string]$stopped.message); Results = $results.ToArray() }
+        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was asked to deallocate, but {1}' -f $guestText, [string]$stopped.message); Results = $results.ToArray(); Left = 'deallocating' }
     }
     $seconds = [int][System.Math]::Max(60, ($TimeoutMinutes * 60) - $watch.Elapsed.TotalSeconds)
     $started = Invoke-DemoVmPowerAction -Config $Config -VmName $VmName -Action Start -TimeoutSeconds ([System.Math]::Min(3600, $seconds)) -PollSeconds $PollSeconds
     if ([string]$started.status -ne 'Pass') {
-        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was deallocated, but its start didn''t finish: {1}' -f $guestText, [string]$started.message); Results = $results.ToArray() }
+        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was deallocated, but its start didn''t finish: {1}' -f $guestText, [string]$started.message); Results = $results.ToArray(); Left = $(if ([string]$started.status -eq 'Fail') { 'deallocated' } else { 'starting' }) }
     }
     $minutes = [int][System.Math]::Max(1, [System.Math]::Ceiling((($TimeoutMinutes * 60) - $watch.Elapsed.TotalSeconds) / 60))
     $agent = Wait-DemoVmAgentReady -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName -TimeoutMinutes ([System.Math]::Min(60, $minutes)) -PollSeconds $PollSeconds
     if ($agent -lt 0) {
-        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was deallocated and started, but its VM agent wasn''t Ready within {1} minutes' -f $guestText, $TimeoutMinutes); Results = $results.ToArray() }
+        return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was deallocated and started, but its VM agent wasn''t Ready within {1} minutes' -f $guestText, $TimeoutMinutes); Results = $results.ToArray(); Left = 'running' }
     }
-    return [pscustomobject]@{ Recovered = $true; Detail = ('{0}it was deallocated and started once, and it''s running with its agent Ready after {1} minutes' -f $guestText, [int][System.Math]::Ceiling($watch.Elapsed.TotalMinutes)); Results = $results.ToArray() }
+    return [pscustomobject]@{ Recovered = $true; Detail = ('{0}it was deallocated and started once, and it''s running with its agent Ready after {1} minutes' -f $guestText, [int][System.Math]::Ceiling($watch.Elapsed.TotalMinutes)); Results = $results.ToArray(); Left = 'running' }
 }
 
 function Invoke-DemoVmWatchdog {
@@ -543,7 +543,9 @@ function Invoke-DemoVmWatchdog {
         $done = '{0} {1}.' -f $done, $detail
     }
     $savedText = if ($saved) { ' Its instance view is saved in {0} for ./scripts/collect-diagnostics.ps1.' -f $saved } else { '' }
-    $evidence = [ordered]@{ vmName = $VmName; restarted = [bool]$restart.Restarted; restartedAtUtc = $(if ($null -ne $restart.AtUtc) { ([datetime]$restart.AtUtc).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }); recovered = $recovered; busy = @($activity.Items); runCommandsDeleting = @($activity.RunCommandsDeleting).Count; instanceView = $saved }
+    # Where the recovery left the VM (deallocating, deallocated, starting, running; '' when it didn't run), so the run's ending
+    # doesn't call a VM it left deallocating running and billing (Get-DemoWatchdogLeftVm).
+    $evidence = [ordered]@{ vmName = $VmName; restarted = [bool]$restart.Restarted; restartedAtUtc = $(if ($null -ne $restart.AtUtc) { ([datetime]$restart.AtUtc).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }); recovered = $recovered; left = [string](Get-DemoMemberValue -InputObject $restart -Name 'Left'); busy = @($activity.Items); runCommandsDeleting = @($activity.RunCommandsDeleting).Count; instanceView = $saved }
     $checkId = 'DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()
     if ($failed) {
         Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -AzureSide -Message ('{0} Azure-side; the run stops this step.' -f $done)
