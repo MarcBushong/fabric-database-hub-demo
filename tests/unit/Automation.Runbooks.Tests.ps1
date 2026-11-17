@@ -104,6 +104,34 @@ BeforeAll {
         $script:secrets = @{}
         $script:secretsForbidden = $false
         $script:tagsForbidden = $false
+        # The session's hosts (2026-11-16): a VM's failed provisioning (Code and Time, by VM name), a Run Command's instance
+        # view (by its name), and the control account's variables as Set-AutomationVariable and Get-AutomationVariable see
+        # them, with a variable that doesn't exist, a count of the reads, and a script block each read runs first.
+        $script:vmFailed = @{}
+        $script:runCommandViews = @{}
+        $script:automationVariables = @{}
+        $script:variableMissing = $false
+        $script:variableReads = 0
+        $script:variableReadHook = $null
+    }
+
+    # The Automation sandbox's internal cmdlets for an existing variable, as the runbooks call them.
+    function Set-AutomationVariable([string] $Name, [object] $Value) {
+        if ($script:variableMissing) {
+            throw ("Variable '{0}' was not found." -f $Name)
+        }
+        $script:automationVariables[$Name] = [string]$Value
+    }
+
+    function Get-AutomationVariable([string] $Name) {
+        $script:variableReads++
+        if ($null -ne $script:variableReadHook) {
+            & $script:variableReadHook
+        }
+        if ($script:variableMissing) {
+            throw ("Variable '{0}' was not found." -f $Name)
+        }
+        return $script:automationVariables[$Name]
     }
 
     function Get-TestVmState([string] $Name) {
@@ -202,6 +230,9 @@ BeforeAll {
             '/virtualMachines/(\w+)/instanceView$' {
                 $name = $Matches[1]
                 $provisioning = @{ code = 'ProvisioningState/succeeded' }
+                if ($script:vmFailed.ContainsKey($name)) {
+                    $provisioning = @{ code = $script:vmFailed[$name].Code; message = 'The VM didn''t start in time.'; time = $script:vmFailed[$name].Time.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+                }
                 if ($script:vmSince.ContainsKey($name)) {
                     $provisioning['time'] = $script:vmSince[$name].ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ', [System.Globalization.CultureInfo]::InvariantCulture)
                 }
@@ -246,6 +277,12 @@ BeforeAll {
                     return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($script:runCommands[$Matches[1]]) } -Depth 8))
                 }
                 return (New-Response 200 ('{{"value":[{{"name":"DbHubControl-{0}-20261026000000"}},{{"name":"DbHubDemo-Other"}}]}}' -f $Matches[1]))
+            }
+            '/runCommands/([A-Za-z0-9-]+)\?\$expand=instanceView$' {
+                if ($script:runCommandViews.ContainsKey($Matches[1])) {
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ name = $Matches[1]; properties = @{ instanceView = $script:runCommandViews[$Matches[1]] } } -Depth 6))
+                }
+                return (New-Response 202)
             }
             '/runCommands/' {
                 if ($Method -eq 'PUT') {
@@ -1829,6 +1866,150 @@ Describe 'DbHub-Monitor (Invoke-DbHubMonitor) against a mocked Azure Resource Ma
         $result.monitoring | Should -Be 'StillNotRunning'
         $result.message | Should -Match 'start-demo\.ps1'
         ($script:clock - $start).TotalMinutes | Should -BeLessThan 11
+    }
+}
+
+Describe 'The session''s hosts (2026-11-16, live: a host''s start failed mid-session, and its status still said its activity went out)' {
+    BeforeEach {
+        Reset-TestAzure
+        Mock Get-DbHubUtcNow { return $script:clock }
+        Mock Start-Sleep { $script:clock = $script:clock.AddSeconds($Seconds) }
+        Mock Invoke-DbHubArm {
+            $script:calls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body; At = $script:clock })
+            return (Invoke-TestAzure -Method $Method -Path $Path -Body $Body)
+        }
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4 = 'Stopped'
+        $script:t4Sku = 'Standard_D4ds_v5'
+        $script:t4Tier = 'GeneralPurpose'
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $script:sessionId = '0123456789abcdef0123456789abcdef'
+        function Get-SessionStatus {
+            $writes = $script:secrets['dbhub-session-status']
+            return ($writes[$writes.Count - 1].Value | ConvertFrom-Json)
+        }
+        function Start-TestSession {
+            return (Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context (New-TestContext))
+        }
+        function Get-HostStep {
+            return @((Get-SessionStatus).steps | Where-Object step -EQ 'Host')
+        }
+    }
+
+    It 'says before the session runs that a host''s start failed, with the fix, and keeps what it wrote for DbHub-Monitor' {
+        # Live: archost01's start ended VMStartTimedOut while its power state already said running.
+        $script:vmFailed['archost01'] = @{ Code = 'ProvisioningState/failed/VMStartTimedOut'; Time = $script:clock.AddMinutes(2) }
+        $result = Start-TestSession
+        $result.status | Should -Be 'Partial'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'running'
+        $hostSteps = @(Get-HostStep)
+        $hostSteps.Count | Should -Be 1
+        $hostSteps[0].state | Should -Be 'Warning'
+        $hostSteps[0].message | Should -BeExactly 'T2: Azure says archost01''s last operation failed (VMStartTimedOut), so T2 may have no activity this session.'
+        $hostSteps[0].fix | Should -Match 'set STOP_NOW = True and Run all, then Run all again, which starts archost01 again'
+        @($status.runCommands | ForEach-Object vm) | Should -Contain 'archost01'
+        @($status.runCommands | Where-Object vm -EQ 'archost01' | ForEach-Object { $_.targets }) | Should -Be @('T2')
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:secrets['dbhub-session-status'][-1].Value
+    }
+
+    It 'blames neither a host that runs nor a failure from before the session started' {
+        $script:vmFailed['sqlvm01'] = @{ Code = 'ProvisioningState/failed/VMExtensionProvisioningError'; Time = $script:clock.AddHours(-3) }
+        $result = Start-TestSession
+        $result.status | Should -Be 'Started'
+        @(Get-HostStep) | Should -BeNullOrEmpty
+    }
+
+    It 'says when a dispatch Run Command failed, with how to see its output' {
+        $script:runCommandViews['DbHubControl-archost01-20261027150000'] = @{ executionState = 'Failed'; exitCode = 1; executionMessage = 'The guest didn''t answer.' }
+        $result = Start-TestSession
+        $result.status | Should -Be 'Partial'
+        $hostSteps = @(Get-HostStep)
+        $hostSteps.Count | Should -Be 1
+        $hostSteps[0].message | Should -BeExactly 'T2: the Run Command DbHubControl-archost01-20261027150000 that set its activity on archost01 ended Failed, exit code 1, so T2 may have no activity this session.'
+        $hostSteps[0].fix | Should -Match ([regex]::Escape('az vm run-command show -g rg-dbhub-demo --vm-name archost01 -n DbHubControl-archost01-20261027150000 --instance-view'))
+    }
+
+    It 'adds a host that stopped mid-session to the running session''s status once, through DbHub-Monitor, and starts or stops nothing' {
+        $null = Start-TestSession
+        $before = Get-SessionStatus
+        $writes = $script:secrets['dbhub-session-status'].Count
+        $script:vm['archost01'] = 'deallocated'
+        $script:clock = $script:clock.AddMinutes(30)
+        $checkedFrom = $script:calls.Count
+        $result = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock)
+        $result.session | Should -Be 'Warned'
+        $result.status | Should -Be 'Partial'
+        $result.monitoring | Should -Be 'Running'
+        $result.message | Should -Match 'T2: archost01 is deallocated, so T2 has no activity now\.'
+        $script:secrets['dbhub-session-status'].Count | Should -Be ($writes + 1)
+        $after = Get-SessionStatus
+        $after.phase | Should -Be 'running'
+        $after.sessionId | Should -Be $script:sessionId
+        @($after.steps).Count | Should -Be (@($before.steps).Count + 1) -Because 'the monitor keeps every step the session wrote'
+        $after.runEndUtc | Should -Be $before.runEndUtc
+        $hostSteps = @(Get-HostStep)
+        $hostSteps.Count | Should -Be 1
+        $hostSteps[0].message | Should -BeExactly 'T2: archost01 is deallocated, so T2 has no activity now.'
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:secrets['dbhub-session-status'][-1].Value
+        @($script:calls | Select-Object -Skip $checkedFrom | Where-Object { $_.Method -eq 'POST' }) | Should -BeNullOrEmpty
+        # The next check finds the same thing: nothing new is written.
+        $again = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock.AddMinutes(30))
+        $again.session | Should -Be 'Known'
+        $script:secrets['dbhub-session-status'].Count | Should -Be ($writes + 1)
+    }
+
+    It 'never writes over a newer status: <Case> between its read and its write' -ForEach @(
+        @{ Case = 'the session''s end'; Phase = 'stopped' }
+        @{ Case = 'another job''s write'; Phase = 'running' }
+    ) {
+        $null = Start-TestSession
+        $writes = $script:secrets['dbhub-session-status'].Count
+        $script:vm['archost01'] = 'deallocated'
+        $script:clock = $script:clock.AddMinutes(30)
+        $newer = (Get-SessionStatus | ConvertTo-Json -Depth 8 | ConvertFrom-Json -AsHashtable)
+        $newer['phase'] = $Phase
+        $newer['updatedUtc'] = '2026-10-27T15:30:01Z'
+        $script:newerJson = ConvertTo-Json -InputObject $newer -Depth 8 -Compress
+        $script:variableReads = 0
+        # The monitor's second read of the copy, right before its write, finds the newer one.
+        $script:variableReadHook = { if ($script:variableReads -eq 2) { $script:automationVariables['DbHubSessionStatus'] = $script:newerJson } }
+        $context = New-TestContext -NowUtc $script:clock
+        $result = Invoke-DbHubMonitor -Context $context
+        $result.session | Should -Be 'Changed'
+        $script:secrets['dbhub-session-status'].Count | Should -Be $writes
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:newerJson
+        @($context.Log | Where-Object { $_ -match 'changed while its hosts were checked .* didn''t write it' }).Count | Should -Be 1
+    }
+
+    It 'skips a variable that doesn''t exist, or a sandbox without the cmdlets, quietly: the session runs with its status, and DbHub-Monitor still checks T1''s plugin' {
+        $script:variableMissing = $true
+        $context = New-TestContext
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context $context
+        $result.status | Should -Be 'Started'
+        (Get-SessionStatus).phase | Should -Be 'running'
+        @($context.Log | Where-Object { $_ -match 'couldn''t be kept for the monitoring re-checks' }).Count | Should -Be 1
+        $script:vm['archost01'] = 'deallocated'
+        $script:clock = $script:clock.AddMinutes(30)
+        $monitor = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock)
+        $monitor.session | Should -Be 'NoStatus'
+        $monitor.monitoring | Should -Be 'Running'
+        $monitor.status | Should -Be 'Checked'
+        $script:variableMissing = $false
+        Mock Get-Command { return $null } -ParameterFilter { $Name -in 'Set-AutomationVariable', 'Get-AutomationVariable' }
+        $quiet = New-TestContext -NowUtc $script:clock
+        (Save-DbHubSessionStatusCopy -Context $quiet -Json '{}') | Should -BeFalse
+        Read-DbHubSessionStatusCopy -Context $quiet | Should -BeNullOrEmpty
+        $quiet.Log | Should -BeNullOrEmpty
+    }
+
+    It 'finds a status''s hosts from the targets its activity went out to when it has no runCommands' {
+        $script:vm['sqlvm01'] = 'running'
+        $script:vm['archost01'] = 'deallocated'
+        $status = [ordered]@{ sessionId = $script:sessionId; acceptedUtc = '2026-10-27T15:00:00Z'; dispatchUtc = [ordered]@{ T1 = '2026-10-27T15:04:00Z'; T2 = '2026-10-27T15:10:00Z' } }
+        $findings = @(Get-DbHubSessionHealth -Context (New-TestContext) -Status $status)
+        $findings.Count | Should -Be 1
+        $findings[0].Message | Should -BeExactly 'T2: archost01 is deallocated, so T2 has no activity now.'
     }
 }
 

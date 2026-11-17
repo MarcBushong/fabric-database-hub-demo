@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-The DbHub-Monitor runbook (ADR 0020): T1's monitoring plugin, checked again while an on-demand run lasts. It never
-starts or stops anything.
+The DbHub-Monitor runbook (ADR 0020): T1's monitoring plugin, checked again while an on-demand run lasts, and, while a
+session runs, the session's hosts (ADR 0026, 2026-11-16). It never starts or stops anything.
 
 .DESCRIPTION
 Windows PowerShell 5.1 in Azure Automation, published by scripts/setup-activity-control.ps1 with
@@ -14,6 +14,12 @@ extension's instance view and, when the Database Hub monitoring plugin reports a
 status for 5 minutes, restarts the SQL IaaS Agent service through an asynchronous managed Run Command, then reads it
 again for up to 5 minutes, as start-demo.ps1 does. Live, the plugin stopped within 90 minutes after a start, and a run
 lasts up to 120.
+
+While a session runs, it first reads the session's last status back from the account's variable DbHubSessionStatus,
+checks the VMs the session's activity went out to and its dispatch Run Commands (Azure Resource Manager reads only), and
+adds a VM that stopped, or a start or Run Command that failed, to the session's status once, as a Warning with the fix
+that the notebook's Run all prints (live, 2026-11-16: archost01's start failed 53 minutes into a session, and nothing
+said so). It writes only while the copy is still the one it read, so a newer status is never overwritten.
 
 When the demo resource group doesn't exist, no run is active, or sqlvm01 doesn't run, it logs that and exits cleanly.
 The job output holds the log and one result line, 'DBHUB-MONITOR <json>'.

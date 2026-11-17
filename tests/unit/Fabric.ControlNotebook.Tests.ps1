@@ -68,6 +68,52 @@ BeforeAll {
         return $file
     }
 
+    # The filled notebook with the live view of 76cdb12 (2026-11-16), from before it read the session's status again: a
+    # copy deployed before, beside runbooks that add a host's failure to the status.
+    function Get-OldLiveViewNotebook {
+        $old = @'
+# Live view: read-only telemetry queries and each beat as it begins, until the session's end (WAIT_FOR_END) or for
+# WATCH_MINUTES.
+refresh = min(max(int(REFRESH_SECONDS), 30), 300)
+view_end = None
+if FOLLOWING and WAIT_FOR_END and (LAST_STATUS or {}).get("phase") == "running":
+    view_end = parse_utc(LAST_STATUS.get("runEndUtc"))
+elif GO and MODE != "check" and (FOLLOWING or JOBS):
+    view_end = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=max(int(WATCH_MINUTES), 0))
+if view_end is not None:
+    announced, telemetry = set(), True
+    while True:
+        now = dt.datetime.now(dt.timezone.utc)
+        for beat in BEATS:
+            key = (beat["target"], beat["scenario"], beat["startUtc"])
+            if beat["startUtc"] <= now and key not in announced:
+                announced.add(key)
+                if now - beat["startUtc"] < dt.timedelta(seconds=refresh * 2):
+                    print("Now: %s %s, until %s; in Database Hub from about %s." % (beat["target"], beat["title"], clock(beat["endUtc"], CATALOG),
+                          clock(beat["startUtc"] + dt.timedelta(minutes=T4_SHOWS_MINUTES if beat["target"] == "T4" else SQL_SHOWS_MINUTES), CATALOG)))
+        if telemetry:
+            frames, message = live_snapshot(LOOKBACK_MINUTES)
+            print("=== %s UTC, the last %d minutes" % (now.strftime("%H:%M"), int(LOOKBACK_MINUTES)))
+            if frames is None:
+                print(message)
+                telemetry = False
+            else:
+                show_snapshot(frames)
+        left = (view_end - dt.datetime.now(dt.timezone.utc)).total_seconds()
+        if left <= 0:
+            break
+        time.sleep(min(refresh, left))
+'@
+        $notebook = Get-Content -LiteralPath (Get-FilledNotebook -Zone 'UTC') -Raw | ConvertFrom-Json -AsHashtable
+        $cell = @($notebook['cells'] | Where-Object { $_['cell_type'] -eq 'code' -and ($_['source'] -join '').StartsWith('# Live view:') })
+        $cell.Count | Should -Be 1
+        $lines = $old.Replace("`r`n", "`n").TrimEnd("`n") -split "`n"
+        $cell[0]['source'] = @(for ($index = 0; $index -lt $lines.Count; $index++) { if ($index -lt $lines.Count - 1) { $lines[$index] + "`n" } else { $lines[$index] } })
+        $file = Join-Path -Path $TestDrive -ChildPath 'filled-old-live-view.ipynb'
+        [System.IO.File]::WriteAllText($file, (ConvertTo-Json -InputObject $notebook -Depth 32), [System.Text.UTF8Encoding]::new($false))
+        return $file
+    }
+
     # Runs every code cell of a filled notebook with stand-ins (no network call leaves the process) and returns what it sent,
     # the histories it saved (reference runs) or started as jobs, the order of both, and what it printed.
     $script:simulator = Join-Path -Path $TestDrive -ChildPath 'simulate_control.py'
@@ -113,7 +159,7 @@ def iso(value):
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-SENT, JOBS, REFS, ORDER, REFUSED, JOBREADS, STOPS, SECRET_URL = [], [], [], [], [0], [0], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
+SENT, JOBS, REFS, ORDER, REFUSED, JOBREADS, STOPS, STATUSREADS, SECRET_URL = [], [], [], [], [0], [0], [0], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
 VAULT = {"dbhub-session-status": "{}", "dbhub-session-metrics": "{}", "dbhub-activity-webhook": SECRET_URL}
 RUNBOOK = {"session": None, "accepted": None, "minutes": 0}
 # The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound" and "full".
@@ -165,11 +211,23 @@ def runbook(body):
                                                          "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
 
 
+HOST_WARNING = {"step": "Host", "state": "Warning", "message": "T2: archost01 is deallocated, so T2 has no activity now.",
+                "fix": "The session's other targets go on. For T2: set STOP_NOW = True and Run all, then Run all again, which starts archost01 again; ./scripts/status.ps1 shows its state."}
+
+
 def vault_read(name):
+    if name == "dbhub-session-status":
+        STATUSREADS[0] += 1
     if name == "dbhub-session-status" and RUNBOOK["session"]:
         current = json.loads(VAULT[name])
         if current.get("phase") == "starting" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(seconds=60):
             VAULT[name] = json.dumps(running_status(RUNBOOK["session"], RUNBOOK["accepted"], RUNBOOK["minutes"]))
+        elif scenario == "hostfail" and current.get("phase") == "running" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=40) \
+                and not any(step.get("step") == "Host" for step in current.get("steps") or []):
+            # DbHub-Monitor's re-check (2026-11-16): the same status, with the host that stopped, and the new runCommands field.
+            current["steps"].append(dict(HOST_WARNING, atUtc=iso(Clock.now)))
+            current["runCommands"] = [{"vm": "archost01", "name": "DbHubControl-archost01-x", "targets": ["T2"]}]
+            VAULT[name] = json.dumps(current)
     return VAULT[name]
 
 
@@ -276,7 +334,7 @@ with contextlib.redirect_stdout(buffer):
     except Exception as failure:
         error = "%s: %s" % (type(failure).__name__, failure)
 printed = buffer.getvalue()
-print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed}))
+print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "statusReads": STATUSREADS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed}))
 '@
 
     function Invoke-Simulation([string] $Path, [string] $Scenario, [string] $Start) {
@@ -800,6 +858,36 @@ print(json.dumps(out))
         $last | Should -Match '\nend_session_for_history\(\)$'
         @([regex]::Matches($script:allCode, 'session\.stop\(\)')).Count | Should -Be 1
         $script:allCode | Should -Match '(?m)^    utils\.session\.stop\(\)\n    return True$'
+    }
+    It 'prints a host''s failure that DbHub-Monitor adds while the session runs, with its fix, reading the status at most every 5 minutes (2026-11-16)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'hostfail' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.printed | Should -Match 'Host\s+Warning T2: archost01 is deallocated, so T2 has no activity now\.\s+Fix: The session''s other targets go on\. For T2: set STOP_NOW = True and Run all, then Run all again'
+        @([regex]::Matches($report.printed, 'archost01 is deallocated')).Count | Should -Be 1
+        $report.printed | Should -Match 'Pass: the history is saved'
+        # The same session with the live view from before (76cdb12): what the re-reads cost, and an old notebook with the
+        # new runbooks, which runs as before and only doesn't show the host live.
+        $old = Invoke-Simulation -Path (Get-OldLiveViewNotebook) -Scenario 'hostfail' -Start '2026-11-14T14:00:00Z'
+        $old.error | Should -BeNullOrEmpty
+        $old.printed | Should -Match 'Pass: the history is saved'
+        $old.printed | Should -Not -Match 'archost01 is deallocated'
+        ($report.statusReads - $old.statusReads) | Should -BeLessOrEqual 19 -Because 'a 90-minute live view reads the status at most every 5 minutes'
+        ($report.statusReads - $old.statusReads) | Should -BeGreaterThan 10
+    }
+
+    It 'shows nothing new from a status that runbooks from before 2026-11-16 wrote, which has no host steps and no runCommands' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'session' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.printed | Should -Not -Match '\bHost\b'
+        $report.printed | Should -Match 'Pass: the history is saved'
     }
     It 'says in the demo''s own time zone when the session ends (needs Python''s time zone data)' {
         if (-not $script:python) {

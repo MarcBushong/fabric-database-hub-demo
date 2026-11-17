@@ -2688,9 +2688,9 @@ function Start-DbHubActivityRun {
 
     $settings = $Context.Settings
     if (-not $PSCmdlet.ShouldProcess($settings.demoResourceGroup, 'Start an on-demand run')) {
-        return [pscustomobject]@{ action = 'run'; status = 'Refused'; message = 'What if: nothing was started.'; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @(); replica = '' }
+        return [pscustomobject]@{ action = 'run'; status = 'Refused'; message = 'What if: nothing was started.'; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @(); replica = ''; runCommands = @() }
     }
-    $result = [ordered]@{ action = 'run'; status = 'Refused'; message = ''; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @(); replica = '' }
+    $result = [ordered]@{ action = 'run'; status = 'Refused'; message = ''; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @(); replica = ''; runCommands = @() }
     $progress = $OnProgress
     if ($null -eq $progress) {
         # Nothing to tell: the kind and detail it's called with are dropped.
@@ -2867,6 +2867,8 @@ function Start-DbHubActivityRun {
     # This run's Run Commands, which no cleanup of its own deletes.
     $runNames = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $runNames.Add(('{0}monitoring-{1}' -f $settings.runCommandPrefix, $stamp))
+    # The dispatch Run Commands Azure accepted, with their VM and targets, for a session's checks of its hosts (2026-11-16).
+    $sentCommands = New-Object -TypeName 'System.Collections.Generic.List[object]'
     $plans = [ordered]@{}
     foreach ($vm in @($byVm.Keys)) {
         # T4's off goes out with sqlvm01's activities, without waiting for T4: its profile is a file on T1.
@@ -2885,6 +2887,7 @@ function Start-DbHubActivityRun {
         param([string] $VmName, [object[]] $Chosen, [string] $Name)
         $runNames.Add($Name)
         if (Send-DbHubDispatch -Context $Context -VmName $VmName -Activity $Chosen -Name $Name -RequestedBy $who) {
+            $sentCommands.Add([ordered]@{ vm = $VmName; name = $Name; targets = @($Chosen | ForEach-Object { [string]$_.Target }) })
             foreach ($item in $Chosen) {
                 if ($item.Scenario -ceq 'off') {
                     $dispatched.Add(('{0}: off' -f $item.Target))
@@ -2998,6 +3001,7 @@ function Start-DbHubActivityRun {
     }
     $result.dispatched = $dispatched.ToArray()
     $result.skipped = $skipped.ToArray()
+    $result.runCommands = $sentCommands.ToArray()
     if ($sent.Activities -eq 0) {
         $stopped = Stop-DbHubDemo -Context $Context -Tags $Tags
         $result.status = 'Failed'
@@ -3280,6 +3284,9 @@ function New-DbHubSessionStatus {
         steps             = @()
         dispatched        = @()
         skipped           = @()
+        # The dispatch Run Commands Azure accepted (vm, name, targets), which the checks of the session's hosts read
+        # (2026-11-16).
+        runCommands       = @()
         monitoring        = ''
         t4                = [ordered]@{ state = ''; sku = ''; tier = ''; dispatchUtc = '' }
         # When each target's activity went out (2026-11-14): its showcase's cycles start there, for the notebook's guide.
@@ -3350,6 +3357,8 @@ function Write-DbHubSessionStatus {
         if (-not $name) {
             $name = 'dbhub-session-status'
         }
+        # The copy DbHub-Monitor reads back, because the vault's can't be read through Azure Resource Manager (2026-11-16).
+        $null = Save-DbHubSessionStatusCopy -Context $Context -Json $json
         $written = Set-DbHubVaultSecret -Context $Context -Name $name -Value $json -Tags @{ sessionId = [string]$Status['sessionId']; phase = [string]$Status['phase'] }
         if ($written.Ok) {
             return $true
@@ -3363,6 +3372,326 @@ function Write-DbHubSessionStatus {
         Write-DbHubLog -Context $Context -Message ('The session''s status wasn''t written: {0}' -f $_.Exception.Message)
     }
     return $false
+}
+
+$script:DbHubStatusVariable = 'DbHubSessionStatus'
+
+function ConvertTo-DbHubDictionary {
+    # A parsed JSON value as ordered dictionaries and arrays, as New-DbHubSessionStatus builds a status, because Windows
+    # PowerShell 5.1's ConvertFrom-Json has no -AsHashtable. A time that PowerShell 7 parsed goes back to its text.
+    param(
+        [AllowNull()]
+        [object] $InputObject
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+    if ($InputObject -is [datetime]) {
+        return (ConvertTo-DbHubTimeText -Value $InputObject)
+    }
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $dictionary = [ordered]@{}
+        foreach ($property in $InputObject.PSObject.Properties) {
+            $dictionary[[string]$property.Name] = ConvertTo-DbHubDictionary -InputObject $property.Value
+        }
+        return $dictionary
+    }
+    if ($InputObject -is [System.Array]) {
+        $items = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        foreach ($item in $InputObject) {
+            $items.Add((ConvertTo-DbHubDictionary -InputObject $item))
+        }
+        return , $items.ToArray()
+    }
+    return $InputObject
+}
+
+function Save-DbHubSessionStatusCopy {
+    <#
+    .SYNOPSIS
+    Keeps the session's status, as written to the vault, in the control account's variable DbHubSessionStatus too
+    (2026-11-16), which infra/control/control.bicep creates: DbHub-Monitor reads it back to add a host's failure,
+    because the identity can't read the vault's value through Azure Resource Manager. Set-AutomationVariable is the
+    sandbox's internal cmdlet for an existing variable, with no role needed
+    (https://learn.microsoft.com/azure/automation/shared-resources/variables). Only in the control's account (its settings
+    name the control vault). Never throws; returns whether it was kept.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Json
+    )
+
+    if (-not [string](Get-DbHubMember -InputObject $Context.Settings -Name 'controlVault') -or -not (Get-Command -Name 'Set-AutomationVariable' -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+    try {
+        Set-AutomationVariable -Name $script:DbHubStatusVariable -Value $Json
+        return $true
+    }
+    catch {
+        if (-not (Get-DbHubMember -InputObject $Context -Name 'StatusCopyWarned')) {
+            $Context | Add-Member -NotePropertyName 'StatusCopyWarned' -NotePropertyValue $true -Force
+            Write-DbHubLog -Context $Context -Message ('The session''s status couldn''t be kept for the monitoring re-checks ({0}), so they can''t add a host''s failure to it; ./scripts/deploy.ps1 creates the variable {1}.' -f $_.Exception.Message, $script:DbHubStatusVariable)
+        }
+        return $false
+    }
+}
+
+function Read-DbHubSessionStatusCopy {
+    # The session's last status from the control account's variable DbHubSessionStatus (Get-AutomationVariable), as
+    # ordered dictionaries, or $null when there's none.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context
+    )
+
+    if (-not (Get-Command -Name 'Get-AutomationVariable' -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+    try {
+        $text = [string](Get-AutomationVariable -Name $script:DbHubStatusVariable)
+        if (-not $text.TrimStart().StartsWith('{')) {
+            return $null
+        }
+        $status = ConvertTo-DbHubDictionary -InputObject ($text | ConvertFrom-Json)
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The session''s status couldn''t be read back from the variable {0}: {1}' -f $script:DbHubStatusVariable, $_.Exception.Message)
+        return $null
+    }
+    if ($status -isnot [System.Collections.IDictionary]) {
+        return $null
+    }
+    return $status
+}
+
+function Get-DbHubSessionHealth {
+    <#
+    .SYNOPSIS
+    The hosts of a session that runs (2026-11-16; live, archost01's start ended VMStartTimedOut 53 minutes into a session
+    and T2's Run Command failed with it, while the session's status still said T2's activity went out): each VM the
+    session's activity went out to, from its instance view, and on a VM that runs, each of the session's dispatch Run
+    Commands, from its instance view. Azure Resource Manager reads only: one per VM and one per Run Command. A VM's
+    failed provisioning counts only from the session's start on, so an older failure (an extension's, say) isn't blamed
+    on it. Returns one finding (Message and Fix) per problem, in words that stay the same while the problem does, so a
+    check that finds it again adds nothing.
+    https://learn.microsoft.com/rest/api/compute/virtual-machines/instance-view
+    https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/get-by-virtual-machine
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status
+    )
+
+    $settings = $Context.Settings
+    # The session's VMs with their targets and Run Commands: from runCommands, or, in a status from before them, from the
+    # targets its activity went out to.
+    $hosts = [ordered]@{}
+    $addHost = {
+        param([string] $VmName)
+        if (-not $hosts.Contains($VmName)) {
+            $hosts[$VmName] = [pscustomobject]@{ Targets = (New-Object -TypeName 'System.Collections.Generic.List[string]'); Commands = (New-Object -TypeName 'System.Collections.Generic.List[object]') }
+        }
+        return $hosts[$VmName]
+    }
+    foreach ($command in @(Get-DbHubMember -InputObject $Status -Name 'runCommands')) {
+        $vm = [string](Get-DbHubMember -InputObject $command -Name 'vm')
+        $name = [string](Get-DbHubMember -InputObject $command -Name 'name')
+        if ($vm -notmatch '^[A-Za-z0-9-]{1,64}$' -or $name -notmatch '^[A-Za-z0-9-]{1,64}$') {
+            continue
+        }
+        $entry = & $addHost $vm
+        $targets = @(@(Get-DbHubMember -InputObject $command -Name 'targets') | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^T[1-4]$' })
+        $entry.Commands.Add([pscustomobject]@{ Name = $name; Targets = $targets })
+        foreach ($target in $targets) {
+            if (-not $entry.Targets.Contains($target)) {
+                $entry.Targets.Add($target)
+            }
+        }
+    }
+    if ($hosts.Count -eq 0) {
+        foreach ($target in @(Get-DbHubPropertyName -InputObject (Get-DbHubMember -InputObject $Status -Name 'dispatchUtc'))) {
+            if ($target -match '^T[1-4]$') {
+                $entry = & $addHost (Get-DbHubTargetVm -Settings $settings -Target $target)
+                if (-not $entry.Targets.Contains($target)) {
+                    $entry.Targets.Add($target)
+                }
+            }
+        }
+    }
+    $label = {
+        param([string[]] $Targets, [string] $VmName)
+        $sorted = @($Targets | Sort-Object)
+        if ($sorted.Count -eq 0) {
+            return $VmName
+        }
+        if ($sorted.Count -le 2) {
+            return ($sorted -join ' and ')
+        }
+        return ('{0}, and {1}' -f ($sorted[0..($sorted.Count - 2)] -join ', '), $sorted[-1])
+    }
+    $since = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $Status -Name 'acceptedUtc')
+    $vmVersion = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines'
+    $commandVersion = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
+    $findings = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    foreach ($vm in @($hosts.Keys)) {
+        $entry = $hosts[$vm]
+        $who = & $label $entry.Targets.ToArray() $vm
+        $vmFix = 'The session''s other targets go on. For {0}: set STOP_NOW = True and Run all, then Run all again, which starts {1} again; ./scripts/status.ps1 shows its state.' -f $who, $vm
+        $view = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/instanceView' -f (Get-DbHubDemoPath -Settings $settings), $vm) -ApiVersion $vmVersion
+        if ($view.StatusCode -ne 200) {
+            Write-DbHubLog -Context $Context -Message ('{0} couldn''t be read for the session''s check: {1}' -f $vm, $view.Error)
+            continue
+        }
+        $power = ''
+        $failed = ''
+        foreach ($item in @(Get-DbHubMember -InputObject $view.Body -Name 'statuses')) {
+            $code = [string](Get-DbHubMember -InputObject $item -Name 'code')
+            if ($code -like 'PowerState/*') {
+                $power = $code.Substring(11)
+            }
+            elseif ($code -like 'ProvisioningState/failed*') {
+                $at = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $item -Name 'time')
+                if ($null -eq $since -or $null -eq $at -or $at -ge $since) {
+                    $parts = $code -split '/'
+                    $failed = 'failed'
+                    if ($parts.Count -ge 3 -and $parts[2] -match '^[A-Za-z0-9]{1,80}$') {
+                        $failed = $parts[2]
+                    }
+                    Write-DbHubLog -Context $Context -Message ('{0}: {1} ({2})' -f $vm, $code, [string](Get-DbHubMember -InputObject $item -Name 'message'))
+                }
+            }
+        }
+        if ($power -in 'deallocated', 'deallocating', 'stopped', 'stopping') {
+            $findings.Add([pscustomobject]@{ Message = ('{0}: {1} is {2}, so {0} has no activity now.' -f $who, $vm, $power); Fix = $vmFix })
+            continue
+        }
+        if ($failed) {
+            $findings.Add([pscustomobject]@{ Message = ('{0}: Azure says {1}''s last operation failed ({2}), so {0} may have no activity this session.' -f $who, $vm, $failed); Fix = $vmFix })
+            continue
+        }
+        if ($power -ne 'running') {
+            continue
+        }
+        foreach ($command in $entry.Commands) {
+            $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands/{2}?$expand=instanceView' -f (Get-DbHubDemoPath -Settings $settings), $vm, $command.Name) -ApiVersion $commandVersion
+            if ($read.StatusCode -ne 200) {
+                continue
+            }
+            $instance = Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'instanceView'
+            $state = [string](Get-DbHubMember -InputObject $instance -Name 'executionState')
+            if ($state -notin 'Failed', 'TimedOut', 'Canceled') {
+                continue
+            }
+            $exit = Get-DbHubMember -InputObject $instance -Name 'exitCode'
+            $exitText = ''
+            if ($null -ne $exit) {
+                $exitText = ', exit code {0}' -f [int]$exit
+            }
+            $commandWho = & $label $command.Targets $vm
+            Write-DbHubLog -Context $Context -Message ('{0}: Run Command {1} ended {2}: {3}' -f $vm, $command.Name, $state, [string](Get-DbHubMember -InputObject $instance -Name 'executionMessage'))
+            $findings.Add([pscustomobject]@{ Message = ('{0}: the Run Command {1} that set its activity on {2} ended {3}{4}, so {0} may have no activity this session.' -f $commandWho, $command.Name, $vm, $state, $exitText); Fix = ('Its output: az vm run-command show -g {0} --vm-name {1} -n {2} --instance-view. The session''s other targets go on; for {3}, set STOP_NOW = True and Run all, then Run all again.' -f $settings.demoResourceGroup, $vm, $command.Name, $commandWho) })
+        }
+    }
+    return $findings.ToArray()
+}
+
+function Add-DbHubSessionHealthStep {
+    # Adds each finding of Get-DbHubSessionHealth as a Host step (Warning) that the status doesn't have yet. Returns how
+    # many it added.
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [AllowEmptyCollection()]
+        [object[]] $Finding = @()
+    )
+
+    $known = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
+    foreach ($step in @($Status['steps'])) {
+        if ([string](Get-DbHubMember -InputObject $step -Name 'step') -eq 'Host') {
+            $null = $known.Add([string](Get-DbHubMember -InputObject $step -Name 'message'))
+        }
+    }
+    $added = 0
+    foreach ($item in $Finding) {
+        if ($null -eq $item -or -not $known.Add((ConvertTo-DbHubSafeText -Text ([string]$item.Message)))) {
+            continue
+        }
+        Add-DbHubSessionStep -Status $Status -Step 'Host' -State 'Warning' -Message ([string]$item.Message) -Fix ([string]$item.Fix)
+        $added++
+    }
+    return $added
+}
+
+function Update-DbHubSessionHealth {
+    <#
+    .SYNOPSIS
+    DbHub-Monitor's look at a running session's hosts (2026-11-16): the session's last status from its copy (the
+    variable DbHubSessionStatus), the checks of Get-DbHubSessionHealth, and the status written again, to the vault and
+    the copy, only when a problem is new, and only while the session runs: before its end, and while its copy is still the
+    one it read, untouched since, right before the write, so a newer status, such as the session's end, is never
+    overwritten. Never throws. Returns Outcome (NoSession, NoStatus, Ended, Healthy, Known, Changed, Warned) and Note, a
+    sentence for the monitor's result.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes only the running session''s own status, from DbHub-Monitor''s scheduled re-check, which starts or stops nothing.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $session = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId')
+    if ($session -notmatch '^[0-9a-f]{32}$') {
+        return [pscustomobject]@{ Outcome = 'NoSession'; Note = '' }
+    }
+    try {
+        $status = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -eq $status) {
+            # No copy (a variable that doesn't exist says so once, in Read-DbHubSessionStatusCopy).
+            return [pscustomobject]@{ Outcome = 'NoStatus'; Note = '' }
+        }
+        if ([string]$status['sessionId'] -ne $session -or [string]$status['phase'] -ne 'running') {
+            # A session that has ended, or a run after one: nothing runs to check.
+            return [pscustomobject]@{ Outcome = 'NoSession'; Note = '' }
+        }
+        $readUpdated = [string]$status['updatedUtc']
+        $end = ConvertTo-DbHubUtc -Value $status['runEndUtc']
+        if ($null -ne $end -and (Get-DbHubUtcNow) -ge $end) {
+            return [pscustomobject]@{ Outcome = 'Ended'; Note = '' }
+        }
+        $findings = @(Get-DbHubSessionHealth -Context $Context -Status $status)
+        if ($findings.Count -eq 0) {
+            return [pscustomobject]@{ Outcome = 'Healthy'; Note = ' The session''s hosts run.' }
+        }
+        $added = Add-DbHubSessionHealthStep -Status $status -Finding $findings
+        if ($added -eq 0) {
+            return [pscustomobject]@{ Outcome = 'Known'; Note = ' The session''s status already says what doesn''t run.' }
+        }
+        # Never over a newer status (the coordinator's guard, 2026-11-16): the copy must be the one read above, of a
+        # session that still runs, or the session's end or another job wrote since, and this write would undo it.
+        $again = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -eq $again -or [string]$again['sessionId'] -ne $session -or [string]$again['phase'] -ne 'running' -or [string]$again['updatedUtc'] -ne $readUpdated) {
+            Write-DbHubLog -Context $Context -Message 'The session''s status changed while its hosts were checked (it ended, or another job wrote it), so this check didn''t write it.'
+            return [pscustomobject]@{ Outcome = 'Changed'; Note = '' }
+        }
+        $null = Write-DbHubSessionStatus -Context $Context -Status $status
+        $texts = @(@($status['steps']) | Select-Object -Last $added | ForEach-Object { [string](Get-DbHubMember -InputObject $_ -Name 'message') })
+        return [pscustomobject]@{ Outcome = 'Warned'; Note = (' The session''s status now says: {0}' -f ($texts -join ' ')) }
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The session''s hosts weren''t checked: {0}' -f $_.Exception.Message)
+        return [pscustomobject]@{ Outcome = 'NoStatus'; Note = '' }
+    }
 }
 
 function Get-DbHubT4Server {
@@ -4571,6 +4900,7 @@ function Start-DbHubSession {
     $status['dispatched'] = @($run.dispatched)
     $status['skipped'] = @($run.skipped)
     $status['monitoring'] = [string]$run.monitoring
+    $status['runCommands'] = @(@(Get-DbHubMember -InputObject $run -Name 'runCommands') | Where-Object { $null -ne $_ })
     if ([string]$run.status -ne 'Dispatched') {
         # Refused (the auto-stop couldn't be created, or there was nothing to run) or Failed (nothing could be dispatched,
         # so the run stopped everything again). The group's tags were read before the marker was set, so it's cleared here.
@@ -4661,6 +4991,10 @@ function Start-DbHubSession {
         }
         Add-DbHubSessionStep -Status $status -Step 'ReplicaLag' -State $lagLevel -Message $lag['note'] -Fix $lag['fix']
     }
+
+    # The session's hosts as its start ends (2026-11-16): a VM whose start failed or that stopped, or a dispatch Run
+    # Command that failed, is a Warning now; DbHub-Monitor's re-checks look again while the session runs.
+    $null = Add-DbHubSessionHealthStep -Status $status -Finding @(Get-DbHubSessionHealth -Context $Context -Status $status)
 
     $warnings = @(@($status['steps']) | Where-Object { $_['state'] -in 'Warning', 'Fail' }).Count
     $result.status = 'Started'
@@ -4928,11 +5262,18 @@ function Invoke-DbHubMonitor {
         Write-DbHubLog -Context $Context -Message ('Nothing to check: {0}.' -f $why)
         return [pscustomobject]@{ action = 'monitor'; status = 'Skipped'; monitoring = ''; message = ('Nothing was checked: {0}.' -f $why) }
     }
+    # A running session's hosts first (2026-11-16): a VM that stopped or whose start failed, or a dispatch Run Command that
+    # failed, goes into the session's status as a Warning, which Run all's live cell prints.
+    $health = Update-DbHubSessionHealth -Context $Context -Tags $group.Tags
     $vm = [string]$settings.sqlVmName
     $state = Get-DbHubVmState -Context $Context -VmName $vm
     if ($state -ne 'running') {
         Write-DbHubLog -Context $Context -Message ('Nothing to check: {0} is {1}.' -f $vm, $state)
-        return [pscustomobject]@{ action = 'monitor'; status = 'Skipped'; monitoring = ''; message = ('Nothing was checked: {0} is {1}.' -f $vm, $state) }
+        $skippedStatus = 'Skipped'
+        if ($health.Outcome -in 'Warned', 'Known') {
+            $skippedStatus = 'Partial'
+        }
+        return [pscustomobject]@{ action = 'monitor'; status = $skippedStatus; monitoring = ''; session = $health.Outcome; message = ('T1''s monitoring plugin wasn''t checked: {0} is {1}.{2}' -f $vm, $state, $health.Note) }
     }
     $stamp = $Context.NowUtc.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
     $look = Initialize-DbHubMonitorState
@@ -4959,8 +5300,8 @@ function Invoke-DbHubMonitor {
         Unfinished      = 'T1''s monitoring plugin wasn''t settled in time; nothing more was changed.'
     }
     $status = 'Checked'
-    if ($outcome -in 'StillNotRunning', 'RestartRefused', 'Unread', 'Unfinished') {
+    if ($outcome -in 'StillNotRunning', 'RestartRefused', 'Unread', 'Unfinished' -or $health.Outcome -in 'Warned', 'Known') {
         $status = 'Partial'
     }
-    return [pscustomobject]@{ action = 'monitor'; status = $status; monitoring = $outcome; message = $texts[$outcome] }
+    return [pscustomobject]@{ action = 'monitor'; status = $status; monitoring = $outcome; session = $health.Outcome; message = ($texts[$outcome] + $health.Note) }
 }

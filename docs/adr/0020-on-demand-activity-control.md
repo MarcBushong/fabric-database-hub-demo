@@ -67,7 +67,8 @@ It's optional and off by default (`control.enabled`; [configuration](../../confi
 | `kv-<prefix>-ctl-<suffix>` | Key Vault, Standard, Azure RBAC, 7-day soft delete, purge protection off so that `-Remove` can purge it, public network access by the mode below, no diagnostic settings |
 | `dbhub-activity-webhook` | The vault's one secret: the webhook URL, expiring with the webhook |
 | `dbhub-autostop` | One-time schedule per run, linked to `DbHub-Stop -Scope All` |
-| `dbhub-monitor-<n>` | One-time schedules every 30 minutes of a run that uses `sqlvm01`, while they come at least 5 minutes before its end, each linked to `DbHub-Monitor` (no parameters); they go with the auto-stop (since 2026-11-03) |
+| `dbhub-monitor-<n>` | One-time schedules every 30 minutes of a run that uses `sqlvm01`, while they come at least 5 minutes before its end, each linked to `DbHub-Monitor` (no parameters); they go with the auto-stop (since 2026-11-03). While a session runs, each also checks the session's hosts (2026-11-16, [ADR 0026](0026-one-run-all-session.md#2026-11-16-amendment-a-host-that-stops-during-a-session)) |
+| `DbHubSessionStatus` | The Automation account's variable with the last status the runbooks wrote to the vault, which `DbHub-Monitor` reads back (2026-11-16, ADR 0026); never a credential |
 | `dbhub-t4-safety-stop` | Daily schedule, linked to `DbHub-Stop -Scope T4` |
 
 The resources carry `component` = `activity-control` and the demo's `solution`, `purpose`, `owner`, and `costCenter` tags, without `environment` or `deploymentId`, so `destroy.ps1`'s residual check never matches them. `infra/control/control.bicep` deploys the identity, the account, and the vault; `infra/control/webhook.bicep` deploys the webhook and its secret.
