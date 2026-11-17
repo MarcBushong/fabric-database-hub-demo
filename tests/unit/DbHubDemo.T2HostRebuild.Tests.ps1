@@ -217,11 +217,14 @@ Describe 'Invoke-DemoT2HostRebuild: once, in order, and what it says (2026-11-17
         $script:rows[0] | Should -Be 'T2.HostRebuild|Running|'
         $script:rows[-1] | Should -Be 'T2.HostRebuild|Done|Warning'
         $script:order | Should -Not -Contain 'shutdown' -Because 'no run is marked busy'
-        # What the run builds on the new host follows the T2 mode.
+        # What the run builds on the new host follows the T2 mode, and so does the time the start announces (measured
+        # live on 2026-11-17 for the Jumpstart image).
         $rebuild.Result.message | Should -Match 'This run now builds T2 on it from Arc Jumpstart''s image and onboards it to Azure Arc \(about an hour\)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'builds T2 on it again in this run \(about 70 minutes in all; 72 when measured on 2026-11-17\); no action needed\.$' } -Times 1 -Exactly
         $developer = New-TestConfig
         $developer['t2SqlInstallMode'] = 'Developer'
         (InModuleScope DbHubDemo -Parameters @{ Config = $developer } { Invoke-DemoT2HostRebuild -Config $Config -Confirm:$false }).Result.message | Should -Match 'This run now builds T2''s guest on it in Developer mode and onboards it to Azure Arc \(longer than an hour'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'builds T2 on it again in this run \(longer than an hour: Windows and SQL Server are installed from evaluation media\); no action needed\.$' } -Times 1 -Exactly
     }
 
     It 'moves the new host''s auto-shutdown out of a busy run''s way before it waits for the agent' {

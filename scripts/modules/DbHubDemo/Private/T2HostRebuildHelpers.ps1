@@ -397,7 +397,9 @@ function Invoke-DemoT2HostRebuild {
     if (-not $PSCmdlet.ShouldProcess('archost01', 'Delete the T2 host and its disks, and create it again from its template')) {
         return [pscustomobject]@{ Rebuilt = $false; Result = $null; Results = @() }
     }
-    $start = 'archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, so deploy.ps1 rebuilds T2''s host once now: it deletes archost01 and its disks, creates it again from the template, and builds T2 on it again in this run (about 90 minutes in all); no action needed.' -f $why
+    $mode = [string]$Config['t2SqlInstallMode']
+    $total = if ($mode -in 'ProductKey', 'Developer') { 'longer than an hour: Windows and SQL Server are installed from evaluation media' } else { 'about 70 minutes in all; 72 when measured on 2026-11-17' }
+    $start = 'archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, so deploy.ps1 rebuilds T2''s host once now: it deletes archost01 and its disks, creates it again from the template, and builds T2 on it again in this run ({1}); no action needed.' -f $why, $total
     Write-DemoLog -Level Warning -Message $start
     Set-DemoProgressStep -Path $ProgressPath -Id $row -State 'Running' -AzureSide -Message $start -MaxLength 1200
     $template = $null
@@ -443,7 +445,6 @@ function Invoke-DemoT2HostRebuild {
         return (& $finish 'Fail' ('archost01 was rebuilt{0}, but the new host''s VM agent wasn''t Ready within {1} minutes either, so the cause is on Azure''s side.' -f $why, $AgentWaitMinutes) 'Run ./scripts/deploy.ps1 again later: it recovers the host, and rebuilds it once more if its agent stays down. If the agent stays down, open a support request with Azure: the VM never gets its goal state from Azure (docs/troubleshooting.md, "A host''s VM agent that isn''t Ready").')
     }
     $minutes = [int][System.Math]::Ceiling($watch.Elapsed.TotalMinutes)
-    $mode = [string]$Config['t2SqlInstallMode']
     $build = if ($mode -in 'ProductKey', 'Developer') { 'builds T2''s guest on it in {0} mode and onboards it to Azure Arc (longer than an hour: Windows and SQL Server are installed from evaluation media)' -f $mode } else { 'builds T2 on it from Arc Jumpstart''s image and onboards it to Azure Arc (about an hour)' }
     return (& $finish 'Warning' ('archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, so deploy.ps1 rebuilt T2''s host in {1} minutes: it deleted archost01 and its disks and created it again from the template, and the new host''s agent is Ready. This run now {2}; T2''s old Arc machine is replaced at onboarding.' -f $why, $minutes, $build) 'Nothing to do: the run goes on with T2. docs/troubleshooting.md ("A host''s VM agent that isn''t Ready") says why it happens.')
 }
