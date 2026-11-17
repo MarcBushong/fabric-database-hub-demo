@@ -190,6 +190,11 @@ function Stop-DemoEnvironment {
         elseif ($item -eq 'T2' -and ($hostVm -ne 'archost01' -or 'archost01' -notin $state.RunnerSentTo)) {
             $skip = 'T2 has no workload runner (the evaluation-only mode, or the runner wasn''t sent to archost01).'
         }
+        elseif (-not $power[$vm]) {
+            # Live, 2026-11-16: a VM whose start Azure ended VMStartTimedOut showed no power state; it was running, so "isn't
+            # running" was wrong. Its deallocation below stops whatever runs there.
+            $skip = '{0} shows no power state (its last operation failed, or one is still running), so its profile wasn''t set to off; its deallocation below stops any activity there.' -f $vm
+        }
         elseif ($power[$vm] -ne 'PowerState/running') {
             $skip = '{0} isn''t running, so no activity runs there. A profile ends at the auto-shutdown it was set for, and nothing sets it again at boot unless activityProfileOnBoot is true.' -f $vm
         }

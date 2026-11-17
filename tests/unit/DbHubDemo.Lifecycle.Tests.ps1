@@ -3440,6 +3440,36 @@ Describe 'Invoke-DemoVmPowerAction' {
         $result.evidence.issued | Should -Be 'start'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'start' }
     }
+
+    It 'deallocates a VM whose last operation failed at once, instead of waiting for a power state that never comes (live, 2026-11-16)' {
+        # Live, 2026-11-16: archost01's start ended VMStartTimedOut, so its instance view showed no power state, and
+        # stop-demo.ps1 waited 900 seconds, then sent no deallocate: the VM kept billing. Its power state stays empty until a
+        # deallocate goes out, as Azure's does.
+        $script:deallocateSent = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($script:deallocateSent) { 'PowerState/deallocated' } else { '' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { if ($ArgumentList -contains 'deallocate') { $script:deallocateSent = $true }; New-AzResult }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm show ' } -MockWith { [System.Threading.Thread]::Sleep(100); New-AzResult -StdOut '/subscriptions/x/resourceGroups/rg-dbhub-test/providers/Microsoft.Compute/virtualMachines/archost01' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { @('ProvisioningState/failed/VMStartTimedOut') }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Deallocate -TimeoutSeconds 30 -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'archost01 is deallocated after .* Its last operation had failed \(ProvisioningState/failed/VMStartTimedOut\)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'deallocate' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAz -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match '^vm show ' } -Because 'it acts on the first read instead of waiting'
+    }
+
+    It 'still waits for a VM that shows no power state while Azure works on it, and never deallocates it mid-operation' {
+        foreach ($state in '', '', 'PowerState/running', 'PowerState/deallocated') {
+            $script:states.Enqueue($state)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm show ' } -MockWith { New-AzResult -StdOut '/subscriptions/x/resourceGroups/rg-dbhub-test/providers/Microsoft.Compute/virtualMachines/archost01' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { @('ProvisioningState/updating') }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Deallocate -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Not -Match 'last operation had failed'
+        $result.evidence.failedState | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAz -Times 2 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match '^vm show ' } -Because 'it waited through both reads without a power state'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'deallocate' }
+    }
 }
 
 Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts what was stopped (Phase 28 live finding)' {

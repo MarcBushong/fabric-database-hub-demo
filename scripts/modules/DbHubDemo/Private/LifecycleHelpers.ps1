@@ -53,11 +53,22 @@ function Invoke-DemoVmPowerAction {
     # can also carry no power state at all (live, 2026-10-22: sqlvm01 just after both VMs' 'az vm start --no-wait'
     # was reported missing), so only a VM that Azure says doesn't exist is reported missing.
     $settle = [System.Diagnostics.Stopwatch]::StartNew()
+    # A VM whose last operation failed shows no power state until another operation changes it (live, 2026-11-16: archost01's
+    # start ended VMStartTimedOut, and stop-demo.ps1 waited 900 seconds for a power state, then sent no deallocate, so the
+    # VM kept billing). Azure accepts a deallocate then, so it goes out at once; a start is left to its caller.
+    $failedCode = ''
     while ($before -in '', 'PowerState/deallocating', 'PowerState/stopping', 'PowerState/starting' -and $settle.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         if (-not $before) {
             $show = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'show', '--resource-group', $resourceGroupName, '--name', $VmName, '--query', 'id', '--output', 'tsv') -AllowFailure
             if ($show.ExitCode -ne 0 -and (Test-DemoAzNotFound -Text ([string]$show.StdErr))) {
                 return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('{0} wasn''t found in {1}.' -f $VmName, $resourceGroupName) -Remediation 'Run deploy.ps1 first.')
+            }
+            if ($Action -eq 'Deallocate') {
+                $failedCode = [string](@(Get-DemoVmStatusCode -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName | Where-Object { $_ -like 'ProvisioningState/failed*' }) | Select-Object -First 1)
+                if ($failedCode) {
+                    Write-DemoLog -Message ('{0} reports no power state because its last operation failed ({1}), so it''s deallocated now.' -f $VmName, $failedCode)
+                    break
+                }
             }
             Write-DemoLog -Message ('{0} reports no power state yet; waiting.' -f $VmName)
         }
@@ -67,7 +78,7 @@ function Invoke-DemoVmPowerAction {
         Start-Sleep -Seconds $PollSeconds
         $before = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
     }
-    if (-not $before) {
+    if (-not $before -and -not $failedCode) {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} reported no power state for {1} seconds.' -f $VmName, $TimeoutSeconds) -Remediation 'Check the VM in the portal; run the script again.')
     }
     if ($before -eq $wanted) {
@@ -96,7 +107,8 @@ function Invoke-DemoVmPowerAction {
         Start-Sleep -Seconds $PollSeconds
         $current = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
         if ($current -eq $wanted) {
-            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1} after {2:N0} seconds.' -f $VmName, $wanted.Split('/')[1], $watch.Elapsed.TotalSeconds) -Evidence ([ordered]@{ before = $before; after = $current; issued = $issued }))
+            $note = if ($failedCode) { ' Its last operation had failed ({0}), so it showed no power state before.' -f $failedCode } else { '' }
+            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1} after {2:N0} seconds.{3}' -f $VmName, $wanted.Split('/')[1], $watch.Elapsed.TotalSeconds, $note) -Evidence ([ordered]@{ before = $before; after = $current; issued = $issued; failedState = $failedCode }))
         }
         if ($pending -and $current -in 'PowerState/stopped', 'PowerState/deallocated' -and -not (Test-DemoVmOperationInProgress -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName)) {
             # The start Azure was working on ended without the VM running, so this one starts it, once.
@@ -131,8 +143,31 @@ function Test-DemoVmOperationInProgress {
         [string] $VmName
     )
 
+    return (@(Get-DemoVmStatusCode -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName) -contains 'ProvisioningState/updating')
+}
+
+function Get-DemoVmStatusCode {
+    <#
+    .SYNOPSIS
+    The status codes of a VM's instance view (ProvisioningState/..., PowerState/...), in one bounded read; none when it
+    can't be read. Internal.
+    Source: https://learn.microsoft.com/cli/azure/vm#az-vm-get-instance-view
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string] $VmName
+    )
+
     $codes = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('vm', 'get-instance-view', '--resource-group', $ResourceGroupName, '--name', $VmName, '--query', 'instanceView.statuses[].code', '--output', 'json') -AsJson -AllowFailure -TimeoutSeconds 120
-    return (@($codes | ForEach-Object { [string]$_ }) -contains 'ProvisioningState/updating')
+    return [string[]]@($codes | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
 }
 
 function Request-DemoVmStart {
