@@ -2011,6 +2011,15 @@ Describe 'The session''s hosts (2026-11-16, live: a host''s start failed mid-ses
         $findings.Count | Should -Be 1
         $findings[0].Message | Should -BeExactly 'T2: archost01 is deallocated, so T2 has no activity now.'
     }
+
+    It 'says "have" for a host that drives several targets' {
+        # Live, 2026-11-17: sqlvm01 drives T1, T3, and T4, and the Warning read "so T1, T3, and T4 has no activity now".
+        $script:vm['sqlvm01'] = 'deallocated'
+        $status = [ordered]@{ sessionId = $script:sessionId; acceptedUtc = '2026-10-27T15:00:00Z'; dispatchUtc = [ordered]@{ T1 = '2026-10-27T15:04:00Z'; T3 = '2026-10-27T15:04:00Z'; T4 = '2026-10-27T15:05:00Z' } }
+        $findings = @(Get-DbHubSessionHealth -Context (New-TestContext) -Status $status)
+        $findings.Count | Should -Be 1
+        $findings[0].Message | Should -BeExactly 'T1, T3, and T4: sqlvm01 is deallocated, so T1, T3, and T4 have no activity now.'
+    }
 }
 
 Describe 'Invoke-DbHubArm''s requests' {

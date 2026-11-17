@@ -3570,7 +3570,12 @@ function Get-DbHubSessionHealth {
             }
         }
         if ($power -in 'deallocated', 'deallocating', 'stopped', 'stopping') {
-            $findings.Add([pscustomobject]@{ Message = ('{0}: {1} is {2}, so {0} has no activity now.' -f $who, $vm, $power); Fix = $vmFix })
+            # Live, 2026-11-17: sqlvm01 drives T1, T3, and T4, and "T1, T3, and T4 has no activity" read wrong.
+            $verb = 'has'
+            if ($entry.Targets.Count -gt 1) {
+                $verb = 'have'
+            }
+            $findings.Add([pscustomobject]@{ Message = ('{0}: {1} is {2}, so {0} {3} no activity now.' -f $who, $vm, $power, $verb); Fix = $vmFix })
             continue
         }
         if ($failed) {
