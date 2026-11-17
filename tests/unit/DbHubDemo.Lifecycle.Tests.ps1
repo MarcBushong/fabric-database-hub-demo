@@ -94,6 +94,41 @@ Describe 'Deployment state in the resource group''s tags' {
         @($script:azCalls | Where-Object { $_[0] -eq 'tag' }).Count | Should -Be 0
     }
 
+    It 'merges under the lock the parallel tracks share, so another process''s write never overlaps it, and goes through from a holder of that lock (live, 2026-11-17)' {
+        # Live, 2026-11-17: the busy marker's refresh, from its own process and 0.6 seconds from T2's last track record, lost
+        # that record, and the run ended NOT DONE with "Not every target finished: T2".
+        $script:lockName = & (Get-Module -Name DbHubDemo) { param($c) Get-DemoStateLockName -Config $c } $config
+        $script:probe = {
+            $lockName = $script:lockName
+            Start-ThreadJob -ScriptBlock {
+                $mutex = [System.Threading.Mutex]::new($false, $using:lockName)
+                try {
+                    $free = $false
+                    try {
+                        $free = $mutex.WaitOne(0)
+                    }
+                    catch [System.Threading.AbandonedMutexException] {
+                        $free = $true
+                    }
+                    if ($free) {
+                        $mutex.ReleaseMutex()
+                    }
+                    $free
+                }
+                finally {
+                    $mutex.Dispose()
+                }
+            } | Receive-Job -Wait -AutoRemoveJob
+        }
+        $script:freeDuringWrite = [System.Collections.Generic.List[bool]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { $script:freeDuringWrite.Add([bool](& $script:probe)); [pscustomobject]@{ ExitCode = 0; StdOut = '{}'; StdErr = '' } }
+        Set-DemoDeploymentState -Config $config -Value @{ BusyUntilUtc = '2026-11-17T19:38:22Z'; BusyBy = 'deploy' } -Confirm:$false
+        & (Get-Module -Name DbHubDemo) { param($c) Set-DemoDeploymentStateLocked -Config $c -Value @{ TrackT2 = 'Telemetry' } -Confirm:$false } $config
+        @($script:freeDuringWrite) | Should -Be @($false, $false) -Because 'each merge runs while this process holds the lock'
+        [bool](& $script:probe) | Should -BeTrue -Because 'the lock is released after each write'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 2 -Exactly
+    }
+
     It 'reads the state back, with lists, counts, and an explicit false' {
         $state = Get-DemoDeploymentState -Config $config
         $state.Exists | Should -BeTrue
