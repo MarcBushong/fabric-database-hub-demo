@@ -541,6 +541,9 @@ Describe 'Invoke-DemoDeploymentTrack' {
         }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
+        # The T2 step's gate reads archost01's VM agent first (2026-11-17): Ready, unless a test says otherwise.
+        $script:hostAgent = 'Ready'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/succeeded'; ProvisionedUtc = $null; Power = 'PowerState/running'; Agent = $script:hostAgent; Text = ('provisioning succeeded, power running, agent {0}' -f $script:hostAgent) } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $script:state }
         Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith {
             if ($AddKind) {
@@ -750,6 +753,113 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $sent[1] | Should -BeLike 'watchdog archost01: sending its artifacts got stuck (archost01: Azure didn''t delete the Run Command of chunk 3 of 8*R871*'
         $sent[2] | Should -Be 'chunks archost01 1'
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.WATCHDOG_ARCHOST01' }).status | Should -Be 'Warning'
+    }
+
+    Context 'the T2 host''s rebuild when its agent stays down (2026-11-17)' {
+        BeforeEach {
+            $script:state.BundleSentTo = @()
+            $script:state.RunnerSentTo = @()
+            $script:sends = 0
+            $script:deadSends = 1
+            $script:rebuilds = 0
+            $script:rebuildWorks = $true
+            $script:context['T2Source'] = 'existing-build'
+            # The watchdog's in-place recovery: the deletes, one deallocate and start, and the agent still down.
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmWatchdog -MockWith {
+                $script:calls.Add(('watchdog {0}' -f $VmName))
+                $result = New-DemoResult -CheckId ('DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('{0} was deallocated and started automatically at 05:37 (local time), but its VM agent wasn''t Ready within 20 minutes.' -f $VmName) -Evidence ([ordered]@{ vmName = $VmName; agentDead = $true })
+                [pscustomobject]@{ Restarted = $true; Recovered = $false; Failed = $true; AgentDead = $true; Saved = ''; Items = @(); Result = $result; Results = @() }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Send-DemoChunkSet -MockWith {
+                $script:sends++
+                $script:calls.Add(('chunks {0}' -f $VmName))
+                if ($script:sends -le $script:deadSends) {
+                    throw 'archost01: no chunk finished for 5 minutes'
+                }
+                @($File | ForEach-Object { [pscustomobject]@{ Description = $_.Description; Sha256 = $_.Sha256; ChunkCount = 1; Seconds = 90 } })
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT2HostRebuild -MockWith {
+                $script:rebuilds++
+                $script:calls.Add(('rebuild: {0}' -f $Cause))
+                $status = if ($script:rebuildWorks) { 'Warning' } else { 'Fail' }
+                $result = New-DemoResult -CheckId 'DEPLOY.T2.HOSTREBUILD' -Area 'infra' -Target 'T2' -Status $status -Message ('rebuild {0}' -f $status)
+                [pscustomobject]@{ Rebuilt = $script:rebuildWorks; Result = $result; Results = @($result) }
+            }
+        }
+
+        It 'rebuilds archost01 once, then runs T2''s steps again on the new host, and the failed attempt''s Fails become Warnings' {
+            $context = $script:context
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts', 'Bootstraps', 'T2', 'Telemetry') }
+            $outcome.Status | Should -Be 'Pass'
+            $outcome.Steps | Should -Be @('Artifacts', 'Bootstraps', 'T2', 'Telemetry')
+            $script:rebuilds | Should -Be 1
+            @($script:calls | Where-Object { $_ -match '^(chunks|watchdog|rebuild|loader) ' -or $_ -match '^rebuild:' }) | Should -Be @('chunks archost01', 'watchdog archost01', 'rebuild: T2''s Artifacts step', 'chunks archost01', 'loader archost01')
+            $context['T2Source'] | Should -Be 'build'
+            @($outcome.Results | Where-Object { [string]$_.status -eq 'Fail' }) | Should -BeNullOrEmpty -Because 'the rebuild took over, so nothing keeps the run from DONE'
+            $watchdog = $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.WATCHDOG_ARCHOST01' }
+            $watchdog.status | Should -Be 'Warning'
+            $watchdog.message | Should -Match 'deploy\.ps1 then rebuilt archost01 \(DEPLOY\.T2\.HOSTREBUILD\)\.$'
+            ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.HOSTREBUILD' }).status | Should -Be 'Warning'
+        }
+
+        It 'ends the track with the rebuild''s Fail first when the rebuild fails' {
+            $script:rebuildWorks = $false
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts', 'Bootstraps', 'T2', 'Telemetry') }
+            $outcome.Status | Should -Be 'Fail'
+            $outcome.Steps | Should -BeNullOrEmpty
+            $ids = @($outcome.Results | ForEach-Object { [string]$_.checkId })
+            [array]::IndexOf($ids, 'DEPLOY.T2.HOSTREBUILD') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.WATCHDOG_ARCHOST01'))
+            ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.WATCHDOG_ARCHOST01' }).status | Should -Be 'Fail'
+        }
+
+        It 'rebuilds only once per run: a new host whose agent stays down too ends the track' {
+            $script:deadSends = 2
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts', 'Bootstraps', 'T2', 'Telemetry') }
+            $outcome.Status | Should -Be 'Fail'
+            $script:rebuilds | Should -Be 1
+            $script:sends | Should -Be 2
+        }
+
+        It 'never rebuilds for T1''s VM' {
+            $script:state.BundleSentTo = @()
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Artifacts') }
+            $outcome.Status | Should -Be 'Fail'
+            $script:rebuilds | Should -Be 0
+        }
+
+        It 'waits for, and recovers, a host whose agent is down before the T2 step''s Run Commands; a Ready host goes on at once' {
+            $script:settles = [System.Collections.Generic.List[string]]::new()
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith { $script:settles.Add(('{0} {1}' -f $VmName, (@($ProgressId) -join ','))); [pscustomobject]@{ Settled = $true; Results = @() } }
+            $script:hostAgent = 'Not Ready'
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+            $outcome.Status | Should -Be 'Pass'
+            @($script:settles) | Should -Be @('archost01 T2.HostBuild')
+
+            $script:settles.Clear()
+            $script:hostAgent = 'Ready'
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+            @($script:settles) | Should -BeNullOrEmpty
+        }
+
+        It 'rebuilds the host when the T2 step finds its agent down and the deallocate and start don''t bring it back, then runs the steps the new host needs' {
+            $script:hostAgent = 'Not Ready'
+            $script:deadSends = 0
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith {
+                $script:calls.Add(('settle {0}' -f $VmName))
+                if ($script:rebuilds -eq 0) {
+                    $dead = New-DemoResult -CheckId 'DEPLOY.WATCHDOG_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'archost01''s VM agent wasn''t Ready within 20 minutes.' -Evidence ([ordered]@{ vmName = $VmName; agentDead = $true })
+                    return [pscustomobject]@{ Settled = $false; Results = @($dead) }
+                }
+                [pscustomobject]@{ Settled = $true; Results = @() }
+            }
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('T2') }
+            $outcome.Status | Should -Be 'Pass'
+            $script:rebuilds | Should -Be 1
+            # Each step waits for the new host's agent again: the rebuild clears what was settled on the old one.
+            @($script:calls | Where-Object { $_ -match '^(settle|chunks) ' -or $_ -match '^rebuild:' }) | Should -Be @('settle archost01', 'rebuild: T2''s T2 step', 'settle archost01', 'chunks archost01', 'settle archost01', 'settle archost01')
+            $outcome.Steps | Should -Be @('Artifacts', 'Bootstraps', 'T2')
+            ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.WATCHDOG_ARCHOST01' }).status | Should -Be 'Warning'
+        }
     }
 
     It 'clears chunk Run Commands Azure hadn''t deleted on archost01 through the watchdog once the artifacts are recorded, and only warns on sqlvm01 (R871, 2026-11-17)' {
@@ -1728,6 +1838,10 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:calls.Add('replica end')
             New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.END' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'replica end' -Evidence @{ outcome = 'Deleted' }
         }
+        # The T2 host's missing-host check (2026-11-17) has its own tests (DbHubDemo.T2HostRebuild.Tests.ps1): here the host
+        # exists unless a test says not.
+        $script:hostMissing = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT2HostMissingResult -MockWith { $script:calls.Add('host check'); $script:hostMissing }
     }
 
     It 'restores T2 from the golden snapshot, runs the three tracks, validates, and stops the clock' {
@@ -1978,6 +2092,27 @@ Describe 'Invoke-DemoParallelDeployment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $state = New-TestState; $state.Stage = 'Validation'; $state }
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
         $script:calls | Should -Contain 'preflight'
+    }
+
+    It 'starts from preflight, so the template creates T2''s host again, when the host the state records doesn''t exist, and says so (2026-11-17)' {
+        $script:stateReads = 0
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $script:stateReads++; $state = New-TestState; $state.Stage = 'Infrastructure'; $state.TrackT1 = 'Bootstraps'; $state }
+        $script:hostMissing = New-TestResult 'DEPLOY.T2.HOSTMISSING'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume })
+        @($script:calls | Select-Object -First 2) | Should -Be @('app sign-in check', 'host check')
+        $script:calls | Should -Contain 'preflight'
+        $script:calls | Should -Contain 'template disk=golden'
+        $script:calls | Should -Contain 'track T2: Restore,Artifacts,Bootstraps,T2,Telemetry'
+        @($results | Where-Object { $_.checkId -eq 'DEPLOY.T2.HOSTMISSING' }).Count | Should -Be 1
+        $script:stateReads | Should -BeGreaterThan 1 -Because 'the state is read again once the old host''s records are cleared'
+
+        # A host that exists changes nothing: the run continues as recorded.
+        $script:calls.Clear()
+        $script:hostMissing = $null
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -AutoResume } | Out-Null
+        $script:calls | Should -Contain 'host check'
+        $script:calls | Should -Not -Contain 'preflight'
     }
 
     It 'takes the history report''s snapshot last: after DONE''s checks and the switch, before DEPLOY.SUMMARY, and as the deploying run''s own step (2026-11-06)' {

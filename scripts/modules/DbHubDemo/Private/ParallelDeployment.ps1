@@ -500,6 +500,20 @@ function Invoke-DemoParallelDeployment {
             $Resume = [switch]::new($false)
         }
     }
+    # 2026-11-17: a T2 host that a rebuild deleted and didn't create again, or one deleted by hand, would make the T2 track fail
+    # on a VM that doesn't exist. Its records are cleared (its artifacts go again), and a resume starts from preflight instead,
+    # so the template creates it.
+    if (-not $whatIf) {
+        $missingHost = Get-DemoT2HostMissingResult -Config $Config -State $state
+        if ($null -ne $missingHost) {
+            $results.Add($missingHost)
+            Write-DemoLog -Message $missingHost.message
+            if ($Resume -and -not $FromStage) {
+                $Resume = [switch]::new($false)
+            }
+            $state = Get-DemoDeploymentState -Config $Config
+        }
+    }
     # A resume sends a VM's artifacts again, with its loader and the steps after them, when the bootstrap bundle or the
     # workload runner this checkout builds isn't what the resource group's state records for that VM, so a fix pulled since
     # the last run reaches it (live finding, 2026-11-06). With nothing changed, each track resumes as recorded.

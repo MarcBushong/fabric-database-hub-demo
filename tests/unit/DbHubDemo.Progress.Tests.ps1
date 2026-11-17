@@ -38,7 +38,8 @@ Describe 'The progress model (Phase 28, brief item 11)' {
     It 'lists the steps per track in the brief''s order, with no guided stop in any mode (retired, 2026-11-09)' {
         $model = New-TestModel -T4
         @($model['tracks'] | ForEach-Object { $_['name'] }) | Should -Be @('Preflight', 'Infrastructure', 'T1', 'T3', 'T4', 'Fabric', 'T2', 'Validation')
-        $t2Steps = @('T2.Restore', 'T2.Artifacts', 'T2.Bootstraps', 'T2.HostBuild', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring', 'T2.Telemetry')
+        # The T2 host's rebuild (2026-11-17) is T2's first row: when it runs, T2's steps run again after it.
+        $t2Steps = @('T2.HostRebuild', 'T2.Restore', 'T2.Artifacts', 'T2.Bootstraps', 'T2.HostBuild', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring', 'T2.Telemetry')
         @(($model['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be $t2Steps
         foreach ($mode in 'JumpstartImage', 'ProductKey', 'Developer') {
             @(((New-TestModel -InstallMode $mode)['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be $t2Steps -Because $mode

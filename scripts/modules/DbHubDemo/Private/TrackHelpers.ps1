@@ -171,7 +171,8 @@ function Set-DemoDeploymentStateLocked {
     Set-DemoDeploymentState under a lock that the parallel tracks on this machine share. With -AddVm, it
     adds the VM to BundleSentTo or RunnerSentTo for that SHA-256 inside the lock (a list another track may be
     extending at the same moment); with -RemoveBundleVm, it takes the VM out of BundleSentTo, which a loader that found
-    the VM's chunks unusable needs (2026-11-06). Internal.
+    the VM's chunks unusable needs (2026-11-06), and with -RemoveRunnerVm out of RunnerSentTo, which a rebuilt T2 host needs
+    (Reset-DemoT2HostRecord, 2026-11-17). Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -189,7 +190,9 @@ function Set-DemoDeploymentStateLocked {
 
         [int] $ChunkCount = 0,
 
-        [string] $RemoveBundleVm = ''
+        [string] $RemoveBundleVm = '',
+
+        [string] $RemoveRunnerVm = ''
     )
 
     if (-not $PSCmdlet.ShouldProcess((Get-DemoResourceGroupName -Config $Config), 'Record the deployment state under the tracks'' lock')) {
@@ -226,6 +229,10 @@ function Set-DemoDeploymentStateLocked {
         if ($RemoveBundleVm) {
             $state = Get-DemoDeploymentState -Config $Config
             $values['BundleSentTo'] = @(@($state.BundleSentTo) | Where-Object { $_ -and $_ -ne $RemoveBundleVm })
+        }
+        if ($RemoveRunnerVm) {
+            $state = Get-DemoDeploymentState -Config $Config
+            $values['RunnerSentTo'] = @(@($state.RunnerSentTo) | Where-Object { $_ -and $_ -ne $RemoveRunnerVm })
         }
         if ($values.Count -gt 0) {
             Set-DemoDeploymentState -Config $Config -Value $values -Confirm:$false
@@ -1149,7 +1156,10 @@ function Invoke-DemoDeploymentTrack {
         }
     }
 
-    foreach ($name in $Step) {
+    # The steps run in order from a queue: the T2 host's rebuild (2026-11-17) puts T2's steps back in it.
+    $queue = [System.Collections.Generic.Queue[string]]::new([string[]]@($Step | Where-Object { $_ }))
+    while ($queue.Count -gt 0) {
+        $name = $queue.Dequeue()
         # Every step waits for the template, except the restore of a T2 host the template has already deployed.
         if (-not ($earlyRestore -and $name -eq 'Restore') -and -not (& $awaitInfrastructure)) {
             Write-DemoLog -Level Warning -Message ('Track {0} stops before {1}: {2}' -f $Track, $name, $(if ([string](Get-DemoMemberValue -InputObject $shared['Infrastructure'] -Name 'Message')) { [string]$shared['Infrastructure'].Message } else { 'the template deployment didn''t succeed.' }))
@@ -1413,6 +1423,16 @@ function Invoke-DemoDeploymentTrack {
                     }
                 }
                 'T2/T2' {
+                    # 2026-11-17: this step's Run Commands (the host's health, Arc onboarding) need archost01's VM agent. A host
+                    # that runs with its agent down gets the same wait and watchdog as the steps before it (Invoke-DemoVmSettle),
+                    # which recover it or lead to its rebuild; a host whose agent is Ready goes on at once, as before.
+                    if ((Get-DemoHostVmName -Config $Config) -eq 'archost01') {
+                        $gate = Get-DemoVmRestartState -SubscriptionId ([string]$Config['subscriptionId']) -ResourceGroupName (Get-DemoResourceGroupName -Config $Config) -VmName 'archost01'
+                        if ($gate.Read -and $gate.Power -eq 'PowerState/running' -and $gate.Agent -ne 'Ready' -and -not (& $settle 'archost01' 'T2.HostBuild')) {
+                            $outcome = 'Fail'
+                            break
+                        }
+                    }
                     $source = [string](& $option 'T2Source' '')
                     $golden = $source -in 'golden', 'existing-golden'
                     $waiting = -not $golden -and [bool](& $option 'WaitForT2' $false)
@@ -1694,6 +1714,41 @@ function Invoke-DemoDeploymentTrack {
         # in Deleting, are a Warning on the step's row and in DONE or NOT DONE (DEPLOY.RUNCOMMAND.STUCK_<VM>).
         & $addAll @(Get-DemoRunCommandStuckResult -Clear)
         $timing[$name] = [int]$watch.Elapsed.TotalSeconds
+        # 2026-11-17 (the owner's decision): when archost01's VM agent stayed down through its deallocate and start (the
+        # watchdog's agentDead), the host is rebuilt, once per run, and T2's steps run again on the new host.
+        if ($outcome -eq 'Fail' -and $Track -eq 'T2' -and -not $shared['HostRebuilt'] -and (Test-DemoT2HostDeadResult -Result @($results | Select-Object -Skip $resultsBefore))) {
+            $shared['HostRebuilt'] = $true
+            $rebuild = Invoke-DemoT2HostRebuild -Config $Config -Cause ('T2''s {0} step' -f $name) -ProgressPath $progress -Confirm:$false
+            if ([bool]$rebuild.Rebuilt) {
+                Set-DemoT2HostRebuildSuperseded -Result @($results | Select-Object -Skip $resultsBefore)
+                & $addAll @($rebuild.Results)
+                foreach ($key in @($shared['Sent'] | Where-Object { $_ -like '*/archost01/*' })) {
+                    $null = $shared['Sent'].Remove($key)
+                }
+                foreach ($key in @($shared['Settled'] | Where-Object { $_ -like 'archost01/*' })) {
+                    $null = $shared['Settled'].Remove($key)
+                }
+                $Context['T2Source'] = 'build'
+                # From Artifacts to the plan's last step: the new host needs its artifacts, its loader, its build and
+                # onboarding, and its telemetry.
+                $t2Names = @((Get-DemoTrackStep -Track 'T2').Keys)
+                $fromIndex = [array]::IndexOf($t2Names, 'Artifacts')
+                $lastIndex = [System.Math]::Max($fromIndex, [array]::IndexOf($t2Names, [string]@($Step)[-1]))
+                $again = @(for ($i = $fromIndex; $i -le $lastIndex; $i++) { [string]$t2Names[$i] })
+                $queue.Clear()
+                $done.Clear()
+                foreach ($item in $again) {
+                    $queue.Enqueue($item)
+                    Set-DemoProgressStep -Path $progress -Id @(Get-DemoProgressStepId -Track 'T2' -Step $item) -State 'Pending' -Message 'Runs again on the rebuilt archost01.'
+                }
+                Write-DemoLog -Message ('Track T2: {0} run again on the rebuilt archost01.' -f ($again -join ', '))
+                continue
+            }
+            # The rebuild's Fail comes first among the step's results, so the status page's row and the console say it.
+            foreach ($item in @(@($rebuild.Results) | Where-Object { $null -ne $_ })) {
+                $results.Insert($resultsBefore, $item)
+            }
+        }
         if (-not $ownProgress -and $stepIds.Count -gt 0) {
             $stepResults = @($results | Select-Object -Skip $resultsBefore)
             $worst = Get-DemoWorstStatus -Status @($stepResults | ForEach-Object { [string]$_.status })

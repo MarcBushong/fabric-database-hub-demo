@@ -1886,9 +1886,28 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $watchdog.Failed | Should -BeTrue
         $watchdog.Result.status | Should -Be 'Fail'
         $watchdog.Result.message | Should -Match 'its VM agent wasn''t Ready within 20 minutes'
-        $watchdog.Result.remediation | Should -Match '^Run ./scripts/deploy\.ps1 again: it sends the deletes of the host''s chunk Run Commands again, then deallocates and starts it once more\.'
+        $watchdog.Result.remediation | Should -Match '^Run ./scripts/deploy\.ps1 again: when archost01''s VM agent stays down after its deallocate and start, deploy\.ps1 deletes the host and its disks and creates it again from the template, once per run \(DEPLOY\.T2\.HOSTREBUILD\)'
         $watchdog.Result.remediation | Should -Not -Match 'Wait 30 minutes'
+        # The T2 track's cue for the host's rebuild (2026-11-17).
+        $watchdog.AgentDead | Should -BeTrue
+        $watchdog.Result.evidence.agentDead | Should -BeTrue
         $script:restarts | Should -Be 0
+    }
+
+    It 'reaches DONE after the T2 host''s rebuild and says what happened; a failed rebuild is NOT DONE''s reason, before the watchdog''s Fail (2026-11-17)' {
+        $rebuilt = New-DemoResult -CheckId 'DEPLOY.T2.HOSTREBUILD' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01''s VM agent stayed down after its deallocate and start, so deploy.ps1 rebuilt T2''s host in 14 minutes.' -Remediation 'Nothing to do: the run goes on with T2.'
+        $superseded = New-DemoResult -CheckId 'DEPLOY.WATCHDOG_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01''s VM agent wasn''t Ready within 20 minutes. deploy.ps1 then rebuilt archost01 (DEPLOY.T2.HOSTREBUILD).' -Remediation 'Nothing to do: deploy.ps1 rebuilt archost01 in this run.'
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($superseded, $rebuilt)); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $outcome.Kind | Should -Be 'Done'
+        @($outcome.Notes | Where-Object { $_ -match '^archost01, T2''s host, was rebuilt in this run: ' }).Count | Should -Be 1
+        ((InModuleScope DbHubDemo -Parameters @{ Outcome = $outcome } { Get-DemoDeploymentOutcomeLine -Outcome $Outcome }) -join "`n") | Should -Match 'T2''s host, was rebuilt in this run'
+
+        $failed = New-DemoResult -CheckId 'DEPLOY.T2.HOSTREBUILD' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'archost01 couldn''t be created again: the template''s deployment failed.' -Remediation 'Run ./scripts/deploy.ps1 -FromStage Infrastructure.'
+        $dead = New-DemoResult -CheckId 'DEPLOY.WATCHDOG_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'archost01''s VM agent wasn''t Ready within 20 minutes.' -Remediation 'Run ./scripts/deploy.ps1 again.'
+        $notDone = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($failed, $dead)); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        $notDone.Kind | Should -Be 'NotDone'
+        $notDone.Reason | Should -Match '^DEPLOY\.T2\.HOSTREBUILD: archost01 couldn''t be created again'
+        @($notDone.Notes | Where-Object { $_ -match 'was rebuilt' }).Count | Should -Be 0
     }
 
     It 'fails the step, with the single next step and the time to wait, when Azure refuses the deallocate, and waits no longer (2026-11-16)' {
@@ -1927,6 +1946,7 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $fail[0].status | Should -Be 'Fail'
         $fail[0].message | Should -Match 'Azure refused its deallocate: .*OperationNotAllowed'
         $fail[0].remediation | Should -Match '^Wait 30 minutes, then run \./scripts/deploy\.ps1 again'
+        $fail[0].evidence.agentDead | Should -BeFalse -Because 'a refused deallocate isn''t a dead agent, so it never leads to a rebuild'
         @($settle.Results | Where-Object { $_.checkId -eq 'DEPLOY.EXTENSIONS_SQLVM01' }).Count | Should -Be 0
     }
 

@@ -1545,6 +1545,11 @@ function Get-DemoDeploymentOutcome {
     if ($repairNote) {
         $notes.Add($repairNote)
     }
+    # The T2 host, rebuilt in this run, or created again at its start (2026-11-17).
+    $hostNote = Get-DemoT2HostRebuildNote -Result $all
+    if ($hostNote) {
+        $notes.Add($hostNote)
+    }
     if ($installMode -eq 'Developer') {
         $notes.Add('T2 runs SQL Server Developer edition (t2SqlInstallMode Developer, which you chose): it''s in Database Hub''s Estate, but T2 has no performance data or Database Agent findings. JumpstartImage (the default) or ProductKey mode gives them.')
     }

@@ -180,6 +180,8 @@ function Get-DemoProgressCatalog {
             })
     }
     $t2 = [System.Collections.Generic.List[object]]::new()
+    # Displayed when it happens (2026-11-17): the T2 track sets it itself (Invoke-DemoT2HostRebuild); the plan marks it Skipped.
+    $t2.Add((& $step 'T2.HostRebuild' 'Rebuild of archost01 (only when its VM agent stays down after a deallocate and start)' @()))
     $t2.Add((& $step 'T2.Restore' 'Restore from the golden snapshot' @('T2/Restore')))
     $t2.Add((& $step 'T2.Artifacts' 'Artifacts to archost01' @('T2/Artifacts')))
     $t2.Add((& $step 'T2.Bootstraps' 'Bootstrap' @('T2/Bootstraps')))
@@ -398,6 +400,8 @@ function Set-DemoProgressPlan {
     # The history report's snapshot runs at the end of every run that reaches its validation, a resumed one included, so it's
     # never "finished in an earlier run" (2026-11-06).
     $map['Fabric.History'] = if ($Plan.Validation) { 'Run' } else { 'Skip' }
+    # The T2 host's rebuild (2026-11-17) happens only when its agent stays down; the T2 track sets the row when it does.
+    $map['T2.HostRebuild'] = if (@($Plan.Tracks['T2']).Count -gt 0) { 'Rebuild' } else { 'Skip' }
     Update-DemoProgress -Path $Path -Data @{ Map = $map; Notes = $notes } -Action {
         param($Model, $Change)
         $now = Get-DemoUnixTime
@@ -409,6 +413,7 @@ function Set-DemoProgressPlan {
                     'Again' { 'Didn''t finish in the previous run; running it again.' }
                     'Resend' { [string]$Change['Notes'][[string]$item['id']] }
                     'Skip' { 'Not part of this run.' }
+                    'Rebuild' { 'Only when archost01''s VM agent stays down after its deallocate and start: deploy.ps1 then deletes the host and creates it again, once.' }
                     'Golden' { 'Restored from the golden snapshot: no build.' }
                     'Build' { 'No golden snapshot: the host builds its guest instead.' }
                     default { '' }
