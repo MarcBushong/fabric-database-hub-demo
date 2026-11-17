@@ -184,6 +184,7 @@ Two colleagues' first runs took more than 2 hours and never finished (2026-10-29
 **What the scripts do since 2026-11-17:**
 
 - `deploy.ps1` sends the T2 host's chunks one at a time, and each chunk's Run Command is deleted, and the delete confirmed, before the next goes. A delete Azure hasn't finished in 5 minutes is asked for once more; after a second one, the watchdog steps in.
+- `deploy.ps1` sends nothing to a VM whose agent isn't Ready: until it is, the VM's start counts as Azure's work in progress, and after 20 minutes the watchdog steps in. Live, chunks sent to a host whose agent wasn't Ready stayed in Creating, and no deallocate removed them.
 - When the T2 host's VM agent isn't Ready, or the host lists chunk Run Commands, the watchdog doesn't restart it: it sends the chunks' deletes, then deallocates and starts the host once, which completes them, and the run goes on. `DEPLOY.WATCHDOG_ARCHOST01` is then a **Warning** that says "deallocated and started", with the reason. A host that still isn't back is a **Fail**, and the run ends **NOT DONE**.
 - `stop-demo.ps1` sends the deletes of a running VM's chunk Run Commands right before it deallocates the VM.
 
@@ -192,6 +193,7 @@ Two colleagues' first runs took more than 2 hours and never finished (2026-10-29
 - Run `./scripts/deploy.ps1`. It brings the host back as above, and it brings this fix to an older demo ([update an existing environment](deployment.md#update-an-existing-environment)). On a host whose start doesn't finish, that can take about an hour.
 - Meanwhile, the session's other targets go on. For T2, set `STOP_NOW = True` and Run all, or run `./scripts/stop-demo.ps1`, which deallocates a VM whose start failed (since 2026-11-17). `./scripts/status.ps1` shows the host's state. T1, T3, T4, and Fabric aren't affected; T2's Arc data and its Database Hub history stay, without new activity.
 - By hand, for example on an older version: start the host (`az vm start --resource-group <group> --name archost01 --no-wait`), and once `az vm get-instance-view` shows it running, even with the agent **Not Ready**, list its chunks (`az vm run-command list --resource-group <group> --vm-name archost01`) and delete each `DbHubDemo-Chunk-*` one with `az vm run-command delete --resource-group <group> --vm-name archost01 --name <name> --yes --no-wait` ([az vm run-command](https://learn.microsoft.com/cli/azure/vm/run-command)). A minute later, deallocate the host (`az vm deallocate`) and start it again: the deletes complete with the deallocation, and the agent is Ready within minutes.
+- When the agent still isn't Ready after that, and `az vm run-command list` still shows chunk Run Commands **Deleting** or **Creating** after one more `./scripts/deploy.ps1`, a deallocate cancels their deletes instead of completing them. Live, that happened on a test host whose chunks an earlier version had sent while its agent wasn't Ready (2026-11-17, twice). Rebuild T2: `./scripts/destroy.ps1`, then `./scripts/deploy.ps1`.
 
 ## T2: Arc Jumpstart's image (`JumpstartImage`)
 

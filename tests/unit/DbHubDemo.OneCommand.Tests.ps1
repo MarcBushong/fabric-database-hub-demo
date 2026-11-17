@@ -1522,6 +1522,38 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $activity.RunCommandsDeleting | Should -Be @('DbHubDemo-Chunk-1')
     }
 
+    It 'counts a running VM whose agent isn''t Ready as busy, so nothing is sent to it yet: <Case> (R871, live 2026-11-17)' -ForEach @(
+        @{ Case = 'agent Not Ready'; Power = 'PowerState/running'; Agent = 'Not Ready'; Busy = $true; Item = 'VM agent (Not Ready)' }
+        @{ Case = 'no agent status, as on a host whose start never got its goal state'; Power = 'PowerState/running'; Agent = ''; Busy = $true; Item = 'VM agent (no status)' }
+        @{ Case = 'agent Ready'; Power = 'PowerState/running'; Agent = 'Ready'; Busy = $false; Item = '' }
+        @{ Case = 'not running'; Power = 'PowerState/deallocated'; Agent = ''; Busy = $false; Item = '' }
+    ) {
+        # Live: chunks sent to the T2 host while its agent wasn't Ready stayed in Creating, and a deallocate canceled their
+        # deletes instead of completing them, so the host never started again.
+        $agentStatus = if ($Agent) { [pscustomobject]@{ statuses = @([pscustomobject]@{ displayStatus = $Agent }) } } else { $null }
+        $script:views.Enqueue([pscustomobject]@{ resources = @(); instanceView = [pscustomobject]@{ extensions = @(); statuses = @([pscustomobject]@{ code = 'ProvisioningState/updating' }, [pscustomobject]@{ code = $Power }); vmAgent = $agentStatus } })
+        $activity = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoVmExtensionActivity -Config $Config -VmName 'archost01' }
+        $activity.Busy | Should -Be $Busy
+        if ($Busy) {
+            $activity.Items | Should -Be @($Item)
+            $activity.Labels | Should -Be @('the VM''s start (its agent isn''t Ready yet)')
+        }
+        else {
+            $activity.Items | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'gives a T2 host whose agent never comes Ready the watchdog from the settle step, before anything is sent to it (R871)' {
+        $script:views.Enqueue([pscustomobject]@{ resources = @(); instanceView = [pscustomobject]@{ extensions = @(); statuses = @([pscustomobject]@{ code = 'ProvisioningState/updating' }, [pscustomobject]@{ code = 'PowerState/running' }) } })
+        $script:watchdogCause = ''
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmWatchdog -MockWith { $script:watchdogCause = $Cause; [pscustomobject]@{ Restarted = $true; Recovered = $true; Failed = $false; Saved = ''; Items = @(); Result = (New-DemoResult -CheckId 'DEPLOY.WATCHDOG_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'deallocated and started'); Results = @() } }
+        $settle = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmSettle -Config $Config -VmName 'archost01' -FirstMinutes 0 -AfterRestartMinutes 0 -PollSeconds 1 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmWatchdog -Times 1 -Exactly -ParameterFilter { $VmName -eq 'archost01' }
+        $script:watchdogCause | Should -Match 'didn''t finish'
+        $settle.Settled | Should -BeFalse -Because 'the fake host never comes Ready, so the step stops with the stuck result instead of sending'
+        ($settle.Results | Where-Object { $_.checkId -eq 'DEPLOY.EXTENSIONS_ARCHOST01' }).message | Should -Match 'agent isn''t Ready yet'
+    }
+
     It 'waits for the extensions to settle, and says so on the status page as an Azure-side wait' {
         $path = Join-Path -Path $TestDrive -ChildPath ('settle-' + [guid]::NewGuid().ToString('N') + '.json')
         InModuleScope DbHubDemo -Parameters @{ Path = $path } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }

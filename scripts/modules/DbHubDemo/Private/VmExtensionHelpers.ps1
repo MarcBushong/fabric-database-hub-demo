@@ -36,10 +36,11 @@ function Get-DemoVmExtensionActivity {
     <#
     .SYNOPSIS
     The Azure-side work in progress on one VM, from its instance view (az vm get-instance-view): extensions whose
-    provisioning state is Creating, Updating, or Deleting, or whose instance-view status is transitioning. The Run Command
-    handler isn't counted. Also lists the Run Commands Azure is still deleting, which don't make it busy. Returns
-    Readable, Busy, Items (each extension with its state), Labels (for the status page), RunCommandsDeleting, and View
-    (the instance view, for diagnostics). Internal.
+    provisioning state is Creating, Updating, or Deleting, or whose instance-view status is transitioning, and a running VM
+    whose agent isn't Ready (its start, R871). The Run Command handler isn't counted. Also lists the Run Commands Azure is
+    still deleting, which don't make it busy, and every chunk Run Command (Chunks). Returns Readable, Busy, Items (each
+    extension with its state), Labels (for the status page), RunCommandsDeleting, Chunks, and View (the instance view, for
+    diagnostics). Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -83,6 +84,20 @@ function Get-DemoVmExtensionActivity {
             $moving = @($codes | Where-Object { $_ -match '(?i)^ProvisioningState/(transitioning|creating|updating|deleting)$' })
             if ($moving.Count -gt 0) {
                 & $add ([string](Get-DemoMemberValue -InputObject $extension -Name 'name')) ($moving[0] -replace '(?i)^ProvisioningState/', '')
+            }
+        }
+        # A running VM whose agent isn't Ready gets no Run Command yet (R871, live 2026-11-17): chunks sent to the T2 host then
+        # stayed in Creating, and a later deallocate canceled their deletes instead of completing them, so the host never
+        # started again. A healthy start has the agent Ready within about 2 minutes; a host whose start never got its goal
+        # state gets the watchdog, which deletes its chunks and deallocates and starts it.
+        $vmStatuses = Get-DemoMemberList -InputObject $instanceView -Name 'statuses'
+        $vmCodes = @(foreach ($status in $vmStatuses) { [string](Get-DemoMemberValue -InputObject $status -Name 'code') })
+        if ('PowerState/running' -in $vmCodes) {
+            $agentStatuses = Get-DemoMemberList -InputObject (Get-DemoMemberValue -InputObject $instanceView -Name 'vmAgent') -Name 'statuses'
+            $agent = [string](Get-DemoMemberValue -InputObject (@($agentStatuses) | Select-Object -First 1) -Name 'displayStatus')
+            if ($agent -ne 'Ready') {
+                $items.Add(('VM agent ({0})' -f $(if ($agent) { $agent } else { 'no status' })))
+                $labels.Add('the VM''s start (its agent isn''t Ready yet)')
             }
         }
     }
