@@ -1764,6 +1764,9 @@ function New-DemoActivityControlEndpoint {
     states and the delete are documented:
     https://learn.microsoft.com/rest/api/fabric/core/managed-private-endpoints/get-workspace-managed-private-endpoint and
     https://learn.microsoft.com/rest/api/fabric/core/managed-private-endpoints/delete-workspace-managed-private-endpoint.
+    A create that Fabric answers with a server error (5xx) is tried again after each wait in -CreateRetrySeconds, unless
+    Fabric lists the endpoint by then (live, 2026-11-17: HTTP 500 seconds after the failed one's delete, and the same
+    create succeeded two minutes later). The POST isn't idempotent, so the list is read before every new try.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -1787,7 +1790,10 @@ function New-DemoActivityControlEndpoint {
         [int] $GoneWaitSeconds = 300,
 
         [ValidateRange(1, 120)]
-        [int] $PollSeconds = 15
+        [int] $PollSeconds = 15,
+
+        [ValidateRange(0, 600)]
+        [int[]] $CreateRetrySeconds = @(60, 120)
     )
 
     $action = if ($null -ne $Failed) { 'Delete the failed managed private endpoint {0} and create it again' -f $Name.PrivateEndpoint } else { 'Create the managed private endpoint {0} to {1}' -f $Name.PrivateEndpoint, $Name.KeyVault }
@@ -1813,9 +1819,23 @@ function New-DemoActivityControlEndpoint {
             Start-Sleep -Seconds $PollSeconds
         }
     }
-    $created = Invoke-DemoFabricRequest -Method Post -Uri $EndpointsUri -Body ([ordered]@{ name = $Name.PrivateEndpoint; targetPrivateLinkResourceId = $Name.KeyVaultId; targetSubresourceType = 'vault'; requestMessage = $RequestMessage }) -Token $Token -NotIdempotent
-    if ($created.StatusCode -notin 200, 201, 202) {
-        return [pscustomobject]@{ Ok = $false; Replaced = $false; Error = (Get-DemoFabricErrorText -Response $created) }
+    $body = [ordered]@{ name = $Name.PrivateEndpoint; targetPrivateLinkResourceId = $Name.KeyVaultId; targetSubresourceType = 'vault'; requestMessage = $RequestMessage }
+    $waits = @($CreateRetrySeconds)
+    for ($try = 0; ; $try++) {
+        $created = Invoke-DemoFabricRequest -Method Post -Uri $EndpointsUri -Body $body -Token $Token -NotIdempotent
+        if ($created.StatusCode -in 200, 201, 202) {
+            break
+        }
+        if ($created.StatusCode -lt 500 -or $try -ge $waits.Count) {
+            $tries = if ($try -gt 0) { ' ({0} tries)' -f ($try + 1) } else { '' }
+            return [pscustomobject]@{ Ok = $false; Replaced = $false; Error = ('{0}{1}' -f (Get-DemoFabricErrorText -Response $created), $tries) }
+        }
+        Write-DemoLog -Level Warning -Message ('Fabric answered the creation of the managed private endpoint {0} with {1}; it''s read again, and created again if it''s still missing, in {2} seconds (try {3} of {4}).' -f $Name.PrivateEndpoint, (Get-DemoFabricErrorText -Response $created), $waits[$try], ($try + 2), ($waits.Count + 1))
+        Start-Sleep -Seconds $waits[$try]
+        $list = Get-DemoActivityControlFabricList -Uri $EndpointsUri -Token $Token
+        if ($list.StatusCode -eq 200 -and @($list.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') -eq $Name.PrivateEndpoint }).Count -gt 0) {
+            break
+        }
     }
     return [pscustomobject]@{ Ok = $true; Replaced = ($null -ne $Failed); Error = '' }
 }

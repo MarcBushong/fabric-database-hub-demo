@@ -1038,6 +1038,12 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
         # What a created endpoint does: nothing more (the default), puts a pending connection on the vault ('Pending'), or
         # fails like the live one ('Failed', 2026-11-16).
         $script:createdEndpoint = ''
+        # Status codes Fabric answers the next endpoint creations with before it accepts one (live, 2026-11-17: HTTP 500
+        # seconds after the failed one's delete); with $script:serverErrorCreates, such a creation still makes the endpoint.
+        $script:endpointPostStatus = [System.Collections.Generic.Queue[int]]::new()
+        $script:serverErrorCreates = $false
+        $script:sleeps = [System.Collections.Generic.List[int]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:sleeps.Add([int]$Seconds) }
         $script:imports = [System.Collections.Generic.List[object]]::new()
         $script:lakehouses = @(@{ id = 'cccccccc-0000-0000-0000-000000000003'; displayName = 'LH_DatabaseHub' })
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -MockWith { @([pscustomobject]@{ checkId = 'FABRIC.P5.CAPACITY'; status = $script:capacityStatus; message = ('The capacity is {0}.' -f $(if ($script:capacityStatus -eq 'Pass') { 'Active' } else { 'Paused' })) }) }
@@ -1061,6 +1067,14 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
                     '^/v1/workspaces$' { return [pscustomobject]@{ StatusCode = 201; Body = @{ id = '0c0c0c0c-0000-0000-0000-000000000002' } } }
                     '/managedPrivateEndpoints$' {
                         $id = 'endpoint-new-{0}' -f $script:fabricPosts.Count
+                        if ($script:endpointPostStatus.Count -gt 0) {
+                            $code = $script:endpointPostStatus.Dequeue()
+                            if ($script:serverErrorCreates) {
+                                $script:endpoints = @($script:endpoints) + @(@{ id = $id; name = $Body['name']; provisioningState = 'Succeeded' })
+                                $script:connections.Add([pscustomobject]@{ name = ('connection-{0}' -f $id); status = 'Pending'; description = $Body['requestMessage'] })
+                            }
+                            return [pscustomobject]@{ StatusCode = $code; Body = @{ errorCode = 'InternalServerError'; message = 'An error occured'; requestId = 'request-1' } }
+                        }
                         if ($script:createdEndpoint -eq 'Failed') {
                             $script:endpoints = @($script:endpoints) + @(@{ id = $id; name = $Body['name']; provisioningState = 'Failed' })
                         }
@@ -1214,6 +1228,47 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
         $endpoint.remediation | Should -Match 'it deletes the failed endpoint and creates it again'
         $endpoint.remediation | Should -Not -Match 'approve the pending connection' -Because 'there''s no connection to approve'
         ($results | Where-Object checkId -EQ 'CONTROL.FABRIC.NOTEBOOK').status | Should -Be 'Pass' -Because 'the notebook is still imported'
+    }
+
+    It 'private: creates the replacement again when Fabric answers its creation with a server error, in the same run' {
+        # Live, 2026-11-17: the create sent seconds after the failed one's delete got HTTP 500, and the same create succeeded
+        # two minutes later, in a second run.
+        $script:fabricWorkspaces = @(@{ id = $script:shared; displayName = 'Demo workspace' }, @{ id = '0c0c0c0c-0000-0000-0000-000000000002'; displayName = 'DBHub Control' })
+        $name = Get-ControlName (New-ControlConfig)
+        $script:endpoints = @(@{ id = 'endpoint-failed'; name = $name.PrivateEndpoint; provisioningState = 'Failed' })
+        $script:createdEndpoint = 'Pending'
+        $script:endpointPostStatus.Enqueue(500)
+        $results = @(Invoke-Placement -Mode 'private')
+        $script:fabricDeletes.Count | Should -Be 1
+        $script:fabricPosts.Count | Should -Be 2
+        @($script:sleeps) | Should -Contain 60
+        $endpoint = $results | Where-Object checkId -EQ 'CONTROL.FABRIC.ENDPOINT'
+        $endpoint.status | Should -Be 'Pass'
+        $endpoint.message | Should -Match 'failed to provision it at first, so it was deleted and created again'
+    }
+
+    It 'private: doesn''t create the endpoint twice when Fabric made it despite the server error' {
+        $script:fabricWorkspaces = @(@{ id = $script:shared; displayName = 'Demo workspace' }, @{ id = '0c0c0c0c-0000-0000-0000-000000000002'; displayName = 'DBHub Control' })
+        $script:endpointPostStatus.Enqueue(500)
+        $script:serverErrorCreates = $true
+        $results = @(Invoke-Placement -Mode 'private')
+        @($script:fabricPosts | Where-Object Path -Like '*/managedPrivateEndpoints').Count | Should -Be 1 -Because 'the list is read before a new try, and the POST isn''t idempotent'
+        ($results | Where-Object checkId -EQ 'CONTROL.FABRIC.ENDPOINT').status | Should -Be 'Pass'
+    }
+
+    It 'private: stops after three tries when Fabric keeps answering the creation with a server error' {
+        $script:fabricWorkspaces = @(@{ id = $script:shared; displayName = 'Demo workspace' }, @{ id = '0c0c0c0c-0000-0000-0000-000000000002'; displayName = 'DBHub Control' })
+        $name = Get-ControlName (New-ControlConfig)
+        $script:endpoints = @(@{ id = 'endpoint-failed'; name = $name.PrivateEndpoint; provisioningState = 'Failed' })
+        foreach ($code in 500, 503, 500, 500) {
+            $script:endpointPostStatus.Enqueue($code)
+        }
+        $results = @(Invoke-Placement -Mode 'private')
+        $script:fabricPosts.Count | Should -Be 3
+        @($script:sleeps) | Should -Be @(60, 120)
+        $endpoint = $results | Where-Object checkId -EQ 'CONTROL.FABRIC.ENDPOINT'
+        $endpoint.status | Should -Be 'Manual action required'
+        $endpoint.message | Should -Match 'replacing it failed: HTTP 500 InternalServerError An error occured \(request request-1\) \(3 tries\)'
     }
 
     It 'private: reports outbound access protection that someone turned on as a Fail, and never changes it' {
