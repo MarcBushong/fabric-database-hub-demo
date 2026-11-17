@@ -58,7 +58,9 @@ function Invoke-DemoControlDeployStep {
       workspace with a managed private endpoint to the vault (a private one), as the vault actually is
       (Set-DemoActivityControlFabric). Nothing in Fabric changes while the capacity isn't Active (a Warning; the next
       deploy.ps1 does it), and the capacity is never resumed or paused.
-    The status page's "Session control" row follows both parts, and DEPLOY.CONTROL says where Run all is.
+    The status page's "Session control" row follows both parts, and DEPLOY.CONTROL says where Run all is. After the
+    Fabric part, Invoke-DemoFabricOwnershipStep records the workspaces this environment uses on its resource group and
+    checks that no other environment records them (DEPLOY.FABRIC.SHARED, 2026-11-17).
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -165,7 +167,26 @@ function Invoke-DemoControlDeployStep {
     }
     $fix = [string](@($open | ForEach-Object { [string]$_.remediation } | Where-Object { $_ }) | Select-Object -First 1)
     $results.Add((New-DemoResult -CheckId 'DEPLOY.CONTROL' -Area 'workload' -Target 'fabric' -Status $status -Message $message -Evidence ([ordered]@{ notebook = $name.Notebook; place = $where; resourceGroup = $name.ResourceGroup; ready = ($status -eq 'Pass') }) -Remediation $fix -DocUrl $doc))
-    Set-DemoProgressStep -Path $ProgressPath -Id 'Control' -State 'Done' -Status $status -Message $(if ($fix) { '{0} {1}' -f $message, $fix } else { $message }) -MaxLength 1200
+    # The Fabric workspaces this environment uses, recorded on its resource group for destroy.ps1, and whether another
+    # environment uses the same ones (2026-11-17); a Warning shows on the status page's row too. Never a Fail.
+    $ownership = $null
+    try {
+        $ownership = Invoke-DemoFabricOwnershipStep -Config $Config -Result $converted
+    }
+    catch {
+        $ownership = New-DemoResult -CheckId 'DEPLOY.FABRIC.SHARED' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The Fabric workspaces this environment uses couldn''t be recorded: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run ./scripts/deploy.ps1 again.'
+    }
+    $row = if ($fix) { '{0} {1}' -f $message, $fix } else { $message }
+    $rowStatus = $status
+    if ($null -ne $ownership) {
+        $results.Add($ownership)
+        if ([string]$ownership.status -eq 'Warning') {
+            $rowStatus = 'Warning'
+            $row = '{0} {1} {2}' -f $row, [string]$ownership.message, [string]$ownership.remediation
+            Write-DemoLog -Level Warning -Message ([string]$ownership.message)
+        }
+    }
+    Set-DemoProgressStep -Path $ProgressPath -Id 'Control' -State 'Done' -Status $rowStatus -Message $row.Trim() -MaxLength 1200
     if ($status -ne 'Pass') {
         Write-DemoLog -Level Warning -Message ('The session control: {0}' -f $message)
     }

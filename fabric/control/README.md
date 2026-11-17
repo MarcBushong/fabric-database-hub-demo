@@ -23,7 +23,7 @@ Run all keeps this notebook's Spark session for the whole session, about two hou
 
 In the folder **DBHub Control** of the demo's workspace where new Key Vaults can be public, so its Spark sessions start fast on the workspace's starter pool; or in a separate workspace named after the demo's ("Database Hub Demo Control" by default; **DBHub Control** for a control set up before 2026-11-14), on the same capacity, where a policy makes new vaults private. That workspace has a managed private endpoint to the vault, which creates a managed virtual network for the whole workspace and turns off starter pools, so its sessions start in 3 to 5 minutes ([managed virtual networks](https://learn.microsoft.com/fabric/security/security-managed-vnets-fabric-overview)). A folder can't do that: network isolation in Fabric is per workspace. The history runs in the control notebook's own session, so it needs no second session to start.
 
-`./scripts/deploy.ps1` puts the notebook there on every run. `./scripts/destroy.ps1` deletes the separate workspace with the rest of the environment when the notebook in it serves this environment, and a folder with the demo's workspace ([delete everything](../../README.md#delete-everything)).
+`./scripts/deploy.ps1` puts the notebook there on every run. `./scripts/destroy.ps1` deletes the separate workspace with the rest of the environment when the notebook in it serves this environment and no other environment uses the workspace, and a folder with the demo's workspace ([delete everything](../../README.md#delete-everything)).
 
 ## Details
 

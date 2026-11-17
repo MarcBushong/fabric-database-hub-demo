@@ -116,6 +116,11 @@ function Get-DemoDeploymentStateTagName {
         # nightly stop waited for, which ended), or session. The safety stop's runbook reads them (Get-DbHubBusyMarker).
         BusyUntilUtc             = 'DbHubBusyUntilUtc'
         BusyBy                   = 'DbHubBusyBy'
+        # 2026-11-17: the Fabric workspaces this environment uses, by ID: the demo's, and the one with the control notebook
+        # (its own workspace, or the demo's when the notebook is in its folder). destroy.ps1 in another environment keeps a
+        # workspace that one of these names, or that an environment without them might use (Get-DemoFabricWorkspaceGuard).
+        FabricWorkspaceId        = 'DbHubFabricWorkspaceId'
+        ControlWorkspaceId       = 'DbHubControlWorkspaceId'
     }
 }
 

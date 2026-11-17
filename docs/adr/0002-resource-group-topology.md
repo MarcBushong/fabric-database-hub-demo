@@ -102,6 +102,15 @@ Option 2.
 - **The golden group is unchanged:** it stays unless `-IncludeGolden`.
 - **Live (2026-11-17), two test environments whose groups were already gone:** one deleted its control (its workspace with the managed private endpoint, 6 role assignments, its two suffixed roles, the identity, the vault, purged, and the Automation account), its demo workspace, and its security group, in 5 minutes 16 seconds; a third run deleted the control group, empty by then, in about 3 minutes. The other deleted its workspace and its group in 2 minutes 48 seconds. The owner's roles (22 and 7 actions), `rg-dbhub-demo`, `rg-dbhub-control`, and the other environments' items were unchanged.
 
+## Amendment (2026-11-17): a workspace another environment might use stays
+
+**Decision** (the coordinator): `destroy.ps1` never deletes what another environment might use. Two environments can name the same Fabric workspace (`fabric.workspaceName`), and an environment deployed before this change doesn't record which workspaces it uses.
+
+- **`deploy.ps1` records the workspaces it uses** on its demo resource group, on every run that puts the control notebook in Fabric, so an upgrade records them too: `DbHubFabricWorkspaceId`, the demo's workspace, and `DbHubControlWorkspaceId`, the control notebook's, which is the demo's when the notebook is in its folder. When another environment records the same workspace, `DEPLOY.FABRIC.SHARED` is a **Warning** that doesn't block, with the fix: each environment its own `fabric.workspaceName` and `control.fabricWorkspaceName`.
+- **`destroy.ps1` deletes a workspace that its own checks found to be this environment's only when** one Azure Resource Graph query across the subscriptions the caller can read shows no other demo environment that records it, and none without the record. A demo environment is a resource group with the `deploymentId` or `DbHubDeployStage` tag; the golden group and the session controls' groups carry `solution`, but neither of those, so they don't count. Otherwise, and when Resource Graph can't be read or its answer doesn't list the configured subscription, the workspace stays: a **Warning** that names the other environments, with the fix.
+- **Consequence:** with a single environment, the usual case, everything still goes in one command. While an older environment exists, such as one that runs `main`'s code, every workspace stays until that environment's next `deploy.ps1` records its own, or until it's destroyed.
+- **Sources (checked 2026-11-17):** Resource Graph's [query scope](https://learn.microsoft.com/azure/governance/resource-graph/concepts/query-language#query-scope), "If a management group or a subscription list isn't defined, the query scope is all resources"; Fabric's [retention and recovery](https://learn.microsoft.com/fabric/admin/portal-workspaces#retention-and-recovery): a deleted collaborative workspace can be restored by a Fabric administrator during its retention period, 7 days by default, configurable from 7 to 90.
+
 ## Sources (checked 2026-10-19)
 
 - Subscription-scope deployments: <https://learn.microsoft.com/azure/azure-resource-manager/bicep/deploy-to-subscription>

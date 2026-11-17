@@ -128,6 +128,9 @@ Describe 'Get-DemoDestroyFabricPlan: only workspaces that are this environment''
             throw ('unexpected request: {0} {1}' -f $Method, $Uri)
         }
         $script:control = [pscustomobject]@{ Name = (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoActivityControlName -Config $Config }); State = 'Serves' }
+        # Resource Graph's answer for the guard (2026-11-17): by default, no other demo environment.
+        $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -MockWith { $script:claim }
     }
 
     It 'deletes the demo''s workspace when everything in it is the demo''s, and the control''s when its notebook serves this environment' {
@@ -137,6 +140,42 @@ Describe 'Get-DemoDestroyFabricPlan: only workspaces that are this environment''
         $plan.Demo.Reason | Should -Be 'everything in it is the demo''s (9 item(s))'
         $plan.Control.Delete | Should -BeTrue
         $plan.Control.Reason | Should -Be 'its control notebook serves rg-dbhub-demo'
+        # Only this environment: one Resource Graph query, and nothing kept for another.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -Times 1 -Exactly
+        $plan.Demo.Guard | Should -BeNullOrEmpty
+    }
+
+    It 'keeps a workspace another environment records as its own, and names it; the other workspace still goes (the shared-workspace guard)' {
+        $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @([pscustomobject]@{ Name = 'rg-dbhubfd-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhubfd-demo'; Tagged = $true; Claims = @('demo-ws', '0a0a0a0a-0000-0000-0000-000000000001') }) }
+        $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
+        $plan.Demo.Delete | Should -BeFalse
+        $plan.Demo.Guard | Should -Be 'Claimed'
+        $plan.Demo.Reason | Should -Be 'rg-dbhubfd-demo records it as its own'
+        @($plan.Demo.ClaimedBy) | Should -Be @('rg-dbhubfd-demo')
+        $plan.Demo.Remediation | Should -Match '^Run \./scripts/destroy\.ps1 again once rg-dbhubfd-demo is destroyed, or delete it in Fabric once nothing uses it \(Workspace settings > Remove this workspace\)\. To keep environments apart, give each its own fabric\.workspaceName and control\.fabricWorkspaceName\.$'
+        $plan.Control.Delete | Should -BeTrue -Because 'no other environment records the control''s workspace'
+    }
+
+    It 'keeps both while a demo environment deployed by an earlier version, which records no workspace, might use them' {
+        $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @([pscustomobject]@{ Name = 'rg-dbhub-demo'; SubscriptionId = '99999999-2222-3333-4444-555555555555'; Label = 'rg-dbhub-demo (subscription 99999999-2222-3333-4444-555555555555)'; Tagged = $false; Claims = @() }) }
+        $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
+        foreach ($workspace in $plan.Demo, $plan.Control) {
+            $workspace.Delete | Should -BeFalse
+            $workspace.Guard | Should -Be 'Untagged'
+            $workspace.Reason | Should -Be 'rg-dbhub-demo (subscription 99999999-2222-3333-4444-555555555555) was deployed by an earlier version of the demo, which doesn''t record the workspaces it uses, so it might use it'
+            $workspace.Remediation | Should -Match '^Run \./scripts/destroy\.ps1 again after the next \./scripts/deploy\.ps1 of rg-dbhub-demo \(subscription 99999999-2222-3333-4444-555555555555\), which records the workspaces it uses, or after its destroy; or delete it in Fabric once nothing uses it'
+        }
+    }
+
+    It 'keeps both when Resource Graph can''t be read, and says so' {
+        $script:claim = [pscustomobject]@{ Ok = $false; Error = 'AuthorizationFailed: no access.'; Others = @() }
+        $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
+        foreach ($workspace in $plan.Demo, $plan.Control) {
+            $workspace.Delete | Should -BeFalse
+            $workspace.Guard | Should -Be 'Unreadable'
+            $workspace.Reason | Should -Be 'Azure Resource Graph couldn''t be read, so destroy.ps1 can''t tell whether another environment uses it (AuthorizationFailed: no access)'
+            $workspace.Remediation | Should -Match '^Run \./scripts/destroy\.ps1 again when Azure Resource Graph answers; or delete it in Fabric once nothing uses it'
+        }
     }
 
     It 'keeps a workspace with anything the demo didn''t create, and names it' {
@@ -159,6 +198,70 @@ Describe 'Get-DemoDestroyFabricPlan: only workspaces that are this environment''
         $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
         $plan.Ok | Should -BeFalse
         $plan.Kind | Should -Be 'CapacityInactive'
+    }
+}
+
+Describe 'Get-DemoFabricWorkspaceClaim: the other demo environments, across the subscriptions the caller can read (2026-11-17)' {
+    BeforeEach {
+        $config = New-TestConfig
+        $script:subscription = '11111111-2222-3333-4444-555555555555'
+        $script:graphCalls = [System.Collections.Generic.List[object]]::new()
+        $group = { param([string] $Name, [hashtable] $Tags, [string] $Subscription = $script:subscription) [pscustomobject]@{ id = ('/subscriptions/{0}/resourceGroups/{1}' -f $Subscription, $Name); name = $Name; type = 'microsoft.resources/subscriptions/resourcegroups'; subscriptionId = $Subscription; tags = [pscustomobject]$Tags } }
+        $script:rows = @(
+            [pscustomobject]@{ id = ('/subscriptions/{0}' -f $script:subscription); name = 'Demo subscription'; type = 'microsoft.resources/subscriptions'; subscriptionId = $script:subscription; tags = $null }
+            # This environment's own group isn't another environment.
+            & $group 'rg-dbhub-demo' @{ deploymentId = 'aaaaaa'; DbHubDeployStage = 'Validation'; DbHubFabricWorkspaceId = 'dddddddd-0000-0000-0000-000000000001' }
+            # Another environment on this code: it records its workspaces.
+            & $group 'rg-dbhubfd-demo' @{ deploymentId = 'bbbbbb'; DbHubDeployStage = 'Validation'; DbHubFabricWorkspaceId = 'DDDDDDDD-0000-0000-0000-000000000002'; DbHubControlWorkspaceId = 'cccccccc-0000-0000-0000-000000000002' }
+            # One deployed by an earlier version, like the owner's: no workspace recorded, and its tag's name in another case.
+            & $group 'rg-dbhubowner-demo' @{ DEPLOYMENTID = 'cccccc' }
+            # The golden group and a session control's group carry solution, but neither environment tag.
+            & $group 'rg-dbhub-golden' @{ environment = 'golden'; solution = 'fabric-database-hub-demo' }
+            & $group 'rg-dbhub-control' @{ component = 'activity-control'; solution = 'fabric-database-hub-demo' }
+            # Another subscription's environment, whose only record isn't a workspace ID.
+            & $group 'rg-dbhub-demo' @{ deploymentId = 'eeeeee'; DbHubFabricWorkspaceId = 'not-an-id' } '99999999-2222-3333-4444-555555555555'
+        )
+        $script:graph = { [pscustomobject]@{ Succeeded = $true; Error = ''; Rows = $script:rows; Truncated = $false } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHubResourceGraph -MockWith { $script:graphCalls.Add([pscustomobject]@{ Query = $Query; All = [bool]$PesterBoundParameters['AllSubscriptions']; SubscriptionId = $SubscriptionId }); & $script:graph }
+    }
+
+    It 'lists every other demo environment with what it records, in one query across the subscriptions the caller can read' {
+        $claim = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoFabricWorkspaceClaim -Config $Config }
+        $claim.Ok | Should -BeTrue
+        $script:graphCalls.Count | Should -Be 1
+        $script:graphCalls[0].All | Should -BeTrue
+        $script:graphCalls[0].Query | Should -Match '^resourcecontainers \| where \(type =~ ''microsoft\.resources/subscriptions'' and subscriptionId =~ ''11111111-2222-3333-4444-555555555555''\)'
+        @($claim.Others | ForEach-Object { $_.Label }) | Should -Be @('rg-dbhubfd-demo', 'rg-dbhubowner-demo', 'rg-dbhub-demo (subscription 99999999-2222-3333-4444-555555555555)')
+        $fd = $claim.Others[0]
+        $fd.Tagged | Should -BeTrue
+        @($fd.Claims) | Should -Be @('dddddddd-0000-0000-0000-000000000002', 'cccccccc-0000-0000-0000-000000000002')
+        $claim.Others[1].Tagged | Should -BeFalse -Because 'an earlier version records no workspace'
+        $claim.Others[2].Tagged | Should -BeFalse -Because 'a record that isn''t a workspace ID doesn''t count'
+    }
+
+    It 'can''t tell when Resource Graph fails, cuts its answer short, throws, or doesn''t list the subscription' {
+        foreach ($case in @(
+                @{ Graph = { [pscustomobject]@{ Succeeded = $false; Error = 'AccessDenied'; Rows = @(); Truncated = $false } }; Error = '^AccessDenied$' }
+                @{ Graph = { [pscustomobject]@{ Succeeded = $true; Error = ''; Rows = $script:rows; Truncated = $true } }; Error = 'cut short' }
+                @{ Graph = { throw 'The token''s tenant isn''t the configured one.' }; Error = 'tenant isn''t the configured one' }
+                @{ Graph = { [pscustomobject]@{ Succeeded = $true; Error = ''; Rows = @($script:rows | Select-Object -Skip 1); Truncated = $false } }; Error = '^Resource Graph didn''t list the subscription 11111111-2222-3333-4444-555555555555' }
+            )) {
+            $script:graph = $case.Graph
+            $claim = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoFabricWorkspaceClaim -Config $Config }
+            $claim.Ok | Should -BeFalse
+            $claim.Error | Should -Match $case.Error
+        }
+    }
+}
+
+Describe 'Invoke-DemoHubResourceGraph -AllSubscriptions (2026-11-17)' {
+    It 'sends no subscription list for a query across every subscription the caller can read, and the configured one otherwise' {
+        $script:bodies = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith { $script:bodies.Add([string]$Body); [pscustomobject]@{ ExitCode = 0; StatusCode = 200; StdOut = '{"data":[],"resultTruncated":"false"}'; StdErr = '' } }
+        $null = InModuleScope DbHubDemo { Invoke-DemoHubResourceGraph -SubscriptionId '11111111-2222-3333-4444-555555555555' -Query 'resourcecontainers | limit 1' -AllSubscriptions }
+        $null = InModuleScope DbHubDemo { Invoke-DemoHubResourceGraph -SubscriptionId '11111111-2222-3333-4444-555555555555' -Query 'resourcecontainers | limit 1' }
+        ($script:bodies[0] | ConvertFrom-Json).PSObject.Properties.Name | Should -Not -Contain 'subscriptions'
+        @(($script:bodies[1] | ConvertFrom-Json).subscriptions) | Should -Be @('11111111-2222-3333-4444-555555555555')
     }
 }
 
@@ -274,6 +377,18 @@ Describe 'Invoke-DemoDestroyExtra: each part deletes what''s this environment''s
         $control.status | Should -Be 'Not selected'
         $control.message | Should -Be 'The session control in rg-dbhub-control stays: its runbooks serve rg-dbhubowner-demo, not rg-dbhub-demo.'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.ENTRA.GROUP' }).message | Should -Match 'stays: init\.ps1 didn''t create it \(you supplied it\)\.$'
+    }
+
+    It 'keeps a workspace the guard kept as a Warning with its fix, and still deletes what''s free (2026-11-17)' {
+        $script:plan.Fabric.Plan.Demo = [pscustomobject]@{ Name = 'Database Hub Demo'; Id = 'demo-ws'; Exists = $true; Delete = $false; Items = @(); Foreign = @(); Notebook = ''; Reason = 'rg-dbhub-demo was deployed by an earlier version of the demo, which doesn''t record the workspaces it uses, so it might use it'; Guard = 'Untagged'; ClaimedBy = @(); Untagged = @('rg-dbhub-demo'); Remediation = 'Run ./scripts/destroy.ps1 again after the next ./scripts/deploy.ps1 of rg-dbhub-demo.' }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Plan = $script:plan } { Invoke-DemoDestroyExtra -Config $Config -Plan $Plan })
+        @($script:requests) | Should -Not -Contain 'Delete /workspaces/demo-ws'
+        @($script:requests) | Should -Contain 'Delete /workspaces/control-ws'
+        $workspace = $results | Where-Object { $_.checkId -eq 'DESTROY.FABRIC.WORKSPACE' }
+        $workspace.status | Should -Be 'Warning'
+        $workspace.message | Should -Be 'The Fabric workspace "Database Hub Demo" stays: rg-dbhub-demo was deployed by an earlier version of the demo, which doesn''t record the workspaces it uses, so it might use it.'
+        $workspace.remediation | Should -Be 'Run ./scripts/destroy.ps1 again after the next ./scripts/deploy.ps1 of rg-dbhub-demo.'
+        @($workspace.evidence.untagged) | Should -Be @('rg-dbhub-demo')
     }
 
     It 'says to resume a paused capacity, and goes on with the other parts when one stops' {

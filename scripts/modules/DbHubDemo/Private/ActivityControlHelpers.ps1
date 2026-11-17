@@ -1915,7 +1915,7 @@ function Set-DemoActivityControlFabric {
     $workspaceCheck = @(Test-DemoFabricWorkspace -Config $Config -Token $Token)
     $capacity = @($workspaceCheck | Where-Object { $_.checkId -eq 'FABRIC.P5.CAPACITY' }) | Select-Object -First 1
     if ($null -eq $capacity -or $capacity.status -notin 'Pass', 'Warning') {
-        & $add 'CONTROL.FABRIC.NOTEBOOK' 'Manual action required' ('The existing workspace''s capacity isn''t usable now ({0}), so nothing was created in Fabric; this script never resumes, pauses, or scales a capacity.' -f $(if ($null -ne $capacity) { $capacity.message } else { 'unknown' })) @{} 'When the capacity''s administrator has it Active, run setup-activity-control.ps1 again.' 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
+        & $add 'CONTROL.FABRIC.NOTEBOOK' 'Manual action required' ('The existing workspace''s capacity isn''t usable now ({0}), so nothing was created in Fabric; this script never resumes, pauses, or scales a capacity.' -f $(if ($null -ne $capacity) { $capacity.message } else { 'unknown' })) ([ordered]@{ demoWorkspaceId = $sharedId }) 'When the capacity''s administrator has it Active, run setup-activity-control.ps1 again.' 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
         return $results.ToArray()
     }
 
@@ -2063,7 +2063,9 @@ function Set-DemoActivityControlFabric {
         $import['FolderId'] = $folderId
     }
     $imported = Import-DemoFabricNotebook @import
-    $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status ([string]$imported.status) -Message ('{0} {1}' -f $Name.Notebook, [string]$imported.message) -Evidence ([ordered]@{ workspace = $(if ($Mode -eq 'public') { 'existing' } else { $Name.FabricWorkspace }); folder = $(if ($folderId) { $Name.FabricFolder } else { '' }); mode = $Mode }) -Remediation ([string]$imported.remediation) -DocUrl 'https://learn.microsoft.com/rest/api/fabric/core/items/create-item'))
+    # The workspaces' IDs go with it, so deploy.ps1 records them on the demo resource group (Invoke-DemoFabricOwnershipStep,
+    # 2026-11-17): the notebook's own, and the demo's.
+    $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status ([string]$imported.status) -Message ('{0} {1}' -f $Name.Notebook, [string]$imported.message) -Evidence ([ordered]@{ workspace = $(if ($Mode -eq 'public') { 'existing' } else { $Name.FabricWorkspace }); folder = $(if ($folderId) { $Name.FabricFolder } else { '' }); mode = $Mode; workspaceId = $targetWorkspace; demoWorkspaceId = $sharedId }) -Remediation ([string]$imported.remediation) -DocUrl 'https://learn.microsoft.com/rest/api/fabric/core/items/create-item'))
     if ([string]$imported.status -eq 'Pass') {
         # A reference run uses the caller's Spark session, so the history needs no second Spark job (2026-11-14).
         $runDoc = 'https://learn.microsoft.com/fabric/data-engineering/notebookutils/notebookutils-notebook-run'

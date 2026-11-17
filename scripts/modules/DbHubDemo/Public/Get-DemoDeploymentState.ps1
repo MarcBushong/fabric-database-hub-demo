@@ -26,7 +26,9 @@ function Get-DemoDeploymentState {
     read replica for this environment, in the DbHubT4Replica tag; 2026-11-13, ADR 0025), T4ReplicaSize (the size and zone the
     last replica was created with, in the DbHubT4ReplicaSize tag), BusyUntilUtc and BusyBy (the busy marker that keeps the
     nightly stop waiting for a run that's still going, in DbHubBusyUntilUtc and DbHubBusyBy; 2026-11-14,
-    ConvertTo-DemoBusyMarker), and Tags (every tag on the group). Read-only.
+    ConvertTo-DemoBusyMarker), FabricWorkspaceId and ControlWorkspaceId (the Fabric workspaces this environment uses, by
+    ID, in DbHubFabricWorkspaceId and DbHubControlWorkspaceId; 2026-11-17, Invoke-DemoFabricOwnershipStep), and Tags
+    (every tag on the group). Read-only.
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -83,6 +85,8 @@ function Get-DemoDeploymentState {
         T4ReplicaSize     = & $read 'T4ReplicaSize'
         BusyUntilUtc      = & $read 'BusyUntilUtc'
         BusyBy            = & $read 'BusyBy'
+        FabricWorkspaceId  = (& $read 'FabricWorkspaceId').ToLowerInvariant()
+        ControlWorkspaceId = (& $read 'ControlWorkspaceId').ToLowerInvariant()
         Tags              = $tags
     }
 }

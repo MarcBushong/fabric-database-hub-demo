@@ -141,9 +141,12 @@ function Get-DemoDestroyFabricPlan {
     Which Fabric workspaces destroy.ps1 deletes, read-only: the demo's (fabric.workspaceName), when every item in it is
     one the demo creates; and the control's (control.fabricWorkspaceName), when everything in it is the control
     notebook, and that notebook names this environment's resource group, or the workspace is empty and the control
-    serves this environment. Returns Ok, Error, Kind (Get-DemoFabricListFailureKind, when a list failed), Demo, and
-    Control; each workspace has Name, Id, Exists, Delete, Items (type: name), Foreign (what the demo didn't create), and
-    Reason. Internal.
+    serves this environment. Either goes only when no other demo environment records it, none was deployed by a version
+    that doesn't record its workspaces, and Azure Resource Graph answered (Get-DemoFabricWorkspaceGuard, 2026-11-17);
+    otherwise Guard says why it stays (Unreadable, Claimed, or Untagged), with ClaimedBy, Untagged, and Remediation.
+    Returns Ok, Error, Kind (Get-DemoFabricListFailureKind, when a list failed), Demo, and Control; each workspace has
+    Name, Id, Exists, Delete, Items (type: name), Foreign (what the demo didn't create), Reason, and the guard's fields.
+    Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -186,7 +189,7 @@ function Get-DemoDestroyFabricPlan {
     }
     $read = {
         param([string] $Name, [object[]] $Allowed)
-        $plan = [ordered]@{ Name = $Name; Id = ''; Exists = $false; Delete = $false; Items = @(); Foreign = @(); Notebook = ''; Reason = '' }
+        $plan = [ordered]@{ Name = $Name; Id = ''; Exists = $false; Delete = $false; Items = @(); Foreign = @(); Notebook = ''; Reason = ''; Guard = ''; ClaimedBy = @(); Untagged = @(); Remediation = '' }
         $match = @($workspaces.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'displayName') -ceq $Name })
         if ($match.Count -eq 0) {
             $plan.Reason = 'it doesn''t exist'
@@ -234,36 +237,62 @@ function Get-DemoDestroyFabricPlan {
 
     $controlName = [string]$Control.Name.FabricWorkspace
     if ($controlName -ceq [string]$setting.WorkspaceName) {
-        $answer.Control = [pscustomobject]@{ Name = $controlName; Id = $demo.Id; Exists = $false; Delete = $false; Items = @(); Foreign = @(); Notebook = ''; Reason = 'it''s the demo''s own workspace' }
-        return [pscustomobject]$answer
+        $answer.Control = [pscustomobject]@{ Name = $controlName; Id = $demo.Id; Exists = $false; Delete = $false; Items = @(); Foreign = @(); Notebook = ''; Reason = 'it''s the demo''s own workspace'; Guard = ''; ClaimedBy = @(); Untagged = @(); Remediation = '' }
     }
-    $plan = & $read $controlName $controlItems
-    if ($plan.Exists -and -not $plan.Reason) {
-        if ($plan.Foreign.Count -gt 0) {
-            $plan.Reason = ('it holds what the control didn''t create: {0}' -f ($plan.Foreign -join ', '))
-        }
-        elseif ($plan.Notebook) {
-            $served = Get-DemoFabricNotebookResourceGroup -WorkspaceId $plan.Id -ItemId $plan.Notebook -Token $Token
-            if (-not $served.Ok) {
-                $plan.Reason = ('its control notebook couldn''t be read, so it can''t tell which environment it serves: {0}' -f $served.Error)
+    else {
+        $plan = & $read $controlName $controlItems
+        if ($plan.Exists -and -not $plan.Reason) {
+            if ($plan.Foreign.Count -gt 0) {
+                $plan.Reason = ('it holds what the control didn''t create: {0}' -f ($plan.Foreign -join ', '))
             }
-            elseif ([string]::Equals($served.ResourceGroup, $resourceGroup, [System.StringComparison]::OrdinalIgnoreCase)) {
+            elseif ($plan.Notebook) {
+                $served = Get-DemoFabricNotebookResourceGroup -WorkspaceId $plan.Id -ItemId $plan.Notebook -Token $Token
+                if (-not $served.Ok) {
+                    $plan.Reason = ('its control notebook couldn''t be read, so it can''t tell which environment it serves: {0}' -f $served.Error)
+                }
+                elseif ([string]::Equals($served.ResourceGroup, $resourceGroup, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $plan.Delete = $true
+                    $plan.Reason = ('its control notebook serves {0}' -f $resourceGroup)
+                }
+                else {
+                    $plan.Reason = ('its control notebook serves {0}, not {1}' -f $(if ($served.ResourceGroup) { $served.ResourceGroup } else { 'no resource group it names' }), $resourceGroup)
+                }
+            }
+            elseif ($Control.State -eq 'Serves') {
                 $plan.Delete = $true
-                $plan.Reason = ('its control notebook serves {0}' -f $resourceGroup)
+                $plan.Reason = 'it''s empty, and the control serves this environment'
             }
             else {
-                $plan.Reason = ('its control notebook serves {0}, not {1}' -f $(if ($served.ResourceGroup) { $served.ResourceGroup } else { 'no resource group it names' }), $resourceGroup)
+                $plan.Reason = 'it''s empty, and nothing says it''s this environment''s'
             }
         }
-        elseif ($Control.State -eq 'Serves') {
-            $plan.Delete = $true
-            $plan.Reason = 'it''s empty, and the control serves this environment'
+        $answer.Control = [pscustomobject]$plan
+    }
+
+    # 2026-11-17 (the coordinator's decision: destroy.ps1 never deletes what another environment might use): a workspace
+    # those checks found to be this environment's goes only when no other demo environment records it, none was deployed
+    # by a version that doesn't record its workspaces, and Azure Resource Graph answered (Get-DemoFabricWorkspaceGuard).
+    $deleting = @(@($answer.Demo, $answer.Control) | Where-Object { $null -ne $_ -and $_.Delete })
+    if ($deleting.Count -gt 0) {
+        $claim = $null
+        try {
+            $claim = Get-DemoFabricWorkspaceClaim -Config $Config
         }
-        else {
-            $plan.Reason = 'it''s empty, and nothing says it''s this environment''s'
+        catch {
+            $claim = [pscustomobject]@{ Ok = $false; Error = (Protect-DemoText -Text $_.Exception.Message).Trim(); Others = @() }
+        }
+        foreach ($workspace in $deleting) {
+            $guard = Get-DemoFabricWorkspaceGuard -Claim $claim -WorkspaceId ([string]$workspace.Id)
+            if (-not $guard.Free) {
+                $workspace.Delete = $false
+                $workspace.Guard = $guard.Guard
+                $workspace.ClaimedBy = @($guard.ClaimedBy)
+                $workspace.Untagged = @($guard.Untagged)
+                $workspace.Reason = $guard.Reason
+                $workspace.Remediation = $guard.Remediation
+            }
         }
     }
-    $answer.Control = [pscustomobject]$plan
     return [pscustomobject]$answer
 }
 
@@ -494,6 +523,11 @@ function Invoke-DemoDestroyExtra {
                 return (New-DemoResult -CheckId $kind.CheckId -Area 'teardown' -Target 'fabric' -Status 'Pass' -Message ('{0} {1} doesn''t exist; nothing to delete.' -f $kind.Title, $label).Replace('  ', ' ') -DocUrl $fabricDoc)
             }
             if (-not $workspace.Delete) {
+                # Kept because another environment records it, might use it, or that couldn't be checked: a Warning with
+                # the fix (2026-11-17).
+                if ([string](Get-DemoMemberValue -InputObject $workspace -Name 'Guard')) {
+                    return (New-DemoResult -CheckId $kind.CheckId -Area 'teardown' -Target 'fabric' -Status 'Warning' -Message ('The Fabric workspace "{0}" stays: {1}.' -f $workspace.Name, $workspace.Reason) -Evidence ([ordered]@{ workspace = $workspace.Name; workspaceId = $workspace.Id; guard = $workspace.Guard; claimedBy = @($workspace.ClaimedBy); untagged = @($workspace.Untagged) }) -Remediation ([string]$workspace.Remediation) -DocUrl 'https://learn.microsoft.com/fabric/admin/portal-workspaces#retention-and-recovery')
+                }
                 return (New-DemoResult -CheckId $kind.CheckId -Area 'teardown' -Target 'fabric' -Status 'Not selected' -Message ('The Fabric workspace "{0}" stays: {1}.' -f $workspace.Name, $workspace.Reason) -Evidence ([ordered]@{ workspace = $workspace.Name; items = @($workspace.Items); foreign = @($workspace.Foreign) }) -Remediation 'If it''s yours to delete, delete it in Fabric (Workspace settings > Remove this workspace).' -DocUrl $fabricDoc)
             }
             $endpoints = Get-DemoActivityControlFabricList -Uri ('{0}/workspaces/{1}/managedPrivateEndpoints' -f $base, $workspace.Id) -Token $fabric.Token

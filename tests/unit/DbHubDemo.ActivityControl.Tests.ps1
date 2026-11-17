@@ -787,6 +787,13 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
             throw ('unexpected ARM call: {0}' -f $Url)
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -MockWith { [System.Security.SecureString]::new() }
+        # The workspaces' record on the demo group and Resource Graph's answer (2026-11-17): by default, no other environment.
+        $script:recorded = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:recorded.Add($Value) }
+        $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -MockWith { $script:claim }
+        $script:demoId = 'dddddddd-0000-0000-0000-000000000001'
+        $script:controlId = 'cccccccc-0000-0000-0000-000000000001'
     }
 
     It 'is on whatever an older configuration says, and notes an older "enabled": false once' {
@@ -914,6 +921,74 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
         Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -Times 0 -Exactly
         ($results | Where-Object checkId -EQ 'CONTROL.FABRIC.NOTEBOOK').message | Should -Match 'kv-dbhub-ctl-[0-9a-f]{6} isn''t there'
         ($results | Where-Object checkId -EQ 'DEPLOY.CONTROL').status | Should -Be 'Warning'
+        $results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED' | Should -BeNullOrEmpty -Because 'no workspace was resolved, so nothing is recorded'
+        $script:recorded | Should -BeNullOrEmpty
+    }
+
+    Context 'the Fabric workspaces it uses, recorded on its resource group (2026-11-17)' {
+        BeforeEach {
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -MockWith {
+                New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'NB_DatabaseHub_Control was updated.' -Evidence ([ordered]@{ workspace = $Name.FabricWorkspace; folder = ''; mode = $Mode; workspaceId = $script:controlId.ToUpperInvariant(); demoWorkspaceId = $script:demoId })
+            }
+        }
+
+        It 'records both on every run, and says no other environment records them' {
+            $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric -ProgressPath 'out/progress.json' })
+            $script:recorded.Count | Should -Be 1
+            $script:recorded[0]['FabricWorkspaceId'] | Should -Be $script:demoId
+            $script:recorded[0]['ControlWorkspaceId'] | Should -Be $script:controlId
+            Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -Times 1 -Exactly
+            $shared = $results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED'
+            $shared.status | Should -Be 'Pass'
+            $shared.message | Should -BeExactly 'Recorded the Fabric workspaces this environment uses on rg-dbhub-demo (the workspace "Database Hub Demo" and the workspace "Database Hub Demo Control"), and no other environment records them.'
+            $script:steps[-1].Status | Should -Be 'Pass'
+        }
+
+        It 'warns when another environment records the same workspace, names it, gives the fix, and the status page shows it; never a Fail' {
+            $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @(
+                    [pscustomobject]@{ Name = 'rg-dbhubfd-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhubfd-demo'; Tagged = $true; Claims = @($script:demoId) }
+                    [pscustomobject]@{ Name = 'rg-other-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-other-demo'; Tagged = $true; Claims = @('eeeeeeee-0000-0000-0000-000000000001') }
+                ) }
+            $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric -ProgressPath 'out/progress.json' })
+            @($results | Where-Object status -In 'Fail', 'Manual action required') | Should -BeNullOrEmpty
+            $shared = $results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED'
+            $shared.status | Should -Be 'Warning'
+            $shared.message | Should -Match '^Another environment uses the same Fabric workspace as this one: rg-dbhubfd-demo records the workspace "Database Hub Demo"\. Each deploy\.ps1 then puts its own notebooks there'
+            $shared.message | Should -Not -Match 'rg-other-demo'
+            $shared.remediation | Should -BeExactly 'Give each environment its own fabric.workspaceName and control.fabricWorkspaceName in its configuration, then run ./scripts/deploy.ps1 for it.'
+            @($shared.evidence.sharedWith) | Should -Be @('rg-dbhubfd-demo records the workspace "Database Hub Demo"')
+            ($results | Where-Object checkId -EQ 'DEPLOY.CONTROL').status | Should -Be 'Pass' -Because 'Run all is still ready'
+            $script:steps[-1].Status | Should -Be 'Warning'
+            $script:steps[-1].Message | Should -Match 'rg-dbhubfd-demo records the workspace "Database Hub Demo"'
+            $script:recorded.Count | Should -Be 1 -Because 'it records its own workspaces either way'
+        }
+
+        It 'records them, and says so, when Resource Graph can''t check; and says so when the record fails' {
+            $script:claim = [pscustomobject]@{ Ok = $false; Error = 'AccessDenied.'; Others = @() }
+            $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric })
+            $shared = $results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED'
+            $shared.status | Should -Be 'Warning'
+            $shared.message | Should -BeExactly 'Whether another environment uses the same Fabric workspaces couldn''t be checked: AccessDenied.'
+            $shared.remediation | Should -Match '^Nothing to do now'
+            $script:recorded.Count | Should -Be 1
+
+            $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @() }
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { throw 'Recording the deployment state failed: AuthorizationFailed.' }
+            $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric })
+            $shared = $results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED'
+            $shared.status | Should -Be 'Warning'
+            $shared.message | Should -Match '^The Fabric workspaces this environment uses couldn''t be recorded on rg-dbhub-demo \(Recording the deployment state failed: AuthorizationFailed\), so destroy\.ps1 in another environment keeps them until a later deploy\.ps1 records them\.$'
+            $shared.remediation | Should -Be 'Run ./scripts/deploy.ps1 again.'
+        }
+
+        It 'records the demo''s workspace while the capacity isn''t Active, when that''s all it knows' {
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -MockWith {
+                New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message 'The existing workspace''s capacity isn''t usable now (Paused).' -Evidence ([ordered]@{ demoWorkspaceId = $script:demoId }) -Remediation 'When the capacity''s administrator has it Active, run setup-activity-control.ps1 again.'
+            }
+            $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric })
+            @($script:recorded[0].Keys) | Should -Be @('FabricWorkspaceId')
+            ($results | Where-Object checkId -EQ 'DEPLOY.FABRIC.SHARED').message | Should -Match '\(the workspace "Database Hub Demo"\), and no other environment records them\.$'
+        }
     }
 
     It 'runs on both deploy paths: the Azure part beside the nightly safety stop, the notebook after the Fabric track, a status page row, and DONE''s line' {
@@ -1183,6 +1258,19 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
         $script:fabricPosts.Count | Should -Be 0
         $script:imports.Count | Should -Be 0
         @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
+    }
+
+    It 'tells deploy.ps1 which workspaces it used, for destroy.ps1''s guard: the demo''s, and the one the notebook is in (2026-11-17)' {
+        $public = @(Invoke-Placement -Mode 'public') | Where-Object checkId -EQ 'CONTROL.FABRIC.NOTEBOOK'
+        $public.evidence.demoWorkspaceId | Should -Be $script:shared
+        $public.evidence.workspaceId | Should -Be $script:shared -Because 'a public vault''s notebook is in a folder of the demo''s workspace'
+        $script:connections.Add([pscustomobject]@{ name = 'connection-1'; status = 'Pending'; description = 'DBHub Control notebook to the control vault (ADR 0020)' })
+        $private = @(Invoke-Placement -Mode 'private') | Where-Object checkId -EQ 'CONTROL.FABRIC.NOTEBOOK'
+        $private.evidence.demoWorkspaceId | Should -Be $script:shared
+        $private.evidence.workspaceId | Should -Be '0c0c0c0c-0000-0000-0000-000000000002'
+        $script:capacityStatus = 'Fail'
+        $paused = @(Invoke-Placement -Mode 'private')
+        $paused[0].evidence.demoWorkspaceId | Should -Be $script:shared -Because 'the demo''s workspace is known before the capacity is read'
     }
 
     It 'private: creates the DBHub Control workspace on the same capacity, a managed private endpoint to the vault, approves it on the vault, and imports the notebook there' {
