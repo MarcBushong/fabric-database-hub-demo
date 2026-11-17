@@ -339,14 +339,14 @@ function Restart-DemoVmOnce {
                 }
             }
             $why = if ($agentDown) { 'its VM agent isn''t Ready ({0})' -f $state.Text } else { 'it lists {0} chunk Run Command(s) that a restart would keep' -f $chunks.Count }
-            $sent = if ($asked -gt 0) { 'the deletes of its {0} leftover chunk Run Command(s) were sent first, so they finish with the deallocate, and ' -f $asked } else { '' }
+            $sent = if ($asked -gt 0) { 'the deletes of its {0} chunk Run Command(s) went first, to complete with the deallocate; ' -f $asked } else { '' }
             Write-DemoLog -Level Warning -Message ('{0}: {1} for about 15 minutes, and {2}, so it isn''t restarted: {3}it''s deallocated and started once now (R871); no action needed.' -f $VmName, $Because, $why, $sent)
             if ($asked -gt 0) {
                 # Live, the deallocate went out a minute after the deletes.
                 Start-Sleep -Seconds 60
             }
             $recover = Invoke-DemoVmRestartRecovery -Config $Config -VmName $VmName -TimeoutMinutes $RecoverMinutes -PollSeconds $PollSeconds
-            $detail = '{0}{1}, so {2}{3}' -f $why.Substring(0, 1).ToUpperInvariant(), $why.Substring(1), $sent, $recover.Detail
+            $detail = '{0}{1}, so it wasn''t restarted: {2}{3}' -f $why.Substring(0, 1).ToUpperInvariant(), $why.Substring(1), $sent, $recover.Detail
             return [pscustomobject]@{ Restarted = $true; Reason = ''; AtUtc = $at; Recovered = [bool]$recover.Recovered; Failed = -not [bool]$recover.Recovered; Detail = $detail; Results = @($recover.Results); Left = [string](Get-DemoMemberValue -InputObject $recover -Name 'Left'); Action = 'deallocated and started'; AgentDown = $agentDown; ChunksDeleted = $asked }
         }
     }
@@ -532,7 +532,7 @@ function Invoke-DemoVmRestartRecovery {
         return [pscustomobject]@{ Recovered = $false; Detail = ('{0}Azure refused its deallocate: {1}' -f $guestText, (Get-DemoDeploymentErrorText -Text $deallocate.StdErr -MaxLength 300)); Results = $results.ToArray(); Left = '' }
     }
     $seconds = [int][System.Math]::Max(60, ($TimeoutMinutes * 60) - $watch.Elapsed.TotalSeconds)
-    $stopped = Invoke-DemoVmPowerAction -Config $Config -VmName $VmName -Action Deallocate -TimeoutSeconds ([System.Math]::Min(3600, $seconds)) -PollSeconds $PollSeconds
+    $stopped = Invoke-DemoVmPowerAction -Config $Config -VmName $VmName -Action Deallocate -TimeoutSeconds ([System.Math]::Min(3600, $seconds)) -PollSeconds $PollSeconds -DeallocateRequested
     if ([string]$stopped.status -ne 'Pass') {
         return [pscustomobject]@{ Recovered = $false; Detail = ('{0}it was asked to deallocate, but {1}' -f $guestText, [string]$stopped.message); Results = $results.ToArray(); Left = 'deallocating' }
     }
@@ -603,7 +603,10 @@ function Invoke-DemoVmWatchdog {
     }
     else {
         Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -AzureSide -Message ('{0} No action needed.' -f $done)
-        $result = New-DemoResult -CheckId $checkId -Area 'infra' -Target (Get-DemoVmTarget -VmName $VmName) -Status 'Warning' -Message ('{0}{1}' -f $done, $savedText) -Evidence $evidence -Remediation 'Nothing to do. If it happens on every run, an extension that a policy installs may be failing on the VM: see docs/troubleshooting.md.' -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-restart'
+        # R871: the T2 host's chunk Run Commands, not a policy's extension, kept its agent from Ready.
+        $remediation = if ($action) { 'Nothing to do: the run went on. docs/troubleshooting.md ("A host''s VM agent that isn''t Ready") says why it happens and what keeps it from happening again.' } else { 'Nothing to do. If it happens on every run, an extension that a policy installs may be failing on the VM: see docs/troubleshooting.md.' }
+        $docUrl = if ($action) { 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed' } else { 'https://learn.microsoft.com/cli/azure/vm#az-vm-restart' }
+        $result = New-DemoResult -CheckId $checkId -Area 'infra' -Target (Get-DemoVmTarget -VmName $VmName) -Status 'Warning' -Message ('{0}{1}' -f $done, $savedText) -Evidence $evidence -Remediation $remediation -DocUrl $docUrl
     }
     return [pscustomobject]@{ Restarted = [bool]$restart.Restarted; Recovered = $recovered; Failed = $failed; Saved = $saved; Items = @($activity.Labels); Result = $result; Results = @(@((Get-DemoMemberValue -InputObject $restart -Name 'Results')) | Where-Object { $null -ne $_ }) }
 }

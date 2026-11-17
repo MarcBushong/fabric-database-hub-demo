@@ -1820,8 +1820,13 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $watchdog.Result.message | Should -Match ('^archost01 was deallocated and started automatically at \d\d:\d\d \(local time\), because Azure''s work on its extensions was stuck\. ' + $Why)
         $watchdog.Result.evidence['action'] | Should -Be 'deallocated and started'
         $watchdog.Result.evidence['chunksDeleted'] | Should -Be $Chunks.Count
+        $watchdog.Result.message | Should -Match ', so it wasn''t restarted: '
+        $watchdog.Result.remediation | Should -Match '^Nothing to do: the run went on\. docs/troubleshooting\.md \("A host''s VM agent that isn''t Ready"\)'
+        $watchdog.Result.remediation | Should -Not -Match 'policy'
+        # The recovery asked for the deallocate itself, so its wait sends no second one (live, 2026-11-17).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -ParameterFilter { $Action -eq 'Deallocate' -and $DeallocateRequested } -Times 1 -Exactly
         if ($Chunks.Count -gt 0) {
-            $watchdog.Result.message | Should -Match ('the deletes of its {0} leftover chunk Run Command\(s\) were sent first, so they finish with the deallocate' -f $Chunks.Count)
+            $watchdog.Result.message | Should -Match ('the deletes of its {0} chunk Run Command\(s\) went first, to complete with the deallocate; ' -f $Chunks.Count)
             Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 60 } -Times 1 -Exactly
         }
     }
