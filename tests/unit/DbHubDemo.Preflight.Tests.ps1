@@ -742,6 +742,22 @@ Describe 'Invoke-DemoPreflight' {
         $p6 = Invoke-DemoPreflight -Config $config | Where-Object checkId -eq 'PREFLIGHT.P6.GROUP'
         $p6.status | Should -Be 'Fail'
         $p6.message | Should -Match 'not found in the configured tenant'
+        $p6.remediation | Should -Match 'Create an Entra security group'
+    }
+
+    It 'asks for a new sign-in, not a new group, when Microsoft Graph refuses the token (live, 2026-11-16)' {
+        # Live, 2026-11-16: after the tenant's sign-in policies changed, Graph answered 401 with Continuous Access
+        # Evaluation's InteractionRequired, also for one fresh token, and P6 told the user to create a new group.
+        Set-HappyAzMock
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -ParameterFilter { $Uri -like 'https://graph.microsoft.com/v1.0/groups/*' } -MockWith {
+            [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'HTTP 401 on GET https://graph.microsoft.com/v1.0/groups/x: {"error":{"code":"InvalidAuthenticationToken","message":"Continuous access evaluation resulted in challenge with result: InteractionRequired and code: TokenCreatedWithOutdatedPolicies"}}'; StatusCode = 401; Challenge = 'Claims challenge (Continuous Access Evaluation) on the cached token, and the request failed again with one fresh token.' }
+        }
+        $p6 = Invoke-DemoPreflight -Config $config | Where-Object checkId -eq 'PREFLIGHT.P6.GROUP'
+        $p6.status | Should -Be 'Fail'
+        $p6.message | Should -Match 'refused the Azure CLI''s sign-in and asks for a new one'
+        $p6.remediation | Should -Match '^Sign in again yourself: az login'
+        $p6.remediation | Should -Match 'nothing in the configuration changes'
+        $p6.remediation | Should -Not -Match 'Create an Entra security group' -Because 'the group exists; only the sign-in is refused'
     }
 
     It 'passes --subscription on every subscription-scoped call' {

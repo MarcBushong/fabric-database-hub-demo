@@ -552,8 +552,18 @@ function Invoke-DemoPreflight {
     $groupRead = Invoke-DemoRestRequest -SubscriptionId $subscriptionId -Method 'GET' -Uri ('{0}/groups/{1}?$select=id,displayName' -f $graph, $groupId)
     $group = if ($groupRead.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$groupRead.StdOut)) { [string]$groupRead.StdOut | ConvertFrom-Json -Depth 8 } else { $null }
     if (-not $group) {
-        $reason = if ($groupRead.StatusCode -eq 404) { 'was not found in the configured tenant' } else { 'could not be read from Microsoft Graph ({0})' -f ([string]$groupRead.StdErr).Trim() }
-        Add-Check 'PREFLIGHT.P6.GROUP' 'tenant' 'Fail' "The T3 admin group $groupId $reason." -Remediation 'Create an Entra security group you own in the demo tenant and set t3AdminGroupObjectId (prerequisite P6).' -DocUrl 'https://learn.microsoft.com/graph/api/group-get'
+        # Only a group Graph says isn't there needs a new one. A token Graph refused (live, 2026-11-16: HTTP 401, Continuous
+        # Access Evaluation's "InteractionRequired ... TokenCreatedWithOutdatedPolicies" after the tenant's sign-in policies
+        # changed) needs a new sign-in; following "create a group" there would change a working configuration.
+        if ($groupRead.StatusCode -eq 404) {
+            Add-Check 'PREFLIGHT.P6.GROUP' 'tenant' 'Fail' "The T3 admin group $groupId was not found in the configured tenant." -Remediation 'Create an Entra security group you own in the demo tenant and set t3AdminGroupObjectId (prerequisite P6).' -DocUrl 'https://learn.microsoft.com/graph/api/group-get'
+        }
+        elseif ($groupRead.StatusCode -eq 401 -or [string](Get-DemoMemberValue -InputObject $groupRead -Name 'Challenge')) {
+            Add-Check 'PREFLIGHT.P6.GROUP' 'tenant' 'Fail' ('The T3 admin group {0} could not be read: Microsoft Graph refused the Azure CLI''s sign-in and asks for a new one ({1}).' -f $groupId, ([string]$groupRead.StdErr).Trim()) -Remediation 'Sign in again yourself: az login (az login --use-device-code in a codespace), for the demo''s tenant. Then run the script again; nothing in the configuration changes.' -DocUrl 'https://learn.microsoft.com/entra/identity-platform/claims-challenge'
+        }
+        else {
+            Add-Check 'PREFLIGHT.P6.GROUP' 'tenant' 'Fail' ('The T3 admin group {0} could not be read from Microsoft Graph ({1}).' -f $groupId, ([string]$groupRead.StdErr).Trim()) -Remediation 'Check that you can read the group in the demo tenant, then run the script again. Only if it doesn''t exist, create an Entra security group you own and set t3AdminGroupObjectId (prerequisite P6).' -DocUrl 'https://learn.microsoft.com/graph/api/group-get'
+        }
     }
     else {
         $groupDisplayName = [string](Get-DemoMemberValue -InputObject $group -Name 'displayName')
