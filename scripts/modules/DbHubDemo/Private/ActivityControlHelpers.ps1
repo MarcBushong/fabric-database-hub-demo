@@ -1751,6 +1751,75 @@ function Get-DemoActivityControlFabricList {
     return [pscustomobject]@{ StatusCode = 200; Items = $items.ToArray(); Error = '' }
 }
 
+function New-DemoActivityControlEndpoint {
+    <#
+    .SYNOPSIS
+    Creates the control workspace's managed private endpoint to the vault. With -Failed, first deletes the one Fabric
+    failed to provision and waits, at most -GoneWaitSeconds, until Fabric no longer lists it. Returns Ok, Replaced, and
+    Error. Internal.
+
+    .DESCRIPTION
+    A failed endpoint never puts a connection on the vault, so waiting for its approval can't help (live, 2026-11-16:
+    Fabric's write of the connection to the vault ended BadRequest, and the endpoint read Failed). The provisioning
+    states and the delete are documented:
+    https://learn.microsoft.com/rest/api/fabric/core/managed-private-endpoints/get-workspace-managed-private-endpoint and
+    https://learn.microsoft.com/rest/api/fabric/core/managed-private-endpoints/delete-workspace-managed-private-endpoint.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $EndpointsUri,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name,
+
+        [Parameter(Mandatory)]
+        [string] $RequestMessage,
+
+        [Parameter(Mandatory)]
+        [securestring] $Token,
+
+        [AllowNull()]
+        [object] $Failed = $null,
+
+        [ValidateRange(0, 1800)]
+        [int] $GoneWaitSeconds = 300,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 15
+    )
+
+    $action = if ($null -ne $Failed) { 'Delete the failed managed private endpoint {0} and create it again' -f $Name.PrivateEndpoint } else { 'Create the managed private endpoint {0} to {1}' -f $Name.PrivateEndpoint, $Name.KeyVault }
+    if (-not $PSCmdlet.ShouldProcess($EndpointsUri, $action)) {
+        return [pscustomobject]@{ Ok = $false; Replaced = $false; Error = 'not confirmed' }
+    }
+    if ($null -ne $Failed) {
+        $id = [string](Get-DemoMemberValue -InputObject $Failed -Name 'id')
+        $deleted = Invoke-DemoFabricRequest -Method Delete -Uri ('{0}/{1}' -f $EndpointsUri, $id) -Token $Token
+        if ($deleted.StatusCode -notin 200, 202, 204, 404) {
+            return [pscustomobject]@{ Ok = $false; Replaced = $false; Error = ('the failed one couldn''t be deleted: {0}' -f (Get-DemoFabricErrorText -Response $deleted)) }
+        }
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($true) {
+            $list = Get-DemoActivityControlFabricList -Uri $EndpointsUri -Token $Token
+            $left = @($list.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') -eq $Name.PrivateEndpoint })
+            if ($list.StatusCode -eq 200 -and $left.Count -eq 0) {
+                break
+            }
+            if ($watch.Elapsed.TotalSeconds -ge $GoneWaitSeconds) {
+                return [pscustomobject]@{ Ok = $false; Replaced = $false; Error = ('Fabric still lists the failed one {0} seconds after its delete' -f [int]$watch.Elapsed.TotalSeconds) }
+            }
+            Start-Sleep -Seconds $PollSeconds
+        }
+    }
+    $created = Invoke-DemoFabricRequest -Method Post -Uri $EndpointsUri -Body ([ordered]@{ name = $Name.PrivateEndpoint; targetPrivateLinkResourceId = $Name.KeyVaultId; targetSubresourceType = 'vault'; requestMessage = $RequestMessage }) -Token $Token -NotIdempotent
+    if ($created.StatusCode -notin 200, 201, 202) {
+        return [pscustomobject]@{ Ok = $false; Replaced = $false; Error = (Get-DemoFabricErrorText -Response $created) }
+    }
+    return [pscustomobject]@{ Ok = $true; Replaced = ($null -ne $Failed); Error = '' }
+}
+
 function Set-DemoActivityControlFabric {
     <#
     .SYNOPSIS
@@ -1897,14 +1966,26 @@ function Set-DemoActivityControlFabric {
 
         $endpointDoc = 'https://learn.microsoft.com/fabric/security/security-managed-private-endpoints-create'
         $request = 'DBHub Control notebook to the control vault (ADR 0020)'
-        $endpoints = Get-DemoActivityControlFabricList -Uri ('{0}/workspaces/{1}/managedPrivateEndpoints' -f $base, $targetWorkspace) -Token $Token
-        $endpoint = @($endpoints.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') -eq $Name.PrivateEndpoint }) | Select-Object -First 1
-        if ($null -eq $endpoint -and $PSCmdlet.ShouldProcess($Name.FabricWorkspace, ('Create the managed private endpoint {0} to {1}' -f $Name.PrivateEndpoint, $Name.KeyVault))) {
-            $created = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/workspaces/{1}/managedPrivateEndpoints' -f $base, $targetWorkspace) -Body ([ordered]@{ name = $Name.PrivateEndpoint; targetPrivateLinkResourceId = $Name.KeyVaultId; targetSubresourceType = 'vault'; requestMessage = $request }) -Token $Token -NotIdempotent
-            if ($created.StatusCode -notin 200, 201, 202) {
-                & $add 'CONTROL.FABRIC.ENDPOINT' 'Fail' ('The managed private endpoint couldn''t be created: {0}' -f (Get-DemoFabricErrorText -Response $created)) @{} 'Creating it needs the Admin role in the control workspace; then run setup-activity-control.ps1 again.' $endpointDoc
+        $endpointsUri = '{0}/workspaces/{1}/managedPrivateEndpoints' -f $base, $targetWorkspace
+        $findEndpoint = {
+            $list = Get-DemoActivityControlFabricList -Uri $endpointsUri -Token $Token
+            @($list.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') -eq $Name.PrivateEndpoint }) | Select-Object -First 1
+        }
+        $endpoint = & $findEndpoint
+        $endpointState = [string](Get-DemoMemberValue -InputObject $endpoint -Name 'provisioningState')
+        # A failed endpoint never puts a connection on the vault, so it's deleted and created again, once per run
+        # (New-DemoActivityControlEndpoint), whether it failed in an earlier run or while this one waits below.
+        $replaced = $false
+        $replaceError = ''
+        if (($null -eq $endpoint -or $endpointState -eq 'Failed') -and $PSCmdlet.ShouldProcess($Name.FabricWorkspace, $(if ($null -eq $endpoint) { 'Create the managed private endpoint {0} to {1}' -f $Name.PrivateEndpoint, $Name.KeyVault } else { 'Delete the failed managed private endpoint {0} and create it again' -f $Name.PrivateEndpoint }))) {
+            $made = New-DemoActivityControlEndpoint -EndpointsUri $endpointsUri -Name $Name -RequestMessage $request -Token $Token -Failed $(if ($null -ne $endpoint) { $endpoint } else { $null }) -Confirm:$false
+            if (-not $made.Ok -and $null -eq $endpoint) {
+                & $add 'CONTROL.FABRIC.ENDPOINT' 'Fail' ('The managed private endpoint couldn''t be created: {0}' -f $made.Error) @{} 'Creating it needs the Admin role in the control workspace; then run setup-activity-control.ps1 again.' $endpointDoc
                 return $results.ToArray()
             }
+            $replaced = [bool]$made.Replaced
+            $replaceError = [string]$made.Error
+            $endpointState = if ($made.Ok) { 'Provisioning' } else { 'Failed' }
         }
         $approved = $false
         $deadline = [DateTime]::UtcNow.AddMinutes($ApprovalWaitMinutes)
@@ -1922,15 +2003,38 @@ function Set-DemoActivityControlFabric {
                     $approved = $put.Ok
                 }
             }
-            if (-not $approved -and [DateTime]::UtcNow -lt $deadline) {
+            if (-not $approved -and -not $replaceError) {
+                # The vault gets the connection only once Fabric has provisioned the endpoint, so it's read again here.
+                $endpoint = & $findEndpoint
+                $endpointState = [string](Get-DemoMemberValue -InputObject $endpoint -Name 'provisioningState')
+                if ($endpointState -eq 'Failed' -and -not $replaced -and $PSCmdlet.ShouldProcess($Name.FabricWorkspace, ('Delete the failed managed private endpoint {0} and create it again' -f $Name.PrivateEndpoint))) {
+                    $made = New-DemoActivityControlEndpoint -EndpointsUri $endpointsUri -Name $Name -RequestMessage $request -Token $Token -Failed $endpoint -Confirm:$false
+                    $replaced = [bool]$made.Replaced
+                    $replaceError = [string]$made.Error
+                    if ($made.Ok) {
+                        $endpointState = 'Provisioning'
+                        $deadline = [DateTime]::UtcNow.AddMinutes($ApprovalWaitMinutes)
+                    }
+                }
+                if ($endpointState -eq 'Failed') {
+                    break
+                }
+            }
+            if (-not $approved -and -not $replaceError -and [DateTime]::UtcNow -lt $deadline) {
                 Start-Sleep -Seconds 30
             }
-        } while (-not $approved -and [DateTime]::UtcNow -lt $deadline)
+        } while (-not $approved -and -not $replaceError -and [DateTime]::UtcNow -lt $deadline)
+        $endpointEvidence = [ordered]@{ endpoint = $Name.PrivateEndpoint; provisioningState = $endpointState; replaced = $replaced }
         if ($approved) {
-            & $add 'CONTROL.FABRIC.ENDPOINT' 'Pass' ('The managed private endpoint {0} from "{1}" to {2} is approved on the vault.' -f $Name.PrivateEndpoint, $Name.FabricWorkspace, $Name.KeyVault) @{} '' $endpointDoc
+            $again = if ($replaced) { ' Fabric failed to provision it at first, so it was deleted and created again.' } else { '' }
+            & $add 'CONTROL.FABRIC.ENDPOINT' 'Pass' ('The managed private endpoint {0} from "{1}" to {2} is approved on the vault.{3}' -f $Name.PrivateEndpoint, $Name.FabricWorkspace, $Name.KeyVault, $again) $endpointEvidence '' $endpointDoc
+        }
+        elseif ($endpointState -eq 'Failed' -or $replaceError) {
+            $what = if ($replaceError) { 'and replacing it failed: {0}' -f $replaceError } elseif ($replaced) { 'again after this run deleted it and created it again' } else { 'and nothing replaced it' }
+            & $add 'CONTROL.FABRIC.ENDPOINT' 'Manual action required' ('Fabric failed to provision the managed private endpoint to {0} ({1}), so the vault has no connection to approve and the notebook can''t read the session''s secrets.' -f $Name.KeyVault, $what) $endpointEvidence ('Run setup-activity-control.ps1 again: it deletes the failed endpoint and creates it again. If it fails every time, delete {0} in the workspace "{1}" (Workspace settings > Network security > Managed private endpoints), then run setup-activity-control.ps1 again.' -f $Name.PrivateEndpoint, $Name.FabricWorkspace) $endpointDoc
         }
         else {
-            & $add 'CONTROL.FABRIC.ENDPOINT' 'Manual action required' ('The managed private endpoint to {0} isn''t approved yet (Fabric creates it in a few minutes).' -f $Name.KeyVault) @{} ('Run setup-activity-control.ps1 again in a few minutes, or approve the pending connection in the vault''s Networking > Private endpoint connections in the Azure portal.') $endpointDoc
+            & $add 'CONTROL.FABRIC.ENDPOINT' 'Manual action required' ('The managed private endpoint to {0} isn''t approved yet (Fabric creates it in a few minutes).' -f $Name.KeyVault) $endpointEvidence ('Run setup-activity-control.ps1 again in a few minutes, or approve the pending connection in the vault''s Networking > Private endpoint connections in the Azure portal.') $endpointDoc
         }
     }
 

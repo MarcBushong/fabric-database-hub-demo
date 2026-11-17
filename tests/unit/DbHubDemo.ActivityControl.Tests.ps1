@@ -1034,6 +1034,10 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
         $script:outbound = 'Allow'
         $script:endpoints = @()
         $script:fabricPosts = [System.Collections.Generic.List[object]]::new()
+        $script:fabricDeletes = [System.Collections.Generic.List[string]]::new()
+        # What a created endpoint does: nothing more (the default), puts a pending connection on the vault ('Pending'), or
+        # fails like the live one ('Failed', 2026-11-16).
+        $script:createdEndpoint = ''
         $script:imports = [System.Collections.Generic.List[object]]::new()
         $script:lakehouses = @(@{ id = 'cccccccc-0000-0000-0000-000000000003'; displayName = 'LH_DatabaseHub' })
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -MockWith { @([pscustomobject]@{ checkId = 'FABRIC.P5.CAPACITY'; status = $script:capacityStatus; message = ('The capacity is {0}.' -f $(if ($script:capacityStatus -eq 'Pass') { 'Active' } else { 'Paused' })) }) }
@@ -1045,12 +1049,27 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -MockWith {
             $path = ([uri]$Uri).AbsolutePath
+            if ($Method -eq 'Delete') {
+                $script:fabricDeletes.Add($path)
+                $script:endpoints = @($script:endpoints | Where-Object { $path -notlike ('*/managedPrivateEndpoints/{0}' -f $_['id']) })
+                return [pscustomobject]@{ StatusCode = 200; Body = $null }
+            }
             if ($Method -eq 'Post') {
                 $script:fabricPosts.Add([pscustomobject]@{ Path = $path; Body = $Body })
                 switch -Regex ($path) {
                     '/folders$' { return [pscustomobject]@{ StatusCode = $script:folderStatus; Body = @{ id = '0f0f0f0f-0000-0000-0000-000000000002'; errorCode = 'PreviewApiNotEnabled' } } }
                     '^/v1/workspaces$' { return [pscustomobject]@{ StatusCode = 201; Body = @{ id = '0c0c0c0c-0000-0000-0000-000000000002' } } }
-                    '/managedPrivateEndpoints$' { return [pscustomobject]@{ StatusCode = 201; Body = @{ id = 'endpoint-new' } } }
+                    '/managedPrivateEndpoints$' {
+                        $id = 'endpoint-new-{0}' -f $script:fabricPosts.Count
+                        if ($script:createdEndpoint -eq 'Failed') {
+                            $script:endpoints = @($script:endpoints) + @(@{ id = $id; name = $Body['name']; provisioningState = 'Failed' })
+                        }
+                        elseif ($script:createdEndpoint -eq 'Pending') {
+                            $script:endpoints = @($script:endpoints) + @(@{ id = $id; name = $Body['name']; provisioningState = 'Succeeded' })
+                            $script:connections.Add([pscustomobject]@{ name = ('connection-{0}' -f $id); status = 'Pending'; description = $Body['requestMessage'] })
+                        }
+                        return [pscustomobject]@{ StatusCode = 201; Body = @{ id = $id } }
+                    }
                 }
                 return [pscustomobject]@{ StatusCode = 400; Body = $null }
             }
@@ -1160,6 +1179,41 @@ Describe 'Putting the notebook in Fabric (Set-DemoActivityControlFabric)' {
         foreach ($id in 'CONTROL.FABRIC.WORKSPACE', 'CONTROL.FABRIC.OUTBOUND', 'CONTROL.FABRIC.ENDPOINT', 'CONTROL.FABRIC.NOTEBOOK') {
             ($results | Where-Object checkId -EQ $id).status | Should -Be 'Pass' -Because $id
         }
+    }
+
+    It 'private: deletes a managed private endpoint that Fabric failed to provision, creates it again, and approves the new one' {
+        # Live, 2026-11-16: Fabric's write of the connection to the vault ended BadRequest, the endpoint read Failed, and
+        # the vault never got a connection, so waiting for one, or a rerun that found the endpoint by name, couldn't help.
+        $script:fabricWorkspaces = @(@{ id = $script:shared; displayName = 'Demo workspace' }, @{ id = '0c0c0c0c-0000-0000-0000-000000000002'; displayName = 'DBHub Control' })
+        $name = Get-ControlName (New-ControlConfig)
+        $script:endpoints = @(@{ id = 'endpoint-failed'; name = $name.PrivateEndpoint; provisioningState = 'Failed' })
+        $script:createdEndpoint = 'Pending'
+        $results = @(Invoke-Placement -Mode 'private')
+        @($script:fabricDeletes) | Should -Be @('/v1/workspaces/0c0c0c0c-0000-0000-0000-000000000002/managedPrivateEndpoints/endpoint-failed')
+        @($script:fabricPosts | ForEach-Object Path) | Should -Be @('/v1/workspaces/0c0c0c0c-0000-0000-0000-000000000002/managedPrivateEndpoints')
+        $script:fabricPosts[0].Body['name'] | Should -Be $name.PrivateEndpoint
+        @($script:connections | Where-Object status -EQ 'Approved').Count | Should -Be 1
+        $endpoint = $results | Where-Object checkId -EQ 'CONTROL.FABRIC.ENDPOINT'
+        $endpoint.status | Should -Be 'Pass'
+        $endpoint.message | Should -Match 'failed to provision it at first, so it was deleted and created again'
+        $endpoint.evidence['replaced'] | Should -BeTrue
+    }
+
+    It 'private: replaces a failed endpoint once per run, and says what works, when Fabric fails it again' {
+        $script:fabricWorkspaces = @(@{ id = $script:shared; displayName = 'Demo workspace' }, @{ id = '0c0c0c0c-0000-0000-0000-000000000002'; displayName = 'DBHub Control' })
+        $name = Get-ControlName (New-ControlConfig)
+        $script:endpoints = @(@{ id = 'endpoint-failed'; name = $name.PrivateEndpoint; provisioningState = 'Failed' })
+        $script:createdEndpoint = 'Failed'
+        $results = @(Invoke-Placement -Mode 'private')
+        $script:fabricDeletes.Count | Should -Be 1 -Because 'a run replaces a failed endpoint once, so it never loops'
+        $script:fabricPosts.Count | Should -Be 1
+        $endpoint = $results | Where-Object checkId -EQ 'CONTROL.FABRIC.ENDPOINT'
+        $endpoint.status | Should -Be 'Manual action required'
+        $endpoint.message | Should -Match 'Fabric failed to provision the managed private endpoint to kv-dbhub-ctl-\w+ \(again after this run deleted it and created it again\), so the vault has no connection to approve'
+        $endpoint.message | Should -Not -Match 'Fabric creates it in a few minutes' -Because 'a failed endpoint isn''t created by waiting'
+        $endpoint.remediation | Should -Match 'it deletes the failed endpoint and creates it again'
+        $endpoint.remediation | Should -Not -Match 'approve the pending connection' -Because 'there''s no connection to approve'
+        ($results | Where-Object checkId -EQ 'CONTROL.FABRIC.NOTEBOOK').status | Should -Be 'Pass' -Because 'the notebook is still imported'
     }
 
     It 'private: reports outbound access protection that someone turned on as a Fail, and never changes it' {
