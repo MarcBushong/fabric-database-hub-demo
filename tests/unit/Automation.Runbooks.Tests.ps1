@@ -108,6 +108,9 @@ BeforeAll {
         # view (by its name), and the control account's variables as Set-AutomationVariable and Get-AutomationVariable see
         # them, with a variable that doesn't exist, a count of the reads, and a script block each read runs first.
         $script:vmFailed = @{}
+        # A VM's agent as its instance view reports it, by VM name: 'Ready' unless set ('' for no status at all, as during
+        # a start whose goal state never arrives; live, 2026-11-17).
+        $script:vmAgent = @{}
         $script:runCommandViews = @{}
         $script:automationVariables = @{}
         $script:variableMissing = $false
@@ -236,7 +239,12 @@ BeforeAll {
                 if ($script:vmSince.ContainsKey($name)) {
                     $provisioning['time'] = $script:vmSince[$name].ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ', [System.Globalization.CultureInfo]::InvariantCulture)
                 }
-                return (New-Response 200 (ConvertTo-Json -InputObject @{ statuses = @($provisioning, @{ code = ('PowerState/{0}' -f (Get-TestVmState $name)) }) } -Depth 4))
+                $agent = if ($script:vmAgent.ContainsKey($name)) { [string]$script:vmAgent[$name] } else { 'Ready' }
+                $agentStatuses = @()
+                if ($agent) {
+                    $agentStatuses = @(@{ code = 'ProvisioningState/Unavailable'; displayStatus = $agent; message = 'VM status blob is found but not yet populated.' })
+                }
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ statuses = @($provisioning, @{ code = ('PowerState/{0}' -f (Get-TestVmState $name)) }); vmAgent = @{ vmAgentVersion = '2.7.41491.1243'; statuses = $agentStatuses } } -Depth 5))
             }
             '/virtualMachines/(\w+)/start$' {
                 $name = $Matches[1]
@@ -1957,6 +1965,39 @@ Describe 'The session''s hosts (2026-11-16, live: a host''s start failed mid-ses
         $again = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock.AddMinutes(30))
         $again.session | Should -Be 'Known'
         $script:secrets['dbhub-session-status'].Count | Should -Be ($writes + 1)
+    }
+
+    It 'says through DbHub-Monitor that a host''s VM agent isn''t Ready 15 minutes after its activity went out, once, and gives a host that has just started its time' {
+        # Live, 2026-11-17: archost01 ran, its agent never got its goal state, and the status said T2's activity went out
+        # for the whole session; Azure ends such a start VMStartTimedOut about 58 minutes in.
+        $script:vmAgent['archost01'] = ''
+        $null = Start-TestSession
+        @(Get-HostStep) | Should -BeNullOrEmpty -Because 'the session''s own check comes right after the dispatch, inside the 15 minutes'
+        $writes = $script:secrets['dbhub-session-status'].Count
+        $script:clock = $script:clock.AddMinutes(30)
+        $context = New-TestContext -NowUtc $script:clock
+        $result = Invoke-DbHubMonitor -Context $context
+        $result.session | Should -Be 'Warned'
+        $hostSteps = @(Get-HostStep)
+        $hostSteps.Count | Should -Be 1
+        $hostSteps[0].state | Should -Be 'Warning'
+        $hostSteps[0].message | Should -BeExactly 'T2: archost01''s VM agent wasn''t Ready 15 minutes after T2''s activity went out, so the Run Command that sets it can''t run, and T2 may have no activity this session.'
+        $hostSteps[0].fix | Should -Match 'set STOP_NOW = True and Run all; ./scripts/status.ps1 shows archost01''s state'
+        @($context.Log | Where-Object { $_ -match 'archost01: its VM agent isn''t Ready \(no status\)' }).Count | Should -Be 1
+        $script:secrets['dbhub-session-status'].Count | Should -Be ($writes + 1)
+        $script:vmAgent['archost01'] = 'Not Ready'
+        $again = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock.AddMinutes(30))
+        $again.session | Should -Be 'Known' -Because 'the words stay the same while the problem does'
+    }
+
+    It 'blames no agent that''s Ready, and no VM whose agent''s time hasn''t come' {
+        $null = Start-TestSession
+        $status = Get-SessionStatus | ConvertTo-Json -Depth 8 | ConvertFrom-Json -AsHashtable
+        $script:clock = $script:clock.AddMinutes(30)
+        @(Get-DbHubSessionHealth -Context (New-TestContext -NowUtc $script:clock) -Status $status) | Should -BeNullOrEmpty
+        $script:vmAgent['sqlvm01'] = 'Not Ready'
+        $status['dispatchUtc'] = [ordered]@{}
+        @(Get-DbHubSessionHealth -Context (New-TestContext -NowUtc $script:clock) -Status $status) | Should -BeNullOrEmpty -Because 'without a dispatch time there''s nothing to count from'
     }
 
     It 'never writes over a newer status: <Case> between its read and its write' -ForEach @(

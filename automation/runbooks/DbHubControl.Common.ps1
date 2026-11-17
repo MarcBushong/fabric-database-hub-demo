@@ -3474,8 +3474,9 @@ function Get-DbHubSessionHealth {
     .SYNOPSIS
     The hosts of a session that runs (2026-11-16; live, archost01's start ended VMStartTimedOut 53 minutes into a session
     and T2's Run Command failed with it, while the session's status still said T2's activity went out): each VM the
-    session's activity went out to, from its instance view, and on a VM that runs, each of the session's dispatch Run
-    Commands, from its instance view. Azure Resource Manager reads only: one per VM and one per Run Command. A VM's
+    session's activity went out to, from its instance view (its power state, a failed provisioning, and its VM agent,
+    which must be Ready 15 minutes after its targets' activity went out; 2026-11-17), and on a VM that runs, each of the
+    session's dispatch Run Commands, from its instance view. Azure Resource Manager reads only: one per VM and one per Run Command. A VM's
     failed provisioning counts only from the session's start on, so an older failure (an extension's, say) isn't blamed
     on it. Returns one finding (Message and Fix) per problem, in words that stay the same while the problem does, so a
     check that finds it again adds nothing.
@@ -3538,6 +3539,8 @@ function Get-DbHubSessionHealth {
         return ('{0}, and {1}' -f ($sorted[0..($sorted.Count - 2)] -join ', '), $sorted[-1])
     }
     $since = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $Status -Name 'acceptedUtc')
+    # How long a VM may run after its targets' activity went out before an agent that isn't Ready is a problem.
+    $agentGraceMinutes = 15
     $vmVersion = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines'
     $commandVersion = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
     $findings = New-Object -TypeName 'System.Collections.Generic.List[object]'
@@ -3584,6 +3587,32 @@ function Get-DbHubSessionHealth {
         }
         if ($power -ne 'running') {
             continue
+        }
+        # A running VM whose agent isn't Ready can't run the Run Command that sets its targets' activity (live, 2026-11-17:
+        # archost01's agent never got its goal state after the session's start, the status said T2's activity went out for
+        # the whole session, and Azure ends such a start VMStartTimedOut about 58 minutes in). Counted from the earliest
+        # dispatch of the VM's targets, so a VM that has only just started isn't blamed; the instance view read above
+        # carries the agent's status, so this costs no read.
+        $agentStatus = @(Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $view.Body -Name 'vmAgent') -Name 'statuses') | Select-Object -First 1
+        $agentText = [string](Get-DbHubMember -InputObject $agentStatus -Name 'displayStatus')
+        if ($agentText -ne 'Ready') {
+            $outSince = $null
+            $dispatch = Get-DbHubMember -InputObject $Status -Name 'dispatchUtc'
+            foreach ($target in $entry.Targets) {
+                $at = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $dispatch -Name $target)
+                if ($null -ne $at -and ($null -eq $outSince -or $at -lt $outSince)) {
+                    $outSince = $at
+                }
+            }
+            if ($null -ne $outSince -and ((Get-DbHubUtcNow) - $outSince).TotalMinutes -ge $agentGraceMinutes) {
+                $agentLog = 'no status'
+                if ($agentText) {
+                    $agentLog = '{0}: {1}' -f $agentText, [string](Get-DbHubMember -InputObject $agentStatus -Name 'message')
+                }
+                Write-DbHubLog -Context $Context -Message ('{0}: its VM agent isn''t Ready ({1}).' -f $vm, $agentLog)
+                $findings.Add([pscustomobject]@{ Message = ('{0}: {1}''s VM agent wasn''t Ready {2} minutes after {0}''s activity went out, so the Run Command that sets it can''t run, and {0} may have no activity this session.' -f $who, $vm, $agentGraceMinutes); Fix = ('The session''s other targets go on. For {0}: set STOP_NOW = True and Run all; ./scripts/status.ps1 shows {1}''s state, and docs/troubleshooting.md says what brings its agent back ("A host''s VM agent that isn''t Ready").' -f $who, $vm) })
+                continue
+            }
         }
         foreach ($command in $entry.Commands) {
             $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands/{2}?$expand=instanceView' -f (Get-DbHubDemoPath -Settings $settings), $vm, $command.Name) -ApiVersion $commandVersion
