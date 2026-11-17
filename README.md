@@ -87,13 +87,13 @@ Everything in this table is the demo's. `./scripts/deploy.ps1` creates it and ke
 | The budget and the deployment record `<prefix>-<environment>-main` | Azure | `deploy.ps1` | `destroy.ps1` |
 | The T2 golden snapshot group `rg-<prefix>-golden` (optional) | Azure | `./scripts/capture-t2-golden.ps1` | `destroy.ps1 -IncludeGolden` |
 | The demo's Fabric workspace (`fabric.workspaceName`): the lakehouse `LH_DatabaseHub`, the notebooks `NB_DatabaseHub_Deployment` and `NB_DatabaseHub_LiveActivity`, the Real-Time Dashboard `RTD_DatabaseHub_LiveView`, the model `SM_DatabaseHub_History`, the report `RPT_DatabaseHub_History`, and the Insights app `APP_DatabaseHub_Insights` with its connector | Fabric | `deploy.ps1`'s Fabric track. Each Run all session adds its history to the lakehouse | `destroy.ps1`, when everything in it is the demo's; `-KeepFabric` keeps it |
-| The control's Fabric workspace ("&lt;workspace&gt; Control"): the notebook `NB_DatabaseHub_Control`, and its managed private endpoint to the control's Key Vault | Fabric | `deploy.ps1` | `destroy.ps1`, when its notebook serves this environment; `-KeepFabric` keeps it |
+| The control notebook `NB_DatabaseHub_Control`: where a policy makes new Key Vaults private, in its own workspace ("&lt;workspace&gt; Control") with a managed private endpoint to the control's Key Vault; otherwise in the folder "DBHub Control" of the demo's workspace | Fabric | `deploy.ps1` | `destroy.ps1`: the workspace when its notebook serves this environment, the folder with the demo's workspace; `-KeepFabric` keeps them |
 
 **Not the demo's:** the Fabric capacity, your Fabric and Power BI licenses, and Database Hub's tenant setting. You and your administrators manage them, and no script deletes them. By default no script resumes or pauses the capacity either; `fabric.manageCapacity` opts in to that for a capacity that's yours alone ([automated vs manual](#automated-vs-manual)).
 
 ### What bills, stopped and running
 
-- **Between sessions, with everything stopped:** both VMs' disks, T3's and T4's storage, the private endpoint and the private DNS zones, and the Defender plans where your tenant turns them on. The VMs, T4, and the replica bill no compute, and T3 pauses by itself. A golden snapshot, when you keep one, bills every month, after `destroy.ps1` too.
+- **Between sessions, with everything stopped:** both VMs' disks, T3's and T4's storage, T3's private endpoint in private mode, the private DNS zones, and the Defender plans where your tenant turns them on. The VMs and T4 bill no compute, the replica is deleted, and T3 pauses by itself. A golden snapshot, when you keep one, bills every month, after `destroy.ps1` too.
 - **During a session:** the VMs' compute and their pay-as-you-go SQL Server licenses (T1 by the hour, T2 per core-hour through Azure Arc), T3's compute while it's active, T4 and its read replica, and Bastion, when you started one for interactive access.
 - **Close to nothing:** the two Automation accounts (their jobs fit in the 500 job minutes a month that Azure Automation includes), the Key Vault's operations, the identities, the role definitions, and the budget.
 - **Outside the estimate:** the Fabric capacity, which bills while it runs, and licenses.
@@ -115,7 +115,7 @@ Everything in this table is the demo's. `./scripts/deploy.ps1` creates it and ke
 
 ## Day to day
 
-- **Run a session:** open `NB_DatabaseHub_Control` in the control's workspace and select **Run all**. It starts the VMs, T3, T4, and its replica, runs the showcase, and stops everything at its end ([Run all](#the-session-control-run-all)). Or run `./scripts/start-demo.ps1`, then `./scripts/stop-demo.ps1`.
+- **Run a session:** open `NB_DatabaseHub_Control` where `deploy.ps1`'s **DONE** says (its own workspace, or the folder "DBHub Control" of the demo's) and select **Run all**. It starts the VMs, T3, T4, and its replica, runs the showcase, and stops everything at its end ([Run all](#the-session-control-run-all)). Or run `./scripts/start-demo.ps1`, then `./scripts/stop-demo.ps1`.
 - **Stop now:** `./scripts/stop-demo.ps1`, or the notebook's **Stop now** cell with `STOP_NOW = True`. If you forget, the nightly stop stops the demo that evening.
 - **See where it stands:** `./scripts/status.ps1`, read-only; `-Detail` adds more.
 - **`deploy.ps1` ended NOT DONE:** run the command its banner prints, usually `./scripts/deploy.ps1` again; it continues where it stopped. The banner and the status page, `out/deploy-status.html`, say why.
@@ -679,7 +679,7 @@ Everything below runs with no person and no command. Times are the defaults: `au
 
 **What it deletes, in this order,** each part only when it can tell it's this environment's:
 
-1. **Fabric:** the control's workspace with its managed private endpoint, when its control notebook serves this environment, and the demo's workspace, when every item in it is one the demo creates. A workspace that holds anything else stays whole, and its result names what isn't the demo's. `-KeepFabric` keeps both workspaces, with the history in the lakehouse.
+1. **Fabric:** the control's workspace with its managed private endpoint, when its control notebook serves this environment, and the demo's workspace, when every item in it is one the demo creates, a control notebook in its folder "DBHub Control" included. A workspace that holds anything else stays whole, and its result names what isn't the demo's. `-KeepFabric` keeps both workspaces, with the history in the lakehouse.
 2. **The session control** in `rg-<prefix>-control`, when its runbooks serve this environment's resource group: its role assignments, its custom roles once no other assignment holds them, the identity, the Key Vault (purged), and the Automation account with its runbooks, schedules, and webhook; then the group, once it's empty. Deleting role assignments needs Owner or User Access Administrator: for anyone else, `DESTROY.CONTROL.ROLES` is a **Warning** that says so, and the rest still goes.
 3. **The T3 and T4 administrators' group,** when `init.ps1` created it for this environment.
 4. **T2's Arc resources:** the SQL Server instances, then the machine.
