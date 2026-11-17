@@ -2266,13 +2266,16 @@ function Remove-DemoActivityControlRole {
         }
     }
     $notes = [System.Collections.Generic.List[string]]::new()
-    foreach ($role in @(@{ Id = $roleId; Label = 'the custom role' }, @{ Id = $writerId; Label = ('the custom role "{0}"' -f $Name.WriterRoleName) })) {
-        if (-not $role.Id) {
-            $notes.Add(('{0} didn''t exist' -f $role.Label))
-            continue
-        }
-        $delete = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/{1}?api-version=2022-04-01' -f $Name.SubscriptionId, $role.Id)
-        $notes.Add($(if ($delete.Ok -or $delete.Missing) { '{0} was deleted' -f $role.Label } else { '{0} was kept ({1})' -f $role.Label, $delete.Error }))
+    foreach ($role in @(@{ Id = $roleId; Label = ('the custom role "{0}"' -f $Name.RoleName) }, @{ Id = $writerId; Label = ('the custom role "{0}"' -f $Name.WriterRoleName) })) {
+        # A definition another environment's control still holds stays (2026-11-17): the owner's roles survive a test
+        # environment's removal.
+        $outcome = Remove-DemoUnassignedRoleDefinition -SubscriptionId $Name.SubscriptionId -RoleId $role.Id
+        $notes.Add($(switch ($outcome.Outcome) {
+                    'Missing' { '{0} didn''t exist' -f $role.Label }
+                    'Deleted' { '{0} was deleted' -f $role.Label }
+                    'Kept' { '{0} was kept: {1} role assignment(s) still hold it' -f $role.Label, $outcome.Count }
+                    default { '{0} was kept ({1})' -f $role.Label, $outcome.Error }
+                }))
     }
     $roleNote = $notes -join '; '
     $status = if ($failed.Count -gt 0) { 'Manual action required' } else { 'Pass' }
@@ -2302,8 +2305,9 @@ function Remove-DemoActivityControlResource {
     }
     $done = [System.Collections.Generic.List[string]]::new()
     $failed = [System.Collections.Generic.List[string]]::new()
+    # The Automation account goes last (2026-11-17): its runbooks say which environment the control serves, which a
+    # destroy.ps1 that runs again after an interruption reads before it deletes anything.
     foreach ($item in @(
-            @{ Label = $Name.AutomationAccount; Url = (Get-DemoActivityControlUrl -Id $Name.AutomationAccountId -ApiVersion '2024-10-23') }
             @{ Label = $Name.Identity; Url = (Get-DemoActivityControlUrl -Id $Name.IdentityId -ApiVersion '2024-11-30') }
             @{ Label = $Name.KeyVault; Url = (Get-DemoActivityControlUrl -Id $Name.KeyVaultId -ApiVersion '2026-02-01') }
         )) {
@@ -2316,11 +2320,24 @@ function Remove-DemoActivityControlResource {
         }
     }
     $purge = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method post -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.KeyVault/locations/{1}/deletedVaults/{2}/purge?api-version=2026-02-01' -f $Name.SubscriptionId, [string]$Config['location'], $Name.KeyVault)
+    $blocking = $failed.Count
     if ($purge.Ok) {
         $done.Add('the vault purge')
     }
     elseif (-not $purge.Missing) {
         $failed.Add(('purge: {0}' -f $purge.Error))
+    }
+    if ($blocking -eq 0) {
+        $delete = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method delete -Url (Get-DemoActivityControlUrl -Id $Name.AutomationAccountId -ApiVersion '2024-10-23')
+        if ($delete.Ok -or $delete.Missing) {
+            $done.Add($Name.AutomationAccount)
+        }
+        else {
+            $failed.Add(('{0}: {1}' -f $Name.AutomationAccount, $delete.Error))
+        }
+    }
+    else {
+        $failed.Add(('{0}: kept until the rest is deleted' -f $Name.AutomationAccount))
     }
     foreach ($deployment in $Name.TemplateDeployment, $Name.WebhookDeployment) {
         $null = Invoke-DemoAz -SubscriptionId $Name.SubscriptionId -ArgumentList @('deployment', 'group', 'delete', '--resource-group', $Name.ResourceGroup, '--name', $deployment) -AllowFailure

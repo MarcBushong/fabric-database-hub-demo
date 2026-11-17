@@ -385,6 +385,12 @@ BeforeAll {
                 'deployment group delete*' { return (New-AzResult) }
                 'resource list*' { return (New-AzResult -StdOut ("{0}`n" -f $script:leftInGroup)) }
                 'group delete*' { return (New-AzResult) }
+                # A custom role's assignments, counted before its definition goes (2026-11-17): the fake's own ones.
+                'role assignment list --all --role *' {
+                    $roleId = Get-ArgumentValue $words '--role'
+                    $held = @($script:assignments | Where-Object { ([string]$_.roleDefinitionId).EndsWith('/' + $roleId, [System.StringComparison]::OrdinalIgnoreCase) }).Count
+                    return (New-AzResult -StdOut ("{0}`n" -f $held))
+                }
             }
             return (New-AzResult -ExitCode 1 -StdErr ('ERROR: the fake has no answer for: {0}' -f $text))
         }

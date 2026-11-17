@@ -2999,6 +2999,9 @@ Describe 'Remove-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @() }
         # The nightly safety stop's role definition (ADR 0024): none in these tests, unless one says so.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopRoleState -MockWith { [pscustomobject]@{ Id = ''; Actions = @(); Error = '' } }
+        # What else deploy.ps1 created (2026-11-17) has its own tests (DbHubDemo.Destroy.Tests.ps1); here it notes when it ran.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith { [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; Delete = @(); Keep = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDestroyExtra -MockWith { $script:order.Add('Extra'); @() }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
             $script:order.Add('az ' + ($ArgumentList[0..1] -join ' '))
             $script:groupExists = $false
@@ -3010,7 +3013,8 @@ Describe 'Remove-DemoEnvironment' {
         # T4's read replica (ADR 0025) goes before the group, named from the manifest's deploymentId.
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { $script:order.Add('Replica'); $null }
         $results = Remove-DemoEnvironment -Config $config -Confirm:$false
-        $script:order | Should -Be @('Instance', 'Machine', 'Replica', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
+        # The session control, the Fabric workspaces, and the security group go first (2026-11-17).
+        $script:order | Should -Be @('Extra', 'Instance', 'Machine', 'Replica', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
         Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -Times 1 -Exactly -ParameterFilter { $CheckPrefix -eq 'DESTROY' -and $DeploymentId -eq 'abc123' -and $Quiet }
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.ARC.SQLINSTANCES' }).area | Should -Be 'teardown'

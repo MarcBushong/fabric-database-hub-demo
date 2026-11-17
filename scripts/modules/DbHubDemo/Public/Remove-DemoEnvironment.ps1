@@ -23,12 +23,24 @@ function Remove-DemoEnvironment {
        tags, Arc resources, role assignments, the identities and their P6 membership, deployments, and the
        budget (TEARDOWN.RESIDUAL.*). DESTROY.RESIDUAL sums it up: Pass only when every check is clean (ADR
        0002, step 5).
-    The GitHub identity's resource group (rg-<prefix>-control) isn't touched. With fabric.manageCapacity true (Phase
+    The session control in rg-<prefix>-control, the Fabric workspaces, the T3 administrators' security group, and the
+    custom roles (2026-11-17): read before the confirmation, which lists what goes and what stays
+    (Get-DemoDestroyExtraPlan), and deleted before the group (Invoke-DemoDestroyExtra), each only when it's this
+    environment's. The control goes when its runbooks' settings name this environment's resource group, as
+    setup-activity-control.ps1 -Remove deletes it (DESTROY.CONTROL, DESTROY.CONTROL.ROLES, DESTROY.CONTROL.RESOURCES). The
+    demo's workspace (fabric.workspaceName) goes when every item in it is one the demo creates, and the control's
+    workspace when its control notebook names this environment's resource group, with its managed private endpoint
+    (DESTROY.FABRIC.WORKSPACE, DESTROY.FABRIC.CONTROL); -KeepFabric keeps both, and the history in the lakehouse. The
+    group (t3AdminGroupObjectId) goes when init.ps1 created it for this environment, which its description records; a
+    group you supplied stays (DESTROY.ENTRA.GROUP). A custom role definition goes once no role assignment holds it,
+    so the roles of another environment, the owner's among them, stay (DESTROY.SAFETYSTOP.ROLE, and the control's in
+    DESTROY.CONTROL.ROLES). A part that fails is a Warning that names its fix, and the others go on; the Fabric
+    capacity, which you manage, is never paused or resumed for it. With fabric.manageCapacity true (Phase
     26b, ADR 0023), a Fabric capacity that start-demo.ps1 resumed, as the group's DbHubFabricCapacityResumed tag
     records, is paused before the group goes (DESTROY.FABRIC.CAPACITY; a Warning when it can't be); with false, the
     default, the capacity isn't called. When the group is already gone,
-    steps 1, 4, and 5 still run, so a destroy that was interrupted can be run again: it keeps the manifest an
-    earlier run recorded while the group existed (Resolve-DemoTeardownManifest), and a group still being
+    steps 1, 4, and 5 still run, and so do the parts above, so a destroy that was interrupted can be run again: it keeps
+    the manifest an earlier run recorded while the group existed (Resolve-DemoTeardownManifest), and a group still being
     deleted (ResourceGroupBeingDeleted) is waited for. If the residual check itself can't run, DESTROY.RESIDUAL
     is a Warning that says how to run it again. It never passes --ids or a {subscriptionId} placeholder to the
     Azure CLI.
@@ -41,10 +53,11 @@ function Remove-DemoEnvironment {
     it's a Warning.
 
     ConfirmImpact is High: destroy.ps1 asks unless -Force. Returns DESTROY.EXPIRY (with -IfExpired),
-    DESTROY.GOLDEN.GUARD, DESTROY.ARC.SQLINSTANCES, DESTROY.ARC.MACHINES, DESTROY.RESOURCEGROUP,
-    DESTROY.KEYVAULT (with the Key Vault opt-in), DESTROY.DEPLOYMENT, DESTROY.BUDGET, DESTROY.SAFETYSTOP.ROLE (Not
-    selected: the nightly safety stop's custom role, a role definition that stays unassigned for the next deployment,
-    ADR 0024; its identity, account, schedules, and assignment go with the group), DESTROY.GOLDEN, the
+    DESTROY.GOLDEN.GUARD, DESTROY.FABRIC.CONTROL, DESTROY.FABRIC.WORKSPACE, DESTROY.CONTROL (with DESTROY.CONTROL.ROLES
+    and DESTROY.CONTROL.RESOURCES when it went), DESTROY.ENTRA.GROUP, DESTROY.ARC.SQLINSTANCES, DESTROY.ARC.MACHINES,
+    DESTROY.RESOURCEGROUP, DESTROY.KEYVAULT (with the Key Vault opt-in), DESTROY.DEPLOYMENT, DESTROY.BUDGET,
+    DESTROY.SAFETYSTOP.ROLE (the nightly safety stop's custom role, deleted once no assignment holds it, ADR 0024; its
+    identity, account, schedules, and assignment go with the group), DESTROY.GOLDEN, the
     TEARDOWN.RESIDUAL.* checks, and DESTROY.RESIDUAL. With -ResidueOnly it deletes nothing and asks nothing: it runs
     the residual check again with the manifest an earlier destroy wrote (DESTROY.MANIFEST, the TEARDOWN.RESIDUAL.*
     checks, and DESTROY.RESIDUAL).
@@ -86,6 +99,9 @@ function Remove-DemoEnvironment {
     .PARAMETER WithoutGolden
     Accept losing a PaygWizard install when no boot-verified golden snapshot keeps it.
 
+    .PARAMETER KeepFabric
+    Keep the demo's and the control's Fabric workspaces, with their items and the history in the lakehouse.
+
     .PARAMETER ResidueOnly
     Delete nothing: run only the residual check again, with the manifest at -ManifestPath that an earlier destroy
     wrote, and sum it up in DESTROY.RESIDUAL. The manifest isn't changed, nothing is asked, and -WhatIf isn't needed.
@@ -122,6 +138,8 @@ function Remove-DemoEnvironment {
         [switch] $IncludeGolden,
 
         [switch] $WithoutGolden,
+
+        [switch] $KeepFabric,
 
         [switch] $ResidueOnly,
 
@@ -195,8 +213,28 @@ function Remove-DemoEnvironment {
         }
         $results.Add((New-DemoResult -CheckId 'DESTROY.EXPIRY' -Area 'teardown' -Target 'subscription' -Status 'Pass' -Message ('{0} expired on {1}, so it''s deleted now.' -f $resourceGroupName, $expiresOn)))
     }
-    if (-not $PSCmdlet.ShouldProcess($resourceGroupName, 'Delete the Arc resources, the resource group and everything in it, the subscription deployment record, and the budget')) {
-        $results.Add((New-DemoResult -CheckId 'DESTROY.RESOURCEGROUP' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} wasn''t deleted.' -f $resourceGroupName)))
+    # What else deploy.ps1 created, read before anything is asked or deleted (2026-11-17): the session control, the Fabric
+    # workspaces, the T3 administrators' group, and the custom roles. The confirmation lists what goes and what stays.
+    $extra = $null
+    try {
+        $extra = Get-DemoDestroyExtraPlan -Config $Config -KeepFabric:$KeepFabric
+    }
+    catch {
+        $why = Protect-DemoText -Text $_.Exception.Message
+        Write-DemoLog -Level Warning -Message ('What else deploy.ps1 created couldn''t be read, so only the resource group''s part runs: {0}' -f $why)
+        $unread = [pscustomobject]@{ State = 'Unknown'; Reason = ('it couldn''t be read: {0}' -f $why) }
+        $extra = [pscustomobject]@{ Control = [pscustomobject]@{ Name = (Get-DemoActivityControlName -Config $Config); State = 'Unknown'; ServedGroup = ''; Resources = @(); Reason = $unread.Reason }; Fabric = [pscustomobject]@{ Read = $false; Token = $null; Plan = $null; Reason = $unread.Reason }; Group = [pscustomobject]@{ Id = [string]$Config['t3AdminGroupObjectId']; Name = ''; State = 'Unknown'; Reason = $unread.Reason }; Delete = @(); Keep = @(('the session control, the Fabric workspaces, and the security group: {0}' -f $unread.Reason)) }
+    }
+    $deleteText = @(('the Arc resources, {0} and everything in it, the subscription deployment record, and the budget' -f $resourceGroupName)) + @($extra.Delete)
+    $keepText = @($extra.Keep) + @($(if ($IncludeGolden) { @() } else { @(('{0} and its golden snapshots (-IncludeGolden deletes them)' -f (Get-DemoGoldenResourceGroupName -Config $Config))) }))
+    foreach ($line in $deleteText) {
+        Write-DemoLog -Message ('destroy.ps1 deletes {0}.' -f $line)
+    }
+    foreach ($line in $keepText) {
+        Write-DemoLog -Message ('destroy.ps1 keeps {0}.' -f $line)
+    }
+    if (-not $PSCmdlet.ShouldProcess($resourceGroupName, ('Delete {0}. Keep {1}' -f ($deleteText -join '; '), ($keepText -join '; ')))) {
+        $results.Add((New-DemoResult -CheckId 'DESTROY.RESOURCEGROUP' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} wasn''t deleted, and nothing else was. destroy.ps1 would delete {1}; and keep {2}.' -f $resourceGroupName, ($deleteText -join '; '), ($keepText -join '; '))))
         return $results.ToArray()
     }
 
@@ -235,6 +273,13 @@ function Remove-DemoEnvironment {
     }
     catch {
         Write-DemoLog -Level Warning -Message ('The manifest for the residual check couldn''t be recorded; the check runs without it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+
+    # The Fabric workspaces, the session control, and the security group (2026-11-17), before the group: the control's
+    # schedules then can't start anything in it while it goes. Each part reports itself; one that fails doesn't stop the
+    # rest, and a destroy.ps1 that runs again after the group is gone finishes them.
+    foreach ($item in @(Invoke-DemoDestroyExtra -Config $Config -Plan $extra)) {
+        $results.Add($item)
     }
 
     if ($groupExists) {
@@ -370,12 +415,20 @@ function Remove-DemoEnvironment {
         }
     }
 
-    # The nightly safety stop's custom role (ADR 0024) is a role definition in the subscription: its one assignment went
-    # with the group, and the definition stays, unassigned and free, for the next deploy.ps1. Said here, never deleted.
+    # The nightly safety stop's custom role (ADR 0024) is a role definition in the subscription, which every environment's
+    # safety stop shares: its assignment here went with the group. It's deleted once no assignment holds it (2026-11-17);
+    # while another environment's safety stop holds it, it stays.
     try {
         $safetyRole = Get-DemoSafetyStopRoleState -SubscriptionId $subscriptionId
         if ($safetyRole.Id) {
-            $results.Add((New-DemoResult -CheckId 'DESTROY.SAFETYSTOP.ROLE' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('The custom role "{0}" stays: a role definition in the subscription, with no assignment left (its one assignment went with {1}) and no cost, which the next deploy.ps1 assigns again. An Owner who wants it gone runs: az role definition delete --name "{0}" --scope /subscriptions/{2}' -f $script:SafetyStopRoleName, $resourceGroupName, $subscriptionId) -Evidence ([ordered]@{ role = $script:SafetyStopRoleName; roleId = $safetyRole.Id }) -DocUrl 'https://learn.microsoft.com/azure/role-based-access-control/custom-roles-cli#delete-a-custom-role'))
+            $roleDoc = 'https://learn.microsoft.com/azure/role-based-access-control/custom-roles-cli#delete-a-custom-role'
+            $outcome = Remove-DemoUnassignedRoleDefinition -SubscriptionId $subscriptionId -RoleId $safetyRole.Id
+            $evidence = [ordered]@{ role = $script:SafetyStopRoleName; roleId = $safetyRole.Id; assignments = $outcome.Count }
+            $results.Add($(switch ($outcome.Outcome) {
+                        'Deleted' { New-DemoResult -CheckId 'DESTROY.SAFETYSTOP.ROLE' -Area 'teardown' -Target 'subscription' -Status 'Pass' -Message ('Deleted the custom role "{0}": no role assignment held it any more (its assignment here went with {1}).' -f $script:SafetyStopRoleName, $resourceGroupName) -Evidence $evidence -DocUrl $roleDoc }
+                        'Kept' { New-DemoResult -CheckId 'DESTROY.SAFETYSTOP.ROLE' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('The custom role "{0}" stays: {1} role assignment(s) still hold it, such as another environment''s nightly safety stop. Its assignment here went with {2}.' -f $script:SafetyStopRoleName, $outcome.Count, $resourceGroupName) -Evidence $evidence -DocUrl $roleDoc }
+                        default { New-DemoResult -CheckId 'DESTROY.SAFETYSTOP.ROLE' -Area 'teardown' -Target 'subscription' -Status 'Warning' -Message ('The custom role "{0}" wasn''t deleted: {1}' -f $script:SafetyStopRoleName, $outcome.Error) -Evidence $evidence -Remediation ('Run ./scripts/destroy.ps1 again; or an Owner deletes it once nothing holds it: az role definition delete --name "{0}" --scope /subscriptions/{1}' -f $script:SafetyStopRoleName, $subscriptionId) -DocUrl $roleDoc }
+                    }))
         }
     }
     catch {

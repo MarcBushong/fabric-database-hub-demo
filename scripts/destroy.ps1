@@ -12,7 +12,14 @@ then the subscription-scope deployment record dbhub-<environment>-main. Last, th
 Arc resource, role assignment, managed identity, P6 membership, deployment record, or budget is left
 (DESTROY.RESIDUAL; docs/cleanup.md). Only this environment counts: its resource group by its exact name and its
 deploymentId, never another prefix's environment with the same environment name.
-The GitHub identity's resource group (rg-<prefix>-control) stays. It asks for confirmation unless -Force.
+
+It deletes the rest of what deploy.ps1 created too, each only when it can tell it's this environment's (2026-11-17):
+the session control in rg-<prefix>-control, when its runbooks serve this environment's resource group; the demo's
+Fabric workspace, when every item in it is one the demo creates, and the control's, when its control notebook serves
+this environment; the T3 administrators' security group, when init.ps1 created it for this environment; and the custom
+role definitions, once no role assignment holds them. What isn't this environment's stays, and the results say why.
+-KeepFabric keeps the Fabric workspaces and the history. The Fabric capacity and your licenses are never touched.
+It asks for confirmation, listing what it deletes and what it keeps, unless -Force.
 With -IfExpired (the scheduled expiry workflow) it deletes only when the resource group's expiresOn tag
 (expiresOn in the configuration) has passed, and otherwise does nothing. Running it again after an
 interruption finishes the cleanup.
@@ -61,6 +68,10 @@ the next deploy.ps1 restores T2 from it (DESTROY.GOLDEN says so).
 Destroy a PaygWizard environment even though no boot-verified golden snapshot keeps its setup-wizard step.
 Without it, destroy.ps1 deletes nothing in that case (DESTROY.GOLDEN.GUARD Fail).
 
+.PARAMETER KeepFabric
+Keep the demo's and the session control's Fabric workspaces, with their items and the history in the lakehouse
+(DESTROY.FABRIC.WORKSPACE and DESTROY.FABRIC.CONTROL are Not selected).
+
 .PARAMETER ResidueOnly
 Delete nothing and ask nothing: run only the residual check again with the saved manifest (DESTROY.MANIFEST, the
 TEARDOWN.RESIDUAL.* checks, and DESTROY.RESIDUAL).
@@ -71,6 +82,9 @@ with -ResidueOnly).
 
 .EXAMPLE
 ./scripts/destroy.ps1
+
+.EXAMPLE
+./scripts/destroy.ps1 -KeepFabric
 
 .EXAMPLE
 ./scripts/destroy.ps1 -Force -IfExpired
@@ -105,6 +119,9 @@ param(
 
     [Parameter(ParameterSetName = 'Destroy')]
     [switch] $WithoutGolden,
+
+    [Parameter(ParameterSetName = 'Destroy')]
+    [switch] $KeepFabric,
 
     [Parameter(Mandatory, ParameterSetName = 'Residue')]
     [switch] $ResidueOnly,
@@ -154,6 +171,7 @@ $parameters = @{
     ManifestPath       = $ManifestPath
     IncludeGolden      = $IncludeGolden
     WithoutGolden      = $WithoutGolden
+    KeepFabric         = $KeepFabric
     WhatIf             = [bool]$WhatIfPreference
     Confirm            = $confirm
 }

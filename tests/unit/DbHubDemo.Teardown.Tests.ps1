@@ -557,6 +557,9 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         # The nightly safety stop's role definition (ADR 0024): none, unless a test says so.
         $script:safetyRoleId = ''
         Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopRoleState -MockWith { [pscustomobject]@{ Id = $script:safetyRoleId; Actions = @(); Error = '' } }
+        # What else deploy.ps1 created (2026-11-17) has its own tests (DbHubDemo.Destroy.Tests.ps1); here it notes when it ran.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith { [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; Delete = @(); Keep = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDestroyExtra -MockWith { $script:order.Add('Extra'); @() }
         $script:goldenSnapshots = @()
         $script:hostName = ''
         $script:goldenGroupExists = $false
@@ -596,7 +599,7 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         $manifestPath = Join-Path -Path $TestDrive -ChildPath 'out/destroy-manifest.json'
         $results = @(Remove-DemoEnvironment -Config $config -ManifestPath $manifestPath -Confirm:$false)
         # T4's read replica (ADR 0025) is read before the group, by the manifest's deploymentId; there's none here.
-        $script:order | Should -Be @('Manifest', 'rest --method get', 'group delete --name', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host'
+        $script:order | Should -Be @('Manifest', 'Extra', 'rest --method get', 'group delete --name', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.DEPLOYMENT' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.BUDGET' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }).status | Should -Be 'Pass'
@@ -604,26 +607,33 @@ Describe 'Remove-DemoEnvironment: manifest, deployment record, and residue' {
         (Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).DeploymentId | Should -Be 'abc123'
     }
 
-    It 'finishes the cleanup when the group is already gone' {
+    It 'finishes the cleanup when the group is already gone, the other parts included (2026-11-17)' {
         $script:groupExists = $false
         $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
-        $script:order | Should -Be @('Manifest', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123')
+        $script:order | Should -Be @('Manifest', 'Extra', 'deployment sub show', 'deployment sub delete', 'rest --method get', 'rest --method delete', 'Residue:abc123')
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).message | Should -Match 'doesn''t exist'
     }
 
-    It 'says the nightly safety stop''s role stays, unassigned and free, with an Owner''s command to delete it (ADR 0024)' {
+    It 'deletes the nightly safety stop''s role once no assignment holds it, and keeps it while one does, such as another environment''s (2026-11-17)' {
         $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
         $results | Where-Object { $_.checkId -eq 'DESTROY.SAFETYSTOP.ROLE' } | Should -BeNullOrEmpty
 
+        $script:safetyRoleId = 'eeeeeeee-0000-0000-0000-000000000024'
+        $script:roleOutcome = [pscustomobject]@{ Outcome = 'Kept'; Count = 2; Error = '' }
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoUnassignedRoleDefinition -MockWith { $script:order.Add('Role ' + $RoleId); $script:roleOutcome }
         $script:groupExists = $true
-        $script:safetyRoleId = '/subscriptions/{0}/providers/Microsoft.Authorization/roleDefinitions/eeeeeeee-0000-0000-0000-000000000024' -f $config['subscriptionId']
         $results = @(Remove-DemoEnvironment -Config $config -Confirm:$false)
         $role = $results | Where-Object { $_.checkId -eq 'DESTROY.SAFETYSTOP.ROLE' }
         $role.status | Should -Be 'Not selected'
-        $role.message | Should -Match 'no assignment left \(its one assignment went with rg-dbhub-demo\) and no cost'
-        $role.message | Should -Match ([regex]::Escape(('az role definition delete --name "DbHub Demo Safety Stop" --scope /subscriptions/{0}' -f $config['subscriptionId'])))
+        $role.message | Should -Match '^The custom role "DbHub Demo Safety Stop" stays: 2 role assignment\(s\) still hold it, such as another environment''s nightly safety stop\.'
         $role.evidence.roleId | Should -Be $script:safetyRoleId
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -Times 0 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match 'role definition delete' }
+        [array]::IndexOf(@($script:order), 'Role eeeeeeee-0000-0000-0000-000000000024') | Should -BeGreaterThan ([array]::IndexOf(@($script:order), 'group delete --name')) -Because 'its assignment here goes with the group first'
+
+        $script:roleOutcome = [pscustomobject]@{ Outcome = 'Deleted'; Count = 0; Error = '' }
+        $script:groupExists = $true
+        $deleted = @(Remove-DemoEnvironment -Config $config -Confirm:$false) | Where-Object { $_.checkId -eq 'DESTROY.SAFETYSTOP.ROLE' }
+        $deleted.status | Should -Be 'Pass'
+        $deleted.message | Should -Match '^Deleted the custom role "DbHub Demo Safety Stop": no role assignment held it any more'
     }
 
     Context 'the budget at the group''s scope, which outlives the group (live, 2026-10-22)' {
