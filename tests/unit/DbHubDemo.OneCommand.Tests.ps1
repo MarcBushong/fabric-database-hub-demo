@@ -1655,6 +1655,13 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         ($again.Results | Where-Object { $_.checkId -eq 'DEPLOY.WATCHDOG_SQLVM01' }).message | Should -Match 'restarted once already'
     }
 
+    It 'names the VM, not the step, in the setup the run can''t continue (live, 2026-11-17)' {
+        # Live on mn: "the run can't continue The bootstrap loader's setup until it finishes".
+        $stuck = InModuleScope DbHubDemo { New-DemoVmStuckResult -VmName 'sqlvm01' -What 'The bootstrap loader' -Minutes 30 -Restarted $true }
+        $stuck.checkId | Should -Be 'DEPLOY.EXTENSIONS_SQLVM01'
+        $stuck.message | Should -Be 'The bootstrap loader is still stuck on sqlvm01 after about 30 minutes and one automatic restart: Azure is busy with the VM agent''s Run Command handling. This is Azure-side; the run can''t continue sqlvm01''s setup until it finishes.'
+    }
+
     It 'never restarts the T2 host while its guest may be in the middle of setup' {
         $script:views.Enqueue($script:busy)
         $script:guidedUntil = [DateTime]::UtcNow.AddMinutes(30).ToString('o')

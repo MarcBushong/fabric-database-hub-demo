@@ -654,7 +654,7 @@ function New-DemoVmStuckResult {
     )
 
     $stuck = if (@($Item).Count -gt 0) { @($Item) -join ', ' } else { 'the VM agent''s Run Command handling' }
-    $message = '{0} is still stuck on {1} after about {2} minutes{3}: Azure is busy with {4}. This is Azure-side; the run can''t continue {0}''s setup until it finishes.' -f $What, $VmName, $Minutes, $(if ($Restarted) { ' and one automatic restart' } else { '' }), $stuck
+    $message = '{0} is still stuck on {1} after about {2} minutes{3}: Azure is busy with {4}. This is Azure-side; the run can''t continue {1}''s setup until it finishes.' -f $What, $VmName, $Minutes, $(if ($Restarted) { ' and one automatic restart' } else { '' }), $stuck
     $first = if (@($Item).Count -gt 0) { @($Item)[0] } else { 'the extension' }
     $remediation = 'Wait 15 to 30 minutes, then run ./scripts/deploy.ps1 again; it continues where it stopped. If {0} stays stuck, ask your Azure administrator about it (often a policy installs it), and see docs/troubleshooting.md (Run Commands stuck in Deleting).' -f $first
     return (New-DemoResult -CheckId ('DEPLOY.EXTENSIONS_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target (Get-DemoVmTarget -VmName $VmName) -Status 'Fail' -Message $message -Evidence ([ordered]@{ vmName = $VmName; stuck = @($Item); minutes = $Minutes; restarted = $Restarted }) -Remediation $remediation -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed')
