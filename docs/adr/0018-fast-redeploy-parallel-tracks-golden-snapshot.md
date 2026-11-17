@@ -366,6 +366,16 @@ From about 2026-11-13, every T2 host that kept chunk Run Commands stopped starti
 | A VM's extensions settle before its artifacts and its loader | A running VM whose agent isn't Ready counts as unsettled too (`Get-DemoVmExtensionActivity`), so nothing is sent to it, and after 20 minutes the watchdog steps in | Chunks sent to a host whose agent wasn't Ready stayed in Creating, and a deallocate canceled their deletes instead of completing them. A healthy start has the agent Ready in about 2 minutes |
 | `stop-demo.ps1` deallocates each VM | It sends the deletes of a running VM's chunk Run Commands right before its deallocate (`Clear-DemoChunkRunCommand`) | The deallocate completes deletes that are still pending, so no chunk stays for the next start |
 
+## Amendments (2026-11-17: the T2 host's rebuild, R872)
+
+On a test host whose chunks an earlier version had sent while its VM agent wasn't Ready, the R871 recovery didn't bring the agent back: the chunks stayed **Deleting** or **Creating**, and a deallocate and start left the agent **Not Ready** (2026-11-17, twice). The user's decision: "Automatically: deploy.ps1 deletes and recreates only the T2 host, once, when its agent stays dead". No switch.
+
+| As built (R871) | 2026-11-17 | Why it's safe |
+|---|---|---|
+| A T2 host whose agent isn't Ready after the deallocate and start ends the run **NOT DONE** | The T2 track rebuilds the host, once per run (`Invoke-DemoT2HostRebuild`): it reads the host's own nested template from `azuredeploy.json` and the values its last deployment recorded, before it changes anything; clears what the state records for the old host; deletes `archost01`, its disks, and its network interface; creates it again from that template (deployment `archost01-rebuild`, a new password only in a private file); waits for the new host's agent; and runs T2's steps again from Artifacts. `DEPLOY.T2.HOSTREBUILD` says what happened; the failed attempt's **Fail** results become **Warnings** that name it | Only the host: T1, T3, T4, Fabric, and the guest's golden snapshot aren't touched. The rest of the template isn't deployed again mid-run. The T2 guest is built again on the new host in the configured mode (from Arc Jumpstart's image by default), and Arc onboarding replaces the old `arcsql01` machine, as on a first deployment. A second dead agent in the same run ends it **NOT DONE**, so a run never loops |
+| The T2 step started its Run Commands without checking the host's agent | The T2 step checks it first; a host whose agent is down gets the same wait and watchdog as the steps before it | A host whose agent is Ready goes on at once, as before |
+| A resume trusted the state's record of the T2 host | A host the state records but Azure doesn't have (`DEPLOY.T2.HOSTMISSING`) clears those records, and a resume starts from preflight, so the template creates it | A rebuild that stopped after its delete is finished by the next run |
+
 ## Sources (checked 2026-11-05)
 
 - `slmgr.vbs` options (`/rearm` "resets the activation timers"; `/ato` tries activation): <https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options>

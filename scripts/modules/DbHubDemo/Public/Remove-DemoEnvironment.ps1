@@ -47,11 +47,10 @@ function Remove-DemoEnvironment {
     Azure CLI.
 
     The golden group rg-<prefix>-golden (ADR 0018) belongs to the prefix, not to the environment: it stays
-    unless -IncludeGolden (DESTROY.GOLDEN). Before anything is deleted, an environment whose nested T2 host
-    holds a PaygWizard install (the setup-wizard step, which no script can redo) needs a boot-verified golden
-    snapshot whose guest's evaluation isn't over; without one, nothing is deleted (DESTROY.GOLDEN.GUARD Fail)
-    unless -WithoutGolden or -IncludeGolden accepts losing that state. With -IfExpired, the expiry wins and
-    it's a Warning.
+    unless -IncludeGolden (DESTROY.GOLDEN). Until 2026-11-09, an environment whose nested T2 host held a PaygWizard
+    install needed a boot-verified golden snapshot first (DESTROY.GOLDEN.GUARD), unless -WithoutGolden or
+    -IncludeGolden accepted losing that state; Get-DemoConfig runs a configuration's PaygWizard as JumpstartImage since
+    then, so the guard no longer refuses anything.
 
     ConfirmImpact is High: destroy.ps1 asks unless -Force. Returns DESTROY.EXPIRY (with -IfExpired),
     DESTROY.GOLDEN.GUARD, DESTROY.FABRIC.CONTROL, DESTROY.FABRIC.WORKSPACE, DESTROY.CONTROL (with DESTROY.CONTROL.ROLES

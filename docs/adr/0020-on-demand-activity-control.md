@@ -56,7 +56,7 @@ Placeholders: `<subscriptionId>` is the configured subscription, `<prefix>` the 
 
 ### The control
 
-It's optional and off by default (`control.enabled`; [configuration](../../config/environment.schema.json)). `scripts/setup-activity-control.ps1` sets it up with Contributor, and an Owner runs `-GrantRole` once. Everything lives in `rg-<prefix>-control`, which `destroy.ps1` keeps ([ADR 0002](0002-resource-group-topology.md)):
+It's optional and off by default (`control.enabled`; [configuration](../../config/environment.schema.json)). `scripts/setup-activity-control.ps1` sets it up with Contributor, and an Owner runs `-GrantRole` once. Everything lives in `rg-<prefix>-control`, which `destroy.ps1` keeps (until 2026-11-17: [amendment](#amendment-2026-11-17-destroyps1-deletes-the-control-and-the-removals-order)) ([ADR 0002](0002-resource-group-topology.md)):
 
 | Resource | Settings |
 |---|---|
@@ -171,7 +171,7 @@ It has no `NotActions` and no data actions. It can't create or delete a VM, disk
 
 ### Removal
 
-`setup-activity-control.ps1 -Remove` (with `-WhatIf` first) deletes, in order: the Fabric notebook, its folder when empty, and the control workspace with its endpoint; A1-A3 and the custom role (an Owner); then the Automation account (with its runbooks, schedules, and webhook), the identity, and the vault, which it purges. It deletes `rg-<prefix>-control` only when nothing else is left in it, because the group may also hold the GitHub OIDC identity ([ADR 0002](0002-resource-group-topology.md)).
+`setup-activity-control.ps1 -Remove` (with `-WhatIf` first) deletes, in order: the Fabric notebook, its folder when empty, and the control workspace with its endpoint; A1-A3 and the custom role (an Owner); then the Automation account (with its runbooks, schedules, and webhook), the identity, and the vault, which it purges (the account goes last since 2026-11-17: [amendment](#amendment-2026-11-17-destroyps1-deletes-the-control-and-the-removals-order)). It deletes `rg-<prefix>-control` only when nothing else is left in it, because the group may also hold the GitHub OIDC identity ([ADR 0002](0002-resource-group-topology.md)).
 
 ## Consequences
 
@@ -213,6 +213,12 @@ It has no `NotActions` and no data actions. It can't create or delete a VM, disk
 - **The re-checks:** `dbhub-monitor-<n>` are scheduled only while at least 5 minutes of the run remain, so a run shorter than about 35 minutes gets none, and the 90-minute showcase gets two (at 30 and 60 minutes).
 - **Rollout:** `./scripts/setup-activity-control.ps1 -SkipFabric` publishes the runbooks; without `-SkipFabric` it also imports the notebook again, with the showcase defaults. The runner on the VMs must know `showcase` and `--vcores`: `./scripts/deploy.ps1 -FromStage Infrastructure`, or a plain `deploy.ps1` after **DONE**, updates it ([update an existing environment](../deployment.md#update-an-existing-environment)).
 - **Validation:** unit-tested (`tests/unit/Automation.Runbooks.Tests.ps1`: the requests, the plan, the runner's arguments, the stale Running, a fresh NotRunning, a fresh Running, a missing time, and the VM's start from its instance view; `tests/unit/DbHubDemo.Lifecycle.Tests.ps1` for the module's rule; `tests/unit/Fabric.ControlNotebook.Tests.ps1` for the notebook). Not proven live.
+
+## Amendment (2026-11-17: destroy.ps1 deletes the control, and the removal's order)
+
+- **`destroy.ps1` deletes the control** with the rest of the environment when the settings its runbooks were published with name this environment's resource group ([ADR 0002](0002-resource-group-topology.md#amendment-2026-11-17-destroy-deletes-everything-deployps1-created)); a control that serves another environment stays. So "`rg-<prefix>-control`, which `destroy.ps1` keeps" in [the control](#the-control) no longer holds. The control is no longer optional either: it's part of every deployment since 2026-11-14 ([ADR 0026](0026-one-run-all-session.md)).
+- **The removal's order** (`setup-activity-control.ps1 -Remove`, and `destroy.ps1` through the same code): the Fabric part; the role assignments, then the custom roles "DbHub Demo Activity Operator" and "DbHub Demo Session Writer" only once no role assignment holds them, so another environment's roles stay; the identity and the vault, which it purges; and **the Automation account last**, because its runbooks say which environment the control serves, which a rerun after an interruption reads before it deletes anything. The group goes once nothing else is in it; the account's runbooks, which Azure can still list for a moment after the account is deleted, don't count (live, 2026-11-17).
+- **Live (2026-11-17):** through `destroy.ps1`, in a test environment: its control workspace with its managed private endpoint, 6 role assignments, the two suffixed roles, the identity, the vault (purged), and the Automation account, then the empty group in a later run. The owner's control and roles were unchanged.
 
 ## Validation
 

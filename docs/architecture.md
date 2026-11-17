@@ -86,7 +86,7 @@ Every value is a parameter. Profiles (`lowest-cost`, `demo-day`, `enhanced-perfo
 | Component | Default | Notes |
 |---|---|---|
 | Region | West US 3 | In Hub's performance-monitoring region list and the SQL VM unified-inventory list. Preflight checks sizes and quota and suggests alternatives. |
-| Resource groups | `rg-dbhub-demo`, plus `rg-dbhub-control` only for the GitHub path | [ADR 0002](adr/0002-resource-group-topology.md) |
+| Resource groups | `rg-dbhub-demo`, plus `rg-dbhub-control` for the session control (and the GitHub identity on the GitHub path) | [ADR 0002](adr/0002-resource-group-topology.md) |
 | Network | VNet `10.42.0.0/24`: `snet-sqlvm`, `snet-archost`, `snet-pe` (private mode), `AzureBastionSubnet` | No VM public IPs. [ADR 0007](adr/0007-networking-modes-and-egress.md) |
 | T1 `sqlvm01` | `Standard_D2s_v5` (`lowest-cost`), `MicrosoftSQLServer:sql2022-ws2022:standard-gen2`, OS disk (plus a data disk outside `lowest-cost`), system-assigned identity, SQL connectivity `LOCAL` | `Microsoft.SqlVirtualMachine/sqlVirtualMachines` with license type PAYG. Runs the workload runner for T1 and T3. |
 | T2 host `archost01` | `Standard_E2s_v5` (`lowest-cost`), Windows Server 2022 Datacenter Gen2, `securityType = Standard`; in `lowest-cost` the guest's VHDX (and, in the build modes, its media) use the 128 GiB OS disk, and the other profiles add a 128 GiB data disk | No Arc agent and no SQL IaaS extension. [ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md) |
@@ -282,7 +282,7 @@ flowchart LR
   NB -->|"kusto token, read-only KQL"| TEL["Telemetry endpoint"]
 ```
 
-- Everything lives in `rg-<prefix>-control`, which destroy keeps; only A1 reaches into the demo group.
+- Everything lives in `rg-<prefix>-control`, which `destroy.ps1` deletes with the environment when the control serves it (2026-11-17); only A1 reaches into the demo group.
 - The runbook checks every request against the scenario catalog's allow-lists, refuses a run while another is active, creates the run's auto-stop before it starts anything, and sets each target's profile with the same VM-side request as `demo-control.ps1`. Stop now, the auto-stop, and the daily T4 safety stop go through Azure Resource Manager only.
 - Where the tenant's policy makes new vaults private, the notebook lives in its own "DBHub Control" workspace, because a managed private endpoint turns off starter pools for its whole workspace; otherwise it's in a folder of the existing workspace.
 

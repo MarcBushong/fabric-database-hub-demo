@@ -19,7 +19,7 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | ADR | Title | Source | Status |
 |---|---|---|---|
 | [0001](0001-iac-bicep-avm-compiled-arm.md) | Infrastructure as code with Bicep, Azure Verified Modules, and a compiled `azuredeploy.json` | Engineering | Accepted |
-| [0002](0002-resource-group-topology.md) | One demo resource group plus an optional control resource group | Engineering (Q4c, §9.1) | Accepted |
+| [0002](0002-resource-group-topology.md) | One demo resource group plus a control resource group | Engineering (Q4c, §9.1) | Accepted |
 | [0003](0003-t2-host-size-security-type-bootstrap.md) | T2 host size, security type, and bootstrap state machine | Engineering | Accepted; validated live, except the Trusted Launch host test; Phase 28 amendment (chunk hygiene that doesn't stall) unit-tested |
 | [0004](0004-guest-imds-isolation.md) | Isolating the nested guest from IMDS and the wire server | User-directed (Q5b) | Accepted; validated live, except the port-ACL-only test |
 | [0005](0005-arc-onboarding-authentication.md) | Arc onboarding authentication | Engineering (§9.1) | Accepted; validated live with the operator's token |

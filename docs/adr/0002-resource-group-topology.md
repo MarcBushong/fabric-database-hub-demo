@@ -1,4 +1,4 @@
-# ADR 0002: One demo resource group plus an optional control resource group
+# ADR 0002: One demo resource group plus a control resource group
 
 - **Status:** Accepted
 - **Date:** 2026-10-19 (revised the same day for plan §9, Revision 2)
@@ -32,7 +32,7 @@
 Option 2.
 
 - **Demo resource group:** `rg-<prefix>-<env>` (default `rg-dbhub-demo`), created by `infra/main.bicep` at subscription scope. It holds every demo resource: network, VMs, Azure SQL, schedules, and budget. *(The artifact cache storage account was dropped on 2026-10-20; ADR 0016, C9.)*
-- **Control resource group:** `rg-<prefix>-control` exists only when the GitHub path is used. `scripts/setup-github-oidc.ps1` creates it with the user-assigned identity and its federated credentials. `destroy` never touches it.
+- **Control resource group:** `rg-<prefix>-control` exists only when the GitHub path is used. `scripts/setup-github-oidc.ps1` creates it with the user-assigned identity and its federated credentials. `destroy` never touches it (until 2026-11-17: [below](#amendment-2026-11-17-destroy-deletes-everything-deployps1-created)).
 - **Tags:** the template sets the resource group's tags to `union(existingResourceGroupTags, requiredTags)`. `deploy.ps1` reads the group's current tags and passes them in, so tags added outside the template survive a re-run, and the required tags always win. The tags are `solution`, `environment`, `owner`, `purpose`, `costCenter`, `autoShutdown`, `deploymentId`, `ArcSQLServerExtensionDeployment=PAYG`, an optional `expiresOn`, and the orchestrator's progress tag `dbhubDeployStage`. *(Phase 5: this replaces the earlier `Microsoft.Resources/tags` design, which a subscription-scope resource-group resource would overwrite anyway.)*
 - **`deploymentId`:** six lowercase alphanumeric characters, deterministic by default (`take(uniqueString(subscription().id, prefix, environment), 6)`), so every lifecycle of the same environment uses the same names. Globally unique names (the Azure SQL logical server) carry it as a suffix.
 - **Resume:** after each stage succeeds, `deploy.ps1` records it in `dbhubDeployStage`. `-Resume` continues from the next stage. Every stage is idempotent, so a full re-run also converges.
@@ -86,8 +86,21 @@ Option 2.
 ## Phase 25c addendum: the on-demand activity control (2026-10-26)
 
 - **`rg-<prefix>-control` also holds the optional on-demand activity control** ([ADR 0020](0020-on-demand-activity-control.md)): the identity `id-<prefix>-automation`, the Automation account `aa-<prefix>-control` with its runbooks, schedules, and webhook, and the vault `kv-<prefix>-ctl-<suffix>`. `scripts/setup-activity-control.ps1` creates the group when it doesn't exist (with the control's tags), and keeps the tags of a group that the GitHub path created.
-- **Destroy still never touches the group**, and the control's resources carry no `environment` or `deploymentId` tag, so the residual check doesn't count them. `setup-activity-control.ps1 -Remove` deletes the control's resources one by one, and the group only when nothing else is left in it, because the GitHub OIDC identity may live there too ([cleanup](../cleanup.md#the-on-demand-activity-control)).
+- **Destroy still never touches the group** (until 2026-11-17: [below](#amendment-2026-11-17-destroy-deletes-everything-deployps1-created)), and the control's resources carry no `environment` or `deploymentId` tag, so the residual check doesn't count them. `setup-activity-control.ps1 -Remove` deletes the control's resources one by one, and the group only when nothing else is left in it, because the GitHub OIDC identity may live there too ([cleanup](../cleanup.md#the-on-demand-activity-control)).
 - **One role assignment reaches into the demo group:** A1, the control's custom role for its identity at `rg-<prefix>-<environment>`. The group's deletion removes it, and `deploy.ps1` grants it again after a redeploy when `assignRoles` and `control.enabled` are true; otherwise `DEPLOY.SUMMARY` reports Manual action required with the `-GrantRole` command.
+
+## Amendment (2026-11-17): destroy deletes everything deploy.ps1 created
+
+**Decision** (the coordinator, for the user, whose standing preferences are "ease above all" and documentation that makes clear how to delete everything): one command deletes everything `deploy.ps1` created. A control left behind would keep running its schedules against a deleted environment.
+
+- **What `destroy.ps1` deletes now, each part only when it can tell it's this environment's,** before the Arc resources and the group:
+  - the session control in `rg-<prefix>-control`, when the settings its runbooks were published with name this environment's resource group, with the same code as `setup-activity-control.ps1 -Remove` (`DESTROY.CONTROL`); the group goes once it's empty, and stays while the GitHub identity `id-<prefix>-github` is in it;
+  - the demo's Fabric workspace, when every item in it is one the demo creates, and the control's, when its control notebook names this environment's resource group (`DESTROY.FABRIC.WORKSPACE`, `DESTROY.FABRIC.CONTROL`); `-KeepFabric` keeps both;
+  - the T3 and T4 administrators' security group, when `init.ps1` created it for this environment, which its description records (`DESTROY.ENTRA.GROUP`);
+  - the custom role definitions, once no role assignment holds them, so another environment's roles, the owner's among them, stay (`DESTROY.SAFETYSTOP.ROLE`, `DESTROY.CONTROL.ROLES`).
+- **Behavior:** the confirmation lists what goes and what stays; each part reports itself, and one that fails doesn't stop the others; a paused capacity or another Fabric error is a **Warning** with the fix. A rerun after the group is gone finishes the other parts.
+- **The golden group is unchanged:** it stays unless `-IncludeGolden`.
+- **Live (2026-11-17), two test environments whose groups were already gone:** one deleted its control (its workspace with the managed private endpoint, 6 role assignments, its two suffixed roles, the identity, the vault, purged, and the Automation account), its demo workspace, and its security group, in 5 minutes 16 seconds; a third run deleted the control group, empty by then, in about 3 minutes. The other deleted its workspace and its group in 2 minutes 48 seconds. The owner's roles (22 and 7 actions), `rg-dbhub-demo`, `rg-dbhub-control`, and the other environments' items were unchanged.
 
 ## Sources (checked 2026-10-19)
 

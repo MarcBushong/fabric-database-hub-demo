@@ -843,7 +843,7 @@ When something isn't visible, say so plainly, keep the story moving on another t
    - The month must stay below `monthlyCeilingUsd`, $375 by default since 2026-11-04, the hard ceiling; the budget alerts at 50%, 80%, and 100%.
    - If month-to-date spend grew by more than the session estimate, something ran longer than planned: usually Bastion, an evening start that ran until the next day's shutdown, or a T3 profile left on.
 5. **Record what happened:** the date, the targets the agent covered, the latency, and any action it offered, in the [live coverage record](../fabric/agent/README.md#live-coverage-record); the beat timings; and every *verify in rehearsal* item you settled. When the shared capacity is running, run the live-activity notebook's **Persist** cell if you want the session's telemetry beyond its 7-day retention.
-6. **The wizard's dashboard** (30-minute version): keep it for the next session, or delete it from the workspace yourself. It's a manual step: nothing in the repo created it, so nothing removes it. `RTD_DatabaseHub_LiveView` stays in the workspace between sessions. `destroy.ps1` doesn't touch Fabric items, so it removes neither dashboard, nor the notebooks.
+6. **The wizard's dashboard** (30-minute version): keep it for the next session, or delete it from the workspace yourself. It's a manual step: nothing in the repo created it, so nothing removes it. `RTD_DatabaseHub_LiveView` stays in the workspace between sessions. `destroy.ps1` deletes the demo's workspace only when everything in it is the demo's, so a wizard's dashboard saved there keeps the workspace, and everything in it, until you delete that dashboard.
 
 ## Sources (checked 2026-10-20)
 

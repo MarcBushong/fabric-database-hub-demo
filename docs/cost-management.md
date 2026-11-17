@@ -171,13 +171,13 @@ The notebooks need the Fabric workspace on an F or Trial capacity (prerequisite 
 
 ## The on-demand activity control
 
-Optional (`control.enabled`; [ADR 0020](adr/0020-on-demand-activity-control.md)). Its resources in `rg-<prefix>-control` outlive destroy, so they bill until `setup-activity-control.ps1 -Remove` deletes them:
+Part of every deployment since 2026-11-14 ([ADR 0026](adr/0026-one-run-all-session.md)); `"enabled": false` under `control` no longer turns it off ([ADR 0020](adr/0020-on-demand-activity-control.md)). Its resources in `rg-<prefix>-control` bill until `destroy.ps1` deletes them with the rest of the environment, or `setup-activity-control.ps1 -Remove` deletes the control alone:
 
-- **Key Vault (Standard):** billed per 10,000 operations; a run reads the one secret once. The estimate adds one block of operations a month, from the vault's `Operations` meter.
+- **Key Vault (Standard):** billed per 10,000 operations, for the control's secrets: the webhook's URL and the session's status and metrics. The estimate adds one block of operations a month, from the vault's `Operations` meter.
 - **Azure Automation (Basic):** billed per job minute after the first 500 a month, which are included; a run's jobs take a few minutes. The estimate prices 60 job minutes a month at the meter's first tier, so it's $0 while you stay under 500.
 - **The webhook, the schedules, the identity, and role assignments** have no charge. Managed private endpoints and managed virtual networks in Fabric have no separate meter in the Retail Prices API (checked 2026-10-23); the control notebook uses the capacity's units while it runs, like any notebook.
 - **What a run costs** is the demo's own running time, the VMs and T4 for the run's minutes, which the session estimate already covers; the auto-stop ends it 10 minutes after the run, and the nightly safety stop, in every deployment, and the control's daily T4 safety stop catch a forgotten T4.
-- `estimate-cost.ps1` reads both meters from the Retail Prices API at run time when `control.enabled` is true; no price is hard-coded.
+- `estimate-cost.ps1` reads both meters from the Retail Prices API at run time; no price is hard-coded.
 
 ## Run an estimate
 

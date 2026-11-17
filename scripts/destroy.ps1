@@ -24,10 +24,8 @@ With -IfExpired (the scheduled expiry workflow) it deletes only when the resourc
 (expiresOn in the configuration) has passed, and otherwise does nothing. Running it again after an
 interruption finishes the cleanup.
 
-In a shared subscription, agree on it with the environment's owner first: a PaygWizard environment holds the
-setup-wizard step, which no script can redo (docs/cleanup.md). So destroy.ps1 refuses to delete one unless a
-boot-verified golden snapshot in rg-<prefix>-golden keeps it (capture-t2-golden.ps1, test-t2-golden.ps1), or
--WithoutGolden accepts the loss. The golden group stays unless -IncludeGolden.
+In a shared subscription, agree on it with the environment's owner first (docs/cleanup.md). The golden group stays
+unless -IncludeGolden.
 
 With -ResidueOnly it deletes nothing: it runs only the residual check again, read-only, with the manifest an
 earlier destroy wrote (-ManifestPath, out/destroy-manifest-<environment>.json by default), and writes the results to
@@ -65,8 +63,9 @@ Also delete rg-<prefix>-golden and its T2 golden snapshots (ADR 0018). Without i
 the next deploy.ps1 restores T2 from it (DESTROY.GOLDEN says so).
 
 .PARAMETER WithoutGolden
-Destroy a PaygWizard environment even though no boot-verified golden snapshot keeps its setup-wizard step.
-Without it, destroy.ps1 deletes nothing in that case (DESTROY.GOLDEN.GUARD Fail).
+Changes nothing now. Until 2026-11-09 it let destroy.ps1 delete a PaygWizard environment that no boot-verified golden
+snapshot kept (DESTROY.GOLDEN.GUARD); a configuration's PaygWizard runs as JumpstartImage since then, so that guard
+no longer refuses anything.
 
 .PARAMETER KeepFabric
 Keep the demo's and the session control's Fabric workspaces, with their items and the history in the lakehouse
