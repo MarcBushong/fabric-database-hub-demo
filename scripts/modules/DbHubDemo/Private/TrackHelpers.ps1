@@ -787,6 +787,9 @@ function Invoke-DemoDeploymentTrack {
     $status = 'Pass'
     $startedUtc = [DateTime]::UtcNow
     $firstStepUtc = $null
+    # The host build's "minutes so far" count from the track's first step, or from the T2 host's rebuild in this run, after
+    # which its steps run again on a new host (2026-11-17, live on mn: "71 minutes so far" on a 20-minute-old host).
+    $hostBuildFromUtc = $null
     # True when T1's Bootstraps step merged the monitoring flag in this run: the Monitoring step then gives a NotRunning
     # plugin the longer grace before the agent's restart (Get-DemoSqlVmPluginGrace; Phase 28 live finding, 2026-10-30).
     $monitoringMerged = $false
@@ -1453,7 +1456,7 @@ function Invoke-DemoDeploymentTrack {
                         # followed up while it waits (Wait-DemoT2HostBuild).
                         $sent = Get-DemoDeploymentState -Config $Config
                         $bundlePrefix = if ([string]$sent.BundleSha256 -and 'archost01' -in @($sent.BundleSentTo)) { ([string]$sent.BundleSha256).Substring(0, [System.Math]::Min(12, ([string]$sent.BundleSha256).Length)) } else { '' }
-                        $build = Wait-DemoT2HostBuild -Config $Config -DeadlineUtc $t2Deadline -ProgressPath $progress -PollSeconds ([int](& $option 'HostPollSeconds' 300)) -StartedUtc $firstStepUtc -BundlePrefix $bundlePrefix
+                        $build = Wait-DemoT2HostBuild -Config $Config -DeadlineUtc $t2Deadline -ProgressPath $progress -PollSeconds ([int](& $option 'HostPollSeconds' 300)) -StartedUtc $(if ($null -ne $hostBuildFromUtc) { $hostBuildFromUtc } else { $firstStepUtc }) -BundlePrefix $bundlePrefix
                         # Results is always an array (Wait-DemoT2HostBuild); Get-DemoMemberValue would return it whole, so an
                         # empty one became one item, an empty array, whose checkId threw under strict mode (live, 2026-11-09).
                         & $addAll @($build.Results)
@@ -1734,6 +1737,7 @@ function Invoke-DemoDeploymentTrack {
                     $null = $shared['Settled'].Remove($key)
                 }
                 $Context['T2Source'] = 'build'
+                $hostBuildFromUtc = [DateTime]::UtcNow
                 # From Artifacts to the plan's last step: the new host needs its artifacts, its loader, its build and
                 # onboarding, and its telemetry.
                 $t2Names = @((Get-DemoTrackStep -Track 'T2').Keys)

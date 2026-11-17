@@ -802,6 +802,29 @@ Describe 'Invoke-DemoDeploymentTrack' {
             ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.T2.HOSTREBUILD' }).status | Should -Be 'Warning'
         }
 
+        It 'counts the new host''s build from its rebuild, not from the track''s first step (live on rg-dbhubmn-demo, 2026-11-17)' {
+            $script:context['WaitForT2'] = $true
+            $script:buildFrom = $null
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT2HostRebuild -MockWith {
+                $script:rebuilds++
+                # Strictly later than anything before the rebuild, the track's first step included.
+                $before = [DateTime]::UtcNow
+                while ([DateTime]::UtcNow -le $before) { }
+                $script:rebuiltAt = [DateTime]::UtcNow
+                $result = New-DemoResult -CheckId 'DEPLOY.T2.HOSTREBUILD' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'rebuild Warning'
+                [pscustomobject]@{ Rebuilt = $true; Result = $result; Results = @($result) }
+            }
+            Mock -ModuleName DbHubDemo -CommandName Wait-DemoT2HostBuild -MockWith {
+                $script:buildFrom = $StartedUtc
+                [pscustomobject]@{ Failed = $false; TimedOut = $false; Rebuilt = $false; Results = [System.Collections.Generic.List[object]]::new().ToArray(); Health = [pscustomobject]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; message = 'Every step is in the desired state.'; installMode = 'JumpstartImage' } }
+            }
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts', 'Bootstraps', 'T2', 'Telemetry') }
+            $outcome.Status | Should -Be 'Pass'
+            $script:rebuilds | Should -Be 1
+            $script:buildFrom | Should -Not -BeNullOrEmpty
+            ([datetime]$script:buildFrom) | Should -BeGreaterOrEqual $script:rebuiltAt
+        }
+
         It 'ends the track with the rebuild''s Fail first when the rebuild fails' {
             $script:rebuildWorks = $false
             $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts', 'Bootstraps', 'T2', 'Telemetry') }
