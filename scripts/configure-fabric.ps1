@@ -23,8 +23,8 @@ has no public API or ARM resource, so the checklist uses documented interfaces o
   (not a Fabric administrator, no token), which is a reminder to confirm it, worded as such.
 - P5: Contributor or higher on the resolved workspace and an F or Trial capacity, through Fabric REST with your
   Fabric token.
-- P11 (optional, Phase 18): Power BI viewer licensing on the workspace's capacity (PREFLIGHT.FABRIC.VIEWERLICENSE):
-  a Warning below F64, where viewers of the Phase 19 report and app need Pro, PPU, or a trial.
+- P11 (optional): Power BI viewer licensing (PREFLIGHT.FABRIC.VIEWERLICENSE), assumed since 2026-11-14: Not selected,
+  with the rule (Pro, PPU, or a trial for viewers of the report and the app below F64), and nothing read.
 - Estate: every selected target in Azure Resource Graph, the Hub's inventory source (HUB.ESTATE.*).
 - Telemetry: rows, the newest sample, and the lag per target from the telemetry REST endpoint (TELEMETRY.T1,
   TELEMETRY.T2, TELEMETRY.T3). Telemetry takes 3 to 15 minutes to appear; use -WaitMinutes.
@@ -37,8 +37,8 @@ Step 2, the notebook import (Phase 12; -SkipNotebookImport skips it). For each n
 (NB_DatabaseHub_Deployment and NB_DatabaseHub_LiveActivity), Get-DemoFabricNotebookDefinition validates the
 file and Import-DemoFabricNotebook creates the notebook or overrides its definition through Fabric REST, so
 re-runs converge. The uploaded copy is bound to the resolved lakehouse (ADR 0021); without a resolved lakehouse,
-nothing is imported. Its GITHUB_REPOSITORY and GITHUB_ENVIRONMENT come from github.repository and github.environment,
-unless the repository is still the example configuration's placeholder. With -NewNotebooksOnly, which deploy.ps1
+nothing is imported. NB_DatabaseHub_Deployment's GITHUB_REPOSITORY and GITHUB_ENVIRONMENT come from github.repository
+and github.environment, unless the repository is still the example configuration's placeholder. With -NewNotebooksOnly, which deploy.ps1
 passes while fabric.importNotebooks is false, a notebook that isn't in the workspace yet is imported without asking
 and one that is stays as it is (Not selected).
 The step runs only when the module has those functions; otherwise FABRIC.NOTEBOOKS.IMPORT is
@@ -167,13 +167,20 @@ With -ImportDashboard, skip step 4.
 .PARAMETER RunLiveActivity
 Also run step 5: NB_DatabaseHub_LiveActivity on demand with SAVE_RESULTS true (Invoke-DemoFabricNotebookRun), so
 the lakehouse tables the history report reads (incident windows, telemetry snapshots, validation results) are
-current. It runs analyze-only (CONFIRM and STOP_ACTIVITY false), scoped to the demo's resource group
+current. It runs analyze-only, scoped to the demo's resource group
 (RESOURCE_GROUP, rg-<prefix>-<environment>). It waits up to -TimeoutSeconds (at least 5 minutes) for the job. Step 5
 also runs once by itself when step 2 created the notebook, or bound it to a lakehouse that step 0 created, so a new
 lakehouse gets the tables.
 
 .PARAMETER LiveActivityWindowMinutes
 With -RunLiveActivity: the notebook's WINDOW_MINUTES and TELEMETRY_LOOKBACK_MINUTES (default 1440, one day).
+
+.PARAMETER PostgresMetricsPath
+With -RunLiveActivity: a file that stop-demo.ps1 -SaveHistory kept in out/history-pending when the session's history
+couldn't be saved (STOP.T4.HISTORY.PENDING, for example while the Fabric capacity was paused): T4's and its deleted read
+replica's metrics from that session, which the run adds to the history as the notebook's POSTGRES_METRICS (ADR 0025).
+After a run that passed, the file moves to out/history-pending/saved. Without it, the run sends T4's and a running
+replica's metrics from Azure Monitor over the window, as deploy.ps1's history snapshot does.
 
 .PARAMETER OutputPath
 Where to write the results as JSON lines.
@@ -198,6 +205,9 @@ Exit with code 2 when a check is Manual action required and none failed.
 
 .EXAMPLE
 ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity
+
+.EXAMPLE
+./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity -PostgresMetricsPath ./out/history-pending/postgres-metrics-rg-dbhub-demo-20261113T190000Z.json
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
@@ -257,6 +267,8 @@ param(
     [ValidateRange(15, 10080)]
     [int] $LiveActivityWindowMinutes = 1440,
 
+    [string] $PostgresMetricsPath = '',
+
     [string] $OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '../out/configure-fabric.jsonl'),
 
     [switch] $TreatManualAsError
@@ -273,10 +285,19 @@ $entryNested = $false
 foreach ($entryFrame in @(Get-PSCallStack | Select-Object -Skip 1)) {
     $entryNested = $entryNested -or [bool]($entryFrame.ScriptName -and $entryFrame.ScriptName.StartsWith($entryRepoRoot, [System.StringComparison]::OrdinalIgnoreCase))
 }
-Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested)
+$module = Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules/DbHubDemo/DbHubDemo.psd1') -Force:(-not $entryNested) -PassThru
 # Paths relative to PowerShell's current location, which .NET file calls don't follow (Resolve-DemoUserPath).
 $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
+$PostgresMetricsPath = Resolve-DemoUserPath -Path $PostgresMetricsPath
+if ($PostgresMetricsPath) {
+    if (-not $RunLiveActivity) {
+        throw '-PostgresMetricsPath goes with -RunLiveActivity: the notebook run adds the file''s metrics to the history.'
+    }
+    if (-not (Test-Path -LiteralPath $PostgresMetricsPath -PathType Leaf)) {
+        throw ('-PostgresMetricsPath: the file {0} doesn''t exist. stop-demo.ps1 -SaveHistory names it (STOP.T4.HISTORY.PENDING), in out/history-pending.' -f $PostgresMetricsPath)
+    }
+}
 
 $config = $null
 if (Test-Path -LiteralPath $ConfigPath) {
@@ -595,11 +616,17 @@ if ($RunLiveActivity -or $firstRun) {
         if ($null -eq $runToken -and (Test-Path -Path 'variable:token')) {
             $runToken = $token
         }
+        # Azure Resource Manager reads only after the subscription guard passed in this run: with -FabricToken it doesn't run.
+        $guarded = Get-Variable -Name 'guardResult' -ValueOnly -ErrorAction SilentlyContinue
+        $azGuarded = $null -ne $guarded -and [string]$guarded.status -ne 'Fail'
         if ($null -eq $runToken) {
             $null = Assert-DemoAzContext -SubscriptionId $config['subscriptionId'] -TenantId $config['tenantId'] -Account ([string]$config['azureAccount'])
+            $azGuarded = $true
             $runToken = Get-DemoFabricToken -SubscriptionId $config['subscriptionId']
         }
         $notebookParameters = [ordered]@{
+            # For a notebook imported before 2026-11-14, whose Run all sent an activity request through GitHub: today's
+            # notebook has none of these three (ADR 0026), and a job's extra parameters change nothing in it.
             CONFIRM                    = $false
             STOP_ACTIVITY              = $false
             SAVE_RESULTS               = $true
@@ -611,7 +638,47 @@ if ($RunLiveActivity -or $firstRun) {
             # no telemetry snapshots (live, 2026-11-06).
             RESOURCE_GROUP             = ('rg-{0}-{1}' -f $config['prefix'], $config['environment'])
         }
-        $results.Add((Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes ([Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0)))))
+        # T4 and its read replica (2026-11-13, ADR 0025): the notebook can't read Azure Monitor, so their metrics come with
+        # the run as POSTGRES_METRICS: a file stop-demo.ps1 kept when a session's history couldn't be saved (its replica
+        # is deleted, and its metrics with it), or T4's and a running replica's now, as deploy.ps1's snapshot sends them.
+        if ($PostgresMetricsPath) {
+            $notebookParameters['POSTGRES_METRICS'] = [System.IO.File]::ReadAllText($PostgresMetricsPath)
+            Write-DemoLog -Message ('Sending the PostgreSQL metrics kept in {0} with the run.' -f $PostgresMetricsPath)
+        }
+        elseif ($RunLiveActivity -and $azGuarded) {
+            $postgresCapture = & $module { param($Configuration, $Minutes) Get-DemoPostgresHistoryCapture -Config $Configuration -WindowMinutes $Minutes -CheckId 'FABRIC.T4.HISTORY' } $config $LiveActivityWindowMinutes
+            if ($null -ne $postgresCapture -and $null -ne $postgresCapture.Result) {
+                $results.Add($postgresCapture.Result)
+            }
+            if ($null -ne $postgresCapture -and [string]$postgresCapture.Json) {
+                $notebookParameters['POSTGRES_METRICS'] = [string]$postgresCapture.Json
+            }
+        }
+        # A copy of the notebook from before 2026-11-13 doesn't know POSTGRES_METRICS and would ignore them (2026-11-16): they
+        # aren't sent, and a kept file stays where it is. One whose definition can't be read gets them, as before.
+        $postgresWithheld = $false
+        if ($notebookParameters.Contains('POSTGRES_METRICS')) {
+            $knows = & $module { param($Configuration, $FabricToken) Test-DemoFabricNotebookParameter -WorkspaceId ([string](Get-DemoMemberValue -InputObject $Configuration['fabric'] -Name 'workspaceId')) -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'POSTGRES_METRICS' -Token $FabricToken } $config $runToken
+            if ($knows.Known -and -not $knows.Has) {
+                $notebookParameters.Remove('POSTGRES_METRICS')
+                $postgresWithheld = $true
+                $results.Add((New-DemoResult -CheckId 'FABRIC.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'T4''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history (2026-11-13), so it would ignore them.' -Remediation $(if ($PostgresMetricsPath) { 'Run this command again without -SkipNotebookImport, which updates the notebook first; the file stays where it is.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' })))
+            }
+        }
+        $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes ([Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0)))
+        $results.Add($run)
+        if ($PostgresMetricsPath -and [string]$run.status -eq 'Pass' -and -not $postgresWithheld) {
+            # Added to the history: the file moves aside, so it isn't sent again by mistake.
+            $savedFolder = Join-Path -Path (Split-Path -Path $PostgresMetricsPath -Parent) -ChildPath 'saved'
+            try {
+                $null = New-Item -ItemType Directory -Path $savedFolder -Force
+                Move-Item -LiteralPath $PostgresMetricsPath -Destination (Join-Path -Path $savedFolder -ChildPath (Split-Path -Path $PostgresMetricsPath -Leaf)) -Force
+                Write-DemoLog -Message ('The PostgreSQL metrics in {0} are in the history now; the file moved to {1}.' -f $PostgresMetricsPath, $savedFolder)
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('The PostgreSQL metrics are in the history now, but {0} couldn''t be moved aside: {1}' -f $PostgresMetricsPath, $_.Exception.Message)
+            }
+        }
     }
 }
 #endregion Live-activity notebook run (Phase 20)

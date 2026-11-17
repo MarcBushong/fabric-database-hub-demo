@@ -261,6 +261,8 @@ function Invoke-DemoHubHttp {
         Token                   = $Token
         Headers                 = @{ Accept = 'application/json'; 'x-ms-app' = 'DbHubDemo'; 'x-ms-client-request-id' = 'DbHubDemo;' + [guid]::NewGuid().ToString() }
         TimeoutSec              = $TimeoutSec
+        # PowerShell 7.4's TimeoutSec ends at the response's headers; this bounds each read of its body (R862).
+        OperationTimeoutSeconds = $TimeoutSec
         SkipHttpErrorCheck      = $true
         StatusCodeVariable      = 'statusCode'
         ResponseHeadersVariable = 'responseHeaders'
@@ -553,7 +555,8 @@ function ConvertFrom-DemoKustoV1Response {
 function Invoke-DemoHubResourceGraph {
     <#
     .SYNOPSIS
-    Runs one Azure Resource Graph query for the configured subscription. Internal.
+    Runs one Azure Resource Graph query for the configured subscription, or with -AllSubscriptions across every
+    subscription the caller can read. Internal.
 
     .DESCRIPTION
     POST https://management.azure.com/providers/Microsoft.ResourceGraph/resources (API version in
@@ -561,8 +564,12 @@ function Invoke-DemoHubResourceGraph {
     Get-DemoAccessToken verified for the configured tenant and caller. Not 'az rest': the URL has no
     subscription, so the Azure CLI would take the token from its default account, and Resource Graph refused
     such a query with AccessDenied while that account was in another tenant (live finding, 2026-10-21).
+    -AllSubscriptions sends no subscription list: "If a management group or a subscription list isn't defined, the
+    query scope is all resources" the caller can read (Learn, query scope, checked 2026-11-17). Without
+    allowPartialScopes, a tenant with more subscriptions than Resource Graph allows answers with an error, not a part.
     Returns Succeeded, Error, Rows (the data array, objectArray format), and Truncated.
     https://learn.microsoft.com/rest/api/azureresourcegraph/resourcegraph/resources/resources
+    https://learn.microsoft.com/azure/governance/resource-graph/concepts/query-language#query-scope
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -573,16 +580,19 @@ function Invoke-DemoHubResourceGraph {
 
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string] $Query
+        [string] $Query,
+
+        [switch] $AllSubscriptions
     )
 
     $graph = (Get-DemoHubSetting)['resourceGraph']
     $url = '{0}?api-version={1}' -f $graph['url'], $graph['apiVersion']
-    $body = [ordered]@{
-        subscriptions = @($SubscriptionId)
-        query         = $Query
-        options       = [ordered]@{ resultFormat = 'objectArray'; '$top' = 1000 }
+    $body = [ordered]@{}
+    if (-not $AllSubscriptions) {
+        $body['subscriptions'] = @($SubscriptionId)
     }
+    $body['query'] = $Query
+    $body['options'] = [ordered]@{ resultFormat = 'objectArray'; '$top' = 1000 }
     $result = Invoke-DemoRestRequest -SubscriptionId $SubscriptionId -Method 'POST' -Uri $url -Body ($body | ConvertTo-Json -Depth 5 -Compress)
 
     if ($result.ExitCode -ne 0) {

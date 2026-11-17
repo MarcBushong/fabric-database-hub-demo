@@ -25,7 +25,8 @@ function Get-DemoEnvironmentStatus {
       Get-DemoRunCommandStatus): managed Run Commands the demo left on its VMs, the on-demand control's DbHubControl-*
       and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap and the activity profiles'
       DbHubDemo-Profile (both stay by design), as a Warning with the commands
-      that delete them; Pass when there's none. Read-only.
+      that delete them; Pass when there's none. On the T2 host (2026-11-17), the demo's Run Commands that Azure is still
+      deleting come first, as a Warning whose fix is deploy.ps1. Read-only.
     - STATUS.T3: whether T3 exists and its status (Online, Paused); Not selected after stop-demo.ps1 -RemoveT3.
     - STATUS.T4 (Phase 24, ADR 0019): T4's state; while it runs, its live Azure Monitor metrics from the last
       15 minutes (CPU, memory, connections, CPU credits, and the enhanced metrics: sessions by state and by
@@ -70,7 +71,11 @@ function Get-DemoEnvironmentStatus {
     - STATUS.SHUTDOWN: the next auto-shutdown.
     - STATUS.SAFETYSTOP (ADR 0024, Get-DemoSafetyStopStatus): the nightly safety stop's times, whether its role is
       assigned, what its last run stopped, and what its last T3 check found; a Warning that names the fix when it isn't
-      set up, can't act (its role; T4 isn't covered then), didn't finish, or found T3 still online past its auto-pause.
+      set up, can't act (its role; T4 isn't covered then), didn't finish, or found T3 still online past its auto-pause. A
+      run it waited for (Deferred, 2026-11-14) isn't a problem.
+    - STATUS.NIGHTLYSTOP (2026-11-14, Get-DemoBusyMarkerStatus), only while the busy marker's tag holds anything: a
+      deploy.ps1 run the nightly stop waits for, the deferred pass dbhub-safety-deferred, and a VM auto-shutdown that's
+      moved; a Warning, with the commands that put it back, for one that's moved with no run or pass to explain it.
     - STATUS.FABRIC.CAPACITY, with fabric.manageCapacity true or a DbHubFabricCapacityResumed record only (Phase 26b,
       Get-DemoFabricCapacityStatus): the capacity's state, and whether start-demo.ps1 resumed it (the record, which
       stop-demo.ps1 pauses and clears). Read-only: a stale record is shown, and stop-demo.ps1 clears it.
@@ -210,8 +215,19 @@ function Get-DemoEnvironmentStatus {
     if ($found.Count -gt 0) {
         $results.Add((New-DemoDiskDriftResult -CheckId 'STATUS.DISKS' -Drift @(Get-DemoVmDiskDrift -Config $Config -VmName $found.ToArray()) -VmName $found.ToArray()))
         # Managed Run Commands the demo left on its VMs (Phase 28 follow-up): the on-demand control's, and the scripts'
-        # beyond the bootstrap loader. Read-only; Azure allows 25 per VM.
-        $results.Add((Get-DemoRunCommandStatus -Config $Config -VmName $found.ToArray() -Running $running))
+        # beyond the bootstrap loader. Read-only; Azure allows 25 per VM. A run the busy marker says is going on deletes its
+        # own (2026-11-17), so the result names it.
+        $inProgress = ''
+        try {
+            $marker = ConvertTo-DemoBusyMarker -Tags (Get-DemoMemberValue -InputObject $state -Name 'Tags') -NowUtc $NowUtc
+            if ($marker.Active -and $marker.By -in 'deploy', 'session') {
+                $inProgress = if ($marker.By -eq 'deploy') { 'deploy.ps1' } else { 'A demo session' }
+            }
+        }
+        catch {
+            $inProgress = ''
+        }
+        $results.Add((Get-DemoRunCommandStatus -Config $Config -VmName $found.ToArray() -Running $running -RunInProgress $inProgress))
     }
 
     $t3 = Get-DemoT3State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
@@ -300,6 +316,9 @@ function Get-DemoEnvironmentStatus {
             if ($null -ne $sizeChange) {
                 $results.Add($sizeChange)
             }
+            # T4's read replica (2026-11-13, ADR 0025): not set up yet (the upgrade's command), Not supported on Burstable,
+            # none between sessions, running with its lag, or left over while T4 is stopped.
+            $results.Add((Get-DemoT4ReplicaStatusResult -Config $Config -State $state -T4State $t4 -DeploymentId ([string]$state.Tags['deploymentId'])))
         }
     }
 
@@ -467,5 +486,10 @@ function Get-DemoEnvironmentStatus {
     $results.Add((New-DemoResult -CheckId 'STATUS.SHUTDOWN' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('Next auto-shutdown: {0:yyyy-MM-dd HH:mm} UTC ({1} {2}).' -f $shutdown, $Config['autoShutdownTime'], $Config['autoShutdownTimeZone'])))
     # The nightly safety stop (ADR 0024): its times, its role, and what its last stop and T3 check did. Read-only.
     $results.Add((Get-DemoSafetyStopStatus -Config $Config -NowUtc $NowUtc))
+    # The busy marker (2026-11-14): a run the nightly stop waits for, the deferred pass, a moved auto-shutdown. Read-only.
+    $busy = Get-DemoBusyMarkerStatus -Config $Config -State $state -NowUtc $NowUtc
+    if ($null -ne $busy) {
+        $results.Add($busy)
+    }
     return $results.ToArray()
 }

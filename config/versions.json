@@ -76,7 +76,7 @@
     "avm/res/network/network-security-group": "0.5.4"
   },
   "apiVersions": {
-    "note": "Resource API versions declared directly in infra/ (ADR 0001), plus the ones scripts call through az rest (Phase 7: HybridCompute and AzureArcData, from the REST references on Microsoft Learn, checked 2026-10-20; Phase 13: Microsoft.CostManagement/query for the month-to-date cost, Microsoft.Network/bastionHosts for on-demand Bastion in infra/modules/bastion.bicep, and Microsoft.KeyVault/vaults for the opt-in vault in infra/modules/keyvault.bicep, the newest version Bicep 0.47.16 has types for; 2026-10-21: Microsoft.Resources/subscriptions for the subscription guard's az rest canary, from the Subscriptions - Get reference; Phase 16: Microsoft.Authorization/denyAssignments, which the deployment-stack trial in tests/teardown lists after its cleanup, from the Deny Assignments REST reference, checked 2026-10-21; Phase 24: Microsoft.DBforPostgreSQL/flexibleServers and its administrators, databases, and configurations for T4 in infra/modules/pgflex01.bicep, the newest version Bicep 0.47.16 has types for, checked 2026-10-23; and Microsoft.Insights/metrics, which status.ps1 and validate.ps1 read T4's Azure Monitor metrics through, from the Metrics - List REST reference, checked 2026-10-23; Phase 25c: Microsoft.Automation/automationAccounts, its webhooks, and Microsoft.KeyVault/vaults/secrets for the on-demand activity control in infra/control, the newest versions Bicep 0.47.16 has types for, from the REST references on Microsoft Learn, checked 2026-10-26; its runbooks start and stop T4 with the Microsoft.DBforPostgreSQL/flexibleServers version above; Phase 26b: Microsoft.Fabric/capacities, which start-demo.ps1, stop-demo.ps1, destroy.ps1, and status.ps1 read, resume, and suspend through az rest when fabric.manageCapacity is true, from the Fabric Capacities REST reference, checked 2026-10-27; Phase 28 follow-up: Microsoft.Resources/providers, which destroy.ps1's residual check reads through Invoke-DemoRestRequest to find an API version for a resource type it confirms with Resources - Get By Id, from the Providers - Get REST reference, checked 2026-11-02). A Pester test keeps the Bicep files in sync with this list; the Bicep linter's use-recent-api-versions rule keeps them current.",
+    "note": "Resource API versions declared directly in infra/ (ADR 0001), plus the ones scripts call through az rest (Phase 7: HybridCompute and AzureArcData, from the REST references on Microsoft Learn, checked 2026-10-20; Phase 13: Microsoft.CostManagement/query for the month-to-date cost, Microsoft.Network/bastionHosts for on-demand Bastion in infra/modules/bastion.bicep, and Microsoft.KeyVault/vaults for the opt-in vault in infra/modules/keyvault.bicep, the newest version Bicep 0.47.16 has types for; 2026-10-21: Microsoft.Resources/subscriptions for the subscription guard's az rest canary, from the Subscriptions - Get reference; Phase 16: Microsoft.Authorization/denyAssignments, which the deployment-stack trial in tests/teardown lists after its cleanup, from the Deny Assignments REST reference, checked 2026-10-21; Phase 24: Microsoft.DBforPostgreSQL/flexibleServers and its administrators, databases, and configurations for T4 in infra/modules/pgflex01.bicep, the newest version Bicep 0.47.16 has types for, checked 2026-10-23; and Microsoft.Insights/metrics, which status.ps1 and validate.ps1 read T4's Azure Monitor metrics through, from the Metrics - List REST reference, checked 2026-10-23; Phase 25c: Microsoft.Automation/automationAccounts, its webhooks, and Microsoft.KeyVault/vaults/secrets for the on-demand activity control in infra/control, the newest versions Bicep 0.47.16 has types for, from the REST references on Microsoft Learn, checked 2026-10-26; its runbooks start and stop T4 with the Microsoft.DBforPostgreSQL/flexibleServers version above; Phase 26b: Microsoft.Fabric/capacities, which start-demo.ps1, stop-demo.ps1, destroy.ps1, and status.ps1 read, resume, and suspend through az rest when fabric.manageCapacity is true, from the Fabric Capacities REST reference, checked 2026-10-27; Phase 28 follow-up: Microsoft.Resources/providers, which destroy.ps1's residual check reads through Invoke-DemoRestRequest to find an API version for a resource type it confirms with Resources - Get By Id, from the Providers - Get REST reference, checked 2026-11-02; 2026-11-14: Microsoft.Resources/tags, which the control's runbook merges a session's busy marker into the demo resource group's tags through, from the Tags - Update At Scope REST reference, whose newest version is 2021-04-01, checked 2026-11-14; 2026-11-16: Microsoft.Automation/automationAccounts/variables for the session status's copy in infra/control, which DbHub-Monitor reads back, the Automation account's version, from the Variable - Create Or Update REST reference). A Pester test keeps the Bicep files in sync with this list; the Bicep linter's use-recent-api-versions rule keeps them current.",
     "Microsoft.Authorization/denyAssignments": "2022-04-01",
     "Microsoft.Authorization/locks": "2020-05-01",
     "Microsoft.Authorization/roleAssignments": "2022-04-01",
@@ -96,6 +96,7 @@
     "Microsoft.Network/networkInterfaces": "2025-09-01",
     "Microsoft.Network/publicIPAddresses": "2025-09-01",
     "Microsoft.Resources/providers": "2021-04-01",
+    "Microsoft.Resources/tags": "2021-04-01",
     "Microsoft.Resources/resourceGroups": "2025-04-01",
     "Microsoft.Resources/subscriptions": "2022-12-01",
     "Microsoft.SqlVirtualMachine/sqlVirtualMachines": "2023-10-01",
@@ -113,6 +114,7 @@
     "Microsoft.Insights/metrics": "2023-10-01",
     "Microsoft.Automation/automationAccounts": "2024-10-23",
     "Microsoft.Automation/automationAccounts/webhooks": "2024-10-23",
+    "Microsoft.Automation/automationAccounts/variables": "2024-10-23",
     "Microsoft.KeyVault/vaults/secrets": "2026-02-01",
     "Microsoft.Fabric/capacities": "2023-11-01"
   },
@@ -214,6 +216,32 @@
       "serverParameters": "https://learn.microsoft.com/azure/postgresql/server-parameters/param-connections-authentication-connection-settings",
       "limits": "https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits",
       "restartServer": "https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-restart-server"
+    },
+    "replica": {
+      "note": "T4's read replica (2026-11-13, user-directed; ADR 0025): a same-region read replica of T4, created for each session (deploy.ps1 and start-demo.ps1 create it, stop-demo.ps1 deletes it) from infra/replica/pgreplica01.bicep, in T4's subnet and private DNS zone, at T4's actual size; Burstable isn't supported. Learn (checked 2026-11-13): the replica's vCores must be the same or higher than the source's; stop the primary first and start the replica first, which Azure enforces (SourceReplicasStartStopOrder, live 2026-11-13); a second deployment of the replica's template fails (ReadReplicaAlreadyExistWithGivenName, live), so it's deployed only while the replica doesn't exist. maxStandbyStreamingDelayMs is how long replaying the primary's changes waits for a query on the replica (dynamic), which the replica-lag scenario relies on. generalPurposeSizes are the documented sizes the size fallback tries, in order, never with fewer vCores than T4. Read Replica Lag (physical_replication_delay_in_seconds) is on the replica only, and Max Physical Replication Lag (physical_replication_delay_in_bytes) on the primary only. Measured live on 2026-11-13: created in 525 seconds, deleted in 97, each stop or start about 125.",
+      "serverNamePrefix": "pgreplica01",
+      "templateDeploymentName": "dbhub-t4-replica",
+      "recordTag": "DbHubT4Replica",
+      "recordValue": "Session",
+      "sizeTag": "DbHubT4ReplicaSize",
+      "maxStandbyStreamingDelayMs": 600000,
+      "createMinutes": 9,
+      "createTimeoutMinutes": 40,
+      "deleteTimeoutMinutes": 15,
+      "powerWaitMinutes": 15,
+      "generalPurposeSizes": [ "Standard_D2ds_v5", "Standard_D4ds_v5", "Standard_D4ads_v5" ],
+      "metrics": {
+        "replica": [ "physical_replication_delay_in_seconds", "cpu_percent", "memory_percent", "active_connections", "iops", "storage_percent" ],
+        "primary": [ "physical_replication_delay_in_bytes" ],
+        "hubLag": "physical_replication_delay_in_seconds"
+      },
+      "docUrls": {
+        "concepts": "https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas",
+        "create": "https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica",
+        "capacityErrors": "https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors",
+        "hotStandby": "https://www.postgresql.org/docs/current/hot-standby.html"
+      },
+      "verifiedOn": "2026-11-13"
     },
     "verifiedOn": "2026-10-23"
   },
@@ -360,7 +388,7 @@
       "capacityNote": "Fabric (F) SKUs run notebooks. TODO(verify): Learn doesn't document the SKU string that List Capacities returns for a Trial capacity, so any other SKU is reported as Manual action required until a live read confirms it.",
       "viewerLicense": {
         "minimumFreeViewerFSku": 64,
-        "note": "Phase 18, PREFLIGHT.FABRIC.VIEWERLICENSE: on F SKUs smaller than F64, each user viewing Power BI content must have Pro, PPU, or an individual trial; on F64 or larger, and on P SKUs, users with only a Free license and a viewer role can view. A Trial capacity acts like F64 for viewing, but its SKU string isn't documented, so it's reported as a Warning until a live read records it.",
+        "note": "Phase 18, PREFLIGHT.FABRIC.VIEWERLICENSE: on F SKUs smaller than F64, each user viewing Power BI content must have Pro, PPU, or an individual trial; on F64 or larger, and on P SKUs, users with only a Free license and a viewer role can view. Since 2026-11-14 the viewers' licenses are assumed (the user), so the check is Not selected with this rule and reads nothing.",
         "docUrl": "https://learn.microsoft.com/fabric/enterprise/licenses",
         "verifiedOn": "2026-10-21"
       },

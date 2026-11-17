@@ -358,6 +358,10 @@ function Invoke-DemoParallelDeployment {
        about 15 minutes; a resumed run with nothing left to do runs it again. Never a Fail: a paused capacity or a job that
        outlives its wait is a Warning, and -WhatIf, -SkipFabric, GitHub Actions, or checks that didn't pass are Not
        selected. The status page's Fabric.History row shows it.
+    8. T4's read replica at the run's end (2026-11-16; Invoke-DemoT4ReplicaDeployEnd, DEPLOY.T4.REPLICA.END): after the
+       history snapshot and the session control's notebook, it's deleted, so the run leaves nothing new billing between
+       sessions, unless a session uses it now (the control's pending auto-stop, or a start-demo.ps1 session's mark on the
+       replica); on every run, a NOT DONE one included, never a Fail. The status page's T4ReplicaEnd row shows it.
 
     Phase 28: -AutoResume continues an unfinished deployment (the state's Stage is set and isn't Validation) as -Resume
     does; a resume first checks that sqlvm01 and archost01 have the bootstrap bundle and the workload runner this checkout
@@ -496,6 +500,20 @@ function Invoke-DemoParallelDeployment {
             $Resume = [switch]::new($false)
         }
     }
+    # 2026-11-17: a T2 host that a rebuild deleted and didn't create again, or one deleted by hand, would make the T2 track fail
+    # on a VM that doesn't exist. Its records are cleared (its artifacts go again), and a resume starts from preflight instead,
+    # so the template creates it.
+    if (-not $whatIf) {
+        $missingHost = Get-DemoT2HostMissingResult -Config $Config -State $state
+        if ($null -ne $missingHost) {
+            $results.Add($missingHost)
+            Write-DemoLog -Message $missingHost.message
+            if ($Resume -and -not $FromStage) {
+                $Resume = [switch]::new($false)
+            }
+            $state = Get-DemoDeploymentState -Config $Config
+        }
+    }
     # A resume sends a VM's artifacts again, with its loader and the steps after them, when the bootstrap bundle or the
     # workload runner this checkout builds isn't what the resource group's state records for that VM, so a fix pulled since
     # the last run reaches it (live finding, 2026-11-06). With nothing changed, each track resumes as recorded.
@@ -511,22 +529,49 @@ function Invoke-DemoParallelDeployment {
         $resend = Resolve-DemoArtifactResend -State $state -Plan $resumePlan -SkipRunner:$SkipRunner
         & $addAll @($resend.Results)
     }
+    # 2026-11-13 live finding (on main too): a first run that met a paused Fabric capacity recorded the Fabric step as
+    # finished without its workspace, so no later run created it. A resume whose record says the step finished checks that
+    # the workspace, the lakehouse, and the items are there (read-only), and runs the step again when one is missing.
+    $progressNotes = @{}
+    foreach ($key in @($resend.Notes.Keys)) {
+        $progressNotes[$key] = $resend.Notes[$key]
+    }
+    $reopenFabric = $false
+    if ($Resume -and -not $FromStage -and -not $whatIf -and -not $SkipFabric -and [string](Get-DemoMemberValue -InputObject $state -Name 'TrackFabric') -eq 'Fabric') {
+        # 2026-11-16 (the merge's upgrade test): a resume skipped a Fabric step that an earlier version had finished, so the
+        # workspace kept the older notebooks, history model, and Insights app, and a session's history lost T4's metrics. The
+        # step runs again when this copy publishes other content than the step last published in full; no Fabric call.
+        $contentReason = Get-DemoFabricContentReopen -State $state -Current (Get-DemoFabricContentSha256)
+        if ($contentReason) {
+            $reopenFabric = $true
+            $progressNotes['Fabric'] = 'An earlier run recorded this step as finished, but {0} Publishing them again.' -f $contentReason
+            Write-DemoLog -Message ('An earlier run recorded the Fabric step as finished, but {0} So this run publishes them again: the notebooks, the history model and report, the dashboard, and the Insights app.' -f $contentReason)
+        }
+        else {
+            $fabricMissing = Get-DemoFabricTrackRecheck -Config $Config
+            if ($null -ne $fabricMissing) {
+                $reopenFabric = $true
+                $progressNotes['Fabric'] = 'An earlier run recorded this step as finished, but {0} Running it again.' -f ([string]$fabricMissing.message).TrimEnd()
+                Write-DemoLog -Message ('An earlier run recorded the Fabric step as finished, but {0} So this run runs it again.' -f ([string]$fabricMissing.message).TrimEnd())
+            }
+        }
+    }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28). T4 is part of every
     # deployment (2026-11-09): a "no T4" record (None or Refused) has the fallback try every size again when this run
     # deploys the template.
     $templateRuns = -not $whatIf -and [bool](Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -Resend @($resend.Tracks)).Infrastructure
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:$templateRuns
     $skipT4 = -not (Test-DemoT4Enabled -Config $Config)
-    $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4 -Resend @($resend.Tracks)
+    $plan = Resolve-DemoTrackPlan -FromStage $FromStage -StopAfter $StopAfter -Resume:$Resume -State $state -SkipFabric:$SkipFabric -SkipT4:$skipT4 -Resend @($resend.Tracks) -ReopenFabric:$reopenFabric
     if ($whatIf) {
         $plan = Resolve-DemoTrackPlan -StopAfter 'Infrastructure'
     }
-    Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -ResendNote $resend.Notes
+    Set-DemoProgressPlan -Path $ProgressPath -Plan $plan -Resume:$Resume -ResendNote $progressNotes
     # T4 out of this run is said on its own rows, with why and the fix (2026-11-09); DEPLOY.T4.OFF, a Fail, says it at the end.
     $showT4Off = {
         $offResult = New-DemoT4OffResult -Config $Config -State $state -Result $results.ToArray()
         if ($null -ne $offResult) {
-            Set-DemoProgressStep -Path $ProgressPath -Id 'T4.Server', 'T4.Setup', 'T4.Telemetry' -State 'Skipped' -Status ([string]$offResult.status) -Message ([string]$offResult.message)
+            Set-DemoProgressStep -Path $ProgressPath -Id 'T4.Server', 'T4.Setup', 'T4.Replica', 'T4.Telemetry' -State 'Skipped' -Status ([string]$offResult.status) -Message ([string]$offResult.message)
         }
         $offResult
     }
@@ -727,6 +772,8 @@ function Invoke-DemoParallelDeployment {
                 & $collectPolicy 0
                 & $collectMonitoring 0
                 & $signInTick
+                # The busy marker's refresher (2026-11-14) runs beside the tracks; its lines reach the console here.
+                Receive-DemoBusyMarkerOutput
             }
             catch {
                 Write-DemoLog -Level Warning -Message ('The policy inventory, T1''s monitoring check, or the Insights app''s sign-in couldn''t be read this time: {0}' -f $_.Exception.Message)
@@ -1021,14 +1068,15 @@ function Invoke-DemoParallelDeployment {
             if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                 & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
             }
-            # The on-demand activity control's A1 (ADR 0020), as in the sequential path.
-            & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
         }
         if ($StopAfter -in 'Preflight', 'Infrastructure') {
-            # The nightly safety stop (ADR 0024) comes with what the template deployed, as in a full run.
+            # The nightly safety stop (ADR 0024) and the session control's Azure part (ADR 0026) come with what the template
+            # deployed, as in a full run.
             if ($StopAfter -eq 'Infrastructure' -and $plan.Infrastructure -and -not $whatIf) {
                 Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
                 & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                Write-DemoLog -Message 'Setting up the session control (ADR 0026).'
+                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric)
             }
             & $applyPolicy 15
             $results.Add((New-DemoResult -CheckId 'DEPLOY.SUMMARY' -Area 'infra' -Target 'subscription' -Status $(if (& $hasStatus $results.ToArray() 'Fail') { 'Fail' } else { 'Pass' }) -Message ('Stopped after {0} (-StopAfter).' -f $StopAfter)))
@@ -1036,10 +1084,11 @@ function Invoke-DemoParallelDeployment {
         }
         & $ensureContext
 
-        # The loader settings come from the template; a run that skipped it reads the last deployment's outputs.
+        # The loader settings come from the template; a run that skipped it reads the last deployment's outputs, which
+        # an older template wrote without T4's read replica (2026-11-13 live finding: Add-DemoT4ReplicaLoaderSetting).
         if ($null -eq $loaderSettings -and $needsArtifacts) {
             $outputs = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('deployment', 'sub', 'show', '--name', (Get-DemoMainDeploymentName -Config $Config), '--query', 'properties.outputs.loaderSettings.value', '--output', 'json') -AsJson -AllowFailure
-            $loaderSettings = $outputs
+            $loaderSettings = Add-DemoT4ReplicaLoaderSetting -Config $Config -LoaderSettings $outputs
         }
         $context['LoaderSettings'] = $loaderSettings
         if ($useJobs) {
@@ -1060,6 +1109,10 @@ function Invoke-DemoParallelDeployment {
         if (-not $whatIf) {
             Write-DemoLog -Message 'Setting up the nightly safety stop (ADR 0024).'
             & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+            # The session control's Azure part (ADR 0026), the same way: while the tracks run, never a Fail. A control set up
+            # before 2026-11-14 is adopted; its runbooks get this code, and its roles what this code needs.
+            Write-DemoLog -Message 'Setting up the session control (ADR 0026).'
+            & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
         }
 
         # 4. The tracks.
@@ -1244,6 +1297,24 @@ function Invoke-DemoParallelDeployment {
     if ($plan.Validation) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
     }
+    # 9. The session control's notebook (ADR 0026), once the Fabric track has the demo's workspace: never a Fail, and never
+    # in DONE's way. Without the Fabric track finished (a paused capacity, for example), the next deploy.ps1 does it.
+    if (-not $whatIf -and -not $SkipFabric) {
+        if (& $trackFinished 'Fabric' 'Fabric') {
+            & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
+        }
+        else {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Control' -State 'Skipped' -Message 'The notebook waits for the Fabric track; the next ./scripts/deploy.ps1 puts it in Fabric.'
+        }
+    }
+    # 10. T4's read replica (2026-11-16): DONE's checks and the history snapshot have read it, so it's deleted, and the run
+    # leaves nothing new billing between sessions, unless a session uses it now; start-demo.ps1 and Run all create it for
+    # each session. On every run, a NOT DONE one included; never a Fail, and never in DONE's way.
+    if (-not $whatIf) {
+        $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -ChecksRan $doneChecked -Confirm:$false))
+    }
+    # 2026-11-13 live finding: this process's own Run Commands that ran under a fresh name (the tracks report theirs).
+    & $addAll @(Get-DemoRunCommandStuckResult -Clear)
 
     $all = $results.ToArray()
     # 2026-11-09: T4 out of this deployment is never silent (DEPLOY.T4.OFF): a Fail, because DONE needs T4, with the reason

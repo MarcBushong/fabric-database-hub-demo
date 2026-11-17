@@ -19,7 +19,7 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | ADR | Title | Source | Status |
 |---|---|---|---|
 | [0001](0001-iac-bicep-avm-compiled-arm.md) | Infrastructure as code with Bicep, Azure Verified Modules, and a compiled `azuredeploy.json` | Engineering | Accepted |
-| [0002](0002-resource-group-topology.md) | One demo resource group plus an optional control resource group | Engineering (Q4c, §9.1) | Accepted |
+| [0002](0002-resource-group-topology.md) | One demo resource group plus a control resource group | Engineering (Q4c, §9.1) | Accepted |
 | [0003](0003-t2-host-size-security-type-bootstrap.md) | T2 host size, security type, and bootstrap state machine | Engineering | Accepted; validated live, except the Trusted Launch host test; Phase 28 amendment (chunk hygiene that doesn't stall) unit-tested |
 | [0004](0004-guest-imds-isolation.md) | Isolating the nested guest from IMDS and the wire server | User-directed (Q5b) | Accepted; validated live, except the port-ACL-only test |
 | [0005](0005-arc-onboarding-authentication.md) | Arc onboarding authentication | Engineering (§9.1) | Accepted; validated live with the operator's token |
@@ -42,6 +42,8 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | [0022](0022-public-repository-and-github-actions-hardening.md) | A public repository, and GitHub Actions hardened for it | User-directed (2026-10-26, 2026-10-27), with the coordinator's decisions | Accepted; the GitHub settings and a live Actions run pending until the public repository exists |
 | [0023](0023-first-run-automation.md) | First-run automation: `init.ps1`, the P6 group, the Rayfin sign-in, and opt-in capacity and history steps | User-directed (2026-10-26, 2026-10-27, 2026-11-09), with the coordinator's decisions | Accepted; live check of `init.ps1` read-only, the rest pending; Phase 28: `deploy.ps1` runs the first run; 2026-11-09: the Rayfin CLI deploys with the Azure CLI's tokens, its own sign-in only as the fallback |
 | [0024](0024-nightly-safety-stop.md) | The nightly safety stop: every database stopped or checked each night, with a stop-only role | User-directed (2026-11-05, 2026-11-09), with engineering detail; an owner-approved exception to ADR 0008 | Accepted; ran live from 2026-11-06; amended 2026-11-09 (each link's scope read by its ID, and T4 stopped at the T3 check), unit-tested |
+| [0025](0025-t4-read-replica.md) | T4's read replica, created for each session | User-directed (2026-11-13, "Postgres HA/DR"), with the lifecycle chosen from a live probe and approved within the owner's delegated scope | Accepted; probe live on 2026-11-13; live deployment results in the ADR |
+| [0026](0026-one-run-all-session.md) | One Run all for a whole demo session | User-directed (2026-11-14: one notebook, one thing to run; no GitHub Actions for a demo), with the design and the control identity's grant approved for the user by the coordinator | Accepted; live validation in the ADR |
 
 ## Template
 

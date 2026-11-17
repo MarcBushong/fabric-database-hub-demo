@@ -15,7 +15,9 @@ function Get-DemoFabricNotebookDefinition {
     name, and this binding puts them in at import. Without the IDs, the payload is the file as it is.
 
     -GitHubRepository and -GitHubEnvironment set GITHUB_REPOSITORY and GITHUB_ENVIRONMENT in the uploaded copy's
-    parameters cell, where the notebook has them, so a copy of the repository links to and triggers its own workflows.
+    parameters cell, where the notebook has them, so a copy of the repository links to its own workflows. Since
+    2026-11-14 only NB_DatabaseHub_Deployment has one (GITHUB_REPOSITORY): NB_DatabaseHub_LiveActivity has no GitHub
+    path (ADR 0026), so its copy is unchanged by them.
 
     Notebook definition: https://learn.microsoft.com/rest/api/fabric/articles/item-management/definitions/notebook-definition
     ipynb example (part path notebook-content.ipynb): https://learn.microsoft.com/rest/api/fabric/notebook/items/create-notebook

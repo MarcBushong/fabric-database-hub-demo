@@ -78,13 +78,21 @@ Describe 'The history snapshot''s parameters (2026-11-06)' {
         $parameters['RESOURCE_GROUP'] | Should -Be 'rg-contoso-pilot'
     }
 
-    It 'names only parameters the live-activity notebook declares in its parameters cell' {
+    It 'names only parameters the live-activity notebook declares in its parameters cell, besides the three an older copy reads' {
         $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
         $cell = (@($notebook['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]['source']) -join ''
         $parameters = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoHistorySnapshotParameter -Config $Config }
+        # A copy imported before 2026-11-14 reads these three, so its Run all sends no activity request through GitHub;
+        # today's notebook has none of them (ADR 0026), and a job's parameter it doesn't declare changes nothing in it.
+        $legacy = @('CONFIRM', 'STOP_ACTIVITY', 'KEY_VAULT_URL')
         foreach ($name in $parameters.Keys) {
+            if ($legacy -contains $name) {
+                $cell | Should -Not -Match ('(?m)^{0} = ' -f [regex]::Escape($name)) -Because ('{0} is only for a copy imported before 2026-11-14' -f $name)
+                continue
+            }
             $cell | Should -Match ('(?m)^{0} = ' -f [regex]::Escape($name)) -Because ('{0} must override the cell''s own value' -f $name)
         }
+        @($parameters.Keys | Where-Object { $legacy -contains $_ }).Count | Should -Be 3
     }
 }
 

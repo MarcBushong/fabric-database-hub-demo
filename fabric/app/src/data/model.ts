@@ -346,3 +346,191 @@ export function waitFamily(category: string): string {
     if (/Log Rate Governor/i.test(category)) return "Resource governance";
     return "Other";
 }
+
+// ---- T4: the PostgreSQL flexible server and its read replica (2026-11-13, ADR 0025) ----------------------------------
+
+/** The history's targets for T4: the primary (pgflex01-<deploymentId>) and its read replica (pgreplica01-<deploymentId>). */
+export type PostgresTarget = "T4" | "T4-replica";
+
+export const POSTGRES_TARGET_INFO: Record<PostgresTarget, { name: string; short: string; role: string; color: string }> = {
+    T4: { name: "T4 · Azure Database for PostgreSQL", short: "T4", role: "flexible server", color: "var(--accent)" },
+    "T4-replica": { name: "T4's read replica", short: "Read replica", role: "same-region read replica", color: "var(--accent-2)" },
+};
+
+export function isPostgresTarget(value: unknown): value is PostgresTarget {
+    return value === "T4" || value === "T4-replica";
+}
+
+/** The Azure Monitor metrics the notebook keeps for T4 (analysis postgresql), by what they show. */
+export const POSTGRES_METRICS = {
+    /** Read Replica Lag, Database Hub's Read replica lag chart; on the replica only. */
+    lag: "physical_replication_delay_in_seconds",
+    /** Max Physical Replication Lag; on the primary only. */
+    lagBytes: "physical_replication_delay_in_bytes",
+    cpu: "cpu_percent",
+    memory: "memory_percent",
+    connections: "active_connections",
+    /** Failed connections in each interval (a total, not a maximum). */
+    failed: "connections_failed",
+} as const;
+
+export interface PostgresPoint {
+    at: Date;
+    target: PostgresTarget;
+    server: string;
+    metric: string;
+    value: number;
+}
+
+/** The latest PostgreSQL capture: its window, its servers, and its points, oldest first. */
+export interface PostgresCapture {
+    capturedAt: Date | null;
+    windowStart: Date | null;
+    windowEnd: Date | null;
+    /** Minutes between consecutive points of one series, or null with single points only. */
+    intervalMinutes: number | null;
+    /** Each target's server name. */
+    servers: Partial<Record<PostgresTarget, string>>;
+    points: PostgresPoint[];
+}
+
+const METRIC_NAME = /^[a-z0-9_]{1,64}$/;
+
+function intervalOf(points: readonly PostgresPoint[]): number | null {
+    const previous = new Map<string, number>();
+    let best: number | null = null;
+    for (const p of points) {
+        const key = `${p.target}|${p.metric}`;
+        const before = previous.get(key);
+        const time = p.at.getTime();
+        if (before !== undefined && time > before) {
+            const gap = (time - before) / 60000;
+            if (best === null || gap < best) best = gap;
+        }
+        previous.set(key, time);
+    }
+    return best;
+}
+
+/** The postgres-series rows as one capture, or null without a valid row (no capture yet). */
+export function toPostgresCapture(rows: readonly Row[]): PostgresCapture | null {
+    const points: PostgresPoint[] = [];
+    const servers: Partial<Record<PostgresTarget, string>> = {};
+    let capturedAt: Date | null = null;
+    let windowStart: Date | null = null;
+    let windowEnd: Date | null = null;
+    for (const r of rows) {
+        const at = toDate(r.Bucket);
+        const value = num(r.Value);
+        const metric = text(r.Metric);
+        const target = r.TargetKey;
+        if (!at || value === null || !isPostgresTarget(target) || !METRIC_NAME.test(metric)) continue;
+        const server = safeName(r.ResourceName) ?? "";
+        points.push({ at, target, server, metric, value });
+        if (server && !servers[target]) servers[target] = server;
+        capturedAt ??= toDate(r.CapturedAt);
+        windowStart ??= toDate(r.WindowStart);
+        windowEnd ??= toDate(r.WindowEnd);
+    }
+    if (points.length === 0) return null;
+    points.sort((a, b) => a.at.getTime() - b.at.getTime());
+    return { capturedAt, windowStart, windowEnd, intervalMinutes: intervalOf(points), servers, points };
+}
+
+/** One series of the capture, oldest first; empty without a capture or without that series. */
+export function postgresSeries(capture: PostgresCapture | null, target: PostgresTarget, metric: string): PostgresPoint[] {
+    return capture ? capture.points.filter((p) => p.target === target && p.metric === metric) : [];
+}
+
+export interface PostgresPeak {
+    value: number;
+    at: Date;
+}
+
+/** The highest point of a series (the earliest of equal ones), or null for an empty one. */
+export function postgresPeak(points: readonly PostgresPoint[]): PostgresPeak | null {
+    let peak: PostgresPeak | null = null;
+    for (const p of points) {
+        if (!peak || p.value > peak.value) peak = { value: p.value, at: p.at };
+    }
+    return peak;
+}
+
+/** Read replica lag right after a gap of at least this many minutes in its series: see replicaCatchUp (the notebook's REPLICA_RESTART_GAP_MINUTES). */
+export const REPLICA_RESTART_GAP_MINUTES = 10;
+
+/**
+ * The read replica's lag points that are its catch-up after a restart, not replication lag, as the notebook leaves them
+ * out of its lag finding (2026-11-16): Azure Monitor reports the time since the replica last replayed a transaction, so a
+ * replica that was stopped reports at least the time since then until T4 writes again (live, 2026-11-13: 1,380 s, before
+ * the scenario's 219 s). After a gap of REPLICA_RESTART_GAP_MINUTES (and two intervals) or more in the series, or after the
+ * window's start, the leading points that reach half the time since the last point before the gap are that catch-up.
+ */
+export function replicaCatchUp(capture: PostgresCapture | null, lag: readonly PostgresPoint[]): PostgresPoint[] {
+    if (!capture || lag.length === 0) return [];
+    const intervalMs = (capture.intervalMinutes ?? 5) * 60000;
+    const gapMs = Math.max(REPLICA_RESTART_GAP_MINUTES * 60000, 2 * intervalMs);
+    let anchor = (capture.windowStart ?? lag[0].at).getTime();
+    let resumed: number | null = null;
+    const caught: PostgresPoint[] = [];
+    for (const p of lag) {
+        const at = p.at.getTime();
+        if (at - anchor >= gapMs) resumed = anchor;
+        if (resumed !== null && p.value >= (0.5 * (at + intervalMs - resumed)) / 1000) caught.push(p);
+        else resumed = null;
+        anchor = at + intervalMs;
+    }
+    return caught;
+}
+
+export interface PostgresFinding {
+    id: string;
+    target: string;
+    status: string;
+    statusSort: number;
+    text: string;
+    capturedAt: Date | null;
+    evidence: Record<string, unknown> | null;
+}
+
+function evidenceOf(value: unknown): Record<string, unknown> | null {
+    if (typeof value !== "string" || !value.trim().startsWith("{")) return null;
+    try {
+        const parsed: unknown = JSON.parse(value);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+    } catch {
+        return null;
+    }
+}
+
+/** The latest capture's findings, worst first. */
+export function toPostgresFindings(rows: readonly Row[]): PostgresFinding[] {
+    return rows
+        .map((r) => ({
+            id: text(r.FindingId),
+            target: text(r.TargetKey),
+            status: text(r.Status),
+            statusSort: num(r.StatusSort) ?? 6,
+            text: text(r.Finding),
+            capturedAt: toDate(r.CapturedAt),
+            evidence: evidenceOf(r.Evidence),
+        }))
+        .filter((f) => f.id !== "")
+        .sort((a, b) => a.statusSort - b.statusSort || a.id.localeCompare(b.id));
+}
+
+const SKU = /^[A-Za-z0-9_]{1,64}$/;
+
+/** Each server's compute size, from the capture finding's evidence (servers: role and sku). */
+export function postgresSkus(findings: readonly PostgresFinding[]): Partial<Record<PostgresTarget, string>> {
+    const out: Partial<Record<PostgresTarget, string>> = {};
+    const servers = findings.find((f) => f.id === "postgresql.T4.capture")?.evidence?.servers;
+    if (!Array.isArray(servers)) return out;
+    for (const server of servers as unknown[]) {
+        if (!server || typeof server !== "object") continue;
+        const { role, sku } = server as Record<string, unknown>;
+        const target: PostgresTarget | null = role === "primary" ? "T4" : role === "replica" ? "T4-replica" : null;
+        if (target && typeof sku === "string" && SKU.test(sku)) out[target] = sku;
+    }
+    return out;
+}

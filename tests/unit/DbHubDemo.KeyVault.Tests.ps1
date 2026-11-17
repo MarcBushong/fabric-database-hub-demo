@@ -438,6 +438,9 @@ Describe 'The Key Vault opt-in (keyVault.enabled)' {
             Mock -ModuleName DbHubDemo -CommandName Test-DemoTeardownResidue -MockWith { New-DemoResult -CheckId 'TEARDOWN.RESIDUAL.KEYVAULT' -Area 'teardown' -Target 'subscription' -Status 'Warning' -Message 'soft-deleted' }
             # The golden snapshot guard (ADR 0018) has its own tests too; here a boot-verified snapshot keeps T2.
             Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @([pscustomobject]@{ Name = 'snap-dbhub-t2golden-202601010000'; BootVerifiedUtc = [datetime]'2026-01-01'; EvalDaysLeft = 100 }) }
+            # So does T4's read replica's deletion (DbHubDemo.T4Replica.Tests.ps1). Unmocked, its bounded wait polled the
+            # made-up replica until its 15-minute limit, in real time (2026-11-16: 901 of this file's 910 seconds).
+            Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { }
             $results = Remove-DemoEnvironment -Config $config -Confirm:$false
             $note = $results | Where-Object { $_.checkId -eq 'DESTROY.KEYVAULT' }
             $note.status | Should -Be 'Pass'

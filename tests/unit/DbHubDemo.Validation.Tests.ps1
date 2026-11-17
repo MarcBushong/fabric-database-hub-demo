@@ -218,6 +218,8 @@ Describe 'Stopped VMs are expected (validation areas)' {
         $config = Get-HubTestConfig
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI call expected' }
+        # The session control's CONTROL.* checks, part of every Workload area since 2026-11-14, have their own tests.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoActivityControl -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoBootstrapLoader -MockWith { New-DemoResult -CheckId ('INFRA.BOOTSTRAP.LOADER_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T1' -Status 'Pass' -Message 'loader' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'should not run' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith { throw 'should not run' }
@@ -539,6 +541,8 @@ Describe 'Validation during business-day''s incidents (2026-11-03)' {
     BeforeEach {
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI call expected' }
+        # The session control's CONTROL.* checks, part of every Workload area since 2026-11-14, have their own tests.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoActivityControl -MockWith { }
         Set-TestAzResponse (Get-TestAzResponse -Power 'running')
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Pass'; message = 'Ready.' } }
         # One incident due now, on $script:incidentTarget only; the schedule itself has its own tests.

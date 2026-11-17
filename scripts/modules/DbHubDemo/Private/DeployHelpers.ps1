@@ -80,6 +80,10 @@ function Get-DemoDeploymentStateTagName {
         TrackT2           = 'DbHubTrackT2'
         TrackT4           = 'DbHubTrackT4'
         TrackFabric       = 'DbHubTrackFabric'
+        # 2026-11-16: the Fabric content (Get-DemoFabricContentSha256) that the Fabric step last published in full, the
+        # notebooks, the history model and report, the dashboard, and the Insights app, so a resume publishes them again
+        # when this copy of the scripts has other ones (Get-DemoFabricContentReopen). Empty before 2026-11-16.
+        FabricSha256      = 'DbHubFabricSha256'
         T2Source          = 'DbHubT2Source'
         # fabric.manageCapacity (Phase 26b): the capacity start-demo.ps1 resumed, "<resource group>/<name>", and when.
         FabricCapacityResumed    = 'DbHubFabricCapacityResumed'
@@ -101,6 +105,22 @@ function Get-DemoDeploymentStateTagName {
         # Developer) once nothing is left to set up in it, so a golden capture tags its snapshot with the guest's real mode
         # (Get-DemoT2GuestInstallMode).
         T2InstallMode            = 'DbHubT2InstallMode'
+        # 2026-11-13 (ADR 0025): T4's read replica. T4Replica is Session once deploy.ps1 has set the replica up for this
+        # environment (start-demo.ps1 creates it for each session, stop-demo.ps1 deletes it); an environment without it was
+        # deployed before the replica, and the lifecycle scripts point to ./scripts/deploy.ps1. T4ReplicaSize is the size and
+        # zone the last replica was created with ("Standard_D4ds_v5@any"), where the next one starts while it still fits T4.
+        T4Replica                = 'DbHubT4Replica'
+        T4ReplicaSize            = 'DbHubT4ReplicaSize'
+        # 2026-11-14: the busy marker (BusyMarkerHelpers.ps1). Until when a deploy.ps1 run, or a session, that's still going
+        # keeps the nightly stop waiting (ISO 8601 UTC; empty when none), and who set it: deploy, deploy-grace (a run the
+        # nightly stop waited for, which ended), or session. The safety stop's runbook reads them (Get-DbHubBusyMarker).
+        BusyUntilUtc             = 'DbHubBusyUntilUtc'
+        BusyBy                   = 'DbHubBusyBy'
+        # 2026-11-17: the Fabric workspaces this environment uses, by ID: the demo's, and the one with the control notebook
+        # (its own workspace, or the demo's when the notebook is in its folder). destroy.ps1 in another environment keeps a
+        # workspace that one of these names, or that an environment without them might use (Get-DemoFabricWorkspaceGuard).
+        FabricWorkspaceId        = 'DbHubFabricWorkspaceId'
+        ControlWorkspaceId       = 'DbHubControlWorkspaceId'
     }
 }
 

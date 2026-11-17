@@ -7,7 +7,9 @@ function Complete-DemoDeploymentRun {
 
     .DESCRIPTION
     The outcome reads the resource group's state after the run (each track's last finished step), unless -State is
-    given. While T4 runs at a fallback size (DbHubT4Size Standard_D4ads_v5 or Standard_D2ds_v5), its hourly list price comes from
+    given. A track this run finished (its DEPLOY.TRACK result Pass, with its last step) whose record that state has
+    behind, because the track's own write was lost or failed, is recorded again first, in one write, so DONE judges by
+    what the run did (Sync-DemoTrackRecord, 2026-11-17). While T4 runs at a fallback size (DbHubT4Size Standard_D4ads_v5 or Standard_D2ds_v5), its hourly list price comes from
     this run's DEPLOY.T4.SKU, or from the Azure Retail Prices API now, for the note DONE and NOT DONE add (Phase 28
     follow-up). The note says T4 was created only with evidence that its server exists: this run's results, the T4
     track's record, or else a Servers - Get (review of 20e855c), which also decides when this run's template failed or
@@ -41,13 +43,18 @@ function Complete-DemoDeploymentRun {
     The run was deploy.ps1 -Sequential: judged by its recorded stage, since it records no tracks.
 
     .PARAMETER Stopped
-    The run was stopped (Ctrl+C) before it finished: NOT DONE with the resume command, without reading the resource
-    group's state, so the ending takes no Azure call but the switch below; a Ctrl+C that Enable-DemoRunCancelWatch recorded
-    counts too. Steps still running on the status page go back to Pending with the reason (Phase 28 live finding).
+    -Stopped (Ctrl+C) counts too. Without reading the resource group's state, so the ending takes no Azure call but the
+    switch below and the busy marker's one tag write; steps still running on the status page go back to Pending with the
+    reason (Phase 28 live finding).
 
     Whatever the outcome, a run that ended before its own switch (Ctrl+C, an error) sends it now, without waiting: the VMs
     it left on the interim baseline get the run's activity profile, so none stays on the baseline (2026-11-03, ADR 0010;
     Send-DemoPendingActivitySwitch). That takes a few seconds; a run that switched already sends nothing.
+
+    A run with a busy marker (Start-DemoDeploymentRun -BusyMarker, 2026-11-14) has its refresher stopped and the nightly
+    stop settled first (Complete-DemoBusyMarkerRun): when a nightly pass came while it ran, DEPLOY.NIGHTLYSTOP says when the
+    demo stops tonight, which DONE and NOT DONE say too; a stopped run only clears the marker. The outcome's Added holds
+    what the ending added to the run's results.
 
     .EXAMPLE
     $outcome = Complete-DemoDeploymentRun -Run $run -Config $config -Result $results
@@ -80,6 +87,17 @@ function Complete-DemoDeploymentRun {
     )
 
     $wasStopped = [bool]$Stopped -or (-not $WhatIfRun -and (Test-DemoRunCancelled))
+    # The busy marker (2026-11-14): its refresher stops, and the nightly stop is settled before the run is judged, so DONE or
+    # NOT DONE, the status page, and the run's results say when the demo stops tonight (DEPLOY.NIGHTLYSTOP). A stopped run
+    # only clears the marker.
+    $busyResults = @()
+    try {
+        $busyResults = @(Complete-DemoBusyMarkerRun -Run (Get-DemoMemberValue -InputObject $Run -Name 'Busy') -Config $Config -Result @($Result) -Stopped:$wasStopped -ProgressPath ([string]$Run.ProgressPath) -Confirm:$false)
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The nightly stop couldn''t be settled at the end of this run: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    $Result = @(@($Result) + $busyResults)
     # The run ended before its switch (Ctrl+C, an error): what it left on the interim baseline gets its activity profile
     # now, sent without waiting (2026-11-03). Nothing is pending after a run that switched.
     if (-not $WhatIfRun) {
@@ -99,6 +117,12 @@ function Complete-DemoDeploymentRun {
         catch {
             Write-DemoLog -Level Warning -Message ('The deployment state couldn''t be read to judge the run: {0}' -f $_.Exception.Message)
             $judgedState = $null
+        }
+        # A track this run finished whose own record was lost or failed is recorded again before DONE reads the records,
+        # so the run isn't NOT DONE for it and the next run doesn't start over (live, 2026-11-17). -Sequential records no
+        # tracks.
+        if ($null -ne $judgedState -and -not $Sequential) {
+            $judgedState = Sync-DemoTrackRecord -Config $Config -State $judgedState -Result @($Result) -Confirm:$false
         }
     }
     # What this run started or created: the model says so without an Azure call.
@@ -159,6 +183,8 @@ function Complete-DemoDeploymentRun {
     }
     $minutes = [int][System.Math]::Round(([System.DateTime]::UtcNow - [datetime]$Run.StartedUtc).TotalMinutes)
     $outcome | Add-Member -NotePropertyName 'Minutes' -NotePropertyValue $minutes -Force
+    # What the ending added to the run's results (DEPLOY.NIGHTLYSTOP), for deploy.ps1's report and out/deploy.jsonl.
+    $outcome | Add-Member -NotePropertyName 'Added' -NotePropertyValue @($busyResults) -Force
     # What runs now, and how to choose the other profile: DONE's "Activity:" line, on the console and the status page.
     $activityLine = ''
     try {

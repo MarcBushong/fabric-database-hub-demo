@@ -159,6 +159,35 @@ What doesn't change: the chunk scripts, their names and SHA-256 checks, the 409 
 
 Sources (checked 2026-10-29): [az vm get-instance-view](https://learn.microsoft.com/cli/azure/vm#az-vm-get-instance-view), [az vm restart](https://learn.microsoft.com/cli/azure/vm#az-vm-restart), [managed Run Command](https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed), [VM extensions and their states](https://learn.microsoft.com/azure/virtual-machines/extensions/overview).
 
+### 2026-11-16 amendment: a restart Azure doesn't finish
+
+**The finding (live, 2026-11-16):** the watchdog's `az vm restart` of the T2 host on the upgrade test environment was accepted at 15:06 and still unfinished 40 minutes later, with the VM's provisioning state Updating, no power state, and its agent Not Ready. The call waited without a limit, so the track, and `deploy.ps1`, had no end and no **NOT DONE**. The same host state appeared on another test environment on 2026-11-13 and 14, where a deallocate and start by hand cleared it. `main` has the same unbounded call.
+
+**The decision (the coordinator, for the user: failures surface, and one click):**
+
+1. **The restart is bounded.** `az vm restart --no-wait`, then at most 15 minutes until Azure has finished it: the provisioning state Succeeded again (dated after the request, or after Updating was seen), the VM running, and its agent Ready (`Wait-DemoVmRestarted`).
+2. **Then one deallocate and start, automatically,** each with `--no-wait` and a bounded wait, 20 minutes in all (`Invoke-DemoVmRestartRecovery`). The T2 guest is shut down cleanly first (`STOP.GUEST`, at most 3 minutes) when the host can still run commands, that is, its agent is Ready. A deallocate refused because an operation is still in progress is asked again 4 times, 30 seconds apart.
+3. **What shows:** recovered, `DEPLOY.WATCHDOG_<VM>` stays a **Warning** that says what happened. Refused, or still not running with its agent Ready, `DEPLOY.WATCHDOG_<VM>` is a **Fail**: the step stops at once, without another wait, and **NOT DONE** gives the single next step, "Wait 30 minutes, then run ./scripts/deploy.ps1 again", whose own watchdog restarts the VM again, or deallocates and starts it, if it still needs to.
+4. **Every other call that waits on a VM is bounded too:** `az vm extension set` (T1's monitoring flag, 20 minutes), T1's Run Command for T3's SQL (its batches' time limit plus 15 minutes), and the workload actions (`Invoke-DemoWorkloadAction`: the runner's own limit plus 10 minutes, otherwise 30 minutes). Starts, deallocations, managed Run Commands, and their deletes already were ([implementation report](../implementation-report.md), R857). The same day, each `az rest` call itself got 300 seconds unless its caller sets a limit: one status read got no answer for over 2 hours, and the waits around it never reached their own limits (R862).
+
+Sources (checked 2026-11-16): [az vm restart, deallocate, and start](https://learn.microsoft.com/cli/azure/vm) (`--no-wait`), [VM power states and billing](https://learn.microsoft.com/azure/virtual-machines/states-billing), [action Run Command restrictions](https://learn.microsoft.com/azure/virtual-machines/windows/run-command#restrictions) (90 minutes at most).
+
+### 2026-11-16 amendment: chunk names Azure keeps
+
+**The finding (live, 2026-11-16):** on the upgrade test environment's T2 host, Azure had ended the deletes of 17 chunk Run Commands with an internal error and kept their names marked for deletion since that morning. A rerun's chunk had one of those names, and Azure refused it: "Operation 'PUT Extension' is not allowed on VM extension 'DbHubDemo-Chunk-cb840b69ea86-001' since it is marked for deletion". The transfer failed, and the watchdog restarted the VM, which Azure then left unfinished. `main` has the same fixed names and no other way out.
+
+**The decision (the coordinator, for the user: every known bug fixed):** a chunk whose name Azure refuses that way runs at once under a fresh name, `<name>-yyyyMMddHHmmss`, through the rule named Run Commands follow since 2026-11-13 (`Resolve-DemoRunCommandFreshName -ForChunk`):
+
+- before any conflict backoff, because a retry doesn't free the name;
+- without deleting the set's other chunks, one of which can have finished without being read back yet;
+- reported as `DEPLOY.RUNCOMMAND.STUCK_<VM>` (**Warning**), on the console, the status page, and **DONE** or **NOT DONE**.
+
+**Room first:** every Run Command the VM lists counts toward Azure's 25, one being deleted included, and each chunk of a set can stay listed until Azure has deleted it. At 17:25 the same host listed 23: 9 finished chunks of an earlier send, 8 held ones, and 6 named ones. So when the VM's count plus the set's chunks would pass the fresh-name limit of 24, the send waits for the leftover deletes its cleanup just asked for, 5 minutes at most (`-RoomWaitSeconds`), before the first chunk; a VM with room doesn't wait.
+
+The script, and so the file the VM writes (`chunk-<nnn>.bin`), is the same, and the fresh name still matches `DbHubDemo-Chunk-*`, so the cleanups delete it. With still no room after that wait, a chunk that needs a fresh name stops with Azure's limit of 25 named and goes to the watchdog, as before. Unit-tested in `tests/unit/DbHubDemo.Bundle.Tests.ps1`; live proof is the upgrade test's next run.
+
+Sources (checked 2026-11-16): [managed Run Command](https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed), [Run Command overview](https://learn.microsoft.com/azure/virtual-machines/run-command-overview) (25 per VM).
+
 ## Amendment: the host's steps for JumpstartImage (2026-11-05)
 
 **Why:** since 2026-11-05 the default install mode is `JumpstartImage` (user-directed, [ADR 0006](0006-sql-editions-and-licensing.md#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default)): the host makes the guest from Arc Jumpstart's prebuilt SQL Server 2022 Standard disk instead of building it. This supersedes the context's "`PaygWizard` (default)" and its one guest image in every mode (the guest now has two sources, the Jumpstart image or the build), and, in this mode, replaces steps 5, 6, 9, and 10 above and changes steps 4 and 7. The state machine is unchanged: one step list in every mode, each step checks before it acts, and a step that a mode doesn't use reports **Not selected** with the reason.

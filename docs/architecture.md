@@ -28,8 +28,9 @@ flowchart LR
   subgraph GH["GitHub (optional, P7)"]
     ACT["Workflows: deploy, demo-control, schedules, destroy"]
   end
-  subgraph CTRL["rg-prefix-control (optional)"]
-    UAMI["GitHub identity and federated credentials"]
+  subgraph CTRL["rg-prefix-control"]
+    UAMI["GitHub identity and federated credentials (optional)"]
+    AUTO["Session control: Automation runbook and private vault (ADR 0026)"]
   end
   subgraph RG["rg-prefix-env (one resource group)"]
     BUD["Budget with alerts"]
@@ -51,6 +52,7 @@ flowchart LR
   subgraph FAB["Fabric workspace on F or Trial capacity"]
     NB1["NB_DatabaseHub_Deployment"]
     NB2["NB_DatabaseHub_LiveActivity"]
+    NB3["NB_DatabaseHub_Control: one Run all per session"]
     LH["LH_DatabaseHub Delta tables"]
   end
   AG["Fallback agents: Copilot CLI or VS Code with microsoft-sql-fdh and microsoft-sql"]
@@ -68,11 +70,77 @@ flowchart LR
   TEL --> HUB
   RG -.->|"Azure Resource Graph"| HUB
   NB2 -->|"KQL with kusto token"| TEL
-  NB2 -.->|"workflow_dispatch (P9)"| ACT
+  NB3 -->|"webhook, status and metrics secrets"| AUTO
+  AUTO -->|"start, replica, stop; ARM only"| RG
+  NB3 -->|"job at the session's end"| NB2
   NB1 --> LH
   NB2 --> LH
   AG --> HUB
   AG --> TEL
+```
+
+## At a glance
+
+`deploy.ps1` deploys everything below that has documented automation, with one command after `az login`, in parallel tracks: T1 with T3, T2, T4, and Fabric. T2 needs no person: by default (`JumpstartImage`), the T2 host downloads [Arc Jumpstart](https://github.com/Azure/arc_jumpstart_docs/blob/71a945c619f78acb441c6470d76a9b58347169fe/docs/azure_jumpstart_arcbox/ITPro/_index.md)'s prebuilt SQL Server 2022 Standard guest disk and makes it `arcsql01`, and no Bastion is needed. After `az login`, a default deployment needs a person only when you aren't an Owner, for one command that an Owner runs once for the roles of the nightly safety stop and the session control (`./scripts/grant-safety-stop.ps1`). The Insights app deploys with your `az login` too, so it needs a browser sign-in only if Fabric refuses that token. Neither keeps the run from **DONE**. A clean first deployment took **91 minutes** to **DONE**, measured on 2026-11-06 from a fresh clone, in West US 3 with the default `lowest-cost` profile; [deployment](deployment.md#expected-duration) has the other measured times. [Deploy it, step by step](deployment.md#deploy-it-step-by-step) has every step, and [automated vs manual](automation-support-matrix.md#automated-vs-manual) lists them all, automated or not.
+
+| What | Where | What it is | Deployed by |
+|---|---|---|---|
+| **T1** `sqlvm01` | Azure VM | SQL Server 2022 Standard, pay-as-you-go. Shows in Database Hub through the SQL IaaS Agent extension | `deploy.ps1` |
+| **T2** `arcsql01` | Nested Hyper-V guest on the Azure VM `archost01` | SQL Server 2022 Standard, pay-as-you-go, presented as a **simulated** on-premises server. Shows in Hub through SQL Server enabled by Azure Arc | `deploy.ps1`, unattended: by default (`JumpstartImage`) the guest is Arc Jumpstart's prebuilt SQL Server Standard image, which the host downloads, checks, and makes `arcsql01` ([options](deployment.md#options-t2s-install-modes)). A redeploy can restore the finished guest from an optional golden snapshot ([ADR 0018](adr/0018-fast-redeploy-parallel-tracks-golden-snapshot.md)), with no manual step |
+| **T3** `azuresql01-<id>` | Azure SQL Database | The `ContosoCare` database, General Purpose serverless, Microsoft Entra-only. Native in Hub | `deploy.ps1` |
+| **T4** `pgflex01-<id>` | Azure Database for PostgreSQL flexible server | PostgreSQL 18 with the `contosocare` database, Microsoft Entra only, no public access. Shows in Hub through Azure Monitor metrics. Its size is `t4SkuName`: General Purpose `Standard_D4ds_v5` (4 vCores) by default since 2026-11-04, with autonomous tuning, which needs 4 vCores; when Azure refuses it, another zone, then `Standard_D4ads_v5`, then `Standard_D2ds_v5` with tuning off once its price fits the cost ceilings. `Standard_B1ms` is the cheapest size, with tuning off. T4 is part of every deployment since 2026-11-09: a configuration's `t4Enabled: false` is ignored, with a note ([ADR 0019](adr/0019-t4-postgresql-flexible-server.md)) | `deploy.ps1` |
+| **T4's read replica** `pgreplica01-<id>` | Azure Database for PostgreSQL flexible server | A same-region read replica of T4, at T4's size, **for each session** (since 2026-11-13): it's created at the start, in about 9 minutes, and deleted at the stop, so nothing bills for it between sessions or after a deployment. Database Hub's Estate lists it, and its **Read replica lag** chart has data; the `replica-lag` scenario makes that lag climb on purpose. When Azure refuses T4's size for it, it tries another zone, then a size with at least T4's vCores, and says what that costs. A Burstable T4 has none: **Not supported**, with the fix ([ADR 0025](adr/0025-t4-read-replica.md)) | `start-demo.ps1` or Run all, for each session; `stop-demo.ps1` or the session's auto-stop deletes it. `deploy.ps1` creates it for its checks and deletes it at its end (since 2026-11-16) |
+| Workload | T1 to T4 | A workload runner with activity profiles and bounded incident scenarios that act only inside `ContosoCare` (`contosocare` on T4) | `deploy.ps1`; driven by `demo-control.ps1` |
+| Nightly safety stop | Azure Automation in the demo resource group | Every evening at the VMs' auto-shutdown time, it deallocates both VMs and stops T4 if they run, then reads, through Azure Resource Manager only, whether T3 paused, and stops T4 again if it runs. A read replica that a session left behind is stopped once T4 is, and the job says so, with the fix. It never starts anything or connects to a database. It waits for a `deploy.ps1` that's still running, then stops the demo the same night, 60 minutes after the run ends, and DONE says when (since 2026-11-14; [what stops or pauses on its own](cost-management.md#what-stops-or-pauses-on-its-own)) | `deploy.ps1`, on every run; it assigns the safety stop's role when you're an Owner, and otherwise an Owner runs one command once (P16) |
+| Fabric notebooks | Fabric workspace | `NB_DatabaseHub_Deployment` (validator) and `NB_DatabaseHub_LiveActivity` (live analysis), which save the demo's history to the lakehouse `LH_DatabaseHub` | `deploy.ps1`'s Fabric track (`configure-fabric.ps1`) |
+| Real-Time Dashboard | Fabric workspace | `RTD_DatabaseHub_LiveView`: the live view, defined as code, over the telemetry endpoint | `deploy.ps1`'s Fabric track (`configure-fabric.ps1`) |
+| Power BI history report | Fabric workspace | `RPT_DatabaseHub_History`: four pages over its Direct Lake semantic model, `SM_DatabaseHub_History` | `deploy.ps1`'s Fabric track (`configure-powerbi.ps1`) |
+| [Fabric App](../fabric/app/README.md) (preview) | Fabric workspace | The Insights app, `APP_DatabaseHub_Insights`: a read-only app over the same model, built with the Rayfin SDK and CLI, with custom visuals, DAX and CSV export on every visual, and ready-made prompts for Database Hub's Database Agent. Part of every deployment; when it can't be created, the run goes on and still ends **DONE**, and the status page shows its step as **Failed**, with the actual error and the fix | `deploy.ps1`'s Fabric track (`configure-fabric-app.ps1`), with your `az login`, once a Fabric administrator has turned on two tenant settings. A browser sign-in is needed only if Fabric refuses that token; `deploy.ps1` then starts it at the beginning of the next run ([prerequisites](prerequisites.md#for-the-insights-app)) |
+| Database Hub | Fabric portal | Nothing to deploy: a portal page that finds the targets through Azure Resource Graph and charts their telemetry | — |
+
+Also included: start, stop, reset, status, cost estimate, and destroy, from PowerShell or GitHub Actions; a [Database Agent prompt pack](../fabric/agent/README.md); and validation in six statuses: **Pass**, **Fail**, **Warning**, **Manual action required**, **Not supported**, and **Not selected**. A successful deployment alone is never **Pass**.
+
+```mermaid
+flowchart TB
+  OP["You: PowerShell 7 or GitHub Actions"]
+  subgraph RG["Azure: one resource group, Contributor only"]
+    T1["T1 sqlvm01<br/>SQL Server on an Azure VM"]
+    subgraph HOST["archost01: Hyper-V host"]
+      T2["T2 arcsql01<br/>Arc-enabled SQL Server,<br/>simulated on-premises"]
+    end
+    T3["T3 azuresql01<br/>Azure SQL Database"]
+    T4["T4 pgflex01<br/>Azure Database for PostgreSQL"]
+    T4R["T4's read replica pgreplica01<br/>for each session"]
+  end
+  GOLD[("rg-dbhub-golden<br/>T2 golden snapshot, optional")]
+  JS[("Arc Jumpstart<br/>public SQL Server guest image")]
+  TEL["SQL telemetry endpoint (preview)"]
+  HUB["Database Hub and Database Agent (preview)<br/>a Fabric portal page"]
+  subgraph WS["Fabric workspace on F capacity"]
+    NB["Notebooks"]
+    LH[("LH_DatabaseHub<br/>history tables")]
+    RTD["Real-Time Dashboard<br/>live, as code"]
+    PBI["Semantic model and<br/>Power BI report: history"]
+    APP["Insights app: Fabric App (preview)<br/>history insights"]
+  end
+  OP -- "deploy, start, stop, reset, validate, destroy" --> RG
+  OP -- "import and check" --> WS
+  JS -. "downloaded once per guest build" .-> HOST
+  GOLD -. "restored on a redeploy" .-> HOST
+  T1 --> TEL
+  T2 --> TEL
+  T3 --> TEL
+  RG -. "Estate: Azure Resource Graph" .-> HUB
+  TEL -- "Performance" --> HUB
+  T4 -. "Azure Monitor metrics" .-> HUB
+  T4 -- "replication" --> T4R
+  T4R -. "Azure Monitor metrics: Read replica lag" .-> HUB
+  TEL -- "KQL as each viewer" --> RTD
+  TEL -- "KQL" --> NB
+  NB --> LH
+  LH -- "Direct Lake" --> PBI
+  PBI -- "semantic model connector" --> APP
+  APP -. "Database Agent prompt, pasted by you" .-> HUB
 ```
 
 ## Components and defaults
@@ -82,15 +150,16 @@ Every value is a parameter. Profiles (`lowest-cost`, `demo-day`, `enhanced-perfo
 | Component | Default | Notes |
 |---|---|---|
 | Region | West US 3 | In Hub's performance-monitoring region list and the SQL VM unified-inventory list. Preflight checks sizes and quota and suggests alternatives. |
-| Resource groups | `rg-dbhub-demo`, plus `rg-dbhub-control` only for the GitHub path | [ADR 0002](adr/0002-resource-group-topology.md) |
+| Resource groups | `rg-dbhub-demo`, plus `rg-dbhub-control` for the session control (and the GitHub identity on the GitHub path) | [ADR 0002](adr/0002-resource-group-topology.md) |
 | Network | VNet `10.42.0.0/24`: `snet-sqlvm`, `snet-archost`, `snet-pe` (private mode), `AzureBastionSubnet` | No VM public IPs. [ADR 0007](adr/0007-networking-modes-and-egress.md) |
 | T1 `sqlvm01` | `Standard_D2s_v5` (`lowest-cost`), `MicrosoftSQLServer:sql2022-ws2022:standard-gen2`, OS disk (plus a data disk outside `lowest-cost`), system-assigned identity, SQL connectivity `LOCAL` | `Microsoft.SqlVirtualMachine/sqlVirtualMachines` with license type PAYG. Runs the workload runner for T1 and T3. |
 | T2 host `archost01` | `Standard_E2s_v5` (`lowest-cost`), Windows Server 2022 Datacenter Gen2, `securityType = Standard`; in `lowest-cost` the guest's VHDX (and, in the build modes, its media) use the 128 GiB OS disk, and the other profiles add a 128 GiB data disk | No Arc agent and no SQL IaaS extension. [ADR 0003](adr/0003-t2-host-size-security-type-bootstrap.md) |
 | T2 guest `arcsql01` | Generation 2, 2 vCPU, 8 GiB static memory. By default (`JumpstartImage`, since 2026-11-05) Arc Jumpstart ArcBox's prebuilt guest disk: a dynamic VHDX with a 100 GiB maximum (34 GiB to download), Windows Server 2022 Standard (not an evaluation), and SQL Server 2022 Standard. In the build modes (`ProductKey`, `Developer`, and a kept `PaygWizard` guest): a 64 GB dynamic VHDX, Windows Server 2022 Datacenter Evaluation (Desktop Experience) | IMDS and wire server blocked; automatic start and shutdown. [ADR 0004](adr/0004-guest-imds-isolation.md), [ADR 0006](adr/0006-sql-editions-and-licensing.md) |
 | T3 `azuresql01` | Logical server `azuresql01-<deploymentId>`, database `ContosoCare`, GP serverless Gen5, 0.5–1 vCore, auto-pause 15 minutes, 32 GB maximum size | Entra-only with the P6 group as admin; TLS 1.2 |
+| T4's read replica `pgreplica01` | `pgreplica01-<deploymentId>`, a same-region read replica of T4 at T4's size, in T4's subnet and private DNS zone (`infra/replica/pgreplica01.bicep`), created for each session by `start-demo.ps1` or Run all and deleted by `stop-demo.ps1` or the session's auto-stop; `deploy.ps1` creates it for its checks and deletes it at its end (since 2026-11-16) | Entra-only, inherited from T4; Database Hub's Read replica lag. Not on a Burstable T4. [ADR 0025](adr/0025-t4-read-replica.md) |
 | Budget | `monthlyCeilingUsd` (375 by default since 2026-11-04, the hard monthly ceiling), alerts at 50%, 80%, and 100% to `ownerEmail` | Resource-group scope |
 | Auto-shutdown | DevTest Labs schedules for T1 and the host | The host's guest shuts down cleanly through its stop action |
-| Nightly safety stop | The identity `id-<prefix>-<environment>-safetystop` and the Automation account `aa-<prefix>-<environment>-safetystop` (Basic, local authentication off) with `DbHub-Stop` on two daily schedules | At the auto-shutdown time it deallocates both VMs and stops T4, then reads T3's status; its stop-only custom role at the demo resource group ([ADR 0024](adr/0024-nightly-safety-stop.md)) |
+| Nightly safety stop | The identity `id-<prefix>-<environment>-safetystop` and the Automation account `aa-<prefix>-<environment>-safetystop` (Basic, local authentication off) with `DbHub-Stop` on two daily schedules | At the auto-shutdown time it deallocates both VMs and stops T4, then a read replica a session left running, in Azure's order, then reads T3's status; its stop-only custom role at the demo resource group ([ADR 0024](adr/0024-nightly-safety-stop.md), [ADR 0025](adr/0025-t4-read-replica.md)) |
 | Bastion | Basic SKU with a Standard public IP, created and removed on demand | Optional: no deployment needs it since the `PaygWizard` guided stop was retired (2026-11-09). Removed automatically after `bastionMaxHours` |
 | Key Vault, Log Analytics, storage accounts | Not deployed | Hub telemetry is Microsoft-managed. The artifact cache storage account was dropped on 2026-10-20 ([ADR 0016](adr/0016-cost-profiles.md), C9). Key Vault is an opt-in since Phase 13 (`keyVault.enabled`, which requires `assignRoles`): an RBAC-mode vault `kv-<prefix><environment>-<deploymentId>`, created on demand like Bastion, for the one-time host password ([ADR 0009](adr/0009-secrets-handling.md)). |
 
@@ -277,7 +346,7 @@ flowchart LR
   NB -->|"kusto token, read-only KQL"| TEL["Telemetry endpoint"]
 ```
 
-- Everything lives in `rg-<prefix>-control`, which destroy keeps; only A1 reaches into the demo group.
+- Everything lives in `rg-<prefix>-control`, which `destroy.ps1` deletes with the environment when the control serves it (2026-11-17); only A1 reaches into the demo group.
 - The runbook checks every request against the scenario catalog's allow-lists, refuses a run while another is active, creates the run's auto-stop before it starts anything, and sets each target's profile with the same VM-side request as `demo-control.ps1`. Stop now, the auto-stop, and the daily T4 safety stop go through Azure Resource Manager only.
 - Where the tenant's policy makes new vaults private, the notebook lives in its own "DBHub Control" workspace, because a managed private endpoint turns off starter pools for its whole workspace; otherwise it's in a folder of the existing workspace.
 
@@ -388,7 +457,9 @@ T4 is an Azure Database for PostgreSQL flexible server, `pgflex01-<deploymentId>
 | Database Hub | Estate lists the flexible server; Performance's **PostgreSQL** dashboard charts its Azure Monitor metrics. No query-level diagnostics (`HUB.ESTATE.T4`, `METRICS.T4`) |
 | Live view | Enhanced metrics on (`metrics.collector_database_activity`): sessions by state and by wait event type, the oldest transaction and query, deadlocks. `status.ps1` (`STATUS.T4`, `STATUS.T4.LIVE` with `-Detail`) and `ContosoCare.Workload status --target T4` show them with the sessions, waits, blockers, and connections against `max_connections` |
 | Lifecycle | `deploy.ps1` starts a stopped T4 before the template, its T4 track checks it, and T1's track sets it up; `start-demo.ps1` starts it, `stop-demo.ps1` stops it (a stopped server starts on its own after seven days, and `stop-demo.ps1` and `status.ps1` give that date), `destroy.ps1` removes it with the resource group |
-| Not included | Lakehouse history, the report, the Insights app, and a Real-Time Dashboard page for T4 (follow-ups in ADR 0019); Query Store (not for the Burstable tier) |
+| Read replica (since 2026-11-13) | `pgreplica01-<deploymentId>`, a same-region read replica at T4's size, for each session: `start-demo.ps1` or Run all creates it once T4 runs (about 9 minutes, with T4's size fallback rules), and `stop-demo.ps1` or the session's auto-stop reads its metrics for the history, then deletes it; `deploy.ps1` creates it for its checks and, since 2026-11-16, deletes it at its end unless a session uses it. A stopped replica starts before T4, and stops after it (Azure's order). Database Hub charts its **Read replica lag**; the `replica-lag` scenario makes it climb ([ADR 0025](adr/0025-t4-read-replica.md)) |
+| History | T4's and the replica's Azure Monitor metrics reach the lakehouse (`telemetry_snapshots`, `analysis_findings`, analysis `postgresql`), the history model, and the Insights app's PostgreSQL page through the notebook's `POSTGRES_METRICS`, which `stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s history snapshot pass |
+| Not included | The history report's pages and a Real-Time Dashboard page for T4 (follow-ups in ADR 0019); Query Store (not for the Burstable tier); high availability, geo-replicas, and promotion |
 
 ## Changes from the approved plan
 
@@ -426,6 +497,8 @@ These engineering refinements were made while writing the ADRs. None of them cha
 | 28 | Eight more scenarios, one per wait family: a deep blocking chain with lock escalation, a deadlock storm, tempdb contention, memory grants, parallelism, log flushes, a slow client, and a target at full capacity; `tempdb-contention`'s own temporary tables are the one write outside `ContosoCare` | User-directed, 2026-10-23: diverse, bounded activity for the Performance page and the Database Agent; every scenario keeps a hard maximum duration, runs on every target, and touches only `ContosoCare.Demo/` sessions (Phase 25b) | 0010, 0013 |
 | 29 | T2's default install mode is `JumpstartImage`: the guest is Arc Jumpstart ArcBox's prebuilt SQL Server 2022 Standard image, made `arcsql01` at its first boot with no network; `ProductKey` and `Developer` are opt-in (`PaygWizard` too, until row 30), with no automatic fallback between modes, and the golden snapshot is an optional speed-up | User-directed, 2026-11-05: a one-click deployment that works with no person, for public users in their own subscriptions, reusing Arc Jumpstart's process and prebuilt images | 0006, 0018 |
 | 30 | `PaygWizard` and its guided stop are retired from the one-click deployment: a configuration's `PaygWizard` runs as `JumpstartImage`, a `PaygWizard` guest whose setup wizard was never finished is made again from the image, and a finished one is kept. T4 is part of every deployment, so `t4Enabled: false` is ignored | User-directed, 2026-11-09: "They should not need to manually do a wizard. They should sign into Az login and then have everything deployed." | 0006, 0019 |
+| 31 | T4 gets a same-region read replica for each session: created by `deploy.ps1` and `start-demo.ps1`, deleted by `stop-demo.ps1` after its metrics are read for the history, so it bills only during sessions, has no 7-day restart, and the ceilings, the restart rule, and the roles stay as they were. A bounded `replica-lag` scenario makes Database Hub's Read replica lag climb | User-directed, 2026-11-13 ("Postgres HA/DR"); the per-session lifecycle chosen from a live probe and approved within the owner's delegated scope, with the session ceiling kept at $15 | 0025 |
+| 32 | `deploy.ps1` deletes T4's read replica at its end, once DONE's checks and the history snapshot have read it, unless a session uses it (a Run all session's auto-stop is pending, or a `start-demo.ps1` session's mark on the replica is ahead), so a deployment or an upgrade leaves nothing new billing between sessions | The project's coordinator for the user, 2026-11-16, reversible before the merge to `main` | 0025 |
 
 ## Sources (checked 2026-10-19)
 

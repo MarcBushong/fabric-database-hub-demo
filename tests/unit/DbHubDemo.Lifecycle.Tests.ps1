@@ -1,12 +1,21 @@
 BeforeAll {
     $repoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../..'))
     Import-Module -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1') -Force
+    # No test here reaches the Azure CLI (2026-11-16, tests/TestAzGuard.ps1): an az call that no test mocks gets what the
+    # real CLI answered for these tests' made-up subscription, which they relied on, without leaving this process.
+    Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+        $at = [array]::IndexOf([string[]]$ArgumentList, '--subscription')
+        $subscription = if ($at -ge 0 -and $at + 1 -lt $ArgumentList.Count) { $ArgumentList[$at + 1] } else { '11111111-2222-3333-4444-555555555555' }
+        [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ("ERROR: Subscription '{0}' not found. Check the spelling and casing and try again." -f $subscription) }
+    }
     . (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Guard.Helpers.ps1')
     # Writes and token requests need the context the subscription guard validates; this is the unit-test hook.
     Initialize-GuardTestContext
     # The .NET SDK that deploy.ps1 installs when it's missing (2026-11-09) has its own tests (DbHubDemo.DotNetSdk.Tests.ps1);
     # here it's there, and adds no record, unless a test says otherwise.
     Mock -ModuleName DbHubDemo -CommandName Initialize-DemoDotNetSdk -MockWith { }
+    # The Fabric content the scripts publish (2026-11-16), the same as New-TestState records, unless a test says otherwise.
+    Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricContentSha256 -MockWith { 'f' * 64 }
 
     function New-TestConfig([switch] $WithT4) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
@@ -22,10 +31,11 @@ BeforeAll {
     }
 
     function New-TestState([hashtable] $Values = @{}) {
+        # FabricSha256 is the content Get-DemoFabricContentSha256 returns below (2026-11-16): the Fabric items are current.
         $state = [ordered]@{
             Exists = $true; Stage = ''; StageUtc = ''; BundleSha256 = ''; BundleChunkCount = 0; RunnerSha256 = ''; RunnerChunkCount = 0
             BundleSentTo = @(); RunnerSentTo = @(); NetworkMode = 'private'; T3UseFreeLimit = $false; T3AdminGroupName = 'DbHub T3 Admins'
-            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; Tags = @{ deploymentId = 'abc123' }
+            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; FabricSha256 = ('f' * 64); Tags = @{ deploymentId = 'abc123' }
         }
         foreach ($key in $Values.Keys) {
             $state[$key] = $Values[$key]
@@ -82,6 +92,41 @@ Describe 'Deployment state in the resource group''s tags' {
         { Set-DemoDeploymentState -Config $config -Value @{ Nope = 'x' } -Confirm:$false } | Should -Throw '*Nope*'
         Set-DemoDeploymentState -Config $config -Value @{ T3AdminGroupName = 'a"b' } -Confirm:$false
         @($script:azCalls | Where-Object { $_[0] -eq 'tag' }).Count | Should -Be 0
+    }
+
+    It 'merges under the lock the parallel tracks share, so another process''s write never overlaps it, and goes through from a holder of that lock (live, 2026-11-17)' {
+        # Live, 2026-11-17: the busy marker's refresh, from its own process and 0.6 seconds from T2's last track record, lost
+        # that record, and the run ended NOT DONE with "Not every target finished: T2".
+        $script:lockName = & (Get-Module -Name DbHubDemo) { param($c) Get-DemoStateLockName -Config $c } $config
+        $script:probe = {
+            $lockName = $script:lockName
+            Start-ThreadJob -ScriptBlock {
+                $mutex = [System.Threading.Mutex]::new($false, $using:lockName)
+                try {
+                    $free = $false
+                    try {
+                        $free = $mutex.WaitOne(0)
+                    }
+                    catch [System.Threading.AbandonedMutexException] {
+                        $free = $true
+                    }
+                    if ($free) {
+                        $mutex.ReleaseMutex()
+                    }
+                    $free
+                }
+                finally {
+                    $mutex.Dispose()
+                }
+            } | Receive-Job -Wait -AutoRemoveJob
+        }
+        $script:freeDuringWrite = [System.Collections.Generic.List[bool]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { $script:freeDuringWrite.Add([bool](& $script:probe)); [pscustomobject]@{ ExitCode = 0; StdOut = '{}'; StdErr = '' } }
+        Set-DemoDeploymentState -Config $config -Value @{ BusyUntilUtc = '2026-11-17T19:38:22Z'; BusyBy = 'deploy' } -Confirm:$false
+        & (Get-Module -Name DbHubDemo) { param($c) Set-DemoDeploymentStateLocked -Config $c -Value @{ TrackT2 = 'Telemetry' } -Confirm:$false } $config
+        @($script:freeDuringWrite) | Should -Be @($false, $false) -Because 'each merge runs while this process holds the lock'
+        [bool](& $script:probe) | Should -BeTrue -Because 'the lock is released after each write'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 2 -Exactly
     }
 
     It 'reads the state back, with lists, counts, and an explicit false' {
@@ -933,6 +978,13 @@ Describe 'Invoke-DemoDeployment' {
             $script:history.Add([pscustomobject]@{ Before = $script:order.ToArray(); DoneChecked = [bool]$PesterBoundParameters['DoneChecked']; SkipFabric = [bool]$PesterBoundParameters['SkipFabric']; WhatIfRun = [bool]$PesterBoundParameters['WhatIfRun'] })
             New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Saved the history report''s snapshots.' -Evidence @{ nonBlocking = 'historySnapshot' }
         }
+        # T4's read replica at the run's end (2026-11-16) has its own tests (DbHubDemo.T4Replica.Tests.ps1); here it notes
+        # what had run before it, and never reaches Azure.
+        $script:replicaEnd = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDeployEnd -MockWith {
+            $script:replicaEnd.Add([pscustomobject]@{ Before = $script:order.ToArray(); Snapshots = $script:history.Count })
+            New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.END' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'replica end' -Evidence @{ outcome = 'Deleted' }
+        }
     }
 
     It 'sets up the nightly safety stop after the Infrastructure stage, and not with -WhatIf (ADR 0024)' {
@@ -1044,6 +1096,22 @@ Describe 'Invoke-DemoDeployment' {
             $null = @(Invoke-DemoDeployment -Config $config @run)
             $script:order | Should -Not -Contain 'Sdk'
         }
+    }
+
+    It 'runs the Fabric stage again on -Resume when this copy has other Fabric content than the stage last published, and records it (2026-11-16)' {
+        # Live, on the parallel path (the merge's upgrade test): a resume after the Fabric step kept main's notebook, history
+        # model, and Insights app. A -Sequential resume after its Fabric stage did the same.
+        $script:state = New-TestState @{ Stage = 'Fabric'; FabricSha256 = '' }
+        $null = @(Invoke-DemoDeployment -Config $config -Resume)
+        $script:order | Should -Contain 'Fabric'
+        $script:order | Should -Contain 'App'
+        @($script:recorded | Where-Object { $_.Contains('FabricSha256') })[-1]['FabricSha256'] | Should -Be ('f' * 64)
+
+        # The same content: only the validation runs, as before.
+        $script:order.Clear()
+        $script:state = New-TestState @{ Stage = 'Fabric' }
+        $null = @(Invoke-DemoDeployment -Config $config -Resume)
+        $script:order | Should -Not -Contain 'Fabric'
     }
 
     It 'imports the Real-Time Dashboard and the history model and report in the Fabric stage, as the parallel Fabric track does (review follow-up)' {
@@ -1292,6 +1360,11 @@ Describe 'Invoke-DemoDeployment' {
         $ids = @($results | ForEach-Object { [string]$_.checkId })
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        # T4's read replica goes after the snapshot (2026-11-16): DONE's checks and the snapshot read it first.
+        $script:replicaEnd.Count | Should -Be 1
+        $script:replicaEnd[0].Snapshots | Should -Be 1
+        [array]::IndexOf($ids, 'DEPLOY.T4.REPLICA.END') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY'))
+        [array]::IndexOf($ids, 'DEPLOY.T4.REPLICA.END') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistorySnapshotStep -Times 1 -Exactly -ParameterFilter {
             [bool]$PesterBoundParameters['DoneChecked'] -and -not [bool]$PesterBoundParameters['SkipFabric'] -and -not [bool]$PesterBoundParameters['WhatIfRun'] -and [string]$ActivityProfile.Name -eq 'business-day' -and
             @($Requirement) -contains 'TELEMETRY.T2' -and @($Requirement) -contains 'FABRIC.ITEMS.REQUIRED' -and
@@ -1319,11 +1392,13 @@ Describe 'Invoke-DemoDeployment' {
 
         $script:order.Clear()
         $script:state = New-TestState
+        $script:replicaEnd.Clear()
         $results = @(Invoke-DemoDeployment -Config $config -Resume -WhatIf)
         $script:order | Should -Be @('Preflight', 'Template')
         $script:history.Count | Should -Be 1
         $script:history[0].WhatIfRun | Should -BeTrue
         $results[-1].checkId | Should -Be 'DEPLOY.FABRIC.HISTORY'
+        $script:replicaEnd.Count | Should -Be 0 -Because 'a what-if deletes nothing'
     }
 
     It 'still switches when it stops at a Fail after the profiles were set, so no VM stays on the interim baseline (-Sequential)' {
@@ -1333,6 +1408,9 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Not -Contain 'DoneGate'
         $script:order[-1] | Should -Be 'Switch:T1,T3,T2=business-day'
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.INCIDENTS_T2' }).status | Should -Be 'Pass'
+        # And deletes T4's read replica, as a whole run does (2026-11-16).
+        $script:replicaEnd.Count | Should -Be 1
+        $script:replicaEnd[0].Before[-1] | Should -Be 'Switch:T1,T3,T2=business-day'
     }
 
     It 'reports a switch that doesn''t finish in time as a Warning, never a Fail (-Sequential)' {
@@ -1715,6 +1793,21 @@ Describe 'Stop-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -MockWith { $script:order.Add('Guest'); New-TestResult 'STOP.GUEST' 'Pass' 'infra' 'T2' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Deallocate:' + $VmName); New-TestResult ('STOP.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoT3 -MockWith { $script:order.Add('RemoveT3'); New-TestResult 'T3.REMOVE' 'Pass' 't3' 'T3' }
+        Mock -ModuleName DbHubDemo -CommandName Clear-DemoChunkRunCommand -MockWith { @() }
+    }
+
+    It 'sends the deletes of a running VM''s chunk Run Commands right before its deallocate, which completes them (R871)' {
+        Mock -ModuleName DbHubDemo -CommandName Clear-DemoChunkRunCommand -MockWith { $script:order.Add('Chunks:' + ($BaseUrl -split '/')[-2]); @('DbHubDemo-Chunk-a8a10d93133c-001') }
+        Stop-DemoEnvironment -Config $config -Confirm:$false | Out-Null
+        $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off', 'Guest', 'Chunks:archost01', 'Deallocate:archost01', 'Chunks:sqlvm01', 'Deallocate:sqlvm01')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Clear-DemoChunkRunCommand -Times 1 -Exactly -ParameterFilter { $BaseUrl -like '*/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/archost01/runCommands' }
+
+        # A VM Azure lists as deallocated takes no deletes (Azure refuses them there), and one whose power state couldn't be read
+        # (a start that failed) still gets them.
+        $script:order.Clear()
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = $null }
+        Stop-DemoEnvironment -Config $config -Confirm:$false | Out-Null
+        $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Chunks:archost01', 'Deallocate:archost01', 'Deallocate:sqlvm01')
     }
 
     It 'removes Bastion, rotates the password, turns every profile off, stops the guest, then deallocates' {
@@ -1935,7 +2028,7 @@ Describe 'Start-DemoEnvironment' {
         $results = @(Start-DemoEnvironment -Config $config -Confirm:$false)
         # A VM this start booted gets the interim baseline as soon as it runs, and its own Run Commands wait for it (review of
         # PR 16, and its re-review).
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Switch:T1,T3=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'T1Monitoring', 'WarmT3', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T2=business-day')
+        $script:order | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Switch:T1,T3=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T2', 'T1Monitoring', 'WarmT3', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T2=business-day')
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 1 -Exactly -ParameterFilter { $ProfileName -eq 'business-day' -and $WaitSeconds -eq 180 -and $RequestedBy -eq 'start-demo' }
         foreach ($target in 'T1', 'T3', 'T2') {
             $switch = $results | Where-Object { $_.checkId -eq ('START.INCIDENTS_{0}' -f $target) }
@@ -2023,7 +2116,7 @@ Describe 'Start-DemoEnvironment' {
         # An earlier start, or a deploy.ps1 that ended NOT DONE, can have left business-day's incidents running.
         Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $false }
         Start-DemoEnvironment -Config $config -SkipT3 -Confirm:$false | Out-Null
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Switch:T1,T2=baseline', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Profile:T1=baseline', 'Profile:T2=baseline', 'Switch:T1,T2=business-day') -Because '-SkipT3 leaves T3 alone, quiet included'
+        $script:order | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'Switch:T1,T2=baseline', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Profile:T1=baseline', 'Profile:T2=baseline', 'Switch:T1,T2=business-day') -Because '-SkipT3 leaves T3 alone, quiet included'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoProfileRunCommand -Times 1 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and $WaitSeconds -eq 0 -and $ExpiresMinutes -eq 10 }
 
         # An explicit baseline has no incidents to quiet.
@@ -2079,7 +2172,7 @@ Describe 'Start-DemoEnvironment' {
             $script:refuse = @()
         }
         Start-DemoEnvironment -Config $config -SkipT3 -Confirm:$false | Out-Null
-        @($script:order[0..9]) | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Switch:T2=baseline', 'Start:sqlvm01', 'Switch:T1=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T2')
+        @($script:order[0..10]) | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'Switch:T2=baseline', 'Start:sqlvm01', 'Switch:T1=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T2')
         $script:order[-1] | Should -Be 'Switch:T1,T2=business-day'
 
         # A VM that doesn't run gets nothing: a Run Command can't reach it.
@@ -2150,8 +2243,7 @@ Describe 'Start-DemoEnvironment' {
         $script:order | Should -Contain 'Profile:T2=baseline'
     }
 
-    It 'leaves the auto-stop alone with the control off, or with -WhatIf' {
-        Start-DemoEnvironment -Config $config -Confirm:$false | Out-Null
+    It 'leaves the auto-stop alone with -WhatIf; the control is part of every deployment since 2026-11-14 (ADR 0026)' {
         Start-DemoEnvironment -Config (New-ControlTestConfig) -WhatIf | Out-Null
         Should -Invoke -ModuleName DbHubDemo -CommandName Clear-DemoActivityControlAutoStop -Times 0 -Exactly
     }
@@ -2219,7 +2311,7 @@ Describe 'Start-DemoEnvironment' {
     It 'recreates a removed T3 under the same names, with the recorded bundle and runner, and checks T1''s monitoring after the template' {
         $script:t3Exists = $false
         Start-DemoEnvironment -Config $config -ActivityProfile 'off' -Confirm:$false | Out-Null
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Template:abab:cdcd', 'Group', 'T3Setup', 'EnableT3', 'Gate', 'Monitoring:20', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off')
+        $script:order | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'Start:sqlvm01', 'Start:archost01', 'SourceRelease', 'T1Monitoring', 'Template:abab:cdcd', 'Group', 'T3Setup', 'EnableT3', 'Gate', 'Monitoring:20', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off')
         # A plugin the redeployment leaves NotRunning gets the agent's restart at once, as after a start (the owner's
         # decision, 2026-10-30), never the whole wait.
         Should -Invoke -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters['NotRunningGraceMinutes'] -eq 0 }
@@ -2283,7 +2375,7 @@ Describe 'Start-DemoEnvironment' {
             New-DemoResult -CheckId 'START.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 is {0}.' -f $after) -Evidence @{ stateBefore = 'Stopped'; stateAfter = $after }
         }
         $results = Start-DemoEnvironment -Config (New-TestConfig -WithT4) -Confirm:$false
-        $script:order | Should -Be @('Cost', 'Request:sqlvm01', 'Request:archost01', 'T4:Start:0', 'Start:sqlvm01', 'Switch:T1,T3,T4=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T4,T2', 'T1Monitoring', 'WarmT3', 'T4:Start:15', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T4=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T4,T2=business-day')
+        $script:order | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01', 'Request:archost01', 'T4:Start:0', 'Start:sqlvm01', 'Switch:T1,T3,T4=baseline', 'Start:archost01', 'SourceRelease', 'Switch:T2=baseline', 'Interim:T1,T3,T4,T2', 'T1Monitoring', 'WarmT3', 'T4:Start:15', 'Profile:T1=baseline', 'Profile:T3=baseline', 'Profile:T4=baseline', 'Profile:T2=baseline', 'Switch:T1,T3,T4,T2=business-day')
         ($results | Where-Object { $_.checkId -eq 'START.T4.START' }).status | Should -Be 'Pass'
         # The confirming call knows this run requested the start, so it doesn't say "was already running" (Phase 25d).
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -Times 1 -Exactly -ParameterFilter { $WaitMinutes -gt 0 -and $Requested }
@@ -2400,7 +2492,19 @@ Describe 'Get-DemoEnvironmentStatus' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -Times 0 -Exactly -Because 'T1 is deallocated'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -Times 0 -Exactly
         # The leftover Run Commands of both VMs it found, each with its power state (Phase 28 follow-up).
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRunCommandStatus -Times 1 -Exactly -ParameterFilter { (@($VmName) -join ',') -eq 'sqlvm01,archost01' -and $Running['sqlvm01'] -eq $false -and $Running['archost01'] -eq $false }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRunCommandStatus -Times 1 -Exactly -ParameterFilter { (@($VmName) -join ',') -eq 'sqlvm01,archost01' -and $Running['sqlvm01'] -eq $false -and $Running['archost01'] -eq $false -and $RunInProgress -eq '' }
+    }
+
+    It 'tells STATUS.RUNCOMMANDS which run the busy marker says is going on, and none once the marker has passed (2026-11-17)' {
+        $now = [datetime]::new(2026, 11, 17, 14, 0, 0, [System.DateTimeKind]::Utc)
+        $script:inProgress = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRunCommandStatus -MockWith { $script:inProgress.Add($RunInProgress); New-TestResult 'STATUS.RUNCOMMANDS' 'Pass' 'infra' }
+        foreach ($case in @(@{ By = 'deploy'; Until = '2026-11-17T14:30:00Z' }, @{ By = 'session'; Until = '2026-11-17T14:30:00Z' }, @{ By = 'deploy-grace'; Until = '2026-11-17T14:30:00Z' }, @{ By = 'deploy'; Until = '2026-11-17T13:30:00Z' })) {
+            $script:busyCase = $case
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { New-TestState @{ Stage = 'Validation'; Tags = @{ deploymentId = 'abc123'; expiresOn = '2026-12-31'; DbHubBusyUntilUtc = $script:busyCase.Until; DbHubBusyBy = $script:busyCase.By } } }
+            $null = Get-DemoEnvironmentStatus -Config $config -NowUtc $now
+        }
+        @($script:inProgress) | Should -Be @('deploy.ps1', 'A demo session', '', '') -Because 'the grace after deploy.ps1 ended, and a marker that has passed, mean no run is going on'
     }
 
     It 'reads the active profile on T1 and T3 while sqlvm01 runs, from T1 only' {
@@ -2777,9 +2881,8 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         $result.message | Should -Match 'sqlvm01: the Run Commands couldn''t be listed \(ERROR: \(AuthorizationFailed\)'
     }
 
-    It 'start-demo.ps1''s cleanup says nothing with the control off and nothing to delete, and a Pass with it on' {
+    It 'start-demo.ps1''s cleanup says Pass when the control left nothing to delete (the control is part of every deployment since 2026-11-14)' {
         $script:listed['sqlvm01'] = @(New-RunCommand 'DbHubDemo-Bootstrap')
-        InModuleScope DbHubDemo -Parameters @{ Config = $config } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01') -Confirm:$false } | Should -BeNullOrEmpty
         $controlConfig = New-TestConfig
         $controlConfig['control']['enabled'] = $true
         $result = InModuleScope DbHubDemo -Parameters @{ Config = $controlConfig } { Remove-DemoControlRunCommand -Config $Config -VmName @('sqlvm01') -Confirm:$false }
@@ -2822,6 +2925,38 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01', 'archost01') -Running @{} }
         $result.status | Should -Be 'Warning'
         $result.message | Should -Match 'couldn''t all be listed: archost01: ERROR: \(AuthorizationFailed\)'
+    }
+
+    It 'status.ps1 puts the T2 host''s Run Commands that Azure is still deleting first, with deploy.ps1 as the fix, and names a run in progress (2026-11-17)' {
+        # The other VMs' deletes finish on their own, as before.
+        $script:listed['sqlvm01'] = @((New-RunCommand 'DbHubDemo-Workload' 'Failed'), (New-RunCommand 'DbHubDemo-Chunk-0123456789ab-001' 'Succeeded' 'Deleting'))
+        $script:listed['archost01'] = @(
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-001' 'Succeeded' 'Deleting'
+            New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-002' 'Running' 'Deleting'
+            New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-003' 'Pending' 'Creating'
+            New-RunCommand 'OtherTeam-Patch' 'Succeeded' 'Deleting'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01', 'archost01') -Running @{ sqlvm01 = $true; archost01 = $false } }
+        $result.checkId | Should -Be 'STATUS.RUNCOMMANDS'
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^2 Run Command\(s\) on archost01, T2''s host, are marked for deletion, and Azure hasn''t finished deleting them: archost01/DbHubDemo-Chunk-a8a10d93133c-001, archost01/DbHubDemo-Chunk-a8a10d93133c-002\. Ones that stay there go with a VM agent that isn''t working'
+        $result.message | Should -Match ' 2 other managed Run Command\(s\) are left: sqlvm01/DbHubDemo-Workload, archost01/DbHubDemo-Chunk-a8a10d93133c-003\.$'
+        $result.remediation | Should -Match '^Run \./scripts/deploy\.ps1: when archost01''s VM agent is down, .* rebuilds the host once if the agent stays down \(DEPLOY\.T2\.HOSTREBUILD\)\. Deleting them yourself doesn''t help'
+        @($result.evidence.markedForDeletion) | Should -Be @('archost01/DbHubDemo-Chunk-a8a10d93133c-001', 'archost01/DbHubDemo-Chunk-a8a10d93133c-002')
+        @($script:azLog | Where-Object { $_ -notmatch '^rest --method get ' }) | Should -BeNullOrEmpty -Because 'status.ps1 only reads'
+
+        # A run's own deletes show for a few minutes, so the fix waits for its end.
+        $during = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('archost01') -Running @{ archost01 = $true } -RunInProgress 'deploy.ps1' }
+        $during.message | Should -Match '\. deploy\.ps1 is running now, and a run''s own deletes show here for a few minutes\. '
+        $during.remediation | Should -Match '^Run \./scripts/deploy\.ps1 after that run ends, if they''re still listed: '
+
+        # Evaluation-only mode's T2 VM, arcsql01, isn't a host.
+        $evaluation = New-TestConfig
+        $evaluation['t2Mode'] = 'EvaluationOnlyAzureVm'
+        $script:listed['arcsql01'] = @(New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-001' 'Succeeded' 'Deleting')
+        $other = InModuleScope DbHubDemo -Parameters @{ Config = $evaluation } { Get-DemoRunCommandStatus -Config $Config -VmName @('arcsql01') -Running @{} }
+        $other.status | Should -Be 'Pass'
     }
 
     It 'a control Run Command is finished when its state is terminal, or empty or Unknown an hour after the time in its name: <Name> <State>' -ForEach @(
@@ -2899,6 +3034,9 @@ Describe 'Remove-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @() }
         # The nightly safety stop's role definition (ADR 0024): none in these tests, unless one says so.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopRoleState -MockWith { [pscustomobject]@{ Id = ''; Actions = @(); Error = '' } }
+        # What else deploy.ps1 created (2026-11-17) has its own tests (DbHubDemo.Destroy.Tests.ps1); here it notes when it ran.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith { [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; Delete = @(); Keep = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDestroyExtra -MockWith { $script:order.Add('Extra'); @() }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
             $script:order.Add('az ' + ($ArgumentList[0..1] -join ' '))
             $script:groupExists = $false
@@ -2906,9 +3044,13 @@ Describe 'Remove-DemoEnvironment' {
         }
     }
 
-    It 'deletes the Arc SQL instances, then the Arc machines, then the resource group, then the deployment record and the budget, and checks for residue' {
+    It 'deletes the Arc SQL instances, then the Arc machines, then T4''s read replica, then the resource group, then the deployment record and the budget, and checks for residue' {
+        # T4's read replica (ADR 0025) goes before the group, named from the manifest's deploymentId.
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { $script:order.Add('Replica'); $null }
         $results = Remove-DemoEnvironment -Config $config -Confirm:$false
-        $script:order | Should -Be @('Instance', 'Machine', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
+        # The session control, the Fabric workspaces, and the security group go first (2026-11-17).
+        $script:order | Should -Be @('Extra', 'Instance', 'Machine', 'Replica', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -Times 1 -Exactly -ParameterFilter { $CheckPrefix -eq 'DESTROY' -and $DeploymentId -eq 'abc123' -and $Quiet }
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.ARC.SQLINSTANCES' }).area | Should -Be 'teardown'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESIDUAL' }).status | Should -Be 'Pass'
@@ -3007,6 +3149,66 @@ Describe 'Invoke-DemoControl' {
         # Before T2's setup, the guest has no demo module yet (Phase 28 live finding): a Warning too, not a Fail.
         $script:t2Message = 'The control action failed: The specified module ''C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1'' was not loaded because no valid module file was found in any module directory.'
         (Invoke-DemoControl -Config $config -Target T2 -Scenario baseline -Confirm:$false | Where-Object { $_.checkId -eq 'CONTROL.T2' }).status | Should -Be 'Warning'
+    }
+
+    It 'sends replica-lag only when T4 and its read replica are Ready, and says why not with the fix (live, 2026-11-13)' {
+        # Live (rg-dbhubha-demo, 00:44Z): the safety stop's 19:30 pass had stopped T4 and its replica, and CONTROL.T4 said Pass,
+        # because 'profile set' only stores the profile; T1's profile host couldn't run it, and only its log on sqlvm01 said so.
+        $script:t4 = 'Stopped'
+        $script:replica = 'Ready'
+        $script:sku = 'Standard_D4ds_v5'
+        $script:setUp = 'Session'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Tags = @{ deploymentId = 'rrpigs' }; T4Replica = $script:setUp } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith {
+            $server = [pscustomobject]@{ sku = [pscustomobject]@{ name = $script:sku; tier = $(if ($script:sku -like 'Standard_B*') { 'Burstable' } else { 'GeneralPurpose' }) }; properties = [pscustomobject]@{ state = $script:t4 } }
+            [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = 'pgflex01-rrpigs' }; Exists = $true; Present = $true; Removing = $false; State = $script:t4; Server = $server; Error = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = 'pgreplica01-rrpigs' }; Present = ($script:replica -ne 'NotFound'); State = $script:replica; Error = '' } }
+        $send = { Invoke-DemoControl -Config $config -Target T4 -Scenario 'incident:replica-lag' -DurationMinutes 10 -Confirm:$false | Where-Object { $_.checkId -eq 'CONTROL.T4' } }
+
+        $row = & $send
+        $row.status | Should -Be 'Warning'
+        $row.message | Should -Be 'T4 (pgflex01-rrpigs) is Stopped, so replica-lag wasn''t sent: it needs T4 and its read replica running, and T1''s profile host would refuse it.'
+        $row.remediation | Should -Match '^Run \./scripts/start-demo\.ps1: it starts T4 and creates or starts its read replica'
+        $script:calls.Count | Should -Be 0 -Because 'nothing is sent'
+
+        # The replica: deleted by stop-demo.ps1, stopped, or still being created.
+        $script:t4 = 'Ready'
+        foreach ($case in @(@{ State = 'NotFound'; Fix = 'start-demo\.ps1: it creates the replica' }, @{ State = 'Stopped'; Fix = 'start-demo\.ps1: it starts the replica' }, @{ State = 'Provisioning'; Fix = '^Wait until it''s Ready' })) {
+            $script:replica = $case.State
+            $row = & $send
+            $row.status | Should -Be 'Warning' -Because $case.State
+            $row.message | Should -Match ('^T4''s read replica \(pgreplica01-rrpigs\) ') -Because $case.State
+            $row.remediation | Should -Match $case.Fix -Because $case.State
+        }
+
+        # An environment deployed before the replica, and a Burstable T4.
+        $script:replica = 'Ready'
+        $script:setUp = ''
+        $row = & $send
+        $row.status | Should -Be 'Warning'
+        $row.remediation | Should -Match '^Run \./scripts/deploy\.ps1'
+        $script:setUp = 'Session'
+        $script:sku = 'Standard_B2s'
+        (& $send).status | Should -Be 'Not supported'
+        $script:calls.Count | Should -Be 0
+
+        # Everything Ready: sent as before.
+        $script:sku = 'Standard_D4ds_v5'
+        (& $send).status | Should -Be 'Pass'
+        $script:calls.Count | Should -Be 1
+
+        # sqlvm01 refused it: T1's runner settings don't name the replica (Invoke-DemoWorkloadControl.ps1).
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            [pscustomobject]@{ Status = 'Fail'; ExitCode = $null; Records = @(); Result = (New-DemoResult -CheckId 'WORKLOAD.T4.COMMAND' -Area 'workload' -Target 'T4' -Status 'Fail' -Message 'T1''s runner settings don''t name T4''s read replica, so T1''s profile host would refuse replica-lag; nothing was set. deploy.ps1 sends T1 its name.' -Evidence @{ replicaKnown = $false }) }
+        }
+        $row = & $send
+        $row.status | Should -Be 'Warning'
+        $row.remediation | Should -Match '^Run \./scripts/deploy\.ps1: it sends T1 the replica''s name'
+
+        # Other scenarios aren't checked.
+        $null = Invoke-DemoControl -Config $config -Target T4 -Scenario 'incident:cpu-pressure' -DurationMinutes 10 -Confirm:$false
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -Times 5 -Exactly -Because 'only replica-lag reads the replica, and only once T4 is Ready and set up for it'
     }
 }
 
@@ -3308,6 +3510,124 @@ Describe 'Invoke-DemoVmPowerAction' {
         $result.message | Should -Match 'wasn''t found'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 0 -Exactly
     }
+
+    It 'waits for the start this run asked for while Azure still works on it, and sends no second start (live, 2026-11-16)' {
+        # Live, 2026-11-16: archost01 read stopped, with its provisioning state Updating, for 12 minutes after the start
+        # deploy.ps1 asked for, and a second start went out 19 seconds after the first.
+        foreach ($state in 'PowerState/stopped', 'PowerState/stopped', 'PowerState/stopped', 'PowerState/running') {
+            $script:states.Enqueue($state)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { @('ProvisioningState/updating', 'PowerState/stopped') }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Start -StartRequested -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.evidence.issued | Should -Be ''
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 0 -Exactly
+    }
+
+    It 'starts the VM once when the start Azure was working on ends without it running' {
+        foreach ($state in 'PowerState/stopped', 'PowerState/stopped', 'PowerState/deallocated', 'PowerState/starting', 'PowerState/running') {
+            $script:states.Enqueue($state)
+        }
+        $script:views = [System.Collections.Generic.Queue[object]]::new()
+        $script:views.Enqueue(@('ProvisioningState/updating', 'PowerState/stopped'))
+        $script:views.Enqueue(@('ProvisioningState/updating', 'PowerState/stopped'))
+        $script:views.Enqueue(@('ProvisioningState/failed/AllocationFailed', 'PowerState/deallocated'))
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { if ($script:views.Count -gt 1) { $script:views.Dequeue() } else { $script:views.Peek() } }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Start -StartRequested -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.evidence.issued | Should -Be 'start'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'start' }
+    }
+
+    It 'sends no second start to a VM that Azure is still starting after the whole wait, and says so (2026-11-17)' {
+        # A start Azure accepted for a host whose VM agent never gets ready runs for up to an hour (R871), and Azure refuses
+        # another operation on the VM until it's done.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { [System.Threading.Thread]::Sleep(200); 'PowerState/starting' }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Start -TimeoutSeconds 30 -PollSeconds 1 } $config
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be 'archost01 is still starting after 30 seconds: Azure is still working on its start, so no second start was sent.'
+        $result.remediation | Should -Be 'Wait until Azure has finished starting it (./scripts/status.ps1 shows its state), then run the script again; starting it again doesn''t help.'
+        $result.evidence.inProgress | Should -BeTrue
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 0 -Exactly
+    }
+
+    It 'says Azure is still working on a start it accepted when the VM reads deallocated, Updating, for the whole wait (2026-11-17)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { [System.Threading.Thread]::Sleep(200); 'PowerState/deallocated' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { @('ProvisioningState/updating', 'PowerState/deallocated') }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Start -TimeoutSeconds 30 -PollSeconds 1 } $config
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be 'archost01 is still PowerState/deallocated after 30 seconds: Azure is still working on its start.'
+        $result.evidence.inProgress | Should -BeTrue
+        $result.evidence.issued | Should -Be 'start'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'start' }
+    }
+
+    It 'deallocates a VM whose last operation failed at once, instead of waiting for a power state that never comes (live, 2026-11-16)' {
+        # Live, 2026-11-16: archost01's start ended VMStartTimedOut, so its instance view showed no power state, and
+        # stop-demo.ps1 waited 900 seconds, then sent no deallocate: the VM kept billing. Its power state stays empty until a
+        # deallocate goes out, as Azure's does.
+        $script:deallocateSent = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($script:deallocateSent) { 'PowerState/deallocated' } else { '' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { if ($ArgumentList -contains 'deallocate') { $script:deallocateSent = $true }; New-AzResult }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm show ' } -MockWith { [System.Threading.Thread]::Sleep(100); New-AzResult -StdOut '/subscriptions/x/resourceGroups/rg-dbhub-test/providers/Microsoft.Compute/virtualMachines/archost01' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { @('ProvisioningState/failed/VMStartTimedOut') }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Deallocate -TimeoutSeconds 30 -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match 'archost01 is deallocated after .* Its last operation had failed \(ProvisioningState/failed/VMStartTimedOut\)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'deallocate' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAz -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match '^vm show ' } -Because 'it acts on the first read instead of waiting'
+    }
+
+    It 'still waits for a VM that shows no power state while Azure works on it, and never deallocates it mid-operation' {
+        foreach ($state in '', '', 'PowerState/running', 'PowerState/deallocated') {
+            $script:states.Enqueue($state)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm show ' } -MockWith { New-AzResult -StdOut '/subscriptions/x/resourceGroups/rg-dbhub-test/providers/Microsoft.Compute/virtualMachines/archost01' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { @('ProvisioningState/updating') }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Deallocate -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Not -Match 'last operation had failed'
+        $result.evidence.failedState | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAz -Times 2 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match '^vm show ' } -Because 'it waited through both reads without a power state'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'deallocate' }
+    }
+
+    It 'waits for a deallocate the caller already asked for while Azure still works on it, and sends no second one (live, 2026-11-17)' {
+        # Live, 2026-11-17: the watchdog's recovery asked for the T2 host's deallocate, and its wait sent a second one 8
+        # seconds later, because the host still read running.
+        foreach ($state in 'PowerState/running', 'PowerState/running', 'PowerState/deallocating', 'PowerState/deallocated') {
+            $script:states.Enqueue($state)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { @('ProvisioningState/updating', 'PowerState/running') }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Deallocate -DeallocateRequested -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.evidence.issued | Should -Be ''
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 0 -Exactly
+
+        # Without the switch, a VM that reads running still gets its deallocate, as before.
+        $script:states.Clear()
+        foreach ($state in 'PowerState/running', 'PowerState/deallocated') {
+            $script:states.Enqueue($state)
+        }
+        $plain = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Deallocate -PollSeconds 1 } $config
+        $plain.status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'deallocate' }
+    }
+
+    It 'deallocates the VM once when the deallocate Azure was working on ends with it still running' {
+        foreach ($state in 'PowerState/running', 'PowerState/running', 'PowerState/running', 'PowerState/deallocating', 'PowerState/deallocated') {
+            $script:states.Enqueue($state)
+        }
+        $script:views = [System.Collections.Generic.Queue[object]]::new()
+        $script:views.Enqueue(@('ProvisioningState/updating', 'PowerState/running'))
+        $script:views.Enqueue(@('ProvisioningState/updating', 'PowerState/running'))
+        $script:views.Enqueue(@('ProvisioningState/succeeded', 'PowerState/running'))
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { if ($script:views.Count -gt 1) { $script:views.Dequeue() } else { $script:views.Peek() } }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Deallocate -DeallocateRequested -PollSeconds 1 } $config
+        $result.status | Should -Be 'Pass'
+        $result.evidence.issued | Should -Be 'deallocate'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'deallocate' }
+    }
 }
 
 Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts what was stopped (Phase 28 live finding)' {
@@ -3428,6 +3748,30 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $failed.message | Should -Match 'archost01 isn''t running'
         $failed.remediation | Should -Match ([regex]::Escape('./scripts/start-demo.ps1'))
         $script:calls | Should -Not -Contain 'source release' -Because 'the host isn''t running'
+    }
+
+    It 'tells the person not to start a VM that Azure is still starting, and to run deploy.ps1 again once it has finished (2026-11-17)' {
+        # The coordinator's question: a dead start that never reads running within the wait. The next deploy.ps1, once Azure
+        # has ended the start, brings the T2 host back or builds it again (R871, R872); starting it again doesn't help.
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        $script:inProgress = @{ sqlvm01 = $false; archost01 = $true }
+        $script:noStart = 'archost01'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith {
+            $status = if ($VmName -in @($script:noStart)) { 'Warning' } else { 'Pass' }
+            New-DemoResult -CheckId ('START.VM_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T2' -Status $status -Message ('{0}: {1}' -f $VmName, $status) -Evidence ([ordered]@{ issued = ''; inProgress = ($status -ne 'Pass' -and $script:inProgress[$VmName]) })
+        }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        $failed = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $failed.status | Should -Be 'Fail'
+        $failed.remediation | Should -Be 'Azure is still starting archost01: don''t start it yourself. Run ./scripts/deploy.ps1 again once it has finished, at most about an hour after the start (./scripts/status.ps1 shows its state): it continues where it stopped. When archost01''s VM agent stays down then, that run brings it back, and builds it again once if it must.'
+        @($failed.evidence.stillStarting) | Should -Be @('archost01')
+
+        # With another VM that didn't start for another reason, that one still gets the start fix.
+        $script:noStart = @('sqlvm01', 'archost01')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        $failed = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $failed.remediation | Should -Match '^Azure is still starting archost01: .* Start sqlvm01 in the Azure portal, or run \./scripts/start-demo\.ps1, then run \./scripts/deploy\.ps1 again: it continues where it stopped\.$'
     }
 
     It 'sets the interim baseline on each VM it started as soon as that VM runs, and waits for it before the run''s first Run Command there, and none on a VM that didn''t start (review of PR 16, and its re-review)' {
@@ -4237,6 +4581,261 @@ Describe 'Invoke-DemoSqlVmMonitoringWait: a deployment step''s T1 monitoring (Ph
         $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c } $config)
         @($results.checkId) | Should -Be @('T1.SQLVM.MONITORING')
         $script:calls | Should -Be @('wait')
+    }
+}
+
+Describe 'A Failed SQL IaaS Agent extension: the documented repair, once per run, only when it''s safe (2026-11-16 live finding)' {
+    BeforeAll {
+        $config = New-TestConfig
+        $script:repairUrl = 'https://management.azure.com/subscriptions/{0}/resourceGroups/rg-{1}-{2}/providers/Microsoft.SqlVirtualMachine/sqlVirtualMachines/sqlvm01' -f $config['subscriptionId'], $config['prefix'], $config['environment']
+        # Live, rg-dbhubnu-demo (0f37192): the instance view of the extension whose update met T1's lockout recovery.
+        $script:singleUserText = 'Login failed for user ''NT Service\MSSQLSERVER''. Reason: Server is in single user mode. Only one administrator can connect at this time.'
+        function New-ExtensionJson([string] $State, [string] $Failure = $script:singleUserText) {
+            $substatuses = if ($State -eq 'Failed') { @([ordered]@{ code = 'ComponentStatus/SQL Server IaaS Agent/failed/56061'; level = 'Error'; message = $Failure }, [ordered]@{ code = 'ComponentStatus/DatabaseMonitorArcPlugin/succeeded'; level = 'Info'; message = '{}' }) } else { @([ordered]@{ code = 'ComponentStatus/SQL Server IaaS Agent/succeeded'; level = 'Info'; message = 'Healthy' }) }
+            ConvertTo-Json -Depth 10 -InputObject ([ordered]@{ name = 'SqlIaasExtension'; provisioningState = $State; instanceView = [ordered]@{ substatuses = $substatuses } })
+        }
+        function New-SqlVmResource([string] $State = 'Succeeded', [string] $Connectivity = 'LOCAL', [int] $Port = 1433, [bool] $Upgrade = $true) {
+            [pscustomobject]@{
+                location   = 'westus3'
+                tags       = [pscustomobject]@{ owner = 'tester'; deploymentId = 'abc123' }
+                properties = [pscustomobject]@{
+                    provisioningState                      = $State
+                    virtualMachineResourceId               = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/sqlvm01'
+                    sqlServerLicenseType                   = 'PAYG'
+                    enableAutomaticUpgrade                 = $Upgrade
+                    serverConfigurationsManagementSettings = [pscustomobject]@{ sqlConnectivityUpdateSettings = [pscustomobject]@{ connectivityType = $Connectivity; port = $Port } }
+                }
+            }
+        }
+        function New-FailedMonitoring {
+            New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Fail' -Message 'The SqlIaasExtension on sqlvm01 is Failed, not Succeeded.' -Remediation 'Wait for the extension, or repair it in the portal (SQL virtual machines), then run configure-monitoring.ps1 again.' -Evidence ([ordered]@{ provisioningState = 'Failed'; featureFlagEnabled = $true; pluginState = 'Running'; powerState = 'PowerState/running'; pending = $false; actions = @() })
+        }
+    }
+
+    BeforeEach {
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:calls = [System.Collections.Generic.List[string]]::new()
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed', 'Deleting', 'NotFound', 'Creating', 'Succeeded'))
+        $script:power = 'PowerState/running'
+        $script:mode = '{"bootstrapState":"Ready","sqlService":"Running","singleUser":false,"error":""}'
+        $script:modeSucceeded = $true
+        $script:postExit = 0
+        $script:putExit = 0
+        $script:putBody = $null
+        $script:afterConnectivity = 'LOCAL'
+        $script:afterState = 'Succeeded'
+        $script:monitoringCalls = 0
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add(('{0}|{1}' -f $PesterBoundParameters['Level'], $PesterBoundParameters['Message'])) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        $script:sleptSeconds = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:sleptSeconds += [int]$PesterBoundParameters['Seconds'] }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:calls.Add('power'); $script:power }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $script:calls.Add('mode ' + $RunCommandName)
+            [pscustomobject]@{ Succeeded = $script:modeSucceeded; ExecutionState = $(if ($script:modeSucceeded) { 'Succeeded' } else { 'Failed' }); ExitCode = $(if ($script:modeSucceeded) { 0 } else { 1 }); Output = $script:mode; Error = '' }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith {
+            $script:monitoringCalls++
+            $script:calls.Add('monitoring')
+            if ($script:monitoringCalls -eq 1) {
+                New-FailedMonitoring
+            }
+            else {
+                New-DemoResult -CheckId 'T1.SQLVM.MONITORING' -Area 't1' -Target 'T1' -Status 'Pass' -Message 'sqlvm01 reports DatabaseMonitorArcPlugin Running with MetricsUploadStatus OK.' -Evidence ([ordered]@{ provisioningState = 'Succeeded'; featureFlagEnabled = $true; pluginState = 'Running'; powerState = 'PowerState/running'; pending = $false; actions = @('Merged DatabaseWatcheronAzureVM into the SqlIaasExtension public settings, keeping 4 other setting(s) and 0 other feature flag(s).') })
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = $ArgumentList -join ' '
+            if ($joined -like 'vm extension show*') {
+                $state = if ($script:extensionStates.Count -gt 1) { $script:extensionStates.Dequeue() } else { $script:extensionStates.Peek() }
+                $script:calls.Add('extension ' + $state)
+                if ($state -eq 'NotFound') {
+                    return [pscustomobject]@{ ExitCode = 3; StdOut = ''; StdErr = 'ERROR: (ResourceNotFound) The Resource ''Microsoft.Compute/virtualMachines/sqlvm01/extensions/SqlIaasExtension'' under resource group ''rg-dbhub-demo'' was not found.' }
+                }
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (New-ExtensionJson -State $state); StdErr = '' }
+            }
+            if ($joined -like 'rest --method post*') {
+                $script:calls.Add('post ' + $ArgumentList[4])
+                return [pscustomobject]@{ ExitCode = $script:postExit; StdOut = ''; StdErr = $(if ($script:postExit) { 'ERROR: (AuthorizationFailed) The client does not have authorization to perform action ''Microsoft.SqlVirtualMachine/sqlVirtualMachines/redeploy/action''.' } else { '' }) }
+            }
+            if ($joined -like 'rest --method put*') {
+                $path = ([string]$ArgumentList[[array]::IndexOf($ArgumentList, '--body') + 1]).TrimStart('@')
+                $script:putBody = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+                $script:calls.Add('put ' + $ArgumentList[4])
+                return [pscustomobject]@{ ExitCode = $script:putExit; StdOut = ''; StdErr = $(if ($script:putExit) { 'ERROR: (BadRequest) The SQL virtual machine is in a state that doesn''t allow this operation.' } else { '' }) }
+            }
+            if ($joined -like 'rest --method get*') {
+                $script:calls.Add('get ' + $ArgumentList[4])
+                if ($null -eq $script:putBody) {
+                    return (New-SqlVmResource -Connectivity 'LOCAL')
+                }
+                return (New-SqlVmResource -State $script:afterState -Connectivity $script:afterConnectivity)
+            }
+            throw ('unexpected az call: ' + $joined)
+        }
+    }
+
+    It 'repairs a Failed extension when sqlvm01 runs and SQL Server is multi-user, re-applies and verifies the template''s settings, merges the flag again, and says so first, as a Warning' {
+        # On the code before it, the Monitoring step returned only the Fail, and the run ended NOT DONE with the portal's Repair.
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -ProgressPath 'progress.json' } $config)
+        @($results.checkId) | Should -Be @('DEPLOY.T1.SQLIAAS.REPAIR', 'T1.SQLVM.MONITORING') -Because 'the step''s row shows the first result that isn''t a Pass'
+        $results[0].status | Should -Be 'Warning'
+        $results[1].status | Should -Be 'Pass'
+        $script:monitoringCalls | Should -Be 2 -Because 'the monitoring runs again after the repair, and merges the flag it dropped'
+        # Safe first (running, multi-user), then the documented API, once.
+        @($script:calls | Where-Object { $_ -like 'post *' }) | Should -Be @(('post {0}/redeploy?api-version=2023-10-01' -f $script:repairUrl))
+        $script:calls.IndexOf('mode DbHubDemo-SqlModeRead') | Should -BeLessThan $script:calls.IndexOf(('post {0}/redeploy?api-version=2023-10-01' -f $script:repairUrl))
+        $script:calls.IndexOf('power') | Should -BeLessThan $script:calls.IndexOf('mode DbHubDemo-SqlModeRead')
+        # What the template sets, sent again with the resource's own location, tags, VM, and license, after the extension is back.
+        $script:calls.IndexOf('extension Succeeded') | Should -BeLessThan $script:calls.IndexOf(('put {0}?api-version=2023-10-01' -f $script:repairUrl))
+        $script:putBody['location'] | Should -Be 'westus3'
+        $script:putBody['tags']['owner'] | Should -Be 'tester'
+        $script:putBody['tags']['deploymentId'] | Should -Be 'abc123'
+        $script:putBody['properties']['virtualMachineResourceId'] | Should -Match '/virtualMachines/sqlvm01$'
+        $script:putBody['properties']['sqlServerLicenseType'] | Should -Be 'PAYG'
+        $script:putBody['properties']['enableAutomaticUpgrade'] | Should -BeTrue
+        $script:putBody['properties']['serverConfigurationsManagementSettings']['sqlConnectivityUpdateSettings']['connectivityType'] | Should -Be 'LOCAL'
+        $script:putBody['properties']['serverConfigurationsManagementSettings']['sqlConnectivityUpdateSettings']['port'] | Should -Be 1433
+        @($script:calls | Where-Object { $_ -like 'get *' })[-1] | Should -Be ('get {0}?api-version=2023-10-01&$expand=*' -f $script:repairUrl)
+        $results[0].message | Should -Be 'T1''s SQL IaaS Agent extension had failed (Server is in single user mode), so this run repaired it with Azure''s Redeploy (the portal''s Repair) in 2 minutes and re-applied what a repair drops: LOCAL connectivity on port 1433 and automatic upgrade, both verified (license PAYG kept). The monitoring flag DatabaseWatcheronAzureVM, which the repair dropped, was merged again.'
+        $results[0].message.Length | Should -BeLessOrEqual 400 -Because 'the status page''s row keeps 400 characters'
+        $results[0].remediation | Should -Match '^Nothing to do'
+        $results[0].evidence.repaired | Should -BeTrue
+        $results[0].evidence.verified | Should -BeTrue
+        $results[0].evidence.monitoringFlag | Should -Be 'merged'
+        $results[0].evidence.failure | Should -Be $script:singleUserText
+        @($results[0].evidence.extensionStates) | Should -Be @('Failed', 'Deleting', 'NotFound', 'Creating', 'Succeeded')
+        @($results[0].evidence.reapplied) | Should -Be @('connectivityType=LOCAL', 'port=1433', 'enableAutomaticUpgrade=true', 'sqlServerLicenseType=PAYG')
+        # The console says it as it starts and as it ends; DONE says it too.
+        @($script:logged | Where-Object { $_ -like 'Warning|The SqlIaasExtension on sqlvm01 is Failed (Server is in single user mode); repairing it*' }).Count | Should -Be 1
+        @($script:logged | Where-Object { $_ -like 'Warning|DEPLOY.T1.SQLIAAS.REPAIR: T1''s SQL IaaS Agent extension had failed*' }).Count | Should -Be 1
+        $note = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoSqlIaasRepairNote -Result $r } $results
+        $note | Should -Be ('{0} Nothing to do (DEPLOY.T1.SQLIAAS.REPAIR).' -f $results[0].message)
+
+        # start-demo.ps1 (after it recreates T3) names it START.
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:monitoringCalls = 0
+        $script:putBody = $null
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed', 'Updating', 'Succeeded'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 -RestartAtOnce -CheckId 'START.T1.MONITORING' } $config)
+        $results[0].checkId | Should -Be 'START.T1.SQLIAAS.REPAIR'
+        $results[0].status | Should -Be 'Warning'
+        (& (Get-Module -Name DbHubDemo) { param($r) Get-DemoSqlIaasRepairNote -Result $r } $results) | Should -BeNullOrEmpty -Because 'DONE is deploy.ps1''s'
+    }
+
+    It 'doesn''t repair when <Name>, and says why with the portal''s Repair' -ForEach @(
+        @{ Name = 'sqlvm01 isn''t running'; Power = 'PowerState/deallocated'; Mode = ''; Succeeded = $true; Expected = 'it wasn''t repaired: sqlvm01 is deallocated, and the repair needs it running\.$'; Reads = $false }
+        @{ Name = 'T1''s bootstrap isn''t finished'; Power = 'PowerState/running'; Mode = '{"bootstrapState":"Running","sqlService":"Running","singleUser":false,"error":""}'; Succeeded = $true; Expected = 'T1''s bootstrap isn''t finished \(state Running\), and its lockout recovery restarts SQL Server in single-user mode'; Reads = $true }
+        @{ Name = 'SQL Server is in single-user mode'; Power = 'PowerState/running'; Mode = '{"bootstrapState":"Ready","sqlService":"Running","singleUser":true,"error":"Login failed for user ''NT AUTHORITY\\SYSTEM''. Reason: Server is in single user mode."}'; Succeeded = $true; Expected = 'it wasn''t repaired: SQL Server is in single-user mode\.$'; Reads = $true }
+        @{ Name = 'SQL Server isn''t running'; Power = 'PowerState/running'; Mode = '{"bootstrapState":"Ready","sqlService":"Stopped","singleUser":null,"error":""}'; Succeeded = $true; Expected = 'SQL Server isn''t running \(service Stopped\)'; Reads = $true }
+        @{ Name = 'SQL Server''s mode can''t be read'; Power = 'PowerState/running'; Mode = 'not json'; Succeeded = $false; Expected = 'SQL Server''s mode couldn''t be read \(the Run Command ended Failed \(exit code 1\)'; Reads = $true }
+    ) {
+        $script:power = $Power
+        $script:mode = $Mode
+        $script:modeSucceeded = $Succeeded
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        @($results.checkId) | Should -Be @('DEPLOY.T1.SQLIAAS.REPAIR', 'T1.SQLVM.MONITORING')
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match ('^The SqlIaasExtension on sqlvm01 is Failed \(Server is in single user mode\), and it wasn''t repaired: ')
+        $results[0].message | Should -Match $Expected
+        $results[0].remediation | Should -Match ([regex]::Escape('Repair it in the Azure portal (SQL virtual machines > sqlvm01 > SQL IaaS Agent Extension Settings > Repair), then run ./scripts/deploy.ps1 again.'))
+        $results[0].evidence.repaired | Should -BeFalse
+        $results[1].status | Should -Be 'Fail' -Because 'the monitoring isn''t read again without a repair'
+        @($script:calls | Where-Object { $_ -like 'post *' -or $_ -like 'put *' }) | Should -BeNullOrEmpty
+        ($script:calls -contains 'mode DbHubDemo-SqlModeRead') | Should -Be $Reads -Because 'a VM that isn''t running gets no Run Command'
+        $script:monitoringCalls | Should -Be 1
+    }
+
+    It 'is a Fail with the reason and the portal''s Repair when Azure refuses the repair, when the extension fails again, or when it''s still Failed after 15 minutes' {
+        $script:postExit = 1
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match 'and Azure refused its repair: .*does not have authorization'
+        $results[0].remediation | Should -Match '^Repair it in the Azure portal'
+        @($results.checkId) | Should -Be @('DEPLOY.T1.SQLIAAS.REPAIR', 'T1.SQLVM.MONITORING')
+
+        # The reinstall fails again: its own reason.
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:postExit = 0
+        $script:monitoringCalls = 0
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed', 'Failed', 'Creating', 'Failed'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'This run repaired the SqlIaasExtension on sqlvm01, which was Failed (Server is in single user mode), with Azure''s Redeploy, but it failed again (Login failed for user ''NT Service\MSSQLSERVER''. Reason: Server is in single user mode. Only one administrator can connect at this time).'
+        $results[0].remediation | Should -Match '^Repair it in the Azure portal'
+        @($script:calls | Where-Object { $_ -like 'put *' }) | Should -BeNullOrEmpty
+        $script:monitoringCalls | Should -Be 1
+
+        # Never past its bound: Failed throughout (the old state) is still Failed after 15 minutes.
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:monitoringCalls = 0
+        $script:sleptSeconds = 0
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match 'but it was still Failed after 15 minutes\.$'
+        $script:sleptSeconds | Should -Be 900
+    }
+
+    It 'repairs once per run: a second Failed extension in the same run is a Fail, with no second repair' {
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config
+        @($script:calls | Where-Object { $_ -like 'post *' }).Count | Should -Be 1
+        $script:monitoringCalls = 0
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Be 'The SqlIaasExtension on sqlvm01 is Failed again after this run repaired it, and it isn''t repaired twice in one run.'
+        $results[0].remediation | Should -Match '^Repair it in the Azure portal'
+        @($script:calls | Where-Object { $_ -like 'post *' }).Count | Should -Be 1
+    }
+
+    It 'is a Fail that names the template''s rerun when what a repair drops can''t be re-applied or verified' {
+        $script:putExit = 1
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match '^This run repaired the SqlIaasExtension on sqlvm01 in 2 minutes, but Azure refused what a repair doesn''t keep \(LOCAL connectivity on port 1433 and automatic upgrade\): .*doesn''t allow this operation'
+        $results[0].remediation | Should -Be 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template sets them again, and the run continues from there.'
+        $results[0].evidence.repaired | Should -BeTrue -Because 'the extension itself is back, so the monitoring runs again'
+        $script:monitoringCalls | Should -Be 2
+
+        # Applied, but a read afterward shows another value.
+        & (Get-Module -Name DbHubDemo) { $script:DemoSqlIaasRepairDone = $false }
+        $script:putExit = 0
+        $script:putBody = $null
+        $script:monitoringCalls = 0
+        $script:afterConnectivity = 'PRIVATE'
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Failed', 'Updating', 'Succeeded'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Fail'
+        $results[0].message | Should -Match 'but a read afterward shows connectivity PRIVATE\. The monitoring flag'
+        $results[0].evidence.verified | Should -BeFalse
+    }
+
+    It 'reads an extension that''s no longer Failed again, as it is now, without a repair' {
+        $script:extensionStates = [System.Collections.Generic.Queue[string]]::new([string[]]@('Updating'))
+        $results = @(& (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoSqlVmMonitoringWait -Config $c -WaitMinutes 20 } $config)
+        $results[0].status | Should -Be 'Not selected'
+        $results[0].message | Should -Be 'The SqlIaasExtension on sqlvm01 is Updating now, so there''s nothing to repair.'
+        $results[1].status | Should -Be 'Pass'
+        $script:monitoringCalls | Should -Be 2
+        @($script:calls | Where-Object { $_ -like 'post *' }) | Should -BeNullOrEmpty
+    }
+
+    It 're-applies exactly what infra/modules/sqlvm01.bicep sets on the SQL virtual machine' {
+        # A setting the template adds later fails this test until the repair re-applies it too.
+        $bicep = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/sqlvm01.bicep') -Raw
+        $start = $bicep.IndexOf('resource sqlVirtualMachine ')
+        $start | Should -BeGreaterThan 0
+        $end = $bicep.IndexOf('@description(', $start)
+        $block = $bicep.Substring($start, $end - $start)
+        $keys = @([regex]::Matches($block, '(?m)^\s+(\w+):') | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -notin 'name', 'location', 'tags', 'properties' } | Sort-Object)
+        $keys | Should -Be @('connectivityType', 'enableAutomaticUpgrade', 'port', 'serverConfigurationsManagementSettings', 'sqlConnectivityUpdateSettings', 'sqlServerLicenseType', 'virtualMachineResourceId')
+        $template = & (Get-Module -Name DbHubDemo) { Get-DemoSqlVmTemplateSetting }
+        $block | Should -Match ('enableAutomaticUpgrade: {0}' -f ([string]$template['enableAutomaticUpgrade']).ToLowerInvariant())
+        $block | Should -Match ('connectivityType: ''{0}''' -f $template['connectivityType'])
+        $block | Should -Match ('port: {0}' -f $template['port'])
+        $block | Should -Match 'sqlServerLicenseType: sqlLicenseType' -Because 'the license type is the resource''s own, which a repair keeps'
     }
 }
 

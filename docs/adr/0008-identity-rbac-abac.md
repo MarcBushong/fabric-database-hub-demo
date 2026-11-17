@@ -45,7 +45,7 @@ Preflight checks each prerequisite and reports it with a status ([ADR 0012](0012
 | P6 | An Entra security group **owned by the deploying user**, set as the Azure SQL Entra admin. The deployment adds the T1 runner identity to it. | The user (if group creation is allowed) or an Entra administrator | Fully automated T3 configuration |
 | P7 | *(Optional)* GitHub one-click: `setup-github-oidc.ps1` creates the identity and federated credentials (Contributor can), and an Owner, User Access Administrator, or Role Based Access Control Administrator assigns **Contributor on the subscription** to it. The exact command is printed. | One-time administrator action | `deploy.yml`, `demo-control.yml`, `destroy.yml`, scheduled workflows |
 | P8 | *(Optional)* Reader on the subscription for presenters or attendees who aren't Contributors | Owner, User Access Administrator, or Role Based Access Control Administrator | Hub visibility for those users |
-| P9 | *(Optional)* A GitHub fine-grained token in a Key Vault secret readable by the notebook user | The user | Triggering scenarios from the live-activity notebook |
+| P9 | *(Optional)* A GitHub fine-grained token in a Key Vault secret readable by the notebook user. **Retired 2026-11-14** ([ADR 0026](0026-one-run-all-session.md)): nothing reads it, and a session needs no GitHub | The user | Triggering scenarios from the live-activity notebook, until 2026-11-14 |
 | P10 | *(Optional)* A SQL Server Standard product key | The customer's licensing | `t2SqlInstallMode = ProductKey` |
 
 ### Identities

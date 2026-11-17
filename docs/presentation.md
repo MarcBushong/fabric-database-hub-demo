@@ -48,7 +48,7 @@ The rule for Power BI content, from Microsoft Learn: "On F SKUs smaller than F64
 
 - **Azure access:** the telemetry endpoint returns rows only for resources the caller can read: Reader or higher on each subscription, and `Microsoft.Sql` registered ([query performance monitoring telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry)). Contributors already have it. For others, `Set-DemoPresenterAccess` assigns Reader and the Arc telemetry role (**Azure Hybrid Database Administrator - Read Only Service Role**), or prints the commands ([permissions](permissions.md#presenter-access)).
 - **Dashboard access isn't data access:** sharing the Real-Time Dashboard doesn't grant access to the telemetry; a viewer without Reader sees empty tiles ([Real-Time Dashboard permissions](https://learn.microsoft.com/fabric/real-time-intelligence/dashboard-permissions)).
-- **The check:** `preflight.ps1` and `configure-fabric.ps1` report `PREFLIGHT.FABRIC.VIEWERLICENSE`: a **Warning** with this rule when the workspace's capacity is smaller than F64 or its SKU can't be read, and **Pass** on F64 or larger. It reads the SKU with Get Workspace and List Capacities, and never changes the capacity ([ADR 0012](adr/0012-validation-model.md#phase-18-presentation-checks-2026-10-21)).
+- **The check:** none since 2026-11-14. The demo assumes that its viewers have the licenses this rule asks for (the user, 2026-11-14: "Make the assumption that the PBI licenses are sorted out"), so `preflight.ps1` and `configure-fabric.ps1` report `PREFLIGHT.FABRIC.VIEWERLICENSE` as **Not selected** with the rule and read nothing; before, it read the capacity's SKU and warned below F64. Nothing changes the capacity ([ADR 0012](adr/0012-validation-model.md#phase-18-presentation-checks-2026-10-21)).
 
 ## Cost
 
@@ -72,6 +72,28 @@ The demo's Fabric app is the Insights app, `APP_DatabaseHub_Insights`: a [Fabric
 - **In the walkthrough:** use it after the report, to show that the same governed model feeds a custom experience, and to take a visual's DAX or data out live. During an incident beat, its prompts are a fast way into the Database Agent: pick the window, select **Copy and open Database Hub** on **What caused it**, and paste it into the Database Agent.
 
 The org app that the report spec planned was dropped on 2026-10-22.
+
+## Screenshots
+
+Captured from live data by the agents that built each surface, without automating any portal. Nothing identifying is visible: no tenant, subscription, or resource IDs, no emails, account names, or IP addresses. T3's server suffix shows as `<id>`, and the notebook's run ID is masked.
+
+### The Power BI history report
+
+Power BI Desktop's render of the deployed report against the live model, captured on 2026-10-22 from the history that the notebooks saved on 2026-10-20 and 2026-10-21; times are UTC. No scenario had run yet, so the incident shown is a detected IO-pressure window, not a requested one.
+
+| 1. Estate at a glance | 2. The incident, minute by minute |
+|---|---|
+| ![The Estate at a glance page: 3 of 3 targets sent telemetry, CPU per target against an 80 % attention line, and the findings that still need attention](images/readme/powerbi-report-estate.png) | ![The incident page: Buffer IO waits on T2 around a detected incident window, a verdict, and the notebook's findings for that window](images/readme/powerbi-report-incident.png) |
+| Telemetry coverage, CPU per target against the 80 % attention line, and the findings that still need attention | One incident's signal before, during, and after its window, with a verdict and the notebook's evidence |
+
+| 3. Signal explorer | 4. Readiness checks |
+|---|---|
+| ![The Signal explorer page: CPU per target over time, the signal against load, and wait time by category](images/readme/powerbi-report-explorer.png) | ![The Readiness checks page: 12 checks with 0 failed, 2 manual steps, and 2 warnings, each with its exact fix](images/readme/powerbi-report-readiness.png) |
+| Any signal on any target over time, against load, with the wait time by category | The deployment notebook's checks by status, with the exact fix for each one |
+
+### The Fabric App (preview)
+
+No screenshots yet. The [app's guide](../fabric/app/README.md#whats-in-it) describes its four pages: Estate, Incidents, Readiness, and Live links.
 
 ## Sources (checked 2026-10-21)
 

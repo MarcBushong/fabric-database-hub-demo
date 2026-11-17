@@ -34,6 +34,9 @@ internal sealed record PgEndpoint(string Host, string Database, string User, PgA
     public const string UserVariable = "CONTOSOCARE_PG_USER";
     public const string PasswordVariable = "CONTOSOCARE_PG_PASSWORD";
 
+    /// <summary>True for T4's read replica (ADR 0025): the same database, role, and sign-in as T4, on another server.</summary>
+    public bool IsReplica { get; init; }
+
     public static PgEndpoint Create(string? server, string? user, bool passwordFromEnvironment, string? managedIdentityClientId)
     {
         if (string.IsNullOrWhiteSpace(server))
@@ -41,15 +44,7 @@ internal sealed record PgEndpoint(string Host, string Database, string User, PgA
             throw new ScenarioRequestException("T4 needs --server, the flexible server's name or FQDN (for example pgflex01-abc123.postgres.database.azure.com).");
         }
 
-        var text = server.Trim();
-        var port = 5432;
-        var separator = text.LastIndexOf(':');
-        if (separator > 0 && int.TryParse(text[(separator + 1)..], NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed is > 0 and < 65536)
-        {
-            port = parsed;
-            text = text[..separator];
-        }
-
+        var (text, port) = SplitPort(server);
         if (!IsHostName(text))
         {
             throw new ScenarioRequestException("--server must be a host name such as pgflex01-abc123.postgres.database.azure.com.");
@@ -79,11 +74,41 @@ internal sealed record PgEndpoint(string Host, string Database, string User, PgA
         return new PgEndpoint(text.ToLowerInvariant(), DatabaseName, role, PgAuthMode.ManagedIdentity, managedIdentityClientId, port);
     }
 
+    /// <summary>
+    /// T4's read replica (ADR 0025), named by <paramref name="option"/>: the same database, role, token, and TLS checks
+    /// on the replica's server, whose name is completed like --server's. Null without a name; T4's own server is refused.
+    /// </summary>
+    public PgEndpoint? Replica(string? server, string option = "--replica-server")
+    {
+        if (string.IsNullOrWhiteSpace(server))
+        {
+            return null;
+        }
+
+        var (text, port) = SplitPort(server);
+        if (!IsHostName(text))
+        {
+            throw new ScenarioRequestException($"{option} must be a host name such as pgreplica01-abc123.postgres.database.azure.com.");
+        }
+
+        if (Auth == PgAuthMode.ManagedIdentity)
+        {
+            text = (text.Contains('.', StringComparison.Ordinal) ? text : text + ".postgres.database.azure.com").ToLowerInvariant();
+        }
+
+        if (string.Equals(text, Host, StringComparison.OrdinalIgnoreCase) && port == Port)
+        {
+            throw new ScenarioRequestException($"{option} names T4 itself; it must be T4's read replica (pgreplica01-<id>).");
+        }
+
+        return this with { Host = text, Port = port, IsReplica = true };
+    }
+
     /// <summary>The same server and identity, signed in as another role or to another database (setup's admin and role steps).</summary>
     public PgEndpoint WithUser(string user, string? database = null) => this with { User = user, Database = database ?? Database };
 
     /// <summary>A description that's safe to log (no credentials exist in this record).</summary>
-    public string Describe() => string.Create(CultureInfo.InvariantCulture, $"T4 {Host}/{Database} as {(User.Length > 0 ? User : "(environment)")} ({Auth})");
+    public string Describe() => string.Create(CultureInfo.InvariantCulture, $"{(IsReplica ? "T4's read replica" : "T4")} {Host}/{Database} as {(User.Length > 0 ? User : "(environment)")} ({Auth})");
 
     internal static bool IsHostName(string value) =>
         value.Length is > 0 and <= 253
@@ -95,6 +120,19 @@ internal sealed record PgEndpoint(string Host, string Database, string User, PgA
         value.Length is > 0 and <= 63
         && value.All(c => char.IsAsciiLetterOrDigit(c) || c is ' ' or '_' or '-' or '.' or '(' or ')')
         && value.Trim().Length == value.Length;
+
+    /// <summary>A server name and its port: 5432 unless the name ends with :port.</summary>
+    private static (string Host, int Port) SplitPort(string server)
+    {
+        var text = server.Trim();
+        var separator = text.LastIndexOf(':');
+        if (separator > 0 && int.TryParse(text[(separator + 1)..], NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed is > 0 and < 65536)
+        {
+            return (text[..separator], parsed);
+        }
+
+        return (text, 5432);
+    }
 }
 
 /// <summary>
@@ -163,6 +201,8 @@ internal sealed class PgConnectionOpener(PgEndpoint endpoint, RunnerLog log)
 
     public static TimeSpan RetryWindow => TimeSpan.FromSeconds(90);
 
+    private string Target => endpoint.IsReplica ? "T4 replica" : "T4";
+
     /// <summary>Opens a connection, retrying transient errors unless <paramref name="retry"/> is false. Session limits are applied right after it opens.</summary>
     public async Task<NpgsqlConnection> OpenAsync(string applicationName, CancellationToken cancellationToken, PgSessionLimits? limits = null, bool retry = true)
     {
@@ -178,7 +218,7 @@ internal sealed class PgConnectionOpener(PgEndpoint endpoint, RunnerLog log)
                 await ApplyLimitsAsync(connection, limits ?? PgSessionLimits.Control, cancellationToken).ConfigureAwait(false);
                 if (attempt > 1)
                 {
-                    log.Info("pg.connected", "Connected after retrying.", ("target", "T4"), ("attempts", attempt), ("elapsed", DateTimeOffset.UtcNow - started));
+                    log.Info("pg.connected", "Connected after retrying.", ("target", Target), ("attempts", attempt), ("elapsed", DateTimeOffset.UtcNow - started));
                 }
 
                 return connection;
@@ -190,7 +230,7 @@ internal sealed class PgConnectionOpener(PgEndpoint endpoint, RunnerLog log)
                     await connection.DisposeAsync().ConfigureAwait(false);
                 }
 
-                log.Warn("pg.retry", "Transient connection error; retrying (the server may be starting or at its connection limit).", ("target", "T4"), ("error", Describe(ex)), ("attempt", attempt), ("delay", delay));
+                log.Warn("pg.retry", "Transient connection error; retrying (the server may be starting or at its connection limit).", ("target", Target), ("error", Describe(ex)), ("attempt", attempt), ("delay", delay));
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
                 delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, 15));
             }

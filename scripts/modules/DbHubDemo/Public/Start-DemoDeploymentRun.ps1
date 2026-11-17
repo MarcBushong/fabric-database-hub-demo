@@ -14,7 +14,9 @@ function Start-DemoDeploymentRun {
       browser (Open-DemoProgressPage; in GitHub Codespaces it prints how to preview it). Not in GitHub Actions, and not
       with -NoStatusPage.
     - The banner: Get-DemoDeploymentExpectation and Get-DemoDeploymentNotice, through the redacting console writer.
-    Returns ProgressPath, PagePath, Writer, KeepAwake, StartedUtc, Command, Environment, InstallMode, and WaitForT2, for
+    - The busy marker (2026-11-14), with -BusyMarker: Start-DemoBusyMarkerRun starts its refresher, which keeps the nightly
+      stop waiting while the run goes on; Complete-DemoDeploymentRun ends it. Not with -WhatIf.
+    Returns ProgressPath, PagePath, Writer, KeepAwake, StartedUtc, Command, Environment, InstallMode, WaitForT2, and Busy, for
     Invoke-DemoDeployment and Complete-DemoDeploymentRun.
 
     .PARAMETER Config
@@ -42,8 +44,11 @@ function Start-DemoDeploymentRun {
     Lines that go first in the banner's notes and on the status page, before what the run ignores in the configuration:
     deploy.ps1's self-update, the update it made or why it couldn't (Invoke-DemoSelfUpdate, 2026-11-09).
 
+    .PARAMETER BusyMarker
+    Keep the nightly stop waiting while this run goes on (deploy.ps1; 2026-11-14).
+
     .EXAMPLE
-    $run = Start-DemoDeploymentRun -Config $config -WaitForT2
+    $run = Start-DemoDeploymentRun -Config $config -WaitForT2 -BusyMarker
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -64,7 +69,9 @@ function Start-DemoDeploymentRun {
         [string] $OutputDirectory = '',
 
         [AllowEmptyCollection()]
-        [string[]] $Note = @()
+        [string[]] $Note = @(),
+
+        [switch] $BusyMarker
     )
 
     $environment = Get-DemoRunEnvironment
@@ -84,6 +91,7 @@ function Start-DemoDeploymentRun {
         Environment  = $environment
         InstallMode  = $installMode
         WaitForT2    = [bool]$WaitForT2
+        Busy         = $null
     }
     if (-not $PSCmdlet.ShouldProcess($paths.Model, 'Write the status page and keep this PC awake')) {
         return $run
@@ -106,6 +114,17 @@ function Start-DemoDeploymentRun {
             }
             catch {
                 Write-DemoLog -Level Warning -Message ('The status page couldn''t be set up, so the console is the only view: {0}' -f $_.Exception.Message)
+            }
+        }
+        # The busy marker (2026-11-14), with -BusyMarker (deploy.ps1): its refresher, in its own process with its own
+        # subscription guard, keeps the nightly stop waiting while this run goes on; Complete-DemoDeploymentRun ends it and
+        # settles what the nightly stop does.
+        if ($BusyMarker) {
+            try {
+                $run.Busy = Start-DemoBusyMarkerRun -Config $Config -ProgressPath ([string]$run.ProgressPath) -Confirm:$false
+            }
+            catch {
+                Write-DemoLog -Level Warning -Message ('The nightly stop can''t wait for this run: the busy marker''s refresher didn''t start ({0}).' -f (Protect-DemoText -Text $_.Exception.Message).TrimEnd('.'))
             }
         }
         $notices = Get-DemoDeploymentNotice -Environment $environment -SkipFabric:$SkipFabric

@@ -1,7 +1,20 @@
 import { describe, expect, it } from "vitest";
 
-import type { Bin, Incident, TargetSummary, WaitFlow } from "@/data/model";
-import { busiestHourInsight, compareIncident, coverageInsight, dominantWaitInsight, freshnessInsight, incidentInsight, incidentPadMinutes, lagInsight, readinessInsight } from "./insights";
+import { replicaCatchUp, type Bin, type Incident, type PostgresCapture, type PostgresPoint, type TargetSummary, type WaitFlow } from "@/data/model";
+import {
+    busiestHourInsight,
+    compareIncident,
+    coverageInsight,
+    dominantWaitInsight,
+    failedConnectionsInsight,
+    freshnessInsight,
+    incidentInsight,
+    incidentPadMinutes,
+    lagInsight,
+    postgresCpuInsight,
+    readinessInsight,
+    replicaLagInsight,
+} from "./insights";
 import { mean, quantile, density } from "./stats";
 import { statusBySort, statusClass, statusColor, statusMeta, worstStatus } from "./status";
 
@@ -154,5 +167,89 @@ describe("insights", () => {
         const old = freshnessInsight({ ...empty, latestCapture: at(0), notebookRuns: 1 }, new Date(Date.UTC(2026, 9, 23)));
         expect(old?.status).toBe("Warning");
         expect(old?.detail).toContain("Run NB_DatabaseHub_LiveActivity");
+    });
+});
+
+describe("T4's insights (ADR 0025)", () => {
+    const point = (target: PostgresPoint["target"], metric: string, minute: number, value: number): PostgresPoint => ({
+        at: new Date(Date.UTC(2026, 10, 13, 17, minute)),
+        target,
+        server: target === "T4" ? "pgflex01-test01" : "pgreplica01-test01",
+        metric,
+        value,
+    });
+    const capture = (points: PostgresPoint[]): PostgresCapture => ({
+        capturedAt: null,
+        windowStart: null,
+        windowEnd: null,
+        intervalMinutes: 5,
+        servers: Object.fromEntries(points.map((p) => [p.target, p.server])),
+        points,
+    });
+
+    it("warns about Read replica lag at 60 s or more, and passes below it", () => {
+        const lag = (peak: number) => capture([point("T4-replica", "physical_replication_delay_in_seconds", 0, 6), point("T4-replica", "physical_replication_delay_in_seconds", 5, peak)]);
+        const high = replicaLagInsight(lag(241.4));
+        expect(high?.status).toBe("Warning");
+        expect(high?.title).toBe("Read replica lag peaked at 241 s at 17:05 UTC on 13 Nov.");
+        expect(high?.detail).toBe("124 s on average over 2 intervals on pgreplica01-test01; 60 s or more is a warning.");
+        expect(replicaLagInsight(lag(60))?.status).toBe("Warning");
+        expect(replicaLagInsight(lag(59.9))?.status).toBe("Pass");
+        expect(replicaLagInsight(null)).toBeNull();
+    });
+
+    it("says why a capture has no Read replica lag: the replica exists only during a session", () => {
+        const insight = replicaLagInsight(capture([point("T4", "cpu_percent", 0, 40)]));
+        expect(insight?.status).toBe("Not selected");
+        expect(insight?.detail).toContain("exists only during a session");
+    });
+
+    it("leaves the replica's catch-up after a restart out of the lag's peak, with the Nov 13 data (2026-11-16)", () => {
+        // Live, 2026-11-13: the replica stopped at 00:38:46Z and started again at 00:57Z; Azure Monitor read 1,380 s at 01:00,
+        // the time since its last replay, before the replica-lag beat's 219 s.
+        const lagAt = (hour: number, minute: number, value: number): PostgresPoint => ({
+            at: new Date(Date.UTC(2026, 10, 14, hour, minute)),
+            target: "T4-replica",
+            server: "pgreplica01-rrpigs",
+            metric: "physical_replication_delay_in_seconds",
+            value,
+        });
+        const nov13 = [lagAt(0, 20, 3), lagAt(0, 25, 2), lagAt(0, 30, 4), lagAt(0, 35, 5), lagAt(1, 0, 1380), lagAt(1, 5, 67), lagAt(1, 10, 218), lagAt(1, 15, 219), lagAt(1, 20, 3)];
+        const window = (points: PostgresPoint[], hour = 0, minute = 0): PostgresCapture => ({ ...capture(points), windowStart: new Date(Date.UTC(2026, 10, 14, hour, minute)) });
+        expect(replicaCatchUp(window(nov13), nov13).map((p) => p.value)).toEqual([1380]);
+        const insight = replicaLagInsight(window(nov13));
+        expect(insight?.status).toBe("Warning");
+        expect(insight?.title).toBe("Read replica lag peaked at 219 s at 01:15 UTC on 14 Nov.");
+        expect(insight?.detail).toContain("Left out: 1,380 s at 01:00 UTC, the replica's catch-up after its restart, not lag.");
+        // Only the catch-up: a Pass that says so.
+        const only = [lagAt(1, 0, 3900)];
+        const onlyInsight = replicaLagInsight(window(only));
+        expect(onlyInsight?.status).toBe("Pass");
+        expect(onlyInsight?.title).toBe("The latest capture's Read replica lag is only the replica's catch-up after its restart.");
+        // A fresh replica's small first points, and a beat's 300 s right after a short gap, are lag.
+        const fresh = [lagAt(0, 30, 0.4), lagAt(0, 35, 1), lagAt(0, 40, 120), lagAt(0, 45, 2), lagAt(1, 5, 300), lagAt(1, 10, 2)];
+        expect(replicaCatchUp(window(fresh), fresh)).toEqual([]);
+        expect(replicaLagInsight(window(fresh))?.title).toBe("Read replica lag peaked at 300 s at 01:05 UTC on 14 Nov.");
+    });
+
+    it("warns about T4's CPU at 80 % or more, with its connections' peak", () => {
+        const insight = postgresCpuInsight(capture([point("T4", "cpu_percent", 0, 43.3), point("T4", "cpu_percent", 5, 91.3), point("T4", "active_connections", 5, 34), point("T4-replica", "cpu_percent", 0, 99)]));
+        expect(insight?.status).toBe("Warning");
+        expect(insight?.title).toBe("T4's CPU peaked at 91.3 % at 17:05 UTC on 13 Nov.");
+        expect(insight?.detail).toBe("67.3 % on average; active connections peaked at 34 at 17:05 UTC. 80 % or more is a warning.");
+        expect(postgresCpuInsight(capture([point("T4", "cpu_percent", 0, 79.9)]))?.status).toBe("Pass");
+        expect(postgresCpuInsight(capture([point("T4-replica", "cpu_percent", 0, 99)]))).toBeNull();
+    });
+
+    it("counts T4's failed connections: a warning above 0, a pass at 0", () => {
+        const failed = failedConnectionsInsight(capture([point("T4", "connections_failed", 0, 0), point("T4", "connections_failed", 5, 3), point("T4", "connections_failed", 10, 1)]));
+        expect(failed?.status).toBe("Warning");
+        expect(failed?.metric).toBe("4");
+        expect(failed?.title).toBe("4 failed connections on T4 in the latest capture.");
+        expect(failed?.detail).toBe("At most 3 in one 5-minute interval, at 17:05 UTC on 13 Nov.");
+        const none = failedConnectionsInsight(capture([point("T4", "connections_failed", 0, 0)]));
+        expect(none?.status).toBe("Pass");
+        expect(none?.title).toBe("No failed connections on T4 in the latest capture.");
+        expect(failedConnectionsInsight(null)).toBeNull();
     });
 });

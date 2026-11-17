@@ -284,10 +284,17 @@ function Invoke-DemoWorkloadAction {
     $resourceGroup = 'rg-{0}-{1}' -f $Config['prefix'], $Config['environment']
     $script = Get-DemoWorkloadControlScript -Action $Action -Request $Request
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    $bound = @{}
-    if ($TimeoutSeconds -gt 0) {
-        $bound['TimeoutSeconds'] = $TimeoutSeconds
+    if ($TimeoutSeconds -le 0) {
+        # Bounded by default (2026-11-16): 'az vm run-command invoke' waits for the script, which a stuck VM agent would hold
+        # until Azure's own 90-minute limit. The runner's own time limit, plus its wait to be ready and 10 minutes; 30
+        # minutes for the rest, which take a minute or two.
+        $runnerSeconds = 0
+        if ($Action -eq 'Runner') {
+            $runnerSeconds = [int](Get-DemoMemberValue -InputObject $Request -Name 'timeoutSeconds') + [int](Get-DemoMemberValue -InputObject $Request -Name 'readySeconds') + 600
+        }
+        $TimeoutSeconds = [System.Math]::Min(5400, [System.Math]::Max(1800, $runnerSeconds))
     }
+    $bound = @{ TimeoutSeconds = $TimeoutSeconds }
     $run = Invoke-DemoActionRunCommand -SubscriptionId $Config['subscriptionId'] -ResourceGroupName $resourceGroup -VmName $VmName -Script $script @bound
     $seconds = [int]$clock.Elapsed.TotalSeconds
     if ($run.ExitCode -ne 0) {

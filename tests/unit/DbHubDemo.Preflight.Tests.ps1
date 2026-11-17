@@ -62,9 +62,10 @@ BeforeAll {
             [pscustomobject]@{ Results = @(New-DemoResult -CheckId 'PREFLIGHT.COST.SESSION' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.') }
         }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2GoldenSnapshot -MockWith { @() }
-        # Phase 18's P11 check has its own tests (DbHubDemo.FabricItem.Tests.ps1); here it only has to be called.
+        # The P11 check has its own tests (DbHubDemo.FabricItem.Tests.ps1); here it only has to be called. Since 2026-11-14
+        # the viewers' licenses are assumed, so it's Not selected.
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricViewerLicense -MockWith {
-            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.VIEWERLICENSE' -Area 'preflight' -Target 'fabric' -Status 'Warning' -Message 'F16 is smaller than F64.'
+            New-DemoResult -CheckId 'PREFLIGHT.FABRIC.VIEWERLICENSE' -Area 'preflight' -Target 'fabric' -Status 'Not selected' -Message 'Power BI viewer licenses are assumed.'
         }
         # P5 by name (Phase 26a) has its own tests (DbHubDemo.FabricResolve.Tests.ps1); here it sends nothing.
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricResolution -MockWith {
@@ -741,6 +742,22 @@ Describe 'Invoke-DemoPreflight' {
         $p6 = Invoke-DemoPreflight -Config $config | Where-Object checkId -eq 'PREFLIGHT.P6.GROUP'
         $p6.status | Should -Be 'Fail'
         $p6.message | Should -Match 'not found in the configured tenant'
+        $p6.remediation | Should -Match 'Create an Entra security group'
+    }
+
+    It 'asks for a new sign-in, not a new group, when Microsoft Graph refuses the token (live, 2026-11-16)' {
+        # Live, 2026-11-16: after the tenant's sign-in policies changed, Graph answered 401 with Continuous Access
+        # Evaluation's InteractionRequired, also for one fresh token, and P6 told the user to create a new group.
+        Set-HappyAzMock
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -ParameterFilter { $Uri -like 'https://graph.microsoft.com/v1.0/groups/*' } -MockWith {
+            [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'HTTP 401 on GET https://graph.microsoft.com/v1.0/groups/x: {"error":{"code":"InvalidAuthenticationToken","message":"Continuous access evaluation resulted in challenge with result: InteractionRequired and code: TokenCreatedWithOutdatedPolicies"}}'; StatusCode = 401; Challenge = 'Claims challenge (Continuous Access Evaluation) on the cached token, and the request failed again with one fresh token.' }
+        }
+        $p6 = Invoke-DemoPreflight -Config $config | Where-Object checkId -eq 'PREFLIGHT.P6.GROUP'
+        $p6.status | Should -Be 'Fail'
+        $p6.message | Should -Match 'refused the Azure CLI''s sign-in and asks for a new one'
+        $p6.remediation | Should -Match '^Sign in again yourself: az login'
+        $p6.remediation | Should -Match 'nothing in the configuration changes'
+        $p6.remediation | Should -Not -Match 'Create an Entra security group' -Because 'the group exists; only the sign-in is refused'
     }
 
     It 'passes --subscription on every subscription-scoped call' {
@@ -812,14 +829,13 @@ Describe 'Invoke-DemoPreflight' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { $ArgumentList[0] -eq 'deployment' -and $ArgumentList[1] -eq 'sub' } -Times 0
     }
 
-    It 'reports the optional P11 viewer licensing (Phase 18) once, with the configuration and no token of its own' {
+    It 'reports the optional P11 viewer licensing once, asking it for nothing but the configuration (2026-11-14)' {
         Set-HappyAzMock
         $results = Invoke-DemoPreflight -Config $config -SkipWhatIf
         $license = @($results | Where-Object checkId -eq 'PREFLIGHT.FABRIC.VIEWERLICENSE')
         $license.Count | Should -Be 1
-        $license[0].status | Should -Be 'Warning'
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricViewerLicense -Times 1 -Exactly -ParameterFilter {
-            $Config['fabric']['workspaceId'] -eq $config['fabric']['workspaceId'] -and $null -eq $Token -and $null -eq $CapacityResult
+            $Config['fabric']['workspaceId'] -eq $config['fabric']['workspaceId'] -and @($PesterBoundParameters.Keys) -join ',' -eq 'Config'
         }
         @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty
     }

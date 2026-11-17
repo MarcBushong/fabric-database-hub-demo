@@ -28,12 +28,12 @@ pre-commit install
 ./tests/Invoke-StaticValidation.ps1
 ```
 
-It runs PSScriptAnalyzer, Pester, the Bicep build and `azuredeploy.json` sync check, PSRule for Azure, the workload generator's build and tests, the Fabric App's checks (when Node.js is installed), and markdownlint, and reports each check as **Pass**, **Fail**, or **Not selected**. It makes no Azure calls. CI runs the same checks, plus actionlint and gitleaks.
+It runs PSScriptAnalyzer, Pester, the Bicep build and `azuredeploy.json` sync check, PSRule for Azure, the workload generator's build and tests, the Fabric App's checks (when Node.js is installed), and markdownlint, and reports each check as **Pass**, **Fail**, or **Not selected**. It makes no Azure calls. CI runs the same checks, plus actionlint and gitleaks. Pester runs with a guard (`tests/TestAzGuard.ps1`, 2026-11-16): a stand-in `az` stops any call a unit test makes and lists it as `STATIC.PESTER.AZURECLI` **Fail**, and `AZURE_CONFIG_DIR` is an empty folder, so no test uses your Azure sign-in.
 
 - **A faster loop:** pick checks with `-Check`, for example `./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester`, or run one test file with `Invoke-Pester -Path tests/unit/<file>.Tests.ps1`. Run the whole validation once before you open the pull request.
 - **One copy of the module per window:** Pester runs in the window you start it from. If that window ran the demo's scripts from another copy of the repository, the tests stop with "Multiple script or manifest modules named 'DbHubDemo' are currently loaded"; run them in a new PowerShell window (R822).
 - **Secrets and workflows:** the pre-commit hook runs gitleaks; to run it and actionlint yourself, use the versions pinned in `config/versions.json` (`gitleaks git --redact .` and `actionlint`).
-- **What a pull request runs:** `validate.yml` runs the static checks on every pull request, from a fork too, with a read-only token and no secrets. The live workflows (deploy, destroy, demo-control, warm-up, and the schedules) never run on a pull request: they run only by hand or on a schedule, in a GitHub environment that a maintainer approves ([ADR 0022](docs/adr/0022-public-repository-and-github-actions-hardening.md)).
+- **What a pull request runs:** `validate.yml` runs the static checks on every pull request to this public repository, from a fork too, with a read-only token and no secrets. A private copy runs them only when its repository variable `STATIC_CHECKS_ENABLED` is `true`, or by hand, so it spends no Actions minutes unless its owner opts in. The live workflows (deploy, destroy, demo-control, warm-up, and the schedules) never run on a pull request: they run only by hand or on a schedule, in a GitHub environment that a maintainer approves ([ADR 0022](docs/adr/0022-public-repository-and-github-actions-hardening.md)).
 
 ## Rules
 

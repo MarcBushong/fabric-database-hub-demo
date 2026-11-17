@@ -123,7 +123,9 @@ function Enable-DemoSqlVmMonitoring {
                 '--extension-instance-name', [string]$setting['extensionInstanceName']
                 '--settings', "@$path"
             )
-            $set = Invoke-DemoAzWithConflictRetry -SubscriptionId $state.SubscriptionId -ArgumentList $arguments -Label ('{0}: merging {1}' -f $state.VmName, $flagName)
+            # Bounded (2026-11-16): 'az vm extension set' waits for the extension's own update, which a VM agent that's stuck
+            # would hold without end; 20 minutes is several times a normal update, and the Fail below says what to do.
+            $set = Invoke-DemoAzWithConflictRetry -SubscriptionId $state.SubscriptionId -ArgumentList $arguments -Label ('{0}: merging {1}' -f $state.VmName, $flagName) -TimeoutSeconds 1200
         }
         finally {
             Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null

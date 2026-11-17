@@ -38,8 +38,10 @@ function Invoke-DemoAz {
     https://learn.microsoft.com/cli/azure/role/assignment#az-role-assignment-create
 
     .PARAMETER TimeoutSeconds
-    Stop the Azure CLI when it hasn't finished after this many seconds (0: no limit, except for token
-    requests).
+    Stop the Azure CLI when it hasn't finished after this many seconds (0: no limit, except for token requests,
+    120 seconds, and 'az rest', 300 seconds: it has no time limit of its own, and one call that got no answer held a
+    deploy.ps1 run for over 2 hours on 2026-11-16). Other commands go through the Azure SDK's transport, which has
+    its own read time limit.
 
     .EXAMPLE
     Invoke-DemoAz -SubscriptionId $config.subscriptionId -ArgumentList 'group', 'show', '--name', 'rg-dbhub-demo' -AsJson
@@ -165,8 +167,16 @@ function Invoke-DemoAz {
         $arguments.Add('json')
     }
 
-    if ($isTokenRequest -and $TimeoutSeconds -eq 0) {
-        $TimeoutSeconds = 120
+    if ($TimeoutSeconds -eq 0) {
+        if ($isTokenRequest) {
+            $TimeoutSeconds = 120
+        }
+        elseif ($command -eq 'rest') {
+            # 'az rest' has no time limit of its own: live on 2026-11-16, one GET of a Run Command's instance view got no
+            # answer for over 2 hours, which held deploy.ps1's T1 track with no end and kept the demo awake (R862). Resource
+            # Manager answers in seconds; a call stopped here is a failed call, which every caller handles.
+            $TimeoutSeconds = 300
+        }
     }
     $result = if ($TimeoutSeconds -gt 0) {
         Invoke-DemoAzCli -ArgumentList $arguments.ToArray() -TimeoutSeconds $TimeoutSeconds

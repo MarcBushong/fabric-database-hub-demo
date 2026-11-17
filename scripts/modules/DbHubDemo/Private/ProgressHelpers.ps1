@@ -166,6 +166,7 @@ function Get-DemoProgressCatalog {
         $tracks.Add([ordered]@{ name = 'T4'; label = 'T4: Azure Database for PostgreSQL'; steps = @(
                     (& $step 'T4.Server' 'Server checks' @('T4/Server'))
                     (& $step 'T4.Setup' 'Set up from T1' @('T1/T4'))
+                    (& $step 'T4.Replica' 'Read replica (created for each session; about 9 minutes)' @('T4/Replica'))
                     (& $step 'T4.Telemetry' 'Metrics in Azure Monitor' @('T4/Telemetry'))
                 )
             })
@@ -179,6 +180,8 @@ function Get-DemoProgressCatalog {
             })
     }
     $t2 = [System.Collections.Generic.List[object]]::new()
+    # Displayed when it happens (2026-11-17): the T2 track sets it itself (Invoke-DemoT2HostRebuild); the plan marks it Skipped.
+    $t2.Add((& $step 'T2.HostRebuild' 'Rebuild of archost01 (only when its VM agent stays down and a deallocate and start doesn''t bring it back)' @()))
     $t2.Add((& $step 'T2.Restore' 'Restore from the golden snapshot' @('T2/Restore')))
     $t2.Add((& $step 'T2.Artifacts' 'Artifacts to archost01' @('T2/Artifacts')))
     $t2.Add((& $step 'T2.Bootstraps' 'Bootstrap' @('T2/Bootstraps')))
@@ -198,6 +201,17 @@ function Get-DemoProgressCatalog {
         # Displayed after the validation, when it happens: deploy.ps1 itself runs it once DONE's checks are done
         # (Invoke-DemoHistorySnapshotStep, 2026-11-06).
         $validation.Add((& $step 'Fabric.History' 'History report''s snapshot (NB_DatabaseHub_LiveActivity, once, analyze-only)' @('Validation') $true))
+    }
+    # The busy marker (2026-11-14): deploy.ps1's refresher says here when the nightly stop waits for this run, and its end
+    # says when the demo stops tonight (Update-DemoBusyMarker, Complete-DemoBusyMarkerRun).
+    $validation.Add((& $step 'NightlyStop' 'Nightly stop (waits while this run works, then stops the demo the same night)' @() $true))
+    # The session control (ADR 0026): deploy.ps1 sets it up in Azure while the tracks run, and puts its notebook in Fabric
+    # after the Fabric track (Invoke-DemoControlDeployStep). Non-blocking: it never keeps the run from DONE.
+    $validation.Add((& $step 'Control' 'Session control (NB_DatabaseHub_Control: one Run all runs a whole session)' @() $true))
+    if ($T4Enabled) {
+        # T4's read replica at the run's end (2026-11-16, Invoke-DemoT4ReplicaDeployEnd): deleted once DONE's checks and the
+        # history snapshot have read it, unless a session uses it. Non-blocking: it never keeps the run from DONE.
+        $validation.Add((& $step 'T4ReplicaEnd' 'T4''s read replica at the end (deleted unless a session uses it; start-demo.ps1 and Run all create it for each session)' @() $true))
     }
     $tracks.Add([ordered]@{ name = 'Validation'; label = 'Validation'; steps = $validation.ToArray() })
     return $tracks.ToArray()
@@ -230,6 +244,7 @@ function Get-DemoProgressStepId {
         'T2/T2' { return @('T2.HostBuild', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring') }
         'T2/Telemetry' { return @('T2.Telemetry') }
         'T4/Server' { return @('T4.Server') }
+        'T4/Replica' { return @('T4.Replica') }
         'T4/Telemetry' { return @('T4.Telemetry') }
         'Fabric/Fabric' { return @('Fabric.Items', 'Fabric.Report', 'Fabric.App') }
         default { return @() }
@@ -307,7 +322,8 @@ function Set-DemoProgressPlan {
     a step outside the run is Skipped, and the T2 steps its source doesn't use are Skipped (a golden restore has no build;
     a build has no restore). A track in -ResendNote, which a resumed run sends back to its Artifacts step
     because its VM's artifacts changed since the last run (Resolve-DemoArtifactResend), shows that note on its Artifacts
-    step instead. Internal.
+    step instead; the Fabric track's note, when a resumed run runs its step again although an earlier run recorded it
+    (Get-DemoFabricTrackRecheck), shows on its rows. Internal.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
     [CmdletBinding()]
@@ -356,7 +372,7 @@ function Set-DemoProgressPlan {
                     if ($unused.Contains($id)) {
                         $map[$id] = $unused[$id]
                     }
-                    elseif ($resendText -and $names[$i] -eq 'Artifacts') {
+                    elseif ($resendText -and ($names[$i] -eq 'Artifacts' -or $track -eq 'Fabric')) {
                         $map[$id] = 'Resend'
                         $notes[$id] = Protect-DemoProgressText -Text $resendText
                         $again = $false
@@ -384,6 +400,8 @@ function Set-DemoProgressPlan {
     # The history report's snapshot runs at the end of every run that reaches its validation, a resumed one included, so it's
     # never "finished in an earlier run" (2026-11-06).
     $map['Fabric.History'] = if ($Plan.Validation) { 'Run' } else { 'Skip' }
+    # The T2 host's rebuild (2026-11-17) happens only when its agent stays down; the T2 track sets the row when it does.
+    $map['T2.HostRebuild'] = if (@($Plan.Tracks['T2']).Count -gt 0) { 'Rebuild' } else { 'Skip' }
     Update-DemoProgress -Path $Path -Data @{ Map = $map; Notes = $notes } -Action {
         param($Model, $Change)
         $now = Get-DemoUnixTime
@@ -395,6 +413,7 @@ function Set-DemoProgressPlan {
                     'Again' { 'Didn''t finish in the previous run; running it again.' }
                     'Resend' { [string]$Change['Notes'][[string]$item['id']] }
                     'Skip' { 'Not part of this run.' }
+                    'Rebuild' { 'Only when archost01''s VM agent stays down and a deallocate and start doesn''t bring it back: deploy.ps1 then deletes the host and creates it again, once.' }
                     'Golden' { 'Restored from the golden snapshot: no build.' }
                     'Build' { 'No golden snapshot: the host builds its guest instead.' }
                     default { '' }

@@ -1,6 +1,13 @@
 BeforeAll {
     $modulePath = Join-Path -Path $PSScriptRoot -ChildPath '../../scripts/modules/DbHubDemo/DbHubDemo.psd1'
     Import-Module -Name $modulePath -Force
+    # No test here reaches the Azure CLI (2026-11-16, tests/TestAzGuard.ps1): an az call that no test mocks gets what the
+    # real CLI answered for these tests' made-up subscription, which they relied on, without leaving this process.
+    Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+        $at = [array]::IndexOf([string[]]$ArgumentList, '--subscription')
+        $subscription = if ($at -ge 0 -and $at + 1 -lt $ArgumentList.Count) { $ArgumentList[$at + 1] } else { '11111111-2222-3333-4444-555555555555' }
+        [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ("ERROR: Subscription '{0}' not found. Check the spelling and casing and try again." -f $subscription) }
+    }
     $exampleConfig = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
 
     # Recorded-style price items keyed by a fragment of the API filter. Prices are fixtures, not real prices.
@@ -298,10 +305,12 @@ Describe 'Get-DemoCostEstimate' {
         $cost.T4MonthlyWorstCaseUsd | Should -Be ([System.Math]::Round(27.46 + 0.18 * 730, 2))
         $cost.DefenderIncluded | Should -BeTrue
         @($cost.Unpriced) | Should -BeNullOrEmpty
-        # The demo's month with it is what PREFLIGHT.COST.MONTHLY checks: the light-use month plus the restart's worst case.
+        # The demo's month with it is what PREFLIGHT.COST.MONTHLY checks: the light-use month plus the restart's worst case,
+        # without T4's read replica's share, which never changes a size verdict (ADR 0025, 2026-11-13).
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_D2ds_v5' }) -NetworkMode public -DefenderPlans $plans -T3UseFreeLimit $false
-        $cost.MonthlyWorstCaseUsd | Should -Be ([System.Math]::Round($estimate.LightUseMonthly + $estimate.T4AutoRestartWorstCaseMonthly, 2))
-        $cost.SessionUsd | Should -Be $estimate.SessionCost
+        $cost.MonthlyWorstCaseUsd | Should -Be ([System.Math]::Round($estimate.LightUseMonthlyWithoutReplica + $estimate.T4AutoRestartWorstCaseMonthly, 2))
+        $cost.SessionUsd | Should -Be $estimate.SessionCostWithoutReplica
+        $estimate.SessionCostWithoutReplica | Should -BeLessThan $estimate.SessionCost -Because 'the estimate itself counts the replica'
         $cost.Allowed | Should -Be ($cost.MonthlyWorstCaseUsd -le 250 -and $cost.SessionUsd -le 15)
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoRetailPriceRequest -ParameterFilter { [uri]::UnescapeDataString($Uri) -match "productName eq 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'" }
 
@@ -310,6 +319,68 @@ Describe 'Get-DemoCostEstimate' {
         $unread = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4GeneralPurposeCost -Config $Config -NetworkMode public -T3UseFreeLimit $false }
         $unread.DefenderIncluded | Should -BeFalse
         @($unread.Unpriced) | Should -Contain 'Microsoft Defender for Cloud (the subscription''s plans weren''t read)'
+    }
+
+    It 'prices T4''s read replica for each session only: its compute at T4''s size, its storage by the hour, and its Defender plans, with no restart to count (ADR 0025)' {
+        $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'OpenSourceRelationalDatabases'; pricingTier = 'Standard'; subPlan = $null })
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans
+        $replica = @($estimate.Components | Where-Object Name -Match 'T4 read replica')
+        $compute = $replica | Where-Object Name -EQ 'T4 read replica compute (Standard_D4ds_v5; for each session only)'
+        $compute.Basis | Should -Be 'running'
+        $compute.UnitPrice | Should -Be 0.09 -Because 'T4''s own vCore meter: the replica follows T4''s size'
+        $compute.Quantity | Should -Be 4
+        $storage = $replica | Where-Object Name -EQ 'T4 read replica storage (for each session only)'
+        $storage.Basis | Should -Be 'running'
+        $storage.Quantity | Should -Be (32 / 730) -Because '32 GiB for one of the month''s 730 hours'
+        ($replica | Where-Object Name -Match 'open-source relational').Quantity | Should -Be (1 / 730)
+        ($replica | Where-Object Name -Match 'Defender CSPM').Cost | Should -Be 0.012
+        @($replica | Where-Object Basis -NE 'running').Count | Should -Be 0 -Because 'nothing of it bills between sessions'
+        $hourly = 0.36 + [System.Math]::Round(0.10 * 32 / 730, 4) + [System.Math]::Round(15.0 / 730, 4) + 0.012
+        $estimate.T4ReplicaIncluded | Should -BeTrue
+        $estimate.T4ReplicaHourly | Should -Be ([System.Math]::Round($hourly, 4))
+        $estimate.T4ReplicaSession | Should -Be ([System.Math]::Round($hourly * 5, 2))
+        $estimate.T4ReplicaMonthly | Should -Be ([System.Math]::Round($hourly * 10, 2))
+        $estimate.SessionCost | Should -BeGreaterThan $estimate.SessionCostWithoutReplica
+        [System.Math]::Abs($estimate.SessionCost - ($estimate.SessionCostWithoutReplica + $hourly * 5)) | Should -BeLessOrEqual 0.011 -Because 'both totals are rounded to the cent'
+        [System.Math]::Abs($estimate.LightUseMonthly - ($estimate.LightUseMonthlyWithoutReplica + $hourly * 10)) | Should -BeLessOrEqual 0.011
+        # It's deleted, not stopped, after a session, so T4's restart worst case and fixed costs stay T4's own.
+        $estimate.T4AutoRestartWorstCaseMonthly | Should -Be ([System.Math]::Round(0.09 * 4 * (730 - 10), 2))
+        $estimate.T4FixedMonthly | Should -Be 27.46
+        ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Match ('T4''s read replica, which exists only during a session, is {0:N2} USD of it \(start-demo\.ps1 -SkipT4Replica starts a session without it\)' -f $estimate.T4ReplicaSession)
+        ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'T4''s read replica exists only during a session .+ nothing between sessions, with no automatic restart to count'
+
+        # A Burstable T4 has none: Azure doesn't support read replicas there.
+        $burstable = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t4Enabled = $true; t4SkuName = 'Standard_B1ms' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans
+        @($burstable.Components | Where-Object Name -Match 'read replica').Count | Should -Be 0
+        $burstable.T4ReplicaIncluded | Should -BeFalse
+        $burstable.SessionCost | Should -Be $burstable.SessionCostWithoutReplica
+        ($burstable.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION').message | Should -Not -Match 'read replica'
+    }
+
+    It 'leaves T4''s read replica out of T4''s size verdicts: a demo-day session that only its share puts over sessionCeilingUsd warns, and T4''s one-time move to the default is still allowed (2026-11-13)' {
+        $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'OpenSourceRelationalDatabases'; pricingTier = 'Standard'; subPlan = $null })
+        $config = New-TestConfig -Override @{ t4Enabled = $true }
+        $priced = Get-DemoCostEstimate -Config $config -ProfileName 'demo-day' -NetworkMode public -DefenderPlans $plans -T3UseFreeLimit $false
+        # The session ceiling between the two totals, as demo-day's 2026-11-13 example had it: 14.75 USD without the
+        # replica, 16.56 with it, against 15.
+        $config['sessionCeilingUsd'] = [System.Math]::Round(($priced.SessionCostWithoutReplica + $priced.SessionCost) / 2, 2)
+        $config['monthlyCeilingUsd'] = 100000
+        $estimate = Get-DemoCostEstimate -Config $config -ProfileName 'demo-day' -NetworkMode public -DefenderPlans $plans -T3UseFreeLimit $false
+        $session = $estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION'
+        $session.status | Should -Be 'Warning' -Because 'the session with the replica is over the ceiling'
+        $session.message | Should -Match ('is {0:N2} USD of it \(start-demo\.ps1 -SkipT4Replica' -f $estimate.T4ReplicaSession)
+        # deploy.ps1's move of an older T4 to Standard_D4ds_v5 is gated on this verdict (Invoke-DemoTemplateDeployment), as
+        # before the replica.
+        $move = InModuleScope DbHubDemo -Parameters @{ Estimate = $estimate; Config = $config } { ConvertTo-DemoT4FallbackCost -Estimate $Estimate -Config $Config -SkuName 'Standard_D4ds_v5' }
+        $move.Allowed | Should -BeTrue
+        $move.SkipReason | Should -Be ''
+        $move.SessionUsd | Should -Be $estimate.SessionCostWithoutReplica
+        $move.LightUseMonthlyUsd | Should -Be $estimate.LightUseMonthlyWithoutReplica
+        # An estimate without the replica's totals (from before it) is read as before.
+        $older = [pscustomobject]@{ LightUseMonthly = 50.0; T4AutoRestartWorstCaseMonthly = 100.0; SessionCost = 9.0; T4FixedMonthly = 5.0; DefenderIncluded = $true; MissingPrices = @(); Components = @([pscustomobject]@{ Name = 'T4 compute (Standard_D4ds_v5)'; UnitPrice = 0.09; Quantity = 4 }) }
+        $read = InModuleScope DbHubDemo -Parameters @{ Estimate = $older; Config = $config } { ConvertTo-DemoT4FallbackCost -Estimate $Estimate -Config $Config -SkuName 'Standard_D4ds_v5' }
+        $read.SessionUsd | Should -Be 9.0
+        $read.MonthlyWorstCaseUsd | Should -Be 150.0
     }
 
     It 'reads each price once for estimates that share a price cache, as preflight''s General Purpose check does (Phase 28 follow-up)' {
@@ -345,11 +416,11 @@ Describe 'Get-DemoCostEstimate' {
         # + T3 0.50 x 1 vCore = 1.80 per hour.
         $estimate.HourlyRunning | Should -Be 1.8
         $estimate.BastionHourly | Should -Be 0.2
-        # Idle: 2 x E10 OS disks at 10.00 (lowest-cost has no data disks) + T3 32 GB x 0.10 = 23.20 per month.
-        # There's no artifact cache.
-        $estimate.IdleMonthly | Should -Be 23.2
+        # Idle: 2 x E10 OS disks at 10.00 (lowest-cost has no data disks) + T3 32 GB x 0.10 = 23.20 per month, and the session
+        # control's vault operations, 0.03 (every deployment since 2026-11-14). There's no artifact cache.
+        $estimate.IdleMonthly | Should -Be 23.23
         $estimate.SessionCost | Should -Be 9.2
-        $estimate.LightUseMonthly | Should -Be 41.4
+        $estimate.LightUseMonthly | Should -Be 41.43
         $estimate.MissingPrices | Should -BeNullOrEmpty
         $estimate.Components.Name | Should -Not -Match 'cache|data disk'
     }
@@ -432,10 +503,8 @@ Describe 'Get-DemoCostEstimate' {
         $minutes.Cost | Should -Be 0
         $estimate.MissingPrices | Should -BeNullOrEmpty
     }
-    It 'adds the on-demand activity control''s vault operations and job minutes only when control.enabled is true (ADR 0020)' {
-        $without = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
-        $without.Components.Name | Should -Not -Match 'Activity control'
-        $with = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ control = @{ enabled = $true } }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+    It 'adds the session control''s vault operations and job minutes to every estimate, whatever an older configuration says (ADR 0026)' {
+        $with = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ control = @{ enabled = $false } }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         $operations = $with.Components | Where-Object { $_.Name -eq 'Activity control vault operations' }
         $operations.Meter | Should -Be 'Key Vault / Standard / Operations'
         $operations.Quantity | Should -Be 1
@@ -444,20 +513,19 @@ Describe 'Get-DemoCostEstimate' {
         $minutes = $with.Components | Where-Object { $_.Name -like 'Activity control job minutes*' }
         $minutes.UnitPrice | Should -Be 0
         $minutes.Quantity | Should -Be 60
-        $with.IdleMonthly | Should -Be ([System.Math]::Round($without.IdleMonthly + 0.03, 2))
-        $with.SessionCost | Should -Be $without.SessionCost
+        $operations.Cost | Should -Be 0.03
         $with.MissingPrices | Should -BeNullOrEmpty
     }
 
     It 'subtracts the free-offer allowance from the light-use month and keeps the session at list price' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $true
         # Storage: the offer covers 32 GB, so idle is 2 x E10 at 10.00 = 20.00.
-        $estimate.IdleMonthly | Should -Be 20
+        $estimate.IdleMonthly | Should -Be 20.03
         # The session stays at list price: 1.80 x 5 + 0.20 = 9.20.
         $estimate.SessionCost | Should -Be 9.2
         # Allowance: 10 vCore-hours x 0.50 = 5.00. Month: 20 + 1.80 x 10 + 0.20 - 5.00 = 33.20.
         $estimate.T3FreeOfferCreditMonthly | Should -Be 5
-        $estimate.LightUseMonthly | Should -Be 33.2
+        $estimate.LightUseMonthly | Should -Be 33.23
         $estimate.T3FreeOffer | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer'
     }
@@ -470,7 +538,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless when the free offer is unavailable' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $false
-        $estimate.LightUseMonthly | Should -Be 41.4
+        $estimate.LightUseMonthly | Should -Be 41.43
         $estimate.T3FreeOffer | Should -BeFalse
         $estimate.T3FreeOfferUnchecked | Should -BeFalse
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Not -Match 'free offer'
@@ -478,7 +546,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless and says so when the free offer was not checked' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
-        $estimate.LightUseMonthly | Should -Be 41.4
+        $estimate.LightUseMonthly | Should -Be 41.43
         $estimate.T3FreeOfferUnchecked | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer wasn''t checked'
     }
@@ -593,9 +661,9 @@ Describe 'Get-DemoCostEstimate' {
         # Running: 1.80 + Servers 3 x 0.025 + SQL 2 x 0.02 + CSPM 2 x 0.012 = 1.939 per hour.
         $estimate.HourlyRunning | Should -Be 1.94
         # Idle: 23.20 + Defender for Azure SQL 0.02 x 730 + CSPM 0.012 x 730 = 46.56 per month.
-        $estimate.IdleMonthly | Should -Be 46.56
+        $estimate.IdleMonthly | Should -Be 46.59
         $estimate.SessionCost | Should -Be 7.96
-        $estimate.LightUseMonthly | Should -Be 66.15
+        $estimate.LightUseMonthly | Should -Be 66.18
         $estimate.DefenderSession | Should -Be 0.56
         $estimate.DefenderMonthly | Should -Be 24.75
     }
@@ -737,7 +805,7 @@ Describe 'Get-DemoCostEstimate' {
         ($estimate.Components | Where-Object Name -eq 'T1 data disk (E10)').Cost | Should -Be 10
         ($estimate.Components | Where-Object Name -eq 'T2 host data disk (E10)').Cost | Should -Be 10
         # The two data disks add 2 x 10.00 to the default 41.40.
-        $estimate.LightUseMonthly | Should -Be 61.4
+        $estimate.LightUseMonthly | Should -Be 61.43
     }
 
     It 'removes the demo-day data disks when dataDiskSku is None' {

@@ -90,6 +90,10 @@ export default function LinksPage() {
                         <span>T1, T2, and T3 report performance telemetry (kept 7 days).</span>
                     </li>
                     <li>
+                        <strong>Azure Monitor</strong>
+                        <span>T4's and its read replica's metrics, which stop-demo.ps1 -SaveHistory and deploy.ps1 capture and pass to the notebook.</span>
+                    </li>
+                    <li>
                         <strong>NB_DatabaseHub_LiveActivity</strong>
                         <span>The notebook analyzes a window and writes snapshots, findings, and incident windows.</span>
                     </li>

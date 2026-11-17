@@ -56,9 +56,12 @@ function Invoke-DemoDeployment {
         activity profile, on a run whose validation ran: NB_DatabaseHub_LiveActivity once, analyze-only (CONFIRM false),
         then the history model's refresh (Invoke-DemoHistorySnapshotStep, DEPLOY.FABRIC.HISTORY), as the parallel path
         does. It never stops the run or keeps it from DONE.
+    12. T4's read replica at the run's end (2026-11-16; Invoke-DemoT4ReplicaDeployEnd, DEPLOY.T4.REPLICA.END), as the
+        parallel path does: deleted unless a session uses it now, on a run that stops at a Fail too. Never a Fail.
 
-    A Fail stops the run, and nothing after it runs. Manual action required never stops it and is never
-    hidden: it's in the results and in DEPLOY.SUMMARY. Deployment success alone is never Pass (ADR 0012).
+    A Fail stops the run, and nothing after it runs but the switch and the replica's end. Manual action required never
+    stops it and is never hidden: it's in the results and in DEPLOY.SUMMARY. Deployment success alone is never Pass
+    (ADR 0012).
     With -WhatIf, it runs the read-only preflight (without registering providers) and the template's
     what-if, then stops.
 
@@ -270,6 +273,16 @@ function Invoke-DemoDeployment {
         $startIndex = [array]::IndexOf($stages, 'Validation')
         Write-DemoLog -Message 'Every stage finished earlier; running the validation again.'
     }
+    # 2026-11-16 (the merge's upgrade test): a resume after the Fabric stage publishes the Fabric items again when this copy
+    # of the scripts has other content than the stage last published in full (Get-DemoFabricContentReopen), so an upgraded
+    # environment never keeps the older notebooks, history model, or Insights app.
+    if ($Resume -and -not $FromStage -and -not $whatIf -and -not $SkipFabric -and $startIndex -gt $fabricIndex -and $fabricIndex -le $stopIndex) {
+        $contentReason = Get-DemoFabricContentReopen -State $state -Current (Get-DemoFabricContentSha256)
+        if ($contentReason) {
+            $startIndex = $fabricIndex
+            Write-DemoLog -Message ('An earlier run recorded the Fabric stage as finished, but {0} So this run continues from the Fabric stage, which publishes them again.' -f $contentReason)
+        }
+    }
     # The .NET SDK the workload runner's build needs, before anything is created (2026-11-09): the dotnet on PATH, the SDK
     # installed for the user earlier, or the pinned SDK, installed now (Initialize-DemoDotNetSdk), when the run builds it.
     $artifactsIndex = [array]::IndexOf($stages, 'Artifacts')
@@ -304,9 +317,13 @@ function Invoke-DemoDeployment {
             & $addAll @(Send-DemoPendingActivitySwitch -Config $Config -ActivityProfile $activity -Result $results.ToArray() -CheckPrefix 'DEPLOY' -RequestedBy 'deploy')
         }
     }
-    # A run that stops at a Fail switches the VMs it noted too, then returns what it has.
+    # A run that stops at a Fail switches the VMs it noted too, and deletes T4's read replica as a whole run does
+    # (2026-11-16), then returns what it has.
     $finishEarly = {
         & $switchActivity
+        if (-not $whatIf) {
+            $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -ChecksRan $false -Confirm:$false))
+        }
         $results.ToArray()
     }
     # T4's size as an earlier run's fallback settled it, unless the configuration sets one (Phase 28 and its follow-up). T4 is
@@ -530,11 +547,10 @@ function Invoke-DemoDeployment {
                     # counts in DEPLOY.SUMMARY and the exit code) without stopping the deployment.
                     & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
                 }
-                # The on-demand activity control's A1 (ADR 0020): a redeploy deleted it with the group. Granted again only
-                # with assignRoles; otherwise, or when it fails, Manual action required with the -GrantRole command.
-                & $addAll @(Invoke-DemoActivityControlRegrant -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
                 # The nightly safety stop (ADR 0024), part of every deployment; its problems are Warnings, never a Fail.
                 & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                # The session control's Azure part (ADR 0026), the same way; its notebook comes with the Fabric stage.
+                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
             }
             'Artifacts' {
                 $current = Get-DemoDeploymentState -Config $Config
@@ -704,6 +720,24 @@ function Invoke-DemoDeployment {
                 }
                 $t4State = Get-DemoT4State -Config $Config
                 $results.Add((Test-DemoT4MetricFlow -Config $Config -ServerId $t4State.Names.ServerId -State $t4State.State -WaitMinutes ([System.Math]::Min($TelemetryWaitMinutes, 10))))
+                # T4's read replica (2026-11-13, ADR 0025), after T4's restart above, as the T4 track creates it; once it's created
+                # or isn't supported, the environment has the replica's lifecycle (DbHubT4Replica Session), not after a failure.
+                $replicaResults = @(Invoke-DemoT4ReplicaCreate -Config $Config -CheckPrefix DEPLOY)
+                & $addAll $replicaResults
+                $replicaCreated = @($replicaResults | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0
+                if ($replicaCreated -or @($replicaResults | Where-Object { [string]$_.status -eq 'Not supported' }).Count -gt 0) {
+                    try {
+                        Set-DemoDeploymentState -Config $Config -Value @{ T4Replica = [string](Get-DemoT4ReplicaSetting)['recordValue'] } -Confirm:$false
+                    }
+                    catch {
+                        $results.Add((New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.RECORD' -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('The replica''s record (DbHubT4Replica) wasn''t set on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Run ./scripts/deploy.ps1 again.'))
+                    }
+                }
+                if ($replicaCreated) {
+                    $results.Add((Test-DemoT4ReplicaServer -Config $Config))
+                    $results.Add((Test-DemoT4ReplicaEstate -Config $Config -WaitMinutes 5))
+                    $results.Add((Test-DemoT4ReplicaMetricFlow -Config $Config -WaitMinutes ([System.Math]::Min($TelemetryWaitMinutes, 10))))
+                }
                 & $recordStage 'T4'
                 if ((& $hasStatus $t4Checks 'Fail') -or ($null -ne $t4Enable -and $t4Enable.status -eq 'Fail')) {
                     & $stageResult 'T4' 'Fail' 'A T4 check or its setup failed; the rest of the deployment continues.' 'Read the T4 and WORKLOAD.T4.ENABLE results, fix the cause, then run deploy.ps1 -FromStage T4.'
@@ -739,9 +773,10 @@ function Invoke-DemoDeployment {
                 foreach ($item in $monitoringResults) {
                     $results.Add($item)
                 }
-                $monitoring = $monitoringResults[0]
-                if ($monitoring.status -eq 'Fail') {
-                    & $stageResult 'Monitoring' 'Fail' 'T1 performance monitoring couldn''t be turned on.' $monitoring.remediation
+                # A repair of the SqlIaasExtension, when there was one, comes first (2026-11-16); its Fail has its own fix.
+                $monitoringFail = @($monitoringResults | Where-Object { [string]$_.status -eq 'Fail' } | Select-Object -First 1)
+                if ($monitoringFail.Count -gt 0) {
+                    & $stageResult 'Monitoring' 'Fail' 'T1 performance monitoring couldn''t be turned on.' $monitoringFail[0].remediation
                     return (& $finishEarly)
                 }
                 & $recordStage 'Monitoring'
@@ -809,6 +844,7 @@ function Invoke-DemoDeployment {
                 # parallel Fabric track imports them (review follow-up): DONE's FABRIC.ITEMS.REQUIRED looks for all of them, and a
                 # new workspace has none. Then the Insights app, part of every deployment (2026-11-05), whose step never stops
                 # the stage or keeps the run from DONE (Invoke-DemoInsightsAppStep).
+                $fabricContent = Get-DemoFabricContentSha256
                 $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $ConfigPath -ImportNotebooks:$importNotebooks -NewNotebooksOnly -ImportDashboard)
                 & $addAll $fabric
                 if (& $hasStatus $fabric 'Fail') {
@@ -829,7 +865,10 @@ function Invoke-DemoDeployment {
                 $null = Update-DemoFabricAppSignInFromApp -SignIn $appSignIn -AppResult $app -Results $results
                 $appSummary = Get-DemoInsightsAppSummary -Result $app
                 $appText = if ($null -ne $appSummary -and [bool]$appSummary.Failed) { '; the Insights app wasn''t created or doesn''t work, which doesn''t block DONE (the summary says why)' } elseif ($null -ne $appSummary -and [bool]$appSummary.Deployed) { ', with the Insights app' } else { '' }
-                & $recordStage 'Fabric'
+                # The session control's notebook (ADR 0026), now that the workspace exists; never a Fail.
+                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
+                # What the stage published, once the app is this version's too (2026-11-16, Get-DemoFabricContentReopen).
+                & $recordStage 'Fabric' $(if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') { @{ FabricSha256 = $fabricContent } } else { @{} })
                 & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}{1}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }), $appText)
             }
             'Validation' {
@@ -875,6 +914,11 @@ function Invoke-DemoDeployment {
     # NB_DatabaseHub_LiveActivity runs once, analyze-only, and the history model is refreshed. Never a Fail.
     if ($validated) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
+    }
+    # T4's read replica (2026-11-16), as in the parallel path: DONE's checks and the history snapshot have read it, so it's
+    # deleted unless a session uses it now. Never a Fail.
+    if (-not $whatIf) {
+        $results.Add((Invoke-DemoT4ReplicaDeployEnd -Config $Config -ProgressPath $ProgressPath -ChecksRan $doneChecked -Confirm:$false))
     }
 
     $all = $results.ToArray()

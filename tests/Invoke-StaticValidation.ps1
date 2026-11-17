@@ -8,9 +8,11 @@ Checks:
 - PSScriptAnalyzer: every PowerShell file, with tests/PSScriptAnalyzerSettings.psd1; files under vm/ use
   tests/PSScriptAnalyzerSettings.Vm.psd1 (Windows PowerShell 5.1 syntax, commands, and types), and *.Tests.ps1 files use
   tests/PSScriptAnalyzerSettings.Tests.psd1.
-- Pester: the unit tests in tests/unit, including schema, notebook, link, workflow-pin, and convention tests.
+- Pester: the unit tests in tests/unit, including schema, notebook, link, workflow-pin, and convention tests, with the
+  Azure CLI guard of tests/TestAzGuard.ps1 on: a call a unit test makes to az is stopped and listed (STATIC.PESTER.AZURECLI).
 - Bicep: build, lint, and the azuredeploy.json sync check, plus build and lint of the standalone templates in
-  infra/control (ADR 0020) and infra/safetystop (ADR 0024). Not selected until infra/main.bicep exists.
+  infra/control (ADR 0020), infra/safetystop (ADR 0024), and infra/replica (ADR 0025). Not selected until infra/main.bicep
+  exists.
 - PSRule: PSRule for Azure (Well-Architected rules) on infra/main.bicepparam, with the suppressions in ps-rule.yaml.
 - DotNet: restore (locked mode), build, and test the workload generator.
 - FabricApp: install the Fabric App (fabric/app) from its lock file, then typecheck, lint, test, check the production
@@ -103,6 +105,7 @@ if ('PSScriptAnalyzer' -in $Check) {
 
 if ('Pester' -in $Check) {
     Import-Module -Name Pester -RequiredVersion $versions.tools.pester
+    . (Join-Path -Path $PSScriptRoot -ChildPath 'TestAzGuard.ps1')
     $configuration = New-PesterConfiguration
     $configuration.Run.Path = Join-Path -Path $PSScriptRoot -ChildPath 'unit'
     $configuration.Run.PassThru = $true
@@ -112,7 +115,16 @@ if ('Pester' -in $Check) {
         $configuration.TestResult.OutputFormat = 'JUnitXml'
         $configuration.TestResult.OutputPath = Join-Path -Path $outDirectory -ChildPath 'pester.xml'
     }
-    $run = Invoke-Pester -Configuration $configuration
+    # The unit tests never reach the Azure CLI (2026-11-16): a stand-in 'az' stops and lists any call, and AZURE_CONFIG_DIR
+    # is an empty folder, so no test uses the developer's sign-in (tests/TestAzGuard.ps1).
+    $azGuard = Enable-DemoTestAzGuard
+    try {
+        $run = Invoke-Pester -Configuration $configuration
+        $azLeaks = @(Get-DemoTestAzLeak -State $azGuard)
+    }
+    finally {
+        Disable-DemoTestAzGuard -State $azGuard
+    }
     # The unit tests unload DbHubDemo when they finish; load it again for the remaining checks.
     Import-Module -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1') -Force
     if ($run.Result -ne 'Passed') {
@@ -120,6 +132,13 @@ if ('Pester' -in $Check) {
     }
     else {
         Add-StaticResult -CheckId 'STATIC.PESTER' -Status 'Pass' -Message "$($run.PassedCount) Pester tests passed."
+    }
+    if ($azLeaks.Count -gt 0) {
+        $azLeaks | Select-Object -First 20 | ForEach-Object { Write-Output ('Reached the Azure CLI: {0}' -f (Protect-DemoText -Text $_)) }
+        Add-StaticResult -CheckId 'STATIC.PESTER.AZURECLI' -Status 'Fail' -Message ('{0} call(s) from the unit tests reached the Azure CLI, which the test guard stopped (exit code 97); mock them. The first: {1}' -f $azLeaks.Count, (Protect-DemoText -Text $azLeaks[0]))
+    }
+    else {
+        Add-StaticResult -CheckId 'STATIC.PESTER.AZURECLI' -Status 'Pass' -Message 'No unit test reached the Azure CLI.'
     }
 }
 
@@ -132,9 +151,9 @@ if ('Bicep' -in $Check) {
         $built = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('azuredeploy-{0}.json' -f [guid]::NewGuid())
         $buildExit = Invoke-Native -FilePath 'az' -ArgumentList @('bicep', 'build', '--file', $mainBicep, '--outfile', $built)
         $lintExit = Invoke-Native -FilePath 'az' -ArgumentList @('bicep', 'lint', '--file', $mainBicep)
-        # The standalone templates (ADR 0020's on-demand activity control, ADR 0024's nightly safety stop) aren't modules
-        # of main.bicep: build and lint each one.
-        $standalone = @(foreach ($folder in 'infra/control', 'infra/safetystop') {
+        # The standalone templates (ADR 0020's on-demand activity control, ADR 0024's nightly safety stop, ADR 0025's T4 read
+        # replica) aren't modules of main.bicep: build and lint each one.
+        $standalone = @(foreach ($folder in 'infra/control', 'infra/safetystop', 'infra/replica') {
                 Get-ChildItem -LiteralPath (Join-Path -Path $repoRoot -ChildPath $folder) -Filter '*.bicep' -File -ErrorAction SilentlyContinue
             })
         $standaloneFailures = [System.Collections.Generic.List[string]]::new()
@@ -160,7 +179,7 @@ if ('Bicep' -in $Check) {
                 Add-StaticResult -CheckId 'STATIC.BICEP' -Status 'Fail' -Message 'azuredeploy.json is out of sync with infra/main.bicep. Rebuild it with the pinned Bicep version.'
             }
             else {
-                Add-StaticResult -CheckId 'STATIC.BICEP' -Status 'Pass' -Message ('Bicep builds and lints cleanly (infra/main.bicep and {0} standalone template(s) in infra/control and infra/safetystop), and azuredeploy.json is in sync.' -f $standalone.Count)
+                Add-StaticResult -CheckId 'STATIC.BICEP' -Status 'Pass' -Message ('Bicep builds and lints cleanly (infra/main.bicep and {0} standalone template(s) in infra/control, infra/safetystop, and infra/replica), and azuredeploy.json is in sync.' -f $standalone.Count)
             }
         }
         Remove-Item -LiteralPath $built -Force -ErrorAction SilentlyContinue

@@ -26,6 +26,13 @@ $script:DemoAzGuardActive = $false
 # Phase 28: the VMs deploy.ps1's watchdog restarted in this process (Restart-DemoVmOnce restarts each at most once).
 $script:DemoVmRestarted = @{}
 
+# 2026-11-13 live finding: the Run Command names Azure kept in Deleting in this process, so Invoke-DemoVmRunCommand used a
+# fresh name instead (Resolve-DemoRunCommandFreshName); deploy.ps1's tracks report them (Get-DemoRunCommandStuckResult).
+$script:DemoRunCommandStuck = [System.Collections.Generic.List[object]]::new()
+# The same names as '<vm>/<name>', never cleared by a report, so a later call in this process doesn't wait the whole leftover
+# wait for a name that was stuck already.
+$script:DemoRunCommandStuckName = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
 # Review fix (Phase 28): the golden guest action (the Release) running on the T2 host in this process, keyed
 # '<resource group>/archost01' (Invoke-DemoGoldenGuestAction). The watchdog never restarts the host meanwhile.
 $script:DemoHostAction = @{}
@@ -61,6 +68,12 @@ $script:TokenResourceAlternates = @{
     'https://graph.microsoft.com/' = 'https://graph.microsoft.com'
 }
 $script:DemoTokenResourceInUse = @{}
+
+# 2026-11-16 live finding: the Azure CLI hands back its cached token until about 5 minutes before it expires, so a step that
+# holds a Fabric or Power BI token across a long wait can send it expired. Each one Get-DemoFabricToken and
+# Get-DemoPowerBIToken issued is recorded here, keyed by the SecureString itself (never its value), with where it came from
+# and the token that replaced it (Register-DemoIssuedToken, Get-DemoCurrentToken).
+$script:DemoIssuedToken = [System.Runtime.CompilerServices.ConditionalWeakTable[System.Security.SecureString, object]]::new()
 
 # Every resource type the demo creates, including those created at run time by scripts, Arc onboarding,
 # and on-demand Bastion. The policy inventory (Get-DemoPolicyConstraint) checks Azure Policy against this list.

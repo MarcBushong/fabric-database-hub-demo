@@ -38,7 +38,8 @@ Describe 'The progress model (Phase 28, brief item 11)' {
     It 'lists the steps per track in the brief''s order, with no guided stop in any mode (retired, 2026-11-09)' {
         $model = New-TestModel -T4
         @($model['tracks'] | ForEach-Object { $_['name'] }) | Should -Be @('Preflight', 'Infrastructure', 'T1', 'T3', 'T4', 'Fabric', 'T2', 'Validation')
-        $t2Steps = @('T2.Restore', 'T2.Artifacts', 'T2.Bootstraps', 'T2.HostBuild', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring', 'T2.Telemetry')
+        # The T2 host's rebuild (2026-11-17) is T2's first row: when it runs, T2's steps run again after it.
+        $t2Steps = @('T2.HostRebuild', 'T2.Restore', 'T2.Artifacts', 'T2.Bootstraps', 'T2.HostBuild', 'T2.SignInCleanup', 'T2.ArcOnboarding', 'T2.Monitoring', 'T2.Telemetry')
         @(($model['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be $t2Steps
         foreach ($mode in 'JumpstartImage', 'ProductKey', 'Developer') {
             @(((New-TestModel -InstallMode $mode)['tracks'] | Where-Object { $_['name'] -eq 'T2' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be $t2Steps -Because $mode
@@ -75,15 +76,20 @@ Describe 'The progress model (Phase 28, brief item 11)' {
 
     It 'shows the history report''s snapshot after the validation, where it happens, as not blocking DONE, and leaves it out with -SkipFabric (2026-11-06)' {
         $model = New-TestModel
-        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History')
+        # The busy marker's Nightly stop row (2026-11-14), then the session control's (ADR 0026), come last, with or without Fabric.
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History', 'NightlyStop', 'Control')
         $history = Get-TestStep -Model $model -Id 'Fabric.History'
         $history['nonBlocking'] | Should -BeTrue
         $history['state'] | Should -Be 'Pending'
         $history['label'] | Should -Be 'History report''s snapshot (NB_DatabaseHub_LiveActivity, once, analyze-only)'
         (InModuleScope DbHubDemo { Get-DemoProgressStepLabel -Id 'Fabric.History' }) | Should -Be 'history report''s snapshot'
+        $nightly = Get-TestStep -Model $model -Id 'NightlyStop'
+        $nightly['nonBlocking'] | Should -BeTrue
+        $nightly['state'] | Should -Be 'Pending'
+        (InModuleScope DbHubDemo { Get-DemoProgressStepLabel -Id 'NightlyStop' }) | Should -Be 'nightly stop'
         $skipFabric = InModuleScope DbHubDemo { New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -SkipFabric) }
         Get-TestStep -Model $skipFabric -Id 'Fabric.History' | Should -BeNullOrEmpty
-        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation')
+        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'NightlyStop', 'Control')
     }
 
     It 'takes the snapshot again on a resumed run that has nothing left to do, never "finished in an earlier run", and skips it on a run without the validation (2026-11-06)' {

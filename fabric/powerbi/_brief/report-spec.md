@@ -181,9 +181,9 @@ Five Direct Lake fact tables over the Delta tables and five calculated dimension
 | Telemetry Snapshots | Direct Lake | `dbo.telemetry_snapshots` | One value per run, analysis, target, resource, instance, database, metric, and bin |
 | Analysis Findings | Direct Lake | `dbo.analysis_findings` | One finding per run |
 | Incident Windows | Direct Lake | `dbo.incident_windows` | One incident window; also the incident picker |
-| Target | Calculated (`DATATABLE`) | TMDL | 9 rows: T1, T2, T3, all, fabric, subscription, tenant, github, repo |
+| Target | Calculated (`DATATABLE`) | TMDL | 11 rows: T1, T2, T3, T4, T4-replica, all, fabric, subscription, tenant, github, repo |
 | Status | Calculated (`DATATABLE`) | TMDL | 6 rows: the ADR 0012 statuses |
-| Analysis | Calculated (`DATATABLE`) | TMDL | 16 rows: every analysis key in snapshots and findings |
+| Analysis | Calculated (`DATATABLE`) | TMDL | 17 rows: every analysis key in snapshots and findings |
 | Signal | Calculated (`DATATABLE`), disconnected | TMDL | 11 rows: the explorer's signals |
 | Date | Calculated (`CALENDAR`) | TMDL | One row per UTC date, 2026-01-01 to 2030-12-31; marked as the date table |
 
@@ -210,12 +210,14 @@ DATATABLE (
         { "T1", "T1 · SQL Server on Azure VM", "T1", "SQL target", "SQL Server 2022 on an Azure VM", 1 },
         { "T2", "T2 · Arc-enabled SQL Server", "T2", "SQL target", "Arc-enabled SQL Server in a nested Hyper-V guest", 2 },
         { "T3", "T3 · Azure SQL Database", "T3", "SQL target", "Azure SQL Database", 3 },
-        { "all", "All targets", "All", "All targets", "Every SQL target", 4 },
-        { "fabric", "Fabric workspace", "Fabric", "Platform scope", "Fabric workspace and lakehouse", 5 },
-        { "subscription", "Azure subscription", "Subscription", "Platform scope", "Azure subscription and resource group", 6 },
-        { "tenant", "Fabric tenant", "Tenant", "Platform scope", "Tenant settings", 7 },
-        { "github", "GitHub", "GitHub", "Platform scope", "GitHub repository and Actions", 8 },
-        { "repo", "Repository", "Repo", "Platform scope", "Static checks", 9 }
+        { "T4", "T4 · Azure Database for PostgreSQL", "T4", "PostgreSQL target", "Azure Database for PostgreSQL flexible server", 4 },
+        { "T4-replica", "T4 · read replica", "T4 replica", "PostgreSQL target", "Same-region read replica of T4, during a session", 5 },
+        { "all", "All targets", "All", "All targets", "Every SQL target", 6 },
+        { "fabric", "Fabric workspace", "Fabric", "Platform scope", "Fabric workspace and lakehouse", 7 },
+        { "subscription", "Azure subscription", "Subscription", "Platform scope", "Azure subscription and resource group", 8 },
+        { "tenant", "Fabric tenant", "Tenant", "Platform scope", "Tenant settings", 9 },
+        { "github", "GitHub", "GitHub", "Platform scope", "GitHub repository and Actions", 10 },
+        { "repo", "Repository", "Repo", "Platform scope", "Static checks", 11 }
     }
 )
 
@@ -253,7 +255,8 @@ DATATABLE (
         { "blocking", "Blocking", "Locks and blocking", "Per incident", 13 },
         { "consumption", "Consumption", "CPU and waits", "Per analysis window", 14 },
         { "correlation", "Scenario correlation", "Incidents", "Per scenario window", 15 },
-        { "real_time_dashboard", "Real-Time Dashboard", "Readiness", "Per run", 16 }
+        { "real_time_dashboard", "Real-Time Dashboard", "Readiness", "Per run", 16 },
+        { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 }
     }
 )
 

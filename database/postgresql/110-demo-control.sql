@@ -66,6 +66,16 @@ WITH (fillfactor = 50);
 -- @batch
 ALTER TABLE demo.io_scratch ALTER COLUMN filler SET STORAGE PLAIN;
 -- @batch
+-- replica-lag's marks (ADR 0025): the runner commits one small row every markIntervalMs, and once a cycle takes an
+-- ACCESS EXCLUSIVE lock on this table, which T4's read replica has to replay while a demo report there holds the table
+-- (demo.usp_scenario_replica_lag). Only replica-lag reads or writes it; the auto-cleanup and reset delete its rows.
+CREATE TABLE IF NOT EXISTS demo.replica_lag_marks
+(
+    mark_id    bigint      GENERATED ALWAYS AS IDENTITY CONSTRAINT pk_replica_lag_marks PRIMARY KEY,
+    run_id     varchar(64) NOT NULL,
+    marked_at  timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+-- @batch
 
 -- The scenario catalog: the database layer of the bounds ---------------------------------------------------------------
 
@@ -84,7 +94,8 @@ AS $$
         ('io-pressure', 1800),
         ('connection-surge', 900),
         ('idle-in-transaction', 1800),
-        ('missing-index', 1800)
+        ('missing-index', 1800),
+        ('replica-lag', 900)
     ) AS c (scenario_id, max_duration_seconds);
 $$;
 -- @batch
@@ -440,6 +451,12 @@ BEGIN
             WHERE w.touched_by_run IS NOT NULL
               AND NOT EXISTS (SELECT 1 FROM demo.scenario_runs AS r WHERE r.run_id = w.touched_by_run AND r.status = 'Running');
             RETURN QUERY SELECT 'auto-cleanup'::text, 'Pass'::text, format('%s audit row(s) written by the workload removed.', v_deleted);
+        ELSIF p_scenario_id = 'replica-lag' THEN
+            -- DELETE, not TRUNCATE: TRUNCATE's ACCESS EXCLUSIVE lock would be replayed on T4's read replica too.
+            DELETE FROM demo.replica_lag_marks AS m
+            WHERE NOT EXISTS (SELECT 1 FROM demo.scenario_runs AS r WHERE r.run_id = m.run_id AND r.status = 'Running');
+            GET DIAGNOSTICS v_deleted = ROW_COUNT;
+            RETURN QUERY SELECT 'auto-cleanup'::text, 'Pass'::text, format('%s replica-lag mark(s) removed.', v_deleted);
         ELSE
             RETURN QUERY SELECT 'auto-cleanup'::text, 'Not selected'::text, 'This scenario leaves nothing to clean up: its changes roll back or it only reads.'::text;
         END IF;
@@ -449,7 +466,7 @@ BEGIN
 END;
 $$;
 -- @batch
--- Reset's data steps: the scratch table and every row the workload wrote. The runner calls it after it has stopped
+-- Reset's data steps: the scratch tables and every row the workload wrote. The runner calls it after it has stopped
 -- every run and ended the demo sessions.
 CREATE OR REPLACE FUNCTION demo.usp_restore_seed()
 RETURNS TABLE (check_id text, status text, message text)
@@ -461,9 +478,12 @@ DECLARE
 BEGIN
     BEGIN
         TRUNCATE demo.io_scratch;
-        RETURN QUERY SELECT 'scratch-emptied'::text, 'Pass'::text, 'demo.io_scratch is empty.'::text;
+        -- DELETE, not TRUNCATE: TRUNCATE's ACCESS EXCLUSIVE lock would be replayed on T4's read replica, where a demo
+        -- report may still hold demo.replica_lag_marks.
+        DELETE FROM demo.replica_lag_marks;
+        RETURN QUERY SELECT 'scratch-emptied'::text, 'Pass'::text, 'demo.io_scratch and demo.replica_lag_marks are empty.'::text;
     EXCEPTION WHEN OTHERS THEN
-        RETURN QUERY SELECT 'scratch-emptied'::text, 'Warning'::text, left('demo.io_scratch not emptied: ' || SQLERRM, 400);
+        RETURN QUERY SELECT 'scratch-emptied'::text, 'Warning'::text, left('Scratch tables not emptied: ' || SQLERRM, 400);
     END;
 
     DELETE FROM care.audit_events WHERE run_id IS NOT NULL;

@@ -70,8 +70,10 @@
             "type": "object",
             "additionalProperties": false,
             "required": ["target", "scenario", "startMinute", "durationMinutes"],
-            "if": { "required": ["tier"] },
-            "then": { "properties": { "target": { "const": "T4" } } },
+            "allOf": [
+              { "if": { "required": ["tier"] }, "then": { "properties": { "target": { "const": "T4" } } } },
+              { "if": { "required": ["replica"] }, "then": { "properties": { "target": { "const": "T4" } } } }
+            ],
             "properties": {
               "target": { "enum": ["T1", "T2", "T3", "T4"] },
               "scenario": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$" },
@@ -81,6 +83,7 @@
               "intensity": { "type": "integer", "minimum": 1, "maximum": 10 },
               "cycles": { "type": "string", "pattern": "^(all|odd|even|[1-9][0-9]?(,[1-9][0-9]?)*)$", "description": "The cycles the slot runs in, numbered from 1 at the anchor: all (the default), odd, even, or a list such as 3 or 1,3." },
               "tier": { "enum": ["Burstable", "GeneralPurpose"], "description": "T4 only: the slot runs only on this compute tier, which profile set --tier records; without a recorded tier, only Burstable slots and slots without a tier run." },
+              "replica": { "type": "boolean", "description": "T4 only: true when the slot needs T4's read replica (ADR 0025), so it runs only on a profile host that has one configured (--t4-replica-server or --replica-server); false when it runs only on a host without one, as the slot a replica slot takes over. Without it, the slot runs on every host." },
               "parameters": {
                 "type": "object",
                 "propertyNames": { "pattern": "^[a-z][A-Za-z0-9]*$" },

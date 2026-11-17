@@ -20,18 +20,26 @@ function Enable-DemoT4Workload {
     by). Idempotent.
 
     Returns one WORKLOAD.T4.ENABLE result: Pass, Warning (setup passed but the profile wasn't set), Not
-    selected (T4 off), Manual action required (T4 stopped), or Fail.
+    selected (T4 off), Manual action required (T4 stopped, or still changing after -WaitMinutes), or Fail.
+
+    A T4 that's changing in a way that ends by itself (Updating, Starting, Restarting, or Provisioning; its read replica's
+    creation keeps it Updating for about 9 minutes) is waited for first, at most -WaitMinutes (2026-11-17,
+    Wait-DemoT4Transition).
 
     Sources (checked 2026-10-23):
     - Microsoft Entra roles: https://learn.microsoft.com/azure/postgresql/security/security-manage-entra-users
     - Managed identity sign-in: https://learn.microsoft.com/azure/postgresql/security/security-connect-with-managed-identity
     - Action Run Command: https://learn.microsoft.com/azure/virtual-machines/windows/run-command
+    - The server's states (checked 2026-11-17): https://learn.microsoft.com/rest/api/postgresql/servers/get
 
     .PARAMETER DeploymentId
     The deployment's six-character suffix. Read from the resource group's deploymentId tag when omitted.
 
     .PARAMETER PrincipalId
     T1's managed identity object ID. Read from T1 when omitted.
+
+    .PARAMETER WaitMinutes
+    How long to wait for a T4 that's Updating, Starting, Restarting, or Provisioning to be Ready. 0 doesn't wait.
 
     .EXAMPLE
     Enable-DemoT4Workload -Config $config
@@ -46,7 +54,10 @@ function Enable-DemoT4Workload {
         [string] $DeploymentId = '',
 
         [ValidatePattern('^$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
-        [string] $PrincipalId = ''
+        [string] $PrincipalId = '',
+
+        [ValidateRange(0, 60)]
+        [int] $WaitMinutes = 20
     )
 
     $checkId = 'WORKLOAD.T4.ENABLE'
@@ -56,13 +67,17 @@ function Enable-DemoT4Workload {
     if (-not $names.Enabled) {
         return New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T4' -Status 'Not selected' -Message 'T4 is off in this configuration (t4Enabled is false).'
     }
-    $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
+    $settled = Wait-DemoT4Transition -Config $Config -DeploymentId $DeploymentId -TimeoutMinutes $WaitMinutes
+    $current = $settled.State
     if (-not $current.Exists) {
         # A server Azure is deleting (Dropping, 2026-11-09) isn't T4 any more.
         $why = if ([bool](Get-DemoMemberValue -InputObject $current -Name 'Removing')) { 'Azure is deleting it (Dropping)' } elseif ($current.Error) { $current.Error } else { 'not deployed' }
         return New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T4' -Status 'Fail' -Message ('T4 ({0}) wasn''t found: {1}' -f $names.ServerName, $why) -Remediation 'Deploy it with scripts/deploy.ps1 -Resume, then run this again.' -DocUrl $docUrl
     }
     if ($current.State -ne 'Ready') {
+        if (-not $settled.Ended) {
+            return New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T4' -Status 'Manual action required' -Message ('T4 ({0}) is still {1} after {2} minutes: Azure is still working on it (creating its read replica, for example), so T1 can''t set it up now.' -f $names.ServerName, $current.State, $WaitMinutes) -Remediation 'Nothing to start: Azure ends this by itself. Run ./scripts/deploy.ps1 again once T4 is Ready (./scripts/status.ps1 shows its state).' -DocUrl $docUrl
+        }
         return New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T4' -Status 'Manual action required' -Message ('T4 ({0}) is {1}, so T1 can''t set it up now.' -f $names.ServerName, $current.State) -Remediation 'Start it with start-demo.ps1 (or wait until it''s Ready), then run this again.' -DocUrl $docUrl
     }
 

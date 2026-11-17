@@ -16,9 +16,10 @@ internal static partial class CommandLine
     /// T4's live view: the activity profile, recent runs, stop requests, the demo's sessions with their waits and
     /// blockers, and the server's counters (connections against max_connections, sessions by state and by wait event
     /// type, blocked sessions, the oldest transaction, deadlocks): the live query data Database Hub doesn't show for
-    /// PostgreSQL (its PostgreSQL monitoring is metrics-only).
+    /// PostgreSQL (its PostgreSQL monitoring is metrics-only). With <paramref name="replica"/>, T4's read replica too
+    /// (ADR 0025): whether it's in recovery, its replay lag, and the demo's sessions there.
     /// </summary>
-    private static async Task<int> StatusT4Async(ParseResult parseResult, PgEndpoint endpoint, int runCount, string? profileFile, string? hostStateFile, bool json, RunnerLog log, CancellationToken cancellationToken)
+    private static async Task<int> StatusT4Async(ParseResult parseResult, PgEndpoint endpoint, PgEndpoint? replica, int runCount, string? profileFile, string? hostStateFile, bool json, RunnerLog log, CancellationToken cancellationToken)
     {
         await using var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("status"), cancellationToken).ConfigureAwait(false);
         var database = new PgDemoDatabase(connection);
@@ -27,6 +28,7 @@ internal static partial class CommandLine
         var flags = await database.GetStopFlagsAsync(cancellationToken).ConfigureAwait(false);
         var sessions = await database.GetDemoSessionsAsync(null, cancellationToken).ConfigureAwait(false);
         var server = await database.GetServerViewAsync(cancellationToken).ConfigureAwait(false);
+        var replicaView = replica is null ? null : await PgReplicaSessions.GetViewAsync(new PgConnectionOpener(replica, log), cancellationToken).ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;
         var description = ProfileHost.Describe(profile, now, ActivityProfilesDefinition.Default, ScenarioCatalog.Default);
         var host = HostLaneStatus.ForThisMachine(hostStateFile ?? HostLanesFile.DefaultPath, DemoTarget.T4, ProfileHost.IsActive(profile, now, ActivityProfilesDefinition.Default, ScenarioCatalog.Default));
@@ -47,12 +49,19 @@ internal static partial class CommandLine
                 ["runs"] = new JsonArray([.. runs.Select(RunNode)]),
                 ["stopRequests"] = new JsonArray([.. flags.Select(f => (JsonNode)new JsonObject { ["scenario"] = f.ScenarioId, ["requestedAt"] = f.RequestedAt is { } at ? DemoDatabase.Format(at) : null, ["requestedBy"] = f.RequestedBy })]),
                 ["demoSessions"] = new JsonArray([.. sessions.Select(PgSessionNode)]),
-                ["server"] = ServerNode(server),
-
-                // Last, as on T1 to T3 (Phase 25b): the tail of the output that a Run Command keeps holds it and the
-                // server block before it (validation's WORKLOAD.T4.HOST, status.ps1's STATUS.T4.LIVE).
-                ["host"] = host.ToNode(),
             };
+
+            // Before the server block, so the tail a Run Command keeps still ends with the server and host blocks.
+            if (replicaView is not null)
+            {
+                document["replica"] = ReplicaNode(replicaView);
+            }
+
+            document["server"] = ServerNode(server);
+
+            // Last, as on T1 to T3 (Phase 25b): the tail of the output that a Run Command keeps holds it and the
+            // server block before it (validation's WORKLOAD.T4.HOST, status.ps1's STATUS.T4.LIVE).
+            document["host"] = host.ToNode();
             output.WriteLine(document.ToJsonString(OutputOptions));
             return ExitCodes.Success;
         }
@@ -65,6 +74,12 @@ internal static partial class CommandLine
         output.WriteLine("Waits:       " + (server.ActiveByWaitEventType.Count == 0 ? "no active sessions" : string.Join(", ", server.ActiveByWaitEventType.Select(w => string.Create(CultureInfo.InvariantCulture, $"{w.Key} {w.Value}")))));
         output.WriteLine(string.Create(CultureInfo.InvariantCulture, $"Oldest:      transaction {Seconds(server.LongestTransactionSeconds)}, running query {Seconds(server.LongestQuerySeconds)}; deadlocks since the statistics reset: {server.Deadlocks}"));
         output.WriteLine(string.Create(CultureInfo.InvariantCulture, $"Demo:        {sessions.Count} live demo session(s), {sessions.Count(s => s.OpenTransaction)} with an open transaction, {sessions.Count(s => s.BlockedBy is not null)} blocked"));
+        if (replicaView is not null)
+        {
+            output.WriteLine(replicaView.Error is null
+                ? string.Create(CultureInfo.InvariantCulture, $"Replica:     {replicaView.Fqdn}: {(replicaView.InRecovery == true ? "in recovery" : "NOT in recovery")}, replay lag {Seconds(replicaView.ReplayLagSeconds)} (the time since its last replayed transaction), {replicaView.DemoSessionCount} demo session(s)")
+                : $"Replica:     {replicaView.Fqdn}: {(replicaView.Reachable ? "answered, but couldn't be read" : "not reachable")}: {replicaView.Error}");
+        }
         foreach (var session in sessions.Where(s => s.BlockedBy is not null || s.State.StartsWith("idle in transaction", StringComparison.Ordinal)).Take(20))
         {
             output.WriteLine(string.Create(CultureInfo.InvariantCulture, $"  pid {session.Pid,-6} {session.State,-22} {(session.WaitEventType is null ? "-" : session.WaitEventType + ":" + session.WaitEvent),-28} {(session.BlockedBy is { } blocker ? "blocked by " + blocker.ToString(CultureInfo.InvariantCulture) : string.Empty)} {session.ApplicationName}"));
@@ -174,6 +189,18 @@ internal static partial class CommandLine
         ["deadlocks"] = server.Deadlocks,
         ["canReadAllStats"] = server.CanReadAllStats,
         ["activeByWaitEventType"] = new JsonObject([.. server.ActiveByWaitEventType.Select(w => KeyValuePair.Create(w.Key, (JsonNode?)w.Value))]),
+    };
+
+    /// <summary>T4's read replica in T4's status. No "server" or "host" key: the operator side finds those blocks by name in the output's tail.</summary>
+    internal static JsonObject ReplicaNode(PgReplicaView replica) => new()
+    {
+        ["fqdn"] = replica.Fqdn,
+        ["reachable"] = replica.Reachable,
+        ["inRecovery"] = replica.InRecovery,
+        ["replayLagSeconds"] = replica.ReplayLagSeconds,
+        ["maxStandbyStreamingDelayMs"] = replica.MaxStandbyStreamingDelayMs,
+        ["demoSessionCount"] = replica.DemoSessionCount,
+        ["error"] = replica.Error is null ? null : Redactor.Redact(replica.Error),
     };
 
     private static string Seconds(decimal? value) => value is { } seconds ? seconds.ToString("0.0", CultureInfo.InvariantCulture) + " s" : "none";

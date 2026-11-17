@@ -4,7 +4,8 @@
 //   at the demo resource group (A1) and at the control account (A2), which setup-activity-control.ps1 -GrantRole
 //   assigns as the signed-in owner.
 // - aa-<prefix>-control: the Automation account (Basic; public network access and local authentication on, because
-//   webhooks need both), with only that identity and no system-assigned identity.
+//   webhooks need both), with only that identity and no system-assigned identity, and its variable DbHubSessionStatus
+//   (2026-11-16), the session's last status, which DbHub-Monitor reads back.
 // - kv-<prefix>-ctl-<suffix>: the vault for the webhook URL (Azure RBAC, Standard, 7-day soft delete, purge protection
 //   off so setup-activity-control.ps1 -Remove can purge it), public or private by vaultNetworkMode, which the setup
 //   script resolves from the tenant's policy. No diagnostic settings.
@@ -70,6 +71,19 @@ resource account 'Microsoft.Automation/automationAccounts@2024-10-23' = {
     encryption: {
       keySource: 'Microsoft.Automation'
     }
+  }
+}
+
+// The session's last status for DbHub-Monitor (2026-11-16, ADR 0026): DbHub-Control keeps a copy of what it writes to
+// the vault here (Set-AutomationVariable), and DbHub-Monitor's re-checks read it back to add a host's failure, because
+// the identity can't read the vault's value through Azure Resource Manager. Never a credential; a redeploy empties it.
+resource sessionStatus 'Microsoft.Automation/automationAccounts/variables@2024-10-23' = {
+  parent: account
+  name: 'DbHubSessionStatus'
+  properties: {
+    description: 'The demo session\'s last status (JSON), which the DbHub-Control runbook keeps and DbHub-Monitor reads back. Never a credential.'
+    isEncrypted: false
+    value: '""'
   }
 }
 

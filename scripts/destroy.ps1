@@ -12,15 +12,20 @@ then the subscription-scope deployment record dbhub-<environment>-main. Last, th
 Arc resource, role assignment, managed identity, P6 membership, deployment record, or budget is left
 (DESTROY.RESIDUAL; docs/cleanup.md). Only this environment counts: its resource group by its exact name and its
 deploymentId, never another prefix's environment with the same environment name.
-The GitHub identity's resource group (rg-<prefix>-control) stays. It asks for confirmation unless -Force.
+
+It deletes the rest of what deploy.ps1 created too, each only when it can tell it's this environment's (2026-11-17):
+the session control in rg-<prefix>-control, when its runbooks serve this environment's resource group; the demo's
+Fabric workspace, when every item in it is one the demo creates, and the control's, when its control notebook serves
+this environment; the T3 administrators' security group, when init.ps1 created it for this environment; and the custom
+role definitions, once no role assignment holds them. What isn't this environment's stays, and the results say why.
+-KeepFabric keeps the Fabric workspaces and the history. The Fabric capacity and your licenses are never touched.
+It asks for confirmation, listing what it deletes and what it keeps, unless -Force.
 With -IfExpired (the scheduled expiry workflow) it deletes only when the resource group's expiresOn tag
 (expiresOn in the configuration) has passed, and otherwise does nothing. Running it again after an
 interruption finishes the cleanup.
 
-In a shared subscription, agree on it with the environment's owner first: a PaygWizard environment holds the
-setup-wizard step, which no script can redo (docs/cleanup.md). So destroy.ps1 refuses to delete one unless a
-boot-verified golden snapshot in rg-<prefix>-golden keeps it (capture-t2-golden.ps1, test-t2-golden.ps1), or
--WithoutGolden accepts the loss. The golden group stays unless -IncludeGolden.
+In a shared subscription, agree on it with the environment's owner first (docs/cleanup.md). The golden group stays
+unless -IncludeGolden.
 
 With -ResidueOnly it deletes nothing: it runs only the residual check again, read-only, with the manifest an
 earlier destroy wrote (-ManifestPath, out/destroy-manifest-<environment>.json by default), and writes the results to
@@ -58,8 +63,13 @@ Also delete rg-<prefix>-golden and its T2 golden snapshots (ADR 0018). Without i
 the next deploy.ps1 restores T2 from it (DESTROY.GOLDEN says so).
 
 .PARAMETER WithoutGolden
-Destroy a PaygWizard environment even though no boot-verified golden snapshot keeps its setup-wizard step.
-Without it, destroy.ps1 deletes nothing in that case (DESTROY.GOLDEN.GUARD Fail).
+Changes nothing now. Until 2026-11-09 it let destroy.ps1 delete a PaygWizard environment that no boot-verified golden
+snapshot kept (DESTROY.GOLDEN.GUARD); a configuration's PaygWizard runs as JumpstartImage since then, so that guard
+no longer refuses anything.
+
+.PARAMETER KeepFabric
+Keep the demo's and the session control's Fabric workspaces, with their items and the history in the lakehouse
+(DESTROY.FABRIC.WORKSPACE and DESTROY.FABRIC.CONTROL are Not selected).
 
 .PARAMETER ResidueOnly
 Delete nothing and ask nothing: run only the residual check again with the saved manifest (DESTROY.MANIFEST, the
@@ -71,6 +81,9 @@ with -ResidueOnly).
 
 .EXAMPLE
 ./scripts/destroy.ps1
+
+.EXAMPLE
+./scripts/destroy.ps1 -KeepFabric
 
 .EXAMPLE
 ./scripts/destroy.ps1 -Force -IfExpired
@@ -105,6 +118,9 @@ param(
 
     [Parameter(ParameterSetName = 'Destroy')]
     [switch] $WithoutGolden,
+
+    [Parameter(ParameterSetName = 'Destroy')]
+    [switch] $KeepFabric,
 
     [Parameter(Mandatory, ParameterSetName = 'Residue')]
     [switch] $ResidueOnly,
@@ -154,6 +170,7 @@ $parameters = @{
     ManifestPath       = $ManifestPath
     IncludeGolden      = $IncludeGolden
     WithoutGolden      = $WithoutGolden
+    KeepFabric         = $KeepFabric
     WhatIf             = [bool]$WhatIfPreference
     Confirm            = $confirm
 }

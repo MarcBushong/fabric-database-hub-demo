@@ -49,6 +49,15 @@
 - **Read-only (2026-10-27):** `setup-github-repo.ps1 -Template -WhatIf` against the private archive: the ruleset (HTTP 403) and private vulnerability reporting (HTTP 404) were **Manual action required**, and nothing was written.
 - **Pending, once the public repository exists:** `setup-github-repo.ps1 -WhatIf`, then without it; `setup-github-oidc.ps1 -ConfigureGitHub`; then one run of `validate.yml` with `live` (or `deploy.yml`), whose log, job summary, and artifact must show `***` for every ID. Until then, these GitHub settings are **Manual action required**.
 
+## Amendment (2026-11-14): a copy spends no Actions minutes unless its owner opts in
+
+- **Decision source:** the project's coordinator, under the user's rule that a user must never be required to run GitHub Actions or pay for anything beyond Azure and Fabric.
+- **Why:** a private copy made with **Use this template** ran `validate.yml`'s static checks on every push to `main` and every pull request, Dependabot's included (8 pull requests in this repository in the 30 days before, by the coordinator's count), at about 15 Linux and 15 Windows job-minutes each, which its owner pays for: standard GitHub-hosted runners are free only in a public repository ([GitHub Actions billing](https://docs.github.com/billing/concepts/product-billing/github-actions)).
+- **The change:** `validate.yml`'s `static` job runs on a push or a pull request only when `github.event.repository.visibility` is `public` or the repository variable `STATIC_CHECKS_ENABLED` is `true`, as `codeql.yml` does with `CODE_SCANNING_ENABLED`. A run by hand (`workflow_dispatch`) always runs it, and the `live` job stays by hand only. A skipped job uses no runner.
+- **This repository's CI is unchanged,** because it's public; if it became private, its static checks would need the variable too.
+- **Every automatic trigger is opt-in in a private copy now:** `validate.yml` (`STATIC_CHECKS_ENABLED`), `codeql.yml` (`CODE_SCANNING_ENABLED`), and the four schedules (`DBHUB_SCHEDULES_ENABLED`, off in every copy). `Repo.LifecycleScripts.Tests.ps1` checks that every job a push or a pull request starts is by hand only or carries the public-or-opt-in condition.
+- **The trade-off:** in a private copy without the variable, a pull request, Dependabot's included, can merge without the static checks; run `validate.yml` by hand, or set the variable.
+
 ## Sources (checked 2026-10-27)
 
 - [Deployments and environments](https://docs.github.com/actions/reference/workflows-and-actions/deployments-and-environments)

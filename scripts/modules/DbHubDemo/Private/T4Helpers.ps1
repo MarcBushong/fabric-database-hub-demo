@@ -711,7 +711,9 @@ function ConvertTo-DemoT4FallbackCost {
     place, otherwise the rest of the month's compute at that size), with T4's storage, its private DNS zone, and, where
     the subscription's plans are on Standard (what a tenant policy enforces, PREFLIGHT.POLICY.DEFENDER), Defender CSPM
     and Defender for open-source relational databases. Unpriced names what the Retail Prices API had no price for, which
-    the totals leave out, and Defender for Cloud when its plans weren't read. Returns Allowed, SkipReason
+    the totals leave out, and Defender for Cloud when its plans weren't read. T4's read replica (ADR 0025) is left out
+    of the session and the month here (the estimate's SessionCostWithoutReplica and LightUseMonthlyWithoutReplica), so it
+    never changes a size verdict; PREFLIGHT.COST.* count it. Returns Allowed, SkipReason
     (MonthlyCeiling, SessionCeiling, Price, or ''), SkuName, HourlyUsd, T4LightUseMonthlyUsd and T4MonthlyWorstCaseUsd (T4
     alone), LightUseMonthlyUsd and MonthlyWorstCaseUsd (the demo's month with it), SessionUsd, MonthlyCeilingUsd,
     SessionCeilingUsd, DefenderIncluded, Unpriced, Location, PriceError, and RestartAssumption (SafetyStop, RestOfMonth,
@@ -741,8 +743,19 @@ function ConvertTo-DemoT4FallbackCost {
     $hoursPerMonth = [double](Get-DemoProfile).assumptions.hoursPerMonth
     $monthlyCeiling = [double]$Config['monthlyCeilingUsd']
     $sessionCeiling = [double]$Config['sessionCeilingUsd']
-    $monthlyWorst = [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthly') + [double](Get-DemoMemberValue -InputObject $Estimate -Name 'T4AutoRestartWorstCaseMonthly'), 2)
-    $session = [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'SessionCost'), 2)
+    # T4's read replica (2026-11-13, ADR 0025) is left out of this verdict, so its share of a session never changes a T4 size
+    # decision (the one-time move to the default kept its demo-day behavior; coordinator's direction, 2026-11-13).
+    # PREFLIGHT.COST.* still count it. An estimate from before the replica has no such totals: its own are the same thing.
+    $lightUseBasis = Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthlyWithoutReplica'
+    if ($null -eq $lightUseBasis) {
+        $lightUseBasis = Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthly'
+    }
+    $sessionBasis = Get-DemoMemberValue -InputObject $Estimate -Name 'SessionCostWithoutReplica'
+    if ($null -eq $sessionBasis) {
+        $sessionBasis = Get-DemoMemberValue -InputObject $Estimate -Name 'SessionCost'
+    }
+    $monthlyWorst = [System.Math]::Round([double]$lightUseBasis + [double](Get-DemoMemberValue -InputObject $Estimate -Name 'T4AutoRestartWorstCaseMonthly'), 2)
+    $session = [System.Math]::Round([double]$sessionBasis, 2)
     # T4 alone: its fixed costs and its compute for the light-use hours plus the restart worst case the estimate counted
     # (T4RestartHours: the rest of the month, or about a day per restart where a safety stop is in place;
     # 2026-11-04). An estimate without it counts every hour of the month.
@@ -771,7 +784,7 @@ function ConvertTo-DemoT4FallbackCost {
         HourlyUsd             = $hourly
         T4LightUseMonthlyUsd  = $t4Light
         T4MonthlyWorstCaseUsd = $t4Worst
-        LightUseMonthlyUsd    = $(if ($null -ne $Estimate) { [System.Math]::Round([double](Get-DemoMemberValue -InputObject $Estimate -Name 'LightUseMonthly'), 2) } else { $null })
+        LightUseMonthlyUsd    = $(if ($null -ne $Estimate) { [System.Math]::Round([double]$lightUseBasis, 2) } else { $null })
         MonthlyWorstCaseUsd   = $(if ($null -ne $Estimate) { $monthlyWorst } else { $null })
         SessionUsd            = $(if ($null -ne $Estimate) { $session } else { $null })
         MonthlyCeilingUsd     = $monthlyCeiling
@@ -2061,7 +2074,8 @@ function Get-DemoT4RestartCoverage {
             else {
                 $stopStatus = if ($null -ne $runs.Stop) { [string](Get-DemoMemberValue -InputObject $runs.Stop.Result -Name 'status') } else { '' }
                 $evidence['nightlyLastRun'] = if ($null -eq $runs.Stop) { 'none' } else { '{0} ({1})' -f $runs.Stop.Status, $(if ($stopStatus) { $stopStatus } else { 'no result line' }) }
-                if ($null -ne $runs.Stop -and ($runs.Stop.Status -ne 'Completed' -or $stopStatus -ne 'Stopped')) {
+                # Deferred (2026-11-14): a run was still going, so it changed nothing, by design; it isn't a failed run.
+                if ($null -ne $runs.Stop -and ($runs.Stop.Status -ne 'Completed' -or $stopStatus -notin 'Stopped', 'Deferred')) {
                     $when = if ($null -ne $runs.Stop.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$runs.Stop.CreatedUtc) } else { '' }
                     $gap = @('StopJob', ('the nightly safety stop''s last run{0} didn''t finish its work (job {1}), so it may not stop T4' -f $when, $runs.Stop.Status), 'Run ./scripts/status.ps1 to see what it said (STATUS.SAFETYSTOP), fix that, then run this again.')
                 }
@@ -2147,7 +2161,7 @@ function Get-DemoT4ControlRestartCoverage {
             return (& $missing 'Schedule' ('the daily T4 safety stop {0}' -f $what) ('Run {0}, which schedules it again.' -f $setup) $evidence)
         }
         $name = Get-DemoActivityControlName -Config $Config
-        $roleId = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId
+        $roleId = Get-DemoActivityControlRoleId -SubscriptionId $name.SubscriptionId -RoleName $name.RoleName
         $principalId = if ($roleId) { Get-DemoActivityControlPrincipalId -Name $name } else { '' }
         $a1 = if ($roleId -and $principalId) { Test-DemoActivityControlAssignment -SubscriptionId $name.SubscriptionId -Scope $name.DemoResourceGroupId -PrincipalId $principalId -RoleId $roleId } else { $null }
         $evidence['a1'] = if ($null -ne $a1 -and $a1.Exists) { 'assigned' } elseif ($null -ne $a1 -and $a1.Error -and -not $a1.Missing) { 'unread' } else { 'missing' }
@@ -2390,6 +2404,59 @@ function Wait-DemoT4State {
     }
 }
 
+function Wait-DemoT4Transition {
+    <#
+    .SYNOPSIS
+    Waits while T4 is in a state that ends by itself (2026-11-17, live on rg-dbhubfd-demo): Updating while its read replica
+    is created (about 9 minutes; T4's track creates it alongside T1's) or a scale or a setting applies, Starting,
+    Restarting, or Provisioning. A server that's Ready, stopped, missing, or in any other state returns at once. Counts its
+    polls, at most -TimeoutMinutes. Returns State (Get-DemoT4State's last read), From (the state it waited on, or ''),
+    Seconds, and Ended (false when the bound stopped it). Internal.
+    Source (the states, checked 2026-11-17): https://learn.microsoft.com/rest/api/postgresql/servers/get
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateRange(0, 60)]
+        [int] $TimeoutMinutes = 20,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 20,
+
+        [string] $DeploymentId = '',
+
+        [string] $ProgressPath = '',
+
+        [string] $ProgressId = ''
+    )
+
+    $transient = @('Updating', 'Starting', 'Restarting', 'Provisioning')
+    $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
+    if (-not ($current.Exists -and [string]$current.State -in $transient) -or $TimeoutMinutes -eq 0) {
+        return [pscustomobject]@{ State = $current; From = ''; Seconds = 0; Ended = -not ($current.Exists -and [string]$current.State -in $transient) }
+    }
+    $from = [string]$current.State
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $text = 'T4 ({0}) is {1}, which ends by itself (its read replica''s creation keeps it Updating for about 9 minutes), so T1 waits for it to be Ready, at most {2} minutes; no action needed.' -f [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Names') -Name 'ServerName'), $from, $TimeoutMinutes
+    Write-DemoLog -Message $text
+    if ($ProgressPath -and $ProgressId) {
+        Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -AzureSide -Message $text
+    }
+    $polls = [int][System.Math]::Ceiling($TimeoutMinutes * 60 / $PollSeconds)
+    for ($poll = 1; $poll -le $polls; $poll++) {
+        Start-Sleep -Seconds $PollSeconds
+        $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
+        if (-not ($current.Exists -and [string]$current.State -in $transient)) {
+            break
+        }
+    }
+    $ended = -not ($current.Exists -and [string]$current.State -in $transient)
+    return [pscustomobject]@{ State = $current; From = $from; Seconds = [int]$watch.Elapsed.TotalSeconds; Ended = $ended }
+}
+
 function Invoke-DemoT4PowerAction {
     <#
     .SYNOPSIS
@@ -2454,6 +2521,24 @@ function Invoke-DemoT4PowerAction {
     $wanted = if ($Action -eq 'Start') { 'Ready' } else { 'Stopped' }
     $before = $current.State
     $evidence = [ordered]@{ server = $names.ServerName; stateBefore = $before }
+    # The read replica's start-first record (2026-11-16): its message goes into T4's own record, and its status when that's
+    # worse, so a start-first Warning never shows only in the evidence.
+    $replicaFirst = $null
+    $withFirst = {
+        param([object] $Result)
+        if ($null -eq $replicaFirst -or [string]$replicaFirst.status -in '', 'Not selected') {
+            return $Result
+        }
+        $Result.message = '{0} {1}' -f [string]$Result.message, [string]$replicaFirst.message
+        $worst = Get-DemoWorstStatus -Status @([string]$Result.status, [string]$replicaFirst.status)
+        if ($worst -ne [string]$Result.status) {
+            $Result.status = $worst
+            if (-not [string](Get-DemoMemberValue -InputObject $Result -Name 'remediation')) {
+                $Result.remediation = [string](Get-DemoMemberValue -InputObject $replicaFirst -Name 'remediation')
+            }
+        }
+        return $Result
+    }
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $requestUtc = [DateTime]::UtcNow
     if ($before -ne $wanted) {
@@ -2463,11 +2548,19 @@ function Invoke-DemoT4PowerAction {
             $current = Wait-DemoT4State -Config $Config -State @('Ready', 'Stopped') -TimeoutMinutes 15 -DeploymentId $DeploymentId
         }
         if ($current.State -ne $wanted -and $current.State -ne $(if ($Action -eq 'Start') { 'Starting' } else { 'Stopping' })) {
+            if ($Action -eq 'Start' -and $CheckPrefix -in 'DEPLOY', 'START') {
+                # T4's read replica (ADR 0025): Azure starts T4 only once a stopped replica is Ready
+                # (SourceReplicasStartStopOrder, live 2026-11-13), which a session that ended without stop-demo.ps1 leaves.
+                $replicaFirst = Invoke-DemoT4ReplicaStartFirst -Config $Config -CheckPrefix $CheckPrefix -DeploymentId $DeploymentId
+                if ($null -ne $replicaFirst) {
+                    $evidence['replicaFirst'] = [ordered]@{ status = [string]$replicaFirst.status; message = [string]$replicaFirst.message }
+                }
+            }
             $url = 'https://management.azure.com{0}/{1}?api-version={2}' -f $names.ServerId, $Action.ToLowerInvariant(), (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.DBforPostgreSQL/flexibleServers')
             $post = Invoke-DemoAzWithConflictRetry -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('rest', '--method', 'post', '--url', $url) -Label ('T4 {0}: {1}' -f $names.ServerName, $Action.ToLowerInvariant()) -MaxConflictRetries 4
             if ($post.ExitCode -ne 0) {
                 $evidence['error'] = Protect-DemoText -Text ([string]$post.StdErr).Trim()
-                return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Fail' -Message ('T4 ({0}) couldn''t be {1}: {2}' -f $names.ServerName, $(if ($Action -eq 'Start') { 'started' } else { 'stopped' }), $evidence['error']) -Evidence $evidence -Remediation ('Run the script again in a few minutes; a server that''s updating rejects {0} until it finishes.' -f $Action.ToLowerInvariant()) -DocUrl $docUrl)
+                return (& $withFirst (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Fail' -Message ('T4 ({0}) couldn''t be {1}: {2}' -f $names.ServerName, $(if ($Action -eq 'Start') { 'started' } else { 'stopped' }), $evidence['error']) -Evidence $evidence -Remediation ('Run the script again in a few minutes; a server that''s updating rejects {0} until it finishes.' -f $Action.ToLowerInvariant()) -DocUrl $docUrl))
             }
         }
         if ($WaitMinutes -gt 0) {
@@ -2509,13 +2602,13 @@ function Invoke-DemoT4PowerAction {
     if ($current.State -eq $wanted) {
         $verb = if ($Action -eq 'Start') { 'running (Ready)' } else { 'stopped' }
         $how = if ($before -eq $wanted -and -not $Requested) { 'was already' } else { 'is now' }
-        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 ({0}) {1} {2}.{3}' -f $names.ServerName, $how, $verb, $autoStart) -Evidence $evidence -DocUrl $docUrl)
+        return (& $withFirst (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 ({0}) {1} {2}.{3}' -f $names.ServerName, $how, $verb, $autoStart) -Evidence $evidence -DocUrl $docUrl))
     }
     $pending = if ($Action -eq 'Start') { 'Starting' } else { 'Stopping' }
     if ($WaitMinutes -eq 0 -and $current.State -in @($pending, $before)) {
-        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 ({0}) is {1}; the operation runs in the background.{2}' -f $names.ServerName, $pending.ToLowerInvariant(), $autoStart) -Evidence $evidence -DocUrl $docUrl)
+        return (& $withFirst (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 ({0}) is {1}; the operation runs in the background.{2}' -f $names.ServerName, $pending.ToLowerInvariant(), $autoStart) -Evidence $evidence -DocUrl $docUrl))
     }
-    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4 ({0}) is {1}, not {2}, after {3} minute(s).{4}' -f $names.ServerName, $current.State, $wanted, $WaitMinutes, $autoStart) -Evidence $evidence -Remediation 'Check it again with status.ps1 in a few minutes; a Burstable server that has used up its CPU credits can take longer to stop or start.' -DocUrl $docUrl)
+    return (& $withFirst (New-DemoResult -CheckId $checkId -Area 'infra' -Target 'T4' -Status 'Warning' -Message ('T4 ({0}) is {1}, not {2}, after {3} minute(s).{4}' -f $names.ServerName, $current.State, $wanted, $WaitMinutes, $autoStart) -Evidence $evidence -Remediation 'Check it again with status.ps1 in a few minutes; a Burstable server that has used up its CPU credits can take longer to stop or start.' -DocUrl $docUrl))
 }
 
 function Get-DemoT4ParameterState {

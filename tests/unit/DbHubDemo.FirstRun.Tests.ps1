@@ -4,6 +4,13 @@ BeforeAll {
     # tokens are built at run time.
     $repoRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../..'))
     Import-Module -Name (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/DbHubDemo.psd1') -Force
+    # No test here reaches the Azure CLI (2026-11-16, tests/TestAzGuard.ps1): an az call that no test mocks gets what the
+    # real CLI answered for these tests' made-up subscription, which they relied on, without leaving this process.
+    Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+        $at = [array]::IndexOf([string[]]$ArgumentList, '--subscription')
+        $subscription = if ($at -ge 0 -and $at + 1 -lt $ArgumentList.Count) { $ArgumentList[$at + 1] } else { '11111111-2222-3333-4444-555555555555' }
+        [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ("ERROR: Subscription '{0}' not found. Check the spelling and casing and try again." -f $subscription) }
+    }
     . (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Hub.Helpers.ps1')
     $script:subA = '11111111-2222-3333-4444-555555555555'
     $script:subB = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -656,6 +663,39 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -MockWith {
             New-DemoResult -CheckId 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' -Area 'fabric' -Target 'fabric' -Status $script:runStatus -Message 'ran' -Evidence @{ status = $script:jobStatus; seconds = 95 }
         }
+        $script:notebookKnows = [pscustomobject]@{ Known = $true; Has = $true; Error = '' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { $script:notebookKnows }
+    }
+
+    It 'sends T4''s metrics only to a copy of the notebook that knows POSTGRES_METRICS, and otherwise says so and asks to keep them (2026-11-16)' {
+        # An environment whose deploy.ps1 met a paused capacity still has the notebook from before T4's history, which
+        # would ignore them: the history then mustn't read as if they were saved.
+        $script:notebookKnows = [pscustomobject]@{ Known = $true; Has = $false; Error = '' }
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C -PostgresMetrics '{"version":1}' }
+        $saved.Result.status | Should -Be 'Warning'
+        $saved.Result.message | Should -Match 'T4''s metrics weren''t sent: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history \(2026-11-13\), so it would ignore them\.$'
+        $saved.Result.remediation | Should -Match '^Run \./scripts/configure-fabric\.ps1, which updates the notebook \(fabric\.importNotebooks is false, so deploy\.ps1 keeps the workspace''s copy\)\. T4''s metrics are kept in out/history-pending'
+        $saved.PostgresDropped | Should -BeTrue
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { -not $Parameter.Contains('POSTGRES_METRICS') }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq '13131313-1313-1313-1313-131313131313' -and $Name -eq 'NB_DatabaseHub_LiveActivity' -and $Parameter -eq 'POSTGRES_METRICS' }
+        # With fabric.importNotebooks true, which init.ps1 writes, deploy.ps1 updates it (2026-11-16).
+        $updating = @{} + $script:historyConfig
+        $updating['fabric'] = @{ workspaceName = 'Database Hub Demo'; lakehouseName = 'LH_DatabaseHub'; importNotebooks = $true }
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $updating } { Save-DemoFabricHistory -Config $C -PostgresMetrics '{"version":1}' }
+        $saved.Result.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which updates the notebook\. T4''s metrics are kept in out/history-pending'
+
+        # A copy that knows it, and one whose definition can't be read, get them as before.
+        foreach ($knows in @([pscustomobject]@{ Known = $true; Has = $true; Error = '' }, [pscustomobject]@{ Known = $false; Has = $false; Error = 'a fake error' })) {
+            $script:notebookKnows = $knows
+            $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C -PostgresMetrics '{"version":1}' }
+            $saved.Result.status | Should -Be 'Pass'
+            $saved.PostgresDropped | Should -BeFalse
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 2 -Exactly -ParameterFilter { $Parameter['POSTGRES_METRICS'] -eq '{"version":1}' }
+
+        # Without metrics, nothing is read.
+        $null = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 4 -Exactly
     }
 
     It 'runs NB_DatabaseHub_LiveActivity with only its safe switches, bounded at 15 minutes' {
@@ -741,6 +781,53 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $script:order.Clear()
             Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false | Out-Null
             $script:order | Should -Contain 'SaveHistory'
+        }
+
+        It 'keeps T4''s and its read replica''s captured metrics when the history run didn''t save them, and only then (ADR 0025)' {
+            # stop-demo.ps1 deletes the replica, and Azure Monitor no longer answers for its metrics then: a paused capacity
+            # mustn't lose the session's lag without a word.
+            $script:stopConfig['t4Enabled'] = $true
+            $script:saveStatus = 'Manual action required'
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; RunnerSha256 = ''; RunnerSentTo = @(); HostPasswordUtc = ''; Tags = @{ deploymentId = 'abc123' }; T4Replica = 'Session'; FabricCapacityResumed = ''; FabricCapacityResumedUtc = '' } }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Exists = $true; Removing = $false } }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoPostgresHistoryCapture -MockWith { $script:order.Add('Capture'); [pscustomobject]@{ Json = '{"version":1}'; Result = (New-DemoResult -CheckId 'STOP.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Pass' -Message 'captured') } }
+            Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { $script:order.Add('DeleteReplica'); New-DemoResult -CheckId 'STOP.T4.REPLICA' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'deleted' -Evidence @{ replica = 'pgreplica01-abc123'; stateBefore = 'Ready' } }
+            Mock -ModuleName DbHubDemo -CommandName Wait-DemoT4ReplicaState -MockWith { [pscustomobject]@{ State = 'NotFound'; Present = $false; Names = [pscustomobject]@{ ServerName = 'pgreplica01-abc123' } } }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith { New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'stopped' }
+            # This run deleted the replica, so T4's stop is the confirmed one (R843), which its own tests cover.
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4StopConfirmed -MockWith { $script:order.Add('ConfirmedStop'); New-DemoResult -CheckId 'STOP.T4.STOP' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'stopped' }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoPostgresHistoryPending -MockWith { $script:order.Add('Keep:' + $Json); New-DemoResult -CheckId 'STOP.T4.HISTORY.PENDING' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'kept' }
+            $script:dropped = $false
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -MockWith { $script:order.Add('SaveHistory:' + $PostgresMetrics); [pscustomobject]@{ Result = (New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status $script:saveStatus -Message 'history'); StillRunning = $script:still; PostgresDropped = $script:dropped } }
+
+            $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
+            $script:order.IndexOf('Capture') | Should -BeLessThan $script:order.IndexOf('DeleteReplica') -Because 'a deleted replica''s metrics are gone'
+            @($script:order | Where-Object { $_ -eq 'DeleteReplica' }).Count | Should -Be 1 -Because 'the delete goes once; the wait sees it gone'
+            $script:order.IndexOf('DeleteReplica') | Should -BeLessThan $script:order.IndexOf('ConfirmedStop') -Because 'T4''s stop after the replica''s delete is confirmed (R843)'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -Times 0 -Exactly -Because 'only the confirmed stop stops T4 when this run deleted the replica'
+            ($results | Where-Object { $_.checkId -eq 'STOP.T4.REPLICA' }).message | Should -Be 'T4''s read replica (pgreplica01-abc123) was deleted, so nothing bills for it until the next session creates it again.' -Because 'live, a second call said "isn''t there, so there''s nothing to delete" after this run deleted it'
+            $script:order | Should -Contain 'SaveHistory:{"version":1}'
+            $script:order | Should -Contain 'Keep:{"version":1}'
+            ($results | Where-Object { $_.checkId -eq 'STOP.T4.HISTORY.PENDING' }).status | Should -Be 'Warning'
+
+            # Saved, or still running in Fabric with the metrics: nothing to keep.
+            foreach ($case in @(@{ Status = 'Pass'; Still = $false }, @{ Status = 'Warning'; Still = $true })) {
+                $script:order.Clear()
+                $script:saveStatus = $case.Status
+                $script:still = $case.Still
+                $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
+                @($script:order | Where-Object { $_ -like 'Keep:*' }).Count | Should -Be 0 -Because $case.Status
+                $results | Where-Object { $_.checkId -eq 'STOP.T4.HISTORY.PENDING' } | Should -BeNullOrEmpty
+            }
+
+            # Saved without them, because the workspace's notebook predates T4's history (2026-11-16): they're kept.
+            $script:order.Clear()
+            $script:saveStatus = 'Warning'
+            $script:still = $false
+            $script:dropped = $true
+            $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
+            $script:order | Should -Contain 'Keep:{"version":1}'
+            ($results | Where-Object { $_.checkId -eq 'STOP.T4.HISTORY.PENDING' }).status | Should -Be 'Warning'
         }
     }
 }

@@ -181,17 +181,29 @@ Describe 'Notebook <_>' -ForEach $notebookNames {
         $parameters[0].Source | Should -Match '(?m)^LAKEHOUSE_NAME = "LH_DatabaseHub"\s*$'
     }
 
-    It 'defaults GITHUB_REPOSITORY to the public repository, which the import replaces with github.repository' {
+    It 'defaults GITHUB_REPOSITORY to the public repository, which the import replaces with github.repository (the deployment notebook only)' {
+        if ($name -eq 'NB_DatabaseHub_LiveActivity') {
+            # 2026-11-14 (ADR 0026): the live-activity notebook has no GitHub path, so no repository to name.
+            $parameters[0].Source | Should -Not -Match 'GITHUB_'
+            return
+        }
         $parameters[0].Source | Should -Match '(?m)^GITHUB_REPOSITORY = "MarcBushong/fabric-database-hub-demo"\s*$'
     }
 
-    It 'runs on Run all: CONFIRM is True by default, and the switch that stops activity or drops tables stays False (2026-11-03)' {
+    It 'runs on Run all: nothing to switch first, and the switch that drops tables stays False (2026-11-03)' {
         # The owner, 2026-11-03: "We should not default to dry runs anywhere. users should be able to just click run all
         # and then it should run."
-        $parameters[0].Source | Should -Match '(?m)^CONFIRM = True\s*$'
-        $switches = @([regex]::Matches($parameters[0].Source, '(?m)^(STOP_ACTIVITY|PURGE_DEMO_TABLES) = (\w+)'))
-        $switches.Count | Should -Be 1
-        $switches[0].Groups[2].Value | Should -Be 'False'
+        if ($name -eq 'NB_DatabaseHub_LiveActivity') {
+            # 2026-11-14 (ADR 0026): it changes no activity, so it has no CONFIRM and no stop switch; Run all analyzes and saves.
+            $parameters[0].Source | Should -Not -Match '(?m)^(CONFIRM|STOP_ACTIVITY) = '
+            $parameters[0].Source | Should -Match '(?m)^SAVE_RESULTS = True\s*$'
+        }
+        else {
+            $parameters[0].Source | Should -Match '(?m)^CONFIRM = True\s*$'
+            $switches = @([regex]::Matches($parameters[0].Source, '(?m)^(STOP_ACTIVITY|PURGE_DEMO_TABLES) = (\w+)'))
+            $switches.Count | Should -Be 1
+            $switches[0].Groups[2].Value | Should -Be 'False'
+        }
         $nb.Raw | Should -Not -Match 'Run all\*\* is safe|That''s safe|\(the default\) it only prints a dry run|Leave them False'
     }
 
@@ -247,6 +259,12 @@ Describe 'Notebook <_>' -ForEach $notebookNames {
         $mutating = 'submit_simulation_request|dispatch_workflow|drop_demo_tables'
         foreach ($definition in [regex]::Matches($allCode, "(?ms)^def ($mutating)\(.*?(?=^\S)")) {
             $definition.Value | Should -Match 'if not \(?CONFIRM'
+        }
+        if ($name -eq 'NB_DatabaseHub_LiveActivity') {
+            # 2026-11-14 (ADR 0026): no cell changes a resource; it writes only the lakehouse's tables.
+            $nb.Raw | Should -Not -Match 'RESOURCE-CHANGING CELL|Resource-changing cell'
+            $allCode | Should -Not -Match "\b($mutating)\("
+            return
         }
         $flagged = 0
         for ($index = 0; $index -lt $nb.Cells.Count; $index++) {
@@ -504,18 +522,23 @@ Describe 'NB_DatabaseHub_LiveActivity content' {
         $nb = Get-Notebook -Name 'NB_DatabaseHub_LiveActivity'
         $markdown = ($nb.Cells | Where-Object Type -EQ 'markdown' | ForEach-Object Source) -join "`n"
         $allCode = ($nb.Code | ForEach-Object Source) -join "`n"
-        $adrInputs = @('environment', 'target', 'scenario', 'duration', 'concurrency', 'intensity', 'reset-before', 'auto-cleanup')
     }
 
     It 'narrates section <_>' -ForEach @(
-        'Parameters', 'Helpers', 'Simulation control', 'Telemetry access', 'Estate pulse', 'Locks and blocking', 'Overall consumption',
-        'Correlation: scenario windows and telemetry', 'See it in the Hub', 'Optional: Real-Time Dashboard', 'Persist', 'Stop and clean up', 'Next steps'
+        'Parameters', 'Helpers', 'This session', 'Telemetry access', 'Estate pulse', 'Locks and blocking', 'Overall consumption',
+        'Correlation: scenario windows and telemetry', 'See it in the Hub', 'Optional: Real-Time Dashboard', 'Persist', 'Next steps'
     ) {
         $markdown | Should -Match ('(?m)^## \d+\. ' + [regex]::Escape($_) + '$')
     }
 
-    It 'offers the four activity profiles' {
-        $allCode | Should -Match 'PROFILES = \("baseline", "business-day", "off"\)'
+    It 'uses no GitHub and changes no activity: no workflow dispatch, no token, no Key Vault, no P9 (2026-11-14, ADR 0026)' {
+        foreach ($pattern in 'api\.github\.com', 'workflow_dispatch', 'getSecret\(', 'GITHUB_', 'KEY_VAULT_URL', '\bCONFIRM\b', 'STOP_ACTIVITY', 'demo-control\.yml', 'build_simulation_request', 'submit_simulation_request') {
+            # Case-sensitive: scenario_runs keeps its github_run_id and github_run_url columns, empty, for the report's schema.
+            $allCode | Should -Not -MatchExactly $pattern -Because $pattern
+        }
+        $markdown | Should -Not -Match 'P9|demo-control\.yml|workflow_dispatch'
+        $markdown | Should -Match 'uses no GitHub Actions'
+        $markdown | Should -Match 'NB_DatabaseHub_Control'
         $allCode | Should -Match 'profile\.startswith\("incident:"\)'
     }
 
@@ -528,86 +551,80 @@ Describe 'NB_DatabaseHub_LiveActivity content' {
         $dashboard | Should -BeGreaterThan $helpers
     }
 
-    It 'sends only the demo-control.yml inputs that ADR 0011 defines' {
-        $block = [regex]::Match($allCode, '(?s)    inputs = \{(.*?)\n    \}').Groups[1].Value
-        $keys = @([regex]::Matches($block, '"([a-z-]+)":') | ForEach-Object { $_.Groups[1].Value }) + @([regex]::Matches($allCode, 'inputs\["([a-z-]+)"\] =') | ForEach-Object { $_.Groups[1].Value })
-        $keys | Should -Not -BeNullOrEmpty
-        foreach ($key in $keys) {
-            $key | Should -BeIn $adrInputs
-        }
-        $workflow = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath '.github/workflows/demo-control.yml') -Raw
-        $declared = [regex]::Match($workflow, '(?ms)^\s+workflow_dispatch:\s*\n\s+inputs:\s*\n(.*?)(?=^\S|^\s{0,2}\w|\z)')
-        if (-not $declared.Success) {
-            Set-ItResult -Skipped -Because 'demo-control.yml declares no workflow_dispatch inputs yet (Phase 13)'
-            return
-        }
-        foreach ($key in $keys) {
-            $declared.Groups[1].Value | Should -Match ('(?m)^\s+' + [regex]::Escape($key) + ':')
-        }
-    }
-
-    It 'reads the GitHub token only from Key Vault, and only when P9 is configured' {
-        $nb.Code[0].Source | Should -Match '(?m)^KEY_VAULT_URL = ""'
-        foreach ($call in [regex]::Matches($allCode, 'getSecret\(([^)]*)\)')) {
-            $call.Groups[1].Value | Should -Be 'KEY_VAULT_URL, GITHUB_TOKEN_SECRET_NAME'
-        }
-        $allCode | Should -Match 'Refusing to send the GitHub token outside this repository'
-        $allCode | Should -Match 'GITHUB_API = "https://api\.github\.com"'
-    }
-
-    It 'prints the GitHub link and CLI command when P9 is not configured' {
-        $allCode | Should -Match 'def print_manual_trigger'
-        $allCode | Should -Match '"gh", "workflow", "run", GITHUB_WORKFLOW_FILE'
-    }
-
-    It 'sends business-day on every target for 240 minutes on Run all with its defaults, and never the stop (2026-11-03)' {
+    It 'records a control session and its beats as scenario windows, and saves a session only once (ADR 0026)' {
         if (-not $python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
             return
         }
-        # Runs the notebook's own parameters, send, and stop cells, with stand-ins for the helpers that would reach GitHub.
-        $script = Join-Path -Path $TestDrive -ChildPath 'send.py'
+        # The session helpers from part 3 and the session cell, with stand-ins for what needs pandas or Spark.
+        $script = Join-Path -Path $TestDrive -ChildPath 'session.py'
         Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
-import json, sys
+import datetime as dt, json, re, sys, types
 cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
-params = next(cell for cell in cells if cell.startswith("# Parameters cell"))
-send = next(cell for cell in cells if cell.startswith("# RESOURCE-CHANGING CELL: triggers demo-control.yml"))
-stop = next(cell for cell in cells if cell.startswith("# RESOURCE-CHANGING CELL: sets the activity profile to \"off\""))
+part3 = next(cell for cell in cells if cell.startswith("# Helpers, part 3"))
+session_cell = next(cell for cell in cells if cell.startswith("# This session"))
+functions = "\n".join(re.findall(r"(?m)^_SCENARIO_ID = .*$", part3) + re.findall(r"(?ms)^def (?:parse_session_plan|session_requests)\(.*?(?=^\S|\Z)", part3))
 
-def run(**overrides):
-    ns = {}
-    exec(params, ns)
-    ns.update(overrides)
-    sent = []
-    ns["build_simulation_request"] = lambda profile, target, duration, *rest: {"profile": profile, "target": target, "duration_minutes": duration}
-    ns["REQUEST"] = ns["build_simulation_request"](ns["PROFILE"], ns["SIM_TARGET"], ns["DURATION_MINUTES"])
-    ns["LAST_REQUEST"] = None
-    ns["print_simulation_plan"] = lambda request: None
-    ns["submit_simulation_request"] = lambda request: sent.append(request) or dict(request)
-    exec(send, ns)
-    exec(stop, ns)
-    return ns, sent
+def run(session_id, plan, saved=False):
+    exits = []
+    ns = {"json": json, "re": re, "dt": dt, "RUN_ID": "run-1", "NOTEBOOK_NAME": "NB_DatabaseHub_LiveActivity", "SELECTED_TARGETS": ["T1", "T2", "T3"],
+          "SESSION_REQUESTS": [], "SAVE_RESULTS": True, "SESSION_ID": session_id, "SESSION_PLAN": plan,
+          "_parse_utc": lambda text: dt.datetime.fromisoformat(text.replace("Z", "+00:00")),
+          "utc_now": lambda: dt.datetime(2026, 11, 14, 16, 0, tzinfo=dt.timezone.utc),
+          "session_saved": lambda session: saved,
+          "_notebookutils": lambda: types.SimpleNamespace(notebook=types.SimpleNamespace(exit=lambda value: exits.append(value)))}
+    exec(functions, ns)
+    exec(session_cell, ns)
+    return ns, exits
 
-ns, sent = run()
-assert ns["CONFIRM"] is True and ns["STOP_ACTIVITY"] is False, (ns["CONFIRM"], ns["STOP_ACTIVITY"])
-assert sent == [{"profile": "business-day", "target": "all", "duration_minutes": 240}], sent
-ns, sent = run(CONFIRM=False)
-assert sent == [], sent
-ns, sent = run(STOP_ACTIVITY=True)
-assert [item["profile"] for item in sent] == ["business-day", "off"], sent
-print("ok")
+sid = "0123456789abcdef0123456789abcdef"
+plan = json.dumps({"version": 1, "sessionId": sid, "startUtc": "2026-11-14T14:00:00Z", "endUtc": "2026-11-14T15:30:00Z", "beats": [
+    {"target": "T1", "scenario": "blocking-chain", "startUtc": "2026-11-14T14:04:00Z", "endUtc": "2026-11-14T14:14:00Z"},
+    {"target": "T3", "scenario": "resource-governance", "startUtc": "2026-11-14T14:05:00Z", "endUtc": "2026-11-14T14:17:00Z"},
+    {"target": "T4", "scenario": "replica-lag", "startUtc": "2026-11-14T14:59:00Z", "endUtc": "2026-11-14T15:08:00Z"},
+    {"target": "T1", "scenario": "DROP TABLE", "startUtc": "2026-11-14T14:20:00Z", "endUtc": "2026-11-14T14:30:00Z"},
+    {"target": "T2", "scenario": "cpu-pressure", "startUtc": "2026-11-14T14:30:00Z", "endUtc": "2026-11-14T14:20:00Z"}]})
+report = {}
+ns, exits = run("", "")
+report["none"] = {"rows": len(ns["SESSION_REQUESTS"]), "exits": exits}
+ns, exits = run(sid, plan)
+report["session"] = {"rows": [[row["request_id"], row["target"], row["profile"], row["duration_minutes"], row["dispatch_mode"]] for row in ns["SESSION_REQUESTS"]],
+                     "save": ns["SAVE_RESULTS"], "exits": exits}
+ns, exits = run(sid, plan, saved=True)
+report["saved"] = {"rows": len(ns["SESSION_REQUESTS"]), "save": ns["SAVE_RESULTS"], "exits": exits}
+ns, exits = run(sid, "not json")
+report["bad"] = {"rows": [row["profile"] for row in ns["SESSION_REQUESTS"]], "exits": exits}
+print(json.dumps(report))
 '@
         $PSNativeCommandUseErrorActionPreference = $false
         $output = & $python $script $nb.Path 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
-        $markdown | Should -Match 'With `CONFIRM = False` it sends and records nothing'
-        $markdown | Should -Match '\*\*Run all\*\* never stops anything'
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        $report.none.rows | Should -Be 0
+        @($report.none.exits) | Should -BeNullOrEmpty
+        # The session row, then its beats on T1 to T3 as incident windows; T4's beat shows in its own metrics, and a beat
+        # with a bad scenario or window is left out.
+        $rows = @($report.session.rows)
+        $rows.Count | Should -Be 3
+        $rows[0] | Should -Be @('session:0123456789abcdef0123456789abcdef', 'all', 'session', 90, 'session')
+        $rows[1] | Should -Be @('session:0123456789abcdef0123456789abcdef:00', 'T1', 'incident:blocking-chain', 10, 'session')
+        $rows[2] | Should -Be @('session:0123456789abcdef0123456789abcdef:01', 'T3', 'incident:resource-governance', 12, 'session')
+        $report.session.save | Should -BeTrue
+        # A session already saved: nothing is recorded or saved, and the run ends there.
+        $report.saved.rows | Should -Be 0
+        $report.saved.save | Should -BeFalse
+        @($report.saved.exits).Count | Should -Be 1
+        # A plan it can't read keeps the session's own row out too (no window), and never stops the run.
+        @($report.bad.rows) | Should -BeNullOrEmpty
+        @($report.bad.exits) | Should -BeNullOrEmpty
     }
 
-    It 'records each request in scenario_runs and saves telemetry_snapshots and analysis_findings' {
-        $allCode | Should -Match 'write_delta\("scenario_runs", \[record\], replace_run=False\)'
-        $allCode | Should -Match 'write_delta\("telemetry_snapshots"'
-        $allCode | Should -Match 'write_delta\("analysis_findings"'
+    It 'saves telemetry_snapshots, analysis_findings, and the report tables, then a session''s rows in scenario_runs, last' {
+        $persist = @($nb.Code | Where-Object { $_.Source -match '^# Persist:' })[0].Source
+        $persist | Should -Match 'write_delta\("telemetry_snapshots"'
+        $persist | Should -Match 'write_delta\("analysis_findings"'
+        $persist.IndexOf('prepare_report_tables()') | Should -BeLessThan $persist.IndexOf('write_delta("scenario_runs"')
+        $persist | Should -Match 'write_delta\("scenario_runs", SESSION_ROWS, replace_run=False\)'
     }
 
     It 'analyzes blocking, consumption, and T3 log-rate governance with charts' {
@@ -616,6 +633,71 @@ print("ok")
         }
         $allCode | Should -Match 'import matplotlib\.pyplot as plt'
         $allCode | Should -Match 'axvspan'
+    }
+
+    It 'prints one line for each table and chart in a reference run, as Run all''s history save runs it: no display, no chart, no table value (2026-11-16 live finding)' {
+        # Live: Fabric's reference run (notebookutils.notebook.run) failed on a cell's result, a JSON parse error on a bare
+        # token, so the history fell back to a job that queued behind Run all's own Spark session.
+        $PSNativeCommandUseErrorActionPreference = $false
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'reference_run.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import ast, contextlib, io, json, sys, types
+
+notebook = json.load(open(sys.argv[1], encoding="utf-8"))
+code = ["".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"]
+wanted = {"_notebookutils", "runtime_context", "in_reference_run", "display_frame", "plot_panels"}
+DISPLAYED = []
+namespace = {"display": DISPLAYED.append,
+             "notebookutils": types.SimpleNamespace(runtime=types.SimpleNamespace(context={"isReferenceRun": True}))}
+for source in code:
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "notebook", "exec"), namespace)
+            wanted.discard(node.name)
+if wanted:
+    raise SystemExit("missing notebook functions: %s" % sorted(wanted))
+sys.modules["matplotlib"] = None  # a chart would fail to import
+
+
+class Frame:
+    columns = ["Target", "Value", "Note"]
+    empty = False
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    def to_string(self, index=False):
+        return "\n".join(str(row) for row in self.rows)
+
+
+secret_like = '{"sessionId":"' + "e" * 32 + '","series":[]}'
+frame = Frame([["T1", float("nan"), secret_like], ["T2", float("inf"), "x"], ["T3", 1.5, "y"]])
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    reference = namespace["in_reference_run"]()
+    namespace["REFERENCE_RUN"] = reference
+    namespace["display_frame"](frame)
+    namespace["plot_panels"]("Locks and blocking", [("Blocked processes", frame, "count")])
+    namespace["REFERENCE_RUN"] = False
+    namespace["display_frame"](frame)
+print(json.dumps({"reference": reference, "displayed": len(DISPLAYED), "printed": out.getvalue()}))
+'@
+        $live = Get-Notebook -Name 'NB_DatabaseHub_LiveActivity'
+        $output = & $python $script $live.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        $report.reference | Should -BeTrue
+        $report.displayed | Should -Be 1 -Because 'only a run that isn''t a reference run displays the table'
+        $report.printed | Should -Match '\(3 row\(s\) of Target, Value, Note; the history report and the Insights app show them\.\)'
+        $report.printed | Should -Match 'Locks and blocking: 1 panel\(s\), in the history report and the Insights app; a reference run draws no chart\.'
+        $report.printed | Should -Not -Match '(?i)\bnan\b|\binf\b|eeeeeeee|matplotlib'
     }
 
     It 'describes signals for Database Agent prompts, never expected answers' {
@@ -725,6 +807,246 @@ print(json.dumps({"threshold": threshold, "minBins": min_bins, "before": episode
         $t2[0]['end'] | Should -Be ([datetime]::new(2026, 10, 23, 20, 29, 0))
         ($result['after']['T3'] | ConvertTo-Json -Compress) | Should -Be ($result['before']['T3'] | ConvertTo-Json -Compress) -Because 'T3 stays on AvgCPUPercent'
     }
+
+    It 'adds T4''s Azure Monitor metrics only from POSTGRES_METRICS, empty by default, before the persist cell, without a network call (ADR 0025)' {
+        $parameters = @($nb.Code | Where-Object { @($_.Metadata['tags']) -contains 'parameters' })[0].Source
+        $parameters | Should -Match '(?m)^POSTGRES_METRICS = ""$'
+        $nb.Code[1].Source | Should -Match '(?m)^POSTGRES_METRICS = str\(POSTGRES_METRICS or ""\)\.strip\(\)$'
+        $t4 = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# T4 \(PostgreSQL\):' })
+        $persist = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# Persist:' })
+        $t4 | Should -BeGreaterThan 0
+        $t4 | Should -BeLessThan $persist -Because 'the persist cell saves the rows it adds, with everything else'
+        $nb.Code[$t4].Source | Should -Match '(?m)^    POSTGRES_CAPTURE = record_postgres_metrics\(POSTGRES_METRICS\)$'
+        $markdown | Should -Match '(?m)^### T4: PostgreSQL and its read replica \(Azure Monitor\)$'
+        $allCode | Should -Match 'POSTGRES_TARGETS = \{"primary": "T4", "replica": "T4-replica"\}'
+        $allCode | Should -Match '(?m)^POSTGRES_ANALYSIS = "postgresql"$'
+        foreach ($name in 'parse_postgres_metrics', 'postgres_snapshot_rows', 'postgres_findings', 'record_postgres_metrics', 'postgres_series_frame') {
+            $body = [regex]::Match($allCode, "(?ms)^def $name\(.*?(?=^\S)").Value
+            $body | Should -Not -BeNullOrEmpty -Because $name
+            $body | Should -Not -Match 'https://|requests\.|get_token|getSecret|write_delta|_spark\(' -Because $name
+        }
+    }
+
+    It 'leaves the replica''s catch-up after a restart out of the lag finding''s peak, and says so, with the Nov 13 data (2026-11-16)' {
+        # Live, 2026-11-13: the safety stop stopped the replica at 00:38:46Z, start-demo.ps1 started it first at 00:57Z, and
+        # Azure Monitor's lag read 1,380 s at 01:00 (the time since its last replay until T4 wrote again); the replica-lag beat
+        # then peaked at 219 s. The finding named 1,380 s. Needs Python 3 with pandas: set DBHUB_TEST_PYTHON to its python.
+        $interpreter = $pandasPython
+        $PSNativeCommandUseErrorActionPreference = $false
+        if (-not $interpreter) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $null = & $interpreter -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'catch-up.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, sys, types
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+exec(next(cell for cell in cells if cell.startswith("# Parameters cell")), ns)
+with contextlib.redirect_stdout(io.StringIO()):
+    for index, cell in enumerate(cells):
+        if cell.startswith("# Helpers, part"):
+            exec(compile(cell, "cell-%d" % index, "exec"), ns)
+
+def document(lag):
+    return json.dumps({"version": 1, "capturedUtc": "2026-11-14T01:40:00Z", "startUtc": "2026-11-14T00:00:00Z", "endUtc": "2026-11-14T01:40:00Z",
+                       "windowMinutes": 100, "intervalMinutes": 5,
+                       "servers": [{"role": "primary", "resourceName": "pgflex01-rrpigs", "sku": "Standard_D4ds_v5"},
+                                   {"role": "replica", "resourceName": "pgreplica01-rrpigs", "sku": "Standard_D4ds_v5"}],
+                       "series": [{"role": "replica", "resourceName": "pgreplica01-rrpigs", "metric": "physical_replication_delay_in_seconds",
+                                   "aggregation": "Maximum", "unit": "Seconds", "points": [["2026-11-14T%s:00Z" % at, value] for at, value in lag]}]})
+
+def lag_finding(lag):
+    capture, error = ns["parse_postgres_metrics"](document(lag))
+    found = next(item for item in ns["postgres_findings"](capture) if item["key"] == "lag")
+    return {"status": found["status"], "finding": found["finding"], "evidence": {key: value for key, value in found["evidence"].items() if key != "resourceName"}}
+
+# Running before the stop, nothing while it was stopped, its catch-up at 01:00, then the replica-lag beat.
+nov13 = [("00:20", 3), ("00:25", 2), ("00:30", 4), ("00:35", 5), ("01:00", 1380), ("01:05", 67), ("01:10", 218), ("01:15", 219), ("01:20", 3)]
+# The window starts after the stop, so the series starts with the catch-up.
+late = [("00:50", 1950), ("00:55", 9), ("01:00", 188)]
+# Only the catch-up: no point since the window's start, so it reads at least that long.
+only = [("01:00", 3900)]
+# A replica created during the window: its first points are small, and a beat's peak right after a short gap stays.
+fresh = [("00:30", 0.4), ("00:35", 1), ("00:40", 120), ("00:45", 2), ("01:05", 300), ("01:10", 2)]
+print(json.dumps({"nov13": lag_finding(nov13), "late": lag_finding(late), "only": lag_finding(only), "fresh": lag_finding(fresh)}))
+'@
+        $output = & $interpreter $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $result = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+
+        $result['nov13']['status'] | Should -Be 'Warning'
+        $result['nov13']['finding'] | Should -Be 'Read replica lag on pgreplica01-rrpigs peaked at 219.0 s at 2026-11-14 01:15 UTC (a Warning at 60 s or more). Left out: 1 point from 2026-11-14 01:00 UTC, up to 1380.0 s, the replica''s catch-up after its restart (the time since its last replay until T4 wrote again), not replication lag.'
+        $result['nov13']['evidence']['peakSeconds'] | Should -Be 219
+        $result['nov13']['evidence']['catchUpPoints'] | Should -Be 1
+        $result['nov13']['evidence']['catchUpPeakSeconds'] | Should -Be 1380
+        $result['nov13']['evidence']['points'] | Should -Be 9 -Because 'the rows keep every point; only the finding leaves it out'
+
+        $result['late']['finding'] | Should -Match '^Read replica lag on pgreplica01-rrpigs peaked at 188\.0 s at 2026-11-14 01:00 UTC .* Left out: 1 point from 2026-11-14 00:50 UTC, up to 1950\.0 s'
+        $result['only']['status'] | Should -Be 'Pass'
+        $result['only']['finding'] | Should -Be 'Read replica lag on pgreplica01-rrpigs: only the replica''s catch-up after its restart, up to 3900.0 s from 2026-11-14 01:00 UTC (the time since its last replay until T4 wrote again), not replication lag.'
+        $result['only']['evidence'].ContainsKey('peakSeconds') | Should -BeFalse
+        $result['fresh']['finding'] | Should -Be 'Read replica lag on pgreplica01-rrpigs peaked at 300.0 s at 2026-11-14 01:05 UTC (a Warning at 60 s or more).' -Because 'a gap whose next point is under half its length is lag, not catch-up'
+        $result['fresh']['evidence']['catchUpPoints'] | Should -Be 0
+    }
+
+    It 'turns the document Get-DemoPostgresHistoryParameter writes into postgresql rows and findings, and says so in one line without one (ADR 0025)' {
+        # Get-DemoPostgresHistoryParameter's own JSON, from a fake Azure CLI, goes through the notebook's helpers and its T4
+        # cell. Needs Python 3 with pandas: set DBHUB_TEST_PYTHON to its python.
+        $interpreter = $pandasPython
+        $PSNativeCommandUseErrorActionPreference = $false
+        if (-not $interpreter) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $null = & $interpreter -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        # Five-minute values from 17:00 UTC; the 18:00 interval has no value yet.
+        $script:pgPoints = @{
+            'pgflex01-abc123'    = @{ cpu_percent = @(43.27, 91.26, 50); memory_percent = @(30.15); active_connections = @(12, 34); physical_replication_delay_in_bytes = @(184); connections_failed = @(0, 3, 1) }
+            'pgreplica01-abc123' = @{ physical_replication_delay_in_seconds = @(6, 241.37, 2); cpu_percent = @(10.26); active_connections = @(1) }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $text = @($ArgumentList) -join ' '
+            if ($text -match 'flexibleServers/(pg\w+-abc123)/providers/Microsoft\.Insights/metrics') {
+                $server = $Matches[1]
+                $index = [array]::IndexOf([string[]]@($ArgumentList), '--url-parameters')
+                $query = Get-Content -LiteralPath ([string]$ArgumentList[$index + 1]).Substring(1) -Raw | ConvertFrom-Json -AsHashtable
+                $field = ([string]$query['aggregation']).ToLowerInvariant()
+                $units = @{ cpu_percent = 'Percent'; memory_percent = 'Percent'; physical_replication_delay_in_seconds = 'Seconds'; physical_replication_delay_in_bytes = 'Bytes' }
+                $metrics = foreach ($name in ([string]$query['metricnames']).Split(',')) {
+                    $values = @($script:pgPoints[$server][$name])
+                    $data = @(for ($i = 0; $i -lt $values.Count; $i++) { [ordered]@{ timeStamp = ('2026-11-13T17:{0:00}:00Z' -f ($i * 5)); $field = $values[$i] } }) + @([ordered]@{ timeStamp = '2026-11-13T18:00:00Z' })
+                    @{ name = @{ value = $name }; unit = $(if ($units.ContainsKey($name)) { $units[$name] } else { 'Count' }); timeseries = @(@{ data = $data }) }
+                }
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (ConvertTo-Json -InputObject @{ value = @($metrics) } -Depth 10 -Compress); StdErr = '' }
+            }
+            if ($text -match 'flexibleServers/(pg\w+-abc123)\?') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (ConvertTo-Json -InputObject @{ name = $Matches[1]; sku = @{ name = 'Standard_D4ds_v5' } } -Compress); StdErr = '' }
+            }
+            throw "unexpected Azure CLI call: $text"
+        }
+        $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
+        # An obviously fake ID: every group repeats one character.
+        $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
+        $capture = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoPostgresHistoryParameter -Config $Config -DeploymentId 'abc123' -WindowMinutes 60 -NowUtc ([datetime]::new(2026, 11, 13, 18, 2, 37, [System.DateTimeKind]::Utc)) }
+        $capture.Status | Should -Be 'Pass'
+        $capture.PointCount | Should -Be 15
+        $documentPath = Join-Path -Path $TestDrive -ChildPath 'postgres-metrics.json'
+        Set-Content -LiteralPath $documentPath -Value $capture.Json -Encoding utf8NoBOM -NoNewline
+        $script = Join-Path -Path $TestDrive -ChildPath 'postgres.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, sys, types
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+document = open(sys.argv[2], encoding="utf-8").read()
+parameters = next(cell for cell in cells if cell.startswith("# Parameters cell"))
+t4_cell = next(cell for cell in cells if cell.startswith("# T4 (PostgreSQL):"))
+
+def t4(ns):
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        exec(compile(t4_cell, "t4", "exec"), ns)
+    return printed.getvalue()
+
+def run(metrics):
+    ns = {}
+    exec(parameters, ns)
+    ns["POSTGRES_METRICS"] = metrics
+    with contextlib.redirect_stdout(io.StringIO()):
+        for index, cell in enumerate(cells):
+            if cell.startswith("# Helpers, part"):
+                exec(compile(cell, "cell-%d" % index, "exec"), ns)
+    return ns, t4(ns)
+
+def summary(ns, printed):
+    text = lambda value: value.strftime("%Y-%m-%d %H:%M")
+    rows = [row for row in ns["SNAPSHOT_ROWS"] if row["analysis"] == "postgresql"]
+    return {
+        "printed": printed.strip().splitlines(),
+        "rows": [{"target": row["target"], "resource": row["resource_name"], "type": row["resource_type"], "metric": row["metric"],
+                  "bucket": text(row["bucket_utc"]), "value": row["value"], "unit": row["unit"], "windowStart": text(row["window_start_utc"]),
+                  "windowEnd": text(row["window_end_utc"]), "reportDate": str(ns["report_date"]("telemetry_snapshots", row))} for row in rows],
+        "findings": {item["finding_id"]: {"status": item["status"], "finding": item["finding"], "target": item["target"],
+                                          "reportDate": str(ns["report_date"]("analysis_findings", item))}
+                     for item in ns["FINDINGS"] if item["analysis"] == "postgresql"},
+    }
+
+full, printed = run(document)
+again = t4(full)
+partial = json.loads(document)
+partial["servers"] = [server for server in partial["servers"] if server["role"] == "primary"]
+partial["series"] = [series for series in partial["series"] if series["role"] == "primary"]
+print(json.dumps({
+    "full": summary(full, printed),
+    "again": summary(full, again),
+    "primaryOnly": summary(*run(json.dumps(partial))),
+    "invalid": summary(*run('{"version": 2, "servers": [], "series": []}')),
+    "empty": summary(*run("")),
+}))
+'@
+        $output = & $interpreter $script $nb.Path $documentPath 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $result = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+
+        $full = $result['full']
+        $full['rows'].Count | Should -Be 15 -Because 'one row per point the collector kept'
+        @($full['rows'] | ForEach-Object { $_['target'] } | Sort-Object -Unique) | Should -Be @('T4', 'T4-replica')
+        @($full['rows'] | ForEach-Object { $_['type'] } | Sort-Object -Unique) | Should -Be @('flexibleServers')
+        $lag = @($full['rows'] | Where-Object { $_['metric'] -eq 'physical_replication_delay_in_seconds' })
+        @($lag | ForEach-Object { '{0}={1}' -f $_['bucket'], [string]$_['value'] }) | Should -Be @('2026-11-13 17:00=6', '2026-11-13 17:05=241.4', '2026-11-13 17:10=2')
+        $lag[0]['target'] | Should -Be 'T4-replica'
+        $lag[0]['resource'] | Should -Be 'pgreplica01-abc123'
+        $lag[0]['unit'] | Should -Be 'seconds'
+        $lag[0]['windowStart'] | Should -Be '2026-11-13 17:00'
+        $lag[0]['windowEnd'] | Should -Be '2026-11-13 18:02'
+        $lag[0]['reportDate'] | Should -Be '2026-11-13'
+        @($full['rows'] | Where-Object { $_['metric'] -eq 'connections_failed' } | ForEach-Object { '{0}:{1}:{2}' -f $_['target'], $_['unit'], [string]$_['value'] }) | Should -Be @('T4:connections:0', 'T4:connections:3', 'T4:connections:1')
+        @($full['rows'] | Where-Object { $_['metric'] -eq 'cpu_percent' -and $_['target'] -eq 'T4' } | ForEach-Object { $_['value'] }) | Should -Be @(43.3, 91.3, 50)
+        $full['findings'].Count | Should -Be 4
+        foreach ($id in 'postgresql.T4.capture', 'postgresql.T4-replica.lag', 'postgresql.T4.cpu', 'postgresql.T4.connections_failed') {
+            $full['findings'].ContainsKey($id) | Should -BeTrue -Because $id
+        }
+        $full['findings']['postgresql.T4.capture']['status'] | Should -Be 'Pass'
+        $full['findings']['postgresql.T4.capture']['finding'] | Should -Match '^Azure Monitor metrics of T4 pgflex01-abc123 \(Standard_D4ds_v5\) and its read replica pgreplica01-abc123 \(Standard_D4ds_v5\) from 2026-11-13 17:00 to 2026-11-13 18:02 UTC, every 5 minutes: 8 series, 15 points\.$'
+        $full['findings']['postgresql.T4-replica.lag']['status'] | Should -Be 'Warning' -Because '241 seconds is over the 60-second threshold'
+        $full['findings']['postgresql.T4-replica.lag']['finding'] | Should -Be 'Read replica lag on pgreplica01-abc123 peaked at 241.4 s at 2026-11-13 17:05 UTC (a Warning at 60 s or more).'
+        $full['findings']['postgresql.T4.cpu']['status'] | Should -Be 'Warning'
+        $full['findings']['postgresql.T4.cpu']['finding'] | Should -Be 'T4''s CPU on pgflex01-abc123 peaked at 91.3% at 2026-11-13 17:05 UTC (a Warning at 80% or more).'
+        $full['findings']['postgresql.T4.connections_failed']['status'] | Should -Be 'Warning'
+        $full['findings']['postgresql.T4.connections_failed']['finding'] | Should -Match '^Failed connections on T4 \(pgflex01-abc123\): 4 from 2026-11-13 17:00 to 2026-11-13 17:15 UTC, at most 3 in one 5-minute interval'
+        $full['findings']['postgresql.T4.cpu']['reportDate'] | Should -Be '2026-11-13'
+        $full['printed'] | Should -Contain 'T4''s metrics from 2026-11-13 17:00 to 2026-11-13 18:02 UTC, every 5 minutes:'
+
+        # Running the cell again replaces its rows and findings instead of adding to them.
+        $result['again']['rows'].Count | Should -Be 15
+        $result['again']['findings'].Count | Should -Be 4
+
+        $primaryOnly = $result['primaryOnly']
+        @($primaryOnly['rows'] | Where-Object { $_['target'] -eq 'T4-replica' }).Count | Should -Be 0
+        $primaryOnly['findings']['postgresql.T4-replica.lag']['status'] | Should -Be 'Not selected'
+        $primaryOnly['findings']['postgresql.T4-replica.lag']['finding'] | Should -Match 'exists only during a session'
+        $primaryOnly['findings']['postgresql.T4.capture']['status'] | Should -Be 'Pass'
+
+        $result['invalid']['rows'].Count | Should -Be 0
+        @($result['invalid']['findings'].Keys) | Should -Be @('postgresql.T4.capture')
+        $result['invalid']['findings']['postgresql.T4.capture']['status'] | Should -Be 'Fail'
+        $result['invalid']['findings']['postgresql.T4.capture']['finding'] | Should -Be 'T4''s metrics in POSTGRES_METRICS weren''t added: it isn''t a version 1 document.'
+
+        $result['empty']['rows'].Count | Should -Be 0
+        $result['empty']['findings'].Count | Should -Be 0
+        @($result['empty']['printed']).Count | Should -Be 1
+        @($result['empty']['printed'])[0] | Should -Match '^T4''s PostgreSQL metrics weren''t passed in \(POSTGRES_METRICS is empty\), so this run adds none: \./scripts/stop-demo\.ps1 -SaveHistory and \./scripts/deploy\.ps1 pass them'
+    }
 }
 
 Describe 'Report tables for the Power BI history report (Phase 19)' {
@@ -802,7 +1124,7 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
     It 'prepares the report tables in the persist cell, after both writes and only when SAVE_RESULTS is True' {
         $persist = @($live.Code | Where-Object { $_.Source -match '^# Persist:' })
         $persist.Count | Should -Be 1
-        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+else:'
+        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS, replace_run=False\)\s+else:'
     }
 
     It 'creates missing tables, adds and backfills report_date_utc in UTC, and compacts tables with many files' {
@@ -848,21 +1170,16 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
         ([regex]::Matches($liveCode, '(?m)^def expected_signals\(')).Count | Should -Be 1
     }
 
-    It 'knows every incident scenario in scenarios/ with its default target and expected signal' {
+    It 'knows every incident scenario in scenarios/ with its expected signal' {
         $scenarioFolder = Join-Path -Path $repoRoot -ChildPath 'scenarios'
-        # T4-only scenarios (connection-surge, idle-in-transaction) have no history in the report: T4's metrics
-        # aren't in the telemetry endpoint, and its history export is a follow-up (Phase 24, ADR 0019).
+        # T4-only scenarios (connection-surge, idle-in-transaction, replica-lag) have no scenario windows here: T4's metrics
+        # aren't in the telemetry endpoint. Its history comes from POSTGRES_METRICS instead (ADR 0025).
         $scenarios = @(Get-ChildItem -LiteralPath $scenarioFolder -Directory | Where-Object {
                 $_.Name -ne 'healthy-baseline' -and @((Get-Content -LiteralPath (Join-Path -Path $_.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json).targets.applicable | Where-Object { $_ -ne 'T4' }).Count -gt 0
             })
         $scenarios.Count | Should -BeGreaterThan 5
-        $known = [regex]::Match($liveCode, '(?s)KNOWN_SCENARIOS = \((.*?)\)').Groups[1].Value
-        $defaults = [regex]::Match($liveCode, '(?s)SCENARIO_DEFAULT_TARGET = \{(.*?)\}').Groups[1].Value
         $signals = [regex]::Match($liveCode, '(?s)SCENARIO_SIGNALS = \{(.*?)\n\}').Groups[1].Value
         foreach ($scenario in $scenarios) {
-            $definition = Get-Content -LiteralPath (Join-Path -Path $scenario.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json
-            $known | Should -Match ('"{0}"' -f [regex]::Escape($scenario.Name))
-            $defaults | Should -Match ('"{0}": "{1}"' -f [regex]::Escape($scenario.Name), @($definition.targets.default)[0])
             $signals | Should -Match ('"{0}": \(' -f [regex]::Escape($scenario.Name))
         }
         $signals | Should -Match '"resource-governance": \("cpu",\)'

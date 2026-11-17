@@ -490,7 +490,9 @@ function Wait-DemoVmHealthState {
     .DESCRIPTION
     Every read is a read-only Run Command (Get-DemoVmHealth). A failed read (for example while the host
     restarts) is logged and retried; it's thrown only when no read succeeded. Returns Health (the last summary
-    read) and Polls (how many waits were used), so a caller can share one budget across waits.
+    read), Polls (how many waits were used), so a caller can share one budget across waits, and Full: true when
+    the wait stopped because reads found no room for a fresh Run Command name for -FullMinutes, whatever -MaxPolls
+    allows (Azure keeps the VM's Run Commands in Deleting; 2026-11-13 live finding).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -508,12 +510,17 @@ function Wait-DemoVmHealthState {
         [int] $MaxPolls = 0,
 
         [ValidateRange(1, 3600)]
-        [int] $PollSeconds = 300
+        [int] $PollSeconds = 300,
+
+        [ValidateRange(0, 240)]
+        [int] $FullMinutes = 15
     )
 
     $health = $null
     $lastError = $null
     $polls = 0
+    $fullSince = $null
+    $full = $false
     while ($true) {
         try {
             $read = Get-DemoVmHealth -Config $Config -VmName $VmName -View Summary
@@ -522,21 +529,34 @@ function Wait-DemoVmHealthState {
             }
             $health = $read
             $lastError = $null
+            $fullSince = $null
         }
         catch {
             $lastError = $_
             Write-DemoLog -Level Warning -Message ('Reading the health of {0} failed: {1}' -f $VmName, $_.Exception.Message)
+            if (Test-DemoRunCommandFullError -Text $_.Exception.Message) {
+                if ($null -eq $fullSince) {
+                    $fullSince = [System.DateTime]::UtcNow
+                }
+            }
+            else {
+                $fullSince = $null
+            }
         }
         $current = [string](Get-DemoMemberValue -InputObject $health -Name 'state')
-        if (($null -ne $health -and $null -eq $lastError -and $current -in $State) -or $polls -ge $MaxPolls) {
+        $full = $null -ne $fullSince -and ([System.DateTime]::UtcNow - $fullSince).TotalMinutes -ge $FullMinutes
+        if (($null -ne $health -and $null -eq $lastError -and $current -in $State) -or $polls -ge $MaxPolls -or $full) {
             break
         }
         Write-DemoLog -Message ('{0} reports {1} (step {2}); reading its health again in {3} seconds.' -f $VmName, $(if ($current) { $current } else { 'nothing yet' }), (Get-DemoMemberValue -InputObject $health -Name 'currentStep'), $PollSeconds)
         Start-Sleep -Seconds $PollSeconds
         $polls++
     }
+    if ($full) {
+        Write-DemoLog -Level Warning -Message ('{0}: its health couldn''t be read for {1} minutes, because Azure keeps its Run Commands in Deleting, so this wait stops here (DEPLOY.RUNCOMMAND.STUCK_{2}).' -f $VmName, $FullMinutes, $VmName.ToUpperInvariant())
+    }
     if ($null -eq $health -and $null -ne $lastError) {
         throw $lastError
     }
-    return [pscustomobject]@{ Health = $health; Polls = $polls }
+    return [pscustomobject]@{ Health = $health; Polls = $polls; Full = $full }
 }

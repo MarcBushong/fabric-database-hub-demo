@@ -345,6 +345,37 @@ Unit-tested (`tests/unit/DbHubDemo.Tracks.Tests.ps1`, `tests/unit/DbHubDemo.Prog
 
 Unit-tested (`tests/unit/DbHubDemo.HistorySnapshot.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, `DbHubDemo.Lifecycle.Tests.ps1`, `DbHubDemo.Progress.Tests.ps1`). Not run live yet ([implementation report](../implementation-report.md#the-history-reports-snapshot-at-the-end-of-deployps1)).
 
+## Amendments (2026-11-16: T1's monitoring before its loader)
+
+Phase 22 merged T1's monitoring flag right after the loader started T1's bootstrap. Live on 2026-11-16, on a first deployment, that update of the SQL IaaS Agent extension met the bootstrap's lockout recovery, which restarts SQL Server in single-user mode ([ADR 0003](0003-t2-host-size-security-type-bootstrap.md)), and failed: "Login failed for user 'NT Service\MSSQLSERVER'. Reason: Server is in single user mode". The extension stayed Failed, and the run ended **NOT DONE** with the portal's Repair as the fix.
+
+| Phase 22 as built | 2026-11-16 | Why it's safe |
+|---|---|---|
+| The feature-flag merge right after T1's loader started the bootstrap | The merge right before the loader, once `sqlvm01`'s extensions have settled (the loader's own settle, once per step); the Monitoring step still confirms the plugin | VM extension operations run one at a time, so the update ends before the bootstrap starts, and no Run Command runs on `sqlvm01` then. It costs about 4 minutes on T1's track, which isn't the critical path. With the flag set, as in every environment that's been deployed, nothing is written |
+
+A Failed extension that an earlier run left gets the documented repair in the Monitoring step (`Repair-DemoSqlIaasExtension`, `DEPLOY.T1.SQLIAAS.REPAIR`).
+
+## Amendments (2026-11-17: the T2 host's chunks one at a time, R871)
+
+From about 2026-11-13, every T2 host that kept chunk Run Commands stopped starting: Windows ran, but Azure never sent its VM agent the goal state ("Goal State not yet available" for hours), and the start ended `VMStartTimedOut`. With 8 chunks of up to 711 KB at once, Azure ended their deletes on that host with `InternalExecutionError`. Each one stayed on the VM, marked for deletion, and Azure refuses a delete while the VM is deallocated. `sqlvm01` and T2 hosts without them started in minutes. A delete still pending when the VM deallocates completes with the deallocation: on a test host, the next start had the agent Ready in 1.7 minutes ([implementation report](../implementation-report.md), R871).
+
+| As built (Phase 28) | 2026-11-17 | Why it's safe |
+|---|---|---|
+| Up to 8 chunks at once on each VM; each chunk's delete sent without waiting | On the T2 host (`Send-DemoChunkSet -DeleteWaitSeconds`, 300 seconds by default there), one chunk at a time: its Run Command is deleted, and the delete confirmed, before the next. A delete Azure hasn't finished in 5 minutes is sent once more; after a second one, the send stops, and the watchdog takes over | No more than one chunk is on the host at a time. `sqlvm01` keeps 8 at once: its deletes finish. Live, the host's 9 chunks took 8.3 minutes one at a time, against 7.2 to 7.4 minutes 8 at once in three earlier deploys |
+| The watchdog restarts a stuck VM once | The T2 host whose VM agent isn't Ready, or that lists chunk Run Commands, gets their deletes, then one deallocate and start (`Restart-DemoVmOnce`), and the track sends its chunks again, one at a time. Chunks an earlier run left that Azure hasn't deleted when the host's artifacts have arrived get the same, right away | A restart keeps the chunks, and the host doesn't start with them. The deallocate completes the deletes |
+| A VM's extensions settle before its artifacts and its loader | A running VM whose agent isn't Ready counts as unsettled too (`Get-DemoVmExtensionActivity`), so nothing is sent to it, and after 20 minutes the watchdog steps in | Chunks sent to a host whose agent wasn't Ready stayed in Creating, and a deallocate canceled their deletes instead of completing them. A healthy start has the agent Ready in about 2 minutes |
+| `stop-demo.ps1` deallocates each VM | It sends the deletes of a running VM's chunk Run Commands right before its deallocate (`Clear-DemoChunkRunCommand`) | The deallocate completes deletes that are still pending, so no chunk stays for the next start |
+
+## Amendments (2026-11-17: the T2 host's rebuild, R872)
+
+On a test host whose chunks an earlier version had sent while its VM agent wasn't Ready, the R871 recovery didn't bring the agent back: the chunks stayed **Deleting** or **Creating**, and a deallocate and start left the agent **Not Ready** (2026-11-17, twice). The user's decision: "Automatically: deploy.ps1 deletes and recreates only the T2 host, once, when its agent stays dead". No switch.
+
+| As built (R871) | 2026-11-17 | Why it's safe |
+|---|---|---|
+| A T2 host whose agent isn't Ready after the deallocate and start ends the run **NOT DONE** | The T2 track rebuilds the host, once per run (`Invoke-DemoT2HostRebuild`): it reads the host's own nested template from `azuredeploy.json` and the values its last deployment recorded, before it changes anything; clears what the state records for the old host; deletes `archost01`, its disks, and its network interface; creates it again from that template (deployment `archost01-rebuild`, a new password only in a private file); waits for the new host's agent; and runs T2's steps again from Artifacts. `DEPLOY.T2.HOSTREBUILD` says what happened; the failed attempt's **Fail** results become **Warnings** that name it | Only the host: T1, T3, T4, Fabric, and the guest's golden snapshot aren't touched. The rest of the template isn't deployed again mid-run. The T2 guest is built again on the new host in the configured mode (from Arc Jumpstart's image by default), and Arc onboarding replaces the old `arcsql01` machine, as on a first deployment. A second dead agent in the same run ends it **NOT DONE**, so a run never loops |
+| The T2 step started its Run Commands without checking the host's agent | The T2 step checks it first; a host whose agent is down gets the same wait and watchdog as the steps before it | A host whose agent is Ready goes on at once, as before |
+| A resume trusted the state's record of the T2 host | A host the state records but Azure doesn't have (`DEPLOY.T2.HOSTMISSING`) clears those records, and a resume starts from preflight, so the template creates it | A rebuild that stopped after its delete is finished by the next run |
+
 ## Sources (checked 2026-11-05)
 
 - `slmgr.vbs` options (`/rearm` "resets the activation timers"; `/ato` tries activation): <https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options>

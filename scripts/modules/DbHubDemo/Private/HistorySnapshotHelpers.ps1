@@ -22,13 +22,12 @@ function Get-DemoHistorySnapshotParameter {
     Internal.
 
     .DESCRIPTION
-    - CONFIRM false: the notebook's Run all would otherwise send its activity request through GitHub (P9, 240 minutes of
-      business-day), on top of the one the deployment started.
-    - STOP_ACTIVITY false: it never stops what runs.
     - SAVE_RESULTS true, over the last -WindowMinutes (WINDOW_MINUTES): it writes only the lakehouse's history tables.
-    - KEY_VAULT_URL empty: no GitHub token is read.
     - RESOURCE_GROUP: the demo's resource group, which the notebook's queries are scoped to, as stop-demo.ps1 -SaveHistory
       sends it.
+    - CONFIRM and STOP_ACTIVITY false, and KEY_VAULT_URL empty: for a notebook imported before 2026-11-14, whose Run all
+      sent its own activity request through GitHub (P9). Today's notebook has none of them (ADR 0026: it changes no
+      activity), and a job's extra parameters change nothing in it.
     Invoke-DemoFabricNotebookRun adds the resolved WORKSPACE_ID and LAKEHOUSE_ID.
     #>
     [CmdletBinding()]
@@ -385,7 +384,18 @@ function Invoke-DemoHistorySnapshotStep {
         $ActivityProfile = Get-DemoActivityProfile -Config $Config
     }
     $parameters = Get-DemoHistorySnapshotParameter -Config $Config -WindowMinutes $WindowMinutes
-    $sent = [ordered]@{ CONFIRM = $false; STOP_ACTIVITY = $false; SAVE_RESULTS = $true; WINDOW_MINUTES = $WindowMinutes; KEY_VAULT_URL = '' }
+    # T4's and its read replica's Azure Monitor metrics (2026-11-13, ADR 0025): the notebook can't read Azure Monitor, so they
+    # come with the run (POSTGRES_METRICS); without them it saves the SQL targets' history as before.
+    try {
+        $capture = Get-DemoPostgresHistoryCapture -Config $Config -WindowMinutes $WindowMinutes
+        if ($null -ne $capture -and [string]$capture.Json) {
+            $parameters['POSTGRES_METRICS'] = [string]$capture.Json
+        }
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('T4''s metrics weren''t captured for the history snapshot: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    $sent = [ordered]@{ CONFIRM = $false; STOP_ACTIVITY = $false; SAVE_RESULTS = $true; WINDOW_MINUTES = $WindowMinutes; KEY_VAULT_URL = ''; POSTGRES_METRICS = $(if ($parameters.Contains('POSTGRES_METRICS')) { 'sent' } else { '' }) }
     $modelChecked = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -like 'FABRIC.SEMANTICMODEL.*' }).Count -gt 0
     try {
         Set-DemoProgressStep -Path $ProgressPath -Id $rowId -State 'Running' -Message ('{0} runs once, analyze-only (CONFIRM false: no activity request), and saves the last {1} minutes to the lakehouse; Spark''s start and the analysis take about 2 to 5 minutes, at most {2} here. Then the history model is refreshed. It doesn''t block DONE.' -f $script:HistorySnapshotNotebook, $WindowMinutes, $TimeoutMinutes)

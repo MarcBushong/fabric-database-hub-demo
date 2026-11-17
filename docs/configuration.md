@@ -51,4 +51,4 @@ The nightly safety stop ([ADR 0024](adr/0024-nightly-safety-stop.md)) is part of
 | `autoShutdownTimeZone` | `Pacific Standard Time` | The time zone of both its schedules |
 | `t3AutoPauseMinutes` | `15` | The T3 check's time: 30 minutes after the stop, or this delay plus 15 minutes when that's longer, at most 345 minutes. With `-1` (auto-pause off), the check reports that T3 stays online |
 
-To skip one night, turn off its schedule `dbhub-safety-stop` in `aa-<prefix>-<environment>-safetystop` in the Azure portal; the next `deploy.ps1` turns it on again ([what stops or pauses on its own](../README.md#what-stops-or-pauses-on-its-own)).
+To skip one night, turn off its schedule `dbhub-safety-stop` in `aa-<prefix>-<environment>-safetystop` in the Azure portal; the next `deploy.ps1` turns it on again ([what stops or pauses on its own](cost-management.md#what-stops-or-pauses-on-its-own)).

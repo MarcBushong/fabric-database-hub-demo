@@ -22,8 +22,8 @@ function Invoke-DemoPreflight {
       administrator, otherwise a reminder to confirm it (Test-DemoFabricHubSetting -CheckId PREFLIGHT.P4.HUBSETTING;
       Phase 28 live finding), and the Fabric workspace and lakehouse by
       name, read-only (Test-DemoFabricResolution, Phase 26a): your role and the capacity of a workspace that exists,
-      or the capacity deploy.ps1 would create it on; the optional P11, Power BI viewer licensing on the workspace's
-      capacity (Test-DemoFabricViewerLicense, a Warning below F64); and P12 and P13, the tenant settings the Insights
+      or the capacity deploy.ps1 would create it on; the optional P11, Power BI viewer licensing, which
+      the demo assumes since 2026-11-14 (Test-DemoFabricViewerLicense, Not selected, nothing read); and P12 and P13, the tenant settings the Insights
       app needs, which never block the run (Test-DemoFabricAppTenantSetting, PREFLIGHT.FABRIC.APPSETTINGS: a Pass, or a
       Warning when one is off or can't be read; 2026-11-05).
     - P6: the T3 Entra admin group exists and the caller owns it, read from Microsoft Graph with a token
@@ -160,11 +160,16 @@ function Invoke-DemoPreflight {
         Add-Check 'PREFLIGHT.P1.ROLEASSIGNMENTS' 'subscription' 'Not selected' 'assignRoles is false; no role assignments will be created.'
     }
 
-    # P2: resource providers.
+    # P2: resource providers. The session control (ADR 0026), part of every deployment since 2026-11-14, needs Automation,
+    # Key Vault, and managed identities; with a private vault, its notebook reads the vault through a Fabric managed private
+    # endpoint (Fabric capacities only, Trial capacities included), which needs Microsoft.Network registered:
+    # https://learn.microsoft.com/fabric/security/security-managed-private-endpoints-overview
+    # https://learn.microsoft.com/fabric/security/security-managed-private-endpoints-create#prerequisites
     $requiredProviders = @(
         'Microsoft.Sql', 'Microsoft.SqlVirtualMachine', 'Microsoft.AzureArcData', 'Microsoft.HybridCompute',
         'Microsoft.GuestConfiguration', 'Microsoft.HybridConnectivity', 'Microsoft.Compute', 'Microsoft.Network',
-        'Microsoft.Storage', 'Microsoft.Consumption', 'Microsoft.DevTestLab'
+        'Microsoft.Storage', 'Microsoft.Consumption', 'Microsoft.DevTestLab', 'Microsoft.Automation', 'Microsoft.KeyVault',
+        'Microsoft.ManagedIdentity'
     ) + @(if (Test-DemoT4Enabled -Config $Config) { 'Microsoft.DBforPostgreSQL' })
     $providerStates = @{}
     foreach ($provider in @(Invoke-Az -Arguments @('provider', 'list') -Json)) {
@@ -449,6 +454,8 @@ function Invoke-DemoPreflight {
         $tuningSku = if ($t4Start) { $t4Start } else { $t4Sku }
         $tuningWhy = if ($t4Start -and $t4Pinned) { 'deploy.ps1''s fallback starts at {0} because {1}, the size t4SkuName sets, is ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' -f $t4Start, $t4Pinned } elseif ($t4Start -eq 'Standard_D2ds_v5') { 'deploy.ps1''s fallback uses Standard_D2ds_v5 because the 4-vCore sizes are ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' } elseif ($t4Explicit) { ('t4SkuName sets {0}.' -f $tuningSku) } else { '' }
         $results.Add((New-DemoT4TuningResult -Config $Config -SkuName $tuningSku -Why $tuningWhy -CheckPrefix PREFLIGHT))
+        # T4's read replica (2026-11-13, ADR 0025), on the size T4 gets: a Burstable size has none (Not supported, with the fix).
+        $results.Add((New-DemoT4ReplicaPreflightResult -SkuName $tuningSku))
     }
     else {
         $results.Add((New-DemoT4TuningResult -Config $Config -CheckPrefix PREFLIGHT))
@@ -529,8 +536,9 @@ function Invoke-DemoPreflight {
     $results.Add((Test-DemoFabricHubSetting -Config $Config -CheckId 'PREFLIGHT.P4.HUBSETTING'))
     $fabricCheck = Test-DemoFabricResolution -Config $Config
     $results.Add($fabricCheck.Result)
-    # P11 (optional, Phase 18): Power BI viewer licensing on the workspace's capacity; a Warning below F64.
-    $results.Add((Test-DemoFabricViewerLicense -Config $fabricCheck.Config -CapacityResult $fabricCheck.CapacityResult))
+    # P11 (optional): Power BI viewer licenses are assumed since 2026-11-14 (the user), so it's Not selected and reads
+    # nothing; it used to warn on every deployment below F64.
+    $results.Add((Test-DemoFabricViewerLicense -Config $fabricCheck.Config))
     # P12 and P13 (2026-11-05): the tenant settings the Insights app needs, which is part of every deployment but never
     # blocks it; read through the Fabric admin API, and never more than a Warning.
     $results.Add((Test-DemoFabricAppTenantSetting -Config $Config))
@@ -544,8 +552,18 @@ function Invoke-DemoPreflight {
     $groupRead = Invoke-DemoRestRequest -SubscriptionId $subscriptionId -Method 'GET' -Uri ('{0}/groups/{1}?$select=id,displayName' -f $graph, $groupId)
     $group = if ($groupRead.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$groupRead.StdOut)) { [string]$groupRead.StdOut | ConvertFrom-Json -Depth 8 } else { $null }
     if (-not $group) {
-        $reason = if ($groupRead.StatusCode -eq 404) { 'was not found in the configured tenant' } else { 'could not be read from Microsoft Graph ({0})' -f ([string]$groupRead.StdErr).Trim() }
-        Add-Check 'PREFLIGHT.P6.GROUP' 'tenant' 'Fail' "The T3 admin group $groupId $reason." -Remediation 'Create an Entra security group you own in the demo tenant and set t3AdminGroupObjectId (prerequisite P6).' -DocUrl 'https://learn.microsoft.com/graph/api/group-get'
+        # Only a group Graph says isn't there needs a new one. A token Graph refused (live, 2026-11-16: HTTP 401, Continuous
+        # Access Evaluation's "InteractionRequired ... TokenCreatedWithOutdatedPolicies" after the tenant's sign-in policies
+        # changed) needs a new sign-in; following "create a group" there would change a working configuration.
+        if ($groupRead.StatusCode -eq 404) {
+            Add-Check 'PREFLIGHT.P6.GROUP' 'tenant' 'Fail' "The T3 admin group $groupId was not found in the configured tenant." -Remediation 'Create an Entra security group you own in the demo tenant and set t3AdminGroupObjectId (prerequisite P6).' -DocUrl 'https://learn.microsoft.com/graph/api/group-get'
+        }
+        elseif ($groupRead.StatusCode -eq 401 -or [string](Get-DemoMemberValue -InputObject $groupRead -Name 'Challenge')) {
+            Add-Check 'PREFLIGHT.P6.GROUP' 'tenant' 'Fail' ('The T3 admin group {0} could not be read: Microsoft Graph refused the Azure CLI''s sign-in and asks for a new one ({1}).' -f $groupId, ([string]$groupRead.StdErr).Trim()) -Remediation 'Sign in again yourself: az login (az login --use-device-code in a codespace), for the demo''s tenant. Then run the script again; nothing in the configuration changes.' -DocUrl 'https://learn.microsoft.com/entra/identity-platform/claims-challenge'
+        }
+        else {
+            Add-Check 'PREFLIGHT.P6.GROUP' 'tenant' 'Fail' ('The T3 admin group {0} could not be read from Microsoft Graph ({1}).' -f $groupId, ([string]$groupRead.StdErr).Trim()) -Remediation 'Check that you can read the group in the demo tenant, then run the script again. Only if it doesn''t exist, create an Entra security group you own and set t3AdminGroupObjectId (prerequisite P6).' -DocUrl 'https://learn.microsoft.com/graph/api/group-get'
+        }
     }
     else {
         $groupDisplayName = [string](Get-DemoMemberValue -InputObject $group -Name 'displayName')

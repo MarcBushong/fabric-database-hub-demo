@@ -316,6 +316,8 @@ function Invoke-DemoTemplateDeployment {
     # without a price, T4 keeps its size this time (DEPLOY.T4.SIZE Ceiling), and the next run checks again.
     $t4Default = Get-DemoT4DefaultSkuName -Config $Config
     $t4Scaling = $false
+    # T4's read replica (ADR 0025) has to be at least T4's size, so a T4 about to grow loses it first (below).
+    $t4ScaleTo = ''
     $priceMove = {
         param([string] $Target)
         if (-not (Test-DemoT4SizeIncrease -From $t4ServerSku -To $Target)) {
@@ -331,6 +333,7 @@ function Invoke-DemoTemplateDeployment {
         }
         if ($toDefault -and $ScaleT4 -and $Action -eq 'Create' -and $t4ServerState -eq 'Ready' -and ($null -eq $moveCost -or $moveCost.Allowed)) {
             $t4Scaling = $true
+            $t4ScaleTo = $t4Default
             $results.Add((New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $t4Default -Outcome Scale -Cost $moveCost))
             Write-DemoLog -Level Warning -Message ('T4 exists as {0}; this deployment scales it to the default, {1}, which restarts it.' -f $t4ServerSku, $t4Default)
         }
@@ -356,8 +359,23 @@ function Invoke-DemoTemplateDeployment {
             $effective = Copy-DemoT4Config -Config $effective -Source server -SkuName $t4ServerSku
         }
         elseif ($null -ne $moveCost) {
+            $t4ScaleTo = $wanted
             $results.Add((New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $wanted -Outcome Scale -Cost $moveCost -Explicit))
             Write-DemoLog -Level Warning -Message ('T4 exists as {0}; this deployment scales it to {1}, the size your configuration sets, which restarts it.' -f $t4ServerSku, $wanted)
+        }
+    }
+    if ($t4ScaleTo -and $t4Exists) {
+        # Azure scales a primary only within its replicas' compute ("Scaling up: First scale up a replica's compute, then
+        # scale up the primary"; "Compute on the primary must always be equal to or smaller than the compute on the smallest
+        # replica"; Learn, read replicas, checked 2026-11-13). T4's read replica is created for each session anyway (ADR
+        # 0025), so one that's there now is deleted before T4 grows; the T4 track creates it again at T4's new size.
+        $replicaNow = Get-DemoT4ReplicaState -Config $effective -DeploymentId ([string]$tags['deploymentId'])
+        if ($replicaNow.Present) {
+            Write-DemoLog -Message ('T4 grows to {0}, so its read replica ({1}) is deleted first; this run creates it again at T4''s new size.' -f $t4ScaleTo, $replicaNow.Names.ServerName)
+            $removed = Remove-DemoT4Replica -Config $effective -CheckPrefix DEPLOY -CheckId 'DEPLOY.T4.REPLICA.REMOVE' -DeploymentId ([string]$tags['deploymentId'])
+            if ($null -ne $removed) {
+                $results.Add($removed)
+            }
         }
     }
 

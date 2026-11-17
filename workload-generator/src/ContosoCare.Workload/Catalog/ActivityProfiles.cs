@@ -122,6 +122,13 @@ internal sealed record IncidentSlot
     /// <summary>T4 only: the compute tier the slot runs on (Burstable or GeneralPurpose); null runs on every tier.</summary>
     public string? Tier { get; init; }
 
+    /// <summary>
+    /// T4 only: true when the slot needs T4's read replica (ADR 0025), so it runs only on a profile host that has one
+    /// configured (--t4-replica-server or --replica-server); false when it runs only on a host without one (the slot a
+    /// replica slot takes over); null runs on every host.
+    /// </summary>
+    public bool? Replica { get; init; }
+
     public Dictionary<string, string> Parameters { get; init; } = [];
 
     /// <summary>Whether the slot runs in cycle <paramref name="cycle"/> (1-based).</summary>
@@ -147,6 +154,9 @@ internal sealed record IncidentSlot
         var known = tier is ProfileParameters.TierBurstable or ProfileParameters.TierGeneralPurpose ? tier : ProfileParameters.TierBurstable;
         return string.Equals(Tier, known, StringComparison.Ordinal);
     }
+
+    /// <summary>Whether the slot runs on a host that has (<paramref name="hasReplica"/>) or hasn't T4's read replica configured.</summary>
+    public bool RunsWithReplica(bool hasReplica) => Replica is null || Replica.Value == hasReplica;
 }
 
 /// <summary>Options stored with a profile: what <c>profile set</c> received besides the name.</summary>
@@ -413,7 +423,8 @@ internal static class ProfileScheduler
     /// <summary>
     /// The activities the profile wants at <paramref name="now"/> on <paramref name="target"/>; each ends at its window's end.
     /// The host starts one only when <see cref="PlannedActivity.CanStart"/> (enough time is left), but keeps a running one
-    /// for as long as it's returned here.
+    /// for as long as it's returned here. A slot that needs T4's read replica is planned only when
+    /// <paramref name="hasReplica"/> says the host has one configured.
     /// </summary>
     public static IReadOnlyList<PlannedActivity> Plan(
         ProfileState state,
@@ -421,7 +432,8 @@ internal static class ProfileScheduler
         DateTimeOffset now,
         ActivityProfilesDefinition definitions,
         ScenarioCatalog catalog,
-        DateTimeOffset? notAfter)
+        DateTimeOffset? notAfter,
+        bool hasReplica = false)
     {
         var name = ProfileName.Parse(state.Name, catalog);
         if (name.Kind == ProfileKind.Off || now < state.SetAt)
@@ -469,14 +481,15 @@ internal static class ProfileScheduler
         {
             // business-day's cycles start at each UTC midnight; showcase's at the moment this target's profile was set,
             // so a target that starts late (a cold VM) doesn't lose its first slots. Slots can run in some cycles only
-            // (odd, even, or listed), and on T4's recorded compute tier only.
+            // (odd, even, or listed), on T4's recorded compute tier only, and, for replica-lag, only on a host that has T4's
+            // read replica configured.
             var cycle = TimeSpan.FromMinutes(profile.CycleMinutes);
             var anchor = string.Equals(profile.Anchor, ProfileDefinition.AnchorProfileStart, StringComparison.Ordinal)
                 ? state.SetAt
                 : new DateTimeOffset(now.UtcDateTime.Date, TimeSpan.Zero);
             var index = (now - anchor).Ticks / cycle.Ticks;
             var cycleStart = anchor + TimeSpan.FromTicks(cycle.Ticks * index);
-            foreach (var slot in profile.Incidents.Where(s => string.Equals(s.Target, target.ToString(), StringComparison.Ordinal) && s.RunsInCycle(index + 1) && s.RunsOnTier(parameters?.Tier)))
+            foreach (var slot in profile.Incidents.Where(s => string.Equals(s.Target, target.ToString(), StringComparison.Ordinal) && s.RunsInCycle(index + 1) && s.RunsOnTier(parameters?.Tier) && s.RunsWithReplica(hasReplica)))
             {
                 var windowStart = cycleStart + TimeSpan.FromMinutes(slot.StartMinute);
                 var windowEnd = Min(windowStart + TimeSpan.FromMinutes(slot.DurationMinutes), end);

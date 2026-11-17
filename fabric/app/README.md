@@ -18,16 +18,19 @@ Viewers need:
 
 ## What's in it
 
-Four pages, designed for the portal's item frame (smaller than full screen) and responsive down to a phone width.
+Five pages, designed for the portal's item frame (smaller than full screen) and responsive down to a phone width.
 
 | Page | Visuals | What it answers |
 |---|---|---|
 | **Estate** | Estate constellation (targets orbit the estate; satellites are signals sized by value; a halo takes the worst finding's status), activity clock (24 UTC hours, one ring per target), signal ridgelines (per-bin distributions), the findings feed, and a Database Agent prompt library | Which target works hardest, when, and what changed |
 | **Incidents** | Incident ribbon, replay (every signal bin by bin, with a scrubber, steps, speeds, the window, its baseline, and its peak), **Investigate with the Database Agent** (ready-made prompts for each window), before-and-after spotlight (a wait "rose" that morphs from the minutes before the window into the window), and the wait flow (Sankey or sunburst: wait family to category to target) | What an incident looked like, what changed during it, and what to ask next |
+| **PostgreSQL** | T4, the PostgreSQL flexible server, and its read replica, from the latest capture of their Azure Monitor metrics: the replica's **Read replica lag** over time with its peak and the 60-second warning line, CPU on both servers (80 % warning line), active connections and T4's failed connections, the servers and their sizes, and the notebook's findings. Without a capture yet, it says how one gets there | Is T4 healthy, and how far did the replica lag behind |
 | **Readiness** | Readiness dial and area rings (the latest validation run; inner rings are earlier runs), telemetry coverage, a Database Agent prompt library that starts with telemetry coverage, and every check worst first with its next step and documentation | Is the demo ready, and what's the next step |
 | **Live links** | New-tab links to Database Hub, the Real-Time Dashboard, and the Power BI report; how the history gets here; the connection check | Where the live view is |
 
 Each page starts with **insight cards**: plain sentences computed by rules over the query results in the browser, such as "T3 Buffer IO (PAGEIOLATCH) waits ran at 6.0 times their baseline". No external AI service is called.
+
+**T4's history (2026-11-13, ADR 0025).** The notebook can't read Azure Monitor, so `./scripts/stop-demo.ps1 -SaveHistory` (before it deletes the read replica, whose metrics go with it) and `./scripts/deploy.ps1` (at its end) capture T4's and its replica's metrics and pass them to `NB_DatabaseHub_LiveActivity`, which saves them with the analysis `postgresql` and the targets `T4` and `T4-replica` ([Fabric assets](../README.md#t4s-postgresql-metrics-in-the-history-2026-11-13)). The **PostgreSQL** page reads the latest capture with two queries, `postgres-series` and `postgres-findings`, whatever the filters; the read replica exists only during a session, so a capture between sessions has no lag, and the page says why. The SQL pages, their filters, and their queries stay on T1, T2, and T3.
 
 ### Take the data out
 
@@ -42,7 +45,7 @@ Inside the portal the app has no address bar of its own, so the view (page, filt
 
 ### Customize
 
-- **Filters:** targets (T1, T2, T3) and the period (latest day, 7 days, 30 days, all history), anchored to the newest telemetry day, not to today.
+- **Filters:** targets (T1, T2, T3) and the period (latest day, 7 days, 30 days, all history), anchored to the newest telemetry day, not to today. The **PostgreSQL** page has no filters: it shows T4's latest capture.
 - **Themes:** Aurora (the signature dark glass), Daybreak (light), and Contrast (high contrast). Every text color passes WCAG AA on every surface (`src/theme/themes.test.ts`). The app follows the system's light and high-contrast preferences until you pick one.
 - **Motion:** the sparkle button turns animations off; the app also honors `prefers-reduced-motion`.
 - Keyboard: every control and every target in the constellation is reachable with Tab and Enter; status is never shown by color alone (each status has a shape and a word, ADR 0012).
@@ -73,7 +76,7 @@ Database Hub has a built-in Database Agent (preview). It works only in Database 
 | Visuals | Hand-built SVG with d3 (shape, scale, hierarchy, sankey, interpolate) and Framer Motion; no charting library and no CDN |
 | Fonts | Space Grotesk and JetBrains Mono (OFL), bundled |
 | Data | One connector, `history`: `fabric-semanticmodel`, `executeQuery` only, delegated ([connectors](https://learn.microsoft.com/fabric/apps/connectors)) |
-| Queries | `src/data/queries.ts`: 14 DAX queries, each with a row bound (`resultSetRowCountLimit`); results are cached for 5 minutes and shared between visuals |
+| Queries | `src/data/queries.ts`: 16 DAX queries, each with a row bound (`resultSetRowCountLimit`); results are cached for 5 minutes and shared between visuals |
 | Hosting | `staticHosting.assetAccess: protected`, set explicitly in `rayfin/rayfin.yml` ([hosting](https://learn.microsoft.com/fabric/apps/hosting)) |
 | Backend services | Auth only: no database, storage, or functions |
 
@@ -85,8 +88,8 @@ fabric/app/
   rayfin/connectors/history/   the connector's generated schema (no IDs)
   src/data/                    the DAX catalog, the query client (cache, bounds), and typed parsers
   src/lib/                     DAX builders, formatting, CSV, view state, statistics, the insight rules, and the Database Agent prompts
-  src/visuals/                 the seven custom visuals and their pure layout code (layout.ts)
-  src/pages/                   Estate, Incidents, Readiness, and Live links
+  src/visuals/                 the eight custom visuals and their pure layout code (layout.ts)
+  src/pages/                   Estate, Incidents, PostgreSQL, Readiness, and Live links
   src/theme/                   the three themes and their contrast tests
   src/test/                    the test setup, and the tests of the npm overrides with Rayfin's code (its sign-in harness too)
   scripts/export-queries.ts    writes the catalog as connector payloads for the deploy-time check
@@ -189,7 +192,9 @@ To run the app locally against the deployed backend, work in the stage (`out/fab
 | `FABRIC.APP.DEPLOY` says not signed in or the token expired | The CLI's session lapsed; sign in again with the same command |
 | `FABRIC.APP.ITEMS` is Manual action required | Deploy the model first: `./scripts/configure-powerbi.ps1` |
 | A visual says Fabric refused the query | The viewer needs Read and Build on `SM_DatabaseHub_History`, and the Execute Queries tenant setting |
-| `FABRIC.APP.QUERIES` warns that some queries returned no rows | Run `NB_DatabaseHub_LiveActivity` (and a scenario) so the lakehouse has history for that window |
+| `FABRIC.APP.QUERIES` warns that some queries returned no rows | Run `NB_DatabaseHub_LiveActivity` (and a scenario) so the lakehouse has history for that window. For `postgres-series` and `postgres-findings`, the history has no T4 capture yet: `./scripts/stop-demo.ps1 -SaveHistory` or `./scripts/deploy.ps1` adds one |
+| The **PostgreSQL** page says there's no PostgreSQL history yet | The same: those scripts capture T4's Azure Monitor metrics and pass them to the notebook. A notebook you run by hand has none to pass |
+| The **PostgreSQL** page has no Read replica lag | The latest capture had no read replica: it exists only during a session, so capture before `stop-demo.ps1` deletes it (its `-SaveHistory` does) |
 | A Real-Time Dashboard link opens the wrong page | The portal path for dashboards isn't documented; use the workspace link and open `RTD_DatabaseHub_LiveView` |
 
 More in [troubleshooting](../../docs/troubleshooting.md).

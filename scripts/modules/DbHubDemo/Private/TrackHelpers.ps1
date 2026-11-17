@@ -171,7 +171,8 @@ function Set-DemoDeploymentStateLocked {
     Set-DemoDeploymentState under a lock that the parallel tracks on this machine share. With -AddVm, it
     adds the VM to BundleSentTo or RunnerSentTo for that SHA-256 inside the lock (a list another track may be
     extending at the same moment); with -RemoveBundleVm, it takes the VM out of BundleSentTo, which a loader that found
-    the VM's chunks unusable needs (2026-11-06). Internal.
+    the VM's chunks unusable needs (2026-11-06), and with -RemoveRunnerVm out of RunnerSentTo, which a rebuilt T2 host needs
+    (Reset-DemoT2HostRecord, 2026-11-17). Internal.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -189,7 +190,9 @@ function Set-DemoDeploymentStateLocked {
 
         [int] $ChunkCount = 0,
 
-        [string] $RemoveBundleVm = ''
+        [string] $RemoveBundleVm = '',
+
+        [string] $RemoveRunnerVm = ''
     )
 
     if (-not $PSCmdlet.ShouldProcess((Get-DemoResourceGroupName -Config $Config), 'Record the deployment state under the tracks'' lock')) {
@@ -227,6 +230,10 @@ function Set-DemoDeploymentStateLocked {
             $state = Get-DemoDeploymentState -Config $Config
             $values['BundleSentTo'] = @(@($state.BundleSentTo) | Where-Object { $_ -and $_ -ne $RemoveBundleVm })
         }
+        if ($RemoveRunnerVm) {
+            $state = Get-DemoDeploymentState -Config $Config
+            $values['RunnerSentTo'] = @(@($state.RunnerSentTo) | Where-Object { $_ -and $_ -ne $RemoveRunnerVm })
+        }
         if ($values.Count -gt 0) {
             Set-DemoDeploymentState -Config $Config -Value $values -Confirm:$false
         }
@@ -237,6 +244,82 @@ function Set-DemoDeploymentStateLocked {
         }
         $mutex.Dispose()
     }
+}
+
+function Sync-DemoTrackRecord {
+    <#
+    .SYNOPSIS
+    The end of a run (2026-11-17): a track this run finished whose Track* record in the resource group's state is behind
+    gets it written again, so DONE judges by what the run did. Returns the state, with the records it wrote. Internal.
+
+    .DESCRIPTION
+    A track's own record of a step can be lost (two tag merges at once, the race Set-DemoDeploymentState's lock closes)
+    or fail (the track then logs that its state wasn't recorded). The ending reads the Track* records, so it said NOT DONE
+    for a track that had finished, and the next run started over, because the stage it recorded says Validation (live,
+    2026-11-17). A track counts as finished in this run only when its DEPLOY.TRACK result is Pass and its finished steps
+    include its last step (Get-DemoTrackStep): only then, and only when its record reads another step, is the record
+    written, all of them in one write through Set-DemoDeploymentState, which holds the tracks' lock. A track that didn't
+    finish is never recorded as finished, and nothing is written when every record is right. A write that fails is
+    logged, and the state comes back as it was read.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $State,
+
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    if ($null -eq $State) {
+        return $State
+    }
+    $behind = [ordered]@{}
+    $described = [System.Collections.Generic.List[string]]::new()
+    foreach ($track in 'T1', 'T2', 'T4', 'Fabric') {
+        $summary = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq ('DEPLOY.TRACK.{0}' -f $track.ToUpperInvariant()) }) | Select-Object -Last 1
+        if ($null -eq $summary -or [string]$summary.status -ne 'Pass') {
+            continue
+        }
+        $last = @((Get-DemoTrackStep -Track $track).Keys)[-1]
+        # Get-DemoMemberValue returns an array whole: assigned first, then each step is its own item.
+        $stepValue = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $summary -Name 'evidence') -Name 'steps'
+        $steps = @($stepValue | ForEach-Object { [string]$_ })
+        $key = 'Track{0}' -f $track
+        $recorded = [string](Get-DemoMemberValue -InputObject $State -Name $key)
+        if ($steps -contains $last -and $recorded -ne $last) {
+            $behind[$key] = $last
+            $described.Add(('track {0} at {1} (the state had {2})' -f $track, $last, $(if ($recorded) { $recorded } else { 'no step' })))
+        }
+    }
+    if ($behind.Count -eq 0) {
+        return $State
+    }
+    $text = $described -join ', '
+    if (-not $PSCmdlet.ShouldProcess((Get-DemoResourceGroupName -Config $Config), ('Record again what this run finished: {0}' -f $text))) {
+        return $State
+    }
+    try {
+        Set-DemoDeploymentState -Config $Config -Value $behind -Confirm:$false
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('This run finished {0}, but recording it again failed: {1}' -f $text, (Protect-DemoText -Text $_.Exception.Message))
+        return $State
+    }
+    Write-DemoLog -Message ('Recorded again what this run finished, which the resource group''s state had behind: {0}.' -f $text)
+    foreach ($key in $behind.Keys) {
+        if ($State -is [System.Collections.IDictionary]) {
+            $State[$key] = $behind[$key]
+        }
+        else {
+            $State | Add-Member -NotePropertyName $key -NotePropertyValue $behind[$key] -Force
+        }
+    }
+    return $State
 }
 
 function Get-DemoTrackStep {
@@ -256,7 +339,7 @@ function Get-DemoTrackStep {
     switch ($Track) {
         'T1' { return [ordered]@{ T3Setup = 'T3'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T3 = 'T3'; T4 = 'T4'; Activity = 'Activity'; Monitoring = 'Monitoring'; Telemetry = 'Validation' } }
         'T2' { return [ordered]@{ Restore = 'Artifacts'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T2 = 'T2'; Telemetry = 'Validation' } }
-        'T4' { return [ordered]@{ Server = 'T4'; Telemetry = 'Validation' } }
+        'T4' { return [ordered]@{ Server = 'T4'; Replica = 'T4'; Telemetry = 'Validation' } }
         default { return [ordered]@{ Fabric = 'Fabric' } }
     }
 }
@@ -425,6 +508,8 @@ function Resolve-DemoTrackPlan {
     bundle and workload runner aren't sent again. A track in -Resend goes back to its Artifacts step instead, and runs its
     Bootstraps step and the steps after it again, because what the resource group's state records for its VM isn't what
     this checkout builds (Resolve-DemoArtifactResend; live finding, 2026-11-06); Resend names the tracks it moved back.
+    -ReopenFabric runs a resumed Fabric track's step again although DbHubTrackFabric records it as finished, because the
+    workspace, the lakehouse, or an item isn't there (Get-DemoFabricTrackRecheck; live finding, 2026-11-13).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -443,7 +528,9 @@ function Resolve-DemoTrackPlan {
         [switch] $SkipT4,
 
         [AllowEmptyCollection()]
-        [string[]] $Resend = @()
+        [string[]] $Resend = @(),
+
+        [switch] $ReopenFabric
     )
 
     $stages = @(Get-DemoDeploymentStageName)
@@ -476,6 +563,16 @@ function Resolve-DemoTrackPlan {
             $last = [string](Get-DemoMemberValue -InputObject $State -Name ('Track{0}' -f $track))
             if ($last -and $last -in $names) {
                 $first = [array]::IndexOf($names, $last) + 1
+            }
+            # T4's read replica (2026-11-13, ADR 0025): an environment that an earlier version deployed recorded T4's track
+            # past where the Replica step sits now, so that step runs on its resume until the replica is set up, and the
+            # status page shows it instead of "Finished in an earlier run".
+            $replicaAt = [array]::IndexOf($names, 'Replica')
+            if ($track -eq 'T4' -and $replicaAt -ge 0 -and $first -gt $replicaAt -and -not (Test-DemoT4ReplicaSetUp -State $State)) {
+                $first = $replicaAt
+            }
+            if ($track -eq 'Fabric' -and $ReopenFabric) {
+                $first = 0
             }
             $artifactsAt = [array]::IndexOf($names, 'Artifacts')
             if ($artifactsAt -ge 0 -and $first -gt $artifactsAt -and $stop -ge [array]::IndexOf($stages, 'Artifacts')) {
@@ -720,8 +817,9 @@ function Invoke-DemoDeploymentTrack {
       incidents, which deploy.ps1 switches at its end; 2026-11-03), Monitoring (the plugin confirmed), Telemetry (T1 and T3 in
       Database Hub).
     - T4 (Phase 24, ADR 0019): Server (Test-DemoT4: the server, its version and size, Entra-only, the network,
-      the P6 administrator, the database, the enhanced metrics), Telemetry (METRICS.T4: Azure Monitor has its
-      metrics, which Database Hub's PostgreSQL dashboard charts).
+      the P6 administrator, the database, the enhanced metrics), Replica (2026-11-13, ADR 0025: T4's read replica, created
+      once T1's T4 step has restarted T4, with its checks, its place in Database Hub's Estate, and its Read replica lag in
+      Azure Monitor), Telemetry (METRICS.T4: Azure Monitor has its metrics, which Database Hub's PostgreSQL dashboard charts).
     - T2: Restore (a host restored from a golden snapshot: the VM agent, the host password, then the golden
       Release, which resets a copy's Arc identity locally and rotates the guest password before the guest
       reaches the network; archost01's bundle and runner travel in their own Run Commands while the Release
@@ -765,6 +863,9 @@ function Invoke-DemoDeploymentTrack {
     $status = 'Pass'
     $startedUtc = [DateTime]::UtcNow
     $firstStepUtc = $null
+    # The host build's "minutes so far" count from the track's first step, or from the T2 host's rebuild in this run, after
+    # which its steps run again on a new host (2026-11-17, live on mn: "71 minutes so far" on a 20-minute-old host).
+    $hostBuildFromUtc = $null
     # True when T1's Bootstraps step merged the monitoring flag in this run: the Monitoring step then gives a NotRunning
     # plugin the longer grace before the agent's restart (Get-DemoSqlVmPluginGrace; Phase 28 live finding, 2026-10-30).
     $monitoringMerged = $false
@@ -784,6 +885,8 @@ function Invoke-DemoDeploymentTrack {
     $switchTo = if ($activityProfile.HasIncidents) { $activityProfile.Name } else { '' }
     $tagKey = 'Track{0}' -f $Track
     $recordState = -not [bool](& $option 'NoState' $false)
+    # The Fabric content the Fabric step published in full, recorded with the step (2026-11-16); '' otherwise.
+    $fabricPublished = ''
     $handoff = [string](& $option 'HandoffPath' '')
     $handoffMinutes = [int](& $option 'HandoffTimeoutMinutes' 120)
     # The status page's model (Phase 28); empty when there's none, and every update is then a no-op.
@@ -914,7 +1017,13 @@ function Invoke-DemoDeploymentTrack {
             }
             Write-DemoLog -Level Warning -Message ('{0}: sending the artifacts got stuck ({1}); the watchdog steps in, then they go one chunk at a time.' -f $VmName, $problem)
             $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('sending its artifacts got stuck ({0})' -f $problem) -ProgressPath $progress -ProgressId $progressId
+            foreach ($extra in @((Get-DemoMemberValue -InputObject $watchdog -Name 'Results') | Where-Object { $null -ne $_ })) {
+                $results.Add($extra)
+            }
             $results.Add($watchdog.Result)
+            if ([bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed')) {
+                throw ('{0} isn''t back after its restart and one deallocate and start, so its artifacts weren''t sent (DEPLOY.WATCHDOG_{1}).' -f $VmName, $VmName.ToUpperInvariant())
+            }
             try {
                 $sent = @(Send-DemoChunkSet -Config $Config -File $files -VmName $VmName -ChunkSizeKiB $chunkSize -Parallelism 1)
             }
@@ -929,7 +1038,10 @@ function Invoke-DemoDeploymentTrack {
             & $note ('DEPLOY.ARTIFACTS.STALL_{0}' -f $VmName.ToUpperInvariant()) $target 'Warning' ('{0}: no chunk finished for 5 minutes while several ran, so the rest went one at a time. Azure was busy with the VM''s extensions (Azure-side; nothing to do).' -f $VmName)
         }
         $leftover = if ($first.Count -gt 0) { @(Get-DemoMemberValue -InputObject $first[0] -Name 'LeftoverRunCommands') | Where-Object { $_ } } else { @() }
-        if (@($leftover).Count -gt 0) {
+        # R871 (live, 2026-11-17): a T2 host that keeps chunk Run Commands may not start again, and a deallocate completes
+        # their deletes while they're pending, so the host's are cleared below, once the artifacts are recorded.
+        $hostLeftover = @($leftover).Count -gt 0 -and -not $DuringRelease -and $VmName -eq (Get-DemoHostVmName -Config $Config)
+        if (@($leftover).Count -gt 0 -and -not $hostLeftover) {
             & $note ('DEPLOY.ARTIFACTS.CLEANUP_{0}' -f $VmName.ToUpperInvariant()) $target 'Warning' ('Azure was still deleting {0} chunk Run Command(s) on {1} when its artifacts arrived ({2}). That''s Azure-side and doesn''t block the loader (a VM allows 25 managed Run Commands); the next run''s cleanup checks again.' -f @($leftover).Count, $VmName, (@($leftover) -join ', ')) 'Nothing to do; if they stay for hours, see docs/troubleshooting.md (Run Commands stuck in Deleting).'
         }
         foreach ($item in $missing) {
@@ -940,6 +1052,21 @@ function Invoke-DemoDeploymentTrack {
             $together = if ($missing.Count -gt 1) { ', in one wave with the other artifact' } else { '' }
             & $note $item.CheckId $target 'Pass' ('{0} {1} sent to {2} in {3} chunk(s), {4:N0} seconds{5}.' -f $item.Kind, $item.Sha.Substring(0, 12), $VmName, $one.ChunkCount, $one.Seconds, $together) '' ([ordered]@{ chunks = [int]$one.ChunkCount; seconds = $one.Seconds; parallelism = $parallelism; together = ($missing.Count -gt 1) })
             $null = $shared['Sent'].Add($item.Key)
+        }
+        if ($hostLeftover) {
+            # The watchdog's host path sends their deletes, then deallocates and starts the host, which completes them
+            # (Restart-DemoVmOnce), unless the host mustn't be restarted now (its guest build may be running, for example).
+            $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('Azure hadn''t deleted {0} chunk Run Command(s) on it after its artifacts arrived ({1}), and a T2 host that keeps them may not start again' -f @($leftover).Count, (@($leftover) -join ', ')) -ProgressPath $progress -ProgressId $progressId
+            foreach ($extra in @((Get-DemoMemberValue -InputObject $watchdog -Name 'Results') | Where-Object { $null -ne $_ })) {
+                $results.Add($extra)
+            }
+            $results.Add($watchdog.Result)
+            if (-not [bool]$watchdog.Restarted) {
+                & $note ('DEPLOY.ARTIFACTS.CLEANUP_{0}' -f $VmName.ToUpperInvariant()) $target 'Warning' ('Azure hadn''t deleted {0} chunk Run Command(s) on {1} after its artifacts arrived ({2}), and they weren''t cleared now: {3}. A T2 host that keeps them may not start again.' -f @($leftover).Count, $VmName, (@($leftover) -join ', '), [string](Get-DemoMemberValue -InputObject $watchdog.Result -Name 'message')) 'Stop the demo with ./scripts/stop-demo.ps1, which deletes them before it deallocates the host; if the host doesn''t start later, ./scripts/deploy.ps1 brings it back (docs/troubleshooting.md, "A host''s VM agent that isn''t Ready").'
+            }
+            if ([bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed')) {
+                throw ('{0} isn''t back after its deallocate and start, which cleared its chunk Run Commands (DEPLOY.WATCHDOG_{1}).' -f $VmName, $VmName.ToUpperInvariant())
+            }
         }
     }
     # Runs a VM's loader with the chunks that reached it, then reports the result. Its extensions settle first; a loader
@@ -974,9 +1101,15 @@ function Invoke-DemoDeploymentTrack {
         $loader = & $runLoader
         if ($loader.status -ne 'Pass' -and [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
             $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('its bootstrap loader didn''t start within {0} minutes' -f [int]($loaderStartSeconds / 60)) -ProgressPath $progress -ProgressId $progressId
+            foreach ($extra in @((Get-DemoMemberValue -InputObject $watchdog -Name 'Results') | Where-Object { $null -ne $_ })) {
+                $results.Add($extra)
+            }
             $results.Add($watchdog.Result)
-            $loader = & $runLoader
-            if ($loader.status -ne 'Pass' -and [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
+            # A VM that isn't back gets no second loader run: the watchdog's Fail says when to run deploy.ps1 again.
+            if (-not [bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed')) {
+                $loader = & $runLoader
+            }
+            if (-not [bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed') -and $loader.status -ne 'Pass' -and [bool](Get-DemoMemberValue -InputObject $loader.evidence -Name 'notStarted')) {
                 $activity = Get-DemoVmExtensionActivity -Config $Config -VmName $VmName
                 $results.Add((New-DemoVmStuckResult -VmName $VmName -What 'The bootstrap loader' -Item $activity.Labels -Minutes ([int](2 * $loaderStartSeconds / 60)) -Restarted $watchdog.Restarted))
             }
@@ -1102,7 +1235,10 @@ function Invoke-DemoDeploymentTrack {
         }
     }
 
-    foreach ($name in $Step) {
+    # The steps run in order from a queue: the T2 host's rebuild (2026-11-17) puts T2's steps back in it.
+    $queue = [System.Collections.Generic.Queue[string]]::new([string[]]@($Step | Where-Object { $_ }))
+    while ($queue.Count -gt 0) {
+        $name = $queue.Dequeue()
         # Every step waits for the template, except the restore of a T2 host the template has already deployed.
         if (-not ($earlyRestore -and $name -eq 'Restore') -and -not (& $awaitInfrastructure)) {
             Write-DemoLog -Level Warning -Message ('Track {0} stops before {1}: {2}' -f $Track, $name, $(if ([string](Get-DemoMemberValue -InputObject $shared['Infrastructure'] -Name 'Message')) { [string]$shared['Infrastructure'].Message } else { 'the template deployment didn''t succeed.' }))
@@ -1151,23 +1287,28 @@ function Invoke-DemoDeploymentTrack {
                     & $send 'sqlvm01'
                 }
                 'T1/Bootstraps' {
+                    if ('Monitoring' -in $Step) {
+                        # The documented feature-flag merge before the loader starts T1's bootstrap, once sqlvm01's extensions
+                        # have settled (ADR 0018; R852, live 2026-11-16): merged right after the loader, the extension's update
+                        # met the bootstrap's lockout recovery, which has SQL Server in single-user mode, and failed. VM
+                        # extension operations run one at a time, so the update ends before the bootstrap starts; the plugin
+                        # still starts during the bootstrap, and the Monitoring step confirms it. With the flag set, as in
+                        # every environment that's been deployed, nothing is written.
+                        if (& $settle 'sqlvm01' 'T1.Bootstraps') {
+                            try {
+                                $merge = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes 0 -Confirm:$false
+                                $mergeActions = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $merge -Name 'evidence') -Name 'actions'
+                                $monitoringMerged = @($mergeActions | Where-Object { $_ }).Count -gt 0
+                                Write-DemoLog -Message ('Track T1: T1''s monitoring, set before T1 bootstraps: {0}' -f $merge.message)
+                            }
+                            catch {
+                                Write-DemoLog -Level Warning -Message ('Track T1: T1''s monitoring couldn''t be set before T1 bootstraps; the Monitoring step sets it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+                            }
+                        }
+                    }
                     if (-not (& $load 'sqlvm01' 'sqlVm')) {
                         $outcome = 'Fail'
                         break
-                    }
-                    if ('Monitoring' -in $Step) {
-                        # The documented feature-flag merge right after the loader started T1's bootstrap, while no
-                        # Run Command runs on sqlvm01: the plugin starts during the bootstrap, and the Monitoring
-                        # step confirms it (ADR 0018).
-                        try {
-                            $merge = Enable-DemoSqlVmMonitoring -Config $Config -WaitMinutes 0 -Confirm:$false
-                            $mergeActions = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $merge -Name 'evidence') -Name 'actions'
-                            $monitoringMerged = @($mergeActions | Where-Object { $_ }).Count -gt 0
-                            Write-DemoLog -Message ('Track T1: T1''s monitoring, set while T1 bootstraps: {0}' -f $merge.message)
-                        }
-                        catch {
-                            Write-DemoLog -Level Warning -Message ('Track T1: T1''s monitoring couldn''t be set while T1 bootstraps; the Monitoring step sets it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
-                        }
                     }
                     $minutes = [int](& $option 'T1WaitMinutes' 45)
                     $wait = Wait-DemoVmHealthState -Config $Config -VmName 'sqlvm01' -State @('Ready', 'Failed', 'ManualActionRequired') -MaxPolls ([System.Math]::Max(1, $minutes)) -PollSeconds 60
@@ -1239,6 +1380,11 @@ function Invoke-DemoDeploymentTrack {
                         & $note 'WORKLOAD.T4.ENABLE' 'T4' 'Manual action required' 'T1 isn''t in the P6 group yet, so it can''t sign in to T4 as the group''s role.' 'Add T1 to the group (Add-DemoT1ToT3AdminGroup describes how), then run deploy.ps1 -FromStage T4.'
                         break
                     }
+                    # 2026-11-17 (live, rg-dbhubfd-demo): T4's read replica, which T4's track creates alongside this one, keeps
+                    # T4 Updating for about 9 minutes, and a rerun's T1 gets here during it. T1 waits for such a state to end
+                    # (Wait-DemoT4Transition, at most 20 minutes) before T4's restart and its setup; a stopped T4 is reported
+                    # as before.
+                    $null = Wait-DemoT4Transition -Config $Config -ProgressPath $progress -ProgressId 'T4.Setup'
                     # A max_connections value the template set waits for a restart (a static parameter). T4 restarts here,
                     # right before T1 connects, and nowhere else in the run, so no setup runs into it (ADR 0019, 2026-11-03).
                     $restart = Invoke-DemoT4PendingRestart -Config $Config
@@ -1266,7 +1412,8 @@ function Invoke-DemoDeploymentTrack {
                     # fail, for example) stops the step with its own cause (Invoke-DemoSqlVmMonitoringWait).
                     $monitoring = @(Invoke-DemoSqlVmMonitoringWait -Config $Config -WaitMinutes ([int](& $option 'MonitoringWaitMinutes' 20)) -JustMerged:$monitoringMerged -ProgressPath $progress)
                     & $addAll $monitoring
-                    if ([string]$monitoring[0].status -eq 'Fail') {
+                    # A repair of the SqlIaasExtension, when there was one, comes first (2026-11-16).
+                    if (@($monitoring | Where-Object { [string]$_.status -eq 'Fail' }).Count -gt 0) {
                         $outcome = 'Fail'
                     }
                 }
@@ -1360,6 +1507,16 @@ function Invoke-DemoDeploymentTrack {
                     }
                 }
                 'T2/T2' {
+                    # 2026-11-17: this step's Run Commands (the host's health, Arc onboarding) need archost01's VM agent. A host
+                    # that runs with its agent down gets the same wait and watchdog as the steps before it (Invoke-DemoVmSettle),
+                    # which recover it or lead to its rebuild; a host whose agent is Ready goes on at once, as before.
+                    if ((Get-DemoHostVmName -Config $Config) -eq 'archost01') {
+                        $gate = Get-DemoVmRestartState -SubscriptionId ([string]$Config['subscriptionId']) -ResourceGroupName (Get-DemoResourceGroupName -Config $Config) -VmName 'archost01'
+                        if ($gate.Read -and $gate.Power -eq 'PowerState/running' -and $gate.Agent -ne 'Ready' -and -not (& $settle 'archost01' 'T2.HostBuild')) {
+                            $outcome = 'Fail'
+                            break
+                        }
+                    }
                     $source = [string](& $option 'T2Source' '')
                     $golden = $source -in 'golden', 'existing-golden'
                     $waiting = -not $golden -and [bool](& $option 'WaitForT2' $false)
@@ -1375,7 +1532,7 @@ function Invoke-DemoDeploymentTrack {
                         # followed up while it waits (Wait-DemoT2HostBuild).
                         $sent = Get-DemoDeploymentState -Config $Config
                         $bundlePrefix = if ([string]$sent.BundleSha256 -and 'archost01' -in @($sent.BundleSentTo)) { ([string]$sent.BundleSha256).Substring(0, [System.Math]::Min(12, ([string]$sent.BundleSha256).Length)) } else { '' }
-                        $build = Wait-DemoT2HostBuild -Config $Config -DeadlineUtc $t2Deadline -ProgressPath $progress -PollSeconds ([int](& $option 'HostPollSeconds' 300)) -StartedUtc $firstStepUtc -BundlePrefix $bundlePrefix
+                        $build = Wait-DemoT2HostBuild -Config $Config -DeadlineUtc $t2Deadline -ProgressPath $progress -PollSeconds ([int](& $option 'HostPollSeconds' 300)) -StartedUtc $(if ($null -ne $hostBuildFromUtc) { $hostBuildFromUtc } else { $firstStepUtc }) -BundlePrefix $bundlePrefix
                         # Results is always an array (Wait-DemoT2HostBuild); Get-DemoMemberValue would return it whole, so an
                         # empty one became one item, an empty array, whose checkId threw under strict mode (live, 2026-11-09).
                         & $addAll @($build.Results)
@@ -1386,12 +1543,24 @@ function Invoke-DemoDeploymentTrack {
                             break
                         }
                         if ($build.TimedOut) {
+                            if ([bool](Get-DemoMemberValue -InputObject $build -Name 'Full')) {
+                                # 2026-11-13 live finding: no room for a fresh Run Command name for 15 minutes.
+                                Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Action needed' -Status 'Manual action required' -Message 'archost01''s health couldn''t be read for 15 minutes: Azure keeps its Run Commands in Deleting, close to its limit of 25 (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01).'
+                                & $note 'DEPLOY.T2.WAIT' 'T2' 'Manual action required' ('archost01''s health couldn''t be read for 15 minutes, because Azure keeps its Run Commands in Deleting, close to its limit of 25 managed Run Commands (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01). The guest build goes on in the background; it last reported step {0}.' -f [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep')) 'Run ./scripts/deploy.ps1 again in about 30 minutes: Azure deletes them on its own, and ./scripts/status.ps1 lists the ones that stay (STATUS.RUNCOMMANDS), with the command that deletes each.'
+                                $outcome = 'Open'
+                                break
+                            }
                             Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Action needed' -Status 'Manual action required' -Message 'The build didn''t finish within the wait.'
                             & $note 'DEPLOY.T2.WAIT' 'T2' 'Manual action required' ('archost01''s guest build didn''t finish within {0} minutes (it reports step {1}); it goes on in the background.' -f [int](& $option 'T2WaitMinutes' 180), [string](Get-DemoMemberValue -InputObject $build.Health -Name 'currentStep')) 'Run ./scripts/deploy.ps1 again (or ./scripts/deploy.ps1 -FromStage T2): it waits for T2 again and continues. A slow first build is in docs/troubleshooting.md.'
                             $outcome = 'Open'
                             break
                         }
-                        Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Done' -Status 'Pass' -Message $(if ([bool](Get-DemoMemberValue -InputObject $build -Name 'Rebuilt')) { 'The host made T2 again from Arc Jumpstart''s image (DEPLOY.T2.REBUILD says why).' } else { 'The host and its guest are built.' })
+                        # 2026-11-13 live finding: health reads that ran under a fresh name, because Azure kept their own in
+                        # Deleting, make this row a Warning that says so.
+                        $hostStuck = @(Get-DemoRunCommandStuckResult -Clear)
+                        & $addAll $hostStuck
+                        $builtText = if ([bool](Get-DemoMemberValue -InputObject $build -Name 'Rebuilt')) { 'The host made T2 again from Arc Jumpstart''s image (DEPLOY.T2.REBUILD says why).' } else { 'The host and its guest are built.' }
+                        Set-DemoProgressStep -Path $progress -Id 'T2.HostBuild' -State 'Done' -Status $(if ($hostStuck.Count -gt 0) { 'Warning' } else { 'Pass' }) -Message $(if ($hostStuck.Count -gt 0) { '{0} {1}' -f $builtText, [string]$hostStuck[0].message } else { $builtText })
                         # 2026-11-09: a host that kept its existing finished guest in its own mode says so, and its setup is
                         # done; no guest waits for a person (the guided stop is retired).
                         if ([bool](Get-DemoMemberValue -InputObject $build.Health -Name 'modeAdopted')) {
@@ -1432,9 +1601,12 @@ function Invoke-DemoDeploymentTrack {
                         }
                     }
                     & $addAll $arc
+                    # Its Run Commands that ran under a fresh name (2026-11-13 live finding) show on the onboarding's row.
+                    $arcStuck = @(Get-DemoRunCommandStuckResult -Clear)
+                    & $addAll $arcStuck
                     $onboarding = @($arc | Where-Object { [string]$_.checkId -in 'T2.ARC.ONBOARDING', 'T2.ARC.CONNECTED' })
                     if ($onboarding.Count -gt 0) {
-                        & $partDone 'T2.ArcOnboarding' $onboarding
+                        & $partDone 'T2.ArcOnboarding' @($onboarding + $arcStuck)
                     }
                     if (& $hasStatus $arc 'Fail') {
                         $outcome = 'Fail'
@@ -1478,7 +1650,8 @@ function Invoke-DemoDeploymentTrack {
                             break
                         }
                         else {
-                            & $note 'DEPLOY.T2.READY' 'T2' 'Warning' ('T2''s host isn''t Ready after {0} minutes (state {1}: {2}); its profile is set anyway.' -f $minutes, $state, $message) 'Follow it with ./scripts/status.ps1, and run deploy.ps1 -Resume if a step stays failed.'
+                            $why = if ([bool](Get-DemoMemberValue -InputObject $wait -Name 'Full')) { 'its health couldn''t be read for 15 minutes, because Azure keeps archost01''s Run Commands in Deleting (DEPLOY.RUNCOMMAND.STUCK_ARCHOST01)' } else { 'state {0}: {1}' -f $state, $message }
+                            & $note 'DEPLOY.T2.READY' 'T2' 'Warning' ('T2''s host isn''t Ready after {0} minutes ({1}); its profile is set anyway.' -f $minutes, $why) 'Follow it with ./scripts/status.ps1, and run deploy.ps1 -Resume if a step stays failed.'
                         }
                     }
                     $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName $activityProfile.Interim -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo))
@@ -1501,6 +1674,44 @@ function Invoke-DemoDeploymentTrack {
                         $outcome = 'Fail'
                     }
                 }
+                'T4/Replica' {
+                    # T4's read replica (2026-11-13, ADR 0025): created for each session, here for the deployment's own,
+                    # after T1's T4 step restarted T4 for max_connections (the replica inherits it, and a hot standby needs at
+                    # least the primary's value in effect), so it waits for that restart. It never fails the track: a replica
+                    # Azure refuses every size of is DEPLOY.T4.REPLICA's Fail, with the fix, and the run ends NOT DONE.
+                    if (-not (Test-DemoT4Enabled -Config $Config)) {
+                        & $note 'DEPLOY.T4.REPLICA' 'T4' 'Not selected' 'T4 isn''t deployed in this run (DEPLOY.T4.SKU says why), so it has no read replica.'
+                        break
+                    }
+                    $recordReplica = { param([System.Collections.IDictionary] $Values) if ($recordState) { Set-DemoDeploymentStateLocked -Config $Config -Value $Values -Confirm:$false } }
+                    $replicaResults = @(Invoke-DemoT4ReplicaCreate -Config $Config -CheckPrefix DEPLOY -WaitForRestartMinutes ([int](& $option 'T4ReplicaRestartWaitMinutes' 90)) -RecordState $recordReplica)
+                    & $addAll $replicaResults
+                    $created = @($replicaResults | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0
+                    $notSupported = @($replicaResults | Where-Object { [string]$_.status -eq 'Not supported' }).Count -gt 0
+                    if ($recordState -and ($created -or $notSupported)) {
+                        # The environment has the replica's lifecycle from now on (DbHubT4Replica Session): start-demo.ps1
+                        # creates it, stop-demo.ps1 deletes it, and status.ps1 reports it. Not after a creation that failed
+                        # (live, 2026-11-13): then a resume runs this step again (Resolve-DemoTrackPlan), on T4's row.
+                        try {
+                            Set-DemoDeploymentStateLocked -Config $Config -Value @{ T4Replica = [string](Get-DemoT4ReplicaSetting)['recordValue'] } -Confirm:$false
+                        }
+                        catch {
+                            & $note 'DEPLOY.T4.REPLICA.RECORD' 'T4' 'Warning' ('The replica''s record (DbHubT4Replica) wasn''t set on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/deploy.ps1 again.'
+                        }
+                    }
+                    # A size change's notice (DEPLOY.T4.REPLICA.FALLBACK, a Warning) is the row's message on the status page, as
+                    # T4's own is (2026-11-09): the step's first result that isn't a Pass.
+                    if ($created) {
+                        $results.Add((Test-DemoT4ReplicaServer -Config $Config))
+                        $results.Add((Test-DemoT4ReplicaEstate -Config $Config -WaitMinutes 5))
+                        $results.Add((Test-DemoT4ReplicaMetricFlow -Config $Config -WaitMinutes ([int](& $option 'TelemetryWaitMinutes' 15))))
+                    }
+                    elseif ($notSupported) {
+                        foreach ($requirement in 'HUB.ESTATE.T4.REPLICA', 'METRICS.T4.REPLICA') {
+                            $results.Add((New-DemoT4ReplicaNotSupportedResult -CheckId $requirement -T4SkuName ([string](Get-DemoT4ReplicaSupport -T4State (Get-DemoT4State -Config $Config)).SkuName)))
+                        }
+                    }
+                }
                 'T4/Telemetry' {
                     if (-not (Test-DemoT4Enabled -Config $Config)) {
                         # T4 isn't deployed in this run: Azure refused every size its fallback tries (DEPLOY.T4.SKU says why).
@@ -1520,6 +1731,9 @@ function Invoke-DemoDeploymentTrack {
                 'Fabric/Fabric' {
                     $import = [bool](& $option 'ImportNotebooks' $false) -or [bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')
                     $fabricConfigPath = [string](& $option 'ConfigPath' '')
+                    # What this step publishes, recorded once all of it is in the workspace (2026-11-16), so a later resume
+                    # publishes it again when the scripts have other content (Get-DemoFabricContentReopen).
+                    $fabricContent = Get-DemoFabricContentSha256
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Items' -State 'Running' -Message ''
                     $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks)
                     & $addAll $fabric
@@ -1535,9 +1749,23 @@ function Invoke-DemoDeploymentTrack {
                     # workspace the step above just resolved or created, so it doesn't look it up by name again (live, a
                     # second lookup right after the creation failed). The status page shows its actual reason, as Failed
                     # when it wasn't created, and the console says so at once.
-                    & $addAll @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $fabricConfigPath -FabricResult $fabric -ProgressPath $progress)
+                    $appRecords = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $fabricConfigPath -FabricResult $fabric -ProgressPath $progress)
+                    & $addAll $appRecords
                     if (& $hasStatus @($fabric + $powerBI) 'Fail') {
                         $outcome = 'Fail'
+                    }
+                    elseif (& $hasStatus @($fabric + $powerBI) 'Manual action required') {
+                        # Not finished, so not recorded: the next deploy.ps1 runs this step again once a person has acted (live,
+                        # 2026-11-13: a first run that met a paused capacity recorded the step, so no later run created the
+                        # workspace). The Insights app's records never count, as above.
+                        $outcome = 'Open'
+                    }
+                    else {
+                        # The notebooks, the dashboard, the history model and report, and the app are all this version's.
+                        $appSummary = Get-DemoInsightsAppSummary -Result $appRecords
+                        if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') {
+                            $fabricPublished = $fabricContent
+                        }
                     }
                 }
                 default {
@@ -1566,7 +1794,46 @@ function Invoke-DemoDeploymentTrack {
                 & $note 'DEPLOY.T2.GUIDEDLEFTOVER' 'T2' 'Warning' ('What an earlier guided stop left open couldn''t be checked: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/stop-demo.ps1 -RemoveBastionOnly: it removes Bastion and rotates the host password, and leaves the VMs running.'
             }
         }
+        # 2026-11-13 live finding: Run Commands that ran under a fresh name during this step, because Azure kept their own name
+        # in Deleting, are a Warning on the step's row and in DONE or NOT DONE (DEPLOY.RUNCOMMAND.STUCK_<VM>).
+        & $addAll @(Get-DemoRunCommandStuckResult -Clear)
         $timing[$name] = [int]$watch.Elapsed.TotalSeconds
+        # 2026-11-17 (the owner's decision): when archost01's VM agent stayed down through its deallocate and start (the
+        # watchdog's agentDead), the host is rebuilt, once per run, and T2's steps run again on the new host.
+        if ($outcome -eq 'Fail' -and $Track -eq 'T2' -and -not $shared['HostRebuilt'] -and (Test-DemoT2HostDeadResult -Result @($results | Select-Object -Skip $resultsBefore))) {
+            $shared['HostRebuilt'] = $true
+            $rebuild = Invoke-DemoT2HostRebuild -Config $Config -Cause ('T2''s {0} step' -f $name) -ProgressPath $progress -Confirm:$false
+            if ([bool]$rebuild.Rebuilt) {
+                Set-DemoT2HostRebuildSuperseded -Result @($results | Select-Object -Skip $resultsBefore)
+                & $addAll @($rebuild.Results)
+                foreach ($key in @($shared['Sent'] | Where-Object { $_ -like '*/archost01/*' })) {
+                    $null = $shared['Sent'].Remove($key)
+                }
+                foreach ($key in @($shared['Settled'] | Where-Object { $_ -like 'archost01/*' })) {
+                    $null = $shared['Settled'].Remove($key)
+                }
+                $Context['T2Source'] = 'build'
+                $hostBuildFromUtc = [DateTime]::UtcNow
+                # From Artifacts to the plan's last step: the new host needs its artifacts, its loader, its build and
+                # onboarding, and its telemetry.
+                $t2Names = @((Get-DemoTrackStep -Track 'T2').Keys)
+                $fromIndex = [array]::IndexOf($t2Names, 'Artifacts')
+                $lastIndex = [System.Math]::Max($fromIndex, [array]::IndexOf($t2Names, [string]@($Step)[-1]))
+                $again = @(for ($i = $fromIndex; $i -le $lastIndex; $i++) { [string]$t2Names[$i] })
+                $queue.Clear()
+                $done.Clear()
+                foreach ($item in $again) {
+                    $queue.Enqueue($item)
+                    Set-DemoProgressStep -Path $progress -Id @(Get-DemoProgressStepId -Track 'T2' -Step $item) -State 'Pending' -Message 'Runs again on the rebuilt archost01.'
+                }
+                Write-DemoLog -Message ('Track T2: {0} run again on the rebuilt archost01.' -f ($again -join ', '))
+                continue
+            }
+            # The rebuild's Fail comes first among the step's results, so the status page's row and the console say it.
+            foreach ($item in @(@($rebuild.Results) | Where-Object { $null -ne $_ })) {
+                $results.Insert($resultsBefore, $item)
+            }
+        }
         if (-not $ownProgress -and $stepIds.Count -gt 0) {
             $stepResults = @($results | Select-Object -Skip $resultsBefore)
             $worst = Get-DemoWorstStatus -Status @($stepResults | ForEach-Object { [string]$_.status })
@@ -1607,7 +1874,12 @@ function Invoke-DemoDeploymentTrack {
         $done.Add($name)
         if ($recordState) {
             try {
-                Set-DemoDeploymentStateLocked -Config $Config -Value @{ $tagKey = $name } -Confirm:$false
+                $record = @{ $tagKey = $name }
+                if ($fabricPublished) {
+                    $record['FabricSha256'] = $fabricPublished
+                    $fabricPublished = ''
+                }
+                Set-DemoDeploymentStateLocked -Config $Config -Value $record -Confirm:$false
             }
             catch {
                 Write-DemoLog -Level Warning -Message ('Track {0} finished {1}, but its state wasn''t recorded: {2}' -f $Track, $name, $_.Exception.Message)

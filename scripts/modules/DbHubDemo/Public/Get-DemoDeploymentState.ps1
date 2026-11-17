@@ -10,6 +10,8 @@ function Get-DemoDeploymentState {
     RunnerSha256, RunnerChunkCount, BundleSentTo and RunnerSentTo (the VMs that have the chunks of exactly
     those hashes), NetworkMode, T3UseFreeLimit ($null when unknown), T3AdminGroupName, BastionExpiresUtc,
     HostPasswordUtc, TrackT1, TrackT2, TrackT4, and TrackFabric (the last step each parallel track finished, ADR 0018),
+    FabricSha256 (the Fabric content the Fabric step last published in full, in the DbHubFabricSha256 tag; 2026-11-16,
+    Get-DemoFabricContentReopen),
     T2Source (golden or build), FabricCapacityResumed and FabricCapacityResumedUtc (the capacity start-demo.ps1 resumed
     with fabric.manageCapacity, as "<resource group>/<name>", Phase 26b), GuidedStopUtc (until when the PaygWizard guided
     stop's request is valid; while it's still set after that, the guided stop's cleanup didn't finish and its Bastion
@@ -20,7 +22,13 @@ function Get-DemoDeploymentState {
     configuration asks for first, with the zones tried and when, in the DbHubT4Refused tag; ConvertFrom-DemoT4RefusedRecord),
     T2BuildUtc (when the T2 host's loader started a bootstrap generation that nobody has seen finish; empty when none
     runs; Phase 28 review follow-up), T2InstallMode (the T2 guest's own install mode as its host reported it, in the
-    DbHubT2InstallMode tag; 2026-11-09, Get-DemoT2GuestInstallMode), and Tags (every tag on the group). Read-only.
+    DbHubT2InstallMode tag; 2026-11-09, Get-DemoT2GuestInstallMode), T4Replica (Session once deploy.ps1 has set up T4's
+    read replica for this environment, in the DbHubT4Replica tag; 2026-11-13, ADR 0025), T4ReplicaSize (the size and zone the
+    last replica was created with, in the DbHubT4ReplicaSize tag), BusyUntilUtc and BusyBy (the busy marker that keeps the
+    nightly stop waiting for a run that's still going, in DbHubBusyUntilUtc and DbHubBusyBy; 2026-11-14,
+    ConvertTo-DemoBusyMarker), FabricWorkspaceId and ControlWorkspaceId (the Fabric workspaces this environment uses, by
+    ID, in DbHubFabricWorkspaceId and DbHubControlWorkspaceId; 2026-11-17, Invoke-DemoFabricOwnershipStep), and Tags
+    (every tag on the group). Read-only.
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -64,6 +72,7 @@ function Get-DemoDeploymentState {
         TrackT2           = & $read 'TrackT2'
         TrackT4           = & $read 'TrackT4'
         TrackFabric       = & $read 'TrackFabric'
+        FabricSha256      = (& $read 'FabricSha256').ToLowerInvariant()
         T2Source          = & $read 'T2Source'
         FabricCapacityResumed    = & $read 'FabricCapacityResumed'
         FabricCapacityResumedUtc = & $read 'FabricCapacityResumedUtc'
@@ -72,6 +81,12 @@ function Get-DemoDeploymentState {
         T4Refused         = & $read 'T4Refused'
         T2BuildUtc        = & $read 'T2BuildUtc'
         T2InstallMode     = & $read 'T2InstallMode'
+        T4Replica         = & $read 'T4Replica'
+        T4ReplicaSize     = & $read 'T4ReplicaSize'
+        BusyUntilUtc      = & $read 'BusyUntilUtc'
+        BusyBy            = & $read 'BusyBy'
+        FabricWorkspaceId  = (& $read 'FabricWorkspaceId').ToLowerInvariant()
+        ControlWorkspaceId = (& $read 'ControlWorkspaceId').ToLowerInvariant()
         Tags              = $tags
     }
 }

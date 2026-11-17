@@ -1,0 +1,40 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "replica-lag",
+  "title": "Read replica lag",
+  "summary": "A reporting query on T4's read replica (ContosoCare.Demo/replica-lag/<run>) reads demo.replica_lag_marks and holds its lock for holdSeconds, while T4 takes an ACCESS EXCLUSIVE lock on that table once, in a short transaction, and keeps committing small marks. Replaying that lock on the replica waits for the report, up to max_standby_streaming_delay, so Read Replica Lag climbs to about holdSeconds, then drops when the report ends. It repeats in cycles until the run ends. PostgreSQL (T4) with its read replica only.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_replica_lag",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 900 },
+  "concurrency": { "default": 1, "min": 1, "max": 1, "description": "Fixed: one report on the replica and one writer on T4 each cycle." },
+  "intensity": { "default": 5, "min": 1, "max": 10, "description": "Not used: holdSeconds and markIntervalMs set the scenario's pace." },
+  "targets": {
+    "applicable": ["T4"],
+    "default": ["T4"],
+    "notes": {
+      "T4": "Needs T4's read replica, pgreplica01-<deploymentId>, which start-demo.ps1 creates for each session and whose name deploy.ps1 sends T1 (ADR 0025); without it the run is refused with that fix. The replica's max_standby_streaming_delay is 10 minutes, above holdSeconds' maximum, so each report ends by itself."
+    }
+  },
+  "parameters": {
+    "holdSeconds": { "type": "integer", "default": 240, "minimum": 30, "maximum": 540, "description": "How long each cycle's report on the replica holds demo.replica_lag_marks, so about how high the replica's lag climbs (a cycle is cut to end before the run's deadline)." },
+    "pauseSeconds": { "type": "integer", "default": 60, "minimum": 0, "maximum": 300, "description": "Quiet time between cycles, after the lag has dropped." },
+    "markIntervalMs": { "type": "integer", "default": 1000, "minimum": 250, "maximum": 10000, "description": "How often the writer on T4 commits a small mark, while a report holds the table and for 30 seconds after it ends." }
+  },
+  "expectedHubSignals": [
+    { "signal": "T4 replica: Read replica lag (physical_replication_delay_in_seconds) climbs to about holdSeconds, then drops", "surface": "Performance", "note": "On the replica's own PostgreSQL dashboard: Estate lists it as a server of its own (ADR 0025)." },
+    { "signal": "T4: Max Physical Replication Lag (physical_replication_delay_in_bytes) grows on the primary", "surface": "Azure Monitor", "note": "T4's metrics in the Azure portal; the replica's Read Replica Lag is there too." }
+  ],
+  "expectedSymptoms": [
+    "The replica stops replaying while the report runs: the time since its last replayed transaction grows by a second every second",
+    "The replica's startup process waits on a relation lock (Lock:relation) that the ContosoCare.Demo/replica-lag report holds",
+    "T4 keeps committing marks, so the WAL the replica has received but not replayed grows",
+    "When the report ends, or recovery cancels it at max_standby_streaming_delay (SQLSTATE 40001), replay catches up within seconds and the lag drops"
+  ],
+  "queryLevelEvidence": [
+    "ContosoCare.Workload status --target T4 --replica-server <fqdn>: the replica's replay lag and its demo sessions",
+    "On the replica: pg_stat_activity shows the report active (wait event PgSleep) and the startup process waiting on Lock:relation; pg_locks shows the report's AccessShareLock on demo.replica_lag_marks",
+    "On T4: pg_stat_replication's replay_lag grows, and replay_lsn stays behind sent_lsn",
+    "demo.scenario_run_events records replica-lag-locked, replica-report-ended (or replica-report-recovery-cancel), and replica-lag-recovered for each cycle"
+  ],
+  "reset": "Each report ends by itself, or by its statement_timeout before the run's deadline; the auto-cleanup and reset delete the marks, the only rows it writes. reset and stop with --replica-server also end the demo's sessions on the replica (pg_cancel_backend, then pg_terminate_backend)."
+}

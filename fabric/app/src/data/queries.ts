@@ -472,6 +472,102 @@ ORDER BY [TargetKey]`,
     };
 }
 
+/**
+ * The latest PostgreSQL capture's run (2026-11-13, ADR 0025): the notebook run with the newest `postgresql` finding. Every
+ * capture writes at least one finding (`postgresql.T4.capture`), so its points, when it has any, belong to the same run.
+ */
+const POSTGRES_LATEST_RUN = `VAR LatestCapture =
+    CALCULATE ( MAX ( 'Analysis Findings'[Captured At UTC] ), REMOVEFILTERS (), 'Analysis Findings'[Analysis Key] = "postgresql" )
+VAR LatestRun =
+    CALCULATETABLE (
+        VALUES ( 'Analysis Findings'[Run ID] ),
+        REMOVEFILTERS (),
+        'Analysis Findings'[Analysis Key] = "postgresql",
+        'Analysis Findings'[Captured At UTC] = LatestCapture
+    )`;
+
+/**
+ * T4's and its read replica's Azure Monitor metrics from the latest capture (analysis `postgresql`; targets T4 and
+ * T4-replica), one row per metric and interval. The notebook can't read Azure Monitor, so stop-demo.ps1 -SaveHistory and
+ * deploy.ps1 pass these metrics to it; there are none until one of them ran. Not filtered by target or period.
+ */
+export function postgresSeriesQuery(): QuerySpec {
+    return {
+        id: "postgres-series",
+        title: "T4 and its read replica: Azure Monitor metrics, latest capture",
+        rowLimit: 5000,
+        dax: `EVALUATE
+${POSTGRES_LATEST_RUN}
+RETURN
+    SELECTCOLUMNS (
+        CALCULATETABLE (
+            'Telemetry Snapshots',
+            REMOVEFILTERS (),
+            'Telemetry Snapshots'[Analysis Key] = "postgresql",
+            TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )
+        ),
+        "Bucket", 'Telemetry Snapshots'[Bucket UTC],
+        "TargetKey", 'Telemetry Snapshots'[Target Key],
+        "ResourceName", 'Telemetry Snapshots'[Resource Name],
+        "Metric", 'Telemetry Snapshots'[Metric],
+        "Value", 'Telemetry Snapshots'[Value],
+        "Unit", 'Telemetry Snapshots'[Unit],
+        "WindowStart", 'Telemetry Snapshots'[Window Start UTC],
+        "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
+        "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
+    )
+ORDER BY [Bucket] ASC, [TargetKey] ASC, [Metric] ASC`,
+        columns: [
+            { key: "Bucket", label: "Interval start (UTC)", kind: "datetime" },
+            { key: "TargetKey", label: "Target", kind: "text" },
+            { key: "ResourceName", label: "Server", kind: "text" },
+            { key: "Metric", label: "Azure Monitor metric", kind: "text" },
+            { key: "Value", label: "Value", kind: "decimal" },
+            { key: "Unit", label: "Unit", kind: "text" },
+            { key: "WindowStart", label: "Window start (UTC)", kind: "datetime" },
+            { key: "WindowEnd", label: "Window end (UTC)", kind: "datetime" },
+            { key: "CapturedAt", label: "Captured (UTC)", kind: "datetime" },
+        ],
+    };
+}
+
+/** The findings of the latest PostgreSQL capture: what was captured, the replica's lag, T4's CPU, and its failed connections. */
+export function postgresFindingsQuery(): QuerySpec {
+    return {
+        id: "postgres-findings",
+        title: "T4 and its read replica: findings of the latest capture",
+        rowLimit: 50,
+        dax: `EVALUATE
+${POSTGRES_LATEST_RUN}
+RETURN
+    SELECTCOLUMNS (
+        CALCULATETABLE (
+            'Analysis Findings',
+            REMOVEFILTERS (),
+            'Analysis Findings'[Analysis Key] = "postgresql",
+            TREATAS ( LatestRun, 'Analysis Findings'[Run ID] )
+        ),
+        "FindingId", 'Analysis Findings'[Finding ID],
+        "TargetKey", 'Analysis Findings'[Target Key],
+        "Status", 'Analysis Findings'[Status Key],
+        "StatusSort", RELATED ( 'Status'[Status Sort] ),
+        "Finding", 'Analysis Findings'[Finding],
+        "Evidence", 'Analysis Findings'[Evidence],
+        "WindowStart", 'Analysis Findings'[Window Start UTC],
+        "WindowEnd", 'Analysis Findings'[Window End UTC],
+        "CapturedAt", 'Analysis Findings'[Captured At UTC]
+    )
+ORDER BY [StatusSort] ASC, [FindingId] ASC`,
+        columns: [
+            { key: "Status", label: "Status", kind: "status" },
+            { key: "TargetKey", label: "Target", kind: "text" },
+            { key: "Finding", label: "Finding", kind: "text" },
+            { key: "CapturedAt", label: "Captured (UTC)", kind: "datetime" },
+            { key: "FindingId", label: "Finding ID", kind: "text" },
+        ],
+    };
+}
+
 /** What history-meta found for the deploy-time check's T3 replay; every field is optional. */
 export interface CheckAnchors {
     t3IncidentStart?: Date | null;
@@ -537,5 +633,7 @@ export function catalogForCheck(latestDay: Date, anchors: CheckAnchors = {}): Qu
         readinessSummaryQuery(),
         coverageQuery(),
         targetNamesQuery(),
+        postgresSeriesQuery(),
+        postgresFindingsQuery(),
     ];
 }

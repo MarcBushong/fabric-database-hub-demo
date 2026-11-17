@@ -4,8 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import EstatePage from "@/pages/EstatePage";
 import IncidentsPage from "@/pages/IncidentsPage";
 import LinksPage from "@/pages/LinksPage";
+import PostgresPage from "@/pages/PostgresPage";
 import ReadinessPage from "@/pages/ReadinessPage";
-import { fakeQueryClient, renderWithApp } from "@/test/render";
+import { FIXTURES, fakeQueryClient, renderWithApp } from "@/test/render";
 
 describe("Estate page", () => {
     it("renders the model's headline, insights, the constellation, and the findings feed", async () => {
@@ -45,6 +46,48 @@ describe("Incidents page", () => {
     it("says so when there is no incident", async () => {
         renderWithApp(<IncidentsPage />, { client: fakeQueryClient({ "incident-windows": [] }) });
         expect(await screen.findByText(/No incident window in this period/)).toBeInTheDocument();
+    });
+});
+
+describe("PostgreSQL page (ADR 0025)", () => {
+    it("charts the read replica's lag with its peak, T4's CPU and connections, and the latest capture's findings", async () => {
+        const { client } = renderWithApp(<PostgresPage />);
+        expect(await screen.findByText("Read replica lag peaked at 241 s at 17:05 UTC on 13 Nov.")).toBeInTheDocument();
+        expect(screen.getByText("T4's CPU peaked at 91.3 % at 17:05 UTC on 13 Nov.")).toBeInTheDocument();
+        expect(screen.getByText("4 failed connections on T4 in the latest capture.")).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "Read replica lag" })).toBeInTheDocument();
+        expect(screen.getByText("peak 241 s")).toBeInTheDocument();
+        const lagChart = screen.getByRole("img", { name: "Read replica lag over the latest capture's window" });
+        const paths = [...lagChart.querySelectorAll("path")].map((p) => p.getAttribute("d") ?? "");
+        expect(paths).toHaveLength(1);
+        expect(paths[0]).toMatch(/^M[\d.]+,[\d.]+C/);
+        expect(paths[0]).not.toContain("NaN");
+        expect(screen.getByRole("img", { name: "Active and failed connections over the latest capture's window" })).toBeInTheDocument();
+        const servers = screen.getByRole("region", { name: "The servers" });
+        expect(within(servers).getByText("pgflex01-test01")).toBeInTheDocument();
+        expect(within(servers).getByText("pgreplica01-test01")).toBeInTheDocument();
+        expect(within(servers).getAllByText("Standard_D4ds_v5")).toHaveLength(2);
+        expect(within(servers).getByText("5 min")).toBeInTheDocument();
+        const found = screen.getByRole("region", { name: "What the notebook found" });
+        expect(within(found).getByText(/^Read replica lag on pgreplica01-test01 peaked at 241\.4 s/)).toBeInTheDocument();
+        expect(within(found).getAllByRole("listitem")).toHaveLength(3);
+        expect(client.ran).toEqual(expect.arrayContaining(["postgres-series", "postgres-findings"]));
+    });
+
+    it("says how the data gets there when the history has no capture yet", async () => {
+        renderWithApp(<PostgresPage />, { client: fakeQueryClient({ "postgres-series": [], "postgres-findings": [] }) });
+        expect(await screen.findByRole("heading", { name: "No PostgreSQL history yet" })).toBeInTheDocument();
+        expect(screen.getByText(/stop-demo\.ps1 -SaveHistory \(before it deletes the read replica, whose metrics go with it\) and \.\/scripts\/deploy\.ps1 \(at its end\)/)).toBeInTheDocument();
+        expect(screen.getByText(/The read replica exists only during a session/)).toBeInTheDocument();
+        expect(screen.queryByRole("heading", { name: "Read replica lag" })).not.toBeInTheDocument();
+    });
+
+    it("explains a capture without the read replica, which exists only during a session", async () => {
+        const primary = FIXTURES["postgres-series"].filter((r) => r.TargetKey === "T4");
+        renderWithApp(<PostgresPage />, { client: fakeQueryClient({ "postgres-series": primary }) });
+        expect(await screen.findByText("The latest capture has no Read replica lag.")).toBeInTheDocument();
+        expect(screen.getByText(/^No Read replica lag in this capture: T4's read replica exists only during a session/)).toBeInTheDocument();
+        expect(within(screen.getByRole("region", { name: "The servers" })).getByText("not in this capture")).toBeInTheDocument();
     });
 });
 

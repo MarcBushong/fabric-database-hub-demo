@@ -233,7 +233,7 @@ function Invoke-DbHubArm {
         [object] $Context,
 
         [Parameter(Mandatory = $true)]
-        [ValidateSet('GET', 'PUT', 'POST', 'DELETE')]
+        [ValidateSet('GET', 'PUT', 'POST', 'DELETE', 'PATCH')]
         [string] $Method,
 
         [Parameter(Mandatory = $true)]
@@ -351,7 +351,7 @@ function Get-DbHubRefusal {
         [string] $Reason
     )
 
-    return [pscustomobject]@{ Valid = $false; Reason = $Reason; Action = ''; Activities = @(); DurationMinutes = 0; Targets = @(); RequestedBy = '' }
+    return [pscustomobject]@{ Valid = $false; Reason = $Reason; Action = ''; Activities = @(); DurationMinutes = 0; Targets = @(); RequestedBy = ''; SessionId = '' }
 }
 
 function Test-DbHubControlRequest {
@@ -371,6 +371,13 @@ function Test-DbHubControlRequest {
       is minDurationMinutes to maxDurationMinutes.
     - {"action": "stop"}: Stop now.
     - {"action": "reset", "targets": ["T1"]}: the runner's reset; without targets, every target whose VM runs.
+    - {"action": "session", "sessionId": "<32 lowercase hex>", "durationMinutes": 90}: the control notebook's Run all
+      (2026-11-14): the whole demo session, the showcase on every target, T4's read replica, the busy marker, and the
+      session's status in the control vault (Start-DbHubSession). durationMinutes is optional (the showcase's default),
+      minSessionMinutes to the showcase's maximum.
+    - {"action": "capture", "sessionId": "..."}: T4's and its read replica's Azure Monitor metrics into the control vault,
+      for the history (Save-DbHubSessionMetric); nothing is started or stopped.
+    - "sessionId" is also allowed on stop, whose status then names the session.
     - "requestedBy" is optional on any action: 1-64 letters, digits, or . _ @ / - (a name, never a secret).
     Unknown fields, other values, free text, and a body that isn't a JSON object are refused.
     #>
@@ -407,10 +414,10 @@ function Test-DbHubControlRequest {
         return (Get-DbHubRefusal -Reason 'The request body must be a JSON object.')
     }
     $action = Get-DbHubMember -InputObject $body -Name 'action'
-    if (-not ($action -is [string]) -or $action -cnotin @('run', 'stop', 'reset')) {
-        return (Get-DbHubRefusal -Reason 'action must be run, stop, or reset.')
+    if (-not ($action -is [string]) -or $action -cnotin @('run', 'stop', 'reset', 'session', 'capture')) {
+        return (Get-DbHubRefusal -Reason 'action must be run, session, stop, capture, or reset.')
     }
-    $allowedFields = @{ run = @('action', 'activities', 'durationMinutes', 'requestedBy'); stop = @('action', 'requestedBy'); reset = @('action', 'targets', 'requestedBy') }
+    $allowedFields = @{ run = @('action', 'activities', 'durationMinutes', 'requestedBy'); stop = @('action', 'requestedBy', 'sessionId'); reset = @('action', 'targets', 'requestedBy'); session = @('action', 'durationMinutes', 'sessionId', 'requestedBy'); capture = @('action', 'sessionId', 'requestedBy') }
     foreach ($name in (Get-DbHubPropertyName -InputObject $body)) {
         if ($name -cnotin $allowedFields[$action]) {
             return (Get-DbHubRefusal -Reason ('The field ''{0}'' isn''t allowed for {1}.' -f ($name -replace '[^A-Za-z0-9_-]', '?'), $action))
@@ -424,10 +431,44 @@ function Test-DbHubControlRequest {
         }
         $requestedBy = $who
     }
+    $sessionId = ''
+    $sessionValue = Get-DbHubMember -InputObject $body -Name 'sessionId'
+    if ($null -ne $sessionValue) {
+        if (-not ($sessionValue -is [string]) -or $sessionValue -cnotmatch '^[0-9a-f]{32}$') {
+            return (Get-DbHubRefusal -Reason 'sessionId must be 32 lowercase hexadecimal characters.')
+        }
+        $sessionId = $sessionValue
+    }
+    elseif ($action -in 'session', 'capture') {
+        return (Get-DbHubRefusal -Reason ('{0} needs a sessionId: 32 lowercase hexadecimal characters.' -f $action))
+    }
     $targets = @($Settings.targets.PSObject.Properties | ForEach-Object { [string]$_.Name })
 
-    if ($action -eq 'stop') {
-        return [pscustomobject]@{ Valid = $true; Reason = ''; Action = 'stop'; Activities = @(); DurationMinutes = 0; Targets = @(); RequestedBy = $requestedBy }
+    if ($action -in 'stop', 'capture') {
+        return [pscustomobject]@{ Valid = $true; Reason = ''; Action = $action; Activities = @(); DurationMinutes = 0; Targets = @(); RequestedBy = $requestedBy; SessionId = $sessionId }
+    }
+
+    if ($action -eq 'session') {
+        # The showcase on every target it has incidents for: what Run all always ran, now with the replica (2026-11-14).
+        $showcase = Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $Settings -Name 'profiles') -Name 'showcase'
+        if ($null -eq $showcase) {
+            return (Get-DbHubRefusal -Reason 'The runbook settings have no showcase profile; run ./scripts/deploy.ps1 again.')
+        }
+        $minimum = [int](Get-DbHubMember -InputObject $Settings -Name 'minSessionMinutes')
+        if ($minimum -le 0) {
+            $minimum = 30
+        }
+        $maximum = [int](Get-DbHubMember -InputObject $showcase -Name 'maxMinutes')
+        $minutes = [int](Get-DbHubMember -InputObject $showcase -Name 'defaultMinutes')
+        $duration = Get-DbHubMember -InputObject $body -Name 'durationMinutes'
+        if ($null -ne $duration) {
+            if (-not (Test-DbHubInteger -Value $duration -Minimum $minimum -Maximum $maximum)) {
+                return (Get-DbHubRefusal -Reason ('durationMinutes must be a whole number from {0} to {1}.' -f $minimum, $maximum))
+            }
+            $minutes = [int]$duration
+        }
+        $activities = @($targets | Where-Object { $_ -cin @($showcase.targets) } | ForEach-Object { [pscustomobject]@{ Target = $_; Scenario = 'showcase'; Intensity = 0; Concurrency = 0 } })
+        return [pscustomobject]@{ Valid = $true; Reason = ''; Action = 'session'; Activities = $activities; DurationMinutes = $minutes; Targets = @($activities | ForEach-Object { $_.Target }); RequestedBy = $requestedBy; SessionId = $sessionId }
     }
 
     if ($action -eq 'reset') {
@@ -444,7 +485,7 @@ function Test-DbHubControlRequest {
                 $chosen += $item
             }
         }
-        return [pscustomobject]@{ Valid = $true; Reason = ''; Action = 'reset'; Activities = @(); DurationMinutes = 0; Targets = $chosen; RequestedBy = $requestedBy }
+        return [pscustomobject]@{ Valid = $true; Reason = ''; Action = 'reset'; Activities = @(); DurationMinutes = 0; Targets = $chosen; RequestedBy = $requestedBy; SessionId = '' }
     }
 
     $duration = Get-DbHubMember -InputObject $body -Name 'durationMinutes'
@@ -524,7 +565,7 @@ function Test-DbHubControlRequest {
     if (@($normalized | Where-Object { $_.Scenario -cne 'off' }).Count -eq 0) {
         return (Get-DbHubRefusal -Reason 'A run needs at least one activity that isn''t off; Stop now stops everything.')
     }
-    return [pscustomobject]@{ Valid = $true; Reason = ''; Action = 'run'; Activities = $normalized; DurationMinutes = [int]$duration; Targets = @($seen); RequestedBy = $requestedBy }
+    return [pscustomobject]@{ Valid = $true; Reason = ''; Action = 'run'; Activities = $normalized; DurationMinutes = [int]$duration; Targets = @($seen); RequestedBy = $requestedBy; SessionId = '' }
 }
 
 function Get-DbHubNextShutdownUtc {
@@ -754,6 +795,13 @@ function Clear-DbHubAutoStop {
     $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Automation/automationAccounts'
     $account = Get-DbHubAccountPath -Settings $settings
     $monitors = @(Get-DbHubMonitorScheduleName -Settings $settings)
+    # A session's second auto-stop (2026-11-14), autoStopBackupMinutes after the first, for when the first one's job fails:
+    # it goes with the first, so it never stops a later run.
+    $backup = [string](Get-DbHubMember -InputObject $settings -Name 'autoStopBackupSchedule')
+    $stops = @([string]$settings.autoStopSchedule)
+    if ($backup) {
+        $stops += $backup
+    }
     $clean = $true
     $links = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/jobSchedules' -f $account) -ApiVersion $version
     if ($links.StatusCode -eq 200) {
@@ -761,12 +809,12 @@ function Clear-DbHubAutoStop {
             $properties = Get-DbHubMember -InputObject $link -Name 'properties'
             $scheduleName = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $properties -Name 'schedule') -Name 'name')
             $id = [string](Get-DbHubMember -InputObject $properties -Name 'jobScheduleId')
-            if (($scheduleName -ne [string]$settings.autoStopSchedule -and $scheduleName -notin $monitors) -or $id -notmatch '^[0-9a-fA-F-]{36}$') {
+            if (($scheduleName -notin $stops -and $scheduleName -notin $monitors) -or $id -notmatch '^[0-9a-fA-F-]{36}$') {
                 continue
             }
             $removed = Invoke-DbHubArm -Context $Context -Method DELETE -Path ('{0}/jobSchedules/{1}' -f $account, $id) -ApiVersion $version
             if ($removed.StatusCode -notin 200, 204, 404) {
-                if ($scheduleName -eq [string]$settings.autoStopSchedule) {
+                if ($scheduleName -in $stops) {
                     $clean = $false
                 }
                 Write-DbHubLog -Context $Context -Message ('The link {0} to {1} couldn''t be deleted: {2}' -f $id, $scheduleName, $removed.Error)
@@ -781,6 +829,13 @@ function Clear-DbHubAutoStop {
         $deleted = Invoke-DbHubArm -Context $Context -Method DELETE -Path ('{0}/schedules/{1}' -f $account, $name) -ApiVersion $version
         if ($deleted.StatusCode -notin 200, 204, 404) {
             Write-DbHubLog -Context $Context -Message ('The monitoring re-check {0} couldn''t be deleted: {1}' -f $name, $deleted.Error)
+        }
+    }
+    if ($backup) {
+        $deleted = Invoke-DbHubArm -Context $Context -Method DELETE -Path ('{0}/schedules/{1}' -f $account, $backup) -ApiVersion $version
+        if ($deleted.StatusCode -notin 200, 204, 404) {
+            $clean = $false
+            Write-DbHubLog -Context $Context -Message ('The second auto-stop schedule couldn''t be deleted: {0}' -f $deleted.Error)
         }
     }
     $deleted = Invoke-DbHubArm -Context $Context -Method DELETE -Path ('{0}/schedules/{1}' -f $account, $settings.autoStopSchedule) -ApiVersion $version
@@ -811,7 +866,7 @@ function Register-DbHubAutoStop {
     $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Automation/automationAccounts'
     $account = Get-DbHubAccountPath -Settings $settings
     if (-not (Clear-DbHubAutoStop -Context $Context)) {
-        return [pscustomobject]@{ Created = $false; Error = 'the previous auto-stop couldn''t be removed'; StartUtc = '' }
+        return [pscustomobject]@{ Created = $false; Error = 'the previous auto-stop couldn''t be removed'; StartUtc = ''; BackupUtc = '' }
     }
     $start = [DateTime]::SpecifyKind($AutoStopUtc, [System.DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     $body = @{
@@ -825,7 +880,7 @@ function Register-DbHubAutoStop {
     }
     $schedule = Invoke-DbHubArm -Context $Context -Method PUT -Path ('{0}/schedules/{1}' -f $account, $settings.autoStopSchedule) -ApiVersion $version -Body $body
     if ($schedule.StatusCode -notin 200, 201) {
-        return [pscustomobject]@{ Created = $false; Error = $schedule.Error; StartUtc = '' }
+        return [pscustomobject]@{ Created = $false; Error = $schedule.Error; StartUtc = ''; BackupUtc = '' }
     }
     $link = @{
         properties = @{
@@ -837,9 +892,34 @@ function Register-DbHubAutoStop {
     $linked = Invoke-DbHubArm -Context $Context -Method PUT -Path ('{0}/jobSchedules/{1}' -f $account, [guid]::NewGuid().ToString()) -ApiVersion $version -Body $link
     if ($linked.StatusCode -notin 200, 201) {
         $null = Clear-DbHubAutoStop -Context $Context
-        return [pscustomobject]@{ Created = $false; Error = $linked.Error; StartUtc = '' }
+        return [pscustomobject]@{ Created = $false; Error = $linked.Error; StartUtc = ''; BackupUtc = '' }
     }
-    return [pscustomobject]@{ Created = $true; Error = ''; StartUtc = $start }
+    # The second auto-stop (2026-11-14): if the first one's job fails before it removes them, this one stops the demo.
+    $backupUtc = ''
+    $backup = [string](Get-DbHubMember -InputObject $settings -Name 'autoStopBackupSchedule')
+    if ($backup) {
+        $minutes = [int](Get-DbHubMember -InputObject $settings -Name 'autoStopBackupMinutes')
+        if ($minutes -le 0) {
+            $minutes = 30
+        }
+        $backupStart = [DateTime]::SpecifyKind($AutoStopUtc, [System.DateTimeKind]::Utc).AddMinutes($minutes).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        $backupBody = @{ name = $backup; properties = @{ description = ('Stops the demo if the auto-stop of the run that job {0} started didn''t (ADR 0026).' -f $Context.JobId); startTime = $backupStart; frequency = 'OneTime'; timeZone = 'UTC' } }
+        $made = Invoke-DbHubArm -Context $Context -Method PUT -Path ('{0}/schedules/{1}' -f $account, $backup) -ApiVersion $version -Body $backupBody
+        if ($made.StatusCode -in 200, 201) {
+            $backupLink = @{ properties = @{ schedule = @{ name = $backup }; runbook = @{ name = [string]$settings.stopRunbook }; parameters = @{ Scope = 'All' } } }
+            $madeLink = Invoke-DbHubArm -Context $Context -Method PUT -Path ('{0}/jobSchedules/{1}' -f $account, [guid]::NewGuid().ToString()) -ApiVersion $version -Body $backupLink
+            if ($madeLink.StatusCode -in 200, 201) {
+                $backupUtc = $backupStart
+            }
+            else {
+                Write-DbHubLog -Context $Context -Message ('The second auto-stop wasn''t linked to {0}: {1}' -f $settings.stopRunbook, $madeLink.Error)
+            }
+        }
+        else {
+            Write-DbHubLog -Context $Context -Message ('The second auto-stop wasn''t created: {0}' -f $made.Error)
+        }
+    }
+    return [pscustomobject]@{ Created = $true; Error = ''; StartUtc = $start; BackupUtc = $backupUtc }
 }
 
 function Register-DbHubMonitorRecheck {
@@ -1009,6 +1089,96 @@ function Get-DbHubResourceGroupTag {
         $state = 'Unknown'
     }
     return [pscustomobject]@{ GroupState = $state; Tags = (Get-DbHubMember -InputObject $group.Body -Name 'tags'); Error = $group.Error }
+}
+
+function Get-DbHubBusyMarker {
+    <#
+    .SYNOPSIS
+    The demo resource group's busy marker (2026-11-14): DbHubBusyUntilUtc, which deploy.ps1 and a control session set
+    and refresh while they run, and DbHubBusyBy, who set it (deploy, deploy-grace, or session). Returns Active, UntilUtc,
+    By, and Reason. Active only while the marker is ahead of now by at most busyMarkerMaximumMinutes (180 by default): a
+    marker further ahead can't come from a refresh, so it's ignored, and an expired one means its run ended or was
+    abandoned. Pure, apart from the clock.
+    #>
+    param(
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [AllowNull()]
+        [object] $NowUtc = $null
+    )
+
+    $now = if ($null -ne $NowUtc) { ([datetime]$NowUtc).ToUniversalTime() } else { [DateTime]::UtcNow }
+    $text = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubBusyUntilUtc')
+    $by = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubBusyBy')
+    if ($by -notmatch '^[a-z][a-z-]{0,31}$') {
+        $by = ''
+    }
+    $answer = [pscustomobject]@{ Active = $false; UntilUtc = $null; By = $by; Reason = 'None' }
+    if (-not $text) {
+        return $answer
+    }
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if (-not [datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref] $parsed)) {
+        $answer.Reason = 'Unreadable'
+        return $answer
+    }
+    $answer.UntilUtc = $parsed
+    $maximum = [int](Get-DbHubMember -InputObject $Settings -Name 'busyMarkerMaximumMinutes')
+    if ($maximum -le 0) {
+        $maximum = 180
+    }
+    if ($parsed -le $now) {
+        $answer.Reason = 'Expired'
+    }
+    elseif ($parsed -gt $now.AddMinutes($maximum)) {
+        $answer.Reason = 'TooFar'
+    }
+    else {
+        $answer.Active = $true
+        $answer.Reason = 'Active'
+    }
+    return $answer
+}
+
+function Get-DbHubBusyDeferral {
+    # A stop's result when the busy marker defers it (Get-DbHubBusyMarker): Deferred, with who's busy and until when; or $null.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Label,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Context
+    )
+
+    $busy = Get-DbHubBusyMarker -Tags $Tags -Settings $Context.Settings -NowUtc $Context.NowUtc
+    if (-not $busy.Active) {
+        if ($busy.Reason -in 'TooFar', 'Unreadable') {
+            Write-DbHubLog -Context $Context -Message ('The busy marker ({0}) was ignored: it''s {1}, so the stop goes on.' -f [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubBusyUntilUtc'), $(if ($busy.Reason -eq 'TooFar') { 'further ahead than a run refreshes it' } else { 'not a time' }))
+        }
+        return $null
+    }
+    $who = switch ($busy.By) {
+        'deploy' { 'deploy.ps1 is still running' }
+        'deploy-grace' { 'deploy.ps1 finished after the nightly stop, and its grace period runs' }
+        'session' { 'a demo session is running' }
+        default { 'a run is still busy' }
+    }
+    $until = $busy.UntilUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    $message = 'Deferred: {0} (busy until {1}), so nothing was stopped now. The run stops everything at its end, or a later pass does once the marker expires.' -f $who, $until
+    Write-DbHubLog -Context $Context -Message $message
+    $result = [pscustomobject]@{ action = $Label; status = 'Deferred'; message = $message; busyUntil = $until; busyBy = $busy.By }
+    if ($Label -eq 'check-t3') {
+        $result | Add-Member -NotePropertyName 't3' -NotePropertyValue 'Deferred'
+    }
+    return $result
 }
 
 function Get-DbHubT3State {
@@ -1680,7 +1850,15 @@ function Stop-DbHubDemo {
     (Phase 25a, finding 5): deallocation ends every session on T1 and T2 (the T2 guest shuts down through the host's
     automatic stop action, ShutDown), T3's sessions end with T1's runner, and T3 auto-pauses after its delay. The
     activity profiles end at their own end; the profile host ends what a stopped run left behind when it starts again.
-    Returns Done and Failed.
+    Returns Done, Failed, MetricsStatus, and MetricsMessage.
+
+    .DESCRIPTION
+    With the control's session settings (2026-11-14, ADR 0026), and T4's read replica there or a session's busy marker set:
+    T4's and the replica's Azure Monitor metrics go to the control vault first (Save-DbHubSessionMetric), because a
+    deleted server's can't be read; then the replica is deleted (Remove-DbHubT4Replica) before T4 stops, and a session's
+    busy marker is cleared. T4's stop right after the replica's deletion is confirmed (Stop-DbHubT4Confirmed): Azure can
+    still refuse it then (SourceReplicasStartStopOrder, live 2026-11-14). Without the grant to delete it (or with the safety
+    stop's settings), the replica is stopped once T4 is, as before.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -1688,20 +1866,45 @@ function Stop-DbHubDemo {
         [object] $Context,
 
         [AllowNull()]
-        [object] $Tags
+        [object] $Tags,
+
+        [AllowEmptyString()]
+        [string] $SessionId = '',
+
+        [int] $PollSeconds = 20
     )
 
     $settings = $Context.Settings
     if (-not $PSCmdlet.ShouldProcess($settings.demoResourceGroup, 'Deallocate the VMs and stop T4')) {
-        return [pscustomobject]@{ Done = @(); Failed = @() }
+        return [pscustomobject]@{ Done = @(); Failed = @(); MetricsStatus = ''; MetricsMessage = '' }
     }
     $done = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $failed = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $metricsStatus = ''
+    $metricsMessage = ''
     if (Clear-DbHubAutoStop -Context $Context) {
         $done.Add('auto-stop removed')
     }
     else {
         $failed.Add('auto-stop schedule')
+    }
+    $session = Test-DbHubSessionCapable -Settings $settings
+    $busy = Get-DbHubBusyMarker -Tags $Tags -Settings $settings -NowUtc $Context.NowUtc
+    $replicaThere = $false
+    if ($session) {
+        $replicaThere = (Get-DbHubT4Replica -Context $Context -Tags $Tags).State -notin 'NotConfigured', 'Missing', 'Unknown'
+        if ($replicaThere -or $busy.By -eq 'session') {
+            # The history's metrics first, while the replica exists.
+            $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId $SessionId
+            $metricsStatus = [string]$saved.Status
+            $metricsMessage = [string]$saved.Message
+            if ($saved.Status -in 'Pass', 'Warning') {
+                $done.Add('the history''s metrics saved to the control vault')
+            }
+            else {
+                $done.Add(('the history''s metrics not saved ({0})' -f $saved.Message))
+            }
+        }
     }
     foreach ($vm in @([string]$settings.sqlVmName, [string]$settings.hostVmName)) {
         $state = Get-DbHubVmState -Context $Context -VmName $vm
@@ -1716,19 +1919,78 @@ function Stop-DbHubDemo {
             $failed.Add($vm)
         }
     }
+    $replicaDeleted = $false
+    $replicaJustDeleted = $false
+    if ($session -and $replicaThere) {
+        # T4's read replica (ADR 0025) bills only during a session: deleted, which doesn't wait for T4 (2026-11-14).
+        $removed = Remove-DbHubT4Replica -Context $Context -Tags $Tags -WaitMinutes (Get-DbHubSessionReplicaSetting -Settings $settings).DeleteMinutes
+        switch ($removed.Outcome) {
+            'Deleted' {
+                $done.Add(('T4''s read replica {0} deleted' -f $removed.Name))
+                $replicaDeleted = $true
+                $replicaJustDeleted = $true
+            }
+            'Missing' {
+                $replicaDeleted = $true
+            }
+            'NotGranted' {
+                Write-DbHubLog -Context $Context -Message ('{0}: the control identity can''t delete it yet (an Owner runs ./scripts/grant-safety-stop.ps1), so it''s stopped after T4 instead.' -f $removed.Name)
+            }
+            default {
+                $failed.Add(('T4''s read replica {0} not deleted: {1}' -f $removed.Name, $removed.Error))
+            }
+        }
+    }
     $t4 = Get-DbHubT4 -Context $Context -Tags $Tags
-    if ($t4.State -in 'Ready', 'Starting', 'Updating') {
+    $t4Outcome = ''
+    if ($t4.State -in 'Ready', 'Starting', 'Updating' -and $replicaJustDeleted) {
+        # Right after the replica's delete, Azure can still refuse T4's stop (live, 2026-11-14), so it's confirmed.
+        $confirmed = Stop-DbHubT4Confirmed -Context $Context -Tags $Tags -Name $t4.Name -PollSeconds $PollSeconds
+        if ($confirmed.Stopped) {
+            $done.Add(('{0} stopping' -f $t4.Name))
+            $t4Outcome = 'Sent'
+        }
+        else {
+            $failed.Add(('{0} not stopped: {1}; the nightly safety stop stops it tonight' -f $t4.Name, $confirmed.Error))
+            $t4Outcome = 'Failed'
+        }
+    }
+    elseif ($t4.State -in 'Ready', 'Starting', 'Updating') {
         if (Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action stop) {
             $done.Add(('{0} stopping' -f $t4.Name))
+            $t4Outcome = 'Sent'
         }
         else {
             $failed.Add($t4.Name)
+            $t4Outcome = 'Failed'
         }
     }
     elseif ($t4.State -notin 'Unknown', '') {
         $done.Add(('T4 {0}' -f $t4.State.ToLowerInvariant()))
     }
-    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray() }
+    if (-not $replicaDeleted) {
+        # T4's read replica, when a session left it running (ADR 0025) and the control can't delete it: it's stopped once T4
+        # is (Azure's order), which waits for T4's stop only when there's a replica to stop.
+        $replica = Invoke-DbHubT4ReplicaStop -Context $Context -Tags $Tags -T4Outcome $t4Outcome -WaitMinutes (Get-DbHubT4WaitMinute -Settings $settings)
+        $replicaText = Get-DbHubT4ReplicaStopText -Outcome $replica
+        if ($replica.Outcome -eq 'Failed') {
+            $failed.Add($replicaText)
+        }
+        elseif ($replicaText) {
+            $done.Add($replicaText)
+        }
+    }
+    if ($session -and $busy.By -eq 'session') {
+        # The session's busy marker ends with it, so the nightly stop goes on as usual (2026-11-14).
+        $cleared = Set-DbHubResourceGroupTag -Context $Context -Tags @{ DbHubBusyUntilUtc = ''; DbHubBusyBy = '' }
+        if ($cleared.Ok) {
+            $done.Add('busy marker cleared')
+        }
+        else {
+            Write-DbHubLog -Context $Context -Message ('The session''s busy marker wasn''t cleared ({0}); it expires by itself at {1:yyyy-MM-dd HH:mm} UTC.' -f $cleared.Error, $busy.UntilUtc)
+        }
+    }
+    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage }
 }
 
 function Get-DbHubLastShutdownUtc {
@@ -1945,7 +2207,16 @@ function Invoke-DbHubNightlyStop {
     else {
         $done.Add($t4Text)
     }
-    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); Vms = $vms; T4 = $t4Text }
+    # T4's read replica, when a session left it behind (ADR 0025): stopped once T4 is.
+    $replica = Invoke-DbHubT4ReplicaStop -Context $Context -Tags $Tags -T4Outcome $t4.Outcome -WaitMinutes (Get-DbHubT4WaitMinute -Settings $settings) -PollSeconds $PollSeconds
+    $replicaText = Get-DbHubT4ReplicaStopText -Outcome $replica
+    if ($replica.Outcome -eq 'Failed') {
+        $failed.Add($replicaText)
+    }
+    elseif ($replicaText) {
+        $done.Add($replicaText)
+    }
+    return [pscustomobject]@{ Done = $done.ToArray(); Failed = $failed.ToArray(); Vms = $vms; T4 = $t4Text; Replica = $replicaText }
 }
 
 function Get-DbHubT4WaitMinute {
@@ -1977,6 +2248,200 @@ function Get-DbHubT4StopText {
         'Skipped' { return ('T4 {0}' -f $Outcome.Current.ToLowerInvariant()) }
     }
     return ('failed: {0}' -f $Outcome.Error)
+}
+
+function Get-DbHubT4Replica {
+    # T4's read replica, <t4ReplicaPrefix><deploymentId> (ADR 0025), which start-demo.ps1 creates for each session and
+    # stop-demo.ps1 deletes: Name and State (Ready, Stopped, Starting, Stopping, Dropping, ...), or State Missing (none,
+    # as between sessions), Unknown, or NotConfigured (settings without t4ReplicaPrefix).
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $prefix = [string](Get-DbHubMember -InputObject $Context.Settings -Name 't4ReplicaPrefix')
+    if (-not $prefix) {
+        return [pscustomobject]@{ Name = ''; State = 'NotConfigured' }
+    }
+    $deploymentId = [string](Get-DbHubMember -InputObject $Tags -Name 'deploymentId')
+    if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
+        return [pscustomobject]@{ Name = ''; State = 'Unknown' }
+    }
+    $name = '{0}{1}' -f $prefix, $deploymentId
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
+    $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $name) -ApiVersion $version
+    if ($read.StatusCode -eq 404) {
+        return [pscustomobject]@{ Name = $name; State = 'Missing' }
+    }
+    if ($read.StatusCode -ne 200) {
+        return [pscustomobject]@{ Name = $name; State = 'Unknown' }
+    }
+    return [pscustomobject]@{ Name = $name; State = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'state') }
+}
+
+function Invoke-DbHubT4ReplicaStop {
+    <#
+    .SYNOPSIS
+    Stops T4's read replica when a session left it behind (ADR 0025): start-demo.ps1 creates it and stop-demo.ps1 deletes
+    it, so outside a session it's there only when a session ended without stop-demo.ps1. Azure stops a replica only after
+    its primary is stopped (SourceReplicasStartStopOrder, live 2026-11-13), so this waits for T4 to be stopped, reading
+    both every PollSeconds for up to WaitMinutes; with -T4Outcome Failed (T4's stop failed) it doesn't wait. A replica that's
+    stopped, stopping, being deleted, or missing is left alone, and nothing is started or deleted. Returns Outcome (Sent,
+    AlreadyStopped, Missing, Skipped, NotConfigured, or Failed), Name, State (as last read), and Error.
+    https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [string] $T4Outcome = '',
+
+        [int] $WaitMinutes = 10,
+
+        [int] $PollSeconds = 30
+    )
+
+    $giveUp = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    $errorText = ''
+    while ($true) {
+        $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+        $outcome = [pscustomobject]@{ Outcome = ''; Name = [string]$replica.Name; State = [string]$replica.State; Error = '' }
+        if ($replica.State -in 'NotConfigured', 'Missing') {
+            $outcome.Outcome = $replica.State
+            return $outcome
+        }
+        if ($replica.State -in 'Stopped', 'Stopping') {
+            $outcome.Outcome = 'AlreadyStopped'
+            return $outcome
+        }
+        if ($replica.State -in 'Dropping', 'Disabled') {
+            $outcome.Outcome = 'Skipped'
+            return $outcome
+        }
+        if ($T4Outcome -eq 'Failed') {
+            $outcome.Outcome = 'Failed'
+            $outcome.Error = 'T4 wasn''t stopped, and Azure stops a read replica only after its primary'
+            return $outcome
+        }
+        $t4 = Get-DbHubT4 -Context $Context -Tags $Tags
+        if ($replica.State -eq 'Ready' -and $t4.State -in 'Stopped', 'Missing') {
+            $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
+            $sent = Invoke-DbHubArm -Context $Context -Method POST -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}/stop' -f (Get-DbHubDemoPath -Settings $Context.Settings), $replica.Name) -ApiVersion $version
+            if ($sent.StatusCode -in 200, 202) {
+                Write-DbHubLog -Context $Context -Message ('{0}: stop accepted (T4''s read replica, left from a session).' -f $replica.Name)
+                $outcome.Outcome = 'Sent'
+                return $outcome
+            }
+            $errorText = $sent.Error
+            if ($sent.StatusCode -notin 400, 409) {
+                $outcome.Outcome = 'Failed'
+                $outcome.Error = $errorText
+                return $outcome
+            }
+        }
+        if ((Get-DbHubUtcNow) -ge $giveUp) {
+            $outcome.Outcome = 'Failed'
+            $outcome.Error = if ($errorText) { $errorText } else { 'it was {0} and T4 {1} after {2} minutes, and Azure stops a read replica only after its primary is stopped; the next safety stop tries again' -f $replica.State, $t4.State, $WaitMinutes }
+            Write-DbHubLog -Context $Context -Message ('{0}: not stopped: {1}.' -f $replica.Name, $outcome.Error)
+            return $outcome
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+}
+
+function Get-DbHubT4ReplicaStopText {
+    # What a stop says about T4's read replica, from Invoke-DbHubT4ReplicaStop's outcome, in plain words: nothing when
+    # there's none (between sessions); otherwise that a session left it behind, what that bills, and the fix.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Outcome
+    )
+
+    switch ($Outcome.Outcome) {
+        'Sent' { return ('T4''s read replica {0} stopped (a session left it behind without stop-demo.ps1; stopped it still bills its storage and Defender plans until ./scripts/stop-demo.ps1 deletes it)' -f $Outcome.Name) }
+        'AlreadyStopped' { return ('T4''s read replica {0} already {1} (a session left it behind; ./scripts/stop-demo.ps1 deletes it)' -f $Outcome.Name, $Outcome.State.ToLowerInvariant()) }
+        'Skipped' { return ('T4''s read replica {0} {1}' -f $Outcome.Name, $Outcome.State.ToLowerInvariant()) }
+        { $_ -in 'Missing', 'NotConfigured' } { return '' }
+    }
+    return ('T4''s read replica {0} (a session left it behind) not stopped: {1}; ./scripts/stop-demo.ps1 deletes it' -f $Outcome.Name, $Outcome.Error)
+}
+
+function Invoke-DbHubT4ReplicaStartFirst {
+    <#
+    .SYNOPSIS
+    Before a run starts a stopped T4: Azure starts a primary only once its replicas are Ready (SourceReplicasStartStopOrder,
+    live 2026-11-13), so a stopped replica that a session left behind is started first and waited for, up to WaitMinutes.
+    The control never creates a replica (it can't create servers); without one, Outcome is Missing, and the run says
+    plainly that its replica beat isn't available. Returns Outcome (Missing, NotConfigured, Ready, Started, or Failed), Name,
+    State, and Error.
+    https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [int] $WaitMinutes = 10,
+
+        [int] $PollSeconds = 20
+    )
+
+    $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+    $outcome = [pscustomobject]@{ Outcome = ''; Name = [string]$replica.Name; State = [string]$replica.State; Error = '' }
+    if ($replica.State -in 'NotConfigured', 'Missing') {
+        $outcome.Outcome = $replica.State
+        return $outcome
+    }
+    if ($replica.State -eq 'Ready') {
+        $outcome.Outcome = 'Ready'
+        return $outcome
+    }
+    if ($replica.State -eq 'Stopped' -and -not (Invoke-DbHubT4Action -Context $Context -Name $replica.Name -Action start)) {
+        $outcome.Outcome = 'Failed'
+        $outcome.Error = 'Azure didn''t accept its start'
+        return $outcome
+    }
+    $giveUp = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    while ((Get-DbHubUtcNow) -lt $giveUp) {
+        Start-Sleep -Seconds $PollSeconds
+        $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+        $outcome.State = [string]$replica.State
+        if ($replica.State -eq 'Ready') {
+            $outcome.Outcome = 'Started'
+            return $outcome
+        }
+        if ($replica.State -in 'Missing', 'Dropping') {
+            $outcome.Outcome = 'Missing'
+            return $outcome
+        }
+    }
+    $outcome.Outcome = 'Failed'
+    $outcome.Error = 'it was still {0} after {1} minutes' -f $outcome.State, $WaitMinutes
+    return $outcome
+}
+
+function Get-DbHubT4ReplicaRunNote {
+    # What an on-demand run says about T4's read replica (ADR 0025), plainly, when its replica beat isn't available: the
+    # control doesn't create the replica, so Database Hub's Read replica lag stays empty and the replica-lag scenario
+    # can't run, and start-demo.ps1 is how to get it. Empty when the replica is there, or settings predate it.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Outcome
+    )
+
+    switch ($Outcome.Outcome) {
+        'Missing' { return ('T4''s read replica isn''t there: on-demand runs don''t create it, so Database Hub''s Read replica lag stays empty and the replica-lag scenario can''t run in this run. For that beat, start the demo with ./scripts/start-demo.ps1, which creates the replica (about 9 minutes), and stop it with ./scripts/stop-demo.ps1, which deletes it.') }
+        'Failed' { return ('T4''s read replica {0} couldn''t be started ({1}), and Azure starts T4 only after its replicas, so T4 sits this run out. ./scripts/stop-demo.ps1 deletes the replica; ./scripts/start-demo.ps1 then creates a new one.' -f $Outcome.Name, $Outcome.Error) }
+    }
+    return ''
 }
 
 function Get-DbHubT3Database {
@@ -2123,7 +2588,17 @@ function Invoke-DbHubT3Check {
         $failed = @(('T4 ({0})' -f $t4.Error))
         $sentence = 'T4 couldn''t be stopped: {0}' -f $t4.Error
     }
-    return [pscustomobject]@{ action = 'check-t3'; status = $status; t3 = $check.t3; t3Status = $check.t3Status; autoPauseDelay = $check.autoPauseDelay; minutesSinceStop = $check.minutesSinceStop; message = ('{0} {1}.' -f $check.message, $sentence); t4 = $t4Text; failed = $failed }
+    # T4's read replica, when a session left it behind (ADR 0025): stopped once T4 is.
+    $replica = Invoke-DbHubT4ReplicaStop -Context $Context -Tags $Tags -T4Outcome $t4.Outcome -WaitMinutes (Get-DbHubT4WaitMinute -Settings $Context.Settings) -PollSeconds $PollSeconds
+    $replicaText = Get-DbHubT4ReplicaStopText -Outcome $replica
+    if ($replica.Outcome -eq 'Failed') {
+        $status = 'Partial'
+        $failed = @($failed) + @($replicaText)
+    }
+    if ($replicaText) {
+        $sentence = '{0}; {1}' -f $sentence, $replicaText
+    }
+    return [pscustomobject]@{ action = 'check-t3'; status = $status; t3 = $check.t3; t3Status = $check.t3Status; autoPauseDelay = $check.autoPauseDelay; minutesSinceStop = $check.minutesSinceStop; message = ('{0} {1}.' -f $check.message, $sentence); t4 = $t4Text; replica = $replicaText; failed = $failed }
 }
 
 function Get-DbHubRequester {
@@ -2196,20 +2671,40 @@ function Start-DbHubActivityRun {
 
         [int] $T4WaitMinutes = 20,
 
-        [int] $PollSeconds = 20
+        [int] $PollSeconds = 20,
+
+        # A session's plan (Start-DbHubSession, 2026-11-14), which also checked that no run is active.
+        [AllowNull()]
+        [object] $Plan = $null,
+
+        # Called with a kind (autostop, backup, vm-start, t4-start, dispatched, or skipped) and a detail, for a session's status.
+        [AllowNull()]
+        [scriptblock] $OnProgress = $null,
+
+        # Called once, when T4 is first seen Ready, for a session's read replica.
+        [AllowNull()]
+        [scriptblock] $OnT4Ready = $null
     )
 
     $settings = $Context.Settings
     if (-not $PSCmdlet.ShouldProcess($settings.demoResourceGroup, 'Start an on-demand run')) {
-        return [pscustomobject]@{ action = 'run'; status = 'Refused'; message = 'What if: nothing was started.'; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @() }
+        return [pscustomobject]@{ action = 'run'; status = 'Refused'; message = 'What if: nothing was started.'; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @(); replica = ''; runCommands = @() }
     }
-    $result = [ordered]@{ action = 'run'; status = 'Refused'; message = ''; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @() }
-    $active = Get-DbHubActiveRun -Context $Context
-    if ($active.Active) {
-        $result.message = $active.Reason
-        return [pscustomobject]$result
+    $result = [ordered]@{ action = 'run'; status = 'Refused'; message = ''; runEndUtc = ''; autoStopUtc = ''; dispatched = @(); skipped = @(); monitoring = ''; rechecks = @(); replica = ''; runCommands = @() }
+    $progress = $OnProgress
+    if ($null -eq $progress) {
+        # Nothing to tell: the kind and detail it's called with are dropped.
+        $progress = { }
     }
-    $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc
+    $plan = $Plan
+    if ($null -eq $plan) {
+        $active = Get-DbHubActiveRun -Context $Context
+        if ($active.Active) {
+            $result.message = $active.Reason
+            return [pscustomobject]$result
+        }
+        $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc
+    }
     if (-not $plan.Valid) {
         $result.message = $plan.Reason
         return [pscustomobject]$result
@@ -2295,6 +2790,10 @@ function Start-DbHubActivityRun {
     $result.runEndUtc = $plan.RunEndUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
     $result.autoStopUtc = $stop.StartUtc
     Write-DbHubLog -Context $Context -Message ('Auto-stop set for {0}; the run ends by {1}.' -f $stop.StartUtc, $result.runEndUtc)
+    & $progress 'autostop' $stop.StartUtc
+    if ([string](Get-DbHubMember -InputObject $stop -Name 'BackupUtc')) {
+        & $progress 'backup' ([string]$stop.BackupUtc)
+    }
     if ($sqlActive) {
         $result.rechecks = @(Register-DbHubMonitorRecheck -Context $Context -StartUtc $Context.NowUtc -RunEndUtc $plan.RunEndUtc)
     }
@@ -2307,15 +2806,54 @@ function Start-DbHubActivityRun {
             if ($accepted -and $vm -eq $sqlVm) {
                 $sqlStartedUtc = Get-DbHubUtcNow
             }
+            if ($accepted) {
+                & $progress 'vm-start' $vm
+            }
         }
     }
-    if ($null -ne $t4 -and $t4.State -eq 'Stopped' -and -not (Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action start)) {
-        # Don't wait for a start Azure refused (Phase 25d live: the wait for T4 took the run's whole 15 minutes).
-        $skipped.Add(('T4 ({0} didn''t accept the start)' -f $t4.Name))
-        foreach ($vm in @($byVm.Keys)) {
-            $byVm[$vm] = @($byVm[$vm] | Where-Object { $_.Target -ne 'T4' })
+    if ($null -ne $t4 -and $t4.State -eq 'Stopped') {
+        # T4's read replica (ADR 0025): Azure starts T4 only once a stopped replica is Ready, so one a session left behind
+        # starts first. The control never creates one: without it, the run says plainly that its replica beat isn't there.
+        $replicaFirst = Invoke-DbHubT4ReplicaStartFirst -Context $Context -Tags $Tags -PollSeconds $PollSeconds
+        $replicaNote = ''
+        if ($null -eq $OnT4Ready -or $replicaFirst.Outcome -ne 'Missing') {
+            $replicaNote = Get-DbHubT4ReplicaRunNote -Outcome $replicaFirst
         }
-        $t4 = $null
+        if ($replicaNote) {
+            $result.replica = $replicaNote
+            Write-DbHubLog -Context $Context -Message $replicaNote
+        }
+        if ($replicaFirst.Outcome -eq 'Failed') {
+            $skipped.Add(('T4 (its read replica {0} couldn''t be started first: {1})' -f $replicaFirst.Name, $replicaFirst.Error))
+            foreach ($vm in @($byVm.Keys)) {
+                $byVm[$vm] = @($byVm[$vm] | Where-Object { $_.Target -ne 'T4' })
+            }
+            $t4 = $null
+        }
+    }
+    elseif ($null -ne $t4 -and $null -eq $OnT4Ready) {
+        # A T4 that runs needs nothing first; without a replica, the run still says its replica beat isn't there. A session
+        # (OnT4Ready) creates the replica itself, so it says nothing here (live, 2026-11-14: the note told a session to use
+        # start-demo.ps1 for a replica it was about to create).
+        $replicaNow = Get-DbHubT4Replica -Context $Context -Tags $Tags
+        $replicaNote = Get-DbHubT4ReplicaRunNote -Outcome ([pscustomobject]@{ Outcome = $(if ($replicaNow.State -eq 'Missing') { 'Missing' } else { '' }); Name = [string]$replicaNow.Name; State = [string]$replicaNow.State; Error = '' })
+        if ($replicaNote) {
+            $result.replica = $replicaNote
+            Write-DbHubLog -Context $Context -Message $replicaNote
+        }
+    }
+    if ($null -ne $t4 -and $t4.State -eq 'Stopped') {
+        if (Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action start) {
+            & $progress 't4-start' $t4.Name
+        }
+        else {
+            # Don't wait for a start Azure refused (Phase 25d live: the wait for T4 took the run's whole 15 minutes).
+            $skipped.Add(('T4 ({0} didn''t accept the start)' -f $t4.Name))
+            foreach ($vm in @($byVm.Keys)) {
+                $byVm[$vm] = @($byVm[$vm] | Where-Object { $_.Target -ne 'T4' })
+            }
+            $t4 = $null
+        }
     }
     # The control's finished Run Commands on a demo VM this run doesn't use; each VM it uses gets its own cleanup below.
     Clear-DbHubFinishedRunCommand -Context $Context -Except @($byVm.Keys)
@@ -2329,6 +2867,8 @@ function Start-DbHubActivityRun {
     # This run's Run Commands, which no cleanup of its own deletes.
     $runNames = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $runNames.Add(('{0}monitoring-{1}' -f $settings.runCommandPrefix, $stamp))
+    # The dispatch Run Commands Azure accepted, with their VM and targets, for a session's checks of its hosts (2026-11-16).
+    $sentCommands = New-Object -TypeName 'System.Collections.Generic.List[object]'
     $plans = [ordered]@{}
     foreach ($vm in @($byVm.Keys)) {
         # T4's off goes out with sqlvm01's activities, without waiting for T4: its profile is a file on T1.
@@ -2347,6 +2887,7 @@ function Start-DbHubActivityRun {
         param([string] $VmName, [object[]] $Chosen, [string] $Name)
         $runNames.Add($Name)
         if (Send-DbHubDispatch -Context $Context -VmName $VmName -Activity $Chosen -Name $Name -RequestedBy $who) {
+            $sentCommands.Add([ordered]@{ vm = $VmName; name = $Name; targets = @($Chosen | ForEach-Object { [string]$_.Target }) })
             foreach ($item in $Chosen) {
                 if ($item.Scenario -ceq 'off') {
                     $dispatched.Add(('{0}: off' -f $item.Target))
@@ -2354,12 +2895,14 @@ function Start-DbHubActivityRun {
                 else {
                     $dispatched.Add(('{0}: {1} for {2} minutes' -f $item.Target, $item.Scenario, $item.Minutes))
                     $sent.Activities++
+                    & $progress 'dispatched' ('{0}: {1} for {2} minutes' -f $item.Target, $item.Scenario, $item.Minutes)
                 }
             }
         }
         else {
             foreach ($item in $Chosen) {
                 $skipped.Add(('{0} (the Run Command on {1} wasn''t accepted)' -f $item.Target, $VmName))
+                & $progress 'skipped' ('{0}: the Run Command on {1} wasn''t accepted' -f $item.Target, $VmName)
             }
         }
     }
@@ -2369,11 +2912,19 @@ function Start-DbHubActivityRun {
     $t4Deadline = $started.AddMinutes($T4WaitMinutes)
     # A last bound on the whole loop, past every wait's own.
     $giveUp = $started.AddMinutes([System.Math]::Max($WaitMinutes, $T4WaitMinutes) + 15)
+    $t4ReadySeen = $false
     while ($true) {
         $now = Get-DbHubUtcNow
         $t4State = ''
         if ($t4Pending) {
             $t4State = [string](Get-DbHubT4 -Context $Context -Tags $Tags).State
+        }
+        if ($t4State -eq 'Ready' -and -not $t4ReadySeen) {
+            # A session asks for T4's read replica now (Start-DbHubSession), while the VMs still start.
+            $t4ReadySeen = $true
+            if ($null -ne $OnT4Ready) {
+                & $OnT4Ready
+            }
         }
         foreach ($vm in @($plans.Keys)) {
             $vmPlan = $plans[$vm]
@@ -2450,6 +3001,7 @@ function Start-DbHubActivityRun {
     }
     $result.dispatched = $dispatched.ToArray()
     $result.skipped = $skipped.ToArray()
+    $result.runCommands = $sentCommands.ToArray()
     if ($sent.Activities -eq 0) {
         $stopped = Stop-DbHubDemo -Context $Context -Tags $Tags
         $result.status = 'Failed'
@@ -2464,6 +3016,9 @@ function Start-DbHubActivityRun {
     $plugin = @{ Running = ' T1''s monitoring plugin runs.'; Restarted = ' T1''s monitoring plugin was restarted and runs.'; StillNotRunning = ' T1''s monitoring plugin still didn''t run after its restart.'; RestartRefused = ' T1''s monitoring plugin needed a restart that Azure didn''t accept.' }
     if ($plugin.ContainsKey([string]$result.monitoring)) {
         $note += $plugin[[string]$result.monitoring]
+    }
+    if ($result.replica) {
+        $note += ' ' + $result.replica
     }
     $result.message = 'Dispatched {0}. The profiles end by {1} UTC and the auto-stop runs at {2}; each target is waited for until it accepts connections, and telemetry shows the activity 3 to 15 minutes later.{3}' -f ($dispatched -join '; '), $result.runEndUtc, $result.autoStopUtc, $note
     return [pscustomobject]$result
@@ -2552,11 +3107,2008 @@ function Reset-DbHubActivity {
     return [pscustomobject]@{ action = 'reset'; status = $status; message = ('Reset sent to: {0}. Skipped: {1}.' -f $sentText, $skippedText); dispatched = $sent.ToArray(); skipped = $skipped.ToArray() }
 }
 
+# The control session (ADR 0026, 2026-11-14): the control notebook's one Run all. The session action starts the whole demo
+# with the showcase on every target and creates T4's read replica, marks the demo busy so the nightly stop leaves it to
+# the session's own auto-stop, and writes its progress to the control vault for the notebook, which can't read a job's
+# output. The runbook can't reach a private vault's data plane, so it writes through Azure Resource Manager (Secrets -
+# Create Or Update), which a vault's network rules don't apply to. The stop reads T4's and the replica's Azure Monitor
+# metrics into the vault for the history, then deletes the replica: a deleted server's metrics can't be read.
+
+# What the history keeps of each server, one Metrics - List read per aggregation, as the module's
+# Get-DemoPostgresHistoryParameter reads them: Read Replica Lag exists on a replica only, and Max Physical Replication Lag
+# on the primary only.
+$script:DbHubMetricReads = @{
+    primary = @(
+        @{ Aggregation = 'Maximum'; Names = @('cpu_percent', 'memory_percent', 'active_connections', 'physical_replication_delay_in_bytes') }
+        @{ Aggregation = 'Total'; Names = @('connections_failed') }
+    )
+    replica = @(
+        @{ Aggregation = 'Maximum'; Names = @('physical_replication_delay_in_seconds', 'cpu_percent', 'active_connections') }
+    )
+}
+# The intervals a metrics document steps up through, in minutes, until it fits; each divides a day and the next one.
+$script:DbHubMetricIntervals = @(1, 5, 15, 30, 60, 180, 360, 720, 1440)
+# Decimals kept per Azure Monitor unit; any other unit keeps two.
+$script:DbHubMetricDecimals = @{ Percent = 1; Seconds = 1; Count = 0; Bytes = 0 }
+
+function ConvertTo-DbHubTimeText {
+    # A time as UTC yyyy-MM-ddTHH:mm:ssZ, or '' for anything that isn't a time. A time without a kind is taken as UTC.
+    param(
+        [AllowNull()]
+        [object] $Value
+    )
+
+    if (-not ($Value -is [datetime])) {
+        return ''
+    }
+    $time = [datetime]$Value
+    if ($time.Kind -eq [System.DateTimeKind]::Local) {
+        $time = $time.ToUniversalTime()
+    }
+    return $time.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Test-DbHubSessionCapable {
+    # Whether these are the control's settings with the session's parts (2026-11-14): its vault and the API versions the
+    # session uses. The safety stop's DbHub-Stop has none of them, so its stops are as before.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings
+    )
+
+    if (-not [string](Get-DbHubMember -InputObject $Settings -Name 'controlVault')) {
+        return $false
+    }
+    $versions = Get-DbHubMember -InputObject $Settings -Name 'apiVersions'
+    foreach ($type in 'Microsoft.KeyVault/vaults', 'Microsoft.Resources/tags', 'Microsoft.Insights/metrics', 'Microsoft.DBforPostgreSQL/flexibleServers/configurations') {
+        if (-not [string](Get-DbHubMember -InputObject $versions -Name $type)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Set-DbHubVaultSecret {
+    <#
+    .SYNOPSIS
+    Writes one of the control vault's session secrets through Azure Resource Manager (Secrets - Create Or Update, with the
+    control identity's Microsoft.KeyVault/vaults/secrets/write on that secret only), which works with the vault private.
+    The value is the session's status or its metrics, never a credential. Returns Ok, StatusCode, and Error.
+    https://learn.microsoft.com/rest/api/keyvault/keyvault/secrets/create-or-update
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes only the session''s own status or metrics secret; its callers decide.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string] $Value,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $Tags
+    )
+
+    $settings = $Context.Settings
+    $vault = [string](Get-DbHubMember -InputObject $settings -Name 'controlVault')
+    if ($vault -notmatch '^[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]$' -or $Name -notmatch '^[A-Za-z0-9-]{1,127}$') {
+        return [pscustomobject]@{ Ok = $false; StatusCode = 0; Error = 'the runbook settings name no control vault' }
+    }
+    # The vault's pinned version, which its secrets share (config/versions.json).
+    $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.KeyVault/vaults'
+    $path = '/subscriptions/{0}/resourceGroups/{1}/providers/Microsoft.KeyVault/vaults/{2}/secrets/{3}' -f $settings.subscriptionId, $settings.controlResourceGroup, $vault, $Name
+    $body = @{ properties = @{ value = $Value; contentType = 'application/json' } }
+    if ($null -ne $Tags) {
+        $body['tags'] = $Tags
+    }
+    $put = Invoke-DbHubArm -Context $Context -Method PUT -Path $path -ApiVersion $version -Body $body
+    return [pscustomobject]@{ Ok = ($put.StatusCode -in 200, 201); StatusCode = $put.StatusCode; Error = $put.Error }
+}
+
+function Set-DbHubResourceGroupTag {
+    <#
+    .SYNOPSIS
+    Merges tags into the demo resource group's (Tags - Update At Scope, operation Merge, with the control identity's
+    Microsoft.Resources/tags/write at the demo resource group): the busy marker, the session's ID and start, and the
+    replica's size. Returns Ok, StatusCode, and Error.
+    https://learn.microsoft.com/rest/api/resources/tags/update-at-scope
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Merges only the session''s own tags; Start-DbHubSession and Stop-DbHubDemo, its callers, ask ShouldProcess.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Tags
+    )
+
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Resources/tags'
+    $path = '{0}/providers/Microsoft.Resources/tags/default' -f (Get-DbHubDemoPath -Settings $Context.Settings)
+    $patch = Invoke-DbHubArm -Context $Context -Method PATCH -Path $path -ApiVersion $version -Body @{ operation = 'Merge'; properties = @{ tags = $Tags } }
+    return [pscustomobject]@{ Ok = ($patch.StatusCode -in 200, 201, 202); StatusCode = $patch.StatusCode; Error = $patch.Error }
+}
+
+function New-DbHubSessionStatus {
+    # The session's status (schemaVersion 1), which the control notebook reads from the control vault: names, times, each
+    # step in plain words with its fix, the dispatches, T4, its read replica, and the replica-lag beat's windows.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $SessionId,
+
+        [string] $RequestedBy = 'notebook',
+
+        [int] $DurationMinutes = 0,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $settings = $Context.Settings
+    $deploymentId = [string](Get-DbHubMember -InputObject $Tags -Name 'deploymentId')
+    if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
+        $deploymentId = ''
+    }
+    $names = [ordered]@{ resourceGroup = [string]$settings.demoResourceGroup; deploymentId = $deploymentId; sqlVm = [string]$settings.sqlVmName; hostVm = [string]$settings.hostVmName; t2Guest = [string](Get-DbHubMember -InputObject $settings -Name 't2GuestName'); t3Server = ''; t3Database = [string]$settings.demoDatabase; t4Server = ''; t4Replica = '' }
+    if ($deploymentId) {
+        $names['t3Server'] = '{0}{1}' -f $settings.t3ServerPrefix, $deploymentId
+        $names['t4Server'] = '{0}{1}' -f $settings.t4ServerPrefix, $deploymentId
+        $prefix = [string](Get-DbHubMember -InputObject $settings -Name 't4ReplicaPrefix')
+        if ($prefix) {
+            $names['t4Replica'] = '{0}{1}' -f $prefix, $deploymentId
+        }
+    }
+    return [ordered]@{
+        schemaVersion     = 1
+        sessionId         = $SessionId
+        phase             = 'accepted'
+        updatedUtc        = ''
+        jobId             = [string]$Context.JobId
+        requestedBy       = $RequestedBy
+        acceptedUtc       = ConvertTo-DbHubTimeText -Value $Context.NowUtc
+        durationMinutes   = $DurationMinutes
+        plannedMinutes    = 0
+        runEndUtc         = ''
+        autoStopUtc       = ''
+        autoStopBackupUtc = ''
+        autoShutdownUtc   = ''
+        timeZone          = [string]$settings.autoShutdownTimeZone
+        names             = $names
+        busy              = [ordered]@{ marked = $false; untilUtc = ''; nightlyStopUtc = ''; note = '' }
+        steps             = @()
+        dispatched        = @()
+        skipped           = @()
+        # The dispatch Run Commands Azure accepted (vm, name, targets), which the checks of the session's hosts read
+        # (2026-11-16).
+        runCommands       = @()
+        monitoring        = ''
+        t4                = [ordered]@{ state = ''; sku = ''; tier = ''; dispatchUtc = '' }
+        # When each target's activity went out (2026-11-14): its showcase's cycles start there, for the notebook's guide.
+        dispatchUtc       = [ordered]@{}
+        replica           = [ordered]@{ state = ''; sizeAsked = ''; sizeUsed = ''; attempts = @(); readyUtc = ''; note = ''; fix = '' }
+        replicaLag        = [ordered]@{ planned = $false; windows = @(); note = ''; fix = '' }
+        message           = ''
+    }
+}
+
+function Add-DbHubSessionStep {
+    # One step of the session for the notebook: what (Plan, Busy, Start, Activity, T4, Replica, ReplicaLag, Stop, Capture),
+    # its state (Pass, Warning, Fail, or Info), and the message and fix in plain words. The last 60 are kept.
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Step,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Pass', 'Warning', 'Fail', 'Info')]
+        [string] $State,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Message,
+
+        [string] $Fix = ''
+    )
+
+    $item = [ordered]@{ step = $Step; state = $State; atUtc = (ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)); message = (ConvertTo-DbHubSafeText -Text $Message); fix = (ConvertTo-DbHubSafeText -Text $Fix) }
+    $steps = @($Status['steps']) + @($item)
+    if ($steps.Count -gt 60) {
+        $steps = @($steps | Select-Object -Last 60)
+    }
+    $Status['steps'] = $steps
+}
+
+function Write-DbHubSessionStatus {
+    <#
+    .SYNOPSIS
+    Writes the session's status to the control vault (statusName), tagged with the session and its phase, for the
+    control notebook. Returns $true when it was written. Never throws: a write that fails is logged once, and the
+    session goes on.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [string] $Phase = ''
+    )
+
+    if ($Phase) {
+        $Status['phase'] = $Phase
+    }
+    $Status['updatedUtc'] = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
+    try {
+        $json = ConvertTo-Json -InputObject $Status -Depth 8 -Compress
+        # A Key Vault secret holds 25 KB; the oldest steps go first.
+        while ([System.Text.Encoding]::UTF8.GetByteCount($json) -gt 20000 -and @($Status['steps']).Count -gt 5) {
+            $Status['steps'] = @(@($Status['steps']) | Select-Object -Last ([int][System.Math]::Floor(@($Status['steps']).Count / 2)))
+            $json = ConvertTo-Json -InputObject $Status -Depth 8 -Compress
+        }
+        $name = [string](Get-DbHubMember -InputObject $Context.Settings -Name 'statusName')
+        if (-not $name) {
+            $name = 'dbhub-session-status'
+        }
+        # The copy DbHub-Monitor reads back, because the vault's can't be read through Azure Resource Manager (2026-11-16).
+        $null = Save-DbHubSessionStatusCopy -Context $Context -Json $json
+        $written = Set-DbHubVaultSecret -Context $Context -Name $name -Value $json -Tags @{ sessionId = [string]$Status['sessionId']; phase = [string]$Status['phase'] }
+        if ($written.Ok) {
+            return $true
+        }
+        if (-not (Get-DbHubMember -InputObject $Context -Name 'StatusWarned')) {
+            $Context | Add-Member -NotePropertyName 'StatusWarned' -NotePropertyValue $true -Force
+            Write-DbHubLog -Context $Context -Message ('The session''s status couldn''t be written to the control vault ({0}), so the notebook can''t follow this session; an Owner runs ./scripts/grant-safety-stop.ps1, which lets the control identity write it.' -f $written.Error)
+        }
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The session''s status wasn''t written: {0}' -f $_.Exception.Message)
+    }
+    return $false
+}
+
+$script:DbHubStatusVariable = 'DbHubSessionStatus'
+
+function ConvertTo-DbHubDictionary {
+    # A parsed JSON value as ordered dictionaries and arrays, as New-DbHubSessionStatus builds a status, because Windows
+    # PowerShell 5.1's ConvertFrom-Json has no -AsHashtable. A time that PowerShell 7 parsed goes back to its text.
+    param(
+        [AllowNull()]
+        [object] $InputObject
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+    if ($InputObject -is [datetime]) {
+        return (ConvertTo-DbHubTimeText -Value $InputObject)
+    }
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $dictionary = [ordered]@{}
+        foreach ($property in $InputObject.PSObject.Properties) {
+            $dictionary[[string]$property.Name] = ConvertTo-DbHubDictionary -InputObject $property.Value
+        }
+        return $dictionary
+    }
+    if ($InputObject -is [System.Array]) {
+        $items = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        foreach ($item in $InputObject) {
+            $items.Add((ConvertTo-DbHubDictionary -InputObject $item))
+        }
+        return , $items.ToArray()
+    }
+    return $InputObject
+}
+
+function Save-DbHubSessionStatusCopy {
+    <#
+    .SYNOPSIS
+    Keeps the session's status, as written to the vault, in the control account's variable DbHubSessionStatus too
+    (2026-11-16), which infra/control/control.bicep creates: DbHub-Monitor reads it back to add a host's failure,
+    because the identity can't read the vault's value through Azure Resource Manager. Set-AutomationVariable is the
+    sandbox's internal cmdlet for an existing variable, with no role needed
+    (https://learn.microsoft.com/azure/automation/shared-resources/variables). Only in the control's account (its settings
+    name the control vault). Never throws; returns whether it was kept.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Json
+    )
+
+    if (-not [string](Get-DbHubMember -InputObject $Context.Settings -Name 'controlVault') -or -not (Get-Command -Name 'Set-AutomationVariable' -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+    try {
+        Set-AutomationVariable -Name $script:DbHubStatusVariable -Value $Json
+        return $true
+    }
+    catch {
+        if (-not (Get-DbHubMember -InputObject $Context -Name 'StatusCopyWarned')) {
+            $Context | Add-Member -NotePropertyName 'StatusCopyWarned' -NotePropertyValue $true -Force
+            Write-DbHubLog -Context $Context -Message ('The session''s status couldn''t be kept for the monitoring re-checks ({0}), so they can''t add a host''s failure to it; ./scripts/deploy.ps1 creates the variable {1}.' -f $_.Exception.Message, $script:DbHubStatusVariable)
+        }
+        return $false
+    }
+}
+
+function Read-DbHubSessionStatusCopy {
+    # The session's last status from the control account's variable DbHubSessionStatus (Get-AutomationVariable), as
+    # ordered dictionaries, or $null when there's none.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context
+    )
+
+    if (-not (Get-Command -Name 'Get-AutomationVariable' -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+    try {
+        $text = [string](Get-AutomationVariable -Name $script:DbHubStatusVariable)
+        if (-not $text.TrimStart().StartsWith('{')) {
+            return $null
+        }
+        $status = ConvertTo-DbHubDictionary -InputObject ($text | ConvertFrom-Json)
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The session''s status couldn''t be read back from the variable {0}: {1}' -f $script:DbHubStatusVariable, $_.Exception.Message)
+        return $null
+    }
+    if ($status -isnot [System.Collections.IDictionary]) {
+        return $null
+    }
+    return $status
+}
+
+function Get-DbHubSessionHealth {
+    <#
+    .SYNOPSIS
+    The hosts of a session that runs (2026-11-16; live, archost01's start ended VMStartTimedOut 53 minutes into a session
+    and T2's Run Command failed with it, while the session's status still said T2's activity went out): each VM the
+    session's activity went out to, from its instance view (its power state, a failed provisioning, and its VM agent,
+    which must be Ready 15 minutes after its targets' activity went out; 2026-11-17), and on a VM that runs, each of the
+    session's dispatch Run Commands, from its instance view. Azure Resource Manager reads only: one per VM and one per Run Command. A VM's
+    failed provisioning counts only from the session's start on, so an older failure (an extension's, say) isn't blamed
+    on it. Returns one finding (Message and Fix) per problem, in words that stay the same while the problem does, so a
+    check that finds it again adds nothing.
+    https://learn.microsoft.com/rest/api/compute/virtual-machines/instance-view
+    https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/get-by-virtual-machine
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status
+    )
+
+    $settings = $Context.Settings
+    # The session's VMs with their targets and Run Commands: from runCommands, or, in a status from before them, from the
+    # targets its activity went out to.
+    $hosts = [ordered]@{}
+    $addHost = {
+        param([string] $VmName)
+        if (-not $hosts.Contains($VmName)) {
+            $hosts[$VmName] = [pscustomobject]@{ Targets = (New-Object -TypeName 'System.Collections.Generic.List[string]'); Commands = (New-Object -TypeName 'System.Collections.Generic.List[object]') }
+        }
+        return $hosts[$VmName]
+    }
+    foreach ($command in @(Get-DbHubMember -InputObject $Status -Name 'runCommands')) {
+        $vm = [string](Get-DbHubMember -InputObject $command -Name 'vm')
+        $name = [string](Get-DbHubMember -InputObject $command -Name 'name')
+        if ($vm -notmatch '^[A-Za-z0-9-]{1,64}$' -or $name -notmatch '^[A-Za-z0-9-]{1,64}$') {
+            continue
+        }
+        $entry = & $addHost $vm
+        $targets = @(@(Get-DbHubMember -InputObject $command -Name 'targets') | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^T[1-4]$' })
+        $entry.Commands.Add([pscustomobject]@{ Name = $name; Targets = $targets })
+        foreach ($target in $targets) {
+            if (-not $entry.Targets.Contains($target)) {
+                $entry.Targets.Add($target)
+            }
+        }
+    }
+    if ($hosts.Count -eq 0) {
+        foreach ($target in @(Get-DbHubPropertyName -InputObject (Get-DbHubMember -InputObject $Status -Name 'dispatchUtc'))) {
+            if ($target -match '^T[1-4]$') {
+                $entry = & $addHost (Get-DbHubTargetVm -Settings $settings -Target $target)
+                if (-not $entry.Targets.Contains($target)) {
+                    $entry.Targets.Add($target)
+                }
+            }
+        }
+    }
+    $label = {
+        param([string[]] $Targets, [string] $VmName)
+        $sorted = @($Targets | Sort-Object)
+        if ($sorted.Count -eq 0) {
+            return $VmName
+        }
+        if ($sorted.Count -le 2) {
+            return ($sorted -join ' and ')
+        }
+        return ('{0}, and {1}' -f ($sorted[0..($sorted.Count - 2)] -join ', '), $sorted[-1])
+    }
+    $since = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $Status -Name 'acceptedUtc')
+    # How long a VM may run after its targets' activity went out before an agent that isn't Ready is a problem.
+    $agentGraceMinutes = 15
+    $vmVersion = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines'
+    $commandVersion = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
+    $findings = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    foreach ($vm in @($hosts.Keys)) {
+        $entry = $hosts[$vm]
+        $who = & $label $entry.Targets.ToArray() $vm
+        $vmFix = 'The session''s other targets go on. For {0}: set STOP_NOW = True and Run all, then Run all again, which starts {1} again; ./scripts/status.ps1 shows its state.' -f $who, $vm
+        $view = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/instanceView' -f (Get-DbHubDemoPath -Settings $settings), $vm) -ApiVersion $vmVersion
+        if ($view.StatusCode -ne 200) {
+            Write-DbHubLog -Context $Context -Message ('{0} couldn''t be read for the session''s check: {1}' -f $vm, $view.Error)
+            continue
+        }
+        $power = ''
+        $failed = ''
+        foreach ($item in @(Get-DbHubMember -InputObject $view.Body -Name 'statuses')) {
+            $code = [string](Get-DbHubMember -InputObject $item -Name 'code')
+            if ($code -like 'PowerState/*') {
+                $power = $code.Substring(11)
+            }
+            elseif ($code -like 'ProvisioningState/failed*') {
+                $at = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $item -Name 'time')
+                if ($null -eq $since -or $null -eq $at -or $at -ge $since) {
+                    $parts = $code -split '/'
+                    $failed = 'failed'
+                    if ($parts.Count -ge 3 -and $parts[2] -match '^[A-Za-z0-9]{1,80}$') {
+                        $failed = $parts[2]
+                    }
+                    Write-DbHubLog -Context $Context -Message ('{0}: {1} ({2})' -f $vm, $code, [string](Get-DbHubMember -InputObject $item -Name 'message'))
+                }
+            }
+        }
+        if ($power -in 'deallocated', 'deallocating', 'stopped', 'stopping') {
+            # Live, 2026-11-17: sqlvm01 drives T1, T3, and T4, and "T1, T3, and T4 has no activity" read wrong.
+            $verb = 'has'
+            if ($entry.Targets.Count -gt 1) {
+                $verb = 'have'
+            }
+            $findings.Add([pscustomobject]@{ Message = ('{0}: {1} is {2}, so {0} {3} no activity now.' -f $who, $vm, $power, $verb); Fix = $vmFix })
+            continue
+        }
+        if ($failed) {
+            $findings.Add([pscustomobject]@{ Message = ('{0}: Azure says {1}''s last operation failed ({2}), so {0} may have no activity this session.' -f $who, $vm, $failed); Fix = $vmFix })
+            continue
+        }
+        if ($power -ne 'running') {
+            continue
+        }
+        # A running VM whose agent isn't Ready can't run the Run Command that sets its targets' activity (live, 2026-11-17:
+        # archost01's agent never got its goal state after the session's start, the status said T2's activity went out for
+        # the whole session, and Azure ends such a start VMStartTimedOut about 58 minutes in). Counted from the earliest
+        # dispatch of the VM's targets, so a VM that has only just started isn't blamed; the instance view read above
+        # carries the agent's status, so this costs no read.
+        $agentStatus = @(Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $view.Body -Name 'vmAgent') -Name 'statuses') | Select-Object -First 1
+        $agentText = [string](Get-DbHubMember -InputObject $agentStatus -Name 'displayStatus')
+        if ($agentText -ne 'Ready') {
+            $outSince = $null
+            $dispatch = Get-DbHubMember -InputObject $Status -Name 'dispatchUtc'
+            foreach ($target in $entry.Targets) {
+                $at = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $dispatch -Name $target)
+                if ($null -ne $at -and ($null -eq $outSince -or $at -lt $outSince)) {
+                    $outSince = $at
+                }
+            }
+            if ($null -ne $outSince -and ((Get-DbHubUtcNow) - $outSince).TotalMinutes -ge $agentGraceMinutes) {
+                $agentLog = 'no status'
+                if ($agentText) {
+                    $agentLog = '{0}: {1}' -f $agentText, [string](Get-DbHubMember -InputObject $agentStatus -Name 'message')
+                }
+                Write-DbHubLog -Context $Context -Message ('{0}: its VM agent isn''t Ready ({1}).' -f $vm, $agentLog)
+                $findings.Add([pscustomobject]@{ Message = ('{0}: {1}''s VM agent wasn''t Ready {2} minutes after {0}''s activity went out, so the Run Command that sets it can''t run, and {0} may have no activity this session.' -f $who, $vm, $agentGraceMinutes); Fix = ('The session''s other targets go on. For {0}: set STOP_NOW = True and Run all; ./scripts/status.ps1 shows {1}''s state, and docs/troubleshooting.md says what brings its agent back ("A host''s VM agent that isn''t Ready").' -f $who, $vm) })
+                continue
+            }
+        }
+        foreach ($command in $entry.Commands) {
+            $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands/{2}?$expand=instanceView' -f (Get-DbHubDemoPath -Settings $settings), $vm, $command.Name) -ApiVersion $commandVersion
+            if ($read.StatusCode -ne 200) {
+                continue
+            }
+            $instance = Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'instanceView'
+            $state = [string](Get-DbHubMember -InputObject $instance -Name 'executionState')
+            if ($state -notin 'Failed', 'TimedOut', 'Canceled') {
+                continue
+            }
+            $exit = Get-DbHubMember -InputObject $instance -Name 'exitCode'
+            $exitText = ''
+            if ($null -ne $exit) {
+                $exitText = ', exit code {0}' -f [int]$exit
+            }
+            $commandWho = & $label $command.Targets $vm
+            Write-DbHubLog -Context $Context -Message ('{0}: Run Command {1} ended {2}: {3}' -f $vm, $command.Name, $state, [string](Get-DbHubMember -InputObject $instance -Name 'executionMessage'))
+            $findings.Add([pscustomobject]@{ Message = ('{0}: the Run Command {1} that set its activity on {2} ended {3}{4}, so {0} may have no activity this session.' -f $commandWho, $command.Name, $vm, $state, $exitText); Fix = ('Its output: az vm run-command show -g {0} --vm-name {1} -n {2} --instance-view. The session''s other targets go on; for {3}, set STOP_NOW = True and Run all, then Run all again.' -f $settings.demoResourceGroup, $vm, $command.Name, $commandWho) })
+        }
+    }
+    return $findings.ToArray()
+}
+
+function Add-DbHubSessionHealthStep {
+    # Adds each finding of Get-DbHubSessionHealth as a Host step (Warning) that the status doesn't have yet. Returns how
+    # many it added.
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [AllowEmptyCollection()]
+        [object[]] $Finding = @()
+    )
+
+    $known = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
+    foreach ($step in @($Status['steps'])) {
+        if ([string](Get-DbHubMember -InputObject $step -Name 'step') -eq 'Host') {
+            $null = $known.Add([string](Get-DbHubMember -InputObject $step -Name 'message'))
+        }
+    }
+    $added = 0
+    foreach ($item in $Finding) {
+        if ($null -eq $item -or -not $known.Add((ConvertTo-DbHubSafeText -Text ([string]$item.Message)))) {
+            continue
+        }
+        Add-DbHubSessionStep -Status $Status -Step 'Host' -State 'Warning' -Message ([string]$item.Message) -Fix ([string]$item.Fix)
+        $added++
+    }
+    return $added
+}
+
+function Update-DbHubSessionHealth {
+    <#
+    .SYNOPSIS
+    DbHub-Monitor's look at a running session's hosts (2026-11-16): the session's last status from its copy (the
+    variable DbHubSessionStatus), the checks of Get-DbHubSessionHealth, and the status written again, to the vault and
+    the copy, only when a problem is new, and only while the session runs: before its end, and while its copy is still the
+    one it read, untouched since, right before the write, so a newer status, such as the session's end, is never
+    overwritten. Never throws. Returns Outcome (NoSession, NoStatus, Ended, Healthy, Known, Changed, Warned) and Note, a
+    sentence for the monitor's result.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes only the running session''s own status, from DbHub-Monitor''s scheduled re-check, which starts or stops nothing.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $session = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId')
+    if ($session -notmatch '^[0-9a-f]{32}$') {
+        return [pscustomobject]@{ Outcome = 'NoSession'; Note = '' }
+    }
+    try {
+        $status = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -eq $status) {
+            # No copy (a variable that doesn't exist says so once, in Read-DbHubSessionStatusCopy).
+            return [pscustomobject]@{ Outcome = 'NoStatus'; Note = '' }
+        }
+        if ([string]$status['sessionId'] -ne $session -or [string]$status['phase'] -ne 'running') {
+            # A session that has ended, or a run after one: nothing runs to check.
+            return [pscustomobject]@{ Outcome = 'NoSession'; Note = '' }
+        }
+        $readUpdated = [string]$status['updatedUtc']
+        $end = ConvertTo-DbHubUtc -Value $status['runEndUtc']
+        if ($null -ne $end -and (Get-DbHubUtcNow) -ge $end) {
+            return [pscustomobject]@{ Outcome = 'Ended'; Note = '' }
+        }
+        $findings = @(Get-DbHubSessionHealth -Context $Context -Status $status)
+        if ($findings.Count -eq 0) {
+            return [pscustomobject]@{ Outcome = 'Healthy'; Note = ' The session''s hosts run.' }
+        }
+        $added = Add-DbHubSessionHealthStep -Status $status -Finding $findings
+        if ($added -eq 0) {
+            return [pscustomobject]@{ Outcome = 'Known'; Note = ' The session''s status already says what doesn''t run.' }
+        }
+        # Never over a newer status (the coordinator's guard, 2026-11-16): the copy must be the one read above, of a
+        # session that still runs, or the session's end or another job wrote since, and this write would undo it.
+        $again = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -eq $again -or [string]$again['sessionId'] -ne $session -or [string]$again['phase'] -ne 'running' -or [string]$again['updatedUtc'] -ne $readUpdated) {
+            Write-DbHubLog -Context $Context -Message 'The session''s status changed while its hosts were checked (it ended, or another job wrote it), so this check didn''t write it.'
+            return [pscustomobject]@{ Outcome = 'Changed'; Note = '' }
+        }
+        $null = Write-DbHubSessionStatus -Context $Context -Status $status
+        $texts = @(@($status['steps']) | Select-Object -Last $added | ForEach-Object { [string](Get-DbHubMember -InputObject $_ -Name 'message') })
+        return [pscustomobject]@{ Outcome = 'Warned'; Note = (' The session''s status now says: {0}' -f ($texts -join ' ')) }
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The session''s hosts weren''t checked: {0}' -f $_.Exception.Message)
+        return [pscustomobject]@{ Outcome = 'NoStatus'; Note = '' }
+    }
+}
+
+function Get-DbHubT4Server {
+    # T4 as Azure Resource Manager returns it (Servers - Get), for its replica's creation: Name, State (as Get-DbHubT4),
+    # StatusCode, and Body ($null without one).
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $deploymentId = [string](Get-DbHubMember -InputObject $Tags -Name 'deploymentId')
+    if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
+        return [pscustomobject]@{ Name = ''; State = 'Unknown'; StatusCode = 0; Body = $null }
+    }
+    $name = '{0}{1}' -f $Context.Settings.t4ServerPrefix, $deploymentId
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
+    $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $name) -ApiVersion $version
+    $state = 'Unknown'
+    if ($read.StatusCode -eq 404) {
+        $state = 'Missing'
+    }
+    elseif ($read.StatusCode -eq 200) {
+        $state = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'state')
+    }
+    return [pscustomobject]@{ Name = $name; State = $state; StatusCode = $read.StatusCode; Body = $read.Body }
+}
+
+function Get-DbHubReplicaSizeOrder {
+    <#
+    .SYNOPSIS
+    The sizes a session's read replica tries, in order, never with fewer vCores than T4 ("the same or a higher number of
+    vCores as the source server", ADR 0025), as the module's Get-DemoT4ReplicaSizeOrder orders them, without its zone
+    retry: the recorded size (DbHubT4ReplicaSize, "<size>@<zone or any>") first when it has T4's vCores, then T4's own
+    size, a larger recorded size, the documented sizes with T4's vCores, then larger ones. Pure.
+    #>
+    param(
+        [AllowEmptyString()]
+        [string] $T4SkuName = '',
+
+        [AllowEmptyString()]
+        [string] $Record = '',
+
+        [AllowEmptyCollection()]
+        [string[]] $Sizes = @()
+    )
+
+    $order = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $t4VCores = Get-DbHubT4VCore -SkuName $T4SkuName
+    $documented = @($Sizes | Where-Object { $_ -cmatch '^Standard_[A-Za-z0-9_]+$' })
+    $later = ''
+    if ($Record -match '^(Standard_[A-Za-z0-9_]+)@(any|[123])$') {
+        $recorded = $Matches[1]
+        $recordedVCores = Get-DbHubT4VCore -SkuName $recorded
+        if ($recorded -cin $documented -and $recordedVCores -eq $t4VCores) {
+            $order.Add($recorded)
+        }
+        elseif ($recorded -cin $documented -and $recordedVCores -gt $t4VCores) {
+            $later = $recorded
+        }
+    }
+    if ($T4SkuName -cmatch '^Standard_[A-Za-z0-9_]+$' -and -not $order.Contains($T4SkuName)) {
+        $order.Add($T4SkuName)
+    }
+    if ($later -and -not $order.Contains($later)) {
+        $order.Add($later)
+    }
+    foreach ($size in $documented) {
+        if ((Get-DbHubT4VCore -SkuName $size) -eq $t4VCores -and -not $order.Contains($size)) {
+            $order.Add($size)
+        }
+    }
+    $larger = @($documented | Where-Object { (Get-DbHubT4VCore -SkuName $_) -gt $t4VCores } | Sort-Object -Property @{ Expression = { Get-DbHubT4VCore -SkuName $_ } }, @{ Expression = { [System.Array]::IndexOf($documented, $_) } })
+    foreach ($size in $larger) {
+        if (-not $order.Contains($size)) {
+            $order.Add($size)
+        }
+    }
+    return $order.ToArray()
+}
+
+function Send-DbHubT4ReplicaCreate {
+    <#
+    .SYNOPSIS
+    Asks Azure for T4's read replica at SkuName (Servers - Create, createMode Replica), as infra/replica/pgreplica01.bicep
+    makes it: T4's location, delegated subnet, private DNS zone, and storage, General Purpose, no public network access,
+    and storage auto-grow off, with the demo's tags and component t4-replica. Returns once Azure answered: Accepted,
+    StatusCode, Code (SkuNotAvailable, SourceNotReady, AlreadyExists, NotGranted, or Other), and Error.
+    https://learn.microsoft.com/rest/api/postgresql/flexibleserver/servers/create
+    https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Source,
+
+        [Parameter(Mandatory = $true)]
+        [string] $SkuName,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    $properties = Get-DbHubMember -InputObject $Source -Name 'properties'
+    $network = Get-DbHubMember -InputObject $properties -Name 'network'
+    $storage = Get-DbHubMember -InputObject $properties -Name 'storage'
+    $size = [int](Get-DbHubMember -InputObject $storage -Name 'storageSizeGB')
+    if ($size -le 0) {
+        $size = 32
+    }
+    $tier = [string](Get-DbHubMember -InputObject $storage -Name 'tier')
+    if (-not $tier) {
+        $tier = 'P4'
+    }
+    $replicaTags = [ordered]@{}
+    foreach ($key in 'solution', 'environment', 'owner', 'purpose', 'costCenter', 'autoShutdown', 'deploymentId', 'expiresOn') {
+        $value = [string](Get-DbHubMember -InputObject $Tags -Name $key)
+        if ($value) {
+            $replicaTags[$key] = $value
+        }
+    }
+    $replicaTags['component'] = 't4-replica'
+    $body = [ordered]@{
+        location   = [string](Get-DbHubMember -InputObject $Source -Name 'location')
+        tags       = $replicaTags
+        sku        = [ordered]@{ name = $SkuName; tier = 'GeneralPurpose' }
+        properties = [ordered]@{
+            createMode             = 'Replica'
+            sourceServerResourceId = [string](Get-DbHubMember -InputObject $Source -Name 'id')
+            storage                = [ordered]@{ storageSizeGB = $size; tier = $tier; autoGrow = 'Disabled'; type = 'Premium_LRS' }
+            network                = [ordered]@{ delegatedSubnetResourceId = [string](Get-DbHubMember -InputObject $network -Name 'delegatedSubnetResourceId'); privateDnsZoneArmResourceId = [string](Get-DbHubMember -InputObject $network -Name 'privateDnsZoneArmResourceId'); publicNetworkAccess = 'Disabled' }
+        }
+    }
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
+    $put = Invoke-DbHubArm -Context $Context -Method PUT -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $Name) -ApiVersion $version -Body $body
+    if ($put.StatusCode -in 200, 201, 202) {
+        return [pscustomobject]@{ Accepted = $true; StatusCode = $put.StatusCode; Code = ''; Error = '' }
+    }
+    # The error's code and message, from Invoke-DbHubArm's text and the response body both.
+    $detail = Get-DbHubMember -InputObject $put.Body -Name 'error'
+    $text = ('{0} {1} {2}' -f $put.Error, [string](Get-DbHubMember -InputObject $detail -Name 'code'), [string](Get-DbHubMember -InputObject $detail -Name 'message')).Trim()
+    $code = 'Other'
+    if ($put.StatusCode -eq 403 -or $text -match 'AuthorizationFailed') {
+        $code = 'NotGranted'
+    }
+    elseif ($text -match 'SkuNotAvailable') {
+        $code = 'SkuNotAvailable'
+    }
+    elseif ($text -match 'ReadReplicaServerInUnexpectedState') {
+        $code = 'SourceNotReady'
+    }
+    elseif ($text -match 'ReadReplicaAlreadyExistWithGivenName') {
+        $code = 'AlreadyExists'
+    }
+    return [pscustomobject]@{ Accepted = $false; StatusCode = $put.StatusCode; Code = $code; Error = (ConvertTo-DbHubSafeText -Text $text) }
+}
+
+function Set-DbHubT4ReplicaParameter {
+    # The replica's max_standby_streaming_delay (Configurations - Put), as its template sets it: how long replaying T4's
+    # changes waits for a query on the replica, which the replica-lag beat needs. Dynamic: no restart. Returns Ok and Error.
+    # https://learn.microsoft.com/rest/api/postgresql/flexibleserver/configurations/put
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Start-DbHubSession, its caller, asks ShouldProcess.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [Parameter(Mandatory = $true)]
+        [int] $Milliseconds
+    )
+
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers/configurations'
+    $path = '{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}/configurations/max_standby_streaming_delay' -f (Get-DbHubDemoPath -Settings $Context.Settings), $Name
+    $put = Invoke-DbHubArm -Context $Context -Method PUT -Path $path -ApiVersion $version -Body @{ properties = @{ value = [string]$Milliseconds; source = 'user-override' } }
+    return [pscustomobject]@{ Ok = ($put.StatusCode -in 200, 201, 202); Error = $put.Error }
+}
+
+function Remove-DbHubT4Replica {
+    <#
+    .SYNOPSIS
+    Deletes T4's read replica (Servers - Delete, with the control identity's flexibleServers/delete, 2026-11-14) and waits
+    until it's gone, at most WaitMinutes, so nothing bills for it between sessions. Only a server whose replicationRole
+    says it's a read replica is deleted. Returns Outcome (Deleted, Missing, NotConfigured, NotGranted, NotReplica, or
+    Failed), Name, and Error.
+    https://learn.microsoft.com/rest/api/postgresql/flexibleserver/servers/delete
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Stop-DbHubDemo, its caller, asks ShouldProcess.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [int] $WaitMinutes = 15,
+
+        [int] $PollSeconds = 15
+    )
+
+    $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+    $outcome = [pscustomobject]@{ Outcome = ''; Name = [string]$replica.Name; Error = '' }
+    if ($replica.State -in 'NotConfigured', 'Missing') {
+        $outcome.Outcome = $replica.State
+        return $outcome
+    }
+    $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
+    $path = '{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $replica.Name
+    if ($replica.State -ne 'Dropping') {
+        $read = Invoke-DbHubArm -Context $Context -Method GET -Path $path -ApiVersion $version
+        $role = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'replicationRole')
+        if ($read.StatusCode -eq 404) {
+            $outcome.Outcome = 'Missing'
+            return $outcome
+        }
+        if ($read.StatusCode -ne 200 -or $role -notin 'AsyncReplica', 'GeoAsyncReplica') {
+            # Never delete a server that isn't a read replica, whatever its name.
+            $outcome.Outcome = 'NotReplica'
+            $outcome.Error = if ($read.StatusCode -eq 200) { 'its replicationRole is {0}, not a read replica''s, so it wasn''t deleted' -f $(if ($role) { $role } else { 'empty' }) } else { 'it couldn''t be read: {0}' -f $read.Error }
+            return $outcome
+        }
+        $deleted = Invoke-DbHubArm -Context $Context -Method DELETE -Path $path -ApiVersion $version
+        if ($deleted.StatusCode -eq 404) {
+            $outcome.Outcome = 'Missing'
+            return $outcome
+        }
+        if ($deleted.StatusCode -eq 403 -or $deleted.Error -match 'AuthorizationFailed') {
+            $outcome.Outcome = 'NotGranted'
+            $outcome.Error = $deleted.Error
+            return $outcome
+        }
+        if ($deleted.StatusCode -notin 200, 202, 204) {
+            $outcome.Outcome = 'Failed'
+            $outcome.Error = $deleted.Error
+            return $outcome
+        }
+        Write-DbHubLog -Context $Context -Message ('{0}: delete accepted (T4''s read replica).' -f $replica.Name)
+    }
+    $giveUp = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    while ($true) {
+        $now = Get-DbHubT4Replica -Context $Context -Tags $Tags
+        if ($now.State -eq 'Missing') {
+            $outcome.Outcome = 'Deleted'
+            return $outcome
+        }
+        if ((Get-DbHubUtcNow) -ge $giveUp) {
+            $outcome.Outcome = 'Failed'
+            $outcome.Error = 'it was still {0} after {1} minutes; Azure finishes deleting it on its own' -f $now.State, $WaitMinutes
+            return $outcome
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+}
+
+function Stop-DbHubT4Confirmed {
+    <#
+    .SYNOPSIS
+    T4's stop right after its read replica's deletion, confirmed: Azure refuses a primary's stop while an operation still
+    runs on its replica (SourceReplicasStartStopOrder). Live, 2026-11-14: the replica's GET answered 404 about 20 seconds
+    before its delete finished, and T4's stop, accepted, failed a minute later, which left T4 running after the session's
+    auto-stop. So the stop is asked again until T4 is Stopping or Stopped, at most Attempts times within WaitMinutes.
+    Returns Stopped ($true when T4 is Stopping or Stopped), Attempts, and Error.
+    https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Stop-DbHubDemo, its caller, asks ShouldProcess.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [int] $WaitMinutes = 10,
+
+        [int] $Attempts = 3,
+
+        [int] $SettleSeconds = 150,
+
+        [int] $PollSeconds = 20
+    )
+
+    $giveUp = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    $tries = 0
+    $state = ''
+    while ($tries -lt $Attempts -and (Get-DbHubUtcNow) -lt $giveUp) {
+        $tries++
+        $null = Invoke-DbHubT4Action -Context $Context -Name $Name -Action stop
+        # A stop that Azure took starts within seconds; one that failed leaves T4 Ready, and a second stop while the first
+        # still runs is refused, so each one gets SettleSeconds to show.
+        $settle = (Get-DbHubUtcNow).AddSeconds($SettleSeconds)
+        if ($settle -gt $giveUp) {
+            $settle = $giveUp
+        }
+        while ((Get-DbHubUtcNow) -lt $settle) {
+            Start-Sleep -Seconds $PollSeconds
+            $state = [string](Get-DbHubT4 -Context $Context -Tags $Tags).State
+            if ($state -in 'Stopping', 'Stopped') {
+                if ($tries -gt 1) {
+                    Write-DbHubLog -Context $Context -Message ('{0} is {1} after {2} stops: Azure refused the first while its read replica''s delete finished.' -f $Name, $state.ToLowerInvariant(), $tries)
+                }
+                return [pscustomobject]@{ Stopped = $true; Attempts = $tries; Error = '' }
+            }
+        }
+        Write-DbHubLog -Context $Context -Message ('{0} is still {1} after stop {2}; asking again.' -f $Name, $(if ($state) { $state } else { 'unknown' }), $tries)
+    }
+    return [pscustomobject]@{ Stopped = $false; Attempts = $tries; Error = ('it was still {0} after {1} stop(s) in {2} minutes' -f $(if ($state) { $state } else { 'unknown' }), $tries, $WaitMinutes) }
+}
+
+function Test-DbHubSessionOpen {
+    # Whether the session this job started still goes on: its auto-stop is pending, as a stop removes it. An auto-stop that
+    # can't be read counts as pending.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context
+    )
+
+    return ((Get-DbHubAutoStopRunEnd -Context $Context).State -ne 'None')
+}
+
+function Get-DbHubSessionReplicaSetting {
+    # The settings' t4Replica part (2026-11-14) with its defaults: Sizes, StreamingDelayMs, WaitMinutes, DeleteMinutes, and
+    # RaceMinutes.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Settings
+    )
+
+    $part = Get-DbHubMember -InputObject $Settings -Name 't4Replica'
+    $value = {
+        param([string] $Name, [int] $Default)
+        $item = [int](Get-DbHubMember -InputObject $part -Name $Name)
+        if ($item -gt 0) { $item } else { $Default }
+    }
+    return [pscustomobject]@{
+        Sizes            = @(Get-DbHubMember -InputObject $part -Name 'sizes' | Where-Object { $_ })
+        StreamingDelayMs = (& $value 'maxStandbyStreamingDelayMs' 600000)
+        WaitMinutes      = (& $value 'createWaitMinutes' 25)
+        DeleteMinutes    = (& $value 'deleteWaitMinutes' 15)
+        RaceMinutes      = (& $value 'raceMinutes' 10)
+    }
+}
+
+function Start-DbHubSessionReplica {
+    <#
+    .SYNOPSIS
+    T4's read replica for a session (ADR 0025, 2026-11-14): asks Azure for it once T4 is Ready, at T4's size or the next
+    documented size Azure accepts, and returns once Azure accepted it; Complete-DbHubSessionReplica waits for it. Updates
+    the status's replica part. Returns the work: Done, Pending, Retry, Name, Order, Index, Source, Attempts, and AcceptedUtc.
+
+    .DESCRIPTION
+    - None for settings without the replica, an environment deploy.ps1 hasn't set it up in (DbHubT4Replica isn't
+      Session: ./scripts/deploy.ps1), a Burstable T4 (Not supported), or a T4 that isn't Ready.
+    - A replica that's there and Ready is used as it is; a stopped one is started; one being deleted is waited for.
+    - With RaceMinutes 0 (from inside the run's loop), a T4 that's restarting or updating (ReadReplicaServerInUnexpectedState)
+      leaves Retry set, and the session asks again after its dispatches (Send-DbHubSessionReplicaAttempt).
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Start-DbHubSession, its caller, asks ShouldProcess.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [int] $RaceMinutes = 10,
+
+        [int] $PollSeconds = 30
+    )
+
+    $settings = $Context.Settings
+    $setting = Get-DbHubSessionReplicaSetting -Settings $settings
+    $part = $Status['replica']
+    $work = [pscustomobject]@{ Done = $true; Pending = $false; Retry = $false; Name = ''; Order = @(); Index = 0; Source = $null; Attempts = (New-Object -TypeName 'System.Collections.Generic.List[object]'); AcceptedUtc = $null }
+    $finish = {
+        param([string] $State, [string] $Note, [string] $Fix)
+        $part['state'] = $State
+        $part['note'] = $Note
+        $part['fix'] = $Fix
+        $work.Done = $true
+        $work.Pending = $false
+        $work.Retry = $false
+        Write-DbHubLog -Context $Context -Message ('T4''s read replica: {0}. {1}' -f $State, $Note)
+        return $work
+    }
+    $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+    $work.Name = [string]$replica.Name
+    if ($replica.State -eq 'NotConfigured' -or @($setting.Sizes).Count -eq 0) {
+        return (& $finish 'NotConfigured' 'The control''s settings predate T4''s read replica, so this session has none.' 'Run ./scripts/deploy.ps1: it publishes the control again.')
+    }
+    if ([string](Get-DbHubMember -InputObject $Tags -Name 'DbHubT4Replica') -ne 'Session') {
+        return (& $finish 'NotSetUp' 'T4''s read replica isn''t set up in this environment, which was deployed before the replica existed, so Database Hub''s Read replica lag stays empty and the replica-lag beat doesn''t run.' 'Run ./scripts/deploy.ps1: it sets the replica up, and each session creates it.')
+    }
+    $t4 = Get-DbHubT4Server -Context $Context -Tags $Tags
+    $sku = Get-DbHubMember -InputObject $t4.Body -Name 'sku'
+    $t4Sku = [string](Get-DbHubMember -InputObject $sku -Name 'name')
+    $part['sizeAsked'] = $t4Sku
+    if ([string](Get-DbHubMember -InputObject $sku -Name 'tier') -eq 'Burstable') {
+        return (& $finish 'NotSupported' ('T4 runs on the Burstable size {0}, and Azure supports read replicas only on the General Purpose and Memory Optimized tiers, so this session has none and Database Hub''s Read replica lag stays empty.' -f $t4Sku) 'Remove t4SkuName from config/demo.config.json (the default is General Purpose Standard_D4ds_v5), then run ./scripts/deploy.ps1; ./scripts/estimate-cost.ps1 shows what it costs.')
+    }
+    if ($replica.State -eq 'Ready') {
+        $part['state'] = 'Ready'
+        $part['readyUtc'] = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
+        return $work
+    }
+    if ($replica.State -eq 'Unknown') {
+        return (& $finish 'Failed' ('T4''s read replica ({0}) couldn''t be read, so it wasn''t created.' -f $replica.Name) 'Run all again in a few minutes; ./scripts/status.ps1 shows the replica.')
+    }
+    if ($replica.State -eq 'Dropping') {
+        $giveUp = (Get-DbHubUtcNow).AddMinutes($setting.DeleteMinutes)
+        while ($replica.State -eq 'Dropping' -and (Get-DbHubUtcNow) -lt $giveUp) {
+            Start-Sleep -Seconds $PollSeconds
+            $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+        }
+        if ($replica.State -ne 'Missing') {
+            return (& $finish 'Failed' ('T4''s read replica ({0}) from an earlier session was still being deleted after {1} minutes, so a new one wasn''t created.' -f $replica.Name, $setting.DeleteMinutes) 'Run all again in a few minutes: Azure finishes deleting it on its own.')
+        }
+    }
+    if ($replica.State -in 'Stopped', 'Stopping') {
+        if ($replica.State -eq 'Stopping' -or -not (Invoke-DbHubT4Action -Context $Context -Name $replica.Name -Action start)) {
+            return (& $finish 'Failed' ('T4''s read replica ({0}) from an earlier session is {1} and couldn''t be started.' -f $replica.Name, $replica.State.ToLowerInvariant()) 'Run the notebook''s Stop now cell, which deletes it, then Run all again.')
+        }
+        $part['state'] = 'Starting'
+        $work.Done = $false
+        $work.Pending = $true
+        $work.AcceptedUtc = Get-DbHubUtcNow
+        return $work
+    }
+    if ($replica.State -ne 'Missing') {
+        # Provisioning, Starting, Updating, and the like: wait for Ready.
+        $part['state'] = 'Creating'
+        $work.Done = $false
+        $work.Pending = $true
+        $work.AcceptedUtc = Get-DbHubUtcNow
+        return $work
+    }
+    if ($t4.State -ne 'Ready') {
+        return (& $finish 'NotCreated' ('T4 ({0}) is {1}, not Ready, so its read replica wasn''t created: Azure creates a replica only from a running server.' -f $t4.Name, $t4.State) 'Run all again once T4 runs.')
+    }
+    $work.Order = @(Get-DbHubReplicaSizeOrder -T4SkuName $t4Sku -Record ([string](Get-DbHubMember -InputObject $Tags -Name 'DbHubT4ReplicaSize')) -Sizes $setting.Sizes)
+    $work.Source = $t4.Body
+    $work.Done = $false
+    return (Send-DbHubSessionReplicaAttempt -Context $Context -Tags $Tags -Status $Status -Work $work -RaceMinutes $RaceMinutes -PollSeconds $PollSeconds)
+}
+
+function Send-DbHubSessionReplicaAttempt {
+    <#
+    .SYNOPSIS
+    Asks for the session's read replica at the work's next size: SkuNotAvailable moves to the next size, a T4 that's
+    restarting or updating (ReadReplicaServerInUnexpectedState) is asked again every PollSeconds for up to RaceMinutes (live,
+    2026-11-13: T4's restart refused the replica), and any other refusal ends it, with the fix in the status. Returns the
+    work.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Work,
+
+        [int] $RaceMinutes = 10,
+
+        [int] $PollSeconds = 30
+    )
+
+    $part = $Status['replica']
+    $finish = {
+        param([string] $State, [string] $Note, [string] $Fix)
+        $part['state'] = $State
+        $part['note'] = $Note
+        $part['fix'] = $Fix
+        $Work.Done = $true
+        $Work.Pending = $false
+        $Work.Retry = $false
+        Write-DbHubLog -Context $Context -Message ('T4''s read replica: {0}. {1}' -f $State, $Note)
+        return $Work
+    }
+    $Work.Retry = $false
+    while ($Work.Index -lt @($Work.Order).Count) {
+        $size = [string](@($Work.Order)[$Work.Index])
+        $raceEnd = (Get-DbHubUtcNow).AddMinutes($RaceMinutes)
+        while ($true) {
+            if (-not (Test-DbHubSessionOpen -Context $Context)) {
+                return (& $finish 'NotCreated' 'The session was stopped before its read replica was created.' '')
+            }
+            $sent = Send-DbHubT4ReplicaCreate -Context $Context -Name $Work.Name -Source $Work.Source -SkuName $size -Tags $Tags
+            if ($sent.Accepted -or $sent.Code -ne 'SourceNotReady' -or (Get-DbHubUtcNow) -ge $raceEnd) {
+                break
+            }
+            Write-DbHubLog -Context $Context -Message ('{0}: T4 isn''t ready for a read replica yet ({1}); asking again in {2} seconds.' -f $Work.Name, $sent.Error, $PollSeconds)
+            Start-Sleep -Seconds $PollSeconds
+        }
+        $attempt = [ordered]@{ size = $size; outcome = 'Accepted'; atUtc = (ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)); error = '' }
+        if (-not $sent.Accepted) {
+            $attempt['outcome'] = $sent.Code
+            $attempt['error'] = ConvertTo-DbHubSafeText -Text $sent.Error
+        }
+        $Work.Attempts.Add($attempt)
+        $part['attempts'] = @($Work.Attempts.ToArray())
+        if ($sent.Accepted -or $sent.Code -eq 'AlreadyExists') {
+            Write-DbHubLog -Context $Context -Message ('{0}: creation accepted at {1} (T4''s read replica; about 9 minutes).' -f $Work.Name, $size)
+            $part['state'] = 'Creating'
+            $Work.Pending = $true
+            $Work.AcceptedUtc = Get-DbHubUtcNow
+            return $Work
+        }
+        if ($sent.Code -eq 'SkuNotAvailable') {
+            $Work.Index++
+            continue
+        }
+        if ($sent.Code -eq 'SourceNotReady' -and $RaceMinutes -le 0) {
+            $Work.Retry = $true
+            return $Work
+        }
+        if ($sent.Code -eq 'NotGranted') {
+            return (& $finish 'NotGranted' 'The control identity can''t create T4''s read replica yet: its role doesn''t have the PostgreSQL actions, so this session has none, and Database Hub''s Read replica lag stays empty.' 'An Owner runs ./scripts/grant-safety-stop.ps1 once; the next Run all creates the replica.')
+        }
+        if ($sent.Code -eq 'SourceNotReady') {
+            return (& $finish 'NotCreated' ('T4 wasn''t ready for a read replica within {0} minutes: {1}' -f $RaceMinutes, $sent.Error) 'Run all again in a few minutes.')
+        }
+        return (& $finish 'Failed' ('T4''s read replica couldn''t be created: {0}' -f $sent.Error) 'Fix the cause (a policy denial names its policy), then Run all again; ./scripts/start-demo.ps1 creates it too, with more detail.')
+    }
+    $tried = @($Work.Attempts | ForEach-Object { [string]$_['size'] } | Select-Object -Unique) -join ', '
+    return (& $finish 'Refused' ('Azure refused every size for T4''s read replica ({0}), so this session has none.' -f $tried) 'Ask for the size in the region (a Region access request), or set t4SkuName in config/demo.config.json and run ./scripts/deploy.ps1.')
+}
+
+function Complete-DbHubSessionReplica {
+    <#
+    .SYNOPSIS
+    Waits, at most WaitMinutes, for the read replica Start-DbHubSessionReplica asked for to be Ready, then sets its
+    max_standby_streaming_delay (the replica-lag beat needs it) and records its size in DbHubT4ReplicaSize, so the next
+    session asks for it first. A creation Azure didn't finish (the server goes away) moves to the next size, and each size
+    used other than T4's is in the status. Returns the work.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Work,
+
+        [int] $WaitMinutes = 25,
+
+        [int] $PollSeconds = 20
+    )
+
+    $part = $Status['replica']
+    $setting = Get-DbHubSessionReplicaSetting -Settings $Context.Settings
+    if ($Work.Retry) {
+        $Work = Send-DbHubSessionReplicaAttempt -Context $Context -Tags $Tags -Status $Status -Work $Work -RaceMinutes $setting.RaceMinutes -PollSeconds $PollSeconds
+    }
+    if ($Work.Done -or -not $Work.Pending) {
+        return $Work
+    }
+    $deadline = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    $seen = $false
+    while ($true) {
+        if (-not (Test-DbHubSessionOpen -Context $Context)) {
+            $part['state'] = 'NotCreated'
+            $part['note'] = 'The session was stopped before its read replica was Ready.'
+            $Work.Done = $true
+            return $Work
+        }
+        $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+        if ($replica.State -eq 'Ready') {
+            break
+        }
+        if ($replica.State -notin 'Missing', 'Dropping', 'Unknown') {
+            $seen = $true
+        }
+        $sinceAccepted = ((Get-DbHubUtcNow) - $Work.AcceptedUtc).TotalMinutes
+        if ($replica.State -in 'Missing', 'Dropping' -and ($seen -or $sinceAccepted -ge 5) -and @($Work.Order).Count -gt 0) {
+            # Azure took the request and didn't finish it: the next size, once the name is free.
+            $last = @($Work.Attempts)[-1]
+            $last['outcome'] = 'NotFinished'
+            $part['attempts'] = @($Work.Attempts.ToArray())
+            Write-DbHubLog -Context $Context -Message ('{0}: Azure didn''t finish creating it at {1}; the next size is tried.' -f $Work.Name, $last['size'])
+            $free = (Get-DbHubUtcNow).AddMinutes($setting.DeleteMinutes)
+            while ($replica.State -ne 'Missing' -and (Get-DbHubUtcNow) -lt $free) {
+                Start-Sleep -Seconds $PollSeconds
+                $replica = Get-DbHubT4Replica -Context $Context -Tags $Tags
+            }
+            $Work.Index++
+            $Work.Pending = $false
+            $Work = Send-DbHubSessionReplicaAttempt -Context $Context -Tags $Tags -Status $Status -Work $Work -RaceMinutes $setting.RaceMinutes -PollSeconds $PollSeconds
+            if ($Work.Done -or -not $Work.Pending) {
+                return $Work
+            }
+            $deadline = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+            $seen = $false
+            continue
+        }
+        if ((Get-DbHubUtcNow) -ge $deadline) {
+            $part['state'] = 'NotReady'
+            $part['note'] = 'T4''s read replica ({0}) was still {1} after {2} minutes, so the replica-lag beat may not run this session.' -f $Work.Name, $replica.State, $WaitMinutes
+            $part['fix'] = 'It may still finish: ./scripts/status.ps1 shows it, and the session''s stop deletes it either way.'
+            $Work.Done = $true
+            return $Work
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+    $Work.Done = $true
+    $Work.Pending = $false
+    $part['state'] = 'Ready'
+    $part['readyUtc'] = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
+    $used = ''
+    $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $Work.Name) -ApiVersion (Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers')
+    if ($read.StatusCode -eq 200) {
+        $used = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'sku') -Name 'name')
+    }
+    $part['sizeUsed'] = $used
+    if ($used -and $part['sizeAsked'] -and $used -cne [string]$part['sizeAsked']) {
+        $part['note'] = 'Azure refused T4''s size ({0}) for the replica, so it runs on {1}, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' -f $part['sizeAsked'], $used
+    }
+    $parameter = Set-DbHubT4ReplicaParameter -Context $Context -Name $Work.Name -Milliseconds $setting.StreamingDelayMs
+    if (-not $parameter.Ok) {
+        $part['note'] = ('{0} Its max_standby_streaming_delay wasn''t set ({1}), so Read replica lag climbs only to about 30 seconds in the replica-lag beat.' -f [string]$part['note'], $parameter.Error).Trim()
+    }
+    if ($used) {
+        $recorded = Set-DbHubResourceGroupTag -Context $Context -Tags @{ DbHubT4ReplicaSize = ('{0}@any' -f $used) }
+        if (-not $recorded.Ok) {
+            Write-DbHubLog -Context $Context -Message ('The replica''s size wasn''t recorded: {0}' -f $recorded.Error)
+        }
+    }
+    Write-DbHubLog -Context $Context -Message ('{0}: Ready ({1}).' -f $Work.Name, $used)
+    return $Work
+}
+
+function Get-DbHubReplicaLagPlan {
+    # When the showcase's replica-lag slot runs (ADR 0010, 2026-11-14): from minute 20 of T4's even 30-minute cycles, for 9
+    # minutes, counted from when T4's profile was set, while the run lasts (the runner ends 2 minutes before its end).
+    # Returns the windows, each with startUtc and endUtc. Pure.
+    param(
+        [Parameter(Mandatory = $true)]
+        [datetime] $ProfileSetUtc,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $RunEndUtc,
+
+        [int] $CycleMinutes = 30,
+
+        [int] $StartMinute = 20,
+
+        [int] $DurationMinutes = 9
+    )
+
+    $windows = @()
+    $last = $RunEndUtc.AddMinutes(-2)
+    for ($cycle = 2; $cycle -le 8; $cycle += 2) {
+        $start = $ProfileSetUtc.AddMinutes(($cycle - 1) * $CycleMinutes + $StartMinute)
+        if ($start.AddMinutes(1) -ge $last) {
+            break
+        }
+        $end = $start.AddMinutes($DurationMinutes)
+        if ($end -gt $last) {
+            $end = $last
+        }
+        $windows += [ordered]@{ startUtc = (ConvertTo-DbHubTimeText -Value $start); endUtc = (ConvertTo-DbHubTimeText -Value $end) }
+    }
+    return , $windows
+}
+
+function Read-DbHubMetric {
+    <#
+    .SYNOPSIS
+    One Metrics - List read for one server: Name with one Aggregation, every IntervalMinutes over Timespan. Returns Series
+    (Metric, Unit, Aggregation, and Points: UTC time to value, only the points that have one) and Error. Never throws.
+    https://learn.microsoft.com/rest/api/monitor/metrics/list
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $ServerPath,
+
+        [Parameter(Mandatory = $true)]
+        [string[]] $Name,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Maximum', 'Total', 'Average', 'Minimum')]
+        [string] $Aggregation,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Timespan,
+
+        [int] $IntervalMinutes = 1
+    )
+
+    $series = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $field = $Aggregation.ToLowerInvariant()
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    try {
+        $interval = 'PT{0}M' -f $IntervalMinutes
+        if ($IntervalMinutes -eq 60) {
+            $interval = 'PT1H'
+        }
+        $query = '{0}/providers/Microsoft.Insights/metrics?timespan={1}&interval={2}&metricnames={3}&aggregation={4}' -f $ServerPath, $Timespan, $interval, ($Name -join ','), $Aggregation
+        $read = Invoke-DbHubArm -Context $Context -Method GET -Path $query -ApiVersion (Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.Insights/metrics')
+        if ($read.StatusCode -ne 200) {
+            $why = $read.Error
+            if (-not $why) {
+                $why = 'HTTP {0}' -f $read.StatusCode
+            }
+            return [pscustomobject]@{ Series = $series.ToArray(); Error = $why }
+        }
+        foreach ($metric in @(Get-DbHubMember -InputObject $read.Body -Name 'value')) {
+            $metricName = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $metric -Name 'name') -Name 'value')
+            if ($metricName -notin $Name) {
+                continue
+            }
+            $points = New-Object -TypeName 'System.Collections.Generic.SortedDictionary[datetime,double]'
+            foreach ($timeseries in @(Get-DbHubMember -InputObject $metric -Name 'timeseries')) {
+                foreach ($point in @(Get-DbHubMember -InputObject $timeseries -Name 'data')) {
+                    $value = Get-DbHubMember -InputObject $point -Name $field
+                    $stamp = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $point -Name 'timeStamp')
+                    $number = 0.0
+                    if ($null -eq $value -or $null -eq $stamp -or $value -is [bool] -or -not [double]::TryParse([string]$value, [System.Globalization.NumberStyles]::Float, $invariant, [ref]$number) -or [double]::IsNaN($number) -or [double]::IsInfinity($number)) {
+                        continue
+                    }
+                    $points[[datetime]$stamp] = $number
+                }
+            }
+            $series.Add([pscustomobject]@{ Metric = $metricName; Unit = [string](Get-DbHubMember -InputObject $metric -Name 'unit'); Aggregation = $Aggregation; Points = $points })
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Series = $series.ToArray(); Error = (ConvertTo-DbHubSafeText -Text $_.Exception.Message) }
+    }
+    return [pscustomobject]@{ Series = $series.ToArray(); Error = '' }
+}
+
+function ConvertTo-DbHubMetricPoint {
+    <#
+    .SYNOPSIS
+    One series' points at IntervalMinutes, as the history document holds them (the module's
+    ConvertTo-DemoPostgresHistoryPoint): pairs of the interval's start (yyyy-MM-ddTHH:mm:ssZ, counted from midnight UTC)
+    and its value, the points of one interval combined as the aggregation combines them (Maximum the highest, Total the
+    sum, Minimum the lowest, Average the mean), rounded for the unit, and a whole number written without decimals. Pure.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object] $Point,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Aggregation,
+
+        [AllowEmptyString()]
+        [string] $Unit = '',
+
+        [Parameter(Mandatory = $true)]
+        [int] $IntervalMinutes
+    )
+
+    $epoch = New-Object -TypeName DateTime -ArgumentList 1970, 1, 1, 0, 0, 0, ([System.DateTimeKind]::Utc)
+    $decimals = 2
+    if ($script:DbHubMetricDecimals.ContainsKey($Unit)) {
+        $decimals = [int]$script:DbHubMetricDecimals[$Unit]
+    }
+    $buckets = New-Object -TypeName 'System.Collections.Generic.SortedDictionary[long,System.Collections.Generic.List[double]]'
+    if ($null -ne $Point) {
+        foreach ($pair in $Point.GetEnumerator()) {
+            $minutes = [long][System.Math]::Floor(($pair.Key - $epoch).TotalMinutes)
+            $bucket = [long]($minutes - ($minutes % $IntervalMinutes))
+            if (-not $buckets.ContainsKey($bucket)) {
+                $buckets[$bucket] = New-Object -TypeName 'System.Collections.Generic.List[double]'
+            }
+            $buckets[$bucket].Add([double]$pair.Value)
+        }
+    }
+    $output = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    foreach ($bucket in $buckets.GetEnumerator()) {
+        $values = $bucket.Value
+        $combined = $values[0]
+        foreach ($value in $values) {
+            switch ($Aggregation) {
+                'Total' { }
+                'Average' { }
+                'Minimum' {
+                    if ($value -lt $combined) { $combined = $value }
+                }
+                default {
+                    if ($value -gt $combined) { $combined = $value }
+                }
+            }
+        }
+        if ($Aggregation -in 'Total', 'Average') {
+            $combined = 0.0
+            foreach ($value in $values) {
+                $combined += $value
+            }
+            if ($Aggregation -eq 'Average') {
+                $combined = $combined / $values.Count
+            }
+        }
+        $rounded = [System.Math]::Round([double]$combined, $decimals, [System.MidpointRounding]::AwayFromZero)
+        $number = $rounded
+        if ($rounded -eq [System.Math]::Floor($rounded) -and [System.Math]::Abs($rounded) -lt 1e15) {
+            $number = [long]$rounded
+        }
+        $output.Add([object[]]@($epoch.AddMinutes($bucket.Key).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture), $number))
+    }
+    return , $output.ToArray()
+}
+
+function Get-DbHubPostgresMetricDocument {
+    <#
+    .SYNOPSIS
+    T4's and its read replica's Azure Monitor metrics from StartUtc to EndUtc as NB_DatabaseHub_LiveActivity's
+    POSTGRES_METRICS document (version 1, as the module's Get-DemoPostgresHistoryParameter builds it), with the session's
+    ID. Returns Json, Status (Pass, Warning, or Skipped), Message, ServerCount, SeriesCount, PointCount, IntervalMinutes,
+    Bytes, and Replica (whether the replica's metrics are in it). Never throws for an Azure error.
+
+    .DESCRIPTION
+    T4 (role primary): cpu_percent, memory_percent, active_connections, and physical_replication_delay_in_bytes, each its
+    Maximum per interval, and connections_failed, its Total. The replica (role replica): physical_replication_delay_in_seconds
+    (Read Replica Lag), cpu_percent, and active_connections, each its Maximum. A server that doesn't exist or has no data is
+    left out. At most MaxBytes of UTF-8: coarser intervals until it fits. No resource ID, subscription, or credential.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $StartUtc,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $EndUtc,
+
+        [AllowEmptyString()]
+        [string] $SessionId = '',
+
+        [int] $MaxBytes = 24000
+    )
+
+    $settings = $Context.Settings
+    $answer = {
+        param([string] $Status, [string] $Message, [string] $Json = '', [int] $Servers = 0, [int] $Series = 0, [int] $Points = 0, [int] $Interval = 1, [bool] $Replica = $false)
+        [pscustomobject]@{ Json = $Json; Status = $Status; Message = $Message; ServerCount = $Servers; SeriesCount = $Series; PointCount = $Points; IntervalMinutes = $Interval; Bytes = [System.Text.Encoding]::UTF8.GetByteCount($Json); Replica = $Replica }
+    }
+    $deploymentId = [string](Get-DbHubMember -InputObject $Tags -Name 'deploymentId')
+    if ($deploymentId -notmatch '^[a-z0-9]{6}$') {
+        return (& $answer 'Skipped' 'The demo resource group has no deploymentId tag, so T4 isn''t known and no metrics were read.')
+    }
+    $end = [DateTime]::SpecifyKind($EndUtc, [System.DateTimeKind]::Utc)
+    $end = New-Object -TypeName DateTime -ArgumentList ($end.Ticks - ($end.Ticks % [TimeSpan]::TicksPerMinute)), ([System.DateTimeKind]::Utc)
+    $start = [DateTime]::SpecifyKind($StartUtc, [System.DateTimeKind]::Utc)
+    $start = New-Object -TypeName DateTime -ArgumentList ($start.Ticks - ($start.Ticks % [TimeSpan]::TicksPerMinute)), ([System.DateTimeKind]::Utc)
+    if ($start -ge $end) {
+        $start = $end.AddMinutes(-15)
+    }
+    $timespan = '{0}/{1}' -f (ConvertTo-DbHubTimeText -Value $start), (ConvertTo-DbHubTimeText -Value $end)
+    $demo = Get-DbHubDemoPath -Settings $settings
+    $wanted = @([pscustomobject]@{ Role = 'primary'; Target = 'T4'; Name = ('{0}{1}' -f $settings.t4ServerPrefix, $deploymentId) })
+    $prefix = [string](Get-DbHubMember -InputObject $settings -Name 't4ReplicaPrefix')
+    if ($prefix) {
+        $wanted += [pscustomobject]@{ Role = 'replica'; Target = 'T4-replica'; Name = ('{0}{1}' -f $prefix, $deploymentId) }
+    }
+    $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
+    $servers = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $series = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $notes = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $failed = $false
+    foreach ($server in $wanted) {
+        $path = '{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f $demo, $server.Name
+        $read = Invoke-DbHubArm -Context $Context -Method GET -Path $path -ApiVersion $version
+        if ($read.StatusCode -eq 404) {
+            $notes.Add(('{0} isn''t there, so it''s left out.' -f $server.Name))
+            if ($server.Role -eq 'primary') {
+                break
+            }
+            continue
+        }
+        $sku = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'sku') -Name 'name')
+        $found = 0
+        foreach ($group in $script:DbHubMetricReads[$server.Role]) {
+            $metrics = Read-DbHubMetric -Context $Context -ServerPath $path -Name $group.Names -Aggregation $group.Aggregation -Timespan $timespan -IntervalMinutes 1
+            if ($metrics.Error) {
+                $failed = $true
+                $notes.Add(('{0}''s {1} couldn''t be read: {2}' -f $server.Name, ($group.Names -join ', '), $metrics.Error))
+            }
+            foreach ($item in @($metrics.Series)) {
+                if ($item.Points.Count -gt 0) {
+                    $series.Add([pscustomobject]@{ ResourceName = $server.Name; Role = $server.Role; Metric = $item.Metric; Aggregation = $item.Aggregation; Unit = $item.Unit; Points = $item.Points })
+                    $found++
+                }
+            }
+        }
+        if ($found -gt 0) {
+            $servers.Add([ordered]@{ role = $server.Role; target = $server.Target; resourceName = $server.Name; sku = $sku })
+        }
+        elseif (-not $failed) {
+            $notes.Add(('{0} had no Azure Monitor data in the window, so it''s left out.' -f $server.Name))
+        }
+    }
+    $hasReplica = @($servers | Where-Object { $_['role'] -eq 'replica' }).Count -gt 0
+    if ($series.Count -eq 0) {
+        return (& $answer 'Warning' ('No PostgreSQL metrics were captured: {0}' -f ($notes -join ' ')))
+    }
+    $json = ''
+    $bytes = 0
+    $interval = 1
+    $points = 0
+    foreach ($step in $script:DbHubMetricIntervals) {
+        $interval = $step
+        $points = 0
+        $out = @()
+        foreach ($item in $series) {
+            $converted = ConvertTo-DbHubMetricPoint -Point $item.Points -Aggregation $item.Aggregation -Unit $item.Unit -IntervalMinutes $step
+            $points += @($converted).Count
+            $out += , ([ordered]@{ resourceName = $item.ResourceName; role = $item.Role; metric = $item.Metric; aggregation = $item.Aggregation; unit = $item.Unit; points = $converted })
+        }
+        $document = [ordered]@{
+            version         = 1
+            sessionId       = $SessionId
+            capturedBy      = 'control'
+            capturedUtc     = (ConvertTo-DbHubTimeText -Value $end)
+            startUtc        = (ConvertTo-DbHubTimeText -Value $start)
+            endUtc          = (ConvertTo-DbHubTimeText -Value $end)
+            windowMinutes   = [int][System.Math]::Round(($end - $start).TotalMinutes)
+            intervalMinutes = $step
+            servers         = $servers.ToArray()
+            series          = $out
+        }
+        $json = ConvertTo-Json -InputObject $document -Depth 8 -Compress
+        $bytes = [System.Text.Encoding]::UTF8.GetByteCount($json)
+        if ($bytes -le $MaxBytes) {
+            break
+        }
+    }
+    if ($bytes -gt $MaxBytes) {
+        return (& $answer 'Warning' ('T4''s metrics are too large for the control vault even at {0}-minute intervals ({1:N0} bytes), so none were kept.' -f $interval, $bytes))
+    }
+    $status = 'Pass'
+    if ($failed) {
+        $status = 'Warning'
+    }
+    $names = @($servers | ForEach-Object { $_['resourceName'] }) -join ' and '
+    $message = 'Azure Monitor metrics for the history: {0}, {1} series and {2:N0} points from {3:HH:mm} to {4:HH:mm} UTC, every {5} minute(s) ({6:N1} KB).' -f $names, $series.Count, $points, $start, $end, $interval, ($bytes / 1024.0)
+    if ($notes.Count -gt 0) {
+        $message = '{0} {1}' -f $message, ($notes -join ' ')
+    }
+    return (& $answer $status $message $json $servers.Count $series.Count $points $interval $hasReplica)
+}
+
+function Save-DbHubSessionMetric {
+    <#
+    .SYNOPSIS
+    The session's history metrics into the control vault (metricsName), for the control notebook to hand to
+    NB_DatabaseHub_LiveActivity, which can't read Azure Monitor: from 10 minutes before the session's start (the group's
+    DbHubSessionStartUtc, at most 6 hours back; 3 hours without one) to now. Returns Status (Pass, Warning, Skipped, or
+    Failed), Message, Bytes, and Replica.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [AllowEmptyString()]
+        [string] $SessionId = ''
+    )
+
+    $now = Get-DbHubUtcNow
+    $session = $SessionId
+    if (-not $session) {
+        $session = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId')
+    }
+    $from = $now.AddMinutes(-180)
+    $started = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionStartUtc')
+    if ($null -ne $started -and $started -lt $now -and $started -gt $now.AddHours(-6)) {
+        $from = $started.AddMinutes(-10)
+    }
+    $document = Get-DbHubPostgresMetricDocument -Context $Context -Tags $Tags -StartUtc $from -EndUtc $now -SessionId $session
+    if (-not $document.Json) {
+        return [pscustomobject]@{ Status = $document.Status; Message = $document.Message; Bytes = 0; Replica = $false }
+    }
+    $name = [string](Get-DbHubMember -InputObject $Context.Settings -Name 'metricsName')
+    if (-not $name) {
+        $name = 'dbhub-session-metrics'
+    }
+    $replicaText = 'no'
+    if ($document.Replica) {
+        $replicaText = 'yes'
+    }
+    $written = Set-DbHubVaultSecret -Context $Context -Name $name -Value $document.Json -Tags @{ sessionId = $session; capturedUtc = (ConvertTo-DbHubTimeText -Value $now); replica = $replicaText }
+    if (-not $written.Ok) {
+        return [pscustomobject]@{ Status = 'Failed'; Message = ('The history''s metrics couldn''t be written to the control vault: {0}' -f $written.Error); Bytes = 0; Replica = $document.Replica }
+    }
+    Write-DbHubLog -Context $Context -Message $document.Message
+    return [pscustomobject]@{ Status = $document.Status; Message = $document.Message; Bytes = $document.Bytes; Replica = $document.Replica }
+}
+
+function Start-DbHubSession {
+    <#
+    .SYNOPSIS
+    The session action (ADR 0026, 2026-11-14), the control notebook's one Run all: the whole demo session, with its
+    progress in the control vault for the notebook. Returns the job's result.
+
+    .DESCRIPTION
+    1. Refused while a run is active (Get-DbHubActiveRun), with the reason in the status.
+    2. The plan (Get-DbHubRunPlan): the showcase on every target for the session's minutes, ending before the VMs' next
+       auto-shutdown, as a run does: the profile hosts on the VMs end their activity there. A shorter session than asked
+       ends after its last whole showcase cycle (cycleMinutes), so no beat is cut off, and says so, with when it ends and
+       why; one with less than minSessionMinutes left is refused.
+    3. The busy marker (DbHubBusyUntilUtc, DbHubBusyBy session) until busyMarginMinutes after the auto-stop, with the
+       session's ID and start (DbHubSessionId, DbHubSessionStartUtc): the nightly stop's passes and the control's T4 stop
+       leave the session to its own auto-stop, which saves the metrics and deletes the replica.
+    4. The run (Start-DbHubActivityRun) with this plan: the auto-stop and its second, then the starts and the dispatches.
+       Once T4 is Ready, its read replica is asked for (Start-DbHubSessionReplica), and after the dispatches the job waits
+       for it (Complete-DbHubSessionReplica).
+    5. The replica-lag beat's windows from when T4's profile was set (Get-DbHubReplicaLagPlan), or why it won't run.
+    The job ends with the session going on; its auto-stop ends it.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Request,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [int] $WaitMinutes = 15,
+
+        [int] $T4WaitMinutes = 20,
+
+        [int] $PollSeconds = 20
+    )
+
+    $settings = $Context.Settings
+    $result = [ordered]@{ action = 'session'; status = 'Refused'; message = ''; sessionId = [string]$Request.SessionId; runEndUtc = ''; autoStopUtc = ''; replica = ''; dispatched = @(); skipped = @() }
+    if (-not $PSCmdlet.ShouldProcess($settings.demoResourceGroup, 'Start a demo session')) {
+        $result.message = 'What if: nothing was started.'
+        return [pscustomobject]$result
+    }
+    if (-not (Test-DbHubSessionCapable -Settings $settings)) {
+        $result.message = 'The control''s runbook settings predate the session (2026-11-14): run ./scripts/deploy.ps1, which publishes them again.'
+        return [pscustomobject]$result
+    }
+    $status = New-DbHubSessionStatus -Context $Context -SessionId ([string]$Request.SessionId) -RequestedBy ([string]$Request.RequestedBy) -DurationMinutes ([int]$Request.DurationMinutes) -Tags $Tags
+    $sessionShared = @{ Status = $status; Context = $Context; Tags = $Tags; Work = $null; LastWriteUtc = [datetime]::MinValue; PollSeconds = $PollSeconds }
+    $null = Write-DbHubSessionStatus -Context $Context -Status $status -Phase 'accepted'
+    $refuse = {
+        param([string] $Message, [string] $Fix)
+        Add-DbHubSessionStep -Status $status -Step 'Start' -State 'Fail' -Message $Message -Fix $Fix
+        $status['message'] = $Message
+        $null = Write-DbHubSessionStatus -Context $Context -Status $status -Phase 'refused'
+        $result.message = $Message
+        return [pscustomobject]$result
+    }
+
+    $active = Get-DbHubActiveRun -Context $Context
+    if ($active.Active) {
+        return (& $refuse $active.Reason 'Wait until it ends, or run the notebook''s Stop now cell first.')
+    }
+    $zone = [System.TimeZoneInfo]::Utc
+    try {
+        $zone = [System.TimeZoneInfo]::FindSystemTimeZoneById([string]$settings.autoShutdownTimeZone)
+    }
+    catch {
+        $zone = [System.TimeZoneInfo]::Utc
+    }
+    $clock = {
+        param([datetime] $Utc)
+        [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::SpecifyKind($Utc, [System.DateTimeKind]::Utc), $zone).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc
+    $minimum = [int](Get-DbHubMember -InputObject $settings -Name 'minSessionMinutes')
+    if ($minimum -le 0) {
+        $minimum = 30
+    }
+    $planned = [int][System.Math]::Floor(($plan.RunEndUtc - $Context.NowUtc).TotalMinutes)
+    $status['autoShutdownUtc'] = ConvertTo-DbHubTimeText -Value $plan.ShutdownUtc
+    if (-not $plan.Valid -or $planned -lt $minimum) {
+        return (& $refuse ('The VMs shut down at {0} ({1}), too soon for a session of at least {2} minutes, so nothing was started.' -f (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $minimum) 'Run all again earlier in the day, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.')
+    }
+    # A session that the auto-shutdown cuts short ends after its last whole showcase cycle (2026-11-14), so no beat stops
+    # midway when the VMs' activity ends.
+    $wholeCycles = $false
+    $cycle = [int](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $settings -Name 'profiles') -Name 'showcase') -Name 'cycleMinutes')
+    if ($planned -lt [int]$Request.DurationMinutes - 1 -and $cycle -gt 0 -and $planned -ge $cycle) {
+        if (($planned % $cycle) -ne 0) {
+            $shorter = $Request.PSObject.Copy()
+            $shorter.DurationMinutes = [int]([System.Math]::Floor($planned / $cycle) * $cycle)
+            $plan = Get-DbHubRunPlan -Request $shorter -Settings $settings -NowUtc $Context.NowUtc
+            $planned = [int][System.Math]::Floor(($plan.RunEndUtc - $Context.NowUtc).TotalMinutes)
+        }
+        $wholeCycles = $true
+    }
+    $status['plannedMinutes'] = $planned
+    if ($planned -lt [int]$Request.DurationMinutes - 1) {
+        $cycleText = ''
+        if ($wholeCycles) {
+            $count = [int]($planned / $cycle)
+            $noun = 'cycles'
+            if ($count -eq 1) {
+                $noun = 'cycle'
+            }
+            $cycleText = ' It ends after {0} whole {1}-minute showcase {2}, so no beat is cut off.' -f $count, $cycle, $noun
+        }
+        Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Warning' -Message ('This session runs {0} of the {1} minutes asked: it ends at {2}, before the VMs'' auto-shutdown at {3} ({4}), when the activity on the VMs ends.{5}' -f $planned, $Request.DurationMinutes, (& $clock $plan.RunEndUtc), (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $cycleText) -Fix 'For a full session, Run all earlier, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.'
+    }
+    else {
+        Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Pass' -Message ('The showcase runs {0} minutes on every target, until {1} ({2}).' -f $planned, (& $clock $plan.RunEndUtc), $settings.autoShutdownTimeZone)
+    }
+
+    # The busy marker: the nightly stop leaves the session to its own auto-stop (2026-11-14).
+    $margin = [int](Get-DbHubMember -InputObject $settings -Name 'busyMarginMinutes')
+    if ($margin -le 0) {
+        $margin = 15
+    }
+    $busyUntil = $plan.AutoStopUtc.AddMinutes($margin)
+    $marked = Set-DbHubResourceGroupTag -Context $Context -Tags @{ DbHubBusyUntilUtc = (ConvertTo-DbHubTimeText -Value $busyUntil); DbHubBusyBy = 'session'; DbHubSessionId = [string]$Request.SessionId; DbHubSessionStartUtc = (ConvertTo-DbHubTimeText -Value $Context.NowUtc) }
+    if ($marked.Ok) {
+        $status['busy']['marked'] = $true
+        $status['busy']['untilUtc'] = ConvertTo-DbHubTimeText -Value $busyUntil
+        $text = 'The demo is marked busy until {0} ({1}).' -f (& $clock $busyUntil), $settings.autoShutdownTimeZone
+        if ($plan.ShutdownUtc -le $busyUntil) {
+            $status['busy']['nightlyStopUtc'] = ConvertTo-DbHubTimeText -Value $plan.ShutdownUtc
+            $text = '{0} The nightly stop at {1} waits for it: the session''s own auto-stop at {2} saves its metrics, deletes T4''s read replica, and stops everything.' -f $text, (& $clock $plan.ShutdownUtc), (& $clock $plan.AutoStopUtc)
+        }
+        $status['busy']['note'] = $text
+        Add-DbHubSessionStep -Status $status -Step 'Busy' -State 'Pass' -Message $text
+    }
+    else {
+        $status['busy']['note'] = 'The demo couldn''t be marked busy ({0}), so a nightly stop that comes before the session''s auto-stop may stop T4 and its read replica first; the auto-stop still deletes the replica.' -f $marked.Error
+        Add-DbHubSessionStep -Status $status -Step 'Busy' -State 'Warning' -Message $status['busy']['note'] -Fix 'An Owner runs ./scripts/grant-safety-stop.ps1 once.'
+    }
+    $null = Write-DbHubSessionStatus -Context $Context -Status $status -Phase 'starting'
+
+    # The run, which asks for T4's read replica as soon as T4 is Ready.
+    $onProgress = {
+        param([string] $Kind, [string] $Detail)
+        $shared = $sessionShared
+        switch ($Kind) {
+            'autostop' { $shared.Status['autoStopUtc'] = $Detail }
+            'backup' { $shared.Status['autoStopBackupUtc'] = $Detail }
+            'vm-start' { Add-DbHubSessionStep -Status $shared.Status -Step 'Start' -State 'Info' -Message ('{0} is starting.' -f $Detail) }
+            't4-start' { Add-DbHubSessionStep -Status $shared.Status -Step 'T4' -State 'Info' -Message ('T4 ({0}) is starting.' -f $Detail) }
+            'dispatched' {
+                Add-DbHubSessionStep -Status $shared.Status -Step 'Activity' -State 'Pass' -Message $Detail
+                $target = ($Detail -split ':')[0]
+                if ($target -match '^T[1-4]$') {
+                    $shared.Status['dispatchUtc'][$target] = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
+                }
+                if ($Detail -like 'T4:*') {
+                    $shared.Status['t4']['dispatchUtc'] = ConvertTo-DbHubTimeText -Value (Get-DbHubUtcNow)
+                }
+            }
+            'skipped' { Add-DbHubSessionStep -Status $shared.Status -Step 'Activity' -State 'Warning' -Message $Detail }
+        }
+        $now = Get-DbHubUtcNow
+        if (($now - $shared.LastWriteUtc).TotalSeconds -ge 40) {
+            $shared.LastWriteUtc = $now
+            $null = Write-DbHubSessionStatus -Context $shared.Context -Status $shared.Status
+        }
+    }
+    $onT4Ready = {
+        $shared = $sessionShared
+        if ($null -eq $shared.Work) {
+            Add-DbHubSessionStep -Status $shared.Status -Step 'T4' -State 'Pass' -Message 'T4 is Ready; its read replica is asked for now.'
+            $shared.Work = Start-DbHubSessionReplica -Context $shared.Context -Tags $shared.Tags -Status $shared.Status -RaceMinutes 0 -PollSeconds $shared.PollSeconds
+            $shared.LastWriteUtc = Get-DbHubUtcNow
+            $null = Write-DbHubSessionStatus -Context $shared.Context -Status $shared.Status
+        }
+    }
+    $run = Start-DbHubActivityRun -Context $Context -Request $Request -Tags $Tags -Plan $plan -OnProgress $onProgress -OnT4Ready $onT4Ready -WaitMinutes $WaitMinutes -T4WaitMinutes $T4WaitMinutes -PollSeconds $PollSeconds
+    $result.runEndUtc = [string]$run.runEndUtc
+    $result.autoStopUtc = [string]$run.autoStopUtc
+    $result.dispatched = @($run.dispatched)
+    $result.skipped = @($run.skipped)
+    $status['runEndUtc'] = [string]$run.runEndUtc
+    $status['dispatched'] = @($run.dispatched)
+    $status['skipped'] = @($run.skipped)
+    $status['monitoring'] = [string]$run.monitoring
+    $status['runCommands'] = @(@(Get-DbHubMember -InputObject $run -Name 'runCommands') | Where-Object { $null -ne $_ })
+    if ([string]$run.status -ne 'Dispatched') {
+        # Refused (the auto-stop couldn't be created, or there was nothing to run) or Failed (nothing could be dispatched,
+        # so the run stopped everything again). The group's tags were read before the marker was set, so it's cleared here.
+        if ($marked.Ok) {
+            $null = Set-DbHubResourceGroupTag -Context $Context -Tags @{ DbHubBusyUntilUtc = ''; DbHubBusyBy = '' }
+        }
+        Add-DbHubSessionStep -Status $status -Step 'Start' -State 'Fail' -Message ([string]$run.message) -Fix 'Run all again; ./scripts/status.ps1 shows what''s stopped or missing, and ./scripts/start-demo.ps1 starts the demo with more detail.'
+        $status['message'] = [string]$run.message
+        $phase = 'failed'
+        if ([string]$run.status -eq 'Refused') {
+            $phase = 'refused'
+        }
+        $null = Write-DbHubSessionStatus -Context $Context -Status $status -Phase $phase
+        $result.status = [string]$run.status
+        $result.message = [string]$run.message
+        return [pscustomobject]$result
+    }
+
+    # T4's read replica: asked for once T4 was Ready, or now; then waited for.
+    $t4Now = Get-DbHubT4 -Context $Context -Tags $Tags
+    $status['t4']['state'] = [string]$t4Now.State
+    $status['t4']['sku'] = [string]$t4Now.SkuName
+    $status['t4']['tier'] = [string]$t4Now.Tier
+    if ($null -eq $sessionShared.Work) {
+        if ($t4Now.State -eq 'Ready') {
+            $sessionShared.Work = Start-DbHubSessionReplica -Context $Context -Tags $Tags -Status $status -PollSeconds $PollSeconds
+        }
+        else {
+            $status['replica']['state'] = 'NotCreated'
+            $status['replica']['note'] = 'T4 is {0}, so its read replica wasn''t created this session, and the replica-lag beat doesn''t run.' -f $(if ($t4Now.State) { $t4Now.State } else { 'unknown' })
+            $status['replica']['fix'] = 'Run all again once T4 runs; ./scripts/status.ps1 shows T4.'
+        }
+    }
+    if ($null -ne $sessionShared.Work -and -not $sessionShared.Work.Done) {
+        $null = Write-DbHubSessionStatus -Context $Context -Status $status -Phase 'replica'
+        $setting = Get-DbHubSessionReplicaSetting -Settings $settings
+        $sessionShared.Work = Complete-DbHubSessionReplica -Context $Context -Tags $Tags -Status $status -Work $sessionShared.Work -WaitMinutes $setting.WaitMinutes -PollSeconds $PollSeconds
+    }
+    $replicaState = [string]$status['replica']['state']
+    $replicaLevel = 'Pass'
+    if ($replicaState -ne 'Ready') {
+        $replicaLevel = 'Warning'
+        if ($replicaState -eq 'NotSupported') {
+            $replicaLevel = 'Info'
+        }
+    }
+    $replicaText = 'T4''s read replica ({0}) is Ready.' -f $status['names']['t4Replica']
+    if ($replicaState -ne 'Ready') {
+        $replicaText = [string]$status['replica']['note']
+    }
+    elseif ([string]$status['replica']['note']) {
+        $replicaText = '{0} {1}' -f $replicaText, $status['replica']['note']
+    }
+    Add-DbHubSessionStep -Status $status -Step 'Replica' -State $replicaLevel -Message $replicaText -Fix ([string]$status['replica']['fix'])
+    $result.replica = $replicaText
+
+    # The replica-lag beat: the showcase's slot in T4's even cycles, on T1's profile host, with the replica Ready.
+    $dispatchUtc = ConvertTo-DbHubUtc -Value $status['t4']['dispatchUtc']
+    $lag = $status['replicaLag']
+    if ($replicaState -eq 'Ready' -and $null -ne $dispatchUtc -and [string]$t4Now.Tier -eq 'GeneralPurpose') {
+        $windows = Get-DbHubReplicaLagPlan -ProfileSetUtc $dispatchUtc -RunEndUtc $plan.RunEndUtc
+        $lag['windows'] = $windows
+        if (@($windows).Count -gt 0) {
+            $lag['planned'] = $true
+            $lag['note'] = 'Read replica lag climbs to about 3 minutes, twice, from {0} ({1}) for 9 minutes: the showcase''s replica-lag beat on T1''s profile host, which knows the replica from deploy.ps1.' -f (& $clock (ConvertTo-DbHubUtc -Value $windows[0]['startUtc'])), $settings.autoShutdownTimeZone
+            Add-DbHubSessionStep -Status $status -Step 'ReplicaLag' -State 'Pass' -Message $lag['note']
+        }
+        else {
+            $lag['note'] = 'The session ends before the showcase''s replica-lag beat (50 minutes after T4''s profile was set), so Read replica lag stays at a few seconds.'
+            $lag['fix'] = 'Run all with a longer session (durationMinutes), earlier in the day.'
+            Add-DbHubSessionStep -Status $status -Step 'ReplicaLag' -State 'Info' -Message $lag['note'] -Fix $lag['fix']
+        }
+    }
+    else {
+        $why = 'T4''s read replica isn''t Ready'
+        if ($replicaState -eq 'Ready' -and $null -eq $dispatchUtc) {
+            $why = 'T4''s activity wasn''t dispatched'
+        }
+        elseif ($replicaState -eq 'Ready') {
+            $why = 'T4 isn''t on the General Purpose tier'
+        }
+        $lag['note'] = 'The replica-lag beat doesn''t run this session: {0}.' -f $why
+        $lag['fix'] = [string]$status['replica']['fix']
+        # A Burstable T4 has no replica by Azure's rules (Not supported): that's said once, with the replica.
+        $lagLevel = 'Warning'
+        if ($replicaState -eq 'NotSupported') {
+            $lagLevel = 'Info'
+        }
+        Add-DbHubSessionStep -Status $status -Step 'ReplicaLag' -State $lagLevel -Message $lag['note'] -Fix $lag['fix']
+    }
+
+    # The session's hosts as its start ends (2026-11-16): a VM whose start failed or that stopped, or a dispatch Run
+    # Command that failed, is a Warning now; DbHub-Monitor's re-checks look again while the session runs.
+    $null = Add-DbHubSessionHealthStep -Status $status -Finding @(Get-DbHubSessionHealth -Context $Context -Status $status)
+
+    $warnings = @(@($status['steps']) | Where-Object { $_['state'] -in 'Warning', 'Fail' }).Count
+    $result.status = 'Started'
+    if ($warnings -gt 0 -or @($run.skipped).Count -gt 0) {
+        $result.status = 'Partial'
+    }
+    $result.message = 'The session runs until {0} UTC, and its auto-stop at {1} saves the metrics, deletes the replica, and stops everything. {2}' -f $result.runEndUtc, $result.autoStopUtc, $replicaText
+    $status['message'] = $result.message
+    $null = Write-DbHubSessionStatus -Context $Context -Status $status -Phase 'running'
+    return [pscustomobject]$result
+}
+
+function Invoke-DbHubCapture {
+    # The capture action (2026-11-14): T4's and its read replica's Azure Monitor metrics into the control vault, for the
+    # history; nothing is started or stopped.
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Request,
+
+        [AllowNull()]
+        [object] $Tags
+    )
+
+    if (-not (Test-DbHubSessionCapable -Settings $Context.Settings)) {
+        return [pscustomobject]@{ action = 'capture'; status = 'Refused'; message = 'The control''s runbook settings predate the session (2026-11-14): run ./scripts/deploy.ps1, which publishes them again.'; sessionId = [string]$Request.SessionId }
+    }
+    $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId ([string]$Request.SessionId)
+    $state = 'Captured'
+    if ($saved.Status -eq 'Warning') {
+        $state = 'Partial'
+    }
+    elseif ($saved.Status -ne 'Pass') {
+        $state = 'Failed'
+    }
+    return [pscustomobject]@{ action = 'capture'; status = $state; message = $saved.Message; sessionId = [string]$Request.SessionId; bytes = $saved.Bytes; replica = $saved.Replica }
+}
+
+function Write-DbHubStopStatus {
+    # After Stop now or an auto-stop of a session (2026-11-14): the session's status says it stopped, what was done, and
+    # what failed, for the control notebook. Only when a session is known (the request's or the group's DbHubSessionId).
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [AllowEmptyString()]
+        [string] $SessionId = '',
+
+        [Parameter(Mandatory = $true)]
+        [object] $Stopped,
+
+        [Parameter(Mandatory = $true)]
+        [string] $By
+    )
+
+    if (-not (Test-DbHubSessionCapable -Settings $Context.Settings)) {
+        return
+    }
+    $session = $SessionId
+    if (-not $session) {
+        $session = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId')
+    }
+    if ($session -notmatch '^[0-9a-f]{32}$') {
+        return
+    }
+    $status = [ordered]@{ schemaVersion = 1; sessionId = $session; phase = 'stopped'; updatedUtc = ''; stoppedBy = $By; jobId = [string]$Context.JobId; done = @($Stopped.Done); failed = @($Stopped.Failed); metrics = [ordered]@{ status = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsStatus'); message = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsMessage') } }
+    $null = Write-DbHubSessionStatus -Context $Context -Status $status
+}
+
 function Invoke-DbHubControl {
     <#
     .SYNOPSIS
     DbHub-Control's entry point: validates the webhook request, checks that the demo environment exists and that the
-    identity can read it (A1), then runs, stops, or resets. A bad request is refused, never thrown.
+    identity can read it (A1), then runs, starts a session (the control notebook's Run all, 2026-11-14), captures the
+    history's metrics, stops, or resets. A bad request is refused, never thrown.
     #>
     param(
         [AllowNull()]
@@ -2584,17 +5136,24 @@ function Invoke-DbHubControl {
         return [pscustomobject]@{ action = $request.Action; status = 'NoEnvironment'; message = ('Nothing was done: {0}.' -f $why) }
     }
     if ($request.Action -eq 'stop') {
-        $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags
+        $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags -SessionId $request.SessionId
         $status = 'Stopped'
         $failedText = ''
         if (@($stopped.Failed).Count -gt 0) {
             $status = 'Partial'
             $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
         }
+        Write-DbHubStopStatus -Context $Context -Tags $group.Tags -SessionId $request.SessionId -Stopped $stopped -By 'Stop now'
         return [pscustomobject]@{ action = 'stop'; status = $status; message = ('Stop now: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed }
     }
     if ($request.Action -eq 'reset') {
         return (Reset-DbHubActivity -Context $Context -Request $request -Tags $group.Tags)
+    }
+    if ($request.Action -eq 'session') {
+        return (Start-DbHubSession -Context $Context -Request $request -Tags $group.Tags)
+    }
+    if ($request.Action -eq 'capture') {
+        return (Invoke-DbHubCapture -Context $Context -Request $request -Tags $group.Tags)
     }
     return (Start-DbHubActivityRun -Context $Context -Request $request -Tags $group.Tags)
 }
@@ -2607,7 +5166,8 @@ function Invoke-DbHubStop {
     Nightly (the nightly safety stop, ADR 0024): deallocates the VMs and stops T4 (Invoke-DbHubNightlyStop). Scope T3Check (its
     check, ADR 0024): reads T3's status and stops T4 when it runs (Invoke-DbHubT3Check). None of them starts anything.
     Nightly and T3Check say when the safety stop's identity can't read the demo resource group (NotGranted: its role isn't
-    assigned).
+    assigned). Nightly, T3Check, and T4 are Deferred while the group's busy marker is active (Get-DbHubBusyMarker,
+    2026-11-14): a deploy.ps1 run or a demo session that's still running isn't cut off.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -2643,6 +5203,14 @@ function Invoke-DbHubStop {
         }
         return [pscustomobject]@{ action = $label; status = 'NoEnvironment'; message = ('The demo resource group is {0}; nothing was stopped.' -f $group.GroupState) }
     }
+    if ($Scope -in 'Nightly', 'T3Check', 'T4') {
+        # The busy marker (2026-11-14): a deploy.ps1 run or a demo session that's still running isn't cut off by a nightly
+        # pass; an expired marker no longer defers anything (Get-DbHubBusyMarker).
+        $deferred = Get-DbHubBusyDeferral -Label $label -Tags $group.Tags -Context $Context
+        if ($null -ne $deferred) {
+            return $deferred
+        }
+    }
     if ($Scope -eq 'T3Check') {
         return (Invoke-DbHubT3Check -Context $Context -Tags $group.Tags -PollSeconds $PollSeconds)
     }
@@ -2654,10 +5222,16 @@ function Invoke-DbHubStop {
             $status = 'Partial'
             $failedText = '; failed: ' + (@($nightly.Failed) -join ', ')
         }
-        return [pscustomobject]@{ action = $label; status = $status; message = ('Nightly safety stop: {0}{1}.' -f (@($nightly.Done) -join ', '), $failedText); done = $nightly.Done; failed = $nightly.Failed; vms = $nightly.Vms; t4 = $nightly.T4 }
+        return [pscustomobject]@{ action = $label; status = $status; message = ('Nightly safety stop: {0}{1}.' -f (@($nightly.Done) -join ', '), $failedText); done = $nightly.Done; failed = $nightly.Failed; vms = $nightly.Vms; t4 = $nightly.T4; replica = $nightly.Replica }
     }
     if ($Scope -eq 'T4') {
         $t4 = Get-DbHubT4 -Context $Context -Tags $group.Tags
+        # T4's read replica, when a session left it behind (ADR 0025): stopped once T4 is, which waits for T4's stop.
+        $replicaPart = {
+            param([string] $T4Outcome)
+            $replica = Invoke-DbHubT4ReplicaStop -Context $Context -Tags $group.Tags -T4Outcome $T4Outcome -WaitMinutes (Get-DbHubT4WaitMinute -Settings $Context.Settings) -PollSeconds $PollSeconds
+            return [pscustomobject]@{ Failed = ($replica.Outcome -eq 'Failed'); Text = (Get-DbHubT4ReplicaStopText -Outcome $replica) }
+        }
         if ($t4.State -in 'Ready', 'Starting', 'Updating') {
             $sent = Invoke-DbHubT4Action -Context $Context -Name $t4.Name -Action stop
             $status = 'Partial'
@@ -2666,17 +5240,28 @@ function Invoke-DbHubStop {
                 $status = 'Stopped'
                 $outcome = 'accepted'
             }
-            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 ({0}) was {1}; its stop was {2}.' -f $t4.Name, $t4.State, $outcome) }
+            $replicaDone = & $replicaPart $(if ($sent) { 'Sent' } else { 'Failed' })
+            if ($replicaDone.Failed) {
+                $status = 'Partial'
+            }
+            $replicaSentence = if ($replicaDone.Text) { ' {0}.' -f $replicaDone.Text } else { '' }
+            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 ({0}) was {1}; its stop was {2}.{3}' -f $t4.Name, $t4.State, $outcome, $replicaSentence); replica = $replicaDone.Text }
+        }
+        $replicaDone = & $replicaPart ''
+        if ($replicaDone.Text) {
+            $status = if ($replicaDone.Failed) { 'Partial' } else { 'Stopped' }
+            return [pscustomobject]@{ action = $label; status = $status; message = ('T4 is {0}. {1}.' -f $t4.State, $replicaDone.Text); replica = $replicaDone.Text }
         }
         return [pscustomobject]@{ action = $label; status = 'Skipped'; message = ('T4 is {0}; nothing to stop.' -f $t4.State) }
     }
-    $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags
+    $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags -PollSeconds $PollSeconds
     $status = 'Stopped'
     $failedText = ''
     if (@($stopped.Failed).Count -gt 0) {
         $status = 'Partial'
         $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
     }
+    Write-DbHubStopStatus -Context $Context -Tags $group.Tags -Stopped $stopped -By 'Auto-stop'
     return [pscustomobject]@{ action = $label; status = $status; message = ('Auto-stop: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed }
 }
 
@@ -2711,11 +5296,18 @@ function Invoke-DbHubMonitor {
         Write-DbHubLog -Context $Context -Message ('Nothing to check: {0}.' -f $why)
         return [pscustomobject]@{ action = 'monitor'; status = 'Skipped'; monitoring = ''; message = ('Nothing was checked: {0}.' -f $why) }
     }
+    # A running session's hosts first (2026-11-16): a VM that stopped or whose start failed, or a dispatch Run Command that
+    # failed, goes into the session's status as a Warning, which Run all's live cell prints.
+    $health = Update-DbHubSessionHealth -Context $Context -Tags $group.Tags
     $vm = [string]$settings.sqlVmName
     $state = Get-DbHubVmState -Context $Context -VmName $vm
     if ($state -ne 'running') {
         Write-DbHubLog -Context $Context -Message ('Nothing to check: {0} is {1}.' -f $vm, $state)
-        return [pscustomobject]@{ action = 'monitor'; status = 'Skipped'; monitoring = ''; message = ('Nothing was checked: {0} is {1}.' -f $vm, $state) }
+        $skippedStatus = 'Skipped'
+        if ($health.Outcome -in 'Warned', 'Known') {
+            $skippedStatus = 'Partial'
+        }
+        return [pscustomobject]@{ action = 'monitor'; status = $skippedStatus; monitoring = ''; session = $health.Outcome; message = ('T1''s monitoring plugin wasn''t checked: {0} is {1}.{2}' -f $vm, $state, $health.Note) }
     }
     $stamp = $Context.NowUtc.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
     $look = Initialize-DbHubMonitorState
@@ -2742,8 +5334,8 @@ function Invoke-DbHubMonitor {
         Unfinished      = 'T1''s monitoring plugin wasn''t settled in time; nothing more was changed.'
     }
     $status = 'Checked'
-    if ($outcome -in 'StillNotRunning', 'RestartRefused', 'Unread', 'Unfinished') {
+    if ($outcome -in 'StillNotRunning', 'RestartRefused', 'Unread', 'Unfinished' -or $health.Outcome -in 'Warned', 'Known') {
         $status = 'Partial'
     }
-    return [pscustomobject]@{ action = 'monitor'; status = $status; monitoring = $outcome; message = $texts[$outcome] }
+    return [pscustomobject]@{ action = 'monitor'; status = $status; monitoring = $outcome; session = $health.Outcome; message = ($texts[$outcome] + $health.Note) }
 }

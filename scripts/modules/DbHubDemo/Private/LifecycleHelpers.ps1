@@ -11,7 +11,9 @@ function Invoke-DemoVmPowerAction {
     exist is reported missing. A 409 Conflict (a policy-installed extension) is retried
     (Invoke-DemoAzWithConflictRetry). -StartRequested says that the caller already asked Azure to start the VM
     (Request-DemoVmStart), so a VM that's running by now isn't reported as "already running" (Phase 25d: both VMs
-    were deallocated, start-demo.ps1 started them, and the results said they were already running).
+    were deallocated, start-demo.ps1 started them, and the results said they were already running). -DeallocateRequested
+    does the same for a deallocate the caller already asked for (Invoke-DemoVmRestartRecovery): a VM that still reads
+    running while Azure works on it gets no second deallocate (2026-11-17).
     Sources: https://learn.microsoft.com/cli/azure/vm#az-vm-start,
     https://learn.microsoft.com/cli/azure/vm#az-vm-deallocate (checked 2026-10-20).
     #>
@@ -34,7 +36,12 @@ function Invoke-DemoVmPowerAction {
         [ValidateRange(1, 120)]
         [int] $PollSeconds = 15,
 
-        [switch] $StartRequested
+        [switch] $StartRequested,
+
+        # The caller already asked Azure to deallocate the VM (Invoke-DemoVmRestartRecovery), so a VM that still reads running
+        # or stopped while Azure works on it gets no second deallocate (live, 2026-11-17: the recovery's deallocate went out
+        # twice, 8 seconds apart, while the T2 host still read running).
+        [switch] $DeallocateRequested
     )
 
     $subscriptionId = [string]$Config['subscriptionId']
@@ -53,11 +60,22 @@ function Invoke-DemoVmPowerAction {
     # can also carry no power state at all (live, 2026-10-22: sqlvm01 just after both VMs' 'az vm start --no-wait'
     # was reported missing), so only a VM that Azure says doesn't exist is reported missing.
     $settle = [System.Diagnostics.Stopwatch]::StartNew()
+    # A VM whose last operation failed shows no power state until another operation changes it (live, 2026-11-16: archost01's
+    # start ended VMStartTimedOut, and stop-demo.ps1 waited 900 seconds for a power state, then sent no deallocate, so the
+    # VM kept billing). Azure accepts a deallocate then, so it goes out at once; a start is left to its caller.
+    $failedCode = ''
     while ($before -in '', 'PowerState/deallocating', 'PowerState/stopping', 'PowerState/starting' -and $settle.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         if (-not $before) {
             $show = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'show', '--resource-group', $resourceGroupName, '--name', $VmName, '--query', 'id', '--output', 'tsv') -AllowFailure
             if ($show.ExitCode -ne 0 -and (Test-DemoAzNotFound -Text ([string]$show.StdErr))) {
                 return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('{0} wasn''t found in {1}.' -f $VmName, $resourceGroupName) -Remediation 'Run deploy.ps1 first.')
+            }
+            if ($Action -eq 'Deallocate') {
+                $failedCode = [string](@(Get-DemoVmStatusCode -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName | Where-Object { $_ -like 'ProvisioningState/failed*' }) | Select-Object -First 1)
+                if ($failedCode) {
+                    Write-DemoLog -Message ('{0} reports no power state because its last operation failed ({1}), so it''s deallocated now.' -f $VmName, $failedCode)
+                    break
+                }
             }
             Write-DemoLog -Message ('{0} reports no power state yet; waiting.' -f $VmName)
         }
@@ -67,16 +85,38 @@ function Invoke-DemoVmPowerAction {
         Start-Sleep -Seconds $PollSeconds
         $before = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
     }
-    if (-not $before) {
+    if (-not $before -and -not $failedCode) {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} reported no power state for {1} seconds.' -f $VmName, $TimeoutSeconds) -Remediation 'Check the VM in the portal; run the script again.')
     }
     if ($before -eq $wanted) {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1}.' -f $VmName, $wanted.Split('/')[1]))
     }
+    $stillStarting = 'Wait until Azure has finished starting it (./scripts/status.ps1 shows its state), then run the script again; starting it again doesn''t help.'
+    # A start that something else asked for and that Azure is still working on after the whole wait gets no second start:
+    # Azure refuses another operation on the VM until it's done (2026-11-17, the coordinator's question on a dead start).
+    if ($Action -eq 'Start' -and $before -eq 'PowerState/starting') {
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still starting after {1} seconds: Azure is still working on its start, so no second start was sent.' -f $VmName, $TimeoutSeconds) -Remediation $stillStarting -Evidence ([ordered]@{ before = $before; after = $before; issued = ''; inProgress = $true }))
+    }
     $verb = if ($Action -eq 'Start') { 'start' } else { 'deallocate' }
-    $run = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('vm', $verb, '--resource-group', $resourceGroupName, '--name', $VmName, '--no-wait') -Label ('{0}: {1}' -f $VmName, $verb)
-    if ($run.ExitCode -ne 0 -and -not ($Action -eq 'Deallocate' -and (Test-DemoAzVmNotRunning -Text ([string]$run.StdErr)))) {
-        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('az vm {0} {1} failed: {2}' -f $verb, $VmName, (Get-DemoDeploymentErrorText -Text $run.StdErr -MaxLength 400)))
+    # A start this run asked for (-StartRequested) that Azure is still working on reads stopped or deallocated, with its
+    # provisioning state Updating, for minutes (live, 2026-11-16: archost01 read stopped and Updating for 12 minutes, and a
+    # second start went out 19 seconds after the first, so every start showed twice in the activity log). It's waited for
+    # with no second start; one is sent only if that start ends without the VM running.
+    $pending = $requested -and $before -in 'PowerState/stopped', 'PowerState/deallocated' -and (Test-DemoVmOperationInProgress -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName)
+    $pendingDeallocate = $DeallocateRequested -and $Action -eq 'Deallocate' -and $before -in 'PowerState/running', 'PowerState/stopped' -and (Test-DemoVmOperationInProgress -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName)
+    $issued = ''
+    if ($pendingDeallocate) {
+        Write-DemoLog -Message ('{0}: Azure is still working on the deallocate that was asked for; waiting for it, with no second deallocate.' -f $VmName)
+    }
+    elseif (-not $pending) {
+        $run = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('vm', $verb, '--resource-group', $resourceGroupName, '--name', $VmName, '--no-wait') -Label ('{0}: {1}' -f $VmName, $verb)
+        if ($run.ExitCode -ne 0 -and -not ($Action -eq 'Deallocate' -and (Test-DemoAzVmNotRunning -Text ([string]$run.StdErr)))) {
+            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('az vm {0} {1} failed: {2}' -f $verb, $VmName, (Get-DemoDeploymentErrorText -Text $run.StdErr -MaxLength 400)))
+        }
+        $issued = $verb
+    }
+    else {
+        Write-DemoLog -Message ('{0}: Azure is still working on the start this run asked for; waiting for it, with no second start.' -f $VmName)
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $current = $before
@@ -84,10 +124,82 @@ function Invoke-DemoVmPowerAction {
         Start-Sleep -Seconds $PollSeconds
         $current = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
         if ($current -eq $wanted) {
-            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1} after {2:N0} seconds.' -f $VmName, $wanted.Split('/')[1], $watch.Elapsed.TotalSeconds) -Evidence ([ordered]@{ before = $before; after = $current; issued = $verb }))
+            $note = if ($failedCode) { ' Its last operation had failed ({0}), so it showed no power state before.' -f $failedCode } else { '' }
+            return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1} after {2:N0} seconds.{3}' -f $VmName, $wanted.Split('/')[1], $watch.Elapsed.TotalSeconds, $note) -Evidence ([ordered]@{ before = $before; after = $current; issued = $issued; failedState = $failedCode }))
+        }
+        if ($pending -and $current -in 'PowerState/stopped', 'PowerState/deallocated' -and -not (Test-DemoVmOperationInProgress -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName)) {
+            # The start Azure was working on ended without the VM running, so this one starts it, once.
+            $pending = $false
+            $run = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('vm', 'start', '--resource-group', $resourceGroupName, '--name', $VmName, '--no-wait') -Label ('{0}: start' -f $VmName)
+            if ($run.ExitCode -ne 0) {
+                return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('az vm start {0} failed: {1}' -f $VmName, (Get-DemoDeploymentErrorText -Text $run.StdErr -MaxLength 400)))
+            }
+            $issued = 'start'
+        }
+        if ($pendingDeallocate -and $current -in 'PowerState/running', 'PowerState/stopped' -and -not (Test-DemoVmOperationInProgress -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName)) {
+            # The deallocate that was asked for ended without the VM deallocated, so this one deallocates it, once.
+            $pendingDeallocate = $false
+            $run = Invoke-DemoAzWithConflictRetry -SubscriptionId $subscriptionId -ArgumentList @('vm', 'deallocate', '--resource-group', $resourceGroupName, '--name', $VmName, '--no-wait') -Label ('{0}: deallocate' -f $VmName)
+            if ($run.ExitCode -ne 0 -and -not (Test-DemoAzVmNotRunning -Text ([string]$run.StdErr))) {
+                return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Fail' -Message ('az vm deallocate {0} failed: {1}' -f $VmName, (Get-DemoDeploymentErrorText -Text $run.StdErr -MaxLength 400)))
+            }
+            $issued = 'deallocate'
         }
     }
-    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still {1} after {2} seconds.' -f $VmName, $current, $TimeoutSeconds) -Remediation 'Check the VM in the portal; run the script again.' -Evidence ([ordered]@{ before = $before; after = $current; issued = $verb }))
+    # A start Azure is still working on when the wait ends (it reads starting, or stopped or deallocated with an operation in
+    # progress, as a host whose VM agent never gets ready did for up to an hour, R871) is said so, for the caller's fix.
+    $inProgress = $Action -eq 'Start' -and ($current -eq 'PowerState/starting' -or $pending -or ($current -in 'PowerState/stopped', 'PowerState/deallocated' -and (Test-DemoVmOperationInProgress -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName)))
+    if ($inProgress) {
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still {1} after {2} seconds: Azure is still working on its start.' -f $VmName, $current, $TimeoutSeconds) -Remediation $stillStarting -Evidence ([ordered]@{ before = $before; after = $current; issued = $issued; inProgress = $true }))
+    }
+    return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still {1} after {2} seconds.' -f $VmName, $current, $TimeoutSeconds) -Remediation 'Check the VM in the portal; run the script again.' -Evidence ([ordered]@{ before = $before; after = $current; issued = $issued }))
+}
+
+function Test-DemoVmOperationInProgress {
+    <#
+    .SYNOPSIS
+    $true when the VM's instance view says Azure is still working on it (ProvisioningState/updating), such as a start it
+    accepted and hasn't finished. $false otherwise, and when the instance view can't be read. Internal.
+    Source: https://learn.microsoft.com/azure/virtual-machines/states-billing (provisioning states, checked 2026-11-16).
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string] $VmName
+    )
+
+    return (@(Get-DemoVmStatusCode -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName) -contains 'ProvisioningState/updating')
+}
+
+function Get-DemoVmStatusCode {
+    <#
+    .SYNOPSIS
+    The status codes of a VM's instance view (ProvisioningState/..., PowerState/...), in one bounded read; none when it
+    can't be read. Internal.
+    Source: https://learn.microsoft.com/cli/azure/vm#az-vm-get-instance-view
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string] $VmName
+    )
+
+    $codes = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('vm', 'get-instance-view', '--resource-group', $ResourceGroupName, '--name', $VmName, '--query', 'instanceView.statuses[].code', '--output', 'json') -AsJson -AllowFailure -TimeoutSeconds 120
+    return [string[]]@($codes | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
 }
 
 function Request-DemoVmStart {
@@ -256,12 +368,18 @@ function Wait-DemoStoppedStart {
     # once a VM that was still stopping had settled; never one that was already starting (Phase 28 review).
     $issued = [System.Collections.Generic.List[string]]::new()
     $interimSent = [System.Collections.Generic.List[object]]::new()
+    # The VMs whose start Azure is still working on when the wait ends (Invoke-DemoVmPowerAction's inProgress): starting
+    # one again doesn't help, so the fix is to wait and run deploy.ps1 again (2026-11-17).
+    $stillStarting = [System.Collections.Generic.List[string]]::new()
     $hostVm = Get-DemoHostVmName -Config $Config
     foreach ($vm in @($Request.Vms.Keys)) {
         $item = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:([bool]$Request.Vms[$vm].Requested)
         $results.Add($item)
         if ([string]$item.status -ne 'Pass') {
             $notRunning.Add($vm)
+            if ([bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name 'inProgress')) {
+                $stillStarting.Add($vm)
+            }
         }
         else {
             # The T2 guest starts with its host (its automatic start action), except on a golden snapshot's source host,
@@ -313,7 +431,21 @@ function Wait-DemoStoppedStart {
     $t4Text = if ($null -eq $t4) { '' } elseif ([string]$t4.status -eq 'Pass') { ' T4 is Ready.' } else { ' T4: {0}' -f [string]$t4.message }
     if ($notRunning.Count -gt 0) {
         $message = '{0} isn''t running, so the steps that need it can''t run (Run Command needs a running VM).{1}' -f ($notRunning -join ' and '), $t4Text
-        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message $message -Evidence $evidence -Remediation ('Start {0} in the Azure portal, or run ./scripts/start-demo.ps1, then run ./scripts/deploy.ps1 again: it continues where it stopped.' -f ($notRunning -join ' and ')) -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-start'))
+        # A VM Azure is still starting gets no "start it" fix: a second start doesn't help, and the next deploy.ps1, once the
+        # start has ended, goes on; when the T2 host's VM agent stays down then, its T2 track brings the host back, and
+        # builds it again once if it must (R871, R872). A rebuild here would guess: the agent can't be read before the VM
+        # runs, and a slow start can be a healthy one (2026-11-17, the coordinator's question).
+        $fixes = [System.Collections.Generic.List[string]]::new()
+        if ($stillStarting.Count -gt 0) {
+            $one = $stillStarting.Count -eq 1
+            $fixes.Add(('Azure is still starting {0}: don''t start {1} yourself. Run ./scripts/deploy.ps1 again once it has finished, at most about an hour after the start (./scripts/status.ps1 shows {2} state): it continues where it stopped.{3}' -f ($stillStarting -join ' and '), $(if ($one) { 'it' } else { 'them' }), $(if ($one) { 'its' } else { 'their' }), $(if ($hostVm -in $stillStarting) { (' When {0}''s VM agent stays down then, that run brings it back, and builds it again once if it must.' -f $hostVm) } else { '' })))
+        }
+        $other = @($notRunning | Where-Object { $_ -notin $stillStarting })
+        if ($other.Count -gt 0) {
+            $fixes.Add(('Start {0} in the Azure portal, or run ./scripts/start-demo.ps1, then run ./scripts/deploy.ps1 again: it continues where it stopped.' -f ($other -join ' and ')))
+        }
+        $evidence['stillStarting'] = $stillStarting.ToArray()
+        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message $message -Evidence $evidence -Remediation ($fixes -join ' ') -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-start'))
         Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status 'Fail' -Message $message
         return $results.ToArray()
     }

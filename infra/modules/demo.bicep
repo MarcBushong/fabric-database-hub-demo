@@ -192,6 +192,11 @@ var isNestedT2 = t2Mode != 'EvaluationOnlyAzureVm'
 // the PostgreSQL server to be created. Inside the VNet the public name resolves through the linked private zone.
 var t4ServerName = '${postgres.serverNamePrefix}-${deploymentId}'
 var t4ServerFqdn = '${t4ServerName}.postgres.database.azure.com'
+// T4's read replica (ADR 0025) is created for each session by deploy.ps1 and start-demo.ps1, not by this template; T1 gets
+// its stable name so the runner's replica-lag scenario finds each session's replica. A Burstable T4 has no replica
+// ("not supported in the Burstable tier"), so T1 gets no name then.
+var t4ReplicaServerName = '${postgres.replica.serverNamePrefix}-${deploymentId}'
+var t4ReplicaServerFqdn = startsWith(t4SkuName, 'Standard_B') ? '' : '${t4ReplicaServerName}.postgres.database.azure.com'
 
 // The workload runner (ADR 0010, Phase 13): a new runner SHA-256 changes the settings, which re-runs the loader,
 // and the WorkloadRunner steps install it. The auto-shutdown schedule bounds the activity profiles (--not-after).
@@ -336,7 +341,7 @@ module bootstrap 'bootstrap.bicep' = if (!empty(bootstrapBundleSha256)) {
 
 // The loaders' settings; nothing here is secret. T1 drives T3 and T4 with its managed identity, so it gets their
 // names (stable across stop-demo.ps1 -RemoveT3 and across T4 stops). T4's runner role is the PostgreSQL role
-// mapped to T1's identity that Enable-DemoT4Workload creates (ADR 0019).
+// mapped to T1's identity that Enable-DemoT4Workload creates (ADR 0019); T4's read replica has the same roles (ADR 0025).
 var sqlVmLoaderSettings = union(commonSettings, {
   role: 'SqlVm'
   dataDiskTier: t1DataDiskTier
@@ -351,6 +356,8 @@ var sqlVmLoaderSettings = union(commonSettings, {
     serverFqdn: t4ServerFqdn
     databaseName: postgres.databaseName
     runnerRole: postgres.runnerRole
+    replicaServerName: t4ReplicaServerName
+    replicaServerFqdn: t4ReplicaServerFqdn
   }
 } : {})
 var hostLoaderSettings = union(commonSettings, {

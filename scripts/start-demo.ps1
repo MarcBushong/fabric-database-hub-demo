@@ -16,6 +16,9 @@ sections 9.4, 9.6).
   Graph, the extended property, and fresh telemetry, and reports a Warning with the measured lag otherwise;
   T1's monitoring is checked again after that template deployment, waiting while the SQL IaaS extension
   updates.
+- T4's read replica (ADR 0025) is created for each session once T4 is Ready, about 9 minutes, while the profiles are
+  set and the warm-up runs; the script waits for it at its end (START.T4.REPLICA). stop-demo.ps1 deletes it, so it
+  bills only during sessions. -SkipT4Replica leaves it out.
 - Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
   2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown. business-day is the steady mix plus bounded incidents
   at fixed minutes past each UTC hour, which fill Database Hub's Performance page; set activityProfile to baseline for
@@ -61,6 +64,10 @@ Leave T3 alone.
 .PARAMETER SkipT4
 Leave T4, the PostgreSQL flexible server, stopped.
 
+.PARAMETER SkipT4Replica
+Leave T4's read replica out of this session: no wait for its creation (about 9 minutes) and no cost for it, but no Read
+replica lag in Database Hub and no replica-lag scenario (ADR 0025).
+
 .PARAMETER SkipCostCheck
 Start without the cost guardrail.
 
@@ -102,6 +109,8 @@ param(
 
     [switch] $SkipT4,
 
+    [switch] $SkipT4Replica,
+
     [switch] $SkipCostCheck,
 
     [switch] $Interactive,
@@ -140,7 +149,7 @@ $results = [System.Collections.Generic.List[object]]::new()
 $holdSwitch = @(if ($Interactive -and $ResetAdminPassword -and -not $whatIf -and [string]$config['t2Mode'] -ne 'EvaluationOnlyAzureVm') { 'archost01' })
 $activityDone = $false
 try {
-    $results.AddRange([object[]]@(Start-DemoEnvironment -Config $config -ActivityProfile $ActivityProfile -WarmUpMinutes $WarmUpMinutes -WaitForWarmUp:$WaitForWarmUp -SkipT3:$SkipT3 -SkipT4:$SkipT4 -SkipCostCheck:$SkipCostCheck -Interactive:$Interactive -HoldActivitySwitchVm $holdSwitch -WhatIf:$whatIf -Confirm:$false))
+    $results.AddRange([object[]]@(Start-DemoEnvironment -Config $config -ActivityProfile $ActivityProfile -WarmUpMinutes $WarmUpMinutes -WaitForWarmUp:$WaitForWarmUp -SkipT3:$SkipT3 -SkipT4:$SkipT4 -SkipT4Replica:$SkipT4Replica -SkipCostCheck:$SkipCostCheck -Interactive:$Interactive -HoldActivitySwitchVm $holdSwitch -WhatIf:$whatIf -Confirm:$false))
 
     $keyVaultSection = $config['keyVault']
     $useVault = ($keyVaultSection -is [System.Collections.IDictionary]) -and [bool]$keyVaultSection['enabled']

@@ -45,14 +45,14 @@ Describe 'Invoke-DemoHubReadiness (the configure-fabric.ps1 checklist)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoPresenterAccess -Times 1 -Exactly -ParameterFilter { -not $WhatIf }
     }
 
-    It 'hands the P11 check the capacity that P5 read, so it sends no request of its own (Phase 18)' {
+    It 'asks the P11 check for nothing but the configuration: the viewers'' licenses are assumed (2026-11-14)' {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -MockWith {
             New-DemoResult -CheckId 'FABRIC.P5.WORKSPACE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'p5'
             New-DemoResult -CheckId 'FABRIC.P5.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'capacity' -Evidence @{ capacityId = '77777777-7777-7777-7777-777777777777'; sku = 'F16'; state = 'Active' }
         }
         $null = Invoke-DemoHubReadiness -Config $config
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricViewerLicense -Times 1 -Exactly -ParameterFilter {
-            $CapacityResult.checkId -eq 'FABRIC.P5.CAPACITY' -and $CapacityResult.evidence.sku -eq 'F16'
+            @($PesterBoundParameters.Keys) -join ',' -eq 'Config'
         }
     }
 
@@ -65,12 +65,11 @@ Describe 'Invoke-DemoHubReadiness (the configure-fabric.ps1 checklist)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoPresenterAccess -Times 1 -Exactly -ParameterFilter { $WhatIf }
     }
 
-    It 'passes a Fabric token the operator already has to P4, P5, and P11' {
+    It 'passes a Fabric token the operator already has to P4 and P5' {
         $script:passed = Get-HubFakeToken
         $null = Invoke-DemoHubReadiness -Config $config -FabricToken (ConvertTo-HubSecureString $script:passed)
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricHubSetting -Times 1 -Exactly -ParameterFilter { (ConvertFrom-HubSecureString $Token) -eq $script:passed }
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricWorkspace -Times 1 -Exactly -ParameterFilter { (ConvertFrom-HubSecureString $Token) -eq $script:passed }
-        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricViewerLicense -Times 1 -Exactly -ParameterFilter { (ConvertFrom-HubSecureString $Token) -eq $script:passed }
     }
 
     It 'reports a target without telemetry as the pending manual step that Estate reports' {

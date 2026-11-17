@@ -106,6 +106,10 @@ Describe 'Invoke-DemoVmRunCommand' {
         $script:arguments = [System.Collections.Generic.List[string]]::new()
         $script:logs = [System.Collections.Generic.List[string]]::new()
         $script:runCommands = [ordered]@{}
+        # Names Azure keeps marked for deletion (2026-11-13 live finding): listed as Deleting, a delete doesn't remove them,
+        # and a PUT of one fails with OperationNotAllowed.
+        $script:stuck = [System.Collections.Generic.HashSet[string]]::new()
+        $script:extraListed = 0
         $script:putError = ''
         $script:putCount = 0
         $script:viewStart = $null
@@ -118,11 +122,19 @@ Describe 'Invoke-DemoVmRunCommand' {
             $name = if ($url -match '/runCommands/([^?]+)\?') { $Matches[1] } else { '' }
             $call = [pscustomobject]@{ Method = $method; Name = $name; BodyPath = ''; BodyExisted = $false; Body = $null }
             $script:calls.Add($call)
+            if ($method -eq 'get' -and -not $name) {
+                # The VM's Run Commands (List By Virtual Machine).
+                $listed = @(foreach ($key in $script:runCommands.Keys) { @{ name = $key; properties = @{ provisioningState = 'Succeeded' } } }) + @(foreach ($key in $script:stuck) { @{ name = $key; properties = @{ provisioningState = 'Deleting' } } }) + @(for ($i = 1; $i -le $script:extraListed; $i++) { @{ name = ('Other-{0:00}' -f $i); properties = @{ provisioningState = 'Succeeded' } } })
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (@{ value = $listed } | ConvertTo-Json -Depth 6); StdErr = '' }
+            }
             switch ($method) {
                 'put' {
                     $call.BodyPath = $ArgumentList[[array]::IndexOf($ArgumentList, '--body') + 1].Substring(1)
                     $call.BodyExisted = Test-Path -LiteralPath $call.BodyPath
                     $call.Body = Get-Content -LiteralPath $call.BodyPath -Raw | ConvertFrom-Json -AsHashtable
+                    if ($script:stuck.Contains($name)) {
+                        return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ('ERROR: ({{"error":{{"code":"OperationNotAllowed","message":"Operation ''PUT Extension'' is not allowed on VM extension ''{0}'' since it is marked for deletion. You can only retry the Delete operation (or wait for an ongoing one to complete)."}}}})' -f $name) }
+                    }
                     if ($script:putError) {
                         return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = $script:putError }
                     }
@@ -135,6 +147,9 @@ Describe 'Invoke-DemoVmRunCommand' {
                     return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
                 }
                 default {
+                    if ($script:stuck.Contains($name)) {
+                        return [pscustomobject]@{ ExitCode = 0; StdOut = (@{ name = $name; properties = @{ provisioningState = 'Deleting'; instanceView = @{ executionState = 'Succeeded'; exitCode = 0 } } } | ConvertTo-Json -Depth 5); StdErr = '' }
+                    }
                     if (-not $script:runCommands.Contains($name)) {
                         return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: Not Found({"error":{"code":"NotFound"}})' }
                     }
@@ -201,6 +216,74 @@ Describe 'Invoke-DemoVmRunCommand' {
         $put = @($script:calls | Where-Object Method -eq 'put')
         Test-Path -LiteralPath (Split-Path -Path $put[0].BodyPath -Parent) | Should -BeFalse -Because 'the private body still goes'
         ($script:logs -join ' ') | Should -Match 'left for the next run'
+    }
+
+    It 'runs under a fresh name when Azure keeps the name in Deleting after the leftover wait, and reports it once (2026-11-13 live finding)' {
+        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
+        $null = $script:stuck.Add('DbHubDemo-HealthRead')
+        $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -LeftoverWaitSeconds 0
+
+        $result.Succeeded | Should -BeTrue
+        $result.RunCommandName | Should -Be 'DbHubDemo-HealthRead'
+        $result.UsedName | Should -Match '^DbHubDemo-HealthRead-\d{14}$'
+        @($script:calls | Where-Object Method -eq 'put' | ForEach-Object Name) | Should -Be @($result.UsedName) -Because 'no PUT goes to a name Azure keeps marked for deletion'
+        $script:runCommands.Count | Should -Be 0 -Because 'the fresh one is deleted afterward, as usual'
+        ($script:logs -join ' ') | Should -Match ('Azure still lists DbHubDemo-HealthRead after 0s .*so it runs as {0} instead of waiting' -f [regex]::Escape($result.UsedName))
+        $stuck = @(InModuleScope -ModuleName DbHubDemo { Get-DemoRunCommandStuckResult -Clear })
+        $stuck.Count | Should -Be 1
+        $stuck[0].checkId | Should -Be 'DEPLOY.RUNCOMMAND.STUCK_ARCHOST01'
+        $stuck[0].status | Should -Be 'Warning'
+        $stuck[0].target | Should -Be 'T2'
+        $stuck[0].evidence.freshNames | Should -Contain $result.UsedName
+        $stuck[0].message | Should -Match 'Azure kept DbHubDemo-HealthRead on archost01 in Deleting'
+        @(InModuleScope -ModuleName DbHubDemo { Get-DemoRunCommandStuckResult }).Count | Should -Be 0 -Because '-Clear reports each once'
+    }
+
+    It 'asks earlier fresh copies and finished chunks to go without waiting, and makes no fresh name when the VM is close to Azure''s limit of 25' {
+        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
+        $null = $script:stuck.Add('DbHubDemo-HealthRead')
+        $null = $script:stuck.Add('DbHubDemo-HealthRead-20261113200000')
+        # A chunk left from a finished transfer (live: 9 of the 20 on the T2 host).
+        $script:runCommands['DbHubDemo-Chunk-abcdef123456-001'] = $true
+        $result = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -LeftoverWaitSeconds 0
+        $result.Succeeded | Should -BeTrue
+        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq 'DbHubDemo-HealthRead-20261113200000' }).Count | Should -Be 1
+        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq 'DbHubDemo-Chunk-abcdef123456-001' }).Count | Should -Be 1
+        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear() }
+
+        $script:calls.Clear()
+        $script:extraListed = 22
+        { Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0 -LeftoverWaitSeconds 0 } | Should -Throw '*already has 24 Run Commands (2 being deleted), close to Azure''s limit of 25*'
+        @($script:calls | Where-Object Method -eq 'put').Count | Should -Be 0
+        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq 'DbHubDemo-HealthRead' }).Count | Should -Be 2 -Because 'the delete goes again, without a second wait'
+        @(InModuleScope -ModuleName DbHubDemo { Get-DemoRunCommandStuckResult }).Count | Should -Be 0
+    }
+
+    It 'waits only 30 seconds for a name Azure kept in Deleting earlier in the process, and never for a fresh name''s own delete (live, 2026-11-13)' {
+        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
+        $null = $script:stuck.Add('DbHubDemo-HealthRead')
+        $script:waits = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Remove-DemoRunCommand -MockWith {
+            $name = if ($Url -match '/runCommands/([^?]+)\?') { $Matches[1] } else { '' }
+            $script:waits.Add(('{0} wait={1} nowait={2}' -f $name, $PesterBoundParameters['WaitSeconds'], [bool]$PesterBoundParameters['NoWait']))
+            if ($script:stuck.Contains($name)) {
+                return $false
+            }
+            $script:runCommands.Remove($name)
+            return $true
+        }
+        $first = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0
+        $firstWaits = @($script:waits)
+        $script:waits.Clear()
+        $second = Invoke-DemoVmRunCommand -Config $config -VmName 'archost01' -RunCommandName 'DbHubDemo-HealthRead' -Script 'Write-Output 1' -PollIntervalSeconds 0
+
+        $first.Succeeded | Should -BeTrue
+        $second.Succeeded | Should -BeTrue
+        $firstWaits[0] | Should -Be 'DbHubDemo-HealthRead wait=300 nowait=False' -Because 'the first time, the whole leftover wait'
+        $firstWaits[-1] | Should -BeLike ('{0} wait=* nowait=True' -f $first.UsedName) -Because 'a fresh name''s own delete isn''t waited for'
+        $script:waits[0] | Should -Be 'DbHubDemo-HealthRead wait=30 nowait=False' -Because 'the second time, it was stuck already'
+        $second.UsedName | Should -Match '^DbHubDemo-HealthRead-\d{14}$'
+        InModuleScope -ModuleName DbHubDemo { $script:DemoRunCommandStuck.Clear(); $script:DemoRunCommandStuckName.Clear() }
     }
 
     It 'runs -WhileRunning once, after Azure accepted the Run Command and before waiting for it (ADR 0018)' {
@@ -1444,5 +1527,42 @@ Describe 'Get-DemoArcHostIdentity' {
         $failed = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoArcHostIdentity -Config $Config -Target (Get-DemoArcTarget -Config $Config) }
         $failed.Found | Should -BeFalse
         $failed.Reason | Should -Match 'couldn''t be read'
+    }
+}
+
+Describe 'Wait-DemoVmHealthState stops when the VM has no room for a fresh Run Command name (2026-11-13 live finding)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:reads = 0
+        $script:readError = 'archost01: Azure still lists DbHubDemo-HealthRead after 30s, and the VM already has 24 Run Commands (9 being deleted), close to Azure''s limit of 25, so it didn''t run under a fresh name either. That''s Azure-side: Azure deletes them on its own, and the next try checks again.'
+    }
+
+    It 'ends the wait with Full, whatever MaxPolls allows, and keeps the last state it read' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            $script:reads++
+            if ($script:reads -eq 1) {
+                return [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup' }
+            }
+            throw $script:readError
+        }
+        $wait = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Wait-DemoVmHealthState -Config $Config -VmName 'archost01' -State @('Ready') -MaxPolls 30 -PollSeconds 60 -FullMinutes 0 }
+        $wait.Full | Should -BeTrue
+        $wait.Health.state | Should -Be 'InProgress'
+        $script:reads | Should -Be 2 -Because 'the first refusal ends it with -FullMinutes 0, not 30 polls'
+    }
+
+    It 'keeps waiting through other read failures, as before' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            $script:reads++
+            if ($script:reads -lt 3) {
+                throw 'archost01: DbHubDemo-HealthRead timed out.'
+            }
+            [pscustomobject]@{ state = 'Ready'; currentStep = '' }
+        }
+        $wait = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Wait-DemoVmHealthState -Config $Config -VmName 'archost01' -State @('Ready') -MaxPolls 30 -PollSeconds 60 -FullMinutes 0 }
+        $wait.Full | Should -BeFalse
+        $wait.Health.state | Should -Be 'Ready'
+        $script:reads | Should -Be 3
     }
 }

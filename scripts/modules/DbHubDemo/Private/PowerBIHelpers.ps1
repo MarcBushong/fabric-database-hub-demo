@@ -14,7 +14,10 @@ function Invoke-DemoPowerBIRequest {
     don't throw: the caller reads StatusCode. A transient failure is retried (Invoke-DemoTransientRetry: a network
     error, and HTTP 408, 429, 502, 503, and 504, up to 4 attempts, after Retry-After when there is one); with
     -NotIdempotent (a request that starts something, such as a refresh), only a request that never reached the server,
-    and HTTP 429. A network error that lasts throws, with its innermost cause (Phase 28 live finding, 2026-10-30).
+    and HTTP 429. A network error that lasts throws, with its innermost cause (Phase 28 live finding, 2026-10-30). A
+    token from Get-DemoPowerBIToken goes as the newest of its line, renewed first when it expires within 4 minutes, and
+    a refused token (HTTP 401, or HTTP 403 with X-PowerBI-Error-Info TokenExpired or InvalidToken, which is how Power BI
+    answers; Test-DemoTokenRefused) gets one renewal and one more try (Get-DemoCurrentToken; 2026-11-16 live finding).
     https://learn.microsoft.com/rest/api/power-bi/
     #>
     [CmdletBinding()]
@@ -45,6 +48,8 @@ function Invoke-DemoPowerBIRequest {
         Token              = $Token
         SkipHttpErrorCheck = $true
         TimeoutSec         = 120
+        # PowerShell 7.4's TimeoutSec ends at the response's headers; this bounds each read of its body (R862).
+        OperationTimeoutSeconds = 120
         ErrorAction        = 'Stop'
     }
     if ($null -ne $Body) {
@@ -52,7 +57,19 @@ function Invoke-DemoPowerBIRequest {
         $request['ContentType'] = 'application/json; charset=utf-8'
     }
 
+    # As Invoke-DemoFabricRequest: the newest token of its line, renewed when it's about to expire, and one renewal and one
+    # more try after a refused token, which Power BI answers with HTTP 403 and X-PowerBI-Error-Info (Test-DemoTokenRefused;
+    # 2026-11-16 live finding; Get-DemoCurrentToken).
+    $sendToken = Get-DemoCurrentToken -Token $Token
+    $request['Token'] = $sendToken
     $response = Invoke-DemoTransientRetry -Send { param([hashtable] $Call) Invoke-WebRequest @Call } -State $request -Target ([uri]$Uri).Host -NotIdempotent:$NotIdempotent
+    if (Test-DemoTokenRefused -Response $response) {
+        $renewed = Get-DemoCurrentToken -Token $Token -Rejected $sendToken -RejectedStatus ([int]$response.StatusCode)
+        if (-not [object]::ReferenceEquals($renewed, $sendToken)) {
+            $request['Token'] = $renewed
+            $response = Invoke-DemoTransientRetry -Send { param([hashtable] $Call) Invoke-WebRequest @Call } -State $request -Target ([uri]$Uri).Host -NotIdempotent:$NotIdempotent
+        }
+    }
     $statusCode = [int]$response.StatusCode
 
     $content = [string]$response.Content

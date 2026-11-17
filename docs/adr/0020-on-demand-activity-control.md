@@ -56,7 +56,7 @@ Placeholders: `<subscriptionId>` is the configured subscription, `<prefix>` the 
 
 ### The control
 
-It's optional and off by default (`control.enabled`; [configuration](../../config/environment.schema.json)). `scripts/setup-activity-control.ps1` sets it up with Contributor, and an Owner runs `-GrantRole` once. Everything lives in `rg-<prefix>-control`, which `destroy.ps1` keeps ([ADR 0002](0002-resource-group-topology.md)):
+It's optional and off by default (`control.enabled`; [configuration](../../config/environment.schema.json)). `scripts/setup-activity-control.ps1` sets it up with Contributor, and an Owner runs `-GrantRole` once. Everything lives in `rg-<prefix>-control`, which `destroy.ps1` keeps (until 2026-11-17: [amendment](#amendment-2026-11-17-destroyps1-deletes-the-control-and-the-removals-order)) ([ADR 0002](0002-resource-group-topology.md)):
 
 | Resource | Settings |
 |---|---|
@@ -67,7 +67,8 @@ It's optional and off by default (`control.enabled`; [configuration](../../confi
 | `kv-<prefix>-ctl-<suffix>` | Key Vault, Standard, Azure RBAC, 7-day soft delete, purge protection off so that `-Remove` can purge it, public network access by the mode below, no diagnostic settings |
 | `dbhub-activity-webhook` | The vault's one secret: the webhook URL, expiring with the webhook |
 | `dbhub-autostop` | One-time schedule per run, linked to `DbHub-Stop -Scope All` |
-| `dbhub-monitor-<n>` | One-time schedules every 30 minutes of a run that uses `sqlvm01`, while they come at least 5 minutes before its end, each linked to `DbHub-Monitor` (no parameters); they go with the auto-stop (since 2026-11-03) |
+| `dbhub-monitor-<n>` | One-time schedules every 30 minutes of a run that uses `sqlvm01`, while they come at least 5 minutes before its end, each linked to `DbHub-Monitor` (no parameters); they go with the auto-stop (since 2026-11-03). While a session runs, each also checks the session's hosts (2026-11-16, [ADR 0026](0026-one-run-all-session.md#2026-11-16-amendment-a-host-that-stops-during-a-session)) |
+| `DbHubSessionStatus` | The Automation account's variable with the last status the runbooks wrote to the vault, which `DbHub-Monitor` reads back (2026-11-16, ADR 0026); never a credential |
 | `dbhub-t4-safety-stop` | Daily schedule, linked to `DbHub-Stop -Scope T4` |
 
 The resources carry `component` = `activity-control` and the demo's `solution`, `purpose`, `owner`, and `costCenter` tags, without `environment` or `deploymentId`, so `destroy.ps1`'s residual check never matches them. `infra/control/control.bicep` deploys the identity, the account, and the vault; `infra/control/webhook.bicep` deploys the webhook and its secret.
@@ -128,6 +129,11 @@ One custom role, assignable only in the configured subscription, with exactly th
 - `Microsoft.DBforPostgreSQL/flexibleServers/read`
 - `Microsoft.DBforPostgreSQL/flexibleServers/start/action`
 - `Microsoft.DBforPostgreSQL/flexibleServers/stop/action`
+- `Microsoft.DBforPostgreSQL/flexibleServers/write` (2026-11-14, [ADR 0026](0026-one-run-all-session.md))
+- `Microsoft.DBforPostgreSQL/flexibleServers/delete` (2026-11-14)
+- `Microsoft.DBforPostgreSQL/flexibleServers/configurations/write` (2026-11-14)
+- `Microsoft.Insights/metrics/read` (2026-11-14)
+- `Microsoft.Resources/tags/write` (2026-11-14)
 - `Microsoft.Automation/automationAccounts/read`
 - `Microsoft.Automation/automationAccounts/runbooks/read`
 - `Microsoft.Automation/automationAccounts/jobs/read`
@@ -138,7 +144,7 @@ One custom role, assignable only in the configured subscription, with exactly th
 - `Microsoft.Automation/automationAccounts/jobSchedules/write`
 - `Microsoft.Automation/automationAccounts/jobSchedules/delete`
 
-It has no `NotActions` and no data actions. It can't create or delete a VM, disk, network, or database; it has no action Run Command, and no Key Vault, Fabric, or role-assignment permission. Every name is from the Azure permissions reference: [Compute](https://learn.microsoft.com/azure/role-based-access-control/permissions/compute), [Databases](https://learn.microsoft.com/azure/role-based-access-control/permissions/databases), [Management and governance](https://learn.microsoft.com/azure/role-based-access-control/permissions/management-and-governance), and [General](https://learn.microsoft.com/azure/role-based-access-control/permissions/general). The runbooks poll resources rather than asynchronous operation URLs, so every call stays within the scopes below. `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` fails if the module's list and this one differ.
+It has no `NotActions` and no data actions. It can't create or delete a VM, disk, network, or Azure SQL database; it has no action Run Command, and no Key Vault, Fabric, or role-assignment permission. Since 2026-11-14 ([ADR 0026](0026-one-run-all-session.md), approved for the user by the project's coordinator, who reviews it with the user before any merge), it can create and delete PostgreSQL flexible servers in the demo resource group, for T4's read replica, set the replica's streaming delay, read T4's and the replica's metrics, and tag the demo resource group; ADR 0026 says what each of those actions could touch. Every name is from the Azure permissions reference: [Compute](https://learn.microsoft.com/azure/role-based-access-control/permissions/compute), [Databases](https://learn.microsoft.com/azure/role-based-access-control/permissions/databases), [Networking](https://learn.microsoft.com/azure/role-based-access-control/permissions/networking), [Monitor](https://learn.microsoft.com/azure/role-based-access-control/permissions/monitor), [Management and governance](https://learn.microsoft.com/azure/role-based-access-control/permissions/management-and-governance), and [General](https://learn.microsoft.com/azure/role-based-access-control/permissions/general). The runbooks poll resources rather than asynchronous operation URLs, so every call stays within the scopes below. `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` fails if the module's list and this one differ.
 
 ### The assignments A1-A3
 
@@ -165,7 +171,7 @@ It has no `NotActions` and no data actions. It can't create or delete a VM, disk
 
 ### Removal
 
-`setup-activity-control.ps1 -Remove` (with `-WhatIf` first) deletes, in order: the Fabric notebook, its folder when empty, and the control workspace with its endpoint; A1-A3 and the custom role (an Owner); then the Automation account (with its runbooks, schedules, and webhook), the identity, and the vault, which it purges. It deletes `rg-<prefix>-control` only when nothing else is left in it, because the group may also hold the GitHub OIDC identity ([ADR 0002](0002-resource-group-topology.md)).
+`setup-activity-control.ps1 -Remove` (with `-WhatIf` first) deletes, in order: the Fabric notebook, its folder when empty, and the control workspace with its endpoint; A1-A3 and the custom role (an Owner); then the Automation account (with its runbooks, schedules, and webhook), the identity, and the vault, which it purges (the account goes last since 2026-11-17: [amendment](#amendment-2026-11-17-destroyps1-deletes-the-control-and-the-removals-order)). It deletes `rg-<prefix>-control` only when nothing else is left in it, because the group may also hold the GitHub OIDC identity ([ADR 0002](0002-resource-group-topology.md)).
 
 ## Consequences
 
@@ -207,6 +213,12 @@ It has no `NotActions` and no data actions. It can't create or delete a VM, disk
 - **The re-checks:** `dbhub-monitor-<n>` are scheduled only while at least 5 minutes of the run remain, so a run shorter than about 35 minutes gets none, and the 90-minute showcase gets two (at 30 and 60 minutes).
 - **Rollout:** `./scripts/setup-activity-control.ps1 -SkipFabric` publishes the runbooks; without `-SkipFabric` it also imports the notebook again, with the showcase defaults. The runner on the VMs must know `showcase` and `--vcores`: `./scripts/deploy.ps1 -FromStage Infrastructure`, or a plain `deploy.ps1` after **DONE**, updates it ([update an existing environment](../deployment.md#update-an-existing-environment)).
 - **Validation:** unit-tested (`tests/unit/Automation.Runbooks.Tests.ps1`: the requests, the plan, the runner's arguments, the stale Running, a fresh NotRunning, a fresh Running, a missing time, and the VM's start from its instance view; `tests/unit/DbHubDemo.Lifecycle.Tests.ps1` for the module's rule; `tests/unit/Fabric.ControlNotebook.Tests.ps1` for the notebook). Not proven live.
+
+## Amendment (2026-11-17: destroy.ps1 deletes the control, and the removal's order)
+
+- **`destroy.ps1` deletes the control** with the rest of the environment when the settings its runbooks were published with name this environment's resource group ([ADR 0002](0002-resource-group-topology.md#amendment-2026-11-17-destroy-deletes-everything-deployps1-created)); a control that serves another environment stays. So "`rg-<prefix>-control`, which `destroy.ps1` keeps" in [the control](#the-control) no longer holds. The control is no longer optional either: it's part of every deployment since 2026-11-14 ([ADR 0026](0026-one-run-all-session.md)).
+- **The removal's order** (`setup-activity-control.ps1 -Remove`, and `destroy.ps1` through the same code): the Fabric part; the role assignments, then the custom roles "DbHub Demo Activity Operator" and "DbHub Demo Session Writer" only once no role assignment holds them, so another environment's roles stay; the identity and the vault, which it purges; and **the Automation account last**, because its runbooks say which environment the control serves, which a rerun after an interruption reads before it deletes anything. The group goes once nothing else is in it; the account's runbooks, which Azure can still list for a moment after the account is deleted, don't count (live, 2026-11-17).
+- **Live (2026-11-17):** through `destroy.ps1`, in a test environment: its control workspace with its managed private endpoint, 6 role assignments, the two suffixed roles, the identity, the vault (purged), and the Automation account, then the empty group in a later run. The owner's control and roles were unchanged.
 
 ## Validation
 

@@ -9,10 +9,14 @@ function Set-DemoDeploymentState {
     BundleChunkCount, RunnerSha256, RunnerChunkCount, BundleSentTo, RunnerSentTo (arrays become a comma list),
     NetworkMode, T3UseFreeLimit, T3AdminGroupName, BastionExpiresUtc, HostPasswordSet, FabricCapacityResumed and
     FabricCapacityResumedUtc (fabric.manageCapacity, Phase 26b), GuidedStopUtc and T4Sku (Phase 28), T2BuildUtc (Phase
-    28 review follow-up), and T2InstallMode (2026-11-09). A Stage value also
+    28 review follow-up), T2InstallMode (2026-11-09), T4Replica and T4ReplicaSize (2026-11-13, ADR 0025), BusyUntilUtc
+    and BusyBy (the busy marker, 2026-11-14), FabricSha256 (2026-11-16), and FabricWorkspaceId and ControlWorkspaceId
+    (2026-11-17). A Stage value also
     sets StageUtc. A value that the Azure CLI can't carry safely on Windows (a double quote or a percent sign)
     is left out with a warning. The template keeps these tags on every redeployment, because deploy.ps1 passes
-    the group's existing tags (ADR 0002).
+    the group's existing tags (ADR 0002). Each write holds the lock that deploy.ps1's parallel tracks share
+    (Get-DemoStateLockName), so writes from this machine's processes never overlap: two merges at the same moment can
+    lose one of them (2026-11-17).
 
     Source: az tag update, https://learn.microsoft.com/cli/azure/tag#az-tag-update (checked 2026-10-20).
 
@@ -72,7 +76,30 @@ function Set-DemoDeploymentState {
     }
     $arguments = [System.Collections.Generic.List[string]]::new([string[]]@('tag', 'update', '--resource-id', $resourceGroupId, '--operation', 'Merge', '--tags'))
     $arguments.AddRange($pairs)
-    $result = Invoke-DemoAzWithConflictRetry -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList $arguments.ToArray() -Label 'Recording the deployment state'
+    # One write at a time per resource group on this machine, under the lock the tracks share (Get-DemoStateLockName):
+    # two tag merges at the same moment from two processes can lose one of them (live, 2026-11-17: the busy marker's
+    # refresh, 0.6 seconds from T2's last track record, left DbHubTrackT2 one step behind, and the run ended NOT DONE).
+    # The lock is re-entrant, so Set-DemoDeploymentStateLocked, which holds it already, calls this as before.
+    $mutex = [System.Threading.Mutex]::new($false, (Get-DemoStateLockName -Config $Config))
+    $owned = $false
+    try {
+        try {
+            $owned = $mutex.WaitOne([TimeSpan]::FromMinutes(5))
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $owned = $true
+        }
+        if (-not $owned) {
+            throw 'Recording the deployment state failed: another deploy.ps1 process held the deployment state lock for 5 minutes.'
+        }
+        $result = Invoke-DemoAzWithConflictRetry -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList $arguments.ToArray() -Label 'Recording the deployment state'
+    }
+    finally {
+        if ($owned) {
+            $mutex.ReleaseMutex()
+        }
+        $mutex.Dispose()
+    }
     if ($result.ExitCode -ne 0) {
         throw ('Recording the deployment state failed: {0}' -f (Get-DemoDeploymentErrorText -Text $result.StdErr -MaxLength 400))
     }

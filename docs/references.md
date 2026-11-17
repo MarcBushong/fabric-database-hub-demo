@@ -10,7 +10,7 @@ Every API, command, and setting this repo relies on, grouped by topic. Each doc 
 - [Enable performance monitoring (add SQL)](https://learn.microsoft.com/fabric/database/hub/add-sql): per-target monitoring prerequisites
 - [Database Hub FAQ](https://learn.microsoft.com/fabric/database/hub/faq): Copilot and agents, with human approval
 - [Query performance monitoring telemetry](https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry): the documented telemetry endpoint, its token audience, retention, and the agent instructions block
-- The showcase (2026-11-03, the README's [what fills each visual](../README.md#what-fills-each-database-hub-visual-and-when)): [Monitor PostgreSQL in Database Hub](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql) (T4's metrics) and [Create Activator alerts for Microsoft SQL](https://learn.microsoft.com/fabric/database/hub/sql-activator-alerts) (the alert templates and their thresholds)
+- The showcase (2026-11-03, [what fills each visual](database-hub-visuals.md#what-fills-each-database-hub-visual-and-when)): [Monitor PostgreSQL in Database Hub](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql) (T4's metrics) and [Create Activator alerts for Microsoft SQL](https://learn.microsoft.com/fabric/database/hub/sql-activator-alerts) (the alert templates and their thresholds)
 - [What's new across Microsoft SQL at SQLCon/FabCon Europe 2026](https://devblogs.microsoft.com/azure-sql/whats-new-across-microsoft-sql-at-sqlcon-fabcon-europe-2026/): the Database Agent announcement (2026-09-29)
 
 ## Agent skills and agent hosts
