@@ -355,7 +355,7 @@ function Restart-DemoVmOnce {
             }
             $why = if ($agentDown) { 'its VM agent isn''t Ready ({0})' -f $state.Text } else { 'it lists {0} chunk Run Command(s) that a restart would keep' -f $chunks.Count }
             $sent = if ($asked -gt 0) { 'the deletes of its {0} chunk Run Command(s) went first, to complete with the deallocate; ' -f $asked } else { '' }
-            Write-DemoLog -Level Warning -Message ('{0}: {1} for about 15 minutes, and {2}, so it isn''t restarted: {3}it''s deallocated and started once now (R871); no action needed.' -f $VmName, $Because, $why, $sent)
+            Write-DemoLog -Level Warning -Message ('{0}: {1}, and {2}, so it isn''t restarted: {3}it''s deallocated and started once now (R871); no action needed.' -f $VmName, $Because, $why, $sent)
             if ($asked -gt 0) {
                 # Live, the deallocate went out a minute after the deletes.
                 Start-Sleep -Seconds 60

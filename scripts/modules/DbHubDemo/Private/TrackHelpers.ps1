@@ -952,7 +952,10 @@ function Invoke-DemoDeploymentTrack {
             & $note ('DEPLOY.ARTIFACTS.STALL_{0}' -f $VmName.ToUpperInvariant()) $target 'Warning' ('{0}: no chunk finished for 5 minutes while several ran, so the rest went one at a time. Azure was busy with the VM''s extensions (Azure-side; nothing to do).' -f $VmName)
         }
         $leftover = if ($first.Count -gt 0) { @(Get-DemoMemberValue -InputObject $first[0] -Name 'LeftoverRunCommands') | Where-Object { $_ } } else { @() }
-        if (@($leftover).Count -gt 0) {
+        # R871 (live, 2026-11-17): a T2 host that keeps chunk Run Commands may not start again, and a deallocate completes
+        # their deletes while they're pending, so the host's are cleared below, once the artifacts are recorded.
+        $hostLeftover = @($leftover).Count -gt 0 -and -not $DuringRelease -and $VmName -eq (Get-DemoHostVmName -Config $Config)
+        if (@($leftover).Count -gt 0 -and -not $hostLeftover) {
             & $note ('DEPLOY.ARTIFACTS.CLEANUP_{0}' -f $VmName.ToUpperInvariant()) $target 'Warning' ('Azure was still deleting {0} chunk Run Command(s) on {1} when its artifacts arrived ({2}). That''s Azure-side and doesn''t block the loader (a VM allows 25 managed Run Commands); the next run''s cleanup checks again.' -f @($leftover).Count, $VmName, (@($leftover) -join ', ')) 'Nothing to do; if they stay for hours, see docs/troubleshooting.md (Run Commands stuck in Deleting).'
         }
         foreach ($item in $missing) {
@@ -963,6 +966,21 @@ function Invoke-DemoDeploymentTrack {
             $together = if ($missing.Count -gt 1) { ', in one wave with the other artifact' } else { '' }
             & $note $item.CheckId $target 'Pass' ('{0} {1} sent to {2} in {3} chunk(s), {4:N0} seconds{5}.' -f $item.Kind, $item.Sha.Substring(0, 12), $VmName, $one.ChunkCount, $one.Seconds, $together) '' ([ordered]@{ chunks = [int]$one.ChunkCount; seconds = $one.Seconds; parallelism = $parallelism; together = ($missing.Count -gt 1) })
             $null = $shared['Sent'].Add($item.Key)
+        }
+        if ($hostLeftover) {
+            # The watchdog's host path sends their deletes, then deallocates and starts the host, which completes them
+            # (Restart-DemoVmOnce), unless the host mustn't be restarted now (its guest build may be running, for example).
+            $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('Azure hadn''t deleted {0} chunk Run Command(s) on it after its artifacts arrived ({1}), and a T2 host that keeps them may not start again' -f @($leftover).Count, (@($leftover) -join ', ')) -ProgressPath $progress -ProgressId $progressId
+            foreach ($extra in @((Get-DemoMemberValue -InputObject $watchdog -Name 'Results') | Where-Object { $null -ne $_ })) {
+                $results.Add($extra)
+            }
+            $results.Add($watchdog.Result)
+            if (-not [bool]$watchdog.Restarted) {
+                & $note ('DEPLOY.ARTIFACTS.CLEANUP_{0}' -f $VmName.ToUpperInvariant()) $target 'Warning' ('Azure hadn''t deleted {0} chunk Run Command(s) on {1} after its artifacts arrived ({2}), and they weren''t cleared now: {3}. A T2 host that keeps them may not start again.' -f @($leftover).Count, $VmName, (@($leftover) -join ', '), [string](Get-DemoMemberValue -InputObject $watchdog.Result -Name 'message')) 'Stop the demo with ./scripts/stop-demo.ps1, which deletes them before it deallocates the host; if the host doesn''t start later, ./scripts/deploy.ps1 brings it back (docs/troubleshooting.md, "A host''s VM agent that isn''t Ready").'
+            }
+            if ([bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed')) {
+                throw ('{0} isn''t back after its deallocate and start, which cleared its chunk Run Commands (DEPLOY.WATCHDOG_{1}).' -f $VmName, $VmName.ToUpperInvariant())
+            }
         }
     }
     # Runs a VM's loader with the chunks that reached it, then reports the result. Its extensions settle first; a loader

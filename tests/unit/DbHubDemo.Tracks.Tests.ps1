@@ -752,6 +752,45 @@ Describe 'Invoke-DemoDeploymentTrack' {
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.WATCHDOG_ARCHOST01' }).status | Should -Be 'Warning'
     }
 
+    It 'clears chunk Run Commands Azure hadn''t deleted on archost01 through the watchdog once the artifacts are recorded, and only warns on sqlvm01 (R871, 2026-11-17)' {
+        $script:recorded = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentStateLocked -MockWith { if ($PesterBoundParameters['AddVm']) { $script:calls.Add(('recorded {0} {1}' -f $PesterBoundParameters['AddKind'], $PesterBoundParameters['AddVm'])) } }
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoChunkSet -MockWith {
+            $script:calls.Add(('chunks {0}' -f $VmName))
+            @($File | ForEach-Object { [pscustomobject]@{ Description = $_.Description; Sha256 = $_.Sha256; ChunkCount = 1; Seconds = 90; Stalled = $false; LeftoverRunCommands = @('DbHubDemo-Chunk-0123456789ab-001') } })
+        }
+        $script:watchdogRestarts = $true
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmWatchdog -MockWith { $script:calls.Add(('watchdog {0}: {1}' -f $VmName, $Cause)); [pscustomobject]@{ Restarted = $script:watchdogRestarts; Recovered = $script:watchdogRestarts; Failed = $false; Saved = ''; Items = @(); Result = (New-DemoResult -CheckId ('DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01 wasn''t restarted (its guest build may be running)'); Results = @() } }
+        $script:state.BundleSentTo = @()
+        $script:state.RunnerSentTo = @()
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts') }
+        $outcome.Status | Should -Be 'Pass'
+        $order = @($script:calls | Where-Object { $_ -match '^(chunks|recorded|watchdog) ' })
+        $order[0] | Should -Be 'chunks archost01'
+        $order[1..2] | Should -Be @('recorded Bundle archost01', 'recorded Runner archost01') -Because 'the artifacts arrived, so they''re recorded before the host is deallocated'
+        $order[3] | Should -BeLike 'watchdog archost01: Azure hadn''t deleted 1 chunk Run Command(s) on it after its artifacts arrived (DbHubDemo-Chunk-0123456789ab-001), and a T2 host that keeps them may not start again'
+        $outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.CLEANUP_ARCHOST01' } | Should -BeNullOrEmpty
+
+        # A host that mustn't be restarted now keeps them, and the Warning says what stops the demo safely.
+        $script:calls.Clear()
+        $script:watchdogRestarts = $false
+        $script:state.BundleSentTo = @()
+        $script:state.RunnerSentTo = @()
+        $blocked = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts') }
+        $cleanup = $blocked.Results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.CLEANUP_ARCHOST01' }
+        $cleanup.status | Should -Be 'Warning'
+        $cleanup.message | Should -Match 'weren''t cleared now: archost01 wasn''t restarted \(its guest build may be running\)\. A T2 host that keeps them may not start again\.'
+        $cleanup.remediation | Should -Match '^Stop the demo with \./scripts/stop-demo\.ps1, which deletes them before it deallocates the host'
+
+        # sqlvm01's deletes finish on their own: a Warning, as before, and no watchdog.
+        $script:calls.Clear()
+        $script:state.BundleSentTo = @()
+        $script:state.RunnerSentTo = @()
+        $t1 = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context $Context -Step @('Artifacts') }
+        ($t1.Results | Where-Object { $_.checkId -eq 'DEPLOY.ARTIFACTS.CLEANUP_SQLVM01' }).status | Should -Be 'Warning'
+        @($script:calls | Where-Object { $_ -match '^watchdog ' }) | Should -BeNullOrEmpty
+    }
+
     It 'fails the T2 step when the host''s own last step failed, instead of passing on the Arc checks (live, 2026-10-27)' {
         # The host installs T2's runner after onboarding; live, setup --target T2 failed while every Arc check passed.
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { $script:calls.Add('health ' + $VmName); [pscustomobject]@{ Health = [pscustomobject]@{ state = 'Failed'; message = 'Step WorkloadRunner failed: setup --target T2: Fail.' }; Polls = 4 } }
