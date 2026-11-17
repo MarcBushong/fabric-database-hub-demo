@@ -37,8 +37,9 @@ function Remove-DemoEnvironment {
     DESTROY.CONTROL.ROLES). A part that fails is a Warning that names its fix, and the others go on; the Fabric
     capacity, which you manage, is never paused or resumed for it. With fabric.manageCapacity true (Phase
     26b, ADR 0023), a Fabric capacity that start-demo.ps1 resumed, as the group's DbHubFabricCapacityResumed tag
-    records, is paused before the group goes (DESTROY.FABRIC.CAPACITY; a Warning when it can't be); with false, the
-    default, the capacity isn't called. When the group is already gone,
+    records, is paused once the Fabric workspaces are deleted, whose deletes need it running, and before the group goes
+    (DESTROY.FABRIC.CAPACITY; a Warning when it can't be); with false, the default, the capacity isn't called. When the
+    group is already gone,
     steps 1, 4, and 5 still run, and so do the parts above, so a destroy that was interrupted can be run again: it keeps
     the manifest an earlier run recorded while the group existed (Resolve-DemoTeardownManifest), and a group still being
     deleted (ResourceGroupBeingDeleted) is waited for. If the residual check itself can't run, DESTROY.RESIDUAL
@@ -260,12 +261,6 @@ function Remove-DemoEnvironment {
         }
     }
 
-    # fabric.manageCapacity (Phase 26b, ADR 0023): a Fabric capacity that start-demo.ps1 resumed is paused before its record
-    # goes with the group (a Warning when it can't be). With the default (false), the capacity isn't called.
-    if ($groupExists -and (Get-DemoFabricCapacitySetting -Config $Config).ManageCapacity) {
-        $results.Add((Suspend-DemoFabricCapacity -Config $Config -CheckPrefix DESTROY -Confirm:$false))
-    }
-
     # Read before anything goes: the deploymentId and the identities can't be found once the group is gone.
     $manifest = $null
     try {
@@ -280,6 +275,13 @@ function Remove-DemoEnvironment {
     # rest, and a destroy.ps1 that runs again after the group is gone finishes them.
     foreach ($item in @(Invoke-DemoDestroyExtra -Config $Config -Plan $extra)) {
         $results.Add($item)
+    }
+
+    # fabric.manageCapacity (Phase 26b, ADR 0023): a Fabric capacity that start-demo.ps1 resumed is paused before its record
+    # goes with the group (a Warning when it can't be), and after the Fabric workspaces, whose deletes need it running
+    # (2026-11-17). With the default (false), the capacity isn't called.
+    if ($groupExists -and (Get-DemoFabricCapacitySetting -Config $Config).ManageCapacity) {
+        $results.Add((Suspend-DemoFabricCapacity -Config $Config -CheckPrefix DESTROY -Confirm:$false))
     }
 
     if ($groupExists) {

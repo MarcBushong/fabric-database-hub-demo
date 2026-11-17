@@ -316,4 +316,18 @@ Describe 'Remove-DemoEnvironment lists what it deletes and keeps before it asks 
         $script:keepFabric | Should -BeTrue
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq 'destroy.ps1 keeps the Fabric capacity and your licenses, which you manage.' } -Times 1 -Exactly
     }
+
+    It 'pauses a capacity it resumed (fabric.manageCapacity) only after the Fabric workspaces, whose deletes need it, and before the group' {
+        $script:order = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoTeardownManifest -MockWith { throw 'no manifest in this test' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDestroyExtra -MockWith { $script:order.Add('fabric, control, and group') }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricCapacitySetting -MockWith { [pscustomobject]@{ ManageCapacity = $true } }
+        Mock -ModuleName DbHubDemo -CommandName Suspend-DemoFabricCapacity -MockWith {
+            $script:order.Add('capacity')
+            New-DemoResult -CheckId 'DESTROY.FABRIC.CAPACITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'paused'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcSetting -MockWith { $script:order.Add('Arc'); throw 'the order is known' }
+        { Remove-DemoEnvironment -Config $config -Confirm:$false } | Should -Throw '*the order is known*'
+        ($script:order -join ' > ') | Should -Be 'fabric, control, and group > capacity > Arc'
+    }
 }
