@@ -522,6 +522,31 @@ Describe 'Enable-DemoT4Workload' {
         $script:t4.State = 'Stopped'
         $result = Enable-DemoT4Workload -Config (New-TestConfig) -PrincipalId '88888888-8888-8888-8888-888888888888' -Confirm:$false
         $result.status | Should -Be 'Manual action required'
+        $result.remediation | Should -Match '^Start it with start-demo\.ps1'
+        $script:requests.Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly -Because 'a stopped server doesn''t start by itself, so nothing waits for it'
+    }
+
+    It 'waits for a T4 that''s Updating while its read replica is created, then sets it up (live, 2026-11-17)' {
+        $script:t4.State = 'Updating'
+        $script:sleeps = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:sleeps++; if ($script:sleeps -eq 3) { $script:t4.State = 'Ready' } }
+        $result = Enable-DemoT4Workload -Config (New-TestConfig) -PrincipalId '88888888-8888-8888-8888-888888888888' -Confirm:$false
+        $result.status | Should -Be 'Pass'
+        $script:requests.Count | Should -Be 1
+        $script:sleeps | Should -Be 3
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match '^T4 \(pgflex01-abc123\) is Updating, which ends by itself .* so T1 waits for it to be Ready, at most 20 minutes; no action needed\.$' } -Times 1 -Exactly
+    }
+
+    It 'says T4 is still changing, with the fix that fits, when it doesn''t end within the bound, and waits no longer' {
+        $script:t4.State = 'Updating'
+        $script:sleeps = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:sleeps++ }
+        $result = Enable-DemoT4Workload -Config (New-TestConfig) -PrincipalId '88888888-8888-8888-8888-888888888888' -WaitMinutes 2 -Confirm:$false
+        $result.status | Should -Be 'Manual action required'
+        $result.message | Should -Be 'T4 (pgflex01-abc123) is still Updating after 2 minutes: Azure is still working on it (creating its read replica, for example), so T1 can''t set it up now.'
+        $result.remediation | Should -Match '^Nothing to start: Azure ends this by itself\. Run \./scripts/deploy\.ps1 again once T4 is Ready'
+        $script:sleeps | Should -Be 6 -Because '2 minutes are 6 polls of 20 seconds, counted rather than timed'
         $script:requests.Count | Should -Be 0
     }
 }
@@ -574,6 +599,18 @@ Describe 'T4 in the deployment tracks' {
         $outcome.Status | Should -Be 'Pass'
         @($script:events) | Should -Be @('restart', 'enable')
         ($outcome.Results | Where-Object checkId -EQ 'DEPLOY.T4.RESTART').status | Should -Be 'Pass'
+    }
+
+    It 'waits in T1''s T4 step for a T4 that its read replica''s creation keeps Updating, before T4''s restart and its setup (live, 2026-11-17)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ RunnerSha256 = ('b' * 64); RunnerSentTo = @('sqlvm01') } }
+        Mock -ModuleName DbHubDemo -CommandName Add-DemoT1ToT3AdminGroup -MockWith { New-DemoResult -CheckId 'T3.GROUP' -Area 't3' -Target 'T3' -Status 'Pass' -Message 'member' -Evidence @{ principalId = '88888888-8888-8888-8888-888888888888' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT1PrincipalId -MockWith { '88888888-8888-8888-8888-888888888888' }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoT4Transition -MockWith { $script:events.Add(('wait {0}' -f $ProgressId)); [pscustomobject]@{ State = [pscustomobject]@{ Exists = $true; State = 'Ready' }; From = 'Updating'; Seconds = 400; Ended = $true } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PendingRestart -MockWith { $script:events.Add('restart check'); $null }
+        Mock -ModuleName DbHubDemo -CommandName Enable-DemoT4Workload -MockWith { $script:events.Add('enable'); New-DemoResult -CheckId 'WORKLOAD.T4.ENABLE' -Area 'workload' -Target 'T4' -Status 'Pass' -Message 'set up' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T1' -Context @{ NoState = $true } -Step @('T4') }
+        $outcome.Status | Should -Be 'Pass'
+        @($script:events) | Should -Be @('wait T4.Setup', 'restart check', 'enable')
     }
 }
 

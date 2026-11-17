@@ -1301,6 +1301,11 @@ function Invoke-DemoDeploymentTrack {
                         & $note 'WORKLOAD.T4.ENABLE' 'T4' 'Manual action required' 'T1 isn''t in the P6 group yet, so it can''t sign in to T4 as the group''s role.' 'Add T1 to the group (Add-DemoT1ToT3AdminGroup describes how), then run deploy.ps1 -FromStage T4.'
                         break
                     }
+                    # 2026-11-17 (live, rg-dbhubfd-demo): T4's read replica, which T4's track creates alongside this one, keeps
+                    # T4 Updating for about 9 minutes, and a rerun's T1 gets here during it. T1 waits for such a state to end
+                    # (Wait-DemoT4Transition, at most 20 minutes) before T4's restart and its setup; a stopped T4 is reported
+                    # as before.
+                    $null = Wait-DemoT4Transition -Config $Config -ProgressPath $progress -ProgressId 'T4.Setup'
                     # A max_connections value the template set waits for a restart (a static parameter). T4 restarts here,
                     # right before T1 connects, and nowhere else in the run, so no setup runs into it (ADR 0019, 2026-11-03).
                     $restart = Invoke-DemoT4PendingRestart -Config $Config

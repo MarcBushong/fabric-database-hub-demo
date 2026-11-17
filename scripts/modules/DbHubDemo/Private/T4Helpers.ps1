@@ -2404,6 +2404,59 @@ function Wait-DemoT4State {
     }
 }
 
+function Wait-DemoT4Transition {
+    <#
+    .SYNOPSIS
+    Waits while T4 is in a state that ends by itself (2026-11-17, live on rg-dbhubfd-demo): Updating while its read replica
+    is created (about 9 minutes; T4's track creates it alongside T1's) or a scale or a setting applies, Starting,
+    Restarting, or Provisioning. A server that's Ready, stopped, missing, or in any other state returns at once. Counts its
+    polls, at most -TimeoutMinutes. Returns State (Get-DemoT4State's last read), From (the state it waited on, or ''),
+    Seconds, and Ended (false when the bound stopped it). Internal.
+    Source (the states, checked 2026-11-17): https://learn.microsoft.com/rest/api/postgresql/servers/get
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateRange(0, 60)]
+        [int] $TimeoutMinutes = 20,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 20,
+
+        [string] $DeploymentId = '',
+
+        [string] $ProgressPath = '',
+
+        [string] $ProgressId = ''
+    )
+
+    $transient = @('Updating', 'Starting', 'Restarting', 'Provisioning')
+    $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
+    if (-not ($current.Exists -and [string]$current.State -in $transient) -or $TimeoutMinutes -eq 0) {
+        return [pscustomobject]@{ State = $current; From = ''; Seconds = 0; Ended = -not ($current.Exists -and [string]$current.State -in $transient) }
+    }
+    $from = [string]$current.State
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $text = 'T4 ({0}) is {1}, which ends by itself (its read replica''s creation keeps it Updating for about 9 minutes), so T1 waits for it to be Ready, at most {2} minutes; no action needed.' -f [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Names') -Name 'ServerName'), $from, $TimeoutMinutes
+    Write-DemoLog -Message $text
+    if ($ProgressPath -and $ProgressId) {
+        Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -AzureSide -Message $text
+    }
+    $polls = [int][System.Math]::Ceiling($TimeoutMinutes * 60 / $PollSeconds)
+    for ($poll = 1; $poll -le $polls; $poll++) {
+        Start-Sleep -Seconds $PollSeconds
+        $current = Get-DemoT4State -Config $Config -DeploymentId $DeploymentId
+        if (-not ($current.Exists -and [string]$current.State -in $transient)) {
+            break
+        }
+    }
+    $ended = -not ($current.Exists -and [string]$current.State -in $transient)
+    return [pscustomobject]@{ State = $current; From = $from; Seconds = [int]$watch.Elapsed.TotalSeconds; Ended = $ended }
+}
+
 function Invoke-DemoT4PowerAction {
     <#
     .SYNOPSIS
