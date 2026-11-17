@@ -312,6 +312,15 @@ Describe 'Send-DemoBootstrapBundle' {
                     if (-not $script:runCommands.Contains($name)) {
                         return $notFound
                     }
+                    # A lagged delete finishes after as many reads of the Run Command itself as of the list (R871's wait reads it).
+                    if ($script:pendingDeletes.ContainsKey($name)) {
+                        $script:pendingDeletes[$name]--
+                        if ($script:pendingDeletes[$name] -le 0) {
+                            $script:pendingDeletes.Remove($name)
+                            $script:runCommands.Remove($name)
+                            return $notFound
+                        }
+                    }
                     $failed = $name -eq $script:failName
                     $running = $script:runningReads -gt 0
                     if ($running) {
@@ -355,6 +364,27 @@ Describe 'Send-DemoBootstrapBundle' {
         }
         ($script:calls | Where-Object { $_.Method -eq 'get' -and $_.Name }).Url | ForEach-Object { $_ | Should -Match '&\$expand=instanceView$' }
         $script:runCommands.Count | Should -Be 0
+    }
+
+    It 'sends the T2 host''s chunks one at a time, each chunk''s Run Command gone before the next is written, whatever the parallelism asked (R871)' {
+        # Live, 2026-11-16, eight at once on archost01: Azure ended every chunk's delete with InternalExecutionError, the
+        # chunks stayed, and the host's next start never got its goal state.
+        $sent = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -Parallelism 8 -CleanupWaitSeconds 0 })
+        $sent[0].ChunkCount | Should -Be $expectedChunks.Count
+        # List, then for each chunk: PUT, its result, DELETE, and a read that finds it gone; then the cleanup's list.
+        $sequence = @('get') + @(foreach ($chunk in $expectedChunks) { 'put', 'get', 'delete', 'get' }) + @('get')
+        $script:calls.Method | Should -Be $sequence
+        $script:runCommands.Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like '*chunk*delivered*' } -Times $expectedChunks.Count -Exactly
+    }
+
+    It 'deletes a T2 host chunk''s Run Command once more when Azure didn''t, then stops the transfer before the next chunk (R871)' {
+        $script:stuckDeletes = $true
+        { InModuleScope DbHubDemo -Parameters @{ Config = $config; Bundle = $sendBundle } { Send-DemoChunkSet -Config $Config -File @([pscustomobject]@{ Path = $Bundle.Path; Sha256 = $Bundle.Sha256; SizeBytes = $Bundle.SizeBytes; Description = 'bootstrap bundle' }) -VmName 'archost01' -ChunkSizeKiB 1 -CleanupWaitSeconds 0 -DeleteWaitSeconds 30 } } | Should -Throw ('archost01: Azure didn''t delete the Run Command of chunk 1 of {0}, twice in 30s, so the transfer stops before more chunks stay on archost01*R871*' -f $expectedChunks.Count)
+        @($script:calls | Where-Object Method -EQ 'put').Count | Should -Be 1 -Because 'no second chunk goes while the first stays'
+        @($script:calls | Where-Object { $_.Method -eq 'delete' -and $_.Name -eq $expectedChunks[0].Name }).Count | Should -BeGreaterOrEqual 2
+        @($script:calls | Where-Object { $_.Method -eq 'get' -and $_.Name -eq $expectedChunks[0].Name }).Count | Should -Be 5 -Because 'its result, then 2 reads 15 seconds apart in each of the two rounds'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -like ('archost01: Azure didn''t delete the Run Command of chunk 1 of {0} within 30s, so it''s deleted once more.' -f $expectedChunks.Count) } -Times 1 -Exactly
     }
 
     It 'uses the runCommands API version that bootstrap.bicep declares' {

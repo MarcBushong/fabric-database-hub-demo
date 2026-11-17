@@ -727,6 +727,31 @@ Describe 'Invoke-DemoDeploymentTrack' {
         $script:calls | Should -Contain 'chunks archost01 release=False'
     }
 
+    It 'gives a chunk Run Command Azure didn''t delete on archost01 to the watchdog, then sends one chunk at a time in the same run (R871, 2026-11-17)' {
+        # The watchdog's host path deletes the chunks and deallocates and starts the host, which completes the deletes
+        # (Restart-DemoVmOnce, in DbHubDemo.OneCommand.Tests.ps1); ending the run there would leave them on the host instead.
+        $script:state.BundleSentTo = @()
+        $script:state.RunnerSentTo = @()
+        $script:sends = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmWatchdog -MockWith { $script:calls.Add(('watchdog {0}: {1}' -f $VmName, $Cause)); [pscustomobject]@{ Restarted = $true; Failed = $false; Saved = ''; Items = @(); Result = (New-TestResult ('DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()) 'Warning') } }
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoChunkSet -MockWith {
+            $script:sends++
+            $script:calls.Add(('chunks {0} {1}' -f $VmName, $Parallelism))
+            if ($script:sends -eq 1) {
+                throw 'archost01: Azure didn''t delete the Run Command of chunk 3 of 8, twice in 5m, so the transfer stops before more chunks stay on archost01: a VM that keeps them may not start again (R871).'
+            }
+            @($File | ForEach-Object { [pscustomobject]@{ Description = $_.Description; Sha256 = $_.Sha256; ChunkCount = 4; Seconds = 90 } })
+        }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'T2' -Context $Context -Step @('Artifacts') }
+        $outcome.Status | Should -Be 'Pass'
+        $sent = @($script:calls | Where-Object { $_ -match '^(chunks|watchdog) ' })
+        $sent.Count | Should -Be 3
+        $sent[0] | Should -Be 'chunks archost01 8'
+        $sent[1] | Should -BeLike 'watchdog archost01: sending its artifacts got stuck (archost01: Azure didn''t delete the Run Command of chunk 3 of 8*R871*'
+        $sent[2] | Should -Be 'chunks archost01 1'
+        ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.WATCHDOG_ARCHOST01' }).status | Should -Be 'Warning'
+    }
+
     It 'fails the T2 step when the host''s own last step failed, instead of passing on the Arc checks (live, 2026-10-27)' {
         # The host installs T2's runner after onboarding; live, setup --target T2 failed while every Arc check passed.
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmHealthState -MockWith { $script:calls.Add('health ' + $VmName); [pscustomobject]@{ Health = [pscustomobject]@{ state = 'Failed'; message = 'Step WorkloadRunner failed: setup --target T2: Fail.' }; Polls = 4 } }

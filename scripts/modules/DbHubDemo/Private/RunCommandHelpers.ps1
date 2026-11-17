@@ -728,8 +728,22 @@ function Send-DemoChunkSet {
         [int] $CleanupWaitSeconds = 120,
 
         [ValidateRange(0, 1800)]
-        [int] $RoomWaitSeconds = 300
+        [int] $RoomWaitSeconds = 300,
+
+        # How long each chunk's delete is waited for, then once more after a second delete, before the next chunk goes
+        # (2026-11-17, R871); 0 deletes without waiting (Phase 28). The T2 host defaults to 300, one chunk at a time: there,
+        # with 8 chunks at once, Azure ended every chunk's delete with InternalExecutionError, the chunks stayed on the
+        # VM, and its next start never got its goal state from Azure.
+        [ValidateRange(0, 1800)]
+        [int] $DeleteWaitSeconds = 0
     )
+
+    if (-not $PSBoundParameters.ContainsKey('DeleteWaitSeconds') -and $VmName -eq (Get-DemoHostVmName -Config $Config)) {
+        $DeleteWaitSeconds = 300
+    }
+    if ($DeleteWaitSeconds -gt 0) {
+        $Parallelism = 1
+    }
 
     $subscriptionId = $Config['subscriptionId']
     if (-not $ResourceGroupName) {
@@ -770,7 +784,8 @@ function Send-DemoChunkSet {
         Write-DemoLog -Message ('{0}: sending {1} {2} ({3} bytes) in {4} chunk(s) of {5} KiB.' -f $VmName, $entry.Description, $entry.Sha256.Substring(0, 12), $entry.SizeBytes, $entry.ChunkCount, $ChunkSizeKiB)
     }
     if ($entries.Count -gt 1) {
-        Write-DemoLog -Message ('{0}: the {1} files'' {2} chunks travel together, up to {3} at once.' -f $VmName, $entries.Count, $pending.Count, $Parallelism)
+        $how = if ($DeleteWaitSeconds -gt 0) { 'one at a time, each chunk''s Run Command deleted before the next' } else { 'up to {0} at once' -f $Parallelism }
+        Write-DemoLog -Message ('{0}: the {1} files'' {2} chunks travel together, {3}.' -f $VmName, $entries.Count, $pending.Count, $how)
     }
     try {
         $listing = @{}
@@ -859,7 +874,27 @@ function Send-DemoChunkSet {
                 $detail = if ($State.Error) { $State.Error } else { $State.Output }
                 throw ('{0}: chunk {1} of {2} failed on the VM (execution state {3}, provisioning state {4}, exit code {5}): {6}' -f $VmName, $Chunk.Index, $Chunk.Count, $State.ExecutionState, $State.ProvisioningState, $State.ExitCode, $detail)
             }
-            if (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $Url -NoWait -Confirm:$false)) {
+            if ($DeleteWaitSeconds -gt 0) {
+                # One chunk on the VM at a time (R871): its Run Command is gone before the next chunk goes. A delete Azure
+                # ends without deleting it is asked for once more; a second one stops the transfer, so no more chunks stay.
+                # The wait counts its own polls, 15 seconds apart (no conflict backoff step uses 15).
+                $waitText = Format-DemoProgressDuration -Seconds $DeleteWaitSeconds
+                $gone = $false
+                for ($round = 1; $round -le 2 -and -not $gone; $round++) {
+                    if ($round -gt 1) {
+                        Write-DemoLog -Level Warning -Message ('{0}: Azure didn''t delete the Run Command of chunk {1} of {2} within {3}, so it''s deleted once more.' -f $VmName, $Chunk.Index, $Chunk.Count, $waitText)
+                    }
+                    $null = Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $Url -NoWait -Confirm:$false
+                    for ($waited = 0; $waited -lt $DeleteWaitSeconds -and -not $gone; $waited += 15) {
+                        Start-Sleep -Seconds 15
+                        $gone = [bool](Get-DemoRunCommandState -SubscriptionId $subscriptionId -Url $Url).NotFound
+                    }
+                }
+                if (-not $gone) {
+                    throw ('{0}: Azure didn''t delete the Run Command of chunk {1} of {2}, twice in {3}, so the transfer stops before more chunks stay on {0}: a VM that keeps them may not start again (R871).' -f $VmName, $Chunk.Index, $Chunk.Count, $waitText)
+                }
+            }
+            elseif (-not (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url $Url -NoWait -Confirm:$false)) {
                 Write-DemoLog -Level Warning -Message ('{0}: the Run Command for chunk {1} of {2} couldn''t be deleted yet; the cleanup at the end tries again.' -f $VmName, $Chunk.Index, $Chunk.Count)
             }
             $shared['LastProgressUtc'] = Get-DemoUtcNow
