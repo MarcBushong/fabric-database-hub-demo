@@ -94,12 +94,21 @@ function Get-DemoVmExtensionActivity {
                 [string](Get-DemoMemberValue -InputObject $item -Name 'name')
             }
         })
+    # Every chunk Run Command the VM lists, whatever its state (R871: on the T2 host, one whose delete Azure ended with an
+    # error stays listed as Succeeded, marked for deletion, and the VM's next start never gets its goal state).
+    $chunks = @(foreach ($item in $runCommands) {
+            $name = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
+            if ($name -like 'DbHubDemo-Chunk-*') {
+                $name
+            }
+        })
     return [pscustomobject]@{
         Readable            = ($null -ne $view)
         Busy                = ($items.Count -gt 0)
         Items               = $items.ToArray()
         Labels              = $labels.ToArray()
         RunCommandsDeleting = $deleting
+        Chunks              = $chunks
         View                = $view
     }
 }
@@ -266,6 +275,12 @@ function Restart-DemoVmOnce {
     running, judged from the deployment state (review finding 6 and its follow-up). Returns Restarted, Reason, AtUtc,
     Recovered (the deallocate and start brought it back), Failed (it isn't back: the watchdog's result is a Fail), Detail,
     and Results (the guest's shutdown, when the recovery ran it). Internal.
+
+    The T2 host whose VM agent isn't Ready, or that lists chunk Run Commands (-ChunkRunCommand), gets no restart (R871,
+    2026-11-17): the deletes of those chunks go first, then one deallocate and start (Invoke-DemoVmRestartRecovery). Live,
+    a chunk whose delete Azure had ended with an error stayed on the VM, marked for deletion, and no start or restart got
+    the VM's goal state with it (13 of 13); a delete still pending when the VM deallocated completed with it, and the next
+    start had the agent Ready in 2 minutes. Then Action says 'deallocated and started' and AgentDown says why.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -278,6 +293,9 @@ function Restart-DemoVmOnce {
         [string] $VmName,
 
         [string] $Because = 'Azure''s work on its extensions was stuck',
+
+        [AllowEmptyCollection()]
+        [string[]] $ChunkRunCommand = @(),
 
         [ValidateRange(1, 60)]
         [int] $RestartMinutes = 15,
@@ -305,8 +323,34 @@ function Restart-DemoVmOnce {
     }
     $at = [System.DateTime]::UtcNow
     $script:DemoVmRestarted[$key] = $at
-    Write-DemoLog -Level Warning -Message ('{0}: {1} for about 15 minutes, so the VM restarts once now (az vm restart); the run goes on afterward.' -f $VmName, $Because)
     $subscriptionId = [string]$Config['subscriptionId']
+    $chunks = @($ChunkRunCommand | Where-Object { $_ -like 'DbHubDemo-Chunk-*' })
+    if ($VmName -eq (Get-DemoHostVmName -Config $Config)) {
+        $state = Get-DemoVmRestartState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
+        $agentDown = $state.Read -and $state.Power -eq 'PowerState/running' -and $state.Agent -ne 'Ready'
+        if ($agentDown -or $chunks.Count -gt 0) {
+            # R871: no restart. The chunks' deletes go first, so they're pending when the VM deallocates, which completes them.
+            $baseUrl = Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
+            $apiVersion = Get-DemoRunCommandApiVersion
+            $asked = 0
+            foreach ($name in $chunks) {
+                if (Remove-DemoRunCommand -SubscriptionId $subscriptionId -Url ('{0}/{1}?api-version={2}' -f $baseUrl, $name, $apiVersion) -NoWait -Confirm:$false) {
+                    $asked++
+                }
+            }
+            $why = if ($agentDown) { 'its VM agent isn''t Ready ({0})' -f $state.Text } else { 'it lists {0} chunk Run Command(s) that a restart would keep' -f $chunks.Count }
+            $sent = if ($asked -gt 0) { 'the deletes of its {0} leftover chunk Run Command(s) were sent first, so they finish with the deallocate, and ' -f $asked } else { '' }
+            Write-DemoLog -Level Warning -Message ('{0}: {1} for about 15 minutes, and {2}, so it isn''t restarted: {3}it''s deallocated and started once now (R871); no action needed.' -f $VmName, $Because, $why, $sent)
+            if ($asked -gt 0) {
+                # Live, the deallocate went out a minute after the deletes.
+                Start-Sleep -Seconds 60
+            }
+            $recover = Invoke-DemoVmRestartRecovery -Config $Config -VmName $VmName -TimeoutMinutes $RecoverMinutes -PollSeconds $PollSeconds
+            $detail = '{0}{1}, so {2}{3}' -f $why.Substring(0, 1).ToUpperInvariant(), $why.Substring(1), $sent, $recover.Detail
+            return [pscustomobject]@{ Restarted = $true; Reason = ''; AtUtc = $at; Recovered = [bool]$recover.Recovered; Failed = -not [bool]$recover.Recovered; Detail = $detail; Results = @($recover.Results); Left = [string](Get-DemoMemberValue -InputObject $recover -Name 'Left'); Action = 'deallocated and started'; AgentDown = $agentDown; ChunksDeleted = $asked }
+        }
+    }
+    Write-DemoLog -Level Warning -Message ('{0}: {1} for about 15 minutes, so the VM restarts once now (az vm restart); the run goes on afterward.' -f $VmName, $Because)
     # --no-wait, then a bounded wait (2026-11-16): without them, a restart Azure never finished held the track, and deploy.ps1,
     # with no end and no NOT DONE (live: archost01 'updating', its agent Not Ready, 40 minutes after the restart).
     $restart = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'restart', '--resource-group', $resourceGroupName, '--name', $VmName, '--no-wait') -AllowFailure -TimeoutSeconds 300
@@ -532,24 +576,30 @@ function Invoke-DemoVmWatchdog {
 
     $activity = Get-DemoVmExtensionActivity -Config $Config -VmName $VmName
     $saved = Save-DemoVmInstanceView -View $activity.View -VmName $VmName
-    $restart = Restart-DemoVmOnce -Config $Config -VmName $VmName -Because $Cause -Confirm:$false
+    # Assigned first: Get-DemoMemberValue returns an array as one object.
+    $chunkNames = Get-DemoMemberValue -InputObject $activity -Name 'Chunks'
+    $restart = Restart-DemoVmOnce -Config $Config -VmName $VmName -Because $Cause -ChunkRunCommand @($chunkNames | Where-Object { $_ }) -Confirm:$false
     $at = if ($null -ne $restart.AtUtc) { ([datetime]$restart.AtUtc).ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
     $what = if ($activity.Labels.Count -gt 0) { ' Azure was busy with {0}.' -f ($activity.Labels -join ', ') } else { '' }
     $recovered = [bool](Get-DemoMemberValue -InputObject $restart -Name 'Recovered')
     $failed = [bool](Get-DemoMemberValue -InputObject $restart -Name 'Failed')
     $detail = [string](Get-DemoMemberValue -InputObject $restart -Name 'Detail')
-    $done = if ($restart.Restarted) { '{0} was restarted automatically at {1} (local time), because {2}.{3}' -f $VmName, $at, $Cause, $what } else { '{0} wasn''t restarted ({1}), although {2}.{3}' -f $VmName, $restart.Reason, $Cause, $what }
+    $action = [string](Get-DemoMemberValue -InputObject $restart -Name 'Action')
+    $verb = if ($action) { $action } else { 'restarted' }
+    $done = if ($restart.Restarted) { '{0} was {1} automatically at {2} (local time), because {3}.{4}' -f $VmName, $verb, $at, $Cause, $what } else { '{0} wasn''t restarted ({1}), although {2}.{3}' -f $VmName, $restart.Reason, $Cause, $what }
     if ($detail) {
         $done = '{0} {1}.' -f $done, $detail
     }
     $savedText = if ($saved) { ' Its instance view is saved in {0} for ./scripts/collect-diagnostics.ps1.' -f $saved } else { '' }
     # Where the recovery left the VM (deallocating, deallocated, starting, running; '' when it didn't run), so the run's ending
     # doesn't call a VM it left deallocating running and billing (Get-DemoWatchdogLeftVm).
-    $evidence = [ordered]@{ vmName = $VmName; restarted = [bool]$restart.Restarted; restartedAtUtc = $(if ($null -ne $restart.AtUtc) { ([datetime]$restart.AtUtc).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }); recovered = $recovered; left = [string](Get-DemoMemberValue -InputObject $restart -Name 'Left'); busy = @($activity.Items); runCommandsDeleting = @($activity.RunCommandsDeleting).Count; instanceView = $saved }
+    $evidence = [ordered]@{ vmName = $VmName; restarted = [bool]$restart.Restarted; restartedAtUtc = $(if ($null -ne $restart.AtUtc) { ([datetime]$restart.AtUtc).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }); recovered = $recovered; left = [string](Get-DemoMemberValue -InputObject $restart -Name 'Left'); busy = @($activity.Items); runCommandsDeleting = @($activity.RunCommandsDeleting).Count; instanceView = $saved; action = $verb; agentDown = [bool](Get-DemoMemberValue -InputObject $restart -Name 'AgentDown'); chunksDeleted = [int](Get-DemoMemberValue -InputObject $restart -Name 'ChunksDeleted') }
     $checkId = 'DEPLOY.WATCHDOG_{0}' -f $VmName.ToUpperInvariant()
     if ($failed) {
         Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -AzureSide -Message ('{0} Azure-side; the run stops this step.' -f $done)
-        $result = New-DemoResult -CheckId $checkId -Area 'infra' -Target (Get-DemoVmTarget -VmName $VmName) -Status 'Fail' -Message ('{0}{1}' -f $done, $savedText) -Evidence $evidence -Remediation 'Wait 30 minutes, then run ./scripts/deploy.ps1 again; it continues where it stopped, and restarts the VM again, or deallocates and starts it, if it still needs to.' -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/states-billing'
+        # R871: a host that a deallocate and start didn't bring back isn't helped by waiting.
+        $remediation = if ($action) { 'Run ./scripts/deploy.ps1 again: it sends the deletes of the host''s chunk Run Commands again, then deallocates and starts it once more. If its VM agent still isn''t Ready, see docs/troubleshooting.md ("A host''s VM agent that isn''t Ready").' } else { 'Wait 30 minutes, then run ./scripts/deploy.ps1 again; it continues where it stopped, and restarts the VM again, or deallocates and starts it, if it still needs to.' }
+        $result = New-DemoResult -CheckId $checkId -Area 'infra' -Target (Get-DemoVmTarget -VmName $VmName) -Status 'Fail' -Message ('{0}{1}' -f $done, $savedText) -Evidence $evidence -Remediation $remediation -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/states-billing'
     }
     else {
         Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -AzureSide -Message ('{0} No action needed.' -f $done)

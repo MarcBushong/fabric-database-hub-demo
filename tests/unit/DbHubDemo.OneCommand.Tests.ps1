@@ -1569,6 +1569,7 @@ Describe 'Run Commands never stall a run (brief item 14)' {
 
     It 'never restarts the T2 host mid-build, or while a golden Release runs on it (review finding 6)' {
         # Judged from the deployment state, not the host's health (review follow-up): the agent that would read it is what's stuck.
+        $script:views.Enqueue($script:idle)
         $script:stateValues = @{ GuidedStopUtc = ''; Stage = 'Infrastructure'; TrackT1 = 'Monitoring'; TrackT2 = 'Bootstraps'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '2026-10-29T15:00:00Z' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]$script:stateValues }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'The watchdog must not read health through a Run Command.' }
@@ -1621,6 +1622,7 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         # A golden redeploy's host is a new VM: policy-installed extensions can hold its Run Commands (R336), so a health
         # read through a Run Command times out exactly then.
         $script:healthReads = 0
+        $script:views.Enqueue($script:idle)
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:healthReads++; throw 'Run Command timed out.' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = ''; Stage = 'Infrastructure'; TrackT1 = 'Monitoring'; TrackT2 = 'Restore'; TrackT4 = ''; TrackFabric = ''; T2Source = 'golden'; T2BuildUtc = '' } }
         $restart = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }
@@ -1767,6 +1769,89 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $script:order | Should -Be @('guest 180', 'deallocate', 'Deallocate', 'Start')
         @($recovery.Results).checkId | Should -Be @('STOP.GUEST')
         $recovery.Detail | Should -Match '^its guest was shut down first \(Pass\), it was deallocated and started once'
+    }
+
+    It 'gives the T2 host <Case> no restart: its chunk Run Commands'' deletes go first, then one deallocate and start (R871, live 2026-11-17)' -ForEach @(
+        @{ Case = 'whose agent isn''t Ready'; Agent = 'Not Ready'; Chunks = @('DbHubDemo-Chunk-a8a10d93133c-001', 'DbHubDemo-Chunk-cb840b69ea86-001-20261117032532'); Why = 'Its VM agent isn''t Ready \(provisioning updating, power running, agent Not Ready\)' }
+        @{ Case = 'whose agent isn''t Ready, with no chunks'; Agent = 'Not Ready'; Chunks = @(); Why = 'Its VM agent isn''t Ready' }
+        @{ Case = 'that lists chunks, with its agent Ready'; Agent = 'Ready'; Chunks = @('DbHubDemo-Chunk-a8a10d93133c-001'); Why = 'It lists 1 chunk Run Command\(s\) that a restart would keep' }
+    ) {
+        # Live: a chunk whose delete Azure had ended with an error stayed, marked for deletion, and no start or restart got the
+        # host's goal state with it; deletes still pending when the host deallocated completed with it, and the next start
+        # had the agent Ready in 2 minutes.
+        $script:order = [System.Collections.Generic.List[string]]::new()
+        $script:chunkNames = $Chunks
+        $script:agentNow = $Agent
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = 'PowerState/running'; Agent = $script:agentNow; Text = ('provisioning updating, power running, agent {0}' -f $script:agentNow) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = $ArgumentList -join ' '
+            if ($joined -match '^vm get-instance-view') {
+                return $script:idle
+            }
+            if ($joined -match '^rest --method get') {
+                return [pscustomobject]@{ value = @(@($script:chunkNames) + 'DbHubDemo-Profile' | ForEach-Object { [pscustomobject]@{ name = $_; properties = [pscustomobject]@{ provisioningState = 'Succeeded' } } }) }
+            }
+            if ($joined -match '^rest --method delete --url \S+/runCommands/(\S+)\?') {
+                $script:order.Add(('delete {0}' -f $Matches[1]))
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            if ($joined -match '^vm restart') {
+                $script:restarts++
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            if ($joined -match '^vm deallocate .*--no-wait') {
+                $script:order.Add('deallocate')
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            throw ('unexpected Azure CLI call: ' + $joined)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add($Action); New-DemoResult -CheckId 'STOP.VM_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'ok' }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -MockWith { $script:order.Add('guest'); New-DemoResult -CheckId 'STOP.GUEST' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'The guest is off.' }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoVmInstanceView -MockWith { '' }
+        $script:stateValues = @{ GuidedStopUtc = ''; Stage = ''; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]$script:stateValues }
+        $watchdog = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmWatchdog -Config $Config -VmName 'archost01' -Cause 'Azure''s work on its extensions was stuck' }
+        $script:restarts | Should -Be 0 -Because 'a restart neither gets the goal state nor removes the chunks'
+        $guest = if ($Agent -eq 'Ready') { @('guest') } else { @() }
+        $script:order | Should -Be (@($Chunks | ForEach-Object { 'delete {0}' -f $_ }) + $guest + @('deallocate', 'Deallocate', 'Start'))
+        $watchdog.Recovered | Should -BeTrue
+        $watchdog.Failed | Should -BeFalse
+        $watchdog.Result.status | Should -Be 'Warning'
+        $watchdog.Result.message | Should -Match ('^archost01 was deallocated and started automatically at \d\d:\d\d \(local time\), because Azure''s work on its extensions was stuck\. ' + $Why)
+        $watchdog.Result.evidence['action'] | Should -Be 'deallocated and started'
+        $watchdog.Result.evidence['chunksDeleted'] | Should -Be $Chunks.Count
+        if ($Chunks.Count -gt 0) {
+            $watchdog.Result.message | Should -Match ('the deletes of its {0} leftover chunk Run Command\(s\) were sent first, so they finish with the deallocate' -f $Chunks.Count)
+            Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 60 } -Times 1 -Exactly
+        }
+    }
+
+    It 'ends with a Fail whose fix runs deploy.ps1 again, never "wait 30 minutes", when the host''s agent still isn''t Ready after the deallocate and start (R871)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = 'PowerState/running'; Agent = 'Not Ready'; Text = 'provisioning updating, power running, agent Not Ready' } }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmAgentReady -MockWith { -1 }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = $ArgumentList -join ' '
+            if ($joined -match '^vm get-instance-view') {
+                return $script:idle
+            }
+            if ($joined -match '^rest --method get') {
+                return [pscustomobject]@{ value = @([pscustomobject]@{ name = 'DbHubDemo-Chunk-a8a10d93133c-001'; properties = [pscustomobject]@{ provisioningState = 'Succeeded' } }) }
+            }
+            if ($joined -match '^rest --method delete|^vm deallocate') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            throw ('unexpected Azure CLI call: ' + $joined)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { New-DemoResult -CheckId 'STOP.VM_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'ok' }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoVmInstanceView -MockWith { '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = ''; Stage = ''; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '' } }
+        $watchdog = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmWatchdog -Config $Config -VmName 'archost01' -Cause 'its bootstrap loader didn''t start within 15 minutes' }
+        $watchdog.Failed | Should -BeTrue
+        $watchdog.Result.status | Should -Be 'Fail'
+        $watchdog.Result.message | Should -Match 'its VM agent wasn''t Ready within 20 minutes'
+        $watchdog.Result.remediation | Should -Match '^Run ./scripts/deploy\.ps1 again: it sends the deletes of the host''s chunk Run Commands again, then deallocates and starts it once more\.'
+        $watchdog.Result.remediation | Should -Not -Match 'Wait 30 minutes'
+        $script:restarts | Should -Be 0
     }
 
     It 'fails the step, with the single next step and the time to wait, when Azure refuses the deallocate, and waits no longer (2026-11-16)' {
