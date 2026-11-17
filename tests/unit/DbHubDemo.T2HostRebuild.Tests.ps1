@@ -212,11 +212,16 @@ Describe 'Invoke-DemoT2HostRebuild: once, in order, and what it says (2026-11-17
         $script:order | Should -Be @('template', 'parameters', 'reset', 'delete', 'create', 'agent')
         $rebuild.Result.checkId | Should -Be 'DEPLOY.T2.HOSTREBUILD'
         $rebuild.Result.status | Should -Be 'Warning'
-        $rebuild.Result.message | Should -Match '^archost01''s VM agent stayed down after its deallocate and start \(T2''s Artifacts step\), so deploy\.ps1 rebuilt T2''s host in \d+ minutes: it deleted archost01 and its disks and created it again from the template, and the new host''s agent is Ready\.'
+        $rebuild.Result.message | Should -Match '^archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back \(T2''s Artifacts step\), so deploy\.ps1 rebuilt T2''s host in \d+ minutes: it deleted archost01 and its disks and created it again from the template, and the new host''s agent is Ready\.'
         $rebuild.Result.remediation | Should -Match '^Nothing to do: the run goes on with T2\.'
         $script:rows[0] | Should -Be 'T2.HostRebuild|Running|'
         $script:rows[-1] | Should -Be 'T2.HostRebuild|Done|Warning'
         $script:order | Should -Not -Contain 'shutdown' -Because 'no run is marked busy'
+        # What the run builds on the new host follows the T2 mode.
+        $rebuild.Result.message | Should -Match 'This run now builds T2 on it from Arc Jumpstart''s image and onboards it to Azure Arc \(about an hour\)'
+        $developer = New-TestConfig
+        $developer['t2SqlInstallMode'] = 'Developer'
+        (InModuleScope DbHubDemo -Parameters @{ Config = $developer } { Invoke-DemoT2HostRebuild -Config $Config -Confirm:$false }).Result.message | Should -Match 'This run now builds T2''s guest on it in Developer mode and onboards it to Azure Arc \(longer than an hour'
     }
 
     It 'moves the new host''s auto-shutdown out of a busy run''s way before it waits for the agent' {

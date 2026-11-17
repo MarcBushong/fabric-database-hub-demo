@@ -1886,7 +1886,7 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $watchdog.Failed | Should -BeTrue
         $watchdog.Result.status | Should -Be 'Fail'
         $watchdog.Result.message | Should -Match 'its VM agent wasn''t Ready within 20 minutes'
-        $watchdog.Result.remediation | Should -Match '^Run ./scripts/deploy\.ps1 again: when archost01''s VM agent stays down after its deallocate and start, deploy\.ps1 deletes the host and its disks and creates it again from the template, once per run \(DEPLOY\.T2\.HOSTREBUILD\)'
+        $watchdog.Result.remediation | Should -Match '^Run ./scripts/deploy\.ps1 again: when archost01''s VM agent stays down and a deallocate and start doesn''t bring it back, deploy\.ps1 deletes the host and its disks and creates it again from the template, once per run \(DEPLOY\.T2\.HOSTREBUILD\)'
         $watchdog.Result.remediation | Should -Not -Match 'Wait 30 minutes'
         # The T2 track's cue for the host's rebuild (2026-11-17).
         $watchdog.AgentDead | Should -BeTrue
@@ -1894,8 +1894,63 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $script:restarts | Should -Be 0
     }
 
+    It 'takes a host whose agent was down, and whose deallocate then didn''t finish, as one the rebuild is for (live on rg-dbhubmn-demo, 2026-11-17)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = 'PowerState/running'; Agent = 'Not Ready'; Text = 'provisioning updating, power running, agent Not Ready' } }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmAgentReady -MockWith { -1 }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = $ArgumentList -join ' '
+            if ($joined -match '^vm get-instance-view') {
+                return $script:idle
+            }
+            if ($joined -match '^rest --method get') {
+                return [pscustomobject]@{ value = @() }
+            }
+            if ($joined -match '^vm deallocate') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            throw ('unexpected Azure CLI call: ' + $joined)
+        }
+        # Live, 01:11 UTC: the deallocate during the host's hung start showed no power state for 1193 seconds.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { New-DemoResult -CheckId 'STOP.VM_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01 is still  after 1193 seconds.' }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoVmInstanceView -MockWith { '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = ''; Stage = ''; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '' } }
+        $watchdog = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmWatchdog -Config $Config -VmName 'archost01' -Cause 'its artifacts got stuck' }
+        $watchdog.Result.status | Should -Be 'Fail'
+        $watchdog.Result.message | Should -Match 'it was asked to deallocate, but archost01 is still  after 1193 seconds'
+        $watchdog.AgentDead | Should -BeTrue
+        $watchdog.Result.remediation | Should -Match 'deploy\.ps1 deletes the host and its disks and creates it again from the template, once per run \(DEPLOY\.T2\.HOSTREBUILD\)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Wait-DemoVmAgentReady -Times 0 -Exactly -Because 'a host that never deallocated isn''t waited on again'
+    }
+
+    It 'never takes a refused deallocate on a host whose agent was Ready as one the rebuild is for' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/succeeded'; ProvisionedUtc = $null; Power = 'PowerState/running'; Agent = 'Ready'; Text = 'provisioning succeeded, power running, agent Ready' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $joined = $ArgumentList -join ' '
+            if ($joined -match '^vm get-instance-view') {
+                return $script:idle
+            }
+            if ($joined -match '^rest --method get') {
+                return [pscustomobject]@{ value = @([pscustomobject]@{ name = 'DbHubDemo-Chunk-a8a10d93133c-001'; properties = [pscustomobject]@{ provisioningState = 'Succeeded' } }) }
+            }
+            if ($joined -match '^rest --method delete') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+            }
+            if ($joined -match '^vm deallocate') {
+                return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (OperationNotAllowed) Operation ''deallocate'' is not allowed since a conflicting operation is in progress.' }
+            }
+            throw ('unexpected Azure CLI call: ' + $joined)
+        }
+        Mock -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -MockWith { New-DemoResult -CheckId 'T2.GUEST.STOP' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'stopped' }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoVmInstanceView -MockWith { '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = ''; Stage = ''; TrackT1 = 'Telemetry'; TrackT2 = 'Telemetry'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '' } }
+        $watchdog = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmWatchdog -Config $Config -VmName 'archost01' -Cause 'its artifacts got stuck' }
+        $watchdog.Result.status | Should -Be 'Fail'
+        $watchdog.AgentDead | Should -BeFalse
+        $watchdog.Result.remediation | Should -Not -Match 'HOSTREBUILD'
+    }
+
     It 'reaches DONE after the T2 host''s rebuild and says what happened; a failed rebuild is NOT DONE''s reason, before the watchdog''s Fail (2026-11-17)' {
-        $rebuilt = New-DemoResult -CheckId 'DEPLOY.T2.HOSTREBUILD' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01''s VM agent stayed down after its deallocate and start, so deploy.ps1 rebuilt T2''s host in 14 minutes.' -Remediation 'Nothing to do: the run goes on with T2.'
+        $rebuilt = New-DemoResult -CheckId 'DEPLOY.T2.HOSTREBUILD' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back, so deploy.ps1 rebuilt T2''s host in 14 minutes.' -Remediation 'Nothing to do: the run goes on with T2.'
         $superseded = New-DemoResult -CheckId 'DEPLOY.WATCHDOG_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Warning' -Message 'archost01''s VM agent wasn''t Ready within 20 minutes. deploy.ps1 then rebuilt archost01 (DEPLOY.T2.HOSTREBUILD).' -Remediation 'Nothing to do: deploy.ps1 rebuilt archost01 in this run.'
         $outcome = InModuleScope DbHubDemo -Parameters @{ Result = (@(New-DoneResult) + @($superseded, $rebuilt)); State = (New-FinishedState); Config = (New-TestConfig) } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
         $outcome.Kind | Should -Be 'Done'

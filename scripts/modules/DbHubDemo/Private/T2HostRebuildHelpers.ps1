@@ -397,7 +397,7 @@ function Invoke-DemoT2HostRebuild {
     if (-not $PSCmdlet.ShouldProcess('archost01', 'Delete the T2 host and its disks, and create it again from its template')) {
         return [pscustomobject]@{ Rebuilt = $false; Result = $null; Results = @() }
     }
-    $start = 'archost01''s VM agent stayed down after its deallocate and start{0}, so deploy.ps1 rebuilds T2''s host once now: it deletes archost01 and its disks, creates it again from the template, and builds T2 on it again in this run (about 90 minutes in all); no action needed.' -f $why
+    $start = 'archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, so deploy.ps1 rebuilds T2''s host once now: it deletes archost01 and its disks, creates it again from the template, and builds T2 on it again in this run (about 90 minutes in all); no action needed.' -f $why
     Write-DemoLog -Level Warning -Message $start
     Set-DemoProgressStep -Path $ProgressPath -Id $row -State 'Running' -AzureSide -Message $start -MaxLength 1200
     $template = $null
@@ -405,11 +405,11 @@ function Invoke-DemoT2HostRebuild {
         $template = Get-DemoT2HostTemplate
     }
     catch {
-        return (& $finish 'Fail' ('archost01''s VM agent stayed down after its deallocate and start{0}, and the host wasn''t rebuilt: its template couldn''t be read ({1}). Nothing was deleted.' -f $why, (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/deploy.ps1 again from a complete checkout of the repository; or rebuild T2 by hand: ./scripts/destroy.ps1, then ./scripts/deploy.ps1.')
+        return (& $finish 'Fail' ('archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, and the host wasn''t rebuilt: its template couldn''t be read ({1}). Nothing was deleted.' -f $why, (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/deploy.ps1 again from a complete checkout of the repository; or rebuild T2 by hand: ./scripts/destroy.ps1, then ./scripts/deploy.ps1.')
     }
     $parameters = Get-DemoT2HostDeploymentParameter -Config $Config -Template $template
     if (-not $parameters.Ok) {
-        return (& $finish 'Fail' ('archost01''s VM agent stayed down after its deallocate and start{0}, and the host wasn''t rebuilt: {1}. Nothing was deleted.' -f $why, $parameters.Error) 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template records archost01''s deployment again, and the run rebuilds the host if its agent still stays down. Or rebuild T2 by hand: ./scripts/destroy.ps1, then ./scripts/deploy.ps1.')
+        return (& $finish 'Fail' ('archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, and the host wasn''t rebuilt: {1}. Nothing was deleted.' -f $why, $parameters.Error) 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template records archost01''s deployment again, and the run rebuilds the host if its agent still stays down. Or rebuild T2 by hand: ./scripts/destroy.ps1, then ./scripts/deploy.ps1.')
     }
     Reset-DemoT2HostRecord -Config $Config -Confirm:$false
     Set-DemoProgressStep -Path $ProgressPath -Id $row -State 'Running' -AzureSide -Message 'Deleting archost01 and its disks (Azure-side; no action needed).'
@@ -417,7 +417,7 @@ function Invoke-DemoT2HostRebuild {
     $evidence['deleteSeconds'] = $removal.Seconds
     $evidence['removed'] = @($removal.Removed)
     if (-not $removal.Deleted) {
-        return (& $finish 'Fail' ('archost01''s VM agent stayed down after its deallocate and start{0}, and its rebuild stopped: archost01 couldn''t be deleted ({1}).' -f $why, $removal.Detail) 'Run ./scripts/deploy.ps1 again in about 30 minutes: it finishes the rebuild, and a host that''s gone by then is created again by the template (DEPLOY.T2.HOSTMISSING).')
+        return (& $finish 'Fail' ('archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, and its rebuild stopped: archost01 couldn''t be deleted ({1}).' -f $why, $removal.Detail) 'Run ./scripts/deploy.ps1 again in about 30 minutes: it finishes the rebuild, and a host that''s gone by then is created again by the template (DEPLOY.T2.HOSTMISSING).')
     }
     Write-DemoLog -Message ('archost01 is deleted, with {0}, after {1}; it''s created again from the template now.' -f $(if (@($removal.Removed).Count -gt 0) { @($removal.Removed) -join ' and ' } else { 'its OS disk and network interface' }), (Format-DemoProgressDuration -Seconds ([long]$removal.Seconds)))
     Set-DemoProgressStep -Path $ProgressPath -Id $row -State 'Running' -AzureSide -Message 'Creating archost01 again from the template (Azure-side; no action needed).'
@@ -443,7 +443,9 @@ function Invoke-DemoT2HostRebuild {
         return (& $finish 'Fail' ('archost01 was rebuilt{0}, but the new host''s VM agent wasn''t Ready within {1} minutes either, so the cause is on Azure''s side.' -f $why, $AgentWaitMinutes) 'Run ./scripts/deploy.ps1 again later: it recovers the host, and rebuilds it once more if its agent stays down. If the agent stays down, open a support request with Azure: the VM never gets its goal state from Azure (docs/troubleshooting.md, "A host''s VM agent that isn''t Ready").')
     }
     $minutes = [int][System.Math]::Ceiling($watch.Elapsed.TotalMinutes)
-    return (& $finish 'Warning' ('archost01''s VM agent stayed down after its deallocate and start{0}, so deploy.ps1 rebuilt T2''s host in {1} minutes: it deleted archost01 and its disks and created it again from the template, and the new host''s agent is Ready. This run now builds T2 on it from Arc Jumpstart''s image and onboards it to Azure Arc (about an hour); T2''s old Arc machine is replaced at onboarding.' -f $why, $minutes) 'Nothing to do: the run goes on with T2. docs/troubleshooting.md ("A host''s VM agent that isn''t Ready") says why it happens.')
+    $mode = [string]$Config['t2SqlInstallMode']
+    $build = if ($mode -in 'ProductKey', 'Developer') { 'builds T2''s guest on it in {0} mode and onboards it to Azure Arc (longer than an hour: Windows and SQL Server are installed from evaluation media)' -f $mode } else { 'builds T2 on it from Arc Jumpstart''s image and onboards it to Azure Arc (about an hour)' }
+    return (& $finish 'Warning' ('archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, so deploy.ps1 rebuilt T2''s host in {1} minutes: it deleted archost01 and its disks and created it again from the template, and the new host''s agent is Ready. This run now {2}; T2''s old Arc machine is replaced at onboarding.' -f $why, $minutes, $build) 'Nothing to do: the run goes on with T2. docs/troubleshooting.md ("A host''s VM agent that isn''t Ready") says why it happens.')
 }
 
 function Get-DemoT2HostMissingResult {
@@ -504,7 +506,7 @@ function Get-DemoT2HostRebuildNote {
 
     $rebuild = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T2.HOSTREBUILD' -and [string]$_.status -eq 'Warning' })
     if ($rebuild.Count -gt 0) {
-        return 'archost01, T2''s host, was rebuilt in this run: its VM agent stayed down after a deallocate and start, so deploy.ps1 deleted it and its disks, created it again from the template, and built T2 on it again (DEPLOY.T2.HOSTREBUILD).'
+        return 'archost01, T2''s host, was rebuilt in this run: its VM agent stayed down, and a deallocate and start didn''t bring it back, so deploy.ps1 deleted it and its disks, created it again from the template, and built T2 on it again (DEPLOY.T2.HOSTREBUILD).'
     }
     $missing = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T2.HOSTMISSING' })
     if ($missing.Count -gt 0) {
