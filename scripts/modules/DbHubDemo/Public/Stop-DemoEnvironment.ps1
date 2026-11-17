@@ -257,6 +257,13 @@ function Stop-DemoEnvironment {
     $vms = if ($ParkT2) { @($hostVm) } else { @($hostVm, 'sqlvm01') }
     $deallocated = @{}
     foreach ($vm in $vms) {
+        if ($power[$vm] -eq 'PowerState/running' -or -not $power[$vm]) {
+            # R871 (2026-11-17): the deletes of the VM's chunk Run Commands go right before its deallocate, which completes
+            # them. On the T2 host, Azure ended such deletes with an error and kept the chunks, and the host's next start
+            # never got its goal state; deletes still pending when the VM deallocated completed with it. A VM that shows no
+            # power state (its start failed) runs too.
+            $null = Clear-DemoChunkRunCommand -SubscriptionId $subscriptionId -BaseUrl (Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $vm) -ApiVersion (Get-DemoRunCommandApiVersion)
+        }
         $stopped = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Deallocate
         $results.Add($stopped)
         $deallocated[$vm] = [string]$stopped.status -eq 'Pass'

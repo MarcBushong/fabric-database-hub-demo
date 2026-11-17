@@ -355,6 +355,16 @@ Phase 22 merged T1's monitoring flag right after the loader started T1's bootstr
 
 A Failed extension that an earlier run left gets the documented repair in the Monitoring step (`Repair-DemoSqlIaasExtension`, `DEPLOY.T1.SQLIAAS.REPAIR`).
 
+## Amendments (2026-11-17: the T2 host's chunks one at a time, R871)
+
+From about 2026-11-13, every T2 host that kept chunk Run Commands stopped starting: Windows ran, but Azure never sent its VM agent the goal state ("Goal State not yet available" for hours), and the start ended `VMStartTimedOut`. With 8 chunks of up to 711 KB at once, Azure ended their deletes on that host with `InternalExecutionError`. Each one stayed on the VM, marked for deletion, and Azure refuses a delete while the VM is deallocated. `sqlvm01` and T2 hosts without them started in minutes. A delete still pending when the VM deallocates completes with the deallocation: on a test host, the next start had the agent Ready in 1.7 minutes ([implementation report](../implementation-report.md), R871).
+
+| As built (Phase 28) | 2026-11-17 | Why it's safe |
+|---|---|---|
+| Up to 8 chunks at once on each VM; each chunk's delete sent without waiting | On the T2 host (`Send-DemoChunkSet -DeleteWaitSeconds`, 300 seconds by default there), one chunk at a time: its Run Command is deleted, and the delete confirmed, before the next. A delete Azure hasn't finished in 5 minutes is sent once more; after a second one, the send stops, and the watchdog takes over | No more than one chunk is on the host at a time. `sqlvm01` keeps 8 at once: its deletes finish. The host's 8 or 9 chunks take longer to send ([implementation report](../implementation-report.md), R871, has the time measured live) |
+| The watchdog restarts a stuck VM once | The T2 host whose VM agent isn't Ready, or that lists chunk Run Commands, gets their deletes, then one deallocate and start (`Restart-DemoVmOnce`), and the track sends its chunks again, one at a time | A restart keeps the chunks, and the host doesn't start with them. The deallocate completes the deletes |
+| `stop-demo.ps1` deallocates each VM | It sends the deletes of a running VM's chunk Run Commands right before its deallocate (`Clear-DemoChunkRunCommand`) | The deallocate completes deletes that are still pending, so no chunk stays for the next start |
+
 ## Sources (checked 2026-11-05)
 
 - `slmgr.vbs` options (`/rearm` "resets the activation timers"; `/ato` tries activation): <https://learn.microsoft.com/windows-server/get-started/activation-slmgr-vbs-options>

@@ -1758,6 +1758,21 @@ Describe 'Stop-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -MockWith { $script:order.Add('Guest'); New-TestResult 'STOP.GUEST' 'Pass' 'infra' 'T2' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Deallocate:' + $VmName); New-TestResult ('STOP.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoT3 -MockWith { $script:order.Add('RemoveT3'); New-TestResult 'T3.REMOVE' 'Pass' 't3' 'T3' }
+        Mock -ModuleName DbHubDemo -CommandName Clear-DemoChunkRunCommand -MockWith { @() }
+    }
+
+    It 'sends the deletes of a running VM''s chunk Run Commands right before its deallocate, which completes them (R871)' {
+        Mock -ModuleName DbHubDemo -CommandName Clear-DemoChunkRunCommand -MockWith { $script:order.Add('Chunks:' + ($BaseUrl -split '/')[-2]); @('DbHubDemo-Chunk-a8a10d93133c-001') }
+        Stop-DemoEnvironment -Config $config -Confirm:$false | Out-Null
+        $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off', 'Guest', 'Chunks:archost01', 'Deallocate:archost01', 'Chunks:sqlvm01', 'Deallocate:sqlvm01')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Clear-DemoChunkRunCommand -Times 1 -Exactly -ParameterFilter { $BaseUrl -like '*/resourceGroups/rg-dbhub-demo/providers/Microsoft.Compute/virtualMachines/archost01/runCommands' }
+
+        # A VM Azure lists as deallocated takes no deletes (Azure refuses them there), and one whose power state couldn't be read
+        # (a start that failed) still gets them.
+        $script:order.Clear()
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = $null }
+        Stop-DemoEnvironment -Config $config -Confirm:$false | Out-Null
+        $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Chunks:archost01', 'Deallocate:archost01', 'Deallocate:sqlvm01')
     }
 
     It 'removes Bastion, rotates the password, turns every profile off, stops the guest, then deallocates' {
