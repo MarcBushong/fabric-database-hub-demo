@@ -25,7 +25,8 @@ function Get-DemoEnvironmentStatus {
       Get-DemoRunCommandStatus): managed Run Commands the demo left on its VMs, the on-demand control's DbHubControl-*
       and the scripts' DbHubDemo-* beyond the bootstrap loader DbHubDemo-Bootstrap and the activity profiles'
       DbHubDemo-Profile (both stay by design), as a Warning with the commands
-      that delete them; Pass when there's none. Read-only.
+      that delete them; Pass when there's none. On the T2 host (2026-11-17), the demo's Run Commands that Azure is still
+      deleting come first, as a Warning whose fix is deploy.ps1. Read-only.
     - STATUS.T3: whether T3 exists and its status (Online, Paused); Not selected after stop-demo.ps1 -RemoveT3.
     - STATUS.T4 (Phase 24, ADR 0019): T4's state; while it runs, its live Azure Monitor metrics from the last
       15 minutes (CPU, memory, connections, CPU credits, and the enhanced metrics: sessions by state and by
@@ -214,8 +215,19 @@ function Get-DemoEnvironmentStatus {
     if ($found.Count -gt 0) {
         $results.Add((New-DemoDiskDriftResult -CheckId 'STATUS.DISKS' -Drift @(Get-DemoVmDiskDrift -Config $Config -VmName $found.ToArray()) -VmName $found.ToArray()))
         # Managed Run Commands the demo left on its VMs (Phase 28 follow-up): the on-demand control's, and the scripts'
-        # beyond the bootstrap loader. Read-only; Azure allows 25 per VM.
-        $results.Add((Get-DemoRunCommandStatus -Config $Config -VmName $found.ToArray() -Running $running))
+        # beyond the bootstrap loader. Read-only; Azure allows 25 per VM. A run the busy marker says is going on deletes its
+        # own (2026-11-17), so the result names it.
+        $inProgress = ''
+        try {
+            $marker = ConvertTo-DemoBusyMarker -Tags (Get-DemoMemberValue -InputObject $state -Name 'Tags') -NowUtc $NowUtc
+            if ($marker.Active -and $marker.By -in 'deploy', 'session') {
+                $inProgress = if ($marker.By -eq 'deploy') { 'deploy.ps1' } else { 'A demo session' }
+            }
+        }
+        catch {
+            $inProgress = ''
+        }
+        $results.Add((Get-DemoRunCommandStatus -Config $Config -VmName $found.ToArray() -Running $running -RunInProgress $inProgress))
     }
 
     $t3 = Get-DemoT3State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])

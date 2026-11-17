@@ -2457,7 +2457,19 @@ Describe 'Get-DemoEnvironmentStatus' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -Times 0 -Exactly -Because 'T1 is deallocated'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -Times 0 -Exactly
         # The leftover Run Commands of both VMs it found, each with its power state (Phase 28 follow-up).
-        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRunCommandStatus -Times 1 -Exactly -ParameterFilter { (@($VmName) -join ',') -eq 'sqlvm01,archost01' -and $Running['sqlvm01'] -eq $false -and $Running['archost01'] -eq $false }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRunCommandStatus -Times 1 -Exactly -ParameterFilter { (@($VmName) -join ',') -eq 'sqlvm01,archost01' -and $Running['sqlvm01'] -eq $false -and $Running['archost01'] -eq $false -and $RunInProgress -eq '' }
+    }
+
+    It 'tells STATUS.RUNCOMMANDS which run the busy marker says is going on, and none once the marker has passed (2026-11-17)' {
+        $now = [datetime]::new(2026, 11, 17, 14, 0, 0, [System.DateTimeKind]::Utc)
+        $script:inProgress = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRunCommandStatus -MockWith { $script:inProgress.Add($RunInProgress); New-TestResult 'STATUS.RUNCOMMANDS' 'Pass' 'infra' }
+        foreach ($case in @(@{ By = 'deploy'; Until = '2026-11-17T14:30:00Z' }, @{ By = 'session'; Until = '2026-11-17T14:30:00Z' }, @{ By = 'deploy-grace'; Until = '2026-11-17T14:30:00Z' }, @{ By = 'deploy'; Until = '2026-11-17T13:30:00Z' })) {
+            $script:busyCase = $case
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { New-TestState @{ Stage = 'Validation'; Tags = @{ deploymentId = 'abc123'; expiresOn = '2026-12-31'; DbHubBusyUntilUtc = $script:busyCase.Until; DbHubBusyBy = $script:busyCase.By } } }
+            $null = Get-DemoEnvironmentStatus -Config $config -NowUtc $now
+        }
+        @($script:inProgress) | Should -Be @('deploy.ps1', 'A demo session', '', '') -Because 'the grace after deploy.ps1 ended, and a marker that has passed, mean no run is going on'
     }
 
     It 'reads the active profile on T1 and T3 while sqlvm01 runs, from T1 only' {
@@ -2878,6 +2890,38 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01', 'archost01') -Running @{} }
         $result.status | Should -Be 'Warning'
         $result.message | Should -Match 'couldn''t all be listed: archost01: ERROR: \(AuthorizationFailed\)'
+    }
+
+    It 'status.ps1 puts the T2 host''s Run Commands that Azure is still deleting first, with deploy.ps1 as the fix, and names a run in progress (2026-11-17)' {
+        # The other VMs' deletes finish on their own, as before.
+        $script:listed['sqlvm01'] = @((New-RunCommand 'DbHubDemo-Workload' 'Failed'), (New-RunCommand 'DbHubDemo-Chunk-0123456789ab-001' 'Succeeded' 'Deleting'))
+        $script:listed['archost01'] = @(
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-001' 'Succeeded' 'Deleting'
+            New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-002' 'Running' 'Deleting'
+            New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-003' 'Pending' 'Creating'
+            New-RunCommand 'OtherTeam-Patch' 'Succeeded' 'Deleting'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01', 'archost01') -Running @{ sqlvm01 = $true; archost01 = $false } }
+        $result.checkId | Should -Be 'STATUS.RUNCOMMANDS'
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^2 Run Command\(s\) on archost01, T2''s host, are marked for deletion, and Azure hasn''t finished deleting them: archost01/DbHubDemo-Chunk-a8a10d93133c-001, archost01/DbHubDemo-Chunk-a8a10d93133c-002\. Ones that stay there go with a VM agent that isn''t working'
+        $result.message | Should -Match ' 2 other managed Run Command\(s\) are left: sqlvm01/DbHubDemo-Workload, archost01/DbHubDemo-Chunk-a8a10d93133c-003\.$'
+        $result.remediation | Should -Match '^Run \./scripts/deploy\.ps1: when archost01''s VM agent is down, .* rebuilds the host once if the agent stays down \(DEPLOY\.T2\.HOSTREBUILD\)\. Deleting them yourself doesn''t help'
+        @($result.evidence.markedForDeletion) | Should -Be @('archost01/DbHubDemo-Chunk-a8a10d93133c-001', 'archost01/DbHubDemo-Chunk-a8a10d93133c-002')
+        @($script:azLog | Where-Object { $_ -notmatch '^rest --method get ' }) | Should -BeNullOrEmpty -Because 'status.ps1 only reads'
+
+        # A run's own deletes show for a few minutes, so the fix waits for its end.
+        $during = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('archost01') -Running @{ archost01 = $true } -RunInProgress 'deploy.ps1' }
+        $during.message | Should -Match '\. deploy\.ps1 is running now, and a run''s own deletes show here for a few minutes\. '
+        $during.remediation | Should -Match '^Run \./scripts/deploy\.ps1 after that run ends, if they''re still listed: '
+
+        # Evaluation-only mode's T2 VM, arcsql01, isn't a host.
+        $evaluation = New-TestConfig
+        $evaluation['t2Mode'] = 'EvaluationOnlyAzureVm'
+        $script:listed['arcsql01'] = @(New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-001' 'Succeeded' 'Deleting')
+        $other = InModuleScope DbHubDemo -Parameters @{ Config = $evaluation } { Get-DemoRunCommandStatus -Config $Config -VmName @('arcsql01') -Running @{} }
+        $other.status | Should -Be 'Pass'
     }
 
     It 'a control Run Command is finished when its state is terminal, or empty or Unknown an hour after the time in its name: <Name> <State>' -ForEach @(

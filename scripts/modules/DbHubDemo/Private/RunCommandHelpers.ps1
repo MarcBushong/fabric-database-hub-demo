@@ -1124,8 +1124,10 @@ function Get-DemoVmRunCommandLeftover {
     Running (a deployment, a check, or an on-demand run in progress). Nothing runs on a VM that isn't running, so there
     every one of them counts. Names of anything else aren't the demo's and are left out. Azure allows 25 managed Run
     Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview). Returns Ok, Error, and
-    Items (VmName, Name, Kind Control or Demo, ExecutionState, ProvisioningState, and Finished, by
-    Test-DemoRunCommandFinished).
+    Items (VmName, Name, Kind Control or Demo, ExecutionState, ProvisioningState, Finished, by
+    Test-DemoRunCommandFinished, and Deleting). With -IncludeDeleting (the T2 host, 2026-11-17), the demo's ones that Azure
+    is deleting are items too, the bootstrap loader and the profile included, with Deleting set: on that host, they go
+    with a VM agent that isn't working (R871).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1138,6 +1140,8 @@ function Get-DemoVmRunCommandLeftover {
         [string] $VmName,
 
         [switch] $Running,
+
+        [switch] $IncludeDeleting,
 
         [datetime] $NowUtc = [DateTime]::UtcNow
     )
@@ -1154,17 +1158,23 @@ function Get-DemoVmRunCommandLeftover {
     $items = [System.Collections.Generic.List[object]]::new()
     foreach ($item in @($values)) {
         $name = [string](Get-DemoMemberValue -InputObject $item -Name 'name')
-        $kind = if ($name.StartsWith('DbHubControl-', [System.StringComparison]::Ordinal)) { 'Control' } elseif ($name.StartsWith('DbHubDemo-', [System.StringComparison]::Ordinal) -and $name -notin 'DbHubDemo-Bootstrap', 'DbHubDemo-Profile') { 'Demo' } else { '' }
+        $kind = if ($name.StartsWith('DbHubControl-', [System.StringComparison]::Ordinal)) { 'Control' } elseif ($name.StartsWith('DbHubDemo-', [System.StringComparison]::Ordinal)) { 'Demo' } else { '' }
         if (-not $kind) {
             continue
         }
         $properties = Get-DemoMemberValue -InputObject $item -Name 'properties'
         $provisioning = [string](Get-DemoMemberValue -InputObject $properties -Name 'provisioningState')
         $execution = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'instanceView') -Name 'executionState')
-        if ($provisioning -eq 'Deleting' -or ($Running -and $execution -in 'Pending', 'Running')) {
+        $deleting = $provisioning -eq 'Deleting'
+        if ($deleting) {
+            if (-not $IncludeDeleting) {
+                continue
+            }
+        }
+        elseif ($name -in 'DbHubDemo-Bootstrap', 'DbHubDemo-Profile' -or ($Running -and $execution -in 'Pending', 'Running')) {
             continue
         }
-        $items.Add([pscustomobject]@{ VmName = $VmName; Name = $name; Kind = $kind; ExecutionState = $execution; ProvisioningState = $provisioning; Finished = (Test-DemoRunCommandFinished -Name $name -ExecutionState $execution -NowUtc $NowUtc) })
+        $items.Add([pscustomobject]@{ VmName = $VmName; Name = $name; Kind = $kind; ExecutionState = $execution; ProvisioningState = $provisioning; Finished = (Test-DemoRunCommandFinished -Name $name -ExecutionState $execution -NowUtc $NowUtc); Deleting = $deleting })
     }
     return [pscustomobject]@{ Ok = $true; Error = ''; Items = $items.ToArray() }
 }
@@ -1264,7 +1274,10 @@ function Get-DemoRunCommandStatus {
     (Get-DemoVmRunCommandLeftover). Pass when there's none; a Warning that names them, with the commands that delete
     them, otherwise, or when they can't be listed. On a running VM, a control Run Command that isn't finished
     (Test-DemoRunCommandFinished) belongs to a run in progress and isn't counted, so no delete command stops it.
-    Internal.
+    On the T2 host, archost01 (2026-11-17), the demo's Run Commands that Azure is still deleting come first, as a Warning
+    whose fix is deploy.ps1: ones that stay there go with a VM agent that isn't working (R871), which deploy.ps1 recovers,
+    or rebuilds the host for (R872). -RunInProgress names a run the busy marker says is going on, whose own deletes show
+    for a few minutes. Internal.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -1275,19 +1288,27 @@ function Get-DemoRunCommandStatus {
         [AllowEmptyCollection()]
         [string[]] $VmName = @(),
 
-        [System.Collections.IDictionary] $Running = @{}
+        [System.Collections.IDictionary] $Running = @{},
+
+        [string] $RunInProgress = ''
     )
 
     $doc = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
     $left = [System.Collections.Generic.List[object]]::new()
+    $marked = [System.Collections.Generic.List[object]]::new()
     $errors = [System.Collections.Generic.List[string]]::new()
+    $hostVm = Get-DemoHostVmName -Config $Config
     foreach ($vm in @($VmName | Where-Object { $_ })) {
-        $found = Get-DemoVmRunCommandLeftover -Config $Config -VmName $vm -Running:([bool]$Running[$vm])
+        $found = Get-DemoVmRunCommandLeftover -Config $Config -VmName $vm -Running:([bool]$Running[$vm]) -IncludeDeleting:($vm -eq 'archost01' -and $hostVm -eq $vm)
         if (-not $found.Ok) {
             $errors.Add(('{0}: {1}' -f $vm, $found.Error))
             continue
         }
         foreach ($item in @($found.Items)) {
+            if ([bool](Get-DemoMemberValue -InputObject $item -Name 'Deleting')) {
+                $marked.Add($item)
+                continue
+            }
             if ([bool]$Running[$vm] -and $item.Kind -eq 'Control' -and -not $item.Finished) {
                 continue
             }
@@ -1295,9 +1316,20 @@ function Get-DemoRunCommandStatus {
         }
     }
     $names = @($left | ForEach-Object { '{0}/{1}' -f $_.VmName, $_.Name })
+    $markedNames = @($marked | ForEach-Object { '{0}/{1}' -f $_.VmName, $_.Name })
     $commands = @($left | Select-Object -First 10 | ForEach-Object { Get-DemoRunCommandDeleteCommand -Config $Config -VmName $_.VmName -Name $_.Name })
-    $evidence = [ordered]@{ leftover = $names; deleteCommands = $commands; readErrors = $errors.ToArray(); vms = @($VmName) }
+    $evidence = [ordered]@{ leftover = $names; markedForDeletion = $markedNames; deleteCommands = $commands; readErrors = $errors.ToArray(); vms = @($VmName); runInProgress = $RunInProgress }
     $vmText = if (@($VmName).Count) { @($VmName) -join ' and ' } else { 'the demo VMs' }
+    $more = if ($errors.Count) { ' The Run Commands of {0} couldn''t be listed.' -f (($errors | ForEach-Object { $_.Split(':')[0] }) -join ' and ') } else { '' }
+    if ($marked.Count -gt 0) {
+        $shown = @($markedNames | Select-Object -First 10) -join ', '
+        $extra = if ($marked.Count -gt 10) { ' and {0} more' -f ($marked.Count - 10) } else { '' }
+        $during = if ($RunInProgress) { ' {0} is running now, and a run''s own deletes show here for a few minutes.' -f $RunInProgress } else { '' }
+        $others = if ($left.Count -gt 0) { ' {0} other managed Run Command(s) are left: {1}.' -f $left.Count, ($names -join ', ') } else { '' }
+        $message = '{0} Run Command(s) on archost01, T2''s host, are marked for deletion, and Azure hasn''t finished deleting them: {1}{2}.{3} Ones that stay there go with a VM agent that isn''t working, and they count toward the VM''s limit of 25 managed Run Commands.{4}{5}' -f $marked.Count, $shown, $extra, $during, $others, $more
+        $fix = 'Run ./scripts/deploy.ps1{0}: when archost01''s VM agent is down, it sends the deletes of its chunk Run Commands again and deallocates and starts the host, which completes them, and it rebuilds the host once if the agent stays down (DEPLOY.T2.HOSTREBUILD). Deleting them yourself doesn''t help: Azure is already deleting them. See docs/troubleshooting.md ("A host''s VM agent that isn''t Ready").' -f $(if ($RunInProgress) { ' after that run ends, if they''re still listed' } else { '' })
+        return (New-DemoResult -CheckId 'STATUS.RUNCOMMANDS' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $fix -DocUrl $doc)
+    }
     if ($left.Count -gt 0) {
         $control = @($left | Where-Object { $_.Kind -eq 'Control' }).Count
         $why = @(
@@ -1305,7 +1337,6 @@ function Get-DemoRunCommandStatus {
             if ($left.Count - $control) { 'the next run of the step that made a DbHubDemo-* one deletes it first' }
         ) -join '; '
         $fix = 'Nothing is needed: {0}. To delete one now, while its VM runs: {1}{2}. Azure allows 25 managed Run Commands per VM.' -f $why, $commands[0], $(if ($commands.Count -gt 1) { ' (each command is in this result''s evidence)' } else { '' })
-        $more = if ($errors.Count) { ' The Run Commands of {0} couldn''t be listed.' -f (($errors | ForEach-Object { $_.Split(':')[0] }) -join ' and ') } else { '' }
         return (New-DemoResult -CheckId 'STATUS.RUNCOMMANDS' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('{0} managed Run Command(s) are left on the demo VMs: {1}.{2}' -f $left.Count, ($names -join ', '), $more) -Evidence $evidence -Remediation $fix -DocUrl $doc)
     }
     if ($errors.Count -gt 0) {
