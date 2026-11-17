@@ -58,9 +58,10 @@ function Get-DemoDestroyControlPlan {
     }
     $account = Invoke-DemoAz -SubscriptionId $name.SubscriptionId -ArgumentList @('rest', '--method', 'get', '--url', ('https://management.azure.com{0}?api-version={1}' -f $name.AutomationAccountId, $apiVersion), '--query', 'id', '--output', 'tsv') -AllowFailure -TimeoutSeconds 120
     if ($account.ExitCode -ne 0 -and (Test-DemoAzNotFound -Text ([string]$account.StdErr))) {
-        # What an earlier destroy left once it had deleted the Automation account (its last step), or what else is there.
+        # What an earlier destroy left once it had deleted the Automation account (its last step), or what else is there. The
+        # account's runbooks can still be listed for a moment after it goes, and they go with it.
         $list = Invoke-DemoAz -SubscriptionId $name.SubscriptionId -ArgumentList @('resource', 'list', '--resource-group', $name.ResourceGroup, '--query', '[].name', '--output', 'json') -AsJson -AllowFailure -TimeoutSeconds 120
-        $plan.Resources = @($list | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        $plan.Resources = @($list | Where-Object { $_ } | ForEach-Object { [string]$_ } | Where-Object { -not $_.StartsWith(('{0}/' -f $name.AutomationAccount), [System.StringComparison]::OrdinalIgnoreCase) })
         $plan.State = 'Leftover'
         $plan.Reason = if ($plan.Resources.Count -eq 0) { ('{0} is empty' -f $name.ResourceGroup) } else { ('{0} has no Automation account, so it can''t tell which environment it serves; it holds {1}' -f $name.ResourceGroup, ($plan.Resources -join ', ')) }
         return [pscustomobject]$plan

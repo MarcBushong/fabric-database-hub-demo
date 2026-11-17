@@ -383,7 +383,12 @@ BeforeAll {
                     return (New-AzResult -StdOut '{"identityClientId":{"value":"99999999-9999-9999-9999-999999999999"}}')
                 }
                 'deployment group delete*' { return (New-AzResult) }
-                'resource list*' { return (New-AzResult -StdOut ("{0}`n" -f $script:leftInGroup)) }
+                # The group's resources by name (2026-11-17): a deleted account's runbook can still be listed for a moment,
+                # and doesn't count; $script:leftInGroup is what else is there.
+                'resource list*' {
+                    $names = @('aa-dbhub-control/DbHub-Control') + @(if ($script:leftInGroup -gt 0) { 1..$script:leftInGroup | ForEach-Object { 'id-github-oidc-{0}' -f $_ } })
+                    return (New-AzResult -StdOut (ConvertTo-Json -InputObject @($names) -Compress))
+                }
                 'group delete*' { return (New-AzResult) }
                 # A custom role's assignments, counted before its definition goes (2026-11-17): the fake's own ones.
                 'role assignment list --all --role *' {

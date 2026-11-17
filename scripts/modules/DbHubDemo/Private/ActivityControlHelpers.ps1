@@ -2342,14 +2342,20 @@ function Remove-DemoActivityControlResource {
     foreach ($deployment in $Name.TemplateDeployment, $Name.WebhookDeployment) {
         $null = Invoke-DemoAz -SubscriptionId $Name.SubscriptionId -ArgumentList @('deployment', 'group', 'delete', '--resource-group', $Name.ResourceGroup, '--name', $deployment) -AllowFailure
     }
-    $left = Invoke-DemoAz -SubscriptionId $Name.SubscriptionId -ArgumentList @('resource', 'list', '--resource-group', $Name.ResourceGroup, '--query', 'length(@)', '--output', 'tsv') -AllowFailure
+    # What else is in the group, by name. The deleted account's runbooks can still be listed for a moment after it goes
+    # (live, 2026-11-17: three of them), and they go with it, so they don't count.
+    $listed = Invoke-DemoAz -SubscriptionId $Name.SubscriptionId -ArgumentList @('resource', 'list', '--resource-group', $Name.ResourceGroup, '--query', '[].name', '--output', 'json') -AllowFailure
     $groupNote = ''
-    if ($left.ExitCode -eq 0 -and ([string]$left.StdOut).Trim() -eq '0') {
-        $group = Invoke-DemoAz -SubscriptionId $Name.SubscriptionId -ArgumentList @('group', 'delete', '--name', $Name.ResourceGroup, '--yes', '--no-wait') -AllowFailure
-        $groupNote = if ($group.ExitCode -eq 0) { (' {0} was empty and is being deleted.' -f $Name.ResourceGroup) } else { (' {0} couldn''t be deleted: {1}' -f $Name.ResourceGroup, (Protect-DemoText -Text ([string]$group.StdErr)).Trim()) }
-    }
-    elseif ($left.ExitCode -eq 0) {
-        $groupNote = (' {0} was kept: it holds {1} other resource(s), for example the GitHub OIDC identity.' -f $Name.ResourceGroup, ([string]$left.StdOut).Trim())
+    if ($listed.ExitCode -eq 0) {
+        $names = @(@(([string]$listed.StdOut | ConvertFrom-Json -Depth 8)) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        $others = @($names | Where-Object { -not $_.StartsWith(('{0}/' -f $Name.AutomationAccount), [System.StringComparison]::OrdinalIgnoreCase) -and $_ -ne $Name.AutomationAccount })
+        if ($others.Count -eq 0) {
+            $group = Invoke-DemoAz -SubscriptionId $Name.SubscriptionId -ArgumentList @('group', 'delete', '--name', $Name.ResourceGroup, '--yes', '--no-wait') -AllowFailure
+            $groupNote = if ($group.ExitCode -eq 0) { (' {0} was empty and is being deleted.' -f $Name.ResourceGroup) } else { (' {0} couldn''t be deleted: {1}' -f $Name.ResourceGroup, (Protect-DemoText -Text ([string]$group.StdErr)).Trim()) }
+        }
+        else {
+            $groupNote = (' {0} was kept: it holds {1} other resource(s): {2}.' -f $Name.ResourceGroup, $others.Count, (($others | Select-Object -First 5) -join ', '))
+        }
     }
     $status = if ($failed.Count -gt 0) { 'Fail' } else { 'Pass' }
     return (New-DemoResult -CheckId 'CONTROL.REMOVE.RESOURCES' -Area 'workload' -Target 'subscription' -Status $status -Message ('Deleted: {0}.{1}{2}' -f ($done -join ', '), $(if ($failed.Count) { ' Failed: ' + ($failed -join '; ') + '.' } else { '' }), $groupNote) -Remediation $(if ($failed.Count) { 'Run setup-activity-control.ps1 -Remove again.' } else { '' }) -DocUrl $doc)

@@ -86,6 +86,8 @@ Describe 'Get-DemoDestroyControlPlan: whether the session control serves this en
 
     It 'finds what an earlier destroy left once its Automation account went, and can''t tell otherwise' {
         $script:accountAnswer = New-AzAnswer -ExitCode 1 -StdErr 'ERROR: (ResourceNotFound) The Resource was not found.'
+        # The deleted account's runbooks can still be listed for a moment (live, 2026-11-17), and they go with it.
+        $script:resources = '["aa-dbhub-control/DbHub-Stop"]'
         $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoDestroyControlPlan -Config $Config }
         $plan.State | Should -Be 'Leftover'
         @($plan.Resources) | Should -BeNullOrEmpty
