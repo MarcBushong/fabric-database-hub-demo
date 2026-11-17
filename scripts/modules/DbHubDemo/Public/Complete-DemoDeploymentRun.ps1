@@ -7,7 +7,9 @@ function Complete-DemoDeploymentRun {
 
     .DESCRIPTION
     The outcome reads the resource group's state after the run (each track's last finished step), unless -State is
-    given. While T4 runs at a fallback size (DbHubT4Size Standard_D4ads_v5 or Standard_D2ds_v5), its hourly list price comes from
+    given. A track this run finished (its DEPLOY.TRACK result Pass, with its last step) whose record that state has
+    behind, because the track's own write was lost or failed, is recorded again first, in one write, so DONE judges by
+    what the run did (Sync-DemoTrackRecord, 2026-11-17). While T4 runs at a fallback size (DbHubT4Size Standard_D4ads_v5 or Standard_D2ds_v5), its hourly list price comes from
     this run's DEPLOY.T4.SKU, or from the Azure Retail Prices API now, for the note DONE and NOT DONE add (Phase 28
     follow-up). The note says T4 was created only with evidence that its server exists: this run's results, the T4
     track's record, or else a Servers - Get (review of 20e855c), which also decides when this run's template failed or
@@ -115,6 +117,12 @@ function Complete-DemoDeploymentRun {
         catch {
             Write-DemoLog -Level Warning -Message ('The deployment state couldn''t be read to judge the run: {0}' -f $_.Exception.Message)
             $judgedState = $null
+        }
+        # A track this run finished whose own record was lost or failed is recorded again before DONE reads the records,
+        # so the run isn't NOT DONE for it and the next run doesn't start over (live, 2026-11-17). -Sequential records no
+        # tracks.
+        if ($null -ne $judgedState -and -not $Sequential) {
+            $judgedState = Sync-DemoTrackRecord -Config $Config -State $judgedState -Result @($Result) -Confirm:$false
         }
     }
     # What this run started or created: the model says so without an Azure call.

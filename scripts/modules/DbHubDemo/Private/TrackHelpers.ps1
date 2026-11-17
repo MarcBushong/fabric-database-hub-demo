@@ -246,6 +246,82 @@ function Set-DemoDeploymentStateLocked {
     }
 }
 
+function Sync-DemoTrackRecord {
+    <#
+    .SYNOPSIS
+    The end of a run (2026-11-17): a track this run finished whose Track* record in the resource group's state is behind
+    gets it written again, so DONE judges by what the run did. Returns the state, with the records it wrote. Internal.
+
+    .DESCRIPTION
+    A track's own record of a step can be lost (two tag merges at once, the race Set-DemoDeploymentState's lock closes)
+    or fail (the track then logs that its state wasn't recorded). The ending reads the Track* records, so it said NOT DONE
+    for a track that had finished, and the next run started over, because the stage it recorded says Validation (live,
+    2026-11-17). A track counts as finished in this run only when its DEPLOY.TRACK result is Pass and its finished steps
+    include its last step (Get-DemoTrackStep): only then, and only when its record reads another step, is the record
+    written, all of them in one write through Set-DemoDeploymentState, which holds the tracks' lock. A track that didn't
+    finish is never recorded as finished, and nothing is written when every record is right. A write that fails is
+    logged, and the state comes back as it was read.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $State,
+
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    if ($null -eq $State) {
+        return $State
+    }
+    $behind = [ordered]@{}
+    $described = [System.Collections.Generic.List[string]]::new()
+    foreach ($track in 'T1', 'T2', 'T4', 'Fabric') {
+        $summary = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq ('DEPLOY.TRACK.{0}' -f $track.ToUpperInvariant()) }) | Select-Object -Last 1
+        if ($null -eq $summary -or [string]$summary.status -ne 'Pass') {
+            continue
+        }
+        $last = @((Get-DemoTrackStep -Track $track).Keys)[-1]
+        # Get-DemoMemberValue returns an array whole: assigned first, then each step is its own item.
+        $stepValue = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $summary -Name 'evidence') -Name 'steps'
+        $steps = @($stepValue | ForEach-Object { [string]$_ })
+        $key = 'Track{0}' -f $track
+        $recorded = [string](Get-DemoMemberValue -InputObject $State -Name $key)
+        if ($steps -contains $last -and $recorded -ne $last) {
+            $behind[$key] = $last
+            $described.Add(('track {0} at {1} (the state had {2})' -f $track, $last, $(if ($recorded) { $recorded } else { 'no step' })))
+        }
+    }
+    if ($behind.Count -eq 0) {
+        return $State
+    }
+    $text = $described -join ', '
+    if (-not $PSCmdlet.ShouldProcess((Get-DemoResourceGroupName -Config $Config), ('Record again what this run finished: {0}' -f $text))) {
+        return $State
+    }
+    try {
+        Set-DemoDeploymentState -Config $Config -Value $behind -Confirm:$false
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('This run finished {0}, but recording it again failed: {1}' -f $text, (Protect-DemoText -Text $_.Exception.Message))
+        return $State
+    }
+    Write-DemoLog -Message ('Recorded again what this run finished, which the resource group''s state had behind: {0}.' -f $text)
+    foreach ($key in $behind.Keys) {
+        if ($State -is [System.Collections.IDictionary]) {
+            $State[$key] = $behind[$key]
+        }
+        else {
+            $State | Add-Member -NotePropertyName $key -NotePropertyValue $behind[$key] -Force
+        }
+    }
+    return $State
+}
+
 function Get-DemoTrackStep {
     # The steps of deploy.ps1's parallel tracks, in order, and the sequential stage each belongs to, which maps
     # -FromStage and -StopAfter onto the tracks (ADR 0018). T1's T3Setup belongs to stage T3 but runs first:

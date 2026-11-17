@@ -1355,6 +1355,71 @@ Describe 'Start-DemoDeploymentRun and Complete-DemoDeploymentRun (brief goals 4 
         $null = Complete-DemoDeploymentRun -Run $stopped -Config $config -Result @() -Stopped
         Should -Invoke -ModuleName DbHubDemo -CommandName Complete-DemoBusyMarkerRun -Times 1 -Exactly -ParameterFilter { $Stopped }
     }
+
+    Context 'A finished track whose own record was lost (live, 2026-11-17)' {
+        # Live on mn, 2026-11-17: T2's last record was lost to two tag merges at once, so the run ended NOT DONE with every
+        # track Pass, and the next run started over. The ending records again what this run finished, and only that.
+        BeforeAll {
+            function New-TrackResult([string] $Track, [string] $Status, [string[]] $Steps) {
+                New-DemoResult -CheckId ('DEPLOY.TRACK.{0}' -f $Track.ToUpperInvariant()) -Area 'infra' -Target $(if ($Track -eq 'Fabric') { 'fabric' } else { $Track }) -Status $Status -Message ('Track {0}: {1}; finished steps: {2}.' -f $Track, $Status, ($Steps -join ', ')) -Evidence ([ordered]@{ steps = @($Steps) })
+            }
+            function New-FinishedTrackResult {
+                (New-TrackResult 'T1' 'Pass' @('T3Setup', 'Artifacts', 'Bootstraps', 'T3', 'T4', 'Activity', 'Monitoring', 'Telemetry'))
+                (New-TrackResult 'T2' 'Pass' @('Restore', 'Artifacts', 'Bootstraps', 'T2', 'Telemetry'))
+                (New-TrackResult 'T4' 'Pass' @('Server', 'Replica', 'Telemetry'))
+                (New-TrackResult 'Fabric' 'Pass' @('Fabric'))
+            }
+        }
+
+        BeforeEach {
+            $script:written = [System.Collections.Generic.List[object]]::new()
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:written.Add($PesterBoundParameters['Value']) }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $script:readState }
+            $script:config = New-TestConfig -WithT4
+            $script:run = Start-DemoDeploymentRun -Config $script:config -WaitForT2 -OutputDirectory $script:out -Confirm:$false
+        }
+
+        It 'records the track again, in one write, and ends DONE' {
+            $script:readState = New-FinishedState -WithT4
+            $script:readState.TrackT2 = 'T2'
+            $outcome = Complete-DemoDeploymentRun -Run $script:run -Config $script:config -Result (@(New-DoneResult) + @(New-FinishedTrackResult))
+            $outcome.Kind | Should -Be 'Done' -Because 'T2 finished in this run; only its record was lost'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -Times 1 -Exactly
+            @($script:written[0].Keys) | Should -Be @('TrackT2')
+            $script:written[0]['TrackT2'] | Should -Be 'Telemetry'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq 'Recorded again what this run finished, which the resource group''s state had behind: track T2 at Telemetry (the state had T2).' }
+        }
+
+        It 'writes nothing when every record is right' {
+            $script:readState = New-FinishedState -WithT4
+            $outcome = Complete-DemoDeploymentRun -Run $script:run -Config $script:config -Result (@(New-DoneResult) + @(New-FinishedTrackResult))
+            $outcome.Kind | Should -Be 'Done'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -Times 0 -Exactly
+        }
+
+        It 'never records a track that didn''t finish in this run' {
+            $script:readState = New-FinishedState -WithT4
+            $script:readState.TrackT1 = 'Bootstraps'
+            $script:readState.TrackT4 = 'Server'
+            # T1 failed at its T3 step; T4 passed without its last step (a run stopped after it, with -StopAfter T4).
+            $tracks = @((New-TrackResult 'T1' 'Fail' @('T3Setup', 'Artifacts', 'Bootstraps')), (New-TrackResult 'T4' 'Pass' @('Server')))
+            $outcome = Complete-DemoDeploymentRun -Run $script:run -Config $script:config -Result (@(New-DoneResult) + $tracks)
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -Times 0 -Exactly
+            $outcome.Kind | Should -Be 'NotDone'
+            @($outcome.Unfinished) | Should -Contain 'T1'
+            @($outcome.Unfinished) | Should -Contain 'T4'
+        }
+
+        It 'judges by the state as read when the write fails, with a Warning, and never throws' {
+            $script:readState = New-FinishedState -WithT4
+            $script:readState.TrackT2 = 'T2'
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { throw 'Recording the deployment state failed: (AuthorizationFailed) no tag write' }
+            $outcome = Complete-DemoDeploymentRun -Run $script:run -Config $script:config -Result (@(New-DoneResult) + @(New-FinishedTrackResult))
+            $outcome.Kind | Should -Be 'NotDone'
+            $outcome.Reason | Should -Be 'Not every target finished: T2.'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match '^This run finished track T2 at Telemetry \(the state had T2\), but recording it again failed: ' }
+        }
+    }
 }
 
 Describe 'The host credential an earlier guided stop handed over, rotated and cleaned up (ADR 0009)' {
