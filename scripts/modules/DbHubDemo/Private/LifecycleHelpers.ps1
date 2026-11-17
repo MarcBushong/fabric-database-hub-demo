@@ -91,6 +91,12 @@ function Invoke-DemoVmPowerAction {
     if ($before -eq $wanted) {
         return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Pass' -Message ('{0} is {1}.' -f $VmName, $wanted.Split('/')[1]))
     }
+    $stillStarting = 'Wait until Azure has finished starting it (./scripts/status.ps1 shows its state), then run the script again; starting it again doesn''t help.'
+    # A start that something else asked for and that Azure is still working on after the whole wait gets no second start:
+    # Azure refuses another operation on the VM until it's done (2026-11-17, the coordinator's question on a dead start).
+    if ($Action -eq 'Start' -and $before -eq 'PowerState/starting') {
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still starting after {1} seconds: Azure is still working on its start, so no second start was sent.' -f $VmName, $TimeoutSeconds) -Remediation $stillStarting -Evidence ([ordered]@{ before = $before; after = $before; issued = ''; inProgress = $true }))
+    }
     $verb = if ($Action -eq 'Start') { 'start' } else { 'deallocate' }
     # A start this run asked for (-StartRequested) that Azure is still working on reads stopped or deallocated, with its
     # provisioning state Updating, for minutes (live, 2026-11-16: archost01 read stopped and Updating for 12 minutes, and a
@@ -139,6 +145,12 @@ function Invoke-DemoVmPowerAction {
             }
             $issued = 'deallocate'
         }
+    }
+    # A start Azure is still working on when the wait ends (it reads starting, or stopped or deallocated with an operation in
+    # progress, as a host whose VM agent never gets ready did for up to an hour, R871) is said so, for the caller's fix.
+    $inProgress = $Action -eq 'Start' -and ($current -eq 'PowerState/starting' -or $pending -or ($current -in 'PowerState/stopped', 'PowerState/deallocated' -and (Test-DemoVmOperationInProgress -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName)))
+    if ($inProgress) {
+        return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still {1} after {2} seconds: Azure is still working on its start.' -f $VmName, $current, $TimeoutSeconds) -Remediation $stillStarting -Evidence ([ordered]@{ before = $before; after = $current; issued = $issued; inProgress = $true }))
     }
     return (New-DemoResult -CheckId $checkId -Area 'infra' -Target $target -Status 'Warning' -Message ('{0} is still {1} after {2} seconds.' -f $VmName, $current, $TimeoutSeconds) -Remediation 'Check the VM in the portal; run the script again.' -Evidence ([ordered]@{ before = $before; after = $current; issued = $issued }))
 }
@@ -356,12 +368,18 @@ function Wait-DemoStoppedStart {
     # once a VM that was still stopping had settled; never one that was already starting (Phase 28 review).
     $issued = [System.Collections.Generic.List[string]]::new()
     $interimSent = [System.Collections.Generic.List[object]]::new()
+    # The VMs whose start Azure is still working on when the wait ends (Invoke-DemoVmPowerAction's inProgress): starting
+    # one again doesn't help, so the fix is to wait and run deploy.ps1 again (2026-11-17).
+    $stillStarting = [System.Collections.Generic.List[string]]::new()
     $hostVm = Get-DemoHostVmName -Config $Config
     foreach ($vm in @($Request.Vms.Keys)) {
         $item = Invoke-DemoVmPowerAction -Config $Config -VmName $vm -Action Start -StartRequested:([bool]$Request.Vms[$vm].Requested)
         $results.Add($item)
         if ([string]$item.status -ne 'Pass') {
             $notRunning.Add($vm)
+            if ([bool](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $item -Name 'evidence') -Name 'inProgress')) {
+                $stillStarting.Add($vm)
+            }
         }
         else {
             # The T2 guest starts with its host (its automatic start action), except on a golden snapshot's source host,
@@ -413,7 +431,21 @@ function Wait-DemoStoppedStart {
     $t4Text = if ($null -eq $t4) { '' } elseif ([string]$t4.status -eq 'Pass') { ' T4 is Ready.' } else { ' T4: {0}' -f [string]$t4.message }
     if ($notRunning.Count -gt 0) {
         $message = '{0} isn''t running, so the steps that need it can''t run (Run Command needs a running VM).{1}' -f ($notRunning -join ' and '), $t4Text
-        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message $message -Evidence $evidence -Remediation ('Start {0} in the Azure portal, or run ./scripts/start-demo.ps1, then run ./scripts/deploy.ps1 again: it continues where it stopped.' -f ($notRunning -join ' and ')) -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-start'))
+        # A VM Azure is still starting gets no "start it" fix: a second start doesn't help, and the next deploy.ps1, once the
+        # start has ended, goes on; when the T2 host's VM agent stays down then, its T2 track brings the host back, and
+        # builds it again once if it must (R871, R872). A rebuild here would guess: the agent can't be read before the VM
+        # runs, and a slow start can be a healthy one (2026-11-17, the coordinator's question).
+        $fixes = [System.Collections.Generic.List[string]]::new()
+        if ($stillStarting.Count -gt 0) {
+            $one = $stillStarting.Count -eq 1
+            $fixes.Add(('Azure is still starting {0}: don''t start {1} yourself. Run ./scripts/deploy.ps1 again once it has finished, at most about an hour after the start (./scripts/status.ps1 shows {2} state): it continues where it stopped.{3}' -f ($stillStarting -join ' and '), $(if ($one) { 'it' } else { 'them' }), $(if ($one) { 'its' } else { 'their' }), $(if ($hostVm -in $stillStarting) { (' When {0}''s VM agent stays down then, that run brings it back, and builds it again once if it must.' -f $hostVm) } else { '' })))
+        }
+        $other = @($notRunning | Where-Object { $_ -notin $stillStarting })
+        if ($other.Count -gt 0) {
+            $fixes.Add(('Start {0} in the Azure portal, or run ./scripts/start-demo.ps1, then run ./scripts/deploy.ps1 again: it continues where it stopped.' -f ($other -join ' and ')))
+        }
+        $evidence['stillStarting'] = $stillStarting.ToArray()
+        $results.Add((New-DemoResult -CheckId 'DEPLOY.VMSTART' -Area 'infra' -Target 'subscription' -Status 'Fail' -Message $message -Evidence $evidence -Remediation ($fixes -join ' ') -DocUrl 'https://learn.microsoft.com/cli/azure/vm#az-vm-start'))
         Set-DemoProgressStep -Path $ProgressPath -Id 'StartVms' -Status 'Fail' -Message $message
         return $results.ToArray()
     }

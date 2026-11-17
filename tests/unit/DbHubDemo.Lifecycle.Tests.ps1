@@ -3504,6 +3504,29 @@ Describe 'Invoke-DemoVmPowerAction' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'start' }
     }
 
+    It 'sends no second start to a VM that Azure is still starting after the whole wait, and says so (2026-11-17)' {
+        # A start Azure accepted for a host whose VM agent never gets ready runs for up to an hour (R871), and Azure refuses
+        # another operation on the VM until it's done.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { [System.Threading.Thread]::Sleep(200); 'PowerState/starting' }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Start -TimeoutSeconds 30 -PollSeconds 1 } $config
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be 'archost01 is still starting after 30 seconds: Azure is still working on its start, so no second start was sent.'
+        $result.remediation | Should -Be 'Wait until Azure has finished starting it (./scripts/status.ps1 shows its state), then run the script again; starting it again doesn''t help.'
+        $result.evidence.inProgress | Should -BeTrue
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 0 -Exactly
+    }
+
+    It 'says Azure is still working on a start it accepted when the VM reads deallocated, Updating, for the whole wait (2026-11-17)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { [System.Threading.Thread]::Sleep(200); 'PowerState/deallocated' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -match '^vm get-instance-view ' } -MockWith { @('ProvisioningState/updating', 'PowerState/deallocated') }
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Invoke-DemoVmPowerAction -Config $c -VmName 'archost01' -Action Start -TimeoutSeconds 30 -PollSeconds 1 } $config
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be 'archost01 is still PowerState/deallocated after 30 seconds: Azure is still working on its start.'
+        $result.evidence.inProgress | Should -BeTrue
+        $result.evidence.issued | Should -Be 'start'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains 'start' }
+    }
+
     It 'deallocates a VM whose last operation failed at once, instead of waiting for a power state that never comes (live, 2026-11-16)' {
         # Live, 2026-11-16: archost01's start ended VMStartTimedOut, so its instance view showed no power state, and
         # stop-demo.ps1 waited 900 seconds, then sent no deallocate: the VM kept billing. Its power state stays empty until a
@@ -3690,6 +3713,30 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         $failed.message | Should -Match 'archost01 isn''t running'
         $failed.remediation | Should -Match ([regex]::Escape('./scripts/start-demo.ps1'))
         $script:calls | Should -Not -Contain 'source release' -Because 'the host isn''t running'
+    }
+
+    It 'tells the person not to start a VM that Azure is still starting, and to run deploy.ps1 again once it has finished (2026-11-17)' {
+        # The coordinator's question: a dead start that never reads running within the wait. The next deploy.ps1, once Azure
+        # has ended the start, brings the T2 host back or builds it again (R871, R872); starting it again doesn't help.
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/deallocated' }
+        $script:inProgress = @{ sqlvm01 = $false; archost01 = $true }
+        $script:noStart = 'archost01'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith {
+            $status = if ($VmName -in @($script:noStart)) { 'Warning' } else { 'Pass' }
+            New-DemoResult -CheckId ('START.VM_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T2' -Status $status -Message ('{0}: {1}' -f $VmName, $status) -Evidence ([ordered]@{ issued = ''; inProgress = ($status -ne 'Pass' -and $script:inProgress[$VmName]) })
+        }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        $failed = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $failed.status | Should -Be 'Fail'
+        $failed.remediation | Should -Be 'Azure is still starting archost01: don''t start it yourself. Run ./scripts/deploy.ps1 again once it has finished, at most about an hour after the start (./scripts/status.ps1 shows its state): it continues where it stopped. When archost01''s VM agent stays down then, that run brings it back, and builds it again once if it must.'
+        @($failed.evidence.stillStarting) | Should -Be @('archost01')
+
+        # With another VM that didn't start for another reason, that one still gets the start fix.
+        $script:noStart = @('sqlvm01', 'archost01')
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        $failed = $results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }
+        $failed.remediation | Should -Match '^Azure is still starting archost01: .* Start sqlvm01 in the Azure portal, or run \./scripts/start-demo\.ps1, then run \./scripts/deploy\.ps1 again: it continues where it stopped\.$'
     }
 
     It 'sets the interim baseline on each VM it started as soon as that VM runs, and waits for it before the run''s first Run Command there, and none on a VM that didn''t start (review of PR 16, and its re-review)' {
