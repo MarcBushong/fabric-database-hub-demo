@@ -195,7 +195,7 @@ Describe 'Invoke-DemoT2HostRebuild: once, in order, and what it says (2026-11-17
         $script:busyBy = ''
         $script:busyUntil = ''
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
-        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:rows.Add(('{0}|{1}|{2}' -f (@($Id) -join ','), $State, $Status)) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:rows.Add(('{0}|{1}|{2}' -f (@($Id) -join ','), $State, $PesterBoundParameters['Status'])) }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2HostTemplate -MockWith { $script:order.Add('template'); @{ parameters = @{}; resources = @() } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT2HostDeploymentParameter -MockWith { $script:order.Add('parameters'); [pscustomobject]@{ Ok = $script:paramsOk; Parameters = [ordered]@{ vmSize = @{ value = 'Standard_E2s_v5' } }; Error = 'archost01''s last deployment record in rg-dbhub-demo couldn''t be read: not found' } }
         Mock -ModuleName DbHubDemo -CommandName Reset-DemoT2HostRecord -MockWith { $script:order.Add('reset') }

@@ -65,7 +65,7 @@ Describe 'Get-DemoDestroyControlPlan: whether the session control serves this en
         }
     }
 
-    It 'says there''s none when rg-<prefix>-control doesn''t exist' {
+    It 'says there''s none when the control''s resource group doesn''t exist' {
         $script:groupAnswer = New-AzAnswer -StdOut "false`n"
         $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoDestroyControlPlan -Config $Config }
         $plan.State | Should -Be 'None'
