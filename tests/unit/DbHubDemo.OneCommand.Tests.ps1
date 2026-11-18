@@ -2158,7 +2158,7 @@ Describe 'Run Commands never stall a run (brief item 14)' {
             $activity.Busy | Should -Be $Busy
             $activity.NoPower | Should -Be $Busy
             if ($Busy) {
-                $activity.Labels | Should -Be @('Azure''s operation on the VM (no power state, and its agent isn''t Ready)')
+                $activity.Labels | Should -Be @('the VM''s start or update (no power state, and its agent isn''t Ready)')
             }
         }
 
@@ -2193,7 +2193,7 @@ Describe 'Run Commands never stall a run (brief item 14)' {
             Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 15 } -Times 80
             $watchdog.Recovered | Should -BeTrue
             $watchdog.Result.status | Should -Be 'Warning'
-            $watchdog.Result.message | Should -Match ('It showed no power state, and its VM agent wasn''t Ready, for 20 minutes \(provisioning updating, {0}\), so it wasn''t restarted: ' -f [regex]::Escape($Text))
+            $watchdog.Result.message | Should -Match ('It showed no power state, with its VM agent not Ready, for 20 minutes \(provisioning updating, {0}\), so it wasn''t restarted: ' -f [regex]::Escape($Text))
             $watchdog.Result.evidence['agentDown'] | Should -BeTrue
             $watchdog.Result.evidence['action'] | Should -Be 'deallocated and started'
         }

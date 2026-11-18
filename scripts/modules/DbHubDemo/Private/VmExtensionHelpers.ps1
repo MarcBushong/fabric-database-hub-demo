@@ -101,7 +101,7 @@ function Get-DemoVmExtensionActivity {
             $agent = [string](Get-DemoMemberValue -InputObject (@($agentStatuses) | Select-Object -First 1) -Name 'displayStatus')
             if ($agent -ne 'Ready') {
                 $items.Add(('VM agent ({0})' -f $(if ($agent) { $agent } else { 'no status' })))
-                $labels.Add($(if ($noPower) { 'Azure''s operation on the VM (no power state, and its agent isn''t Ready)' } else { 'the VM''s start (its agent isn''t Ready yet)' }))
+                $labels.Add($(if ($noPower) { 'the VM''s start or update (no power state, and its agent isn''t Ready)' } else { 'the VM''s start (its agent isn''t Ready yet)' }))
                 $noPowerDown = $noPower
             }
         }
@@ -413,7 +413,7 @@ function Restart-DemoVmOnce {
                     $asked++
                 }
             }
-            $why = if ($null -ne $held -and $held.Down) { 'it showed no power state, and its VM agent wasn''t Ready, for {0} minutes ({1})' -f $AgentDownMinutes, $state.Text } elseif ($agentDown) { 'its VM agent isn''t Ready ({0})' -f $state.Text } else { 'it lists {0} chunk Run Command(s) that a restart would keep' -f $chunks.Count }
+            $why = if ($null -ne $held -and $held.Down) { 'it showed no power state, with its VM agent not Ready, for {0} minutes ({1})' -f $AgentDownMinutes, $state.Text } elseif ($agentDown) { 'its VM agent isn''t Ready ({0})' -f $state.Text } else { 'it lists {0} chunk Run Command(s) that a restart would keep' -f $chunks.Count }
             $sent = if ($asked -gt 0) { 'the deletes of its {0} chunk Run Command(s) went first, to complete with the deallocate; ' -f $asked } else { '' }
             Write-DemoLog -Level Warning -Message ('{0}: {1}, and {2}, so it isn''t restarted: {3}it''s deallocated and started once now (R871); no action needed.' -f $VmName, $Because, $why, $sent)
             if ($asked -gt 0) {
