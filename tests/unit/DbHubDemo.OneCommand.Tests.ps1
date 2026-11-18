@@ -1689,7 +1689,7 @@ Describe 'Run Commands never stall a run (brief item 14)' {
     It 'never restarts the T2 host mid-build, or while a golden Release runs on it (review finding 6)' {
         # Judged from the deployment state, not the host's health (review follow-up): the agent that would read it is what's stuck.
         $script:views.Enqueue($script:idle)
-        $script:stateValues = @{ GuidedStopUtc = ''; Stage = 'Infrastructure'; TrackT1 = 'Monitoring'; TrackT2 = 'Bootstraps'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '2026-10-29T15:00:00Z' }
+        $script:stateValues = @{ GuidedStopUtc = ''; Stage = 'Infrastructure'; TrackT1 = 'Monitoring'; TrackT2 = 'Bootstraps'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = [System.DateTime]::UtcNow.AddMinutes(-30).ToString('yyyy-MM-ddTHH:mm:ssZ') }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]$script:stateValues }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'The watchdog must not read health through a Run Command.' }
         $restart = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }
@@ -1762,7 +1762,7 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         }
         $blocker = { InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoHostRestartBlocker -Config $Config } }
         # A generation the loader started that nobody saw finish, even after a rerun from Artifacts recorded an earlier step.
-        $script:stateValues = @{ T2BuildUtc = '2026-10-29T15:00:00Z'; TrackT1 = 'Monitoring'; TrackT2 = 'Restore'; T2Source = 'build' }
+        $script:stateValues = @{ T2BuildUtc = [System.DateTime]::UtcNow.AddMinutes(-30).ToString('yyyy-MM-ddTHH:mm:ssZ'); TrackT1 = 'Monitoring'; TrackT2 = 'Restore'; T2Source = 'build' }
         & $blocker | Should -Match 'bootstrap generation'
         # The track's last step is the loader (a state written before the build was recorded on its own).
         $script:stateValues = @{ TrackT1 = 'Monitoring'; TrackT2 = 'Bootstraps'; T2Source = 'build' }
@@ -1832,7 +1832,16 @@ Describe 'Run Commands never stall a run (brief item 14)' {
     It 'deallocates and starts a VM whose restart Azure doesn''t finish in time, once, bounded, and says so as a Warning (2026-11-16)' {
         $script:power = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmRestarted -MockWith { [pscustomobject]@{ Done = $false; Seconds = 900; State = 'provisioning updating, power unknown, agent Not Ready' } }
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = ''; Agent = 'Not Ready'; Text = 'provisioning updating, power unknown, agent Not Ready' } }
+        # #63: running with its agent Ready before the restart; a host with no power state and its agent not Ready from the
+        # start is down, which gets no restart.
+        $script:restartReads = [System.Collections.Generic.Queue[object]]::new()
+        $script:restartReads.Enqueue([pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/succeeded'; ProvisionedUtc = $null; Power = 'PowerState/running'; Agent = 'Ready'; Text = 'provisioning succeeded, power running, agent Ready' })
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith {
+            if ($script:restartReads.Count -gt 0) {
+                return $script:restartReads.Dequeue()
+            }
+            [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = ''; Agent = 'Not Ready'; Text = 'provisioning updating, power unknown, agent Not Ready' }
+        }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
             $joined = $ArgumentList -join ' '
             if ($joined -match '^vm get-instance-view') {
@@ -2104,6 +2113,146 @@ Describe 'Run Commands never stall a run (brief item 14)' {
         $monitoring | Should -Match "Label \('\{0\}: merging \{1\}' -f \`$state\.VmName, \`$flagName\) -TimeoutSeconds 1200"
         $t3 = Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'scripts/modules/DbHubDemo/Public/Invoke-DemoT3SqlFromT1.ps1') -Raw
         $t3 | Should -Match '-ArgumentList \$arguments -AllowFailure -TimeoutSeconds \('
+    }
+
+    Context 'a T2 host that shows no power state, with its agent not Ready (#63, live 2026-11-18)' {
+        # Live on rg-dbhubvu-demo: after a tenant job deallocated and started the demo's VMs, archost01 stayed "updating", with
+        # no power state and its agent Not Ready, for hours. The run took that for idle and sent it chunks that stayed Pending,
+        # and an older run's bootstrap generation, left recorded, kept the watchdog from recovering it on every later run.
+        BeforeEach {
+            $script:order = [System.Collections.Generic.List[string]]::new()
+            $script:reads = 0
+            $script:noPowerState = [pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = ''; Agent = 'Not Ready'; Text = 'provisioning updating, power unknown, agent Not Ready' }
+            $script:restartReads = [System.Collections.Generic.Queue[object]]::new()
+            $script:lastRead = $script:noPowerState
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith {
+                $script:reads++
+                if ($script:restartReads.Count -gt 0) {
+                    $script:lastRead = $script:restartReads.Dequeue()
+                }
+                $script:lastRead
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+                $joined = $ArgumentList -join ' '
+                if ($joined -match '^vm get-instance-view') {
+                    return $script:idle
+                }
+                if ($joined -match '^rest --method get') {
+                    return [pscustomobject]@{ value = @() }
+                }
+                if ($joined -match '^vm restart') {
+                    $script:restarts++
+                    return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+                }
+                if ($joined -match '^vm deallocate .*--no-wait') {
+                    $script:order.Add('deallocate')
+                    return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' }
+                }
+                throw ('unexpected Azure CLI call: ' + $joined)
+            }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add($Action); New-DemoResult -CheckId 'STOP.VM_ARCHOST01' -Area 'infra' -Target 'T2' -Status 'Pass' -Message 'ok' }
+            Mock -ModuleName DbHubDemo -CommandName Stop-DemoGuestVm -MockWith { throw 'The guest can''t be shut down through a host whose agent isn''t Ready.' }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoVmInstanceView -MockWith { '' }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = ''; Stage = ''; TrackT1 = 'Telemetry'; TrackT2 = 'Artifacts'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = '' } }
+        }
+
+        It 'counts it as busy, so nothing is sent to it: <Case>' -ForEach @(
+            @{ Case = 'agent Not Ready'; Agent = 'Not Ready'; Busy = $true }
+            @{ Case = 'no agent status'; Agent = ''; Busy = $true }
+            @{ Case = 'agent Ready'; Agent = 'Ready'; Busy = $false }
+        ) {
+            $agentStatus = if ($Agent) { [pscustomobject]@{ statuses = @([pscustomobject]@{ displayStatus = $Agent }) } } else { $null }
+            $script:views.Enqueue([pscustomobject]@{ resources = @(); instanceView = [pscustomobject]@{ extensions = @(); statuses = @([pscustomobject]@{ code = 'ProvisioningState/updating' }); vmAgent = $agentStatus } })
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+                if (($ArgumentList -join ' ') -match '^vm get-instance-view') {
+                    return $script:views.Peek()
+                }
+                [pscustomobject]@{ value = @() }
+            }
+            $activity = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoVmExtensionActivity -Config $Config -VmName 'archost01' }
+            $activity.Busy | Should -Be $Busy
+            $activity.NoPower | Should -Be $Busy
+            if ($Busy) {
+                $activity.Labels | Should -Be @('the VM''s start or update (no power state, and its agent isn''t Ready)')
+            }
+        }
+
+        It 'lets the watchdog act on it when the bootstrap generation the state records is older than T2''s longest build' {
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ GuidedStopUtc = ''; Stage = ''; TrackT1 = 'Monitoring'; TrackT2 = 'Artifacts'; TrackT4 = ''; TrackFabric = ''; T2Source = 'build'; T2BuildUtc = $script:buildUtc } }
+            $blocker = { InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoHostRestartBlocker -Config $Config } }
+            # Live: 5 hours after an earlier run's loader started it.
+            $script:buildUtc = [System.DateTime]::UtcNow.AddHours(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
+            & $blocker | Should -BeNullOrEmpty
+            # Within T2's longest build (deploy.ps1 -T2WaitMinutes, 180 minutes), or a time that can't be read: it may be running.
+            foreach ($value in @([System.DateTime]::UtcNow.AddMinutes(-170).ToString('yyyy-MM-ddTHH:mm:ssZ'), 'not a time')) {
+                $script:buildUtc = $value
+                & $blocker | Should -Match 'bootstrap generation' -Because $value
+            }
+        }
+
+        It 'deallocates and starts it, with no restart, once it has stayed down for 20 minutes, read by read: <Case>' -ForEach @(
+            @{ Case = 'no power state throughout'; Later = $null; Text = 'power unknown, agent Not Ready' }
+            @{ Case = 'Azure starts it, and its agent never comes Ready'; Later = 'PowerState/running'; Text = 'power running, agent Not Ready' }
+        ) {
+            if ($Later) {
+                foreach ($i in 1..4) {
+                    $script:restartReads.Enqueue($script:noPowerState)
+                }
+                $script:restartReads.Enqueue([pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = $Later; Agent = 'Not Ready'; Text = 'provisioning updating, power running, agent Not Ready' })
+            }
+            $watchdog = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmWatchdog -Config $Config -VmName 'archost01' -Cause 'Azure''s extension work didn''t finish in 20 minutes' }
+            $script:restarts | Should -Be 0 -Because 'a restart doesn''t get a host whose agent is down its goal state'
+            $script:order | Should -Be @('deallocate', 'Deallocate', 'Start')
+            # 20 minutes of reads every 15 seconds, after the watchdog's own read: never one read.
+            $script:reads | Should -BeGreaterOrEqual 81
+            Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -ParameterFilter { $Seconds -eq 15 } -Times 80
+            $watchdog.Recovered | Should -BeTrue
+            $watchdog.Result.status | Should -Be 'Warning'
+            $watchdog.Result.message | Should -Match ('It showed no power state, with its VM agent not Ready, for 20 minutes \(provisioning updating, {0}\), so it wasn''t restarted: ' -f [regex]::Escape($Text))
+            $watchdog.Result.evidence['agentDown'] | Should -BeTrue
+            $watchdog.Result.evidence['action'] | Should -Be 'deallocated and started'
+        }
+
+        It 'gives it no restart and no deallocate when it shows no power state only briefly: <Case>' -ForEach @(
+            @{ Case = 'Azure''s start ends with its agent Ready'; Power = 'PowerState/running'; Agent = 'Ready'; Then = 'provisioning succeeded, power running, agent Ready' }
+            @{ Case = 'Azure deallocates it meanwhile'; Power = 'PowerState/deallocating'; Agent = ''; Then = 'provisioning updating, power deallocating, agent unknown' }
+        ) {
+            # The watchdog's read and 45 seconds of reads show no power state, then Azure's operation ends.
+            foreach ($i in 1..4) {
+                $script:restartReads.Enqueue($script:noPowerState)
+            }
+            $script:restartReads.Enqueue([pscustomobject]@{ Read = $true; Provisioning = 'ProvisioningState/updating'; ProvisionedUtc = $null; Power = $Power; Agent = $Agent; Text = $Then })
+            $restart = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -Confirm:$false }
+            $restart.Restarted | Should -BeFalse
+            $restart.Reason | Should -Be ('Azure was still working on it: it showed no power state, with its VM agent not Ready, then {0}' -f $Then)
+            $script:restarts | Should -Be 0
+            $script:order | Should -BeNullOrEmpty
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -Times 0
+            (InModuleScope DbHubDemo { $script:DemoVmRestarted.Count }) | Should -Be 0 -Because 'a later stall in the run may still use the watchdog'
+        }
+
+        It 'counts the minutes the settle already saw it so, and still reads it again before it acts' {
+            $script:held = [System.Collections.Generic.List[int]]::new()
+            Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmAgentDown -MockWith { $script:held.Add($Minutes); [pscustomobject]@{ Down = $false; Reads = 1; State = $script:noPowerState } }
+            foreach ($seen in 20, 15, 0) {
+                $null = InModuleScope DbHubDemo -Parameters @{ Config = $config; Seen = $seen } { Restart-DemoVmOnce -Config $Config -VmName 'archost01' -NoPowerMinutes $Seen -Confirm:$false }
+            }
+            $script:held | Should -Be @(0, 5, 20)
+            # The settle's count reaches the restart through the watchdog.
+            Mock -ModuleName DbHubDemo -CommandName Wait-DemoVmExtensionSettled -MockWith { [pscustomobject]@{ Settled = $false; Minutes = 20; Activity = [pscustomobject]@{ Labels = @() }; NoPowerMinutes = 20 } }
+            Mock -ModuleName DbHubDemo -CommandName Restart-DemoVmOnce -MockWith { [pscustomobject]@{ Restarted = $false; Reason = 'test'; AtUtc = $null; Recovered = $false; Failed = $false; Detail = ''; Results = @() } }
+            $null = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoVmSettle -Config $Config -VmName 'archost01' -FirstMinutes 20 -AfterRestartMinutes 0 -PollSeconds 1 }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Restart-DemoVmOnce -ParameterFilter { $NoPowerMinutes -eq 20 } -Times 1 -Exactly
+        }
+
+        It 'reads it again at least once, never acting on the watchdog''s one read' {
+            $wait = InModuleScope DbHubDemo { Wait-DemoVmAgentDown -SubscriptionId '11111111-2222-3333-4444-555555555555' -ResourceGroupName 'rg-dbhub-demo' -VmName 'archost01' -Minutes 0 -PollSeconds 15 }
+            $wait.Down | Should -BeTrue
+            $wait.Reads | Should -Be 1
+            # A read that fails says nothing: no read, no verdict.
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRestartState -MockWith { [pscustomobject]@{ Read = $false; Provisioning = ''; ProvisionedUtc = $null; Power = ''; Agent = ''; Text = 'unreadable' } }
+            (InModuleScope DbHubDemo { Wait-DemoVmAgentDown -SubscriptionId '11111111-2222-3333-4444-555555555555' -ResourceGroupName 'rg-dbhub-demo' -VmName 'archost01' -Minutes 1 -PollSeconds 15 }).Down | Should -BeFalse
+        }
     }
 }
 
