@@ -53,11 +53,11 @@ Describe 'One click: a configuration can''t lead to the setup wizard or leave T4
     }
 
     It 'writes a run''s configuration back without its marks, and it loads the same' {
-        $config = Get-DemoConfig -Path (New-TestConfigFile -Values @{ t2SqlInstallMode = 'PaygWizard'; t4Enabled = $false })
+        $config = Get-DemoConfig -Path (New-TestConfigFile -Values @{ t2SqlInstallMode = 'PaygWizard'; t4Enabled = $false; sessionCeilingUsd = 15 })
         $config['t4SkuSource'] = 'retry'
         $text = InModuleScope DbHubDemo -Parameters @{ Config = $config } { ConvertTo-DemoConfigFileText -Config $Config }
         $written = $text | ConvertFrom-Json -AsHashtable
-        foreach ($mark in 't2SqlInstallModeSource', 't4EnabledIgnored', 't4SkuSource') {
+        foreach ($mark in 't2SqlInstallModeSource', 't4EnabledIgnored', 't4SkuSource', 'sessionCeilingUsdSource') {
             $written.Contains($mark) | Should -BeFalse -Because $mark
         }
         $path = Join-Path -Path $TestDrive -ChildPath 'written.json'
@@ -65,6 +65,18 @@ Describe 'One click: a configuration can''t lead to the setup wizard or leave T4
         $again = Get-DemoConfig -Path $path
         $again['t2SqlInstallMode'] | Should -Be 'JumpstartImage'
         $again['t4Enabled'] | Should -BeTrue
+        $again['sessionCeilingUsd'] | Should -Be 20
+    }
+
+    It 'counts an older configuration''s sessionCeilingUsd of 15 as 20, and says so in one line at the start (2026-11-18, the owner''s decision)' {
+        $config = Get-DemoConfig -Path (New-TestConfigFile -Values @{ sessionCeilingUsd = 15 })
+        $note = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoSessionCeilingLegacyText -Config $Config }
+        $note | Should -Match '^sessionCeilingUsd 15 in your configuration \(the default before 2026-11-18\) counts as 20, the default since then: lowest-cost''s T3 went from 1 to 2 vCores, because Database Agents doesn''t support one-vCore serverless databases'
+        $note | Should -Match 'still only a Warning\. To drop this note, set sessionCeilingUsd to 20, or to any value but 15, which is kept as it is\.$'
+        foreach ($kept in @{}, @{ sessionCeilingUsd = 20 }, @{ sessionCeilingUsd = 16 }) {
+            $other = Get-DemoConfig -Path (New-TestConfigFile -Values $kept)
+            InModuleScope DbHubDemo -Parameters @{ Config = $other } { Get-DemoSessionCeilingLegacyText -Config $Config } | Should -BeNullOrEmpty
+        }
     }
 
     It 'puts what it ignores at the top of the start banner and on the status page' {
@@ -147,6 +159,35 @@ Describe 'No record leaves T4 out: every run tries the sizes again (2026-11-09)'
             $missing = InModuleScope DbHubDemo -Parameters @{ Config = $config; State = $state } { Get-DemoT4MissingResult -Config $Config -State $State }
             $missing.checkId | Should -Be 'DEPLOY.T4.MISSING' -Because ('the record was "{0}"' -f $record)
         }
+    }
+
+    It 'starts a resumed run from preflight when T3''s database doesn''t have the profile''s maximum vCores, so the template scales it (2026-11-18)' {
+        # lowest-cost's T3 went from 1 to 2 maximum vCores (the owner's decision): Database Agents doesn't support one-vCore
+        # serverless databases.
+        $script:t3 = [pscustomobject]@{ Exists = $true; Status = 'Paused'; MaxVcores = 1; ServerName = 'azuresql01-abc123'; DeploymentId = 'abc123' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT3State -MockWith { $script:t3 }
+        $config = [ordered]@{ profile = 'lowest-cost' }
+        $state = [pscustomobject]@{ Stage = 'Infrastructure'; Tags = @{ deploymentId = 'abc123' } }
+        $scale = InModuleScope DbHubDemo -Parameters @{ Config = $config; State = $state } { Get-DemoT3ScaleResult -Config $Config -State $State }
+        $scale.checkId | Should -Be 'DEPLOY.T3.SCALE'
+        $scale.status | Should -Be 'Pass'
+        $scale.message | Should -Match '^T3''s database ContosoCare on azuresql01-abc123 has 1 maximum vCores, and the profile lowest-cost sets 2 .+ so this run starts from preflight instead: the template scales T3 online'
+        $scale.evidence.maxVcores | Should -Be 1
+        $scale.evidence.profileMaxVcores | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT3State -Times 1 -Exactly -ParameterFilter { $DeploymentId -eq 'abc123' }
+
+        # Nothing to scale, or nothing known: the resume goes on.
+        foreach ($t3 in @(
+                [pscustomobject]@{ Exists = $true; Status = 'Online'; MaxVcores = 2; ServerName = 'azuresql01-abc123' }
+                [pscustomobject]@{ Exists = $false; Status = ''; MaxVcores = $null; ServerName = 'azuresql01-abc123' }
+                [pscustomobject]@{ Exists = $true; Status = 'Online'; MaxVcores = $null; ServerName = 'azuresql01-abc123' }
+            )) {
+            $script:t3 = $t3
+            InModuleScope DbHubDemo -Parameters @{ Config = $config; State = $state } { Get-DemoT3ScaleResult -Config $Config -State $State } | Should -BeNullOrEmpty
+        }
+        $noId = [pscustomobject]@{ Stage = 'Infrastructure'; Tags = @{} }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config; State = $noId } { Get-DemoT3ScaleResult -Config $Config -State $State } | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT3State -Times 4 -Exactly -Because 'without a deploymentId there''s no server to read'
     }
 }
 

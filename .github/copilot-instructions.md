@@ -1,6 +1,6 @@
 # Copilot instructions for this repository
 
-This repo deploys a low-cost, repeatable customer demo of **Microsoft Fabric Database Hub (preview)** and its in-Hub **Database Agent (preview)** across three SQL targets: T1 SQL Server on an Azure VM, T2 Arc-enabled SQL Server in a nested Hyper-V guest, and T3 Azure SQL Database. Read `docs/architecture.md` and the ADRs in `docs/adr/` before you change behavior.
+This repo deploys a low-cost, repeatable customer demo of **Microsoft Fabric Database Hub**, generally available since 2026-11-17, with its **Copilot** and **Database Agents** (previews), across three SQL targets: T1 SQL Server on an Azure VM, T2 Arc-enabled SQL Server in a nested Hyper-V guest, and T3 Azure SQL Database. Read `docs/architecture.md` and the ADRs in `docs/adr/` before you change behavior.
 
 ## Non-negotiable rules
 

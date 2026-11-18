@@ -2,11 +2,13 @@
 
 Presenter scripts for the Fabric Database Hub hybrid SQL demo: a 15-minute version and a 30-minute version, what to do before and after a session, a documented fallback for every agent beat, a cheat sheet for each incident scenario, and a recovery playbook. How the demo is built is in the [architecture](architecture.md); what's automated and what isn't is in the [automation support matrix](automation-support-matrix.md).
 
-> **Preview disclosure:** Database Hub, its Database Agent and Copilot, SQL Server on Azure VM performance monitoring, the Arc SQL monitoring setting, and the SQL telemetry endpoint are previews ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview)). Their behavior, coverage, and UI can change. This script never promises what an AI will answer: it names the signals to look for, and every beat that depends on a preview has a fallback.
+> **Preview disclosure:** Database Hub is generally available since 2026-11-17, with its real-time dashboards, bulk monitoring enablement, the SSMS and VS Code entry points, and the CLI skill ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview)). Copilot in Database Hub, Database Agents, alerts, and SQL Server on Azure VM performance monitoring are previews, and Learn still labels the SQL telemetry endpoint and the Arc SQL monitoring setting previews ([limitations](limitations.md#preview-disclosures)). Their behavior, coverage, and UI can change. This script never promises what an AI will answer: it names the signals to look for, and every beat that depends on a preview has a fallback.
 
 **Status (2026-10-21, Phase 15):** aligned with Phase 13 Milestone B, whose `start-demo.ps1`, `stop-demo.ps1`, `status.ps1`, `reset-demo.ps1`, and `demo-control.ps1` this script uses: every command was checked against the scripts' parameters at this commit. It also reflects the [live state on 2026-10-21](#whats-ready-at-this-commit). The Microsoft Learn pages in [Sources](#sources-checked-2026-10-20) were checked on 2026-10-20 and 2026-10-21. **The live rehearsal is pending:** items marked *verify in rehearsal* say what to look for where the preview UI isn't documented. The rehearsal, with its screenshots and measured times, is the owner's, and it settles them.
 
 **Phase 18 (2026-10-21):** the 30-minute script gained [beat 5](#beat-5-13001600-a-monitor-from-a-template-and-the-dashboard-as-code): Database Hub's template wizard, run live, next to the Real-Time Dashboard as code. The other beats were re-timed to keep 30 minutes. Which surface suits which audience, and what each viewer needs, is in [presentation surfaces](presentation.md).
+
+**Database Hub's general availability (2026-11-18):** [the DBA moments in a Run all session](#the-dba-moments-in-a-run-all-session): open at Overview, Optimization with T2 ready to migrate, and the Database Agent loop on T3, with its one-time selection.
 
 ## How to use this script
 
@@ -50,15 +52,65 @@ Presenter scripts for the Fabric Database Hub hybrid SQL demo: a 15-minute versi
 - **Fabric:** both notebooks are imported into the workspace, and `NB_DatabaseHub_Deployment` ran read-only end to end through the Job Scheduler, whose job status was Completed after 57 seconds. The notebook's `kusto` token worked against the telemetry endpoint (`HUB.TELEMETRY.TOKEN` **Pass**, risk R29 closed), so a notebook can validate Hub telemetry directly. `NB_DatabaseHub_LiveActivity` hasn't run live yet, so every beat that relies on it keeps its fallback.
 - **The Fabric capacity** is shared and runs at the owner's choice, so check it before a session ([the day before](#the-day-before)). Database Hub itself needs no capacity ([Database Hub FAQ](https://learn.microsoft.com/fabric/database/hub/faq)); only the notebook and dashboard beats do.
 
+## The DBA moments in a Run all session
+
+Since 2026-11-18, **Run all** in `NB_DatabaseHub_Control` carries three moments a DBA audience remembers. They need nothing beyond the session itself, apart from the one-time agent selection below, and the guide the notebook prints gives each one's time in the demo's clock.
+
+### Open at Overview
+
+1. **Show:** [Database Hub](https://app.fabric.microsoft.com/workloads/fdh/databaseHub) on **Overview**: **What needs attention**, then **Recent signal changes**. Say: "One place for the whole estate: what needs attention now, and what changed."
+2. **Ask Copilot** the three starting questions in [overview.in-hub](../fabric/agent/prompts/overview.in-hub.md): "What changed in my databases?", "Which resource should I investigate next?", and "Which security findings should I address first?". Copilot is a preview and runs on the workspace's Fabric capacity; Database Hub's own pages need no capacity.
+3. **If it isn't there:** read the two Overview cards aloud and open the first resource; Copilot answers from the same signals.
+
+### Optimization: T2 ready to migrate
+
+Database Hub's general availability puts **Optimization** beside security and performance on Overview and Estate. It flags resources whose migration assessment is ready, license-model opportunities such as pay-as-you-go, and SQL Server instances that don't report usage ([announcement](https://techcommunity.microsoft.com/blog/azuresqlblog/database-hub-in-microsoft-fabric-is-generally-available-your-entire-database-est/4574212)).
+
+1. **Show:** **Optimization** on Overview, then T2 (`arcsql01`) with its migration assessment ready.
+2. **Do:** open T2's migration assessment: its readiness for each Azure target (Azure SQL Database, Azure SQL Managed Instance, and SQL Server on Azure Virtual Machines) and the recommended target with its size ([migration assessment](https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment)).
+3. **Say:** "This server is on-premises, connected through Azure Arc. Azure has already assessed it for migration, at no charge, and says where it's ready to go and at what size. Nothing extra was installed for that: the Azure extension for SQL Server runs the assessment every week."
+4. **Say, about licenses:** "T1 and T2 show no license-model finding, because they already use pay-as-you-go: Arc bills T2's SQL Server by the hour, and T1's image includes its license."
+5. **How it gets there:** `deploy.ps1`, in every run, and `configure-arc.ps1` turn T2's migration assessment on and start its first run, so it's ready after the first deploy and stays on through upgrades; then it runs every week, on Sundays at 23:00 on the server's clock. It's free. `T2.ARC.MIGRATIONASSESSMENT` is **Pass** once an assessment has uploaded, with the readiness in its evidence, and a **Warning** until then.
+6. **If it isn't there:** an assessment that hasn't uploaded yet shows nothing in Database Hub: `./scripts/validate.ps1 -Area T2` says whether and when it uploaded. The assessment is also on the SQL Server instance's **Migration** page in the Azure portal.
+
+### The Database Agent loop on T3
+
+The agent's issue, Copilot's analysis of it, a manual response, and the issue closing, in one session. Database Agents is a preview: it detects and investigates without an LLM, explains with Copilot, and applies no change itself ("All scenarios require a manual response"), so the showcase makes the response, the way a DBA would ([Database Agents](https://learn.microsoft.com/fabric/database/hub/database-agents)).
+
+**Once per deployment, about 30 seconds.** Database Agents has no API, so this is the demo's one manual step; `deploy.ps1` lists it under "Please confirm", with the link and the exact database (`HUB.AGENT.T3`):
+
+1. Open Database Hub, select **Manage agents** (upper left), then **Database agent settings**, and turn **Enabled** on.
+2. Select T3's database, `azuresql01-<deploymentId>/ContosoCare`; under **Agent policy**, turn on **Flag long-running queries**, **Force last known good plans**, and **Flag high CPU**; select **Apply**, then **Save**. The green **Database agent is active** message confirms it ([enable Database Agents](https://learn.microsoft.com/fabric/database/hub/enable-database-agents)).
+3. Do it while T3 is awake: right after `deploy.ps1`, or during a session. Saving needs Azure write access on T3 (the account that deployed the demo has it, and `T3.AGENT` checks yours), and T3 must be in the region associated with your Fabric tenant's home region. The selection stays across sessions and upgrades; recreating T3 (`stop-demo.ps1 -RemoveT3`) needs it again.
+
+**In every session** (Run all's guide prints the times; in a 90-minute session the beat runs from about 30 to 60 minutes after T3's activity starts):
+
+| When | What happens | What you do |
+|---|---|---|
+| 3 minutes into the beat | T3's lookup regresses to a scanning plan, and T3's CPU climbs. `FORCE_LAST_GOOD_PLAN` is held off, so automatic tuning doesn't fix it first | Show T3's CPU on **Performance** or the Real-Time Dashboard |
+| About 15 minutes later | Database Agents raises an issue on T3, a new one each session | Open it from Database Hub's issue list. In **Recommended action**, select **Explain why**, then **Analyze slow query** beneath the captured query ([review an issue](https://learn.microsoft.com/fabric/database/hub/review-performance-issue)) |
+| At 85% of the beat | **Respond:** Run all's T3 run forces the last good plan through Query Store, the issue's manual response, and turns `FORCE_LAST_GOOD_PLAN` back on. The notebook prints "Now: T3 Respond" | Say: "The agent investigated and recommended. A person decided, and the runbook made the change." |
+| A few minutes after that | T3's CPU falls on the dashboards, and the notebook compares T3's CPU before and after the response (**Pass**, or a **Warning** that says why) | Show the drop. The issue closes when the agent sees the condition cleared; or close it yourself once you've checked, as Learn says |
+
+- **Say:** "That's the whole loop: the agent detects and investigates, Copilot explains, a person decides the response, and the agent tracks the issue to its close."
+- **If it isn't there:** no issue after about 20 minutes means T3 isn't selected or the agent isn't active: check the green message, and `./scripts/validate.ps1 -Area T3` (`T3.AGENT`) names any gap Azure can see. **Explain why** and **Analyze slow query** need the capacity's Copilot. The regression and its CPU still show on **Performance**, and [plan-regression.in-hub](../fabric/agent/prompts/plan-regression.in-hub.md)'s prompts work in Copilot.
+- **Afterward:** `./scripts/status.ps1` shows `FORCE_LAST_GOOD_PLAN` (`STATUS.T3.AUTOTUNING`). Every way a session ends puts it back: the response, the beat's end, reset, a cancel, a newer Run all, Stop now, `stop-demo.ps1`, and, after the nightly safety stop, the next run on T3; `deploy.ps1` does too ([plan regression](../scenarios/plan-regression/README.md)). Once the session's history is saved, the history report and the Insights app have the beat's `database_agent` finding: T3's CPU before and after the response, with **Pass** when it fell.
+
+### Reset, stop, and repeat
+
+- **Repeat:** every Run all repeats the three moments. The agent raises a new issue each session (closed ones stay in its history), and the beat unforces the plan at its next start.
+- **Reset:** `RESET_NOW = True` in the notebook, or `./scripts/reset-demo.ps1`, unforces the plan and puts back anything a run left.
+- **Stop:** Run all ends the session itself; `./scripts/stop-demo.ps1` stops everything from a PC.
+
 ## Plan the session
 
 ### Pick the targets for the agent beats
 
-Microsoft documents the Database Agent only at overview level: agents "can help translate an operational question into a structured investigation", and their findings "require operator review" ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview)). Which SQL targets the agent covers, how it's turned on, what it needs, and how long it takes aren't documented. Every incident scenario runs on T1, T2, or T3 ([scenarios](../scenarios/README.md)), so plan each agent beat per target:
+Learn documents Database Agents, which raise issues, for Azure SQL Database only, T3 here, with how to turn it on and what it needs ([Database Agents](https://learn.microsoft.com/fabric/database/hub/database-agents)); [the Database Agent loop](#the-database-agent-loop-on-t3) uses it. The agent beats below are Copilot's questions in Database Hub: which SQL targets Copilot covers, and how long it takes, aren't documented. Every incident scenario runs on T1, T2, or T3 ([scenarios](../scenarios/README.md)), so plan each of these beats per target:
 
 | Target | Why it's in the story | Database Agent plan | If the agent declines it or shows nothing |
 |---|---|---|---|
-| T3 `azuresql01-<deploymentId>` / `ContosoCare`, Azure SQL Database | The PaaS path: native inventory, CPU as a percentage of the service tier's limit, log-rate governance, and the most Hub security assessments | **Plan A for every agent beat.** The repo's working assumption is that Azure SQL Database is the most likely agent target; it isn't documented | Run the same scenario's prompts on T1, if you staged it there too, or switch to the [fallback](#the-documented-scriptable-fallback). The `microsoft-sql` diagnostics skills are written for Azure SQL Database, so T3 also has the best query-level fallback |
+| T3 `azuresql01-<deploymentId>` / `ContosoCare`, Azure SQL Database | The PaaS path: native inventory, CPU as a percentage of the service tier's limit, log-rate governance, and the most Hub security assessments | **Plan A for every agent beat.** Database Agents is documented for Azure SQL Database; Copilot's coverage isn't | Run the same scenario's prompts on T1, if you staged it there too, or switch to the [fallback](#the-documented-scriptable-fallback). The `microsoft-sql` diagnostics skills are written for Azure SQL Database, so T3 also has the best query-level fallback |
 | T1 `sqlvm01`, SQL Server on an Azure VM | The IaaS path through the SQL IaaS Agent extension; the default target for locking | **Plan B.** Same prompts | The telemetry prompts in GitHub Copilot CLI. The `microsoft-sql-fdh` skill's description doesn't list SQL Server on Azure VMs (*verify in rehearsal*) |
 | T2 `arcsql01`, SQL Server enabled by Azure Arc in a nested Hyper-V guest, disclosed as a simulated on-premises server | The hybrid path; the default target for CPU, IO, and missing index | **Plan C.** Arc monitoring is documented for SQL Server enabled by Azure Arc in general, and nested guests aren't mentioned. T2's telemetry reached the documented endpoint on 2026-10-21; whether the Hub's **Performance** page and the agent cover it is a rehearsal check | The telemetry prompts, then the instance's **Performance Dashboard** in the Azure portal ([Monitor SQL Server enabled by Azure Arc](https://learn.microsoft.com/sql/sql-server/azure-arc/sql-monitoring)) |
 
@@ -77,7 +129,7 @@ The coordinator's decision (2026-10-20, [ADR 0016](adr/0016-cost-profiles.md)):
 
 ### Know the cost before you start
 
-- **Ceilings** ([ADR 0016](adr/0016-cost-profiles.md)): at most **$15 per demo-day session** (`sessionCeilingUsd`; above it is a **Warning**), and at most **$375 for a light-use month** (`monthlyCeilingUsd`, a hard ceiling since 2026-11-04, $250 before; above it is a **Fail**). The month counts T4's 7-day automatic restart: about a day per restart when a safety stop is in place (the nightly safety stop that every deployment sets up, or the on-demand control's daily T4 safety stop), the rest of the month otherwise ([cost management](cost-management.md#dated-example-the-nightly-safety-stop-2026-11-05)). The Azure budget on the resource group alerts at 50%, 80%, and 100% of the monthly ceiling.
+- **Ceilings** ([ADR 0016](adr/0016-cost-profiles.md)): at most **$20 per demo-day session** (`sessionCeilingUsd`, $15 before 2026-11-18; above it is a **Warning**), and at most **$375 for a light-use month** (`monthlyCeilingUsd`, a hard ceiling since 2026-11-04, $250 before; above it is a **Fail**). The month counts T4's 7-day automatic restart: about a day per restart when a safety stop is in place (the nightly safety stop that every deployment sets up, or the on-demand control's daily T4 safety stop), the rest of the month otherwise ([cost management](cost-management.md#dated-example-the-nightly-safety-stop-2026-11-05)). The Azure budget on the resource group alerts at 50%, 80%, and 100% of the monthly ceiling.
 - **Estimate on the day:** `./scripts/estimate-cost.ps1 -NetworkMode private`, or `public`, whichever mode preflight resolved. When the subscription guard passes, it includes the subscription's Microsoft Defender for Cloud plans and the T3 free offer. It prices everything from the [Azure Retail Prices API](https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices) when you run it, so this script quotes no prices.
 - **The start checks it too:** `start-demo.ps1` runs the cost guardrail before it starts anything: the live estimate against both ceilings (`PREFLIGHT.COST.SESSION` and `PREFLIGHT.COST.MONTHLY`), and this month's actual cost plus one session against `monthlyCeilingUsd` (`START.COST.ACTUAL`). A **Fail** stops the start. `-SkipCostCheck` starts anyway (`START.COST` **Not selected**), so use it only right after a check.
 - **What a session adds:** VM hours, the SQL Server licenses that bill while the VMs run (T1's image license, and Arc pay-as-you-go per core-hour for T2), T3 compute while an activity profile keeps it awake, Defender plans on running VMs, and Bastion with its public IP for every hour it exists. The shared Fabric capacity isn't in the estimate: it's outside the demo's resource group, and it bills while it runs, at the owner's choice.
@@ -109,7 +161,7 @@ Assert-DemoAzContext -SubscriptionId $config.subscriptionId -TenantId $config.te
 ### The day before
 
 1. **Rehearse** both versions against the live environment, and record the results in the [live coverage record](../fabric/agent/README.md#live-coverage-record).
-2. **Estimate the session** (see [Know the cost before you start](#know-the-cost-before-you-start)). A session estimate above $15 is a **Warning**: shorten the session or the incident list.
+2. **Estimate the session** (see [Know the cost before you start](#know-the-cost-before-you-start)). A session estimate above $20 is a **Warning**: shorten the session or the incident list.
 3. **Check T2** while `archost01` runs: `(Get-DemoVmHealth -Config $config -VmName archost01).state`, or `./scripts/status.ps1 -Detail`, which also reads T2's activity profile.
    - `Ready`: go.
    - `ManualActionRequired` with the step `SqlSetupWizard`: an environment from before 2026-11-09 whose `PaygWizard` setup wizard was never finished. Don't finish it by hand: run `./scripts/deploy.ps1` now, never during a session; it makes T2 again from Arc Jumpstart's image with no person, about 27 minutes plus about 33 for Arc onboarding ([deployment](deployment.md#an-older-demo-a-plain-deployps1-upgrades-it-2026-11-09)).
@@ -242,8 +294,8 @@ The story in four beats: one estate of three SQL targets in Database Hub, then p
 ### Beat 1 (0:00–3:00): one estate
 
 - **Say:** "Contoso Care runs SQL in three places: SQL Server on an Azure VM, an on-premises SQL Server, and Azure SQL Database. Today each has its own portal, metrics, and tools, so every investigation starts with switching tools."
-- **Show:** [Database Hub](https://powerbi.com/workloads/fdh/databaseHub) **Overview**, the **What needs attention?** section, then **Estate** with **View: Microsoft SQL** and the demo resource group selected ([Monitor a Microsoft SQL database](https://learn.microsoft.com/fabric/database/hub/monitor-sql)).
-- **Say:** "One inventory across all three. Nothing moved: the databases stay in their subscriptions and on-premises, and Database Hub uses my own Microsoft Entra ID and Azure permissions. It's free with a Fabric Free license." ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview), [FAQ](https://learn.microsoft.com/fabric/database/hub/faq))
+- **Show:** [Database Hub](https://powerbi.com/workloads/fdh/databaseHub) **Overview**: the **What needs attention?** section, **Recent signal changes**, and **Optimization**, where T2 shows its migration assessment ready ([the DBA moments](#optimization-t2-ready-to-migrate)); then **Estate** with **View: Microsoft SQL** and the demo resource group selected ([Monitor a Microsoft SQL database](https://learn.microsoft.com/fabric/database/hub/monitor-sql)).
+- **Say:** "One inventory across all three. Nothing moved: the databases stay in their subscriptions and on-premises, and Database Hub uses my own Microsoft Entra ID and Azure permissions. It's generally available, and free with a Fabric Free license." ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview), [FAQ](https://learn.microsoft.com/fabric/database/hub/faq))
 - **Say, about T2:** "This on-premises server is simulated: a Hyper-V guest inside an Azure VM, connected through Azure Arc the way a real one would be." With the **evaluation only** fallback, say instead: "This one is an Azure VM running the Arc agent for evaluation only."
 - **Look for:** on screen, three resources in **Estate**: `sqlvm01` (SQL Server on an Azure VM, with its database engine only), `arcsql01` (SQL Server enabled by Azure Arc), and `ContosoCare` on `azuresql01-<deploymentId>` (Azure SQL Database), with issues as colored chips under a resource and suggestions as chips with a lightbulb. The signal behind the list is Azure Resource Graph, the Hub's inventory source, which the readiness gates checked as `HUB.ESTATE.T1`–`T3`; for T1, `T1.SQLVM.ASSOCIATEDSERVICES` **Pass** means unified inventory lists only the engine.
 - **If it isn't there:** if T2 is missing because it isn't ready yet (`HUB.ESTATE.T2` isn't **Pass**), say so and continue with T1 and T3. Never present a missing target as healthy. If T1 also shows Analysis Services or Integration Services (`T1.SQLVM.ASSOCIATEDSERVICES` is a **Warning**), say that the Marketplace image installs them, the demo removes them, and the story uses the database engine. Other causes are in the [recovery playbook](#recovery-playbook).
@@ -281,7 +333,7 @@ The story in four beats: one estate of three SQL targets in Database Hub, then p
 
 ### Beat 4 (9:00–14:00): the Database Agent, with human approval
 
-- **Say:** "The Database Agent is a preview. It's presenter-driven, here in the UI, and it has no API. Microsoft doesn't document which SQL targets it covers yet, so I staged this incident on the target we checked in rehearsal."
+- **Say:** "Copilot in Database Hub is a preview. It's presenter-driven, here in the UI, and it has no API. Microsoft doesn't document which SQL targets Copilot covers, so I staged this incident on the target we checked in rehearsal." Database Agents, also a preview, is documented for Azure SQL Database: [the Database Agent loop](#the-database-agent-loop-on-t3) shows it in a Run all session.
 - **Do:** open the agent or Copilot pane on the incident target (*verify in rehearsal*: its entry point and placement aren't documented). Fill the placeholders and ask, in order:
   1. [locking-blocking.in-hub](../fabric/agent/prompts/locking-blocking.in-hub.md), prompt 1: investigate the blocking.
   2. Same file, prompt 3: the supporting evidence.
@@ -313,7 +365,7 @@ The story in four beats: one estate of three SQL targets in Database Hub, then p
 
 - **Show:** back to **Overview**, the whole estate.
 - **Say:** "Faster detection, less tool switching, one inventory across Azure, on-premises, and PaaS, a guided investigation, and a person in control of every action." ([Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview))
-- **Say:** "Database Hub and its agents are in preview, so coverage and behavior can change."
+- **Say:** "Database Hub is generally available; its Copilot and Database Agents are previews, so their coverage and behavior can change."
 - **Look for:** on screen, **Overview** with **What needs attention?** across the three targets. The incident target's issue, if one appeared, can stay open for a few minutes after the fix, because signals refresh behind the activity ([Monitor a Microsoft SQL database](https://learn.microsoft.com/fabric/database/hub/monitor-sql), troubleshooting).
 - **If it isn't there:** if **Overview** shows nothing new, close on the **Estate** list from beat 1 or on the rehearsal screenshot; the value story doesn't depend on a live chart.
 - **Reset:** Nothing to reset: beat 4 returned the targets to the baseline. For a back-to-back session, stage the incident again 10 minutes before it:
@@ -450,7 +502,7 @@ The Phase 25b scenarios fit the same slot when the audience cares about one kind
 ### Beat 6 (16:00–21:00): the Database Agent investigates
 
 - **Show:** if an issue appeared for the target, start from its **Issue Details**: "Findings can come from agents, alerts, resource metadata, or telemetry." ([Monitor databases in Database Hub](https://learn.microsoft.com/fabric/database/hub/monitor)) Then open the agent pane on the target (*verify in rehearsal*: its entry point and placement).
-- **Say:** "The Database Agent is a preview. It's presenter-driven, here in the UI, with no API, and every action it proposes needs explicit approval. Microsoft doesn't document which targets it supports, so this incident runs on the target we checked in rehearsal."
+- **Say:** "Copilot in Database Hub is a preview. It's presenter-driven, here in the UI, with no API, and every action it proposes needs explicit approval. Microsoft doesn't document which targets Copilot supports, so this incident runs on the target we checked in rehearsal." Database Agents raises its own issues on T3 in a Run all session ([the Database Agent loop](#the-database-agent-loop-on-t3)).
 - **Do:** ask every prompt in the scenario's in-Hub file, in order, for example [locking-blocking.in-hub](../fabric/agent/prompts/locking-blocking.in-hub.md) prompts 1 to 3. The [cheat sheet](#per-scenario-cheat-sheet) names the file for each scenario.
 - **Look for:** on screen, the agent's answers in the pane, and **Issue Details** if a finding appeared. In the answers, the prompt file's rubric: the right target and database, a UTC window that overlaps the run, the scenario's signals by name (for locking, `Processes blocked` and Lock-category waits), no blame on signals that didn't move, and a plain list of what the agent couldn't see.
 - **If it isn't there:** if the agent declines the target or shows nothing after about three minutes, say so, then switch to plan B or C from [Pick the targets](#pick-the-targets-for-the-agent-beats), or to the [fallback](#the-documented-scriptable-fallback) with the scenario's skills file. Record the result in the [live coverage record](../fabric/agent/README.md#live-coverage-record) afterward.
@@ -517,7 +569,7 @@ The Phase 25b scenarios fit the same slot when the audience cares about one kind
 ### Close (29:00–30:00): recovery and value
 
 - **Show:** **Performance** for the incident target: the signal returning to the baseline. Telemetry arrives a few minutes after the activity, so the recovery may still be arriving; say so.
-- **Say:** "Faster detection, less tool switching, one hybrid inventory, shared context, a guided investigation, and human-controlled action. Database Hub and its agents are in preview."
+- **Say:** "Faster detection, less tool switching, one hybrid inventory, shared context, a guided investigation, and human-controlled action. Database Hub is generally available; its Copilot and Database Agents are previews."
 - **Look for:** on screen, the incident target's chart heading back to its baseline after the fix. The signal, for locking: `Processes blocked` back at 0 and no new Lock-category waits in the latest samples.
 - **If it isn't there:** if the recovery hasn't arrived yet, say it's a few minutes behind, then show the latest samples on the **Incident** page of `RTD_DatabaseHub_LiveView`, which refreshes every minute, or in the notebook or [beat 9](#beat-9-26002900-the-notebooks)'s fallback. Otherwise show the rehearsal screenshot, and close on the value.
 - **Reset:** Nothing to reset: beat 7 returned the incident target to the baseline, so a back-to-back session can start at beat 1. After the last session, follow [after the session](#after-the-session).
@@ -695,7 +747,7 @@ Invoke-DemoWorkloadCommand -Config $config -Target T2 -ArgumentList 'status', '-
 
 ### tempdb contention
 
-- **Runs on:** T2 by default, T1, and T3. On T3, at 1 vCore or less, expect fewer latch waits and more CPU waits.
+- **Runs on:** T2 by default, T1, and T3. On T3, which manages tempdb itself, expect fewer latch waits and more CPU waits (seen at 1 vCore; T3's maximum is 2 vCores since 2026-11-18).
 - **Bounds:** 10 minutes by default, 30 at most; 16 sessions (32 at most); `rowsPerTable` 200 (10 to 2,000). Its temporary tables belong to its own sessions in tempdb and are dropped every iteration, the one place outside `ContosoCare` a scenario writes.
 - **Start:** `incident:tempdb-contention`. Add `-Concurrency 24` for more contention.
 - **Stop:** `profile set --name baseline`, or `stop --scenario tempdb-contention`.
@@ -715,7 +767,7 @@ Invoke-DemoWorkloadCommand -Config $config -Target T2 -ArgumentList 'status', '-
 
 ### Parallelism waits
 
-- **Runs on:** T2 by default, T1, and T3. On T3, at 1 vCore or less, plans run serially: expect CPU waits, not Parallelism waits.
+- **Runs on:** T2 by default, T1, and T3. On T3, at its 2-vCore maximum since 2026-11-18, the plans can run at DOP 2 too (*verify in rehearsal*); at 1 vCore they ran serially, with CPU waits instead of Parallelism waits.
 - **Bounds:** 10 minutes by default, 30 at most; 4 sessions (8 at most); `maxdop` 4 (2 to 8), and never more threads than the target has schedulers (2 on T1 and T2).
 - **Start:** `incident:parallel-scans`.
 - **Stop:** `profile set --name baseline`, or `stop --scenario parallel-scans`.
@@ -756,8 +808,8 @@ Invoke-DemoWorkloadCommand -Config $config -Target T2 -ArgumentList 'status', '-
 
 ### Plan regression
 
-- **Runs on:** T3 only. SQL Server 2022 Standard on T1 and T2 has no automatic tuning ([editions](https://learn.microsoft.com/sql/sql-server/editions-and-components-of-sql-server-2022)), so the procedure refuses to run there. The showcase runs it on T3 in its third cycle.
-- **Bounds:** 10 minutes by default, 20 at most; 2 sessions (4 at most); `goodPercent` 35 (10 to 80), the share of the run on the fast plan. The lookups only read; the run recompiles and unforces only `demo.usp_visit_summary_lookup`'s plans.
+- **Runs on:** T3 only. SQL Server 2022 Standard on T1 and T2 has no automatic tuning ([editions](https://learn.microsoft.com/sql/sql-server/editions-and-components-of-sql-server-2022)), so the procedure refuses to run there. The showcase runs it on T3 in its third cycle, and in its second cycle as [the Database Agent loop](#the-database-agent-loop-on-t3).
+- **Bounds:** 10 minutes by default, 30 at most; 2 sessions (8 at most); `goodPercent` 35 (10 to 80), the share of the run on the fast plan; `respondPercent`, `holdAutoCorrection`, and `pauseMs` for the agent beat ([plan regression](../scenarios/plan-regression/README.md)). The lookups only read; the run recompiles and unforces only `demo.usp_visit_summary_lookup`'s plans.
 - **Start:** `incident:plan-regression` on T3 with `--duration 15m`.
 - **Stop:** `profile set --name baseline`, or `stop --scenario plan-regression`.
 - **Show:** in Database Hub, CPU stepping up at the switch to the slow plan and back down once automatic tuning forces the fast one; the plans themselves aren't in the telemetry. In T3: `sys.dm_db_tuning_recommendations` (a `FORCE_LAST_GOOD_PLAN` recommendation, Verifying, then Success), the database's **Automatic tuning** page in the Azure portal, and Query Store's **Regressed Queries** and **Queries With Forced Plans** in SSMS ([automatic tuning](https://learn.microsoft.com/azure/azure-sql/database/automatic-tuning-overview)). Whether the plan is forced within one run isn't proven live yet ([limitations](limitations.md)).
@@ -851,7 +903,9 @@ Every page below was read on 2026-10-20, except the rows marked *checked 2026-10
 
 | Page | What this walkthrough relies on | Updated |
 |---|---|---|
-| [Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview) | Overview, Estate, and Performance; agents and the operator review of their findings; the agent skills and the Learn MCP server; supported services; the **Enable Performance Monitoring** option; North and West Europe capacities; Resource Graph discovery | 2026-10-17 |
+| [Database Agents](https://learn.microsoft.com/fabric/database/hub/database-agents), [enable Database Agents](https://learn.microsoft.com/fabric/database/hub/enable-database-agents), [review a Database Agents issue](https://learn.microsoft.com/fabric/database/hub/review-performance-issue) | The Database Agent loop: Azure SQL Database in Database Hub, **Manage agents**, **Agent policy**, the 15-minute issue, Explain why and Analyze slow query, the manual response, and the issue's close (*checked 2026-11-18*) | 2026-11-17 |
+| [Migration assessment for SQL Server enabled by Azure Arc](https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment) | T2's migration assessment: free, weekly, and its readiness per Azure target (*checked 2026-11-18*) | 2026-10-19 |
+| [Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview) | General availability, a Fabric Free license and no capacity (*checked again 2026-11-18*); Overview, Estate, and Performance; agents and the operator review of their findings; the agent skills and the Learn MCP server; supported services; the **Enable Performance Monitoring** option; North and West Europe capacities; Resource Graph discovery | 2026-10-17 |
 | [Database Hub FAQ](https://learn.microsoft.com/fabric/database/hub/faq) | Actions are explicit and approved by the user; Copilot is the conversational interface and agents are the engines, with auditable proposals and no free-form execution; no capacity needed; posture and health signals for databases behind private endpoints; Azure Arc for on-premises SQL Server | 2026-10-17 |
 | [Monitor databases in Database Hub](https://learn.microsoft.com/fabric/database/hub/monitor) | Issues and suggestions for Security, Performance, and Optimization; **Issue Details** with **Summary** and **Recommended action**; findings from agents, alerts, metadata, or telemetry; **Open in...**; saved and shared views; **Recent signal changes**; missing telemetry isn't zero | 2026-10-17 |
 | [Monitor a Microsoft SQL database](https://learn.microsoft.com/fabric/database/hub/monitor-sql) | The tenant setting; **What needs attention?**; **View: Microsoft SQL**; the SQL security assessments; **Create SQL monitors from template** and its six steps, which create a Real-Time Dashboard or a page in an existing one (*checked again 2026-10-21*); the Azure Data Explorer connection; troubleshooting | 2026-10-17 |

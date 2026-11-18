@@ -177,7 +177,7 @@ RETURN
         ('log-flush-waits', 1800),
         ('slow-consumer', 1800),
         ('capacity-max', 1200),
-        ('plan-regression', 1200)
+        ('plan-regression', 1800)
     ) AS c (scenario_id, max_duration_seconds);
 GO
 
@@ -299,6 +299,71 @@ RETURN
       AND (@run_id IS NULL OR s.program_name LIKE CONCAT('ContosoCare.Demo/%/', @run_id));
 GO
 
+-- Automatic tuning hold (2026-11-18, the Database Agent beat on T3) ----------------------------------------------------
+
+-- The FORCE_LAST_GOOD_PLAN state a plan-regression run turned off (@hold_auto_correction), so the regression lasts until
+-- Database Agents raises its issue and the run's own response forces the last good plan. One row while the hold lasts.
+IF OBJECT_ID(N'demo.auto_tuning_hold', N'U') IS NULL
+CREATE TABLE demo.auto_tuning_hold
+(
+    option_name nvarchar(60) NOT NULL CONSTRAINT pk_auto_tuning_hold PRIMARY KEY,
+    prior_state nvarchar(60) NOT NULL,
+    run_id varchar(64) NOT NULL,
+    held_at datetime2(3) NOT NULL
+);
+GO
+
+-- Puts FORCE_LAST_GOOD_PLAN back the way a plan-regression run found it (ON, OFF, or DEFAULT, which follows the server)
+-- and forgets the hold: when @run_id is the run that holds it, when that run isn't Running any more (it ended, was
+-- cancelled, or its runner stopped), or with @force (reset). Every way the beat ends calls it: the run's response and its
+-- end, auto-cleanup after the run, a stale run's recovery (the next run, the profile host's start), reset, and setup
+-- (deploy.ps1). Azure SQL Database only; elsewhere it does nothing. Idempotent: without a hold it does nothing. Each
+-- release is logged as an auto-tuning-restored event of the run that held it, saying what put it back (@by) and to what,
+-- and printed. @released is 1 when it put the option back.
+CREATE OR ALTER PROCEDURE demo.usp_release_auto_tuning_hold
+    @run_id varchar(64) = NULL,
+    @force bit = 0,
+    @by nvarchar(80) = NULL,
+    @released bit = NULL OUTPUT,
+    @restored_state nvarchar(60) = NULL OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @prior nvarchar(60), @holder varchar(64), @held_at datetime2(3), @detail nvarchar(400);
+    SET @released = 0;
+    SET @restored_state = NULL;
+    IF CAST(SERVERPROPERTY('EngineEdition') AS int) <> 5
+        RETURN;
+
+    SELECT @prior = prior_state, @holder = run_id, @held_at = held_at FROM demo.auto_tuning_hold WHERE option_name = N'FORCE_LAST_GOOD_PLAN';
+    IF @holder IS NULL
+        RETURN;
+    IF ISNULL(@force, 0) = 0 AND ISNULL(@run_id, '') <> @holder
+       AND EXISTS (SELECT 1 FROM demo.scenario_runs WHERE run_id = @holder AND status = 'Running')
+        RETURN;
+
+    SET @prior = CASE WHEN @prior IN (N'ON', N'OFF', N'DEFAULT') THEN @prior ELSE N'DEFAULT' END;
+    -- ALTER DATABASE takes no variable; @prior is one of three literals.
+    IF @prior = N'ON'
+        ALTER DATABASE CURRENT SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON);
+    ELSE IF @prior = N'OFF'
+        ALTER DATABASE CURRENT SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = OFF);
+    ELSE
+        ALTER DATABASE CURRENT SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = DEFAULT);
+    DELETE FROM demo.auto_tuning_hold WHERE option_name = N'FORCE_LAST_GOOD_PLAN';
+    SET @released = 1;
+    SET @restored_state = @prior;
+
+    SET @detail = LEFT(CONCAT(N'FORCE_LAST_GOOD_PLAN put back to ', @prior, N' by ', ISNULL(NULLIF(@by, N''), N'a release'),
+        N'; run ', @holder, N' held it off from ', CONVERT(nvarchar(30), @held_at, 126), N'Z.'), 400);
+    IF (SELECT COUNT(*) FROM demo.scenario_run_events WHERE run_id = @holder) < 500
+        INSERT INTO demo.scenario_run_events (run_id, event_time, event_name, session_id, detail)
+        VALUES (@holder, SYSUTCDATETIME(), 'auto-tuning-restored', @@SPID, @detail);
+    PRINT @detail;
+END;
+GO
+
 -- Run bookkeeping ------------------------------------------------------------------------------------------------------
 
 -- Marks runs that passed their deadline plus a grace period without ending as TimedOut (their runner stopped or
@@ -326,6 +391,15 @@ BEGIN
     WHERE status <> 'Running'
       AND stopped_at IS NULL
       AND deadline_at < DATEADD(second, -@grace_seconds, @now);
+
+    -- A plan-regression run that ended without putting FORCE_LAST_GOOD_PLAN back (its runner stopped) leaves a hold that
+    -- the next run's start, or the profile host's after a restart, puts back here (2026-11-18). Never in a run's way.
+    BEGIN TRY
+        EXEC demo.usp_release_auto_tuning_hold @by = N'the next run''s start (the run that held it had ended)';
+    END TRY
+    BEGIN CATCH
+        PRINT CONCAT(N'FORCE_LAST_GOOD_PLAN wasn''t put back: ', ERROR_MESSAGE());
+    END CATCH;
 END;
 GO
 
@@ -837,6 +911,17 @@ BEGIN
             END;
             SELECT check_id = 'auto-cleanup', status = 'Pass', message = LEFT(CONCAT(@deleted, N' audit row(s) written by the workload removed.'), 400);
         END;
+        ELSE IF @scenario_id = 'plan-regression'
+        BEGIN
+            -- The Database Agent beat's hold on FORCE_LAST_GOOD_PLAN, when the run ended without putting it back (a cancel,
+            -- a newer request, or a session that stopped). Its forced plan stays, so it can be shown; reset unforces it.
+            DECLARE @released bit, @restored nvarchar(60);
+            EXEC demo.usp_release_auto_tuning_hold @by = N'auto-cleanup after the run', @released = @released OUTPUT, @restored_state = @restored OUTPUT;
+            IF @released = 1
+                SELECT check_id = 'auto-cleanup', status = 'Pass', message = LEFT(CONCAT(N'FORCE_LAST_GOOD_PLAN is back to ', @restored, N', as the run found it.'), 400);
+            ELSE
+                SELECT check_id = 'auto-cleanup', status = 'Not selected', message = N'Nothing to put back: no hold on automatic tuning is left. The lookups only read.';
+        END;
         ELSE
             SELECT check_id = 'auto-cleanup', status = 'Not selected', message = N'This scenario leaves nothing to clean up: its changes roll back or it only reads.';
     END TRY
@@ -893,6 +978,8 @@ BEGIN
     DECLARE @runs_cancelled int, @indexes_dropped int, @scale int, @seed int;
     DECLARE @forced TABLE (n int IDENTITY(1, 1) PRIMARY KEY, query_id bigint NOT NULL, plan_id bigint NOT NULL);
     DECLARE @unforced int, @query_id bigint, @plan_id bigint;
+    -- Whether plan-regression's Database Agent beat holds FORCE_LAST_GOOD_PLAN off now (step 4b reports it).
+    DECLARE @had_hold bit = CASE WHEN EXISTS (SELECT 1 FROM demo.auto_tuning_hold) THEN 1 ELSE 0 END;
 
     IF @wait_seconds IS NULL OR @wait_seconds < 0
         SET @wait_seconds = 0;
@@ -956,6 +1043,23 @@ BEGIN
         INSERT INTO @checks (check_id, status, message)
         VALUES ('no-open-demo-transactions', 'Manual action required',
             N'Can''t verify open demo transactions without VIEW SERVER STATE (SQL Server) or VIEW DATABASE STATE (Azure SQL Database).');
+
+    -- 4b. The Database Agent beat's hold on FORCE_LAST_GOOD_PLAN (2026-11-18): put back as the run found it, here or by
+    -- the run itself when it saw the stop. A check row appears only when there was a hold.
+    BEGIN TRY
+        DECLARE @hold_released bit, @hold_state nvarchar(60);
+        EXEC demo.usp_release_auto_tuning_hold @force = 1, @by = N'reset', @released = @hold_released OUTPUT, @restored_state = @hold_state OUTPUT;
+        IF @hold_released = 1
+            INSERT INTO @checks (check_id, status, message)
+            VALUES ('auto-tuning-restored', 'Pass', LEFT(CONCAT(N'FORCE_LAST_GOOD_PLAN is back to ', @hold_state, N', as plan-regression''s Database Agent beat found it.'), 400));
+        ELSE IF @had_hold = 1
+            INSERT INTO @checks (check_id, status, message)
+            VALUES ('auto-tuning-restored', 'Pass', N'FORCE_LAST_GOOD_PLAN is back as plan-regression''s Database Agent beat found it: the run put it back when it saw the stop.');
+    END TRY
+    BEGIN CATCH
+        INSERT INTO @checks (check_id, status, message)
+        VALUES ('auto-tuning-restored', 'Fail', LEFT(CONCAT(N'FORCE_LAST_GOOD_PLAN wasn''t put back (needs ALTER on the database; run reset as an administrator): ', ERROR_MESSAGE()), 400));
+    END CATCH;
 
     -- 5. Close run records whose runner didn't.
     EXEC demo.usp_recover_stale_runs @grace_seconds = 0;
@@ -1053,4 +1157,9 @@ BEGIN
 
     SELECT check_id, status, message FROM @checks ORDER BY ordinal;
 END;
+GO
+
+-- Setup (deploy.ps1 runs it on every deployment) puts FORCE_LAST_GOOD_PLAN back when a plan-regression run left it off
+-- and isn't Running any more (2026-11-18); a run that's still going keeps its hold.
+EXEC demo.usp_release_auto_tuning_hold @by = N'setup (deploy.ps1)';
 GO

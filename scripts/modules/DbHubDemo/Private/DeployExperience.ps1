@@ -158,7 +158,8 @@ function Get-DemoDeploymentExpectation {
     }
     $notes = @($Note | Where-Object { $_ })
     foreach ($item in $notes) {
-        # 2026-11-09: what the run ignores in the configuration (Get-DemoT2LegacyModeText, Get-DemoT4IgnoredText).
+        # 2026-11-09: what the run ignores in the configuration (Get-DemoT2LegacyModeText, Get-DemoT4IgnoredText), and since
+        # 2026-11-18 a sessionCeilingUsd of 15 that counts as 20 (Get-DemoSessionCeilingLegacyText).
         $lines.Add(('- {0}' -f $item))
     }
     if ($InstallMode -eq 'JumpstartImage') {
@@ -463,6 +464,8 @@ function Test-DemoConfirmOnlyResult {
       documented).
     - HUB.PRESENTER.*: with assignRoles false (the default, ADR 0008), an administrator grants the presenters' roles.
     - FABRIC.APP.BROWSER: the Insights app, deployed and confirmed once in the browser.
+    - HUB.AGENT.T3 (2026-11-18): the Database Agent loop's one-time selection of T3 in Database Hub's Manage agents, which
+      no API offers or reads.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -489,7 +492,7 @@ function Test-DemoConfirmOnlyResult {
         $evidence = Get-DemoMemberValue -InputObject $Result -Name 'evidence'
         return ([string](Get-DemoMemberValue -InputObject $evidence -Name 'state') -eq 'Active' -and [bool][string](Get-DemoMemberValue -InputObject $evidence -Name 'sku'))
     }
-    return ($id -like 'HUB.PRESENTER.*' -or $id -eq 'FABRIC.APP.BROWSER')
+    return ($id -like 'HUB.PRESENTER.*' -or $id -in 'FABRIC.APP.BROWSER', 'HUB.AGENT.T3')
 }
 
 function Get-DemoConfirmItem {
@@ -534,7 +537,7 @@ function Get-DemoConfirmItem {
     }
     foreach ($item in @($all | Where-Object { [string]$_.checkId -notin 'PREFLIGHT.P4.HUBSETTING', 'FABRIC.P4.HUBSETTING', 'FABRIC.APP.BROWSER' -and (Test-DemoConfirmOnlyResult -Result $_) })) {
         $id = [string]$item.checkId
-        $text = if ($id -eq 'FABRIC.P5.CAPACITY') { [string](Get-DemoMemberValue -InputObject $item -Name 'remediation') } else { '{0} The commands are in its result ({1}).' -f ([string]$item.message).TrimEnd(), $id }
+        $text = if ($id -eq 'FABRIC.P5.CAPACITY') { [string](Get-DemoMemberValue -InputObject $item -Name 'remediation') } elseif ($id -eq 'HUB.AGENT.T3') { [string]$item.message } else { '{0} The commands are in its result ({1}).' -f ([string]$item.message).TrimEnd(), $id }
         & $add $id $id $text
     }
     $app = Get-DemoInsightsAppSummary -Result $all

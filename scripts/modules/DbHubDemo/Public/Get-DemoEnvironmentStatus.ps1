@@ -28,6 +28,9 @@ function Get-DemoEnvironmentStatus {
       that delete them; Pass when there's none. On the T2 host (2026-11-17), the demo's Run Commands that Azure is still
       deleting come first, as a Warning whose fix is deploy.ps1. Read-only.
     - STATUS.T3: whether T3 exists and its status (Online, Paused); Not selected after stop-demo.ps1 -RemoveT3.
+    - STATUS.T3.AUTOTUNING (2026-11-18): T3's FORCE_LAST_GOOD_PLAN, read only while T3 is Online (reading it could wake a
+      paused T3): Pass when it's on; a Warning when it's off, which a session's Database Agent beat does from the
+      regression to its response, with what puts it back (Invoke-DemoT3AutoTuningCheck).
     - STATUS.T4 (Phase 24, ADR 0019): T4's state; while it runs, its live Azure Monitor metrics from the last
       15 minutes (CPU, memory, connections, CPU credits, and the enhanced metrics: sessions by state and by
       wait event type, the oldest transaction, deadlocks); while it's stopped, when Azure starts it again on its own (seven
@@ -238,6 +241,12 @@ function Get-DemoEnvironmentStatus {
     }
     if ($t3.Exists) {
         $results.Add((New-DemoResult -CheckId 'STATUS.T3' -Area 't3' -Target 'T3' -Status 'Pass' -Message ('{0}/ContosoCare is {1}.' -f $t3.ServerName, $t3.Status) -Evidence ([ordered]@{ status = $t3.Status })))
+        # FORCE_LAST_GOOD_PLAN (2026-11-18), which the Database Agent beat holds off until its response; read only while T3
+        # is Online, since reading it could wake a paused T3.
+        $tuning = Invoke-DemoT3AutoTuningCheck -Config $Config -T3 $t3 -CheckId 'STATUS.T3.AUTOTUNING'
+        if ($null -ne $tuning) {
+            $results.Add($tuning)
+        }
     }
     else {
         $results.Add((New-DemoResult -CheckId 'STATUS.T3' -Area 't3' -Target 'T3' -Status 'Not selected' -Message ('T3 ({0}) doesn''t exist; start-demo.ps1 recreates it under the same names.' -f $t3.ServerName)))

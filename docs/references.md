@@ -2,9 +2,12 @@
 
 Every API, command, and setting this repo relies on, grouped by topic. Each doc and ADR that cites a page records the date it was checked (2026-10-19 to 2026-10-21); the pages added in Phases 17 and 18 were checked on 2026-10-21. Previews change, so re-read a page before you build on it. The approved plan's original source list (plan §8) is included.
 
-## Microsoft Fabric Database Hub (preview)
+## Microsoft Fabric Database Hub (generally available since 2026-11-17)
 
-- [Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview): what Hub is, its prerequisites, and its agents
+- [Database Hub overview](https://learn.microsoft.com/fabric/database/hub/overview): what Hub is, its prerequisites, and its agents; general availability, and no Fabric capacity needed (checked 2026-11-18)
+- [Database Hub in Microsoft Fabric is generally available](https://techcommunity.microsoft.com/blog/azuresqlblog/database-hub-in-microsoft-fabric-is-generally-available-your-entire-database-est/4574212) (2026-11-17): what's generally available (Overview, Estate, Performance, security posture, Optimization insights, the real-time dashboards for Microsoft SQL, PostgreSQL, and Azure Cosmos DB, bulk monitoring enablement, the SSMS and VS Code entry points, and the CLI skill), what's still a preview (Copilot, Database Agents, alerts, and SQL Server on Azure VM performance monitoring), and Copilot's three starting questions
+- Database Agents (preview; checked 2026-11-18): [Database Agents](https://learn.microsoft.com/fabric/database/hub/database-agents), [enable and activate Database Agents](https://learn.microsoft.com/fabric/database/hub/enable-database-agents), [review a Database Agents performance issue](https://learn.microsoft.com/fabric/database/hub/review-performance-issue), and [limitations and troubleshooting](https://learn.microsoft.com/fabric/database/hub/database-agents-known-limitations): the Database Agent loop on T3, its one-time selection, and its prerequisites
+- [Find your Fabric home region](https://learn.microsoft.com/fabric/admin/find-fabric-home-region): Database Agents needs T3 in the region associated with it
 - [Monitor databases in Database Hub](https://learn.microsoft.com/fabric/database/hub/monitor): Overview, Estate, and findings
 - [Monitor SQL](https://learn.microsoft.com/fabric/database/hub/monitor-sql): SQL targets, Reader at subscription scope, and `Microsoft.Sql`
 - [Enable performance monitoring (add SQL)](https://learn.microsoft.com/fabric/database/hub/add-sql): per-target monitoring prerequisites
@@ -36,6 +39,7 @@ Every API, command, and setting this repo relies on, grouped by topic. Each doc 
 - [Automatic deployment of the Azure extension for SQL Server](https://learn.microsoft.com/sql/sql-server/azure-arc/manage-autodeploy) and [its configuration](https://learn.microsoft.com/sql/sql-server/azure-arc/manage-configuration)
 - [Prerequisites](https://learn.microsoft.com/sql/sql-server/azure-arc/prerequisites), [FAQ](https://learn.microsoft.com/sql/sql-server/azure-arc/faq), and [delete from Azure Arc](https://learn.microsoft.com/sql/sql-server/azure-arc/delete-from-azure-arc)
 - [SQL Server Instances - Get (REST)](https://learn.microsoft.com/rest/api/arcdata/sql-server-instances/get)
+- Migration assessment (2026-11-18): [assess migration readiness](https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment) (free, weekly, and the extension version it needs), with the REST operations [SQL Server Instances - Update](https://learn.microsoft.com/rest/api/arcdata/sql-server-instances/update) (`migration.assessment.enabled`) and [Run Migration Assessment](https://learn.microsoft.com/rest/api/arcdata/sql-server-instances/run-migration-assessment)
 
 ## Azure Arc-enabled servers
 

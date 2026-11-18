@@ -80,7 +80,7 @@ function Start-DemoDeploymentRun {
     $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
     $paths = Get-DemoProgressPath -Directory $OutputDirectory
     $command = Get-DemoDeployCommand -ConfigPath $ConfigPath
-    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -SkipFabric:$SkipFabric -Note @(@($Note) + @((Get-DemoT2LegacyModeText -Config $Config), (Get-DemoT4IgnoredText -Config $Config)))
+    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -SkipFabric:$SkipFabric -Note @(@($Note) + @((Get-DemoT2LegacyModeText -Config $Config), (Get-DemoT4IgnoredText -Config $Config), (Get-DemoSessionCeilingLegacyText -Config $Config)))
     $run = [pscustomobject]@{
         ProgressPath = ''
         PagePath     = ''

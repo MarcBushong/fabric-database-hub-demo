@@ -186,10 +186,10 @@
       "default": 375
     },
     "sessionCeilingUsd": {
-      "description": "Ceiling for one demo-day session.",
+      "description": "Ceiling for one demo-day session: preflight, start-demo.ps1, and estimate-cost.ps1 report a Warning when a session's estimate is above it, never a Fail. 20 by default since 2026-11-18 (the owner's decision; it was 15), because lowest-cost's T3 went from 1 to 2 maximum vCores: Database Agents doesn't support one-vCore serverless databases (https://learn.microsoft.com/fabric/database/hub/database-agents). A configuration with exactly 15, the default that init.ps1 wrote before 2026-11-18, gets 20 with no edit, and deploy.ps1 says so in one line at its start; any other value stays as it is (ADR 0016).",
       "type": "number",
       "exclusiveMinimum": 0,
-      "default": 15
+      "default": 20
     },
     "autoShutdownTime": {
       "description": "Daily auto-shutdown time (HHmm, 24-hour) for T1 and the T2 host.",
@@ -215,7 +215,7 @@
       "default": false
     },
     "presenterObjectIds": {
-      "description": "User object IDs of presenters who aren't Contributors (prerequisite P8). Used only when assignRoles is true; the role assignments are created with --assignee-principal-type User.",
+      "description": "User object IDs of presenters who aren't Contributors (prerequisite P8). With assignRoles true, they get the Azure roles Database Hub needs: Reader on the subscription and Arc SQL telemetry read on the demo resource group (the role assignments are created with --assignee-principal-type User). Since 2026-11-18, deploy.ps1 also adds them to the demo's Fabric workspace as Viewers, whatever assignRoles says, so they can open the Real-Time Dashboard, the history report, and the Insights app (FABRIC.PRESENTER.VIEWER).",
       "type": "array",
       "items": { "$ref": "#/$defs/uuid" },
       "uniqueItems": true,

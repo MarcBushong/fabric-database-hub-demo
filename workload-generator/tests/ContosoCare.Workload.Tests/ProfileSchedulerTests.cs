@@ -258,9 +258,9 @@ public sealed class ProfileSchedulerTests
 
     [Theory]
     [InlineData(16, "slow-consumer")]
-    [InlineData(46, "missing-index")]
+    [InlineData(32, "missing-index")]
     [InlineData(76, "plan-regression")]
-    [InlineData(106, "missing-index")]
+    [InlineData(92, "missing-index")]
     public void TheShowcaseRunsAListedCycleOnly(int minute, string scenario)
     {
         var state = State("showcase", SetAt.AddMinutes(120));
@@ -270,6 +270,31 @@ public sealed class ProfileSchedulerTests
         Assert.Contains(incidents, a => a.ScenarioId == scenario);
         Assert.True(incidents.Count <= 2, "at most two incidents at once on a target");
         Assert.DoesNotContain(incidents, a => a.ScenarioId == (scenario == "slow-consumer" ? "plan-regression" : "slow-consumer"));
+    }
+
+    [Fact]
+    public void TheShowcasesSecondCycleOnT3IsTheDatabaseAgentBeat()
+    {
+        // 2026-11-18: the whole second cycle, automatic plan correction held off until the run's own response at 85%, so
+        // Database Agents has about 22 minutes of regression to raise its issue; the third cycle's run corrects itself.
+        var state = State("showcase", SetAt.AddMinutes(90));
+
+        var beat = Assert.Single(ProfileScheduler.Plan(state, DemoTarget.T3, SetAt.AddMinutes(31), Definitions, Catalog, null), a => a.ScenarioId == "plan-regression");
+        Assert.Equal(SetAt.AddMinutes(30), beat.Start);
+        Assert.Equal(SetAt.AddMinutes(60), beat.End);
+        Assert.Equal("true", beat.Parameters["holdAutoCorrection"]);
+        Assert.Equal("85", beat.Parameters["respondPercent"]);
+        Assert.Equal("10", beat.Parameters["goodPercent"]);
+
+        var third = Assert.Single(ProfileScheduler.Plan(state, DemoTarget.T3, SetAt.AddMinutes(76), Definitions, Catalog, null), a => a.ScenarioId == "plan-regression");
+        Assert.False(third.Parameters.ContainsKey("holdAutoCorrection"));
+        Assert.False(third.Parameters.ContainsKey("respondPercent"));
+
+        // Nothing else loads T3 between the response and the third cycle's CPU cap, so CPU visibly falls.
+        foreach (var minute in new[] { 56, 58, 61, 64 })
+        {
+            Assert.DoesNotContain(ProfileScheduler.Plan(state, DemoTarget.T3, SetAt.AddMinutes(minute), Definitions, Catalog, null), a => !a.IsBaseline && a.ScenarioId != "plan-regression");
+        }
     }
 
     [Theory]
