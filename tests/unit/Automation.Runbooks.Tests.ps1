@@ -75,6 +75,8 @@ BeforeAll {
         $script:flag = $true
         $script:restartedAt = $null
         $script:runCommandStatus = 201
+        # VMs whose Run Commands Azure refuses (HTTP 400), by name (#27).
+        $script:runCommandRefused = @()
         $script:t4ActionStatus = 202
         # T4's read replica (ADR 0025): its state ('' for none, as between sessions), and the minutes T4's stop and the
         # replica's start take in this fake; without them, T4 stays Stopping and the replica Starting.
@@ -294,6 +296,9 @@ BeforeAll {
             }
             '/runCommands/' {
                 if ($Method -eq 'PUT') {
+                    if ($Path -match '/virtualMachines/(\w+)/runCommands/' -and $script:runCommandRefused -contains $Matches[1]) {
+                        return (New-Response 400 '{"error":{"code":"BadRequest","message":"The Run Command was refused."}}')
+                    }
                     if ($Path -match '/runCommands/DbHubControl-monitoring-' -and $script:runCommandStatus -in 200, 201) { $script:restartedAt = $script:clock }
                     return (New-Response $script:runCommandStatus '{}')
                 }
@@ -677,14 +682,33 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         @($result.dispatched) | Should -Be @('T2: showcase for 30 minutes')
     }
 
-    It 'stops what it started when the only activities it could dispatch are off' {
+    It 'stops what it started when the only activities it could dispatch are off, and leaves the VM that ran before alone (#27)' {
         $script:vm['archost01'] = 'running'
         $script:vmStartMinutes['sqlvm01'] = 60
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }); durationMinutes = 30 }) -Context (New-TestContext)
         @($result.dispatched) | Should -Be @('T2: off')
         $result.status | Should -Be 'Failed'
-        $result.message | Should -Match '^No activity could be dispatched \(T1 \(sqlvm01 isn''t running yet\)\), so everything was stopped again'
-        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate$' }).Count | Should -Be 2
+        $result.message | Should -Match '^No activity could be dispatched \(T1 \(sqlvm01 isn''t running yet\)\), so this run stopped what it started: auto-stop removed, sqlvm01 deallocating\. '
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate$' } | ForEach-Object { ($_.Path -split '/')[-2] }) | Should -Be @('sqlvm01')
+        $script:vm['archost01'] | Should -Be 'running'
+        $result.left | Should -BeExactly 'This run didn''t start archost01 (running), so it left it running, as before; the nightly safety stop still stops it at 19:00 (Eastern Standard Time).'
+        $result.leftFix | Should -BeExactly 'To stop everything now: set STOP_NOW = True and Run all in the control notebook, or run ./scripts/stop-demo.ps1.'
+        $result.message | Should -Match ('{0} {1}$' -f [regex]::Escape($result.left), [regex]::Escape($result.leftFix))
+    }
+
+    It 'leaves a running sqlvm01 and T4 alone when it could send only T1''s off and archost01''s Run Command was refused (#27, the issue''s case)' {
+        $script:vm['sqlvm01'] = 'running'
+        $script:t4 = 'Ready'
+        $script:runCommandRefused = @('archost01')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'off' }, @{ target = 'T2'; scenario = 'showcase' }); durationMinutes = 30 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Failed'
+        @($result.dispatched) | Should -Be @('T1: off')
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate$' } | ForEach-Object { ($_.Path -split '/')[-2] }) | Should -Be @('archost01')
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' }) | Should -BeNullOrEmpty
+        $script:vm['sqlvm01'] | Should -Be 'running'
+        $script:t4 | Should -Be 'Ready'
+        $script:autostop | Should -BeNullOrEmpty
+        $result.left | Should -BeExactly 'This run didn''t start sqlvm01 (running) and T4 (Ready), so it left them running, as before; the nightly safety stop still stops them at 19:00 (Eastern Standard Time).'
     }
 
     It 'sends T4''s showcase without a tier or vCores when its size can''t be read' {
@@ -780,17 +804,40 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         ($script:clock - $start).TotalMinutes | Should -BeLessThan 1
     }
 
-    It 'restarts the plugin''s agent once after a cold start when the agent reports no time, after the wait' {
-        # Without MainServiceLastReportedTime a status can't be told from the one before the stop, so a cold start gets the
-        # restart the 2026-10-22 and 2026-10-30 findings call for; after it, the agent is taken at its word.
+    It 'leaves a Running plugin alone after a cold start when the agent reports no time, and restarts a NotRunning one after the wait (#22)' {
+        # Without MainServiceLastReportedTime nothing proves a Running status stale, so it's taken at its word; a NotRunning
+        # one still waits out the start before the restart the 2026-10-22 and 2026-10-30 findings call for.
         $start = $script:clock
         $script:pluginReported = { $null }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Running'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' }) | Should -BeNullOrEmpty
+
+        Reset-TestAzure
+        $start = $script:clock
+        $script:pluginReported = { $null }
+        $script:plugin = { if ($null -ne $script:restartedAt) { 'Running' } else { 'NotRunning' } }
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
         $result.monitoring | Should -Be 'Restarted'
         $restart = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' })
         $restart.Count | Should -Be 1
         ($restart[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 8
         ($restart[0].At - $start).TotalMinutes | Should -BeLessThan 9
+    }
+
+    It 'leaves a healthy plugin alone on a warm sqlvm01 whose latest start the control''s own Run Commands moved, when the agent reports no time (#22)' {
+        # The provisioning status's time moves with every Run Command, the control's own and the restart included, so it
+        # was 5 minutes old on every warm run and re-check, and the agent was restarted each time.
+        $script:vm['sqlvm01'] = 'running'
+        $script:vmSince['sqlvm01'] = $script:clock.AddMinutes(-5)
+        $script:pluginReported = { $null }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 60 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Running'
+        $script:autostop = '2026-10-27T16:40:00Z'
+        $script:vmSince['sqlvm01'] = $script:clock.AddMinutes(-3)
+        $monitor = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock)
+        $monitor.monitoring | Should -Be 'Running'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' }) | Should -BeNullOrEmpty
     }
 
     It 'compares the status with sqlvm01''s latest start in its instance view when the run didn''t start it' {
@@ -987,12 +1034,13 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/start$' }) | Should -BeNullOrEmpty
     }
 
-    It 'stops everything again when nothing could be dispatched' {
+    It 'stops again what it started when nothing could be dispatched' {
         $script:runCommandStatus = 409
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
         $result.status | Should -Be 'Failed'
-        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate$' }).Count | Should -BeGreaterThan 0
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate$' } | ForEach-Object { ($_.Path -split '/')[-2] }) | Should -Be @('sqlvm01')
         $script:autostop | Should -BeNullOrEmpty
+        $result.left | Should -BeNullOrEmpty -Because 'nothing else runs'
     }
 
     It 'Stop now removes the auto-stop, deallocates both VMs, and stops T4, without Run Command' {
@@ -1202,6 +1250,28 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @($status.steps | ForEach-Object step) | Should -Contain 'ReplicaLag'
         @($script:secrets['dbhub-session-status'] | ForEach-Object { ($_.Value | ConvertFrom-Json).phase } | Select-Object -Unique) | Should -Be @('accepted', 'starting', 'replica', 'running')
         @($script:secrets['dbhub-session-status'] | ForEach-Object { $_.Tags['sessionId'] } | Select-Object -Unique) | Should -Be @($script:sessionId)
+    }
+
+    It 'says on the status what a session that couldn''t send any activity left running, and how to stop everything (#27)' {
+        # The presenter's archost01 ran before; its Run Command is refused, and sqlvm01 doesn't come up in time.
+        $script:vm['archost01'] = 'running'
+        $script:vmStartMinutes['sqlvm01'] = 60
+        $script:runCommandRefused = @('archost01')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $result.status | Should -Be 'Failed'
+        $script:vm['archost01'] | Should -Be 'running'
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate$' } | ForEach-Object { ($_.Path -split '/')[-2] }) | Should -Be @('sqlvm01')
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'failed'
+        $start = @($status.steps | Where-Object { $_.step -eq 'Start' -and $_.state -eq 'Fail' })
+        $start.Count | Should -Be 1
+        $start[0].message | Should -Match '^No activity could be dispatched .*, so this run stopped what it started: auto-stop removed'
+        $start[0].message | Should -Not -Match 'nightly safety stop' -Because 'what it left running is a step of its own'
+        $stop = @($status.steps | Where-Object step -EQ 'Stop')
+        $stop.Count | Should -Be 1
+        $stop[0].state | Should -Be 'Warning'
+        $stop[0].message | Should -BeExactly 'This run didn''t start archost01 (running), so it left it running, as before; the nightly safety stop still stops it at 19:00 (Eastern Standard Time).'
+        $stop[0].fix | Should -BeExactly 'To stop everything now: set STOP_NOW = True and Run all in the control notebook, or run ./scripts/stop-demo.ps1.'
     }
 
     It 'moves to the next documented size when Azure refuses T4''s, and says so with what it used' {
@@ -1806,14 +1876,15 @@ Describe 'T1''s monitoring plugin status: when it was reported, and whether it''
     }
 
     It 'is fresh <Case>' -ForEach @(
-        @{ Case = 'when there''s no start to compare with'; Reported = $null; Since = $null; Expected = $true }
-        @{ Case = 'when reported after the start'; Reported = [datetime]::new(2026, 11, 4, 14, 46, 32, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $true }
-        @{ Case = 'not when reported before the start (the stale Running of 2026-11-04)'; Reported = [datetime]::new(2026, 11, 3, 23, 10, 0, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
-        @{ Case = 'not when reported at the start itself'; Reported = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
-        @{ Case = 'not without a time, 12 minutes after the start'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
-        @{ Case = 'without a time, more than 30 minutes after the start'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 16, 0, [System.DateTimeKind]::Utc); Expected = $true }
+        @{ Case = 'when there''s no start to compare with'; State = 'Running'; Reported = $null; Since = $null; Expected = $true }
+        @{ Case = 'when reported after the start'; State = 'Running'; Reported = [datetime]::new(2026, 11, 4, 14, 46, 32, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $true }
+        @{ Case = 'not when reported before the start (the stale Running of 2026-11-04)'; State = 'Running'; Reported = [datetime]::new(2026, 11, 3, 23, 10, 0, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
+        @{ Case = 'not when reported at the start itself'; State = 'Running'; Reported = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
+        @{ Case = 'when Running without a time, 12 minutes after the start: nothing proves it stale (#22)'; State = 'Running'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $true }
+        @{ Case = 'not when NotRunning without a time, 12 minutes after the start'; State = 'NotRunning'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
+        @{ Case = 'when NotRunning without a time, more than 30 minutes after the start'; State = 'NotRunning'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 16, 0, [System.DateTimeKind]::Utc); Expected = $true }
     ) {
-        $plugin = [pscustomobject]@{ State = 'Running'; ReportedUtc = $Reported }
+        $plugin = [pscustomobject]@{ State = $State; ReportedUtc = $Reported }
         Test-DbHubPluginFresh -Plugin $plugin -SinceUtc $Since -NowUtc ([datetime]::new(2026, 11, 4, 14, 46, 51, [System.DateTimeKind]::Utc)) | Should -Be $Expected
         # The module's check before a start-demo.ps1 or deploy.ps1 run is the same rule.
         InModuleScope -ModuleName DbHubDemo -Parameters @{ Plugin = $plugin; Since = $Since } { Test-DemoSqlVmPluginFresh -Plugin $Plugin -SinceUtc $Since -NowUtc ([datetime]::new(2026, 11, 4, 14, 46, 51, [System.DateTimeKind]::Utc)) } | Should -Be $Expected
@@ -1938,6 +2009,38 @@ Describe 'The session''s hosts (2026-11-16, live: a host''s start failed mid-ses
         $hostSteps[0].fix | Should -Match ([regex]::Escape('az vm run-command show -g rg-dbhub-demo --vm-name archost01 -n DbHubControl-archost01-20261027150000 --instance-view'))
     }
 
+    It 'names each target a dispatch Run Command couldn''t set, with why, and only those (#28; live, 2026-11-04: error 547 on T1)' {
+        $output = @(
+            'DBHUBDEMO-WORKLOAD {"marker":"DBHUBDEMO-WORKLOAD","action":"Runner","status":"Fail","message":"runner profile set --target T1: Fail. error=547 ck_activity_profile_name"}'
+            'DBHUBDEMO-WORKLOAD {"marker":"DBHUBDEMO-WORKLOAD","action":"Runner","status":"Pass","message":"runner profile set --target T3: Pass."}'
+            'DBHUB-DISPATCH {"failed":[{"target":"T1","status":"Fail","message":"runner profile set --target T1: Fail. error=547 ck_activity_profile_name","oldRunner":false}]}'
+        ) -join "`n"
+        $script:runCommandViews['DbHubControl-sqlvm01-20261027150000'] = @{ executionState = 'Failed'; exitCode = 1; output = $output }
+        $result = Start-TestSession
+        $result.status | Should -Be 'Partial'
+        $hostSteps = @(Get-HostStep)
+        $hostSteps.Count | Should -Be 1 -Because 'T3 got its activity from the same Run Command'
+        $hostSteps[0].state | Should -Be 'Warning'
+        $hostSteps[0].message | Should -BeExactly 'T1: its activity wasn''t set on sqlvm01 (Fail: runner profile set --target T1: Fail. error=547 ck_activity_profile_name), so T1 doesn''t get this session''s activity.'
+        $hostSteps[0].fix | Should -Match ([regex]::Escape('az vm run-command show -g rg-dbhub-demo --vm-name sqlvm01 -n DbHubControl-sqlvm01-20261027150000 --instance-view'))
+        $hostSteps[0].fix | Should -Match 'for T1, set STOP_NOW = True and Run all, then Run all again'
+    }
+
+    It 'says a target''s workload runner is older than the control, with deploy.ps1 as the fix, when it refused the activity (#21)' {
+        $script:runCommandViews['DbHubControl-sqlvm01-20261027150000'] = @{ executionState = 'Failed'; exitCode = 1; output = 'DBHUB-DISPATCH {"failed":[{"target":"T3","status":"Fail","message":"runner profile set --target T3: Fail. Unknown activity profile ''showcase''.","oldRunner":true}]}' }
+        $null = Start-TestSession
+        $hostSteps = @(Get-HostStep)
+        $hostSteps.Count | Should -Be 1
+        $hostSteps[0].message | Should -BeExactly 'T3: sqlvm01''s workload runner is older than this session control and refused its activity, so T3 doesn''t get this session''s activity.'
+        $hostSteps[0].fix | Should -Match 'set STOP_NOW = True and Run all to end the session, run \./scripts/deploy\.ps1, which updates the workload runner on sqlvm01, then Run all again'
+    }
+
+    It 'counts a dispatch Run Command that ended with a non-zero exit code as failed, whatever its state says' {
+        $script:runCommandViews['DbHubControl-archost01-20261027150000'] = @{ executionState = 'Succeeded'; exitCode = 1 }
+        $null = Start-TestSession
+        @(Get-HostStep | ForEach-Object message) | Should -Be @('T2: the Run Command DbHubControl-archost01-20261027150000 that set its activity on archost01 ended with exit code 1, so T2 may have no activity this session.')
+    }
+
     It 'adds a host that stopped mid-session to the running session''s status once, through DbHub-Monitor, and starts or stops nothing' {
         $null = Start-TestSession
         $before = Get-SessionStatus
@@ -2060,6 +2163,81 @@ Describe 'The session''s hosts (2026-11-16, live: a host''s start failed mid-ses
         $findings = @(Get-DbHubSessionHealth -Context (New-TestContext) -Status $status)
         $findings.Count | Should -Be 1
         $findings[0].Message | Should -BeExactly 'T1, T3, and T4: sqlvm01 is deallocated, so T1, T3, and T4 have no activity now.'
+    }
+}
+
+Describe 'The dispatch Run Command''s script: a target whose activity wasn''t set ends it Failed (#28, #21)' {
+    BeforeAll {
+        # Windows PowerShell 5.1 runs the script on the VMs; where it isn't installed, pwsh stands in.
+        $script:shell = $null
+        if ($IsWindows) {
+            $script:shell = Get-Command -Name 'powershell.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
+        }
+        if (-not $script:shell) {
+            $script:shell = (Get-Process -Id $PID).Path
+        }
+        # A stand-in for the VM-side control: like the real one, it writes its result line straight to the console, with the
+        # status and message the test gives the request's target.
+        $script:standIn = @(
+            '$request = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(''__REQUEST__'')) | ConvertFrom-Json'
+            '$outcome = (Get-Content -LiteralPath ''__OUTCOMES__'' -Raw | ConvertFrom-Json).($request.target)'
+            'Write-Output (''before {0}'' -f $request.target)'
+            'if ($null -ne $outcome.status) { [Console]::Out.WriteLine(''DBHUBDEMO-WORKLOAD '' + (ConvertTo-Json -InputObject @{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = $outcome.status; message = $outcome.message } -Compress)) }'
+        ) -join "`n"
+        function Invoke-DispatchScript([string[]] $Target, [hashtable] $Outcome, [switch] $RealTemplate) {
+            $settings = $script:settings.PSObject.Copy()
+            if (-not $RealTemplate) {
+                $outcomes = Join-Path -Path $TestDrive -ChildPath ('outcomes-{0}.json' -f [guid]::NewGuid().ToString('N'))
+                Set-Content -LiteralPath $outcomes -Value (ConvertTo-Json -InputObject $Outcome -Depth 4) -Encoding ascii
+                $settings.controlScriptTemplate = $script:standIn.Replace('__OUTCOMES__', $outcomes)
+            }
+            $requests = @($Target | ForEach-Object { [ordered]@{ target = $_; arguments = @('profile', 'set', '--name', 'showcase', '--requested-by', 'test'); timeoutSeconds = 300; readySeconds = 0 } })
+            $path = Join-Path -Path $TestDrive -ChildPath ('dispatch-{0}.ps1' -f [guid]::NewGuid().ToString('N'))
+            Set-Content -LiteralPath $path -Value (Get-DbHubWorkloadScript -Settings $settings -Request $requests) -Encoding ascii
+            $lines = @(& $script:shell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $path)
+            return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Lines = @($lines | ForEach-Object { [string]$_ }); Failed = @(Get-DbHubDispatchFailure -Output ($lines -join "`n")) }
+        }
+    }
+
+    It 'ends with exit code 1 and names the target whose profile set failed, after every target''s own lines (live, 2026-11-04)' {
+        $run = Invoke-DispatchScript -Target 'T1', 'T3' -Outcome @{ T1 = @{ status = 'Fail'; message = 'runner profile set --target T1: Fail. error=547 ck_activity_profile_name' }; T3 = @{ status = 'Pass'; message = 'runner profile set --target T3: Pass.' } }
+        $run.ExitCode | Should -Be 1
+        @($run.Lines | Where-Object { $_ -match '^before T[13]$' }) | Should -Be @('before T1', 'before T3')
+        @($run.Lines | Where-Object { $_.StartsWith('DBHUBDEMO-WORKLOAD ') }).Count | Should -Be 2
+        $run.Lines[-1] | Should -Match '^DBHUB-DISPATCH '
+        $run.Failed.Count | Should -Be 1
+        $run.Failed[0].Target | Should -Be 'T1'
+        $run.Failed[0].Status | Should -Be 'Fail'
+        $run.Failed[0].Message | Should -Match 'error=547'
+        $run.Failed[0].OldRunner | Should -BeFalse
+    }
+
+    It 'says when a runner older than the control refused the profile or an option (#21)' {
+        $run = Invoke-DispatchScript -Target 'T3', 'T4' -Outcome @{ T3 = @{ status = 'Fail'; message = 'runner profile set --target T3: Fail. Unknown activity profile ''showcase''. Use off, baseline, business-day, or incident:<scenario>.' }; T4 = @{ status = 'Fail'; message = 'runner profile set --target T4: Fail. Unrecognized command or argument ''--vcores''.' } }
+        $run.ExitCode | Should -Be 1
+        @($run.Failed | ForEach-Object Target) | Should -Be @('T3', 'T4')
+        @($run.Failed | ForEach-Object OldRunner) | Should -Be @($true, $true)
+    }
+
+    It 'ends with exit code 0, and no DBHUB-DISPATCH line, when every target got its activity' {
+        $run = Invoke-DispatchScript -Target 'T1', 'T3' -Outcome @{ T1 = @{ status = 'Pass'; message = 'ok' }; T3 = @{ status = 'Warning'; message = 'set, with a warning' } }
+        $run.ExitCode | Should -Be 0
+        @($run.Lines | Where-Object { $_.StartsWith('DBHUBDEMO-WORKLOAD ') }).Count | Should -Be 2
+        @($run.Lines | Where-Object { $_.StartsWith('DBHUB-DISPATCH ') }) | Should -BeNullOrEmpty
+    }
+
+    It 'fails a target that wrote no result line, and with the module''s own template a VM without the control' {
+        $run = Invoke-DispatchScript -Target 'T1' -Outcome @{ T1 = @{ status = $null; message = $null } }
+        $run.ExitCode | Should -Be 1
+        $run.Failed[0].Status | Should -Be 'NoResult'
+        if (Test-Path -LiteralPath 'C:\ProgramData\DbHubDemo\settings.json') {
+            Set-ItResult -Skipped -Because 'this machine has the VM-side control'
+            return
+        }
+        $real = Invoke-DispatchScript -Target 'T1' -RealTemplate
+        $real.ExitCode | Should -Be 1
+        $real.Failed[0].Target | Should -Be 'T1'
+        $real.Failed[0].Message | Should -Match 'settings\.json is missing'
     }
 }
 

@@ -588,6 +588,19 @@ function Invoke-DemoParallelDeployment {
         if ($null -ne $notice) {
             $results.Add($notice)
         }
+        # T4's size and autonomous tuning (#24, 2026-11-17): a run that deploys the template without preflight checks them
+        # as PREFLIGHT.T4.TUNING does, so t4AutonomousTuning true with a t4SkuName that can't run it is a Fail before
+        # anything changes, on the console and the status page, rather than tuning silently off.
+        if ($plan.Infrastructure -and -not $skipT4) {
+            $tuning = New-DemoT4TuningResult -Config $Config -CheckPrefix DEPLOY
+            $results.Add($tuning)
+            if ([string]$tuning.status -eq 'Fail') {
+                Stop-DemoRayfinSignInStatus -Status $signInCheck
+                Write-DemoLog -Level Warning -Message ([string]$tuning.message)
+                Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Failed' -Status 'Fail' -Message ('{0} {1}' -f $tuning.message, $tuning.remediation)
+                return $results.ToArray()
+            }
+        }
     }
     # The tracks run for as long as the T2 wait and what follows it can take (Phase 28), with the 65 minutes the guided
     # stop had (retired 2026-11-09) kept as a margin: this is only an upper bound for a process that hangs.
@@ -1000,6 +1013,10 @@ function Invoke-DemoParallelDeployment {
             if ($t4StartSku) {
                 $deployArguments['T4StartSku'] = $t4StartSku
             }
+            if (-not $plan.Preflight) {
+                # Without preflight's cost checks, T4 that doesn't exist yet is priced before it's created (#26, 2026-11-17).
+                $deployArguments['PriceT4Creation'] = $true
+            }
             if (-not $whatIf -and -not $skipT4 -and @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.START' -and [string]$_.status -eq 'Pass' }).Count -eq 0) {
                 # A stopped flexible server rejects every other management operation, including the template's
                 # update, so a stopped T4 starts first (Phase 24, ADR 0019), unless this run already started it. Not
@@ -1064,7 +1081,9 @@ function Invoke-DemoParallelDeployment {
             $deploymentResults = Get-DemoMemberValue -InputObject $deployment -Name 'Results'
             $sizeChange = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.FALLBACK' }) | Select-Object -Last 1
             $context['T4Notice'] = if ($null -ne $sizeChange) { [string]$sizeChange.message } else { '' }
-            & $stageResult 'Infrastructure' 'Pass' $infrastructureText
+            # T4 created over a cost ceiling, or without a price, by a run without preflight (#26): the step is a Warning.
+            $overCeiling = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SIZE' -and [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'outcome') -eq 'Create' }).Count -gt 0
+            & $stageResult 'Infrastructure' $(if ($overCeiling) { 'Warning' } else { 'Pass' }) $infrastructureText
             if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                 & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
             }

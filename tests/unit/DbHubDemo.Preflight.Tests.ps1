@@ -392,6 +392,41 @@ Describe 'Invoke-DemoPreflight' {
         ($results | Where-Object checkId -eq 'PREFLIGHT.T4.TUNING').message | Should -Match 't4SkuName sets Standard_B1ms\.$'
     }
 
+    It 'says an existing T4 moves to the size t4SkuName sets, and prices that size (#24)' {
+        Set-HappyAzMock
+        $script:listSkusJson = ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5' }, @{ name = 'Standard_D4ads_v5' }, @{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '18' }) })
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:listSkusJson; StdErr = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Exists = $true; State = 'Ready'; Server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5'; tier = 'GeneralPurpose' } } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith { [pscustomobject]@{ LightUseMonthly = 10.0; SessionCost = 1.0; T4AutoRestartWorstCaseMonthly = 1.0; T4FixedMonthly = 1.0; DefenderIncluded = $true; MissingPrices = @(); Components = @(); Results = @() } }
+        $pinned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $pinned[$key] = $config[$key] }
+        $pinned['t4SkuName'] = 'Standard_D2ds_v5'
+        $results = Invoke-DemoPreflight -Config $pinned -SkipWhatIf -SkipPolicyInventory
+        $size = @($results | Where-Object checkId -eq 'PREFLIGHT.T4.SIZE')
+        $size.Count | Should -Be 1
+        $size[0].status | Should -Be 'Warning'
+        $size[0].message | Should -Match '^T4 exists as Standard_D4ds_v5 \(General Purpose\), and your configuration sets t4SkuName to Standard_D2ds_v5, so deploy\.ps1 scales it, which restarts it'
+        $size[0].evidence.explicit | Should -BeTrue
+        $size[0].remediation | Should -Match 'set t4SkuName back to Standard_D4ds_v5'
+        ($results | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').message | Should -Match 'offers the size t4SkuName sets it moves to, GeneralPurpose Standard_D2ds_v5'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { [string]$Config['t4SkuName'] -eq 'Standard_D2ds_v5' }
+    }
+
+    It 'reads the size a refused scale kept from the resource group, so it neither announces that scale nor prices the default (#24)' {
+        # preflight.ps1 and validate.ps1 hand preflight the file's configuration; deploy.ps1 resolves the record first.
+        Set-HappyAzMock
+        $script:listSkusJson = ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5' }, @{ name = 'Standard_D4ads_v5' }, @{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '18' }) })
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^postgres flexible-server list-skus' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:listSkusJson; StdErr = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ Exists = $true; State = 'Ready'; Server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; T4Sku = 'Standard_D2ds_v5'; T4Refused = 'Standard_D4ds_v5@any;kept;2026-11-04T10:00:00Z'; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith { [pscustomobject]@{ LightUseMonthly = 10.0; SessionCost = 1.0; T4AutoRestartWorstCaseMonthly = 1.0; T4FixedMonthly = 1.0; DefenderIncluded = $true; MissingPrices = @(); Components = @(); Results = @() } }
+        $results = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory
+        @($results | Where-Object checkId -eq 'PREFLIGHT.T4.SIZE').Count | Should -Be 0
+        ($results | Where-Object checkId -eq 'PREFLIGHT.T4.CAPABILITY').message | Should -Match '^T4 exists as GeneralPurpose Standard_D2ds_v5, and deploy\.ps1 keeps its size'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -ParameterFilter { [string]$Config['t4SkuName'] -eq 'Standard_D2ds_v5' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 0 -Exactly -ParameterFilter { -not $Config.Contains('t4SkuName') -or [string]$Config['t4SkuName'] -eq 'Standard_D4ds_v5' }
+    }
+
     It 'reads a T4 server Azure is deleting as no server, so its size neither moves the fallback''s start nor counts as T4''s (live, 2026-11-09)' {
         Set-HappyAzMock
         $script:listSkusJson = ConvertTo-Json -Depth 10 -InputObject @(@{ name = 'FlexibleServerCapabilities'; supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5' }, @{ name = 'Standard_D4ads_v5' }, @{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @(@{ name = '18' }) })

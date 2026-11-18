@@ -2070,6 +2070,56 @@ Describe 'Invoke-DemoParallelDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
     }
 
+    It 'checks T4''s size and autonomous tuning when -FromStage skips preflight, and stops before any change at a Fail (#24)' {
+        # The issue's case: t4AutonomousTuning true with a t4SkuName that can't run it, from the Infrastructure stage.
+        $config['t4SkuName'] = 'Standard_B1ms'
+        $config['t4AutonomousTuning'] = $true
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Infrastructure' })
+        $tuning = @($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.TUNING' })
+        $tuning.Count | Should -Be 1
+        $tuning[0].status | Should -Be 'Fail'
+        $tuning[0].message | Should -Match '^t4AutonomousTuning is true, but T4''s size Standard_B1ms \(Burstable, 1 vCore\) can''t run autonomous tuning'
+        $tuning[0].remediation | Should -Match '^Set t4SkuName to Standard_D4ds_v5'
+        $script:calls | Should -Not -Contain 'preflight'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
+
+        # A size that runs it, from the same stage: a Pass, and the run goes on.
+        $config['t4SkuName'] = 'Standard_D4ds_v5'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Infrastructure' })
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.TUNING' }).status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 1 -Exactly
+    }
+
+    It 'has the template price T4''s creation only when -FromStage skips preflight, and shows one over a ceiling as a Warning on the Infrastructure step (#26)' {
+        $script:note = 'T4 doesn''t exist yet, so this deployment creates it as Standard_D4ds_v5 (General Purpose, 4 vCores). Raise monthlyCeilingUsd.'
+        $script:created = New-DemoResult -CheckId 'DEPLOY.T4.SIZE' -Area 't4' -Target 'T4' -Status 'Warning' -Message 'T4 doesn''t exist yet.' -Evidence ([ordered]@{ outcome = 'Create'; skuName = 'Standard_D4ds_v5' })
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
+            $script:calls.Add(('template price={0}' -f [bool](Get-Variable -Name 'PriceT4Creation' -ValueOnly -ErrorAction SilentlyContinue)))
+            [pscustomobject]@{ Succeeded = $true; Results = @((New-TestResult 'DEPLOY.TEMPLATE'), $script:created); Outputs = @{ loaderSettings = @{ sqlVm = @{ role = 'SqlVm' }; host = @{ role = 'ArcHost' } } }; Changes = @(); T3UseFreeLimit = $true; T4Enabled = $true; T4SkuName = 'Standard_D4ds_v5'; T4Note = $script:note }
+        }
+        $progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
+        InModuleScope DbHubDemo -Parameters @{ Path = $progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config; Path = $progress } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Infrastructure' -ProgressPath $Path })
+        $script:calls | Should -Contain 'template price=True'
+        $stage = @($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.INFRASTRUCTURE' })
+        $stage[0].status | Should -Be 'Warning'
+        $stage[0].message | Should -BeLike ('The infrastructure is deployed (*). {0}' -f $script:note)
+        $model = Get-Content -LiteralPath $progress -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $infrastructure = @(foreach ($track in @($model['tracks'])) { foreach ($item in @($track['steps'])) { if ([string]$item['id'] -eq 'Infrastructure') { $item } } })[0]
+        $infrastructure['status'] | Should -Be 'Warning'
+        $infrastructure['message'] | Should -BeLike ('The infrastructure is deployed (*). {0}' -f $script:note)
+
+        # With preflight, which prices T4 itself, the template doesn't, and the step is a Pass.
+        $script:calls.Clear()
+        $script:created = New-TestResult 'DEPLOY.T4.SKU'
+        $script:note = ''
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess })
+        $script:calls | Should -Contain 'preflight'
+        $script:calls | Should -Contain 'template price=False'
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.INFRASTRUCTURE' }).status | Should -Be 'Pass'
+    }
+
     It 'stops after the infrastructure with -StopAfter Infrastructure' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -StopAfter 'Infrastructure' -InProcess })
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly

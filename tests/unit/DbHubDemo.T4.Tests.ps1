@@ -649,12 +649,25 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
         $script:roleId = 'dddddddd-0000-0000-0000-000000000009'
         $script:a1 = [pscustomobject]@{ Exists = $true; Missing = $false; Error = '' }
         $script:jobs = [pscustomobject]@{ Ok = $true; Missing = $false; Error = ''; Value = @{ value = @() } }
+        # Each DbHub-Stop job's own result line (Job - Get Output; #23), by job ID: Stopped unless a test says otherwise, and
+        # $null for output without the line.
+        $script:stopResults = @{}
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlSetting -MockWith { [pscustomobject]@{ Enabled = $script:control } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4SafetyStopState -MockWith { [pscustomobject]@{ State = $script:schedule; NextRunUtc = $null } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlRoleId -MockWith { $script:roleId }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoActivityControlPrincipalId -MockWith { 'dddddddd-0000-0000-0000-000000000004' }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoActivityControlAssignment -MockWith { $script:a1 }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith { $script:jobs }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            if ($Url -match '/jobs/([^/?]+)/output') {
+                $line = @{ action = 'stop-t4'; status = 'Stopped'; message = 'T4 (pgflex01-abc123) was Ready; its stop was accepted.' }
+                if ($script:stopResults.ContainsKey($Matches[1])) {
+                    $line = $script:stopResults[$Matches[1]]
+                }
+                $text = if ($null -eq $line) { '[19:15:02Z] The job''s log, without its result line.' } else { "[19:15:02Z] The job's log.`nDBHUB-STOP " + (ConvertTo-Json -InputObject $line -Compress) }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Error = ''; Value = $text }
+            }
+            $script:jobs
+        }
         # The nightly safety stop (ADR 0024): not in place unless a test says so.
         $script:nightly = [pscustomobject]@{ State = 'NotScheduled'; NextRunUtc = $null; CheckNextRunUtc = $null; CheckScheduled = $false; RoleAssigned = $null; Missing = 'the schedule dbhub-safety-stop doesn''t exist'; Error = '' }
         $script:nightlyRuns = [pscustomobject]@{ Ok = $true; Error = ''; Stop = $null; Check = $null }
@@ -730,9 +743,40 @@ Describe 'Get-DemoT4RestartCoverage (2026-11-04; the nightly safety stop since 2
         $coverage.Counts | Should -BeTrue -Because 'the newest job that ended completed; a running one hasn''t ended'
         $coverage.Missing | Should -Be ''
         $coverage.Reason | Should -Be 'the on-demand control''s daily T4 safety stop is scheduled, A1 is assigned, and the last DbHub-Stop job didn''t fail'
-        $coverage.Evidence.lastStopJob | Should -Be 'Completed'
+        $coverage.Evidence.lastStopJob | Should -Be 'Completed (Stopped)'
         $script:jobs.Value = @{ value = @() }
         (& $script:controlCoverage).Counts | Should -BeTrue -Because 'a control whose stop never ran has no failed job'
+    }
+
+    It 'the control''s own counts when its last DbHub-Stop job says <Status>' -ForEach @(
+        @{ Status = 'Skipped'; Message = 'T4 is Stopped; nothing to stop.' }
+        @{ Status = 'Deferred'; Message = 'A demo session runs until 20:40 UTC, so nothing was stopped.' }
+    ) {
+        $script:jobs.Value = @{ value = @(New-StopJob -Status 'Completed' -Created '2026-11-03T19:15:00Z') }
+        $script:stopResults['job-Completed'] = @{ action = 'stop-t4'; status = $Status; message = $Message }
+        $coverage = & $script:controlCoverage
+        $coverage.Counts | Should -BeTrue
+        $coverage.Evidence.lastStopJob | Should -Be ('Completed ({0})' -f $Status)
+    }
+
+    It 'the control''s own doesn''t count when its last DbHub-Stop job completed but couldn''t stop T4, and names why (#23): <Case>' -ForEach @(
+        @{ Case = 'Azure refused T4''s stop (Partial)'; Line = @{ action = 'stop-t4'; status = 'Partial'; message = 'T4 (pgflex01-abc123) was Ready; its stop was failed.' }; Reason = '^the last DbHub-Stop job \(created 2026-11-03 19:15 UTC\) didn''t finish its work \(it says Partial: T4 \(pgflex01-abc123\) was Ready; its stop was failed\), so the safety stop may not stop T4$'; LastRun = 'Completed (Partial)' }
+        @{ Case = 'the auto-stop''s T4 stop failed (Partial)'; Line = @{ action = 'stop-all'; status = 'Partial'; message = 'Auto-stop: auto-stop removed, sqlvm01 deallocating; failed: pgflex01-abc123.' }; Reason = 'it says Partial: Auto-stop: auto-stop removed, sqlvm01 deallocating; failed: pgflex01-abc123\)'; LastRun = 'Completed (Partial)' }
+        @{ Case = 'it ended with an error'; Line = @{ action = 'stop-t4'; status = 'Error'; message = 'The identity endpoint didn''t answer.' }; Reason = 'it says Error: The identity endpoint didn''t answer\)'; LastRun = 'Completed (Error)' }
+        @{ Case = 'its result line couldn''t be read'; Line = $null; Reason = 'its result couldn''t be read, so it''s taken as failed'; LastRun = 'Completed (no result line)' }
+    ) {
+        $script:jobs.Value = @{ value = @(New-StopJob -Status 'Completed' -Created '2026-11-03T19:15:00Z') }
+        $script:stopResults['job-Completed'] = $Line
+        $coverage = & $script:controlCoverage
+        $coverage.Counts | Should -BeFalse
+        $coverage.Missing | Should -Be 'StopJob'
+        $coverage.Reason | Should -Match $Reason
+        $coverage.Fix | Should -Match '^Open the job in aa-dbhub-control \(Process Automation > Jobs\) to see what it couldn''t stop'
+        $coverage.Evidence.lastStopJob | Should -Be $LastRun
+        # Without the nightly safety stop, the monthly ceiling then counts T4's restart for the rest of the month.
+        $whole = & $script:coverage
+        $whole.Counts | Should -BeFalse
+        $whole.Evidence.control.missing | Should -Be 'StopJob'
     }
 
     It 'the control''s own doesn''t count, and names the missing piece and its exact fix: <Case>' -ForEach @(

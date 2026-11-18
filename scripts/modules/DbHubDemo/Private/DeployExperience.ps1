@@ -1409,7 +1409,8 @@ function Get-DemoDeploymentOutcome {
     The one ending of a deploy.ps1 run (brief item 1): Kind Done, NotDone, or WhatIf, with Reason, Next (the single next
     action), NextCommand (the exact command), Notes (what DONE states plainly: T4 off and why, T4 on the General Purpose
     fallback with its hourly price from -T4HourlyUsd, "created" only when -T4Created or this run's evidence shows the
-    server, a nightly safety stop this run set up only in part (Get-DemoSafetyStopNote, ADR 0024), the nightly stop that
+    server, T4 that a run without preflight created over a cost ceiling (Get-DemoT4CreateCostNote, #26), a nightly safety
+    stop this run set up only in part (Get-DemoSafetyStopNote, ADR 0024), the nightly stop that
     waited for this run and when the demo stops tonight (Get-DemoBusyMarkerNote, 2026-11-14), Run Commands that ran
     under a fresh name because Azure kept their own in Deleting (Get-DemoRunCommandStuckNote), T1's SQL IaaS Agent
     extension that this run repaired (Get-DemoSqlIaasRepairNote), Developer mode's T2),
@@ -1509,6 +1510,11 @@ function Get-DemoDeploymentOutcome {
     $t4Fallback = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd $T4HourlyUsd -Created $t4Created -Why $T4Why -Notice $T4Notice
     if ($t4Fallback) {
         $notes.Add($t4Fallback)
+    }
+    # T4 created over a cost ceiling, or without a price, by a run that skipped preflight (#26, 2026-11-17).
+    $t4CreateCost = Get-DemoT4CreateCostNote -Result $all
+    if ($t4CreateCost) {
+        $notes.Add($t4CreateCost)
     }
     # The nightly safety stop (ADR 0024), said plainly when this run set it up only in part, such as without its role.
     $safetyStop = Get-DemoSafetyStopNote -Result $all
