@@ -40,6 +40,10 @@ function Get-DemoEnvironmentStatus {
       the difference (Get-DemoT4RecordedSizeChange). STATUS.PROFILE_T4 is its activity
       profile, and with -Detail STATUS.T4.LIVE is T1's runner's live view of T4 (connections against
       max_connections, sessions by state, blockers, the oldest transaction, deadlocks).
+    - STATUS.T5 (2026-11-18, ADR 0027): the Azure Cosmos DB account's state and its Azure Monitor metrics from the last 15
+      minutes (requests, throttled requests (429), request units, normalized RU consumption), with whether it has the free
+      tier; it has no stop, so its throughput bills every hour without it. A demo deployed before T5 gets a Warning with
+      the upgrade's command. STATUS.PROFILE_T5 is its activity profile (T1's runner runs T5's workload).
     - T1.SQLVM.ASSOCIATEDSERVICES (Phase 7, read-only): the SQL Server instances unified inventory lists for
       T1, Pass with the engine only and a Warning while associated services are still listed; and T1.SQLVM.MONITORING while sqlvm01
       runs (an extension that's Updating after a redeployment is a Warning).
@@ -322,10 +326,36 @@ function Get-DemoEnvironmentStatus {
         }
     }
 
+    # T5 (2026-11-18, ADR 0027): the Azure Cosmos DB account, with its Azure Monitor metrics from the last 15 minutes (the
+    # ones Database Hub's Cosmos DB views chart). It has no stop: its throughput bills every hour unless it has the free tier.
+    $t5 = $null
+    if (-not (Test-DemoT5Enabled -Config $Config)) {
+        $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status 'Not selected' -Message 'T5 is off in this configuration (t5Enabled is false).'))
+    }
+    else {
+        $t5 = Get-DemoT5State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $t5Docs = (Get-DemoCosmosSetting)['docUrls']
+        if (-not $t5.Exists -and $t5.State -eq 'NotFound') {
+            $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) doesn''t exist: a demo deployed before 2026-11-18 doesn''t have it yet.' -f $t5.Names.AccountName) -Remediation 'Run ./scripts/deploy.ps1: it adds T5, with nothing else to do.' -DocUrl ([string]$t5Docs['hubMonitor'])))
+        }
+        elseif (-not $t5.Exists) {
+            $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) couldn''t be read: {1}' -f $t5.Names.AccountName, $t5.Error) -Remediation 'Run status.ps1 again.'))
+        }
+        else {
+            $snapshot = Get-DemoT5MetricSnapshot -Config $Config -AccountId $t5.Names.AccountId -Minutes 15
+            $billing = if ($t5.FreeTier) { 'it has the free tier, so its {0} RU/s cost nothing' -f $t5.Names.Throughput } else { 'it has no stop, so its {0} RU/s bill every hour' -f $t5.Names.Throughput }
+            $metricText = if ($snapshot.Succeeded) { Format-DemoT5MetricText -Snapshot $snapshot } else { 'its metrics couldn''t be read: {0}' -f $snapshot.Error }
+            $message = '{0} is {1}: {2} (Azure Monitor; Database Hub''s Cosmos DB views chart the same metrics); {3}.' -f $t5.Names.AccountName, $t5.State, $metricText, $billing
+            $evidence = [ordered]@{ state = $t5.State; freeTier = [bool]$t5.FreeTier; throughput = $t5.Names.Throughput; requests = $snapshot.Requests; throttled = $snapshot.Throttled; requestUnits = $snapshot.RequestUnits; peakNormalizedRuPercent = $snapshot.PeakNormalizedRu; latestNormalizedRuPercent = $snapshot.LatestNormalizedRu }
+            $t5Status = if ($t5.State -eq 'Succeeded') { 'Pass' } else { 'Warning' }
+            $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status $t5Status -Message $message -Evidence $evidence -DocUrl ([string]$t5Docs['hubMonitor'])))
+        }
+    }
+
     if ($running['sqlvm01'] -and $state.RunnerSha256) {
         # The active profile (plan section 9.6). The T3 profile is a file on T1, so reading it doesn't wake T3.
         $configuredActivity = Get-DemoActivityProfile -Config $Config
-        $profileTargets = @('T1') + @(if ($t3.Exists) { 'T3' }) + @(if ($null -ne $t4 -and $t4.Exists) { 'T4' })
+        $profileTargets = @('T1') + @(if ($t3.Exists) { 'T3' }) + @(if ($null -ne $t4 -and $t4.Exists) { 'T4' }) + @(if ($null -ne $t5 -and $t5.Exists) { 'T5' })
         if ($Detail -and $hostVm -eq 'archost01' -and $running[$hostVm] -and 'archost01' -in $state.RunnerSentTo) {
             $profileTargets += 'T2'
         }

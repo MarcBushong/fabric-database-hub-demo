@@ -15,7 +15,7 @@ table Analysis
         sourceColumn: [Analysis]
         sortByColumn: 'Analysis Sort'
 
-    /// The signal area: Estate, CPU, Locks and blocking, Throughput, Waits, IO, Memory, Storage, Readiness, Incidents, or PostgreSQL.
+    /// The signal area: Estate, CPU, Locks and blocking, Throughput, Waits, IO, Memory, Storage, Readiness, Incidents, PostgreSQL, or Cosmos DB.
     column 'Analysis Group'
         dataType: string
         isNameInferred
@@ -56,6 +56,7 @@ table Analysis
                         { "consumption", "Consumption", "CPU and waits", "Per analysis window", 14 },
                         { "correlation", "Scenario correlation", "Incidents", "Per scenario window", 15 },
                         { "real_time_dashboard", "Real-Time Dashboard", "Readiness", "Per run", 16 },
-                        { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 }
+                        { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 },
+                        { "cosmosdb", "Azure Cosmos DB (Azure Monitor)", "Cosmos DB", "Per bin", 18 }
                     }
                 )

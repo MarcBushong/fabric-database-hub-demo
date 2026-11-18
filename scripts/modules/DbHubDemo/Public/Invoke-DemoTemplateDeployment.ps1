@@ -17,7 +17,10 @@ function Invoke-DemoTemplateDeployment {
     3. Runs 'az deployment sub create' (or 'what-if --no-pretty-print') through Invoke-DemoAz, deployment name
        <prefix>-<environment>-main (dbhub-demo-main with the defaults).
     4. If the deployment fails because Azure rejected the free offer (Resolve-DemoT3FreeOfferError), it
-       deploys again with t3UseFreeLimit false and returns the T3.FREEOFFER Warning (ADR 0016, C7).
+       deploys again with t3UseFreeLimit false and returns the T3.FREEOFFER Warning (ADR 0016, C7). T5's free tier
+       (2026-11-18, ADR 0027) is decided first (Resolve-DemoT5FreeTier, DEPLOY.T5.FREETIER: an existing account keeps what
+       it has; a new one gets it when no other account in the subscription has it), and a refusal deploys again without it,
+       once (a DEPLOY.T5.FREETIER Warning).
     5. Phase 24: an existing VM's disks whose type drifted from the profile (Get-DemoVmDiskDrift; the
        subscription's automation can switch a deallocated VM's disks to Standard HDD) keep their current type
        through diskSkuOverrides, with the DEPLOY.DISKS.DRIFT Warning; T4's availability zone goes only to a
@@ -394,6 +397,21 @@ function Invoke-DemoTemplateDeployment {
 
     $useFreeLimit = $T3UseFreeLimit
     $freeOfferTried = $false
+    # T5's free tier (2026-11-18, ADR 0027): an existing account keeps what it has (Azure sets it only at creation); a new one
+    # gets it when no other account in the subscription has it (Resolve-DemoT5FreeTier, DEPLOY.T5.FREETIER). A refusal
+    # (another account took it meanwhile) deploys again without it, once.
+    $t5FreeTier = $false
+    $t5FreeTried = $false
+    if (Test-DemoT5Enabled -Config $effective) {
+        try {
+            $t5Free = Resolve-DemoT5FreeTier -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' })
+            $t5FreeTier = [bool]$t5Free.UseFreeTier
+            $results.Add($t5Free.Result)
+        }
+        catch {
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('Whether T5 can use the subscription''s free tier couldn''t be read ({0}), so it''s created without it: its throughput is billed every hour.' -f (Protect-DemoText -Text $_.Exception.Message)) -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['freeTier'])))
+        }
+    }
     # The fallback works on $effective, only for a server that doesn't exist yet: without t4SkuName (2026-11-04), and for a
     # size t4SkuName sets (2026-11-09, user-directed: "fall back automatically, cheapest first, with a Warning").
     $ladder = $t4On -and -not $t4Exists -and $Action -eq 'Create'
@@ -664,6 +682,7 @@ function Invoke-DemoTemplateDeployment {
             ExistingVmName            = $existing
             T1SecurityType            = $securityType.SecurityType
             T3UseFreeLimit            = $useFreeLimit
+            T5FreeTier                = $t5FreeTier
         }
         if ($budgetStart) {
             $parameterArguments['BudgetStartDate'] = $budgetStart
@@ -866,6 +885,16 @@ function Invoke-DemoTemplateDeployment {
                     $createResult = $null
                 }
             }
+            continue
+        }
+        # T5's free tier refused (ADR 0027): another account in the subscription took it after Resolve-DemoT5FreeTier read the
+        # subscription, or Resource Graph didn't list that account. Learn lists no error code, so the match needs an error that
+        # names the free tier (Test-DemoT5FreeTierRefusal); the template is deployed again once, without it.
+        if (-not $t5FreeTried -and $t5FreeTier -and (Test-DemoT5FreeTierRefusal -Text ([string]$run.StdErr))) {
+            $t5FreeTried = $true
+            $t5FreeTier = $false
+            $results.Add((New-DemoResult -CheckId 'DEPLOY.T5.FREETIER' -Area 't5' -Target 'T5' -Status 'Warning' -Message 'Azure refused T5''s free tier (the subscription''s one free-tier Azure Cosmos DB account is taken), so the template is deployed again without it: T5''s throughput is billed every hour (estimate-cost.ps1 prices it).' -Evidence ([ordered]@{ useFreeTier = $false; refused = $true }) -Remediation 'Nothing to do. Azure sets the free tier only when an account is created.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['freeTier'])))
+            Write-DemoLog -Level Warning -Message 'Azure refused T5''s free tier; deploying again without it.'
             continue
         }
         if (-not $t4FailureRead -and (Test-DemoT4Enabled -Config $effective) -and ($Action -eq 'Create') -and (-not $t4Exists -or $t4Scaling)) {

@@ -723,8 +723,8 @@ function Set-DemoTargetProfile {
 
     .DESCRIPTION
     deploy.ps1's Activity stage, start-demo.ps1, and stop-demo.ps1 use it. A profile other than off ends
-    before the next auto-shutdown (--not-after). The T3 and T4 profiles are files on T1, so setting them never
-    wakes T3 or connects to T4. A target the caller can't reach (-SkipReason) is Not selected. A profile that can't be set is a
+    before the next auto-shutdown (--not-after). The T3, T4, and T5 profiles are files on T1, so setting them never
+    wakes T3 or connects to T4 or T5. A target the caller can't reach (-SkipReason) is Not selected. A profile that can't be set is a
     Warning, not a Fail: the demo's resources are fine, the profile ends at the auto-shutdown anyway, and
     demo-control.yml or start-demo.ps1 -ActivityProfile sets it again; a T2 guest that isn't set up yet (no demo module or
     workload runner before SQL Server setup; Test-DemoT2NotSetUpText) is Not selected. -Attempts retries a target that
@@ -745,7 +745,7 @@ function Set-DemoTargetProfile {
         [System.Collections.IDictionary] $Config,
 
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target,
 
         [Parameter(Mandatory)]
@@ -959,6 +959,8 @@ function Test-DemoStartCost {
     if ($t4On) {
         $costParameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
     }
+    # T5's free tier (2026-11-18, ADR 0027), so a free-tier account isn't priced at list price.
+    $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
     $sessionCost = 0.0
     try {
         $estimate = Get-DemoCostEstimate @costParameters

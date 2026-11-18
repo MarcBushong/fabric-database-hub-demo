@@ -1047,6 +1047,202 @@ print(json.dumps({
         @($result['empty']['printed']).Count | Should -Be 1
         @($result['empty']['printed'])[0] | Should -Match '^T4''s PostgreSQL metrics weren''t passed in \(POSTGRES_METRICS is empty\), so this run adds none: \./scripts/stop-demo\.ps1 -SaveHistory and \./scripts/deploy\.ps1 pass them'
     }
+
+    It 'adds T5''s Azure Monitor metrics only from COSMOS_METRICS, empty by default, after T4''s and before the persist cell, without a network call (ADR 0027)' {
+        $parameters = @($nb.Code | Where-Object { @($_.Metadata['tags']) -contains 'parameters' })[0].Source
+        $parameters | Should -Match '(?m)^COSMOS_METRICS = ""$'
+        $nb.Code[1].Source | Should -Match '(?m)^COSMOS_METRICS = str\(COSMOS_METRICS or ""\)\.strip\(\)$'
+        $t4 = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# T4 \(PostgreSQL\):' })
+        $t5 = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# T5 \(Azure Cosmos DB\):' })
+        $persist = [array]::FindIndex([object[]]$nb.Code, [Predicate[object]] { param($cell) $cell.Source -match '^# Persist:' })
+        $t5 | Should -BeGreaterThan $t4
+        $t5 | Should -BeLessThan $persist -Because 'the persist cell saves the rows it adds, with everything else'
+        $nb.Code[$t5].Source | Should -Match '(?m)^    COSMOS_CAPTURE = record_cosmos_metrics\(COSMOS_METRICS\)$'
+        $markdown | Should -Match '(?m)^### T5: Azure Cosmos DB \(Azure Monitor\)$'
+        $allCode | Should -Match '(?m)^COSMOS_ANALYSIS = "cosmosdb"$'
+        $allCode | Should -Match '(?m)^COSMOS_TARGET = "T5"$'
+        foreach ($name in 'parse_cosmos_metrics', 'cosmos_snapshot_rows', 'cosmos_throttle_episodes', 'cosmos_findings', 'record_cosmos_metrics', 'cosmos_series_frame') {
+            $body = [regex]::Match($allCode, "(?ms)^def $name\(.*?(?=^\S)").Value
+            $body | Should -Not -BeNullOrEmpty -Because $name
+            $body | Should -Not -Match 'https://|requests\.|get_token|getSecret|write_delta|_spark\(' -Because $name
+        }
+        # A session's T5 beats are kept with the session, as T4's are; T5's own metrics show them.
+        $allCode | Should -Match ([regex]::Escape('beat.get("target") not in ("T1", "T2", "T3", "T4", "T5")'))
+    }
+
+    It 'turns the document Get-DemoCosmosHistoryParameter writes into cosmosdb rows and findings, with each throttling episode and its recovery, and says so in one line without one (ADR 0027)' {
+        # Get-DemoCosmosHistoryParameter's own JSON, from a fake Azure CLI, goes through the notebook's helpers and its T5
+        # cell. Needs Python 3 with pandas: set DBHUB_TEST_PYTHON to its python.
+        $interpreter = $pandasPython
+        $PSNativeCommandUseErrorActionPreference = $false
+        if (-not $interpreter) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $null = & $interpreter -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        # One-minute values from 17:02 UTC: an ru-storm wave saturates T5 from 17:05 to 17:09 and is throttled at 17:05,
+        # 17:06, and 17:08; Azure Monitor sends no point for the 429s' other minutes, and none for 18:01 yet.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            $text = @($ArgumentList) -join ' '
+            if ($text -match 'databaseAccounts/cosmos01-abc123/providers/Microsoft\.Insights/metrics') {
+                $index = [array]::IndexOf([string[]]@($ArgumentList), '--url-parameters')
+                $query = Get-Content -LiteralPath ([string]$ArgumentList[$index + 1]).Substring(1) -Raw | ConvertFrom-Json -AsHashtable
+                $field = ([string]$query['aggregation']).ToLowerInvariant()
+                $name = [string]$query['metricnames']
+                $hourly = $query['interval'] -eq 'PT1H'
+                $data = if ($hourly) {
+                    @([ordered]@{ timeStamp = '2026-11-13T17:00:00Z'; $field = @{ ProvisionedThroughput = 400; ServiceAvailability = 100 }[$name] }, [ordered]@{ timeStamp = '2026-11-13T18:00:00Z' })
+                }
+                else {
+                    @(for ($minute = 2; $minute -le 20; $minute++) {
+                            $value = if ($query.Contains('$filter')) { @{ 5 = 50; 6 = 40; 8 = 30 }[$minute] } else { @{ NormalizedRUConsumption = $(if ($minute -ge 5 -and $minute -le 9) { 100 } else { 20 }); TotalRequestUnits = 6000; TotalRequests = 600; ServerSideLatencyGateway = 5.5 }[$name] }
+                            $point = [ordered]@{ timeStamp = ('2026-11-13T17:{0:00}:00Z' -f $minute) }
+                            if ($null -ne $value) { $point[$field] = $value }
+                            $point
+                        })
+                }
+                $unit = @{ NormalizedRUConsumption = 'Percent'; ServiceAvailability = 'Percent'; ServerSideLatencyGateway = 'MilliSeconds' }[$name]
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (ConvertTo-Json -InputObject @{ value = @(@{ name = @{ value = $name }; unit = $(if ($unit) { $unit } else { 'Count' }); timeseries = @(@{ data = @($data) }) }) } -Depth 10 -Compress); StdErr = '' }
+            }
+            if ($text -match 'databaseAccounts/cosmos01-abc123\?') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = (ConvertTo-Json -InputObject @{ name = 'cosmos01-abc123'; properties = @{ provisioningState = 'Succeeded' } } -Compress); StdErr = '' }
+            }
+            throw "unexpected Azure CLI call: $text"
+        }
+        $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
+        # An obviously fake ID: every group repeats one character.
+        $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
+        $capture = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoCosmosHistoryParameter -Config $Config -DeploymentId 'abc123' -WindowMinutes 60 -NowUtc ([datetime]::new(2026, 11, 13, 18, 2, 37, [System.DateTimeKind]::Utc)) }
+        $capture.Status | Should -Be 'Pass'
+        $capture.PointCount | Should -Be 81
+        $documentPath = Join-Path -Path $TestDrive -ChildPath 'cosmos-metrics.json'
+        Set-Content -LiteralPath $documentPath -Value $capture.Json -Encoding utf8NoBOM -NoNewline
+        $script = Join-Path -Path $TestDrive -ChildPath 'cosmos.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, sys, types
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+document = open(sys.argv[2], encoding="utf-8").read()
+parameters = next(cell for cell in cells if cell.startswith("# Parameters cell"))
+t5_cell = next(cell for cell in cells if cell.startswith("# T5 (Azure Cosmos DB):"))
+
+def t5(ns):
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        exec(compile(t5_cell, "t5", "exec"), ns)
+    return printed.getvalue()
+
+def run(metrics):
+    ns = {}
+    exec(parameters, ns)
+    ns["COSMOS_METRICS"] = metrics
+    with contextlib.redirect_stdout(io.StringIO()):
+        for index, cell in enumerate(cells):
+            if cell.startswith("# Helpers, part"):
+                exec(compile(cell, "cell-%d" % index, "exec"), ns)
+    return ns, t5(ns)
+
+def summary(ns, printed):
+    text = lambda value: value.strftime("%Y-%m-%d %H:%M") if value is not None else None
+    rows = [row for row in ns["SNAPSHOT_ROWS"] if row["analysis"] == "cosmosdb"]
+    return {
+        "printed": printed.strip().splitlines(),
+        "rows": [{"target": row["target"], "resource": row["resource_name"], "type": row["resource_type"], "metric": row["metric"],
+                  "bucket": text(row["bucket_utc"]), "value": row["value"], "unit": row["unit"], "windowStart": text(row["window_start_utc"]),
+                  "windowEnd": text(row["window_end_utc"]), "reportDate": str(ns["report_date"]("telemetry_snapshots", row))} for row in rows],
+        "findings": {item["finding_id"]: {"status": item["status"], "finding": item["finding"], "target": item["target"],
+                                          "start": text(item["window_start_utc"]), "end": text(item["window_end_utc"]),
+                                          "reportDate": str(ns["report_date"]("analysis_findings", item))}
+                     for item in ns["FINDINGS"] if item["analysis"] == "cosmosdb"},
+    }
+
+full, printed = run(document)
+again = t5(full)
+# Still throttled at the capture's end: the last minutes are a storm.
+stormy = json.loads(document)
+for series in stormy["series"]:
+    if series["metric"] == "ThrottledRequests":
+        series["points"].append(["2026-11-13T17:20:00Z", 10])
+    if series["metric"] == "NormalizedRUConsumption":
+        series["points"] = [[at, 100 if at >= "2026-11-13T17:18:00Z" else value] for at, value in series["points"]]
+calm = json.loads(document)
+for series in calm["series"]:
+    if series["metric"] == "ThrottledRequests":
+        series["points"] = []
+print(json.dumps({
+    "full": summary(full, printed),
+    "again": summary(full, again),
+    "stormy": summary(*run(json.dumps(stormy))),
+    "calm": summary(*run(json.dumps(calm))),
+    "invalid": summary(*run('{"version": 2, "accounts": [], "series": []}')),
+    "empty": summary(*run("")),
+}))
+'@
+        $output = & $interpreter $script $nb.Path $documentPath 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $result = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+
+        $full = $result['full']
+        # 19 points of each one-minute signal, the 429s filled with 0 in the 16 minutes with requests and none throttled,
+        # and one hourly point of each hourly signal.
+        $full['rows'].Count | Should -Be 97
+        @($full['rows'] | ForEach-Object { $_['target'] } | Sort-Object -Unique) | Should -Be @('T5')
+        @($full['rows'] | ForEach-Object { $_['type'] } | Sort-Object -Unique) | Should -Be @('databaseAccounts')
+        @($full['rows'] | ForEach-Object { $_['resource'] } | Sort-Object -Unique) | Should -Be @('cosmos01-abc123')
+        @($full['rows'] | ForEach-Object { '{0}={1}' -f $_['metric'], $_['unit'] } | Sort-Object -Unique) | Should -Be @(
+            'NormalizedRUConsumption=percent', 'ProvisionedThroughput=RU/s', 'ServerSideLatencyGateway=ms', 'ServiceAvailability=percent',
+            'ThrottledRequests=requests', 'TotalRequests=requests', 'TotalRequestUnits=RU')
+        $throttled = @($full['rows'] | Where-Object { $_['metric'] -eq 'ThrottledRequests' })
+        $throttled.Count | Should -Be 19
+        @($throttled | Where-Object { $_['value'] -gt 0 } | ForEach-Object { '{0}={1}' -f $_['bucket'], [string]$_['value'] }) | Should -Be @('2026-11-13 17:05=50', '2026-11-13 17:06=40', '2026-11-13 17:08=30')
+        $throttled[0]['windowStart'] | Should -Be '2026-11-13 17:02'
+        $throttled[0]['windowEnd'] | Should -Be '2026-11-13 18:02'
+        $throttled[0]['reportDate'] | Should -Be '2026-11-13'
+        @($full['findings'].Keys | Sort-Object) | Should -Be @('cosmosdb.T5.capture', 'cosmosdb.T5.recovery', 'cosmosdb.T5.throttle.20261113T1705', 'cosmosdb.T5.throttling')
+        $full['findings']['cosmosdb.T5.capture']['status'] | Should -Be 'Pass'
+        $full['findings']['cosmosdb.T5.capture']['finding'] | Should -Be 'Azure Monitor metrics of T5 cosmos01-abc123 from 2026-11-13 17:02 to 2026-11-13 18:02 UTC, every 1 minutes: 7 series, 97 points.'
+        $full['findings']['cosmosdb.T5.throttling']['status'] | Should -Be 'Warning'
+        $full['findings']['cosmosdb.T5.throttling']['finding'] | Should -Be 'Normalized RU consumption on T5 cosmos01-abc123 reached 100% with 120 throttled requests (429s) of 11,400 requests (1.1%) in 1 episode between 2026-11-13 17:05 and 2026-11-13 17:09 UTC.'
+        $episode = $full['findings']['cosmosdb.T5.throttle.20261113T1705']
+        $episode['status'] | Should -Be 'Warning'
+        $episode['finding'] | Should -Be 'Normalized RU consumption on T5 reached 100% with 120 throttled requests (429s) of 2,400 requests between 2026-11-13 17:05 and 17:09 UTC; the throttling stopped at 17:09 UTC, and normalized RU fell back to 20% from 17:10 UTC.'
+        $episode['start'] | Should -Be '2026-11-13 17:05'
+        $episode['end'] | Should -Be '2026-11-13 17:09'
+        $full['findings']['cosmosdb.T5.recovery']['status'] | Should -Be 'Pass'
+        $full['findings']['cosmosdb.T5.recovery']['finding'] | Should -Be 'T5 cosmos01-abc123 was back at its baseline before the capture''s end: its last throttling stopped at 17:09 UTC, and normalized RU consumption fell back to 20% from 17:10 UTC, with no 429s after it.'
+        $full['printed'] | Should -Contain 'T5''s metrics (cosmos01-abc123) from 2026-11-13 17:02 to 2026-11-13 18:02 UTC, every 1 minutes:'
+
+        # Running the cell again replaces its rows and findings instead of adding to them.
+        $result['again']['rows'].Count | Should -Be 97
+        $result['again']['findings'].Count | Should -Be 4
+
+        # Still throttled at the capture's end: a second episode, and a Warning that T5 wasn't back at its baseline.
+        $result['stormy']['findings'].Contains('cosmosdb.T5.throttle.20261113T1720') | Should -BeTrue
+        $result['stormy']['findings']['cosmosdb.T5.throttle.20261113T1720']['finding'] | Should -Match '; it was still throttled at the capture''s end\.$'
+        $result['stormy']['findings']['cosmosdb.T5.recovery']['status'] | Should -Be 'Warning'
+        $result['stormy']['findings']['cosmosdb.T5.recovery']['finding'] | Should -Be 'T5 cosmos01-abc123 was still throttled (429s) at the capture''s end, 18:02 UTC: its last throttling began at 17:20 UTC.'
+
+        # No 429 at all: a Pass, the 429s all 0, and no episode or recovery to tell.
+        $calm = $result['calm']
+        @($calm['findings'].Keys | Sort-Object) | Should -Be @('cosmosdb.T5.capture', 'cosmosdb.T5.throttling')
+        $calm['findings']['cosmosdb.T5.throttling']['status'] | Should -Be 'Pass'
+        $calm['findings']['cosmosdb.T5.throttling']['finding'] | Should -Be 'No throttled requests (429s) on T5 cosmos01-abc123 from 2026-11-13 17:02 to 2026-11-13 18:02 UTC, 11,400 requests; normalized RU consumption peaked at 100% at 2026-11-13 17:05 UTC.'
+        @($calm['rows'] | Where-Object { $_['metric'] -eq 'ThrottledRequests' -and $_['value'] -ne 0 }).Count | Should -Be 0
+
+        $result['invalid']['rows'].Count | Should -Be 0
+        @($result['invalid']['findings'].Keys) | Should -Be @('cosmosdb.T5.capture')
+        $result['invalid']['findings']['cosmosdb.T5.capture']['status'] | Should -Be 'Fail'
+        $result['invalid']['findings']['cosmosdb.T5.capture']['finding'] | Should -Be 'T5''s metrics in COSMOS_METRICS weren''t added: it isn''t a version 1 document.'
+
+        $result['empty']['rows'].Count | Should -Be 0
+        $result['empty']['findings'].Count | Should -Be 0
+        @($result['empty']['printed']).Count | Should -Be 1
+        @($result['empty']['printed'])[0] | Should -Match '^T5''s Azure Cosmos DB metrics weren''t passed in \(COSMOS_METRICS is empty\), so this run adds none'
+    }
 }
 
 Describe 'Report tables for the Power BI history report (Phase 19)' {
@@ -1173,9 +1369,10 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
     It 'knows every incident scenario in scenarios/ with its expected signal' {
         $scenarioFolder = Join-Path -Path $repoRoot -ChildPath 'scenarios'
         # T4-only scenarios (connection-surge, idle-in-transaction, replica-lag) have no scenario windows here: T4's metrics
-        # aren't in the telemetry endpoint. Its history comes from POSTGRES_METRICS instead (ADR 0025).
+        # aren't in the telemetry endpoint. Its history comes from POSTGRES_METRICS instead (ADR 0025). The same goes for
+        # T5-only ones (ru-storm) and COSMOS_METRICS (2026-11-18, ADR 0027).
         $scenarios = @(Get-ChildItem -LiteralPath $scenarioFolder -Directory | Where-Object {
-                $_.Name -ne 'healthy-baseline' -and @((Get-Content -LiteralPath (Join-Path -Path $_.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json).targets.applicable | Where-Object { $_ -ne 'T4' }).Count -gt 0
+                $_.Name -ne 'healthy-baseline' -and @((Get-Content -LiteralPath (Join-Path -Path $_.FullName -ChildPath 'scenario.json') -Raw | ConvertFrom-Json).targets.applicable | Where-Object { $_ -notin 'T4', 'T5' }).Count -gt 0
             })
         $scenarios.Count | Should -BeGreaterThan 5
         $signals = [regex]::Match($liveCode, '(?s)SCENARIO_SIGNALS = \{(.*?)\n\}').Groups[1].Value

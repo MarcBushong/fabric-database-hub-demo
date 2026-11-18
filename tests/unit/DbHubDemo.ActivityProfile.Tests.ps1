@@ -5,11 +5,13 @@ BeforeAll {
     # Writes through Invoke-DemoAz need the context the subscription guard validates; this is the unit-test hook.
     Initialize-GuardTestContext
 
-    function New-TestConfig([switch] $WithT4, [switch] $Unset, [string] $ActivityProfile = '') {
+    function New-TestConfig([switch] $WithT4, [switch] $Unset, [string] $ActivityProfile = '', [switch] $WithT5) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
         $config['t4Enabled'] = [bool]$WithT4
+        # T5 (2026-11-18, ADR 0027) only where a test says so.
+        $config['t5Enabled'] = [bool]$WithT5
         if ($Unset) {
             $config.Remove('activityProfile')
         }
@@ -148,8 +150,10 @@ Describe 'The default activity profile (the owner''s decision of 2026-11-03)' {
 
 Describe 'business-day''s schedule and what the scripts say about it' {
     It 'reads the hourly incidents from the runner''s profiles, for every target and for one' {
-        InModuleScope DbHubDemo { Format-DemoBusinessDaySchedule } | Should -Be 'T1 at :10 and :40, T2 at :05, :20, :35, and :50, T3 at :15 and :45, and T4 at :08, :22, and :42 past each UTC hour'
+        InModuleScope DbHubDemo { Format-DemoBusinessDaySchedule } | Should -Be 'T1 at :10 and :40, T2 at :05, :20, :35, and :50, T3 at :15 and :45, T4 at :08, :22, and :42, and T5 at :25 past each UTC hour'
         InModuleScope DbHubDemo { Format-DemoBusinessDaySchedule -Target 'T3' } | Should -Be 'at :15 (resource-governance, 5 minutes) and :45 (log-rate-pressure, 5 minutes) past each UTC hour'
+        # T5's RU storm (2026-11-18, ADR 0027).
+        InModuleScope DbHubDemo { Format-DemoBusinessDaySchedule -Target 'T5' } | Should -Be 'at :25 (ru-storm, 8 minutes) past each UTC hour'
         InModuleScope DbHubDemo { Get-DemoT3IncidentShare } | Should -Be (10.0 / 60.0)
     }
 

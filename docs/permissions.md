@@ -193,3 +193,11 @@ Live result, 2026-10-21 (Key Vault opt-in off): no role assignments at or below 
 ## T4 administration (Phase 24)
 
 T4, the PostgreSQL flexible server, needs nothing beyond P1 and P6 ([ADR 0019](adr/0019-t4-postgresql-flexible-server.md)): the template makes the P6 group T4's Microsoft Entra administrator (`flexibleServers/administrators`, a resource Contributor can write), T1's managed identity signs in through the group to create the runner's role, and no Azure role assignment is made. Database Hub discovers and monitors T4 with Reader on the subscription, which Contributor covers. To see T4's queries or sessions yourself, sign in to `contosocare` as a member of the P6 group from a demo VM (T4 has no public endpoint).
+
+## T5 access (2026-11-18)
+
+T5, the Azure Cosmos DB account, needs nothing beyond P1 ([ADR 0027](adr/0027-t5-cosmos-db.md)): no group, no Owner, and no Azure role assignment.
+
+- **T1's data-plane role:** the template gives T1's managed identity **Cosmos DB Built-in Data Contributor** (`00000000-0000-0000-0000-000000000002`), scoped to the account. That's a `Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments` resource, the account's own role-based access control, which Contributor creates (`sqlRoleAssignments/write` is a Contributor action); it isn't an Azure role assignment, so ADR 0008's Contributor-only model holds ([grant data-plane access](https://learn.microsoft.com/azure/cosmos-db/nosql/how-to-grant-data-plane-access)). The runner reads and writes documents only in `contosocare`/`patient-events`.
+- **No keys:** local (key) authentication is off, so no account key works for data, and nothing stores one.
+- **You and your presenters:** Database Hub reads T5 from Azure Resource Graph and Azure Monitor, so Reader on the subscription (or the resource group) is enough to see it in Estate and Performance. Reading T5's documents yourself (the portal's Data Explorer) needs a data-plane role of your own, which the demo doesn't grant: the account has no public network access either, so it would be from a demo VM.

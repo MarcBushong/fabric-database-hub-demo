@@ -99,6 +99,18 @@ BeforeAll {
             @{ productName = 'Automation'; skuName = 'Basic'; meterName = 'Basic Runtime'; retailPrice = 0.002; unitOfMeasure = '1 Minute'; tierMinimumUnits = 500 }
             @{ productName = 'Automation'; skuName = 'Basic'; meterName = 'Basic Runtime'; retailPrice = 0.0; unitOfMeasure = '1 Minute'; tierMinimumUnits = 0 }
         )
+        # T5 (2026-11-18, ADR 0027): provisioned throughput per 100 RU/s an hour, storage, and the Free Tier meters at zero.
+        "serviceName eq 'Azure Cosmos DB'"                                                    = @(
+            @{ productName = 'Azure Cosmos DB'; skuName = 'RUs'; meterName = '100 RU/s'; retailPrice = 0.008; unitOfMeasure = '1/Hour' }
+            @{ productName = 'Azure Cosmos DB'; skuName = 'RUs'; meterName = 'Data Stored'; retailPrice = 0.25; unitOfMeasure = '1 GB/Month' }
+            @{ productName = 'Azure Cosmos DB'; skuName = 'mRUs'; meterName = '100 Multi-master RU/s'; retailPrice = 0.016; unitOfMeasure = '1/Hour' }
+            @{ productName = 'Azure Cosmos DB'; skuName = 'Free Tier'; meterName = '100 RU/s'; retailPrice = 0.0; unitOfMeasure = '1/Hour' }
+            @{ productName = 'Azure Cosmos DB'; skuName = 'Free Tier'; meterName = 'Data Stored'; retailPrice = 0.0; unitOfMeasure = '1 GB/Month' }
+        )
+        "productName eq 'Microsoft Defender for Azure Cosmos DB'"                             = @(
+            @{ productName = 'Microsoft Defender for Azure Cosmos DB'; skuName = 'Standard Trial'; meterName = 'Standard Trial 100 RU/s'; retailPrice = 0.0; unitOfMeasure = '1/Hour'; armRegionName = 'westus3' }
+            @{ productName = 'Microsoft Defender for Azure Cosmos DB'; skuName = 'Standard'; meterName = 'Standard 100 RU/s'; retailPrice = 0.0012; unitOfMeasure = '1/Hour'; armRegionName = 'westus3' }
+        )
     }
 
     # The shape 'az security pricing list' returns, trimmed to the fields the estimate reads.
@@ -117,8 +129,9 @@ BeforeAll {
         $config = @{}
         foreach ($key in $exampleConfig.Keys) { $config[$key] = $exampleConfig[$key] }
         $config['hybridBenefit'] = @{ windows = $false; sql = $false; entitlementAttested = $false }
-        # T4 (Phase 24) has its own tests below; the others keep their totals with T4 off.
+        # T4 (Phase 24) has its own tests below; the others keep their totals with T4 off. T5 (2026-11-18, ADR 0027) too.
         $config['t4Enabled'] = $false
+        $config['t5Enabled'] = $false
         foreach ($key in $Override.Keys) { $config[$key] = $Override[$key] }
         return $config
     }
@@ -423,6 +436,50 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.LightUseMonthly | Should -Be 41.43
         $estimate.MissingPrices | Should -BeNullOrEmpty
         $estimate.Components.Name | Should -Not -Match 'cache|data disk'
+    }
+
+    It 'prices T5 all month, because a Cosmos DB account has no stop: list price, the free tier at zero, and an unchecked free tier at list price (ADR 0027)' {
+        $base = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $listPrice = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T5FreeTier $false
+        $t5 = @($listPrice.Components | Where-Object Name -Match '^T5 ')
+        # 400 RU/s = 4 x 100 RU/s, 730 hours, at 0.008; 1 GB at 0.25; the private endpoint in public mode too (0.01 x 730); one DNS zone.
+        ($t5 | Where-Object Name -Match 'throughput').Cost | Should -Be 23.36
+        ($t5 | Where-Object Name -Match 'throughput').Basis | Should -Be 'idle'
+        ($t5 | Where-Object Name -Match 'storage').Cost | Should -Be 0.25
+        ($t5 | Where-Object Name -EQ 'T5 private endpoint').Cost | Should -Be 7.3
+        ($t5 | Where-Object Name -EQ 'T5 private DNS zone').Cost | Should -Be 0.5
+        $listPrice.T5FixedMonthly | Should -Be 31.41
+        $listPrice.HourlyRunning | Should -Be $base.HourlyRunning -Because 'nothing of T5 is a running cost'
+        $listPrice.IdleMonthly | Should -Be ([System.Math]::Round($base.IdleMonthly + 31.41, 2))
+        $monthly = $listPrice.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.message | Should -Match 'T5 \(Azure Cosmos DB\) has no stop, so it costs 31\.41 USD a month'
+        $monthly.message | Should -Match 'doesn''t have the free tier'
+
+        $free = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T5FreeTier $true
+        ($free.Components | Where-Object Name -Match '^T5 throughput').Cost | Should -Be 0
+        ($free.Components | Where-Object Name -Match '^T5 throughput').Meter | Should -Match 'Free Tier'
+        $free.T5FixedMonthly | Should -Be 7.8 -Because 'the private endpoint and its DNS zone still bill'
+        ($free.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'has the subscription''s free tier'
+
+        $unchecked = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        $unchecked.T5FixedMonthly | Should -Be 31.41
+        $unchecked.T5FreeTier | Should -BeNullOrEmpty
+        ($unchecked.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'wasn''t checked, so its throughput is at list price, an upper bound'
+        @($unchecked.MissingPrices) | Should -BeNullOrEmpty
+    }
+
+    It 'prices Defender for Azure Cosmos DB on T5''s provisioned throughput all month when its plan is on Standard, and attributes the plan (ADR 0027)' {
+        $plans = @($defenderPlans) + @([pscustomobject]@{ name = 'CosmosDbs'; pricingTier = 'Standard'; subPlan = $null })
+        $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ t5Enabled = $true }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -DefenderPlans $plans -T5FreeTier $true
+        $defender = $estimate.Components | Where-Object Name -Match 'Defender for Azure Cosmos DB'
+        $defender.Meter | Should -Match 'Standard 100 RU/s$' -Because 'the Standard meter, not the trial'
+        $defender.Cost | Should -Be 3.504 -Because '4 x 100 RU/s for 730 hours at 0.0012, free tier or not'
+        $defender.Basis | Should -Be 'idle'
+        $estimate.T5FixedMonthly | Should -Be 11.3
+        $message = ($estimate.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.DEFENDER').message
+        $message | Should -Match 'CosmosDbs'
+        $message | Should -Not -Match 'not attributed to the demo: [^.]*CosmosDbs'
+        @($estimate.Components | Where-Object { $_.Name -match 'CSPM' -and $_.Name -match 'T5' }) | Should -BeNullOrEmpty -Because 'Defender CSPM doesn''t bill Cosmos DB accounts'
     }
 
     It 'counts business-day''s T3 incidents, which the shipped share already prices at T3''s maximum, so both ceilings hold as before (2026-11-03)' {

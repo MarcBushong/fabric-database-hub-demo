@@ -757,6 +757,17 @@ function Invoke-DemoDeployment {
                     $results.Add((Test-DemoT4ReplicaEstate -Config $Config -WaitMinutes 5))
                     $results.Add((Test-DemoT4ReplicaMetricFlow -Config $Config -WaitMinutes ([System.Math]::Min($TelemetryWaitMinutes, 10))))
                 }
+                # T5 (2026-11-18, ADR 0027), which this stage covers too, as T1's T5 step does in the parallel path: the Cosmos
+                # DB account's checks, then T1's access through the runner's warmup. A T5 failure doesn't stop the stage; DONE
+                # needs HUB.ESTATE.T5 and METRICS.T5.
+                if (Test-DemoT5Enabled -Config $Config) {
+                    $t5Checks = @(Test-DemoT5 -Config $Config)
+                    & $addAll $t5Checks
+                    $t5Current = Get-DemoDeploymentState -Config $Config
+                    if (-not (& $hasStatus $t5Checks 'Fail') -and $t5Current.RunnerSha256 -and 'sqlvm01' -in $t5Current.RunnerSentTo) {
+                        $results.Add((Invoke-DemoT5WarmUp -Config $Config))
+                    }
+                }
                 & $recordStage 'T4'
                 if ((& $hasStatus $t4Checks 'Fail') -or ($null -ne $t4Enable -and $t4Enable.status -eq 'Fail')) {
                     & $stageResult 'T4' 'Fail' 'A T4 check or its setup failed; the rest of the deployment continues.' 'Read the T4 and WORKLOAD.T4.ENABLE results, fix the cause, then run deploy.ps1 -FromStage T4.'
@@ -772,7 +783,7 @@ function Invoke-DemoDeployment {
                 $current = Get-DemoDeploymentState -Config $Config
                 $profileName = $activity.Interim
                 $skip = if ($current.RunnerSha256) { '' } else { 'No workload runner was deployed (-SkipRunner).' }
-                $activityResults = @(foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' })) {
+                $activityResults = @(foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' })) {
                         Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo
                     })
                 & $addAll $activityResults
@@ -921,7 +932,7 @@ function Invoke-DemoDeployment {
     if ($validated -and -not $context.OpenStage -and -not (& $hasStatus $results.ToArray() 'Fail')) {
         $current = Get-DemoDeploymentState -Config $Config
         $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
-        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric
+        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric -SkipT5:(-not (Test-DemoT5Enabled -Config $Config))
         & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
         $doneChecked = $true
     }

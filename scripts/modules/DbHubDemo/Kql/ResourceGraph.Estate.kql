@@ -4,15 +4,17 @@
 // Resources API (https://learn.microsoft.com/rest/api/azureresourcegraph/resourcegraph/resources/resources)
 // with the subscription in the request body.
 // T1 appears through its SQL virtual machine resource, T2 through its Arc SQL Server instance, T3 as an
-// Azure SQL database, and T4 as an Azure Database for PostgreSQL flexible server (the Estate lists flexible
+// Azure SQL database, T4 as an Azure Database for PostgreSQL flexible server (the Estate lists flexible
 // servers, not their databases: https://learn.microsoft.com/fabric/database/hub/monitor-postgresql, checked
-// 2026-10-23); the VM, the Arc machine, and the logical server are listed too, for diagnosis.
+// 2026-10-23), and T5 as an Azure Cosmos DB account (the Estate lists the account, not its databases or containers:
+// https://learn.microsoft.com/fabric/database/hub/monitor-cosmos-db, checked 2026-11-18); the VM, the Arc machine, and
+// the logical server are listed too, for diagnosis.
 // Parameters, rendered by Test-DemoHubEstate: SubscriptionId (string), ResourceGroup (string).
 resources
 | where subscriptionId =~ {{SubscriptionId}}
 | where resourceGroup =~ {{ResourceGroup}}
-| where type in~ ('microsoft.compute/virtualmachines', 'microsoft.sqlvirtualmachine/sqlvirtualmachines', 'microsoft.hybridcompute/machines', 'microsoft.azurearcdata/sqlserverinstances', 'microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.dbforpostgresql/flexibleservers')
-| extend status = iff(type =~ 'microsoft.dbforpostgresql/flexibleservers', tostring(properties.state), tostring(properties.status)),
+| where type in~ ('microsoft.compute/virtualmachines', 'microsoft.sqlvirtualmachine/sqlvirtualmachines', 'microsoft.hybridcompute/machines', 'microsoft.azurearcdata/sqlserverinstances', 'microsoft.sql/servers', 'microsoft.sql/servers/databases', 'microsoft.dbforpostgresql/flexibleservers', 'microsoft.documentdb/databaseaccounts')
+| extend status = case(type =~ 'microsoft.dbforpostgresql/flexibleservers', tostring(properties.state), type =~ 'microsoft.documentdb/databaseaccounts', tostring(properties.provisioningState), tostring(properties.status)),
          createdUtc = tostring(properties.creationDate),
          edition = tostring(properties.edition),
          licenseType = tostring(properties.licenseType),

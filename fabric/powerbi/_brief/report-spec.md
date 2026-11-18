@@ -181,9 +181,9 @@ Five Direct Lake fact tables over the Delta tables and five calculated dimension
 | Telemetry Snapshots | Direct Lake | `dbo.telemetry_snapshots` | One value per run, analysis, target, resource, instance, database, metric, and bin |
 | Analysis Findings | Direct Lake | `dbo.analysis_findings` | One finding per run |
 | Incident Windows | Direct Lake | `dbo.incident_windows` | One incident window; also the incident picker |
-| Target | Calculated (`DATATABLE`) | TMDL | 11 rows: T1, T2, T3, T4, T4-replica, all, fabric, subscription, tenant, github, repo |
+| Target | Calculated (`DATATABLE`) | TMDL | 12 rows: T1, T2, T3, T4, T4-replica, T5, all, fabric, subscription, tenant, github, repo |
 | Status | Calculated (`DATATABLE`) | TMDL | 6 rows: the ADR 0012 statuses |
-| Analysis | Calculated (`DATATABLE`) | TMDL | 17 rows: every analysis key in snapshots and findings |
+| Analysis | Calculated (`DATATABLE`) | TMDL | 18 rows: every analysis key in snapshots and findings |
 | Signal | Calculated (`DATATABLE`), disconnected | TMDL | 11 rows: the explorer's signals |
 | Date | Calculated (`CALENDAR`) | TMDL | One row per UTC date, 2026-01-01 to 2030-12-31; marked as the date table |
 
@@ -212,12 +212,13 @@ DATATABLE (
         { "T3", "T3 · Azure SQL Database", "T3", "SQL target", "Azure SQL Database", 3 },
         { "T4", "T4 · Azure Database for PostgreSQL", "T4", "PostgreSQL target", "Azure Database for PostgreSQL flexible server", 4 },
         { "T4-replica", "T4 · read replica", "T4 replica", "PostgreSQL target", "Same-region read replica of T4, during a session", 5 },
-        { "all", "All targets", "All", "All targets", "Every SQL target", 6 },
-        { "fabric", "Fabric workspace", "Fabric", "Platform scope", "Fabric workspace and lakehouse", 7 },
-        { "subscription", "Azure subscription", "Subscription", "Platform scope", "Azure subscription and resource group", 8 },
-        { "tenant", "Fabric tenant", "Tenant", "Platform scope", "Tenant settings", 9 },
-        { "github", "GitHub", "GitHub", "Platform scope", "GitHub repository and Actions", 10 },
-        { "repo", "Repository", "Repo", "Platform scope", "Static checks", 11 }
+        { "T5", "T5 · Azure Cosmos DB", "T5", "Cosmos DB target", "Azure Cosmos DB for NoSQL account", 6 },
+        { "all", "All targets", "All", "All targets", "Every SQL target", 7 },
+        { "fabric", "Fabric workspace", "Fabric", "Platform scope", "Fabric workspace and lakehouse", 8 },
+        { "subscription", "Azure subscription", "Subscription", "Platform scope", "Azure subscription and resource group", 9 },
+        { "tenant", "Fabric tenant", "Tenant", "Platform scope", "Tenant settings", 10 },
+        { "github", "GitHub", "GitHub", "Platform scope", "GitHub repository and Actions", 11 },
+        { "repo", "Repository", "Repo", "Platform scope", "Static checks", 12 }
     }
 )
 
@@ -256,7 +257,8 @@ DATATABLE (
         { "consumption", "Consumption", "CPU and waits", "Per analysis window", 14 },
         { "correlation", "Scenario correlation", "Incidents", "Per scenario window", 15 },
         { "real_time_dashboard", "Real-Time Dashboard", "Readiness", "Per run", 16 },
-        { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 }
+        { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 },
+        { "cosmosdb", "Azure Cosmos DB (Azure Monitor)", "Cosmos DB", "Per bin", 18 }
     }
 )
 
@@ -335,7 +337,8 @@ Summary (format strings in backticks; "dynamic" means a dynamic format string):
 | Telemetry Snapshots, Estate | Targets Reporting `#,0`; Telemetry Lag at Capture (min) `#,0.0`; Target Tile Context (text); Target Attention Signals (text) |
 | Telemetry Snapshots, Freshness | Latest Capture UTC `yyyy-mm-dd hh:nn`; Hours Since Latest Capture `#,0.0`; History Freshness Status (text); History Freshness Label (text); Notebook Runs Captured `#,0` |
 | Telemetry Snapshots, Coverage | Coverage Tables (selected run) `#,0`; Coverage Last Sample Age (min) `#,0.0`; Coverage Attention (text) |
-| Analysis Findings | Findings `#,0`; Findings Needing Attention `#,0`; Blocking Incidents `#,0`; Estate Headline (text) |
+| Telemetry Snapshots, Cosmos DB | Peak Norm RU (%) `#,0.0" %"`; Cosmos DB Requests `#,0`; Throttled Requests (429s) `#,0`; 429 Rate (%) `#,0.0" %"`; RU Consumed `#,0`; Provisioned RU/s `#,0`; Cosmos DB Availability (%) `#,0.00" %"`; Cosmos DB Gateway Latency (ms) `#,0.0`; Cosmos DB Headline (text) |
+| Analysis Findings | Findings `#,0`; Findings Needing Attention `#,0`; Blocking Incidents `#,0`; Throttling Episodes `#,0`; Estate Headline (text) |
 | Validation Results | Checks (selected run) `#,0`; Checks Failed (selected run) `#,0`; Checks Needing a Manual Step (selected run) `#,0`; Checks With Warnings (selected run) `#,0`; Checks Passed (selected run) `#,0`; Checks Not Supported (selected run) `#,0`; Checks Not Selected (selected run) `#,0`; Checks Needing Attention (selected run) `#,0`; Checks Context (text); Readiness (%) `0%`; Readiness Headline (text); Validation Run Label (text); Worst Check Status Glyph (text); Run Start UTC `yyyy-mm-dd hh:nn` |
 | Scenario Runs | Scenario Requests `#,0` |
 | Incident Windows | Incidents `#,0`; Focus Signal Value (dynamic); Focus Window Band (dynamic); Focus Peak Point (dynamic); Focus Peak (dynamic); Focus Baseline (dynamic); Focus Threshold `#,0.#`; Focus Duration (min) `#,0`; Focus Window Start UTC and Focus Window End UTC `yyyy-mm-dd hh:nn`; Focus Verdict, Focus Peak Delta Label, Incident Headline, Incident Narrative, Incident Timeline Alt Text (text) |

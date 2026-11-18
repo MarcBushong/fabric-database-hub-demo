@@ -1192,6 +1192,25 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 4 -Exactly
     }
 
+    It 'sends T5''s metrics as COSMOS_METRICS only to a copy of the notebook that knows it, and otherwise says that Azure Monitor keeps them (2026-11-18)' {
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C -CosmosMetrics '{"version":1,"accounts":[]}' }
+        $saved.Result.status | Should -Be 'Pass'
+        $saved.CosmosDropped | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { $Parameter['COSMOS_METRICS'] -eq '{"version":1,"accounts":[]}' -and -not $Parameter.Contains('POSTGRES_METRICS') }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 1 -Exactly -ParameterFilter { $Name -eq 'NB_DatabaseHub_LiveActivity' -and $Parameter -eq 'COSMOS_METRICS' }
+
+        # A copy from before T5's history would ignore them: they aren't sent, and the run is a Warning that says so.
+        $script:notebookKnows = [pscustomobject]@{ Known = $true; Has = $false; Error = '' }
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C -CosmosMetrics '{"version":1}' }
+        $saved.Result.status | Should -Be 'Warning'
+        $saved.CosmosDropped | Should -BeTrue
+        $saved.PostgresDropped | Should -BeFalse -Because 'T5''s metrics stay in Azure Monitor, so nothing is kept in out/history-pending'
+        $saved.Result.message | Should -Match 'T5''s metrics weren''t sent: the workspace''s NB_DatabaseHub_LiveActivity is from before T5''s history \(2026-11-18\), so it would ignore them; Azure Monitor keeps them'
+        $saved.Result.evidence['cosmosMetrics'] | Should -Be 'withheld'
+        $saved.Result.remediation | Should -Match 'configure-fabric\.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity adds T5''s metrics from Azure Monitor'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { -not $Parameter.Contains('COSMOS_METRICS') }
+    }
+
     It 'runs NB_DatabaseHub_LiveActivity with only its safe switches, bounded at 15 minutes' {
         $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C }
         $saved.Result.checkId | Should -Be 'STOP.FABRIC.SAVEHISTORY'
@@ -1241,6 +1260,8 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $script:stopConfig['subscriptionId'] = $script:subA
             $script:stopConfig['tenantId'] = $script:tenant
             $script:stopConfig['t4Enabled'] = $false
+            # T5 (2026-11-18) has its own test below; the others keep their focus with T5 off.
+            $script:stopConfig['t5Enabled'] = $false
             $script:stopConfig['fabric']['manageCapacity'] = $true
             Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'ok' }
             Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; RunnerSha256 = ''; RunnerSentTo = @(); HostPasswordUtc = ''; Tags = @{ deploymentId = 'abc123' }; FabricCapacityResumed = 'rg-fabric/fabcap01'; FabricCapacityResumedUtc = '2026-10-27T14:00:00Z' } }
@@ -1322,6 +1343,22 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
             $script:order | Should -Contain 'Keep:{"version":1}'
             ($results | Where-Object { $_.checkId -eq 'STOP.T4.HISTORY.PENDING' }).status | Should -Be 'Warning'
+        }
+
+        It 'reads T5''s metrics for the history right before the run, and sends them as COSMOS_METRICS; nothing without -SaveHistory (2026-11-18)' {
+            $script:stopConfig['t5Enabled'] = $true
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123' }; Exists = $true; State = 'Succeeded'; FreeTier = $true; Account = $null; Error = '' } }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoT5StopResult -MockWith { New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Not supported' -Message 'An Azure Cosmos DB account has no stop.' }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoCosmosHistoryCapture -MockWith { $script:order.Add(('CosmosCapture:{0}:{1}:{2}' -f $CheckId, $DeploymentId, $WindowMinutes)); [pscustomobject]@{ Json = '{"version":1,"accounts":[{"target":"T5"}]}'; Result = (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'T5' -Status 'Pass' -Message 'captured') } }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -MockWith { $script:order.Add('SaveHistory:' + $CosmosMetrics); [pscustomobject]@{ Result = (New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'saved'); StillRunning = $false } }
+            $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -SaveHistoryWindowMinutes 240 -Confirm:$false
+            $capture = $script:order.IndexOf('CosmosCapture:STOP.T5.HISTORY:abc123:240')
+            $capture | Should -BeGreaterOrEqual 0
+            $capture | Should -BeLessThan $script:order.IndexOf('SaveHistory:{"version":1,"accounts":[{"target":"T5"}]}')
+            ($results | Where-Object { $_.checkId -eq 'STOP.T5.HISTORY' }).status | Should -Be 'Pass'
+            $script:order.Clear()
+            Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false | Out-Null
+            @($script:order | Where-Object { $_ -like 'CosmosCapture:*' }) | Should -BeNullOrEmpty
         }
     }
 }

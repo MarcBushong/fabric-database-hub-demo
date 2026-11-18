@@ -128,6 +128,7 @@
         'Test-DemoT3'
         'Test-DemoT3Readiness'
         'Test-DemoT4'
+        'Test-DemoT5'
         'Test-DemoTeardownResidue'
         'Wait-DemoBootstrapLoader'
         'Write-DemoDeploymentOutcome'

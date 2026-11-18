@@ -829,9 +829,10 @@ function Get-DemoDoneRequirement {
     <#
     .SYNOPSIS
     The checks DONE needs to pass (brief item 16; the same list stops ADR 0018's clock): Database Hub's own views of
-    every target. HUB.ESTATE.T1 to T4; TELEMETRY.T1, T2, and T3; METRICS.T4; T4's read replica in Estate and in Azure
+    every target. HUB.ESTATE.T1 to T5; TELEMETRY.T1, T2, and T3; METRICS.T4; T4's read replica in Estate and in Azure
     Monitor (HUB.ESTATE.T4.REPLICA and METRICS.T4.REPLICA, 2026-11-13, ADR 0025; Not supported meets them on a Burstable
-    T4); T2.ARC.SQLINSTANCE (Standard with PAYG or
+    T4); METRICS.T5 (2026-11-18, ADR 0027: T5's requests and normalized RU in Azure Monitor; T5's are left out when the
+    configuration turns T5 off, -SkipT5); T2.ARC.SQLINSTANCE (Standard with PAYG or
     Paid) and T2.ARC.MONITORING in JumpstartImage, PaygWizard, and ProductKey modes; T1.SQLVM.ASSOCIATEDSERVICES (T1's
     inventory); and FABRIC.ITEMS.REQUIRED (the workspace, the lakehouse, the notebooks, the Real-Time Dashboard, and the
     history model and report). T4's are always in (2026-11-09, user-directed: T4 isn't optional); Developer mode (opt-in)
@@ -844,11 +845,14 @@ function Get-DemoDoneRequirement {
         [ValidateSet('JumpstartImage', 'PaygWizard', 'ProductKey', 'Developer')]
         [string] $InstallMode = 'JumpstartImage',
 
-        [switch] $SkipFabric
+        [switch] $SkipFabric,
+
+        # T5 turned off in the configuration (t5Enabled false; ADR 0027): its estate and metrics aren't required.
+        [switch] $SkipT5
     )
 
     $ids = [System.Collections.Generic.List[string]]::new()
-    foreach ($target in 'T1', 'T2', 'T3', 'T4') {
+    foreach ($target in @('T1', 'T2', 'T3', 'T4') + @(if (-not $SkipT5) { 'T5' })) {
         $ids.Add(('HUB.ESTATE.{0}' -f $target))
     }
     $ids.Add('TELEMETRY.T1')
@@ -859,6 +863,10 @@ function Get-DemoDoneRequirement {
     $ids.Add('METRICS.T4')
     $ids.Add('HUB.ESTATE.T4.REPLICA')
     $ids.Add('METRICS.T4.REPLICA')
+    if (-not $SkipT5) {
+        # T5, the Cosmos DB account (2026-11-18, ADR 0027): Azure Monitor has its requests and normalized RU.
+        $ids.Add('METRICS.T5')
+    }
     if ($InstallMode -ne 'Developer') {
         $ids.Add('T2.ARC.SQLINSTANCE')
         $ids.Add('T2.ARC.MONITORING')
@@ -1330,6 +1338,13 @@ function Invoke-DemoDoneGate {
         $t4 = Get-DemoT4State -Config $Config
         $results.Add((Test-DemoT4MetricFlow -Config $Config -ServerId $t4.Names.ServerId -State $t4.State -WaitMinutes $TelemetryWaitMinutes))
     }
+    if ('METRICS.T5' -in $missing) {
+        # T5 (ADR 0027): its metrics come while T1's activity sends it requests.
+        Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Telemetry' -State 'Running' -Message 'Reading T5''s normalized RU, requests, and 429s in Azure Monitor.'
+        $t5Metrics = Test-DemoT5MetricFlow -Config $Config -AccountId ([string](Get-DemoT5Name -Config $Config).AccountId) -WaitMinutes $TelemetryWaitMinutes
+        $results.Add($t5Metrics)
+        Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Telemetry' -Status ([string]$t5Metrics.status) -Message ([string]$t5Metrics.message)
+    }
     if ('METRICS.T4.REPLICA' -in $missing -or 'HUB.ESTATE.T4.REPLICA' -in $missing) {
         # T4's read replica (ADR 0025) exists only during a session: a run that didn't create it (a resumed run's
         # validation, after stop-demo.ps1 deleted it) creates it now, as the T4 track does, then reads it.
@@ -1582,8 +1597,12 @@ function Get-DemoDeploymentOutcome {
     $leftover = Get-DemoGuidedStopLeftover -State $State
     $stopCommand = Get-DemoStopDemoCommand -Command $Command
     $leftoverNext = 'Run {0}: it removes Bastion and rotates the host password, and leaves the VMs running. Then run {1} again.' -f $stopCommand, $Command
-    # T4 is part of every deployment (2026-11-09): its track is always expected.
-    $expected = [ordered]@{ T1 = 'Telemetry'; T2 = 'Telemetry'; T4 = 'Telemetry' }
+    # T4 is part of every deployment (2026-11-09): its track is always expected. Each track's last step from its step list
+    # (T1's is T5Telemetry since 2026-11-18, ADR 0027).
+    $expected = [ordered]@{}
+    foreach ($track in 'T1', 'T2', 'T4') {
+        $expected[$track] = [string]@((Get-DemoTrackStep -Track $track).Keys)[-1]
+    }
     if (-not $SkipFabric) {
         $expected['Fabric'] = 'Fabric'
     }
@@ -1617,16 +1636,20 @@ function Get-DemoDeploymentOutcome {
         }
     }
     $outcome.Unfinished = $unfinished.ToArray()
-    $evidence = Test-DemoDoneEvidence -Result $core -Requirement (Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric)
+    $t5On = Test-DemoT5Enabled -Config $Config
+    $evidence = Test-DemoDoneEvidence -Result $core -Requirement (Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric -SkipT5:(-not $t5On))
     $outcome.Missing = @($evidence.Missing)
     if ($fails.Count -eq 0 -and $manual.Count -eq 0 -and $unfinished.Count -eq 0 -and $evidence.Complete -and -not $StopAfter -and -not $leftover) {
         $outcome.Kind = 'Done'
         $outcome.Done = $true
         $outcome.ExitCode = 0
         $outcome.NextCommand = ''
-        $targets = 'T1, T2, T3, and T4'
+        $targets = if ($t5On) { 'T1, T2, T3, T4, and T5' } else { 'T1, T2, T3, and T4' }
         $performance = if ($installMode -eq 'Developer') { 'performance telemetry from T1 and T3' } else { 'performance telemetry from T1, T2, and T3' }
         $metrics = if (@($core | Where-Object { [string]$_.checkId -eq 'METRICS.T4.REPLICA' -and [string]$_.status -eq 'Pass' }).Count -gt 0) { ' and T4''s Azure Monitor metrics, with its read replica''s Read replica lag' } else { ' and T4''s Azure Monitor metrics' }
+        if ($t5On) {
+            $metrics += ', and T5''s (Azure Cosmos DB: normalized RU, requests, and throttled 429s)'
+        }
         $t2 = if ($installMode -eq 'Developer') { '' } else { ' T2 runs SQL Server Standard with pay-as-you-go (or your license) and monitoring on.' }
         # The Insights app, part of every deployment, when this run's records show it deployed and working.
         $app = Get-DemoInsightsAppSummary -Result $all

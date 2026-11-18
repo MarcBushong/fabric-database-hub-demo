@@ -17,12 +17,13 @@ BeforeAll {
     # The Fabric content the scripts publish (2026-11-16), the same as New-TestState records, unless a test says otherwise.
     Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricContentSha256 -MockWith { 'f' * 64 }
 
-    function New-TestConfig([switch] $WithT4) {
+    function New-TestConfig([switch] $WithT4, [switch] $WithT5) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
-        # T4 (Phase 24) has its own tests; the others keep their focus with T4 off.
+        # T4 (Phase 24) has its own tests; the others keep their focus with T4 off. T5 (2026-11-18, ADR 0027) too.
         $config['t4Enabled'] = [bool]$WithT4
+        $config['t5Enabled'] = [bool]$WithT5
         return $config
     }
 
@@ -3141,6 +3142,22 @@ Describe 'Invoke-DemoControl' {
     It 'leaves out the scenario''s defaults and the end time for off' {
         Invoke-DemoControl -Config $config -Target T3 -Scenario off -Confirm:$false | Out-Null
         $script:calls[0].Arguments | Should -Be 'profile set --name off --requested-by demo-control'
+    }
+
+    It 'sends T5 its activity on sqlvm01 with all when T5 is on, an ru-storm on T5, and nothing to T5 when it''s off (2026-11-18, ADR 0027)' {
+        $withT5 = New-TestConfig -WithT5
+        $null = Invoke-DemoControl -Config $withT5 -Target all -Scenario baseline -DurationMinutes 30 -Confirm:$false
+        $script:calls.Target | Should -Be @('T1', 'T2', 'T3', 'T5')
+        $script:calls.Clear()
+        $results = Invoke-DemoControl -Config $withT5 -Target all -Scenario 'incident:ru-storm' -DurationMinutes 10 -Confirm:$false
+        $script:calls.Target | Should -Be @('T5') -Because 'an incident on all runs on its default target, and ru-storm''s is T5'
+        $script:calls[0].Arguments | Should -Match '^profile set --name incident:ru-storm --duration 10m '
+        ($results | Where-Object { $_.checkId -eq 'CONTROL.T5' }).status | Should -Be 'Pass'
+        $script:calls.Clear()
+        $results = Invoke-DemoControl -Config $config -Target T5 -Scenario baseline -Confirm:$false
+        $script:calls.Count | Should -Be 0
+        ($results | Where-Object { $_.checkId -eq 'CONTROL.T5' }).status | Should -Be 'Not selected'
+        ($results | Where-Object { $_.checkId -eq 'CONTROL.T5' }).message | Should -Match 't5Enabled is false'
     }
 
     It 'runs an incident on all on the scenario''s default target' {

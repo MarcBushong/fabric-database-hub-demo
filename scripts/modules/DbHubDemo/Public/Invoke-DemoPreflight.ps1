@@ -170,7 +170,7 @@ function Invoke-DemoPreflight {
         'Microsoft.GuestConfiguration', 'Microsoft.HybridConnectivity', 'Microsoft.Compute', 'Microsoft.Network',
         'Microsoft.Storage', 'Microsoft.Consumption', 'Microsoft.DevTestLab', 'Microsoft.Automation', 'Microsoft.KeyVault',
         'Microsoft.ManagedIdentity'
-    ) + @(if (Test-DemoT4Enabled -Config $Config) { 'Microsoft.DBforPostgreSQL' })
+    ) + @(if (Test-DemoT4Enabled -Config $Config) { 'Microsoft.DBforPostgreSQL' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'Microsoft.DocumentDB' })
     $providerStates = @{}
     foreach ($provider in @(Invoke-Az -Arguments @('provider', 'list') -Json)) {
         $providerStates[$provider.namespace] = $provider.registrationState
@@ -722,6 +722,8 @@ function Invoke-DemoPreflight {
     catch {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots could not be listed, so the cost estimate leaves them out: {0}' -f $_.Exception.Message)
     }
+    # T5's free tier (2026-11-18, ADR 0027): the account's own, or whether the subscription's one free-tier account is free.
+    $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
     # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where a safety stop
     # is fully in place (the nightly safety stop, ADR 0024: its schedule, its role, and a last run that didn't fail; or the
     # control's); otherwise the rest of the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART). On

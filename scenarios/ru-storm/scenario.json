@@ -1,0 +1,43 @@
+{
+  "$schema": "../scenario.schema.json",
+  "id": "ru-storm",
+  "title": "RU storm (request rate too large)",
+  "summary": "A bedside-monitor integration stuck in a retry loop floods one patient's partition: waves of writes to one hot logical partition from every writer, as fast as the pacing allows, use up the container's 400 RU/s, so normalized RU consumption reaches 100% and Cosmos DB answers 429 (request rate too large). Then a calm with no storm writes, so normalized RU falls back and the throttling stops. It repeats until the run ends, then deletes its storm documents. Azure Cosmos DB for NoSQL (T5) only.",
+  "orchestration": "workers",
+  "procedure": "demo.usp_scenario_ru_storm",
+  "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
+  "concurrency": { "default": 8, "min": 1, "max": 16, "description": "Writers in each storm wave." },
+  "intensity": { "default": 7, "min": 1, "max": 10, "description": "Pacing: at 10 writers never pause; at 1 each writer waits about 200 ms between writes." },
+  "targets": {
+    "applicable": ["T5"],
+    "default": ["T5"],
+    "notes": {
+      "T5": "The runner's Cosmos DB REST client upserts to contosocare/patient-events, whose 400 RU/s of manual throughput one hot logical partition can use up. Writes overwrite a fixed set of 100 documents per hot partition (storm-01-000 to storm-01-099 in p-storm-01), tagged kind ru-storm. Each writer sends 100 requests a second at most, and after a 429 waits the server's x-ms-retry-after-ms (10 ms to 2 seconds) before its next write. The name in procedure is only a label: T5 has no procedures."
+    }
+  },
+  "parameters": {
+    "stormSeconds": { "type": "integer", "default": 150, "minimum": 30, "maximum": 600, "description": "How long each storm wave writes." },
+    "calmSeconds": { "type": "integer", "default": 90, "minimum": 0, "maximum": 600, "description": "The calm after each wave, with no storm writes, so normalized RU falls back and the 429s stop; 0 makes one continuous storm." },
+    "documentKb": { "type": "integer", "default": 2, "minimum": 1, "maximum": 16, "description": "Each storm document's size in KB; its bulk is the payload property, which the container doesn't index. Larger documents cost more request units per write." },
+    "hotPartitions": { "type": "integer", "default": 1, "minimum": 1, "maximum": 4, "description": "Hot logical partitions, p-storm-01 to p-storm-0N; the writers take them in turn." }
+  },
+  "expectedHubSignals": [
+    { "signal": "T5: Normalized RU consumption (NormalizedRUConsumption) at 100% during each wave", "surface": "Performance", "note": "Database Hub's Cosmos DB view shows Azure Monitor metrics; split by PartitionKeyRangeId, the hot partition's range is the one at 100%." },
+    { "signal": "T5: Total requests (TotalRequests) split by status code shows 429s, the throttled requests, during each wave", "surface": "Azure Monitor" },
+    { "signal": "T5: Availability stays at 100%: 429s aren't availability errors", "surface": "Azure Monitor" },
+    { "signal": "T5: Between waves, normalized RU falls back to the baseline's level and the 429s stop", "surface": "Performance" }
+  ],
+  "expectedSymptoms": [
+    "Writes to one logical partition (patientId p-storm-01) use up the container's 400 RU/s; Cosmos DB answers 429 (request rate too large) with x-ms-retry-after-ms",
+    "Every client of the container is throttled during a wave, the baseline included: the throughput is shared",
+    "Availability stays at 100%: throttled requests aren't failures, and every writer waits the server's retry-after before its next write",
+    "Between waves, normalized RU falls back to the baseline's level and the 429s stop",
+    "When the run ends, it deletes its storm documents at 200 RU/s, so the container is back to the baseline's data"
+  ],
+  "queryLevelEvidence": [
+    "ContosoCare.Workload status --target T5 shows requests, RU, and 429s per second, and the 429s in the last minute",
+    "Azure Monitor: TotalRequests split by StatusCode (429), and NormalizedRUConsumption split by PartitionKeyRangeId",
+    "The account's Insights in the Azure portal: Throughput, and Requests by status code"
+  ],
+  "reset": "Every writer stops when the run ends or stops; the run then deletes its storm documents (tagged kind ru-storm: storm-<pp>-000 to storm-<pp>-099 in each hot partition, 400 at most), paced to 200 RU/s, and reset --target T5 deletes any left over, for example after T1 stopped mid-storm."
+}

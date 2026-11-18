@@ -327,7 +327,9 @@ function Get-DemoTrackStep {
     # -FromStage and -StopAfter onto the tracks (ADR 0018). T1's T3Setup belongs to stage T3 but runs first:
     # T3's telemetry starts about 10 minutes after its setup (live, 2026-10-22). T4 (Phase 24, ADR 0019) has a
     # track for the server's checks and its Azure Monitor metrics; its setup is T1's T4 step, because T1's
-    # runner does it through action Run Command, one at a time on sqlvm01. Internal.
+    # runner does it through action Run Command, one at a time on sqlvm01. T5 (2026-11-18, ADR 0027) is one of T1's steps:
+    # T5 (the account's checks and the runner's warmup through T1, in stage T4, which -FromStage T4 runs); its Azure
+    # Monitor metrics (METRICS.T5) are read in the run's validation, once T1's activity has given it requests. Internal.
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
     param(
@@ -337,7 +339,7 @@ function Get-DemoTrackStep {
     )
 
     switch ($Track) {
-        'T1' { return [ordered]@{ T3Setup = 'T3'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T3 = 'T3'; T4 = 'T4'; Activity = 'Activity'; Monitoring = 'Monitoring'; Telemetry = 'Validation' } }
+        'T1' { return [ordered]@{ T3Setup = 'T3'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T3 = 'T3'; T4 = 'T4'; T5 = 'T4'; Activity = 'Activity'; Monitoring = 'Monitoring'; Telemetry = 'Validation' } }
         'T2' { return [ordered]@{ Restore = 'Artifacts'; Artifacts = 'Artifacts'; Bootstraps = 'Bootstraps'; T2 = 'T2'; Telemetry = 'Validation' } }
         'T4' { return [ordered]@{ Server = 'T4'; Replica = 'T4'; Telemetry = 'Validation' } }
         default { return [ordered]@{ Fabric = 'Fabric' } }
@@ -813,9 +815,11 @@ function Invoke-DemoDeploymentTrack {
       parallel), Bootstraps (the loader; then T1's monitoring merge while the bootstrap runs; then T1 Ready),
       T3 (the T3Setup results, or the same work again when they didn't pass, then T3's workload and checks),
       T4 (Enable-DemoT4Workload: T1 sets T4 up through the P6 group; a T4 failure is reported but doesn't stop
-      T1's track), Activity (T1, T3, and T4: the activity profile's interim, baseline in place of a profile with
-      incidents, which deploy.ps1 switches at its end; 2026-11-03), Monitoring (the plugin confirmed), Telemetry (T1 and T3 in
-      Database Hub).
+      T1's track), T5 (2026-11-18, ADR 0027: Test-DemoT5, then the runner's warmup through T1, which proves T1's
+      data-plane access to the Cosmos DB account; a T5 failure doesn't stop T1's track either), Activity (T1, T3, T4,
+      and T5: the activity profile's interim, baseline in place of a profile with incidents, which deploy.ps1 switches at
+      its end; 2026-11-03), Monitoring (the plugin confirmed), Telemetry (T1 and T3 in Database Hub). T5's metrics
+      (METRICS.T5) are read in the run's validation, after the tracks.
     - T4 (Phase 24, ADR 0019): Server (Test-DemoT4: the server, its version and size, Entra-only, the network,
       the P6 administrator, the database, the enhanced metrics), Replica (2026-11-13, ADR 0025: T4's read replica, created
       once T1's T4 step has restarted T4, with its checks, its place in Database Hub's Estate, and its Read replica lag in
@@ -1397,10 +1401,32 @@ function Invoke-DemoDeploymentTrack {
                     }
                     $results.Add($enable)
                 }
+                'T1/T5' {
+                    # T5 (2026-11-18, ADR 0027): the Cosmos DB account's checks, then the runner's warmup through T1, which
+                    # proves T1's identity reads and writes it with the data-plane role the template assigned. A T5 failure
+                    # is reported, and keeps the run from DONE (HUB.ESTATE.T5, METRICS.T5), but doesn't stop T1's track, so
+                    # T1 to T4 still get their activity and checks.
+                    if (-not (Test-DemoT5Enabled -Config $Config)) {
+                        & $note 'T5.ACCOUNT' 'T5' 'Not selected' 'T5 is off in this configuration (t5Enabled is false).'
+                        break
+                    }
+                    $checks = @(Test-DemoT5 -Config $Config)
+                    & $addAll $checks
+                    if (& $hasStatus $checks 'Fail') {
+                        & $note 'WORKLOAD.T5.WARMUP' 'T5' 'Not selected' 'T5''s account checks failed (above), so T1''s access to it wasn''t tried.'
+                        break
+                    }
+                    $current = Get-DemoDeploymentState -Config $Config
+                    if (-not ($current.RunnerSha256 -and 'sqlvm01' -in $current.RunnerSentTo)) {
+                        & $note 'WORKLOAD.T5.WARMUP' 'T5' 'Not selected' 'No workload runner was deployed to T1 (-SkipRunner), so T1''s access to T5 wasn''t tried.'
+                        break
+                    }
+                    $results.Add((Invoke-DemoT5WarmUp -Config $Config -WaitMinutes ([int](& $option 'T5AccessWaitMinutes' 10))))
+                }
                 'T1/Activity' {
                     $current = Get-DemoDeploymentState -Config $Config
                     $skip = if ($current.RunnerSha256) { '' } else { 'No workload runner was deployed (-SkipRunner).' }
-                    foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' })) {
+                    foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' })) {
                         $results.Add((Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $activityProfile.Interim -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo))
                     }
                 }

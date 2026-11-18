@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
 The DbHub-Control runbook (ADR 0020, ADR 0026): started only by its webhook, it validates the request against the
-allow-lists, then runs a control session, runs, stops, or resets the demo's activity, or saves T4's metrics, and exits.
+allow-lists, then runs a control session, runs, stops, or resets the demo's activity, or saves T4's and T5's metrics,
+and exits.
 
 .DESCRIPTION
 Windows PowerShell 5.1 in Azure Automation. scripts/setup-activity-control.ps1 publishes this file with
@@ -19,15 +20,17 @@ at the control account (A2), and DbHub Demo Session Writer at the control vault'
   VMs' next auto-shutdown; creates the one-time auto-stop schedule (and, for a run that uses sqlvm01, the monitoring
   re-checks that start DbHub-Monitor) before anything starts; starts the VMs (and T4) when they're stopped; and sets
   each target's activity profile through an asynchronous managed Run Command on each VM as soon as it runs (T4's once
-  it's Ready, without holding back T1 to T3). The VM-side control waits for each target to accept connections, and
+  it's Ready, without holding back T1 to T3). T5 (2026-11-18, ADR 0027), the Azure Cosmos DB account, needs nothing
+  started: its activity goes out with sqlvm01's, and a showcase on it ends at its baseline, with no ru-storm still
+  running, before the run's end. The VM-side control waits for each target to accept connections, and
   releases or starts T2's guest when it's off, before it sets the profile. Once sqlvm01 runs, the job looks after T1's
   monitoring plugin and restarts its agent when the plugin doesn't run. It doesn't wait for the Run Commands, and each
   profile ends on its own at the run's end.
-- capture: saves T4's and its replica's Azure Monitor metrics for the session to the control vault's session metrics,
-  which the notebook reads for the history.
+- capture: saves T4's and its replica's Azure Monitor metrics, and T5's, for the session to the control vault's session
+  metrics, which the notebook reads for the history.
 - stop (Stop now; DbHub-Stop's auto-stop does the same): removes the auto-stop, saves a session's metrics first,
   deallocates both VMs, deletes T4's read replica (or stops it where the control can't delete it), and stops T4,
-  through Azure Resource Manager only.
+  through Azure Resource Manager only. T5 has no stop: its result says so, and that its throughput keeps billing.
 - reset: the runner's reset on the targets whose VM runs.
 
 The job output holds the log and one result line, 'DBHUB-CONTROL <json>'. The webhook URL never reaches the runbook.

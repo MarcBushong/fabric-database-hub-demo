@@ -2,18 +2,19 @@
   "$schema": "../scenario.schema.json",
   "id": "healthy-baseline",
   "title": "Healthy baseline",
-  "summary": "A steady Contoso Care OLTP mix: front-desk patient lookups, provider schedules, billing balances, check-ins, work-queue triage, supply updates, and audit events. Short, indexed statements with no blocking, used as the baseline activity profile and as the before picture for every incident.",
+  "summary": "A steady Contoso Care OLTP mix: front-desk patient lookups, provider schedules, billing balances, check-ins, work-queue triage, supply updates, and audit events. Short, indexed statements with no blocking, used as the baseline activity profile and as the before picture for every incident. On T5 (Cosmos DB), the same steady pace as point reads, upserts, and single-partition queries on patient documents.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_healthy_baseline",
   "duration": { "defaultSeconds": 1800, "maxSeconds": 14400 },
   "concurrency": { "default": 2, "min": 1, "max": 16, "description": "Sessions running the OLTP mix." },
   "intensity": { "default": 3, "min": 1, "max": 10, "description": "Pace: about 1 operation per second per session at 1, about 20 at 10." },
   "targets": {
-    "applicable": ["T1", "T2", "T3", "T4"],
-    "default": ["T1", "T2", "T3", "T4"],
+    "applicable": ["T1", "T2", "T3", "T4", "T5"],
+    "default": ["T1", "T2", "T3", "T4", "T5"],
     "notes": {
       "T3": "Keeps the serverless database awake while it runs; the T3 baseline in activity-profiles.json uses one session at intensity 2.",
-      "T4": "The PostgreSQL steps (database/postgresql/120-scenario-functions.sql): the same lookups, a work-item touch, and a tagged audit row; the T4 baseline uses one session at intensity 2."
+      "T4": "The PostgreSQL steps (database/postgresql/120-scenario-functions.sql): the same lookups, a work-item touch, and a tagged audit row; the T4 baseline uses one session at intensity 2.",
+      "T5": "The runner's Cosmos DB REST client, in contosocare/patient-events: 40% point reads, 40% upserts, and 20% single-partition queries over 500 patients (p-0001 to p-0500). Upserts overwrite each patient's profile document and 20 events (hb-ev-0 to hb-ev-19), so storage stays bounded without deletes; the T5 baseline uses one session at intensity 2, a few RU/s against the container's 400."
     }
   },
   "parameters": {},
@@ -22,7 +23,8 @@
     { "signal": "SqlServerCPUUtilization low and flat", "surface": "Performance" },
     { "signal": "SqlServerActiveSessions: a few ContosoCare.Demo/healthy-baseline sessions, none blocked", "surface": "Performance" },
     { "signal": "No Database Agent finding for the target", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." },
-    { "signal": "T4: CPU (cpu_percent) and Connections (active_connections) low and flat", "surface": "Performance", "note": "Database Hub's PostgreSQL dashboard (Azure Monitor metrics; Hub has no query-level data for PostgreSQL)." }
+    { "signal": "T4: CPU (cpu_percent) and Connections (active_connections) low and flat", "surface": "Performance", "note": "Database Hub's PostgreSQL dashboard (Azure Monitor metrics; Hub has no query-level data for PostgreSQL)." },
+    { "signal": "T5: Normalized RU consumption low and flat; Total requests steady, with no 429s", "surface": "Performance", "note": "Database Hub's Cosmos DB view shows Azure Monitor metrics: NormalizedRUConsumption, and TotalRequests split by StatusCode." }
   ],
   "expectedSymptoms": [
     "Short, indexed queries with no blocking and no lock waits",
@@ -31,7 +33,8 @@
   ],
   "queryLevelEvidence": [
     "Query Store: many short queries with low duration and logical reads",
-    "demo.scenario_runs and demo.scenario_run_events record the run, its sessions, and its counters"
+    "demo.scenario_runs and demo.scenario_run_events record the run, its sessions, and its counters",
+    "T5: ContosoCare.Workload status --target T5 shows the run and its requests, RU, and 429s per second"
   ],
-  "reset": "Status changes toggle within their seeded values, so business data stays as seeded; auto-cleanup and reset remove the workload's audit rows."
+  "reset": "Status changes toggle within their seeded values, so business data stays as seeded; auto-cleanup and reset remove the workload's audit rows. On T5, upserts overwrite a bounded set of documents, so there's nothing to remove."
 }

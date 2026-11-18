@@ -5,13 +5,15 @@ BeforeAll {
     Initialize-GuardTestContext
 
     # T4 is part of every deployment since 2026-11-09 (user-directed), so a configuration always has it; -WithT4 stays for
-    # the tests that say so. -WithoutT4 is a run whose template deployed without T4 (Azure refused every size).
-    function New-TestConfig([switch] $WithT4, [string] $InstallMode = 'PaygWizard', [switch] $WithoutT4) {
+    # the tests that say so. -WithoutT4 is a run whose template deployed without T4 (Azure refused every size). T5
+    # (2026-11-18, ADR 0027) has its own tests (DbHubDemo.T5.Tests.ps1); the others keep their focus with it off, unless -WithT5.
+    function New-TestConfig([switch] $WithT4, [string] $InstallMode = 'PaygWizard', [switch] $WithoutT4, [switch] $WithT5) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
         $config['t3AdminGroupObjectId'] = '77777777-7777-7777-7777-777777777777'
         $config['t4Enabled'] = -not $WithoutT4
+        $config['t5Enabled'] = [bool]$WithT5
         $config['t2SqlInstallMode'] = $InstallMode
         return $config
     }
@@ -175,9 +177,14 @@ Describe 'The first-run setup from deploy.ps1 (brief goal 1)' {
 Describe 'What DONE requires (brief item 16)' {
     It 'is Database Hub''s own views of every target, T2 at Standard with PAYG and monitoring, T1''s inventory, and the required Fabric items' {
         $ids = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' }
-        $ids | Should -Be @('HUB.ESTATE.T1', 'HUB.ESTATE.T2', 'HUB.ESTATE.T3', 'HUB.ESTATE.T4', 'TELEMETRY.T1', 'TELEMETRY.T2', 'TELEMETRY.T3', 'METRICS.T4', 'HUB.ESTATE.T4.REPLICA', 'METRICS.T4.REPLICA', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T1.SQLVM.ASSOCIATEDSERVICES', 'FABRIC.ITEMS.REQUIRED')
+        $ids | Should -Be @('HUB.ESTATE.T1', 'HUB.ESTATE.T2', 'HUB.ESTATE.T3', 'HUB.ESTATE.T4', 'HUB.ESTATE.T5', 'TELEMETRY.T1', 'TELEMETRY.T2', 'TELEMETRY.T3', 'METRICS.T4', 'HUB.ESTATE.T4.REPLICA', 'METRICS.T4.REPLICA', 'METRICS.T5', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T1.SQLVM.ASSOCIATEDSERVICES', 'FABRIC.ITEMS.REQUIRED')
         (InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'ProductKey' }) | Should -Contain 'T2.ARC.MONITORING'
         $ids | Should -Not -Contain 'DEPLOY.FABRIC.APP'
+        # T5 turned off (t5Enabled false; 2026-11-18, ADR 0027): its estate and metrics aren't needed.
+        $withoutT5 = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' -SkipT5 }
+        $withoutT5 | Should -Not -Contain 'HUB.ESTATE.T5'
+        $withoutT5 | Should -Not -Contain 'METRICS.T5'
+        $withoutT5 | Should -Contain 'METRICS.T4'
     }
 
     It 'always needs T4 (2026-11-09), and leaves T2''s performance, PAYG, and monitoring out in Developer mode' {
@@ -191,13 +198,16 @@ Describe 'What DONE requires (brief item 16)' {
     }
 
     It 'checks only what this run''s results don''t show passing, so a resumed run judges every target' {
-        $config = New-TestConfig -WithT4
+        $config = New-TestConfig -WithT4 -WithT5
         $script:calls = [System.Collections.Generic.List[string]]::new()
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoHubEstate -MockWith { $script:calls.Add('estate ' + ($Target -join ',')); foreach ($t in $Target) { New-TestResult ('HUB.ESTATE.{0}' -f $t) } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoHubTelemetry -MockWith { $script:calls.Add('telemetry ' + ($Target -join ',')); foreach ($t in $Target) { New-TestResult ('TELEMETRY.{0}' -f $t) } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { [pscustomobject]@{ State = 'Ready'; Names = [pscustomobject]@{ ServerId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123' } } }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoT4MetricFlow -MockWith { $script:calls.Add('metrics'); New-TestResult 'METRICS.T4' }
+        # T5's metrics (2026-11-18, ADR 0027), for the account the deploymentId names.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5Name -MockWith { [pscustomobject]@{ AccountId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.DocumentDB/databaseAccounts/cosmos01-abc123' } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5MetricFlow -MockWith { $script:calls.Add('t5 metrics ' + ($AccountId -replace '^.*/', '')); New-TestResult 'METRICS.T5' }
         # T4's read replica (ADR 0025): created when a run didn't create it, then read (its own tests are in DbHubDemo.T4Replica.Tests.ps1).
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDoneCheck -MockWith { $script:calls.Add('replica ' + (@($Missing | Where-Object { $_ -like '*.T4.REPLICA' }) -join ',')); New-TestResult 'HUB.ESTATE.T4.REPLICA'; New-TestResult 'METRICS.T4.REPLICA' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcCheck -MockWith { $script:calls.Add('arc ' + ($Check -join ',')); foreach ($c in $Check) { New-TestResult ('T2.ARC.{0}' -f $c.ToUpperInvariant()) } }
@@ -206,7 +216,7 @@ Describe 'What DONE requires (brief item 16)' {
         $seen = @((New-TestResult 'HUB.ESTATE.T1'), (New-TestResult 'HUB.ESTATE.T3'), (New-TestResult 'TELEMETRY.T1'), (New-TestResult 'TELEMETRY.T3'), (New-TestResult 'T2.ARC.SQLINSTANCE'), (New-TestResult 'TELEMETRY.T2' 'Warning'))
         $requirement = InModuleScope DbHubDemo { Get-DemoDoneRequirement -InstallMode 'PaygWizard' }
         $new = InModuleScope DbHubDemo -Parameters @{ Config = $config; Seen = $seen; Requirement = $requirement } { Invoke-DemoDoneGate -Config $Config -Result $Seen -Requirement $Requirement -TelemetryWaitMinutes 5 }
-        $script:calls | Should -Be @('estate T2,T4', 'metrics', 'replica HUB.ESTATE.T4.REPLICA,METRICS.T4.REPLICA', 'arc Monitoring', 'inventory', 'fabric', 'telemetry T2') -Because 'the telemetry comes last, so its recovery runs only when the rest passed (Phase 28 live finding)'
+        $script:calls | Should -Be @('estate T2,T4,T5', 'metrics', 't5 metrics cosmos01-abc123', 'replica HUB.ESTATE.T4.REPLICA,METRICS.T4.REPLICA', 'arc Monitoring', 'inventory', 'fabric', 'telemetry T2') -Because 'the telemetry comes last, so its recovery runs only when the rest passed (Phase 28 live finding)'
         (InModuleScope DbHubDemo -Parameters @{ All = @($seen + $new); Requirement = $requirement } { Test-DemoDoneEvidence -Result $All -Requirement $Requirement }).Complete | Should -BeTrue
     }
 

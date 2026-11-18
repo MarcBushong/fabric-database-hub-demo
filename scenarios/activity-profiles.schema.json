@@ -26,7 +26,8 @@
             "T1": { "$ref": "#/$defs/load" },
             "T2": { "$ref": "#/$defs/load" },
             "T3": { "$ref": "#/$defs/load" },
-            "T4": { "$ref": "#/$defs/load" }
+            "T4": { "$ref": "#/$defs/load" },
+            "T5": { "$ref": "#/$defs/load" }
           }
         }
       }
@@ -75,7 +76,7 @@
               { "if": { "required": ["replica"] }, "then": { "properties": { "target": { "const": "T4" } } } }
             ],
             "properties": {
-              "target": { "enum": ["T1", "T2", "T3", "T4"] },
+              "target": { "enum": ["T1", "T2", "T3", "T4", "T5"] },
               "scenario": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$" },
               "startMinute": { "type": "integer", "minimum": 0, "maximum": 1439 },
               "durationMinutes": { "type": "integer", "minimum": 1, "maximum": 240 },

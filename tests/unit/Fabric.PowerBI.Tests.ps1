@@ -69,7 +69,7 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
         $model | Should -Match 'culture: en-US'
         $model | Should -Match 'discourageImplicitMeasures'
         $tableFiles.Count | Should -Be 10
-        @($script:measures).Count | Should -Be 103
+        @($script:measures).Count | Should -Be 114
         ([regex]::Matches((Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/relationships.tmdl') -Raw), '(?m)^relationship ')).Count | Should -Be 16
     }
 
@@ -92,6 +92,45 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
 
     It 'gives every measure a /// description' {
         @($script:measures | Where-Object { -not $_.Description } | ForEach-Object { '{0}[{1}]' -f $_.Table, $_.Name }) | Should -BeNullOrEmpty
+    }
+
+    It 'names T5 in the Target and Analysis dimensions, and reads its Cosmos DB measures from the rows NB_DatabaseHub_LiveActivity writes (ADR 0027)' {
+        $tables = Join-Path -Path $modelRoot -ChildPath 'definition/tables'
+        $target = [System.IO.File]::ReadAllText((Join-Path -Path $tables -ChildPath 'Target.tmdl'))
+        $target | Should -Match '\{ "T5", "T5 . Azure Cosmos DB", "T5", "Cosmos DB target", "Azure Cosmos DB for NoSQL account", 6 \},'
+        $target | Should -Match '\{ "repo", "Repository", "Repo", "Platform scope", "Static checks", 12 \}'
+        [System.IO.File]::ReadAllText((Join-Path -Path $tables -ChildPath 'Analysis.tmdl')) | Should -Match '\{ "cosmosdb", "Azure Cosmos DB \(Azure Monitor\)", "Cosmos DB", "Per bin", 18 \}'
+        # The notebook's own names for T5's rows: analysis, target, and the metrics it writes.
+        $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        $code = (@($notebook['cells'] | Where-Object { $_['cell_type'] -eq 'code' } | ForEach-Object { @($_['source']) -join '' })) -join "`n"
+        $code | Should -Match '(?m)^COSMOS_ANALYSIS = "cosmosdb"$'
+        $code | Should -Match '(?m)^COSMOS_TARGET = "T5"$'
+        $written = @([regex]::Matches([regex]::Match($code, '(?s)COSMOS_METRIC_UNITS = \{(.*?)\n\}').Groups[1].Value, '"(\w+)":') | ForEach-Object { $_.Groups[1].Value })
+        $written | Should -Be @('NormalizedRUConsumption', 'TotalRequestUnits', 'TotalRequests', 'ThrottledRequests', 'ServerSideLatencyGateway', 'ProvisionedThroughput', 'ServiceAvailability')
+        $snapshots = [System.IO.File]::ReadAllText((Join-Path -Path $tables -ChildPath 'Telemetry Snapshots.tmdl'))
+        $expected = [ordered]@{
+            'Peak Norm RU (%)'               = 'NormalizedRUConsumption'
+            'Cosmos DB Requests'             = 'TotalRequests'
+            'Throttled Requests (429s)'      = 'ThrottledRequests'
+            'RU Consumed'                    = 'TotalRequestUnits'
+            'Provisioned RU/s'               = 'ProvisionedThroughput'
+            'Cosmos DB Availability (%)'     = 'ServiceAvailability'
+            'Cosmos DB Gateway Latency (ms)' = 'ServerSideLatencyGateway'
+        }
+        foreach ($name in $expected.Keys) {
+            $block = [regex]::Match($snapshots, ("(?ms)^ {{4}}measure '{0}' =.*?(?=^ {{4}}\S|\z)" -f [regex]::Escape($name))).Value
+            $block | Should -Match ([regex]::Escape('''Telemetry Snapshots''[Analysis Key] = "cosmosdb"')) -Because $name
+            $block | Should -Match ([regex]::Escape(('''Telemetry Snapshots''[Metric] = "{0}"' -f $expected[$name]))) -Because $name
+            $block | Should -Match '(?m)^ {8}displayFolder: Cosmos DB$' -Because $name
+            $written | Should -Contain $expected[$name] -Because $name
+        }
+        foreach ($name in '429 Rate (%)', 'Has Cosmos DB Bins', 'Cosmos DB Headline') {
+            [regex]::Match($snapshots, ("(?ms)^ {{4}}measure '{0}' =.*?(?=^ {{4}}\S|\z)" -f [regex]::Escape($name))).Value | Should -Match '(?m)^ {8}displayFolder: Cosmos DB$' -Because $name
+        }
+        $episodes = [regex]::Match([System.IO.File]::ReadAllText((Join-Path -Path $tables -ChildPath 'Analysis Findings.tmdl')), "(?ms)^ {4}measure 'Throttling Episodes' =.*?(?=^ {4}\S|\z)").Value
+        $episodes | Should -Match ([regex]::Escape('''Analysis Findings''[Analysis Key] = "cosmosdb"'))
+        $episodes | Should -Match ([regex]::Escape('CONTAINSSTRING ( ''Analysis Findings''[Finding ID], ".throttle." )'))
+        $code | Should -Match ([regex]::Escape('"key": "throttle.%s" % episode["start"].strftime("%Y%m%dT%H%M")'))
     }
 
     It 'names no DAX variable after a table or a reserved word' {

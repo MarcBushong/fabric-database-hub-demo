@@ -164,11 +164,18 @@ param t4AvailabilityZone string = ''
 @description('Current storage types of existing disks that drifted from the profile, keyed by disk name; the VMs keep them (Phase 24).')
 param diskSkuOverrides object = {}
 
+@description('Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Entra-only, a private endpoint in snet-pe in both network modes, and one container at 400 RU/s (ADR 0027).')
+param t5Enabled bool = true
+
+@description('T5 uses the subscription\'s one free-tier account, which Azure sets only at creation; deploy.ps1 decides, and passes an existing account\'s own value (ADR 0027).')
+param t5FreeTier bool = false
+
 // Single sources: profile sizing and disk tiers (config/profiles.json) and images (config/versions.json).
 var catalogProfile = loadJsonContent('../../config/profiles.json', '$.profiles')[profile]
 var diskTiers = loadJsonContent('../../config/profiles.json', '$.diskTiers')
 var vmImages = loadJsonContent('../../config/versions.json', '$.vmImages')
 var postgres = loadJsonContent('../../config/versions.json', '$.postgresql')
+var cosmos = loadJsonContent('../../config/versions.json', '$.cosmosdb')
 
 // Data disk tiers (ADR 0016). Keep in step with Resolve-DemoDataDiskTier in the DbHubDemo module, which the
 // cost estimate and preflight use. An explicit dataDiskSku wins (P10 is only ever an explicit opt-in, and
@@ -197,6 +204,11 @@ var t4ServerFqdn = '${t4ServerName}.postgres.database.azure.com'
 // ("not supported in the Burstable tier"), so T1 gets no name then.
 var t4ReplicaServerName = '${postgres.replica.serverNamePrefix}-${deploymentId}'
 var t4ReplicaServerFqdn = startsWith(t4SkuName, 'Standard_B') ? '' : '${t4ReplicaServerName}.postgres.database.azure.com'
+
+// T5's names are computed too (ADR 0027), so T1's settings never wait for the Cosmos DB account. Inside the VNet its
+// documents host resolves to the private endpoint through the linked privatelink zone.
+var t5AccountName = '${cosmos.accountNamePrefix}-${deploymentId}'
+var t5AccountHost = '${t5AccountName}.documents.azure.com'
 
 // The workload runner (ADR 0010, Phase 13): a new runner SHA-256 changes the settings, which re-runs the loader,
 // and the WorkloadRunner steps install it. The auto-shutdown schedule bounds the activity profiles (--not-after).
@@ -339,9 +351,10 @@ module bootstrap 'bootstrap.bicep' = if (!empty(bootstrapBundleSha256)) {
   }
 }
 
-// The loaders' settings; nothing here is secret. T1 drives T3 and T4 with its managed identity, so it gets their
+// The loaders' settings; nothing here is secret. T1 drives T3, T4, and T5 with its managed identity, so it gets their
 // names (stable across stop-demo.ps1 -RemoveT3 and across T4 stops). T4's runner role is the PostgreSQL role
 // mapped to T1's identity that Enable-DemoT4Workload creates (ADR 0019); T4's read replica has the same roles (ADR 0025).
+// T5's data-plane role assignment is in this template (cosmos01-access.bicep; ADR 0027), so T5 needs no setup step.
 var sqlVmLoaderSettings = union(commonSettings, {
   role: 'SqlVm'
   dataDiskTier: t1DataDiskTier
@@ -358,6 +371,13 @@ var sqlVmLoaderSettings = union(commonSettings, {
     runnerRole: postgres.runnerRole
     replicaServerName: t4ReplicaServerName
     replicaServerFqdn: t4ReplicaServerFqdn
+  }
+} : {}, t5Enabled ? {
+  t5: {
+    accountName: t5AccountName
+    accountHost: t5AccountHost
+    databaseName: cosmos.databaseName
+    containerName: cosmos.containerName
   }
 } : {})
 var hostLoaderSettings = union(commonSettings, {
@@ -425,6 +445,39 @@ module pgflex01 'pgflex01.bicep' = if (t4Enabled) {
   }
 }
 
+// T5 (ADR 0027): stable names, Entra-only, and a private endpoint in snet-pe in both network modes (public network access
+// off), with the privatelink.documents.azure.com zone linked to the network. Database Hub finds it through Azure Resource
+// Graph and charts its Azure Monitor metrics, with no setup.
+module cosmos01 'cosmos01.bicep' = if (t5Enabled) {
+  name: 'cosmos01'
+  params: {
+    location: location
+    tags: tags
+    accountName: t5AccountName
+    databaseName: cosmos.databaseName
+    containerName: cosmos.containerName
+    partitionKeyPath: cosmos.partitionKeyPath
+    throughput: cosmos.throughputRUs
+    enableFreeTier: t5FreeTier
+    privateEndpointSubnetId: network.outputs.subnetIds[2]
+    virtualNetworkId: network.outputs.virtualNetworkId
+    privateEndpointName: 'pe-${prefix}-${environment}-cosmos01'
+    privateDnsZoneName: cosmos.privateDnsZoneName
+    privateEndpointGroupId: cosmos.privateEndpointGroupId
+  }
+}
+
+// T1's identity gets the data-plane role once both T1 and the account exist; a module of its own, so the account doesn't
+// wait for T1's module.
+module cosmos01Access 'cosmos01-access.bicep' = if (t5Enabled) {
+  name: 'cosmos01-access'
+  params: {
+    accountName: cosmos01!.outputs.accountName
+    principalId: sqlvm01.outputs.principalId
+    roleDefinitionId: cosmos.dataContributorRoleDefinitionId
+  }
+}
+
 resource lock 'Microsoft.Authorization/locks@2020-05-01' = if (enableLocks) {
   name: 'lock-${prefix}-${environment}'
   properties: {
@@ -483,6 +536,15 @@ output t4ServerId string = t4Enabled ? pgflex01!.outputs.serverId : ''
 
 @description('Name of the T4 database, or empty when T4 is off.')
 output t4DatabaseName string = t4Enabled ? pgflex01!.outputs.databaseName : ''
+
+@description('Name of the T5 account (cosmos01-<deploymentId>), or empty when T5 is off.')
+output t5AccountName string = t5Enabled ? cosmos01!.outputs.accountName : ''
+
+@description('The T5 account\'s document endpoint, or empty when T5 is off.')
+output t5DocumentEndpoint string = t5Enabled ? cosmos01!.outputs.documentEndpoint : ''
+
+@description('Resource ID of the T5 account, or empty when T5 is off.')
+output t5AccountId string = t5Enabled ? cosmos01!.outputs.accountId : ''
 
 @description('The bootstrap loaders\' settings (nothing secret), for the loaders deploy.ps1 runs itself (ADR 0018); deploy.ps1 fills in the workload runner fields.')
 output loaderSettings object = {

@@ -39,6 +39,8 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Mock Export-DemoResult { }
         # The module's own read of the safety stop, which the script reaches only through the module's scope.
         Mock -ModuleName DbHubDemo Get-DemoT4RestartCoverage { [pscustomobject]@{ Counts = $true; Reason = 'the nightly safety stop is in place'; Missing = ''; Fix = '' } }
+        # T5's free tier (2026-11-18, ADR 0027), read the same way.
+        Mock -ModuleName DbHubDemo Get-DemoT5FreeTierStatus { $true }
         Mock Get-DemoCostEstimate {
             [pscustomobject]@{
                 Results = @(); Components = @(); HourlyRunning = 1.0; BastionHourly = 0.2; SessionCost = 5.0; IdleMonthly = 30.0; LightUseMonthly = 40.0
@@ -55,6 +57,8 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $null -ne $T4RestartCoverage -and $T4RestartCoverage.Counts -and $PesterBoundParameters.ContainsKey('DefenderPlans') }
         Should -Invoke Write-DemoLog -Times 0 -Exactly -ParameterFilter { $Level -eq 'Warning' } -Because 'everything was read'
         Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like 'T4''s automatic restart: about a day each, the nightly safety stop is in place*' }
+        # T5's free tier prices its throughput at zero (ADR 0027).
+        Should -Invoke Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5FreeTier -eq $true }
     }
 
     It 'says exactly what it couldn''t read, and still reads the rest' {
@@ -82,5 +86,6 @@ Describe 'estimate-cost.ps1 signed in: what it reads, and what it says it left o
         Should -Invoke Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'The Azure CLI isn''t signed in to the configured subscription, so the estimate excludes Defender for Cloud and the T2 golden snapshots, prices T3 as regular serverless, and counts T4''s 7-day restart for the rest of the month.*' }
         Should -Invoke Get-DemoDefenderPlan -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4RestartCoverage -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT5FreeTierStatus -Times 0 -Exactly
     }
 }
