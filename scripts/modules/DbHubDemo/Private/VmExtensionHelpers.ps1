@@ -39,8 +39,8 @@ function Get-DemoVmExtensionActivity {
     provisioning state is Creating, Updating, or Deleting, or whose instance-view status is transitioning, and a running VM
     whose agent isn't Ready (its start, R871). The Run Command handler isn't counted. Also lists the Run Commands Azure is
     still deleting, which don't make it busy, and every chunk Run Command (Chunks). Returns Readable, Busy, Items (each
-    extension with its state), Labels (for the status page), RunCommandsDeleting, Chunks, and View (the instance view, for
-    diagnostics). Internal.
+    extension with its state), Labels (for the status page), RunCommandsDeleting, Chunks, NoPower (it shows no power state
+    and its agent isn't Ready, #63), and View (the instance view, for diagnostics). Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -67,6 +67,7 @@ function Get-DemoVmExtensionActivity {
         }
     }
     $view = Invoke-DemoAz -SubscriptionId $subscriptionId -ArgumentList @('vm', 'get-instance-view', '--resource-group', $resourceGroupName, '--name', $VmName, '--output', 'json') -AsJson -AllowFailure
+    $noPowerDown = $false
     if ($null -ne $view) {
         # Get-DemoMemberList returns its list as one object: it's assigned before it's enumerated.
         $resources = Get-DemoMemberList -InputObject $view -Name 'resources'
@@ -89,15 +90,19 @@ function Get-DemoVmExtensionActivity {
         # A running VM whose agent isn't Ready gets no Run Command yet (R871, live 2026-11-17): chunks sent to the T2 host then
         # stayed in Creating, and a later deallocate canceled their deletes instead of completing them, so the host never
         # started again. A healthy start has the agent Ready within about 2 minutes; a host whose start never got its goal
-        # state gets the watchdog, which deletes its chunks and deallocates and starts it.
+        # state gets the watchdog, which deletes its chunks and deallocates and starts it. So does a VM that shows no power
+        # state at all, while Azure's operation on it runs (#63, live 2026-11-18: the T2 host stayed "updating", with no power
+        # state and its agent Not Ready, for hours, and the run sent it chunks that stayed in Creating).
         $vmStatuses = Get-DemoMemberList -InputObject $instanceView -Name 'statuses'
         $vmCodes = @(foreach ($status in $vmStatuses) { [string](Get-DemoMemberValue -InputObject $status -Name 'code') })
-        if ('PowerState/running' -in $vmCodes) {
+        $noPower = @($vmCodes | Where-Object { $_ -like 'ProvisioningState/*' }).Count -gt 0 -and @($vmCodes | Where-Object { $_ -like 'PowerState/*' }).Count -eq 0
+        if ('PowerState/running' -in $vmCodes -or $noPower) {
             $agentStatuses = Get-DemoMemberList -InputObject (Get-DemoMemberValue -InputObject $instanceView -Name 'vmAgent') -Name 'statuses'
             $agent = [string](Get-DemoMemberValue -InputObject (@($agentStatuses) | Select-Object -First 1) -Name 'displayStatus')
             if ($agent -ne 'Ready') {
                 $items.Add(('VM agent ({0})' -f $(if ($agent) { $agent } else { 'no status' })))
-                $labels.Add('the VM''s start (its agent isn''t Ready yet)')
+                $labels.Add($(if ($noPower) { 'the VM''s start or update (no power state, and its agent isn''t Ready)' } else { 'the VM''s start (its agent isn''t Ready yet)' }))
+                $noPowerDown = $noPower
             }
         }
     }
@@ -124,6 +129,7 @@ function Get-DemoVmExtensionActivity {
         Labels              = $labels.ToArray()
         RunCommandsDeleting = $deleting
         Chunks              = $chunks
+        NoPower             = $noPowerDown
         View                = $view
     }
 }
@@ -158,15 +164,25 @@ function Wait-DemoVmExtensionSettled {
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $nextLog = [System.DateTime]::MinValue
     $waited = $false
+    # #63: since when every read has shown no power state with the agent not Ready, for the watchdog's agent-down rule.
+    $noPowerSince = $null
     while ($true) {
         $activity = Get-DemoVmExtensionActivity -Config $Config -VmName $VmName
         $minutes = [int][System.Math]::Floor($watch.Elapsed.TotalMinutes)
+        if ([bool](Get-DemoMemberValue -InputObject $activity -Name 'NoPower')) {
+            if ($null -eq $noPowerSince) {
+                $noPowerSince = $watch.Elapsed
+            }
+        }
+        elseif ([bool](Get-DemoMemberValue -InputObject $activity -Name 'Readable')) {
+            $noPowerSince = $null
+        }
         if (-not $activity.Busy) {
             if ($waited) {
                 Write-DemoLog -Message ('{0}: Azure finished its extension work after {1} minute(s).' -f $VmName, $minutes)
                 Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -Message ('Azure finished its extension work on {0}; continuing.' -f $VmName)
             }
-            return [pscustomobject]@{ Settled = $true; Minutes = $minutes; Activity = $activity }
+            return [pscustomobject]@{ Settled = $true; Minutes = $minutes; Activity = $activity; NoPowerMinutes = 0 }
         }
         $waited = $true
         $text = 'Azure is finishing {0} on {1}; no action needed ({2} min so far).' -f ($activity.Labels -join ', '), $VmName, $minutes
@@ -178,7 +194,8 @@ function Wait-DemoVmExtensionSettled {
             $nextLog = [System.DateTime]::UtcNow.AddMinutes(2)
         }
         if ($watch.Elapsed.TotalMinutes -ge $TimeoutMinutes) {
-            return [pscustomobject]@{ Settled = $false; Minutes = $minutes; Activity = $activity }
+            $noPowerMinutes = if ($null -ne $noPowerSince) { [int][System.Math]::Floor(($watch.Elapsed - $noPowerSince).TotalMinutes) } else { 0 }
+            return [pscustomobject]@{ Settled = $false; Minutes = $minutes; Activity = $activity; NoPowerMinutes = $noPowerMinutes }
         }
         Start-Sleep -Seconds $PollSeconds
     }
@@ -223,6 +240,10 @@ function Save-DemoVmInstanceView {
     }
 }
 
+# #63: deploy.ps1's longest wait for T2's guest build (-T2WaitMinutes, 180). A bootstrap generation the state records for
+# longer has finished unseen or died, so it no longer keeps the watchdog from the T2 host (Get-DemoHostRestartBlocker).
+$script:T2BuildRecordMaxMinutes = 180
+
 function Get-DemoHostRestartBlocker {
     <#
     .SYNOPSIS
@@ -237,7 +258,9 @@ function Get-DemoHostRestartBlocker {
     Bootstraps (a state written before T2BuildUtc existed), or, for a sequential run's state (no track recorded), while
     the recorded stage is between Bootstraps and T2. So a new host before its loader, a golden copy after its Release
     (until its loader starts a new generation), and a host whose T2 step finished may be restarted; a state that can't be
-    read may not.
+    read may not. A generation older than T2's longest build ($script:T2BuildRecordMaxMinutes) finished unseen or died,
+    so it doesn't block (#63, live 2026-11-18: an older run cut short left it, the host's agent died, and no later run
+    could see the build finish, so none recovered the host).
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -265,7 +288,13 @@ function Get-DemoHostRestartBlocker {
     }
     $building = [string](Get-DemoMemberValue -InputObject $state -Name 'T2BuildUtc')
     if ($building) {
-        return ('its loader started a bootstrap generation at {0} that hasn''t been seen to finish, so its guest build may be running' -f $building)
+        $since = ConvertTo-DemoRunCommandUtc -Value $building
+        if ($null -eq $since -or ([System.DateTime]::UtcNow - $since).TotalMinutes -lt $script:T2BuildRecordMaxMinutes) {
+            return ('its loader started a bootstrap generation at {0} that hasn''t been seen to finish, so its guest build may be running' -f $building)
+        }
+        # #63: older than T2's longest build, so it isn't running any more. Its record is newer than a Bootstraps track
+        # the same run left, so that doesn't block either.
+        return ''
     }
     $track = [string](Get-DemoMemberValue -InputObject $state -Name 'TrackT2')
     if ($track -eq 'Bootstraps') {
@@ -296,6 +325,10 @@ function Restart-DemoVmOnce {
     a chunk whose delete Azure had ended with an error stayed on the VM, marked for deletion, and no start or restart got
     the VM's goal state with it (13 of 13); a delete still pending when the VM deallocated completed with it, and the next
     start had the agent Ready in 2 minutes. Then Action says 'deallocated and started' and AgentDown says why.
+
+    #63 (live, 2026-11-18): so does a T2 host that shows no power state, with its agent not Ready, once it has stayed down
+    for -AgentDownMinutes in all (Wait-DemoVmAgentDown), never on one read. One that comes Ready, or that Azure or someone
+    stops, meanwhile gets nothing, unless it lists chunks.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -317,6 +350,15 @@ function Restart-DemoVmOnce {
 
         [ValidateRange(1, 60)]
         [int] $RecoverMinutes = 20,
+
+        # #63: how long a T2 host that shows no power state, with its agent not Ready, must stay down to count as down: the
+        # 20 minutes a running VM's agent gets before the watchdog (Invoke-DemoVmSettle -FirstMinutes). -NoPowerMinutes is
+        # how long the caller already saw it so, read by read (the settle's wait); the rest is read here, at least once.
+        [ValidateRange(0, 60)]
+        [int] $AgentDownMinutes = 20,
+
+        [ValidateRange(0, 1440)]
+        [int] $NoPowerMinutes = 0,
 
         [ValidateRange(1, 120)]
         [int] $PollSeconds = 15
@@ -343,6 +385,24 @@ function Restart-DemoVmOnce {
     if ($VmName -eq (Get-DemoHostVmName -Config $Config)) {
         $state = Get-DemoVmRestartState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
         $agentDown = $state.Read -and $state.Power -eq 'PowerState/running' -and $state.Agent -ne 'Ready'
+        $held = $null
+        if (-not $agentDown -and $state.Read -and $state.Provisioning -and -not $state.Power -and $state.Agent -ne 'Ready') {
+            # #63 (live, 2026-11-18): a host that Azure keeps in an operation, with no power state and its agent not Ready, is
+            # down too, but only once it stays down as long as a running VM's agent gets: Azure's start or update that takes a
+            # few minutes reads the same at first, and mustn't be deallocated.
+            $more = [System.Math]::Max(0, $AgentDownMinutes - $NoPowerMinutes)
+            $held = Wait-DemoVmAgentDown -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName -Minutes $more -PollSeconds $PollSeconds
+            if ($held.Down) {
+                $agentDown = $true
+                $state = $held.State
+            }
+            elseif ($chunks.Count -eq 0) {
+                # Not down: nothing to restart now, and a later stall in this run may still use the watchdog.
+                $script:DemoVmRestarted.Remove($key)
+                $reason = if ($null -ne $held.State) { 'Azure was still working on it: it showed no power state, with its VM agent not Ready, then {0}' -f $held.State.Text } else { 'it showed no power state, with its VM agent not Ready, and its instance view couldn''t be read again, so it isn''t judged down on one read' }
+                return [pscustomobject]@{ Restarted = $false; Reason = $reason; AtUtc = $null; Recovered = $false; Failed = $false; Detail = ''; Results = @() }
+            }
+        }
         if ($agentDown -or $chunks.Count -gt 0) {
             # R871: no restart. The chunks' deletes go first, so they're pending when the VM deallocates, which completes them.
             $baseUrl = Get-DemoRunCommandBaseUrl -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $VmName
@@ -353,7 +413,7 @@ function Restart-DemoVmOnce {
                     $asked++
                 }
             }
-            $why = if ($agentDown) { 'its VM agent isn''t Ready ({0})' -f $state.Text } else { 'it lists {0} chunk Run Command(s) that a restart would keep' -f $chunks.Count }
+            $why = if ($null -ne $held -and $held.Down) { 'it showed no power state, with its VM agent not Ready, for {0} minutes ({1})' -f $AgentDownMinutes, $state.Text } elseif ($agentDown) { 'its VM agent isn''t Ready ({0})' -f $state.Text } else { 'it lists {0} chunk Run Command(s) that a restart would keep' -f $chunks.Count }
             $sent = if ($asked -gt 0) { 'the deletes of its {0} chunk Run Command(s) went first, to complete with the deallocate; ' -f $asked } else { '' }
             Write-DemoLog -Level Warning -Message ('{0}: {1}, and {2}, so it isn''t restarted: {3}it''s deallocated and started once now (R871); no action needed.' -f $VmName, $Because, $why, $sent)
             if ($asked -gt 0) {
@@ -432,6 +492,54 @@ function Get-DemoVmRestartState {
     }
     $state.Text = 'provisioning {0}, power {1}, agent {2}' -f $(if ($state.Provisioning) { $state.Provisioning.Split('/')[-1] } else { 'unknown' }), $(if ($state.Power) { $state.Power.Split('/')[-1] } else { 'unknown' }), $(if ($agent) { $agent } else { 'unknown' })
     return $state
+}
+
+function Wait-DemoVmAgentDown {
+    <#
+    .SYNOPSIS
+    Whether a VM that read with no power state and its agent not Ready stays down for -Minutes more (#63): its instance
+    view is read again every -PollSeconds, -Minutes * 60 / -PollSeconds times, and at least once, so it's never judged on
+    the caller's one read. It stays down while its agent isn't Ready and it shows no power state, or starting, or running
+    (a start whose agent never comes Ready is down too, as in R871). A read with its agent Ready ends it, and so does a
+    power state that isn't one of those (Azure or someone is stopping it): Down is false, as for Azure's start or update
+    that takes a few minutes. A read that fails says nothing either way. Returns Down, Reads (the readable reads), and
+    State (the last readable one, as Get-DemoVmRestartState gives it, or $null). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroupName,
+
+        [Parameter(Mandatory)]
+        [string] $VmName,
+
+        [ValidateRange(0, 60)]
+        [int] $Minutes = 20,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 15
+    )
+
+    $tries = [System.Math]::Max(1, [int][System.Math]::Ceiling($Minutes * 60 / $PollSeconds))
+    $reads = 0
+    $last = $null
+    for ($try = 0; $try -lt $tries; $try++) {
+        Start-Sleep -Seconds $PollSeconds
+        $read = Get-DemoVmRestartState -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -VmName $VmName
+        if (-not $read.Read) {
+            continue
+        }
+        $reads++
+        $last = $read
+        if ($read.Agent -eq 'Ready' -or $read.Power -notin @('', 'PowerState/starting', 'PowerState/running')) {
+            return [pscustomobject]@{ Down = $false; Reads = $reads; State = $read }
+        }
+    }
+    return [pscustomobject]@{ Down = ($reads -gt 0); Reads = $reads; State = $last }
 }
 
 function Wait-DemoVmRestarted {
@@ -589,6 +697,10 @@ function Invoke-DemoVmWatchdog {
         [Parameter(Mandatory)]
         [string] $Cause,
 
+        # #63: how long the caller already saw the VM with no power state and its agent not Ready (Restart-DemoVmOnce).
+        [ValidateRange(0, 1440)]
+        [int] $NoPowerMinutes = 0,
+
         [string] $ProgressPath = '',
 
         [string[]] $ProgressId = @()
@@ -598,7 +710,7 @@ function Invoke-DemoVmWatchdog {
     $saved = Save-DemoVmInstanceView -View $activity.View -VmName $VmName
     # Assigned first: Get-DemoMemberValue returns an array as one object.
     $chunkNames = Get-DemoMemberValue -InputObject $activity -Name 'Chunks'
-    $restart = Restart-DemoVmOnce -Config $Config -VmName $VmName -Because $Cause -ChunkRunCommand @($chunkNames | Where-Object { $_ }) -Confirm:$false
+    $restart = Restart-DemoVmOnce -Config $Config -VmName $VmName -Because $Cause -ChunkRunCommand @($chunkNames | Where-Object { $_ }) -NoPowerMinutes $NoPowerMinutes -Confirm:$false
     $at = if ($null -ne $restart.AtUtc) { ([datetime]$restart.AtUtc).ToLocalTime().ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
     $what = if ($activity.Labels.Count -gt 0) { ' Azure was busy with {0}.' -f ($activity.Labels -join ', ') } else { '' }
     $recovered = [bool](Get-DemoMemberValue -InputObject $restart -Name 'Recovered')
@@ -696,7 +808,7 @@ function Invoke-DemoVmSettle {
     if ($first.Settled) {
         return [pscustomobject]@{ Settled = $true; Results = @() }
     }
-    $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('Azure''s extension work didn''t finish in {0} minutes' -f $first.Minutes) -ProgressPath $ProgressPath -ProgressId $ProgressId
+    $watchdog = Invoke-DemoVmWatchdog -Config $Config -VmName $VmName -Cause ('Azure''s extension work didn''t finish in {0} minutes' -f $first.Minutes) -NoPowerMinutes ([int](Get-DemoMemberValue -InputObject $first -Name 'NoPowerMinutes')) -ProgressPath $ProgressPath -ProgressId $ProgressId
     if ([bool](Get-DemoMemberValue -InputObject $watchdog -Name 'Failed')) {
         # The VM isn't back (its restart and the deallocate and start didn't finish): the watchdog's Fail says why and when to
         # run deploy.ps1 again, and waiting on its extensions here would only add time.
