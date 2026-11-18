@@ -8,7 +8,11 @@ again (plan section 9.2, ADR 0011, Phase 28).
 One command, one guided stop (Phase 28):
 - No configuration yet: it writes one first, as init.ps1 does (Initialize-DemoFirstRun: the same prompts, and the P6
   admin group created when it's missing and you may create it), then deploys. init.ps1 still works on its own. Since
-  2026-11-09 neither asks how T2 gets SQL Server: a first deployment gets JumpstartImage, which needs nobody.
+  2026-11-09 neither asks how T2 gets SQL Server: a first deployment gets JumpstartImage, which needs nobody. Since
+  2026-11-18 (issue 60) it first reads whether the subscription already has the environment: when it's yours, the
+  configuration is written from what's deployed (its deployment record and its resource group's tags), so the run changes
+  nothing you didn't ask for; when it isn't, or that can't be told, the run never updates it and deploys a new
+  environment with a free prefix instead. Either way INIT.EXISTING, the start banner, and the status page say so.
 - An existing environment is upgraded in place (2026-11-09): a T2 guest built in PaygWizard mode whose SQL Server setup
   was never finished is rebuilt from Arc Jumpstart's image (about 27 minutes; DEPLOY.T2.REBUILD), a finished guest keeps
   its mode when the configuration doesn't name t2SqlInstallMode (DEPLOY.T2.MODE), and a missing T4 is created
@@ -281,6 +285,11 @@ try {
         Write-DemoDeploymentOutcome -Outcome $firstRun.Outcome
         exit ([int]$firstRun.Outcome.ExitCode)
     }
+    # A subscription that already had the environment (issue 60): the configuration was written from what's deployed (it's
+    # yours), or for a new environment with a free prefix (it isn't). One line on the start banner and the status page,
+    # and INIT.EXISTING with the run's results.
+    $firstRunNote = if ($null -ne $firstRun.PSObject.Properties['Note']) { @($firstRun.Note | Where-Object { $_ }) } else { @() }
+    $firstRunResult = @($firstRun.Results | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'INIT.EXISTING' -and [string]$_.status -ne 'Pass' })
 
     $config = Get-DemoConfig -Path $ConfigPath
     $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
@@ -289,8 +298,8 @@ try {
     $waitForT2Now = -not $NoWaitForT2 -and (-not $environment.Ci -or $WaitForT2) -and -not $Sequential
     # A Ctrl+C while the run's experience starts still lets the PC sleep again (the outer finally block below).
     $awake = 'starting'
-    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -Note @($selfUpdate.Note) -BusyMarker -WhatIf:$whatIf -Confirm:$false
-    $results = @($selfUpdate.Result | Where-Object { $null -ne $_ })
+    $run = Start-DemoDeploymentRun -Config $config -ConfigPath $resolvedConfigPath -WaitForT2:$waitForT2Now -SkipFabric:$SkipFabric -NoStatusPage:$NoStatusPage -NoBrowser:$NoBrowser -OutputDirectory $outDirectory -Note (@($selfUpdate.Note) + @($firstRunNote)) -BusyMarker -WhatIf:$whatIf -Confirm:$false
+    $results = @($selfUpdate.Result | Where-Object { $null -ne $_ }) + @($firstRunResult)
     $outcome = $null
     $finished = $false
     $stopped = $false

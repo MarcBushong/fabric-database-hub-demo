@@ -14,6 +14,18 @@ function Initialize-DemoConfig {
     3. The subscription guard (Assert-DemoAzContext) for the chosen subscription, its tenant, and its account. Every
        later call goes through it: Invoke-DemoAz, Invoke-DemoRestRequest, and the Fabric REST helpers.
     4. The signed-in user from Microsoft Graph (/me): the owner tag and the budget alerts' address (INIT.USER).
+    4b. An environment that exists already (INIT.EXISTING; issue 60, 2026-11-18), read-only: the subscription's resource
+       groups and deployment records (Resolve-DemoExistingEnvironment). No rg-<prefix>-<environment>, rg-<prefix>-control,
+       rg-<prefix>-golden, or record <prefix>-<environment>-main: a new environment (Pass), as before. One that's yours
+       (its owner tag or budget address is your sign-in, or you own the group that administers its T3 and T4): the
+       configuration is written from what's deployed, its deployment record's parameters and its resource group's tags
+       (ConvertFrom-DemoDeploymentRecord), so the next deploy.ps1 changes nothing you didn't ask for; its Fabric
+       workspaces and their capacity come from what it records (Resolve-DemoRecoveredWorkspace), its administrators'
+       group is kept (never created), and the settings Azure doesn't record keep their defaults, listed (Warning). One
+       that isn't yours, or can't be told apart: never written for. With an explicit -Prefix, Manual action required
+       (-OwnerEmail with its recorded budget address claims it); otherwise the first prefix after it that's yours, or
+       that's free (<prefix>2 to <prefix>99), with its own group and the Fabric workspace "Database Hub Demo <prefix>"
+       (Warning). A read that fails is a Fail, and nothing is written. Parameters you pass win over what's recovered.
     5. P1 (INIT.P1.CONTRIBUTOR): the caller's permissions on the subscription, as preflight reads them; without
        Contributor, Manual action required with the Owner's exact command.
     6. Fabric (INIT.FABRIC.CAPACITY, INIT.FABRIC.WORKSPACE): the capacities you can assign (Capacities - List
@@ -34,7 +46,9 @@ function Initialize-DemoConfig {
        -ManageCapacity.
 
     Results use the ADR 0012 statuses. Messages name the subscription, workspace, capacity, and group; their IDs are
-    only in the evidence and the file. Returns Results, Config, Path, Written, BackupPath, and NextSteps.
+    only in the evidence and the file. Returns Results, Config, Path, Written, BackupPath, NextSteps, and Existing (Kind:
+    New, Recovered, NewPrefix, NotYours, or Unreadable; Prefix, ResourceGroup, Signal, and Note, the line deploy.ps1's
+    banner and status page show).
 
     Sources (checked 2026-10-27):
     - az account list: https://learn.microsoft.com/cli/azure/account#az-account-list
@@ -60,7 +74,8 @@ function Initialize-DemoConfig {
     The Azure region (default: the example's, westus3).
 
     .PARAMETER Prefix
-    The resource name prefix (default dbhub).
+    The resource name prefix (default dbhub). When its environment exists and isn't yours, nothing is written (issue 60);
+    without it, a first run picks a free prefix by itself.
 
     .PARAMETER T2SqlInstallMode
     JumpstartImage or Developer, to choose T2's mode on purpose; empty gives JumpstartImage, the default, without a
@@ -85,7 +100,9 @@ function Initialize-DemoConfig {
     Create the P6 group, owned by you, when no group has its name.
 
     .PARAMETER OwnerEmail
-    The budget alerts' address, when Microsoft Graph doesn't return yours (for example for a service principal).
+    The budget alerts' address, when Microsoft Graph doesn't return yours (for example for a service principal). With an
+    explicit -Prefix whose environment records it as its budget address or owner tag, it claims that environment as yours
+    (issue 60).
 
     .PARAMETER TimeZone
     The Windows time zone ID for the VMs' daily auto-shutdown (default: this machine's).
@@ -197,6 +214,7 @@ function Initialize-DemoConfig {
         param([string] $CheckId, [string] $Area, [string] $Target, [string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}, [string] $Remediation = '', [string] $DocUrl = '')
         $results.Add((New-DemoResult -CheckId $CheckId -Area $Area -Target $Target -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $DocUrl))
     }
+    $existingSummary = $null
     $finish = {
         param([bool] $Written, [string] $BackupPath = '', $Config = $null)
         [pscustomobject]@{
@@ -207,6 +225,7 @@ function Initialize-DemoConfig {
             Written    = $Written
             BackupPath = $BackupPath
             NextSteps  = $nextSteps.ToArray()
+            Existing   = $existingSummary
         }
     }
 
@@ -311,21 +330,70 @@ function Initialize-DemoConfig {
     if (-not $email -and $account -match $emailPattern) {
         $email = $account
     }
+    # Your sign-in's addresses, which tell an environment that's yours (issue 60). Never -OwnerEmail, which can be any
+    # address: it counts only as a claim, with an explicit -Prefix (region 4b).
+    $signIn = [System.Collections.Generic.List[string]]::new()
+    if ($user) {
+        $signIn.Add([string]$user.UserPrincipalName)
+        $signIn.Add([string]$user.Mail)
+    }
+    $signIn.Add($account)
+    $addresses = @($signIn | Where-Object { $_ -match $emailPattern })
+    #endregion 4. The signed-in user (INIT.USER is reported in region 4b, with the values the configuration gets)
+
+    #region Defaults
+    $example = Get-Content -LiteralPath $ExamplePath -Raw | ConvertFrom-Json -AsHashtable -Depth 32
+    $schemaDefaults = Get-DemoSchemaDefault -Node (Get-Content -LiteralPath $SchemaPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64)
+    $effectivePrefix = if ($Prefix) { $Prefix } elseif ($example['prefix']) { [string]$example['prefix'] } else { 'dbhub' }
+    $environment = if ($example['environment']) { [string]$example['environment'] } else { 'demo' }
+    $exampleFabric = if ($example['fabric'] -is [System.Collections.IDictionary]) { $example['fabric'] } else { @{} }
+    $workspace = if ($WorkspaceName) { $WorkspaceName.Trim() } elseif ($exampleFabric['workspaceName']) { [string]$exampleFabric['workspaceName'] } else { 'Database Hub Demo' }
+    $lakehouse = if ($LakehouseName) { $LakehouseName.Trim() } elseif ($exampleFabric['lakehouseName']) { [string]$exampleFabric['lakehouseName'] } else { 'LH_DatabaseHub' }
+    #endregion Defaults
+
+    #region 4b. An environment that exists already (issue 60, 2026-11-18)
+    # Before 2026-11-18 a first run wrote the defaults for the prefix without checking whether its environment existed, so
+    # the next deploy.ps1 applied them to it. Reads only: the subscription's resource groups and deployment records, the
+    # environment's record, and Microsoft Graph for its administrators' group.
+    $callerId = [string]$caller.ObjectId
+    $claims = if ($Prefix -and $OwnerEmail) { @($OwnerEmail) } else { @() }
+    $existing = Resolve-DemoExistingEnvironment -SubscriptionId $subscription -Prefix $effectivePrefix -Environment $environment -ExplicitPrefix:([bool]$Prefix) -Address $addresses -Claim $claims -CallerId $callerId
+    $recovered = $existing.Kind -eq 'Recovered'
+    $recoveredValue = { param([string] $Key) if ($recovered -and $existing.Values.Contains($Key)) { $existing.Values[$Key] } else { $null } }
+    if ($existing.Kind -in 'Unreadable', 'NotYours') {
+        $report = Get-DemoExistingEnvironmentReport -Existing $existing -Path $fullPath
+        $results.Add($report.Result)
+        $existingSummary = [pscustomobject]@{ Kind = [string]$existing.Kind; Prefix = [string]$existing.Prefix; ResourceGroup = [string]$existing.ResourceGroup; Signal = ''; Note = '' }
+        return (& $finish $false)
+    }
+    $effectivePrefix = [string]$existing.Prefix
+    if ($existing.Kind -eq 'NewPrefix' -and -not $WorkspaceName) {
+        # The new environment's own workspace, so it never shares the other environment's ("Database Hub Demo <prefix>").
+        $workspace = '{0} {1}' -f $workspace, $effectivePrefix
+    }
+    # The budget alerts' address and the owner tag: -OwnerEmail, else what the environment records, else your sign-in.
+    $emailSource = if ($OwnerEmail) { 'option' } else { 'sign-in' }
+    if (-not $OwnerEmail -and (& $recoveredValue 'ownerEmail')) {
+        $email = [string](& $recoveredValue 'ownerEmail')
+        $emailSource = 'recorded'
+    }
     $aliasSource = if ($email) { ([string]$email).Split('@')[0] } elseif ($user) { [string]$user.DisplayName } else { '' }
     $ownerAlias = ($aliasSource -replace '[^A-Za-z0-9._-]', '')
     if ($ownerAlias.Length -gt 64) {
         $ownerAlias = $ownerAlias.Substring(0, 64)
     }
+    $ownerTag = if (& $recoveredValue 'owner') { [string](& $recoveredValue 'owner') } elseif ($ownerAlias) { $ownerAlias } else { [string]$schemaDefaults['owner'] }
+    $recordedNote = ' (as {0} has it)' -f $existing.ResourceGroup
     if (-not $email) {
         & $add 'INIT.USER' 'preflight' 'subscription' 'Manual action required' 'No email address was found for the budget alerts (ownerEmail): Microsoft Graph returned none for this sign-in.' @{} 'Run init.ps1 -OwnerEmail <address> -Force.' $docs.Me
     }
     elseif ($user) {
-        & $add 'INIT.USER' 'preflight' 'subscription' 'Pass' ('Signed in as {0}: budget alerts go to {1}, and the owner tag is {2}.' -f $(if ($user.UserPrincipalName) { $user.UserPrincipalName } else { $account }), $email, $(if ($ownerAlias) { $ownerAlias } else { 'demo-owner' })) @{} '' $docs.Me
+        & $add 'INIT.USER' 'preflight' 'subscription' 'Pass' ('Signed in as {0}: budget alerts go to {1}{2}, and the owner tag is {3}{4}.' -f $(if ($user.UserPrincipalName) { $user.UserPrincipalName } else { $account }), $email, $(if ($emailSource -eq 'recorded') { $recordedNote } else { '' }), $ownerTag, $(if (& $recoveredValue 'owner') { $recordedNote } else { '' })) @{} '' $docs.Me
     }
     else {
-        & $add 'INIT.USER' 'preflight' 'subscription' 'Warning' ('Microsoft Graph didn''t return the signed-in user, so budget alerts go to {0}.' -f $email) @{} 'Check ownerEmail in the configuration, or run init.ps1 -OwnerEmail <address> -Force.' $docs.Me
+        & $add 'INIT.USER' 'preflight' 'subscription' 'Warning' ('Microsoft Graph didn''t return the signed-in user, so budget alerts go to {0}{1}.' -f $email, $(if ($emailSource -eq 'recorded') { $recordedNote } else { '' })) @{} 'Check ownerEmail in the configuration, or run init.ps1 -OwnerEmail <address> -Force.' $docs.Me
     }
-    #endregion 4. The signed-in user
+    #endregion 4b. An environment that exists already
 
     #region 5. P1: Contributor on the subscription
     $permissionUrl = 'https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01' -f $subscription
@@ -349,20 +417,24 @@ function Initialize-DemoConfig {
     }
     #endregion 5. P1
 
-    #region Defaults
-    $example = Get-Content -LiteralPath $ExamplePath -Raw | ConvertFrom-Json -AsHashtable -Depth 32
-    $schemaDefaults = Get-DemoSchemaDefault -Node (Get-Content -LiteralPath $SchemaPath -Raw | ConvertFrom-Json -AsHashtable -Depth 64)
-    $effectivePrefix = if ($Prefix) { $Prefix } elseif ($example['prefix']) { [string]$example['prefix'] } else { 'dbhub' }
-    $environment = if ($example['environment']) { [string]$example['environment'] } else { 'demo' }
-    $exampleFabric = if ($example['fabric'] -is [System.Collections.IDictionary]) { $example['fabric'] } else { @{} }
-    $workspace = if ($WorkspaceName) { $WorkspaceName.Trim() } elseif ($exampleFabric['workspaceName']) { [string]$exampleFabric['workspaceName'] } else { 'Database Hub Demo' }
-    $lakehouse = if ($LakehouseName) { $LakehouseName.Trim() } elseif ($exampleFabric['lakehouseName']) { [string]$exampleFabric['lakehouseName'] } else { 'LH_DatabaseHub' }
-    #endregion Defaults
-
     #region 6. Fabric: the capacity and the workspace
     $capacityChosen = ''
     $workspaceExists = $false
     $fabricToken = $null
+    # A recovered environment's workspaces and capacity come from what's deployed (issue 60, Resolve-DemoRecoveredWorkspace).
+    $defaultPrefix = if ($example['prefix']) { [string]$example['prefix'] } else { 'dbhub' }
+    $defaultWorkspace = if ($exampleFabric['workspaceName']) { [string]$exampleFabric['workspaceName'] } else { 'Database Hub Demo' }
+    $workspaceSource = ''
+    $controlWorkspace = ''
+    $controlEnabled = $false
+    $workspaceNote = ''
+    $preferredCapacity = $null
+    $capacityKept = $false
+    $stateTags = Get-DemoDeploymentStateTagName
+    $recordedId = { param([string] $Key) if ($existing.Tags.Contains($stateTags[$Key])) { ([string]$existing.Tags[$stateTags[$Key]]).Trim() } else { '' } }
+    $unknownWorkspace = {
+        & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Manual action required' ('{0} doesn''t record its Fabric workspace (it was deployed before 2026-11-17, or Fabric couldn''t be read), and none has the name a first run gives it ("{1}"). "{2}" may be another environment''s, so init.ps1 doesn''t take it.' -f $existing.ResourceGroup, $workspace, $defaultWorkspace) @{ workspaceName = $workspace } ('Run init.ps1 -Force -Prefix {0} -WorkspaceName <its Fabric workspace''s name>.' -f $effectivePrefix) $docs.Workspaces
+    }
     try {
         $fabricToken = Get-DemoFabricToken -SubscriptionId $subscription
     }
@@ -379,6 +451,24 @@ function Initialize-DemoConfig {
         $describe = { param($Item) '{0} ({1}, {2}, {3})' -f [string](Get-DemoMemberValue -InputObject $Item -Name 'displayName'), [string](Get-DemoMemberValue -InputObject $Item -Name 'sku'), [string](Get-DemoMemberValue -InputObject $Item -Name 'state'), [string](Get-DemoMemberValue -InputObject $Item -Name 'region') }
         $visible = (@($capacities | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'displayName') }) | Select-Object -First 8) -join ', '
         $addContributor = 'A capacity administrator adds you as a contributor (Fabric admin portal > Capacity settings > the capacity > Contributor permissions), or start a Fabric trial in the Fabric portal. The scripts never create a capacity.'
+        $workspaceList = Read-DemoHubFabricList -Uri ('{0}/workspaces' -f $script:FabricApiBaseUri) -Token $fabricToken -MaxPages 20
+        $shared = @($workspaceList.Items | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'type') -ine 'Personal' })
+        if ($recovered) {
+            $place = Resolve-DemoRecoveredWorkspace -Workspace $shared -Listed ([bool]$workspaceList.Succeeded) -Prefix $effectivePrefix -DefaultPrefix $defaultPrefix -DefaultName $defaultWorkspace -FabricWorkspaceId (& $recordedId 'FabricWorkspaceId') -ControlWorkspaceId (& $recordedId 'ControlWorkspaceId') -ControlGroup ([bool]$existing.ControlGroup)
+            $workspaceSource = [string]$place.Source
+            $controlWorkspace = [string]$place.ControlName
+            $controlEnabled = [bool]$place.ControlEnabled
+            $workspaceNote = [string]$place.Note
+            if (-not $WorkspaceName) {
+                $workspace = [string]$place.WorkspaceName
+            }
+            # Its workspace keeps the capacity it's on, so there's nothing to ask (a workspace with a capacity is never moved).
+            $current = @(Select-DemoFabricNamed -Items $shared -Name $workspace) | Select-Object -First 1
+            $currentCapacity = if ($null -ne $current) { ([string](Get-DemoMemberValue -InputObject $current -Name 'capacityId')).ToLowerInvariant() } else { '' }
+            if ($currentCapacity -and -not $CapacityName) {
+                $preferredCapacity = @($capacities | Where-Object { ([string](Get-DemoMemberValue -InputObject $_ -Name 'id')).ToLowerInvariant() -eq $currentCapacity }) | Select-Object -First 1
+            }
+        }
         $capacity = $null
         if (-not $capacityList.Succeeded) {
             & $add 'INIT.FABRIC.CAPACITY' 'fabric' 'fabric' 'Warning' ('The Fabric capacities you can assign couldn''t be listed: {0}' -f $capacityList.Error) @{} 'Set fabric.capacityName in the configuration to the F or Trial capacity for the workspace.' $docs.Capacities
@@ -391,6 +481,10 @@ function Initialize-DemoConfig {
             else {
                 & $add 'INIT.FABRIC.CAPACITY' 'fabric' 'fabric' 'Manual action required' ('{0} capacity named "{1}" is among those you can assign ({2}).' -f $(if ($named.Count -eq 0) { 'No' } else { 'More than one' }), $CapacityName, $(if ($visible) { $visible } else { 'none' })) @{} ('Run init.ps1 -Force -CapacityName with one of them. {0}' -f $addContributor) $docs.Capacities
             }
+        }
+        elseif ($null -ne $preferredCapacity) {
+            $capacity = $preferredCapacity
+            $capacityKept = $true
         }
         elseif ($capacities.Count -eq 0) {
             & $add 'INIT.FABRIC.CAPACITY' 'fabric' 'fabric' 'Manual action required' ('You can''t assign any F or Trial Fabric capacity{0}, so deploy.ps1 can''t create the workspace on one.' -f $(if ($skipped -gt 0) { ' ({0} other capacities, such as Premium Per User, don''t run Fabric items)' -f $skipped } else { '' })) @{} ('{0} Then run init.ps1 -Force.' -f $addContributor) $docs.Capacities
@@ -410,34 +504,47 @@ function Initialize-DemoConfig {
             $capacityChosen = [string](Get-DemoMemberValue -InputObject $capacity -Name 'displayName')
             $state = [string](Get-DemoMemberValue -InputObject $capacity -Name 'state')
             $evidence = [ordered]@{ capacityName = $capacityChosen; sku = [string](Get-DemoMemberValue -InputObject $capacity -Name 'sku'); state = $state; region = [string](Get-DemoMemberValue -InputObject $capacity -Name 'region') }
+            $where = if ($capacityKept) { 'The workspace "{0}" stays on its capacity' -f $workspace } else { 'The workspace goes on the capacity' }
             if ($state -ieq 'Active') {
-                & $add 'INIT.FABRIC.CAPACITY' 'fabric' 'fabric' 'Pass' ('The workspace goes on the capacity {0}.' -f (& $describe $capacity)) $evidence '' $docs.Capacities
+                & $add 'INIT.FABRIC.CAPACITY' 'fabric' 'fabric' 'Pass' ('{0} {1}.' -f $where, (& $describe $capacity)) $evidence '' $docs.Capacities
             }
             else {
                 $resume = if ($ManageCapacity) { 'With fabric.manageCapacity true, start-demo.ps1 resumes it; deploy.ps1 doesn''t, so resume it once yourself before deploy.ps1 (Azure portal > the Fabric capacity > Resume).' } else { 'Its administrator resumes it before deploy.ps1 (Azure portal > the Fabric capacity > Resume): the Fabric track needs it running, and the scripts never resume it unless fabric.manageCapacity is true.' }
-                & $add 'INIT.FABRIC.CAPACITY' 'fabric' 'fabric' 'Warning' ('The workspace goes on the capacity {0}, which isn''t running now.' -f (& $describe $capacity)) $evidence $resume 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
+                & $add 'INIT.FABRIC.CAPACITY' 'fabric' 'fabric' 'Warning' ('{0} {1}, which isn''t running now.' -f $where, (& $describe $capacity)) $evidence $resume 'https://learn.microsoft.com/fabric/enterprise/pause-resume'
             }
         }
 
-        $workspaceList = Read-DemoHubFabricList -Uri ('{0}/workspaces' -f $script:FabricApiBaseUri) -Token $fabricToken -MaxPages 20
-        if (-not $workspaceList.Succeeded) {
+        if ($recovered -and -not $WorkspaceName -and $Prefix -and $effectivePrefix -cne $defaultPrefix -and $workspaceSource -eq 'unknown') {
+            & $unknownWorkspace
+        }
+        elseif (-not $workspaceList.Succeeded) {
             & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Warning' ('Your Fabric workspaces couldn''t be listed: {0}' -f $workspaceList.Error) @{ workspaceName = $workspace } 'deploy.ps1 finds or creates the workspace by name (ADR 0021).' $docs.Workspaces
         }
         else {
-            $shared = @($workspaceList.Items | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'type') -ine 'Personal' })
             $found = @(Select-DemoFabricNamed -Items $shared -Name $workspace)
             if ($found.Count -gt 1) {
                 & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Manual action required' ('More than one workspace named "{0}" is visible to you.' -f $workspace) @{ workspaceName = $workspace; matches = $found.Count } 'Run init.ps1 -Force -WorkspaceName with a name no other workspace uses.' $docs.Workspaces
             }
             elseif ($found.Count -eq 1) {
                 $workspaceExists = $true
-                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Pass' ('The Fabric workspace "{0}" exists; the scripts use it, and deploy.ps1 adds only the notebooks that are missing.' -f $workspace) @{ workspaceName = $workspace } '' $docs.Workspaces
+                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Pass' ('The Fabric workspace "{0}" exists; the scripts use it, and deploy.ps1 adds only the notebooks that are missing.{1}' -f $workspace, $(if ($workspaceNote) { ' ' + $workspaceNote } else { '' })) @{ workspaceName = $workspace } '' $docs.Workspaces
             }
             elseif ($capacityChosen) {
-                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Pass' ('The Fabric workspace "{0}" doesn''t exist yet: deploy.ps1 creates it on "{1}" with the lakehouse "{2}", and imports the notebooks (fabric.importNotebooks true). Creating it needs the Fabric tenant setting "Create workspaces" for you.' -f $workspace, $capacityChosen, $lakehouse) @{ workspaceName = $workspace; capacityName = $capacityChosen } '' 'https://learn.microsoft.com/fabric/admin/portal-workspace'
+                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Pass' ('The Fabric workspace "{0}" doesn''t exist yet: deploy.ps1 creates it on "{1}" with the lakehouse "{2}", and imports the notebooks (fabric.importNotebooks true). Creating it needs the Fabric tenant setting "Create workspaces" for you.{3}' -f $workspace, $capacityChosen, $lakehouse, $(if ($workspaceNote) { ' ' + $workspaceNote } else { '' })) @{ workspaceName = $workspace; capacityName = $capacityChosen } '' 'https://learn.microsoft.com/fabric/admin/portal-workspace'
             }
             else {
                 & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Manual action required' ('The Fabric workspace "{0}" doesn''t exist yet, and no capacity is chosen to create it on.' -f $workspace) @{ workspaceName = $workspace } 'Fix INIT.FABRIC.CAPACITY above, or create the workspace on an F or Trial capacity yourself and add a lakehouse named LH_DatabaseHub; then run init.ps1 -Force.' $docs.Workspaces
+            }
+        }
+    }
+    elseif ($recovered -and -not $WorkspaceName) {
+        # Fabric couldn't be read, so the workspace it records can't be found. Another prefix's environment never gets the
+        # default name, which is the default prefix's environment's; with an explicit -Prefix, the person names it.
+        $workspaceSource = 'unknown'
+        if ($effectivePrefix -cne $defaultPrefix) {
+            $workspace = '{0} {1}' -f $defaultWorkspace, $effectivePrefix
+            if ($Prefix) {
+                & $unknownWorkspace
             }
         }
     }
@@ -445,8 +552,12 @@ function Initialize-DemoConfig {
 
     #region 7. P6: the Microsoft Entra security group
     $groupId = $zeroGuid
-    $groupName = if ($AdminGroupName) { $AdminGroupName.Trim() } else { '{0}-{1}-sql-admins' -f $effectivePrefix, $environment }
-    $callerId = [string]$caller.ObjectId
+    # A recovered environment keeps the group that administers its T3 and T4 (issue 60): the one its record names, or,
+    # without a record, the one its DbHubT3AdminGroup tag names. Never a new one: that would change T3's and T4's
+    # administrators.
+    $keptGroupId = if ($recovered -and -not $AdminGroupObjectId -and -not $AdminGroupName) { [string](& $recoveredValue 't3AdminGroupObjectId') } else { '' }
+    $keptGroupName = if ($recovered -and -not $keptGroupId -and -not $AdminGroupObjectId -and -not $AdminGroupName) { [string]$existing.GroupName } else { '' }
+    $groupName = if ($AdminGroupName) { $AdminGroupName.Trim() } elseif ($keptGroupName) { $keptGroupName } else { '{0}-{1}-sql-admins' -f $effectivePrefix, $environment }
     $ownership = {
         param([string] $Id, [string] $Name, [string] $How)
         $owned = if ($callerId) { Test-DemoEntraGroupOwner -SubscriptionId $subscription -GroupId $Id -OwnerId $callerId } else { $null }
@@ -458,15 +569,32 @@ function Initialize-DemoConfig {
         }
     }
     $createSteps = "An Entra administrator creates a security group named '{0}' with you as its owner (Microsoft Entra admin center > Groups > All groups > New group: Security, Owners: you), or runs: az ad group create --display-name {0} --mail-nickname {0}, then az ad group owner add --group {0} --owner-object-id {1}. Then run init.ps1 -Force -AdminGroupObjectId <the group's object ID>." -f $groupName, $(if ($callerId) { $callerId } else { '<your object ID>' })
-    if ($AdminGroupObjectId) {
-        $read = Find-DemoEntraGroup -SubscriptionId $subscription -ObjectId $AdminGroupObjectId
+    $keptMissing = 'If it was deleted, create a security group you own (init.ps1 -Force -CreateAdminGroup -AdminGroupName <a new name> does), then run init.ps1 -Force -AdminGroupObjectId <its object ID>: deploy.ps1 then makes it T3''s and T4''s administrator.'
+    if ($AdminGroupObjectId -or $keptGroupId) {
+        $lookupId = if ($AdminGroupObjectId) { $AdminGroupObjectId } else { $keptGroupId }
+        $read = Find-DemoEntraGroup -SubscriptionId $subscription -ObjectId $lookupId
         if ($read.Succeeded -and @($read.Groups).Count -eq 1) {
-            $groupId = $AdminGroupObjectId.ToLowerInvariant()
+            $groupId = $lookupId.ToLowerInvariant()
             $groupName = [string](Get-DemoMemberValue -InputObject @($read.Groups)[0] -Name 'displayName')
-            & $ownership $groupId $groupName 'Using'
+            & $ownership $groupId $groupName $(if ($AdminGroupObjectId) { 'Using' } else { 'Keeping, as deployed,' })
+        }
+        elseif ($AdminGroupObjectId) {
+            & $add 'INIT.P6.GROUP' 'preflight' 'tenant' 'Manual action required' ('The group in -AdminGroupObjectId wasn''t found in the tenant ({0}).' -f $(if ($read.Error) { $read.Error } else { 'not found' })) @{} 'Check the object ID in the Microsoft Entra admin center (Groups), then run init.ps1 -Force again.' $docs.ListGroups
         }
         else {
-            & $add 'INIT.P6.GROUP' 'preflight' 'tenant' 'Manual action required' ('The group in -AdminGroupObjectId wasn''t found in the tenant ({0}).' -f $(if ($read.Error) { $read.Error } else { 'not found' })) @{} 'Check the object ID in the Microsoft Entra admin center (Groups), then run init.ps1 -Force again.' $docs.ListGroups
+            & $add 'INIT.P6.GROUP' 'preflight' 'tenant' 'Manual action required' ('The security group that administers T3 and T4 in {0}, as its deployment record names it, wasn''t found in the tenant ({1}), so no other group was taken in its place.' -f $existing.ResourceGroup, $(if ($read.Error) { $read.Error } else { 'not found' })) @{ groupObjectId = $keptGroupId } $keptMissing $docs.ListGroups
+        }
+    }
+    elseif ($keptGroupName) {
+        $read = Find-DemoEntraGroup -SubscriptionId $subscription -DisplayName $groupName
+        $matched = @($read.Groups | Where-Object { [string]::Equals([string](Get-DemoMemberValue -InputObject $_ -Name 'displayName'), $groupName, [System.StringComparison]::OrdinalIgnoreCase) })
+        if ($read.Succeeded -and $matched.Count -eq 1) {
+            $groupId = ([string](Get-DemoMemberValue -InputObject $matched[0] -Name 'id')).ToLowerInvariant()
+            & $ownership $groupId $groupName 'Keeping, as deployed,'
+        }
+        else {
+            $why = if (-not $read.Succeeded) { 'Microsoft Entra groups couldn''t be searched: {0}' -f $read.Error } elseif ($matched.Count -gt 1) { 'more than one group has that name' } else { 'no group has that name' }
+            & $add 'INIT.P6.GROUP' 'preflight' 'tenant' 'Manual action required' ('The security group that administers T3 and T4 in {0}, "{1}" by its tag, couldn''t be taken ({2}), so no other group was taken in its place.' -f $existing.ResourceGroup, $groupName, $why) @{ groupDisplayName = $groupName } $keptMissing $docs.ListGroups
         }
     }
     else {
@@ -520,7 +648,12 @@ function Initialize-DemoConfig {
     # 2026-11-09 (user-directed): no question. A first deployment is one click, so T2 gets the default, JumpstartImage, which
     # needs nobody; -T2SqlInstallMode picks another mode on purpose.
     $mode = $T2SqlInstallMode
-    if (-not $mode) {
+    if (-not $mode -and (& $recoveredValue 't2SqlInstallMode')) {
+        # A recovered environment keeps the mode its T2 was deployed in (issue 60); the T2 host keeps a finished guest anyway.
+        $mode = [string](& $recoveredValue 't2SqlInstallMode')
+        Write-DemoLog -Message ('T2 keeps the mode it was deployed in: t2SqlInstallMode {0}, as {1} records it.{2}' -f $mode, $existing.ResourceGroup, $(if ($mode -ceq 'PaygWizard') { ' deploy.ps1 runs PaygWizard as JumpstartImage, with no setup wizard, and keeps a T2 guest whose SQL Server is set up as it is.' } else { '' }))
+    }
+    elseif (-not $mode) {
         $mode = 'JumpstartImage'
         Write-DemoLog -Message 'T2 gets SQL Server from Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest (t2SqlInstallMode JumpstartImage, the default): unattended, so nobody signs in to a VM. To choose another mode on purpose, run init.ps1 -Force -T2SqlInstallMode Developer (T2 in Database Hub''s Estate only), or set ProductKey in the configuration (prerequisite P10).'
     }
@@ -536,6 +669,10 @@ function Initialize-DemoConfig {
         & $add 'INIT.CONFIG' 'preflight' 'repo' 'Fail' ('"{0}" isn''t a Windows time zone ID.' -f $zone) @{} 'Pass a Windows time zone ID, for example -TimeZone ''Eastern Standard Time'' (Get-TimeZone -ListAvailable lists them).' 'https://learn.microsoft.com/windows-hardware/manufacture/desktop/default-time-zones'
         return (& $finish $false)
     }
+    if (-not $zone -and (& $recoveredValue 'autoShutdownTimeZone')) {
+        # A recovered environment keeps its schedule (issue 60), whatever this machine's time zone is.
+        $zone = [string](& $recoveredValue 'autoShutdownTimeZone')
+    }
     if (-not $zone) {
         $local = Get-DemoWindowsTimeZoneId
         $zone = if ($local.Id) { $local.Id } else { [string]$schemaDefaults['autoShutdownTimeZone'] }
@@ -544,6 +681,21 @@ function Initialize-DemoConfig {
         }
     }
     $config = $example
+    # A recovered environment's values first (issue 60): what's deployed. What you pass, and what this run resolves, go over
+    # them below.
+    if ($recovered) {
+        foreach ($path in @($existing.Values.Keys)) {
+            $parts = ([string]$path).Split('.')
+            if ($parts.Count -eq 1) {
+                $config[$path] = $existing.Values[$path]
+                continue
+            }
+            if ($config[$parts[0]] -isnot [System.Collections.IDictionary]) {
+                $config[$parts[0]] = [ordered]@{}
+            }
+            $config[$parts[0]][$parts[1]] = $existing.Values[$path]
+        }
+    }
     $config['subscriptionId'] = $subscription
     $config['tenantId'] = $tenant
     if ($account) {
@@ -558,7 +710,7 @@ function Initialize-DemoConfig {
     $config['prefix'] = $effectivePrefix
     $config['t2SqlInstallMode'] = $mode
     $config['t3AdminGroupObjectId'] = $groupId
-    $config['owner'] = if ($ownerAlias) { $ownerAlias } else { [string]$schemaDefaults['owner'] }
+    $config['owner'] = $ownerTag
     if ($email) {
         $config['ownerEmail'] = [string]$email
     }
@@ -574,16 +726,46 @@ function Initialize-DemoConfig {
     $fabric['importNotebooks'] = -not $workspaceExists
     $fabric['manageCapacity'] = [bool]$ManageCapacity
     $config['fabric'] = $fabric
+    if ($controlWorkspace) {
+        # The control notebook's workspace, as deployed; "DBHub Control", the name init.ps1 wrote before 2026-11-14, stays
+        # only with "enabled": true (Get-DemoActivityControlSetting).
+        if ($config['control'] -isnot [System.Collections.IDictionary]) {
+            $config['control'] = [ordered]@{}
+        }
+        $config['control']['fabricWorkspaceName'] = $controlWorkspace
+        if ($controlEnabled) {
+            $config['control']['enabled'] = $true
+        }
+    }
     $repository = Get-DemoGitHubRepositoryName
     if ($repository -and $config['github'] -is [System.Collections.IDictionary]) {
         $config['github']['repository'] = $repository
     }
 
+    # What the run found in the subscription (INIT.EXISTING, issue 60), with the values the file gets.
+    $defaulted = [System.Collections.Generic.List[string]]::new()
+    if ($recovered) {
+        foreach ($item in @($existing.Missing) + @($script:DemoUnrecordedSetting)) {
+            $explicit = ($item -eq 'location' -and $Location) -or ($item -eq 'autoShutdownTimeZone' -and $TimeZone) -or ($item -eq 't2SqlInstallMode' -and $T2SqlInstallMode) -or ($item -eq 'ownerEmail' -and $OwnerEmail) -or ($item -eq 'fabric.lakehouseName' -and $LakehouseName) -or ($item -eq 'fabric.manageCapacity' -and $ManageCapacity) -or ($item -eq 't3AdminGroupObjectId' -and $groupId -ne $zeroGuid)
+            $label = if ($item -eq 'control' -and $controlWorkspace) { 'control (all but its fabricWorkspaceName)' } else { $item }
+            if (-not $explicit -and -not $defaulted.Contains($label)) {
+                $defaulted.Add($label)
+            }
+        }
+        if ($workspaceSource -eq 'unknown' -and -not $WorkspaceName) {
+            # Not recorded, or Fabric couldn't be read: the name a first run gives this prefix's workspace.
+            $defaulted.Add('fabric.workspaceName')
+        }
+    }
+    $report = Get-DemoExistingEnvironmentReport -Existing $existing -Path $fullPath -GroupName $(if ($groupId -ne $zeroGuid) { $groupName } else { '' }) -WorkspaceName $workspace -WorkspaceSource $workspaceSource -ControlName $controlWorkspace -Defaulted $defaulted.ToArray() -DryRun:$dryRun
+    $results.Add($report.Result)
+    $existingSummary = [pscustomobject]@{ Kind = [string]$existing.Kind; Prefix = $effectivePrefix; ResourceGroup = [string]$existing.ResourceGroup; Signal = [string]$existing.Signal; Note = [string]$report.Note }
+
     $json = $config | ConvertTo-Json -Depth 32
     $validationErrors = @()
     $valid = Test-Json -Json $json -SchemaFile $SchemaPath -ErrorVariable validationErrors -ErrorAction SilentlyContinue
-    $written = @('subscriptionId', 'tenantId', $(if ($account) { 'azureAccount' }), 'prefix', 't2SqlInstallMode', 't3AdminGroupObjectId', 'owner', 'ownerEmail', 'autoShutdownTimeZone', 'fabric') | Where-Object { $_ }
-    $summary = 'subscription "{0}", region {1}, prefix {2}, T2 {3}, the workspace "{4}" on "{5}", and the P6 group {6}' -f $chosen.Name, $config['location'], $effectivePrefix, $mode, $workspace, $(if ($capacityChosen) { $capacityChosen } else { '(none yet)' }), $(if ($groupId -ne $zeroGuid) { '"' + $groupName + '"' } else { '(none yet)' })
+    $written = @(@('subscriptionId', 'tenantId', $(if ($account) { 'azureAccount' }), 'prefix', 't2SqlInstallMode', 't3AdminGroupObjectId', 'owner', 'ownerEmail', 'autoShutdownTimeZone', 'fabric') + @($(if ($recovered) { @($existing.Values.Keys | ForEach-Object { ([string]$_).Split('.')[0] }) })) + @($(if ($controlWorkspace) { 'control' })) | Where-Object { $_ } | Select-Object -Unique)
+    $summary = 'subscription "{0}", region {1}, prefix {2}, network {3}, T2 {4}, the workspace "{5}" on "{6}", and the P6 group {7}' -f $chosen.Name, $config['location'], $effectivePrefix, $config['networkMode'], $mode, $workspace, $(if ($capacityChosen) { $capacityChosen } else { '(none yet)' }), $(if ($groupId -ne $zeroGuid) { '"' + $groupName + '"' } else { '(none yet)' })
     if (-not $valid) {
         $details = ($validationErrors | ForEach-Object { $_.Exception.Message } | Select-Object -Unique) -join '; '
         & $add 'INIT.CONFIG' 'preflight' 'repo' 'Fail' ('The configuration doesn''t match config/environment.schema.json, so it wasn''t written: {0}' -f $details) @{} 'Check the values you passed to init.ps1 and run it again.' $docs.Schema

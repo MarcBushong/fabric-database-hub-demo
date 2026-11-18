@@ -155,6 +155,21 @@ Describe 'The first-run setup from deploy.ps1 (brief goal 1)' {
         $first.Outcome.NextCommand | Should -Match '^\./scripts/deploy\.ps1 -ConfigPath'
         Should -Invoke -ModuleName DbHubDemo -CommandName Initialize-DemoConfig -Times 1 -Exactly -ParameterFilter { $NonInteractive -and $CreateAdminGroup }
     }
+
+    It 'passes on what it found in the subscription (issue 60): the note for the banner and the status page, which the WHAT IF ending says too' {
+        Mock -ModuleName DbHubDemo -CommandName Initialize-DemoConfig -MockWith {
+            # -WhatIf is a common parameter: a mock sees it only in $PesterBoundParameters.
+            $dry = [bool]$PesterBoundParameters['WhatIf']
+            $words = if ($dry) { 'would be written' } else { 'was written' }
+            [pscustomobject]@{ Results = @(New-DemoResult -CheckId 'INIT.EXISTING' -Area 'preflight' -Target 'subscription' -Status 'Warning' -Message 'rg-dbhub-demo is yours.'); Config = @{}; Path = $Path; Written = -not $dry; BackupPath = ''; NextSteps = @(); Existing = [pscustomobject]@{ Kind = 'Recovered'; Prefix = 'dbhub'; ResourceGroup = 'rg-dbhub-demo'; Signal = 'owner-tag'; Note = ('No configuration file: rg-dbhub-demo is yours, so its configuration {0} from what''s deployed.' -f $words) } }
+        }
+        $first = Initialize-DemoFirstRun -ConfigPath $script:path -Environment $script:interactive
+        $first.Ready | Should -BeTrue
+        @($first.Note) | Should -Be @('No configuration file: rg-dbhub-demo is yours, so its configuration was written from what''s deployed.')
+        $dry = Initialize-DemoFirstRun -ConfigPath $script:path -Environment $script:interactive -WhatIf
+        $dry.Outcome.Kind | Should -Be 'WhatIf'
+        $dry.Outcome.Reason | Should -Match 'Nothing was written or deployed\. No configuration file: rg-dbhub-demo is yours, so its configuration would be written'
+    }
 }
 
 Describe 'What DONE requires (brief item 16)' {
