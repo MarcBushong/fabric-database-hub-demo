@@ -25,6 +25,11 @@ What it does, in order:
 3. Finds the Microsoft Entra security group for T3's and T4's administrators (P6) by name, by default
    <prefix>-<environment>-sql-admins. With -CreateAdminGroup it creates it with you as the owner when it's missing; a
    tenant that doesn't allow that gets Manual action required with the steps for an administrator.
+   Before that (2026-11-18, issue 60) it reads whether the subscription already has the environment: one that's yours (its
+   owner tag or budget address is your sign-in, or you own its administrators' group) gets its configuration back from
+   what's deployed, with its group, network mode, schedule, ceilings, sizes, and workspaces, so deploy.ps1 then changes
+   nothing you didn't ask for; one that isn't yours is never written for: with -Prefix, Manual action required, and
+   otherwise a free prefix (INIT.EXISTING).
 4. Sets how T2 gets SQL Server without asking (2026-11-09, so a first deployment never needs anyone to sign in to a VM):
    -T2SqlInstallMode when you give it, otherwise JumpstartImage (the default: Arc Jumpstart's prebuilt SQL Server 2022
    Standard guest; no stop, and Hub Performance on T2), and one line says which and how to choose another on purpose:
@@ -51,7 +56,8 @@ Only consider subscriptions in this tenant.
 The Azure region (default westus3). Preflight checks that Database Hub supports it.
 
 .PARAMETER Prefix
-The resource name prefix (default dbhub).
+The resource name prefix (default dbhub). When rg-<prefix>-demo exists and is yours, the configuration is written from
+what's deployed; when it isn't yours, nothing is written.
 
 .PARAMETER T2SqlInstallMode
 JumpstartImage or Developer, to choose T2's mode on purpose; without it, JumpstartImage, the default, with no question
@@ -76,7 +82,8 @@ Use this P6 group.
 Create the P6 group, owned by you, when none has its name.
 
 .PARAMETER OwnerEmail
-The budget alerts' address, when Microsoft Graph returns none for you.
+The budget alerts' address, when Microsoft Graph returns none for you. With -Prefix, it also claims an environment
+that records it as its budget address or owner tag as yours.
 
 .PARAMETER TimeZone
 The Windows time zone ID for the VMs' daily auto-shutdown, for example 'Eastern Standard Time' (default: this

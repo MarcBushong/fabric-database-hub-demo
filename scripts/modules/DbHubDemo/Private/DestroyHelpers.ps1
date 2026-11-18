@@ -135,6 +135,70 @@ function Get-DemoFabricNotebookResourceGroup {
     return [pscustomobject]@{ Ok = $true; ResourceGroup = ''; Error = '' }
 }
 
+function Get-DemoFabricNotebookName {
+    # The notebooks the demo publishes to its Fabric workspace, the ones fabric.importNotebooks governs: each one in
+    # fabric/notebooks, by name (configure-fabric.ps1's -Notebook). Internal.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    return @(Get-ChildItem -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'fabric/notebooks') -Filter '*.ipynb' -File | Sort-Object -Property Name | ForEach-Object { $_.BaseName })
+}
+
+function Get-DemoFabricDemoItem {
+    <#
+    .SYNOPSIS
+    The items the demo creates in its Fabric workspace, by type and name: the lakehouse and its SQL analytics endpoint,
+    each notebook in fabric/notebooks (Get-DemoFabricNotebookName), the control notebook, the Real-Time Dashboard, the
+    history model and report, and the Insights app with its connector. destroy.ps1 deletes the demo's workspace only when
+    everything in it is among these (Get-DemoDestroyFabricPlan), and a first run that recovers an environment updates the
+    workspace's notebooks then too (issue 60, Resolve-DemoRecoveredNotebookImport). Returns Type and Name for each.
+    Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $LakehouseName,
+
+        [string] $ControlNotebook = 'NB_DatabaseHub_Control'
+    )
+
+    $app = Get-DemoFabricAppSetting
+    $items = [System.Collections.Generic.List[object]]::new()
+    $items.Add([pscustomobject]@{ Type = 'Lakehouse'; Name = $LakehouseName })
+    $items.Add([pscustomobject]@{ Type = 'SQLEndpoint'; Name = $LakehouseName })
+    foreach ($name in @(Get-DemoFabricNotebookName)) {
+        $items.Add([pscustomobject]@{ Type = 'Notebook'; Name = $name })
+    }
+    $items.Add([pscustomobject]@{ Type = 'Notebook'; Name = $ControlNotebook })
+    $items.Add([pscustomobject]@{ Type = 'KQLDashboard'; Name = [string]$app['dashboardName'] })
+    $items.Add([pscustomobject]@{ Type = 'SemanticModel'; Name = [string]$app['semanticModelName'] })
+    $items.Add([pscustomobject]@{ Type = 'Report'; Name = [string]$app['reportName'] })
+    $items.Add([pscustomobject]@{ Type = [string]$app['itemType']; Name = [string]$app['itemName'] })
+    $items.Add([pscustomobject]@{ Type = 'UserDataFunction'; Name = ('{0}_connector' -f [string]$app['itemName']) })
+    return $items.ToArray()
+}
+
+function Test-DemoFabricDemoItem {
+    # Whether a workspace item, by the type and display name Items - List Items gives it, is one the demo creates
+    # (-Allowed, from Get-DemoFabricDemoItem): the same type, and the same name, case-sensitive. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Allowed = @(),
+
+        [AllowEmptyString()]
+        [string] $Type = '',
+
+        [AllowEmptyString()]
+        [string] $Name = ''
+    )
+
+    return (@($Allowed | Where-Object { $null -ne $_ -and [string]$_.Type -eq $Type -and [string]$_.Name -ceq $Name }).Count -gt 0)
+}
+
 function Get-DemoDestroyFabricPlan {
     <#
     .SYNOPSIS
@@ -164,21 +228,8 @@ function Get-DemoDestroyFabricPlan {
     $base = $script:FabricApiBaseUri
     $resourceGroup = Get-DemoResourceGroupName -Config $Config
     $setting = Get-DemoFabricResolveSetting -Config $Config
-    $app = Get-DemoFabricAppSetting
-    $demoItems = @(
-        @{ Type = 'Lakehouse'; Name = [string]$setting.LakehouseName }
-        @{ Type = 'SQLEndpoint'; Name = [string]$setting.LakehouseName }
-        foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'fabric/notebooks') -Filter '*.ipynb' -File)) {
-            @{ Type = 'Notebook'; Name = $file.BaseName }
-        }
-        @{ Type = 'Notebook'; Name = [string]$Control.Name.Notebook }
-        @{ Type = 'KQLDashboard'; Name = [string]$app['dashboardName'] }
-        @{ Type = 'SemanticModel'; Name = [string]$app['semanticModelName'] }
-        @{ Type = 'Report'; Name = [string]$app['reportName'] }
-        @{ Type = [string]$app['itemType']; Name = [string]$app['itemName'] }
-        @{ Type = 'UserDataFunction'; Name = ('{0}_connector' -f [string]$app['itemName']) }
-    )
-    $controlItems = @(@{ Type = 'Notebook'; Name = [string]$Control.Name.Notebook })
+    $demoItems = @(Get-DemoFabricDemoItem -LakehouseName ([string]$setting.LakehouseName) -ControlNotebook ([string]$Control.Name.Notebook))
+    $controlItems = @([pscustomobject]@{ Type = 'Notebook'; Name = [string]$Control.Name.Notebook })
     $answer = [ordered]@{ Ok = $true; Error = ''; Kind = ''; Demo = $null; Control = $null }
     $workspaces = Get-DemoActivityControlFabricList -Uri ('{0}/workspaces' -f $base) -Token $Token
     if ($workspaces.StatusCode -ne 200) {
@@ -211,7 +262,7 @@ function Get-DemoDestroyFabricPlan {
             $type = [string](Get-DemoMemberValue -InputObject $item -Name 'type')
             $display = [string](Get-DemoMemberValue -InputObject $item -Name 'displayName')
             $labels.Add(('{0} {1}' -f $type, $display))
-            if (@($Allowed | Where-Object { $_.Type -eq $type -and $_.Name -ceq $display }).Count -eq 0) {
+            if (-not (Test-DemoFabricDemoItem -Allowed $Allowed -Type $type -Name $display)) {
                 $foreign.Add(('{0} {1}' -f $type, $display))
             }
             if ($type -eq 'Notebook' -and $display -ceq [string]$Control.Name.Notebook) {
