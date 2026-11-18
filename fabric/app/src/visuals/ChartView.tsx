@@ -7,7 +7,7 @@ import { scaleBand, scaleLinear, scalePoint, scaleUtc } from "d3-scale";
 import { area as d3area, curveMonotoneX, line as d3line } from "d3-shape";
 
 import type { ChartSpec, ContextRow } from "@/copilot/contract";
-import { buildChartModel, describeModel, formatTick, formatValue, formatX, nearestIndex, numberOf, seriesColor, timeOf, yDomain, type ChartModel, type ChartPoint, type ChartSeries } from "./chart-kit";
+import { AXIS_ROTATION_DEG, buildChartModel, categoryAxis, describeModel, formatTick, formatValue, formatX, labelWidth, nearestIndex, numberOf, seriesColor, timeOf, truncateLabel, yDomain, type ChartModel, type ChartPoint, type ChartSeries } from "./chart-kit";
 
 import "./chart-view.css";
 
@@ -124,7 +124,20 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
     const [y0, y1] = yDomain(model, visible.length > 0 ? visible : model.series, stacked);
     const y = scaleLinear().domain([y0, y1]).nice(4);
     const yTicks = y.ticks(4);
-    const left = Math.max(32, Math.min(72, 10 + Math.max(...yTicks.map((t) => formatTick(t, model.unit).length)) * 6.6));
+    const numeric = model.xKind === "time" || model.xKind === "number" || model.xKind === "index";
+    const xs = model.xs;
+    const first = xs[0] as number;
+    const last = xs[xs.length - 1] as number;
+    const span = numeric ? last - first : 0;
+    const categorical = bars || !numeric;
+    const xLabels = categorical ? xs.map((x) => formatX(x, model.xKind, span)) : [];
+
+    const leftForTicks = Math.max(32, Math.min(72, 10 + Math.max(...yTicks.map((t) => formatTick(t, model.unit).length)) * 6.6));
+    const slot = (width - leftForTicks - MARGIN.right) / Math.max(1, xs.length);
+    const axis = categorical ? categoryAxis(xLabels, slot) : null;
+    // A rotated first label reaches left of its tick; the margin makes room for it, up to a point.
+    const overhang = axis?.rotate ? labelWidth(truncateLabel(xLabels[0] ?? "", axis.maxChars)) * Math.cos((AXIS_ROTATION_DEG * Math.PI) / 180) - slot / 2 + 4 : 0;
+    const left = Math.max(leftForTicks, Math.min(Math.ceil(overhang), Math.floor(width * 0.3)));
     const innerW = Math.max(40, width - left - MARGIN.right);
     const innerH = Math.max(40, height - MARGIN.top - MARGIN.bottom);
     y.range([innerH, 0]);
@@ -132,11 +145,6 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
     const keyOf = (x: number | string) => String(x);
     const band = scaleBand<string>().domain(model.xs.map(keyOf)).range([0, innerW]).paddingInner(0.22).paddingOuter(0.1);
     const groups = scaleBand<string>().domain(visible.map((s) => s.key)).range([0, band.bandwidth()]).padding(0.08);
-    const numeric = model.xKind === "time" || model.xKind === "number" || model.xKind === "index";
-    const xs = model.xs;
-    const first = xs[0] as number;
-    const last = xs[xs.length - 1] as number;
-    const span = numeric ? last - first : 0;
     const time = scaleUtc().domain([new Date(first), new Date(last === first ? first + 60000 : last)]).range([0, innerW]);
     const linear = scaleLinear().domain([first, last === first ? first + 1 : last]).range([0, innerW]);
     const point = scalePoint<string>().domain(xs.map(keyOf)).range([0, innerW]).padding(0.5);
@@ -150,8 +158,8 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
     const byX = useMemo(() => model.series.map((s) => new Map<number | string, ChartPoint>(s.points.map((p) => [p.x, p]))), [model]);
     const colorOf = (s: ChartSeries) => seriesColor(s.key, model.series.indexOf(s), props.colors);
 
-    const xTicks: Array<number | string> = bars || !numeric
-        ? xs.filter((_, i) => i % Math.max(1, Math.ceil((xs.length * 64) / innerW)) === 0)
+    const xTicks: Array<number | string> = categorical
+        ? xs.filter((_, i) => i % (axis?.every ?? 1) === 0)
         : model.xKind === "time"
           ? time.ticks(Math.max(2, Math.floor(innerW / 96))).map((d) => d.getTime())
           : linear.ticks(Math.max(2, Math.floor(innerW / 80)));
@@ -224,7 +232,7 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
             <div
                 ref={ref}
                 className="chart-plot"
-                style={{ height }}
+                style={{ height: height + (axis?.extraBottom ?? 0) }}
                 tabIndex={0}
                 role="group"
                 aria-roledescription="chart"
@@ -236,7 +244,7 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
                 onKeyDown={onKeyDown}
                 onBlur={() => setActive(null)}
             >
-                <svg className="chart-svg" width={width} height={height} aria-hidden="true" focusable="false">
+                <svg className="chart-svg" width={width} height={height + (axis?.extraBottom ?? 0)} aria-hidden="true" focusable="false">
                     <g transform={`translate(${left},${MARGIN.top})`}>
                         {(() => {
                             // Band labels skip when they'd overlap the previous one; the band itself always shows.
@@ -277,11 +285,23 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
                             </g>
                         ))}
                         <line className="chart-axis" x1={0} x2={innerW} y1={innerH} y2={innerH} />
-                        {xTicks.map((t) => (
-                            <text key={`x-${t}`} className="chart-xtick" x={px(t)} y={innerH + 17} textAnchor="middle">
-                                {formatX(t, model.xKind, span)}
-                            </text>
-                        ))}
+                        {xTicks.map((t) => {
+                            const full = categorical ? (xLabels[xs.indexOf(t)] ?? String(t)) : formatX(t, model.xKind, span);
+                            if (!axis?.rotate) {
+                                return (
+                                    <text key={`x-${t}`} className="chart-xtick" x={px(t)} y={innerH + 17} textAnchor="middle">
+                                        {full}
+                                    </text>
+                                );
+                            }
+                            const shown = truncateLabel(full, axis.maxChars);
+                            return (
+                                <text key={`x-${t}`} className="chart-xtick" x={px(t)} y={innerH + 14} textAnchor="end" transform={`rotate(-${AXIS_ROTATION_DEG} ${px(t)} ${innerH + 14})`}>
+                                    {shown !== full ? <title>{full}</title> : null}
+                                    {shown}
+                                </text>
+                            );
+                        })}
 
                         {bars
                             ? model.xs.map((x) => (

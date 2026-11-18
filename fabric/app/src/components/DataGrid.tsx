@@ -75,6 +75,8 @@ export function DataGrid<R extends Record<string, unknown>>(props: DataGridProps
     }, [filtered, sort, props.columns]);
 
     const shown = sorted.slice(0, max);
+    // Columns keep a readable width; a narrow container (the dock open, a laptop) scrolls the table sideways instead.
+    const minWidth = props.columns.reduce((sum, c) => sum + (c.width ? Number.parseInt(c.width, 10) || 120 : c.kind === "datetime" ? 150 : c.numeric || (c.kind && NUMERIC.has(c.kind)) ? 96 : 130), 0);
     const csv = () => toCsv(props.columns, sorted);
     const toggleSort = (key: string) => setSort((s) => (s?.key === key ? (s.dir === 1 ? { key, dir: -1 } : null) : { key, dir: 1 }));
     const onRowKey = (event: KeyboardEvent<HTMLTableRowElement>, row: R) => {
@@ -124,7 +126,7 @@ export function DataGrid<R extends Record<string, unknown>>(props: DataGridProps
                 </div>
             ) : null}
             <div className="grid-scroll" tabIndex={0} role="region" aria-label={props.caption}>
-                <Table size={props.size === "medium" ? "medium" : "small"} sortable aria-label={props.caption} className="grid-table">
+                <Table size={props.size === "medium" ? "medium" : "small"} sortable aria-label={props.caption} className="grid-table" style={{ minWidth: `max(100%, ${minWidth}px)` }}>
                     <TableHeader>
                         <TableRow>
                             {props.columns.map((c) => (

@@ -246,3 +246,38 @@ export const TARGET_COLORS: Record<string, string> = {
 export function seriesColor(key: string, index: number, colors?: Record<string, string>): string {
     return colors?.[key] ?? TARGET_COLORS[key] ?? `var(--chart-${(index % 8) + 1})`;
 }
+
+/** How a categorical axis fits its labels (wait types such as SOS_SCHEDULER_YIELD are long, and the dock is narrow). */
+export interface CategoryAxis {
+    /** Rotated 35 degrees, anchored at the tick, when a label doesn't fit its slot flat. */
+    rotate: boolean;
+    /** Every nth label, when even rotated labels would overlap. */
+    every: number;
+    /** Longer labels end in an ellipsis; the full label is the tick's tooltip. */
+    maxChars: number;
+    /** The room rotated labels need below the axis. */
+    extraBottom: number;
+}
+
+export const AXIS_ROTATION_DEG = 35;
+const ROTATED_MAX_CHARS = 16;
+const ROTATED_LINE_PX = 14;
+
+/** About how wide a label is at the ticks' 11 px: capitals, digits, and underscores are wider. */
+export function labelWidth(text: string): number {
+    let width = 0;
+    for (const ch of text) width += /[A-Z0-9_%]/.test(ch) ? 7.2 : 6;
+    return width;
+}
+
+export function truncateLabel(text: string, max: number): string {
+    return text.length > max ? `${text.slice(0, Math.max(1, max - 1))}\u2026` : text;
+}
+
+export function categoryAxis(labels: readonly string[], step: number): CategoryAxis {
+    const widest = Math.max(0, ...labels.map(labelWidth));
+    if (widest <= step - 6) return { rotate: false, every: 1, maxChars: Number.POSITIVE_INFINITY, extraBottom: 0 };
+    const every = Math.max(1, Math.ceil(ROTATED_LINE_PX / Math.max(1, step)));
+    const longest = Math.max(0, ...labels.map((l) => labelWidth(truncateLabel(l, ROTATED_MAX_CHARS))));
+    return { rotate: true, every, maxChars: ROTATED_MAX_CHARS, extraBottom: Math.ceil(longest * Math.sin((AXIS_ROTATION_DEG * Math.PI) / 180)) };
+}
