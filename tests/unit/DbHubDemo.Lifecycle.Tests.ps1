@@ -995,6 +995,16 @@ Describe 'Invoke-DemoDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
     }
 
+    It 'checks T4''s size and autonomous tuning when -FromStage skips preflight, and stops before any change at a Fail (#24)' {
+        $pinned = New-TestConfig -WithT4
+        $pinned['t4SkuName'] = 'Standard_B1ms'
+        $pinned['t4AutonomousTuning'] = $true
+        $results = @(Invoke-DemoDeployment -Config $pinned -FromStage Infrastructure)
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.TUNING' }).status | Should -Be 'Fail'
+        $script:order | Should -Not -Contain 'Preflight'
+        @($script:order | Where-Object { $_ -like 'Template*' }) | Should -BeNullOrEmpty
+    }
+
     It 'starts deallocated VMs while preflight runs, and runs them before the first stage that needs them; running ones are only read (Phase 28 live finding)' {
         Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $true }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Running:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }

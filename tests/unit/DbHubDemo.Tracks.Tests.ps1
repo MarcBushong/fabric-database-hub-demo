@@ -2070,6 +2070,27 @@ Describe 'Invoke-DemoParallelDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
     }
 
+    It 'checks T4''s size and autonomous tuning when -FromStage skips preflight, and stops before any change at a Fail (#24)' {
+        # The issue's case: t4AutonomousTuning true with a t4SkuName that can't run it, from the Infrastructure stage.
+        $config['t4SkuName'] = 'Standard_B1ms'
+        $config['t4AutonomousTuning'] = $true
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Infrastructure' })
+        $tuning = @($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.TUNING' })
+        $tuning.Count | Should -Be 1
+        $tuning[0].status | Should -Be 'Fail'
+        $tuning[0].message | Should -Match '^t4AutonomousTuning is true, but T4''s size Standard_B1ms \(Burstable, 1 vCore\) can''t run autonomous tuning'
+        $tuning[0].remediation | Should -Match '^Set t4SkuName to Standard_D4ds_v5'
+        $script:calls | Should -Not -Contain 'preflight'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
+
+        # A size that runs it, from the same stage: a Pass, and the run goes on.
+        $config['t4SkuName'] = 'Standard_D4ds_v5'
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -InProcess -FromStage 'Infrastructure' })
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.TUNING' }).status | Should -Be 'Pass'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -Times 1 -Exactly
+    }
+
     It 'stops after the infrastructure with -StopAfter Infrastructure' {
         $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $config } { Invoke-DemoParallelDeployment -Config $Config -StopAfter 'Infrastructure' -InProcess })
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly

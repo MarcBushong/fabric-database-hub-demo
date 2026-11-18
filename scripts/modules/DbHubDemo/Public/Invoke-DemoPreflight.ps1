@@ -298,6 +298,18 @@ function Invoke-DemoPreflight {
     # to the default once (PREFLIGHT.T4.SIZE), or to the size t4SkuName names, so the fallback doesn't apply to it.
     # PREFLIGHT.T4.TUNING says whether the size T4 gets runs autonomous tuning.
     $t4On = Test-DemoT4Enabled -Config $Config
+    # T4's size as an earlier run recorded it (#24, 2026-11-17): deploy.ps1 hands preflight a configuration whose record it
+    # resolved already, but preflight.ps1 and validate.ps1 handed it the file's, so after a refused scale preflight announced
+    # a scale that won't happen and priced Standard_D4ds_v5. One read of the resource group's tags, as deploy.ps1's; one
+    # that can't be read keeps the file's configuration.
+    if ($t4On -and -not ($Config.Contains('t4SkuSource') -and [string]$Config['t4SkuSource'])) {
+        try {
+            $Config = Resolve-DemoEffectiveConfig -Config $Config -State (Get-DemoDeploymentState -Config $Config) -TemplateRuns
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('T4''s recorded size couldn''t be read, so preflight checks the configured one: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        }
+    }
     $t4Explicit = Test-DemoT4SkuExplicit -Config $Config
     $t4Exists = $false
     $t4ServerSku = ''
@@ -306,17 +318,19 @@ function Invoke-DemoPreflight {
     if ($t4On) {
         $postgres = Get-DemoPostgresSetting
         # One read: the server, when it exists, and its own size (Servers - Get). A size t4SkuName sets has the fallback for
-        # a new server too (2026-11-09), so the server is read for it as well; its own size matters only without t4SkuName.
+        # a new server too (2026-11-09), so the server is read for it as well; an existing server keeps its own size without
+        # t4SkuName, or moves to the size t4SkuName sets (#24, PREFLIGHT.T4.SIZE says so).
         $t4Current = Get-DemoT4State -Config $Config
         $t4Exists = [bool](Get-DemoMemberValue -InputObject $t4Current -Name 'Exists')
         # A server Azure is deleting (Dropping, the shell of a size it refused: 2026-11-09) has no size to keep.
-        if (-not $t4Explicit -and $t4Exists) {
+        if ($t4Exists) {
             $t4ServerSku = Get-DemoT4ServerSku -Server (Get-DemoMemberValue -InputObject $t4Current -Name 'Server')
         }
         $t4Planned = Get-DemoT4SkuName -Config $Config
         $t4Default = Get-DemoT4DefaultSkuName -Config $Config
-        # An existing server that no record keeps moves to the default at deploy.ps1's run (2026-11-04).
-        $t4Scale = $t4Exists -and [bool]$t4ServerSku -and $t4ServerSku -cne $t4Default -and $t4Planned -ceq $t4Default
+        # An existing server that no record keeps moves to the default at deploy.ps1's run (2026-11-04), and one whose size
+        # t4SkuName sets to another size moves to it (#24).
+        $t4Scale = $t4Exists -and [bool]$t4ServerSku -and $t4ServerSku -cne $t4Planned -and ($t4Explicit -or $t4Planned -ceq $t4Default)
         $t4Sku = if ($t4ServerSku -and -not $t4Scale) { $t4ServerSku } else { $t4Planned }
         $t4Tier = (Get-DemoT4SkuSpec -SkuName $t4Sku).Tier
         $t4Ladder = -not $t4Exists
@@ -360,7 +374,9 @@ function Invoke-DemoPreflight {
         }
         elseif ($t4Exists -and $t4Scale) {
             $scaleStatus = if (& $offers $t4Sku) { 'Pass' } else { 'Warning' }
-            $scaleMessage = if ($scaleStatus -eq 'Pass') { 'T4 exists as {0}, and {1} offers the default it moves to, {2} {3} ({4}; PREFLIGHT.T4.SIZE).' -f $t4ServerSku, $location, $t4Tier, $t4Sku, $capabilitySource } else { 'T4 exists as {0}, and {1} doesn''t list the default it would move to, {2} {3} ({4}): deploy.ps1 tries the scale, and if Azure refuses it, T4 keeps {0} (PREFLIGHT.T4.SIZE).' -f $t4ServerSku, $location, $t4Tier, $t4Sku, $capabilitySource }
+            # The default, or the size t4SkuName sets (#24).
+            $scaleTo = if ($t4Explicit) { 'the size t4SkuName sets' } else { 'the default' }
+            $scaleMessage = if ($scaleStatus -eq 'Pass') { 'T4 exists as {0}, and {1} offers {5} it moves to, {2} {3} ({4}; PREFLIGHT.T4.SIZE).' -f $t4ServerSku, $location, $t4Tier, $t4Sku, $capabilitySource, $scaleTo } elseif ($t4Explicit) { 'T4 exists as {0}, and {1} doesn''t list {5} it would move to, {2} {3} ({4}): deploy.ps1 tries the move anyway, because the list can lag (PREFLIGHT.T4.SIZE).' -f $t4ServerSku, $location, $t4Tier, $t4Sku, $capabilitySource, $scaleTo } else { 'T4 exists as {0}, and {1} doesn''t list {5} it would move to, {2} {3} ({4}): deploy.ps1 tries the scale, and if Azure refuses it, T4 keeps {0} (PREFLIGHT.T4.SIZE).' -f $t4ServerSku, $location, $t4Tier, $t4Sku, $capabilitySource, $scaleTo }
             Add-Check 'PREFLIGHT.T4.CAPABILITY' 'T4' $scaleStatus $scaleMessage -Evidence $t4Evidence -Remediation $(if ($scaleStatus -eq 'Pass') { '' } else { ('To keep T4 as it is, set t4SkuName to {0}.' -f $t4ServerSku) }) -DocUrl $capabilityDoc
         }
         elseif ($t4Exists -and -not $t4Explicit) {
@@ -449,7 +465,7 @@ function Invoke-DemoPreflight {
         # The one-time move of an existing T4 to the default (2026-11-04), and whether the size T4 gets runs autonomous
         # tuning: the configured or recorded size, the server's own, or where the fallback starts.
         if ($t4Scale) {
-            $results.Add((New-DemoT4SizeResult -CheckPrefix PREFLIGHT -ServerSku $t4ServerSku -SkuName $t4Sku -Outcome Scale))
+            $results.Add((New-DemoT4SizeResult -CheckPrefix PREFLIGHT -ServerSku $t4ServerSku -SkuName $t4Sku -Outcome Scale -Explicit:$t4Explicit))
         }
         $tuningSku = if ($t4Start) { $t4Start } else { $t4Sku }
         $tuningWhy = if ($t4Start -and $t4Pinned) { 'deploy.ps1''s fallback starts at {0} because {1}, the size t4SkuName sets, is ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' -f $t4Start, $t4Pinned } elseif ($t4Start -eq 'Standard_D2ds_v5') { 'deploy.ps1''s fallback uses Standard_D2ds_v5 because the 4-vCore sizes are ruled out here (PREFLIGHT.T4.CAPABILITY or PREFLIGHT.T4.SKU).' } elseif ($t4Explicit) { ('t4SkuName sets {0}.' -f $tuningSku) } else { '' }

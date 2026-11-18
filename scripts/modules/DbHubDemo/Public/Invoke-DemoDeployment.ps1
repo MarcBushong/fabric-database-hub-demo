@@ -331,6 +331,18 @@ function Invoke-DemoDeployment {
     # the template.
     $infrastructureIndex = [array]::IndexOf($stages, 'Infrastructure')
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:(-not $whatIf -and $startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex)
+    # T4's size and autonomous tuning (#24, 2026-11-17): a run that deploys the template without preflight checks them as
+    # PREFLIGHT.T4.TUNING does, so a t4SkuName that can't run the tuning t4AutonomousTuning asks for is a Fail before
+    # anything changes.
+    if ($startIndex -gt 0 -and -not $whatIf -and $startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex -and (Test-DemoT4Enabled -Config $Config)) {
+        $tuning = New-DemoT4TuningResult -Config $Config -CheckPrefix DEPLOY
+        $results.Add($tuning)
+        if ([string]$tuning.status -eq 'Fail') {
+            Write-DemoLog -Level Warning -Message ([string]$tuning.message)
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Failed' -Status 'Fail' -Message ('{0} {1}' -f $tuning.message, $tuning.remediation)
+            return $results.ToArray()
+        }
+    }
 
     # Values later stages need; preflight resolves them, and a resumed run reads them from the state.
     $context = @{

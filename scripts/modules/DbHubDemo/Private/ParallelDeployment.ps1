@@ -588,6 +588,19 @@ function Invoke-DemoParallelDeployment {
         if ($null -ne $notice) {
             $results.Add($notice)
         }
+        # T4's size and autonomous tuning (#24, 2026-11-17): a run that deploys the template without preflight checks them
+        # as PREFLIGHT.T4.TUNING does, so t4AutonomousTuning true with a t4SkuName that can't run it is a Fail before
+        # anything changes, on the console and the status page, rather than tuning silently off.
+        if ($plan.Infrastructure -and -not $skipT4) {
+            $tuning = New-DemoT4TuningResult -Config $Config -CheckPrefix DEPLOY
+            $results.Add($tuning)
+            if ([string]$tuning.status -eq 'Fail') {
+                Stop-DemoRayfinSignInStatus -Status $signInCheck
+                Write-DemoLog -Level Warning -Message ([string]$tuning.message)
+                Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Failed' -Status 'Fail' -Message ('{0} {1}' -f $tuning.message, $tuning.remediation)
+                return $results.ToArray()
+            }
+        }
     }
     # The tracks run for as long as the T2 wait and what follows it can take (Phase 28), with the 65 minutes the guided
     # stop had (retired 2026-11-09) kept as a margin: this is only an upper bound for a process that hangs.
