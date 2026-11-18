@@ -437,8 +437,10 @@ function Invoke-DemoTemplateDeployment {
     # t4SkuName (a start preflight or an older record gave), DbHubT4Refused stays as it is.
     $groupSeen = $tags.Count -gt 0
     $record = {
-        param([string] $Value)
-        $refusedValue = if (-not $Value) { '' } elseif ($t4Pinned -or $t4Refusals.Count -gt 0) { ConvertTo-DemoT4RefusedRecord -Refusal @(& $refusalList) -TimeUtc $t4RefusalUtc } else { [string]$tags[$t4RefusedTagName] }
+        # -KeptFrom (#25, 2026-11-17): a refused scale's record, which says the server kept its size (ConvertTo-DemoT4RefusedRecord
+        # -Kept), with the size Azure refused first, so DONE and status.ps1 never call the server the fallback's creation.
+        param([string] $Value, [AllowNull()] [object] $KeptFrom = $null)
+        $refusedValue = if (-not $Value) { '' } elseif ($null -ne $KeptFrom) { ConvertTo-DemoT4RefusedRecord -Refusal @([pscustomobject]@{ Sku = [string]$KeptFrom.Sku; Zones = [string[]]@($(if ([string]$KeptFrom.Zone) { [string]$KeptFrom.Zone } else { 'any' })) }) -TimeUtc ([string]$KeptFrom.TimeUtc) -Kept } elseif ($t4Pinned -or $t4Refusals.Count -gt 0) { ConvertTo-DemoT4RefusedRecord -Refusal @(& $refusalList) -TimeUtc $t4RefusalUtc } else { [string]$tags[$t4RefusedTagName] }
         if ([string]$tags[$t4TagName] -ceq $Value -and [string]$tags[$t4RefusedTagName] -ceq $refusedValue) {
             return
         }
@@ -456,6 +458,11 @@ function Invoke-DemoTemplateDeployment {
     }
     # An older caller's None counts as Standard_D2ds_v5, and Refused as no start (2026-11-09: no step leaves T4 out).
     $startSku = switch ($T4StartSku) { 'None' { 'Standard_D2ds_v5' } 'Refused' { '' } default { $T4StartSku } }
+    # A refused scale's record (#25) whose server is gone: this run creates T4 at the recorded size, so the record becomes
+    # the fallback's, without "kept".
+    if ($ladder -and [string]$effective['t4SkuSource'] -ceq 'record' -and (ConvertFrom-DemoT4RefusedRecord -Value ([string]$tags[$t4RefusedTagName])).Kept) {
+        & $record ([string]$tags[$t4TagName])
+    }
     if ($ladder -and $startSku -and $t4Pinned) {
         # Preflight found the size t4SkuName sets, and maybe the next ones, unavailable here (2026-11-09): the fallback starts
         # at the first size it found, whose cost check and result come right before the first attempt (below).
@@ -818,7 +825,7 @@ function Invoke-DemoTemplateDeployment {
         if ($t4Scaling -and $null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current) {
             $t4Scaling = $false
             $effective = Copy-DemoT4Config -Config $effective -Source server -SkuName $t4ServerSku
-            & $record $t4ServerSku
+            & $record $t4ServerSku -KeptFrom ([pscustomobject]@{ Sku = $current; Zone = [string]$t4Failure.Zone; TimeUtc = [string]$t4Failure.TimeUtc })
             $results.Add((New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $current -Outcome Refused -Failure $t4Failure))
             Write-DemoLog -Level Warning -Message ('Azure refused to scale T4 to {0}; deploying again with T4 at {1}.' -f $current, $t4ServerSku)
             continue

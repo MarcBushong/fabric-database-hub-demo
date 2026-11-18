@@ -320,14 +320,17 @@ function ConvertTo-DemoT4RefusedRecord {
     # DbHubT4Refused's value (2026-11-09): the sizes Azure refused for T4 with SkuNotAvailable, the asked size first, each
     # with the zones it was tried in ('any' for no zone preference), and when, as in
     # "Standard_B1ms@1,2;Standard_B2s@1;2026-11-09T21:25:13Z"; within a tag's 256 characters. -Refusal items have Sku and
-    # Zones. Pure. Internal.
+    # Zones. -Kept (#25, 2026-11-17) adds the part "kept": Azure refused to scale an existing T4 to that size, and it kept
+    # its own, as in "Standard_D4ds_v5@any;kept;2026-11-17T12:00:00Z"; an older reader skips the part. Pure. Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [AllowEmptyCollection()]
         [object[]] $Refusal = @(),
 
-        [string] $TimeUtc = ''
+        [string] $TimeUtc = '',
+
+        [switch] $Kept
     )
 
     $parts = [System.Collections.Generic.List[string]]::new()
@@ -339,6 +342,9 @@ function ConvertTo-DemoT4RefusedRecord {
     if ($parts.Count -eq 0) {
         return ''
     }
+    if ($Kept) {
+        $parts.Add('kept')
+    }
     if ($TimeUtc) {
         $parts.Add($TimeUtc)
     }
@@ -347,8 +353,9 @@ function ConvertTo-DemoT4RefusedRecord {
 }
 
 function ConvertFrom-DemoT4RefusedRecord {
-    # Reads DbHubT4Refused (ConvertTo-DemoT4RefusedRecord): Asked (its first size, or ''), Refusals (Sku and Zones), and
-    # TimeUtc. An empty or unreadable value gives an empty record. Pure. Internal.
+    # Reads DbHubT4Refused (ConvertTo-DemoT4RefusedRecord): Asked (its first size, or ''), Refusals (Sku and Zones),
+    # TimeUtc, and Kept (#25: the record is a refused scale's, which kept an existing server's size). An empty or unreadable
+    # value gives an empty record. Pure. Internal.
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -359,9 +366,14 @@ function ConvertFrom-DemoT4RefusedRecord {
 
     $refusals = [System.Collections.Generic.List[object]]::new()
     $time = ''
+    $kept = $false
     foreach ($part in @(([string]$Value) -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
         if ($part -match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?Z$') {
             $time = $part
+            continue
+        }
+        if ($part -ceq 'kept') {
+            $kept = $true
             continue
         }
         if ($part -cmatch '^(?<sku>Standard_[A-Za-z0-9_]+)(@(?<zones>[a-z0-9,]+))?$' -and $Matches['sku'] -cin $script:T4Sizes) {
@@ -371,7 +383,7 @@ function ConvertFrom-DemoT4RefusedRecord {
             $refusals.Add([pscustomobject]@{ Sku = $sku; Zones = $zones })
         }
     }
-    return [pscustomobject]@{ Asked = $(if ($refusals.Count -gt 0) { [string]$refusals[0].Sku } else { '' }); Refusals = $refusals.ToArray(); TimeUtc = $time }
+    return [pscustomobject]@{ Asked = $(if ($refusals.Count -gt 0) { [string]$refusals[0].Sku } else { '' }); Refusals = $refusals.ToArray(); TimeUtc = $time; Kept = ($kept -and $refusals.Count -gt 0) }
 }
 
 function Test-DemoT4RecordInEffect {
@@ -1508,7 +1520,63 @@ function Test-DemoT4FallbackSize {
     if (-not $recorded -or $recorded -ceq (Get-DemoT4AskedSku -Config $Config) -or -not (Test-DemoT4RecordInEffect -Config $Config -Recorded $recorded -Refused $refused)) {
         return $false
     }
-    return ([bool](ConvertFrom-DemoT4RefusedRecord -Value $refused).Asked -or $recorded -cin 'Standard_D4ads_v5', 'Standard_D2ds_v5')
+    $record = ConvertFrom-DemoT4RefusedRecord -Value $refused
+    if ($record.Kept) {
+        # A refused scale's record (#25): the server kept its size, and the fallback didn't create it (Test-DemoT4KeptSize).
+        return $false
+    }
+    return ([bool]$record.Asked -or $recorded -cin 'Standard_D4ads_v5', 'Standard_D2ds_v5')
+}
+
+function Test-DemoT4KeptSize {
+    # True when an existing T4 runs at a size it kept because Azure refused to scale it to the size the configuration asks
+    # for (#25, 2026-11-17): the resource group's DbHubT4Size records its size, DbHubT4Refused says "kept"
+    # (ConvertTo-DemoT4RefusedRecord -Kept), and the record holds (Test-DemoT4RecordInEffect). The fallback didn't create
+    # it, so Test-DemoT4FallbackSize is false. A record from before 2026-11-17 has no "kept" and can't be told apart. Pure.
+    # Internal.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [System.Collections.IDictionary] $Config = @{},
+
+        [AllowNull()]
+        [object] $State
+    )
+
+    if (-not (Test-DemoT4Enabled -Config $Config)) {
+        return $false
+    }
+    $recorded = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku')
+    $refused = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Refused')
+    if (-not $recorded -or $recorded -ceq (Get-DemoT4AskedSku -Config $Config) -or -not (Test-DemoT4RecordInEffect -Config $Config -Recorded $recorded -Refused $refused)) {
+        return $false
+    }
+    return [bool](ConvertFrom-DemoT4RefusedRecord -Value $refused).Kept
+}
+
+function Format-DemoT4KeptText {
+    # What DONE and status.ps1 say about T4 at a size it kept (#25, Test-DemoT4KeptSize): that it kept its size, which size
+    # Azure refused to scale it to, and when, and that later runs keep it. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [System.Collections.IDictionary] $Config = @{},
+
+        [AllowNull()]
+        [object] $State
+    )
+
+    $sku = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku')
+    $refused = ConvertFrom-DemoT4RefusedRecord -Value ([string](Get-DemoMemberValue -InputObject $State -Name 'T4Refused'))
+    $asked = if ($refused.Asked) { $refused.Asked } else { Get-DemoT4AskedSku -Config $Config }
+    $spec = Get-DemoT4SkuSpec -SkuName $sku
+    $sized = '{0} {1} ({2} vCore{3})' -f $(if ($spec.Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' }), $sku, $spec.VCores, $(if ($spec.VCores -eq 1) { '' } else { 's' })
+    $whose = if (Get-DemoT4PinnedSku -Config $Config) { 'the size t4SkuName sets' } else { 'T4''s default size' }
+    $text = 'T4 kept its size, {0}: Azure refused to scale it to {1}, {2} (SkuNotAvailable{3}), so later runs keep it (the resource group''s DbHubT4Size records it); deploy.ps1''s fallback didn''t create it.' -f $sized, $asked, $whose, $(if ($refused.TimeUtc) { ', at ' + $refused.TimeUtc } else { '' })
+    if ((Get-DemoT4Tuning -Config $Config -SkuName $asked).Enabled -and -not (Get-DemoT4Tuning -Config $Config -SkuName $sku).Enabled) {
+        $text += ' Autonomous tuning stays off at this size: it needs a General Purpose size with at least 4 vCores.'
+    }
+    return $text
 }
 
 function Get-DemoT4ServerEvidence {
@@ -1626,6 +1694,10 @@ function Get-DemoT4FallbackNote {
         [string] $Notice = ''
     )
 
+    if (Test-DemoT4KeptSize -Config $Config -State $State) {
+        # A size an existing T4 kept after a refused scale (#25) is said as that, never as the fallback's creation.
+        return (Format-DemoT4KeptText -Config $Config -State $State)
+    }
     if (-not (Test-DemoT4FallbackSize -Config $Config -State $State)) {
         return ''
     }
@@ -1868,7 +1940,8 @@ function Get-DemoT4RecordedSizeChange {
     The size change's notice for T4 at a size an earlier run's fallback chose (2026-11-09), for status.ps1 (STATUS.T4.SIZE)
     and the ending of a later deploy.ps1: New-DemoT4SizeChangeResult from the record (DbHubT4Size, and DbHubT4Refused
     with the zones tried and when) and T4's monthly estimate at both sizes now (Get-DemoT4SizeChangeCost). $null when T4
-    runs at the size the configuration asks for (Test-DemoT4FallbackSize). Never throws. Internal.
+    runs at the size the configuration asks for (Test-DemoT4FallbackSize). For a size an existing T4 kept after a refused
+    scale (#25, Test-DemoT4KeptSize), a Warning that says so instead (Format-DemoT4KeptText). Never throws. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1883,6 +1956,13 @@ function Get-DemoT4RecordedSizeChange {
         [string] $CheckId = 'STATUS.T4.SIZE'
     )
 
+    if (Test-DemoT4KeptSize -Config $Config -State $State) {
+        $kept = [string](Get-DemoMemberValue -InputObject $State -Name 'T4Sku')
+        $keptFrom = ConvertFrom-DemoT4RefusedRecord -Value ([string](Get-DemoMemberValue -InputObject $State -Name 'T4Refused'))
+        $evidence = [ordered]@{ keptSku = $kept; askedSku = $keptFrom.Asked; refusedUtc = $keptFrom.TimeUtc; kept = $true }
+        $remediation = 'Nothing to do: later runs keep T4 at {0}, so nothing resizes or restarts it. To try {1} again, set t4SkuName to it and run ./scripts/deploy.ps1, which moves T4 to it after checking its cost, and restarts it; to keep {0} for good, set t4SkuName to {0}.' -f $kept, $keptFrom.Asked
+        return (New-DemoResult -CheckId $CheckId -Area 't4' -Target 'T4' -Status 'Warning' -Message (Format-DemoT4KeptText -Config $Config -State $State) -Evidence $evidence -Remediation $remediation -DocUrl 'https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources')
+    }
     if (-not (Test-DemoT4FallbackSize -Config $Config -State $State)) {
         return $null
     }

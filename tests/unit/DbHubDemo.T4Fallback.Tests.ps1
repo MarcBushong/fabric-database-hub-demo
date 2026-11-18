@@ -1104,6 +1104,45 @@ Describe 'The 4-vCore default (2026-11-04): another zone, the fallback''s sizes,
         InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Test-DemoT4FallbackSize -Config $Config -State ([pscustomobject]@{ T4Sku = 'Standard_D4ads_v5' }) } | Should -BeTrue
     }
 
+    It 'records a size an existing T4 kept as kept, so DONE and status.ps1 never call it the fallback''s creation (#25)' {
+        # The issue's case: an existing T4 at Standard_D2ds_v5 whose move to the default Azure refused.
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D2ds_v5'; tier = 'GeneralPurpose' } }
+        $script:codes = @{ Standard_D4ds_v5 = 'SkuNotAvailable' }
+        $script:refusesExisting = $true
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        $deployment.Succeeded | Should -BeTrue
+        @($script:recorded) | Should -Be @('Standard_D2ds_v5')
+        @($script:recordedRefused) | Should -Be @('Standard_D4ds_v5@any;kept;2026-11-02T14:00:00Z')
+        $state = New-TestState -T4Sku 'Standard_D2ds_v5' -T4Refused $script:recordedRefused[0]
+        $read = InModuleScope DbHubDemo -Parameters @{ State = $state; Config = (New-TestConfig) } {
+            [pscustomobject]@{
+                Fallback = Test-DemoT4FallbackSize -Config $Config -State $State
+                Kept     = Test-DemoT4KeptSize -Config $Config -State $State
+                Note     = Get-DemoT4FallbackNote -Config $Config -State $State -HourlyUsd 0.2 -Created $true
+                Status   = Get-DemoT4RecordedSizeChange -Config $Config -State $State -CheckId 'STATUS.T4.SIZE'
+                Keeps    = (Resolve-DemoEffectiveConfig -Config $Config -State $State)['t4SkuName']
+            }
+        }
+        $read.Fallback | Should -BeFalse
+        $read.Kept | Should -BeTrue
+        $read.Note | Should -BeExactly 'T4 kept its size, General Purpose Standard_D2ds_v5 (2 vCores): Azure refused to scale it to Standard_D4ds_v5, T4''s default size (SkuNotAvailable, at 2026-11-02T14:00:00Z), so later runs keep it (the resource group''s DbHubT4Size records it); deploy.ps1''s fallback didn''t create it. Autonomous tuning stays off at this size: it needs a General Purpose size with at least 4 vCores.'
+        $read.Status.checkId | Should -Be 'STATUS.T4.SIZE'
+        $read.Status.status | Should -Be 'Warning'
+        $read.Status.message | Should -BeExactly $read.Note
+        $read.Status.evidence.kept | Should -BeTrue
+        $read.Status.remediation | Should -Match '^Nothing to do: later runs keep T4 at Standard_D2ds_v5'
+        $read.Keeps | Should -Be 'Standard_D2ds_v5' -Because 'the record keeps the server''s size, as before'
+        # A record from before 2026-11-17 has no "kept", so it can't be told from the fallback's, and reads as before.
+        InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Test-DemoT4FallbackSize -Config $Config -State ([pscustomobject]@{ T4Sku = 'Standard_D2ds_v5' }) } | Should -BeTrue
+
+        # When that server is gone, the next run creates T4 at the recorded size, and the record becomes the fallback's.
+        Initialize-TemplateHarness
+        $script:groupTags = @{ deploymentId = 'abc123'; DbHubT4Size = 'Standard_D2ds_v5'; DbHubT4Refused = 'Standard_D4ds_v5@any;kept;2026-11-02T14:00:00Z' }
+        $null = Invoke-DemoTemplateDeployment -Config (Resolve-TestConfig -Config (New-TestConfig) -Record 'Standard_D2ds_v5' -Refused 'Standard_D4ds_v5@any;kept;2026-11-02T14:00:00Z' -TemplateRuns) -NetworkMode private -T3UseFreeLimit $false -ScaleT4
+        @($script:sizes) | Should -Be @('Standard_D2ds_v5')
+        $script:recordedRefused[0] | Should -BeExactly 'Standard_D4ds_v5@any;2026-11-02T14:00:00Z'
+    }
+
     It 'prices the move of an existing T4 to the default first, and keeps its size over a ceiling, naming the ceiling to raise (review of PR 20)' {
         # The reviewer's case: monthlyCeilingUsd set to 250, no t4SkuName, and no safety stop in place, so T4's 7-day restart
         # counts the rest of the month: light use plus that worst case is 312.21 USD, a Fail that -FromStage Infrastructure never ran.
