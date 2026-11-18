@@ -571,6 +571,115 @@ function Restart-DemoGuestVm {
     return $how
 }
 
+function Get-DemoGuestHostVmId {
+    # This host's own Azure VM ID from the Instance Metadata Service (the host can reach it; only the guest is blocked,
+    # ADR 0004), or '' when it can't be read. A function of its own so tests can stand in for it.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    try {
+        $request = [System.Net.WebRequest]::Create('http://169.254.169.254/metadata/instance/compute/vmId?api-version=2021-02-01&format=text')
+        $request.Headers.Add('Metadata', 'true')
+        $request.Proxy = New-Object -TypeName 'System.Net.WebProxy'
+        $request.Timeout = 10000
+        $response = $request.GetResponse()
+        try {
+            $reader = New-Object -TypeName 'System.IO.StreamReader' -ArgumentList $response.GetResponseStream()
+            return $reader.ReadToEnd().Trim()
+        }
+        finally {
+            $response.Close()
+        }
+    }
+    catch {
+        return ''
+    }
+}
+
+function Test-DemoGuestCaptureInProgress {
+    <#
+    .SYNOPSIS
+    Whether a golden capture is in progress on this host, read as the golden script's Get-GoldenCaptureProgress reads
+    its marker (second review of #65). Prepare writes golden\capture-in-progress.json before the snapshot, so every
+    copy restored from it carries the marker, and there it means nothing: it counts only on the host it names
+    (sourceAzureVmId, against this host's VM ID from IMDS), and for 6 hours after Prepare wrote it. A marker that names
+    no host or whose time can't be read, or one that counts while this host's VM ID can't be read, is taken as a capture
+    in progress (fail closed). Never throws.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $path = [System.IO.Path]::Combine($StateRoot, 'golden', 'capture-in-progress.json')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $marker = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
+        $sourceProperty = $marker.PSObject.Properties['sourceAzureVmId']
+        $source = if ($null -ne $sourceProperty -and $null -ne $sourceProperty.Value) { [string]$sourceProperty.Value } else { '' }
+        $vmId = Get-DemoGuestHostVmId
+        if ($vmId -and $source -and -not [string]::Equals($source, $vmId, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        $since = [datetime]::MinValue
+        $readable = $false
+        $started = $marker.PSObject.Properties['startedUtc']
+        if ($null -ne $started -and $started.Value -is [datetime]) {
+            $since = if ($started.Value.Kind -eq [System.DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($started.Value, [System.DateTimeKind]::Utc) } else { $started.Value.ToUniversalTime() }
+            $readable = $true
+        }
+        elseif ($null -ne $started -and $started.Value -is [string]) {
+            $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+            $readable = [datetime]::TryParseExact($started.Value, "yyyy-MM-dd'T'HH':'mm':'ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$since)
+        }
+        if (-not $source -or -not $readable) {
+            return $true
+        }
+        return ($NowUtc.ToUniversalTime() -lt $since.AddHours(6))
+    }
+    catch {
+        return $true
+    }
+}
+
+function Test-DemoGuestRestartedSince {
+    # True when the guest has booted since SinceUtc (its uptime is shorter than the time since), false when it still runs
+    # the boot it had then, or when that can't be told. Never throws.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $Vm,
+
+        [AllowNull()]
+        [object] $SinceUtc,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    try {
+        $since = [datetime]::MinValue
+        if ($SinceUtc -is [datetime]) {
+            $since = if ($SinceUtc.Kind -eq [System.DateTimeKind]::Unspecified) { [datetime]::SpecifyKind($SinceUtc, [System.DateTimeKind]::Utc) } else { $SinceUtc.ToUniversalTime() }
+        }
+        elseif (-not [datetime]::TryParse([string]$SinceUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$since)) {
+            return $false
+        }
+        $uptime = Get-DemoGuestUptime -Vm $Vm
+        return ($uptime -gt 0 -and $uptime -lt ($NowUtc.ToUniversalTime() - $since).TotalMinutes)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-DemoGuestRecoveryUnfinished {
     # guest-recovery.json's latest entry when its restart never finished (no endedUtc): its process ended between
     # Stop-VM and Start-VM, or before it recorded the end. $null otherwise. Never throws.
@@ -602,7 +711,7 @@ function Test-DemoGuestHeldOff {
         [string] $StateRoot
     )
 
-    if (Test-Path -LiteralPath ([System.IO.Path]::Combine($StateRoot, 'golden', 'capture-in-progress.json'))) {
+    if (Test-DemoGuestCaptureInProgress -StateRoot $StateRoot) {
         return $true
     }
     $capturePath = [System.IO.Path]::Combine($StateRoot, 'golden', 'capture.json')
@@ -629,9 +738,12 @@ function Complete-DemoGuestRecoveryInterrupted {
     .DESCRIPTION
     Only when guest-recovery.json's latest entry has no endedUtc, under the host's recovery lock (so not while a restart
     runs), and for the same guest (its VM ID). A guest that's Off is started and waited for, unless something keeps it
-    off on purpose (Test-DemoGuestHeldOff: a golden capture, or a restored copy that isn't released yet); one that runs
-    only gets its entry completed. The entry ends with stoppedBy Interrupted. A guest that's Off for any other reason,
-    without such an entry, is never started here.
+    off on purpose (Test-DemoGuestHeldOff: a golden capture on this host, or a restored copy that isn't released yet).
+    One that still runs the boot the restart began on (Hyper-V says Running until the guest's operating system powers
+    off, so it may be shutting down) is restarted (Restart-DemoGuestVm: up to StopMinutes for its shutdown, then turned
+    off, then started). One that booted since only gets its entry completed. The entry ends with stoppedBy Interrupted,
+    never while the guest is still Off. A guest that's Off for any other reason, without such an entry, is never
+    started here.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     [OutputType([pscustomobject])]
@@ -649,6 +761,10 @@ function Complete-DemoGuestRecoveryInterrupted {
 
         [ValidateRange(1, 60)]
         [int] $OnlineMinutes = 10,
+
+        # How long a guest that still runs the boot the restart began on may take to shut down before it's turned off.
+        [ValidateRange(1, 30)]
+        [int] $StopMinutes = 6,
 
         # The caller holds the recovery lock already (Invoke-DemoGuestRecovery).
         [switch] $LockHeld
@@ -683,13 +799,30 @@ function Complete-DemoGuestRecoveryInterrupted {
         }
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
         $result = [ordered]@{ Action = 'Interrupted'; Restarted = $true; Recovered = $false; Seconds = 0; Reason = [string]$entry['reason']; By = [string]$entry['by']; Key = [string]$entry['key']; AtUtc = (Get-DemoVmUtcNow); RestartUtc = [string]$entry['startedUtc']; StoppedBy = 'Interrupted'; Message = '' }
+        $how = 'it was running'
         if ($state -eq 'Off') {
             Write-DemoVmLog -Level 'Warning' -Message ('{0} is off because its restart by {1} at {2} didn''t finish; it''s started again.' -f $Name, $result.By, $result.RestartUtc)
             Start-VM -Name $Name
             Start-Sleep -Seconds 20
+            $how = 'it was started again'
+        }
+        elseif (-not (Test-DemoGuestRestartedSince -Vm $vm -SinceUtc $entry['startedUtc'])) {
+            # Still the boot the restart began on: Hyper-V says Running until the guest's operating system powers off, so it
+            # may be shutting down, or its process ended before Stop-VM. It's restarted as that recovery meant to be:
+            # Restart-DemoGuestVm waits up to StopMinutes for it to be off, turns it off after that, and starts it.
+            Write-DemoVmLog -Level 'Warning' -Message ('{0}''s restart by {1} at {2} didn''t finish, and it still runs the boot it had then; it''s restarted.' -f $Name, $result.By, $result.RestartUtc)
+            $null = Restart-DemoGuestVm -Name $Name -StopMinutes $StopMinutes -Confirm:$false
+            Start-Sleep -Seconds 20
+            $how = 'it was restarted'
         }
         $result.Recovered = Wait-DemoGuestOnline -Name $Name -Credential $Credential -TimeoutMinutes $OnlineMinutes
         $result.Seconds = [int]$clock.Elapsed.TotalSeconds
+        if (-not $result.Recovered -and [string](Get-VM -Name $Name -ErrorAction SilentlyContinue).State -eq 'Off') {
+            # Never closed while the guest is off: the next run tries again.
+            $result.Message = ('{0}''s restart by {1} at {2} was interrupted, and it is still off.' -f $Name, $result.By, $result.RestartUtc)
+            Write-DemoVmLog -Level 'Error' -Message $result.Message
+            return [pscustomobject]$result
+        }
         $entry['endedUtc'] = Get-DemoVmUtcNow
         $entry['stoppedBy'] = 'Interrupted'
         $entry['recovered'] = [bool]$result.Recovered
@@ -697,7 +830,7 @@ function Complete-DemoGuestRecoveryInterrupted {
         # deploy.ps1 reports it once, at the time it was finished, from this result or from the host's health.
         $result.AtUtc = [string]$entry['endedUtc']
         $result.Message = if ($result.Recovered) {
-            '{0}''s restart by {1} at {2} was interrupted; {3}, and it answers over PowerShell Direct again.' -f $Name, $result.By, $result.RestartUtc, $(if ($state -eq 'Off') { 'it was started again' } else { 'it was running' })
+            '{0}''s restart by {1} at {2} was interrupted; {3}, and it answers over PowerShell Direct again.' -f $Name, $result.By, $result.RestartUtc, $how
         }
         else {
             '{0}''s restart by {1} at {2} was interrupted, and it didn''t answer over PowerShell Direct within {3} minutes.' -f $Name, $result.By, $result.RestartUtc, $OnlineMinutes
@@ -802,7 +935,7 @@ function Invoke-DemoGuestRecovery {
             return [pscustomobject]$result
         }
         # A restart whose process ended before it finished (review of #65) is finished first; that counts as this one.
-        $interrupted = Complete-DemoGuestRecoveryInterrupted -Name $Name -Credential $Credential -StateRoot $StateRoot -OnlineMinutes $OnlineMinutes -LockHeld -Confirm:$false
+        $interrupted = Complete-DemoGuestRecoveryInterrupted -Name $Name -Credential $Credential -StateRoot $StateRoot -OnlineMinutes $OnlineMinutes -StopMinutes $StopMinutes -LockHeld -Confirm:$false
         if ($null -ne $interrupted) {
             return $interrupted
         }
@@ -816,7 +949,7 @@ function Invoke-DemoGuestRecovery {
         if (-not $result.Reason) {
             $result.Reason = [string]$probe.Error
         }
-        $capture = Test-Path -LiteralPath ([System.IO.Path]::Combine($StateRoot, 'golden', 'capture-in-progress.json'))
+        $capture = Test-DemoGuestCaptureInProgress -StateRoot $StateRoot
         $decision = Get-DemoGuestRecoveryDecision -State $probe.State -Heartbeat $probe.Heartbeat -UptimeMinutes $probe.UptimeMinutes -Broken ([bool]$probe.Broken) -Record (Read-DemoGuestRecoveryRecord -StateRoot $StateRoot) -Key $Key -CaptureInProgress $capture
         $result.Action = $decision.Action
         if ($decision.Action -in 'None', 'Exhausted') {

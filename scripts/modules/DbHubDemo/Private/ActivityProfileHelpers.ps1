@@ -500,8 +500,14 @@ function Get-DemoProfileRunCommandScript {
         $lines.Add('    if ($null -ne $dbhubResult.PSObject.Properties[''evidence''] -and $null -ne $dbhubResult.evidence) {')
         $lines.Add('        if ($null -ne $dbhubResult.evidence.PSObject.Properties[''exitCode'']) { $dbhubExit = $dbhubResult.evidence.exitCode }')
         $lines.Add('        if ($null -ne $dbhubResult.evidence.PSObject.Properties[''golden'']) { $dbhubGolden = $dbhubResult.evidence.golden }')
-        # A guest restart that cleared a broken PowerShell Direct channel (issue #65), kept short for the 4 KB.
-        $lines.Add('        if ($null -ne $dbhubResult.evidence.PSObject.Properties[''guestRecovery''] -and $null -ne $dbhubResult.evidence.guestRecovery -and [bool]$dbhubResult.evidence.guestRecovery.restarted) { $dbhubGr = $dbhubResult.evidence.guestRecovery; $dbhubWhy = [string]$dbhubGr.reason; if ($dbhubWhy.Length -gt 120) { $dbhubWhy = $dbhubWhy.Substring(0, 120) }; $dbhubRecovery = @{ restarted = $true; recovered = [bool]$dbhubGr.recovered; seconds = [int]$dbhubGr.seconds; restartUtc = [string]$dbhubGr.restartUtc; stoppedBy = [string]$dbhubGr.stoppedBy; by = [string]$dbhubGr.by; reason = $dbhubWhy } }')
+        # A recovery from a broken PowerShell Direct channel (issue #65), kept short for the 4 KB, with what deploy.ps1 needs to
+        # report it once: its action and time, read through PSObject.Properties for any relay's version.
+        $lines.Add('        if ($null -ne $dbhubResult.evidence.PSObject.Properties[''guestRecovery''] -and $null -ne $dbhubResult.evidence.guestRecovery) {')
+        $lines.Add('            $dbhubGr = $dbhubResult.evidence.guestRecovery')
+        $lines.Add('            $dbhubPick = @{}')
+        $lines.Add('            foreach ($dbhubName in ''action'', ''restarted'', ''recovered'', ''seconds'', ''atUtc'', ''restartUtc'', ''stoppedBy'', ''by'', ''reason'') { $dbhubProperty = $dbhubGr.PSObject.Properties[$dbhubName]; $dbhubPick[$dbhubName] = $(if ($null -ne $dbhubProperty) { $dbhubProperty.Value } else { $null }) }')
+        $lines.Add('            if ([bool]$dbhubPick[''restarted''] -or [string]$dbhubPick[''action''] -eq ''Healed'') { $dbhubWhy = [string]$dbhubPick[''reason'']; if ($dbhubWhy.Length -gt 120) { $dbhubWhy = $dbhubWhy.Substring(0, 120) }; $dbhubRecovery = @{ action = [string]$dbhubPick[''action'']; restarted = [bool]$dbhubPick[''restarted'']; recovered = [bool]$dbhubPick[''recovered'']; seconds = [int]$dbhubPick[''seconds'']; atUtc = [string]$dbhubPick[''atUtc'']; restartUtc = [string]$dbhubPick[''restartUtc'']; stoppedBy = [string]$dbhubPick[''stoppedBy'']; by = [string]$dbhubPick[''by'']; reason = $dbhubWhy } }')
+        $lines.Add('        }')
         $lines.Add('    }')
         $lines.Add(('    $dbhubShort = @{{ marker = ''DBHUBDEMO-WORKLOAD''; action = ''Runner''; status = [string]$dbhubResult.status; message = $dbhubMessage; evidence = @{{ target = ''{0}''; exitCode = $dbhubExit; attempts = $dbhubAttempts; golden = $dbhubGolden; guestRecovery = $dbhubRecovery }} }}' -f $item))
         $lines.Add('}')

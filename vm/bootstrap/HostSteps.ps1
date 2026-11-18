@@ -325,7 +325,8 @@ function Invoke-DemoHostGuestRecoveryRepair {
             return
         }
         $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
-        $null = Complete-DemoGuestRecoveryInterrupted -Name $Context.GuestName -Credential $credential -StateRoot $Context.Root -Confirm:$false
+        # Bounded for a bootstrap run: at most 6 minutes for a shutdown and 5 for the guest to answer.
+        $null = Complete-DemoGuestRecoveryInterrupted -Name $Context.GuestName -Credential $credential -StateRoot $Context.Root -OnlineMinutes 5 -StopMinutes 6 -Confirm:$false
     }
     catch {
         Write-DemoVmLog -Level 'Warning' -Message ('An interrupted restart of the guest couldn''t be finished: {0}' -f $_.Exception.Message)

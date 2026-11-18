@@ -511,8 +511,8 @@ Describe 'A restart of the guest that its process didn''t finish (review of #65)
             }
         }
         $script:vmId = '77777777-8888-9999-0000-111111111111'
-        function Set-TestUnfinishedRestart([string] $Root, [string] $VmId = $script:vmId) {
-            $record = [ordered]@{ schemaVersion = 1; restarts = @([ordered]@{ id = 'a1'; key = 'deploy-aaaaaaaaaaaa'; by = 'Arc onboarding'; reason = 'The Hyper-V socket target process has ended.'; vmId = $VmId; startedUtc = '2026-11-18T18:50:00Z'; endedUtc = ''; seconds = 0; stoppedBy = ''; recovered = $false }) }
+        function Set-TestUnfinishedRestart([string] $Root, [string] $VmId = $script:vmId, [string] $StartedUtc = '2026-11-18T18:50:00Z') {
+            $record = [ordered]@{ schemaVersion = 1; restarts = @([ordered]@{ id = 'a1'; key = 'deploy-aaaaaaaaaaaa'; by = 'Arc onboarding'; reason = 'The Hyper-V socket target process has ended.'; vmId = $VmId; startedUtc = $StartedUtc; endedUtc = ''; seconds = 0; stoppedBy = ''; recovered = $false }) }
             Set-Content -LiteralPath (Join-Path -Path $Root -ChildPath 'guest-recovery.json') -Value ($record | ConvertTo-Json -Depth 4)
         }
         function Get-TestLastRestart([string] $Root) {
@@ -606,5 +606,87 @@ Describe 'A restart of the guest that its process didn''t finish (review of #65)
         { Invoke-DemoArcOnboardWithRecovery -ActionName 'WriteMarker' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot } | Should -Throw 'DbHubDemo Arc WriteMarker failed: *target process has ended*'
         Should -Invoke -CommandName Start-VM -Times 0 -Exactly
         Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+    }
+
+    It 'waits for a guest that was still shutting down when its restart was cut short, then starts it (second review of #65)' {
+        # Hyper-V says Running until the guest's operating system powers off: the same boot as when the entry was written.
+        $script:vm.State = 'Running'
+        $script:vm.Heartbeat = 'OkApplicationsHealthy'
+        $script:vm.Uptime = [timespan]::FromHours(3)
+        Set-TestUnfinishedRestart -Root $script:root -StartedUtc ([DateTime]::UtcNow.AddMinutes(-4).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        $done = Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false
+        $done.Recovered | Should -BeTrue
+        Should -Invoke -CommandName Stop-VM -Times 1 -Exactly -ParameterFilter { $Force -and $AsJob -and -not $TurnOff }
+        Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+        (Get-TestLastRestart -Root $script:root).stoppedBy | Should -Be 'Interrupted'
+    }
+
+    It 'only completes the entry of a guest that booted since, and never closes one while the guest stays off' {
+        $script:vm.State = 'Running'
+        $script:vm.Heartbeat = 'OkApplicationsHealthy'
+        $script:vm.Uptime = [timespan]::FromMinutes(2)
+        $script:answers = $true
+        Set-TestUnfinishedRestart -Root $script:root -StartedUtc ([DateTime]::UtcNow.AddMinutes(-10).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        (Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false).Recovered | Should -BeTrue
+        Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+
+        # A guest that doesn't come up: its entry stays open for the next run.
+        $script:vm.State = 'Off'
+        $script:answers = $false
+        Mock -CommandName Start-VM -MockWith { }
+        Set-TestUnfinishedRestart -Root $script:root
+        (Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false).Recovered | Should -BeFalse
+        (Get-TestLastRestart -Root $script:root).endedUtc | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'A golden capture marker, read as Get-GoldenCaptureProgress reads it (second review of #65)' {
+    BeforeEach {
+        $script:root = New-TestStateRoot
+        New-Item -ItemType Directory -Path (Join-Path -Path $script:root -ChildPath 'golden') -Force | Out-Null
+        $script:hostVmId = 'aaaaaaaa-1111-2222-3333-444444444444'
+        Mock -CommandName Get-DemoGuestHostVmId -MockWith { $script:hostVmId }
+        function Set-TestMarker([string] $Source, [datetime] $StartedUtc) {
+            $marker = [ordered]@{ schemaVersion = 1; snapshotName = 'snap-dbhub-t2golden-202611181200'; startedUtc = $StartedUtc.ToString("yyyy-MM-dd'T'HH':'mm':'ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture); sourceAzureVmId = $Source }
+            Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture-in-progress.json') -Value ($marker | ConvertTo-Json)
+        }
+        $script:now = [datetime]::new(2026, 11, 18, 13, 0, 0, [System.DateTimeKind]::Utc)
+    }
+
+    It 'counts on the capture''s source only, for 6 hours, and fails closed when it can''t tell' {
+        Test-DemoGuestCaptureInProgress -StateRoot $script:root -NowUtc $script:now | Should -BeFalse -Because 'there is no marker'
+        # Every copy restored from the snapshot carries its source's marker: there it means nothing.
+        Set-TestMarker -Source 'bbbbbbbb-1111-2222-3333-444444444444' -StartedUtc $script:now.AddMinutes(-30)
+        Test-DemoGuestCaptureInProgress -StateRoot $script:root -NowUtc $script:now | Should -BeFalse -Because 'a restored copy'
+        Set-TestMarker -Source $script:hostVmId -StartedUtc $script:now.AddMinutes(-30)
+        Test-DemoGuestCaptureInProgress -StateRoot $script:root -NowUtc $script:now | Should -BeTrue -Because 'the capture''s source, during its capture'
+        Set-TestMarker -Source $script:hostVmId -StartedUtc $script:now.AddHours(-7)
+        Test-DemoGuestCaptureInProgress -StateRoot $script:root -NowUtc $script:now | Should -BeFalse -Because 'an interrupted capture''s marker stops counting after 6 hours'
+        $script:hostVmId = ''
+        Set-TestMarker -Source 'bbbbbbbb-1111-2222-3333-444444444444' -StartedUtc $script:now.AddMinutes(-30)
+        Test-DemoGuestCaptureInProgress -StateRoot $script:root -NowUtc $script:now | Should -BeTrue -Because 'this host''s VM ID can''t be read'
+        Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture-in-progress.json') -Value 'not json'
+        Test-DemoGuestCaptureInProgress -StateRoot $script:root -NowUtc $script:now | Should -BeTrue -Because 'only Prepare writes it'
+    }
+
+    It 'lets the recovery restart a restored copy that carries its source''s marker' {
+        Set-TestMarker -Source 'bbbbbbbb-1111-2222-3333-444444444444' -StartedUtc ([DateTime]::UtcNow.AddMinutes(-30))
+        $secure = [System.Security.SecureString]::new()
+        foreach ($character in 'not-a-real-secret'.ToCharArray()) { $secure.AppendChar($character) }
+        $credential = [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+        $script:vm = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; Uptime = [timespan]::FromMinutes(42) }
+        $script:broken = $true
+        Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = $script:vm.State; Heartbeat = $script:vm.Heartbeat; Uptime = $script:vm.Uptime; VMId = '77777777-8888-9999-0000-111111111111' } }
+        Mock -CommandName Stop-VM -MockWith { $script:vm.State = 'Off' }
+        Mock -CommandName Start-VM -MockWith { $script:vm.State = 'Running'; $script:vm.Uptime = [timespan]::FromSeconds(40); $script:broken = $false }
+        Mock -CommandName Start-Sleep -MockWith { }
+        Mock -CommandName Get-DemoGuestComputerName -MockWith { if ($script:broken) { throw 'The Hyper-V socket target process has ended.' } 'ARCSQL01' }
+        Mock -CommandName Wait-DemoGuestOnline -MockWith { -not $script:broken }
+        Mock -CommandName Enter-DemoGuestRecoveryLock -MockWith { [pscustomobject]@{ Lock = 'test' } }
+        Mock -CommandName Exit-DemoGuestRecoveryLock -MockWith { }
+        $recovery = Invoke-DemoGuestRecovery -Name 'arcsql01' -Credential $credential -Key 'deploy-aaaaaaaaaaaa' -By 'Arc onboarding' -StateRoot $script:root -Confirm:$false
+        $recovery.Action | Should -Be 'Restart'
+        $recovery.Recovered | Should -BeTrue
     }
 }
