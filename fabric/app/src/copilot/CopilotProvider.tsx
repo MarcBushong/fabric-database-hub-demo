@@ -322,15 +322,17 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 return;
             }
             const copied = await (navigator.clipboard?.writeText(start.userCode).then(() => true, () => false) ?? Promise.resolve(false));
+            let opened = false;
             if (tab) {
                 try {
                     tab.opener = null;
                     tab.location.href = start.verificationUri;
+                    opened = !tab.closed;
                 } catch {
                     tab.close();
                 }
             }
-            setDevice({ userCode: start.userCode, verificationUri: start.verificationUri, expiresAt: Date.now() + start.expiresIn * 1000, copied });
+            setDevice({ userCode: start.userCode, verificationUri: start.verificationUri, expiresAt: Date.now() + start.expiresIn * 1000, copied, opened });
             let interval = Math.max(5, start.interval);
             const deadline = Date.now() + start.expiresIn * 1000;
             while (!run.cancelled && Date.now() < deadline) {

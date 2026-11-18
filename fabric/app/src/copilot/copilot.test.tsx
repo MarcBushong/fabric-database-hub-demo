@@ -105,6 +105,21 @@ describe("the Copilot dock", () => {
         expect(screen.getByTestId("account")).toHaveTextContent("signed-out");
     });
 
+    it("says where to enter the code when the browser or the portal's frame blocks the new tab", async () => {
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/device": { deviceCode: "d", userCode: "WDJB-MJHT", verificationUri: "https://github.com/login/device", expiresIn: 900, interval: 5 },
+            }),
+        );
+        vi.stubGlobal("open", vi.fn(() => null));
+        renderDock();
+        fireEvent.click(await screen.findByRole("button", { name: /Sign in with GitHub/ }));
+        expect(await screen.findByText("WDJB-MJHT")).toBeInTheDocument();
+        expect(screen.getByText(/in a new tab/)).toHaveTextContent("Open github.com/login/device in a new tab");
+    });
+
     it("says when GitHub sign-in isn't set up, and when Ask isn't deployed", async () => {
         vi.stubGlobal("fetch", fetchStub({ "/healthz": { ok: true, version: "t", signIn: "off" } }));
         renderDock();

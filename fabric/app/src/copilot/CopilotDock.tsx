@@ -248,8 +248,17 @@ function SignIn({ chat }: { chat: ChatController }) {
                     {state.device.userCode}
                 </p>
                 <p>
-                    {state.device.copied ? "It's on your clipboard, and " : ""}GitHub opened in a new tab: paste the code there and authorize <strong>Database Hub Insights Ask</strong>. This panel continues by
-                    itself.
+                    {state.device.opened ? (
+                        <>
+                            {state.device.copied ? "It's on your clipboard, and " : ""}GitHub opened in a new tab: paste the code there and authorize <strong>Database Hub Insights Ask</strong>.
+                        </>
+                    ) : (
+                        <>
+                            Open <strong>{state.device.verificationUri.replace(/^https:\/\//, "")}</strong> in a new tab{state.device.copied ? " (the code is on your clipboard)" : ""}, enter the code, and authorize{" "}
+                            <strong>Database Hub Insights Ask</strong>.
+                        </>
+                    )}{" "}
+                    This panel continues by itself.
                 </p>
                 <p className="copilot-fine">
                     GitHub may show the request coming from the app&apos;s chat relay in Azure{region ? ` (${region})` : ""}, not from where you are: the relay asks GitHub on your behalf. Check that the app

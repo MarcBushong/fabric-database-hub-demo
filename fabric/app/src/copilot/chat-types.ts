@@ -17,6 +17,8 @@ export interface DeviceState {
     expiresAt: number;
     /** False when the browser refused the clipboard: the dock asks the viewer to copy the code. */
     copied: boolean;
+    /** False when the browser (or the frame the app runs in) blocked the new tab: the dock shows where to go. */
+    opened: boolean;
 }
 
 /** What GitHub Copilot says about the signed-in account, from the relay's check. */
