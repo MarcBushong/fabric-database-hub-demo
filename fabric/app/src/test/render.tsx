@@ -10,6 +10,7 @@ import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { AppContext, MANAGE_READ_ONLY, type AppContextValue, type ManageAccess } from "@/app-context";
 import type { CopilotApi } from "@/copilot/contract";
 import { CopilotContext } from "@/copilot/use-copilot";
+import { setLiveEstateReader } from "@/data/live-estate";
 import { toMeta } from "@/data/model";
 import type { QuerySpec } from "@/data/queries";
 import type { QueryClient, QueryResult, Row } from "@/data/query-client";
@@ -17,6 +18,7 @@ import { QueryClientContext } from "@/data/use-query";
 import type { AppRuntime } from "@/lib/runtime-config";
 import { sqlTargets } from "@/lib/estate";
 import { DEFAULT_VIEW, type ViewState } from "@/lib/view-state";
+import { sampleLiveReader } from "@/preview/sample-live";
 
 const ZERO = "00000000-0000-0000-0000-000000000000";
 
@@ -203,9 +205,12 @@ export interface RenderOptions {
     manage?: ManageAccess;
     /** No history yet: the first run. */
     metaEmpty?: boolean;
+    /** Database Hub's live answers: the sample's, or none (the app's function isn't deployed), the default. */
+    live?: "sample" | "off";
 }
 
 export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
+    setLiveEstateReader(sampleLiveReader({ at: "2026-10-21T21:00:00.000Z", off: options.live === "sample" ? undefined : "the live estate function isn't deployed in this app" }));
     const setView = vi.fn();
     const navigate = vi.fn();
     const notify = vi.fn();

@@ -47,6 +47,8 @@ export interface AskInput {
     filters?: Filters;
     window?: WindowId;
     anomaly?: AnomalyContext;
+    /** When the rows were read, for live data; history visuals take the newest snapshot's time from meta. */
+    asOf?: string;
 }
 
 export function buildAskContext(input: AskInput): AskContext {
@@ -66,7 +68,8 @@ export function buildAskContext(input: AskInput): AskContext {
         ctx.truncated = rows.length > MAX_CONTEXT_ROWS;
     }
     if (input.columns) ctx.columns = contextColumns(input.columns);
-    if (input.meta?.latestCapture) ctx.asOf = input.meta.latestCapture.toISOString();
+    if (input.asOf) ctx.asOf = input.asOf;
+    else if (input.meta?.latestCapture) ctx.asOf = input.meta.latestCapture.toISOString();
     if (input.filters) {
         ctx.filters = {
             targets: [...input.filters.targets],

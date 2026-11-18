@@ -66,6 +66,20 @@ describe("Overview", () => {
         expect(ctx.asOf).toBe("2026-10-21T20:30:00.000Z");
     });
 
+    it("shows what Database Hub says right now, live, and opens its security checks", async () => {
+        const { navigate } = renderWithApp(<OverviewPage />, { live: "sample" });
+        const live = await screen.findByRole("region", { name: "Live now" });
+        await waitFor(() => expect(within(live).getByRole("button", { name: /^Resources in Database Hub: 6\./ })).toBeInTheDocument());
+        expect(within(live).getByText("Live · as of 21 Oct 21:00 UTC")).toBeInTheDocument();
+        expect(within(live).getByRole("button", { name: /^Cosmos DB, last 24 hours: 100(\.0)? ?%\./ })).toBeInTheDocument();
+        fireEvent.click(within(live).getByRole("button", { name: /^Security warnings: 2\./ }));
+        expect(navigate).toHaveBeenCalledWith("findings", { category: "security" });
+    });
+
+    it("says in one line when nothing is read live", async () => {
+        renderWithApp(<OverviewPage />);
+        expect(await screen.findByText(/Not read live here: the live estate function isn't deployed in this app\. Every page shows the history/)).toBeInTheDocument();
+    });
     it("on the first run, says the one action that fills it: Run all in NB_DatabaseHub_Control", async () => {
         renderWithApp(<OverviewPage />, { client: fakeQueryClient({ "history-meta": [] }), metaEmpty: true });
         expect(await screen.findByText("No history yet")).toBeInTheDocument();
@@ -211,28 +225,49 @@ describe("Performance", () => {
 });
 
 describe("Findings", () => {
-    it("files each finding under its category, and points security to Database Hub's live view", async () => {
-        renderWithApp(<FindingsPage />);
+    it("files each finding under its category, and opens a category in the address", async () => {
+        const { setView } = renderWithApp(<FindingsPage />);
         const grid = await screen.findByRole("table", { name: "Findings" });
         await waitFor(() => expect(within(grid).getByText("Auditing is off on arcsql01")).toBeInTheDocument());
         fireEvent.click(screen.getByRole("tab", { name: /^Security \(1\)/ }));
-        expect(screen.getByRole("heading", { name: "Security posture, live in Database Hub" })).toBeInTheDocument();
-        expect(screen.getByRole("link", { name: "Open Database Hub, then Security" })).toHaveAttribute("target", "_blank");
-        expect(within(screen.getByRole("table", { name: "Findings" })).getAllByRole("row")).toHaveLength(2);
-        fireEvent.click(screen.getByRole("tab", { name: /^Availability/ }));
-        expect(await screen.findByText(/^Read replica lag on pgreplica01-test01 peaked at 241\.4 s/)).toBeInTheDocument();
+        expect(setView).toHaveBeenCalledWith({ category: "security" });
     });
 
-    it("names T2's SQL Server instance on Optimization, whose migration assessment Database Hub shows live", async () => {
-        renderWithApp(<FindingsPage />);
-        fireEvent.click(await screen.findByRole("tab", { name: /^Optimization/ }));
-        const panel = screen.getByRole("region", { name: "Optimization insights, live in Database Hub" });
+    it("says why security isn't read live, links to Database Hub, and keeps the history's findings", async () => {
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "security" } });
+        expect(await screen.findByText(/^Not read live here: the live estate function isn't deployed in this app\./)).toBeInTheDocument();
+        const panel = screen.getByRole("region", { name: "Security posture, live from Database Hub" });
+        expect(within(panel).getByRole("link", { name: "Open Database Hub, then Security" })).toHaveAttribute("target", "_blank");
+        await waitFor(() => expect(within(screen.getByRole("table", { name: "Findings" })).getAllByRole("row")).toHaveLength(2));
+    });
+
+    it("reads security live: the Hub's warnings first, then its recommendations, without repeating a warning", async () => {
+        const { copilot } = renderWithApp(<FindingsPage />, { view: { page: "findings", category: "security" }, live: "sample" });
+        const grid = await screen.findByRole("table", { name: "Live security checks" });
+        await waitFor(() => expect(within(grid).getAllByRole("row")).toHaveLength(6));
+        const checks = within(grid).getAllByRole("row").slice(1).map((r) => r.textContent ?? "");
+        expect(checks[0]).toMatch(/^Needs attention.*azuresql01-sample\/ContosoCare.*Auditing is disabled$/);
+        expect(checks[1]).toMatch(/^Needs attention.*Customer-managed keys.*CMK is not configured for TDE protector$/);
+        expect(checks.filter((c) => /ContosoCare.*No customer-managed key/.test(c))).toHaveLength(0);
+        expect(checks.filter((c) => /^Recommended/.test(c))).toHaveLength(3);
+        expect(screen.getByText("Live · as of 21 Oct 21:00 UTC")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /^Security · live: 2\./ })).toBeInTheDocument();
+        fireEvent.click(within(screen.getByRole("region", { name: "Security posture, live from Database Hub" })).getByRole("button", { name: "Ask Copilot" }));
+        const ctx = vi.mocked(copilot.ask).mock.calls[0][0];
+        expect(ctx).toMatchObject({ source: "live", asOf: "2026-10-21T21:00:00.000Z", visualId: "findings.live.security", totalRows: 5 });
+        expect(ctx.dax).toBeUndefined();
+    });
+
+    it("names T2's SQL Server instance for its migration assessment, and reads the optimization checks live", async () => {
+        renderWithApp(<FindingsPage />, { view: { page: "findings", category: "optimization" }, live: "sample" });
+        const panel = screen.getByRole("region", { name: "Migration assessment, in Database Hub" });
         expect(await within(panel).findByText(/T2's SQL Server instance arcsql01 shows as "migration assessment ready"/)).toBeInTheDocument();
         expect(within(panel).getByRole("link", { name: "Open Database Hub, then Optimization" })).toHaveAttribute("rel", "noopener noreferrer");
-        expect(screen.getByText(/^From the history, a fallback for Database Hub's live view/)).toBeInTheDocument();
+        const grid = await screen.findByRole("table", { name: "Live optimization checks" });
+        await waitFor(() => expect(within(grid).getByText("Pay-as-you-go SQL Server license: a license-model opportunity")).toBeInTheDocument());
+        expect(screen.getByText(/^From the history, beside Database Hub's live view/)).toBeInTheDocument();
     });
 });
-
 describe("Readiness", () => {
     it("shows the open checks worst first with their next steps", async () => {
         renderWithApp(<ReadinessPage />);

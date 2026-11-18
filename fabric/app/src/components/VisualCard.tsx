@@ -23,6 +23,12 @@ export interface VisualTable {
     caption: string;
 }
 
+export interface LiveSource {
+    at: string;
+    source: readonly string[];
+    errors: readonly string[];
+}
+
 export interface VisualCardProps {
     /** Stable visual ID ("overview.health"): Copilot's visualId and the CSV's name. */
     id: string;
@@ -46,6 +52,8 @@ export interface VisualCardProps {
     askPrompt?: string;
     /** Hide the provenance chip (a page that says it once already). */
     quiet?: boolean;
+    /** Live data from Database Hub instead of the history: when it was read, the routes that answered, and the ones that failed. */
+    live?: LiveSource | null;
     children: ReactNode;
 }
 
@@ -92,14 +100,14 @@ export function VisualCard(props: VisualCardProps) {
                 title: props.title,
                 page: view.page,
                 visualId: props.id,
-                specs,
+                specs: props.live ? [] : specs,
                 rows: props.table?.rows,
                 columns: props.table?.columns,
                 prompt: props.askPrompt,
-                provenance,
-                meta,
-                filters,
-                window: view.window,
+                provenance: props.live ? "live" : provenance,
+                meta: props.live ? null : meta,
+                asOf: props.live?.at,
+                ...(props.live ? {} : { filters, window: view.window }),
             }),
         );
 
@@ -120,16 +128,24 @@ export function VisualCard(props: VisualCardProps) {
                 </MenuTrigger>
                 <MenuPopover>
                     <MenuList>
-                        <MenuItem icon={<Code16Regular />} onClick={() => setShowDax((v) => !v)} disabled={specs.length === 0}>
-                            {showDax ? "Hide the DAX" : "Show the DAX"}
-                        </MenuItem>
-                        <MenuItem
-                            icon={<Copy16Regular />}
-                            disabled={specs.length === 0}
-                            onClick={async () => notify((await copyText(specs.map((s) => `// ${s.title}\n${s.dax}`).join("\n\n"))) ? "DAX copied" : "Copy is blocked here: select the query and press Ctrl+C", "info")}
-                        >
-                            Copy the DAX
-                        </MenuItem>
+                        {props.live ? (
+                            <MenuItem icon={<Code16Regular />} onClick={() => setShowDax((v) => !v)}>
+                                {showDax ? "Hide the Database Hub routes" : "Show the Database Hub routes"}
+                            </MenuItem>
+                        ) : (
+                            <>
+                                <MenuItem icon={<Code16Regular />} onClick={() => setShowDax((v) => !v)} disabled={specs.length === 0}>
+                                    {showDax ? "Hide the DAX" : "Show the DAX"}
+                                </MenuItem>
+                                <MenuItem
+                                    icon={<Copy16Regular />}
+                                    disabled={specs.length === 0}
+                                    onClick={async () => notify((await copyText(specs.map((s) => `// ${s.title}\n${s.dax}`).join("\n\n"))) ? "DAX copied" : "Copy is blocked here: select the query and press Ctrl+C", "info")}
+                                >
+                                    Copy the DAX
+                                </MenuItem>
+                            </>
+                        )}
                         <MenuDivider />
                         <MenuItem
                             icon={<ArrowDownload16Regular />}
@@ -163,7 +179,17 @@ export function VisualCard(props: VisualCardProps) {
 
     const extras = (
         <>
-            {showDax
+            {showDax && props.live ? (
+                <div className="vcard-dax">
+                    <p className="vcard-meta">
+                        <strong>Database Hub routes</strong> · read-only, through the app's function, scoped to the demo's resource groups
+                    </p>
+                    <pre className="vcard-routes" aria-label="Database Hub routes">
+                        {[...props.live.source, ...props.live.errors.map((e) => `failed: ${e}`)].join("\n")}
+                    </pre>
+                </div>
+            ) : null}
+            {showDax && !props.live
                 ? specs.map((s) => (
                       <div key={s.id} className="vcard-dax">
                           <p className="vcard-meta">
@@ -193,7 +219,12 @@ export function VisualCard(props: VisualCardProps) {
                 <Body {...props} />
             </div>
             {extras}
-            {!props.quiet && (props.fetchedAt || provenance !== "history") ? (
+            {props.live ? (
+                <footer className="vcard-foot">
+                    <ProvenanceBadge provenance="live" asOf={new Date(props.live.at)} />
+                    {props.live.errors.length > 0 ? <span className="vcard-partial">{`Partial: ${props.live.errors.length} of ${props.live.source.length + props.live.errors.length} routes failed`}</span> : null}
+                </footer>
+            ) : !props.quiet && (props.fetchedAt || provenance !== "history") ? (
                 <footer className="vcard-foot">
                     <ProvenanceBadge provenance={provenance} asOf={meta?.latestCapture} compact />
                     {props.fetchedAt ? <span>Queried {formatDateTimeUtc(props.fetchedAt)}</span> : null}

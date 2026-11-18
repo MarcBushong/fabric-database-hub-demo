@@ -9,6 +9,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { HealthTile } from "@/components/HealthTile";
 import { Insights } from "@/components/Insights";
 import { KpiTile } from "@/components/KpiTile";
+import { LiveNow } from "@/components/LiveNow";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
@@ -150,10 +151,13 @@ export default function OverviewPage() {
                 }
             />
 
+            <LiveNow />
+
             {noHistory ? (
                 <FirstRun />
             ) : (
                 <>
+                    <h2 className="section-title span-12">At a glance, from the history</h2>
                     <section className="kpis" aria-label="At a glance">
                         <KpiTile
                             label="Targets needing attention"

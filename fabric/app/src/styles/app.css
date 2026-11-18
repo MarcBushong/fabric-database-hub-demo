@@ -1760,3 +1760,51 @@ button.kpi-main:hover {
     inset: 0;
     border-radius: 3px;
 }
+
+/* ---------- Live ---------- */
+
+.vcard-routes {
+    margin: 0;
+    padding: 8px 10px;
+    overflow-x: auto;
+    border-radius: var(--borderRadiusMedium);
+    background: var(--colorNeutralBackground3);
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: var(--fontSizeBase200);
+    white-space: pre;
+}
+
+.vcard-partial {
+    color: var(--status-warning);
+}
+
+.live-now {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.live-now-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+}
+
+.live-now-head .section-title {
+    margin: 0;
+}
+
+.live-now-tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: auto;
+}
+
+.live-off {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+}

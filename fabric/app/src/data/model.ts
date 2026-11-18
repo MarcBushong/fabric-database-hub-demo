@@ -2,6 +2,7 @@
 
 import { isTargetKey, SQL_TARGETS, type TargetKey } from "../lib/dax";
 import { isNumber, toDate } from "../lib/format";
+import type { FindingsTab } from "../lib/view-state";
 import type { Row } from "./query-client";
 
 export const TARGET_INFO: Record<TargetKey, { name: string; short: string; platform: string; resource: string }> = {
@@ -131,7 +132,8 @@ export function toFindings(rows: readonly Row[]): Finding[] {
 }
 
 /** What a finding is about, for the Findings page's tabs. */
-export type FindingCategory = "performance" | "availability" | "security" | "optimization" | "readiness" | "capacity";
+/** The categories a finding files under: the Findings page's tabs. */
+export type FindingCategory = FindingsTab;
 
 export const FINDING_CATEGORIES: ReadonlyArray<{ id: FindingCategory; label: string; description: string }> = [
     { id: "performance", label: "Performance", description: "CPU, waits, blocking, IO, and memory" },

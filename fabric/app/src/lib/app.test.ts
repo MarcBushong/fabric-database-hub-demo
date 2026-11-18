@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 
 import { MAX_CONTEXT_ROWS } from "@/copilot/contract";
 import { estateQuery } from "@/data/queries";
+import { flagText, inventoryMix, liveOptimizationRows, liveSecurityRows, targetOfResource } from "@/lib/live-findings";
+import { sampleLiveAnswers } from "@/preview/sample-live";
 import { buildAskContext } from "@/lib/ask";
 import { describeRequest, notebookParameters, validateRequest } from "@/lib/control";
 import { profileLabel, SCENARIOS } from "@/lib/scenarios";
@@ -50,6 +52,11 @@ describe("view state", () => {
         expect(toHash(DEFAULT_VIEW)).toBe("#/overview");
     });
 
+    it("opens a Findings category from the address, and drops an unknown one", () => {
+        expect(parseHash("#/findings/security")).toMatchObject({ page: "findings", category: "security" });
+        expect(parseHash("#/findings/bogus").category).toBeUndefined();
+        expect(toHash(mergeView({ page: "findings", category: "optimization" }))).toBe("#/findings/optimization");
+    });
     it("opens an older app's PostgreSQL page as T4's drill-down, and drops unknown or unsafe values", () => {
         expect(parseHash("#/postgres")).toEqual({ page: "estate", target: "T4" });
         expect(parseHash("#/admin?t=T9,T2&w=1y&i=<script>&r=-3")).toEqual({ targets: ["T2"] });
@@ -119,5 +126,27 @@ describe("trends", () => {
         const [t1] = weekOverWeek(days);
         expect(t1).toMatchObject({ target: "T1", cpuNow: 20, cpuBefore: 10, waitNow: 7, waitBefore: 7, incidentsNow: 1, incidentsBefore: 0 });
         expect(weekOverWeek([])).toEqual([]);
+    });
+});
+
+describe("live findings", () => {
+    it("names the demo's targets, reads Database Hub's flags, and keeps each warning once", () => {
+        const answers = sampleLiveAnswers("2026-10-21T21:00:00.000Z");
+        expect(targetOfResource({ name: "pgreplica01-x", databaseType: "PostgreSql" })).toBe("T4-replica");
+        expect(targetOfResource({ name: "ContosoCare", databaseType: "AzureSql" }, "azuresql01-x")).toBe("T3");
+        expect(targetOfResource({ name: "elsewhere", databaseType: "PostgreSql" })).toBe("");
+        expect(flagText("hasSomethingNewIssue")).toBe("Something new");
+        const rows = liveSecurityRows(answers.security.data, answers.inventory.data);
+        expect(rows.map((r) => `${r.attention}|${r.target}|${r.area}`)).toEqual([
+            "Needs attention|T3|Auditing",
+            "Needs attention|T3|Customer-managed keys",
+            "Recommended|T3|Ledger",
+            "Recommended|T4|Customer-managed keys",
+            "Recommended|T4-replica|Customer-managed keys",
+        ]);
+        expect(liveOptimizationRows(answers.inventory.data)).toMatchObject([{ target: "T1", attention: "Needs attention", area: "Licensing" }]);
+        expect(inventoryMix(answers.inventory.data)).toBe("2 PostgreSQL · 1 Arc SQL · 1 Azure SQL · 1 SQL VM · 1 Cosmos DB");
+        expect(inventoryMix(answers.inventory.data, true)).toMatch(/^2 Azure Database for PostgreSQL, 1 Arc-enabled SQL Server, /);
+        expect(liveSecurityRows(null, null)).toEqual([]);
     });
 });

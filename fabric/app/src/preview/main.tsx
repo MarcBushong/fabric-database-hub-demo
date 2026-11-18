@@ -1,12 +1,14 @@
 // The local preview: the app with made-up history and no Fabric sign-in, for development and screenshots
 // (npm run dev:sample opens /preview.html). Query parameters: theme=light|dark|contrast, copilot=open, manage=on,
-// empty=1 (no history: the first-run state). Vite builds only index.html, so none of this ships in the app.
+// empty=1 (no history: the first-run state), live=off (no live estate source). Vite builds only index.html, so none of
+// this ships in the app.
 
 import { createRoot } from "react-dom/client";
 
 import App from "../App";
 import { MANAGE_READ_ONLY, type ManageAccess } from "../app-context";
 import { CopilotProvider } from "../copilot/CopilotProvider";
+import { setLiveEstateReader } from "../data/live-estate";
 import { createSourceClient, type DataSource } from "../data/query-client";
 import { QueryClientContext } from "../data/use-query";
 import { AuthContext, type AuthContextValue } from "../hooks/auth.context";
@@ -14,6 +16,7 @@ import type { AppRuntime } from "../lib/runtime-config";
 import { isThemeChoice } from "../theme/fluent";
 import { AppThemeProvider } from "../theme/AppThemeProvider";
 import { sampleRows } from "./sample-data";
+import { sampleLiveReader } from "./sample-live";
 
 import "../styles/app.css";
 
@@ -38,6 +41,7 @@ const runtime: AppRuntime = {
 };
 
 const empty = params.get("empty") === "1";
+setLiveEstateReader(sampleLiveReader({ at: new Date().toISOString(), delayMs: 900, off: params.get("live") === "off" ? "the live estate function isn't deployed in this app" : undefined }));
 const sample: DataSource = {
     provenance: "sample",
     answers: () => true,

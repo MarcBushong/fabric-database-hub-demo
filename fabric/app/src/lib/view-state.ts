@@ -15,6 +15,10 @@ export const FILTER_TARGETS: readonly FilterTarget[] = ["T1", "T2", "T3", "T4", 
 export type EstateTarget = FilterTarget | "T4-replica";
 export const ESTATE_TARGETS: readonly EstateTarget[] = ["T1", "T2", "T3", "T4", "T4-replica", "T5"];
 
+/** The Findings page's categories, which Overview's tiles open directly (`#/findings/security`). */
+export const FINDINGS_TABS = ["performance", "availability", "security", "optimization", "capacity", "readiness"] as const;
+export type FindingsTab = (typeof FINDINGS_TABS)[number];
+
 export interface ViewState {
     page: PageId;
     targets: FilterTarget[];
@@ -23,6 +27,8 @@ export interface ViewState {
     target: EstateTarget | null;
     incident: string | null;
     replay: number | null;
+    /** The Findings page's category, or null for all of them. */
+    category: FindingsTab | null;
 }
 
 export interface PageInfo {
@@ -58,6 +64,7 @@ export const DEFAULT_VIEW: ViewState = {
     target: null,
     incident: null,
     replay: null,
+    category: null,
 };
 
 const PAGE_IDS = new Set<PageId>(PAGES.map((p) => p.id));
@@ -100,6 +107,7 @@ export function parseHash(hash: string): Partial<ViewState> {
     if (page) out.page = page;
     if (page === "estate" && isEstateTarget(sub)) out.target = sub;
     if (page === "incidents" && INCIDENT_KEY.test(sub)) out.incident = sub;
+    if (page === "findings" && (FINDINGS_TABS as readonly string[]).includes(sub)) out.category = sub as FindingsTab;
     const targets = (params.get("t") ?? "").split(",").filter(isFilterTarget);
     if (targets.length > 0) out.targets = FILTER_TARGETS.filter((t) => targets.includes(t));
     const window = pick(params.get("w"), WINDOW_IDS);
@@ -118,6 +126,7 @@ export function toHash(state: ViewState): string {
     let path: string = state.page;
     if (state.page === "estate" && state.target) path += `/${encodeURIComponent(state.target)}`;
     else if (state.page === "incidents" && state.incident) path += `/${encodeURIComponent(state.incident)}`;
+    else if (state.page === "findings" && state.category) path += `/${state.category}`;
     else if (state.incident) params.set("i", state.incident);
     if (state.replay !== null) params.set("r", String(state.replay));
     const query = params.toString();
