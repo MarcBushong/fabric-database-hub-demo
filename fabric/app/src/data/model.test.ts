@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import { catalogForCheck, checkIncidentRange, estateQuery, findingsQuery, incidentSeriesQuery, postgresFindingsQuery, postgresSeriesQuery, targetNamesQuery } from "./queries";
 import {
+    beatFor,
     postgresPeak,
     postgresSeries,
     postgresSkus,
+    toAgentBeats,
     toBins,
     toChecks,
     toIncidents,
@@ -139,15 +141,32 @@ describe("model parsers", () => {
         expect(postgresSkus(findings)).toEqual({ T4: "Standard_D4ds_v5" });
         expect(postgresSkus([])).toEqual({});
     });
+
+    it("reads each Database Agent beat's regression, response, and CPU from its evidence, and matches it to the incident it overlaps", () => {
+        const beats = toAgentBeats([
+            { FindingId: "a1", TargetKey: "T3", Status: "Pass", Finding: "Database Agent loop", Evidence: '{"regressUtc": "2026-10-21T10:03:00Z", "respondUtc": "2026-10-21T10:26:00Z", "cpuBeforePercent": 84, "cpuAfterPercent": 22.5}', RequestId: "session:abcd1234:05", WindowStart: "2026-10-21T10:00:00", WindowEnd: "2026-10-21T10:30:00" },
+            { FindingId: "a0", TargetKey: "T3", Status: "Warning", Evidence: "not json", WindowStart: "2026-10-20T10:00:00", WindowEnd: "2026-10-20T10:30:00" },
+            { FindingId: "", TargetKey: "T3" },
+        ]);
+        expect(beats.map((b) => b.id)).toEqual(["a1", "a0"]);
+        expect(beats[0]).toMatchObject({ requestId: "session:abcd1234:05", cpuBefore: 84, cpuAfter: 22.5 });
+        expect(beats[0].respondAt?.toISOString()).toBe("2026-10-21T10:26:00.000Z");
+        expect(beats[1]).toMatchObject({ regressAt: null, respondAt: null, cpuBefore: null });
+        const at = (iso: string) => new Date(`${iso}Z`);
+        expect(beatFor({ target: "T3", start: at("2026-10-21T10:10:00"), end: at("2026-10-21T11:00:00") }, beats)?.id).toBe("a1");
+        expect(beatFor({ target: "T1", start: at("2026-10-21T10:10:00"), end: at("2026-10-21T11:00:00") }, beats)).toBeNull();
+        expect(beatFor({ target: "T3", start: at("2026-10-21T10:30:00"), end: at("2026-10-21T11:00:00") }, beats)).toBeNull();
+    });
 });
 
 describe("query catalog", () => {
     const latest = new Date(Date.UTC(2026, 9, 21));
     const catalog = catalogForCheck(latest);
 
-    it("has 16 bounded, unique, read-only queries", () => {
-        expect(catalog).toHaveLength(16);
-        expect(new Set(catalog.map((q) => q.id)).size).toBe(16);
+    it("has 19 bounded, unique, read-only queries, and marks the ones a healthy new environment has no rows for", () => {
+        expect(catalog).toHaveLength(19);
+        expect(new Set(catalog.map((q) => q.id)).size).toBe(19);
+        expect(catalog.filter((q) => q.mayBeEmpty).map((q) => q.id)).toEqual(["scenario-runs", "agent-loop"]);
         for (const q of catalog) {
             expect(q.dax.trimStart().startsWith("EVALUATE") || q.dax.trimStart().startsWith("DEFINE")).toBe(true);
             expect(q.rowLimit).toBeGreaterThan(0);
@@ -191,6 +210,9 @@ describe("query catalog", () => {
             "target-names",
             "postgres-series",
             "postgres-findings",
+            "scenario-runs",
+            "daily-trend",
+            "agent-loop",
         ];
 
         it("lies in the newest telemetry day when history-meta has no anchors", () => {

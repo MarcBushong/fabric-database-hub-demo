@@ -5,12 +5,17 @@ import { render } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { vi } from "vitest";
 
-import { AppContext, type AppContextValue } from "@/app-context";
+import { FluentProvider, webLightTheme } from "@fluentui/react-components";
+
+import { AppContext, MANAGE_READ_ONLY, type AppContextValue, type ManageAccess } from "@/app-context";
+import type { CopilotApi } from "@/copilot/contract";
+import { CopilotContext } from "@/copilot/use-copilot";
 import { toMeta } from "@/data/model";
 import type { QuerySpec } from "@/data/queries";
 import type { QueryClient, QueryResult, Row } from "@/data/query-client";
 import { QueryClientContext } from "@/data/use-query";
 import type { AppRuntime } from "@/lib/runtime-config";
+import { sqlTargets } from "@/lib/estate";
 import { DEFAULT_VIEW, type ViewState } from "@/lib/view-state";
 
 const ZERO = "00000000-0000-0000-0000-000000000000";
@@ -68,8 +73,9 @@ export const FIXTURES: Record<string, Row[]> = {
     ],
     headlines: [{ EstateHeadline: "3 of 3 SQL targets sent telemetry in this period; 3 findings need attention", ReadinessHeadline: "12 checks: 0 failed, 2 manual steps, 2 warnings", Freshness: "Pass" }],
     "findings-latest": [
-        { FindingId: "f1", Status: "Warning", StatusSort: 3, TargetKey: "T3", Analysis: "IO pressure", Finding: "Buffer IO waits rose sharply", CapturedAt: "2026-10-21T20:30:00" },
-        { FindingId: "f2", Status: "Pass", StatusSort: 4, TargetKey: "T1", Analysis: "Blocking", Finding: "No blocking chains", CapturedAt: "2026-10-21T20:30:00" },
+        { FindingId: "f1", AnalysisKey: "storage_io", Status: "Warning", StatusSort: 3, TargetKey: "T3", Analysis: "IO pressure", AnalysisGroup: "IO", Finding: "Buffer IO waits rose sharply", CapturedAt: "2026-10-21T20:30:00" },
+        { FindingId: "f2", AnalysisKey: "blocking", Status: "Pass", StatusSort: 4, TargetKey: "T1", Analysis: "Blocking", AnalysisGroup: "Locks and blocking", Finding: "No blocking chains", CapturedAt: "2026-10-21T20:30:00" },
+        { FindingId: "sec.T2.audit", AnalysisKey: "security_posture", Status: "Warning", StatusSort: 3, TargetKey: "T2", Analysis: "", AnalysisGroup: "", Finding: "Auditing is off on arcsql01", CapturedAt: "2026-10-21T20:30:00" },
     ],
     "signals-per-bin": [...bins("T3", 3, 10), ...bins("T1", 1, 1)],
     "waits-by-category": [
@@ -119,6 +125,28 @@ export const FIXTURES: Record<string, Row[]> = {
         ...postgresPoints("T4", "connections_failed", [0, 3, 1]),
         ...postgresPoints("T4", "physical_replication_delay_in_bytes", [184]),
     ],
+    "scenario-runs": [
+        { RequestId: "session:abcd1234:05", RequestedAt: "2026-10-21T09:00:01", TargetKey: "T3", Profile: "incident:plan-regression", DurationMin: 30, Intensity: 5, Concurrency: 2, Dispatch: "webhook", Status: "Pass", Message: "Session abcd1234's Database Agent beat: the plan regresses at 10:03 UTC; the run's response forces the last good plan at 10:26 UTC.", WindowStart: "2026-10-21T10:00:00", WindowEnd: "2026-10-21T10:30:00" },
+        { RequestId: "r1", RequestedAt: "2026-10-21T09:00:00", TargetKey: "", Profile: "showcase", DurationMin: 90, Intensity: null, Concurrency: null, Dispatch: "webhook", Status: "Pass", Message: "Session started on T1, T2, T3, and T4", WindowStart: "2026-10-21T09:00:00", WindowEnd: "2026-10-21T10:30:00" },
+    ],
+    "agent-loop": [
+        {
+            FindingId: "database_agent.T3.session:abcd1234:05",
+            TargetKey: "T3",
+            Status: "Pass",
+            Finding: "Database Agent loop: the plan regressed at 10:03 UTC and the response forced the last good plan at 10:26 UTC; T3's CPU fell from 84% to 22%.",
+            Evidence: '{"sessionId": "abcd1234", "regressUtc": "2026-10-21T10:03:00Z", "respondUtc": "2026-10-21T10:26:00Z", "cpuBeforePercent": 84, "cpuAfterPercent": 22}',
+            RequestId: "session:abcd1234:05",
+            WindowStart: "2026-10-21T10:00:00",
+            WindowEnd: "2026-10-21T10:30:00",
+            CapturedAt: "2026-10-21T11:05:00",
+        },
+    ],
+    "daily-trend": [
+        { Date: "2026-10-20T00:00:00", "Target Key": "T1", CpuAvg: 10, CpuPeak: 20, WaitS: 100, BufferIoS: 5, LockWaitS: 1, Batch: 1000, SessionsPeak: 5, Incidents: 0 },
+        { Date: "2026-10-21T00:00:00", "Target Key": "T1", CpuAvg: 12, CpuPeak: 30, WaitS: 120, BufferIoS: 6, LockWaitS: 2, Batch: 1100, SessionsPeak: 6, Incidents: 1 },
+        { Date: "2026-10-21T00:00:00", "Target Key": "T3", CpuAvg: 40, CpuPeak: 97.5, WaitS: 4000, BufferIoS: 900, LockWaitS: 3, Batch: 90000, SessionsPeak: 22, Incidents: 2 },
+    ],
     "postgres-findings": [
         {
             FindingId: "postgresql.T4.capture",
@@ -163,13 +191,23 @@ export function fakeQueryClient(overrides: Record<string, Row[] | Error> = {}): 
             ran.push(spec.id);
             const value = overrides[spec.id] ?? FIXTURES[spec.id] ?? [];
             if (value instanceof Error) throw value;
-            return { spec, columns: spec.columns, rows: value, requestId: "test", fetchedAt: new Date(Date.UTC(2026, 9, 21, 21)) };
+            return { spec, columns: spec.columns, rows: value, requestId: "test", fetchedAt: new Date(Date.UTC(2026, 9, 21, 21)), provenance: "history" };
         }),
     };
 }
 
-export function renderWithApp(ui: ReactElement, options: { view?: Partial<ViewState>; client?: FakeQueryClient; embedded?: boolean } = {}) {
+export interface RenderOptions {
+    view?: Partial<ViewState>;
+    client?: FakeQueryClient;
+    embedded?: boolean;
+    manage?: ManageAccess;
+    /** No history yet: the first run. */
+    metaEmpty?: boolean;
+}
+
+export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
     const setView = vi.fn();
+    const navigate = vi.fn();
     const notify = vi.fn();
     const view: ViewState = { ...DEFAULT_VIEW, ...options.view };
     const context: AppContextValue = {
@@ -177,20 +215,28 @@ export function renderWithApp(ui: ReactElement, options: { view?: Partial<ViewSt
         embedded: options.embedded ?? true,
         view,
         setView,
-        filters: { targets: view.targets, window: null },
-        meta: toMeta(FIXTURES["history-meta"]),
-        theme: "aurora",
-        setTheme: vi.fn(),
-        motion: "reduced",
-        setMotion: vi.fn(),
+        navigate,
+        filters: { targets: sqlTargets(view.targets), window: null },
+        meta: options.metaEmpty ? null : toMeta(FIXTURES["history-meta"]),
+        metaLoading: false,
+        metaError: null,
+        provenance: "history",
         reducedMotion: true,
         notify,
+        manage: options.manage ?? MANAGE_READ_ONLY,
     };
+    const copilot: CopilotApi = { open: vi.fn(), ask: vi.fn() };
     const client = options.client ?? fakeQueryClient();
     const result = render(
-        <QueryClientContext.Provider value={client}>
-            <AppContext.Provider value={context}>{ui}</AppContext.Provider>
-        </QueryClientContext.Provider>,
+        <FluentProvider theme={webLightTheme}>
+            <QueryClientContext.Provider value={client}>
+                <CopilotContext.Provider
+                    value={{ api: copilot, dock: { isOpen: false, setOpen: vi.fn() }, account: { status: "unavailable", signIn: vi.fn(), signOut: vi.fn() }, attached: null }}
+                >
+                    <AppContext.Provider value={context}>{ui}</AppContext.Provider>
+                </CopilotContext.Provider>
+            </QueryClientContext.Provider>
+        </FluentProvider>,
     );
-    return { ...result, setView, notify, client };
+    return { ...result, setView, navigate, notify, client, copilot };
 }

@@ -238,23 +238,36 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
             >
                 <svg className="chart-svg" width={width} height={height} aria-hidden="true" focusable="false">
                     <g transform={`translate(${left},${MARGIN.top})`}>
-                        {(annotations?.bands ?? []).map((b, i) => {
-                            const from = annotationX(b.from, model);
-                            const to = annotationX(b.to, model);
-                            if (from === null || to === null) return null;
-                            const x0 = Math.max(0, Math.min(innerW, px(from)));
-                            const x1 = Math.max(0, Math.min(innerW, px(to)));
-                            return (
-                                <g key={`band-${i}`} className={`chart-band chart-band-${b.tone ?? "incident"}`}>
-                                    <rect x={Math.min(x0, x1)} y={0} width={Math.max(2, Math.abs(x1 - x0))} height={innerH} />
-                                    {b.label ? (
-                                        <text x={Math.min(x0, x1) + 4} y={11}>
-                                            {b.label}
-                                        </text>
-                                    ) : null}
-                                </g>
+                        {(() => {
+                            // Band labels skip when they'd overlap the previous one; the band itself always shows.
+                            const placed = (annotations?.bands ?? []).map((b) => {
+                                const from = annotationX(b.from, model);
+                                const to = annotationX(b.to, model);
+                                if (from === null || to === null) return null;
+                                const x0 = Math.max(0, Math.min(innerW, px(from)));
+                                const x1 = Math.max(0, Math.min(innerW, px(to)));
+                                return { b, left: Math.min(x0, x1), width: Math.max(2, Math.abs(x1 - x0)) };
+                            });
+                            const labelled = placed.reduce<{ end: number; shown: boolean[] }>(
+                                (acc, p) => {
+                                    const show = Boolean(p && p.b.label && p.left >= acc.end + 6 && p.left < innerW - 40);
+                                    return { end: show && p ? p.left + (p.b.label?.length ?? 0) * 6.2 : acc.end, shown: [...acc.shown, show] };
+                                },
+                                { end: -Infinity, shown: [] },
+                            ).shown;
+                            return placed.map((p, i) =>
+                                p ? (
+                                    <g key={`band-${i}`} className={`chart-band chart-band-${p.b.tone ?? "incident"}`}>
+                                        <rect x={p.left} y={0} width={p.width} height={innerH} />
+                                        {labelled[i] ? (
+                                            <text x={p.left + 4} y={11}>
+                                                {p.b.label}
+                                            </text>
+                                        ) : null}
+                                    </g>
+                                ) : null,
                             );
-                        })}
+                        })()}
                         {yTicks.map((t) => (
                             <g key={`y-${t}`} className="chart-grid">
                                 <line x1={0} x2={innerW} y1={y(t)} y2={y(t)} />
@@ -331,7 +344,7 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
                         {(annotations?.thresholds ?? []).map((t, i) => (
                             <g key={`th-${i}`} className={`chart-threshold chart-threshold-${t.tone ?? "warning"}`}>
                                 <line x1={0} x2={innerW} y1={y(t.value)} y2={y(t.value)} />
-                                <text x={innerW - 4} y={y(t.value) - 5} textAnchor="end">
+                                <text x={4} y={y(t.value) - 5} textAnchor="start">
                                     {t.label}
                                 </text>
                             </g>

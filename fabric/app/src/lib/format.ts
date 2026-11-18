@@ -87,6 +87,16 @@ export function formatAgo(date: Date | null, now: Date = new Date()): string {
     return `${formatDuration(minutes)} ago`;
 }
 
+/** "26 h ago", "3 d ago": the age in its largest whole unit, for tiles. */
+export function formatAgoShort(date: Date | null, now: Date = new Date()): string {
+    if (!date) return "never";
+    const minutes = (now.getTime() - date.getTime()) / 60000;
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return `${Math.floor(minutes)} min ago`;
+    if (minutes < 48 * 60) return `${Math.floor(minutes / 60)} h ago`;
+    return `${Math.floor(minutes / 1440)} d ago`;
+}
+
 /** A table cell as the visual's data table shows it, by the column's kind. */
 export function formatCell(column: { kind: string }, value: unknown): string {
     if (value === null || value === undefined || value === "") return "–";

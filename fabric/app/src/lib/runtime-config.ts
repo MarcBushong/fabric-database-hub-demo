@@ -6,6 +6,8 @@ export interface AppLinks {
     realTimeDashboard?: string;
     report?: string;
     workspace?: string;
+    /** The control notebook NB_DatabaseHub_Control, in its own workspace: Run all runs a whole session. */
+    controlNotebook?: string;
 }
 
 /** Everything the app needs at run time, from rayfin.config.json, the build's VITE_* values, and dbhub-app.json. */
@@ -66,7 +68,7 @@ export async function loadAppRuntime(fetchImpl: typeof fetch = fetch): Promise<A
     }
     const deploy = await loadDeployFile(fetchImpl);
     const links: AppLinks = {};
-    for (const key of ["databaseHub", "realTimeDashboard", "report", "workspace"] as const) {
+    for (const key of ["databaseHub", "realTimeDashboard", "report", "workspace", "controlNotebook"] as const) {
         const value = text(deploy?.links?.[key]);
         if (value && /^https:\/\//i.test(value)) links[key] = value;
     }

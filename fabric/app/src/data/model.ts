@@ -105,7 +105,10 @@ export function toTargets(rows: readonly Row[]): TargetSummary[] {
 
 export interface Finding {
     id: string;
+    analysisKey: string;
     analysis: string;
+    /** The model's Analysis Group: Estate, CPU, Locks and blocking, Waits, IO, Memory, Storage, Readiness, Incidents, PostgreSQL. */
+    group: string;
     target: string;
     status: string;
     statusSort: number;
@@ -116,13 +119,164 @@ export interface Finding {
 export function toFindings(rows: readonly Row[]): Finding[] {
     return rows.map((r) => ({
         id: text(r.FindingId),
+        analysisKey: text(r.AnalysisKey),
         analysis: text(r.Analysis) || text(r.AnalysisKey).replace(/_/g, " "),
+        group: text(r.AnalysisGroup),
         target: text(r.TargetKey),
         status: text(r.Status),
         statusSort: num(r.StatusSort) ?? 6,
         text: text(r.Finding),
         capturedAt: toDate(r.CapturedAt),
     }));
+}
+
+/** What a finding is about, for the Findings page's tabs. */
+export type FindingCategory = "performance" | "availability" | "security" | "optimization" | "readiness" | "capacity";
+
+export const FINDING_CATEGORIES: ReadonlyArray<{ id: FindingCategory; label: string; description: string }> = [
+    { id: "performance", label: "Performance", description: "CPU, waits, blocking, IO, and memory" },
+    { id: "availability", label: "Availability", description: "Replicas, connections, and throttling" },
+    { id: "security", label: "Security", description: "Authentication, auditing, and encryption posture" },
+    { id: "optimization", label: "Optimization", description: "Migration readiness, licensing, and sizing" },
+    { id: "capacity", label: "Capacity", description: "Storage growth and capacity use" },
+    { id: "readiness", label: "Telemetry and readiness", description: "What Database Hub can see" },
+];
+
+const GROUP_CATEGORY: Record<string, FindingCategory> = {
+    CPU: "performance",
+    "Locks and blocking": "performance",
+    Throughput: "performance",
+    Waits: "performance",
+    IO: "performance",
+    Memory: "performance",
+    "CPU and waits": "capacity",
+    Storage: "capacity",
+    Readiness: "readiness",
+    Estate: "readiness",
+    Incidents: "performance",
+};
+
+/** The category of a finding from its analysis: security, optimization, and migration analyses by key. */
+export function findingCategory(f: Pick<Finding, "analysisKey" | "group" | "id">): FindingCategory {
+    const key = `${f.analysisKey} ${f.id}`.toLowerCase();
+    if (/security|auth|audit|encrypt|cmk|tde|firewall|defender|vulnerab/.test(key)) return "security";
+    if (/optimi|migration|assessment|license|licensing|rightsiz|sizing|payg/.test(key)) return "optimization";
+    if (/lag|replica|connection|throttl|429|availability|failover/.test(key)) return "availability";
+    if (f.group === "PostgreSQL" || f.analysisKey === "postgresql") return "performance";
+    return GROUP_CATEGORY[f.group] ?? "performance";
+}
+
+/** One activity request the notebooks recorded: a session's plan or one incident request. */
+export interface SessionRun {
+    requestId: string;
+    requestedAt: Date | null;
+    target: string;
+    profile: string;
+    durationMin: number | null;
+    status: string;
+    message: string;
+    windowStart: Date | null;
+    windowEnd: Date | null;
+    dispatch: string;
+}
+
+export function toSessions(rows: readonly Row[]): SessionRun[] {
+    return rows
+        .map((r) => ({
+            requestId: text(r.RequestId),
+            requestedAt: toDate(r.RequestedAt),
+            target: text(r.TargetKey),
+            profile: text(r.Profile),
+            durationMin: num(r.DurationMin),
+            status: text(r.Status),
+            message: text(r.Message),
+            windowStart: toDate(r.WindowStart),
+            windowEnd: toDate(r.WindowEnd),
+            dispatch: text(r.Dispatch),
+        }))
+        .sort((a, b) => (b.requestedAt?.getTime() ?? 0) - (a.requestedAt?.getTime() ?? 0));
+}
+
+/** T3's Database Agent beat: the regression, the documented response the run applied, and whether CPU recovered. */
+export interface AgentBeat {
+    id: string;
+    target: string;
+    status: string;
+    text: string;
+    requestId: string;
+    windowStart: Date | null;
+    windowEnd: Date | null;
+    regressAt: Date | null;
+    respondAt: Date | null;
+    cpuBefore: number | null;
+    cpuAfter: number | null;
+}
+
+export function toAgentBeats(rows: readonly Row[]): AgentBeat[] {
+    return rows
+        .map((r) => {
+            const evidence = evidenceOf(r.Evidence) ?? {};
+            return {
+                id: text(r.FindingId),
+                target: text(r.TargetKey),
+                status: text(r.Status),
+                text: text(r.Finding),
+                requestId: text(r.RequestId),
+                windowStart: toDate(r.WindowStart),
+                windowEnd: toDate(r.WindowEnd),
+                regressAt: toDate(evidence.regressUtc),
+                respondAt: toDate(evidence.respondUtc),
+                cpuBefore: num(evidence.cpuBeforePercent),
+                cpuAfter: num(evidence.cpuAfterPercent),
+            };
+        })
+        .filter((b) => b.id !== "")
+        .sort((a, b) => (b.windowStart?.getTime() ?? 0) - (a.windowStart?.getTime() ?? 0));
+}
+
+/** The beat whose window overlaps the incident's, on the same target. */
+export function beatFor(incident: Pick<Incident, "target" | "start" | "end">, beats: readonly AgentBeat[]): AgentBeat | null {
+    return (
+        beats.find(
+            (b) => b.target === incident.target && b.windowStart !== null && b.windowEnd !== null && b.windowStart.getTime() < incident.end.getTime() && b.windowEnd.getTime() > incident.start.getTime(),
+        ) ?? null
+    );
+}
+
+/** One UTC day of one SQL target. */
+export interface DayRow {
+    day: Date;
+    target: TargetKey;
+    cpuAvg: number | null;
+    cpuPeak: number | null;
+    waitS: number | null;
+    bufferIoS: number | null;
+    lockWaitS: number | null;
+    batch: number | null;
+    sessionsPeak: number | null;
+    incidents: number;
+}
+
+export function toDays(rows: readonly Row[]): DayRow[] {
+    const out: DayRow[] = [];
+    for (const r of rows) {
+        const day = toDate(r.Date);
+        const target = r["Target Key"];
+        if (!day || !isTargetKey(target)) continue;
+        out.push({
+            day,
+            target,
+            cpuAvg: num(r.CpuAvg),
+            cpuPeak: num(r.CpuPeak),
+            waitS: num(r.WaitS),
+            bufferIoS: num(r.BufferIoS),
+            lockWaitS: num(r.LockWaitS),
+            batch: num(r.Batch),
+            sessionsPeak: num(r.SessionsPeak),
+            incidents: num(r.Incidents) ?? 0,
+        });
+    }
+    return out.sort((a, b) => a.day.getTime() - b.day.getTime() || a.target.localeCompare(b.target));
 }
 
 export interface Bin {
