@@ -335,7 +335,7 @@ Describe 'deploy.ps1 and its self-update' {
         }
         $text | Should -Match '(?s)if \(\$selfUpdate\.Restarted\) \{\s*exit \(\[int\]\$selfUpdate\.ExitCode\)\s*\}'
         $text | Should -Match '-ConfigPath \(Resolve-DemoUserPath -Path \$ConfigPath\) -NoSelfUpdate:\$NoSelfUpdate -Nested:\$entryNested'
-        $text | Should -Match '-Note @\(\$selfUpdate\.Note\)'
+        $text | Should -Match '-Note \(@\(\$selfUpdate\.Note\) \+ @\(\$firstRunNote\)\)' -Because 'the self-update''s line goes first on the banner and the status page, then the first run''s (issue 60)'
         $text | Should -Match '\[switch\] \$NoSelfUpdate'
     }
 

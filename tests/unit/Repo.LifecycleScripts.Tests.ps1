@@ -438,6 +438,21 @@ Describe 'Lifecycle scripts' {
             Should -Invoke -CommandName Write-DemoDeploymentOutcome -ParameterFilter { $Outcome.Reason -eq 'INIT.P6.GROUP' }
         }
 
+        It 'puts what the first run found in the subscription on the start banner, the status page, and the run''s results (issue 60)' {
+            $fresh = Join-Path -Path $TestDrive -ChildPath ('fresh-' + [guid]::NewGuid().ToString('N') + '.local.json')
+            $capture['template'] = Get-Content -LiteralPath $configPath -Raw
+            Mock -CommandName Initialize-DemoFirstRun -MockWith {
+                Set-Content -LiteralPath $ConfigPath -Value $capture['template']
+                $found = New-DemoResult -CheckId 'INIT.EXISTING' -Area 'preflight' -Target 'subscription' -Status 'Warning' -Message 'rg-dbhub-demo exists in this subscription, and it''s yours.'
+                [pscustomobject]@{ Ran = $true; Ready = $true; Results = @($found, (New-DemoResult -CheckId 'INIT.CONFIG' -Area 'preflight' -Target 'repo' -Status 'Pass' -Message 'written')); Path = $ConfigPath; NextSteps = @(); Outcome = $null; Note = @('No configuration file: rg-dbhub-demo is yours.') }
+            }
+            Mock -CommandName Invoke-DemoDeployment -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $fresh -OutputPath $outputPath
+            $LASTEXITCODE | Should -Be 0
+            Should -Invoke -CommandName Start-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { @($Note) -contains 'No configuration file: rg-dbhub-demo is yours.' }
+            Should -Invoke -CommandName Complete-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { @($Result | Where-Object { $_.checkId -eq 'INIT.EXISTING' -and $_.status -eq 'Warning' }).Count -eq 1 -and @($Result | Where-Object { $_.checkId -eq 'INIT.CONFIG' }).Count -eq 0 }
+        }
+
         It 'status.ps1 -Watch shows the live model, and reads Azure only without one' {
             Mock -CommandName Get-DemoEnvironmentStatus -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
             Mock -CommandName Show-DemoDeploymentProgress -MockWith { $capture['view'] }

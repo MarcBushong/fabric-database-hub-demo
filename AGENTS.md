@@ -26,6 +26,7 @@ These are for an agent asked to **set up, deploy, upgrade, or try** this demo fo
 - **Every automatic size change:** `DEPLOY.T4.FALLBACK` and `DEPLOY.T4.REPLICA.FALLBACK` say what was asked for, what Azure refused, what was deployed, and the cost difference; pass them on.
 - **When the demo stops tonight,** when `DEPLOY.NIGHTLYSTOP` is a **Warning**: the run was still going at the nightly stop's time, which waited for it, and the demo now stops 60 minutes after the run. Pass on its time and both choices: `./scripts/start-demo.ps1` keeps it running tonight, `./scripts/stop-demo.ps1` stops it now. Don't change the schedules yourself.
 - **Whether it updated itself from GitHub:** the first line, "Updated this copy from GitHub's main: ... to ...", or the `DEPLOY.SELFUPDATE` **Warning** with its command.
+- **What its first run found, when it wrote the configuration:** `INIT.EXISTING` (since 2026-11-18). A **Warning** that the environment is the person's, so the configuration came from what's deployed, with the settings that kept their defaults and whether the run republishes its notebooks (`fabric.importNotebooks`, with why); or that it isn't theirs, so the run deploys a new environment with the prefix it names. Pass on which, and the settings it lists; don't change the configuration or the prefix yourself.
 - **What it lists under Please confirm:** for example the Database Hub tenant setting, which only a Fabric administrator can read, and Database Hub's own pages, which have no API.
 
 ## Steps only a person can do
