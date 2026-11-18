@@ -474,7 +474,12 @@ Describe 'The dashboard shared with the presenters (Grant-DemoPresenterWorkspace
         $result.message | Should -Match '^The demo workspace is shared with the 2 presenter\(s\) in presenterObjectIds \(1 added as Viewers, 1 already had a role\), so they can open RTD_DatabaseHub_LiveView'
         $posts = @($requests | Where-Object Method -EQ 'Post')
         $posts.Count | Should -Be 1
-        ($posts[0].Body | ConvertFrom-Json -AsHashtable) | ConvertTo-Json -Compress -Depth 5 | Should -Be (@{ principal = [ordered]@{ id = $script:alice; type = 'User' }; role = 'Viewer' } | ConvertTo-Json -Compress -Depth 5)
+        # Field by field: a hashtable's key order isn't stable from one process to the next.
+        $posted = $posts[0].Body | ConvertFrom-Json
+        @($posted.PSObject.Properties.Name | Sort-Object) | Should -Be @('principal', 'role')
+        $posted.role | Should -Be 'Viewer'
+        $posted.principal.id | Should -Be $script:alice
+        $posted.principal.type | Should -Be 'User'
     }
 
     It 'warns with the portal''s steps, and never fails, when a presenter can''t be added or the roles can''t be listed' {

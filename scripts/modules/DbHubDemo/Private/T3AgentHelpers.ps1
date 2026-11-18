@@ -342,7 +342,10 @@ function Get-DemoT3AgentSetupItem {
         return $null
     }
     $tenant = ([string]$Config['tenantId']).ToLowerInvariant()
-    $link = 'https://app.fabric.microsoft.com/workloads/fdh/databaseHub{0}' -f $(if ($tenant) { '?ctid=' + $tenant } else { '' })
+    # The portal's address comes from config/versions.json (fabricApp.portalUrl), as the Insights app's links do: Database
+    # Hub has no API, and this is the page a person opens.
+    $portal = ([string](Get-DemoFabricAppSetting)['portalUrl']).TrimEnd('/')
+    $link = '{0}/workloads/fdh/databaseHub{1}' -f $portal, $(if ($tenant) { '?ctid=' + $tenant } else { '' })
     $database = '{0}/ContosoCare' -f $ServerName
     $where = if ($Region) { $Region } else { [string]$Config['location'] }
     $message = 'Database Agents on T3, once per deployment (the Database Agent loop; it stays across sessions and upgrades, unless T3 is recreated): open {0}, select Manage agents, then Database agent settings; turn Enabled on, select {1}, and under Agent policy turn on {2}; select Apply, then Save (about 30 seconds). T3 must be awake: right after deploy.ps1, or during a session. Database Agents needs T3''s region ({3}) to be the one associated with your Fabric tenant''s home region (Fabric: ? > About Fabric).' -f $link, $database, ($script:DemoAgentPolicy -join ', '), $where

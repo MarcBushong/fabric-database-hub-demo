@@ -197,7 +197,7 @@ public sealed class SqlScriptTests
             Assert.Contains("EXEC demo.usp_release_auto_tuning_hold", ProcedureText(caller), StringComparison.Ordinal);
         }
 
-        Assert.EndsWith("EXEC demo.usp_release_auto_tuning_hold;\nGO", File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql")).Replace("\r\n", "\n", StringComparison.Ordinal).TrimEnd(), StringComparison.Ordinal);
+        Assert.EndsWith("EXEC demo.usp_release_auto_tuning_hold @by = N'setup (deploy.ps1)';\nGO", File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql")).Replace("\r\n", "\n", StringComparison.Ordinal).TrimEnd(), StringComparison.Ordinal);
     }
 
     [Fact]
