@@ -273,7 +273,7 @@ Since 2026-11-18, every step that uses PowerShell Direct after an update clears 
 3. When it stays broken, `archost01` shuts the guest down cleanly (`Stop-VM`, then `Start-VM`; [Stop-VM](https://learn.microsoft.com/powershell/module/hyper-v/stop-vm)), waits until it answers, and runs the step again: `DEPLOY.T2.GUESTRESTART`, a **Warning** that says what broke and that the restart cleared it. A guest that started less than 5 minutes ago is waited for, never restarted, and nothing is restarted during a golden capture.
 4. A run restarts the guest at most once: each `deploy.ps1` run has its own key, the session control one an hour. When it still fails, the step is a **Fail** that says so, with `./scripts/deploy.ps1` as the fix.
 
-The host's bootstrap clears a broken channel the same way, once per bundle, for a guest that's onboarded. Each restart is recorded in `C:\ProgramData\DbHubDemo\guest-recovery.json` on `archost01`, and the host's health shows the last one (`guestRecovery`).
+The host's bootstrap clears a broken channel the same way, once per bundle, for a guest that's onboarded. Each restart is recorded in `C:\ProgramData\DbHubDemo\guest-recovery.json` on `archost01` before the guest stops, and the host's health shows the last one (`guestRecovery`). A restart whose own process ended before it started the guest again (`deploy.ps1` stopped with Ctrl+C, or its Run Command deleted or timed out) is finished by the host: its bootstrap, every 5 minutes, and the next recovery or Arc probe start the guest it left off, never one that's off for another reason (a golden capture, a restored copy not yet released, the host's own stop). A host whose bundle is older than this fix fails as before, until `./scripts/deploy.ps1` sends it the new one.
 
 ## T1
 

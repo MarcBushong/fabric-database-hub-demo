@@ -310,6 +310,28 @@ function Test-DemoHostGuestReachable {
 
 $script:DemoHostRecoveryTried = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
 
+function Invoke-DemoHostGuestRecoveryRepair {
+    # Every bootstrap run (every 5 minutes): a restart of the guest whose process ended before it finished, which left the
+    # guest off (review of #65), is finished: Complete-DemoGuestRecoveryInterrupted starts it, only with such an entry in
+    # guest-recovery.json and never while something keeps it off on purpose. Never throws.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Context
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Context.SecretPath -PathType Leaf) -or $null -eq (Get-DemoGuestRecoveryUnfinished -StateRoot $Context.Root)) {
+            return
+        }
+        $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
+        $null = Complete-DemoGuestRecoveryInterrupted -Name $Context.GuestName -Credential $credential -StateRoot $Context.Root -Confirm:$false
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('An interrupted restart of the guest couldn''t be finished: {0}' -f $_.Exception.Message)
+    }
+}
+
 function Wait-DemoHostGuest {
     # Starts the guest if needed (after a host restart, for example) and waits up to 10 minutes.
     [CmdletBinding()]

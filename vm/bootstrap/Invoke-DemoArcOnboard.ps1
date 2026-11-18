@@ -936,6 +936,14 @@ function Invoke-DemoArcOnboardWithRecovery {
     if ($null -eq $failure -and -not ($ActionName -eq 'Probe' -and -not [bool]$result['guestReachable'])) {
         return $result
     }
+    # A host whose installed bundle is from before #65 has no recovery functions: its failure stays as it is.
+    $recoveryCommands = @('Test-DemoGuestChannelBroken', 'Test-DemoGuestChannel', 'Get-DemoGuestRecoveryKey', 'Invoke-DemoGuestRecovery', 'Complete-DemoGuestRecoveryInterrupted')
+    if (@($recoveryCommands | Where-Object { -not (Get-Command -Name $_ -ErrorAction SilentlyContinue) }).Count -gt 0) {
+        if ($null -ne $failure) {
+            throw $failure
+        }
+        return $result
+    }
     # Only a broken channel calls for more; another failure stays as it is.
     $failureText = if ($null -ne $failure) { [string]$failure.Exception.Message } else { '' }
     if ($null -ne $failure -and -not (Test-DemoGuestChannelBroken -Text $failureText)) {
@@ -947,20 +955,34 @@ function Invoke-DemoArcOnboardWithRecovery {
         $guestName = [string]$guestConfig.Name
     }
     $credential = Get-DemoGuestCredential -SecretPath ([System.IO.Path]::Combine($StateRoot, 'protected', 'guest-administrator.bin')) -UserName ([string]$guestConfig.AdministratorName)
-    $reason = $failureText
-    if ($null -eq $failure) {
-        # A Probe that found the guest unreachable without an error: only a channel that's broken now calls for more.
-        $probe = Test-DemoGuestChannel -Name $guestName -Credential $credential
-        if (-not $probe.Broken) {
-            return $result
-        }
-        $reason = [string]$probe.Error
-    }
-    # A break that's over by now (the user's demo, 2026-11-18: about 2 seconds) only waits for the guest to answer;
-    # one that stays restarts the guest once for this run (vu, 2026-11-18: 20 minutes and more).
     $key = Get-DemoGuestRecoveryKey -Key $RecoveryKey -Prefix 'arc'
-    $recovery = Invoke-DemoGuestRecovery -Name $guestName -Credential $credential -Key $key -By 'Arc onboarding' -Reason $reason -StateRoot $StateRoot -Confirm:$false
-    $evidence = [ordered]@{ action = [string]$recovery.Action; restarted = [bool]$recovery.Restarted; recovered = [bool]$recovery.Recovered; seconds = [int]$recovery.Seconds; atUtc = [string]$recovery.AtUtc; restartUtc = [string]$recovery.RestartUtc; stoppedBy = [string]$recovery.StoppedBy; by = [string]$recovery.By; key = $key; reason = $reason; message = [string]$recovery.Message; guest = $guestName }
+    $toEvidence = {
+        param([object] $Recovery, [string] $Why)
+        [ordered]@{ action = [string]$Recovery.Action; restarted = [bool]$Recovery.Restarted; recovered = [bool]$Recovery.Recovered; seconds = [int]$Recovery.Seconds; atUtc = [string]$Recovery.AtUtc; restartUtc = [string]$Recovery.RestartUtc; stoppedBy = [string]$Recovery.StoppedBy; by = [string]$Recovery.By; key = $(if ([string]$Recovery.Key) { [string]$Recovery.Key } else { $key }); reason = $Why; message = [string]$Recovery.Message; guest = $guestName }
+    }
+    $reason = $failureText
+    $recovery = $null
+    if ($null -eq $failure) {
+        # A Probe that found the guest unreachable without an error. A guest that an interrupted restart left off is
+        # started again first (review of #65); otherwise only a channel that's broken now calls for more.
+        $recovery = Complete-DemoGuestRecoveryInterrupted -Name $guestName -Credential $credential -StateRoot $StateRoot -Confirm:$false
+        if ($null -ne $recovery) {
+            $reason = [string]$recovery.Reason
+        }
+        else {
+            $probe = Test-DemoGuestChannel -Name $guestName -Credential $credential
+            if (-not $probe.Broken) {
+                return $result
+            }
+            $reason = [string]$probe.Error
+        }
+    }
+    if ($null -eq $recovery) {
+        # A break that's over by now (the user's demo, 2026-11-18: about 2 seconds) only waits for the guest to answer;
+        # one that stays restarts the guest once for this run (vu, 2026-11-18: 20 minutes and more).
+        $recovery = Invoke-DemoGuestRecovery -Name $guestName -Credential $credential -Key $key -By 'Arc onboarding' -Reason $reason -StateRoot $StateRoot -Confirm:$false
+    }
+    $evidence = & $toEvidence $recovery $reason
     if (-not $recovery.Recovered) {
         if ($null -ne $failure) {
             throw ('{0} PowerShell Direct into {1} is broken. {2}' -f $failureText, $guestName, $recovery.Message)

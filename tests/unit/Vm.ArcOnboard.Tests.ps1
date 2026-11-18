@@ -498,3 +498,113 @@ Describe 'A broken PowerShell Direct channel into the guest (issue #65)' {
         (Get-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'guest-recovery.json') -Raw | ConvertFrom-Json).restarts[0].key | Should -Be 'bootstrap-6a85c5d88e3a-20261118134518'
     }
 }
+
+Describe 'A restart of the guest that its process didn''t finish (review of #65)' {
+    BeforeAll {
+        foreach ($stub in @(
+                @{ Name = 'Get-VM'; Body = 'param([string] $Name)' }
+                @{ Name = 'Stop-VM'; Body = 'param([string] $Name, [switch] $Force, [switch] $AsJob, [switch] $TurnOff)' }
+                @{ Name = 'Start-VM'; Body = 'param([string] $Name)' }
+            )) {
+            if (-not (Get-Command -Name $stub.Name -ErrorAction SilentlyContinue)) {
+                New-Item -Path ('function:global:' + $stub.Name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stub.Body)) | Out-Null
+            }
+        }
+        $script:vmId = '77777777-8888-9999-0000-111111111111'
+        function Set-TestUnfinishedRestart([string] $Root, [string] $VmId = $script:vmId) {
+            $record = [ordered]@{ schemaVersion = 1; restarts = @([ordered]@{ id = 'a1'; key = 'deploy-aaaaaaaaaaaa'; by = 'Arc onboarding'; reason = 'The Hyper-V socket target process has ended.'; vmId = $VmId; startedUtc = '2026-11-18T18:50:00Z'; endedUtc = ''; seconds = 0; stoppedBy = ''; recovered = $false }) }
+            Set-Content -LiteralPath (Join-Path -Path $Root -ChildPath 'guest-recovery.json') -Value ($record | ConvertTo-Json -Depth 4)
+        }
+        function Get-TestLastRestart([string] $Root) {
+            @((Get-Content -LiteralPath (Join-Path -Path $Root -ChildPath 'guest-recovery.json') -Raw | ConvertFrom-Json).restarts)[-1]
+        }
+        $secure = [System.Security.SecureString]::new()
+        foreach ($character in 'not-a-real-secret'.ToCharArray()) { $secure.AppendChar($character) }
+        $script:credential = [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+    }
+
+    BeforeEach {
+        $script:root = New-TestStateRoot
+        # The process that restarted the guest ended after Stop-VM: the guest is off, and nothing answers.
+        $script:vm = @{ State = 'Off'; Heartbeat = ''; Uptime = [timespan]::Zero }
+        $script:answers = $false
+        Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = $script:vm.State; Heartbeat = $script:vm.Heartbeat; Uptime = $script:vm.Uptime; VMId = $script:vmId } }
+        Mock -CommandName Stop-VM -MockWith { $script:vm.State = 'Off' }
+        Mock -CommandName Start-VM -MockWith { $script:vm.State = 'Running'; $script:vm.Heartbeat = 'OkApplicationsHealthy'; $script:answers = $true }
+        Mock -CommandName Start-Sleep -MockWith { }
+        Mock -CommandName Wait-DemoGuestOnline -MockWith { $script:answers }
+        Mock -CommandName Get-DemoGuestComputerName -MockWith { if ($script:answers) { 'ARCSQL01' } else { throw 'The virtual machine arcsql01 is not in running state.' } }
+        Mock -CommandName Enter-DemoGuestRecoveryLock -MockWith { [pscustomobject]@{ Lock = 'test' } }
+        Mock -CommandName Exit-DemoGuestRecoveryLock -MockWith { }
+    }
+
+    It 'starts the guest it left off once, waits until it answers, and completes its entry' {
+        Set-TestUnfinishedRestart -Root $script:root
+        $done = Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false
+        $done.Action | Should -Be 'Interrupted'
+        $done.Restarted | Should -BeTrue
+        $done.Recovered | Should -BeTrue
+        $done.StoppedBy | Should -Be 'Interrupted'
+        $done.AtUtc | Should -Not -BeNullOrEmpty
+        Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+        $last = Get-TestLastRestart -Root $script:root
+        $last.stoppedBy | Should -Be 'Interrupted'
+        $last.recovered | Should -BeTrue
+        $last.endedUtc | Should -Not -BeNullOrEmpty
+        # Finished: nothing to do the next time.
+        Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+    }
+
+    It 'never starts a guest that''s off for another reason: no unfinished entry, another guest, a golden capture, a copy not released, or the host''s own stop' {
+        Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false | Should -BeNullOrEmpty
+        Set-TestUnfinishedRestart -Root $script:root -VmId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false | Should -BeNullOrEmpty
+        Set-TestUnfinishedRestart -Root $script:root
+        New-Item -ItemType Directory -Path (Join-Path -Path $script:root -ChildPath 'golden') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture-in-progress.json') -Value '{"snapshotName":"snap-dbhub-t2golden-202611182200"}'
+        Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false | Should -BeNullOrEmpty
+        Remove-Item -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture-in-progress.json')
+        Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json') -Value '{"snapshotName":"snap-dbhub-t2golden-202611182200","released":false}'
+        Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false | Should -BeNullOrEmpty
+        Remove-Item -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture.json')
+        Close-DemoGuestRecoveryUnfinished -StateRoot $script:root -Confirm:$false
+        (Get-TestLastRestart -Root $script:root).stoppedBy | Should -Be 'HostStop'
+        Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+    }
+
+    It 'is finished by the host''s bootstrap, every run, with no deploy.ps1 running' {
+        Set-TestUnfinishedRestart -Root $script:root
+        $secret = Join-Path -Path $script:root -ChildPath 'protected\guest-administrator.bin'
+        Set-Content -LiteralPath $secret -Value 'not-a-real-secret'
+        Mock -CommandName Get-DemoGuestCredential -MockWith { $script:credential }
+        Invoke-DemoHostGuestRecoveryRepair -Context @{ Root = $script:root; SecretPath = $secret; GuestName = 'arcsql01'; Guest = @{ AdministratorName = 'Administrator' } }
+        Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+        (Get-TestLastRestart -Root $script:root).stoppedBy | Should -Be 'Interrupted'
+    }
+
+    It 'lets Arc onboarding''s probe start the guest again and probe once more (Ctrl+C during a restart, then a rerun)' {
+        Set-TestUnfinishedRestart -Root $script:root
+        Mock -CommandName Get-DemoGuestCredential -MockWith { $script:credential }
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith { [ordered]@{ action = 'Probe'; guestReachable = $script:answers } }
+        $result = Invoke-DemoArcOnboardWithRecovery -ActionName 'Probe' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot -RecoveryKey 'deploy-bbbbbbbbbbbb'
+        $result.guestReachable | Should -BeTrue
+        $result.guestRecovery.action | Should -Be 'Interrupted'
+        $result.guestRecovery.restarted | Should -BeTrue
+        Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+        Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+    }
+
+    It 'keeps the failure, or the Probe''s result, as it is on a host whose bundle has no recovery yet (an older bundle)' {
+        Mock -CommandName Get-Command -ParameterFilter { $Name -eq 'Complete-DemoGuestRecoveryInterrupted' } -MockWith { $null }
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith { [ordered]@{ action = 'Probe'; guestReachable = $false } }
+        $probe = Invoke-DemoArcOnboardWithRecovery -ActionName 'Probe' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot
+        $probe.guestReachable | Should -BeFalse
+        $probe.Contains('guestRecovery') | Should -BeFalse
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith { throw 'DbHubDemo Arc WriteMarker failed: The background process reported an error with the following message: "The Hyper-V socket target process has ended.".' }
+        { Invoke-DemoArcOnboardWithRecovery -ActionName 'WriteMarker' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot } | Should -Throw 'DbHubDemo Arc WriteMarker failed: *target process has ended*'
+        Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+        Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+    }
+}

@@ -1447,7 +1447,9 @@ function Invoke-DemoControlStopGuest {
         [System.Collections.IDictionary] $Request,
 
         [Parameter(Mandatory = $true)]
-        [System.Collections.IDictionary] $Settings
+        [System.Collections.IDictionary] $Settings,
+
+        [string] $StateRoot = 'C:\ProgramData\DbHubDemo'
     )
 
     $guest = Import-PowerShellDataFile -Path ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'dsc', 'guest.psd1'))
@@ -1455,6 +1457,9 @@ function Invoke-DemoControlStopGuest {
     if ($Settings.Contains('guest') -and $null -ne $Settings['guest'] -and $Settings['guest']['name']) {
         $guestName = [string]$Settings['guest']['name']
     }
+    # A restart that its process didn't finish (#65) ends here, so nothing starts the guest that this stop turns off.
+    . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
+    Close-DemoGuestRecoveryUnfinished -StateRoot $StateRoot -Confirm:$false
     $minutes = 10
     if ($Request.Contains('timeoutMinutes') -and [int]$Request['timeoutMinutes'] -ge 1) {
         $minutes = [System.Math]::Min(30, [int]$Request['timeoutMinutes'])
@@ -1528,7 +1533,7 @@ function Invoke-DemoWorkloadControl {
                 Write-DemoControlResult -ActionName $ActionName -Status 'Fail' -Message 'StopGuest runs on the T2 host (archost01).'
                 return
             }
-            Invoke-DemoControlStopGuest -Request $body -Settings $settings
+            Invoke-DemoControlStopGuest -Request $body -Settings $settings -StateRoot $StateRoot
         }
         default {
             Write-DemoControlResult -ActionName ([string]$ActionName) -Status 'Fail' -Message 'Unknown action; use EnableT3, EnableT4, Runner, or StopGuest.'

@@ -571,6 +571,183 @@ function Restart-DemoGuestVm {
     return $how
 }
 
+function Get-DemoGuestRecoveryUnfinished {
+    # guest-recovery.json's latest entry when its restart never finished (no endedUtc): its process ended between
+    # Stop-VM and Start-VM, or before it recorded the end. $null otherwise. Never throws.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot
+    )
+
+    $record = Read-DemoGuestRecoveryRecord -StateRoot $StateRoot
+    if ($null -eq $record -or -not $record.Contains('restarts')) {
+        return $null
+    }
+    $last = @($record['restarts']) | Select-Object -Last 1
+    if ($last -is [System.Collections.IDictionary] -and -not [string]$last['endedUtc']) {
+        return $last
+    }
+    return $null
+}
+
+function Test-DemoGuestHeldOff {
+    # True while something keeps the guest off on purpose, so nothing may start it: a golden capture in progress, or a
+    # capture record that isn't released (a restored copy waiting for its reset and release, or a source the capture
+    # hasn't returned yet). A record that can't be read counts as held. Never throws.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot
+    )
+
+    if (Test-Path -LiteralPath ([System.IO.Path]::Combine($StateRoot, 'golden', 'capture-in-progress.json'))) {
+        return $true
+    }
+    $capturePath = [System.IO.Path]::Combine($StateRoot, 'golden', 'capture.json')
+    if (-not (Test-Path -LiteralPath $capturePath -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $capture = Read-DemoVmJsonFile -Path $capturePath
+        return ($null -eq $capture -or -not [bool]$capture['released'])
+    }
+    catch {
+        return $true
+    }
+}
+
+function Complete-DemoGuestRecoveryInterrupted {
+    <#
+    .SYNOPSIS
+    Finishes a restart of the guest that its own process didn't (review of #65): a deploy.ps1 stopped with Ctrl+C, a Run
+    Command deleted or timed out during the restart, or the host's bootstrap stopped. Returns $null when there's nothing
+    to finish, else Action (Interrupted), Restarted, Recovered, Seconds, Reason, By, Key, AtUtc, RestartUtc, StoppedBy,
+    and Message, as Invoke-DemoGuestRecovery does. Never throws.
+
+    .DESCRIPTION
+    Only when guest-recovery.json's latest entry has no endedUtc, under the host's recovery lock (so not while a restart
+    runs), and for the same guest (its VM ID). A guest that's Off is started and waited for, unless something keeps it
+    off on purpose (Test-DemoGuestHeldOff: a golden capture, or a restored copy that isn't released yet); one that runs
+    only gets its entry completed. The entry ends with stoppedBy Interrupted. A guest that's Off for any other reason,
+    without such an entry, is never started here.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name,
+
+        [Parameter(Mandatory = $true)]
+        [pscredential] $Credential,
+
+        [string] $StateRoot = 'C:\ProgramData\DbHubDemo',
+
+        [ValidateRange(1, 60)]
+        [int] $LockMinutes = 1,
+
+        [ValidateRange(1, 60)]
+        [int] $OnlineMinutes = 10,
+
+        # The caller holds the recovery lock already (Invoke-DemoGuestRecovery).
+        [switch] $LockHeld
+    )
+
+    $lock = $null
+    try {
+        if ($null -eq (Get-DemoGuestRecoveryUnfinished -StateRoot $StateRoot)) {
+            return $null
+        }
+        if (-not $LockHeld) {
+            $lock = Enter-DemoGuestRecoveryLock -Minutes $LockMinutes
+            if ($null -eq $lock) {
+                return $null
+            }
+        }
+        # Read again under the lock: a restart that held it has finished its own entry since.
+        $entry = Get-DemoGuestRecoveryUnfinished -StateRoot $StateRoot
+        $vm = Get-VM -Name $Name -ErrorAction SilentlyContinue
+        if ($null -eq $entry -or -not $vm) {
+            return $null
+        }
+        if ([string]$entry['vmId'] -and -not [string]::Equals([string]$entry['vmId'], [string]$vm.VMId, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $null
+        }
+        $state = [string]$vm.State
+        if ($state -eq 'Off' -and (Test-DemoGuestHeldOff -StateRoot $StateRoot)) {
+            return $null
+        }
+        if (-not $PSCmdlet.ShouldProcess($Name, 'Finish a restart that was interrupted')) {
+            return $null
+        }
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $result = [ordered]@{ Action = 'Interrupted'; Restarted = $true; Recovered = $false; Seconds = 0; Reason = [string]$entry['reason']; By = [string]$entry['by']; Key = [string]$entry['key']; AtUtc = (Get-DemoVmUtcNow); RestartUtc = [string]$entry['startedUtc']; StoppedBy = 'Interrupted'; Message = '' }
+        if ($state -eq 'Off') {
+            Write-DemoVmLog -Level 'Warning' -Message ('{0} is off because its restart by {1} at {2} didn''t finish; it''s started again.' -f $Name, $result.By, $result.RestartUtc)
+            Start-VM -Name $Name
+            Start-Sleep -Seconds 20
+        }
+        $result.Recovered = Wait-DemoGuestOnline -Name $Name -Credential $Credential -TimeoutMinutes $OnlineMinutes
+        $result.Seconds = [int]$clock.Elapsed.TotalSeconds
+        $entry['endedUtc'] = Get-DemoVmUtcNow
+        $entry['stoppedBy'] = 'Interrupted'
+        $entry['recovered'] = [bool]$result.Recovered
+        Save-DemoGuestRecoveryEntry -StateRoot $StateRoot -Entry $entry
+        # deploy.ps1 reports it once, at the time it was finished, from this result or from the host's health.
+        $result.AtUtc = [string]$entry['endedUtc']
+        $result.Message = if ($result.Recovered) {
+            '{0}''s restart by {1} at {2} was interrupted; {3}, and it answers over PowerShell Direct again.' -f $Name, $result.By, $result.RestartUtc, $(if ($state -eq 'Off') { 'it was started again' } else { 'it was running' })
+        }
+        else {
+            '{0}''s restart by {1} at {2} was interrupted, and it didn''t answer over PowerShell Direct within {3} minutes.' -f $Name, $result.By, $result.RestartUtc, $OnlineMinutes
+        }
+        Write-DemoVmLog -Level $(if ($result.Recovered) { 'Warning' } else { 'Error' }) -Message $result.Message
+        return [pscustomobject]$result
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('An interrupted restart of {0} couldn''t be finished: {1}' -f $Name, (Protect-DemoVmText -Text $_.Exception.Message))
+        return $null
+    }
+    finally {
+        Exit-DemoGuestRecoveryLock -Lock $lock
+    }
+}
+
+function Close-DemoGuestRecoveryUnfinished {
+    # Ends an unfinished restart's entry without starting the guest, for the host's own stop (StopGuest), so nothing starts
+    # the guest that the stop turns off. Never throws.
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [string] $StateRoot = 'C:\ProgramData\DbHubDemo',
+
+        [ValidateSet('HostStop')]
+        [string] $How = 'HostStop'
+    )
+
+    $lock = $null
+    try {
+        if ($null -eq (Get-DemoGuestRecoveryUnfinished -StateRoot $StateRoot)) {
+            return
+        }
+        $lock = Enter-DemoGuestRecoveryLock -Minutes 1
+        $entry = Get-DemoGuestRecoveryUnfinished -StateRoot $StateRoot
+        if ($null -eq $lock -or $null -eq $entry -or -not $PSCmdlet.ShouldProcess('guest-recovery.json', 'End an unfinished restart''s entry')) {
+            return
+        }
+        $entry['endedUtc'] = Get-DemoVmUtcNow
+        $entry['stoppedBy'] = $How
+        $entry['recovered'] = $false
+        Save-DemoGuestRecoveryEntry -StateRoot $StateRoot -Entry $entry
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('An unfinished restart''s entry couldn''t be ended: {0}' -f (Protect-DemoVmText -Text $_.Exception.Message))
+    }
+    finally {
+        Exit-DemoGuestRecoveryLock -Lock $lock
+    }
+}
+
 function Invoke-DemoGuestRecovery {
     <#
     .SYNOPSIS
@@ -580,11 +757,13 @@ function Invoke-DemoGuestRecovery {
     and Message. Never throws.
 
     .DESCRIPTION
-    Under a host-wide lock, it probes the guest three times, 10 seconds apart, so a one-off failure restarts nothing, and
-    another caller's restart counts (Healed). Get-DemoGuestRecoveryDecision then decides; a restart happens at most once
-    per Key, the caller's run (deploy.ps1's run, a session, or the host bootstrap's generation). The guest shuts down
-    through its operating system (Restart-DemoGuestVm), so SQL Server stops cleanly, and starts again; its own startup
-    tasks run, its workload runner's profile host included.
+    Under a host-wide lock, it first finishes a restart that its own process didn't (Complete-DemoGuestRecoveryInterrupted:
+    it starts a guest that restart left off, and returns that as this recovery). It then probes the guest three times,
+    10 seconds apart, so a one-off failure restarts nothing, and another caller's restart counts (Healed).
+    Get-DemoGuestRecoveryDecision then decides; a restart happens at most once per Key, the caller's run (deploy.ps1's run,
+    a session, or the host bootstrap's generation). The guest shuts down through its operating system
+    (Restart-DemoGuestVm), so SQL Server stops cleanly, and starts again; its own startup tasks run, its workload runner's
+    profile host included. The restart's entry, with the guest's VM ID, is in guest-recovery.json before the shutdown.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     [OutputType([pscustomobject])]
@@ -622,6 +801,11 @@ function Invoke-DemoGuestRecovery {
             $result.Message = ('Another restart of {0} held the host''s recovery lock for 20 minutes, so it wasn''t restarted again.' -f $Name)
             return [pscustomobject]$result
         }
+        # A restart whose process ended before it finished (review of #65) is finished first; that counts as this one.
+        $interrupted = Complete-DemoGuestRecoveryInterrupted -Name $Name -Credential $Credential -StateRoot $StateRoot -OnlineMinutes $OnlineMinutes -LockHeld -Confirm:$false
+        if ($null -ne $interrupted) {
+            return $interrupted
+        }
         $probe = Test-DemoGuestChannel -Name $Name -Credential $Credential -Attempts 3 -DelaySeconds 10
         if ($probe.Ok) {
             $result.Action = 'Healed'
@@ -649,7 +833,8 @@ function Invoke-DemoGuestRecovery {
             return [pscustomobject]$result
         }
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        $entry = [ordered]@{ id = [guid]::NewGuid().ToString('N'); key = $Key; by = $By; reason = (Protect-DemoVmText -Text ([string]$result.Reason)); startedUtc = (Get-DemoVmUtcNow); endedUtc = ''; seconds = 0; stoppedBy = ''; recovered = $false }
+        $vmNow = Get-VM -Name $Name -ErrorAction SilentlyContinue
+        $entry = [ordered]@{ id = [guid]::NewGuid().ToString('N'); key = $Key; by = $By; reason = (Protect-DemoVmText -Text ([string]$result.Reason)); vmId = $(if ($vmNow) { [string]$vmNow.VMId } else { '' }); startedUtc = (Get-DemoVmUtcNow); endedUtc = ''; seconds = 0; stoppedBy = ''; recovered = $false }
         if (([string]$entry['reason']).Length -gt 400) {
             $entry['reason'] = ([string]$entry['reason']).Substring(0, 400)
         }

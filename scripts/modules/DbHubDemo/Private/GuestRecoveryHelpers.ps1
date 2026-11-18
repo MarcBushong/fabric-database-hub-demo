@@ -103,6 +103,16 @@ function ConvertTo-DemoGuestRecovery {
     $restarted = Get-DemoMemberValue -InputObject $InputObject -Name 'restarted'
     $kind = 'Restart'
     $at = $restartUtc
+    if ([string](Get-DemoMemberValue -InputObject $InputObject -Name 'stoppedBy') -eq 'Interrupted') {
+        # A restart whose process ended before it finished counts when the host finished it (review of #65).
+        $finished = ConvertTo-DemoRecoveryUtcText -Value (Get-DemoMemberValue -InputObject $InputObject -Name 'atUtc')
+        if (-not $finished) {
+            $finished = ConvertTo-DemoRecoveryUtcText -Value (Get-DemoMemberValue -InputObject $InputObject -Name 'endedUtc')
+        }
+        if ($finished) {
+            $at = $finished
+        }
+    }
     if (-not $restartUtc -or ($null -ne $restarted -and -not [bool]$restarted)) {
         # A break that was over when the guest was probed again: the step ran again without a restart.
         $at = ConvertTo-DemoRecoveryUtcText -Value (Get-DemoMemberValue -InputObject $InputObject -Name 'atUtc')
@@ -111,7 +121,11 @@ function ConvertTo-DemoGuestRecovery {
         }
         $kind = 'Retry'
     }
-    # The host's record says endedUtc once its restart is over; one that's still going is reported by a later read.
+    # The host's record says endedUtc once its restart is over; one that's still going is reported by a later read, and one
+    # the host's own stop ended (an interrupted restart, review of #65) isn't a recovery.
+    if ([string](Get-DemoMemberValue -InputObject $InputObject -Name 'stoppedBy') -eq 'HostStop') {
+        return $null
+    }
     $ended = $InputObject.PSObject.Properties['endedUtc']
     if ($InputObject -is [System.Collections.IDictionary]) {
         if ($InputObject.Contains('endedUtc') -and -not [string]$InputObject['endedUtc']) {
@@ -201,7 +215,11 @@ function Get-DemoGuestRecoveryRunResult {
             $out.Add((New-DemoResult -CheckId $retryId -Area 't2' -Target 'T2' -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'Nothing to do: the step ran again. If it happens on every run, open an issue with archost01''s C:\ProgramData\DbHubDemo\logs.' -DocUrl $docUrl))
             continue
         }
-        $how = if ($recovery.StoppedBy -eq 'TurnOff') { 'turned it off after its shutdown didn''t finish, and started it again' } else { 'shut it down cleanly and started it again' }
+        $how = switch ($recovery.StoppedBy) {
+            'TurnOff' { 'turned it off after its shutdown didn''t finish, and started it again' }
+            'Interrupted' { 'shut it down, and since that restart was interrupted, archost01 started it again later' }
+            default { 'shut it down cleanly and started it again' }
+        }
         if ($recovery.Recovered) {
             $message = 'PowerShell Direct into {0} broke at {1:HH:mm} UTC ({2}), so {3} restarted {0} once for this run: it {4}, and {0} answered again after {5} seconds, so the step went on.' -f $GuestName, $when, $why, $who, $how, $recovery.Seconds
             $out.Add((New-DemoResult -CheckId $restartId -Area 't2' -Target 'T2' -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'Nothing to do: the restart cleared it. If it happens on every run, open an issue with archost01''s C:\ProgramData\DbHubDemo\logs.' -DocUrl $docUrl))

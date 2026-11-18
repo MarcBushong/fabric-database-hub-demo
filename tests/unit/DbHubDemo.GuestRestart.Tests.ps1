@@ -54,6 +54,20 @@ Describe 'deploy.ps1''s report of a guest restart that cleared a broken PowerShe
         @(Get-TestRestart -Health ([pscustomobject]@{ state = 'Ready' })).Count | Should -Be 0
     }
 
+    It 'reports a restart that was interrupted once, when the host finished it in this run, and never one the host''s own stop ended (review of #65)' {
+        # Started in an earlier run (Ctrl+C), finished by this run's Arc probe at 20:31:05.
+        $finished = '2026-11-18T20:31:05.0000000Z'
+        $health = ([ordered]@{ state = 'Ready'; guestRecovery = [ordered]@{ startedUtc = '2026-11-18T18:52:10Z'; endedUtc = $finished; by = 'Arc onboarding'; key = 'deploy-aaaaaaaaaaaa'; seconds = 70; stoppedBy = 'Interrupted'; recovered = $true; reason = $script:brokenText } } | ConvertTo-Json -Depth 4) | ConvertFrom-Json
+        $arc = New-DemoResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -Status 'Pass' -Message 'x' -Evidence ([ordered]@{ guestRecovery = [ordered]@{ action = 'Interrupted'; restarted = $true; recovered = $true; seconds = 70; atUtc = $finished; restartUtc = '2026-11-18T18:52:10Z'; stoppedBy = 'Interrupted'; by = 'Arc onboarding'; reason = $script:brokenText } })
+        $results = @(Get-TestRestart -Result @($arc) -Health $health -SinceUtc ([datetime]::new(2026, 11, 18, 20, 0, 0, [System.DateTimeKind]::Utc)))
+        $results.Count | Should -Be 1
+        $results[0].checkId | Should -Be 'DEPLOY.T2.GUESTRESTART'
+        $results[0].status | Should -Be 'Warning'
+        $results[0].message | Should -Match 'broke at 20:31 UTC .*since that restart was interrupted, archost01 started it again later'
+        $stopped = ([ordered]@{ state = 'Ready'; guestRecovery = [ordered]@{ startedUtc = '2026-11-18T20:40:00Z'; endedUtc = '2026-11-18T20:45:00Z'; by = 'the T2 relay'; seconds = 0; stoppedBy = 'HostStop'; recovered = $false; reason = 'x' } } | ConvertTo-Json -Depth 4) | ConvertFrom-Json
+        @(Get-TestRestart -Health $stopped).Count | Should -Be 0
+    }
+
     It 'stays a Fail, with what to run, when the guest still didn''t answer after its restart, and sets the status page''s row' {
         $failed = @(Get-TestRestart -Health (New-TestHealth -Recovered $false))
         $failed.Count | Should -Be 1
