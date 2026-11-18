@@ -212,6 +212,37 @@ public sealed class HostLaneStatusTests
     }
 
     [Fact]
+    public async Task TheHostReplacesTheFileWhileStatusReadsIt()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var folder = Path.Combine(AppContext.BaseDirectory, "host-lanes-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(folder, HostLanesFile.FileName);
+        try
+        {
+            HostLanesFile.Write(path, Document(Lane("T1")));
+
+            // 'status' reading it, as HostLanesFile.Read opens it: on Windows, a replace is refused while it's open.
+            var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var release = Task.Run(
+                async () =>
+                {
+                    await Task.Delay(300, token);
+                    await reader.DisposeAsync();
+                },
+                token);
+
+            HostLanesFile.Write(path, Document(Lane("T1"), Lane("T4")));
+            await release;
+
+            Assert.Equal(["T1", "T4"], HostLanesFile.Read(path).Document!.Lanes!.Select(l => l.Target));
+        }
+        finally
+        {
+            Directory.Delete(folder, recursive: true);
+        }
+    }
+
+    [Fact]
     public void TheDefaultFileSitsNextToTheT3ProfileFile()
     {
         Assert.Equal(Path.GetDirectoryName(FileProfileStore.DefaultPath), Path.GetDirectoryName(HostLanesFile.DefaultPath));

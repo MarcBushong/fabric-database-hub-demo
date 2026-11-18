@@ -139,6 +139,73 @@ public sealed class ProfileStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task AWriterReplacesTheProfileFileWhileTheHostReadsIt()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var store = new FileProfileStore(FilePath);
+        await store.SetAsync("baseline", "test", null, null, null, token);
+
+        // The profile host's poll, as File.ReadAllTextAsync opens it: on Windows, a replace is refused while it's open.
+        var reader = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var release = Task.Run(
+            async () =>
+            {
+                await Task.Delay(300, token);
+                await reader.DisposeAsync();
+            },
+            token);
+
+        Assert.True((await store.SetAsync("business-day", "test", null, null, null, token)).Applied);
+        await release;
+        Assert.Equal("business-day", (await store.GetAsync(token)).Name);
+    }
+
+    [Fact]
+    public async Task AWriterTriesTheReplaceAgainOnlyWhileTheFileIsInUse()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var tries = 0;
+        var busyTwice = new FileProfileStore(FilePath, replace: (source, destination) =>
+        {
+            if (++tries <= 2)
+            {
+                throw new UnauthorizedAccessException("Access to the path is denied.");
+            }
+
+            File.Move(source, destination, overwrite: true);
+        });
+
+        Assert.True((await busyTwice.SetAsync("baseline", "test", null, null, null, token)).Applied);
+        Assert.Equal(3, tries);
+        Assert.Equal("baseline", (await busyTwice.GetAsync(token)).Name);
+
+        tries = 0;
+        var diskFull = new FileProfileStore(FilePath, replace: (_, _) =>
+        {
+            tries++;
+            throw new IOException("There is not enough space on the disk.", unchecked((int)0x80070070));
+        });
+        await Assert.ThrowsAsync<IOException>(() => diskFull.SetAsync("off", "test", null, null, null, token));
+        Assert.Equal(1, tries);
+    }
+
+    [Fact]
+    public async Task AWriterGivesUpWhenTheFileStaysInUse()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var tries = 0;
+        var store = new FileProfileStore(FilePath, replace: (_, _) =>
+        {
+            tries++;
+            throw new IOException("The process cannot access the file because it is being used by another process.", unchecked((int)0x80070020));
+        });
+
+        await Assert.ThrowsAsync<IOException>(() => store.SetAsync("baseline", "test", null, null, null, token));
+
+        Assert.Equal(FileReplace.RetryDelays.Count + 1, tries);
+    }
+
+    [Fact]
     public void ProfileSetStampsT4sFileAndALaterOlderRequestChangesNothing()
     {
         Directory.CreateDirectory(folder);
