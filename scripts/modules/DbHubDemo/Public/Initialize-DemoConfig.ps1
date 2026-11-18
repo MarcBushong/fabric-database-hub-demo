@@ -20,7 +20,8 @@ function Initialize-DemoConfig {
        (its owner tag or budget address is your sign-in, or you own the group that administers its T3 and T4): the
        configuration is written from what's deployed, its deployment record's parameters and its resource group's tags
        (ConvertFrom-DemoDeploymentRecord), so the next deploy.ps1 changes nothing you didn't ask for; its Fabric
-       workspaces and their capacity come from what it records (Resolve-DemoRecoveredWorkspace), its administrators'
+       workspaces and their capacity come from what it records (Resolve-DemoRecoveredWorkspace), its session control's
+       custom roles keep their suffix (control.roleNameSuffix, Get-DemoControlRoleSuffix), its administrators'
        group is kept (never created), and the settings Azure doesn't record keep their defaults, listed (Warning). One
        that isn't yours, or can't be told apart: never written for. With an explicit -Prefix, Manual action required
        (-OwnerEmail with its recorded budget address claims it); otherwise the first prefix after it that's yours, or
@@ -31,7 +32,11 @@ function Initialize-DemoConfig {
     6. Fabric (INIT.FABRIC.CAPACITY, INIT.FABRIC.WORKSPACE): the capacities you can assign (Capacities - List
        Capacities; it asks when there's more than one) and whether the workspace fabric.workspaceName already exists
        (Workspaces - List Workspaces). A workspace that doesn't exist yet gets fabric.importNotebooks true; deploy.ps1
-       creates it, its lakehouse, and the notebooks (ADR 0021). Nothing is created in Fabric here.
+       creates it, its lakehouse, and the notebooks (ADR 0021). One that exists gets false, so deploy.ps1 only adds the
+       notebooks that are missing, except a recovered environment's own (4b): the workspace its resource group records,
+       or one that holds only what the demo creates (Items - List Items, read-only), gets true, as the update republishes
+       its notebooks (Resolve-DemoRecoveredNotebookImport), and INIT.EXISTING says which and why. Nothing is created in
+       Fabric here.
     7. P6 (INIT.P6.GROUP): the Microsoft Entra security group by -AdminGroupObjectId, or by name (default
        <prefix>-<environment>-sql-admins), and whether you own it. With -CreateAdminGroup, a missing group is created
        with you as its owner (Microsoft Graph Create group and Add owners, the calls behind 'az ad group create' and
@@ -430,6 +435,9 @@ function Initialize-DemoConfig {
     $workspaceNote = ''
     $preferredCapacity = $null
     $capacityKept = $false
+    # A recovered environment's fabric.importNotebooks, and why (Resolve-DemoRecoveredNotebookImport); $null keeps the
+    # first run's rule.
+    $notebookImport = $null
     $stateTags = Get-DemoDeploymentStateTagName
     $recordedId = { param([string] $Key) if ($existing.Tags.Contains($stateTags[$Key])) { ([string]$existing.Tags[$stateTags[$Key]]).Trim() } else { '' } }
     $unknownWorkspace = {
@@ -514,6 +522,20 @@ function Initialize-DemoConfig {
             }
         }
 
+        if ($recovered) {
+            # The update republishes the notebooks of the demo's own workspace (issue 60, Resolve-DemoRecoveredNotebookImport):
+            # the one its resource group records, or else, read-only, one that holds only what the demo creates.
+            $recordedWorkspace = & $recordedId 'FabricWorkspaceId'
+            $namedWorkspaces = @(if ($workspaceList.Succeeded) { Select-DemoFabricNamed -Items $shared -Name $workspace })
+            $itemList = $null
+            if ($namedWorkspaces.Count -eq 1) {
+                $namedId = ([string](Get-DemoMemberValue -InputObject $namedWorkspaces[0] -Name 'id')).ToLowerInvariant()
+                if ($namedId -match $script:GuidPattern -and -not ($recordedWorkspace -and $namedId -eq $recordedWorkspace.ToLowerInvariant())) {
+                    $itemList = Read-DemoHubFabricList -Uri ('{0}/workspaces/{1}/items' -f $script:FabricApiBaseUri, $namedId) -Token $fabricToken -MaxPages 10
+                }
+            }
+            $notebookImport = Resolve-DemoRecoveredNotebookImport -WorkspaceName $workspace -Workspace $(if ($namedWorkspaces.Count -eq 1) { $namedWorkspaces[0] } else { $null }) -Found $namedWorkspaces.Count -Listed ([bool]$workspaceList.Succeeded) -RecordedId $recordedWorkspace -ResourceGroup ([string]$existing.ResourceGroup) -ItemList $itemList -Allowed @(Get-DemoFabricDemoItem -LakehouseName $lakehouse)
+        }
         if ($recovered -and -not $WorkspaceName -and $Prefix -and $effectivePrefix -cne $defaultPrefix -and $workspaceSource -eq 'unknown') {
             & $unknownWorkspace
         }
@@ -527,7 +549,8 @@ function Initialize-DemoConfig {
             }
             elseif ($found.Count -eq 1) {
                 $workspaceExists = $true
-                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Pass' ('The Fabric workspace "{0}" exists; the scripts use it, and deploy.ps1 adds only the notebooks that are missing.{1}' -f $workspace, $(if ($workspaceNote) { ' ' + $workspaceNote } else { '' })) @{ workspaceName = $workspace } '' $docs.Workspaces
+                $notebooks = if ($null -ne $notebookImport -and $notebookImport.Import) { 'deploy.ps1 updates its notebooks, as an update does (fabric.importNotebooks true; INIT.EXISTING says why)' } else { 'deploy.ps1 adds only the notebooks that are missing' }
+                & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Pass' ('The Fabric workspace "{0}" exists; the scripts use it, and {1}.{2}' -f $workspace, $notebooks, $(if ($workspaceNote) { ' ' + $workspaceNote } else { '' })) @{ workspaceName = $workspace } '' $docs.Workspaces
             }
             elseif ($capacityChosen) {
                 & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' 'Pass' ('The Fabric workspace "{0}" doesn''t exist yet: deploy.ps1 creates it on "{1}" with the lakehouse "{2}", and imports the notebooks (fabric.importNotebooks true). Creating it needs the Fabric tenant setting "Create workspaces" for you.{3}' -f $workspace, $capacityChosen, $lakehouse, $(if ($workspaceNote) { ' ' + $workspaceNote } else { '' })) @{ workspaceName = $workspace; capacityName = $capacityChosen } '' 'https://learn.microsoft.com/fabric/admin/portal-workspace'
@@ -547,6 +570,10 @@ function Initialize-DemoConfig {
                 & $unknownWorkspace
             }
         }
+    }
+    if ($recovered -and $null -eq $notebookImport) {
+        # Fabric couldn't be read: the first run's rule, and why (Resolve-DemoRecoveredNotebookImport).
+        $notebookImport = Resolve-DemoRecoveredNotebookImport -WorkspaceName $workspace -Listed $false
     }
     #endregion 6. Fabric
 
@@ -723,7 +750,9 @@ function Initialize-DemoConfig {
     $fabric['lakehouseName'] = $lakehouse
     $fabric['capacityName'] = $capacityChosen
     $fabric['createIfMissing'] = $true
-    $fabric['importNotebooks'] = -not $workspaceExists
+    # A first run's rule: true only for a workspace that doesn't exist yet. A recovered environment's own workspace gets
+    # true, as the update republishes its notebooks (issue 60, Resolve-DemoRecoveredNotebookImport).
+    $fabric['importNotebooks'] = if ($null -ne $notebookImport) { [bool]$notebookImport.Import } else { -not $workspaceExists }
     $fabric['manageCapacity'] = [bool]$ManageCapacity
     $config['fabric'] = $fabric
     if ($controlWorkspace) {
@@ -745,9 +774,11 @@ function Initialize-DemoConfig {
     # What the run found in the subscription (INIT.EXISTING, issue 60), with the values the file gets.
     $defaulted = [System.Collections.Generic.List[string]]::new()
     if ($recovered) {
+        # The control's settings that were recovered: its workspace, and its custom roles' suffix (Get-DemoControlRoleSuffix).
+        $controlKnown = @(@($(if ($controlWorkspace) { 'fabricWorkspaceName' }), $(if ([bool](Get-DemoMemberValue -InputObject $existing -Name 'RoleSuffixFound')) { 'roleNameSuffix' })) | Where-Object { $_ })
         foreach ($item in @($existing.Missing) + @($script:DemoUnrecordedSetting)) {
             $explicit = ($item -eq 'location' -and $Location) -or ($item -eq 'autoShutdownTimeZone' -and $TimeZone) -or ($item -eq 't2SqlInstallMode' -and $T2SqlInstallMode) -or ($item -eq 'ownerEmail' -and $OwnerEmail) -or ($item -eq 'fabric.lakehouseName' -and $LakehouseName) -or ($item -eq 'fabric.manageCapacity' -and $ManageCapacity) -or ($item -eq 't3AdminGroupObjectId' -and $groupId -ne $zeroGuid)
-            $label = if ($item -eq 'control' -and $controlWorkspace) { 'control (all but its fabricWorkspaceName)' } else { $item }
+            $label = if ($item -eq 'control' -and $controlKnown.Count -gt 0) { 'control (all but its {0})' -f ($controlKnown -join ' and ') } else { $item }
             if (-not $explicit -and -not $defaulted.Contains($label)) {
                 $defaulted.Add($label)
             }
@@ -757,7 +788,7 @@ function Initialize-DemoConfig {
             $defaulted.Add('fabric.workspaceName')
         }
     }
-    $report = Get-DemoExistingEnvironmentReport -Existing $existing -Path $fullPath -GroupName $(if ($groupId -ne $zeroGuid) { $groupName } else { '' }) -WorkspaceName $workspace -WorkspaceSource $workspaceSource -ControlName $controlWorkspace -Defaulted $defaulted.ToArray() -DryRun:$dryRun
+    $report = Get-DemoExistingEnvironmentReport -Existing $existing -Path $fullPath -GroupName $(if ($groupId -ne $zeroGuid) { $groupName } else { '' }) -WorkspaceName $workspace -WorkspaceSource $workspaceSource -ControlName $controlWorkspace -NotebookImport $notebookImport -Defaulted $defaulted.ToArray() -DryRun:$dryRun
     $results.Add($report.Result)
     $existingSummary = [pscustomobject]@{ Kind = [string]$existing.Kind; Prefix = $effectivePrefix; ResourceGroup = [string]$existing.ResourceGroup; Signal = [string]$existing.Signal; Note = [string]$report.Note }
 

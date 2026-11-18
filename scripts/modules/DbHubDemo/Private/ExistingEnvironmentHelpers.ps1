@@ -166,6 +166,100 @@ function Get-DemoDeploymentRecord {
     return [pscustomobject]$answer
 }
 
+function Get-DemoControlRoleSuffix {
+    <#
+    .SYNOPSIS
+    The control.roleNameSuffix an environment's session control runs with (issue 60, 2026-11-18), read-only: the custom
+    role its automation identity holds at the demo resource group (A1, Get-DemoActivityControlGrantPlan), "DbHub Demo
+    Activity Operator" or "DbHub Demo Activity Operator (<suffix>)". Internal; tests mock it.
+
+    .DESCRIPTION
+    An environment that shares its subscription with a demo on other code has its own two custom roles, named with its
+    suffix. Without the suffix, deploy.ps1 would create or update the shared roles, which the other demo's control holds,
+    so an environment that holds a role of its own never gets the shared ones back:
+    - One suffix, with or without the shared role: that suffix.
+    - More than one: the one named after -Prefix (the convention), else the one assigned last (createdOn), and Note says
+      so; the others are in Others.
+    - Only the shared role: Found, with Suffix ''.
+    - None: Found $false; the setting keeps its default.
+    - A read that fails: Error, and the caller writes nothing, as for its other reads.
+    Returns Found, Suffix, Others, Note, and Error.
+    Source (checked 2026-11-18): https://learn.microsoft.com/cli/azure/role/assignment#az-role-assignment-list
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $SubscriptionId,
+
+        [Parameter(Mandatory)]
+        [string] $ResourceGroup,
+
+        [AllowEmptyString()]
+        [string] $Prefix = ''
+    )
+
+    $answer = [ordered]@{ Found = $false; Suffix = ''; Others = @(); Note = ''; Error = '' }
+    $base = [string]$script:ActivityControlRoleName
+    $read = Invoke-DemoAz -SubscriptionId $SubscriptionId -ArgumentList @('role', 'assignment', 'list', '--resource-group', $ResourceGroup, '--fill-principal-name', 'false', '--query', ("[?starts_with(roleDefinitionName, '{0}')].{{name: roleDefinitionName, created: createdOn}}" -f $base), '--output', 'json') -AllowFailure -TimeoutSeconds 120
+    if ($read.ExitCode -ne 0) {
+        $answer.Error = 'the role assignments at {0} couldn''t be read: {1}' -f $ResourceGroup, (Get-DemoDeploymentErrorText -Text ([string]$read.StdErr) -MaxLength 300)
+        return [pscustomobject]$answer
+    }
+    $assignments = @()
+    if (-not [string]::IsNullOrWhiteSpace([string]$read.StdOut)) {
+        try {
+            $assignments = @([string]$read.StdOut | ConvertFrom-Json -ErrorAction Stop)
+        }
+        catch {
+            $answer.Error = 'the role assignments at {0} couldn''t be read: {1}' -f $ResourceGroup, (Protect-DemoText -Text $_.Exception.Message)
+            return [pscustomobject]$answer
+        }
+    }
+    $pattern = '^{0} \((?<suffix>[A-Za-z0-9-]{{1,24}})\)$' -f [regex]::Escape($base)
+    $latest = @{}
+    $shared = $false
+    foreach ($assignment in $assignments) {
+        $name = [string](Get-DemoMemberValue -InputObject $assignment -Name 'name')
+        # ConvertFrom-Json reads an ISO 8601 date as a DateTime; text that isn't one counts as the oldest.
+        $createdValue = Get-DemoMemberValue -InputObject $assignment -Name 'created'
+        $created = [DateTime]::MinValue
+        if ($createdValue -is [DateTime]) {
+            $created = $createdValue.ToUniversalTime()
+        }
+        elseif ($createdValue -is [string]) {
+            $parsed = [DateTime]::MinValue
+            if ([DateTime]::TryParse($createdValue, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$parsed)) {
+                $created = $parsed
+            }
+        }
+        $match = [regex]::Match($name, $pattern)
+        if ($match.Success) {
+            $suffix = $match.Groups['suffix'].Value
+            if (-not $latest.ContainsKey($suffix) -or $created -gt $latest[$suffix]) {
+                $latest[$suffix] = $created
+            }
+        }
+        elseif ($name -ceq $base) {
+            $shared = $true
+        }
+    }
+    if ($latest.Count -gt 0) {
+        $ordered = @($latest.Keys | Sort-Object -Property @{ Expression = { [string]::Equals($_, $Prefix, [System.StringComparison]::OrdinalIgnoreCase) }; Descending = $true }, @{ Expression = { $latest[$_] }; Descending = $true }, @{ Expression = { $_ }; Descending = $false })
+        $answer.Found = $true
+        $answer.Suffix = [string]$ordered[0]
+        $answer.Others = @($ordered | Select-Object -Skip 1)
+        if ($answer.Others.Count -gt 0) {
+            $why = if ([string]::Equals($answer.Suffix, $Prefix, [System.StringComparison]::OrdinalIgnoreCase)) { 'the one named after its prefix' } else { 'the one assigned last' }
+            $answer.Note = 'Its session control''s identity holds the demo''s custom roles under more than one suffix ({0}), so control.roleNameSuffix is "{1}", {2}, and never the shared roles; set it in the configuration if it''s another.' -f (@($ordered) -join ', '), $answer.Suffix, $why
+        }
+    }
+    elseif ($shared) {
+        $answer.Found = $true
+    }
+    return [pscustomobject]$answer
+}
+
 function Get-DemoEnvironmentTrace {
     <#
     .SYNOPSIS
@@ -573,8 +667,9 @@ function Resolve-DemoExistingEnvironment {
     - A read that failed: Kind Unreadable; nothing is written, so a first run never applies the defaults to an environment
       it couldn't check.
     Returns Kind, Prefix, ResourceGroup, DefaultResourceGroup (the configured prefix's), Signal, Values, Missing, Notes,
-    RecordDate, Record (a record was read), GroupId, GroupName, Tags, ControlGroup, Skipped (the taken candidates'
-    resource groups), and Error.
+    RecordDate, Record (a record was read), GroupId, GroupName, Tags, ControlGroup, RoleSuffixFound (the session
+    control's custom roles were read, Get-DemoControlRoleSuffix: their suffix, if any, is in Values as
+    control.roleNameSuffix), Skipped (the taken candidates' resource groups), and Error.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -616,6 +711,7 @@ function Resolve-DemoExistingEnvironment {
         GroupName            = ''
         Tags                 = @{}
         ControlGroup         = $false
+        RoleSuffixFound      = $false
         Skipped              = @()
         Error                = ''
     }
@@ -642,6 +738,24 @@ function Resolve-DemoExistingEnvironment {
             $answer.Notes = @($recovered.Notes)
             $answer.RecordDate = $Evidence.RecordDate
             $answer.Record = $null -ne $Evidence.Parameters
+            # Its session control's own custom roles (control.roleNameSuffix), which no record or tag holds: without the
+            # suffix, deploy.ps1 would create or update the shared roles, which another environment's control holds. A read
+            # that fails writes nothing, as the others do.
+            if ($Trace.DemoGroup) {
+                $role = Get-DemoControlRoleSuffix -SubscriptionId $SubscriptionId -ResourceGroup $Trace.ResourceGroup -Prefix $Trace.Prefix
+                if ($role.Error) {
+                    $answer.Kind = 'Unreadable'
+                    $answer.Error = [string]$role.Error
+                    return [pscustomobject]$answer
+                }
+                $answer.RoleSuffixFound = [bool]$role.Found
+                if ($role.Found -and $role.Suffix) {
+                    $answer.Values['control.roleNameSuffix'] = [string]$role.Suffix
+                }
+                if ($role.Note) {
+                    $answer.Notes = @($answer.Notes) + @([string]$role.Note)
+                }
+            }
         }
         else {
             # Only its session control's or its golden snapshots' group: nothing to recover, and a new environment there.
@@ -787,6 +901,91 @@ function Resolve-DemoRecoveredWorkspace {
     return [pscustomobject]$answer
 }
 
+function Resolve-DemoRecoveredNotebookImport {
+    <#
+    .SYNOPSIS
+    fabric.importNotebooks for a recovered environment, and why (issue 60; the coordinator's decision of 2026-11-18).
+    Pure. Internal.
+
+    .DESCRIPTION
+    A first run gives a workspace that exists false, so deploy.ps1 adds only the notebooks that are missing and keeps
+    edits made in Fabric. But an update republishes the notebooks (README, "Upgrading an existing demo"), and the
+    configuration that was lost had true when its first run created the workspace. So a recovered environment's own
+    workspace gets true: the one its resource group records (DbHubFabricWorkspaceId), or one that holds only items the
+    demo creates (Get-DemoFabricDemoItem, the rule destroy.ps1 deletes it by). Anything else keeps the first run's rule:
+    false for a workspace that holds anything else, or whose items couldn't all be listed; true for one that doesn't
+    exist yet, or that Fabric couldn't be asked about.
+    -Found is how many workspaces have the name (-Workspace is the one, when it's 1), -Listed whether Fabric's workspaces
+    were listed, and -ItemList Read-DemoHubFabricList's answer for its items ($null when they weren't read). Returns
+    Import and Reason, which INIT.EXISTING says.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $WorkspaceName,
+
+        [AllowNull()]
+        [object] $Workspace = $null,
+
+        [int] $Found = 0,
+
+        [bool] $Listed = $true,
+
+        [AllowEmptyString()]
+        [string] $RecordedId = '',
+
+        [AllowEmptyString()]
+        [string] $ResourceGroup = '',
+
+        [AllowNull()]
+        [object] $ItemList = $null,
+
+        [AllowEmptyCollection()]
+        [object[]] $Allowed = @()
+    )
+
+    $answer = { param([bool] $Import, [string] $Reason) [pscustomobject]@{ Import = $Import; Reason = $Reason } }
+    $keep = 'so deploy.ps1 adds only the notebooks that are missing and keeps the copies there (./scripts/configure-fabric.ps1 updates them)'
+    if (-not $Listed) {
+        return (& $answer $true 'Fabric couldn''t be read, so, as for a workspace that doesn''t exist yet, deploy.ps1 imports the notebooks or updates them')
+    }
+    if ($Found -gt 1) {
+        return (& $answer $true ('more than one workspace is named "{0}" (INIT.FABRIC.WORKSPACE), so, as for a workspace that doesn''t exist yet, deploy.ps1 imports the notebooks or updates them' -f $WorkspaceName))
+    }
+    if ($Found -eq 0 -or $null -eq $Workspace) {
+        return (& $answer $true ('"{0}" doesn''t exist yet, so deploy.ps1 creates it and imports the notebooks' -f $WorkspaceName))
+    }
+    $id = ([string](Get-DemoMemberValue -InputObject $Workspace -Name 'id')).ToLowerInvariant()
+    if ($id -and $RecordedId -and $id -eq $RecordedId.ToLowerInvariant()) {
+        return (& $answer $true ('"{0}" is the workspace {1} records (DbHubFabricWorkspaceId), so deploy.ps1 updates its notebooks, as an update does' -f $WorkspaceName, $ResourceGroup))
+    }
+    if ($null -eq $ItemList -or -not [bool](Get-DemoMemberValue -InputObject $ItemList -Name 'Succeeded') -or -not [bool](Get-DemoMemberValue -InputObject $ItemList -Name 'Complete')) {
+        $problem = if ($null -ne $ItemList) { ([string](Get-DemoMemberValue -InputObject $ItemList -Name 'Error')).TrimEnd('.') } else { '' }
+        return (& $answer $false ('the items in "{0}" couldn''t all be listed{1}, {2}' -f $WorkspaceName, $(if ($problem) { ' (' + $problem + ')' } else { '' }), $keep))
+    }
+    # Assign before wrapping: Get-DemoMemberValue returns an array as one object.
+    $listedItems = Get-DemoMemberValue -InputObject $ItemList -Name 'Items'
+    $count = 0
+    $foreign = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in @($listedItems)) {
+        if ($null -eq $item) {
+            continue
+        }
+        $count++
+        $type = [string](Get-DemoMemberValue -InputObject $item -Name 'type')
+        $display = [string](Get-DemoMemberValue -InputObject $item -Name 'displayName')
+        if (-not (Test-DemoFabricDemoItem -Allowed $Allowed -Type $type -Name $display)) {
+            $foreign.Add(('{0} {1}' -f $type, $display))
+        }
+    }
+    if ($foreign.Count -eq 0) {
+        return (& $answer $true ('everything in "{0}" is the demo''s ({1} item(s)), so deploy.ps1 updates its notebooks, as an update does' -f $WorkspaceName, $count))
+    }
+    $named = (@($foreign | Select-Object -First 5) -join ', ') + $(if ($foreign.Count -gt 5) { ', and {0} more' -f ($foreign.Count - 5) } else { '' })
+    return (& $answer $false ('"{0}" holds what the demo didn''t create ({1}), {2}' -f $WorkspaceName, $named, $keep))
+}
+
 function Get-DemoExistingEnvironmentReport {
     <#
     .SYNOPSIS
@@ -795,8 +994,9 @@ function Get-DemoExistingEnvironmentReport {
 
     .DESCRIPTION
     - New: Pass, with no note.
-    - Recovered: Warning: whose it is and by which sign, what the configuration took from what's deployed, and the
-      settings that Azure doesn't record, which have their defaults (-Defaulted).
+    - Recovered: Warning: whose it is and by which sign, what the configuration took from what's deployed, fabric.importNotebooks
+      and why (-NotebookImport, Resolve-DemoRecoveredNotebookImport), and the settings that Azure doesn't record, which
+      have their defaults (-Defaulted).
     - NewPrefix: Warning: the environment that isn't yours, which a first run never updates, and the new one's prefix,
       resource group, administrators' group, and Fabric workspace.
     - NotYours: Manual action required; nothing was written.
@@ -823,6 +1023,9 @@ function Get-DemoExistingEnvironmentReport {
         [AllowEmptyString()]
         [string] $ControlName = '',
 
+        [AllowNull()]
+        [pscustomobject] $NotebookImport = $null,
+
         [AllowEmptyCollection()]
         [string[]] $Defaulted = @(),
 
@@ -846,12 +1049,15 @@ function Get-DemoExistingEnvironmentReport {
         recordDate    = [string]$Existing.RecordDate
         skipped       = @($Existing.Skipped)
     }
+    if ($null -ne $NotebookImport) {
+        $evidence['importNotebooks'] = [bool]$NotebookImport.Import
+    }
     $notYours = 'its owner tag and its budget address aren''t your sign-in, and you don''t own the security group that administers its T3 and T4'
     $result = { param([string] $Status, [string] $Message, [string] $Remediation) New-DemoResult -CheckId 'INIT.EXISTING' -Area 'preflight' -Target 'subscription' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $doc }
     switch ([string]$Existing.Kind) {
         'Unreadable' {
-            $message = 'Whether this subscription already has the environment {0} couldn''t be checked: {1}. A first run writes nothing it can''t check, so it never applies the defaults to an environment that exists. Nothing was written.' -f $defaultGroup, ([string]$Existing.Error).TrimEnd('.')
-            return [pscustomobject]@{ Result = (& $result 'Fail' $message 'Run the command again in a few minutes. If it fails the same way, check that you can read the subscription''s resource groups and deployments, and Microsoft Graph''s groups.'); Note = '' }
+            $message = 'Whether this subscription already has the environment {0}, and what it holds, couldn''t be checked: {1}. A first run writes nothing it can''t check, so it never applies the defaults to an environment that exists. Nothing was written.' -f $defaultGroup, ([string]$Existing.Error).TrimEnd('.')
+            return [pscustomobject]@{ Result = (& $result 'Fail' $message 'Run the command again in a few minutes. If it fails the same way, check that you can read the subscription''s resource groups, deployments, and role assignments, and Microsoft Graph''s groups.'); Note = '' }
         }
         'NotYours' {
             $skipped = @($Existing.Skipped)
@@ -890,12 +1096,14 @@ function Get-DemoExistingEnvironmentReport {
             if (& $value 'ownerEmail') { $parts.Add(('budget alerts to {0}' -f (& $value 'ownerEmail'))) }
             if ($WorkspaceName -and $WorkspaceSource -ne 'unknown') { $parts.Add(('the Fabric workspace "{0}"{1}' -f $WorkspaceName, $(if ($WorkspaceSource -eq 'default') { ' (by its default name: it doesn''t record one)' } else { '' }))) }
             if ($ControlName) { $parts.Add(('the control''s workspace "{0}"' -f $ControlName)) }
+            if (& $value 'control.roleNameSuffix') { $parts.Add(('its own custom roles, "{0} ({1})" and its Session Writer (control.roleNameSuffix)' -f $script:ActivityControlRoleName, (& $value 'control.roleNameSuffix'))) }
             $source = if ([bool]$Existing.Record) { 'its deployment record of {0} and its resource group''s tags' -f $(if ($Existing.RecordDate) { $Existing.RecordDate } else { 'an earlier run' }) } else { 'its resource group''s tags, without a deployment record' }
             $before = if ($group -ne $defaultGroup) { '{0} isn''t yours, so a first run never updates it. ' -f $defaultGroup } else { '' }
             # Assign before wrapping: Get-DemoMemberValue returns an array as one object.
             $noteValue = Get-DemoMemberValue -InputObject $Existing -Name 'Notes'
             $more = (@($noteValue) | Where-Object { $_ } | ForEach-Object { ' ' + $_ }) -join ''
-            $message = '{0}{1} exists in this subscription, and it''s yours ({2}), so the configuration {6} from what''s deployed ({3}), not from the defaults: {4}. deploy.ps1 then changes nothing you didn''t ask for.{5}{7}' -f $before, $group, (Get-DemoOwnerSignalText -Signal ([string]$Existing.Signal)), $source, ($parts -join ', '), $(if (@($Defaulted).Count -gt 0) { ' Not recorded in Azure, so they have the defaults: {0}.' -f (@($Defaulted) -join ', ') } else { '' }), $written, $more
+            $notebooks = if ($null -ne $NotebookImport) { ' fabric.importNotebooks is {0}: {1}.' -f $(if ([bool]$NotebookImport.Import) { 'true' } else { 'false' }), ([string]$NotebookImport.Reason).TrimEnd('.') } else { '' }
+            $message = '{0}{1} exists in this subscription, and it''s yours ({2}), so the configuration {6} from what''s deployed ({3}), not from the defaults: {4}. deploy.ps1 then changes nothing you didn''t ask for.{8}{5}{7}' -f $before, $group, (Get-DemoOwnerSignalText -Signal ([string]$Existing.Signal)), $source, ($parts -join ', '), $(if (@($Defaulted).Count -gt 0) { ' Not recorded in Azure, so they have the defaults: {0}.' -f (@($Defaulted) -join ', ') } else { '' }), $written, $more, $notebooks
             $remediation = 'Check the settings that have the defaults in {0}, and set any that your earlier configuration had; then run ./scripts/deploy.ps1 again.' -f $Path
             $short = @($parts | Select-Object -First 3) -join ', '
             $note = if ($DryRun) {

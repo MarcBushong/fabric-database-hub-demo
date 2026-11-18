@@ -38,6 +38,14 @@ BeforeAll {
         [pscustomobject]@{ id = $Id; displayName = $Name; sku = 'F2'; state = 'Active'; region = 'West US 3' }
     }
 
+    function New-DemoWorkspaceContent {
+        # What a workspace that holds only the demo's items lists (Items - List Items): its lakehouse with its SQL
+        # analytics endpoint, and its three notebooks; plus -Extra items as "<type>|<name>" (issue 60's follow-up).
+        param([string[]] $Extra = @())
+        $own = @('Lakehouse|LH_DatabaseHub', 'SQLEndpoint|LH_DatabaseHub', 'Notebook|NB_DatabaseHub_Deployment', 'Notebook|NB_DatabaseHub_LiveActivity', 'Notebook|NB_DatabaseHub_Control')
+        @(@($own) + @($Extra) | ForEach-Object { $parts = $_ -split '\|', 2; [pscustomobject]@{ id = 'eeeeeeee-0000-0000-0000-000000000001'; type = $parts[0]; displayName = $parts[1] } })
+    }
+
     function Set-InitMock {
         # Mocks for Initialize-DemoConfig; $script:init holds what each one answers, and $script:calls their order.
         $script:calls = [System.Collections.Generic.List[string]]::new()
@@ -55,6 +63,10 @@ BeforeAll {
             Permissions  = [pscustomobject]@{ value = @([pscustomobject]@{ actions = @('*'); notActions = @() }) }
             Inventory    = [pscustomobject]@{ Succeeded = $true; Error = ''; Groups = @{}; Deployments = [System.Collections.Generic.List[string]]::new() }
             Records      = @{}
+            # A workspace's items by its ID (Items - List Items), and the control's custom roles (Get-DemoControlRoleSuffix).
+            WorkspaceItems = @{}
+            ItemsError   = ''
+            RoleSuffix   = [pscustomobject]@{ Found = $false; Suffix = ''; Others = @(); Note = ''; Error = '' }
         }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoAzProfileSubscription -MockWith { $script:calls.Add('Profile'); $script:init.Profile }
@@ -73,6 +85,14 @@ BeforeAll {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -MockWith { $script:calls.Add('FabricToken'); $script:fabricToken }
         Mock -ModuleName DbHubDemo -CommandName Read-DemoHubFabricList -MockWith {
             $script:calls.Add('Fabric:' + ($Uri -split '/')[-1])
+            if ($Uri -like '*/items') {
+                if ($script:init.ItemsError) {
+                    return [pscustomobject]@{ Succeeded = $false; StatusCode = 403; Error = $script:init.ItemsError; Items = @(); Pages = 1; Complete = $false }
+                }
+                $id = ($Uri -split '/')[-2]
+                $content = if ($script:init.WorkspaceItems.Contains($id)) { @($script:init.WorkspaceItems[$id]) } else { @() }
+                return [pscustomobject]@{ Succeeded = $true; StatusCode = 200; Error = ''; Items = $content; Pages = 1; Complete = $true }
+            }
             $items = if ($Uri -like '*/capacities') { $script:init.Capacities } else { $script:init.Workspaces }
             [pscustomobject]@{ Succeeded = $true; StatusCode = 200; Error = ''; Items = @($items); Pages = 1; Complete = $true }
         }
@@ -84,6 +104,7 @@ BeforeAll {
         # Issue 60: the subscription's resource groups and deployment records, empty unless a test puts an environment in
         # them (New-InitEnvironment), and each record's parameters.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionInventory -MockWith { $script:calls.Add('Inventory'); $script:init.Inventory }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoControlRoleSuffix -MockWith { $script:calls.Add('Roles:' + $ResourceGroup); $script:init.RoleSuffix }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentRecord -MockWith {
             $script:calls.Add('Record:' + $Name)
             if ($script:init.Records.Contains($Name)) {
@@ -615,7 +636,10 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $written = Get-DemoConfig -Path $script:path
         $written['fabric']['workspaceName'] | Should -Be 'Contoso Hub'
         $written['fabric']['capacityName'] | Should -Be 'capb' -Because 'the workspace keeps its capacity, so there''s no choice to ask about'
-        $written['fabric']['importNotebooks'] | Should -BeFalse
+        $written['fabric']['importNotebooks'] | Should -BeTrue -Because 'it''s the workspace the environment records, and the update republishes its notebooks'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Read-DemoHubFabricList -Times 0 -Exactly -ParameterFilter { $Uri -like '*/items' } -Because 'the recorded ID says it''s the demo''s own'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is true: "Contoso Hub" is the workspace rg-dbhub-demo records \(DbHubFabricWorkspaceId\), so deploy\.ps1 updates its notebooks, as an update does\.'
+        (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 updates its notebooks, as an update does'
         $written['control']['fabricWorkspaceName'] | Should -Be 'Contoso Hub Ctl'
         (Get-InitResult $init 'INIT.FABRIC.CAPACITY').status | Should -Be 'Pass'
         (Get-InitResult $init 'INIT.FABRIC.CAPACITY').message | Should -Match 'The workspace "Contoso Hub" stays on its capacity capb'
@@ -632,6 +656,61 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $written['control']['enabled'] | Should -BeTrue -Because 'Get-DemoActivityControlSetting keeps "DBHub Control" only with "enabled": true'
         InModuleScope DbHubDemo -Parameters @{ Config = (Get-DemoConfig -Path $script:path) } { (Get-DemoActivityControlSetting -Config $Config).FabricWorkspaceName } | Should -Be 'DBHub Control'
         (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'the Fabric workspace "Database Hub Demo" \(by its default name: it doesn''t record one\), the control''s workspace "DBHub Control"'
+    }
+
+    It 'updates the notebooks of a workspace that holds only what the demo creates, as an update does, and keeps them where it holds anything else' {
+        $workspaceId = 'dddddddd-0000-0000-0000-000000000001'
+        $script:init.Workspaces = @(New-FabricWorkspaceItem 'Database Hub Demo' $workspaceId $script:capacityFabricId)
+        $script:init.WorkspaceItems[$workspaceId] = @(New-DemoWorkspaceContent)
+        New-InitEnvironment -Tag @{ owner = 'colleague@contoso.example' } -Parameter (New-RecordParameter)
+        $init = Initialize-DemoConfig -Path $script:path -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-DemoConfig -Path $script:path)['fabric']['importNotebooks'] | Should -BeTrue -Because 'the configuration that was lost had true, and the update republishes the notebooks'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is true: everything in "Database Hub Demo" is the demo''s \(5 item\(s\)\), so deploy\.ps1 updates its notebooks, as an update does\.'
+        (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 updates its notebooks'
+
+        $script:init.WorkspaceItems[$workspaceId] = @(New-DemoWorkspaceContent -Extra 'Notebook|Sales Forecast', 'Report|Quarterly')
+        $shared = Join-Path -Path $TestDrive -ChildPath ('shared.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        $init = Initialize-DemoConfig -Path $shared -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-DemoConfig -Path $shared)['fabric']['importNotebooks'] | Should -BeFalse -Because 'a workspace that holds anything else keeps a first run''s rule'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), so deploy\.ps1 adds only the notebooks that are missing and keeps the copies there \(\./scripts/configure-fabric\.ps1 updates them\)\.'
+        (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 adds only the notebooks that are missing'
+
+        $script:init.ItemsError = 'HTTP 403: InsufficientWorkspaceRole'
+        $unlisted = Join-Path -Path $TestDrive -ChildPath ('unlisted.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        $init = Initialize-DemoConfig -Path $unlisted -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-DemoConfig -Path $unlisted)['fabric']['importNotebooks'] | Should -BeFalse
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is false: the items in "Database Hub Demo" couldn''t all be listed \(HTTP 403: InsufficientWorkspaceRole\)'
+    }
+
+    It 'keeps the session control''s own custom roles, so the update never touches the shared ones that another environment''s control holds' {
+        $script:init.RoleSuffix = [pscustomobject]@{ Found = $true; Suffix = 'dbhubvn'; Others = @(); Note = ''; Error = '' }
+        New-InitEnvironment -Tag @{ owner = 'colleague@contoso.example' } -Parameter (New-RecordParameter)
+        $init = Initialize-DemoConfig -Path $script:path -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $written = Get-DemoConfig -Path $script:path
+        $written['control']['roleNameSuffix'] | Should -Be 'dbhubvn'
+        InModuleScope DbHubDemo -Parameters @{ Config = $written } { (Get-DemoActivityControlName -Config $Config).RoleName } | Should -Be 'DbHub Demo Activity Operator (dbhubvn)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoControlRoleSuffix -Times 1 -Exactly -ParameterFilter { $ResourceGroup -eq 'rg-dbhub-demo' -and $Prefix -eq 'dbhub' }
+        $existing = (Get-InitResult $init 'INIT.EXISTING').message
+        $existing | Should -Match 'its own custom roles, "DbHub Demo Activity Operator \(dbhubvn\)" and its Session Writer \(control\.roleNameSuffix\)'
+        ($existing -split 'have the defaults: ')[1] | Should -Match 'control \(all but its roleNameSuffix\)'
+
+        $script:init.RoleSuffix = [pscustomobject]@{ Found = $true; Suffix = 'dbhubvn'; Others = @('older'); Note = 'Its session control''s identity holds the demo''s custom roles under more than one suffix (dbhubvn, older), so control.roleNameSuffix is "dbhubvn", the one assigned last, and never the shared roles; set it in the configuration if it''s another.'; Error = '' }
+        $two = Join-Path -Path $TestDrive -ChildPath ('two.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        $init = Initialize-DemoConfig -Path $two -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-DemoConfig -Path $two)['control']['roleNameSuffix'] | Should -Be 'dbhubvn'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'more than one suffix \(dbhubvn, older\), so control\.roleNameSuffix is "dbhubvn", the one assigned last, and never the shared roles' -Because 'a choice the run made is never silent'
+
+        # A read that fails writes nothing, as the first run's other reads do: the shared roles are never the fallback.
+        $script:init.RoleSuffix = [pscustomobject]@{ Found = $false; Suffix = ''; Others = @(); Note = ''; Error = 'the role assignments at rg-dbhub-demo couldn''t be read: HTTP 429' }
+        $unread = Join-Path -Path $TestDrive -ChildPath ('unread.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        $init = Initialize-DemoConfig -Path $unread -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $init.Written | Should -BeFalse
+        Test-Path -LiteralPath $unread | Should -BeFalse
+        $failed = Get-InitResult $init 'INIT.EXISTING'
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match 'couldn''t be checked: the role assignments at rg-dbhub-demo couldn''t be read: HTTP 429\. A first run writes nothing it can''t check'
+        $init.Existing.Kind | Should -Be 'Unreadable'
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoEntraSecurityGroup -Times 0 -Exactly
     }
 }
 
@@ -698,6 +777,59 @@ Describe 'Reading back what a deployment recorded (issue 60)' {
         $candidates[0] | Should -Be 'dbhub2'
         $candidates[-1] | Should -Be 'dbhub99'
         @(InModuleScope DbHubDemo { Get-DemoPrefixCandidate -Prefix 'contosox' }) | ForEach-Object { $_ | Should -Match '^[a-z][a-z0-9]{2,7}$' }
+    }
+
+    It 'reads the control''s custom roles'' suffix from the role its identity holds at the demo resource group, without Microsoft Graph, and never falls back to the shared roles' {
+        $script:roleAnswer = ''
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
+            if ($script:roleAnswer -eq 'fail') {
+                return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (AuthorizationFailed) The client does not have authorization.' }
+            }
+            [pscustomobject]@{ ExitCode = 0; StdOut = $script:roleAnswer; StdErr = '' }
+        }
+        $read = { param([string] $Answer) $script:roleAnswer = $Answer; InModuleScope DbHubDemo -Parameters @{ Sub = $script:subA } { Get-DemoControlRoleSuffix -SubscriptionId $Sub -ResourceGroup 'rg-dbhubvn-demo' -Prefix 'dbhubvn' } }
+        $role = { param([string] $Name, [string] $Created) '{{"name": "{0}", "created": "{1}"}}' -f $Name, $Created }
+        $own = & $read ('[{0}]' -f (& $role 'DbHub Demo Activity Operator (dbhubvn)' '2026-11-18T03:54:09.593856+00:00'))
+        $own.Found | Should -BeTrue
+        $own.Suffix | Should -Be 'dbhubvn'
+        $own.Note | Should -BeNullOrEmpty
+        $shared = & $read ('[{0}]' -f (& $role 'DbHub Demo Activity Operator' '2026-10-27T15:54:14+00:00'))
+        $shared.Found | Should -BeTrue
+        $shared.Suffix | Should -BeNullOrEmpty
+        (& $read ('[{0}, {1}]' -f (& $role 'DbHub Demo Activity Operator' '2026-11-20T00:00:00+00:00'), (& $role 'DbHub Demo Activity Operator (contoso)' '2026-11-01T00:00:00+00:00'))).Suffix | Should -Be 'contoso' -Because 'an environment that holds a role of its own never gets the shared ones back'
+        $named = & $read ('[{0}, {1}]' -f (& $role 'DbHub Demo Activity Operator (dbhubvn)' '2026-11-01T00:00:00+00:00'), (& $role 'DbHub Demo Activity Operator (newer)' '2026-11-10T00:00:00+00:00'))
+        $named.Suffix | Should -Be 'dbhubvn' -Because 'the suffix named after its prefix comes first'
+        @($named.Others) | Should -Be @('newer')
+        $named.Note | Should -Match 'more than one suffix \(dbhubvn, newer\), so control\.roleNameSuffix is "dbhubvn", the one named after its prefix, and never the shared roles'
+        $latest = & $read ('[{0}, {1}]' -f (& $role 'DbHub Demo Activity Operator (alpha)' '2026-11-01T00:00:00+00:00'), (& $role 'DbHub Demo Activity Operator (beta)' '2026-11-10T00:00:00+00:00'))
+        $latest.Suffix | Should -Be 'beta' -Because 'without one named after its prefix, the one assigned last is the one its configuration had last'
+        $latest.Note | Should -Match 'so control\.roleNameSuffix is "beta", the one assigned last'
+        $none = & $read '[]'
+        $none.Found | Should -BeFalse
+        $none.Error | Should -BeNullOrEmpty
+        $failed = & $read 'fail'
+        $failed.Found | Should -BeFalse
+        $failed.Error | Should -Match 'AuthorizationFailed'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { ($ArgumentList -join ' ') -like 'role assignment list --resource-group rg-dbhubvn-demo --fill-principal-name false *createdOn*' }
+    }
+
+    It 'decides a recovered workspace''s fabric.importNotebooks by what''s in it, names case-sensitive, and only from a list that''s whole' {
+        InModuleScope DbHubDemo {
+            $allowed = @(Get-DemoFabricDemoItem -LakehouseName 'LH_DatabaseHub')
+            $workspace = [pscustomobject]@{ id = 'DDDDDDDD-0000-0000-0000-000000000001'; displayName = 'Contoso Hub' }
+            $list = { param([object[]] $Items, [bool] $Complete = $true) [pscustomobject]@{ Succeeded = $true; Error = ''; Items = $Items; Complete = $Complete } }
+            $item = { param([string] $Type, [string] $Name) [pscustomobject]@{ type = $Type; displayName = $Name } }
+            $decide = { param([object] $ItemList) Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Workspace $workspace -Found 1 -RecordedId 'dddddddd-0000-0000-0000-000000000099' -ItemList $ItemList -Allowed $allowed }
+            (& $decide (& $list @((& $item 'Lakehouse' 'LH_DatabaseHub'), (& $item 'Notebook' 'NB_DatabaseHub_Control')))).Import | Should -BeTrue
+            (& $decide (& $list @((& $item 'Notebook' 'nb_databasehub_control')))).Import | Should -BeFalse
+            (& $decide (& $list @((& $item 'Lakehouse' 'LH_DatabaseHub')) $false)).Import | Should -BeFalse -Because 'items it didn''t list could be anyone''s'
+            $many = & $decide (& $list @(1..7 | ForEach-Object { & $item 'Notebook' ('Mine{0}' -f $_) }))
+            $many.Import | Should -BeFalse
+            $many.Reason | Should -Match '\(Notebook Mine1, Notebook Mine2, Notebook Mine3, Notebook Mine4, Notebook Mine5, and 2 more\)'
+            (Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Workspace $workspace -Found 1 -RecordedId 'dddddddd-0000-0000-0000-000000000001' -ResourceGroup 'rg-contoso-demo').Reason | Should -Match '^"Contoso Hub" is the workspace rg-contoso-demo records'
+            (Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Found 0).Import | Should -BeTrue
+            (Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Listed $false).Reason | Should -Match '^Fabric couldn''t be read'
+        }
     }
 }
 
