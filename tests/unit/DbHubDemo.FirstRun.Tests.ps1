@@ -40,10 +40,9 @@ BeforeAll {
 
     function New-DemoWorkspaceContent {
         # What a workspace that holds only the demo's items lists (Items - List Items): its lakehouse with its SQL
-        # analytics endpoint, and its three notebooks; plus -Extra items as "<type>|<name>" (issue 60's follow-up).
-        param([string[]] $Extra = @())
-        $own = @('Lakehouse|LH_DatabaseHub', 'SQLEndpoint|LH_DatabaseHub', 'Notebook|NB_DatabaseHub_Deployment', 'Notebook|NB_DatabaseHub_LiveActivity', 'Notebook|NB_DatabaseHub_Control')
-        @(@($own) + @($Extra) | ForEach-Object { $parts = $_ -split '\|', 2; [pscustomobject]@{ id = 'eeeeeeee-0000-0000-0000-000000000001'; type = $parts[0]; displayName = $parts[1] } })
+        # analytics endpoint, and its three notebooks (-Own); plus -Extra items, each "<type>|<name>" (issue 60's follow-up).
+        param([string[]] $Own = @('Lakehouse|LH_DatabaseHub', 'SQLEndpoint|LH_DatabaseHub', 'Notebook|NB_DatabaseHub_Deployment', 'Notebook|NB_DatabaseHub_LiveActivity', 'Notebook|NB_DatabaseHub_Control'), [string[]] $Extra = @())
+        @(@($Own) + @($Extra) | ForEach-Object { $parts = $_ -split '\|', 2; [pscustomobject]@{ id = 'eeeeeeee-0000-0000-0000-000000000001'; type = $parts[0]; displayName = $parts[1] } })
     }
 
     function Set-InitMock {
@@ -658,7 +657,7 @@ Describe 'A first run in a subscription that already has the environment (issue 
         (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'the Fabric workspace "Database Hub Demo" \(by its default name: it doesn''t record one\), the control''s workspace "DBHub Control"'
     }
 
-    It 'updates the notebooks of a workspace that holds only what the demo creates, as an update does, and keeps them where it holds anything else' {
+    It 'updates the notebooks of a workspace that holds only what the demo creates, as an update does, and keeps them where it holds neither that nor the demo''s notebooks' {
         $workspaceId = 'dddddddd-0000-0000-0000-000000000001'
         $script:init.Workspaces = @(New-FabricWorkspaceItem 'Database Hub Demo' $workspaceId $script:capacityFabricId)
         $script:init.WorkspaceItems[$workspaceId] = @(New-DemoWorkspaceContent)
@@ -668,18 +667,36 @@ Describe 'A first run in a subscription that already has the environment (issue 
         (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is true: everything in "Database Hub Demo" is the demo''s \(5 item\(s\)\), so deploy\.ps1 updates its notebooks, as an update does\.'
         (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 updates its notebooks'
 
-        $script:init.WorkspaceItems[$workspaceId] = @(New-DemoWorkspaceContent -Extra 'Notebook|Sales Forecast', 'Report|Quarterly')
+        $script:init.WorkspaceItems[$workspaceId] = @(New-DemoWorkspaceContent -Own 'Lakehouse|LH_DatabaseHub', 'SQLEndpoint|LH_DatabaseHub' -Extra 'Notebook|Sales Forecast', 'Report|Quarterly')
         $shared = Join-Path -Path $TestDrive -ChildPath ('shared.{0}.json' -f [guid]::NewGuid().ToString('N'))
         $init = Initialize-DemoConfig -Path $shared -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
-        (Get-DemoConfig -Path $shared)['fabric']['importNotebooks'] | Should -BeFalse -Because 'a workspace that holds anything else keeps a first run''s rule'
-        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), so deploy\.ps1 adds only the notebooks that are missing and keeps the copies there \(\./scripts/configure-fabric\.ps1 updates them\)\.'
+        (Get-DemoConfig -Path $shared)['fabric']['importNotebooks'] | Should -BeFalse -Because 'a workspace that holds anything else, and none of the demo''s notebooks, keeps a first run''s rule'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), and none of the demo''s notebooks, so deploy\.ps1 adds only the notebooks that are missing and keeps the copies there \(\./scripts/configure-fabric\.ps1 updates them\)\.'
         (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 adds only the notebooks that are missing'
 
         $script:init.ItemsError = 'HTTP 403: InsufficientWorkspaceRole'
         $unlisted = Join-Path -Path $TestDrive -ChildPath ('unlisted.{0}.json' -f [guid]::NewGuid().ToString('N'))
         $init = Initialize-DemoConfig -Path $unlisted -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
         (Get-DemoConfig -Path $unlisted)['fabric']['importNotebooks'] | Should -BeFalse
-        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is false: the items in "Database Hub Demo" couldn''t all be listed \(HTTP 403: InsufficientWorkspaceRole\)'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is false: the items in "Database Hub Demo" couldn''t be listed \(HTTP 403: InsufficientWorkspaceRole\)'
+    }
+
+    It 'updates the notebooks of a workspace the demo''s notebooks are already in, whatever else it holds, as the configuration that was lost did' {
+        # The owner's "Database Hub Demo" (2026-11-18): the demo's items, and the org app shell from its first live run.
+        $workspaceId = 'dddddddd-0000-0000-0000-000000000001'
+        $script:init.Workspaces = @(New-FabricWorkspaceItem 'Database Hub Demo' $workspaceId $script:capacityFabricId)
+        $script:init.WorkspaceItems[$workspaceId] = @(New-DemoWorkspaceContent -Extra 'OrgApp|APP_DatabaseHub_Demo')
+        New-InitEnvironment -Tag @{ owner = 'colleague@contoso.example' } -Parameter (New-RecordParameter)
+        $init = Initialize-DemoConfig -Path $script:path -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-DemoConfig -Path $script:path)['fabric']['importNotebooks'] | Should -BeTrue -Because 'the demo imported its notebooks there before, so the update republishes them'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is true: the demo''s notebooks are already in "Database Hub Demo" \(NB_DatabaseHub_Deployment, NB_DatabaseHub_LiveActivity\): the demo imported them there before, so deploy\.ps1 updates them, as an update does; what else it holds \(OrgApp APP_DatabaseHub_Demo\) stays as it is\.'
+        (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 updates its notebooks, as an update does'
+
+        $script:init.WorkspaceItems[$workspaceId] = @(New-DemoWorkspaceContent -Own 'Lakehouse|LH_DatabaseHub', 'Notebook|NB_DatabaseHub_LiveActivity' -Extra 'Report|Quarterly')
+        $one = Join-Path -Path $TestDrive -ChildPath ('one.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        $init = Initialize-DemoConfig -Path $one -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-DemoConfig -Path $one)['fabric']['importNotebooks'] | Should -BeTrue -Because 'one of the demo''s notebooks is there, so the demo imported its notebooks there'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'the demo''s notebooks are already in "Database Hub Demo" \(NB_DatabaseHub_LiveActivity\)'
     }
 
     It 'keeps the session control''s own custom roles, so the update never touches the shared ones that another environment''s control holds' {
@@ -816,16 +833,27 @@ Describe 'Reading back what a deployment recorded (issue 60)' {
     It 'decides a recovered workspace''s fabric.importNotebooks by what''s in it, names case-sensitive, and only from a list that''s whole' {
         InModuleScope DbHubDemo {
             $allowed = @(Get-DemoFabricDemoItem -LakehouseName 'LH_DatabaseHub')
+            $notebooks = @(Get-DemoFabricNotebookName)
             $workspace = [pscustomobject]@{ id = 'DDDDDDDD-0000-0000-0000-000000000001'; displayName = 'Contoso Hub' }
             $list = { param([object[]] $Items, [bool] $Complete = $true) [pscustomobject]@{ Succeeded = $true; Error = ''; Items = $Items; Complete = $Complete } }
             $item = { param([string] $Type, [string] $Name) [pscustomobject]@{ type = $Type; displayName = $Name } }
-            $decide = { param([object] $ItemList) Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Workspace $workspace -Found 1 -RecordedId 'dddddddd-0000-0000-0000-000000000099' -ItemList $ItemList -Allowed $allowed }
+            $decide = { param([object] $ItemList) Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Workspace $workspace -Found 1 -RecordedId 'dddddddd-0000-0000-0000-000000000099' -ItemList $ItemList -Allowed $allowed -Notebook $notebooks }
             (& $decide (& $list @((& $item 'Lakehouse' 'LH_DatabaseHub'), (& $item 'Notebook' 'NB_DatabaseHub_Control')))).Import | Should -BeTrue
             (& $decide (& $list @((& $item 'Notebook' 'nb_databasehub_control')))).Import | Should -BeFalse
             (& $decide (& $list @((& $item 'Lakehouse' 'LH_DatabaseHub')) $false)).Import | Should -BeFalse -Because 'items it didn''t list could be anyone''s'
             $many = & $decide (& $list @(1..7 | ForEach-Object { & $item 'Notebook' ('Mine{0}' -f $_) }))
             $many.Import | Should -BeFalse
-            $many.Reason | Should -Match '\(Notebook Mine1, Notebook Mine2, Notebook Mine3, Notebook Mine4, Notebook Mine5, and 2 more\)'
+            $many.Reason | Should -Match '\(Notebook Mine1, Notebook Mine2, Notebook Mine3, Notebook Mine4, Notebook Mine5, and 2 more\), and none of the demo''s notebooks'
+            # The demo's own notebooks, already there (the coordinator's third rule): true, whatever else it holds.
+            $imported = & $decide (& $list @((& $item 'Notebook' 'NB_DatabaseHub_Deployment'), (& $item 'OrgApp' 'APP_DatabaseHub_Demo')))
+            $imported.Import | Should -BeTrue
+            $imported.Reason | Should -Match '^the demo''s notebooks are already in "Contoso Hub" \(NB_DatabaseHub_Deployment\): .+; what else it holds \(OrgApp APP_DatabaseHub_Demo\) stays as it is$'
+            (& $decide (& $list @((& $item 'Notebook' 'NB_DatabaseHub_LiveActivity')) $false)).Import | Should -BeTrue -Because 'the notebooks it did list are the demo''s'
+            (& $decide (& $list @((& $item 'Notebook' 'nb_databasehub_deployment'), (& $item 'Report' 'Quarterly')))).Import | Should -BeFalse -Because 'names are case-sensitive, as destroy.ps1 reads them'
+            (& $decide (& $list @((& $item 'Notebook' 'NB_DatabaseHub_Control'), (& $item 'Report' 'Quarterly')))).Import | Should -BeFalse -Because 'the control''s notebook isn''t one fabric.importNotebooks publishes'
+            $refused = & $decide ([pscustomobject]@{ Succeeded = $false; Error = 'HTTP 403: InsufficientWorkspaceRole'; Items = @(); Complete = $false })
+            $refused.Import | Should -BeFalse
+            $refused.Reason | Should -Match '^the items in "Contoso Hub" couldn''t be listed \(HTTP 403: InsufficientWorkspaceRole\)'
             (Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Workspace $workspace -Found 1 -RecordedId 'dddddddd-0000-0000-0000-000000000001' -ResourceGroup 'rg-contoso-demo').Reason | Should -Match '^"Contoso Hub" is the workspace rg-contoso-demo records'
             (Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Found 0).Import | Should -BeTrue
             (Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Listed $false).Reason | Should -Match '^Fabric couldn''t be read'

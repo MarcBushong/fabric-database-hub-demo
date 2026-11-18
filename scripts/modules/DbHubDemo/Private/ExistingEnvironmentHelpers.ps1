@@ -904,17 +904,21 @@ function Resolve-DemoRecoveredWorkspace {
 function Resolve-DemoRecoveredNotebookImport {
     <#
     .SYNOPSIS
-    fabric.importNotebooks for a recovered environment, and why (issue 60; the coordinator's decision of 2026-11-18).
+    fabric.importNotebooks for a recovered environment, and why (issue 60; the coordinator's decisions of 2026-11-18).
     Pure. Internal.
 
     .DESCRIPTION
     A first run gives a workspace that exists false, so deploy.ps1 adds only the notebooks that are missing and keeps
     edits made in Fabric. But an update republishes the notebooks (README, "Upgrading an existing demo"), and the
     configuration that was lost had true when its first run created the workspace. So a recovered environment's own
-    workspace gets true: the one its resource group records (DbHubFabricWorkspaceId), or one that holds only items the
-    demo creates (Get-DemoFabricDemoItem, the rule destroy.ps1 deletes it by). Anything else keeps the first run's rule:
-    false for a workspace that holds anything else, or whose items couldn't all be listed; true for one that doesn't
-    exist yet, or that Fabric couldn't be asked about.
+    workspace gets true:
+    1. the one its resource group records (DbHubFabricWorkspaceId);
+    2. one that holds only items the demo creates (Get-DemoFabricDemoItem, the rule destroy.ps1 deletes it by);
+    3. one that holds the demo's own notebooks already (-Notebook, Get-DemoFabricNotebookName): the demo imported them
+       there before, so the update republishes them, as the configuration that was lost did, and what else it holds stays
+       as it is. It's read from the items that were listed, even when the list isn't whole.
+    Anything else keeps the first run's rule: false for a workspace that holds neither, or whose items couldn't be
+    listed; true for one that doesn't exist yet, or that Fabric couldn't be asked about.
     -Found is how many workspaces have the name (-Workspace is the one, when it's 1), -Listed whether Fabric's workspaces
     were listed, and -ItemList Read-DemoHubFabricList's answer for its items ($null when they weren't read). Returns
     Import and Reason, which INIT.EXISTING says.
@@ -942,7 +946,10 @@ function Resolve-DemoRecoveredNotebookImport {
         [object] $ItemList = $null,
 
         [AllowEmptyCollection()]
-        [object[]] $Allowed = @()
+        [object[]] $Allowed = @(),
+
+        [AllowEmptyCollection()]
+        [string[]] $Notebook = @()
     )
 
     $answer = { param([bool] $Import, [string] $Reason) [pscustomobject]@{ Import = $Import; Reason = $Reason } }
@@ -960,14 +967,16 @@ function Resolve-DemoRecoveredNotebookImport {
     if ($id -and $RecordedId -and $id -eq $RecordedId.ToLowerInvariant()) {
         return (& $answer $true ('"{0}" is the workspace {1} records (DbHubFabricWorkspaceId), so deploy.ps1 updates its notebooks, as an update does' -f $WorkspaceName, $ResourceGroup))
     }
-    if ($null -eq $ItemList -or -not [bool](Get-DemoMemberValue -InputObject $ItemList -Name 'Succeeded') -or -not [bool](Get-DemoMemberValue -InputObject $ItemList -Name 'Complete')) {
+    if ($null -eq $ItemList -or -not [bool](Get-DemoMemberValue -InputObject $ItemList -Name 'Succeeded')) {
         $problem = if ($null -ne $ItemList) { ([string](Get-DemoMemberValue -InputObject $ItemList -Name 'Error')).TrimEnd('.') } else { '' }
-        return (& $answer $false ('the items in "{0}" couldn''t all be listed{1}, {2}' -f $WorkspaceName, $(if ($problem) { ' (' + $problem + ')' } else { '' }), $keep))
+        return (& $answer $false ('the items in "{0}" couldn''t be listed{1}, {2}' -f $WorkspaceName, $(if ($problem) { ' (' + $problem + ')' } else { '' }), $keep))
     }
+    $complete = [bool](Get-DemoMemberValue -InputObject $ItemList -Name 'Complete')
     # Assign before wrapping: Get-DemoMemberValue returns an array as one object.
     $listedItems = Get-DemoMemberValue -InputObject $ItemList -Name 'Items'
     $count = 0
     $foreign = [System.Collections.Generic.List[string]]::new()
+    $present = [System.Collections.Generic.List[string]]::new()
     foreach ($item in @($listedItems)) {
         if ($null -eq $item) {
             continue
@@ -978,12 +987,22 @@ function Resolve-DemoRecoveredNotebookImport {
         if (-not (Test-DemoFabricDemoItem -Allowed $Allowed -Type $type -Name $display)) {
             $foreign.Add(('{0} {1}' -f $type, $display))
         }
-    }
-    if ($foreign.Count -eq 0) {
-        return (& $answer $true ('everything in "{0}" is the demo''s ({1} item(s)), so deploy.ps1 updates its notebooks, as an update does' -f $WorkspaceName, $count))
+        if ($type -eq 'Notebook' -and $display -cin @($Notebook) -and -not $present.Contains($display)) {
+            $present.Add($display)
+        }
     }
     $named = (@($foreign | Select-Object -First 5) -join ', ') + $(if ($foreign.Count -gt 5) { ', and {0} more' -f ($foreign.Count - 5) } else { '' })
-    return (& $answer $false ('"{0}" holds what the demo didn''t create ({1}), {2}' -f $WorkspaceName, $named, $keep))
+    if ($complete -and $foreign.Count -eq 0) {
+        return (& $answer $true ('everything in "{0}" is the demo''s ({1} item(s)), so deploy.ps1 updates its notebooks, as an update does' -f $WorkspaceName, $count))
+    }
+    if ($present.Count -gt 0) {
+        $rest = if ($foreign.Count -gt 0) { '; what else it holds ({0}) stays as it is' -f $named } else { '' }
+        return (& $answer $true ('the demo''s notebooks are already in "{0}" ({1}): the demo imported them there before, so deploy.ps1 updates them, as an update does{2}' -f $WorkspaceName, ($present -join ', '), $rest))
+    }
+    if (-not $complete) {
+        return (& $answer $false ('the items in "{0}" couldn''t all be listed, {1}' -f $WorkspaceName, $keep))
+    }
+    return (& $answer $false ('"{0}" holds what the demo didn''t create ({1}), and none of the demo''s notebooks, {2}' -f $WorkspaceName, $named, $keep))
 }
 
 function Get-DemoExistingEnvironmentReport {

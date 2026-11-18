@@ -135,14 +135,25 @@ function Get-DemoFabricNotebookResourceGroup {
     return [pscustomobject]@{ Ok = $true; ResourceGroup = ''; Error = '' }
 }
 
+function Get-DemoFabricNotebookName {
+    # The notebooks the demo publishes to its Fabric workspace, the ones fabric.importNotebooks governs: each one in
+    # fabric/notebooks, by name (configure-fabric.ps1's -Notebook). Internal.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    return @(Get-ChildItem -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'fabric/notebooks') -Filter '*.ipynb' -File | Sort-Object -Property Name | ForEach-Object { $_.BaseName })
+}
+
 function Get-DemoFabricDemoItem {
     <#
     .SYNOPSIS
     The items the demo creates in its Fabric workspace, by type and name: the lakehouse and its SQL analytics endpoint,
-    each notebook in fabric/notebooks, the control notebook, the Real-Time Dashboard, the history model and report, and
-    the Insights app with its connector. destroy.ps1 deletes the demo's workspace only when everything in it is among
-    these (Get-DemoDestroyFabricPlan), and a first run that recovers an environment updates the workspace's notebooks on
-    the same condition (issue 60, Resolve-DemoRecoveredNotebookImport). Returns Type and Name for each. Internal.
+    each notebook in fabric/notebooks (Get-DemoFabricNotebookName), the control notebook, the Real-Time Dashboard, the
+    history model and report, and the Insights app with its connector. destroy.ps1 deletes the demo's workspace only when
+    everything in it is among these (Get-DemoDestroyFabricPlan), and a first run that recovers an environment updates the
+    workspace's notebooks then too (issue 60, Resolve-DemoRecoveredNotebookImport). Returns Type and Name for each.
+    Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject[]])]
@@ -157,8 +168,8 @@ function Get-DemoFabricDemoItem {
     $items = [System.Collections.Generic.List[object]]::new()
     $items.Add([pscustomobject]@{ Type = 'Lakehouse'; Name = $LakehouseName })
     $items.Add([pscustomobject]@{ Type = 'SQLEndpoint'; Name = $LakehouseName })
-    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'fabric/notebooks') -Filter '*.ipynb' -File)) {
-        $items.Add([pscustomobject]@{ Type = 'Notebook'; Name = $file.BaseName })
+    foreach ($name in @(Get-DemoFabricNotebookName)) {
+        $items.Add([pscustomobject]@{ Type = 'Notebook'; Name = $name })
     }
     $items.Add([pscustomobject]@{ Type = 'Notebook'; Name = $ControlNotebook })
     $items.Add([pscustomobject]@{ Type = 'KQLDashboard'; Name = [string]$app['dashboardName'] })

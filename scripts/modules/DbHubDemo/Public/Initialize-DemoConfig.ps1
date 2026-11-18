@@ -34,9 +34,9 @@ function Initialize-DemoConfig {
        (Workspaces - List Workspaces). A workspace that doesn't exist yet gets fabric.importNotebooks true; deploy.ps1
        creates it, its lakehouse, and the notebooks (ADR 0021). One that exists gets false, so deploy.ps1 only adds the
        notebooks that are missing, except a recovered environment's own (4b): the workspace its resource group records,
-       or one that holds only what the demo creates (Items - List Items, read-only), gets true, as the update republishes
-       its notebooks (Resolve-DemoRecoveredNotebookImport), and INIT.EXISTING says which and why. Nothing is created in
-       Fabric here.
+       one that holds only what the demo creates, or one the demo's notebooks are already in (Items - List Items,
+       read-only), gets true, as the update republishes its notebooks (Resolve-DemoRecoveredNotebookImport), and
+       INIT.EXISTING says which and why. Nothing is created in Fabric here.
     7. P6 (INIT.P6.GROUP): the Microsoft Entra security group by -AdminGroupObjectId, or by name (default
        <prefix>-<environment>-sql-admins), and whether you own it. With -CreateAdminGroup, a missing group is created
        with you as its owner (Microsoft Graph Create group and Add owners, the calls behind 'az ad group create' and
@@ -524,7 +524,8 @@ function Initialize-DemoConfig {
 
         if ($recovered) {
             # The update republishes the notebooks of the demo's own workspace (issue 60, Resolve-DemoRecoveredNotebookImport):
-            # the one its resource group records, or else, read-only, one that holds only what the demo creates.
+            # the one its resource group records, or else, read-only, one that holds only what the demo creates, or the
+            # demo's notebooks already.
             $recordedWorkspace = & $recordedId 'FabricWorkspaceId'
             $namedWorkspaces = @(if ($workspaceList.Succeeded) { Select-DemoFabricNamed -Items $shared -Name $workspace })
             $itemList = $null
@@ -534,7 +535,7 @@ function Initialize-DemoConfig {
                     $itemList = Read-DemoHubFabricList -Uri ('{0}/workspaces/{1}/items' -f $script:FabricApiBaseUri, $namedId) -Token $fabricToken -MaxPages 10
                 }
             }
-            $notebookImport = Resolve-DemoRecoveredNotebookImport -WorkspaceName $workspace -Workspace $(if ($namedWorkspaces.Count -eq 1) { $namedWorkspaces[0] } else { $null }) -Found $namedWorkspaces.Count -Listed ([bool]$workspaceList.Succeeded) -RecordedId $recordedWorkspace -ResourceGroup ([string]$existing.ResourceGroup) -ItemList $itemList -Allowed @(Get-DemoFabricDemoItem -LakehouseName $lakehouse)
+            $notebookImport = Resolve-DemoRecoveredNotebookImport -WorkspaceName $workspace -Workspace $(if ($namedWorkspaces.Count -eq 1) { $namedWorkspaces[0] } else { $null }) -Found $namedWorkspaces.Count -Listed ([bool]$workspaceList.Succeeded) -RecordedId $recordedWorkspace -ResourceGroup ([string]$existing.ResourceGroup) -ItemList $itemList -Allowed @(Get-DemoFabricDemoItem -LakehouseName $lakehouse) -Notebook @(Get-DemoFabricNotebookName)
         }
         if ($recovered -and -not $WorkspaceName -and $Prefix -and $effectivePrefix -cne $defaultPrefix -and $workspaceSource -eq 'unknown') {
             & $unknownWorkspace
