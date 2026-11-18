@@ -2921,6 +2921,10 @@ Each part reports its own `DESTROY.*` result, and one that fails is a **Warning*
   - PSScriptAnalyzer: 0 findings in 364 files.
   - Pester: 4,487 passed (the 4,477 above and #64's 10), 0 failed, and the same 39 skipped, of 4,526; no unit test reached the Azure CLI.
   - The workload generator: 577 tests, 0 failed. markdownlint: 0 issues in 139 files.
+- **Merged with `main` at afd50eb** (2026-11-18, #62, the fix for #60): only the changelog's Fixed list conflicted, and both are kept, this branch's entries first. This report and the deployment guide merged on their own, and no code file is changed by both sides. #62's recovery of a configuration reads `DbHubT4Refused`'s first size, which a refused scale's `kept` record (#25) sets to the default, so it recovers no `t4SkuName`, and T4 keeps its recorded size, as with the record before #25 (checked on the merged code). The full static validation on the merged tree (9a405e6, 26.9 minutes): exit 0.
+  - PSScriptAnalyzer: 0 findings in 365 files.
+  - Pester: 4,509 passed (the 4,487 above and #62's 22), 0 failed, and the same 39 skipped, of 4,548; no unit test reached the Azure CLI.
+  - The workload generator: 577 tests, 0 failed. markdownlint: 0 issues in 139 files.
 - **On the old code:** every new test fails on b27f0c1's code, each run with only its fix stashed: the runbooks' (#28, #21, #27, #22), the module's (#22, #23, #25, #24, #26). The dispatch script's tests run the generated script in Windows PowerShell 5.1, as the VMs do (in `pwsh` where it isn't installed), with a failing, a refusing, a passing, and a silent target.
 - **Live:** none; the test environments were destroyed. The user checks #21, #22, #27, and #28 live before this pull request is merged, on an existing demo upgraded from `main` ([still to verify](#still-to-verify)).
 
