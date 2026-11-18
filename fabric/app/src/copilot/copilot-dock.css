@@ -1,0 +1,125 @@
+/* The placeholder dock's layout. It uses the Fluent 2 tokens the FluentProvider sets. */
+
+.copilot-dock {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    background: var(--colorNeutralBackground1, #ffffff);
+    color: var(--colorNeutralForeground1, #242424);
+}
+
+.copilot-dock-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 8px 8px 14px;
+    border-bottom: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+}
+
+.copilot-dock-head h2 {
+    margin: 0;
+    font-size: var(--fontSizeBase400, 16px);
+    font-weight: 600;
+}
+
+.copilot-mark {
+    display: inline-grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    color: #ffffff;
+    background: linear-gradient(135deg, #8a3ffc 0%, #0f6cbd 100%);
+}
+
+.copilot-dock-spacer {
+    flex: 1;
+}
+
+.copilot-dock-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 16px 14px;
+}
+
+.copilot-intro-title {
+    font-size: var(--fontSizeBase400, 16px);
+    font-weight: 600;
+    margin: 0 0 4px;
+}
+
+.copilot-intro p {
+    margin: 0;
+    color: var(--colorNeutralForeground2, #424242);
+    line-height: 1.45;
+}
+
+.copilot-attached {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px;
+    border-radius: var(--borderRadiusLarge, 6px);
+    background: var(--colorNeutralBackground2, #fafafa);
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+}
+
+.copilot-eyebrow {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--colorBrandForeground1, #0f6cbd);
+}
+
+.copilot-prompt {
+    margin: 0;
+    color: var(--colorNeutralForeground2, #424242);
+}
+
+.copilot-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.copilot-chips span {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: var(--colorNeutralBackground1, #ffffff);
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    color: var(--colorNeutralForeground2, #424242);
+}
+
+.copilot-starters {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+.copilot-starters button {
+    text-align: left;
+    justify-content: flex-start;
+}
+
+.copilot-dock-foot {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 14px 14px;
+    border-top: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+}
+
+.copilot-dock-foot textarea {
+    min-height: 56px;
+}
