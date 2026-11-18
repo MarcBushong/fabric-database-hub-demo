@@ -44,14 +44,16 @@ internal sealed class SqlProfileStore(SqlConnectionOpener opener) : IProfileStor
 /// T3 and T4: a JSON file on T1 (ADR 0010, ADR 0019), so polling the profile never connects to a remote database: T3's
 /// serverless database can auto-pause and a stopped T4 isn't retried while the profile is off. Writes go to a
 /// temporary file that replaces the old one, under an exclusive lock file, so two writers can't both pass the
-/// compare-and-set of stamped requests.
+/// compare-and-set of stamped requests; the replace is tried again briefly while a reader has the file open (FileReplace).
 /// </summary>
-internal sealed class FileProfileStore(string path, TimeSpan? lockTimeout = null) : IProfileStore
+internal sealed class FileProfileStore(string path, TimeSpan? lockTimeout = null, Action<string, string>? replace = null) : IProfileStore
 {
     /// <summary>How long a writer waits for another writer's lock on the profile file before it gives up.</summary>
     internal static readonly TimeSpan DefaultLockTimeout = TimeSpan.FromSeconds(10);
 
     private readonly TimeSpan lockWait = lockTimeout ?? DefaultLockTimeout;
+
+    private readonly Action<string, string> replaceFile = replace ?? FileReplace.Move;
 
     /// <summary>T3's profile file (the default for every command that takes --profile-file).</summary>
     public static string DefaultPath => DefaultPathFor(DemoTarget.T3);
@@ -114,7 +116,7 @@ internal sealed class FileProfileStore(string path, TimeSpan? lockTimeout = null
         var content = new ProfileFileContent { Profile = profileName, SetAt = DateTimeOffset.UtcNow, SetBy = setBy, ExpiresAt = expiresAt, Parameters = parameters, RequestedAt = requestedAt, RequestId = requestId };
         var temporary = path + ".tmp";
         await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(content, CatalogJsonContext.Default.ProfileFileContent), cancellationToken).ConfigureAwait(false);
-        File.Move(temporary, path, overwrite: true);
+        await FileReplace.ReplaceAsync(temporary, path, replaceFile, cancellationToken).ConfigureAwait(false);
         return ProfileSetResult.Written;
     }
 

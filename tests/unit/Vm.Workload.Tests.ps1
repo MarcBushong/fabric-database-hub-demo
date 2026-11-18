@@ -384,6 +384,14 @@ Describe 'Runner results' {
         $fail.Message | Should -Match '18456'
     }
 
+    It 'counts checks only when the runner wrote records (2026-11-17)' {
+        $records = [pscustomobject]@{ ExitCode = 0; StdOut = '[{"checkId":"WORKLOAD.T1.SETUP.A","status":"Pass","message":"ok"}]'; StdErr = '' }
+        (Get-DemoVmRunnerOutcome -Run $records -Label 'setup').Message | Should -Be 'setup: Pass (1 check(s) passed).'
+        # demo-control's commands run without --json, so their output has no records to count.
+        $plain = [pscustomobject]@{ ExitCode = 0; StdOut = 'Pass  profile-set  T4 profile set to incident:replica-lag.'; StdErr = '' }
+        (Get-DemoVmRunnerOutcome -Run $plain -Label 'runner profile set --target T4').Message | Should -Be 'runner profile set --target T4: Pass.'
+    }
+
     It 'runs setup with --server for T3 and --grant-windows-login when asked' {
         Mock -ModuleName DbHubDemo.Vm -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '[]'; StdErr = '' } }
         Invoke-DemoVmRunnerSetup -DotNetExe 'dotnet.exe' -RunnerDll 'runner.dll' -Target 'T3' -Server 'azuresql01-abc123.database.windows.net' | Out-Null

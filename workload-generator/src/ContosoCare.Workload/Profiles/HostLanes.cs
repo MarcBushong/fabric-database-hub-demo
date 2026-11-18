@@ -108,7 +108,7 @@ internal static class HostLanesFile
 
         var temporary = path + ".tmp";
         File.WriteAllText(temporary, JsonSerializer.Serialize(document, CatalogJsonContext.Default.HostLanesDocument));
-        File.Move(temporary, path, overwrite: true);
+        FileReplace.Replace(temporary, path, FileReplace.Move);
     }
 
     public static HostLanesRead Read(string path)
@@ -120,7 +120,9 @@ internal static class HostLanesFile
 
         try
         {
-            // Shared for writing and deleting, so the host can replace the file while it's being read.
+            // Shared for writing and deleting, so the host can replace the file while it's being read on Linux and macOS. On
+            // Windows the replace is refused while this handle is open, whatever its share mode, so the host tries again
+            // briefly (FileReplace).
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             var document = JsonSerializer.Deserialize(stream, CatalogJsonContext.Default.HostLanesDocument);
             return document is null ? new HostLanesRead(path, null, "the file is empty") : new HostLanesRead(path, document, null);

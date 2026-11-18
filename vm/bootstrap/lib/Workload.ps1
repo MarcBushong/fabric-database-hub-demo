@@ -796,7 +796,7 @@ function Get-DemoVmRunnerOutcome {
     }
     $notable = @($records | Where-Object { [string]$_.status -ne 'Pass' } | ForEach-Object { '{0}: {1}' -f $_.status, $_.message })
     if ($notable.Count -eq 0 -and $status -ne 'Fail') {
-        $message = '{0}: {1} ({2} check(s) passed).' -f $Label, $status, $records.Count
+        $message = if ($records.Count -gt 0) { '{0}: {1} ({2} check(s) passed).' -f $Label, $status, $records.Count } else { '{0}: {1}.' -f $Label, $status }
     }
     elseif ($notable.Count -gt 0) {
         $message = '{0}: {1}. {2}' -f $Label, $status, ($notable -join ' | ')
