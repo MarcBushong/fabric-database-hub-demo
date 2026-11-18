@@ -813,6 +813,93 @@ Describe 'Guardrail 3: the console, DONE, and the status page say it, with the h
     }
 }
 
+Describe 'T4 created by a run that skipped preflight is priced first, as a scale-up is (#26, 2026-11-17)' {
+    BeforeEach {
+        Initialize-TemplateHarness
+    }
+
+    It 'prices the default before it creates T4, and over monthlyCeilingUsd says so with the ceiling and a cheaper t4SkuName, on the console, in T4Note, and at DONE, and creates T4 anyway' {
+        $script:costBySize = @{ Standard_D4ds_v5 = (New-TestCost -SkuName 'Standard_D4ds_v5' -SkipReason 'MonthlyCeiling' -HourlyUsd 1.0 -MonthlyWorstCaseUsd 312.4) }
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -PriceT4Creation
+        $deployment.Succeeded | Should -BeTrue
+        $deployment.T4SkuName | Should -Be 'Standard_D4ds_v5'
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5') -Because 'T4 is part of every deployment, so a ceiling never leaves it out'
+        @($script:pricedSizes) | Should -Be @('Standard_D4ds_v5')
+        $size = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE')
+        $size.Count | Should -Be 1
+        $size[0].status | Should -Be 'Warning'
+        $size[0].evidence.outcome | Should -Be 'Create'
+        $size[0].evidence.cheaperSku | Should -Be 'Standard_D2ds_v5'
+        $size[0].message | Should -Be 'T4 doesn''t exist yet, so this deployment creates it as Standard_D4ds_v5 (General Purpose, 4 vCores), about 1.000 USD an hour while running (list price in westus3, Azure Retail Prices API). This run skipped preflight, so it priced T4 first, as it prices a scale-up: the demo''s worst-case month comes to 312.40 USD, over monthlyCeilingUsd (250.00 USD). T4 is part of every deployment, so it''s created anyway.'
+        $size[0].remediation | Should -Be 'Raise monthlyCeilingUsd to at least 313 in your configuration (the budget follows it), then run ./scripts/deploy.ps1 -FromStage Infrastructure again. Or set t4SkuName to Standard_D2ds_v5 (General Purpose, 2 vCores; no autonomous tuning, so t4AutonomousTuning can''t be true), a cheaper size, and run ./scripts/deploy.ps1 again, which moves T4 to it.'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -eq $size[0].message }
+        $deployment.T4Note | Should -Be ('{0} {1}' -f $size[0].message, $size[0].remediation)
+        $outcome = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Result = @($deployment.Results); State = (New-TestState -T4Sku '') } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config }
+        @($outcome.Notes) | Should -Contain $deployment.T4Note
+    }
+
+    It 'names the ceiling to raise and the next cheaper size for a size t4SkuName sets: <Sku>, <Reason>' -ForEach @(
+        @{ Sku = 'Standard_B2s'; Reason = 'SessionCeiling'; Message = ', the size t4SkuName sets, about 0\.040 USD an hour while running \(list price in westus3, Azure Retail Prices API\)\. This run skipped preflight, so it priced T4 first, as it prices a scale-up: a session comes to 18\.20 USD, over sessionCeilingUsd \(15\.00 USD\)\.'; Remediation = '^Raise sessionCeilingUsd to at least 19 in your configuration\. Or set t4SkuName to Standard_B1ms \(Burstable, 1 vCore; no autonomous tuning, so t4AutonomousTuning can''t be true, and no read replica\), a cheaper size, and run \./scripts/deploy\.ps1 again, which moves T4 to it\.$' }
+        @{ Sku = 'Standard_B1ms'; Reason = 'Price'; Message = '^T4 doesn''t exist yet, so this deployment creates it as Standard_B1ms \(Burstable, 1 vCore\), the size t4SkuName sets\. This run skipped preflight, so it priced T4 first, as it prices a scale-up, but the Azure Retail Prices API gave no price just now \(offline\), so it isn''t checked against monthlyCeilingUsd and sessionCeilingUsd\.'; Remediation = '^Run \./scripts/estimate-cost\.ps1 once the Azure Retail Prices API answers\. If the month is over monthlyCeilingUsd, or a session over sessionCeilingUsd, raise that ceiling in your configuration\. T4 is at its smallest size, Standard_B1ms\.$' }
+        @{ Sku = 'Standard_D4ads_v5'; Reason = 'MonthlyCeiling'; Message = ', the size t4SkuName sets, about 0\.040 USD an hour'; Remediation = 'Or set t4SkuName to Standard_D2ds_v5 \(General Purpose, 2 vCores; no autonomous tuning' }
+    ) {
+        $script:costBySize = @{ $Sku = (New-TestCost -SkuName $Sku -SkipReason $Reason -HourlyUsd $(if ($Reason -eq 'Price') { $null } else { 0.04 }) -SessionUsd 18.2 -MonthlyWorstCaseUsd 260.0) }
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig -SkuName $Sku) -NetworkMode private -T3UseFreeLimit $false -PriceT4Creation
+        @($script:sizes) | Should -Be @($Sku)
+        @($script:pricedSizes) | Should -Be @($Sku)
+        $size = @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE')
+        $size.Count | Should -Be 1
+        $size[0].evidence.explicit | Should -BeTrue
+        $size[0].message | Should -Match ('^T4 doesn''t exist yet, so this deployment creates it as {0} \(' -f $Sku)
+        $size[0].message | Should -Match $Message
+        $size[0].message | Should -Match 'T4 is part of every deployment, so it''s created anyway\.$'
+        $size[0].remediation | Should -Match $Remediation
+    }
+
+    It 'says nothing when the creation fits both ceilings, and prices nothing when preflight ran (no -PriceT4Creation) or T4 exists' {
+        $script:costBySize = @{ Standard_D4ds_v5 = (New-TestCost -SkuName 'Standard_D4ds_v5') }
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -PriceT4Creation
+        @($script:pricedSizes) | Should -Be @('Standard_D4ds_v5')
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE') | Should -BeNullOrEmpty
+        $deployment.T4Note | Should -BeNullOrEmpty
+
+        $script:pricedSizes.Clear()
+        $script:costBySize = @{ Standard_D4ds_v5 = (New-TestCost -SkuName 'Standard_D4ds_v5' -SkipReason 'MonthlyCeiling') }
+        $deployment = Invoke-TestTemplate -Config (New-TestConfig)
+        @($script:pricedSizes) | Should -BeNullOrEmpty -Because 'preflight priced T4 already'
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE') | Should -BeNullOrEmpty
+
+        $script:server = [pscustomobject]@{ sku = [pscustomobject]@{ name = 'Standard_D4ds_v5' } }
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -PriceT4Creation
+        @($script:pricedSizes) | Should -BeNullOrEmpty -Because 'an existing T4 isn''t created'
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE') | Should -BeNullOrEmpty
+    }
+
+    It 'drops the Warning for a size Azure refused, and the fallback''s own checks price the sizes it moves to' {
+        $script:codes = @{ Standard_D4ds_v5 = 'SkuNotAvailable'; Standard_D4ads_v5 = 'SkuNotAvailable' }
+        $script:costBySize = @{ Standard_D4ds_v5 = (New-TestCost -SkuName 'Standard_D4ds_v5' -SkipReason 'MonthlyCeiling') }
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $false -PriceT4Creation
+        $deployment.Succeeded | Should -BeTrue
+        @($script:sizes) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5', 'Standard_D2ds_v5')
+        @($script:pricedSizes | Where-Object { $_ -ceq 'Standard_D4ds_v5' }).Count | Should -BeGreaterOrEqual 1
+        @($script:pricedSizes | Where-Object { $_ -ceq 'Standard_D2ds_v5' }).Count | Should -BeGreaterOrEqual 1
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE') | Should -BeNullOrEmpty
+        $deployment.T4Note | Should -Not -Match 'doesn''t exist yet'
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.FALLBACK').Count | Should -Be 1
+    }
+
+    It 'prices it again after Azure rejects the T3 free offer, whose allowance the first check counted, and keeps one Warning' {
+        $script:freeOfferFails = $true
+        $script:costBySize = @{ Standard_D4ds_v5 = (New-TestCost -SkuName 'Standard_D4ds_v5' -SkipReason 'SessionCeiling' -SessionUsd 18.2) }
+        $deployment = Invoke-DemoTemplateDeployment -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $true -PriceT4Creation
+        $deployment.Succeeded | Should -BeTrue
+        $deployment.T3UseFreeLimit | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $SkuName -eq 'Standard_D4ds_v5' -and $T3UseFreeLimit -eq $true }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4GeneralPurposeCost -Times 1 -Exactly -ParameterFilter { $SkuName -eq 'Standard_D4ds_v5' -and $T3UseFreeLimit -eq $false }
+        @($deployment.Results | Where-Object checkId -EQ 'DEPLOY.T4.SIZE').Count | Should -Be 1
+    }
+}
+
 Describe 'Guardrail 4: the size is recorded, and an existing server is never resized' {
     BeforeEach {
         Initialize-TemplateHarness

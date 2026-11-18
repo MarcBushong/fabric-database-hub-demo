@@ -558,8 +558,11 @@ function New-DemoT4SizeResult {
       restart worst case a safety stop allows) put the month over monthlyCeilingUsd, a session over
       sessionCeilingUsd, or found no price, so this deployment keeps the server's size and names the ceiling to raise; the
       next run that deploys the template checks again. Nothing is recorded.
-    -Explicit words it for a t4SkuName the configuration changed on an existing server; -Cost on Scale says the check
-    passed.
+    - Create (#26, 2026-11-17): T4 doesn't exist yet (-ServerSku ''), and a run that skipped preflight priced its creation
+      at -SkuName the same way (-Cost): over either ceiling, or without a price, it names the ceiling to raise and the next
+      cheaper documented size for t4SkuName, and T4 is created anyway (T4 is part of every deployment).
+    -Explicit words it for a t4SkuName the configuration changed on an existing server, or, with Create, the size it sets;
+    -Cost on Scale says the check passed.
     Internal.
     Source (checked 2026-11-04; updated 2026-07-16): https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources
     #>
@@ -572,13 +575,14 @@ function New-DemoT4SizeResult {
         [string] $CheckPrefix,
 
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string] $ServerSku,
 
         [Parameter(Mandatory)]
         [string] $SkuName,
 
         [Parameter(Mandatory)]
-        [ValidateSet('Scale', 'Waiting', 'Refused', 'Ceiling')]
+        [ValidateSet('Scale', 'Waiting', 'Refused', 'Ceiling', 'Create')]
         [string] $Outcome,
 
         [string] $State = '',
@@ -595,7 +599,7 @@ function New-DemoT4SizeResult {
     $checkId = '{0}.T4.SIZE' -f $CheckPrefix
     $area = if ($CheckPrefix -eq 'PREFLIGHT') { 'preflight' } else { 't4' }
     $docUrl = 'https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources'
-    $from = '{0} ({1})' -f $ServerSku, $(if ((Get-DemoT4SkuSpec -SkuName $ServerSku).Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' })
+    $from = if ($ServerSku) { '{0} ({1})' -f $ServerSku, $(if ((Get-DemoT4SkuSpec -SkuName $ServerSku).Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' }) } else { '' }
     $evidence = [ordered]@{ serverSku = $ServerSku; skuName = $SkuName; outcome = $Outcome; explicit = [bool]$Explicit }
     $keep = 'To keep T4 at {0}, set t4SkuName to {0} in your configuration (autonomous tuning then stays off on a size under 4 vCores); an existing server keeps a size you set.' -f $ServerSku
     $culture = [System.Globalization.CultureInfo]::InvariantCulture
@@ -639,6 +643,46 @@ function New-DemoT4SizeResult {
                 }
                 'SessionCeiling' { [string]::Format($culture, 'To move T4 to {0}, raise sessionCeilingUsd to at least {1:N0}, then run ./scripts/deploy.ps1 -FromStage Infrastructure again. {2}', $SkuName, [System.Math]::Ceiling([double]$Cost.SessionUsd), $back) }
                 default { 'Run ./scripts/deploy.ps1 -FromStage Infrastructure again once the Azure Retail Prices API answers: the move is priced first. {0}' -f $back }
+            }
+            return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl 'https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices')
+        }
+        'Create' {
+            $spec = Get-DemoT4SkuSpec -SkuName $SkuName
+            $sized = { param([pscustomobject] $Of, [string] $Extra = '') '{0} ({1}, {2} vCore{3}{4})' -f $Of.SkuName, $(if ($Of.Tier -eq 'GeneralPurpose') { 'General Purpose' } else { 'Burstable' }), $Of.VCores, $(if ($Of.VCores -eq 1) { '' } else { 's' }), $Extra }
+            $reason = [string](Get-DemoMemberValue -InputObject $Cost -Name 'SkipReason')
+            $hourlyUsd = Get-DemoMemberValue -InputObject $Cost -Name 'HourlyUsd'
+            $evidence['hourlyUsd'] = $hourlyUsd
+            $priceText = if ($null -ne $hourlyUsd) { ', ' + (Format-DemoT4HourlyText -HourlyUsd $hourlyUsd -Location ([string](Get-DemoMemberValue -InputObject $Cost -Name 'Location'))) } else { '' }
+            $why = switch ($reason) {
+                'MonthlyCeiling' { [string]::Format($culture, ': the demo''s worst-case month comes to {0:N2} USD, over monthlyCeilingUsd ({1:N2} USD)', [double]$Cost.MonthlyWorstCaseUsd, [double]$Cost.MonthlyCeilingUsd) }
+                'SessionCeiling' { [string]::Format($culture, ': a session comes to {0:N2} USD, over sessionCeilingUsd ({1:N2} USD)', [double]$Cost.SessionUsd, [double]$Cost.SessionCeilingUsd) }
+                default {
+                    $problem = [string](Get-DemoMemberValue -InputObject $Cost -Name 'PriceError')
+                    ', but the Azure Retail Prices API gave no price just now{0}, so it isn''t checked against monthlyCeilingUsd and sessionCeilingUsd' -f $(if ($problem) { ' (' + $problem + ')' } else { '' })
+                }
+            }
+            $message = 'T4 doesn''t exist yet, so this deployment creates it as {0}{1}{2}. This run skipped preflight, so it priced T4 first, as it prices a scale-up{3}. T4 is part of every deployment, so it''s created anyway.' -f (& $sized $spec), $(if ($Explicit) { ', the size t4SkuName sets' } else { '' }), $priceText, $why
+            # The next cheaper documented size (T4's cost order: tier, then vCores; never a price, ADR 0016), which deploy.ps1
+            # moves an existing T4 to once t4SkuName sets it.
+            $rank = Get-DemoT4SizeRank -SkuName $SkuName
+            $cheaper = [string](@($script:T4CostOrder | Where-Object { (Get-DemoT4SizeRank -SkuName $_) -lt $rank }) | Select-Object -Last 1)
+            $evidence['cheaperSku'] = $cheaper
+            $smaller = if ($cheaper) {
+                $cheaperSpec = Get-DemoT4SkuSpec -SkuName $cheaper
+                $loses = if ($cheaperSpec.Tier -ne 'GeneralPurpose') { '; no autonomous tuning, so t4AutonomousTuning can''t be true, and no read replica' } elseif ($cheaperSpec.VCores -lt [int](Get-DemoPostgresSetting)['autonomousTuning']['minVCores']) { '; no autonomous tuning, so t4AutonomousTuning can''t be true' } else { '' }
+                'set t4SkuName to {0}, a cheaper size, and run ./scripts/deploy.ps1 again, which moves T4 to it.' -f (& $sized $cheaperSpec $loses)
+            }
+            else {
+                ''
+            }
+            $smallest = 'T4 is at its smallest size, {0}.' -f $SkuName
+            $remediation = switch ($reason) {
+                'MonthlyCeiling' {
+                    $safety = if ([string](Get-DemoMemberValue -InputObject $Cost -Name 'RestartAssumption') -eq 'RestOfMonth') { ' Or put the nightly safety stop fully in place (./scripts/deploy.ps1 sets it up, and an Owner runs ./scripts/grant-safety-stop.ps1 once when deploy.ps1 couldn''t assign its role), so each of T4''s 7-day restarts counts as about a day.' } else { '' }
+                    [string]::Format($culture, 'Raise monthlyCeilingUsd to at least {0:N0} in your configuration (the budget follows it), then run ./scripts/deploy.ps1 -FromStage Infrastructure again.{1} {2}', [System.Math]::Ceiling([double]$Cost.MonthlyWorstCaseUsd), $safety, $(if ($smaller) { 'Or ' + $smaller } else { $smallest }))
+                }
+                'SessionCeiling' { [string]::Format($culture, 'Raise sessionCeilingUsd to at least {0:N0} in your configuration. {1}', [System.Math]::Ceiling([double]$Cost.SessionUsd), $(if ($smaller) { 'Or ' + $smaller } else { $smallest })) }
+                default { 'Run ./scripts/estimate-cost.ps1 once the Azure Retail Prices API answers. If the month is over monthlyCeilingUsd, or a session over sessionCeilingUsd, raise that ceiling in your configuration{0}' -f $(if ($smaller) { ', or ' + $smaller } else { '. ' + $smallest }) }
             }
             return (New-DemoResult -CheckId $checkId -Area $area -Target 'T4' -Status 'Warning' -Message $message -Evidence $evidence -Remediation $remediation -DocUrl 'https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices')
         }
@@ -1726,6 +1770,27 @@ function Get-DemoT4FallbackNote {
         return ('T4 isn''t created yet: the fallback chose {0} {1} {2}, {3}, but {4}. The next ./scripts/deploy.ps1 that deploys the template creates it, after checking its price against the ceilings again.' -f $tierText, $sku, $origin, $hourly, $because)
     }
     return ('The fallback chose {0} {1} for T4 {2}, {3}; whether the server exists couldn''t be confirmed just now, and ./scripts/status.ps1 shows it.' -f $tierText, $sku, $origin, $hourly)
+}
+
+function Get-DemoT4CreateCostNote {
+    <#
+    .SYNOPSIS
+    What DONE and NOT DONE say, on the console and the status page, when a run that skipped preflight created T4 over a
+    cost ceiling, or without a price (#26, 2026-11-17): DEPLOY.T4.SIZE's Create Warning, with its fix, or ''. Pure.
+    Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $created = @($Result | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SIZE' -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'evidence') -Name 'outcome') -eq 'Create' } | Select-Object -Last 1)
+    if ($created.Count -eq 0) {
+        return ''
+    }
+    return ('{0} {1}' -f [string]$created[0].message, [string]$created[0].remediation)
 }
 
 function Get-DemoT4SizeChangeCost {

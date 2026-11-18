@@ -1013,6 +1013,10 @@ function Invoke-DemoParallelDeployment {
             if ($t4StartSku) {
                 $deployArguments['T4StartSku'] = $t4StartSku
             }
+            if (-not $plan.Preflight) {
+                # Without preflight's cost checks, T4 that doesn't exist yet is priced before it's created (#26, 2026-11-17).
+                $deployArguments['PriceT4Creation'] = $true
+            }
             if (-not $whatIf -and -not $skipT4 -and @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.START' -and [string]$_.status -eq 'Pass' }).Count -eq 0) {
                 # A stopped flexible server rejects every other management operation, including the template's
                 # update, so a stopped T4 starts first (Phase 24, ADR 0019), unless this run already started it. Not
@@ -1077,7 +1081,9 @@ function Invoke-DemoParallelDeployment {
             $deploymentResults = Get-DemoMemberValue -InputObject $deployment -Name 'Results'
             $sizeChange = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.FALLBACK' }) | Select-Object -Last 1
             $context['T4Notice'] = if ($null -ne $sizeChange) { [string]$sizeChange.message } else { '' }
-            & $stageResult 'Infrastructure' 'Pass' $infrastructureText
+            # T4 created over a cost ceiling, or without a price, by a run without preflight (#26): the step is a Warning.
+            $overCeiling = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SIZE' -and [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'outcome') -eq 'Create' }).Count -gt 0
+            & $stageResult 'Infrastructure' $(if ($overCeiling) { 'Warning' } else { 'Pass' }) $infrastructureText
             if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                 & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
             }

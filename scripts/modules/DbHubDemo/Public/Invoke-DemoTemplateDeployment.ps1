@@ -57,7 +57,11 @@ function Invoke-DemoTemplateDeployment {
        the 2-vCore fallback's estimate at that size (Get-DemoT4GeneralPurposeCost, with the safety stops' restart
        coverage), because deploy.ps1 -FromStage Infrastructure skips preflight's cost checks (review of PR 20): over
        either ceiling, or without a price, the server keeps its size this time (DEPLOY.T4.SIZE Ceiling, naming the ceiling
-       to raise; nothing recorded, so the next run checks again). A record that doesn't
+       to raise; nothing recorded, so the next run checks again). T4 that doesn't exist yet is priced the same way at the
+       size the first attempt creates when -PriceT4Creation says preflight didn't run (#26, 2026-11-17), unless a fallback
+       step's own check prices that size: over either ceiling, or without a price, it's DEPLOY.T4.SIZE's Create Warning,
+       which names the ceiling to raise and a cheaper t4SkuName, on the console, in T4Note, and at DONE, and T4 is created
+       anyway; priced again after Azure rejects the T3 free offer, and dropped when Azure refuses that size. A record that doesn't
        match the server that exists is cleared, never set to its size, unless it's the size a refused scale kept. A
        record no longer holds once the configuration sets t4SkuName (review finding 5). The VMs that exist are read again
        before each attempt, so a VM a failed attempt created never gets an osProfile again. While the fallback is
@@ -146,6 +150,12 @@ function Invoke-DemoTemplateDeployment {
     .PARAMETER TemplatePath
     The compiled template; defaults to the repository's azuredeploy.json.
 
+    .PARAMETER PriceT4Creation
+    deploy.ps1's, when this run skipped preflight (-FromStage, or a resume past it; #26, 2026-11-17): T4 that doesn't exist
+    yet is priced at the size the first attempt creates before it's created, as a scale-up is (Get-DemoT4GeneralPurposeCost,
+    with the safety stops' restart coverage, against monthlyCeilingUsd and sessionCeilingUsd). It only reports: over either
+    ceiling, or without a price, DEPLOY.T4.SIZE's Create Warning, and T4 is created anyway.
+
     .PARAMETER ProgressPath
     deploy.ps1's progress model, for the wait for a refused T4 server's removal on the status page's Infrastructure and
     T4 rows (2026-11-09); '' writes nothing there.
@@ -198,6 +208,8 @@ function Invoke-DemoTemplateDeployment {
         [switch] $ScaleT4,
 
         [string] $TemplatePath = (Join-Path -Path $script:RepoRoot -ChildPath 'azuredeploy.json'),
+
+        [switch] $PriceT4Creation,
 
         [AllowEmptyString()]
         [string] $ProgressPath = '',
@@ -404,6 +416,10 @@ function Invoke-DemoTemplateDeployment {
     $gpChecked = $false
     $gpRefusal = $null
     $gpResult = $null
+    # T4's creation priced for a run without preflight (#26): checked once, the size it priced, and its Warning.
+    $createChecked = $false
+    $createSku = ''
+    $createResult = $null
     $t4Note = ''
     # What Azure refused, with the zones tried (DbHubT4Refused, the asked size first), and the cost checks this run made,
     # for the size change's notice (2026-11-09). A record this run starts from brings the refusals it recorded.
@@ -589,6 +605,24 @@ function Invoke-DemoTemplateDeployment {
                 Write-DemoLog -Level Warning -Message $gpResult.message
             }
         }
+        # #26 (2026-11-17): a run that skipped preflight (-PriceT4Creation) prices T4's creation at the size this attempt
+        # creates, as a scale-up is priced, unless a fallback step's check above priced that size already. Over either ceiling,
+        # or without a price, it's DEPLOY.T4.SIZE's Create Warning, which names the ceiling to raise and a cheaper t4SkuName,
+        # and T4 is created anyway (T4 is part of every deployment).
+        if ($ladder -and $PriceT4Creation -and -not $createChecked -and (Test-DemoT4Enabled -Config $effective)) {
+            $createChecked = $true
+            $creating = Get-DemoT4SkuName -Config $effective
+            if (-not $t4Costs.Contains($creating)) {
+                $createSku = $creating
+                $createCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $createSku -Cache $costCache
+                $t4Costs[$createSku] = $createCost
+                if (-not $createCost.Allowed) {
+                    $createResult = New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku '' -SkuName $createSku -Outcome Create -Cost $createCost -Explicit:($createSku -ceq $t4Pinned)
+                    $results.Add($createResult)
+                    Write-DemoLog -Level Warning -Message $createResult.message
+                }
+            }
+        }
         # A T4 server Azure refused is still a shell that Azure removes (2026-11-09): this attempt creates a server with its
         # name, so it waits for it first. When it outlasts the bound, the plain rerun goes on from the next size of the
         # fallback, recorded now with what Azure refused; a retry in another zone has no record of its own, so the rerun goes
@@ -730,6 +764,11 @@ function Invoke-DemoTemplateDeployment {
             elseif ($state -eq 'Succeeded' -and $t4On -and -not $t4Deployed -and $t4Refused.Count -gt 0) {
                 $t4Note = 'T4 isn''t deployed: Azure refused its 4-vCore sizes here, and the 2-vCore fallback wasn''t created (DEPLOY.T4.SKU says why).'
             }
+            # T4 created over a cost ceiling, or without a price, by a run that skipped preflight (#26): the status page's
+            # Infrastructure step says it with its fix, as DONE does (Get-DemoT4CreateCostNote).
+            if ($state -eq 'Succeeded' -and $t4Deployed -and $null -ne $createResult -and [string]$createResult.evidence['skuName'] -ceq $t4SkuName) {
+                $t4Note = (@($t4Note, ('{0} {1}' -f $createResult.message, $createResult.remediation)) | Where-Object { $_ }) -join ' '
+            }
             $results.Add((New-DemoResult -CheckId 'DEPLOY.TEMPLATE' -Area 'infra' -Target 'subscription' -Status $status -Message ('Deployment {0}: {1} in {2}.' -f $deploymentName, $state, $duration) -Evidence ([ordered]@{ provisioningState = $state; duration = $duration; newVms = $missing; t3UseFreeLimit = $useFreeLimit; bundle = $BootstrapBundleSha256; runner = $WorkloadRunnerSha256; t2Disk = $(if ($hostSnapshotId) { 'golden: ' + ($hostSnapshotId -replace '^.*/', '') } elseif ($attachHostDisk) { 'attached' } else { 'image' }); t4Enabled = $t4Deployed; t4SkuName = (Get-DemoT4SkuName -Config $effective); t4Fallback = $(if ($t4Deployed -and $t4Refused.Count -gt 0) { $t4SkuName } elseif ($t4Refused.Count -gt 0) { [string]$tags[$t4TagName] } else { '' }); t4Scaled = $(if ($t4Deployed -and $t4Scaling) { $t4ServerSku } else { '' }); t4AutonomousTuning = $($t4Deployed -and (Get-DemoT4Tuning -Config $effective).Enabled) }) -DocUrl $docUrl))
             return [pscustomobject]@{ Succeeded = ($state -eq 'Succeeded'); Results = $results.ToArray(); Outputs = (ConvertTo-DemoDeploymentOutput -Deployment $parsed); Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = $t4Deployed; T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note }
         }
@@ -814,6 +853,18 @@ function Invoke-DemoTemplateDeployment {
                     $stepResult = $null
                 }
             }
+            # And for T4's creation priced for a run without preflight (#26).
+            if ($ladder -and $createChecked) {
+                $createChecked = $false
+                if ($createSku) {
+                    [void]$t4Costs.Remove($createSku)
+                    $createSku = ''
+                }
+                if ($null -ne $createResult) {
+                    [void]$results.Remove($createResult)
+                    $createResult = $null
+                }
+            }
             continue
         }
         if (-not $t4FailureRead -and (Test-DemoT4Enabled -Config $effective) -and ($Action -eq 'Create') -and (-not $t4Exists -or $t4Scaling)) {
@@ -856,6 +907,11 @@ function Invoke-DemoTemplateDeployment {
                 continue
             }
             $t4Refused.Add($current)
+            # The creation's Warning was for a size Azure refused (#26): the fallback's own results say what this run does instead.
+            if ($null -ne $createResult -and [string]$createResult.evidence['skuName'] -ceq $current) {
+                [void]$results.Remove($createResult)
+                $createResult = $null
+            }
             if ($t4Pinned) {
                 $next = Get-DemoT4NextSku -Config $effective -Current $current
                 if ($next) {

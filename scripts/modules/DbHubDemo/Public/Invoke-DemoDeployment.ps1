@@ -512,6 +512,10 @@ function Invoke-DemoDeployment {
                 if ($context.T4StartSku) {
                     $deployArguments['T4StartSku'] = $context.T4StartSku
                 }
+                if ($startIndex -gt 0) {
+                    # Without preflight's cost checks, T4 that doesn't exist yet is priced before it's created (#26, 2026-11-17).
+                    $deployArguments['PriceT4Creation'] = $true
+                }
                 if (-not $whatIf -and (Test-DemoT4Enabled -Config $Config) -and @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T4.START' -and [string]$_.status -eq 'Pass' }).Count -eq 0) {
                     # A stopped T4 rejects the template's update, so it starts first (Phase 24, ADR 0019), unless this run
                     # already started it.
@@ -553,7 +557,10 @@ function Invoke-DemoDeployment {
                 }
                 & $recordStage 'Infrastructure' @{ NetworkMode = $context.NetworkMode; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T3AdminGroupName = [string]$context.T3AdminGroupName }
                 $t4NoteValue = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T4Note')
-                & $stageResult 'Infrastructure' 'Pass' $(if ($t4NoteValue) { 'The infrastructure is deployed. ' + $t4NoteValue } else { 'The infrastructure is deployed.' })
+                # T4 created over a cost ceiling, or without a price, by a run without preflight (#26): the stage is a Warning.
+                $deploymentResults = Get-DemoMemberValue -InputObject $deployment -Name 'Results'
+                $overCeiling = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SIZE' -and [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'outcome') -eq 'Create' }).Count -gt 0
+                & $stageResult 'Infrastructure' $(if ($overCeiling) { 'Warning' } else { 'Pass' }) $(if ($t4NoteValue) { 'The infrastructure is deployed. ' + $t4NoteValue } else { 'The infrastructure is deployed.' })
                 if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                     # Opt-in, and only start-demo.ps1 -Interactive needs it, so a vault Fail is reported (it
                     # counts in DEPLOY.SUMMARY and the exit code) without stopping the deployment.
