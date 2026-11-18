@@ -61,7 +61,8 @@ function Invoke-DemoTemplateDeployment {
        size the first attempt creates when -PriceT4Creation says preflight didn't run (#26, 2026-11-17), unless a fallback
        step's own check prices that size: over either ceiling, or without a price, it's DEPLOY.T4.SIZE's Create Warning,
        which names the ceiling to raise and a cheaper t4SkuName, on the console, in T4Note, and at DONE, and T4 is created
-       anyway; priced again after Azure rejects the T3 free offer, and dropped when Azure refuses that size. A record that doesn't
+       anyway; priced again after Azure rejects the T3 free offer, and, when Azure refuses that size, the next size the
+       fallback tries is priced instead, unless the fallback's own check prices it. A record that doesn't
        match the server that exists is cleared, never set to its size, unless it's the size a refused scale kept. A
        record no longer holds once the configuration sets t4SkuName (review finding 5). The VMs that exist are read again
        before each attempt, so a VM a failed attempt created never gets an osProfile again. While the fallback is
@@ -907,10 +908,16 @@ function Invoke-DemoTemplateDeployment {
                 continue
             }
             $t4Refused.Add($current)
-            # The creation's Warning was for a size Azure refused (#26): the fallback's own results say what this run does instead.
-            if ($null -ne $createResult -and [string]$createResult.evidence['skuName'] -ceq $current) {
-                [void]$results.Remove($createResult)
-                $createResult = $null
+            # The creation's check was for a size Azure refused (#26): its Warning goes, and the next attempt's size is priced
+            # instead, unless a fallback step's own check prices it (Standard_D4ads_v5 has none).
+            if ($createSku -and $createSku -ceq $current) {
+                $createChecked = $false
+                [void]$t4Costs.Remove($createSku)
+                $createSku = ''
+                if ($null -ne $createResult) {
+                    [void]$results.Remove($createResult)
+                    $createResult = $null
+                }
             }
             if ($t4Pinned) {
                 $next = Get-DemoT4NextSku -Config $effective -Current $current

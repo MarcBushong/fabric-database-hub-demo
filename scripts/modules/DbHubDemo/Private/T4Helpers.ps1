@@ -391,9 +391,10 @@ function Test-DemoT4RecordInEffect {
     Whether the size T4's fallback recorded (DbHubT4Size, -Recorded) still applies to this configuration (2026-11-09): it
     stands in for the size the configuration asks for (Get-DemoT4AskedSku) while that's the size Azure refused, the first
     one in DbHubT4Refused (-Refused). A record without DbHubT4Refused comes from the fallback without t4SkuName, or from a
-    scale to the default that Azure refused, so it holds only while t4SkuName isn't set (review finding 5). So a server the
-    fallback created keeps its size on later runs, with no resize and no refusal again, until t4SkuName names another
-    size. Pure. Internal.
+    scale to the default that Azure refused, so it holds only while t4SkuName isn't set (review finding 5); so does a
+    refused scale's record that says "kept" (#25), though it names the size Azure refused, so a t4SkuName you set moves T4
+    again. So a server the fallback created keeps its size on later runs, with no resize and no refusal again, until
+    t4SkuName names another size. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
@@ -412,11 +413,11 @@ function Test-DemoT4RecordInEffect {
     if (-not ($Recorded -cin $script:T4Sizes)) {
         return $false
     }
-    $asked = (ConvertFrom-DemoT4RefusedRecord -Value $Refused).Asked
-    if (-not $asked) {
+    $record = ConvertFrom-DemoT4RefusedRecord -Value $Refused
+    if (-not $record.Asked -or $record.Kept) {
         return (-not (Get-DemoT4PinnedSku -Config $Config))
     }
-    return ($asked -ceq (Get-DemoT4AskedSku -Config $Config))
+    return ($record.Asked -ceq (Get-DemoT4AskedSku -Config $Config))
 }
 
 function Format-DemoT4ZoneText {
