@@ -21,6 +21,8 @@
     "verify": "npm run typecheck && npm run lint && npm run test && npm run check:licenses && npm run build"
   },
   "dependencies": {
+    "@fluentui/react-components": "9.75.2",
+    "@fluentui/react-icons": "2.0.346",
     "@fontsource-variable/jetbrains-mono": "5.3.0",
     "@fontsource-variable/space-grotesk": "5.3.0",
     "@microsoft/rayfin-auth": "1.36.2",
