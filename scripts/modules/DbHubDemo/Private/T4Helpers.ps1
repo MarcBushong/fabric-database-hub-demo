@@ -2128,7 +2128,10 @@ function Get-DemoT4ControlRestartCoverage {
     - the schedule dbhub-t4-safety-stop exists, is enabled, and is linked to DbHub-Stop (Get-DemoT4SafetyStopState);
     - A1, the control identity's custom role on the demo's resource group, is assigned: DbHub-Stop can't stop T4 without
       it, and destroy deletes it with the group, so only assignRoles or -GrantRole grants it again;
-    - the last DbHub-Stop job that ended didn't fail (Failed, Stopped, or Suspended).
+    - the last DbHub-Stop job that ended completed, and its own result line (DBHUB-STOP, Get-DemoSafetyStopJobResult) says
+      it stopped what ran (Stopped), had nothing to stop (Skipped, NoEnvironment), or left a run in progress alone
+      (Deferred): a Partial (Azure refused T4's stop, and the job still completed), an Error, or a line that can't be read
+      doesn't count (#23, 2026-11-17).
     Anything else, a read that fails included (fail safe), doesn't count, and Missing, Reason, and Fix say what's missing.
     #>
     [CmdletBinding()]
@@ -2180,6 +2183,24 @@ function Get-DemoT4ControlRestartCoverage {
             $when = if ($null -ne $job.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$job.CreatedUtc) } else { '' }
             $reason = 'the last DbHub-Stop job{0} ended {1}, so the safety stop may not stop T4' -f $when, $job.Status
             return (& $missing 'StopJob' $reason ('Open the job in {0} (Process Automation > Jobs) to see why; when A1 is the cause, an Owner runs {1}. Then run {2}.' -f $name.AutomationAccount, $grant, $setup) $evidence)
+        }
+        if ($job.Found) {
+            # A job that completed can still say it didn't stop T4 (#23, 2026-11-17): DbHub-Stop -Scope T4 and the auto-stop end
+            # Completed with status Partial when Azure refused T4's stop, so its own result line decides, as the nightly
+            # safety stop's does. One that can't be read is taken as failed (fail safe).
+            $stop = if ($job.Id) { Get-DemoSafetyStopJobResult -Name $name -JobName $job.Id } else { $null }
+            $stopStatus = [string](Get-DemoMemberValue -InputObject $stop -Name 'status')
+            $evidence['lastStopJob'] = '{0} ({1})' -f $job.Status, $(if ($stopStatus) { $stopStatus } else { 'no result line' })
+            if ($stopStatus -notin 'Stopped', 'Skipped', 'Deferred', 'NoEnvironment') {
+                $when = if ($null -ne $job.CreatedUtc) { ' (created {0:yyyy-MM-dd HH:mm} UTC)' -f ([datetime]$job.CreatedUtc) } else { '' }
+                $said = (Protect-DemoText -Text ([string](Get-DemoMemberValue -InputObject $stop -Name 'message'))).Trim()
+                if ($said.Length -gt 200) {
+                    $said = $said.Substring(0, 200) + '...'
+                }
+                $what = if (-not $stopStatus) { 'its result couldn''t be read, so it''s taken as failed' } elseif ($said) { 'it says {0}: {1}' -f $stopStatus, $said.TrimEnd('.') } else { 'it says {0}' -f $stopStatus }
+                $reason = 'the last DbHub-Stop job{0} didn''t finish its work ({1}), so the safety stop may not stop T4' -f $when, $what
+                return (& $missing 'StopJob' $reason ('Open the job in {0} (Process Automation > Jobs) to see what it couldn''t stop; when A1 is the cause, an Owner runs {1}. Then run {2}.' -f $name.AutomationAccount, $grant, $setup) $evidence)
+            }
         }
         $evidence['counts'] = $true
         $evidence['missing'] = ''
