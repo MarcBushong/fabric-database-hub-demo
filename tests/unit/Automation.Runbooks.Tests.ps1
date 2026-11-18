@@ -804,17 +804,40 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         ($script:clock - $start).TotalMinutes | Should -BeLessThan 1
     }
 
-    It 'restarts the plugin''s agent once after a cold start when the agent reports no time, after the wait' {
-        # Without MainServiceLastReportedTime a status can't be told from the one before the stop, so a cold start gets the
-        # restart the 2026-10-22 and 2026-10-30 findings call for; after it, the agent is taken at its word.
+    It 'leaves a Running plugin alone after a cold start when the agent reports no time, and restarts a NotRunning one after the wait (#22)' {
+        # Without MainServiceLastReportedTime nothing proves a Running status stale, so it's taken at its word; a NotRunning
+        # one still waits out the start before the restart the 2026-10-22 and 2026-10-30 findings call for.
         $start = $script:clock
         $script:pluginReported = { $null }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Running'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' }) | Should -BeNullOrEmpty
+
+        Reset-TestAzure
+        $start = $script:clock
+        $script:pluginReported = { $null }
+        $script:plugin = { if ($null -ne $script:restartedAt) { 'Running' } else { 'NotRunning' } }
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
         $result.monitoring | Should -Be 'Restarted'
         $restart = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' })
         $restart.Count | Should -Be 1
         ($restart[0].At - $start).TotalMinutes | Should -BeGreaterOrEqual 8
         ($restart[0].At - $start).TotalMinutes | Should -BeLessThan 9
+    }
+
+    It 'leaves a healthy plugin alone on a warm sqlvm01 whose latest start the control''s own Run Commands moved, when the agent reports no time (#22)' {
+        # The provisioning status's time moves with every Run Command, the control's own and the restart included, so it
+        # was 5 minutes old on every warm run and re-check, and the agent was restarted each time.
+        $script:vm['sqlvm01'] = 'running'
+        $script:vmSince['sqlvm01'] = $script:clock.AddMinutes(-5)
+        $script:pluginReported = { $null }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 60 }) -Context (New-TestContext)
+        $result.monitoring | Should -Be 'Running'
+        $script:autostop = '2026-10-27T16:40:00Z'
+        $script:vmSince['sqlvm01'] = $script:clock.AddMinutes(-3)
+        $monitor = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock)
+        $monitor.monitoring | Should -Be 'Running'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-monitoring-' }) | Should -BeNullOrEmpty
     }
 
     It 'compares the status with sqlvm01''s latest start in its instance view when the run didn''t start it' {
@@ -1853,14 +1876,15 @@ Describe 'T1''s monitoring plugin status: when it was reported, and whether it''
     }
 
     It 'is fresh <Case>' -ForEach @(
-        @{ Case = 'when there''s no start to compare with'; Reported = $null; Since = $null; Expected = $true }
-        @{ Case = 'when reported after the start'; Reported = [datetime]::new(2026, 11, 4, 14, 46, 32, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $true }
-        @{ Case = 'not when reported before the start (the stale Running of 2026-11-04)'; Reported = [datetime]::new(2026, 11, 3, 23, 10, 0, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
-        @{ Case = 'not when reported at the start itself'; Reported = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
-        @{ Case = 'not without a time, 12 minutes after the start'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
-        @{ Case = 'without a time, more than 30 minutes after the start'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 16, 0, [System.DateTimeKind]::Utc); Expected = $true }
+        @{ Case = 'when there''s no start to compare with'; State = 'Running'; Reported = $null; Since = $null; Expected = $true }
+        @{ Case = 'when reported after the start'; State = 'Running'; Reported = [datetime]::new(2026, 11, 4, 14, 46, 32, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $true }
+        @{ Case = 'not when reported before the start (the stale Running of 2026-11-04)'; State = 'Running'; Reported = [datetime]::new(2026, 11, 3, 23, 10, 0, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
+        @{ Case = 'not when reported at the start itself'; State = 'Running'; Reported = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
+        @{ Case = 'when Running without a time, 12 minutes after the start: nothing proves it stale (#22)'; State = 'Running'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $true }
+        @{ Case = 'not when NotRunning without a time, 12 minutes after the start'; State = 'NotRunning'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 34, 25, [System.DateTimeKind]::Utc); Expected = $false }
+        @{ Case = 'when NotRunning without a time, more than 30 minutes after the start'; State = 'NotRunning'; Reported = $null; Since = [datetime]::new(2026, 11, 4, 14, 16, 0, [System.DateTimeKind]::Utc); Expected = $true }
     ) {
-        $plugin = [pscustomobject]@{ State = 'Running'; ReportedUtc = $Reported }
+        $plugin = [pscustomobject]@{ State = $State; ReportedUtc = $Reported }
         Test-DbHubPluginFresh -Plugin $plugin -SinceUtc $Since -NowUtc ([datetime]::new(2026, 11, 4, 14, 46, 51, [System.DateTimeKind]::Utc)) | Should -Be $Expected
         # The module's check before a start-demo.ps1 or deploy.ps1 run is the same rule.
         InModuleScope -ModuleName DbHubDemo -Parameters @{ Plugin = $plugin; Since = $Since } { Test-DemoSqlVmPluginFresh -Plugin $Plugin -SinceUtc $Since -NowUtc ([datetime]::new(2026, 11, 4, 14, 46, 51, [System.DateTimeKind]::Utc)) } | Should -Be $Expected

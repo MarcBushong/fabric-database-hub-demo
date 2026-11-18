@@ -4370,14 +4370,25 @@ Describe 'Restore-DemoSqlVmMonitoringPlugin' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
     }
 
-    It 'restarts once after a recent start when the agent reports no time, and takes a VM that has run a while at its word' {
+    It 'leaves a Running plugin alone after a recent start when the agent reports no time, and restarts a NotRunning one after the wait (#22)' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { [datetime]::new(2026, 11, 4, 14, 36, 0, [System.DateTimeKind]::Utc) }
+        # The VM's latest start in its instance view, 2 minutes ago: the provisioning status's time, which every Run Command
+        # moves, deploy.ps1's and start-demo.ps1's own included, so nothing proves a Running status without a time stale.
         $script:vmSinceUtc = [datetime]::new(2026, 11, 4, 14, 34, 0, [System.DateTimeKind]::Utc)
-        foreach ($entry in 'Running', 'Running', 'Running', 'Running') {
+        $script:pluginStates.Enqueue('Running')
+        $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -SettleMinutes 1 -PollSeconds 30 } $config
+        $result.status | Should -Be 'Pass'
+        $result.evidence.fresh | Should -BeTrue
+        $script:readsAtRestart | Should -Be -1 -Because 'a healthy, Running plugin is left alone'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+
+        $script:pluginStates.Clear()
+        $script:reads = 0
+        foreach ($entry in 'NotRunning', 'NotRunning', 'NotRunning', 'Running') {
             $script:pluginStates.Enqueue($entry)
         }
         $result = & (Get-Module -Name DbHubDemo) { param($c) Restore-DemoSqlVmMonitoringPlugin -Config $c -SettleMinutes 1 -PollSeconds 30 } $config
-        $script:readsAtRestart | Should -Be 3
+        $script:readsAtRestart | Should -Be 3 -Because 'a NotRunning status without a time still waits out a recent start'
         $result.status | Should -Be 'Pass' -Because 'after the restart, an agent without the time is taken at its word'
         $result.evidence.reportedUtc | Should -Be 'an unknown time'
 

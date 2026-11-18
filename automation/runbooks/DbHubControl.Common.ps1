@@ -1655,8 +1655,10 @@ function Test-DbHubPluginFresh {
     .SYNOPSIS
     Whether a plugin status (Get-DbHubMonitoringPlugin) was reported after SinceUtc, sqlvm01's start: its ReportedUtc is
     later. Without SinceUtc there's nothing to compare, so it's fresh. Without a ReportedUtc (an agent that doesn't report
-    the time), it's fresh only once the start is more than 30 minutes old, so a cold start still gets its restart and a VM
-    that has run a while isn't restarted on every look.
+    the time), nothing proves a Running status stale, so it's taken at its word (#22, 2026-11-17): the start it would be
+    counted from, the VM's provisioning status's time, moves with every Run Command, the control's own included, and a
+    healthy agent was restarted on every warm run and re-check. Another state without a time is fresh only once the start
+    is more than 30 minutes old, so a recent start still gets its wait before the restart.
     #>
     param(
         [AllowNull()]
@@ -1675,6 +1677,9 @@ function Test-DbHubPluginFresh {
     $reported = Get-DbHubMember -InputObject $Plugin -Name 'ReportedUtc'
     if ($null -ne $reported) {
         return ([datetime]$reported -gt [datetime]$SinceUtc)
+    }
+    if ([string](Get-DbHubMember -InputObject $Plugin -Name 'State') -eq 'Running') {
+        return $true
     }
     return (($NowUtc - [datetime]$SinceUtc).TotalMinutes -gt 30)
 }
