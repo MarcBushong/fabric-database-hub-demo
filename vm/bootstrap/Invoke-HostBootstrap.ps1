@@ -371,6 +371,11 @@ function Get-DemoHostHealthDetail {
     if ($null -ne $evaluation) {
         $detail.evaluation = [ordered]@{ checkedUtc = $evaluation['checkedUtc']; action = $evaluation['action']; reason = $evaluation['reason']; lastRearmUtc = $evaluation['lastRearmUtc'] }
     }
+    # The last restart that cleared a broken PowerShell Direct channel (issue #65); deploy.ps1 reports one from its run.
+    $recovery = Read-DemoGuestRecoveryRecord -StateRoot $Context.Root
+    if ($null -ne $recovery -and $recovery.Contains('restarts') -and @($recovery['restarts']).Count -gt 0) {
+        $detail.guestRecovery = @($recovery['restarts'])[-1]
+    }
     if ($Context.Mode -eq 'PaygWizard') {
         $detail.guidedSetup = Get-DemoHostGuidedSetupDetail -Context $Context
     }

@@ -268,7 +268,9 @@ function Get-DemoHostGuestIsoPath {
 }
 
 function Test-DemoHostGuestReachable {
-    # Never throws: false while the guest is off, booting, or in first-boot setup.
+    # Never throws: false while the guest is off, booting, or in first-boot setup. A broken PowerShell Direct channel in a
+    # guest that's onboarded (so never during its build) is cleared once per bootstrap generation by restarting the guest
+    # (Invoke-DemoGuestRecovery; issue #65): the generation's next steps then reach it.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -281,13 +283,32 @@ function Test-DemoHostGuestReachable {
             return $false
         }
         $credential = Get-DemoGuestCredential -SecretPath $Context.SecretPath -UserName $Context.Guest.AdministratorName
-        return (Test-DemoGuestOnline -Name $Context.GuestName -Credential $credential)
+        $probe = Test-DemoGuestChannel -Name $Context.GuestName -Credential $credential
+        if ($probe.Ok) {
+            return $true
+        }
+        if (-not $probe.Broken) {
+            return $false
+        }
+        $key = 'bootstrap-' + [string]$Context.Settings['generation']
+        if ($script:DemoHostRecoveryTried.Contains($key) -or -not (Test-DemoArcOnboarded -MarkerPath $Context.ArcMarkerPath -MachineName $Context.GuestName -GuestVmId (Get-DemoHostGuestVmId -Name $Context.GuestName))) {
+            return $false
+        }
+        # Once per pass: a recovery that this run can't make (Exhausted, None) isn't asked for again in the same pass.
+        [void]$script:DemoHostRecoveryTried.Add($key)
+        $recovery = Invoke-DemoGuestRecovery -Name $Context.GuestName -Credential $credential -Key $key -By 'archost01''s bootstrap' -Reason $probe.Error -StateRoot $Context.Root -Confirm:$false
+        if ($recovery.Recovered) {
+            [void]$script:DemoHostRecoveryTried.Remove($key)
+        }
+        return [bool]$recovery.Recovered
     }
     catch {
         Write-DemoVmLog -Level 'Warning' -Message ('The guest is not reachable yet: {0}' -f $_.Exception.Message)
         return $false
     }
 }
+
+$script:DemoHostRecoveryTried = New-Object -TypeName 'System.Collections.Generic.HashSet[string]'
 
 function Wait-DemoHostGuest {
     # Starts the guest if needed (after a host restart, for example) and waits up to 10 minutes.
