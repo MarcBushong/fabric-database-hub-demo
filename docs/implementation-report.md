@@ -2911,13 +2911,17 @@ Each part reports its own `DESTROY.*` result, and one that fails is a **Warning*
 
 **Validation.**
 
-- **Full static validation** (`./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester, DotNet, Markdown -CI`, on the final code, after the review's fixes, 27.1 minutes): exit 0.
+- **Full static validation** (`./tests/Invoke-StaticValidation.ps1 -Check PSScriptAnalyzer, Pester, DotNet, Markdown -CI`, on this branch's code, after the review's fixes, 27.1 minutes): exit 0.
   - PSScriptAnalyzer: 0 findings in 364 files.
   - Pester: 4,477 passed, 0 failed, and 39 skipped, of the 4,516 tests discovery finds; no unit test reached the Azure CLI. The skips are this PC's, none of them a new test: 35 notebook tests need Python 3, 3 are gitleaks's, and 1 needs the Insights app's npm packages.
   - The workload generator: 577 tests, 559 passed, 18 skipped (they need a SQL Server or a PostgreSQL server), 0 failed.
   - markdownlint: 0 issues in 139 files.
+- **Merged with `main` at 9fe9a3a** (2026-11-18, #64, the fix for #63): only this report's last section conflicted, and both are kept, this section first. The changelog, the troubleshooting guide, and the code merged on their own. The full static validation on the merged tree (febf1c0, 27.4 minutes): exit 0.
+  - PSScriptAnalyzer: 0 findings in 364 files.
+  - Pester: 4,487 passed (the 4,477 above and #64's 10), 0 failed, and the same 39 skipped, of 4,526; no unit test reached the Azure CLI.
+  - The workload generator: 577 tests, 0 failed. markdownlint: 0 issues in 139 files.
 - **On the old code:** every new test fails on b27f0c1's code, each run with only its fix stashed: the runbooks' (#28, #21, #27, #22), the module's (#22, #23, #25, #24, #26). The dispatch script's tests run the generated script in Windows PowerShell 5.1, as the VMs do (in `pwsh` where it isn't installed), with a failing, a refusing, a passing, and a silent target.
-- **Live:** none; the test environments were destroyed. The user checks #21, #22, #27, and #28 live before the merge, on an existing demo upgraded from `main` ([still to verify](#still-to-verify)).
+- **Live:** none; the test environments were destroyed. The user checks #21, #22, #27, and #28 live before this pull request is merged, on an existing demo upgraded from `main` ([still to verify](#still-to-verify)).
 
 **Risks.** R883 to R889 new; R661 closed; R656 updated.
 
