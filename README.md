@@ -1,10 +1,11 @@
 # Fabric Database Hub hybrid SQL demo
 
-A low-cost, repeatable customer demo of **Microsoft Fabric Database Hub (preview)** and its in-Hub **Database Agent (preview)**, across three SQL targets and one PostgreSQL target, deployed with one command into your own Azure subscription and Fabric capacity.
+A low-cost, repeatable customer demo of **Microsoft Fabric Database Hub**, generally available since Microsoft Ignite on 2026-11-17, with its **Copilot** and **Database Agents** (previews), across three SQL targets and one PostgreSQL target, deployed with one command into your own Azure subscription and Fabric capacity.
 
 **Start here:**
 
 - [Deploy it](#quick-start)
+- [Demo it yourself](#demo-it-yourself)
 - [What's deployed, and by what](#whats-deployed-and-by-what)
 - [What bills, stopped and running](#what-bills-stopped-and-running)
 - [What you control](#what-you-control)
@@ -12,9 +13,9 @@ A low-cost, repeatable customer demo of **Microsoft Fabric Database Hub (preview
 - [Upgrading an existing demo](#upgrading-an-existing-demo)
 - [Delete everything](#delete-everything)
 
-**The story:** fragmented visibility before; one hybrid estate in Database Hub after; then a live incident (locking, CPU, IO, a missing index, an inefficient query, or a read replica that falls behind) that the presenter investigates with the Database Agent. Every action the agent proposes needs human approval.
+**The story:** fragmented visibility before; one hybrid estate in Database Hub after, with what needs attention, what changed, and which server is ready to migrate; then a live incident (locking, CPU, IO, a missing index, an inefficient query, or a read replica that falls behind) that the presenter investigates with Copilot, and, on T3, the whole Database Agent loop: the agent raises the issue, Copilot explains it, a person responds, and the agent tracks it to its close. Every action an agent proposes needs human approval.
 
-> **Preview disclosure:** Database Hub, the Database Agent, SQL VM performance monitoring, unified inventory, the Arc SQL monitoring setting, the telemetry endpoint, and Fabric Apps are previews and can change. This repo uses only documented interfaces and says plainly what's manual, unsupported, or not yet proven ([limitations](docs/limitations.md)).
+> **What's generally available, and what's a preview:** Database Hub is generally available (2026-11-17): its estate, performance, security, and optimization views, its real-time dashboards for SQL, PostgreSQL, and Cosmos DB, its SSMS and VS Code entry points, bulk monitoring enablement, and its CLI skill. Copilot, Database Agents, alerts, and SQL Server on Azure VM monitoring are still previews, as are unified inventory, the Arc SQL monitoring setting, the telemetry endpoint, and Fabric Apps, and they can change. Database Hub's own views need no Fabric capacity; Copilot, custom alerts, shared dashboards, and the demo's notebooks and app do. This repo uses only documented interfaces and says plainly what's manual, unsupported, or not yet proven ([limitations](docs/limitations.md#preview-disclosures)).
 
 ## What's deployed, and by what
 
@@ -30,7 +31,7 @@ Everything goes to two places, which the scripts find by name and create when th
 | The T3 and T4 administrators' group `<prefix>-<environment>-sql-admins` | Microsoft Entra ID | `./scripts/init.ps1 -CreateAdminGroup`, or `deploy.ps1`'s first run, which does the same | `destroy.ps1`, when `init.ps1` created it. A group you supplied stays |
 | The budget and the deployment record `<prefix>-<environment>-main` | Azure | `deploy.ps1` | `destroy.ps1` |
 | The T2 golden snapshot group `rg-<prefix>-golden` (optional: it only speeds up a redeploy) | Azure | `./scripts/capture-t2-golden.ps1` | `destroy.ps1 -IncludeGolden` |
-| The demo's Fabric workspace (`fabric.workspaceName`): the lakehouse `LH_DatabaseHub`, the notebooks `NB_DatabaseHub_Deployment` and `NB_DatabaseHub_LiveActivity`, the Real-Time Dashboard `RTD_DatabaseHub_LiveView`, the model `SM_DatabaseHub_History`, the report `RPT_DatabaseHub_History`, and the Insights app `APP_DatabaseHub_Insights` with its connector | Fabric | `deploy.ps1`'s Fabric track. Each Run all session adds its history to the lakehouse | `destroy.ps1`, when everything in it is the demo's and no other environment uses it; `-KeepFabric` keeps it |
+| The demo's Fabric workspace (`fabric.workspaceName`): the lakehouse `LH_DatabaseHub`, the notebooks `NB_DatabaseHub_Deployment` and `NB_DatabaseHub_LiveActivity`, the Real-Time Dashboard `RTD_DatabaseHub_LiveView`, the model `SM_DatabaseHub_History`, the report `RPT_DatabaseHub_History`, and the Insights app `APP_DatabaseHub_Insights` with its connector; and, since 2026-11-18, the presenters in `presenterObjectIds` as the workspace's Viewers | Fabric | `deploy.ps1`'s Fabric track. Each Run all session adds its history to the lakehouse | `destroy.ps1`, when everything in it is the demo's and no other environment uses it; `-KeepFabric` keeps it |
 | The control notebook `NB_DatabaseHub_Control`: where a policy makes new Key Vaults private, in its own workspace ("&lt;workspace&gt; Control") with a managed private endpoint to the control's Key Vault; otherwise in the folder "DBHub Control" of the demo's workspace | Fabric | `deploy.ps1` | `destroy.ps1`: the workspace when its notebook serves this environment and no other environment uses it, the folder with the demo's workspace; `-KeepFabric` keeps them |
 
 **Database Hub itself** is a Fabric portal page, with nothing to deploy: it finds the targets through Azure Resource Graph and charts their telemetry and metrics. The [architecture](docs/architecture.md#at-a-glance) has a diagram and each part's details.
@@ -43,7 +44,7 @@ Everything goes to two places, which the scripts find by name and create when th
 - **During a session:** the VMs' compute and their pay-as-you-go SQL Server licenses (T1 by the hour, T2 per core-hour through Azure Arc), T3's compute while it's active, T4 and its read replica, and Bastion, when you started one for interactive access.
 - **Close to nothing:** the two Automation accounts (their jobs fit in the 500 job minutes a month that Azure Automation includes), the Key Vault's operations, the identities, the role definitions, and the budget.
 - **Outside the estimate:** the Fabric capacity, which bills while it runs, and licenses.
-- **The ceilings:** $15 a session (`sessionCeilingUsd`), a **Warning** above it, and $375 a month (`monthlyCeilingUsd`), a hard ceiling that preflight fails above. The deployment adds a budget with alerts at 50%, 80%, and 100% of the monthly one.
+- **The ceilings:** $20 a session (`sessionCeilingUsd`; $15 before 2026-11-18, and a configuration that still says 15 gets 20), a **Warning** above it, and $375 a month (`monthlyCeilingUsd`), a hard ceiling that preflight fails above. The deployment adds a budget with alerts at 50%, 80%, and 100% of the monthly one.
 - **The figures:** `./scripts/estimate-cost.ps1` prices it from Azure's list prices at run time, with no sign-in; [cost management](docs/cost-management.md#at-a-glance) has dated examples.
 
 ## Quick start
@@ -75,13 +76,34 @@ On its first run, `deploy.ps1` writes `config/demo.config.json` from your sign-i
 - **NOT DONE:** why, the single next action, and the exact command: usually `./scripts/deploy.ps1` again, which continues where it stopped. If the window closes or the PC restarts, run it again; you never need a flag to continue.
 - **The Insights app** deploys with your `az login`. When it can't be created, the run still ends **DONE**, and the status page shows the app's step as **Failed**, with the error and the fix. A browser sign-in, `./scripts/configure-fabric-app.ps1 -SignIn`, is needed only if Fabric refuses your Azure CLI's token.
 
-**See it:** open **Database Hub** in the Fabric portal and look at Estate and Performance. The default activity, `business-day`, runs bounded incidents at fixed minutes every hour, so Performance's problem panels fill within the hour. For one right now: `./scripts/demo-control.ps1 -Target T2 -Scenario incident:cpu-pressure -Duration 25`. Then investigate it with the Database Agent, approving or cancelling each action it proposes.
+**See it:** open **Database Hub** in the Fabric portal and look at Estate and Performance. The default activity, `business-day`, runs bounded incidents at fixed minutes every hour, so Performance's problem panels fill within the hour. For one right now: `./scripts/demo-control.ps1 -Target T2 -Scenario incident:cpu-pressure -Duration 25`. Then investigate it with Copilot in Database Hub, approving or cancelling each action it proposes.
 
 **More:** [deployment](docs/deployment.md#deploy-it-step-by-step) has every step, option, and command, and [how long each takes](docs/deployment.md#how-long-each-step-takes). An AI assistant can run it for you, but `az login` stays yours ([running it with an AI assistant](docs/deployment.md#running-it-with-an-ai-assistant), [AGENTS.md](AGENTS.md)).
 
+## Demo it yourself
+
+Whoever deploys the demo can present it, as often as they like, with the same steps every time.
+
+**Once per deployment:**
+
+1. **Deploy:** `az login`, then `./scripts/deploy.ps1`, and wait for **DONE** ([quick start](#quick-start)). An upgrade is the same command.
+2. **Select T3 for Database Agents, about 30 seconds.** Database Agents has no API, so this is the one step no script can do: **DONE** and the status page list it under **Please confirm**, with the link and the exact database (`HUB.AGENT.T3`). In [Database Hub](https://app.fabric.microsoft.com/workloads/fdh/databaseHub), select **Manage agents** (upper left), then **Database agent settings**; turn **Enabled** on, select `azuresql01-<deploymentId>/ContosoCare`, turn on **Flag long-running queries**, **Force last known good plans**, and **Flag high CPU**, then select **Apply** and **Save**. The green **Database agent is active** message confirms it. Do it while T3 is awake, right after **DONE** or during a session. It stays selected through sessions and upgrades; only a recreated T3 (`stop-demo.ps1 -RemoveT3`) needs it again. Saving needs Azure write access on T3, which `T3.AGENT` checks and gives the fix for, and T3 in a region associated with your Fabric tenant's home region ([the Database Agent loop](docs/demo-walkthrough.md#the-database-agent-loop-on-t3)).
+3. **Open the Insights app,** `APP_DatabaseHub_Insights` in the demo workspace, and sign in with GitHub once when it asks: its Copilot chat uses your GitHub Copilot license ([the Insights app](fabric/app/README.md)).
+
+**Every session:**
+
+1. **Run all:** resume the Fabric capacity if it's paused, open `NB_DatabaseHub_Control`, and select **Run all**, about 30 minutes before your audience. There's nothing to edit, and the guide it prints gives each moment's time in your clock.
+2. **Show the DBA moments** (the rehearsal steps are in [the walkthrough](docs/demo-walkthrough.md#the-dba-moments-in-a-run-all-session)):
+   - **[Open at Overview](docs/demo-walkthrough.md#open-at-overview):** **What needs attention**, then **Recent signal changes**. Ask Copilot "What changed in my databases?", "Which resource should I investigate next?", and "Which security findings should I address first?".
+   - **[T2 ready to migrate](docs/demo-walkthrough.md#optimization-t2-ready-to-migrate):** **Optimization**, then T2 (`arcsql01`) and its migration assessment: its readiness for each Azure SQL target and the recommended size, at no charge. T1 and T2 show no license finding because they already use pay-as-you-go.
+   - **[The Database Agent loop on T3](docs/demo-walkthrough.md#the-database-agent-loop-on-t3),** from about 30 to 60 minutes into the session: T3's plan regresses, and about 15 minutes later the agent raises an issue. Open it, select **Explain why**, then **Analyze slow query**. When the notebook prints "Now: T3 Respond", Run all makes the manual response, forcing the last good plan; T3's CPU falls, and the issue closes, or you close it once you've checked.
+3. **The end:** Run all stops everything and saves the session's history. The report and the Insights app show it, with T3's CPU before and after the response.
+
+**Reset, stop, and repeat:** every Run all repeats the moments. The agent raises a new issue each session (closed ones stay in its history), `FORCE_LAST_GOOD_PLAN` comes back on however a session ends (`./scripts/status.ps1` shows it), and T2's assessment stays on through upgrades. To start clean: `RESET_NOW = True` in the notebook, or `./scripts/reset-demo.ps1`. To stop from a PC: `./scripts/stop-demo.ps1`. The [nightly stop](#what-stops-or-pauses-on-its-own) catches what you forget.
+
 ## Day to day
 
-- **Run a session:** open `NB_DatabaseHub_Control` where **DONE** says (its own workspace, or the folder "DBHub Control" of the demo's) and select **Run all**. With nothing to edit, it starts the VMs, T4, and T4's read replica, runs the 90-minute showcase of bounded incidents on all four targets, prints a presenter's guide with links and Database Agent prompts, shows a live view, then stops everything and saves the session's history for the report and the Insights app ([the notebook's guide](fabric/control/README.md)). Resume the capacity first: it runs the notebook, and Run all never resumes it. Start about 30 minutes before your audience: the first data reaches Database Hub 10 to 35 minutes after Run all ([what fills each visual, and when](docs/database-hub-visuals.md)).
+- **Run a session:** open `NB_DatabaseHub_Control` where **DONE** says (its own workspace, or the folder "DBHub Control" of the demo's) and select **Run all**. With nothing to edit, it starts the VMs, T4, and T4's read replica, runs the 90-minute showcase of bounded incidents on all four targets, prints a presenter's guide with links, the Database Agent loop's times, and Copilot prompts, shows a live view, then stops everything and saves the session's history for the report and the Insights app ([the notebook's guide](fabric/control/README.md)). Resume the capacity first: it runs the notebook, and Run all never resumes it. Start about 30 minutes before your audience: the first data reaches Database Hub 10 to 35 minutes after Run all ([what fills each visual, and when](docs/database-hub-visuals.md)).
 - **Or from your PC:** `./scripts/start-demo.ps1` (about 8 minutes; it creates T4's read replica within its warm-up, about 9), then `./scripts/stop-demo.ps1 -SaveHistory`, which saves the session's history.
 - **Stop now:** `./scripts/stop-demo.ps1`: it turns the activity off, shuts T2's guest down, deallocates both VMs, deletes T4's read replica, and stops T4. Or the notebook's **Stop now** cell, with `STOP_NOW = True`. If you forget, the [nightly stop](#what-stops-or-pauses-on-its-own) stops the demo that evening.
 - **See where it stands:** `./scripts/status.ps1`, read-only; `-Detail` adds more.
@@ -98,6 +120,7 @@ On its first run, `deploy.ps1` writes `config/demo.config.json` from your sign-i
   - size and cost: `profile` (`lowest-cost` by default), `t4SkuName`, `monthlyCeilingUsd`, and `sessionCeilingUsd`;
   - when the demo stops: `autoShutdownTime` and `autoShutdownTimeZone`, which the VMs' auto-shutdown and the nightly safety stop use, and `t3AutoPauseMinutes`;
   - the activity: `activityProfile` (`business-day` by default; `baseline` for a quiet demo);
+  - who presents: `presenterObjectIds`, whom `deploy.ps1` adds to the demo workspace as Viewers (and, with `assignRoles`, gives the Azure roles Database Hub needs);
   - Fabric: `fabric.workspaceName`, `fabric.capacityName`, and `fabric.lakehouseName`; and the control's `control.fabricWorkspaceName` and `control.roleNameSuffix`. Each environment needs its own `fabric.workspaceName`, and its own `control.fabricWorkspaceName` when its configuration sets one (by default it follows the workspace's name). Two environments in one workspace overwrite each other's notebooks: `deploy.ps1` says so in a **Warning** (`DEPLOY.FABRIC.SHARED`), and `destroy.ps1` keeps that workspace.
 - **`deploy.ps1`'s switches**, rarely needed: `-FromStage <stage>` runs again from a stage, `-StopAfter <stage>` stops after one, `-SkipFabric` leaves Fabric alone, `-NoSelfUpdate` runs the code you have, and `-WhatIf` changes nothing.
 - **Run all's parameters,** in the control notebook's first cell; none needs editing: `DURATION_MINUTES` (90 by default, 30 to 120), `MODE` (`"check"` shows the plan and sends nothing), and `STOP_NOW = True` or `RESET_NOW = True` for its **Stop now** and **Reset** cells ([the switches](fabric/control/README.md#the-switches)).
@@ -127,9 +150,10 @@ Nothing here needs you, and nothing here starts anything: only Azure starts a st
 - **One command:** `./scripts/deploy.ps1`. It first updates a clean checkout of `main` from GitHub, then runs that code; `-NoSelfUpdate` runs the code you have. Your configuration file needs no edit.
 - **Without your configuration file** (a fresh clone, another PC, a lost file; since 2026-11-18, [#60](https://github.com/MarcBushong/fabric-database-hub-demo/issues/60)): the same command's first run reads what this subscription already has before it writes one. When the environment is yours (its owner tag or budget address is your sign-in, or you own the group that administers its T3 and T4), the configuration is written from what's deployed: its administrators' group, network mode, region, sizes, schedule, ceilings, profile, Fabric workspaces, and the session control's own custom roles, so the update changes nothing you didn't ask for. It republishes the notebooks of the demo's own workspace: the one it records, one that holds only what the demo creates, or one the demo's notebooks are already in. Another workspace keeps its copies, and `INIT.EXISTING` says which, and why. Settings Azure doesn't record, such as `sessionCeilingUsd` and `activityProfile`, keep their defaults, and `INIT.EXISTING` lists them. When it isn't yours, or that can't be told, the run never updates it: it deploys a new environment with the next free prefix (`dbhub2`, ...), its own group, and its own workspace. The console and the status page say which. For an environment with another prefix, run `./scripts/init.ps1 -Prefix <prefix>` first ([deployment](docs/deployment.md#first-run-initps1)).
 - **What that run changes,** with nothing to do by hand: it adds T4's read replica for each session and the session control behind Run all (a control you set up before is adopted as it is); republishes the runbooks, the notebooks, the history model, the Insights app, and the workload runner; keeps the lakehouse's history; and brings back a T2 host whose VM agent no longer starts, rebuilding only that VM, once, when nothing else works (about 70 minutes more). T4 keeps its size and its data.
+- **The Database Hub GA updates (2026-11-18):** the same run scales T3 to 2 vCores online (under 30 seconds of interruption; a free-offer database keeps its offer), turns on T2's migration assessment and starts its first run, gives a configuration whose session ceiling is exactly 15 the new 20, republishes the notebooks with the Database Agent loop, and shares the demo's dashboard with your presenters (`presenterObjectIds`). Then select T3 for Database Agents once ([demo it yourself](#demo-it-yourself)); **DONE** lists it under **Please confirm** (`HUB.AGENT.T3`) ([deployment](docs/deployment.md#upgrading-to-the-database-hub-ga-updates-2026-11-18)).
 - **When you aren't an Owner:** **DONE** prints `./scripts/grant-safety-stop.ps1` for an Owner to run once, for the nightly safety stop's and the session control's roles together.
 - **`destroy.ps1` deletes more than it used to** (2026-11-17): also the session control, the Fabric workspaces with the history in the lakehouse, and the administrators' group that `init.ps1` created, each only when it's this environment's ([delete everything](#delete-everything)).
-- **Cost:** nothing new bills between sessions. The replica adds about $1.80 to a 5-hour session and under $0.50 to each `deploy.ps1` run, at the 2026-11-13 list prices.
+- **Cost:** nothing new bills between sessions. The replica adds about $1.80 to a 5-hour session and under $0.50 to each `deploy.ps1` run, at the 2026-11-13 list prices. T3's second vCore (2026-11-18) adds up to about $0.52 for each hour T3 runs: a 5-hour `lowest-cost` session goes from $12.42 to $15.03 at the 2026-11-18 list prices, within the $20 ceiling. T2's migration assessment is free.
 
 [Deployment](docs/deployment.md#upgrading-from-before-the-read-replica-and-run-all-2026-11-13-to-2026-11-16) has each change in detail.
 
@@ -169,7 +193,7 @@ Then it checks that nothing of the environment is left (`DESTROY.RESIDUAL`, [cle
 - **A bug in the code or the docs:** open an issue with the **Bug report** template. For an idea, use **Feature request**.
 - **Replace your IDs first:** this repository is public. Before you paste output into an issue, replace subscription, tenant, object, client, and workspace IDs, the T3 and T4 server names' random suffix, and your account with placeholders such as `<subscriptionId>`, and never paste a token, a password, or a webhook URL.
 - **A security problem:** report it privately, as [SECURITY.md](SECURITY.md) describes, never in an issue.
-- **Questions about the products** (Database Hub, the Database Agent, Fabric, Azure Arc): see [Microsoft Learn](https://learn.microsoft.com/fabric/database/hub/overview) and the [official sources](docs/references.md); this repository is a demo, not a product support channel.
+- **Questions about the products** (Database Hub, its Copilot and Database Agents, Fabric, Azure Arc): see [Microsoft Learn](https://learn.microsoft.com/fabric/database/hub/overview) and the [official sources](docs/references.md); this repository is a demo, not a product support channel.
 
 ## Documentation
 
@@ -180,7 +204,7 @@ Then it checks that nothing of the environment is left (`DESTROY.RESIDUAL`, [cle
 - **Every prerequisite and how it's checked:** [prerequisites](docs/prerequisites.md#each-prerequisite-and-how-its-checked) and [permissions](docs/permissions.md).
 - **The parts at a glance, with a diagram:** [architecture](docs/architecture.md#at-a-glance) and the [decisions (ADRs)](docs/adr/README.md).
 - **What fills each Database Hub visual, when, and the baseline run:** [Database Hub's visuals](docs/database-hub-visuals.md).
-- **Presenting:** [presentation surfaces](docs/presentation.md), with screenshots, and the [demo walkthrough](docs/demo-walkthrough.md).
+- **Presenting:** [presentation surfaces](docs/presentation.md), with screenshots, the [demo walkthrough](docs/demo-walkthrough.md), and its [DBA moments in a Run all session](docs/demo-walkthrough.md#the-dba-moments-in-a-run-all-session).
 - **Run all:** [the control notebook's guide](fabric/control/README.md) and its [runbooks](automation/README.md).
 - **Cost, and everything that stops or pauses on its own:** [cost management](docs/cost-management.md).
 - **Your sign-in and tokens:** [security model](docs/security-model.md#your-sign-in-and-tokens) and the [security policy](SECURITY.md).

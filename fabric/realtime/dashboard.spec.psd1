@@ -72,8 +72,10 @@
             Page     = 'estate-pulse'
             Title    = 'About this view'
             Visual   = 'markdownCard'
-            Layout   = @{ X = 0; Y = 0; Width = 24; Height = 2 }
-            Markdown = '**Live view of the Database Hub telemetry endpoint (preview).** Samples arrive a few minutes after the activity, and each viewer sees only the resources their own Azure access allows. No data is not zero.'
+            Layout   = @{ X = 0; Y = 0; Width = 24; Height = 3 }
+            # T4 and Azure Cosmos DB aren't in the SQL telemetry: Database Hub's own real-time dashboards show them, generally
+            # available since 2026-11-17 (2026-11-18, ADR 0019's follow-up; no Log Analytics workspace).
+            Markdown = '**Live view of the Database Hub telemetry endpoint (preview): T1, T2, and T3.** Samples arrive a few minutes after the activity, and each viewer sees only the resources their own Azure access allows. No data is not zero. **T4 (PostgreSQL) and Azure Cosmos DB:** open [Database Hub](https://app.fabric.microsoft.com/workloads/fdh/databaseHub), then **Performance**: their real-time dashboards are generally available.'
         }
         @{
             Key        = 'freshness'
@@ -81,7 +83,7 @@
             Title      = 'Freshness per target'
             Visual     = 'multistat'
             Query      = 'estate-pulse'
-            Layout     = @{ X = 0; Y = 2; Width = 10; Height = 5 }
+            Layout     = @{ X = 0; Y = 3; Width = 10; Height = 5 }
             Label      = 'Target'
             Value      = 'Freshness'
             Slots      = 3
@@ -97,7 +99,7 @@
             Title      = 'Reporting per target: tables, rows, and the newest sample'
             Visual     = 'table'
             Query      = 'estate-pulse'
-            Layout     = @{ X = 10; Y = 2; Width = 14; Height = 5 }
+            Layout     = @{ X = 10; Y = 3; Width = 14; Height = 5 }
             ColorRules = @(
                 @{ Name = 'Fresh'; Column = 'State'; Operator = '=='; Values = @('Fresh'); Color = 'green'; Icon = 'completed' }
                 @{ Name = 'Stale'; Column = 'State'; Operator = '=='; Values = @('Stale'); Color = 'yellow'; Icon = 'warning' }
@@ -110,7 +112,7 @@
             Title  = 'Telemetry heartbeat: CPU samples per bin'
             Visual = 'timechart'
             Query  = 'heartbeat'
-            Layout = @{ X = 0; Y = 7; Width = 24; Height = 6 }
+            Layout = @{ X = 0; Y = 8; Width = 24; Height = 6 }
             X      = 'Bucket'
             Y      = @('Samples')
             Series = @('Target')

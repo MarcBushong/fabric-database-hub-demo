@@ -905,6 +905,12 @@ function Invoke-DemoDeployment {
                     $status = Invoke-DemoWorkloadCommand -Config $Config -Target 'T1' -ArgumentList 'status', '--json' -TimeoutSeconds 300 -Confirm:$false
                     $results.Add($status.Result)
                 }
+                # The Database Agent loop's one manual step, once per deployment (2026-11-18): under "Please confirm"
+                # (HUB.AGENT.T3), as in the parallel path.
+                $agentItem = Get-DemoT3AgentSetupItem -Config $Config -ServerName ('azuresql01-{0}' -f [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Tags') -Name 'deploymentId'))
+                if ($null -ne $agentItem) {
+                    $results.Add($agentItem)
+                }
                 & $recordStage 'Validation'
                 & $stageResult 'Validation' 'Pass' ('The validation ran for {0}.' -f ($targets -join ', '))
                 $validated = $true

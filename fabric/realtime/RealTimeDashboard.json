@@ -251,9 +251,9 @@
         "x": 0,
         "y": 0,
         "width": 24,
-        "height": 2
+        "height": 3
       },
-      "markdownText": "**Live view of the Database Hub telemetry endpoint (preview).** Samples arrive a few minutes after the activity, and each viewer sees only the resources their own Azure access allows. No data is not zero.",
+      "markdownText": "**Live view of the Database Hub telemetry endpoint (preview): T1, T2, and T3.** Samples arrive a few minutes after the activity, and each viewer sees only the resources their own Azure access allows. No data is not zero. **T4 (PostgreSQL) and Azure Cosmos DB:** open [Database Hub](https://app.fabric.microsoft.com/workloads/fdh/databaseHub), then **Performance**: their real-time dashboards are generally available.",
       "visualOptions": {}
     },
     {
@@ -263,7 +263,7 @@
       "pageId": "7f1e76e8-8e22-594f-a60f-c51d2bec421c",
       "layout": {
         "x": 0,
-        "y": 2,
+        "y": 3,
         "width": 10,
         "height": 5
       },
@@ -361,7 +361,7 @@
       "pageId": "7f1e76e8-8e22-594f-a60f-c51d2bec421c",
       "layout": {
         "x": 10,
-        "y": 2,
+        "y": 3,
         "width": 14,
         "height": 5
       },
@@ -457,7 +457,7 @@
       "pageId": "7f1e76e8-8e22-594f-a60f-c51d2bec421c",
       "layout": {
         "x": 0,
-        "y": 7,
+        "y": 8,
         "width": 24,
         "height": 6
       },

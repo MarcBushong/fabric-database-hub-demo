@@ -403,8 +403,8 @@ Describe 'configure-fabric.ps1 -ImportDashboard' {
         $output = & $configureFabric -ConfigPath $configPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -ImportDashboard -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1 | Out-String
         $LASTEXITCODE | Should -Be 0
         $results = Read-DashboardResult
-        $results.checkId | Should -Be @('FABRIC.IMPORT.RTD_DATABASEHUB_LIVEVIEW', 'FABRIC.READBACK.RTD_DATABASEHUB_LIVEVIEW', 'PREFLIGHT.GUARD.CONTEXT', 'FABRIC.DASHBOARD.DATA')
-        $results.status | Should -Be @('Pass', 'Pass', 'Pass', 'Pass')
+        $results.checkId | Should -Be @('FABRIC.IMPORT.RTD_DATABASEHUB_LIVEVIEW', 'FABRIC.READBACK.RTD_DATABASEHUB_LIVEVIEW', 'FABRIC.PRESENTER.VIEWER', 'PREFLIGHT.GUARD.CONTEXT', 'FABRIC.DASHBOARD.DATA')
+        $results.status | Should -Be @('Pass', 'Pass', 'Not selected', 'Pass', 'Pass')
         Should -Invoke -CommandName Test-DemoRealTimeDashboardData -Times 1 -Exactly
         $output | Should -Not -Match ([regex]::Escape($plainToken))
         ((Get-Content -LiteralPath $outputPath -Raw)) | Should -Not -Match ([regex]::Escape($plainToken))
@@ -418,7 +418,7 @@ Describe 'configure-fabric.ps1 -ImportDashboard' {
             @{ Method = 'Post'; Match = $readUri; Responses = @(New-FabricResponse -Status 200 -Body (ConvertTo-ReadBackBody -Json $rendered)) }
         )
         $null = & $configureFabric -ConfigPath $configPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -ImportDashboard -SkipDashboardDataCheck -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
-        (Read-DashboardResult).checkId | Should -Be @('FABRIC.IMPORT.RTD_DATABASEHUB_LIVEVIEW', 'FABRIC.READBACK.RTD_DATABASEHUB_LIVEVIEW')
+        (Read-DashboardResult).checkId | Should -Be @('FABRIC.IMPORT.RTD_DATABASEHUB_LIVEVIEW', 'FABRIC.READBACK.RTD_DATABASEHUB_LIVEVIEW', 'FABRIC.PRESENTER.VIEWER')
 
         Set-FabricMock -Routes @(
             @{ Method = 'Get'; Match = $listUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @() }) }
@@ -449,6 +449,59 @@ Describe 'configure-fabric.ps1 -ImportDashboard' {
         $null = & $configureFabric -ConfigPath $configPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -Confirm:$false *>&1
         $LASTEXITCODE | Should -Be 0
         @(Get-Content -LiteralPath $outputPath | Where-Object { $_ }).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-WebRequest -Times 0 -Exactly
+    }
+}
+
+Describe 'The dashboard shared with the presenters (Grant-DemoPresenterWorkspaceAccess, 2026-11-18)' {
+    BeforeAll {
+        $script:secureToken = ConvertTo-TestSecureString $script:plainToken
+        $script:roleUri = '^' + [regex]::Escape("$script:api/workspaces/$script:workspaceId/roleAssignments") + '$'
+        $script:alice = 'aaaaaaaa-0000-0000-0000-00000000000a'
+        $script:bob = 'bbbbbbbb-0000-0000-0000-00000000000b'
+    }
+
+    It 'adds each presenter without a role as a Viewer of the demo workspace, and keeps the role one already has' {
+        $config = Get-TestConfig
+        $config['presenterObjectIds'] = @($script:alice, $script:bob.ToUpperInvariant())
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $roleUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = 'r1'; principal = @{ id = $script:bob; type = 'User' }; role = 'Contributor' }) }) }
+            @{ Method = 'Post'; Match = $roleUri; Responses = @(New-FabricResponse -Status 201 -Body @{ id = 'r2'; principal = @{ id = $script:alice; type = 'User' }; role = 'Viewer' }) }
+        )
+        $result = Grant-DemoPresenterWorkspaceAccess -Config $config -WorkspaceId $script:workspaceId -Token $secureToken -Confirm:$false
+        $result.checkId | Should -Be 'FABRIC.PRESENTER.VIEWER'
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match '^The demo workspace is shared with the 2 presenter\(s\) in presenterObjectIds \(1 added as Viewers, 1 already had a role\), so they can open RTD_DatabaseHub_LiveView'
+        $posts = @($requests | Where-Object Method -EQ 'Post')
+        $posts.Count | Should -Be 1
+        # Field by field: a hashtable's key order isn't stable from one process to the next.
+        $posted = $posts[0].Body | ConvertFrom-Json
+        @($posted.PSObject.Properties.Name | Sort-Object) | Should -Be @('principal', 'role')
+        $posted.role | Should -Be 'Viewer'
+        $posted.principal.id | Should -Be $script:alice
+        $posted.principal.type | Should -Be 'User'
+    }
+
+    It 'warns with the portal''s steps, and never fails, when a presenter can''t be added or the roles can''t be listed' {
+        $config = Get-TestConfig
+        $config['presenterObjectIds'] = @($script:alice)
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = $roleUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @() }) }
+            @{ Method = 'Post'; Match = $roleUri; Responses = @(New-FabricResponse -Status 403 -Body @{ errorCode = 'InsufficientPrivileges'; message = 'The caller is a Viewer.' }) }
+        )
+        $refused = Grant-DemoPresenterWorkspaceAccess -Config $config -WorkspaceId $script:workspaceId -Token $secureToken -Confirm:$false
+        $refused.status | Should -Be 'Warning'
+        $refused.message | Should -Match 'HTTP 403 InsufficientPrivileges'
+        $refused.remediation | Should -Match 'Manage access, then Add people or groups, and add each presenter as Viewer'
+        Set-FabricMock -Routes @(@{ Method = 'Get'; Match = $roleUri; Responses = @(New-FabricResponse -Status 401 -Body @{ errorCode = 'Unauthorized' }) })
+        (Grant-DemoPresenterWorkspaceAccess -Config $config -WorkspaceId $script:workspaceId -Token $secureToken -Confirm:$false).message | Should -Match 'couldn''t be listed \(HTTP 401 Unauthorized\)'
+    }
+
+    It 'sends nothing without presenters' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { throw 'no network calls expected' }
+        $config = Get-TestConfig
+        $config['presenterObjectIds'] = @()
+        (Grant-DemoPresenterWorkspaceAccess -Config $config -WorkspaceId $script:workspaceId -Token $secureToken -Confirm:$false).status | Should -Be 'Not selected'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-WebRequest -Times 0 -Exactly
     }
 }
