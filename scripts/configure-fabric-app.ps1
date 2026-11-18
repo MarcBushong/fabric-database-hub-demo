@@ -363,15 +363,24 @@ if (-not $RayfinSignIn) {
 }
 
 #region Step 4-5: stage and prerequisites
+$resourceGroupName = $(if ($config -and $config['prefix'] -and $config['environment']) { 'rg-{0}-{1}' -f $config['prefix'], $config['environment'] } else { '' })
 $deployFile = [ordered]@{
     expectedAccount  = $(if ($config) { [string]$config['azureAccount'] } else { '' })
     expectedTenantId = $tenantId
     # Names only, for the app's Database Agent prompts: never an ID or a secret.
-    resourceGroup    = $(if ($config -and $config['prefix'] -and $config['environment']) { 'rg-{0}-{1}' -f $config['prefix'], $config['environment'] } else { '' })
+    resourceGroup    = $resourceGroupName
     links            = $links
 }
+# The Copilot dock (Ask): the chat relay's address, and whether the live estate function has a scope. The relay is
+# found by its tag in the demo's resource group (deploy.ps1 creates it); without one, the dock says Ask isn't deployed.
+$functionScope = $null
+if ($config -and $guarded -and $resourceGroupName) {
+    $askRelay = Get-DemoAskRelayEndpoint -SubscriptionId ([string]$config['subscriptionId']) -ResourceGroupName $resourceGroupName
+    $functionScope = @{ subscriptionId = [string]$config['subscriptionId']; resourceGroups = @($resourceGroupName) }
+    $deployFile['ask'] = [ordered]@{ relayUrl = $(if ($askRelay) { $askRelay } else { '' }); estate = $true }
+}
 $envValues = [ordered]@{ DBHUB_FABRIC_WORKSPACE_ID = $targetWorkspaceId; DBHUB_SEMANTIC_MODEL_ID = $modelId }
-$stageResults = @(Sync-DemoFabricAppStage -SourcePath $sourcePath -StagePath $stage -EnvValues $envValues -DeployFile $deployFile -SkipInstall:$SkipInstall -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
+$stageResults = @(Sync-DemoFabricAppStage -SourcePath $sourcePath -StagePath $stage -EnvValues $envValues -DeployFile $deployFile -FunctionScope $functionScope -SkipInstall:$SkipInstall -TimeoutSeconds $TimeoutSeconds -Confirm:$false)
 $results.AddRange([object[]]$stageResults)
 if (@($stageResults | Where-Object { $_.status -eq 'Fail' }).Count -gt 0) {
     & $skip 'FABRIC.APP.DEPLOY' 'The deploy stage isn''t ready, so nothing was deployed.'

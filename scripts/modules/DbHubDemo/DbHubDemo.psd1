@@ -28,6 +28,7 @@
         'Find-DemoSemanticModel'
         'Find-DemoSignInData'
         'Get-DemoArcCheck'
+        'Get-DemoAskRelayEndpoint'
         'Get-DemoConfig'
         'Get-DemoCostEstimate'
         'Get-DemoDefenderPlan'

@@ -614,6 +614,37 @@ function Get-DemoFabricAppFileHash {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Get-DemoFabricAppScopeSource {
+    <#
+    .SYNOPSIS
+    The TypeScript of rayfin/functions/src/scope.generated.ts for the deploy stage: the subscription and resource groups
+    the live estate function may read (Database Hub's view, filtered to them). A missing or malformed scope gives the
+    empty placeholder, which the function reports as "no scope". Names only: a subscription ID and resource group
+    names, never a secret.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [System.Collections.IDictionary] $Scope
+    )
+
+    $subscription = if ($Scope) { [string]$Scope['subscriptionId'] } else { '' }
+    $groups = @(if ($Scope) { @($Scope['resourceGroups']) | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^[\w.()-]{1,90}$' } })
+    if ($subscription -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or $groups.Count -eq 0) {
+        $subscription = ''
+        $groups = @()
+    }
+    $list = ($groups | ForEach-Object { '"{0}"' -f $_ }) -join ', '
+    return @(
+        '// Written by scripts/configure-fabric-app.ps1 in the deploy stage: the demo''s own resources, the only scope the',
+        '// estate function reads. Git holds an empty placeholder.',
+        'import type { EstateScope } from "./estate-core.js";',
+        '',
+        ('export const ESTATE_SCOPE: EstateScope = {{ subscriptionId: "{0}", resourceGroups: [{1}] }};' -f $subscription.ToLowerInvariant(), $list),
+        ''
+    ) -join "`n"
+}
+
 function Set-DemoFabricAppEnvValue {
     <#
     .SYNOPSIS
