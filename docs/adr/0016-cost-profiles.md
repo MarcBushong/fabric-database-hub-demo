@@ -295,13 +295,13 @@ Prices here are dated examples: list prices in USD for West US 3 from the Azure 
 | Case | T5's container | Worst case | Ceiling | Margin |
 |---|---|---|---|---|
 | The owner's update (their configuration, the safety stop in place), at 52df9bd | All month | $175.20; $151.59 on the free tier | $250 | +$74.80; +$98.41 |
-| The same, after (an Owner's run updates the roles) | Each session | $148.46; $148.13 on the free tier | $250 | +$101.54; +$101.87 |
+| The same, after (an Owner's run updates the roles) | Each session | $149.54; $149.21 on the free tier | $250 | +$100.46; +$100.79 |
 | The example configuration, a new deployment by an Owner, at 52df9bd | All month | $397.34; $373.73 on the free tier | $375 | −$22.34 (**Fail**); +$1.27 |
-| The same, after (the safety stop counts: 96 hours) | Each session | $148.46; $148.13 on the free tier | $390 | +$241.54; +$241.87 |
+| The same, after (the safety stop counts: 96 hours) | Each session | $149.54; $149.21 on the free tier | $390 | +$240.46; +$240.79 |
 | The example configuration, a new deployment by a Contributor, at 52df9bd | All month | $397.34; $373.73 on the free tier | $375 | −$22.34 (**Fail**); +$1.27 |
-| The same, after (no role for the session control, so T5 is session-only; the restart counts 720 hours) | Each session | $370.60; $370.27 on the free tier | $390 | +$19.40; +$19.73 |
+| The same, after (no role for the session control, so T5 is session-only; the restart counts 720 hours) | Each session | $371.68; $371.35 on the free tier | $390 | +$18.32; +$18.65 |
 
-If the safety stop that an Owner's first deployment counts isn't put in place after all, that run's worst case is $370.60 ($370.27 on the free tier), within $390, and the run says so. Without the session control's fix, a Contributor's new deployment would price T5 all month: $397.34, over $390.
+If the safety stop that an Owner's first deployment counts isn't put in place after all, that run's worst case is $371.68 ($371.35 on the free tier), within $390, and the run says so. Without the session control's fix, a Contributor's new deployment would price T5 all month: $398.42, over $390. The figures after the changes include Ask's chat relay (ADR 0028, merged the same day) for the month's 10 running hours, about $1.08; the ones at 52df9bd don't have it.
 
 - **Validation:** unit-tested (`tests/unit/DbHubDemo.SafetyStop.Tests.ps1`: the permissions an Owner, a Contributor, and a Role Based Access Control Administrator have, a group that doesn't exist yet, a read that fails, a role that's current or one action short, and `DEPLOY.COST.T4RESTART` over and within the ceiling; `DbHubDemo.Preflight.Tests.ps1`: an Owner's and a Contributor's first deployment; `DbHubDemo.Cost.Tests.ps1`: the planned case's figures and message; `DbHubDemo.T5.Tests.ps1`: T5's price for a new environment, an update from `main`, and each deployer; `DbHubDemo.Progress.Tests.ps1`; `DbHubDemo.Config.Tests.ps1`, `DbHubDemo.Validation.Tests.ps1`: the 390 default). `azuredeploy.json` was rebuilt with the pinned Bicep 0.47.16. Live: see the implementation report.
 
