@@ -757,6 +757,8 @@ Describe 'Get-DemoCostEstimate' {
         $file | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $legacyPath -Encoding utf8NoBOM
         $legacy = Get-DemoConfig -Path $legacyPath
         $legacy['t4Enabled'] = $false
+        # Ask's relay is priced in its own test; this one checks the ceiling, at the figure below without it.
+        $legacy['ask'] = @{ enabled = $false; image = ''; githubClientId = '' }
         # The fixture's lowest-cost session, 11.70 USD, is between the two ceilings: a Pass against 20, not a Warning against 15.
         $session = (Get-DemoCostEstimate -Config $legacy -ProfileName 'lowest-cost' -DemoHours 5 -BastionHours 1 -NetworkMode public -DefenderPlans @()).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.SESSION'
         $session.status | Should -Be 'Pass'
