@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { connect } from "node:net";
 import WebSocket from "ws";
@@ -190,9 +191,11 @@ describe("relay WebSocket", () => {
 
     it("refuses an upgrade whose target new URL() can't read, and keeps serving (security review, 2026-11-19)", async () => {
         const { base, port } = await listen();
+        // A WebSocket key is any 16 random bytes in base64 (RFC 6455); built here so no key-shaped literal is in the source.
+        const key = randomBytes(16).toString("base64");
         const status = await rawRequest(
             port,
-            `GET /\\x:a HTTP/1.1\r\nHost: relay\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: ${APP}\r\n\r\n`,
+            `GET /\\x:a HTTP/1.1\r\nHost: relay\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\nOrigin: ${APP}\r\n\r\n`,
         );
         expect(status).toMatch(/^HTTP\/1\.1 4\d\d /);
         expect((await fetch(`${base}/healthz`)).status).toBe(200);
