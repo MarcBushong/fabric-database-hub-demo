@@ -119,6 +119,8 @@ export default function OverviewPage() {
     const latestRun = checks.reduce((a, c) => (c.runId > a ? c.runId : a), "");
     const openChecks = checks.filter((c) => c.runId === latestRun && c.statusSort <= 3).sort((a, b) => a.statusSort - b.statusSort);
     const readiness = summary?.readiness ?? null;
+    // A validation run has at least one check: the summary's row of zeros isn't one.
+    const hasRun = summary !== null && summary.checks > 0;
     const lastSession = sessions.find((s) => /showcase|session/i.test(s.profile)) ?? sessions[0] ?? null;
     const newest = incidents[0] ?? null;
     const needs = health.filter((h) => h.status === "Fail" || h.status === "Warning" || h.status === "Manual action required");
@@ -194,9 +196,9 @@ export default function OverviewPage() {
                         />
                         <KpiTile
                             label="Demo readiness"
-                            value={readiness !== null ? `${Math.round(readiness * 100)} %` : "–"}
-                            status={summary ? (summary.failed > 0 ? "Fail" : summary.manual > 0 ? "Manual action required" : summary.warnings > 0 ? "Warning" : "Pass") : null}
-                            sub={summary ? `${summary.failed} failed · ${summary.manual} manual · ${summary.warnings} warnings` : "No validation run yet"}
+                            value={hasRun && readiness !== null ? `${Math.round(readiness * 100)} %` : "–"}
+                            status={hasRun ? (summary.failed > 0 ? "Fail" : summary.manual > 0 ? "Manual action required" : summary.warnings > 0 ? "Warning" : "Pass") : null}
+                            sub={hasRun ? `${summary.failed} failed · ${summary.manual} manual · ${summary.warnings} warnings` : "Run all in NB_DatabaseHub_Control fills this"}
                             onOpen={() => navigate("readiness")}
                             openLabel="Open readiness"
                         />
@@ -321,7 +323,7 @@ export default function OverviewPage() {
                         loading={summaryState.loading || checksState.loading}
                         error={summaryState.error ?? checksState.error}
                         empty={!checksState.loading && checks.length === 0}
-                        emptyText="No validation run in the history yet: deploy.ps1 runs one."
+                        emptyText="No validation run yet: Run all in NB_DatabaseHub_Control fills this, or run NB_DatabaseHub_Deployment yourself."
                         table={checksState.data ? { columns: checksSpec.columns, rows: checksState.data.rows.filter((r) => r.RunId === latestRun), caption: "Checks of the latest validation run" } : null}
                         summary={summary ? `${summary.passed} of ${summary.checks} checks pass.` : "Readiness."}
                         askPrompt="Is the demo ready? What should I fix before presenting?"

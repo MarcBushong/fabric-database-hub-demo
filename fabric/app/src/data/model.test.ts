@@ -183,7 +183,7 @@ describe("query catalog", () => {
     it("has 21 bounded, unique, read-only queries, and marks the ones a healthy new environment has no rows for", () => {
         expect(catalog).toHaveLength(21);
         expect(new Set(catalog.map((q) => q.id)).size).toBe(21);
-        expect(catalog.filter((q) => q.mayBeEmpty).map((q) => q.id)).toEqual(["scenario-runs", "agent-loop", "cosmos-series", "cosmos-findings"]);
+        expect(catalog.filter((q) => q.mayBeEmpty).map((q) => q.id)).toEqual(["readiness-checks", "scenario-runs", "agent-loop", "cosmos-series", "cosmos-findings"]);
         for (const q of catalog) {
             expect(q.dax.trimStart().startsWith("EVALUATE") || q.dax.trimStart().startsWith("DEFINE")).toBe(true);
             expect(q.rowLimit).toBeGreaterThan(0);

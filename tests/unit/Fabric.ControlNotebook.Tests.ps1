@@ -159,7 +159,7 @@ def iso(value):
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-SENT, JOBS, REFS, ORDER, REFUSED, JOBREADS, STOPS, STATUSREADS, SECRET_URL = [], [], [], [], [0], [0], [0], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
+SENT, JOBS, REFS, VALIDATORS, ORDER, REFUSED, JOBREADS, STOPS, STATUSREADS, SECRET_URL = [], [], [], [], [], [0], [0], [0], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
 VAULT = {"dbhub-session-status": "{}", "dbhub-session-metrics": "{}", "dbhub-activity-webhook": SECRET_URL}
 RUNBOOK = {"session": None, "accepted": None, "minutes": 0}
 # The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound" and "full".
@@ -240,9 +240,20 @@ class Credentials:
 
 
 class Notebook:
-    """notebookutils.notebook: a reference run takes 4 minutes, in "refail" it fails as Fabric's lakehouse check would."""
+    """notebookutils.notebook: a reference run takes 4 minutes, in "refail" it fails as Fabric's lakehouse check would.
+    The validator (NB_DatabaseHub_Deployment) takes 70 seconds: in "valfail" it fails, in "valslow" it passes its timeout."""
     def run(self, path, timeout_seconds=90, arguments=None, workspace=""):
         arguments = dict(arguments or {})
+        if path == "NB_DatabaseHub_Deployment":
+            VALIDATORS.append({"path": path, "timeout": timeout_seconds, "workspace": workspace, "args": arguments})
+            ORDER.append("validator")
+            if scenario == "valfail":
+                raise RuntimeError("Notebook execution failed in cell 12: the telemetry endpoint didn't answer.")
+            if scenario == "valslow":
+                _sleep(timeout_seconds)
+                raise RuntimeError("The notebook run didn't finish in %d seconds." % timeout_seconds)
+            _sleep(70)
+            return ""
         REFS.append({"path": path, "timeout": timeout_seconds, "workspace": workspace, "args": arguments})
         ORDER.append("history:" + str(arguments.get("SESSION_ID", ""))[:8])
         if scenario == "refail":
@@ -334,7 +345,7 @@ with contextlib.redirect_stdout(buffer):
     except Exception as failure:
         error = "%s: %s" % (type(failure).__name__, failure)
 printed = buffer.getvalue()
-print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "statusReads": STATUSREADS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed}))
+print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "validators": VALIDATORS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "statusReads": STATUSREADS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed}))
 '@
 
     function Invoke-Simulation([string] $Path, [string] $Scenario, [string] $Start) {
@@ -841,7 +852,7 @@ print(json.dumps(out))
         ([datetime]$job.WINDOW_START_UTC).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 14, 13, 55, 0, [System.DateTimeKind]::Utc))
         $job.RESOURCE_GROUP | Should -Be 'rg-dbhub-demo'
         $job.T1_VM_NAME | Should -Be 'sqlvm01'
-        @($report.order) | Should -Be @('sent:session', 'sent:stop', ('history:{0}' -f $job.SESSION_ID.Substring(0, 8)))
+        @($report.order) | Should -Be @('sent:session', 'validator', 'sent:stop', ('history:{0}' -f $job.SESSION_ID.Substring(0, 8)))
         $report.printed | Should -Match 'This session runs 90 minutes, until 15:30 \(UTC\)'
         # The capacity runs this notebook, so it isn't checked; the stand-in fails on any capacity call. ("Capacity maxed
         # out" is a showcase scenario.)
@@ -877,17 +888,75 @@ print(json.dumps(out))
         $report.refs[0].args.T3_SERVER_PREFIX | Should -Not -BeNullOrEmpty
     }
 
+    It 'checks readiness once the session runs: NB_DatabaseHub_Deployment, read-only, in this notebook''s Spark session, before the guide (2026-11-18)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # Run all does everything (the user), so every session fills the Insights app's Readiness page (validation_results).
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC' -Prefix 'contoso') -Scenario 'session' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.validators).Count | Should -Be 1
+        $run = $report.validators[0]
+        $run.path | Should -BeExactly 'NB_DatabaseHub_Deployment'
+        $run.workspace | Should -Be 'bbbbbbbb-0000-0000-0000-000000000002'
+        $run.timeout | Should -Be 300
+        # Read-only: its results saved, its cleanup off, and this environment's names rather than the validator's defaults.
+        @($run.args.PSObject.Properties.Name | Sort-Object) | Should -Be @('CONFIRM', 'LAKEHOUSE_ID', 'PURGE_DEMO_TABLES', 'RESOURCE_GROUP', 'SAVE_RESULTS', 'T1_VM_NAME', 'T2_MACHINE_NAME', 'T3_SERVER_PREFIX', 'WORKSPACE_ID')
+        $run.args.SAVE_RESULTS | Should -BeTrue
+        $run.args.CONFIRM | Should -BeFalse
+        $run.args.PURGE_DEMO_TABLES | Should -BeFalse
+        $run.args.WORKSPACE_ID | Should -Be 'bbbbbbbb-0000-0000-0000-000000000002'
+        $run.args.LAKEHOUSE_ID | Should -Be 'cccccccc-0000-0000-0000-000000000003'
+        $run.args.RESOURCE_GROUP | Should -Be 'rg-contoso-demo'
+        $line = 'Readiness: NB_DatabaseHub_Deployment ran its read-only checks in 1 minute; the Insights app''s Readiness page shows each one, worst first, after its next refresh.'
+        $report.printed | Should -Match ([regex]::Escape($line))
+        $report.printed.IndexOf('Pass: the session runs until') | Should -BeLessThan $report.printed.IndexOf($line)
+        $report.printed.IndexOf($line) | Should -BeLessThan $report.printed.IndexOf('=== The presenter''s guide')
+    }
+
+    It 'goes on with the session, the Database Agent beat, and its history when the readiness check <Case>' -ForEach @(
+        @{ Case = 'fails'; Scenario = 'valfail'; Printed = 'Warning: readiness wasn''t checked: NB_DatabaseHub_Deployment didn''t finish in this session (RuntimeError: Notebook execution failed in cell 12: the telemetry endpoint didn''t answer). The session goes on. Fix: run NB_DatabaseHub_Deployment in the demo workspace while the session runs; the Insights app''s Readiness page shows its checks.' }
+        @{ Case = 'runs past its 5 minutes'; Scenario = 'valslow'; Printed = 'Warning: readiness wasn''t checked: NB_DatabaseHub_Deployment didn''t finish in this session (RuntimeError: The notebook run didn''t finish in 300 seconds). The session goes on.' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.validators).Count | Should -Be 1
+        $report.printed | Should -Match ([regex]::Escape($Printed))
+        @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+        @($report.order) | Should -Be @('sent:session', 'validator', 'sent:stop', ('history:{0}' -f $report.sent[0].sessionId.Substring(0, 8)))
+        $report.printed | Should -Match '=== The presenter''s guide: session [0-9a-f]{8}'
+        $report.printed | Should -Match 'Now: T3 Respond, the Database Agent loop''s manual response'
+        $report.printed | Should -Match 'Pass: the history is saved'
+    }
+
+    It 'says why readiness wasn''t checked when this notebook can''t run it in its own Spark session, and how to check it' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'unbound' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.validators).Count | Should -Be 0
+        $report.printed | Should -Match ([regex]::Escape('Readiness: not checked in this Run all, because this notebook''s default lakehouse isn''t the demo''s (none is attached; ./scripts/deploy.ps1 attaches it). Fix: run NB_DatabaseHub_Deployment in the demo workspace while the session runs; the Insights app''s Readiness page shows its checks.'))
+        @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+    }
+
     It 'runs Run all in <Case>' -ForEach @(
-        @{ Case = 'a session that already runs: it follows that one and ends it, rather than start another'; Scenario = 'active'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Printed = 'A session already runs \(session aaaaaaaa, until 15:10, UTC\): this Run all follows it' }
-        @{ Case = 'the evening, too close to the auto-shutdown: nothing starts, and it says how to change it'; Scenario = 'late'; Start = '2026-11-14T18:45:00Z'; Sent = @(); Refs = 0; Jobs = 0; Printed = 'Nothing is started: .* too soon for a session of at least 30 minutes\.\s+Fix: Run all again earlier in the day, or set autoShutdownTime' }
-        @{ Case = 'the late afternoon: it says before it starts when the session ends and why'; Scenario = 'capped'; Start = '2026-11-14T17:45:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Printed = 'This session runs 60 of the 90 minutes asked: it ends at 18:45' }
-        @{ Case = 'an earlier session''s metrics in the vault: its history is saved right after the start is sent'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
-        @{ Case = 'Stop now: it ends the session that runs, its history saved too'; Scenario = 'stopnow'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Printed = '=== Stop now: stopping session aaaaaaaa ===' }
-        @{ Case = 'MODE "check": the plan and the checks, and nothing sent'; Scenario = 'check'; Start = '2026-11-14T14:00:00Z'; Sent = @(); Refs = 0; Jobs = 0; Printed = 'MODE is "check", so nothing was sent\.' }
-        @{ Case = 'WAIT_FOR_END False: the session goes on, and its auto-stop ends it'; Scenario = 'nowait'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Refs = 0; Jobs = 0; Printed = 'The session goes on until 15:30 \(UTC\)\. Its auto-stop at 15:40' }
-        @{ Case = 'a runbook that refuses the session: the reason and the fix'; Scenario = 'refused'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Refs = 0; Jobs = 0; Printed = '(?s)A run is already active.*Fix: Wait until it ends, or run the notebook''s Stop now cell first\..*Nothing runs: A run is already active' }
-        @{ Case = 'a notebook without the demo''s lakehouse: the history runs as a job in the demo workspace, and it says why'; Scenario = 'unbound'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 0; Jobs = 1; Printed = 'NB_DatabaseHub_LiveActivity runs as a job in the demo workspace instead, because this notebook''s default lakehouse isn''t the demo''s \(none is attached; \./scripts/deploy\.ps1 attaches it\)\.' }
-        @{ Case = 'a reference run that fails: the history runs as a job, with the reason'; Scenario = 'refail'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 1; Printed = 'runs as a job in the demo workspace instead, because it didn''t finish in this session \(RuntimeError: The referenced notebook''s default lakehouse differs' }
+        @{ Case = 'a session that already runs: it follows that one and ends it, rather than start another'; Scenario = 'active'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'A session already runs \(session aaaaaaaa, until 15:10, UTC\): this Run all follows it' }
+        @{ Case = 'the evening, too close to the auto-shutdown: nothing starts, and it says how to change it'; Scenario = 'late'; Start = '2026-11-14T18:45:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'Nothing is started: .* too soon for a session of at least 30 minutes\.\s+Fix: Run all again earlier in the day, or set autoShutdownTime' }
+        @{ Case = 'the late afternoon: it says before it starts when the session ends and why'; Scenario = 'capped'; Start = '2026-11-14T17:45:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 0; Validators = 1; Printed = 'This session runs 60 of the 90 minutes asked: it ends at 18:45' }
+        @{ Case = 'an earlier session''s metrics in the vault: its history is saved right after the start is sent'; Scenario = 'leftover'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 2; Jobs = 0; Validators = 1; Printed = 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent, while the VMs start\.' }
+        @{ Case = 'Stop now: it ends the session that runs, its history saved too'; Scenario = 'stopnow'; Start = '2026-11-14T14:00:00Z'; Sent = @('stop'); Refs = 1; Jobs = 0; Validators = 0; Printed = '=== Stop now: stopping session aaaaaaaa ===' }
+        @{ Case = 'MODE "check": the plan and the checks, and nothing sent'; Scenario = 'check'; Start = '2026-11-14T14:00:00Z'; Sent = @(); Refs = 0; Jobs = 0; Validators = 0; Printed = 'MODE is "check", so nothing was sent\.' }
+        @{ Case = 'WAIT_FOR_END False: the session goes on, and its auto-stop ends it'; Scenario = 'nowait'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Refs = 0; Jobs = 0; Validators = 1; Printed = 'The session goes on until 15:30 \(UTC\)\. Its auto-stop at 15:40' }
+        @{ Case = 'a runbook that refuses the session: the reason and the fix'; Scenario = 'refused'; Start = '2026-11-14T14:00:00Z'; Sent = @('session'); Refs = 0; Jobs = 0; Validators = 0; Printed = '(?s)A run is already active.*Fix: Wait until it ends, or run the notebook''s Stop now cell first\..*Nothing runs: A run is already active' }
+        @{ Case = 'a notebook without the demo''s lakehouse: the history runs as a job in the demo workspace, and it says why'; Scenario = 'unbound'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 0; Jobs = 1; Validators = 0; Printed = 'NB_DatabaseHub_LiveActivity runs as a job in the demo workspace instead, because this notebook''s default lakehouse isn''t the demo''s \(none is attached; \./scripts/deploy\.ps1 attaches it\)\.' }
+        @{ Case = 'a reference run that fails: the history runs as a job, with the reason'; Scenario = 'refail'; Start = '2026-11-14T14:00:00Z'; Sent = @('session', 'stop'); Refs = 1; Jobs = 1; Validators = 1; Printed = 'runs as a job in the demo workspace instead, because it didn''t finish in this session \(RuntimeError: The referenced notebook''s default lakehouse differs' }
     ) {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
@@ -899,12 +968,13 @@ print(json.dumps(out))
         @($report.sent | ForEach-Object action) | Should -Be $Sent
         @($report.refs).Count | Should -Be $Refs
         @($report.jobs).Count | Should -Be $Jobs
+        @($report.validators).Count | Should -Be $Validators -Because 'the readiness check runs once per Run all that follows a running session'
         $report.printed | Should -Match $Printed
         $report.printed | Should -Not -Match 'Warning: the session''s history wasn''t saved'
         if ($Scenario -eq 'leftover') {
             # Its metrics are read before the start, and its history saved right after the start is sent.
             $session = $report.sent[0].sessionId
-            @($report.order) | Should -Be @('sent:session', 'history:eeeeeeee', 'sent:stop', ('history:{0}' -f $session.Substring(0, 8)))
+            @($report.order) | Should -Be @('sent:session', 'history:eeeeeeee', 'validator', 'sent:stop', ('history:{0}' -f $session.Substring(0, 8)))
             $report.refs[0].args.SESSION_ID | Should -Be ('e' * 32)
             $report.refs[0].args.PSObject.Properties.Name | Should -Contain 'POSTGRES_METRICS'
             $report.refs[1].args.SESSION_ID | Should -Be $session

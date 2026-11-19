@@ -114,7 +114,7 @@ Anyone who deploys the demo shows the Insights app themselves, with nothing to s
 6. **Ask Copilot:** on any visual, **Ask Copilot** opens the dock with what's on screen. The first time, the dock signs in to GitHub with your Copilot license; the top bar then shows your GitHub login next to your Fabric account.
 7. **Manage:** **Reset** or **Start a session** says what it will do and asks for confirmation. An operator's request goes to the session control; otherwise the app copies the request for Run all in the control notebook.
 
-- **If it isn't there:** "Not read live here" means the app's live function isn't deployed: the pages show the history, and Database Hub has the live view. No T5 means the deployment has no Cosmos DB. An empty agent loop means the session's history isn't saved yet: it's saved about 15 minutes after the session's end.
+- **If it isn't there:** **Live · unavailable** means the app's live function isn't deployed: the pages show the history, and Database Hub has the live view. No T5 means the deployment has no Cosmos DB. An empty agent loop means the session's history isn't saved yet: it's saved about 15 minutes after the session's end. An empty **Readiness** means no session has run yet: each Run all runs `NB_DatabaseHub_Deployment`'s read-only checks once its session runs, which fill it.
 - **Repeat:** every session adds to the history, and Reset and the next Run all work the same way each time.
 
 ## Plan the session

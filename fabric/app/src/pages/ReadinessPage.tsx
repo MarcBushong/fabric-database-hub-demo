@@ -87,7 +87,10 @@ export default function ReadinessPage() {
 
             {!checksState.loading && checks.length === 0 ? (
                 <EmptyState title="No validation run in the history yet">
-                    <p>./scripts/deploy.ps1 runs NB_DatabaseHub_Deployment, which saves its checks here.</p>
+                    <p>
+                        Run all in <strong>NB_DatabaseHub_Control</strong> fills this: once its session runs, it runs NB_DatabaseHub_Deployment's read-only checks, which save here.
+                    </p>
+                    <p>Or run NB_DatabaseHub_Deployment yourself, in the demo workspace.</p>
                 </EmptyState>
             ) : (
                 <>

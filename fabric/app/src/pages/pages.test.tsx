@@ -305,7 +305,24 @@ describe("Readiness", () => {
         fireEvent.click(screen.getByRole("tab", { name: /^All/ }));
         expect(within(screen.getByRole("table", { name: "Validation checks" })).getByText("t3-telemetry")).toBeInTheDocument();
     });
+
+    it("says what fills readiness before any validation run: Run all in NB_DatabaseHub_Control, or the validator by hand", async () => {
+        renderWithApp(<ReadinessPage />, { client: fakeQueryClient(NO_VALIDATION_RUN) });
+        expect(await screen.findByText("No validation run in the history yet")).toBeInTheDocument();
+        expect(screen.getByText(/fills this: once its session runs/)).toHaveTextContent("Run all in NB_DatabaseHub_Control fills this: once its session runs, it runs NB_DatabaseHub_Deployment's read-only checks, which save here.");
+        expect(screen.getByText("Or run NB_DatabaseHub_Deployment yourself, in the demo workspace.")).toBeInTheDocument();
+    });
+
+    it("keeps Overview's readiness tile blank, with what fills it, while the summary is a row of zeros", async () => {
+        renderWithApp(<OverviewPage />, { client: fakeQueryClient(NO_VALIDATION_RUN) });
+        expect(await screen.findByRole("button", { name: "Demo readiness: –. Open readiness" })).toBeInTheDocument();
+        expect(screen.getByText("Run all in NB_DatabaseHub_Control fills this")).toBeInTheDocument();
+        expect(screen.queryByText(/0 failed · 0 manual · 0 warnings/)).not.toBeInTheDocument();
+    });
 });
+
+// What a new environment's model answers before any validation run (dbhubc5, 2026-11-18): no checks, and a summary row of zeros.
+const NO_VALIDATION_RUN = { "readiness-checks": [], "readiness-summary": [{ Checks: 0, Failed: 0, Manual: 0, Warnings: 0, Passed: 0, NotSupported: 0, NotSelected: 0, Readiness: null, RunLabel: null }] };
 
 describe("Trends", () => {
     it("compares the newest week with the week before, per target", async () => {
